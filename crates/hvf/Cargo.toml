@@ -1,0 +1,11 @@
+[package]
+name = "bangbang-hvf"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+bangbang-runtime = { path = "../runtime" }
+
+[lints]
+workspace = true
