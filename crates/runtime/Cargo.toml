@@ -1,0 +1,10 @@
+[package]
+name = "bangbang-runtime"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

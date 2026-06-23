@@ -1,0 +1,11 @@
+[package]
+name = "bangbang"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+bangbang-hvf = { path = "../hvf" }
+
+[lints]
+workspace = true
