@@ -114,7 +114,7 @@ exist.
 | --- | --- | --- | --- |
 | `PUT /boot-source` | `kernel_image_path` | required | Host path to the kernel image; future validation must check access without leaking sensitive path details. |
 | `PUT /boot-source` | `initrd_path` | optional | Host path to an initrd; future validation follows the kernel path policy. |
-| `PUT /boot-source` | `boot_args` | optional | Kernel command line string; later work should define size and character validation. |
+| `PUT /boot-source` | `boot_args` | optional | Firecracker uses its default kernel command line when omitted; later work should define size and character validation. |
 | `PUT /boot-source` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /machine-config` | `vcpu_count` | required | Firecracker bounds this to `1..=32`; HVF work must also account for host CPU and thread limits. |
 | `PUT /machine-config` | `mem_size_mib` | required | Drives guest memory allocation and mapping; later work must cover bounds and startup performance. |
