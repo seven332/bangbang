@@ -148,17 +148,64 @@ API behavior ships. Security review must cover host paths, socket-like fields,
 device identifiers, and error messages. Performance review must cover boot path
 setup, memory size, and block device I/O when those surfaces are implemented.
 
-## State and Response Scope
+## API State and Response Policy
 
-The initial tier is pre-boot oriented. Machine configuration, boot source, and
-drive configuration are planned pre-boot operations, and `InstanceStart` is the
-planned transition into guest execution. Runtime actions after start are outside
-this initial tier.
+The current scaffold still implements no HTTP API behavior. The policy below is
+the first compatibility target for future request parsing, VMM action mapping,
+state validation, and golden API tests.
 
-The API should eventually use Firecracker-shaped success and error responses.
-Exact status codes, response bodies, and unsupported-endpoint behavior are not
-defined by this initial scope and should be specified before endpoint behavior
-ships.
+### Initial API State Model
+
+The first API implementation should model the same broad stages as Firecracker:
+
+- pre-boot: configuration requests are accepted and stored before guest
+  execution starts
+- starting: `PUT /actions` with `InstanceStart` validates the accumulated
+  configuration, starts guest execution, and transitions the process out of
+  pre-boot state on success
+- runtime: the microVM is running; pre-boot-only configuration requests should
+  fail with a Firecracker-shaped unsupported-state error
+- paused/resumed: deferred until `/vm` state update work defines pause and
+  resume behavior
+
+### Initial Operation State Matrix
+
+| Operation | Pre-boot behavior | Runtime behavior | Notes |
+| --- | --- | --- | --- |
+| `GET /` | supported target; `200` JSON | supported target; `200` JSON | Response state should reflect the current microVM state. |
+| `GET /version` | supported target; `200` JSON | supported target; `200` JSON | Body should use Firecracker's `firecracker_version` field shape. |
+| `GET /vm/config` | supported target; `200` JSON | supported target; `200` JSON | Returns the accumulated or active VM configuration once models exist. |
+| `GET /machine-config` | supported target; `200` JSON | supported target; `200` JSON | Returns machine configuration and defaulted values. |
+| `PUT /machine-config` | supported target; `204` empty response on success | unsupported after start; `400` `fault_message` | Pre-boot-only configuration. |
+| `PUT /boot-source` | supported target; `204` empty response on success | unsupported after start; `400` `fault_message` | Host path errors must avoid leaking sensitive path details. |
+| `PUT /drives/{drive_id}` | supported target; `204` empty response on success | unsupported after start; `400` `fault_message` | Runtime hotplug remains deferred. |
+| `PUT /actions` with `InstanceStart` | supported target; `204` empty response on successful transition | unsupported after start; `400` `fault_message` | Startup validation failures should also use `400` `fault_message`. |
+| `PUT /actions` with `FlushMetrics` | deferred; `400` `fault_message` until metrics support exists | deferred; `400` `fault_message` until metrics support exists | Tied to observability work. |
+| `PUT /actions` with `SendCtrlAltDel` | intentionally unsupported; `400` `fault_message` | intentionally unsupported; `400` `fault_message` | Firecracker rejects this on aarch64; bangbang's first target is Apple Silicon. |
+| Deferred endpoints from the endpoint matrix | `400` `fault_message` until their capability exists | `400` `fault_message` until their capability exists | A later capability PR may define more specific state behavior. |
+| Unknown endpoint or invalid method/path | `400` `fault_message` | `400` `fault_message` | Matches Firecracker's parser-level invalid path or method handling. |
+
+### Response Policy
+
+| Case | HTTP status | Body policy |
+| --- | --- | --- |
+| Successful data response | `200 OK` | JSON body with Firecracker-shaped field names. |
+| Successful empty response | `204 No Content` | Empty body. |
+| Invalid path, invalid method, invalid JSON, unknown field, invalid field, unsupported endpoint, or unsupported state | `400 Bad Request` | JSON object with `fault_message`. |
+| Startup, configuration, or VMM action failure | `400 Bad Request` | JSON object with `fault_message`; exact strings can be refined with the implementation. |
+| MMDS payload-limit failure | deferred | Firecracker uses `413 Payload Too Large`; define this with MMDS support. |
+
+Future API work should use `fault_message` consistently where Firecracker does.
+Exact message strings should be covered by golden tests once the API parser and
+VMM action model exist, but this document only defines the initial status/body
+shape.
+
+API request bodies, path identifiers, and host resource paths are untrusted
+input. Future implementations must validate them before mutating VMM state and
+redact sensitive host path details from error messages. API parsing and response
+serialization must stay outside the VM and vCPU fast path; expensive startup,
+memory, or device work belongs in explicit VMM actions where it can be measured
+and tested.
 
 ## Non-Initial Firecracker Features
 
