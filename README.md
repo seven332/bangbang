@@ -17,7 +17,7 @@ crates/bangbang   VMM process entrypoint skeleton
 
 ## Current Scope
 
-The first target is Apple Silicon macOS. This PR intentionally does not include:
+The first target is Apple Silicon macOS. The current scaffold intentionally does not include:
 
 - an API server
 - JSON request/response models
