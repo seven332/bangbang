@@ -281,6 +281,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_version_arg_ignores_other_args() {
+        let args = parse(&["--version", "--unknown"]).expect("version should bypass parsing");
+
+        assert_eq!(args.command, Command::Version);
+    }
+
+    #[test]
     fn parse_short_version_arg() {
         let args = parse(&["-V"]).expect("short version arg should parse");
 
@@ -394,6 +401,16 @@ mod tests {
         let err = parse(&["--config-file", "vm.json"]).expect_err("unsupported arg should fail");
 
         assert_eq!(err, "unsupported Firecracker argument: --config-file");
+    }
+
+    #[test]
+    fn rejects_unsupported_firecracker_config_file_equals_arg() {
+        let err = parse(&["--config-file=vm.json"]).expect_err("unsupported arg should fail");
+
+        assert_eq!(
+            err,
+            "unsupported Firecracker argument: --config-file=vm.json"
+        );
     }
 
     #[test]
