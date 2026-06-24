@@ -94,7 +94,12 @@ surface:
 - platform-gated tests for HVF behavior
 - boot smoke tests once kernel loading and vCPU execution exist
 
+## Security and Performance Scope
+
 Security review should cover host paths, Unix sockets, FFI boundaries, guest
 memory, device I/O, and untrusted API or guest input as those surfaces are
 introduced. Performance review should cover startup path, memory mapping, vCPU
 run loops, and device I/O when those areas change.
+
+Detailed security and performance analysis belongs with the capability work that
+introduces or changes the relevant surface.
