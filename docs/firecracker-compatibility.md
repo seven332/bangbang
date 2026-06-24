@@ -44,7 +44,9 @@ Firecracker behavior:
 - `docs/design.md` for process model, thread model, and threat-containment
   expectations
 
-Future baseline updates should describe API, state, security, performance, and
+Unreviewed upstream drift in API routing, VMM actions, device behavior, or
+published docs should not implicitly change bangbang's target. Future baseline
+updates should describe API, state, documentation, security, performance, and
 test impact before changing this reference.
 
 ## Initial Compatibility Tier
