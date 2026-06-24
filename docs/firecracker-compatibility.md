@@ -29,7 +29,7 @@ bangbang's first Firecracker compatibility baseline is the upstream
 
 A release tag is the compatibility reference because it represents a published
 Firecracker interface. Development branch commits can still inform
-implementation research, but they should not redefine bangbang's compatibility
+implementation research, but they must not redefine bangbang's compatibility
 target without an explicit baseline update. A standalone pinned commit is
 precise, but it should be tied to a release tag for this project so the baseline
 is both reproducible and recognizable.
@@ -45,9 +45,10 @@ Firecracker behavior:
   expectations
 
 Unreviewed upstream drift in API routing, VMM actions, device behavior, or
-published docs should not implicitly change bangbang's target. Future baseline
-updates should describe API, state, documentation, security, performance, and
-test impact before changing this reference.
+published docs must not implicitly change bangbang's target. Future baseline
+updates must be explicit, reviewed documentation changes that describe API,
+state, documentation, security, performance, and test impact before changing
+this reference.
 
 ## Initial Compatibility Tier
 
