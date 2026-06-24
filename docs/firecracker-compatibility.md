@@ -36,6 +36,18 @@ The first planned compatibility tier is the smallest boot-oriented API surface:
 Until the API server and VMM action model exist, these endpoints are
 compatibility targets rather than implemented behavior.
 
+## State and Response Scope
+
+The initial tier is pre-boot oriented. Machine configuration, boot source, and
+drive configuration are planned pre-boot operations, and `InstanceStart` is the
+planned transition into guest execution. Runtime actions after start are outside
+this initial tier.
+
+The API should eventually use Firecracker-shaped success and error responses.
+Exact status codes, response bodies, and unsupported-endpoint behavior are not
+defined by this initial scope and should be specified before endpoint behavior
+ships.
+
 ## Deferred Firecracker Features
 
 The following Firecracker features are intentionally deferred from the initial
