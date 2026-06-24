@@ -139,7 +139,7 @@ exist.
 | `PUT /drives/{drive_id}` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /actions` | `action_type=InstanceStart` | required initially | The only initial action target. |
 | `PUT /actions` | `action_type=FlushMetrics` | deferred | Depends on logger and metrics support. |
-| `PUT /actions` | `action_type=SendCtrlAltDel` | intentionally unsupported initially | Firecracker gates this on x86 keyboard behavior; the first target is Apple Silicon. |
+| `PUT /actions` | `action_type=SendCtrlAltDel` | intentionally unsupported | Firecracker gates this on x86 keyboard behavior; the first target is Apple Silicon. |
 | `PUT /actions` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 
 Future implementation PRs should derive unit or golden tests from these tables.
