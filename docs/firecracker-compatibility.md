@@ -46,9 +46,9 @@ Firecracker behavior:
 
 Unreviewed upstream drift in API routing, VMM actions, device behavior, or
 published docs must not implicitly change bangbang's target. Future baseline
-updates must be explicit, reviewed documentation changes that describe API,
-state, documentation, security, performance, and test impact before changing
-this reference.
+updates must be explicit pull requests that update this documentation and
+describe API, state, documentation, security, performance, and test impact
+before changing this reference.
 
 ## Initial Compatibility Tier
 
