@@ -2,7 +2,7 @@
 
 bangbang is a Rust VMM project for macOS hosts. The public control plane is intended to stay compatible with the Firecracker HTTP API over a Unix domain socket, while the VM backend is built on Apple's Hypervisor.framework.
 
-This repository is currently a scaffold. It defines crate boundaries, Firecracker-compatible API endpoint names, a backend trait, and the smallest Hypervisor.framework VM create/destroy wrapper.
+This repository is currently a scaffold. It defines crate boundaries, Firecracker-compatible API endpoint names, an initial process startup CLI, a backend trait, and the smallest Hypervisor.framework VM create/destroy wrapper.
 
 See [Firecracker Compatibility Scope](docs/firecracker-compatibility.md) for the intended compatibility target and current limitations.
 
@@ -12,7 +12,7 @@ See [Firecracker Compatibility Scope](docs/firecracker-compatibility.md) for the
 crates/api        Firecracker-compatible API endpoint names
 crates/runtime    Backend-neutral VM trait and error type
 crates/hvf        Hypervisor.framework backend skeleton
-crates/bangbang   VMM process entrypoint skeleton
+crates/bangbang   VMM process entrypoint and startup CLI
 ```
 
 ## Current Scope
