@@ -17,7 +17,7 @@ guest execution fast path.
 
 The intended public control plane is Firecracker-style HTTP over a Unix domain
 socket. API requests should eventually map to explicit VMM actions and VM state
-transitions, but this PR only documents the initial scope.
+transitions, but this document only defines the initial scope.
 
 ## Initial Compatibility Tier
 
@@ -85,12 +85,3 @@ Security review should cover host paths, Unix sockets, FFI boundaries, guest
 memory, device I/O, and untrusted API or guest input as those surfaces are
 introduced. Performance review should cover startup path, memory mapping, vCPU
 run loops, and device I/O when those areas change.
-
-## Follow-Up Work
-
-This document intentionally leaves detailed compatibility decisions to follow-up
-issues:
-
-- #23 selects the Firecracker release or source baseline.
-- #26 defines the full endpoint and field compatibility matrix.
-- #29 defines exact API state and error response compatibility rules.
