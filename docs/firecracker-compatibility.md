@@ -55,16 +55,15 @@ before changing this reference.
 The current scaffold still implements no HTTP API behavior. The support levels
 below describe compatibility targets for future API work:
 
-- initial target: supported tier planned for the first boot-oriented API
-  implementation
+- supported target: planned for the first boot-oriented API implementation
 - planned later: expected to be compatible later, but outside the first tier
 - deferred: blocked on a separate capability, device, or backend design
 - intentionally unsupported: not part of the current macOS/HVF target without a
   later compatibility policy change
 
 For request fields, rejected means the future API should fail the request once
-JSON models exist. Ignored means accepted with no effect. No initial target field
-is intentionally ignored; unknown JSON fields should be rejected to match
+JSON models exist. Ignored means accepted with no effect. No supported target
+field is intentionally ignored; unknown JSON fields should be rejected to match
 Firecracker `v1.16.0` request models that deny unknown fields.
 
 ## Endpoint Compatibility Matrix
@@ -74,26 +73,30 @@ This matrix does not imply that the current scaffold implements the endpoints.
 
 | Method | Endpoint | Support level | Scope notes |
 | --- | --- | --- | --- |
-| `GET` | `/` | initial target | Describe the microVM instance. |
-| `GET` | `/version` | initial target | Report the VMM version with a Firecracker-shaped body. |
-| `GET` | `/vm/config` | initial target | Return the full VM configuration once configuration models exist. |
-| `GET` | `/machine-config` | initial target | Return machine configuration and defaults. |
-| `PUT` | `/machine-config` | initial target | Configure vCPU and memory settings before boot. |
-| `PUT` | `/boot-source` | initial target | Configure the guest kernel, initrd, and boot arguments before boot. |
-| `PUT` | `/drives/{drive_id}` | initial target | Configure initial virtio-block devices before boot. |
-| `PUT` | `/actions` | initial target | Start the microVM with `InstanceStart`; other action values are outside the first tier. |
+| `GET` | `/` | supported target | Describe the microVM instance. |
+| `GET` | `/version` | supported target | Report the VMM version with a Firecracker-shaped body. |
+| `GET` | `/vm/config` | supported target | Return the full VM configuration once configuration models exist. |
+| `GET` | `/machine-config` | supported target | Return machine configuration and defaults. |
+| `PUT` | `/machine-config` | supported target | Configure vCPU and memory settings before boot. |
+| `PUT` | `/boot-source` | supported target | Configure the guest kernel, initrd, and boot arguments before boot. |
+| `PUT` | `/drives/{drive_id}` | supported target | Configure initial virtio-block devices before boot. |
+| `PUT` | `/actions` | supported target | Start the microVM with `InstanceStart`; other action values are outside the first tier. |
 | `PUT` | `/actions` with `SendCtrlAltDel` | intentionally unsupported | Firecracker gates this action on x86 keyboard behavior; the first bangbang target is Apple Silicon. |
 | `PUT` | `/logger`, `/metrics` | planned later | Tied to observability work in #17. |
+| `PATCH` | `/machine-config` | deferred | Partial updates belong with later state and validation rules. |
 | `PUT` | `/cpu-config` | deferred | Needs HVF CPU feature design with VM and boot work in #8 and #10. |
 | `PUT` | `/network-interfaces/{iface_id}` | deferred | Tied to virtio network work in #14. |
 | `PUT` | `/vsock` | deferred | Tied to virtio vsock work in #15. |
-| `PUT` | `/mmds`, `/mmds/config` | deferred | Tied to MMDS work in #16. |
+| `GET`, `PUT`, `PATCH` | `/mmds` | deferred | Tied to MMDS work in #16. |
+| `PUT` | `/mmds/config` | deferred | Tied to MMDS work in #16. |
 | `PUT` | `/snapshot/create`, `/snapshot/load` | deferred | Tied to snapshot and restore work in #19. |
-| `GET`, `PUT`, `PATCH` | `/balloon`, `/balloon/statistics`, `/balloon/hinting/*` | deferred | Requires balloon device and runtime update design. |
+| `GET`, `PUT`, `PATCH` | `/balloon` | deferred | Requires balloon device and runtime update design. |
+| `GET`, `PATCH` | `/balloon/statistics`, `/balloon/hinting/*` | deferred | Requires balloon statistics and hinting design. |
 | `PUT`, `PATCH`, `DELETE` | `/pmem/{id}` | deferred | Requires a separate pmem device design. |
-| `PUT` | `/entropy`, `/serial`, `/hotplug/memory` | deferred | Requires separate device and macOS/HVF design work. |
+| `PUT` | `/entropy`, `/serial` | deferred | Requires separate device and macOS/HVF design work. |
+| `GET`, `PUT`, `PATCH` | `/hotplug/memory` | deferred | Requires memory hotplug device and runtime update design. |
 | `PATCH` | `/vm` | deferred | Pause and resume state rules belong with #29 and VMM action work. |
-| `PATCH`, `DELETE` | drive, network, pmem, balloon, and hotplug update endpoints | deferred | Hotplug and runtime update behavior belongs with the relevant device issues. |
+| `PATCH`, `DELETE` | `/drives/{drive_id}`, `/network-interfaces/{iface_id}` | deferred | Hotplug and runtime update behavior belongs with the relevant device issues. |
 
 ## Initial Field Handling Policy
 
@@ -123,7 +126,7 @@ exist.
 | `PUT /drives/{drive_id}` | `cache_type` | optional | Firecracker accepts `Unsafe` and `Writeback`; macOS behavior needs later performance review. |
 | `PUT /drives/{drive_id}` | `rate_limiter` | deferred | Tied to future block I/O performance work in #13. |
 | `PUT /drives/{drive_id}` | `io_engine` | rejected initially | Firecracker's Linux I/O engine choices do not directly map to the first macOS target. |
-| `PUT /drives/{drive_id}` | `socket` | deferred | Vhost-user-block is outside the first tier. |
+| `PUT /drives/{drive_id}` | `socket` | deferred | Vhost-user-block is outside the first tier; future validation must cover socket path ownership and permissions. |
 | `PUT /drives/{drive_id}` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /actions` | `action_type=InstanceStart` | required initially | The only initial action target. |
 | `PUT /actions` | `action_type=FlushMetrics` | deferred | Depends on logger and metrics support. |
@@ -131,9 +134,10 @@ exist.
 | `PUT /actions` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 
 Future implementation PRs should derive unit or golden tests from these tables.
-Security review must cover host paths, socket-like fields, device identifiers,
-and error messages. Performance review must cover boot path setup, memory size,
-and block device I/O when those surfaces are implemented.
+User documentation should keep the same support and field-status vocabulary when
+API behavior ships. Security review must cover host paths, socket-like fields,
+device identifiers, and error messages. Performance review must cover boot path
+setup, memory size, and block device I/O when those surfaces are implemented.
 
 ## State and Response Scope
 
