@@ -54,8 +54,8 @@ compatibility tier:
 - pause and resume actions
 - PATCH and DELETE hotplug/update behavior
 
-Deferred features should be introduced through narrower issues and PRs that
-cover behavior, validation, documentation, security, and performance together.
+Deferred features should be introduced through narrower capability work that
+covers behavior, validation, documentation, security, and performance together.
 
 ## macOS and HVF Differences
 
@@ -63,7 +63,8 @@ Firecracker targets Linux/KVM. bangbang targets macOS with Apple's
 Hypervisor.framework. Some Firecracker host mechanisms therefore need explicit
 macOS design work instead of direct implementation:
 
-- KVM ioctls map to Hypervisor.framework calls.
+- KVM-specific VM and vCPU operations need HVF equivalents rather than direct
+  KVM ioctl usage.
 - Linux seccomp, jailer, cgroups, and namespaces do not directly apply.
 - Linux TAP-based networking needs a macOS-specific design.
 - Snapshot and device behavior may differ when backed by HVF.
@@ -73,7 +74,7 @@ pretending they are solved.
 
 ## Validation Expectations
 
-Every future compatibility PR should choose validation appropriate to its
+Every future compatibility change should choose validation appropriate to its
 surface:
 
 - unit tests for parsing, configuration, and state transitions
