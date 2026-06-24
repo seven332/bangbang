@@ -64,8 +64,10 @@ below describe compatibility targets for future API work:
 For request fields, rejected means the future API should fail the request once
 JSON models exist. Ignored means accepted with no effect. No supported target
 field is intentionally ignored. Deferred request fields should be rejected until
-their capability is implemented. Unknown JSON fields should be rejected to match
-Firecracker `v1.16.0` request models that deny unknown fields.
+their capability is implemented. Some fields have value-specific policy so
+Firecracker's explicit default values remain accepted while feature-enabling
+values stay out of the first tier. Unknown JSON fields should be rejected to
+match Firecracker `v1.16.0` request models that deny unknown fields.
 
 ## Endpoint Compatibility Matrix
 
@@ -116,10 +118,10 @@ exist.
 | `PUT /boot-source` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /machine-config` | `vcpu_count` | required | Firecracker bounds this to `1..=32`; HVF work must also account for host CPU and thread limits. |
 | `PUT /machine-config` | `mem_size_mib` | required | Drives guest memory allocation and mapping; later work must cover bounds and startup performance. |
-| `PUT /machine-config` | `smt` | rejected initially | Apple Silicon has no direct SMT setting for the initial HVF target. |
+| `PUT /machine-config` | `smt` | optional when `false`; rejected when `true` | Firecracker defaults this to `false` and rejects `true` on aarch64; the initial HVF target should accept explicit no-SMT config without exposing SMT control. |
 | `PUT /machine-config` | `cpu_template` | deferred | Firecracker CPU templates need a separate HVF compatibility design. |
-| `PUT /machine-config` | `track_dirty_pages` | deferred | Snapshot support is outside the first tier. |
-| `PUT /machine-config` | `huge_pages` | rejected initially | Linux hugetlbfs does not directly apply to the macOS target. |
+| `PUT /machine-config` | `track_dirty_pages` | optional when `false`; deferred when `true` | Explicit `false` matches Firecracker's default; enabling dirty tracking belongs with snapshot support. |
+| `PUT /machine-config` | `huge_pages` | optional when `None`; rejected for `2M` | Explicit `None` matches Firecracker's default; Linux hugetlbfs does not directly apply to the macOS target. |
 | `PUT /machine-config` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /drives/{drive_id}` | path `drive_id` | required | Must be nonempty and contain only alphanumeric characters or `_`. |
 | `PUT /drives/{drive_id}` | body `drive_id` | required | Must match the path `drive_id`. |
