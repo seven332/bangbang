@@ -50,22 +50,103 @@ updates must be explicit pull requests that update this documentation and
 describe API, state, documentation, security, performance, and test impact
 before changing this reference.
 
-## Initial Compatibility Tier
+## Support Level Vocabulary
 
-The first planned compatibility tier is the smallest boot-oriented API surface:
+The current scaffold still implements no HTTP API behavior. The support levels
+below describe compatibility targets for future API work:
 
-| Method | Endpoint | Planned purpose |
-| --- | --- | --- |
-| `GET` | `/` | Describe the microVM instance. |
-| `GET` | `/version` | Report the VMM version. |
-| `GET` | `/vm/config` | Return the full VM configuration. |
-| `PUT` | `/machine-config` | Configure vCPU and memory settings before boot. |
-| `PUT` | `/boot-source` | Configure the guest kernel and boot arguments before boot. |
-| `PUT` | `/drives/{drive_id}` | Configure block devices before boot. |
-| `PUT` | `/actions` | Start the microVM with `InstanceStart`. |
+- supported target: planned for the first boot-oriented API implementation
+- planned later: expected to be compatible later, but outside the first tier
+- deferred: blocked on a separate capability, device, or backend design
+- intentionally unsupported: not part of the current macOS/HVF target without a
+  later compatibility policy change
 
-Until the API server and VMM action model exist, these endpoints are
-compatibility targets rather than implemented behavior.
+For request fields, rejected means the future API should fail the request once
+JSON models exist. Optional means the field may be omitted; for Firecracker
+fields represented as nullable optional values, explicit `null` should be
+treated like omission unless a row says otherwise. Ignored means accepted with
+no effect. No supported target field is intentionally ignored. Deferred request
+fields should be rejected until their capability is implemented. Some fields
+have value-specific policy so Firecracker's explicit default values remain
+accepted while feature-enabling values stay out of the first tier. Unknown JSON
+fields should be rejected to match Firecracker `v1.16.0` request models that
+deny unknown fields.
+
+## Endpoint Compatibility Matrix
+
+The first planned compatibility tier is the smallest boot-oriented API surface.
+This matrix does not imply that the current scaffold implements the endpoints.
+
+| Method | Endpoint | Support level | Scope notes |
+| --- | --- | --- | --- |
+| `GET` | `/` | supported target | Describe the microVM instance. |
+| `GET` | `/version` | supported target | Report the VMM version with a Firecracker-shaped body. |
+| `GET` | `/vm/config` | supported target | Return the full VM configuration once configuration models exist. |
+| `GET` | `/machine-config` | supported target | Return machine configuration and defaults. |
+| `PUT` | `/machine-config` | supported target | Configure vCPU and memory settings before boot. |
+| `PUT` | `/boot-source` | supported target | Configure the guest kernel, initrd, and boot arguments before boot. |
+| `PUT` | `/drives/{drive_id}` | supported target | Configure initial virtio-block devices before boot. |
+| `PUT` | `/actions` | supported target | Start the microVM with `InstanceStart`; other action values are outside the first tier. |
+| `PUT` | `/actions` with `SendCtrlAltDel` | intentionally unsupported | Firecracker gates this action on x86 keyboard behavior; the first bangbang target is Apple Silicon. |
+| `PUT` | `/logger`, `/metrics` | planned later | Tied to observability work in #17. |
+| `PATCH` | `/machine-config` | deferred | Partial updates belong with later state and validation rules. |
+| `PUT` | `/cpu-config` | deferred | Needs HVF CPU feature design with VM and boot work in #8 and #10. |
+| `PUT` | `/network-interfaces/{iface_id}` | deferred | Tied to virtio network work in #14. |
+| `PUT` | `/vsock` | deferred | Tied to virtio vsock work in #15. |
+| `GET`, `PUT`, `PATCH` | `/mmds` | deferred | Tied to MMDS work in #16. |
+| `PUT` | `/mmds/config` | deferred | Tied to MMDS work in #16. |
+| `PUT` | `/snapshot/create`, `/snapshot/load` | deferred | Tied to snapshot and restore work in #19. |
+| `GET`, `PUT`, `PATCH` | `/balloon` | deferred | Requires balloon device and runtime update design. |
+| `GET`, `PATCH` | `/balloon/statistics` | deferred | Requires balloon statistics design. |
+| `PATCH` | `/balloon/hinting/start`, `/balloon/hinting/stop` | deferred | Requires balloon free-page hinting design. |
+| `GET` | `/balloon/hinting/status` | deferred | Requires balloon free-page hinting design. |
+| `PUT`, `PATCH` | `/pmem/{id}` | deferred | Requires a separate pmem device design. |
+| `PUT` | `/entropy`, `/serial` | deferred | Requires separate device and macOS/HVF design work. |
+| `GET`, `PUT`, `PATCH` | `/hotplug/memory` | deferred | Requires memory hotplug device and runtime update design. |
+| `PATCH` | `/vm` | deferred | Pause and resume state rules belong with #29 and VMM action work. |
+| `PATCH` | `/drives/{drive_id}`, `/network-interfaces/{iface_id}` | deferred | Hotplug and runtime update behavior belongs with the relevant device issues. |
+| `DELETE` | `/drives/{drive_id}`, `/pmem/{id}`, `/network-interfaces/{iface_id}` | deferred | Firecracker routes these hot-unplug requests in `parsed_request.rs`, but they are not in the `v1.16.0` swagger surface; support needs an explicit compatibility decision. |
+
+## Initial Field Handling Policy
+
+Field policy is based on Firecracker `v1.16.0` schemas and parser behavior. The
+future API should use these tables as golden/API test input once JSON models
+exist.
+
+| Endpoint | Field | Handling | Notes |
+| --- | --- | --- | --- |
+| `PUT /boot-source` | `kernel_image_path` | required | Host path to the kernel image; future validation must check access without leaking sensitive path details. |
+| `PUT /boot-source` | `initrd_path` | optional | Host path to an initrd; future validation follows the kernel path policy. |
+| `PUT /boot-source` | `boot_args` | optional | Firecracker uses its default kernel command line when omitted; later work should define size and character validation. |
+| `PUT /boot-source` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
+| `PUT /machine-config` | `vcpu_count` | required | Firecracker bounds this to `1..=32`; HVF work must also account for host CPU and thread limits. |
+| `PUT /machine-config` | `mem_size_mib` | required | Drives guest memory allocation and mapping; later work must cover bounds and startup performance. |
+| `PUT /machine-config` | `smt` | optional when `false`; rejected when `true` | Firecracker defaults this to `false` and rejects `true` on aarch64; the initial HVF target should accept explicit no-SMT config without exposing SMT control. |
+| `PUT /machine-config` | `cpu_template` | optional when omitted, `null`, or `None`; deferred for non-`None` templates | Explicit `None` matches Firecracker's deprecated default; non-default CPU templates need a separate HVF compatibility design. |
+| `PUT /machine-config` | `track_dirty_pages` | optional when `false`; deferred when `true` | Explicit `false` matches Firecracker's default; enabling dirty tracking belongs with snapshot support. |
+| `PUT /machine-config` | `huge_pages` | optional when `None`; rejected for `2M` | Explicit `None` matches Firecracker's default; Linux hugetlbfs does not directly apply to the macOS target. |
+| `PUT /machine-config` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
+| `PUT /drives/{drive_id}` | path `drive_id` | required | Must be nonempty and contain only alphanumeric characters or `_`. |
+| `PUT /drives/{drive_id}` | body `drive_id` | required | Must match the path `drive_id`. |
+| `PUT /drives/{drive_id}` | `is_root_device` | required | Identifies whether this drive is the boot device. |
+| `PUT /drives/{drive_id}` | `path_on_host` | required initially | Host path for the initial virtio-block target; future validation must cover access, file type, and path redaction in errors. |
+| `PUT /drives/{drive_id}` | `is_read_only` | optional | Firecracker defaults omitted virtio-block drives to read-write; future validation should keep write intent clear in errors and user documentation. |
+| `PUT /drives/{drive_id}` | `partuuid` | optional | Only meaningful for root-device boot selection. |
+| `PUT /drives/{drive_id}` | `cache_type` | optional when `Unsafe`; deferred when `Writeback` | Explicit `Unsafe` matches Firecracker's default and avoids advertising guest flush support; `Writeback` needs macOS-specific correctness and performance review. |
+| `PUT /drives/{drive_id}` | `rate_limiter` | optional when absent or `null`; deferred when configured | Non-null rate limiting is tied to future block I/O performance work in #13. |
+| `PUT /drives/{drive_id}` | `io_engine` | optional when `Sync`; rejected when `Async` | Explicit `Sync` matches Firecracker's default; `Async` is tied to Linux io_uring and does not directly map to the first macOS target. |
+| `PUT /drives/{drive_id}` | `socket` | optional when absent or `null`; deferred when set | Vhost-user-block is outside the first tier; future validation must cover socket path ownership and permissions. |
+| `PUT /drives/{drive_id}` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
+| `PUT /actions` | `action_type=InstanceStart` | required initially | The only initial action target. |
+| `PUT /actions` | `action_type=FlushMetrics` | deferred | Depends on logger and metrics support. |
+| `PUT /actions` | `action_type=SendCtrlAltDel` | intentionally unsupported | Firecracker gates this on x86 keyboard behavior; the first target is Apple Silicon. |
+| `PUT /actions` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
+
+Future implementation PRs should derive unit or golden tests from these tables.
+User documentation should keep the same support and field-status vocabulary when
+API behavior ships. Security review must cover host paths, socket-like fields,
+device identifiers, and error messages. Performance review must cover boot path
+setup, memory size, and block device I/O when those surfaces are implemented.
 
 ## State and Response Scope
 
@@ -79,10 +160,10 @@ Exact status codes, response bodies, and unsupported-endpoint behavior are not
 defined by this initial scope and should be specified before endpoint behavior
 ships.
 
-## Deferred Firecracker Features
+## Non-Initial Firecracker Features
 
-The following Firecracker features are intentionally deferred from the initial
-compatibility tier:
+The following Firecracker features are outside the first compatibility tier.
+Their eventual support level should follow the endpoint matrix:
 
 - networking and `network-interfaces`
 - vsock
@@ -94,10 +175,10 @@ compatibility tier:
 - serial customization
 - metrics and logger configuration
 - memory hotplug
-- pause and resume actions
+- pause and resume VM state updates
 - PATCH and DELETE hotplug/update behavior
 
-Deferred features should be introduced through narrower capability work that
+Non-initial features should be introduced through narrower capability work that
 covers behavior, validation, documentation, security, and performance together.
 
 ## macOS and HVF Differences
