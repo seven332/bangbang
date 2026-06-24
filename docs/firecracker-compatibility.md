@@ -119,7 +119,7 @@ exist.
 | `PUT /machine-config` | `vcpu_count` | required | Firecracker bounds this to `1..=32`; HVF work must also account for host CPU and thread limits. |
 | `PUT /machine-config` | `mem_size_mib` | required | Drives guest memory allocation and mapping; later work must cover bounds and startup performance. |
 | `PUT /machine-config` | `smt` | optional when `false`; rejected when `true` | Firecracker defaults this to `false` and rejects `true` on aarch64; the initial HVF target should accept explicit no-SMT config without exposing SMT control. |
-| `PUT /machine-config` | `cpu_template` | deferred | Firecracker CPU templates need a separate HVF compatibility design. |
+| `PUT /machine-config` | `cpu_template` | optional when `None`; deferred for non-`None` templates | Explicit `None` matches Firecracker's deprecated default; non-default CPU templates need a separate HVF compatibility design. |
 | `PUT /machine-config` | `track_dirty_pages` | optional when `false`; deferred when `true` | Explicit `false` matches Firecracker's default; enabling dirty tracking belongs with snapshot support. |
 | `PUT /machine-config` | `huge_pages` | optional when `None`; rejected for `2M` | Explicit `None` matches Firecracker's default; Linux hugetlbfs does not directly apply to the macOS target. |
 | `PUT /machine-config` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
@@ -127,11 +127,11 @@ exist.
 | `PUT /drives/{drive_id}` | body `drive_id` | required | Must match the path `drive_id`. |
 | `PUT /drives/{drive_id}` | `is_root_device` | required | Identifies whether this drive is the boot device. |
 | `PUT /drives/{drive_id}` | `path_on_host` | required initially | Host path for the initial virtio-block target; future validation must cover access, file type, and path redaction in errors. |
-| `PUT /drives/{drive_id}` | `is_read_only` | required initially | Required for the first virtio-block policy. |
+| `PUT /drives/{drive_id}` | `is_read_only` | optional | Firecracker defaults omitted virtio-block drives to read-write; future validation should keep write intent clear in errors and user documentation. |
 | `PUT /drives/{drive_id}` | `partuuid` | optional | Only meaningful for root-device boot selection. |
-| `PUT /drives/{drive_id}` | `cache_type` | deferred | Cache semantics need macOS-specific correctness and performance review. |
+| `PUT /drives/{drive_id}` | `cache_type` | optional when `Unsafe`; deferred when `Writeback` | Explicit `Unsafe` matches Firecracker's default and avoids advertising guest flush support; `Writeback` needs macOS-specific correctness and performance review. |
 | `PUT /drives/{drive_id}` | `rate_limiter` | deferred | Tied to future block I/O performance work in #13. |
-| `PUT /drives/{drive_id}` | `io_engine` | rejected initially | Firecracker's Linux I/O engine choices do not directly map to the first macOS target. |
+| `PUT /drives/{drive_id}` | `io_engine` | optional when `Sync`; rejected when `Async` | Explicit `Sync` matches Firecracker's default; `Async` is tied to Linux io_uring and does not directly map to the first macOS target. |
 | `PUT /drives/{drive_id}` | `socket` | deferred | Vhost-user-block is outside the first tier; future validation must cover socket path ownership and permissions. |
 | `PUT /drives/{drive_id}` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /actions` | `action_type=InstanceStart` | required initially | The only initial action target. |
