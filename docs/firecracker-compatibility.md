@@ -19,6 +19,34 @@ The intended public control plane is Firecracker-style HTTP over a Unix domain
 socket. API requests should eventually map to explicit VMM actions and VM state
 transitions, but this document only defines the initial scope.
 
+## Compatibility Baseline
+
+bangbang's first Firecracker compatibility baseline is the upstream
+`firecracker-microvm/firecracker` `v1.16.0` release tag:
+
+- tag: `v1.16.0`
+- commit: `d83d72b710361a10294480131377b1b00b163af8`
+
+A release tag is the compatibility reference because it represents a published
+Firecracker interface. Development branch commits can still inform
+implementation research, but they should not redefine bangbang's compatibility
+target without an explicit baseline update. A standalone pinned commit is
+precise, but it should be tied to a release tag for this project so the baseline
+is both reproducible and recognizable.
+
+Use these upstream files and documents as sources of truth when comparing
+Firecracker behavior:
+
+- `src/firecracker/swagger/firecracker.yaml` for the published HTTP API surface
+- `src/firecracker/src/api_server/parsed_request.rs` for method and path routing
+- `src/vmm/src/rpc_interface.rs` for VMM actions and state-dependent behavior
+- `docs/device-api.md` for endpoint, device, input, and output dependencies
+- `docs/design.md` for process model, thread model, and threat-containment
+  expectations
+
+Future baseline updates should describe API, state, security, performance, and
+test impact before changing this reference.
+
 ## Initial Compatibility Tier
 
 The first planned compatibility tier is the smallest boot-oriented API surface:
