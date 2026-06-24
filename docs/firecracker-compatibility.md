@@ -63,7 +63,8 @@ below describe compatibility targets for future API work:
 
 For request fields, rejected means the future API should fail the request once
 JSON models exist. Ignored means accepted with no effect. No supported target
-field is intentionally ignored; unknown JSON fields should be rejected to match
+field is intentionally ignored. Deferred request fields should be rejected until
+their capability is implemented. Unknown JSON fields should be rejected to match
 Firecracker `v1.16.0` request models that deny unknown fields.
 
 ## Endpoint Compatibility Matrix
@@ -91,12 +92,15 @@ This matrix does not imply that the current scaffold implements the endpoints.
 | `PUT` | `/mmds/config` | deferred | Tied to MMDS work in #16. |
 | `PUT` | `/snapshot/create`, `/snapshot/load` | deferred | Tied to snapshot and restore work in #19. |
 | `GET`, `PUT`, `PATCH` | `/balloon` | deferred | Requires balloon device and runtime update design. |
-| `GET`, `PATCH` | `/balloon/statistics`, `/balloon/hinting/*` | deferred | Requires balloon statistics and hinting design. |
-| `PUT`, `PATCH`, `DELETE` | `/pmem/{id}` | deferred | Requires a separate pmem device design. |
+| `GET`, `PATCH` | `/balloon/statistics` | deferred | Requires balloon statistics design. |
+| `PATCH` | `/balloon/hinting/start`, `/balloon/hinting/stop` | deferred | Requires balloon free-page hinting design. |
+| `GET` | `/balloon/hinting/status` | deferred | Requires balloon free-page hinting design. |
+| `PUT`, `PATCH` | `/pmem/{id}` | deferred | Requires a separate pmem device design. |
 | `PUT` | `/entropy`, `/serial` | deferred | Requires separate device and macOS/HVF design work. |
 | `GET`, `PUT`, `PATCH` | `/hotplug/memory` | deferred | Requires memory hotplug device and runtime update design. |
 | `PATCH` | `/vm` | deferred | Pause and resume state rules belong with #29 and VMM action work. |
-| `PATCH`, `DELETE` | `/drives/{drive_id}`, `/network-interfaces/{iface_id}` | deferred | Hotplug and runtime update behavior belongs with the relevant device issues. |
+| `PATCH` | `/drives/{drive_id}`, `/network-interfaces/{iface_id}` | deferred | Hotplug and runtime update behavior belongs with the relevant device issues. |
+| `DELETE` | `/drives/{drive_id}`, `/pmem/{id}`, `/network-interfaces/{iface_id}` | deferred | Firecracker routes these hot-unplug requests in `parsed_request.rs`, but they are not in the `v1.16.0` swagger surface; support needs an explicit compatibility decision. |
 
 ## Initial Field Handling Policy
 
@@ -123,7 +127,7 @@ exist.
 | `PUT /drives/{drive_id}` | `path_on_host` | required initially | Host path for the initial virtio-block target; future validation must cover access, file type, and path redaction in errors. |
 | `PUT /drives/{drive_id}` | `is_read_only` | required initially | Required for the first virtio-block policy. |
 | `PUT /drives/{drive_id}` | `partuuid` | optional | Only meaningful for root-device boot selection. |
-| `PUT /drives/{drive_id}` | `cache_type` | optional | Firecracker accepts `Unsafe` and `Writeback`; macOS behavior needs later performance review. |
+| `PUT /drives/{drive_id}` | `cache_type` | deferred | Cache semantics need macOS-specific correctness and performance review. |
 | `PUT /drives/{drive_id}` | `rate_limiter` | deferred | Tied to future block I/O performance work in #13. |
 | `PUT /drives/{drive_id}` | `io_engine` | rejected initially | Firecracker's Linux I/O engine choices do not directly map to the first macOS target. |
 | `PUT /drives/{drive_id}` | `socket` | deferred | Vhost-user-block is outside the first tier; future validation must cover socket path ownership and permissions. |
@@ -151,10 +155,10 @@ Exact status codes, response bodies, and unsupported-endpoint behavior are not
 defined by this initial scope and should be specified before endpoint behavior
 ships.
 
-## Deferred Firecracker Features
+## Non-Initial Firecracker Features
 
-The following Firecracker features are intentionally deferred from the initial
-compatibility tier:
+The following Firecracker features are outside the first compatibility tier.
+Their eventual support level should follow the endpoint matrix:
 
 - networking and `network-interfaces`
 - vsock
@@ -169,7 +173,7 @@ compatibility tier:
 - pause and resume actions
 - PATCH and DELETE hotplug/update behavior
 
-Deferred features should be introduced through narrower capability work that
+Non-initial features should be introduced through narrower capability work that
 covers behavior, validation, documentation, security, and performance together.
 
 ## macOS and HVF Differences
