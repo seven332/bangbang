@@ -62,12 +62,15 @@ below describe compatibility targets for future API work:
   later compatibility policy change
 
 For request fields, rejected means the future API should fail the request once
-JSON models exist. Ignored means accepted with no effect. No supported target
-field is intentionally ignored. Deferred request fields should be rejected until
-their capability is implemented. Some fields have value-specific policy so
-Firecracker's explicit default values remain accepted while feature-enabling
-values stay out of the first tier. Unknown JSON fields should be rejected to
-match Firecracker `v1.16.0` request models that deny unknown fields.
+JSON models exist. Optional means the field may be omitted; for Firecracker
+fields represented as nullable optional values, explicit `null` should be
+treated like omission unless a row says otherwise. Ignored means accepted with
+no effect. No supported target field is intentionally ignored. Deferred request
+fields should be rejected until their capability is implemented. Some fields
+have value-specific policy so Firecracker's explicit default values remain
+accepted while feature-enabling values stay out of the first tier. Unknown JSON
+fields should be rejected to match Firecracker `v1.16.0` request models that
+deny unknown fields.
 
 ## Endpoint Compatibility Matrix
 
