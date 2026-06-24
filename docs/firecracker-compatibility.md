@@ -170,7 +170,7 @@ Their eventual support level should follow the endpoint matrix:
 - serial customization
 - metrics and logger configuration
 - memory hotplug
-- pause and resume actions
+- pause and resume VM state updates
 - PATCH and DELETE hotplug/update behavior
 
 Non-initial features should be introduced through narrower capability work that
