@@ -2,7 +2,7 @@
 
 bangbang is a Rust VMM project for macOS hosts. The public control plane is intended to stay compatible with the Firecracker HTTP API over a Unix domain socket, while the VM backend is built on Apple's Hypervisor.framework.
 
-This repository is currently a scaffold. It defines crate boundaries, an initial Firecracker-compatible API socket, a process startup CLI, a minimal internal VMM action model, a backend trait, and the smallest Hypervisor.framework VM create/destroy wrapper.
+This repository is currently a scaffold. It defines crate boundaries, an initial Firecracker-compatible API socket, a process startup CLI, a minimal internal VMM action model, a backend trait, and the smallest Hypervisor.framework VM and current-thread vCPU create/destroy wrappers.
 
 See [Firecracker Compatibility Scope](docs/firecracker-compatibility.md) for the intended compatibility target and current limitations.
 See [Pull Request Review Guidelines](docs/review-guidelines.md) for the project-specific review standard.
@@ -18,12 +18,12 @@ crates/bangbang   VMM process entrypoint and startup CLI
 
 ## Current Scope
 
-The first target is Apple Silicon macOS. The current scaffold includes HTTP over a Unix domain socket for `GET /` and `GET /version`, routed through a minimal read-only VMM action model. It intentionally does not include:
+The first target is Apple Silicon macOS. The current scaffold includes HTTP over a Unix domain socket for `GET /` and `GET /version`, routed through a minimal read-only VMM action model. The HVF crate can create/destroy a process VM and create/destroy one current-thread vCPU handle for lifecycle smoke testing. It intentionally does not include:
 
 - API endpoints beyond `GET /` and `GET /version`
 - JSON request body models
 - guest memory mapping
-- vCPU creation or a run loop
+- vCPU register setup, exit handling, or a run loop
 - kernel loading
 
 ## Process CLI
@@ -77,6 +77,29 @@ The version response body is Firecracker-shaped JSON:
 ```sh
 cargo check
 cargo test
+```
+
+On macOS Apple Silicon hosts, the ignored HVF lifecycle smoke test requires the
+test binary to be signed with the Hypervisor entitlement before running:
+
+```sh
+cargo test -p bangbang-hvf --no-run
+TEST_BIN=$(cargo test -p bangbang-hvf --no-run --message-format=json \
+  | sed -n 's/.*"executable":"\([^"]*bangbang_hvf-[^"]*\)".*/\1/p' \
+  | head -1)
+ENTITLEMENTS=$(mktemp "${TMPDIR:-/tmp}/bangbang-hvf-entitlements.XXXXXX")
+cat > "$ENTITLEMENTS" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.hypervisor</key>
+  <true/>
+</dict>
+</plist>
+EOF
+codesign --force --sign - --entitlements "$ENTITLEMENTS" "$TEST_BIN"
+BANGBANG_RUN_HVF_TESTS=1 "$TEST_BIN" --ignored
 ```
 
 Run the VMM process skeleton and API server:

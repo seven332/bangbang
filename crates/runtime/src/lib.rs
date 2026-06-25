@@ -132,6 +132,7 @@ impl VmmController {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendError {
     Unsupported(&'static str),
+    InvalidState(&'static str),
     Hypervisor(String),
 }
 
@@ -139,6 +140,7 @@ impl fmt::Display for BackendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unsupported(message) => write!(f, "unsupported backend: {message}"),
+            Self::InvalidState(message) => write!(f, "invalid backend state: {message}"),
             Self::Hypervisor(message) => write!(f, "hypervisor error: {message}"),
         }
     }
@@ -238,6 +240,16 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "unsupported backend: macOS on Apple Silicon required"
+        );
+    }
+
+    #[test]
+    fn displays_invalid_state_error() {
+        let err = BackendError::InvalidState("VM must be created before creating a vCPU");
+
+        assert_eq!(
+            err.to_string(),
+            "invalid backend state: VM must be created before creating a vCPU"
         );
     }
 
