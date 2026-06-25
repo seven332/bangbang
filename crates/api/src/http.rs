@@ -121,11 +121,17 @@ pub fn parse_request(bytes: &[u8]) -> Result<ApiRequest, RequestError> {
         .get(header_len..)
         .ok_or(RequestError::MalformedRequest)?;
 
+    if request_body.has_unsupported_encoding() {
+        return Err(RequestError::MalformedRequest);
+    }
+
+    checked_request_len(header_len, request_body.content_length())?;
+
     if body.len() != request_body.content_length() {
         return Err(RequestError::MalformedRequest);
     }
 
-    if method == "GET" && request_body.is_present() {
+    if method == "GET" && request_body.has_content() {
         return Err(RequestError::GetRequestBody);
     }
 
@@ -155,15 +161,10 @@ pub fn request_total_len(bytes: &[u8]) -> Result<Option<usize>, RequestError> {
         return Err(RequestError::MalformedRequest);
     }
 
-    let total_len = header_len
-        .checked_add(body.content_length())
-        .ok_or(RequestError::PayloadTooLarge)?;
-
-    if total_len > HTTP_MAX_PAYLOAD_SIZE {
-        return Err(RequestError::PayloadTooLarge);
-    }
-
-    Ok(Some(total_len))
+    Ok(Some(checked_request_len(
+        header_len,
+        body.content_length(),
+    )?))
 }
 
 fn parse_request_head(bytes: &[u8]) -> Result<(&str, &str, usize, RequestBody), RequestError> {
@@ -200,8 +201,8 @@ impl RequestBody {
         self.transfer_encoding
     }
 
-    const fn is_present(self) -> bool {
-        self.content_length > 0 || self.transfer_encoding
+    const fn has_content(self) -> bool {
+        self.content_length > 0
     }
 }
 
@@ -215,13 +216,7 @@ fn request_body(headers: &[httparse::Header<'_>]) -> Result<RequestBody, Request
                 return Err(RequestError::MalformedRequest);
             }
 
-            let value =
-                std::str::from_utf8(header.value).map_err(|_| RequestError::MalformedRequest)?;
-            let parsed = value
-                .trim()
-                .parse::<usize>()
-                .map_err(|_| RequestError::MalformedRequest)?;
-            content_length = Some(parsed);
+            content_length = Some(parse_content_length(header.value)?);
         } else if header.name.eq_ignore_ascii_case("Transfer-Encoding") {
             transfer_encoding = true;
         }
@@ -231,6 +226,56 @@ fn request_body(headers: &[httparse::Header<'_>]) -> Result<RequestBody, Request
         content_length: content_length.unwrap_or(0),
         transfer_encoding,
     })
+}
+
+fn parse_content_length(value: &[u8]) -> Result<usize, RequestError> {
+    let value = trim_http_optional_whitespace(value);
+    if value.is_empty() {
+        return Err(RequestError::MalformedRequest);
+    }
+
+    let mut parsed = 0usize;
+    for byte in value {
+        if !byte.is_ascii_digit() {
+            return Err(RequestError::MalformedRequest);
+        }
+
+        parsed = parsed
+            .checked_mul(10)
+            .and_then(|parsed| parsed.checked_add(usize::from(byte - b'0')))
+            .ok_or(RequestError::PayloadTooLarge)?;
+    }
+
+    Ok(parsed)
+}
+
+fn trim_http_optional_whitespace(value: &[u8]) -> &[u8] {
+    let start = value
+        .iter()
+        .position(|&byte| !is_http_optional_whitespace(byte))
+        .unwrap_or(value.len());
+    let end = value
+        .iter()
+        .rposition(|&byte| !is_http_optional_whitespace(byte))
+        .map_or(start, |index| index + 1);
+
+    &value[start..end]
+}
+
+const fn is_http_optional_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t')
+}
+
+fn checked_request_len(header_len: usize, content_length: usize) -> Result<usize, RequestError> {
+    let total_len = header_len
+        .checked_add(content_length)
+        .ok_or(RequestError::PayloadTooLarge)?;
+
+    if total_len > HTTP_MAX_PAYLOAD_SIZE {
+        return Err(RequestError::PayloadTooLarge);
+    }
+
+    Ok(total_len)
 }
 
 impl From<ApiRequest> for Endpoint {
@@ -267,7 +312,7 @@ mod tests {
     fn rejects_get_version_with_transfer_encoding_body() {
         let request = b"GET /version HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
 
-        assert_eq!(parse_request(request), Err(RequestError::GetRequestBody));
+        assert_eq!(parse_request(request), Err(RequestError::MalformedRequest));
     }
 
     #[test]
@@ -306,6 +351,34 @@ mod tests {
         let request = b"GET /version HTTP/1.1\r\nContent-Length: 2\r\n\r\n{";
 
         assert_eq!(parse_request(request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_non_digit_content_length() {
+        let request = b"GET /version HTTP/1.1\r\nContent-Length: +0\r\n\r\n";
+
+        assert_eq!(parse_request(request), Err(RequestError::MalformedRequest));
+        assert_eq!(
+            request_total_len(request),
+            Err(RequestError::MalformedRequest)
+        );
+    }
+
+    #[test]
+    fn rejects_declared_content_length_over_payload_limit() {
+        let request = format!(
+            "GET /version HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            HTTP_MAX_PAYLOAD_SIZE + 1
+        );
+
+        assert_eq!(
+            parse_request(request.as_bytes()),
+            Err(RequestError::PayloadTooLarge)
+        );
+        assert_eq!(
+            request_total_len(request.as_bytes()),
+            Err(RequestError::PayloadTooLarge)
+        );
     }
 
     #[test]
