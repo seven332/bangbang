@@ -3,10 +3,10 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use bangbang_api::http::{handle_request_bytes, request_total_len, HttpResponse, RequestError};
@@ -14,7 +14,6 @@ use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 
 const READ_CHUNK_SIZE: usize = 4096;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
-const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 static NEXT_TEMP_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -76,21 +75,28 @@ impl ApiServer {
         &self,
         version: &str,
         shutdown_requested: &AtomicBool,
+        shutdown_wakeup: &mut UnixStream,
     ) -> Result<(), ApiServerError> {
         self.listener
             .set_nonblocking(true)
             .map_err(|err| ApiServerError::Accept(err.kind()))?;
+        shutdown_wakeup
+            .set_nonblocking(true)
+            .map_err(|err| ApiServerError::Connection(err.kind()))?;
 
         loop {
             if shutdown_requested.load(Ordering::Relaxed) {
                 return Ok(());
             }
 
+            wait_for_listener_or_shutdown(&self.listener, shutdown_wakeup)?;
+            if drain_shutdown_wakeup(shutdown_wakeup)? {
+                return Ok(());
+            }
+
             match self.serve_next(version) {
                 Ok(()) => {}
-                Err(ApiServerError::Accept(std::io::ErrorKind::WouldBlock)) => {
-                    thread::sleep(ACCEPT_RETRY_DELAY);
-                }
+                Err(ApiServerError::Accept(std::io::ErrorKind::WouldBlock)) => {}
                 Err(ApiServerError::Accept(std::io::ErrorKind::Interrupted)) => {}
                 Err(err) => return Err(err),
             }
@@ -109,6 +115,59 @@ impl ApiServer {
         let _ = handle_connection(&mut stream, version);
 
         Ok(())
+    }
+}
+
+fn wait_for_listener_or_shutdown(
+    listener: &UnixListener,
+    shutdown_wakeup: &UnixStream,
+) -> Result<(), ApiServerError> {
+    let mut poll_fds = [
+        libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: shutdown_wakeup.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+
+    loop {
+        // SAFETY: `poll_fds` points to two initialized `pollfd` values and
+        // remains valid for the duration of the call. The timeout is infinite.
+        let result = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as _, -1) };
+        if result > 0 {
+            return Ok(());
+        }
+
+        let kind = std::io::Error::last_os_error().kind();
+        if kind != std::io::ErrorKind::Interrupted {
+            return Err(ApiServerError::Accept(kind));
+        }
+    }
+}
+
+fn drain_shutdown_wakeup(shutdown_wakeup: &mut UnixStream) -> Result<bool, ApiServerError> {
+    let mut drained = false;
+    let mut buffer = [0; 64];
+
+    loop {
+        match shutdown_wakeup.read(&mut buffer) {
+            Ok(0) => return Ok(true),
+            Ok(_) => drained = true,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                return Ok(drained);
+            }
+            Err(err) => return Err(ApiServerError::Connection(err.kind())),
+        }
     }
 }
 
@@ -339,7 +398,7 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::sync::{Arc, Barrier};
     use std::thread;
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
 
@@ -472,9 +531,13 @@ mod tests {
         let server = ApiServer::bind(&path).expect("server should bind");
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         let run_shutdown_requested = Arc::clone(&shutdown_requested);
+        let (mut shutdown_reader, mut shutdown_writer) =
+            UnixStream::pair().expect("shutdown stream pair should be created");
         let mut client = UnixStream::connect(&path).expect("client should connect");
 
-        let handle = thread::spawn(move || server.run_until(VERSION, &run_shutdown_requested));
+        let handle = thread::spawn(move || {
+            server.run_until(VERSION, &run_shutdown_requested, &mut shutdown_reader)
+        });
 
         client
             .write_all(b"GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n")
@@ -485,6 +548,9 @@ mod tests {
             .read_to_string(&mut response)
             .expect("client should read response");
         shutdown_requested.store(true, Ordering::Relaxed);
+        shutdown_writer
+            .write_all(b"x")
+            .expect("shutdown wakeup should be written");
 
         assert_eq!(
             handle.join().expect("server thread should not panic"),
@@ -500,19 +566,16 @@ mod tests {
         let server = ApiServer::bind(&path).expect("server should bind");
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         let run_shutdown_requested = Arc::clone(&shutdown_requested);
-        let handle = thread::spawn(move || server.run_until(VERSION, &run_shutdown_requested));
+        let (mut shutdown_reader, mut shutdown_writer) =
+            UnixStream::pair().expect("shutdown stream pair should be created");
+        let handle = thread::spawn(move || {
+            server.run_until(VERSION, &run_shutdown_requested, &mut shutdown_reader)
+        });
 
         shutdown_requested.store(true, Ordering::Relaxed);
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !handle.is_finished() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
-
-        if !handle.is_finished() {
-            let _ = UnixStream::connect(&path);
-            let _ = handle.join();
-            panic!("server should exit without an external socket wake");
-        }
+        shutdown_writer
+            .write_all(b"x")
+            .expect("shutdown wakeup should be written");
 
         assert_eq!(
             handle.join().expect("server thread should not panic"),
@@ -522,7 +585,7 @@ mod tests {
     }
 
     #[test]
-    fn request_read_timeout_applies_to_total_request() {
+    fn request_read_timeout_returns_partial_request_after_expired_deadline() {
         let (mut client, mut server) = UnixStream::pair().expect("stream pair should be created");
         let partial_request = b"GET /version HTTP/1.1\r\n";
 
@@ -530,7 +593,7 @@ mod tests {
             .write_all(partial_request)
             .expect("client should write partial request");
 
-        let request = read_request(&mut server, Duration::from_millis(10))
+        let request = read_request(&mut server, Duration::from_millis(1))
             .expect("read timeout should not fail");
 
         assert_eq!(request, RequestRead::Complete(partial_request.to_vec()));

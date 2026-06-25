@@ -1,15 +1,16 @@
 use std::env;
 use std::fmt;
+use std::os::unix::io::IntoRawFd;
+use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 
 mod api_server;
 
 use api_server::{ApiServer, ApiServerError};
 use bangbang_hvf::HvfBackend;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
-use signal_hook::{flag, low_level, SigId};
+use signal_hook::{low_level, SigId};
 
 const DEFAULT_API_SOCK_PATH: &str = "/tmp/bangbang.socket";
 const DEFAULT_INSTANCE_ID: &str = "anonymous-instance";
@@ -68,11 +69,16 @@ fn run() -> Result<(), ProcessError> {
                 HvfBackend::is_supported_target()
             );
 
-            let shutdown_signal = ShutdownSignal::install()?;
+            let mut shutdown_signal = ShutdownSignal::install()?;
             let server = ApiServer::bind(&config.api_sock).map_err(ProcessError::ApiServer)?;
             println!("status: API server listening; VM startup is not implemented yet");
+            let (shutdown_requested, shutdown_wakeup) = shutdown_signal.parts();
             server
-                .run_until(env!("CARGO_PKG_VERSION"), shutdown_signal.requested())
+                .run_until(
+                    env!("CARGO_PKG_VERSION"),
+                    shutdown_requested,
+                    shutdown_wakeup,
+                )
                 .map_err(ProcessError::ApiServer)?;
         }
     }
@@ -136,31 +142,51 @@ impl std::error::Error for ProcessError {}
 
 #[derive(Debug)]
 struct ShutdownSignal {
-    requested: Arc<AtomicBool>,
+    requested: AtomicBool,
+    wakeup_reader: UnixStream,
     signal_ids: [SigId; 2],
 }
 
 impl ShutdownSignal {
     fn install() -> Result<Self, ProcessError> {
-        let requested = Arc::new(AtomicBool::new(false));
-        let sigint = flag::register(SIGINT, Arc::clone(&requested))
-            .map_err(|err| ProcessError::SignalHandler(err.kind()))?;
-        let sigterm = match flag::register(SIGTERM, Arc::clone(&requested)) {
+        let requested = AtomicBool::new(false);
+        let (wakeup_reader, wakeup_writer) =
+            UnixStream::pair().map_err(|err| ProcessError::SignalHandler(err.kind()))?;
+        let sigint = register_signal_wakeup(SIGINT, &wakeup_writer)?;
+        let sigterm = match register_signal_wakeup(SIGTERM, &wakeup_writer) {
             Ok(sigterm) => sigterm,
             Err(err) => {
                 low_level::unregister(sigint);
-                return Err(ProcessError::SignalHandler(err.kind()));
+                return Err(err);
             }
         };
 
         Ok(Self {
             requested,
+            wakeup_reader,
             signal_ids: [sigint, sigterm],
         })
     }
 
-    fn requested(&self) -> &AtomicBool {
-        &self.requested
+    fn parts(&mut self) -> (&AtomicBool, &mut UnixStream) {
+        (&self.requested, &mut self.wakeup_reader)
+    }
+}
+
+fn register_signal_wakeup(signal: i32, wakeup_writer: &UnixStream) -> Result<SigId, ProcessError> {
+    let wakeup_fd = wakeup_writer
+        .try_clone()
+        .map_err(|err| ProcessError::SignalHandler(err.kind()))?
+        .into_raw_fd();
+
+    match low_level::pipe::register_raw(signal, wakeup_fd) {
+        Ok(signal_id) => Ok(signal_id),
+        Err(err) => {
+            // SAFETY: `wakeup_fd` came from `UnixStream::into_raw_fd` and has
+            // not been handed to a registered signal action on this error path.
+            let _ = unsafe { libc::close(wakeup_fd) };
+            Err(ProcessError::SignalHandler(err.kind()))
+        }
     }
 }
 
