@@ -108,11 +108,6 @@ if [[ "$hv_disable" == "1" ]]; then
   finish_unsupported "Hypervisor.framework is disabled on this host"
 fi
 
-hv_vmm_present="$(sysctl -n kern.hv_vmm_present 2>/dev/null || true)"
-if [[ "$hv_vmm_present" == "1" ]]; then
-  finish_unsupported "nested Hypervisor.framework execution is not available on this virtualized host"
-fi
-
 for test_bin in "${signed_test_bins[@]}"; do
   if [[ "${#test_args[@]}" -eq 0 ]]; then
     "$test_bin" --test-threads=1
