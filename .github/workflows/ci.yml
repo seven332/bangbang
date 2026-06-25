@@ -26,7 +26,7 @@ jobs:
 
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt --target aarch64-apple-darwin
           rustup default stable
 
       - name: Cache Rust dependencies
