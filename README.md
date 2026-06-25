@@ -88,6 +88,13 @@ signed test wrapper so host or entitlement failures fail the test run:
 scripts/run-hvf-tests.sh
 ```
 
+Hosted macOS CI may build and sign the lifecycle test without executing it when
+Hypervisor.framework is unavailable:
+
+```sh
+scripts/run-hvf-tests.sh --allow-unsupported
+```
+
 Run the VMM process skeleton and API server:
 
 ```sh

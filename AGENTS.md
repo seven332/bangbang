@@ -20,10 +20,10 @@ Unit tests live next to the code they exercise under each crate’s `src/` tree.
 - `cargo test -p bangbang-hvf --lib --all-features --locked`: run unsigned HVF unit tests.
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: run lint checks with warnings treated as errors.
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked`: build documentation without dependency docs.
-- `scripts/run-hvf-tests.sh`: sign and run HVF integration tests on macOS Apple Silicon.
+- `scripts/run-hvf-tests.sh`: sign and run HVF integration tests on macOS Apple Silicon; use `--allow-unsupported` only for CI runners that cannot execute HVF.
 - `cargo run -p bangbang`: run the current VMM process skeleton.
 
-Use these commands before opening or updating a pull request. HVF lifecycle tests should fail rather than be ignored when the host cannot run them.
+Use these commands before opening or updating a pull request. For local or self-hosted HVF verification, run `scripts/run-hvf-tests.sh` without `--allow-unsupported` so unsupported hosts fail instead of being ignored.
 
 ## Coding Style & Naming Conventions
 

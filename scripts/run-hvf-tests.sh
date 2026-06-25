@@ -1,16 +1,66 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+usage() {
+  cat <<'EOF'
+Usage: scripts/run-hvf-tests.sh [--allow-unsupported] [-- TEST_ARGS...]
+
+Build and sign the bangbang-hvf lifecycle integration test, then run it when
+the host supports Hypervisor.framework VM creation.
+
+Options:
+  --allow-unsupported  Exit 0 instead of 1 when the host cannot run HVF tests.
+  -h, --help           Show this help.
+
+Any arguments after -- are passed to the signed Rust test binary.
+EOF
+}
+
+allow_unsupported=false
+test_args=()
+
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --allow-unsupported)
+      allow_unsupported=true
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      test_args+=("$@")
+      break
+      ;;
+    *)
+      test_args+=("$1")
+      ;;
+  esac
+  shift
+done
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
-  echo "bangbang-hvf tests require macOS Apple Silicon; found $(uname -s) $(uname -m)" >&2
-  exit 1
-fi
-
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/bangbang-hvf-tests.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
+
+finish_unsupported() {
+  local message="$1"
+
+  if [[ "$allow_unsupported" == true ]]; then
+    echo "$message; skipping signed HVF lifecycle test"
+    exit 0
+  fi
+
+  echo "$message" >&2
+  exit 1
+}
+
+if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
+  finish_unsupported "bangbang-hvf tests require macOS Apple Silicon; found $(uname -s) $(uname -m)"
+fi
 
 entitlements="$tmp_dir/hvf-entitlements.plist"
 cat > "$entitlements" <<'EOF'
@@ -25,7 +75,7 @@ cat > "$entitlements" <<'EOF'
 EOF
 
 cargo_messages="$tmp_dir/cargo-test.json"
-cargo test -p bangbang-hvf --test hvf_lifecycle --all-features --locked --no-run --message-format=json > "$cargo_messages"
+cargo test --target-dir "$tmp_dir/target" -p bangbang-hvf --test hvf_lifecycle --all-features --locked --no-run --message-format=json > "$cargo_messages"
 
 test_bins=()
 while IFS= read -r test_bin; do
@@ -41,5 +91,27 @@ fi
 
 for test_bin in "${test_bins[@]}"; do
   codesign --force --sign - --entitlements "$entitlements" "$test_bin"
-  "$test_bin" --test-threads=1 "$@"
+done
+
+hv_support="$(sysctl -n kern.hv_support 2>/dev/null || sysctl -n kern.hv.supported 2>/dev/null || true)"
+if [[ "$hv_support" != "1" ]]; then
+  finish_unsupported "Hypervisor.framework is not supported by this host"
+fi
+
+hv_disable="$(sysctl -n kern.hv_disable 2>/dev/null || true)"
+if [[ "$hv_disable" == "1" ]]; then
+  finish_unsupported "Hypervisor.framework is disabled on this host"
+fi
+
+hv_vmm_present="$(sysctl -n kern.hv_vmm_present 2>/dev/null || true)"
+if [[ "$hv_vmm_present" == "1" ]]; then
+  finish_unsupported "nested Hypervisor.framework execution is not available on this virtualized host"
+fi
+
+for test_bin in "${test_bins[@]}"; do
+  if [[ "${#test_args[@]}" -eq 0 ]]; then
+    "$test_bin" --test-threads=1
+  else
+    "$test_bin" --test-threads=1 "${test_args[@]}"
+  fi
 done

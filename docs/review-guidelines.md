@@ -30,7 +30,9 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --lock
 
 On macOS Apple Silicon, also run `scripts/run-hvf-tests.sh` for signed HVF
 integration tests under `crates/hvf/tests/`. HVF lifecycle tests should not be
-skipped or ignored when they are in scope for the PR.
+skipped or ignored on hosts that support HVF. Hosted CI may use
+`scripts/run-hvf-tests.sh --allow-unsupported` to validate build/sign behavior
+without executing HVF when the runner does not support it.
 
 Reviewers should confirm the PR body lists the checks that were run. If any
 command is intentionally skipped, the PR should explain why the skipped command

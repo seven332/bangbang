@@ -44,8 +44,8 @@ jobs:
       - name: Run HVF unit tests
         run: cargo test -p bangbang-hvf --lib --all-features --locked
 
-      - name: Run signed HVF smoke test
-        run: scripts/run-hvf-tests.sh
+      - name: Build and sign HVF smoke test
+        run: scripts/run-hvf-tests.sh --allow-unsupported
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
