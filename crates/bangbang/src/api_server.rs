@@ -136,6 +136,10 @@ fn wait_for_listener_or_shutdown(
     ];
 
     loop {
+        for poll_fd in &mut poll_fds {
+            poll_fd.revents = 0;
+        }
+
         // SAFETY: `poll_fds` points to two initialized `pollfd` values and
         // remains valid for the duration of the call. The timeout is infinite.
         let result = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as _, -1) };
@@ -158,14 +162,10 @@ fn drain_shutdown_wakeup(shutdown_wakeup: &mut UnixStream) -> Result<bool, ApiSe
         match shutdown_wakeup.read(&mut buffer) {
             Ok(0) => return Ok(true),
             Ok(_) => drained = true,
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                ) =>
-            {
+            Err(err) if matches!(err.kind(), std::io::ErrorKind::WouldBlock) => {
                 return Ok(drained);
             }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(err) => return Err(ApiServerError::Connection(err.kind())),
         }
     }
@@ -226,7 +226,7 @@ fn bind_unpublished_socket(
     path: &Path,
 ) -> Result<(UnixListener, BoundSocketMetadata), ApiServerError> {
     for _ in 0..16 {
-        let temp_path = temporary_socket_path(path);
+        let temp_path = next_temporary_socket_path(path);
         let listener = match UnixListener::bind(&temp_path) {
             Ok(listener) => listener,
             Err(err)
@@ -260,8 +260,21 @@ fn bind_unpublished_socket(
     Err(ApiServerError::Bind(std::io::ErrorKind::AlreadyExists))
 }
 
-fn temporary_socket_path(path: &Path) -> PathBuf {
-    let id = NEXT_TEMP_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
+fn next_temporary_socket_path(path: &Path) -> PathBuf {
+    next_temporary_socket_path_from(path, &NEXT_TEMP_SOCKET_ID)
+}
+
+fn next_temporary_socket_path_from(path: &Path, next_id: &AtomicU64) -> PathBuf {
+    loop {
+        let id = next_id.fetch_add(1, Ordering::Relaxed);
+        let temp_path = temporary_socket_path(path, id);
+        if temp_path != path {
+            return temp_path;
+        }
+    }
+}
+
+fn temporary_socket_path(path: &Path, id: u64) -> PathBuf {
     let mut temp_name = OsString::from(".bb.");
     temp_name.push(format!("{}.{}", std::process::id(), id));
 
@@ -445,6 +458,22 @@ mod tests {
             .collect::<Vec<_>>();
         paths.sort();
         paths
+    }
+
+    #[test]
+    fn temporary_socket_path_skips_requested_path_collision() {
+        let id = 7;
+        let path = PathBuf::from("/tmp").join(format!(".bb.{}.{}", std::process::id(), id));
+        let next_id = AtomicU64::new(id);
+
+        let temp_path = next_temporary_socket_path_from(&path, &next_id);
+
+        assert_ne!(temp_path, path);
+        assert_eq!(
+            temp_path,
+            PathBuf::from("/tmp").join(format!(".bb.{}.{}", std::process::id(), id + 1))
+        );
+        assert_eq!(next_id.load(Ordering::Relaxed), id + 2);
     }
 
     #[test]
