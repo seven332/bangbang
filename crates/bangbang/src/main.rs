@@ -1,16 +1,15 @@
 use std::env;
 use std::fmt;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::thread;
 
 mod api_server;
 
 use api_server::{ApiServer, ApiServerError};
 use bangbang_hvf::HvfBackend;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
-use signal_hook::iterator::{Handle as SignalHandle, Signals};
+use signal_hook::{flag, low_level, SigId};
 
 const DEFAULT_API_SOCK_PATH: &str = "/tmp/bangbang.socket";
 const DEFAULT_INSTANCE_ID: &str = "anonymous-instance";
@@ -138,27 +137,25 @@ impl std::error::Error for ProcessError {}
 #[derive(Debug)]
 struct ShutdownSignal {
     requested: Arc<AtomicBool>,
-    signal_handle: SignalHandle,
-    signal_thread: Option<thread::JoinHandle<()>>,
+    signal_ids: [SigId; 2],
 }
 
 impl ShutdownSignal {
     fn install() -> Result<Self, ProcessError> {
         let requested = Arc::new(AtomicBool::new(false));
-        let thread_requested = Arc::clone(&requested);
-        let mut signals = Signals::new([SIGINT, SIGTERM])
+        let sigint = flag::register(SIGINT, Arc::clone(&requested))
             .map_err(|err| ProcessError::SignalHandler(err.kind()))?;
-        let signal_handle = signals.handle();
-        let signal_thread = thread::spawn(move || {
-            if signals.forever().next().is_some() {
-                thread_requested.store(true, Ordering::Relaxed);
+        let sigterm = match flag::register(SIGTERM, Arc::clone(&requested)) {
+            Ok(sigterm) => sigterm,
+            Err(err) => {
+                low_level::unregister(sigint);
+                return Err(ProcessError::SignalHandler(err.kind()));
             }
-        });
+        };
 
         Ok(Self {
             requested,
-            signal_handle,
-            signal_thread: Some(signal_thread),
+            signal_ids: [sigint, sigterm],
         })
     }
 
@@ -169,9 +166,8 @@ impl ShutdownSignal {
 
 impl Drop for ShutdownSignal {
     fn drop(&mut self) {
-        self.signal_handle.close();
-        if let Some(signal_thread) = self.signal_thread.take() {
-            let _ = signal_thread.join();
+        for signal_id in self.signal_ids {
+            low_level::unregister(signal_id);
         }
     }
 }
