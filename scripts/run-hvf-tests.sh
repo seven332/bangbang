@@ -75,7 +75,7 @@ cat > "$entitlements" <<'EOF'
 EOF
 
 cargo_messages="$tmp_dir/cargo-test.json"
-cargo test --target-dir "$tmp_dir/target" -p bangbang-hvf --test hvf_lifecycle --all-features --locked --no-run --message-format=json > "$cargo_messages"
+cargo test -p bangbang-hvf --test hvf_lifecycle --all-features --locked --no-run --message-format=json > "$cargo_messages"
 
 test_bins=()
 while IFS= read -r test_bin; do
@@ -89,8 +89,13 @@ if [[ "${#test_bins[@]}" -eq 0 ]]; then
   exit 1
 fi
 
-for test_bin in "${test_bins[@]}"; do
-  codesign --force --sign - --entitlements "$entitlements" "$test_bin"
+signed_test_bins=()
+for index in "${!test_bins[@]}"; do
+  test_bin="${test_bins[$index]}"
+  signed_test_bin="$tmp_dir/$(basename "$test_bin").$index"
+  cp "$test_bin" "$signed_test_bin"
+  codesign --force --sign - --entitlements "$entitlements" "$signed_test_bin"
+  signed_test_bins+=("$signed_test_bin")
 done
 
 hv_support="$(sysctl -n kern.hv_support 2>/dev/null || sysctl -n kern.hv.supported 2>/dev/null || true)"
@@ -108,7 +113,7 @@ if [[ "$hv_vmm_present" == "1" ]]; then
   finish_unsupported "nested Hypervisor.framework execution is not available on this virtualized host"
 fi
 
-for test_bin in "${test_bins[@]}"; do
+for test_bin in "${signed_test_bins[@]}"; do
   if [[ "${#test_args[@]}" -eq 0 ]]; then
     "$test_bin" --test-threads=1
   else
