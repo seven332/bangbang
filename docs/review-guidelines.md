@@ -22,10 +22,17 @@ Run the repository checks before opening or updating a pull request:
 ```sh
 cargo fmt --all -- --check
 cargo check --workspace --all-targets --all-features --locked
-cargo test --workspace --all-targets --all-features --locked
+cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf
+cargo test -p bangbang-hvf --lib --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 ```
+
+On macOS Apple Silicon, also run `scripts/run-hvf-tests.sh` for signed HVF
+integration tests under `crates/hvf/tests/`. HVF lifecycle tests should not be
+skipped or ignored on hosts that support HVF. Hosted CI may use
+`scripts/run-hvf-tests.sh --allow-unsupported` to validate build/sign behavior
+without executing HVF when the runner does not support it.
 
 Reviewers should confirm the PR body lists the checks that were run. If any
 command is intentionally skipped, the PR should explain why the skipped command

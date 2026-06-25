@@ -15,7 +15,7 @@ env:
 jobs:
   rust:
     name: rust
-    runs-on: macos-latest
+    runs-on: macos-26
     timeout-minutes: 15
 
     steps:
@@ -26,7 +26,7 @@ jobs:
 
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt --target aarch64-apple-darwin
           rustup default stable
 
       - name: Cache Rust dependencies
@@ -39,7 +39,13 @@ jobs:
         run: cargo check --workspace --all-targets --all-features --locked
 
       - name: Run tests
-        run: cargo test --workspace --all-targets --all-features --locked
+        run: cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf
+
+      - name: Run HVF unit tests
+        run: cargo test -p bangbang-hvf --lib --all-features --locked
+
+      - name: Build and sign HVF smoke test
+        run: scripts/run-hvf-tests.sh --allow-unsupported
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings

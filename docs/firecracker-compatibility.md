@@ -7,9 +7,10 @@ the current scaffold implements all listed API behavior.
 The current repository defines crate boundaries, endpoint names, a minimal
 HTTP-over-Unix-socket API server for `GET /` and `GET /version`, a backend-neutral VM
 trait, a minimal read-only VMM action/data model, a minimal
-Hypervisor.framework VM create/destroy wrapper, and an initial process startup
-argument model. There is no broader API request body model, guest memory
-mapping, vCPU loop, or kernel loading yet.
+Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
+create/destroy wrapper, and an initial process startup argument model. There is
+no broader API request body model, guest memory mapping, vCPU register setup,
+exit handling, run loop, or kernel loading yet.
 
 ## Firecracker Model Alignment
 
@@ -307,6 +308,10 @@ macOS design work instead of direct implementation:
 
 - KVM-specific VM and vCPU operations need HVF equivalents rather than direct
   KVM ioctl usage.
+- HVF vCPU handles are thread-affine: creation, register access, run, and
+  destroy operations must happen on the owning thread. The initial vCPU wrapper
+  covers create/destroy lifecycle only; future run-loop work should use a
+  thread-owned runner.
 - Linux seccomp, jailer, cgroups, and namespaces do not directly apply.
 - Linux TAP-based networking needs a macOS-specific design.
 - Snapshot and device behavior may differ when backed by HVF.
@@ -321,7 +326,11 @@ surface:
 
 - unit tests for parsing, configuration, and state transitions
 - golden tests for Firecracker-shaped API responses once the API exists
-- platform-gated tests for HVF behavior
+- real HVF tests on macOS Apple Silicon through `scripts/run-hvf-tests.sh`,
+  which signs the `bangbang-hvf` integration test with the
+  `com.apple.security.hypervisor` entitlement before running it; the script
+  fails when the host cannot run HVF tests unless CI explicitly uses
+  `--allow-unsupported` after build/sign validation
 - boot smoke tests once kernel loading and vCPU execution exist
 
 ## Security and Performance Scope
