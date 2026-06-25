@@ -62,6 +62,11 @@ if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
   finish_unsupported "bangbang-hvf tests require macOS Apple Silicon; found $(uname -s) $(uname -m)"
 fi
 
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 is required to parse cargo test JSON output" >&2
+  exit 1
+fi
+
 entitlements="$tmp_dir/hvf-entitlements.plist"
 cat > "$entitlements" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -77,12 +82,33 @@ EOF
 cargo_messages="$tmp_dir/cargo-test.json"
 cargo test -p bangbang-hvf --test hvf_lifecycle --all-features --locked --no-run --message-format=json > "$cargo_messages"
 
+test_bins_file="$tmp_dir/test-bins"
+python3 - "$cargo_messages" > "$test_bins_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as messages:
+    for line in messages:
+        message = json.loads(line)
+        target = message.get("target", {})
+        executable = message.get("executable")
+
+        if (
+            message.get("reason") == "compiler-artifact"
+            and executable is not None
+            and target.get("name") == "hvf_lifecycle"
+            and "test" in target.get("kind", [])
+        ):
+            sys.stdout.write(executable)
+            sys.stdout.write("\0")
+PY
+
 test_bins=()
-while IFS= read -r test_bin; do
+while IFS= read -r -d "" test_bin; do
   if [[ -n "$test_bin" ]]; then
     test_bins+=("$test_bin")
   fi
-done < <(sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' "$cargo_messages")
+done < "$test_bins_file"
 
 if [[ "${#test_bins[@]}" -eq 0 ]]; then
   echo "failed to locate bangbang-hvf lifecycle test executable" >&2
