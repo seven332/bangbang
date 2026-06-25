@@ -52,10 +52,8 @@ fn run() -> Result<(), String> {
             println!("bangbang {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
-        Command::Run(config) => {
+        Command::Run(_) => {
             println!("bangbang {}", env!("CARGO_PKG_VERSION"));
-            println!("id: {}", config.id);
-            println!("api socket: {}", config.api_sock);
             println!(
                 "hvf target supported: {}",
                 HvfBackend::is_supported_target()

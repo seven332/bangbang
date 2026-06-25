@@ -44,7 +44,8 @@ it rejects invalid IDs, empty socket paths, and socket paths containing control
 characters, but performs no filesystem creation, canonicalization, deletion,
 socket binding, permission checks, or VM work. Those checks belong with later
 socket lifecycle and API server work. Process CLI parsing stays outside the
-future VM/vCPU fast path and should add only trivial startup overhead.
+future VM/vCPU fast path and should add only trivial startup overhead. Error and
+status output avoid echoing path-like CLI values.
 
 ## Compatibility Baseline
 
