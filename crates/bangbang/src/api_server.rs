@@ -3,11 +3,13 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use bangbang_api::http::{handle_request_bytes, request_total_len, HttpResponse, RequestError};
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 
 const READ_CHUNK_SIZE: usize = 4096;
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ApiServerError {
@@ -76,7 +78,9 @@ impl ApiServer {
             .accept()
             .map_err(|err| ApiServerError::Accept(err.kind()))?;
 
-        handle_connection(&mut stream, version)
+        let _ = handle_connection(&mut stream, version);
+
+        Ok(())
     }
 }
 
@@ -127,6 +131,13 @@ enum RequestRead {
 }
 
 fn handle_connection(stream: &mut UnixStream, version: &str) -> Result<(), ApiServerError> {
+    stream
+        .set_read_timeout(Some(CONNECTION_TIMEOUT))
+        .map_err(|err| ApiServerError::Connection(err.kind()))?;
+    stream
+        .set_write_timeout(Some(CONNECTION_TIMEOUT))
+        .map_err(|err| ApiServerError::Connection(err.kind()))?;
+
     let response = match read_request(stream)? {
         RequestRead::Complete(request) => handle_request_bytes(&request, version),
         RequestRead::TooLarge => HttpResponse::fault(RequestError::PayloadTooLarge.fault_message()),
@@ -158,9 +169,18 @@ fn read_request(stream: &mut UnixStream) -> Result<RequestRead, ApiServerError> 
         }
 
         let read_len = chunk.len().min(remaining);
-        let bytes_read = stream
-            .read(&mut chunk[..read_len])
-            .map_err(|err| ApiServerError::Connection(err.kind()))?;
+        let bytes_read = match stream.read(&mut chunk[..read_len]) {
+            Ok(bytes_read) => bytes_read,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Ok(RequestRead::Complete(request));
+            }
+            Err(err) => return Err(ApiServerError::Connection(err.kind())),
+        };
 
         if bytes_read == 0 {
             return Ok(RequestRead::Complete(request));
@@ -235,6 +255,22 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
         assert!(response.contains(r#"{"fault_message":"Invalid request method and/or path."}"#));
+    }
+
+    #[test]
+    fn client_disconnect_does_not_fail_server() {
+        let path = unique_socket_path("disconnect");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+
+        client
+            .write_all(b"GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("client should write request");
+        drop(client);
+
+        server
+            .serve_next(VERSION)
+            .expect("client disconnect should not fail server");
     }
 
     #[test]

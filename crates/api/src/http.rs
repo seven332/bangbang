@@ -134,16 +134,16 @@ pub fn parse_request(bytes: &[u8]) -> Result<ApiRequest, RequestError> {
         return Err(RequestError::PayloadTooLarge);
     }
 
-    let (method, path, header_len, content_length) = parse_request_head(bytes)?;
+    let (method, path, header_len, request_body) = parse_request_head(bytes)?;
     let body = bytes
         .get(header_len..)
         .ok_or(RequestError::MalformedRequest)?;
 
-    if body.len() != content_length {
+    if body.len() != request_body.content_length() {
         return Err(RequestError::MalformedRequest);
     }
 
-    if method == "GET" && content_length > 0 {
+    if method == "GET" && request_body.is_present() {
         return Err(RequestError::GetRequestBody);
     }
 
@@ -167,10 +167,14 @@ pub fn request_total_len(bytes: &[u8]) -> Result<Option<usize>, RequestError> {
         httparse::Status::Complete(header_len) => header_len,
         httparse::Status::Partial => return Ok(None),
     };
-    let content_length = content_length(request.headers)?;
+    let body = request_body(request.headers)?;
+
+    if body.has_unsupported_encoding() {
+        return Err(RequestError::MalformedRequest);
+    }
 
     let total_len = header_len
-        .checked_add(content_length)
+        .checked_add(body.content_length())
         .ok_or(RequestError::PayloadTooLarge)?;
 
     if total_len > HTTP_MAX_PAYLOAD_SIZE {
@@ -180,7 +184,7 @@ pub fn request_total_len(bytes: &[u8]) -> Result<Option<usize>, RequestError> {
     Ok(Some(total_len))
 }
 
-fn parse_request_head(bytes: &[u8]) -> Result<(&str, &str, usize, usize), RequestError> {
+fn parse_request_head(bytes: &[u8]) -> Result<(&str, &str, usize, RequestBody), RequestError> {
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut request = httparse::Request::new(&mut headers);
 
@@ -194,33 +198,57 @@ fn parse_request_head(bytes: &[u8]) -> Result<(&str, &str, usize, usize), Reques
 
     let method = request.method.ok_or(RequestError::MalformedRequest)?;
     let path = request.path.ok_or(RequestError::MalformedRequest)?;
-    let content_length = content_length(request.headers)?;
+    let body = request_body(request.headers)?;
 
-    Ok((method, path, header_len, content_length))
+    Ok((method, path, header_len, body))
 }
 
-fn content_length(headers: &[httparse::Header<'_>]) -> Result<usize, RequestError> {
-    let mut content_length = None;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequestBody {
+    content_length: usize,
+    transfer_encoding: bool,
+}
 
-    for header in headers {
-        if !header.name.eq_ignore_ascii_case("Content-Length") {
-            continue;
-        }
-
-        if content_length.is_some() {
-            return Err(RequestError::MalformedRequest);
-        }
-
-        let value =
-            std::str::from_utf8(header.value).map_err(|_| RequestError::MalformedRequest)?;
-        let parsed = value
-            .trim()
-            .parse::<usize>()
-            .map_err(|_| RequestError::MalformedRequest)?;
-        content_length = Some(parsed);
+impl RequestBody {
+    const fn content_length(self) -> usize {
+        self.content_length
     }
 
-    Ok(content_length.unwrap_or(0))
+    const fn has_unsupported_encoding(self) -> bool {
+        self.transfer_encoding
+    }
+
+    const fn is_present(self) -> bool {
+        self.content_length > 0 || self.transfer_encoding
+    }
+}
+
+fn request_body(headers: &[httparse::Header<'_>]) -> Result<RequestBody, RequestError> {
+    let mut content_length = None;
+    let mut transfer_encoding = false;
+
+    for header in headers {
+        if header.name.eq_ignore_ascii_case("Content-Length") {
+            if content_length.is_some() {
+                return Err(RequestError::MalformedRequest);
+            }
+
+            let value =
+                std::str::from_utf8(header.value).map_err(|_| RequestError::MalformedRequest)?;
+            let parsed = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| RequestError::MalformedRequest)?;
+            content_length = Some(parsed);
+        } else if header.name.eq_ignore_ascii_case("Transfer-Encoding") {
+            transfer_encoding = true;
+        }
+    }
+
+    Ok(RequestBody {
+        content_length: content_length.unwrap_or(0),
+        transfer_encoding,
+    })
 }
 
 impl From<ApiRequest> for Endpoint {
@@ -251,6 +279,23 @@ mod tests {
             b"GET /version HTTP/1.1\r\nContent-Length: 2\r\nContent-Type: application/json\r\n\r\n{}";
 
         assert_eq!(parse_request(request), Err(RequestError::GetRequestBody));
+    }
+
+    #[test]
+    fn rejects_get_version_with_transfer_encoding_body() {
+        let request = b"GET /version HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+        assert_eq!(parse_request(request), Err(RequestError::GetRequestBody));
+    }
+
+    #[test]
+    fn total_len_rejects_unsupported_transfer_encoding() {
+        let request = b"GET /version HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+        assert_eq!(
+            request_total_len(request),
+            Err(RequestError::MalformedRequest)
+        );
     }
 
     #[test]
