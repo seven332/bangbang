@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bangbang_api::http::{handle_request_bytes, request_total_len, HttpResponse, RequestError};
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
@@ -137,13 +137,10 @@ enum RequestRead {
 
 fn handle_connection(stream: &mut UnixStream, version: &str) -> Result<(), ApiServerError> {
     stream
-        .set_read_timeout(Some(CONNECTION_TIMEOUT))
-        .map_err(|err| ApiServerError::Connection(err.kind()))?;
-    stream
         .set_write_timeout(Some(CONNECTION_TIMEOUT))
         .map_err(|err| ApiServerError::Connection(err.kind()))?;
 
-    let response = match read_request(stream)? {
+    let response = match read_request(stream, CONNECTION_TIMEOUT)? {
         RequestRead::Complete(request) => handle_request_bytes(&request, version),
         RequestRead::TooLarge => HttpResponse::fault(RequestError::PayloadTooLarge.fault_message()),
     };
@@ -153,7 +150,8 @@ fn handle_connection(stream: &mut UnixStream, version: &str) -> Result<(), ApiSe
         .map_err(|err| ApiServerError::Connection(err.kind()))
 }
 
-fn read_request(stream: &mut UnixStream) -> Result<RequestRead, ApiServerError> {
+fn read_request(stream: &mut UnixStream, timeout: Duration) -> Result<RequestRead, ApiServerError> {
+    let deadline = Instant::now() + timeout;
     let mut request = Vec::new();
     let mut chunk = [0; READ_CHUNK_SIZE];
 
@@ -174,6 +172,16 @@ fn read_request(stream: &mut UnixStream) -> Result<RequestRead, ApiServerError> 
         }
 
         let read_len = chunk.len().min(remaining);
+        let Some(read_timeout) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(RequestRead::Complete(request));
+        };
+        if read_timeout.is_zero() {
+            return Ok(RequestRead::Complete(request));
+        }
+        stream
+            .set_read_timeout(Some(read_timeout))
+            .map_err(|err| ApiServerError::Connection(err.kind()))?;
+
         let bytes_read = match stream.read(&mut chunk[..read_len]) {
             Ok(bytes_read) => bytes_read,
             Err(err)
@@ -200,7 +208,7 @@ mod tests {
     use std::env;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
 
@@ -300,6 +308,21 @@ mod tests {
         server
             .serve_next(VERSION)
             .expect("client disconnect should not fail server");
+    }
+
+    #[test]
+    fn request_read_timeout_applies_to_total_request() {
+        let (mut client, mut server) = UnixStream::pair().expect("stream pair should be created");
+        let partial_request = b"GET /version HTTP/1.1\r\n";
+
+        client
+            .write_all(partial_request)
+            .expect("client should write partial request");
+
+        let request = read_request(&mut server, Duration::from_millis(10))
+            .expect("read timeout should not fail");
+
+        assert_eq!(request, RequestRead::Complete(partial_request.to_vec()));
     }
 
     #[test]
