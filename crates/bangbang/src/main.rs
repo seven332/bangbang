@@ -320,7 +320,7 @@ fn os_arg_into_string(arg: OsString) -> Result<String, String> {
 
 fn print_help() {
     println!(
-        "bangbang {}\n\nUsage:\n  bangbang [OPTIONS]\n\nOptions:\n      --api-sock <PATH>  Unix domain socket path for the API server [default: {}]\n      --id <ID>          MicroVM unique identifier: 1-64 bytes, ASCII alphanumeric or '-' [default: {}]\n  -V, --version          Print version\n  -h, --help             Print help\n\nCurrent scope:\n  Serves GET /version over the API socket; VM startup is not implemented yet.",
+        "bangbang {}\n\nUsage:\n  bangbang [OPTIONS]\n\nOptions:\n      --api-sock <PATH>  Unix domain socket path for the API server [default: {}]\n      --id <ID>          MicroVM unique identifier [default: {}]\n                         Accepts 1-64 bytes, ASCII alphanumeric or '-'\n  -V, --version          Print version\n  -h, --help             Print help\n\nCurrent scope:\n  Serves GET /version over the API socket; VM startup is not implemented yet.",
         env!("CARGO_PKG_VERSION"),
         DEFAULT_API_SOCK_PATH,
         DEFAULT_INSTANCE_ID
