@@ -35,7 +35,7 @@ cargo run -p bangbang -- --api-sock /tmp/bangbang.socket --id demo-1
 ```
 
 - `--api-sock <PATH>` sets the Unix socket path for the API server. The default is `/tmp/bangbang.socket`.
-- `--id <ID>` records the microVM identifier. The default is `anonymous-instance`.
+- `--id <ID>` records the microVM identifier. IDs must be 1 to 64 bytes and contain only ASCII alphanumeric characters or `-`. The default is `anonymous-instance`.
 - `--help`, `-h`, `--version`, and `-V` are supported.
 
 `bangbang` binds the configured socket path, serves `GET /version`, and stays running until `SIGINT` or `SIGTERM` requests shutdown. Unsupported Firecracker process options such as `--config-file`, `--no-api`, seccomp, logging, metrics, snapshot, MMDS, and PCI flags are rejected instead of ignored.
