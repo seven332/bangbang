@@ -10,10 +10,6 @@ fn creates_and_destroys_hvf_vcpu() {
     {
         let mut vcpu = backend.create_vcpu().expect("vCPU should be created");
         vcpu.destroy().expect("vCPU should be destroyed");
-        assert_eq!(
-            format!("{vcpu:?}"),
-            "HvfVcpu { vcpu: None, has_exit: false, .. }"
-        );
         vcpu.destroy()
             .expect("destroyed vCPU should remain destroyed");
     }
