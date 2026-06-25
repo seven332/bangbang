@@ -40,6 +40,12 @@ cargo run -p bangbang -- --api-sock /tmp/bangbang.socket --id demo-1
 
 These arguments are parsed and validated only. `bangbang` does not bind the socket or serve the API yet. Unsupported Firecracker process options such as `--config-file`, `--no-api`, seccomp, logging, metrics, snapshot, MMDS, and PCI flags are rejected instead of ignored.
 
+## Exit Status
+
+- `0`: help, version, or parser-only startup completed successfully.
+- `153`: startup argument parsing or validation failed. This matches Firecracker's argument-parsing exit code.
+- `1`: reserved for future non-argument process failures; the current scaffold has no such failure path.
+
 ## Build
 
 ```sh

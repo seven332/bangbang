@@ -47,6 +47,20 @@ socket lifecycle and API server work. Process CLI parsing stays outside the
 future VM/vCPU fast path and should add only trivial startup overhead. Error and
 status output avoid echoing path-like CLI values.
 
+### Process Exit Status
+
+The current executable uses a small process exit status contract:
+
+| Exit status | Current meaning | Compatibility notes |
+| --- | --- | --- |
+| `0` | Help, version, or parser-only startup completed successfully. | Matches Firecracker's success status. |
+| `153` | Startup argument parsing or validation failed. | Matches Firecracker's `ArgParsing` exit code. |
+| `1` | Reserved for future non-argument process failures. | The current scaffold has no such failure path yet. |
+
+Firecracker also defines bad-configuration and signal-specific exit codes.
+bangbang does not expose those until the corresponding configuration loading,
+signal handling, API server, or VM runtime behavior exists.
+
 ## Compatibility Baseline
 
 bangbang's first Firecracker compatibility baseline is the upstream

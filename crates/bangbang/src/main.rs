@@ -1,4 +1,5 @@
 use std::env;
+use std::fmt;
 use std::process::ExitCode;
 
 use bangbang_hvf::HvfBackend;
@@ -34,14 +35,15 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
+            let exit_code = err.exit_code().into_exit_code();
             eprintln!("bangbang: {err}");
-            ExitCode::from(1)
+            exit_code
         }
     }
 }
 
-fn run() -> Result<(), String> {
-    let args = Args::parse(env::args().skip(1))?;
+fn run() -> Result<(), ProcessError> {
+    let args = parse_process_args(env::args().skip(1))?;
 
     match args.command {
         Command::Help => {
@@ -64,6 +66,51 @@ fn run() -> Result<(), String> {
 
     Ok(())
 }
+
+fn parse_process_args<I>(args: I) -> Result<Args, ProcessError>
+where
+    I: IntoIterator<Item = String>,
+{
+    Args::parse(args).map_err(ProcessError::ArgumentParsing)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessExitCode {
+    ArgumentParsing = 153,
+}
+
+impl ProcessExitCode {
+    const fn value(self) -> u8 {
+        self as u8
+    }
+
+    fn into_exit_code(self) -> ExitCode {
+        ExitCode::from(self.value())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProcessError {
+    ArgumentParsing(String),
+}
+
+impl ProcessError {
+    fn exit_code(&self) -> ProcessExitCode {
+        match self {
+            Self::ArgumentParsing(_) => ProcessExitCode::ArgumentParsing,
+        }
+    }
+}
+
+impl fmt::Display for ProcessError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ArgumentParsing(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ProcessError {}
 
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
@@ -234,8 +281,8 @@ fn unsupported_equals_syntax(arg: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, Command, StartupConfig, DEFAULT_API_SOCK_PATH, DEFAULT_INSTANCE_ID,
-        MAX_INSTANCE_ID_LEN,
+        parse_process_args, Args, Command, ProcessError, ProcessExitCode, StartupConfig,
+        DEFAULT_API_SOCK_PATH, DEFAULT_INSTANCE_ID, MAX_INSTANCE_ID_LEN,
     };
 
     fn parse(args: &[&str]) -> Result<Args, String> {
@@ -247,6 +294,37 @@ mod tests {
             Command::Run(config) => Ok(config),
             command => Err(format!("expected run command, got {command:?}")),
         }
+    }
+
+    #[test]
+    fn process_exit_code_value_matches_argument_parsing_contract() {
+        assert_eq!(ProcessExitCode::ArgumentParsing.value(), 153);
+    }
+
+    #[test]
+    fn argument_parse_error_maps_to_argument_parsing_exit_code() {
+        let err = ProcessError::ArgumentParsing("unknown argument: --unknown".to_string());
+
+        assert_eq!(err.exit_code(), ProcessExitCode::ArgumentParsing);
+    }
+
+    #[test]
+    fn process_error_display_preserves_parser_message() {
+        let err = ProcessError::ArgumentParsing("unknown argument: --unknown".to_string());
+
+        assert_eq!(err.to_string(), "unknown argument: --unknown");
+    }
+
+    #[test]
+    fn parse_process_args_wraps_parser_errors() {
+        let err = parse_process_args(["--unknown=/tmp/secret".to_string()])
+            .expect_err("process arg parsing should fail");
+
+        assert_eq!(
+            err,
+            ProcessError::ArgumentParsing("unknown argument: --unknown".to_string())
+        );
+        assert_eq!(err.exit_code(), ProcessExitCode::ArgumentParsing);
     }
 
     #[test]
