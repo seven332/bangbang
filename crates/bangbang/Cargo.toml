@@ -5,6 +5,7 @@ edition.workspace = true
 repository.workspace = true
 
 [dependencies]
+bangbang-api = { path = "../api" }
 bangbang-hvf = { path = "../hvf" }
 
 [lints]

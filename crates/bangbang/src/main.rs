@@ -2,6 +2,9 @@ use std::env;
 use std::fmt;
 use std::process::ExitCode;
 
+mod api_server;
+
+use api_server::{ApiServer, ApiServerError};
 use bangbang_hvf::HvfBackend;
 
 const DEFAULT_API_SOCK_PATH: &str = "/tmp/bangbang.socket";
@@ -54,13 +57,18 @@ fn run() -> Result<(), ProcessError> {
             println!("bangbang {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
-        Command::Run(_) => {
+        Command::Run(config) => {
             println!("bangbang {}", env!("CARGO_PKG_VERSION"));
             println!(
                 "hvf target supported: {}",
                 HvfBackend::is_supported_target()
             );
-            println!("status: startup arguments parsed; API server and VM startup are not implemented yet");
+
+            let server = ApiServer::bind(&config.api_sock).map_err(ProcessError::ApiServer)?;
+            println!("status: API server listening; VM startup is not implemented yet");
+            server
+                .run(env!("CARGO_PKG_VERSION"))
+                .map_err(ProcessError::ApiServer)?;
         }
     }
 
@@ -76,6 +84,7 @@ where
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessExitCode {
+    ProcessFailure = 1,
     ArgumentParsing = 153,
 }
 
@@ -91,12 +100,14 @@ impl ProcessExitCode {
 
 #[derive(Debug, PartialEq, Eq)]
 enum ProcessError {
+    ApiServer(ApiServerError),
     ArgumentParsing(String),
 }
 
 impl ProcessError {
     fn exit_code(&self) -> ProcessExitCode {
         match self {
+            Self::ApiServer(_) => ProcessExitCode::ProcessFailure,
             Self::ArgumentParsing(_) => ProcessExitCode::ArgumentParsing,
         }
     }
@@ -105,6 +116,7 @@ impl ProcessError {
 impl fmt::Display for ProcessError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ApiServer(err) => write!(f, "API server error: {err}"),
             Self::ArgumentParsing(message) => f.write_str(message),
         }
     }
@@ -210,7 +222,7 @@ impl Args {
 
 fn print_help() {
     println!(
-        "bangbang {}\n\nUsage:\n  bangbang [OPTIONS]\n\nOptions:\n      --api-sock <PATH>  Record API socket path for future API server support [default: {}]\n      --id <ID>          MicroVM unique identifier [default: {}]\n  -V, --version          Print version\n  -h, --help             Print help\n\nCurrent scope:\n  Parses startup configuration only; no API server or VM startup is implemented yet.",
+        "bangbang {}\n\nUsage:\n  bangbang [OPTIONS]\n\nOptions:\n      --api-sock <PATH>  Unix domain socket path for the API server [default: {}]\n      --id <ID>          MicroVM unique identifier [default: {}]\n  -V, --version          Print version\n  -h, --help             Print help\n\nCurrent scope:\n  Serves GET /version over the API socket; VM startup is not implemented yet.",
         env!("CARGO_PKG_VERSION"),
         DEFAULT_API_SOCK_PATH,
         DEFAULT_INSTANCE_ID
@@ -281,8 +293,8 @@ fn unsupported_equals_syntax(arg: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_process_args, Args, Command, ProcessError, ProcessExitCode, StartupConfig,
-        DEFAULT_API_SOCK_PATH, DEFAULT_INSTANCE_ID, MAX_INSTANCE_ID_LEN,
+        parse_process_args, ApiServerError, Args, Command, ProcessError, ProcessExitCode,
+        StartupConfig, DEFAULT_API_SOCK_PATH, DEFAULT_INSTANCE_ID, MAX_INSTANCE_ID_LEN,
     };
 
     fn parse(args: &[&str]) -> Result<Args, String> {
@@ -298,7 +310,15 @@ mod tests {
 
     #[test]
     fn process_exit_code_value_matches_argument_parsing_contract() {
+        assert_eq!(ProcessExitCode::ProcessFailure.value(), 1);
         assert_eq!(ProcessExitCode::ArgumentParsing.value(), 153);
+    }
+
+    #[test]
+    fn api_server_error_maps_to_process_failure_exit_code() {
+        let err = ProcessError::ApiServer(ApiServerError::SocketPathExists);
+
+        assert_eq!(err.exit_code(), ProcessExitCode::ProcessFailure);
     }
 
     #[test]
