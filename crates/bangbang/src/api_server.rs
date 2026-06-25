@@ -382,20 +382,32 @@ fn handle_request_bytes(bytes: &[u8], vmm: &mut VmmController) -> HttpResponse {
 
 fn handle_api_request(request: ApiRequest, vmm: &mut VmmController) -> HttpResponse {
     match request {
-        ApiRequest::GetVersion => handle_vmm_data(
-            vmm.handle_action(VmmAction::GetVmmVersion),
-            "version request returned unexpected VMM data.",
-        ),
+        ApiRequest::GetInstanceInfo => {
+            handle_instance_info(vmm.handle_action(VmmAction::GetVmInstanceInfo))
+        }
+        ApiRequest::GetVersion => handle_vmm_version(vmm.handle_action(VmmAction::GetVmmVersion)),
     }
 }
 
-fn handle_vmm_data(
-    result: Result<VmmData, bangbang_runtime::VmmActionError>,
-    unexpected_message: &str,
-) -> HttpResponse {
+fn handle_vmm_version(result: Result<VmmData, bangbang_runtime::VmmActionError>) -> HttpResponse {
     match result {
         Ok(VmmData::VmmVersion(version)) => HttpResponse::version(&version),
-        Ok(VmmData::InstanceInformation(_)) => HttpResponse::fault(unexpected_message),
+        Ok(VmmData::InstanceInformation(_)) => {
+            HttpResponse::fault("version request returned unexpected VMM data.")
+        }
+        Err(err) => HttpResponse::fault(&err.to_string()),
+    }
+}
+
+fn handle_instance_info(result: Result<VmmData, bangbang_runtime::VmmActionError>) -> HttpResponse {
+    match result {
+        Ok(VmmData::InstanceInformation(info)) => {
+            let state = info.state.to_string();
+            HttpResponse::instance_info(&info.id, &state, &info.vmm_version, &info.app_name)
+        }
+        Ok(VmmData::VmmVersion(_)) => {
+            HttpResponse::fault("instance info request returned unexpected VMM data.")
+        }
         Err(err) => HttpResponse::fault(&err.to_string()),
     }
 }
@@ -555,6 +567,19 @@ mod tests {
     }
 
     #[test]
+    fn dispatches_instance_info_request_through_vmm_controller() {
+        let mut vmm = VmmController::new("demo-9", "9.9.9", "bangbang");
+
+        let response = handle_request_bytes(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", &mut vmm);
+
+        assert_eq!(response.status(), bangbang_api::http::StatusCode::Ok);
+        assert!(response.body().contains(r#""id":"demo-9""#));
+        assert!(response.body().contains(r#""state":"Not started""#));
+        assert!(response.body().contains(r#""vmm_version":"9.9.9""#));
+        assert!(response.body().contains(r#""app_name":"bangbang""#));
+    }
+
+    #[test]
     fn socket_path_cleanup_keeps_replaced_path() {
         let path = unique_socket_path("cln");
         let listener = UnixListener::bind(&path).expect("temporary listener should bind");
@@ -619,13 +644,40 @@ mod tests {
     }
 
     #[test]
+    fn serves_instance_info_over_unix_socket() {
+        let path = unique_socket_path("instance-info");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("client should write request");
+        let mut vmm = test_controller();
+        server
+            .serve_next(&mut vmm)
+            .expect("server should handle one request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("client should read response");
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Content-Type: application/json\r\n"));
+        assert!(response.contains(r#""id":"demo-1""#));
+        assert!(response.contains(r#""state":"Not started""#));
+        assert!(response.contains(r#""vmm_version":"0.1.0""#));
+        assert!(response.contains(r#""app_name":"bangbang""#));
+    }
+
+    #[test]
     fn returns_fault_for_unsupported_path() {
         let path = unique_socket_path("fault");
         let server = ApiServer::bind(&path).expect("server should bind");
         let mut client = UnixStream::connect(&path).expect("client should connect");
 
         client
-            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .write_all(b"GET /unknown HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .expect("client should write request");
         let mut vmm = test_controller();
         server

@@ -18,9 +18,9 @@ crates/bangbang   VMM process entrypoint and startup CLI
 
 ## Current Scope
 
-The first target is Apple Silicon macOS. The current scaffold includes HTTP over a Unix domain socket for `GET /version` only, routed through a minimal read-only VMM action model. It intentionally does not include:
+The first target is Apple Silicon macOS. The current scaffold includes HTTP over a Unix domain socket for `GET /` and `GET /version`, routed through a minimal read-only VMM action model. It intentionally does not include:
 
-- API endpoints beyond `GET /version`
+- API endpoints beyond `GET /` and `GET /version`
 - JSON request body models
 - guest memory mapping
 - vCPU creation or a run loop
@@ -38,19 +38,29 @@ cargo run -p bangbang -- --api-sock /tmp/bangbang.socket --id demo-1
 - `--id <ID>` records the microVM identifier. IDs must be 1 to 64 bytes and contain only ASCII alphanumeric characters or `-`. The default is `anonymous-instance`.
 - `--help`, `-h`, `--version`, and `-V` are supported.
 
-`bangbang` binds the configured socket path, serves `GET /version`, and stays running until `SIGINT` or `SIGTERM` requests shutdown. Unsupported Firecracker process options such as `--config-file`, `--no-api`, seccomp, logging, metrics, snapshot, MMDS, and PCI flags are rejected instead of ignored.
+`bangbang` binds the configured socket path, serves `GET /` and `GET /version`, and stays running until `SIGINT` or `SIGTERM` requests shutdown. Unsupported Firecracker process options such as `--config-file`, `--no-api`, seccomp, logging, metrics, snapshot, MMDS, and PCI flags are rejected instead of ignored.
 
 The API socket is an unauthenticated local control interface. Filesystem
 permissions on the socket path and parent directory are the access-control
 boundary, so use a private directory or restrictive umask on multi-user hosts.
 
-Query the first supported endpoint:
+Query the supported read-only endpoints:
+
+```sh
+curl --unix-socket /tmp/bangbang.socket http://localhost/
+```
+
+The instance info response is Firecracker-shaped JSON:
+
+```json
+{"app_name":"bangbang","id":"demo-1","state":"Not started","vmm_version":"0.1.0"}
+```
 
 ```sh
 curl --unix-socket /tmp/bangbang.socket http://localhost/version
 ```
 
-The response body is Firecracker-shaped JSON:
+The version response body is Firecracker-shaped JSON:
 
 ```json
 {"firecracker_version":"0.1.0"}
