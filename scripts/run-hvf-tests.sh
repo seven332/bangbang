@@ -67,6 +67,8 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
+target_triple="aarch64-apple-darwin"
+
 entitlements="$tmp_dir/hvf-entitlements.plist"
 cat > "$entitlements" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -80,7 +82,15 @@ cat > "$entitlements" <<'EOF'
 EOF
 
 cargo_messages="$tmp_dir/cargo-test.json"
-cargo test -p bangbang-hvf --test hvf_lifecycle --all-features --locked --no-run --message-format=json > "$cargo_messages"
+cargo test \
+  -p bangbang-hvf \
+  --test hvf_lifecycle \
+  --all-features \
+  --locked \
+  --target "$target_triple" \
+  --no-run \
+  --message-format=json \
+  > "$cargo_messages"
 
 test_bins_file="$tmp_dir/test-bins"
 python3 - "$cargo_messages" > "$test_bins_file" <<'PY'
