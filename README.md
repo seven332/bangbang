@@ -80,27 +80,11 @@ cargo test --workspace --all-targets --all-features --locked --exclude bangbang-
 ```
 
 On macOS Apple Silicon hosts, `bangbang-hvf` contains a real HVF lifecycle smoke
-test. The test is not ignored; sign the test binary with the Hypervisor
-entitlement and run it directly:
+test. The test is not ignored; run the signed test wrapper so host or
+entitlement failures fail the test run:
 
 ```sh
-TEST_BIN=$(cargo test -p bangbang-hvf --all-targets --all-features --locked --no-run --message-format=json \
-  | sed -n 's/.*"executable":"\([^"]*bangbang_hvf-[^"]*\)".*/\1/p' \
-  | tail -1)
-test -n "$TEST_BIN"
-ENTITLEMENTS=$(mktemp "${TMPDIR:-/tmp}/bangbang-hvf-entitlements.XXXXXX")
-cat > "$ENTITLEMENTS" <<'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>com.apple.security.hypervisor</key>
-  <true/>
-</dict>
-</plist>
-EOF
-codesign --force --sign - --entitlements "$ENTITLEMENTS" "$TEST_BIN"
-"$TEST_BIN"
+scripts/run-hvf-tests.sh
 ```
 
 Run the VMM process skeleton and API server:

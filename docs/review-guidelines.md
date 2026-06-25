@@ -27,9 +27,8 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 ```
 
-On macOS Apple Silicon, also sign and run the `bangbang-hvf` test binary as
-shown in `README.md`. HVF lifecycle tests should not be skipped or ignored when
-they are in scope for the PR.
+On macOS Apple Silicon, also run `scripts/run-hvf-tests.sh`. HVF lifecycle tests
+should not be skipped or ignored when they are in scope for the PR.
 
 Reviewers should confirm the PR body lists the checks that were run. If any
 command is intentionally skipped, the PR should explain why the skipped command

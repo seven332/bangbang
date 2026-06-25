@@ -326,10 +326,10 @@ surface:
 
 - unit tests for parsing, configuration, and state transitions
 - golden tests for Firecracker-shaped API responses once the API exists
-- real HVF tests on macOS Apple Silicon, with the `bangbang-hvf` test binary
-  signed using the `com.apple.security.hypervisor` entitlement before running;
-  HVF lifecycle tests should fail instead of being ignored when the host cannot
-  run them
+- real HVF tests on macOS Apple Silicon through `scripts/run-hvf-tests.sh`,
+  which signs the `bangbang-hvf` test binary with the
+  `com.apple.security.hypervisor` entitlement before running it; HVF lifecycle
+  tests should fail instead of being ignored when the host cannot run them
 - boot smoke tests once kernel loading and vCPU execution exist
 
 ## Security and Performance Scope
