@@ -58,8 +58,11 @@ finish_unsupported() {
   exit 1
 }
 
-if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
-  finish_unsupported "bangbang-hvf tests require macOS Apple Silicon; found $(uname -s) $(uname -m)"
+host_os="$(uname -s)"
+host_arch="$(uname -m)"
+
+if [[ "$host_os" != "Darwin" ]]; then
+  finish_unsupported "bangbang-hvf tests require macOS; found $host_os $host_arch"
 fi
 
 if ! command -v python3 >/dev/null 2>&1; then
@@ -133,6 +136,10 @@ for index in "${!test_bins[@]}"; do
   codesign --force --sign - --entitlements "$entitlements" "$signed_test_bin"
   signed_test_bins+=("$signed_test_bin")
 done
+
+if [[ "$host_arch" != "arm64" ]]; then
+  finish_unsupported "bangbang-hvf tests require Apple Silicon; found $host_os $host_arch"
+fi
 
 hv_support="$(sysctl -n kern.hv_support 2>/dev/null || sysctl -n kern.hv.supported 2>/dev/null || true)"
 if [[ "$hv_support" != "1" ]]; then
