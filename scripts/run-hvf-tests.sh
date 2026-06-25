@@ -12,7 +12,8 @@ Options:
   --allow-unsupported  Exit 0 instead of 1 when the host cannot run HVF tests.
   -h, --help           Show this help.
 
-Any arguments after -- are passed to the signed Rust test binary.
+Arguments after -- are passed to the signed Rust test binary, except
+--test-threads because the wrapper always runs HVF tests with one test thread.
 EOF
 }
 
@@ -41,6 +42,17 @@ while [[ "$#" -gt 0 ]]; do
   esac
   shift
 done
+
+if [[ "${#test_args[@]}" -gt 0 ]]; then
+  for test_arg in "${test_args[@]}"; do
+    case "$test_arg" in
+      --test-threads | --test-threads=*)
+        echo "scripts/run-hvf-tests.sh controls --test-threads and always uses 1" >&2
+        exit 2
+        ;;
+    esac
+  done
+fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
