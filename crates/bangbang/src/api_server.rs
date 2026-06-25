@@ -23,6 +23,7 @@ pub(crate) enum ApiServerError {
     Connection(std::io::ErrorKind),
     SocketMetadata(std::io::ErrorKind),
     SocketPathCheck(std::io::ErrorKind),
+    SocketPathChanged,
     SocketPathExists,
     SocketPathIsNotSocket,
 }
@@ -37,6 +38,7 @@ impl std::fmt::Display for ApiServerError {
                 write!(f, "failed to inspect bound API socket: {kind:?}")
             }
             Self::SocketPathCheck(kind) => write!(f, "failed to check API socket path: {kind:?}"),
+            Self::SocketPathChanged => f.write_str("API socket path changed during bind"),
             Self::SocketPathExists => f.write_str("API socket path already exists"),
             Self::SocketPathIsNotSocket => f.write_str("bound API path is not a socket"),
         }
@@ -61,9 +63,10 @@ impl ApiServer {
 
         let (listener, metadata) = bind_unpublished_socket(path)?;
         publish_socket_path(&metadata.path, path).inspect_err(|_| {
-            let _ = fs::remove_file(&metadata.path);
+            remove_socket_path_if_owned(&metadata.path, metadata.dev, metadata.ino);
         })?;
         let socket_guard = SocketGuard::new(path, metadata);
+        ensure_socket_path_owner(path, socket_guard.dev, socket_guard.ino)?;
 
         Ok(Self {
             listener,
@@ -195,11 +198,7 @@ impl SocketGuard {
     }
 
     fn owns_current_path(&self) -> bool {
-        let Ok(metadata) = socket_path_metadata(&self.path) else {
-            return false;
-        };
-
-        metadata.dev() == self.dev && metadata.ino() == self.ino
+        socket_path_is_owned(&self.path, self.dev, self.ino).unwrap_or(false)
     }
 }
 
@@ -239,13 +238,7 @@ fn bind_unpublished_socket(
             }
             Err(err) => return Err(ApiServerError::Bind(err.kind())),
         };
-        let metadata = match socket_path_metadata(&temp_path) {
-            Ok(metadata) => metadata,
-            Err(err) => {
-                let _ = fs::remove_file(&temp_path);
-                return Err(err);
-            }
-        };
+        let metadata = socket_path_metadata(&temp_path)?;
 
         return Ok((
             listener,
@@ -279,6 +272,26 @@ fn temporary_socket_path(path: &Path, id: u64) -> PathBuf {
     temp_name.push(format!("{}.{}", std::process::id(), id));
 
     path.with_file_name(temp_name)
+}
+
+fn ensure_socket_path_owner(path: &Path, dev: u64, ino: u64) -> Result<(), ApiServerError> {
+    if socket_path_is_owned(path, dev, ino)? {
+        Ok(())
+    } else {
+        Err(ApiServerError::SocketPathChanged)
+    }
+}
+
+fn remove_socket_path_if_owned(path: &Path, dev: u64, ino: u64) {
+    if socket_path_is_owned(path, dev, ino).unwrap_or(false) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn socket_path_is_owned(path: &Path, dev: u64, ino: u64) -> Result<bool, ApiServerError> {
+    let metadata = socket_path_metadata(path)?;
+
+    Ok(metadata.dev() == dev && metadata.ino() == ino)
 }
 
 #[cfg(target_os = "macos")]
@@ -474,6 +487,46 @@ mod tests {
             PathBuf::from("/tmp").join(format!(".bb.{}.{}", std::process::id(), id + 1))
         );
         assert_eq!(next_id.load(Ordering::Relaxed), id + 2);
+    }
+
+    #[test]
+    fn socket_path_cleanup_keeps_replaced_path() {
+        let path = unique_socket_path("cln");
+        let listener = UnixListener::bind(&path).expect("temporary listener should bind");
+        let metadata = socket_path_metadata(&path).expect("temporary listener path should exist");
+
+        fs::remove_file(&path).expect("temporary socket path should be removable");
+        fs::write(&path, "replacement").expect("replacement should be written");
+
+        remove_socket_path_if_owned(&path, metadata.dev(), metadata.ino());
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("replacement should remain"),
+            "replacement"
+        );
+
+        drop(listener);
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn socket_path_owner_check_rejects_replaced_socket() {
+        let path = unique_socket_path("own");
+        let listener = UnixListener::bind(&path).expect("temporary listener should bind");
+        let metadata = socket_path_metadata(&path).expect("temporary listener path should exist");
+
+        fs::remove_file(&path).expect("temporary socket path should be removable");
+        let replacement =
+            UnixListener::bind(&path).expect("replacement listener should bind same path");
+
+        let err = ensure_socket_path_owner(&path, metadata.dev(), metadata.ino())
+            .expect_err("replaced socket should not be owned");
+
+        assert_eq!(err, ApiServerError::SocketPathChanged);
+
+        drop(listener);
+        drop(replacement);
+        fs::remove_file(path).expect("fixture should clean up");
     }
 
     #[test]
