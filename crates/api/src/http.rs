@@ -1,7 +1,5 @@
 use std::fmt;
 
-use serde::Serialize;
-
 use crate::route::Endpoint;
 use crate::HTTP_MAX_PAYLOAD_SIZE;
 
@@ -69,15 +67,7 @@ pub struct HttpResponse {
 
 impl HttpResponse {
     pub fn version(version: &str) -> Self {
-        #[derive(Serialize)]
-        struct VersionResponse<'a> {
-            firecracker_version: &'a str,
-        }
-
-        let body = serde_json::to_string(&VersionResponse {
-            firecracker_version: version,
-        })
-        .expect("serializing version response should not fail");
+        let body = serde_json::json!({ "firecracker_version": version }).to_string();
 
         Self {
             status: StatusCode::Ok,
@@ -86,15 +76,7 @@ impl HttpResponse {
     }
 
     pub fn fault(message: &str) -> Self {
-        #[derive(Serialize)]
-        struct FaultMessage<'a> {
-            fault_message: &'a str,
-        }
-
-        let body = serde_json::to_string(&FaultMessage {
-            fault_message: message,
-        })
-        .expect("serializing fault response should not fail");
+        let body = serde_json::json!({ "fault_message": message }).to_string();
 
         Self {
             status: StatusCode::BadRequest,
