@@ -17,9 +17,10 @@ Unit tests live next to the code they exercise under each crate’s `src/` tree.
 - `cargo fmt --all -- --check`: verify Rust formatting.
 - `cargo check --workspace --all-targets --all-features --locked`: type-check the full workspace using the committed lockfile.
 - `cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf`: run non-HVF tests with all targets and features enabled.
+- `cargo test -p bangbang-hvf --lib --all-features --locked`: run unsigned HVF unit tests.
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: run lint checks with warnings treated as errors.
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked`: build documentation without dependency docs.
-- `scripts/run-hvf-tests.sh`: sign and run `bangbang-hvf` tests on macOS Apple Silicon.
+- `scripts/run-hvf-tests.sh`: sign and run HVF integration tests on macOS Apple Silicon.
 - `cargo run -p bangbang`: run the current VMM process skeleton.
 
 Use these commands before opening or updating a pull request. HVF lifecycle tests should fail rather than be ignored when the host cannot run them.

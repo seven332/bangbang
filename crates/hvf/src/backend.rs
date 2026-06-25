@@ -64,7 +64,7 @@ impl Drop for HvfBackend {
 
 #[cfg(test)]
 mod tests {
-    use bangbang_runtime::{BackendError, VmBackend};
+    use bangbang_runtime::BackendError;
 
     use super::HvfBackend;
 
@@ -99,6 +99,8 @@ mod tests {
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     #[test]
     fn unsupported_target_rejects_vm_creation() {
+        use bangbang_runtime::VmBackend;
+
         let mut backend = HvfBackend::new();
 
         assert_eq!(
@@ -107,18 +109,5 @@ mod tests {
                 crate::ffi::UNSUPPORTED_TARGET_MESSAGE
             ))
         );
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[test]
-    fn creates_and_destroys_hvf_vcpu() {
-        let mut backend = HvfBackend::new();
-
-        backend.create_vm().expect("VM should be created");
-        {
-            let vcpu = backend.create_vcpu().expect("vCPU should be created");
-            vcpu.destroy().expect("vCPU should be destroyed");
-        }
-        backend.destroy_vm().expect("VM should be destroyed");
     }
 }

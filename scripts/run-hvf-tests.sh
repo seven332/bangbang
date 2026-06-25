@@ -25,21 +25,21 @@ cat > "$entitlements" <<'EOF'
 EOF
 
 cargo_messages="$tmp_dir/cargo-test.json"
-cargo test -p bangbang-hvf --all-targets --all-features --locked --no-run --message-format=json > "$cargo_messages"
+cargo test -p bangbang-hvf --test hvf_lifecycle --all-features --locked --no-run --message-format=json > "$cargo_messages"
 
 test_bins=()
 while IFS= read -r test_bin; do
   if [[ -n "$test_bin" ]]; then
     test_bins+=("$test_bin")
   fi
-done < <(sed -n 's/.*"executable":"\([^"]*bangbang_hvf-[^"]*\)".*/\1/p' "$cargo_messages")
+done < <(sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' "$cargo_messages")
 
 if [[ "${#test_bins[@]}" -eq 0 ]]; then
-  echo "failed to locate bangbang-hvf test executable" >&2
+  echo "failed to locate bangbang-hvf lifecycle test executable" >&2
   exit 1
 fi
 
 for test_bin in "${test_bins[@]}"; do
   codesign --force --sign - --entitlements "$entitlements" "$test_bin"
-  "$test_bin" "$@"
+  "$test_bin" --test-threads=1 "$@"
 done

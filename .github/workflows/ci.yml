@@ -41,6 +41,9 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf
 
+      - name: Run HVF unit tests
+        run: cargo test -p bangbang-hvf --lib --all-features --locked
+
       - name: Run signed HVF smoke test
         run: scripts/run-hvf-tests.sh
 

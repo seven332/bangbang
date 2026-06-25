@@ -77,11 +77,12 @@ The version response body is Firecracker-shaped JSON:
 ```sh
 cargo check --workspace --all-targets --all-features --locked
 cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf
+cargo test -p bangbang-hvf --lib --all-features --locked
 ```
 
 On macOS Apple Silicon hosts, `bangbang-hvf` contains a real HVF lifecycle smoke
-test. The test is not ignored; run the signed test wrapper so host or
-entitlement failures fail the test run:
+test in `crates/hvf/tests/hvf_lifecycle.rs`. The test is not ignored; run the
+signed test wrapper so host or entitlement failures fail the test run:
 
 ```sh
 scripts/run-hvf-tests.sh
