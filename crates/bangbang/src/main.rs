@@ -1,8 +1,16 @@
 use std::env;
+use std::ffi::OsString;
 use std::fmt;
+use std::os::unix::io::IntoRawFd;
+use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 
+mod api_server;
+
+use api_server::{ApiServer, ApiServerError};
 use bangbang_hvf::HvfBackend;
+use signal_hook::consts::signal::{SIGINT, SIGTERM};
+use signal_hook::{low_level, SigId};
 
 const DEFAULT_API_SOCK_PATH: &str = "/tmp/bangbang.socket";
 const DEFAULT_INSTANCE_ID: &str = "anonymous-instance";
@@ -43,7 +51,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), ProcessError> {
-    let args = parse_process_args(env::args().skip(1))?;
+    let args = parse_process_args(env::args_os().skip(1))?;
 
     match args.command {
         Command::Help => {
@@ -54,13 +62,20 @@ fn run() -> Result<(), ProcessError> {
             println!("bangbang {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
-        Command::Run(_) => {
+        Command::Run(config) => {
             println!("bangbang {}", env!("CARGO_PKG_VERSION"));
             println!(
                 "hvf target supported: {}",
                 HvfBackend::is_supported_target()
             );
-            println!("status: startup arguments parsed; API server and VM startup are not implemented yet");
+
+            let mut shutdown_signal = ShutdownSignal::install()?;
+            let server = ApiServer::bind(&config.api_sock).map_err(ProcessError::ApiServer)?;
+            println!("status: API server listening; VM startup is not implemented yet");
+            let shutdown_wakeup = shutdown_signal.wakeup_reader();
+            server
+                .run_until(env!("CARGO_PKG_VERSION"), shutdown_wakeup)
+                .map_err(ProcessError::ApiServer)?;
         }
     }
 
@@ -69,13 +84,14 @@ fn run() -> Result<(), ProcessError> {
 
 fn parse_process_args<I>(args: I) -> Result<Args, ProcessError>
 where
-    I: IntoIterator<Item = String>,
+    I: IntoIterator<Item = OsString>,
 {
-    Args::parse(args).map_err(ProcessError::ArgumentParsing)
+    Args::parse_os(args).map_err(ProcessError::ArgumentParsing)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessExitCode {
+    ProcessFailure = 1,
     ArgumentParsing = 153,
 }
 
@@ -91,13 +107,17 @@ impl ProcessExitCode {
 
 #[derive(Debug, PartialEq, Eq)]
 enum ProcessError {
+    ApiServer(ApiServerError),
     ArgumentParsing(String),
+    SignalHandler(std::io::ErrorKind),
 }
 
 impl ProcessError {
     fn exit_code(&self) -> ProcessExitCode {
         match self {
+            Self::ApiServer(_) => ProcessExitCode::ProcessFailure,
             Self::ArgumentParsing(_) => ProcessExitCode::ArgumentParsing,
+            Self::SignalHandler(_) => ProcessExitCode::ProcessFailure,
         }
     }
 }
@@ -105,12 +125,71 @@ impl ProcessError {
 impl fmt::Display for ProcessError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ApiServer(err) => write!(f, "API server error: {err}"),
             Self::ArgumentParsing(message) => f.write_str(message),
+            Self::SignalHandler(kind) => {
+                write!(f, "failed to register shutdown signal handler: {kind:?}")
+            }
         }
     }
 }
 
 impl std::error::Error for ProcessError {}
+
+#[derive(Debug)]
+struct ShutdownSignal {
+    wakeup_reader: UnixStream,
+    signal_ids: [SigId; 2],
+}
+
+impl ShutdownSignal {
+    fn install() -> Result<Self, ProcessError> {
+        let (wakeup_reader, wakeup_writer) =
+            UnixStream::pair().map_err(|err| ProcessError::SignalHandler(err.kind()))?;
+        let sigint = register_signal_wakeup(SIGINT, &wakeup_writer)?;
+        let sigterm = match register_signal_wakeup(SIGTERM, &wakeup_writer) {
+            Ok(sigterm) => sigterm,
+            Err(err) => {
+                low_level::unregister(sigint);
+                return Err(err);
+            }
+        };
+
+        Ok(Self {
+            wakeup_reader,
+            signal_ids: [sigint, sigterm],
+        })
+    }
+
+    fn wakeup_reader(&mut self) -> &mut UnixStream {
+        &mut self.wakeup_reader
+    }
+}
+
+fn register_signal_wakeup(signal: i32, wakeup_writer: &UnixStream) -> Result<SigId, ProcessError> {
+    let wakeup_fd = wakeup_writer
+        .try_clone()
+        .map_err(|err| ProcessError::SignalHandler(err.kind()))?
+        .into_raw_fd();
+
+    match low_level::pipe::register_raw(signal, wakeup_fd) {
+        Ok(signal_id) => Ok(signal_id),
+        Err(err) => {
+            // SAFETY: `wakeup_fd` came from `UnixStream::into_raw_fd` and has
+            // not been handed to a registered signal action on this error path.
+            let _ = unsafe { libc::close(wakeup_fd) };
+            Err(ProcessError::SignalHandler(err.kind()))
+        }
+    }
+}
+
+impl Drop for ShutdownSignal {
+    fn drop(&mut self) {
+        for signal_id in self.signal_ids {
+            low_level::unregister(signal_id);
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
@@ -140,6 +219,32 @@ impl Default for StartupConfig {
 }
 
 impl Args {
+    fn parse_os<I>(args: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = OsString>,
+    {
+        let args = args.into_iter().collect::<Vec<_>>();
+
+        if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+            return Ok(Self {
+                command: Command::Help,
+            });
+        }
+
+        if args.iter().any(|arg| arg == "--version" || arg == "-V") {
+            return Ok(Self {
+                command: Command::Version,
+            });
+        }
+
+        let args = args
+            .into_iter()
+            .map(os_arg_into_string)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Self::parse(args)
+    }
+
     fn parse<I>(args: I) -> Result<Self, String>
     where
         I: IntoIterator<Item = String>,
@@ -208,9 +313,14 @@ impl Args {
     }
 }
 
+fn os_arg_into_string(arg: OsString) -> Result<String, String> {
+    arg.into_string()
+        .map_err(|_| "invalid argument: arguments must be valid UTF-8".to_string())
+}
+
 fn print_help() {
     println!(
-        "bangbang {}\n\nUsage:\n  bangbang [OPTIONS]\n\nOptions:\n      --api-sock <PATH>  Record API socket path for future API server support [default: {}]\n      --id <ID>          MicroVM unique identifier [default: {}]\n  -V, --version          Print version\n  -h, --help             Print help\n\nCurrent scope:\n  Parses startup configuration only; no API server or VM startup is implemented yet.",
+        "bangbang {}\n\nUsage:\n  bangbang [OPTIONS]\n\nOptions:\n      --api-sock <PATH>  Unix domain socket path for the API server [default: {}]\n      --id <ID>          MicroVM unique identifier [default: {}]\n  -V, --version          Print version\n  -h, --help             Print help\n\nCurrent scope:\n  Serves GET /version over the API socket; VM startup is not implemented yet.",
         env!("CARGO_PKG_VERSION"),
         DEFAULT_API_SOCK_PATH,
         DEFAULT_INSTANCE_ID
@@ -280,9 +390,12 @@ fn unsupported_equals_syntax(arg: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
     use super::{
-        parse_process_args, Args, Command, ProcessError, ProcessExitCode, StartupConfig,
-        DEFAULT_API_SOCK_PATH, DEFAULT_INSTANCE_ID, MAX_INSTANCE_ID_LEN,
+        parse_process_args, ApiServerError, Args, Command, ProcessError, ProcessExitCode,
+        StartupConfig, DEFAULT_API_SOCK_PATH, DEFAULT_INSTANCE_ID, MAX_INSTANCE_ID_LEN,
     };
 
     fn parse(args: &[&str]) -> Result<Args, String> {
@@ -298,7 +411,15 @@ mod tests {
 
     #[test]
     fn process_exit_code_value_matches_argument_parsing_contract() {
+        assert_eq!(ProcessExitCode::ProcessFailure.value(), 1);
         assert_eq!(ProcessExitCode::ArgumentParsing.value(), 153);
+    }
+
+    #[test]
+    fn api_server_error_maps_to_process_failure_exit_code() {
+        let err = ProcessError::ApiServer(ApiServerError::SocketPathExists);
+
+        assert_eq!(err.exit_code(), ProcessExitCode::ProcessFailure);
     }
 
     #[test]
@@ -317,7 +438,7 @@ mod tests {
 
     #[test]
     fn parse_process_args_wraps_parser_errors() {
-        let err = parse_process_args(["--unknown=/tmp/secret".to_string()])
+        let err = parse_process_args([OsString::from("--unknown=/tmp/secret")])
             .expect_err("process arg parsing should fail");
 
         assert_eq!(
@@ -325,6 +446,22 @@ mod tests {
             ProcessError::ArgumentParsing("unknown argument: --unknown".to_string())
         );
         assert_eq!(err.exit_code(), ProcessExitCode::ArgumentParsing);
+    }
+
+    #[test]
+    fn parse_os_help_arg_ignores_non_utf8_args() {
+        let args = Args::parse_os([OsString::from("--help"), OsString::from_vec(vec![0xff])])
+            .expect("help should bypass parsing");
+
+        assert_eq!(args.command, Command::Help);
+    }
+
+    #[test]
+    fn rejects_non_utf8_process_arg() {
+        let err =
+            Args::parse_os([OsString::from_vec(vec![0xff])]).expect_err("non-utf8 arg should fail");
+
+        assert_eq!(err, "invalid argument: arguments must be valid UTF-8");
     }
 
     #[test]

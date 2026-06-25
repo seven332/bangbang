@@ -5,7 +5,10 @@ edition.workspace = true
 repository.workspace = true
 
 [dependencies]
+bangbang-api = { path = "../api" }
 bangbang-hvf = { path = "../hvf" }
+libc = "0.2"
+signal-hook = "0.3"
 
 [lints]
 workspace = true

@@ -2,13 +2,13 @@
 
 This document describes bangbang's intended Firecracker compatibility scope. It
 is a planning reference for future API, VMM, and backend work; it does not mean
-the current scaffold implements the listed API behavior.
+the current scaffold implements all listed API behavior.
 
-The current repository defines crate boundaries, endpoint names, a
-backend-neutral VM trait, a minimal Hypervisor.framework VM create/destroy
-wrapper, and an initial process startup argument model. There is no API server,
-Unix socket listener, JSON request/response model, guest memory mapping, vCPU
-loop, or kernel loading yet.
+The current repository defines crate boundaries, endpoint names, a minimal
+HTTP-over-Unix-socket API server for `GET /version`, a backend-neutral VM
+trait, a minimal Hypervisor.framework VM create/destroy wrapper, and an initial
+process startup argument model. There is no broader API request body model,
+guest memory mapping, vCPU loop, or kernel loading yet.
 
 ## Firecracker Model Alignment
 
@@ -23,14 +23,14 @@ transitions, but this document only defines the initial scope.
 ## Process Startup CLI
 
 The current `bangbang` executable parses only the first process-lifecycle
-arguments. Parsing records startup configuration but does not bind a Unix
-socket, start an API server, load a configuration file, or start a guest.
+arguments and starts the first API socket surface. It binds a Unix socket and
+serves `GET /version`, but does not load a configuration file or start a guest.
 
 | Argument | Current behavior | Compatibility notes |
 | --- | --- | --- |
-| `--api-sock <PATH>` | parsed and stored | Firecracker defaults to `/run/firecracker.socket`; bangbang defaults to `/tmp/bangbang.socket` because macOS does not normally provide `/run`. This is an intentional host-platform difference. |
+| `--api-sock <PATH>` | binds the API Unix socket | Firecracker defaults to `/run/firecracker.socket`; bangbang defaults to `/tmp/bangbang.socket` because macOS does not normally provide `/run`. This is an intentional host-platform difference. |
 | `--id <ID>` | parsed and stored | Defaults to Firecracker's `anonymous-instance`. IDs must be 1 to 64 bytes and contain only alphanumeric characters or `-`, matching the Firecracker `v1.16.0` validator policy. |
-| `--help`, `-h` | prints help | Help describes the current parser-only scope. |
+| `--help`, `-h` | prints help | Help describes the current API socket scope. |
 | `--version`, `-V` | prints version | `-V` is retained from the existing bangbang scaffold. |
 | `--config-file`, `--no-api` | rejected | Deferred until VM configuration models and no-API startup behavior exist. |
 | seccomp, logger, metrics, snapshot, MMDS, boot timer, payload-size, and PCI process flags | rejected | These Firecracker options are Linux-specific, observability-related, or tied to later capability work. They must not be accepted as no-op compatibility shims. |
@@ -39,11 +39,15 @@ Only the Firecracker-style `--arg value` form is supported for the initial
 startup arguments. The `--arg=value` form is rejected until a separate
 compatibility decision expands the CLI parser.
 
-CLI values are untrusted input. Current validation is intentionally string-only:
-it rejects invalid IDs, empty socket paths, and socket paths containing control
-characters, but performs no filesystem creation, canonicalization, deletion,
-socket binding, permission checks, or VM work. Those checks belong with later
-socket lifecycle and API server work. Process CLI parsing stays outside the
+CLI values are untrusted input. Current validation rejects invalid IDs, empty
+socket paths, and socket paths containing control characters. API startup also
+fails if the configured socket path already exists. Socket cleanup removes the
+socket inode created by the current process during normal shutdown and handled
+`SIGINT`/`SIGTERM` shutdown; uncatchable forced termination such as `SIGKILL`
+can still leave a stale socket path behind. The API socket is unauthenticated;
+filesystem permissions on the socket path and parent directory are the current
+access-control boundary. Operators should use a private socket directory or a
+restrictive umask on multi-user hosts. Process CLI parsing stays outside the
 future VM/vCPU fast path and should add only trivial startup overhead. Error and
 status output avoid echoing path-like CLI values.
 
@@ -53,9 +57,9 @@ The current executable uses a small process exit status contract:
 
 | Exit status | Current meaning | Compatibility notes |
 | --- | --- | --- |
-| `0` | Help, version, or parser-only startup completed successfully. | Matches Firecracker's success status. |
+| `0` | Help or version completed successfully, or the API server exited without error, including handled `SIGINT`/`SIGTERM` shutdown. | Matches Firecracker's success status. |
 | `153` | Startup argument parsing or validation failed. | Matches Firecracker's `ArgParsing` exit code. |
-| `1` | Reserved for future non-argument process failures. | The current scaffold has no such failure path yet. |
+| `1` | API socket bind or accept failure. | Used for non-argument process failures before more specific Firecracker-compatible process errors exist. Per-connection read/write errors do not terminate the API server. |
 
 Firecracker also defines bad-configuration and signal-specific exit codes.
 bangbang does not expose those until the corresponding configuration loading,
@@ -94,8 +98,9 @@ before changing this reference.
 
 ## Support Level Vocabulary
 
-The current scaffold still implements no HTTP API behavior. The support levels
-below describe compatibility targets for future API work:
+The current scaffold implements only `GET /version` over HTTP on a Unix domain
+socket. The support levels below describe compatibility targets for future API
+work:
 
 - supported target: planned for the first boot-oriented API implementation
 - planned later: expected to be compatible later, but outside the first tier
@@ -117,12 +122,13 @@ deny unknown fields.
 ## Endpoint Compatibility Matrix
 
 The first planned compatibility tier is the smallest boot-oriented API surface.
-This matrix does not imply that the current scaffold implements the endpoints.
+Rows marked as implemented describe current behavior; the rest describe planned
+compatibility targets.
 
 | Method | Endpoint | Support level | Scope notes |
 | --- | --- | --- | --- |
 | `GET` | `/` | supported target | Describe the microVM instance. |
-| `GET` | `/version` | supported target | Report the VMM version with a Firecracker-shaped body. |
+| `GET` | `/version` | supported target; implemented first | Report the VMM version with a Firecracker-shaped body. |
 | `GET` | `/vm/config` | supported target | Return the full VM configuration once configuration models exist. |
 | `GET` | `/machine-config` | supported target | Return machine configuration and defaults. |
 | `PUT` | `/machine-config` | supported target | Configure vCPU and memory settings before boot. |
@@ -192,9 +198,9 @@ setup, memory size, and block device I/O when those surfaces are implemented.
 
 ## API State and Response Policy
 
-The current scaffold still implements no HTTP API behavior. The policy below is
-the first compatibility target for future request parsing, VMM action mapping,
-state validation, and golden API tests.
+The current scaffold implements the first HTTP API behavior for `GET /version`.
+The policy below is the compatibility target for future request parsing, VMM
+action mapping, state validation, and golden API tests.
 
 ### Initial API State Model
 
@@ -215,7 +221,7 @@ The first API implementation should model the same broad stages as Firecracker:
 | Operation | Pre-boot behavior | Runtime behavior | Notes |
 | --- | --- | --- | --- |
 | `GET /` | supported target; `200` JSON | supported target; `200` JSON | Response state should reflect the current microVM state. |
-| `GET /version` | supported target; `200` JSON | supported target; `200` JSON | Body should use Firecracker's `firecracker_version` field shape. |
+| `GET /version` | implemented; `200` JSON | implemented; `200` JSON | Body uses Firecracker's `firecracker_version` field shape. |
 | `GET /vm/config` | supported target; `200` JSON | supported target; `200` JSON | Returns the accumulated or active VM configuration once models exist. |
 | `GET /machine-config` | supported target; `200` JSON | supported target; `200` JSON | Returns machine configuration and defaulted values. |
 | `PUT /machine-config` | supported target; `204` empty response on success | unsupported after start; `400` `fault_message` | Pre-boot-only configuration. |
@@ -241,6 +247,14 @@ Future API work should use `fault_message` consistently where Firecracker does.
 Exact message strings should be covered by golden tests once the API parser and
 VMM action model exist, but this document only defines the initial status/body
 shape.
+
+The initial API implementation uses Firecracker's default `51200` byte HTTP
+request payload limit. The `--http-api-max-payload-size` process argument
+remains rejected until configurable payload limits are introduced explicitly.
+Invalid path and method errors use the Firecracker `fault_message` body shape
+but intentionally avoid echoing path-like request values.
+The initial blocking API server also uses a short per-connection timeout so an
+incomplete request cannot hold the single server loop indefinitely.
 
 API request bodies, path identifiers, and host resource paths are untrusted
 input. Future implementations must validate them before mutating VMM state and
