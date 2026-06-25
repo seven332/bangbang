@@ -30,8 +30,9 @@ impl<'vm> HvfVcpu<'vm> {
     }
 
     fn destroy_inner(&mut self) -> Result<(), BackendError> {
-        if let Some(vcpu) = self.vcpu.take() {
+        if let Some(vcpu) = self.vcpu {
             crate::ffi::destroy_vcpu(vcpu)?;
+            self.vcpu = None;
         }
         Ok(())
     }
