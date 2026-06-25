@@ -8,6 +8,7 @@ use crate::backend::HvfBackend;
 use crate::exit::HvfVcpuExit;
 
 const DESTROYED_VCPU_MESSAGE: &str = "vCPU has already been destroyed";
+const NO_VCPU_EXIT_MESSAGE: &str = "vCPU has not exited yet";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HvfRegister(u32);
@@ -47,6 +48,7 @@ pub struct HvfVcpu<'vm> {
 struct HvfVcpuHandle {
     vcpu: crate::ffi::HvVcpu,
     exit: *mut crate::ffi::HvVcpuExit,
+    exit_available: bool,
 }
 
 impl<'vm> HvfVcpu<'vm> {
@@ -57,6 +59,7 @@ impl<'vm> HvfVcpu<'vm> {
             handle: Some(HvfVcpuHandle {
                 vcpu: created.vcpu,
                 exit: created.exit,
+                exit_available: false,
             }),
             _vm: PhantomData,
             _not_send_sync: PhantomData,
@@ -68,7 +71,14 @@ impl<'vm> HvfVcpu<'vm> {
     }
 
     pub fn exit_snapshot(&self) -> Result<HvfVcpuExit, BackendError> {
-        let raw_exit = crate::ffi::copy_vcpu_exit(self.handle()?.exit)?;
+        let handle = self.handle()?;
+        if !handle.exit_available {
+            return Err(BackendError::InvalidState(NO_VCPU_EXIT_MESSAGE));
+        }
+
+        // SAFETY: `handle` belongs to this live current-thread vCPU, and
+        // `exit_available` is only set after HVF has produced exit data.
+        let raw_exit = unsafe { crate::ffi::copy_vcpu_exit(handle.exit)? };
 
         Ok(HvfVcpuExit::from_raw(raw_exit))
     }
@@ -116,14 +126,19 @@ impl Drop for HvfVcpu<'_> {
 
 impl fmt::Debug for HvfVcpu<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (vcpu, has_exit) = match &self.handle {
-            Some(handle) => (Some(handle.vcpu), !handle.exit.is_null()),
-            None => (None, false),
+        let (vcpu, has_exit_pointer, exit_available) = match &self.handle {
+            Some(handle) => (
+                Some(handle.vcpu),
+                !handle.exit.is_null(),
+                handle.exit_available,
+            ),
+            None => (None, false, false),
         };
 
         f.debug_struct("HvfVcpu")
             .field("vcpu", &vcpu)
-            .field("has_exit", &has_exit)
+            .field("has_exit_pointer", &has_exit_pointer)
+            .field("exit_available", &exit_available)
             .finish_non_exhaustive()
     }
 }
@@ -136,7 +151,10 @@ mod tests {
 
     use bangbang_runtime::BackendError;
 
-    use super::{HvfRegister, HvfSystemRegister, HvfVcpu, HvfVcpuHandle, DESTROYED_VCPU_MESSAGE};
+    use super::{
+        HvfRegister, HvfSystemRegister, HvfVcpu, HvfVcpuHandle, DESTROYED_VCPU_MESSAGE,
+        NO_VCPU_EXIT_MESSAGE,
+    };
     use crate::exit::{HvfExceptionExit, HvfVcpuExit};
 
     fn raw_exit(reason: u32) -> crate::ffi::HvVcpuExit {
@@ -150,9 +168,13 @@ mod tests {
         }
     }
 
-    fn fake_vcpu(exit: *mut crate::ffi::HvVcpuExit) -> HvfVcpu<'static> {
+    fn fake_vcpu(exit: *mut crate::ffi::HvVcpuExit, exit_available: bool) -> HvfVcpu<'static> {
         HvfVcpu {
-            handle: Some(HvfVcpuHandle { vcpu: 7, exit }),
+            handle: Some(HvfVcpuHandle {
+                vcpu: 7,
+                exit,
+                exit_available,
+            }),
             _vm: PhantomData,
             _not_send_sync: PhantomData::<Rc<()>>,
         }
@@ -161,7 +183,7 @@ mod tests {
     #[test]
     fn exit_snapshot_copies_raw_exit_data() {
         let mut exit = raw_exit(crate::ffi::HV_EXIT_REASON_EXCEPTION);
-        let mut vcpu = fake_vcpu(ptr::addr_of_mut!(exit));
+        let mut vcpu = fake_vcpu(ptr::addr_of_mut!(exit), true);
 
         assert_eq!(
             vcpu.exit_snapshot(),
@@ -177,7 +199,7 @@ mod tests {
 
     #[test]
     fn exit_snapshot_rejects_null_exit_pointer() {
-        let mut vcpu = fake_vcpu(ptr::null_mut());
+        let mut vcpu = fake_vcpu(ptr::null_mut(), true);
 
         let err = vcpu
             .exit_snapshot()
@@ -186,6 +208,19 @@ mod tests {
         assert_eq!(
             err,
             BackendError::Hypervisor("hv_vcpu_exit_t pointer is null".to_string())
+        );
+
+        vcpu.handle = None;
+    }
+
+    #[test]
+    fn exit_snapshot_rejects_unavailable_exit() {
+        let mut exit = raw_exit(crate::ffi::HV_EXIT_REASON_EXCEPTION);
+        let mut vcpu = fake_vcpu(ptr::addr_of_mut!(exit), false);
+
+        assert_eq!(
+            vcpu.exit_snapshot(),
+            Err(BackendError::InvalidState(NO_VCPU_EXIT_MESSAGE))
         );
 
         vcpu.handle = None;

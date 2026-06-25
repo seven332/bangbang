@@ -41,7 +41,12 @@ pub(crate) struct CreatedVcpu {
     pub(crate) exit: *mut HvVcpuExit,
 }
 
-pub(crate) fn copy_vcpu_exit(
+/// # Safety
+///
+/// `exit` must point to initialized `HvVcpuExit` data belonging to a live
+/// current-thread vCPU whose latest `hv_vcpu_run` call has returned, or to
+/// test-owned memory with the same layout.
+pub(crate) unsafe fn copy_vcpu_exit(
     exit: *const HvVcpuExit,
 ) -> Result<HvVcpuExit, bangbang_runtime::BackendError> {
     if exit.is_null() {
@@ -50,10 +55,7 @@ pub(crate) fn copy_vcpu_exit(
         ));
     }
 
-    // SAFETY: The caller provides a non-null pointer to an initialized `HvVcpuExit`
-    // belonging to a live current-thread vCPU or to test-owned memory with the same
-    // layout. The raw struct is `Copy`, so this snapshots the current values without
-    // moving or retaining HVF-owned memory.
+    // SAFETY: The caller guarantees `exit` is valid for a read of `HvVcpuExit`.
     unsafe { Ok(*exit) }
 }
 
