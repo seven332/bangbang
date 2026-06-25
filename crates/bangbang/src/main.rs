@@ -1,6 +1,5 @@
 use std::env;
 use std::fmt;
-use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -70,7 +69,7 @@ fn run() -> Result<(), ProcessError> {
                 HvfBackend::is_supported_target()
             );
 
-            let shutdown_signal = ShutdownSignal::install(config.api_sock.clone())?;
+            let shutdown_signal = ShutdownSignal::install()?;
             let server = ApiServer::bind(&config.api_sock).map_err(ProcessError::ApiServer)?;
             println!("status: API server listening; VM startup is not implemented yet");
             server
@@ -144,7 +143,7 @@ struct ShutdownSignal {
 }
 
 impl ShutdownSignal {
-    fn install(api_sock: String) -> Result<Self, ProcessError> {
+    fn install() -> Result<Self, ProcessError> {
         let requested = Arc::new(AtomicBool::new(false));
         let thread_requested = Arc::clone(&requested);
         let mut signals = Signals::new([SIGINT, SIGTERM])
@@ -153,7 +152,6 @@ impl ShutdownSignal {
         let signal_thread = thread::spawn(move || {
             if signals.forever().next().is_some() {
                 thread_requested.store(true, Ordering::Relaxed);
-                let _ = UnixStream::connect(api_sock);
             }
         });
 
