@@ -104,13 +104,6 @@ impl HttpResponse {
     }
 }
 
-pub fn handle_request_bytes(bytes: &[u8], version: &str) -> HttpResponse {
-    match parse_request(bytes) {
-        Ok(ApiRequest::GetVersion) => HttpResponse::version(version),
-        Err(err) => HttpResponse::fault(err.fault_message()),
-    }
-}
-
 pub fn parse_request(bytes: &[u8]) -> Result<ApiRequest, RequestError> {
     if bytes.len() > HTTP_MAX_PAYLOAD_SIZE {
         return Err(RequestError::PayloadTooLarge);
@@ -445,14 +438,5 @@ mod tests {
         assert!(text.contains("Content-Type: application/json\r\n"));
         assert!(text.contains(&format!("Content-Length: {}\r\n", response.body().len())));
         assert!(text.ends_with(r#"{"firecracker_version":"0.1.0"}"#));
-    }
-
-    #[test]
-    fn handles_request_bytes_as_response() {
-        let response =
-            handle_request_bytes(b"GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n", VERSION);
-
-        assert_eq!(response.status(), StatusCode::Ok);
-        assert_eq!(response.body(), r#"{"firecracker_version":"0.1.0"}"#);
     }
 }

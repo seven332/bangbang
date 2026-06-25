@@ -6,9 +6,10 @@ the current scaffold implements all listed API behavior.
 
 The current repository defines crate boundaries, endpoint names, a minimal
 HTTP-over-Unix-socket API server for `GET /version`, a backend-neutral VM
-trait, a minimal Hypervisor.framework VM create/destroy wrapper, and an initial
-process startup argument model. There is no broader API request body model,
-guest memory mapping, vCPU loop, or kernel loading yet.
+trait, a minimal read-only VMM action/data model, a minimal
+Hypervisor.framework VM create/destroy wrapper, and an initial process startup
+argument model. There is no broader API request body model, guest memory
+mapping, vCPU loop, or kernel loading yet.
 
 ## Firecracker Model Alignment
 
@@ -17,8 +18,10 @@ manages one microVM. Future API work should keep the control plane outside the
 guest execution fast path.
 
 The intended public control plane is Firecracker-style HTTP over a Unix domain
-socket. API requests should eventually map to explicit VMM actions and VM state
-transitions, but this document only defines the initial scope.
+socket. The implemented `GET /version` request already maps through a minimal
+internal VMM action/data boundary. Future API requests should map to explicit
+VMM actions and VM state transitions, but this document only defines the
+initial scope.
 
 ## Process Startup CLI
 
@@ -205,6 +208,11 @@ setup, memory size, and block device I/O when those surfaces are implemented.
 The current scaffold implements the first HTTP API behavior for `GET /version`.
 The policy below is the compatibility target for future request parsing, VMM
 action mapping, state validation, and golden API tests.
+
+The implemented `GET /version` path currently flows through the minimal
+read-only VMM action model as `GetVmmVersion` and returns VMM version data.
+The internal instance information state model also exists for future `GET /`,
+but `GET /` itself is not implemented yet.
 
 ### Initial API State Model
 

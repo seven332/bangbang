@@ -9,8 +9,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use bangbang_api::http::{handle_request_bytes, request_total_len, HttpResponse, RequestError};
+use bangbang_api::http::{
+    parse_request, request_total_len, ApiRequest, HttpResponse, RequestError,
+};
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
+use bangbang_runtime::{VmmAction, VmmController, VmmData};
 
 const READ_CHUNK_SIZE: usize = 4096;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -76,7 +79,7 @@ impl ApiServer {
 
     pub(crate) fn run_until(
         &self,
-        version: &str,
+        vmm: &mut VmmController,
         shutdown_wakeup: &mut UnixStream,
     ) -> Result<(), ApiServerError> {
         self.listener
@@ -92,7 +95,7 @@ impl ApiServer {
                 return Ok(());
             }
 
-            match self.serve_next(version) {
+            match self.serve_next(vmm) {
                 Ok(()) => {}
                 Err(ApiServerError::Accept(kind)) if is_transient_accept_error(kind) => {}
                 Err(err) => return Err(err),
@@ -100,7 +103,7 @@ impl ApiServer {
         }
     }
 
-    fn serve_next(&self, version: &str) -> Result<(), ApiServerError> {
+    fn serve_next(&self, vmm: &mut VmmController) -> Result<(), ApiServerError> {
         let (mut stream, _) = self
             .listener
             .accept()
@@ -109,7 +112,7 @@ impl ApiServer {
             .set_nonblocking(false)
             .map_err(|err| ApiServerError::Connection(err.kind()))?;
 
-        let _ = handle_connection(&mut stream, version);
+        let _ = handle_connection(&mut stream, vmm);
 
         Ok(())
     }
@@ -352,19 +355,49 @@ enum RequestRead {
     TooLarge,
 }
 
-fn handle_connection(stream: &mut UnixStream, version: &str) -> Result<(), ApiServerError> {
+fn handle_connection(
+    stream: &mut UnixStream,
+    vmm: &mut VmmController,
+) -> Result<(), ApiServerError> {
     stream
         .set_write_timeout(Some(CONNECTION_TIMEOUT))
         .map_err(|err| ApiServerError::Connection(err.kind()))?;
 
     let response = match read_request(stream, CONNECTION_TIMEOUT)? {
-        RequestRead::Complete(request) => handle_request_bytes(&request, version),
+        RequestRead::Complete(request) => handle_request_bytes(&request, vmm),
         RequestRead::TooLarge => HttpResponse::fault(RequestError::PayloadTooLarge.fault_message()),
     };
 
     stream
         .write_all(&response.to_http_bytes())
         .map_err(|err| ApiServerError::Connection(err.kind()))
+}
+
+fn handle_request_bytes(bytes: &[u8], vmm: &mut VmmController) -> HttpResponse {
+    match parse_request(bytes) {
+        Ok(request) => handle_api_request(request, vmm),
+        Err(err) => HttpResponse::fault(err.fault_message()),
+    }
+}
+
+fn handle_api_request(request: ApiRequest, vmm: &mut VmmController) -> HttpResponse {
+    match request {
+        ApiRequest::GetVersion => handle_vmm_data(
+            vmm.handle_action(VmmAction::GetVmmVersion),
+            "version request returned unexpected VMM data.",
+        ),
+    }
+}
+
+fn handle_vmm_data(
+    result: Result<VmmData, bangbang_runtime::VmmActionError>,
+    unexpected_message: &str,
+) -> HttpResponse {
+    match result {
+        Ok(VmmData::VmmVersion(version)) => HttpResponse::version(&version),
+        Ok(VmmData::InstanceInformation(_)) => HttpResponse::fault(unexpected_message),
+        Err(err) => HttpResponse::fault(&err.to_string()),
+    }
 }
 
 fn read_request(stream: &mut UnixStream, timeout: Duration) -> Result<RequestRead, ApiServerError> {
@@ -443,6 +476,10 @@ mod tests {
 
     const VERSION: &str = "0.1.0";
 
+    fn test_controller() -> VmmController {
+        VmmController::new("demo-1", VERSION, "bangbang")
+    }
+
     fn unique_socket_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -505,6 +542,19 @@ mod tests {
     }
 
     #[test]
+    fn dispatches_version_request_through_vmm_controller() {
+        let mut vmm = VmmController::new("demo-1", "9.9.9", "bangbang");
+
+        let response = handle_request_bytes(
+            b"GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &mut vmm,
+        );
+
+        assert_eq!(response.status(), bangbang_api::http::StatusCode::Ok);
+        assert_eq!(response.body(), r#"{"firecracker_version":"9.9.9"}"#);
+    }
+
+    #[test]
     fn socket_path_cleanup_keeps_replaced_path() {
         let path = unique_socket_path("cln");
         let listener = UnixListener::bind(&path).expect("temporary listener should bind");
@@ -553,8 +603,9 @@ mod tests {
         client
             .write_all(b"GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .expect("client should write request");
+        let mut vmm = test_controller();
         server
-            .serve_next(VERSION)
+            .serve_next(&mut vmm)
             .expect("server should handle one request");
 
         let mut response = String::new();
@@ -576,8 +627,9 @@ mod tests {
         client
             .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .expect("client should write request");
+        let mut vmm = test_controller();
         server
-            .serve_next(VERSION)
+            .serve_next(&mut vmm)
             .expect("server should handle one request");
 
         let mut response = String::new();
@@ -602,8 +654,9 @@ mod tests {
         client
             .write_all(request.as_bytes())
             .expect("client should write request");
+        let mut vmm = test_controller();
         server
-            .serve_next(VERSION)
+            .serve_next(&mut vmm)
             .expect("server should handle one request");
 
         let mut response = String::new();
@@ -627,8 +680,9 @@ mod tests {
             .expect("client should write request");
         drop(client);
 
+        let mut vmm = test_controller();
         server
-            .serve_next(VERSION)
+            .serve_next(&mut vmm)
             .expect("client disconnect should not fail server");
     }
 
@@ -640,7 +694,10 @@ mod tests {
             UnixStream::pair().expect("shutdown stream pair should be created");
         let mut client = UnixStream::connect(&path).expect("client should connect");
 
-        let handle = thread::spawn(move || server.run_until(VERSION, &mut shutdown_reader));
+        let handle = thread::spawn(move || {
+            let mut vmm = test_controller();
+            server.run_until(&mut vmm, &mut shutdown_reader)
+        });
 
         client
             .write_all(b"GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n")
@@ -668,7 +725,10 @@ mod tests {
         let server = ApiServer::bind(&path).expect("server should bind");
         let (mut shutdown_reader, mut shutdown_writer) =
             UnixStream::pair().expect("shutdown stream pair should be created");
-        let handle = thread::spawn(move || server.run_until(VERSION, &mut shutdown_reader));
+        let handle = thread::spawn(move || {
+            let mut vmm = test_controller();
+            server.run_until(&mut vmm, &mut shutdown_reader)
+        });
 
         shutdown_writer
             .write_all(b"x")

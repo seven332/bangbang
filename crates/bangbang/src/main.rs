@@ -9,11 +9,13 @@ mod api_server;
 
 use api_server::{ApiServer, ApiServerError};
 use bangbang_hvf::HvfBackend;
+use bangbang_runtime::VmmController;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::{low_level, SigId};
 
 const DEFAULT_API_SOCK_PATH: &str = "/tmp/bangbang.socket";
 const DEFAULT_INSTANCE_ID: &str = "anonymous-instance";
+const APP_NAME: &str = "bangbang";
 const MIN_INSTANCE_ID_LEN: usize = 1;
 const MAX_INSTANCE_ID_LEN: usize = 64;
 const UNSUPPORTED_FIRECRACKER_ARGS: &[&str] = &[
@@ -71,10 +73,11 @@ fn run() -> Result<(), ProcessError> {
 
             let mut shutdown_signal = ShutdownSignal::install()?;
             let server = ApiServer::bind(&config.api_sock).map_err(ProcessError::ApiServer)?;
+            let mut vmm = VmmController::new(config.id, env!("CARGO_PKG_VERSION"), APP_NAME);
             println!("status: API server listening; VM startup is not implemented yet");
             let shutdown_wakeup = shutdown_signal.wakeup_reader();
             server
-                .run_until(env!("CARGO_PKG_VERSION"), shutdown_wakeup)
+                .run_until(&mut vmm, shutdown_wakeup)
                 .map_err(ProcessError::ApiServer)?;
         }
     }
