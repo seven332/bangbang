@@ -2,7 +2,7 @@
 
 bangbang is a Rust VMM project for macOS hosts. The public control plane is intended to stay compatible with the Firecracker HTTP API over a Unix domain socket, while the VM backend is built on Apple's Hypervisor.framework.
 
-This repository is currently a scaffold. It defines crate boundaries, an initial Firecracker-compatible API socket, a process startup CLI, a minimal internal VMM action model, a backend trait, and the smallest Hypervisor.framework VM and current-thread vCPU create/destroy wrappers.
+This repository is currently a scaffold. It defines crate boundaries, an initial Firecracker-compatible API socket, a process startup CLI, a minimal internal VMM action model, a backend trait, and the smallest Hypervisor.framework VM, current-thread vCPU lifecycle, exit snapshot, and register wrappers.
 
 See [Firecracker Compatibility Scope](docs/firecracker-compatibility.md) for the intended compatibility target and current limitations.
 See [Pull Request Review Guidelines](docs/review-guidelines.md) for the project-specific review standard.
@@ -18,12 +18,12 @@ crates/bangbang   VMM process entrypoint and startup CLI
 
 ## Current Scope
 
-The first target is Apple Silicon macOS. The current scaffold includes HTTP over a Unix domain socket for `GET /` and `GET /version`, routed through a minimal read-only VMM action model. The HVF crate can create/destroy a process VM and create/destroy one current-thread vCPU handle for lifecycle smoke testing. It intentionally does not include:
+The first target is Apple Silicon macOS. The current scaffold includes HTTP over a Unix domain socket for `GET /` and `GET /version`, routed through a minimal read-only VMM action model. The HVF crate can create/destroy a process VM, create/destroy one current-thread vCPU handle, snapshot typed HVF exit data, and get/set a narrow set of vCPU registers for lifecycle smoke testing. It intentionally does not include:
 
 - API endpoints beyond `GET /` and `GET /version`
 - JSON request body models
 - guest memory mapping
-- vCPU register setup, exit handling, or a run loop
+- guest execution, vCPU run loops, MMIO/device emulation, or boot register setup
 - kernel loading
 
 ## Process CLI

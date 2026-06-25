@@ -1,6 +1,62 @@
 pub(crate) const UNSUPPORTED_TARGET_MESSAGE: &str =
     "Hypervisor.framework backend currently targets macOS on Apple Silicon";
 
+pub(crate) type HvVcpu = u64;
+pub(crate) type HvExitReason = u32;
+pub(crate) type HvReg = u32;
+pub(crate) type HvSysReg = u16;
+
+pub(crate) const HV_EXIT_REASON_CANCELED: HvExitReason = 0;
+pub(crate) const HV_EXIT_REASON_EXCEPTION: HvExitReason = 1;
+pub(crate) const HV_EXIT_REASON_VTIMER_ACTIVATED: HvExitReason = 2;
+pub(crate) const HV_EXIT_REASON_UNKNOWN: HvExitReason = 3;
+pub(crate) const HV_REG_X0: HvReg = 0;
+pub(crate) const HV_REG_X1: HvReg = 1;
+pub(crate) const HV_REG_X2: HvReg = 2;
+pub(crate) const HV_REG_X3: HvReg = 3;
+pub(crate) const HV_REG_PC: HvReg = 31;
+pub(crate) const HV_REG_CPSR: HvReg = 34;
+pub(crate) const HV_SYS_REG_SPSR_EL1: HvSysReg = 0xc200;
+pub(crate) const HV_SYS_REG_ELR_EL1: HvSysReg = 0xc201;
+pub(crate) const HV_SYS_REG_SP_EL1: HvSysReg = 0xe208;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HvVcpuExitException {
+    pub(crate) syndrome: u64,
+    pub(crate) virtual_address: u64,
+    pub(crate) physical_address: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HvVcpuExit {
+    pub(crate) reason: HvExitReason,
+    pub(crate) exception: HvVcpuExitException,
+}
+
+#[derive(Debug)]
+pub(crate) struct CreatedVcpu {
+    pub(crate) vcpu: HvVcpu,
+    pub(crate) exit: *mut HvVcpuExit,
+}
+
+pub(crate) fn copy_vcpu_exit(
+    exit: *const HvVcpuExit,
+) -> Result<HvVcpuExit, bangbang_runtime::BackendError> {
+    if exit.is_null() {
+        return Err(bangbang_runtime::BackendError::Hypervisor(
+            "hv_vcpu_exit_t pointer is null".to_string(),
+        ));
+    }
+
+    // SAFETY: The caller provides a non-null pointer to an initialized `HvVcpuExit`
+    // belonging to a live current-thread vCPU or to test-owned memory with the same
+    // layout. The raw struct is `Copy`, so this snapshots the current values without
+    // moving or retaining HVF-owned memory.
+    unsafe { Ok(*exit) }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod imp {
     use std::ffi::c_void;
@@ -8,11 +64,11 @@ mod imp {
 
     use bangbang_runtime::BackendError;
 
+    use super::{CreatedVcpu, HvReg, HvSysReg, HvVcpu, HvVcpuExit};
+
     pub type HvReturn = i32;
     pub type HvVmConfig = *mut c_void;
-    pub type HvVcpu = u64;
     pub type HvVcpuConfig = *mut c_void;
-    pub type HvVcpuExit = c_void;
 
     pub const HV_SUCCESS: HvReturn = 0;
     const HV_ERROR: HvReturn = 0xfae94001u32 as HvReturn;
@@ -24,12 +80,6 @@ mod imp {
     const HV_FAULT: HvReturn = 0xfae94008u32 as HvReturn;
     const HV_UNSUPPORTED: HvReturn = 0xfae9400fu32 as HvReturn;
 
-    #[derive(Debug)]
-    pub struct CreatedVcpu {
-        pub vcpu: HvVcpu,
-        pub exit: *mut HvVcpuExit,
-    }
-
     #[link(name = "Hypervisor", kind = "framework")]
     extern "C" {
         pub fn hv_vm_create(config: HvVmConfig) -> HvReturn;
@@ -40,6 +90,10 @@ mod imp {
             config: HvVcpuConfig,
         ) -> HvReturn;
         pub fn hv_vcpu_destroy(vcpu: HvVcpu) -> HvReturn;
+        pub fn hv_vcpu_get_reg(vcpu: HvVcpu, reg: HvReg, value: *mut u64) -> HvReturn;
+        pub fn hv_vcpu_set_reg(vcpu: HvVcpu, reg: HvReg, value: u64) -> HvReturn;
+        pub fn hv_vcpu_get_sys_reg(vcpu: HvVcpu, reg: HvSysReg, value: *mut u64) -> HvReturn;
+        pub fn hv_vcpu_set_sys_reg(vcpu: HvVcpu, reg: HvSysReg, value: u64) -> HvReturn;
     }
 
     fn hv_return_name(code: HvReturn) -> Option<&'static str> {
@@ -108,9 +162,44 @@ mod imp {
         unsafe { check(hv_vcpu_destroy(vcpu), "hv_vcpu_destroy") }
     }
 
+    pub fn get_reg(vcpu: HvVcpu, reg: HvReg) -> Result<u64, BackendError> {
+        let mut value = 0;
+
+        // SAFETY: The caller owns this current-thread vCPU handle, and `value` is a valid
+        // out-pointer for the duration of the call.
+        unsafe { check(hv_vcpu_get_reg(vcpu, reg, &mut value), "hv_vcpu_get_reg")? };
+
+        Ok(value)
+    }
+
+    pub fn set_reg(vcpu: HvVcpu, reg: HvReg, value: u64) -> Result<(), BackendError> {
+        // SAFETY: The caller owns this current-thread vCPU handle.
+        unsafe { check(hv_vcpu_set_reg(vcpu, reg, value), "hv_vcpu_set_reg") }
+    }
+
+    pub fn get_sys_reg(vcpu: HvVcpu, reg: HvSysReg) -> Result<u64, BackendError> {
+        let mut value = 0;
+
+        // SAFETY: The caller owns this current-thread vCPU handle, and `value` is a valid
+        // out-pointer for the duration of the call.
+        unsafe {
+            check(
+                hv_vcpu_get_sys_reg(vcpu, reg, &mut value),
+                "hv_vcpu_get_sys_reg",
+            )?
+        };
+
+        Ok(value)
+    }
+
+    pub fn set_sys_reg(vcpu: HvVcpu, reg: HvSysReg, value: u64) -> Result<(), BackendError> {
+        // SAFETY: The caller owns this current-thread vCPU handle.
+        unsafe { check(hv_vcpu_set_sys_reg(vcpu, reg, value), "hv_vcpu_set_sys_reg") }
+    }
+
     #[cfg(test)]
     mod tests {
-        use super::{check, HV_DENIED, HV_UNSUPPORTED};
+        use super::{check, HV_BAD_ARGUMENT, HV_DENIED, HV_UNSUPPORTED};
 
         #[test]
         fn check_displays_named_hv_return() {
@@ -132,25 +221,25 @@ mod imp {
                 "hypervisor error: hv_vm_create failed with HV_UNSUPPORTED (hv_return_t=0xfae9400f)"
             );
         }
+
+        #[test]
+        fn check_displays_register_operation_hv_return() {
+            let err =
+                check(HV_BAD_ARGUMENT, "hv_vcpu_get_reg").expect_err("HV_BAD_ARGUMENT should fail");
+
+            assert_eq!(
+                err.to_string(),
+                "hypervisor error: hv_vcpu_get_reg failed with HV_BAD_ARGUMENT (hv_return_t=0xfae94003)"
+            );
+        }
     }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 mod imp {
-    use std::ffi::c_void;
-
     use bangbang_runtime::BackendError;
 
-    use super::UNSUPPORTED_TARGET_MESSAGE;
-
-    pub type HvVcpu = u64;
-    pub type HvVcpuExit = c_void;
-
-    #[derive(Debug)]
-    pub struct CreatedVcpu {
-        pub vcpu: HvVcpu,
-        pub exit: *mut HvVcpuExit,
-    }
+    use super::{CreatedVcpu, HvReg, HvSysReg, HvVcpu, UNSUPPORTED_TARGET_MESSAGE};
 
     pub fn create_vm() -> Result<(), BackendError> {
         Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
@@ -167,6 +256,46 @@ mod imp {
     pub fn destroy_vcpu(_: HvVcpu) -> Result<(), BackendError> {
         Ok(())
     }
+
+    pub fn get_reg(_: HvVcpu, _: HvReg) -> Result<u64, BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
+    pub fn set_reg(_: HvVcpu, _: HvReg, _: u64) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
+    pub fn get_sys_reg(_: HvVcpu, _: HvSysReg) -> Result<u64, BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
+    pub fn set_sys_reg(_: HvVcpu, _: HvSysReg, _: u64) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
 }
 
-pub use imp::*;
+pub(crate) use imp::*;
+
+#[cfg(test)]
+mod tests {
+    use std::mem::{align_of, offset_of, size_of};
+
+    use super::{HvVcpuExit, HvVcpuExitException};
+
+    #[test]
+    fn vcpu_exit_layout_matches_hvf_sdk() {
+        assert_eq!(size_of::<HvVcpuExit>(), 32);
+        assert_eq!(align_of::<HvVcpuExit>(), 8);
+        assert_eq!(offset_of!(HvVcpuExit, reason), 0);
+        assert_eq!(offset_of!(HvVcpuExit, exception), 8);
+        assert_eq!(offset_of!(HvVcpuExit, exception.syndrome), 8);
+        assert_eq!(offset_of!(HvVcpuExit, exception.virtual_address), 16);
+        assert_eq!(offset_of!(HvVcpuExit, exception.physical_address), 24);
+    }
+
+    #[test]
+    fn vcpu_exit_exception_layout_matches_hvf_sdk() {
+        assert_eq!(size_of::<HvVcpuExitException>(), 24);
+        assert_eq!(align_of::<HvVcpuExitException>(), 8);
+    }
+}

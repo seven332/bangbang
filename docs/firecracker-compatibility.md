@@ -8,9 +8,10 @@ The current repository defines crate boundaries, endpoint names, a minimal
 HTTP-over-Unix-socket API server for `GET /` and `GET /version`, a backend-neutral VM
 trait, a minimal read-only VMM action/data model, a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
-create/destroy wrapper, and an initial process startup argument model. There is
-no broader API request body model, guest memory mapping, vCPU register setup,
-exit handling, run loop, or kernel loading yet.
+create/destroy wrapper, typed HVF exit snapshots, narrow vCPU register wrappers,
+and an initial process startup argument model. There is no broader API request
+body model, guest memory mapping, guest execution, vCPU run loop, MMIO/device
+emulation, boot register setup, or kernel loading yet.
 
 ## Firecracker Model Alignment
 
@@ -309,9 +310,12 @@ macOS design work instead of direct implementation:
 - KVM-specific VM and vCPU operations need HVF equivalents rather than direct
   KVM ioctl usage.
 - HVF vCPU handles are thread-affine: creation, register access, run, and
-  destroy operations must happen on the owning thread. The initial vCPU wrapper
-  covers create/destroy lifecycle only; future run-loop work should use a
-  thread-owned runner.
+  destroy operations must happen on the owning thread. The current vCPU wrapper
+  covers current-thread lifecycle, typed exit snapshots, and narrow register
+  access only; future run-loop work should use a thread-owned runner.
+- HVF exit snapshots preserve Hypervisor.framework reasons such as canceled,
+  exception, virtual timer activation, and unknown. They are not yet decoded
+  into MMIO, timer, device, or runtime events.
 - Linux seccomp, jailer, cgroups, and namespaces do not directly apply.
 - Linux TAP-based networking needs a macOS-specific design.
 - Snapshot and device behavior may differ when backed by HVF.
