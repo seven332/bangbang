@@ -24,7 +24,7 @@ mod imp {
     const HV_FAULT: HvReturn = 0xfae94008u32 as HvReturn;
     const HV_UNSUPPORTED: HvReturn = 0xfae9400fu32 as HvReturn;
 
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug)]
     pub struct CreatedVcpu {
         pub vcpu: HvVcpu,
         pub exit: *mut HvVcpuExit,
@@ -146,7 +146,7 @@ mod imp {
     pub type HvVcpu = u64;
     pub type HvVcpuExit = c_void;
 
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug)]
     pub struct CreatedVcpu {
         pub vcpu: HvVcpu,
         pub exit: *mut HvVcpuExit,
