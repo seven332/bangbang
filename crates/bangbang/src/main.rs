@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsString;
 use std::fmt;
 use std::os::unix::io::IntoRawFd;
 use std::os::unix::net::UnixStream;
@@ -51,7 +52,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), ProcessError> {
-    let args = parse_process_args(env::args().skip(1))?;
+    let args = parse_process_args(env::args_os().skip(1))?;
 
     match args.command {
         Command::Help => {
@@ -88,9 +89,9 @@ fn run() -> Result<(), ProcessError> {
 
 fn parse_process_args<I>(args: I) -> Result<Args, ProcessError>
 where
-    I: IntoIterator<Item = String>,
+    I: IntoIterator<Item = OsString>,
 {
-    Args::parse(args).map_err(ProcessError::ArgumentParsing)
+    Args::parse_os(args).map_err(ProcessError::ArgumentParsing)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,6 +227,32 @@ impl Default for StartupConfig {
 }
 
 impl Args {
+    fn parse_os<I>(args: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = OsString>,
+    {
+        let args = args.into_iter().collect::<Vec<_>>();
+
+        if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+            return Ok(Self {
+                command: Command::Help,
+            });
+        }
+
+        if args.iter().any(|arg| arg == "--version" || arg == "-V") {
+            return Ok(Self {
+                command: Command::Version,
+            });
+        }
+
+        let args = args
+            .into_iter()
+            .map(os_arg_into_string)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Self::parse(args)
+    }
+
     fn parse<I>(args: I) -> Result<Self, String>
     where
         I: IntoIterator<Item = String>,
@@ -292,6 +319,11 @@ impl Args {
             command: Command::Run(config),
         })
     }
+}
+
+fn os_arg_into_string(arg: OsString) -> Result<String, String> {
+    arg.into_string()
+        .map_err(|_| "invalid argument: arguments must be valid UTF-8".to_string())
 }
 
 fn print_help() {
@@ -366,6 +398,9 @@ fn unsupported_equals_syntax(arg: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
     use super::{
         parse_process_args, ApiServerError, Args, Command, ProcessError, ProcessExitCode,
         StartupConfig, DEFAULT_API_SOCK_PATH, DEFAULT_INSTANCE_ID, MAX_INSTANCE_ID_LEN,
@@ -411,7 +446,7 @@ mod tests {
 
     #[test]
     fn parse_process_args_wraps_parser_errors() {
-        let err = parse_process_args(["--unknown=/tmp/secret".to_string()])
+        let err = parse_process_args([OsString::from("--unknown=/tmp/secret")])
             .expect_err("process arg parsing should fail");
 
         assert_eq!(
@@ -419,6 +454,22 @@ mod tests {
             ProcessError::ArgumentParsing("unknown argument: --unknown".to_string())
         );
         assert_eq!(err.exit_code(), ProcessExitCode::ArgumentParsing);
+    }
+
+    #[test]
+    fn parse_os_help_arg_ignores_non_utf8_args() {
+        let args = Args::parse_os([OsString::from("--help"), OsString::from_vec(vec![0xff])])
+            .expect("help should bypass parsing");
+
+        assert_eq!(args.command, Command::Help);
+    }
+
+    #[test]
+    fn rejects_non_utf8_process_arg() {
+        let err =
+            Args::parse_os([OsString::from_vec(vec![0xff])]).expect_err("non-utf8 arg should fail");
+
+        assert_eq!(err, "invalid argument: arguments must be valid UTF-8");
     }
 
     #[test]
