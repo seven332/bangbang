@@ -41,11 +41,12 @@ compatibility decision expands the CLI parser.
 
 CLI values are untrusted input. Current validation rejects invalid IDs, empty
 socket paths, and socket paths containing control characters. API startup also
-fails if the configured socket path already exists. Socket cleanup only removes
-the socket inode created by the current process during normal shutdown; signal
-handling and forced-termination cleanup are not implemented yet. Process CLI
-parsing stays outside the future VM/vCPU fast path and should add only trivial
-startup overhead. Error and status output avoid echoing path-like CLI values.
+fails if the configured socket path already exists. Socket cleanup removes the
+socket inode created by the current process during normal shutdown and handled
+`SIGINT`/`SIGTERM` shutdown; uncatchable forced termination such as `SIGKILL`
+can still leave a stale socket path behind. Process CLI parsing stays outside
+the future VM/vCPU fast path and should add only trivial startup overhead. Error
+and status output avoid echoing path-like CLI values.
 
 ### Process Exit Status
 
@@ -53,7 +54,7 @@ The current executable uses a small process exit status contract:
 
 | Exit status | Current meaning | Compatibility notes |
 | --- | --- | --- |
-| `0` | Help or version completed successfully, or the API server exited without error. | Matches Firecracker's success status. |
+| `0` | Help or version completed successfully, or the API server exited without error, including handled `SIGINT`/`SIGTERM` shutdown. | Matches Firecracker's success status. |
 | `153` | Startup argument parsing or validation failed. | Matches Firecracker's `ArgParsing` exit code. |
 | `1` | API socket bind or accept failure. | Used for non-argument process failures before more specific Firecracker-compatible process errors exist. Per-connection read/write errors do not terminate the API server. |
 

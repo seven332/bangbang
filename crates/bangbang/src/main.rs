@@ -1,11 +1,17 @@
 use std::env;
 use std::fmt;
+use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
 
 mod api_server;
 
 use api_server::{ApiServer, ApiServerError};
 use bangbang_hvf::HvfBackend;
+use signal_hook::consts::signal::{SIGINT, SIGTERM};
+use signal_hook::iterator::{Handle as SignalHandle, Signals};
 
 const DEFAULT_API_SOCK_PATH: &str = "/tmp/bangbang.socket";
 const DEFAULT_INSTANCE_ID: &str = "anonymous-instance";
@@ -64,10 +70,11 @@ fn run() -> Result<(), ProcessError> {
                 HvfBackend::is_supported_target()
             );
 
+            let shutdown_signal = ShutdownSignal::install(config.api_sock.clone())?;
             let server = ApiServer::bind(&config.api_sock).map_err(ProcessError::ApiServer)?;
             println!("status: API server listening; VM startup is not implemented yet");
             server
-                .run(env!("CARGO_PKG_VERSION"))
+                .run_until(env!("CARGO_PKG_VERSION"), shutdown_signal.requested())
                 .map_err(ProcessError::ApiServer)?;
         }
     }
@@ -102,6 +109,7 @@ impl ProcessExitCode {
 enum ProcessError {
     ApiServer(ApiServerError),
     ArgumentParsing(String),
+    SignalHandler(std::io::ErrorKind),
 }
 
 impl ProcessError {
@@ -109,6 +117,7 @@ impl ProcessError {
         match self {
             Self::ApiServer(_) => ProcessExitCode::ProcessFailure,
             Self::ArgumentParsing(_) => ProcessExitCode::ArgumentParsing,
+            Self::SignalHandler(_) => ProcessExitCode::ProcessFailure,
         }
     }
 }
@@ -118,11 +127,59 @@ impl fmt::Display for ProcessError {
         match self {
             Self::ApiServer(err) => write!(f, "API server error: {err}"),
             Self::ArgumentParsing(message) => f.write_str(message),
+            Self::SignalHandler(kind) => {
+                write!(f, "failed to register shutdown signal handler: {kind:?}")
+            }
         }
     }
 }
 
 impl std::error::Error for ProcessError {}
+
+#[derive(Debug)]
+struct ShutdownSignal {
+    requested: Arc<AtomicBool>,
+    signal_handle: SignalHandle,
+    signal_thread: Option<thread::JoinHandle<()>>,
+}
+
+impl ShutdownSignal {
+    fn install(api_sock: String) -> Result<Self, ProcessError> {
+        let requested = Arc::new(AtomicBool::new(false));
+        let thread_requested = Arc::clone(&requested);
+        let mut signals = Signals::new([SIGINT, SIGTERM])
+            .map_err(|err| ProcessError::SignalHandler(err.kind()))?;
+        let signal_handle = signals.handle();
+        let signal_thread = thread::spawn(move || {
+            if signals.forever().next().is_some() {
+                thread_requested.store(true, Ordering::Relaxed);
+                let _ = UnixStream::connect(api_sock);
+            }
+        });
+
+        Ok(Self {
+            requested,
+            signal_handle,
+            signal_thread: Some(signal_thread),
+        })
+    }
+
+    fn requested(&self) -> &AtomicBool {
+        &self.requested
+    }
+}
+
+impl Drop for ShutdownSignal {
+    fn drop(&mut self) {
+        let should_join = !self.requested.load(Ordering::Relaxed);
+        self.signal_handle.close();
+        if should_join {
+            if let Some(signal_thread) = self.signal_thread.take() {
+                let _ = signal_thread.join();
+            }
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct Args {

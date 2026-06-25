@@ -37,7 +37,7 @@ cargo run -p bangbang -- --api-sock /tmp/bangbang.socket --id demo-1
 - `--id <ID>` records the microVM identifier. The default is `anonymous-instance`.
 - `--help`, `-h`, `--version`, and `-V` are supported.
 
-`bangbang` binds the configured socket path, serves `GET /version`, and stays running. Unsupported Firecracker process options such as `--config-file`, `--no-api`, seccomp, logging, metrics, snapshot, MMDS, and PCI flags are rejected instead of ignored.
+`bangbang` binds the configured socket path, serves `GET /version`, and stays running until `SIGINT` or `SIGTERM` requests shutdown. Unsupported Firecracker process options such as `--config-file`, `--no-api`, seccomp, logging, metrics, snapshot, MMDS, and PCI flags are rejected instead of ignored.
 
 Query the first supported endpoint:
 

@@ -5,7 +5,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bangbang_api::http::{handle_request_bytes, request_total_len, HttpResponse, RequestError};
@@ -70,9 +70,21 @@ impl ApiServer {
         })
     }
 
-    pub(crate) fn run(&self, version: &str) -> Result<(), ApiServerError> {
+    pub(crate) fn run_until(
+        &self,
+        version: &str,
+        shutdown_requested: &AtomicBool,
+    ) -> Result<(), ApiServerError> {
         loop {
-            self.serve_next(version)?;
+            if shutdown_requested.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+
+            match self.serve_next(version) {
+                Ok(()) => {}
+                Err(ApiServerError::Accept(std::io::ErrorKind::Interrupted)) => {}
+                Err(err) => return Err(err),
+            }
         }
     }
 
@@ -81,6 +93,9 @@ impl ApiServer {
             .listener
             .accept()
             .map_err(|err| ApiServerError::Accept(err.kind()))?;
+        stream
+            .set_nonblocking(false)
+            .map_err(|err| ApiServerError::Connection(err.kind()))?;
 
         let _ = handle_connection(&mut stream, version);
 
@@ -440,6 +455,35 @@ mod tests {
         server
             .serve_next(VERSION)
             .expect("client disconnect should not fail server");
+    }
+
+    #[test]
+    fn run_until_cleans_socket_after_shutdown_request() {
+        let path = unique_socket_path("shutdown");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let run_shutdown_requested = Arc::clone(&shutdown_requested);
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+
+        let handle = thread::spawn(move || server.run_until(VERSION, &run_shutdown_requested));
+
+        client
+            .write_all(b"GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("client should write request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("client should read response");
+        shutdown_requested.store(true, Ordering::Relaxed);
+        let _ = UnixStream::connect(&path);
+
+        assert_eq!(
+            handle.join().expect("server thread should not panic"),
+            Ok(())
+        );
+        assert!(response.contains(r#"{"firecracker_version":"0.1.0"}"#));
+        assert!(!path.exists());
     }
 
     #[test]
