@@ -34,7 +34,9 @@ while [[ "$#" -gt 0 ]]; do
       break
       ;;
     *)
-      test_args+=("$1")
+      echo "unknown argument before --: $1" >&2
+      usage >&2
+      exit 2
       ;;
   esac
   shift
