@@ -17,8 +17,7 @@ failing scenario, impacted file or behavior, and the smallest credible fix.
 
 ## Required Verification
 
-Run the repository checks before approval unless the PR is explicitly
-documentation-only and the skipped checks are justified:
+Run the repository checks before opening or updating a pull request:
 
 ```sh
 cargo fmt --all -- --check
@@ -26,6 +25,10 @@ cargo check
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
+
+Reviewers should confirm the PR body lists the checks that were run. If any
+command is intentionally skipped, the PR should explain why the skipped command
+does not add useful signal for that change.
 
 Add targeted smoke tests when the PR changes process startup, CLI behavior, API
 socket serving, signal handling, filesystem cleanup, FFI, or platform gating.
@@ -54,10 +57,10 @@ Treat CLI values, API request bodies, identifiers, host paths, and guest input a
 untrusted. Review validation, redaction, and ownership checks before any input
 can affect host resources or VM state.
 
-The API socket is a local control interface. PRs touching socket behavior must
-cover filesystem permission assumptions, stale socket handling, symlink or
-replacement races, cleanup ownership, and behavior when multiple `bangbang`
-processes run concurrently.
+The API socket is currently an unauthenticated local control interface. PRs
+touching socket behavior must cover filesystem permission assumptions, stale
+socket handling, symlink or replacement races, cleanup ownership, and behavior
+when multiple `bangbang` processes run concurrently.
 
 Unsafe code belongs behind small FFI wrappers. Every unsafe block must have a
 specific `SAFETY:` explanation, and the wrapper should translate platform errors
@@ -110,5 +113,6 @@ Use Conventional Commits. Keep PRs narrow enough to review independently, link
 the tracking issue, summarize scope exclusions, and list verification commands
 and manual smoke tests in the PR body.
 
-Before approval, confirm the worktree only contains intended files and that the
-PR does not include unrelated formatting, generated artifacts, or metadata churn.
+Before requesting review, confirm the worktree only contains intended files.
+Before approval, confirm the PR diff does not include unrelated formatting,
+generated artifacts, or metadata churn.
