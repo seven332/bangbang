@@ -39,6 +39,10 @@ cargo run -p bangbang -- --api-sock /tmp/bangbang.socket --id demo-1
 
 `bangbang` binds the configured socket path, serves `GET /version`, and stays running until `SIGINT` or `SIGTERM` requests shutdown. Unsupported Firecracker process options such as `--config-file`, `--no-api`, seccomp, logging, metrics, snapshot, MMDS, and PCI flags are rejected instead of ignored.
 
+The API socket is an unauthenticated local control interface. Filesystem
+permissions on the socket path and parent directory are the access-control
+boundary, so use a private directory or restrictive umask on multi-user hosts.
+
 Query the first supported endpoint:
 
 ```sh
