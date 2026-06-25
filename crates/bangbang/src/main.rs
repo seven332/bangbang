@@ -4,7 +4,6 @@ use std::fmt;
 use std::os::unix::io::IntoRawFd;
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
-use std::sync::atomic::AtomicBool;
 
 mod api_server;
 
@@ -73,13 +72,9 @@ fn run() -> Result<(), ProcessError> {
             let mut shutdown_signal = ShutdownSignal::install()?;
             let server = ApiServer::bind(&config.api_sock).map_err(ProcessError::ApiServer)?;
             println!("status: API server listening; VM startup is not implemented yet");
-            let (shutdown_requested, shutdown_wakeup) = shutdown_signal.parts();
+            let shutdown_wakeup = shutdown_signal.wakeup_reader();
             server
-                .run_until(
-                    env!("CARGO_PKG_VERSION"),
-                    shutdown_requested,
-                    shutdown_wakeup,
-                )
+                .run_until(env!("CARGO_PKG_VERSION"), shutdown_wakeup)
                 .map_err(ProcessError::ApiServer)?;
         }
     }
@@ -143,14 +138,12 @@ impl std::error::Error for ProcessError {}
 
 #[derive(Debug)]
 struct ShutdownSignal {
-    requested: AtomicBool,
     wakeup_reader: UnixStream,
     signal_ids: [SigId; 2],
 }
 
 impl ShutdownSignal {
     fn install() -> Result<Self, ProcessError> {
-        let requested = AtomicBool::new(false);
         let (wakeup_reader, wakeup_writer) =
             UnixStream::pair().map_err(|err| ProcessError::SignalHandler(err.kind()))?;
         let sigint = register_signal_wakeup(SIGINT, &wakeup_writer)?;
@@ -163,14 +156,13 @@ impl ShutdownSignal {
         };
 
         Ok(Self {
-            requested,
             wakeup_reader,
             signal_ids: [sigint, sigterm],
         })
     }
 
-    fn parts(&mut self) -> (&AtomicBool, &mut UnixStream) {
-        (&self.requested, &mut self.wakeup_reader)
+    fn wakeup_reader(&mut self) -> &mut UnixStream {
+        &mut self.wakeup_reader
     }
 }
 

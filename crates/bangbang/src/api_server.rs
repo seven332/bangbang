@@ -6,7 +6,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bangbang_api::http::{handle_request_bytes, request_total_len, HttpResponse, RequestError};
@@ -77,7 +77,6 @@ impl ApiServer {
     pub(crate) fn run_until(
         &self,
         version: &str,
-        shutdown_requested: &AtomicBool,
         shutdown_wakeup: &mut UnixStream,
     ) -> Result<(), ApiServerError> {
         self.listener
@@ -88,10 +87,6 @@ impl ApiServer {
             .map_err(|err| ApiServerError::Connection(err.kind()))?;
 
         loop {
-            if shutdown_requested.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-
             wait_for_listener_or_shutdown(&self.listener, shutdown_wakeup)?;
             if drain_shutdown_wakeup(shutdown_wakeup)? {
                 return Ok(());
@@ -641,15 +636,11 @@ mod tests {
     fn run_until_cleans_socket_after_shutdown_request() {
         let path = unique_socket_path("shutdown");
         let server = ApiServer::bind(&path).expect("server should bind");
-        let shutdown_requested = Arc::new(AtomicBool::new(false));
-        let run_shutdown_requested = Arc::clone(&shutdown_requested);
         let (mut shutdown_reader, mut shutdown_writer) =
             UnixStream::pair().expect("shutdown stream pair should be created");
         let mut client = UnixStream::connect(&path).expect("client should connect");
 
-        let handle = thread::spawn(move || {
-            server.run_until(VERSION, &run_shutdown_requested, &mut shutdown_reader)
-        });
+        let handle = thread::spawn(move || server.run_until(VERSION, &mut shutdown_reader));
 
         client
             .write_all(b"GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n")
@@ -659,7 +650,6 @@ mod tests {
         client
             .read_to_string(&mut response)
             .expect("client should read response");
-        shutdown_requested.store(true, Ordering::Relaxed);
         shutdown_writer
             .write_all(b"x")
             .expect("shutdown wakeup should be written");
@@ -676,15 +666,10 @@ mod tests {
     fn run_until_cleans_idle_socket_after_shutdown_request() {
         let path = unique_socket_path("idle-shutdown");
         let server = ApiServer::bind(&path).expect("server should bind");
-        let shutdown_requested = Arc::new(AtomicBool::new(false));
-        let run_shutdown_requested = Arc::clone(&shutdown_requested);
         let (mut shutdown_reader, mut shutdown_writer) =
             UnixStream::pair().expect("shutdown stream pair should be created");
-        let handle = thread::spawn(move || {
-            server.run_until(VERSION, &run_shutdown_requested, &mut shutdown_reader)
-        });
+        let handle = thread::spawn(move || server.run_until(VERSION, &mut shutdown_reader));
 
-        shutdown_requested.store(true, Ordering::Relaxed);
         shutdown_writer
             .write_all(b"x")
             .expect("shutdown wakeup should be written");
