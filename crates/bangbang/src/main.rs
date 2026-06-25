@@ -153,7 +153,7 @@ impl Args {
                 other if other.starts_with('-') => {
                     return Err(format!("unknown argument: {}", display_arg_name(other)));
                 }
-                other => return Err(format!("unexpected positional argument: {other}")),
+                _ => return Err("unexpected positional argument".to_string()),
             }
         }
 
@@ -471,6 +471,13 @@ mod tests {
     fn rejects_positional_arg() {
         let err = parse(&["image.bin"]).expect_err("positional args should fail");
 
-        assert_eq!(err, "unexpected positional argument: image.bin");
+        assert_eq!(err, "unexpected positional argument");
+    }
+
+    #[test]
+    fn rejects_positional_path_without_echoing_value() {
+        let err = parse(&["/tmp/secret.img"]).expect_err("positional args should fail");
+
+        assert_eq!(err, "unexpected positional argument");
     }
 }
