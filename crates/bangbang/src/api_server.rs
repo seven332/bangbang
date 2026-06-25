@@ -314,6 +314,8 @@ mod tests {
     use std::env;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -484,6 +486,48 @@ mod tests {
         drop(temp_listener);
         fs::remove_file(temp_path).expect("temporary socket should clean up");
         fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn concurrent_binds_allow_only_one_owner() {
+        const ATTEMPTS: usize = 8;
+
+        let path = unique_socket_path("concurrent");
+        let start = Arc::new(Barrier::new(ATTEMPTS));
+        let finish = Arc::new(Barrier::new(ATTEMPTS));
+        let handles = (0..ATTEMPTS)
+            .map(|_| {
+                let path = path.clone();
+                let start = Arc::clone(&start);
+                let finish = Arc::clone(&finish);
+
+                thread::spawn(move || {
+                    start.wait();
+                    let result = ApiServer::bind(&path);
+                    let outcome = match &result {
+                        Ok(_) => Ok(()),
+                        Err(err) => Err(err),
+                    };
+                    finish.wait();
+                    outcome.map_err(|err| matches!(err, ApiServerError::SocketPathExists))
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("bind thread should not panic"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(true)))
+                .count(),
+            ATTEMPTS - 1
+        );
+        assert!(!path.exists());
     }
 
     #[test]
