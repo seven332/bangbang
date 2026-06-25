@@ -21,9 +21,10 @@ Run the repository checks before opening or updating a pull request:
 
 ```sh
 cargo fmt --all -- --check
-cargo check
-cargo test
-cargo clippy --all-targets -- -D warnings
+cargo check --workspace --all-targets --all-features --locked
+cargo test --workspace --all-targets --all-features --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 ```
 
 Reviewers should confirm the PR body lists the checks that were run. If any

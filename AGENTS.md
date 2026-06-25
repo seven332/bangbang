@@ -14,10 +14,11 @@ Unit tests live next to the code they exercise under each crate’s `src/` tree.
 
 ## Build, Test, and Development Commands
 
-- `cargo check`: type-check the full workspace quickly.
-- `cargo test`: run all unit and doc tests.
-- `cargo clippy --all-targets -- -D warnings`: run lint checks with warnings treated as errors.
 - `cargo fmt --all -- --check`: verify Rust formatting.
+- `cargo check --workspace --all-targets --all-features --locked`: type-check the full workspace using the committed lockfile.
+- `cargo test --workspace --all-targets --all-features --locked`: run all unit and doc tests with all targets and features enabled.
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: run lint checks with warnings treated as errors.
+- `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked`: build documentation without dependency docs.
 - `cargo run -p bangbang`: run the current VMM process skeleton.
 
 Use these commands before opening or updating a pull request.
