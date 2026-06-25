@@ -99,8 +99,7 @@ impl ApiServer {
 
             match self.serve_next(version) {
                 Ok(()) => {}
-                Err(ApiServerError::Accept(std::io::ErrorKind::WouldBlock)) => {}
-                Err(ApiServerError::Accept(std::io::ErrorKind::Interrupted)) => {}
+                Err(ApiServerError::Accept(kind)) if is_transient_accept_error(kind) => {}
                 Err(err) => return Err(err),
             }
         }
@@ -119,6 +118,15 @@ impl ApiServer {
 
         Ok(())
     }
+}
+
+fn is_transient_accept_error(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::ConnectionAborted
+    )
 }
 
 fn wait_for_listener_or_shutdown(
@@ -487,6 +495,18 @@ mod tests {
             PathBuf::from("/tmp").join(format!(".bb.{}.{}", std::process::id(), id + 1))
         );
         assert_eq!(next_id.load(Ordering::Relaxed), id + 2);
+    }
+
+    #[test]
+    fn classifies_transient_accept_errors() {
+        assert!(is_transient_accept_error(std::io::ErrorKind::WouldBlock));
+        assert!(is_transient_accept_error(std::io::ErrorKind::Interrupted));
+        assert!(is_transient_accept_error(
+            std::io::ErrorKind::ConnectionAborted
+        ));
+        assert!(!is_transient_accept_error(
+            std::io::ErrorKind::PermissionDenied
+        ));
     }
 
     #[test]
