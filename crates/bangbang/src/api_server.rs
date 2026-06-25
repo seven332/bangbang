@@ -1,9 +1,11 @@
+use std::ffi::{CString, OsString};
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bangbang_api::http::{handle_request_bytes, request_total_len, HttpResponse, RequestError};
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
@@ -54,8 +56,11 @@ impl ApiServer {
             return Err(ApiServerError::SocketPathExists);
         }
 
-        let listener = UnixListener::bind(path).map_err(|err| ApiServerError::Bind(err.kind()))?;
-        let socket_guard = SocketGuard::new(path)?;
+        let (listener, metadata) = bind_unpublished_socket(path)?;
+        publish_socket_path(&metadata.path, path).inspect_err(|_| {
+            let _ = fs::remove_file(&metadata.path);
+        })?;
+        let socket_guard = SocketGuard::new(path, metadata);
 
         Ok(Self {
             listener,
@@ -82,6 +87,13 @@ impl ApiServer {
 }
 
 #[derive(Debug)]
+struct BoundSocketMetadata {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+#[derive(Debug)]
 struct SocketGuard {
     path: PathBuf,
     dev: u64,
@@ -89,27 +101,20 @@ struct SocketGuard {
 }
 
 impl SocketGuard {
-    fn new(path: &Path) -> Result<Self, ApiServerError> {
-        let metadata =
-            fs::symlink_metadata(path).map_err(|err| ApiServerError::SocketMetadata(err.kind()))?;
-
-        if !metadata.file_type().is_socket() {
-            return Err(ApiServerError::SocketPathIsNotSocket);
-        }
-
-        Ok(Self {
+    fn new(path: &Path, metadata: BoundSocketMetadata) -> Self {
+        Self {
             path: path.to_path_buf(),
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-        })
+            dev: metadata.dev,
+            ino: metadata.ino,
+        }
     }
 
     fn owns_current_path(&self) -> bool {
-        let Ok(metadata) = fs::symlink_metadata(&self.path) else {
+        let Ok(metadata) = socket_path_metadata(&self.path) else {
             return false;
         };
 
-        metadata.file_type().is_socket() && metadata.dev() == self.dev && metadata.ino() == self.ino
+        metadata.dev() == self.dev && metadata.ino() == self.ino
     }
 }
 
@@ -119,6 +124,107 @@ impl Drop for SocketGuard {
             let _ = fs::remove_file(&self.path);
         }
     }
+}
+
+fn socket_path_metadata(path: &Path) -> Result<fs::Metadata, ApiServerError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|err| ApiServerError::SocketMetadata(err.kind()))?;
+
+    if !metadata.file_type().is_socket() {
+        return Err(ApiServerError::SocketPathIsNotSocket);
+    }
+
+    Ok(metadata)
+}
+
+fn bind_unpublished_socket(
+    path: &Path,
+) -> Result<(UnixListener, BoundSocketMetadata), ApiServerError> {
+    for attempt in 0..16 {
+        let temp_path = temporary_socket_path(path, attempt);
+        let listener = match UnixListener::bind(&temp_path) {
+            Ok(listener) => listener,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::AddrInUse | std::io::ErrorKind::AlreadyExists
+                ) =>
+            {
+                continue;
+            }
+            Err(err) => return Err(ApiServerError::Bind(err.kind())),
+        };
+        let metadata = match socket_path_metadata(&temp_path) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                let _ = fs::remove_file(&temp_path);
+                return Err(err);
+            }
+        };
+
+        return Ok((
+            listener,
+            BoundSocketMetadata {
+                path: temp_path,
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            },
+        ));
+    }
+
+    Err(ApiServerError::Bind(std::io::ErrorKind::AlreadyExists))
+}
+
+fn temporary_socket_path(path: &Path, attempt: u8) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+
+    let mut temp_name = OsString::from(".bb.");
+    temp_name.push(format!("{}.{}.{}.sock", std::process::id(), nanos, attempt));
+
+    path.with_file_name(temp_name)
+}
+
+#[cfg(target_os = "macos")]
+fn publish_socket_path(from: &Path, to: &Path) -> Result<(), ApiServerError> {
+    use std::os::raw::{c_char, c_int, c_uint};
+
+    const RENAME_EXCL: c_uint = 0x0000_0004;
+
+    unsafe extern "C" {
+        fn renamex_np(from: *const c_char, to: *const c_char, flags: c_uint) -> c_int;
+    }
+
+    let from = path_to_cstring(from)?;
+    let to = path_to_cstring(to)?;
+    // SAFETY: both pointers come from live `CString` values and are valid
+    // NUL-terminated paths for the duration of this call.
+    let result = unsafe { renamex_np(from.as_ptr(), to.as_ptr(), RENAME_EXCL) };
+    if result == 0 {
+        return Ok(());
+    }
+
+    let kind = std::io::Error::last_os_error().kind();
+    if kind == std::io::ErrorKind::AlreadyExists {
+        Err(ApiServerError::SocketPathExists)
+    } else {
+        Err(ApiServerError::Bind(kind))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn publish_socket_path(from: &Path, to: &Path) -> Result<(), ApiServerError> {
+    if path_exists_without_following_links(to)? {
+        return Err(ApiServerError::SocketPathExists);
+    }
+
+    fs::rename(from, to).map_err(|err| ApiServerError::Bind(err.kind()))
+}
+
+fn path_to_cstring(path: &Path) -> Result<CString, ApiServerError> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| ApiServerError::Bind(std::io::ErrorKind::InvalidInput))
 }
 
 fn path_exists_without_following_links(path: &Path) -> Result<bool, ApiServerError> {
@@ -355,6 +461,28 @@ mod tests {
             .file_type()
             .is_symlink());
 
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn publish_does_not_replace_existing_socket_path() {
+        let path = unique_socket_path("publish-race");
+        let temp_path = unique_socket_path("publish-temp");
+        let temp_listener = UnixListener::bind(&temp_path).expect("temporary listener should bind");
+        fs::write(&path, "replacement").expect("replacement should be written");
+
+        let err = publish_socket_path(&temp_path, &path)
+            .expect_err("publishing over an existing path should fail");
+
+        assert_eq!(err, ApiServerError::SocketPathExists);
+        assert_eq!(
+            fs::read_to_string(&path).expect("replacement should remain"),
+            "replacement"
+        );
+        assert!(temp_path.exists());
+
+        drop(temp_listener);
+        fs::remove_file(temp_path).expect("temporary socket should clean up");
         fs::remove_file(path).expect("fixture should clean up");
     }
 
