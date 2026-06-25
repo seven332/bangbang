@@ -75,18 +75,19 @@ The version response body is Firecracker-shaped JSON:
 ## Build
 
 ```sh
-cargo check
-cargo test
+cargo check --workspace --all-targets --all-features --locked
+cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf
 ```
 
-On macOS Apple Silicon hosts, the ignored HVF lifecycle smoke test requires the
-test binary to be signed with the Hypervisor entitlement before running:
+On macOS Apple Silicon hosts, `bangbang-hvf` contains a real HVF lifecycle smoke
+test. The test is not ignored; sign the test binary with the Hypervisor
+entitlement and run it directly:
 
 ```sh
-cargo test -p bangbang-hvf --no-run
-TEST_BIN=$(cargo test -p bangbang-hvf --no-run --message-format=json \
+TEST_BIN=$(cargo test -p bangbang-hvf --all-targets --all-features --locked --no-run --message-format=json \
   | sed -n 's/.*"executable":"\([^"]*bangbang_hvf-[^"]*\)".*/\1/p' \
-  | head -1)
+  | tail -1)
+test -n "$TEST_BIN"
 ENTITLEMENTS=$(mktemp "${TMPDIR:-/tmp}/bangbang-hvf-entitlements.XXXXXX")
 cat > "$ENTITLEMENTS" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -99,7 +100,7 @@ cat > "$ENTITLEMENTS" <<'EOF'
 </plist>
 EOF
 codesign --force --sign - --entitlements "$ENTITLEMENTS" "$TEST_BIN"
-BANGBANG_RUN_HVF_TESTS=1 "$TEST_BIN" --ignored
+"$TEST_BIN"
 ```
 
 Run the VMM process skeleton and API server:

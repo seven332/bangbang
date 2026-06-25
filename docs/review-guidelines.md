@@ -22,10 +22,14 @@ Run the repository checks before opening or updating a pull request:
 ```sh
 cargo fmt --all -- --check
 cargo check --workspace --all-targets --all-features --locked
-cargo test --workspace --all-targets --all-features --locked
+cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 ```
+
+On macOS Apple Silicon, also sign and run the `bangbang-hvf` test binary as
+shown in `README.md`. HVF lifecycle tests should not be skipped or ignored when
+they are in scope for the PR.
 
 Reviewers should confirm the PR body lists the checks that were run. If any
 command is intentionally skipped, the PR should explain why the skipped command

@@ -111,16 +111,7 @@ mod tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
-    #[ignore = "requires a signed Hypervisor.framework entitlement on macOS Apple Silicon"]
     fn creates_and_destroys_hvf_vcpu() {
-        if std::env::var("BANGBANG_RUN_HVF_TESTS").as_deref() != Ok("1") {
-            eprintln!(
-                "sign the test binary with com.apple.security.hypervisor and set \
-                 BANGBANG_RUN_HVF_TESTS=1 to run real HVF lifecycle smoke tests"
-            );
-            return;
-        }
-
         let mut backend = HvfBackend::new();
 
         backend.create_vm().expect("VM should be created");

@@ -15,7 +15,7 @@ env:
 jobs:
   rust:
     name: rust
-    runs-on: macos-latest
+    runs-on: macos-26
     timeout-minutes: 15
 
     steps:
@@ -39,7 +39,29 @@ jobs:
         run: cargo check --workspace --all-targets --all-features --locked
 
       - name: Run tests
-        run: cargo test --workspace --all-targets --all-features --locked
+        run: cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf
+
+      - name: Run signed HVF smoke test
+        run: |
+          TEST_BIN=$(cargo test -p bangbang-hvf --all-targets --all-features --locked --no-run --message-format=json \
+            | sed -n 's/.*"executable":"\([^"]*bangbang_hvf-[^"]*\)".*/\1/p' \
+            | tail -1)
+          test -n "$TEST_BIN"
+
+          ENTITLEMENTS=$(mktemp "${TMPDIR:-/tmp}/bangbang-hvf-entitlements.XXXXXX")
+          cat > "$ENTITLEMENTS" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.hypervisor</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+          codesign --force --sign - --entitlements "$ENTITLEMENTS" "$TEST_BIN"
+          "$TEST_BIN"
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
