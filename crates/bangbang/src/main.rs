@@ -320,7 +320,7 @@ fn os_arg_into_string(arg: OsString) -> Result<String, String> {
 
 fn print_help() {
     println!(
-        "bangbang {}\n\nUsage:\n  bangbang [OPTIONS]\n\nOptions:\n      --api-sock <PATH>  Unix domain socket path for the API server [default: {}]\n      --id <ID>          MicroVM unique identifier [default: {}]\n  -V, --version          Print version\n  -h, --help             Print help\n\nCurrent scope:\n  Serves GET /version over the API socket; VM startup is not implemented yet.",
+        "bangbang {}\n\nUsage:\n  bangbang [OPTIONS]\n\nOptions:\n      --api-sock <PATH>  Unix domain socket path for the API server [default: {}]\n      --id <ID>          MicroVM unique identifier: 1-64 bytes, ASCII alphanumeric or '-' [default: {}]\n  -V, --version          Print version\n  -h, --help             Print help\n\nCurrent scope:\n  Serves GET /version over the API socket; VM startup is not implemented yet.",
         env!("CARGO_PKG_VERSION"),
         DEFAULT_API_SOCK_PATH,
         DEFAULT_INSTANCE_ID
@@ -618,9 +618,15 @@ mod tests {
 
     #[test]
     fn rejects_id_with_non_ascii_alphanumeric() {
-        let err = parse(&["--id", "vmé1"]).expect_err("non-ascii id should fail");
+        const NON_ASCII_ALPHANUMERIC: char = '\u{e9}';
 
-        assert_eq!(err, "invalid --id: invalid character 'é' at position 2");
+        let id = format!("vm{NON_ASCII_ALPHANUMERIC}1");
+        let err = Args::parse(["--id".to_string(), id]).expect_err("non-ascii id should fail");
+
+        assert_eq!(
+            err,
+            format!("invalid --id: invalid character {NON_ASCII_ALPHANUMERIC:?} at position 2")
+        );
     }
 
     #[test]
@@ -636,7 +642,7 @@ mod tests {
 
     #[test]
     fn rejects_multibyte_id_over_max_length_by_bytes() {
-        let id = "é".repeat(MAX_INSTANCE_ID_LEN / 2 + 1);
+        let id = "\u{e9}".repeat(MAX_INSTANCE_ID_LEN / 2 + 1);
         let err = Args::parse(["--id".to_string(), id]).expect_err("long id should fail");
 
         assert_eq!(
