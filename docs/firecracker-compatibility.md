@@ -5,7 +5,7 @@ is a planning reference for future API, VMM, and backend work; it does not mean
 the current scaffold implements all listed API behavior.
 
 The current repository defines crate boundaries, endpoint names, a minimal
-HTTP-over-Unix-socket API server for `GET /version`, a backend-neutral VM
+HTTP-over-Unix-socket API server for `GET /` and `GET /version`, a backend-neutral VM
 trait, a minimal read-only VMM action/data model, a minimal
 Hypervisor.framework VM create/destroy wrapper, and an initial process startup
 argument model. There is no broader API request body model, guest memory
@@ -18,16 +18,17 @@ manages one microVM. Future API work should keep the control plane outside the
 guest execution fast path.
 
 The intended public control plane is Firecracker-style HTTP over a Unix domain
-socket. The implemented `GET /version` request already maps through a minimal
-internal VMM action/data boundary. Future API requests should map to explicit
-VMM actions and VM state transitions, but this document only defines the
-initial scope.
+socket. The implemented `GET /` and `GET /version` requests already map
+through a minimal internal VMM action/data boundary. Future API requests should
+map to explicit VMM actions and VM state transitions, but this document only
+defines the initial scope.
 
 ## Process Startup CLI
 
 The current `bangbang` executable parses only the first process-lifecycle
 arguments and starts the first API socket surface. It binds a Unix socket and
-serves `GET /version`, but does not load a configuration file or start a guest.
+serves `GET /` and `GET /version`, but does not load a configuration file or
+start a guest.
 
 | Argument | Current behavior | Compatibility notes |
 | --- | --- | --- |
@@ -105,9 +106,9 @@ before changing this reference.
 
 ## Support Level Vocabulary
 
-The current scaffold implements only `GET /version` over HTTP on a Unix domain
-socket. The support levels below describe compatibility targets for future API
-work:
+The current scaffold implements only `GET /` and `GET /version` over HTTP on a
+Unix domain socket. The support levels below describe compatibility targets for
+future API work:
 
 - supported target: planned for the first boot-oriented API implementation
 - planned later: expected to be compatible later, but outside the first tier
@@ -134,8 +135,8 @@ compatibility targets.
 
 | Method | Endpoint | Support level | Scope notes |
 | --- | --- | --- | --- |
-| `GET` | `/` | supported target | Describe the microVM instance. |
-| `GET` | `/version` | supported target; implemented first | Report the VMM version with a Firecracker-shaped body. |
+| `GET` | `/` | supported target; implemented | Describe the microVM instance. The current state remains `Not started` until startup behavior exists. |
+| `GET` | `/version` | supported target; implemented | Report the VMM version with a Firecracker-shaped body. |
 | `GET` | `/vm/config` | supported target | Return the full VM configuration once configuration models exist. |
 | `GET` | `/machine-config` | supported target | Return machine configuration and defaults. |
 | `PUT` | `/machine-config` | supported target | Configure vCPU and memory settings before boot. |
@@ -205,14 +206,16 @@ setup, memory size, and block device I/O when those surfaces are implemented.
 
 ## API State and Response Policy
 
-The current scaffold implements the first HTTP API behavior for `GET /version`.
+The current scaffold implements the first HTTP API behavior for `GET /` and
+`GET /version`.
 The policy below is the compatibility target for future request parsing, VMM
 action mapping, state validation, and golden API tests.
 
 The implemented `GET /version` path currently flows through the minimal
 read-only VMM action model as `GetVmmVersion` and returns VMM version data.
-The internal instance information state model also exists for future `GET /`,
-but `GET /` itself is not implemented yet.
+The implemented `GET /` path flows through the same boundary as
+`GetVmInstanceInfo` and returns Firecracker-shaped instance information. The
+state currently remains `Not started` until real startup behavior exists.
 
 ### Initial API State Model
 
@@ -232,7 +235,7 @@ The first API implementation should model the same broad stages as Firecracker:
 
 | Operation | Pre-boot behavior | Runtime behavior | Notes |
 | --- | --- | --- | --- |
-| `GET /` | supported target; `200` JSON | supported target; `200` JSON | Response state should reflect the current microVM state. |
+| `GET /` | implemented; `200` JSON | implemented; `200` JSON | Response state should reflect the current microVM state. It currently remains `Not started` until startup behavior exists. |
 | `GET /version` | implemented; `200` JSON | implemented; `200` JSON | Body uses Firecracker's `firecracker_version` field shape. |
 | `GET /vm/config` | supported target; `200` JSON | supported target; `200` JSON | Returns the accumulated or active VM configuration once models exist. |
 | `GET /machine-config` | supported target; `200` JSON | supported target; `200` JSON | Returns machine configuration and defaulted values. |

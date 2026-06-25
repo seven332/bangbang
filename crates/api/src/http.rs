@@ -7,6 +7,7 @@ const MAX_HEADERS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiRequest {
+    GetInstanceInfo,
     GetVersion,
 }
 
@@ -66,6 +67,21 @@ pub struct HttpResponse {
 }
 
 impl HttpResponse {
+    pub fn instance_info(id: &str, state: &str, vmm_version: &str, app_name: &str) -> Self {
+        let body = serde_json::json!({
+            "app_name": app_name,
+            "id": id,
+            "state": state,
+            "vmm_version": vmm_version,
+        })
+        .to_string();
+
+        Self {
+            status: StatusCode::Ok,
+            body,
+        }
+    }
+
     pub fn version(version: &str) -> Self {
         let body = serde_json::json!({ "firecracker_version": version }).to_string();
 
@@ -129,6 +145,7 @@ pub fn parse_request(bytes: &[u8]) -> Result<ApiRequest, RequestError> {
     }
 
     match (method, path) {
+        ("GET", "/") => Ok(ApiRequest::GetInstanceInfo),
         ("GET", "/version") => Ok(ApiRequest::GetVersion),
         _ => Err(RequestError::InvalidPathMethod),
     }
@@ -274,6 +291,7 @@ fn checked_request_len(header_len: usize, content_length: usize) -> Result<usize
 impl From<ApiRequest> for Endpoint {
     fn from(request: ApiRequest) -> Self {
         match request {
+            ApiRequest::GetInstanceInfo => Self::DescribeInstance,
             ApiRequest::GetVersion => Self::Version,
         }
     }
@@ -284,6 +302,30 @@ mod tests {
     use super::*;
 
     const VERSION: &str = "0.1.0";
+
+    #[test]
+    fn parses_get_instance_info() {
+        let request = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+        assert_eq!(parse_request(request), Ok(ApiRequest::GetInstanceInfo));
+        assert_eq!(request_total_len(request), Ok(Some(request.len())));
+    }
+
+    #[test]
+    fn rejects_get_instance_info_with_body() {
+        let request =
+            b"GET / HTTP/1.1\r\nContent-Length: 2\r\nContent-Type: application/json\r\n\r\n{}";
+
+        assert_eq!(parse_request(request), Err(RequestError::GetRequestBody));
+    }
+
+    #[test]
+    fn parses_get_instance_info_with_zero_content_length() {
+        let request = b"GET / HTTP/1.1\r\nContent-Length:\t0 \r\n\r\n";
+
+        assert_eq!(parse_request(request), Ok(ApiRequest::GetInstanceInfo));
+        assert_eq!(request_total_len(request), Ok(Some(request.len())));
+    }
 
     #[test]
     fn parses_get_version() {
@@ -335,7 +377,7 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_path() {
-        let request = b"GET / HTTP/1.1\r\n\r\n";
+        let request = b"GET /unknown HTTP/1.1\r\n\r\n";
 
         assert_eq!(parse_request(request), Err(RequestError::InvalidPathMethod));
     }
@@ -421,6 +463,24 @@ mod tests {
     }
 
     #[test]
+    fn response_body_contains_instance_info() {
+        let response = HttpResponse::instance_info("demo-1", "Not started", VERSION, "bangbang");
+        let body: serde_json::Value =
+            serde_json::from_str(response.body()).expect("body should be JSON");
+
+        assert_eq!(response.status(), StatusCode::Ok);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "app_name": "bangbang",
+                "id": "demo-1",
+                "state": "Not started",
+                "vmm_version": "0.1.0",
+            })
+        );
+    }
+
+    #[test]
     fn fault_body_contains_fault_message() {
         let response = HttpResponse::fault("message");
 
@@ -438,5 +498,14 @@ mod tests {
         assert!(text.contains("Content-Type: application/json\r\n"));
         assert!(text.contains(&format!("Content-Length: {}\r\n", response.body().len())));
         assert!(text.ends_with(r#"{"firecracker_version":"0.1.0"}"#));
+    }
+
+    #[test]
+    fn api_request_converts_to_endpoint() {
+        assert_eq!(
+            Endpoint::from(ApiRequest::GetInstanceInfo),
+            Endpoint::DescribeInstance
+        );
+        assert_eq!(Endpoint::from(ApiRequest::GetVersion), Endpoint::Version);
     }
 }
