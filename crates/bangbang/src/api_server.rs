@@ -340,6 +340,16 @@ fn handle_connection(stream: &mut UnixStream, version: &str) -> Result<(), ApiSe
 
 fn read_request(stream: &mut UnixStream, timeout: Duration) -> Result<RequestRead, ApiServerError> {
     let deadline = Instant::now() + timeout;
+    let mut now = Instant::now;
+
+    read_request_until(stream, deadline, &mut now)
+}
+
+fn read_request_until(
+    stream: &mut UnixStream,
+    deadline: Instant,
+    now: &mut impl FnMut() -> Instant,
+) -> Result<RequestRead, ApiServerError> {
     let mut request = Vec::new();
     let mut chunk = [0; READ_CHUNK_SIZE];
 
@@ -360,7 +370,7 @@ fn read_request(stream: &mut UnixStream, timeout: Duration) -> Result<RequestRea
         }
 
         let read_len = chunk.len().min(remaining);
-        let Some(read_timeout) = deadline.checked_duration_since(Instant::now()) else {
+        let Some(read_timeout) = deadline.checked_duration_since(now()) else {
             return Ok(RequestRead::Complete(request));
         };
         if read_timeout.is_zero() {
@@ -398,7 +408,7 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::sync::{Arc, Barrier};
     use std::thread;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::*;
 
@@ -593,7 +603,18 @@ mod tests {
             .write_all(partial_request)
             .expect("client should write partial request");
 
-        let request = read_request(&mut server, Duration::from_millis(1))
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(1);
+        let mut first_now = true;
+        let mut now = || {
+            if std::mem::replace(&mut first_now, false) {
+                start
+            } else {
+                deadline + Duration::from_nanos(1)
+            }
+        };
+
+        let request = read_request_until(&mut server, deadline, &mut now)
             .expect("read timeout should not fail");
 
         assert_eq!(request, RequestRead::Complete(partial_request.to_vec()));
