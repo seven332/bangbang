@@ -5,13 +5,15 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use bangbang_api::http::{handle_request_bytes, request_total_len, HttpResponse, RequestError};
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 
 const READ_CHUNK_SIZE: usize = 4096;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+static NEXT_TEMP_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ApiServerError {
@@ -140,8 +142,8 @@ fn socket_path_metadata(path: &Path) -> Result<fs::Metadata, ApiServerError> {
 fn bind_unpublished_socket(
     path: &Path,
 ) -> Result<(UnixListener, BoundSocketMetadata), ApiServerError> {
-    for attempt in 0..16 {
-        let temp_path = temporary_socket_path(path, attempt);
+    for _ in 0..16 {
+        let temp_path = temporary_socket_path(path);
         let listener = match UnixListener::bind(&temp_path) {
             Ok(listener) => listener,
             Err(err)
@@ -175,13 +177,10 @@ fn bind_unpublished_socket(
     Err(ApiServerError::Bind(std::io::ErrorKind::AlreadyExists))
 }
 
-fn temporary_socket_path(path: &Path, attempt: u8) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-
+fn temporary_socket_path(path: &Path) -> PathBuf {
+    let id = NEXT_TEMP_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
     let mut temp_name = OsString::from(".bb.");
-    temp_name.push(format!("{}.{}.{}.sock", std::process::id(), nanos, attempt));
+    temp_name.push(format!("{}.{}", std::process::id(), id));
 
     path.with_file_name(temp_name)
 }
@@ -328,6 +327,31 @@ mod tests {
             .expect("system clock should be after unix epoch")
             .as_nanos();
         env::temp_dir().join(format!("bb-{name}-{}-{nanos}.sock", std::process::id()))
+    }
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let path = PathBuf::from("/tmp").join(format!("bb-{name}-{}-{nanos}", std::process::id()));
+        fs::create_dir(&path).expect("fixture directory should be created");
+        path
+    }
+
+    fn temporary_socket_entries(dir: &Path) -> Vec<PathBuf> {
+        let prefix = format!(".bb.{}.", std::process::id());
+        let mut paths = fs::read_dir(dir)
+            .expect("fixture directory should be readable")
+            .filter_map(|entry| {
+                let entry = entry.expect("fixture directory entry should be readable");
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with(&prefix).then(|| entry.path())
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
     }
 
     #[test]
@@ -492,7 +516,8 @@ mod tests {
     fn concurrent_binds_allow_only_one_owner() {
         const ATTEMPTS: usize = 8;
 
-        let path = unique_socket_path("concurrent");
+        let dir = unique_temp_dir("concurrent");
+        let path = dir.join("api.sock");
         let start = Arc::new(Barrier::new(ATTEMPTS));
         let finish = Arc::new(Barrier::new(ATTEMPTS));
         let handles = (0..ATTEMPTS)
@@ -504,12 +529,15 @@ mod tests {
                 thread::spawn(move || {
                     start.wait();
                     let result = ApiServer::bind(&path);
-                    let outcome = match &result {
-                        Ok(_) => Ok(()),
-                        Err(err) => Err(err),
-                    };
+                    let outcome = (
+                        result.is_ok(),
+                        matches!(
+                            result.as_ref().err(),
+                            Some(ApiServerError::SocketPathExists)
+                        ),
+                    );
                     finish.wait();
-                    outcome.map_err(|err| matches!(err, ApiServerError::SocketPathExists))
+                    outcome
                 })
             })
             .collect::<Vec<_>>();
@@ -519,15 +547,18 @@ mod tests {
             .map(|handle| handle.join().expect("bind thread should not panic"))
             .collect::<Vec<_>>();
 
-        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|(is_ok, _)| *is_ok).count(), 1);
         assert_eq!(
             results
                 .iter()
-                .filter(|result| matches!(result, Err(true)))
+                .filter(|(_, is_path_exists)| *is_path_exists)
                 .count(),
             ATTEMPTS - 1
         );
         assert!(!path.exists());
+        assert_eq!(temporary_socket_entries(&dir), Vec::<PathBuf>::new());
+
+        fs::remove_dir(dir).expect("fixture directory should clean up");
     }
 
     #[test]
