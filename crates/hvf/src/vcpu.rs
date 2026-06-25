@@ -25,7 +25,7 @@ impl<'vm> HvfVcpu<'vm> {
         })
     }
 
-    pub fn destroy(mut self) -> Result<(), BackendError> {
+    pub fn destroy(&mut self) -> Result<(), BackendError> {
         self.destroy_inner()
     }
 
@@ -33,6 +33,7 @@ impl<'vm> HvfVcpu<'vm> {
         if let Some(vcpu) = self.vcpu {
             crate::ffi::destroy_vcpu(vcpu)?;
             self.vcpu = None;
+            self.exit = std::ptr::null_mut();
         }
         Ok(())
     }

@@ -37,7 +37,7 @@ Unsafe code must stay isolated behind small FFI wrappers, with `SAFETY:` comment
 
 Use Rust’s built-in test framework with `#[test]`. Add focused unit tests for argument parsing, error formatting, and backend state transitions as those surfaces grow. Test names should describe behavior, such as `parse_help_arg` or `displays_hypervisor_error`.
 
-Do not add integration tests that require creating real Hypervisor.framework VMs until the runtime can gate them clearly by platform and privileges.
+Real Hypervisor.framework integration tests must stay in `crates/hvf/tests/` and run through `scripts/run-hvf-tests.sh` so the test binary is signed and unsupported hosts are handled explicitly. Do not run or add real HVF integration tests through the unsigned workspace test path.
 
 ## Commit & Pull Request Guidelines
 
