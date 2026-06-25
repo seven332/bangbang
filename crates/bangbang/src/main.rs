@@ -635,6 +635,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_multibyte_id_over_max_length_by_bytes() {
+        let id = "é".repeat(MAX_INSTANCE_ID_LEN / 2 + 1);
+        let err = Args::parse(["--id".to_string(), id]).expect_err("long id should fail");
+
+        assert_eq!(
+            err,
+            "invalid --id: invalid length 66; length must be between 1 and 64"
+        );
+    }
+
+    #[test]
     fn rejects_unsupported_firecracker_config_file_arg() {
         let err = parse(&["--config-file", "vm.json"]).expect_err("unsupported arg should fail");
 

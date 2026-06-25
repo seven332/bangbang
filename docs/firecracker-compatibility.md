@@ -35,6 +35,10 @@ serves `GET /version`, but does not load a configuration file or start a guest.
 | `--config-file`, `--no-api` | rejected | Deferred until VM configuration models and no-API startup behavior exist. |
 | seccomp, logger, metrics, snapshot, MMDS, boot timer, payload-size, and PCI process flags | rejected | These Firecracker options are Linux-specific, observability-related, or tied to later capability work. They must not be accepted as no-op compatibility shims. |
 
+bangbang intentionally treats `--id` alphanumeric characters as ASCII only.
+This is stricter than Firecracker `v1.16.0`'s Rust validator, which accepts
+Unicode alphanumeric characters.
+
 Only the Firecracker-style `--arg value` form is supported for the initial
 startup arguments. The `--arg=value` form is rejected until a separate
 compatibility decision expands the CLI parser.
