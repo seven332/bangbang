@@ -357,7 +357,7 @@ fn validate_instance_id(id: &str) -> Result<(), String> {
     }
 
     for (position, ch) in id.chars().enumerate() {
-        if !(ch == '-' || ch.is_alphanumeric()) {
+        if !(ch == '-' || ch.is_ascii_alphanumeric()) {
             return Err(format!(
                 "invalid --id: invalid character {ch:?} at position {position}"
             ));
@@ -614,6 +614,13 @@ mod tests {
         let err = parse(&["--id", "vm:1"]).expect_err("colon id should fail");
 
         assert_eq!(err, "invalid --id: invalid character ':' at position 2");
+    }
+
+    #[test]
+    fn rejects_id_with_non_ascii_alphanumeric() {
+        let err = parse(&["--id", "vmé1"]).expect_err("non-ascii id should fail");
+
+        assert_eq!(err, "invalid --id: invalid character 'é' at position 2");
     }
 
     #[test]

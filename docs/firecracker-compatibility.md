@@ -29,7 +29,7 @@ serves `GET /version`, but does not load a configuration file or start a guest.
 | Argument | Current behavior | Compatibility notes |
 | --- | --- | --- |
 | `--api-sock <PATH>` | binds the API Unix socket | Firecracker defaults to `/run/firecracker.socket`; bangbang defaults to `/tmp/bangbang.socket` because macOS does not normally provide `/run`. This is an intentional host-platform difference. |
-| `--id <ID>` | parsed and stored | Defaults to Firecracker's `anonymous-instance`. IDs must be 1 to 64 bytes and contain only alphanumeric characters or `-`, matching the Firecracker `v1.16.0` validator policy. |
+| `--id <ID>` | parsed and stored | Defaults to Firecracker's `anonymous-instance`. IDs must be 1 to 64 bytes and contain only ASCII alphanumeric characters or `-`. |
 | `--help`, `-h` | prints help | Help describes the current API socket scope. |
 | `--version`, `-V` | prints version | `-V` is retained from the existing bangbang scaffold. |
 | `--config-file`, `--no-api` | rejected | Deferred until VM configuration models and no-API startup behavior exist. |
