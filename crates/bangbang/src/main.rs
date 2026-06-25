@@ -142,17 +142,16 @@ impl Args {
                     id_seen = true;
                     index += 2;
                 }
-                other if unsupported_firecracker_arg(other).is_some() => {
-                    return Err(format!("unsupported Firecracker argument: {other}"));
+                other if let Some(name) = unsupported_firecracker_arg(other) => {
+                    return Err(format!("unsupported Firecracker argument: --{name}"));
                 }
                 other if let Some(name) = unsupported_equals_syntax(other) => {
                     return Err(format!(
-                        "unsupported argument syntax: {other}; use --{} <VALUE>",
-                        name
+                        "unsupported argument syntax for --{name}; use --{name} <VALUE>"
                     ));
                 }
                 other if other.starts_with('-') => {
-                    return Err(format!("unknown argument: {other}"))
+                    return Err(format!("unknown argument: {}", display_arg_name(other)));
                 }
                 other => return Err(format!("unexpected positional argument: {other}")),
             }
@@ -183,6 +182,10 @@ fn take_value(args: &[String], index: usize, name: &str) -> Result<String, Strin
 fn validate_api_sock(api_sock: &str) -> Result<(), String> {
     if api_sock.is_empty() {
         return Err("invalid --api-sock: path must not be empty".to_string());
+    }
+
+    if api_sock.chars().any(char::is_control) {
+        return Err("invalid --api-sock: path must not contain control characters".to_string());
     }
 
     Ok(())
@@ -218,6 +221,10 @@ fn firecracker_arg_name(arg: &str) -> Option<&str> {
     let name = arg.strip_prefix("--")?;
 
     Some(name.split_once('=').map_or(name, |(name, _)| name))
+}
+
+fn display_arg_name(arg: &str) -> &str {
+    arg.split_once('=').map_or(arg, |(name, _)| name)
 }
 
 fn unsupported_equals_syntax(arg: &str) -> Option<&'static str> {
@@ -362,6 +369,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_api_sock_with_control_character() {
+        let err = parse(&["--api-sock", "/tmp/bangbang\n.socket"])
+            .expect_err("api socket with control character should fail");
+
+        assert_eq!(
+            err,
+            "invalid --api-sock: path must not contain control characters"
+        );
+    }
+
+    #[test]
     fn rejects_empty_id() {
         let err = parse(&["--id", ""]).expect_err("empty id should fail");
 
@@ -407,10 +425,7 @@ mod tests {
     fn rejects_unsupported_firecracker_config_file_equals_arg() {
         let err = parse(&["--config-file=vm.json"]).expect_err("unsupported arg should fail");
 
-        assert_eq!(
-            err,
-            "unsupported Firecracker argument: --config-file=vm.json"
-        );
+        assert_eq!(err, "unsupported Firecracker argument: --config-file");
     }
 
     #[test]
@@ -434,13 +449,20 @@ mod tests {
 
         assert_eq!(
             err,
-            "unsupported argument syntax: --api-sock=/tmp/bangbang.socket; use --api-sock <VALUE>"
+            "unsupported argument syntax for --api-sock; use --api-sock <VALUE>"
         );
     }
 
     #[test]
     fn rejects_unknown_arg() {
         let err = parse(&["--unknown"]).expect_err("unknown args should fail");
+
+        assert_eq!(err, "unknown argument: --unknown");
+    }
+
+    #[test]
+    fn rejects_unknown_equals_arg_without_echoing_value() {
+        let err = parse(&["--unknown=/tmp/secret"]).expect_err("unknown args should fail");
 
         assert_eq!(err, "unknown argument: --unknown");
     }

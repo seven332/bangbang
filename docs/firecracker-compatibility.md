@@ -40,11 +40,11 @@ startup arguments. The `--arg=value` form is rejected until a separate
 compatibility decision expands the CLI parser.
 
 CLI values are untrusted input. Current validation is intentionally string-only:
-it rejects invalid IDs and empty socket paths but performs no filesystem
-creation, canonicalization, deletion, socket binding, permission checks, or VM
-work. Those checks belong with later socket lifecycle and API server work.
-Process CLI parsing stays outside the future VM/vCPU fast path and should add
-only trivial startup overhead.
+it rejects invalid IDs, empty socket paths, and socket paths containing control
+characters, but performs no filesystem creation, canonicalization, deletion,
+socket binding, permission checks, or VM work. Those checks belong with later
+socket lifecycle and API server work. Process CLI parsing stays outside the
+future VM/vCPU fast path and should add only trivial startup overhead.
 
 ## Compatibility Baseline
 
