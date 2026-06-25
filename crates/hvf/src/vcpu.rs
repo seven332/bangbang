@@ -12,7 +12,6 @@ pub struct HvfVcpu<'vm> {
     _not_send_sync: PhantomData<Rc<()>>,
 }
 
-#[derive(Clone, Copy)]
 struct HvfVcpuHandle {
     vcpu: crate::ffi::HvVcpu,
     exit: *mut crate::ffi::HvVcpuExit,
@@ -37,9 +36,11 @@ impl<'vm> HvfVcpu<'vm> {
     }
 
     fn destroy_inner(&mut self) -> Result<(), BackendError> {
-        if let Some(handle) = self.handle {
-            crate::ffi::destroy_vcpu(handle.vcpu)?;
-            self.handle = None;
+        if let Some(handle) = self.handle.take() {
+            if let Err(err) = crate::ffi::destroy_vcpu(handle.vcpu) {
+                self.handle = Some(handle);
+                return Err(err);
+            }
         }
         Ok(())
     }
@@ -53,7 +54,7 @@ impl Drop for HvfVcpu<'_> {
 
 impl fmt::Debug for HvfVcpu<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (vcpu, has_exit) = match self.handle {
+        let (vcpu, has_exit) = match &self.handle {
             Some(handle) => (Some(handle.vcpu), !handle.exit.is_null()),
             None => (None, false),
         };
