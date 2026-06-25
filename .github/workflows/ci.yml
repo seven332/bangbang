@@ -14,15 +14,8 @@ env:
 
 jobs:
   rust:
-    name: rust (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
+    name: rust
+    runs-on: macos-latest
 
     steps:
       - name: Checkout
@@ -30,7 +23,7 @@ jobs:
 
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal --component clippy rustfmt
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
           rustup default stable
 
       - name: Check formatting
