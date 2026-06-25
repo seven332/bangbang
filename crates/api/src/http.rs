@@ -309,6 +309,14 @@ mod tests {
     }
 
     #[test]
+    fn parses_get_version_with_zero_content_length() {
+        let request = b"GET /version HTTP/1.1\r\nContent-Length:\t0 \r\n\r\n";
+
+        assert_eq!(parse_request(request), Ok(ApiRequest::GetVersion));
+        assert_eq!(request_total_len(request), Ok(Some(request.len())));
+    }
+
+    #[test]
     fn rejects_get_version_with_transfer_encoding_body() {
         let request = b"GET /version HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
 
@@ -365,6 +373,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_duplicate_content_length() {
+        let request = b"GET /version HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n";
+
+        assert_eq!(parse_request(request), Err(RequestError::MalformedRequest));
+        assert_eq!(
+            request_total_len(request),
+            Err(RequestError::MalformedRequest)
+        );
+    }
+
+    #[test]
     fn rejects_declared_content_length_over_payload_limit() {
         let request = format!(
             "GET /version HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
@@ -377,6 +396,18 @@ mod tests {
         );
         assert_eq!(
             request_total_len(request.as_bytes()),
+            Err(RequestError::PayloadTooLarge)
+        );
+    }
+
+    #[test]
+    fn rejects_declared_content_length_over_usize() {
+        let request =
+            b"GET /version HTTP/1.1\r\nContent-Length: 999999999999999999999999999999\r\n\r\n";
+
+        assert_eq!(parse_request(request), Err(RequestError::PayloadTooLarge));
+        assert_eq!(
+            request_total_len(request),
             Err(RequestError::PayloadTooLarge)
         );
     }
