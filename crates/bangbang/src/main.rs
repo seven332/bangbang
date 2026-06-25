@@ -171,12 +171,9 @@ impl ShutdownSignal {
 
 impl Drop for ShutdownSignal {
     fn drop(&mut self) {
-        let should_join = !self.requested.load(Ordering::Relaxed);
         self.signal_handle.close();
-        if should_join {
-            if let Some(signal_thread) = self.signal_thread.take() {
-                let _ = signal_thread.join();
-            }
+        if let Some(signal_thread) = self.signal_thread.take() {
+            let _ = signal_thread.join();
         }
     }
 }
