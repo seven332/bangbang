@@ -4,10 +4,11 @@ This document describes bangbang's intended Firecracker compatibility scope. It
 is a planning reference for future API, VMM, and backend work; it does not mean
 the current scaffold implements the listed API behavior.
 
-The current repository only defines crate boundaries, endpoint names, a
-backend-neutral VM trait, and a minimal Hypervisor.framework VM create/destroy
-wrapper. There is no API server, JSON request/response model, `--api-sock`
-argument, guest memory mapping, vCPU loop, or kernel loading yet.
+The current repository defines crate boundaries, endpoint names, a
+backend-neutral VM trait, a minimal Hypervisor.framework VM create/destroy
+wrapper, and an initial process startup argument model. There is no API server,
+Unix socket listener, JSON request/response model, guest memory mapping, vCPU
+loop, or kernel loading yet.
 
 ## Firecracker Model Alignment
 
@@ -18,6 +19,33 @@ guest execution fast path.
 The intended public control plane is Firecracker-style HTTP over a Unix domain
 socket. API requests should eventually map to explicit VMM actions and VM state
 transitions, but this document only defines the initial scope.
+
+## Process Startup CLI
+
+The current `bangbang` executable parses only the first process-lifecycle
+arguments. Parsing records startup configuration but does not bind a Unix
+socket, start an API server, load a configuration file, or start a guest.
+
+| Argument | Current behavior | Compatibility notes |
+| --- | --- | --- |
+| `--api-sock <PATH>` | parsed and stored | Firecracker defaults to `/run/firecracker.socket`; bangbang defaults to `/tmp/bangbang.socket` because macOS does not normally provide `/run`. This is an intentional host-platform difference. |
+| `--id <ID>` | parsed and stored | Defaults to Firecracker's `anonymous-instance`. IDs must be 1 to 64 bytes and contain only alphanumeric characters or `-`, matching the Firecracker `v1.16.0` validator policy. |
+| `--help`, `-h` | prints help | Help describes the current parser-only scope. |
+| `--version`, `-V` | prints version | `-V` is retained from the existing bangbang scaffold. |
+| `--config-file`, `--no-api` | rejected | Deferred until VM configuration models and no-API startup behavior exist. |
+| seccomp, logger, metrics, snapshot, MMDS, boot timer, payload-size, and PCI process flags | rejected | These Firecracker options are Linux-specific, observability-related, or tied to later capability work. They must not be accepted as no-op compatibility shims. |
+
+Only the Firecracker-style `--arg value` form is supported for the initial
+startup arguments. The `--arg=value` form is rejected until a separate
+compatibility decision expands the CLI parser.
+
+CLI values are untrusted input. Current validation is intentionally string-only:
+it rejects invalid IDs, empty socket paths, and socket paths containing control
+characters, but performs no filesystem creation, canonicalization, deletion,
+socket binding, permission checks, or VM work. Those checks belong with later
+socket lifecycle and API server work. Process CLI parsing stays outside the
+future VM/vCPU fast path and should add only trivial startup overhead. Error and
+status output avoid echoing path-like CLI values.
 
 ## Compatibility Baseline
 
