@@ -50,10 +50,7 @@ impl ApiServer {
     pub(crate) fn bind(path: impl AsRef<Path>) -> Result<Self, ApiServerError> {
         let path = path.as_ref();
 
-        if path
-            .try_exists()
-            .map_err(|err| ApiServerError::SocketPathCheck(err.kind()))?
-        {
+        if path_exists_without_following_links(path)? {
             return Err(ApiServerError::SocketPathExists);
         }
 
@@ -94,7 +91,7 @@ struct SocketGuard {
 impl SocketGuard {
     fn new(path: &Path) -> Result<Self, ApiServerError> {
         let metadata =
-            fs::metadata(path).map_err(|err| ApiServerError::SocketMetadata(err.kind()))?;
+            fs::symlink_metadata(path).map_err(|err| ApiServerError::SocketMetadata(err.kind()))?;
 
         if !metadata.file_type().is_socket() {
             return Err(ApiServerError::SocketPathIsNotSocket);
@@ -108,7 +105,7 @@ impl SocketGuard {
     }
 
     fn owns_current_path(&self) -> bool {
-        let Ok(metadata) = fs::metadata(&self.path) else {
+        let Ok(metadata) = fs::symlink_metadata(&self.path) else {
             return false;
         };
 
@@ -121,6 +118,14 @@ impl Drop for SocketGuard {
         if self.owns_current_path() {
             let _ = fs::remove_file(&self.path);
         }
+    }
+}
+
+fn path_exists_without_following_links(path: &Path) -> Result<bool, ApiServerError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(ApiServerError::SocketPathCheck(err.kind())),
     }
 }
 
@@ -206,10 +211,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after unix epoch")
             .as_nanos();
-        env::temp_dir().join(format!(
-            "bangbang-{name}-{}-{nanos}.socket",
-            std::process::id()
-        ))
+        env::temp_dir().join(format!("bb-{name}-{}-{nanos}.sock", std::process::id()))
     }
 
     #[test]
@@ -258,6 +260,33 @@ mod tests {
     }
 
     #[test]
+    fn returns_fault_for_request_over_payload_limit() {
+        let path = unique_socket_path("limit");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+        let request = format!(
+            "GET /version HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            HTTP_MAX_PAYLOAD_SIZE + 1
+        );
+
+        client
+            .write_all(request.as_bytes())
+            .expect("client should write request");
+        server
+            .serve_next(VERSION)
+            .expect("server should handle one request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("client should read response");
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response
+            .contains(r#"{"fault_message":"HTTP request payload exceeds the configured limit."}"#));
+    }
+
+    #[test]
     fn client_disconnect_does_not_fail_server() {
         let path = unique_socket_path("disconnect");
         let server = ApiServer::bind(&path).expect("server should bind");
@@ -285,6 +314,23 @@ mod tests {
             fs::read_to_string(&path).expect("existing file should remain"),
             "existing file"
         );
+
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn fails_when_socket_path_is_broken_symlink_without_deleting_it() {
+        let path = unique_socket_path("symlink");
+        let target = unique_socket_path("missing-target");
+        std::os::unix::fs::symlink(&target, &path).expect("fixture symlink should be created");
+
+        let err = ApiServer::bind(&path).expect_err("existing symlink path should fail");
+
+        assert_eq!(err, ApiServerError::SocketPathExists);
+        assert!(fs::symlink_metadata(&path)
+            .expect("symlink should remain")
+            .file_type()
+            .is_symlink());
 
         fs::remove_file(path).expect("fixture should clean up");
     }

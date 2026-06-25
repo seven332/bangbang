@@ -249,6 +249,8 @@ request payload limit. The `--http-api-max-payload-size` process argument
 remains rejected until configurable payload limits are introduced explicitly.
 Invalid path and method errors use the Firecracker `fault_message` body shape
 but intentionally avoid echoing path-like request values.
+The initial blocking API server also uses a short per-connection timeout so an
+incomplete request cannot hold the single server loop indefinitely.
 
 API request bodies, path identifiers, and host resource paths are untrusted
 input. Future implementations must validate them before mutating VMM state and
