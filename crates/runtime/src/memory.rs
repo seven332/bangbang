@@ -1378,6 +1378,28 @@ mod tests {
     }
 
     #[test]
+    fn guest_memory_access_rejects_unmapped_hole_without_partial_read() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let mut memory =
+            allocate_memory(vec![range(0, page_size), range(2 * page_size, page_size)]);
+        let address = GuestAddress::new(page_size - 1);
+        let access_range = range(page_size - 1, 2);
+        let mut destination = [0x55, 0x66];
+
+        memory
+            .write_slice(&[0xaa], address)
+            .expect("single-byte write before hole should succeed");
+
+        assert_eq!(
+            memory.read_slice(address, &mut destination),
+            Err(GuestMemoryAccessError::UnmappedRange {
+                range: access_range
+            })
+        );
+        assert_eq!(destination, [0x55, 0x66]);
+    }
+
+    #[test]
     fn guest_memory_access_spans_adjacent_ranges() {
         let page_size = host_page_size().expect("host page size should be available for tests");
         let mut memory = allocate_memory(vec![range(0, page_size), range(page_size, page_size)]);
