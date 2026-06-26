@@ -586,8 +586,8 @@ impl Drop for AnonymousMapping {
 mod tests {
     use std::collections::HashSet;
     use std::io;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
     use std::thread;
 
     use super::{
@@ -976,9 +976,14 @@ mod tests {
     #[test]
     fn guest_memory_allocations_are_independent_across_threads() {
         let page_size = host_page_size().expect("host page size should be available for tests");
-        let handles = (0..4)
+        let thread_count = 4;
+        let start = Arc::new(Barrier::new(thread_count));
+        let handles = (0..thread_count)
             .map(|_| {
+                let start = Arc::clone(&start);
                 thread::spawn(move || {
+                    start.wait();
+
                     let layout = GuestMemoryLayout::new(vec![range(0, page_size)])
                         .expect("page-aligned layout should be valid");
 
