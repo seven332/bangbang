@@ -11,6 +11,7 @@ use crate::exit::HvfVcpuExit;
 use crate::vcpu::HvfVcpuOwner;
 
 const RUNNER_SHUT_DOWN_MESSAGE: &str = "vCPU runner is shut down";
+const RUN_IN_FLIGHT_MESSAGE: &str = "vCPU runner already has a run in flight";
 const RUNNER_STATE_POISONED_MESSAGE: &str = "vCPU runner state lock is poisoned";
 const COMMAND_CHANNEL_CLOSED_MESSAGE: &str = "vCPU runner command channel is closed";
 const RESPONSE_CHANNEL_CLOSED_MESSAGE: &str = "vCPU runner response channel is closed";
@@ -203,14 +204,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.thread.is_none() || state.shutting_down {
             return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
         }
+        if state.in_flight_runs > 0 {
+            return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
+        }
 
-        state.in_flight_runs =
-            state
-                .in_flight_runs
-                .checked_add(1)
-                .ok_or(HvfVcpuRunnerError::InvalidState(
-                    "too many in-flight vCPU runs",
-                ))?;
+        state.in_flight_runs = 1;
 
         Ok(self.command_sender.clone())
     }
@@ -516,6 +514,36 @@ mod tests {
         runner
             .shutdown()
             .expect("repeated shutdown should be idempotent");
+    }
+
+    #[test]
+    fn concurrent_run_once_is_rejected() {
+        let (runner, entered_run_receiver, destroyed_receiver) = start_fake_runner();
+
+        thread::scope(|scope| {
+            let run = scope.spawn(|| runner.run_once());
+            entered_run_receiver
+                .recv()
+                .expect("runner should enter fake run");
+
+            assert_eq!(
+                runner.run_once(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::RUN_IN_FLIGHT_MESSAGE
+                ))
+            );
+
+            runner.cancel().expect("cancel should release fake run");
+            assert_eq!(
+                run.join().expect("run thread should join"),
+                Ok(HvfVcpuExit::Canceled)
+            );
+        });
+
+        runner.shutdown().expect("runner should shut down");
+        destroyed_receiver
+            .recv()
+            .expect("fake vCPU should be destroyed");
     }
 
     #[test]
