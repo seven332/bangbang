@@ -260,16 +260,23 @@ fn parse_content_length(value: &[u8]) -> Result<usize, RequestError> {
 }
 
 fn trim_http_optional_whitespace(value: &[u8]) -> &[u8] {
-    let start = value
-        .iter()
-        .position(|&byte| !is_http_optional_whitespace(byte))
-        .unwrap_or(value.len());
-    let end = value
-        .iter()
-        .rposition(|&byte| !is_http_optional_whitespace(byte))
-        .map_or(start, |index| index + 1);
+    let mut value = value;
 
-    &value[start..end]
+    while let Some((&byte, rest)) = value.split_first() {
+        if !is_http_optional_whitespace(byte) {
+            break;
+        }
+        value = rest;
+    }
+
+    while let Some((&byte, rest)) = value.split_last() {
+        if !is_http_optional_whitespace(byte) {
+            break;
+        }
+        value = rest;
+    }
+
+    value
 }
 
 const fn is_http_optional_whitespace(byte: u8) -> bool {

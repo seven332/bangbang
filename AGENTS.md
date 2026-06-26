@@ -15,7 +15,6 @@ Unit tests live next to the code they exercise under each crate’s `src/` tree.
 ## Build, Test, and Development Commands
 
 - `cargo fmt --all -- --check`: verify Rust formatting.
-- `cargo +1.85.0 check --workspace --all-targets --all-features --locked`: verify the declared minimum Rust toolchain.
 - `cargo check --workspace --all-targets --all-features --locked`: type-check the full workspace using the committed lockfile.
 - `cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf`: run non-HVF tests with all targets and features enabled.
 - `cargo test -p bangbang-hvf --lib --all-features --locked`: run unsigned HVF unit tests.
@@ -28,9 +27,13 @@ Use these commands before opening or updating a pull request. For local or self-
 
 ## Coding Style & Naming Conventions
 
+Use the latest stable Rust toolchain; this repository does not declare an MSRV.
+
 Use Rust 2024 edition style and `rustfmt` defaults. Keep modules small and aligned with crate boundaries. Public names should describe stable concepts, not future plans; for example, prefer explicit names like `is_supported_target()` when checking compile-target support only.
 
 Library package names use the `bangbang-*` pattern even when their directory names are shorter, such as `crates/hvf` for `bangbang-hvf`. The executable package is `bangbang` in `crates/bangbang`.
+
+Workspace lints deny Rust warnings, strict rustdoc issues, and selected Clippy lints. Keep test-only Clippy exceptions in `clippy.toml` instead of adding broad inline `allow` attributes.
 
 Unsafe code must stay isolated behind small FFI wrappers, with `SAFETY:` comments explaining each unsafe call.
 

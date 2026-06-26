@@ -454,7 +454,10 @@ fn read_request_until(
             .set_read_timeout(Some(read_timeout))
             .map_err(|err| ApiServerError::Connection(err.kind()))?;
 
-        let bytes_read = match stream.read(&mut chunk[..read_len]) {
+        let read_buffer = chunk
+            .get_mut(..read_len)
+            .ok_or(ApiServerError::Connection(std::io::ErrorKind::InvalidInput))?;
+        let bytes_read = match stream.read(read_buffer) {
             Ok(bytes_read) => bytes_read,
             Err(err)
                 if matches!(
@@ -471,7 +474,10 @@ fn read_request_until(
             return Ok(RequestRead::Complete(request));
         }
 
-        request.extend_from_slice(&chunk[..bytes_read]);
+        let bytes = chunk
+            .get(..bytes_read)
+            .ok_or(ApiServerError::Connection(std::io::ErrorKind::InvalidInput))?;
+        request.extend_from_slice(bytes);
     }
 }
 

@@ -271,9 +271,7 @@ impl Args {
         let mut id_seen = false;
         let mut index = 0;
 
-        while index < args.len() {
-            let arg = &args[index];
-
+        while let Some(arg) = args.get(index) {
             match arg.as_str() {
                 "--api-sock" => {
                     if api_sock_seen {
