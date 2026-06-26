@@ -465,7 +465,7 @@ impl AnonymousMapping {
                 ptr::null_mut(),
                 size,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
                 -1,
                 0,
             )
@@ -852,6 +852,32 @@ mod tests {
 
         let err = GuestMemory::allocate_with_mapper(&layout, page_size, &mut mapper)
             .expect_err("unaligned allocation should fail");
+
+        assert!(matches!(
+            err,
+            GuestMemoryAllocationError::InvalidLayout(GuestMemoryError::UnalignedRange {
+                range,
+                alignment,
+            }) if range == unaligned_range && alignment == page_size
+        ));
+        assert_eq!(mapper.maps, 0);
+        assert_eq!(drop_count.get(), 0);
+    }
+
+    #[test]
+    fn guest_memory_validates_all_ranges_before_allocation() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let unaligned_range = range(page_size, page_size - 1);
+        let layout = GuestMemoryLayout::new(vec![range(0, page_size), unaligned_range])
+            .expect("layout ordering should be valid");
+        let drop_count = Rc::new(Cell::new(0));
+        let mut mapper = CountingMapper {
+            maps: 0,
+            drop_count: Rc::clone(&drop_count),
+        };
+
+        let err = GuestMemory::allocate_with_mapper(&layout, page_size, &mut mapper)
+            .expect_err("unaligned second range should fail before allocation");
 
         assert!(matches!(
             err,
