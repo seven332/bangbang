@@ -84,6 +84,10 @@ impl GuestMemoryRange {
         self.end_exclusive.0 == other.start.0 || other.end_exclusive.0 == self.start.0
     }
 
+    pub const fn contains(self, address: GuestAddress) -> bool {
+        self.start.0 <= address.0 && address.0 < self.end_exclusive.0
+    }
+
     pub fn validate_alignment(self, alignment: u64) -> Result<(), GuestMemoryError> {
         validate_alignment(alignment)?;
 
@@ -199,6 +203,117 @@ impl GuestMemory {
             .map(|region| region.range().size())
             .sum::<u64>()
     }
+
+    pub fn write_slice(
+        &mut self,
+        source: &[u8],
+        guest_address: GuestAddress,
+    ) -> Result<(), GuestMemoryAccessError> {
+        let Some(range) = access_range(guest_address, source.len())? else {
+            return Ok(());
+        };
+
+        self.validate_mapped_range(range)?;
+
+        let mut remaining = source;
+        let mut current = range.start();
+        for region in &mut self.regions {
+            if remaining.is_empty() {
+                break;
+            }
+            if region.range().end_exclusive() <= current {
+                continue;
+            }
+
+            let segment = access_segment(region, current, range.end_exclusive())?;
+            let (source_segment, next_remaining) = remaining.split_at(segment.size);
+            let destination = region
+                .mapping
+                .address()
+                .as_ptr()
+                .cast::<u8>()
+                .wrapping_add(segment.offset);
+
+            // SAFETY: `validate_mapped_range` proved the whole requested guest
+            // range is backed by live mappings. `access_segment` bounds this
+            // segment to `region`, and the destination pointer is within that
+            // mapping. The safe API provides no way to alias `source` with the
+            // private anonymous mapping mutably.
+            unsafe {
+                ptr::copy_nonoverlapping(source_segment.as_ptr(), destination, segment.size);
+            }
+
+            remaining = next_remaining;
+            current = advance_address(current, segment.size)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn read_slice(
+        &self,
+        guest_address: GuestAddress,
+        destination: &mut [u8],
+    ) -> Result<(), GuestMemoryAccessError> {
+        let Some(range) = access_range(guest_address, destination.len())? else {
+            return Ok(());
+        };
+
+        self.validate_mapped_range(range)?;
+
+        let mut remaining = destination;
+        let mut current = range.start();
+        for region in &self.regions {
+            if remaining.is_empty() {
+                break;
+            }
+            if region.range().end_exclusive() <= current {
+                continue;
+            }
+
+            let segment = access_segment(region, current, range.end_exclusive())?;
+            let (destination_segment, next_remaining) = remaining.split_at_mut(segment.size);
+            let source = region
+                .mapping
+                .address()
+                .as_ptr()
+                .cast::<u8>()
+                .wrapping_add(segment.offset);
+
+            // SAFETY: `validate_mapped_range` proved the whole requested guest
+            // range is backed by live mappings. `access_segment` bounds this
+            // segment to `region`, and the source pointer is within that
+            // mapping. The destination is a caller-provided mutable slice.
+            unsafe {
+                ptr::copy_nonoverlapping(source, destination_segment.as_mut_ptr(), segment.size);
+            }
+
+            remaining = next_remaining;
+            current = advance_address(current, segment.size)?;
+        }
+
+        Ok(())
+    }
+
+    fn validate_mapped_range(&self, range: GuestMemoryRange) -> Result<(), GuestMemoryAccessError> {
+        let mut current = range.start();
+        for region in &self.regions {
+            if region.range().end_exclusive() <= current {
+                continue;
+            }
+            if !region.range().contains(current) {
+                return Err(GuestMemoryAccessError::UnmappedRange { range });
+            }
+
+            let segment = access_segment(region, current, range.end_exclusive())?;
+            current = advance_address(current, segment.size)?;
+            if current == range.end_exclusive() {
+                return Ok(());
+            }
+        }
+
+        Err(GuestMemoryAccessError::UnmappedRange { range })
+    }
 }
 
 pub struct GuestMemoryRegion {
@@ -294,6 +409,64 @@ impl From<GuestMemoryError> for GuestMemoryAllocationError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestMemoryAccessError {
+    SizeTooLarge {
+        size: usize,
+    },
+    AddressOverflow {
+        start: GuestAddress,
+        size: u64,
+    },
+    UnmappedRange {
+        range: GuestMemoryRange,
+    },
+    SegmentOffsetTooLarge {
+        range: GuestMemoryRange,
+        offset: u64,
+    },
+    SegmentSizeTooLarge {
+        range: GuestMemoryRange,
+        size: u64,
+    },
+}
+
+impl fmt::Display for GuestMemoryAccessError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SizeTooLarge { size } => {
+                write!(
+                    f,
+                    "guest memory access size {size} bytes is too large to represent"
+                )
+            }
+            Self::AddressOverflow { start, size } => {
+                write!(
+                    f,
+                    "guest memory access overflows address space: start={start}, size={size}"
+                )
+            }
+            Self::UnmappedRange { range } => {
+                write!(f, "guest memory access range {range} is not fully mapped")
+            }
+            Self::SegmentOffsetTooLarge { range, offset } => {
+                write!(
+                    f,
+                    "guest memory access offset {offset} in range {range} is too large for this host"
+                )
+            }
+            Self::SegmentSizeTooLarge { range, size } => {
+                write!(
+                    f,
+                    "guest memory access segment of {size} bytes in range {range} is too large for this host"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for GuestMemoryAccessError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestMemoryError {
     EmptyLayout,
     EmptyRange {
@@ -368,6 +541,11 @@ pub mod aarch64 {
 
     pub const DRAM_MEM_START: u64 = 0x8000_0000;
     pub const DRAM_MEM_MAX_SIZE: u64 = 0x00FF_8000_0000;
+    pub const SYSTEM_MEM_START: u64 = DRAM_MEM_START;
+    pub const SYSTEM_MEM_SIZE: u64 = 0x20_0000;
+    pub const CMDLINE_MAX_SIZE: usize = 2048;
+    pub const FDT_MAX_SIZE: u64 = 0x20_0000;
+    pub const GUEST_PAGE_SIZE: u64 = 4096;
     pub const MMIO64_MEM_START: u64 = 256 << 30;
     pub const MMIO64_MEM_SIZE: u64 = 256 << 30;
     pub const FIRST_ADDR_PAST_64BITS_MMIO: u64 = MMIO64_MEM_START + MMIO64_MEM_SIZE;
@@ -405,6 +583,125 @@ pub mod aarch64 {
 
         GuestMemoryLayout::new(ranges)
     }
+
+    pub const fn kernel_load_address() -> GuestAddress {
+        GuestAddress::new(SYSTEM_MEM_START + SYSTEM_MEM_SIZE)
+    }
+
+    pub fn fdt_address(layout: &GuestMemoryLayout) -> Result<GuestAddress, GuestMemoryError> {
+        let first_range = first_range(layout)?;
+        let candidate = match first_range
+            .end_exclusive()
+            .raw_value()
+            .checked_sub(FDT_MAX_SIZE)
+        {
+            Some(address) => GuestAddress::new(address),
+            None => return Ok(first_range.start()),
+        };
+
+        if first_range.contains(candidate) {
+            Ok(candidate)
+        } else {
+            Ok(first_range.start())
+        }
+    }
+
+    pub fn initrd_load_address(
+        layout: &GuestMemoryLayout,
+        initrd_size: u64,
+    ) -> Result<Option<GuestAddress>, GuestMemoryError> {
+        let fdt_address = fdt_address(layout)?;
+        let Some(rounded_size) = align_up(initrd_size, GUEST_PAGE_SIZE) else {
+            return Ok(None);
+        };
+        let Some(load_address) = fdt_address.raw_value().checked_sub(rounded_size) else {
+            return Ok(None);
+        };
+        let load_address = GuestAddress::new(load_address);
+
+        if first_range(layout)?.contains(load_address) {
+            Ok(Some(load_address))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn first_range(layout: &GuestMemoryLayout) -> Result<GuestMemoryRange, GuestMemoryError> {
+        layout
+            .ranges()
+            .first()
+            .copied()
+            .ok_or(GuestMemoryError::EmptyLayout)
+    }
+
+    const fn align_up(value: u64, alignment: u64) -> Option<u64> {
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return None;
+        }
+
+        let mask = alignment - 1;
+        match value.checked_add(mask) {
+            Some(rounded) => Some(rounded & !mask),
+            None => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GuestMemorySegment {
+    offset: usize,
+    size: usize,
+}
+
+fn access_range(
+    start: GuestAddress,
+    size: usize,
+) -> Result<Option<GuestMemoryRange>, GuestMemoryAccessError> {
+    if size == 0 {
+        return Ok(None);
+    }
+
+    let size = u64::try_from(size).map_err(|_| GuestMemoryAccessError::SizeTooLarge { size })?;
+    let end_exclusive = start
+        .checked_add(size)
+        .ok_or(GuestMemoryAccessError::AddressOverflow { start, size })?;
+
+    Ok(Some(GuestMemoryRange {
+        start,
+        size,
+        end_exclusive,
+    }))
+}
+
+fn access_segment(
+    region: &GuestMemoryRegion,
+    current: GuestAddress,
+    end: GuestAddress,
+) -> Result<GuestMemorySegment, GuestMemoryAccessError> {
+    let range = region.range();
+    let offset = current.raw_value() - range.start().raw_value();
+    let offset = usize::try_from(offset)
+        .map_err(|_| GuestMemoryAccessError::SegmentOffsetTooLarge { range, offset })?;
+    let size = (range.end_exclusive().raw_value() - current.raw_value())
+        .min(end.raw_value() - current.raw_value());
+    let size = usize::try_from(size)
+        .map_err(|_| GuestMemoryAccessError::SegmentSizeTooLarge { range, size })?;
+
+    Ok(GuestMemorySegment { offset, size })
+}
+
+fn advance_address(
+    address: GuestAddress,
+    offset: usize,
+) -> Result<GuestAddress, GuestMemoryAccessError> {
+    let size =
+        u64::try_from(offset).map_err(|_| GuestMemoryAccessError::SizeTooLarge { size: offset })?;
+    address
+        .checked_add(size)
+        .ok_or(GuestMemoryAccessError::AddressOverflow {
+            start: address,
+            size,
+        })
 }
 
 fn validate_alignment(alignment: u64) -> Result<(), GuestMemoryError> {
@@ -591,8 +888,9 @@ mod tests {
     use std::thread;
 
     use super::{
-        AnonymousMapper, AnonymousMapping, GuestAddress, GuestMemory, GuestMemoryAllocationError,
-        GuestMemoryError, GuestMemoryLayout, GuestMemoryRange, aarch64, host_page_size,
+        AnonymousMapper, AnonymousMapping, GuestAddress, GuestMemory, GuestMemoryAccessError,
+        GuestMemoryAllocationError, GuestMemoryError, GuestMemoryLayout, GuestMemoryRange, aarch64,
+        host_page_size,
     };
 
     const PAGE_SIZE: u64 = 4096;
@@ -600,6 +898,13 @@ mod tests {
     fn range(start: u64, size: u64) -> GuestMemoryRange {
         GuestMemoryRange::new(GuestAddress::new(start), size)
             .expect("range should be valid for test")
+    }
+
+    fn allocate_memory(ranges: Vec<GuestMemoryRange>) -> GuestMemory {
+        let layout =
+            GuestMemoryLayout::new(ranges).expect("guest memory layout should be valid for test");
+
+        GuestMemory::allocate(&layout).expect("guest memory allocation should succeed")
     }
 
     #[test]
@@ -855,6 +1160,79 @@ mod tests {
     }
 
     #[test]
+    fn aarch64_boot_constants_match_firecracker_layout() {
+        assert_eq!(aarch64::SYSTEM_MEM_START, aarch64::DRAM_MEM_START);
+        assert_eq!(aarch64::SYSTEM_MEM_SIZE, 0x20_0000);
+        assert_eq!(aarch64::CMDLINE_MAX_SIZE, 2048);
+        assert_eq!(aarch64::FDT_MAX_SIZE, 0x20_0000);
+        assert_eq!(aarch64::GUEST_PAGE_SIZE, 4096);
+    }
+
+    #[test]
+    fn aarch64_kernel_load_address_follows_system_memory() {
+        assert_eq!(
+            aarch64::kernel_load_address(),
+            GuestAddress::new(aarch64::DRAM_MEM_START + aarch64::SYSTEM_MEM_SIZE)
+        );
+    }
+
+    #[test]
+    fn aarch64_fdt_address_uses_dram_start_for_small_or_equal_memory() {
+        for size in [aarch64::FDT_MAX_SIZE - PAGE_SIZE, aarch64::FDT_MAX_SIZE] {
+            let layout =
+                aarch64::dram_layout(size).expect("small fdt layout should be valid for test");
+
+            assert_eq!(
+                aarch64::fdt_address(&layout),
+                Ok(GuestAddress::new(aarch64::DRAM_MEM_START))
+            );
+        }
+    }
+
+    #[test]
+    fn aarch64_fdt_address_reserves_last_fdt_window_for_larger_memory() {
+        let layout = aarch64::dram_layout(aarch64::FDT_MAX_SIZE + PAGE_SIZE)
+            .expect("large fdt layout should be valid");
+
+        assert_eq!(
+            aarch64::fdt_address(&layout),
+            Ok(GuestAddress::new(aarch64::DRAM_MEM_START + PAGE_SIZE))
+        );
+    }
+
+    #[test]
+    fn aarch64_initrd_load_address_aligns_before_fdt() {
+        let layout = aarch64::dram_layout(aarch64::FDT_MAX_SIZE + (4 * PAGE_SIZE))
+            .expect("initrd layout should be valid");
+
+        assert_eq!(
+            aarch64::initrd_load_address(&layout, PAGE_SIZE + 1),
+            Ok(Some(GuestAddress::new(
+                aarch64::DRAM_MEM_START + (2 * PAGE_SIZE)
+            )))
+        );
+    }
+
+    #[test]
+    fn aarch64_initrd_load_address_returns_fdt_address_for_empty_payload() {
+        let layout =
+            aarch64::dram_layout(aarch64::FDT_MAX_SIZE).expect("fdt-only layout should be valid");
+
+        assert_eq!(
+            aarch64::initrd_load_address(&layout, 0),
+            Ok(Some(GuestAddress::new(aarch64::DRAM_MEM_START)))
+        );
+    }
+
+    #[test]
+    fn aarch64_initrd_load_address_returns_none_without_space() {
+        let layout =
+            aarch64::dram_layout(aarch64::FDT_MAX_SIZE).expect("fdt-only layout should be valid");
+
+        assert_eq!(aarch64::initrd_load_address(&layout, 1), Ok(None));
+    }
+
+    #[test]
     fn guest_memory_allocates_small_layout() {
         let page_size = host_page_size().expect("host page size should be available for tests");
         let layout = GuestMemoryLayout::new(vec![range(0, page_size)])
@@ -909,6 +1287,139 @@ mod tests {
 
         assert!(!debug.contains(&host_address));
         assert!(debug.contains("host_size"));
+    }
+
+    #[test]
+    fn guest_memory_write_and_read_slice_round_trip() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let mut memory = allocate_memory(vec![range(page_size, page_size)]);
+        let address = GuestAddress::new(page_size + 128);
+        let source = [0xde, 0xad, 0xbe, 0xef];
+        let mut destination = [0; 4];
+
+        memory
+            .write_slice(&source, address)
+            .expect("guest memory write should succeed");
+        memory
+            .read_slice(address, &mut destination)
+            .expect("guest memory read should succeed");
+
+        assert_eq!(destination, source);
+    }
+
+    #[test]
+    fn guest_memory_access_accepts_exact_end_boundary() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let mut memory = allocate_memory(vec![range(0, page_size)]);
+        let source = [1, 2, 3, 4];
+        let address = GuestAddress::new(page_size - u64::try_from(source.len()).unwrap());
+        let mut destination = [0; 4];
+
+        memory
+            .write_slice(&source, address)
+            .expect("guest memory write ending at range boundary should succeed");
+        memory
+            .read_slice(address, &mut destination)
+            .expect("guest memory read ending at range boundary should succeed");
+
+        assert_eq!(destination, source);
+    }
+
+    #[test]
+    fn guest_memory_access_treats_zero_length_as_noop() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let mut memory = allocate_memory(vec![range(0, page_size)]);
+        let mut destination: [u8; 0] = [];
+
+        memory
+            .write_slice(&[], GuestAddress::new(u64::MAX))
+            .expect("zero-length write should not validate address");
+        memory
+            .read_slice(GuestAddress::new(u64::MAX), &mut destination)
+            .expect("zero-length read should not validate address");
+    }
+
+    #[test]
+    fn guest_memory_access_rejects_address_overflow() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let mut memory = allocate_memory(vec![range(0, page_size)]);
+
+        assert_eq!(
+            memory.write_slice(&[0], GuestAddress::new(u64::MAX)),
+            Err(GuestMemoryAccessError::AddressOverflow {
+                start: GuestAddress::new(u64::MAX),
+                size: 1
+            })
+        );
+    }
+
+    #[test]
+    fn guest_memory_access_rejects_unmapped_hole_without_partial_write() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let mut memory =
+            allocate_memory(vec![range(0, page_size), range(2 * page_size, page_size)]);
+        let address = GuestAddress::new(page_size - 1);
+        let access_range = range(page_size - 1, 2);
+
+        assert_eq!(
+            memory.write_slice(&[0xaa, 0xbb], address),
+            Err(GuestMemoryAccessError::UnmappedRange {
+                range: access_range
+            })
+        );
+
+        let mut byte = [0xff];
+        memory
+            .read_slice(address, &mut byte)
+            .expect("single-byte read before hole should still succeed");
+
+        assert_eq!(byte, [0]);
+    }
+
+    #[test]
+    fn guest_memory_access_spans_adjacent_ranges() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let mut memory = allocate_memory(vec![range(0, page_size), range(page_size, page_size)]);
+        let source = [0x11, 0x22];
+        let address = GuestAddress::new(page_size - 1);
+        let mut destination = [0; 2];
+
+        memory
+            .write_slice(&source, address)
+            .expect("guest memory write should cross adjacent ranges");
+        memory
+            .read_slice(address, &mut destination)
+            .expect("guest memory read should cross adjacent ranges");
+
+        assert_eq!(destination, source);
+    }
+
+    #[test]
+    fn guest_memory_access_validation_rejects_aarch64_mmio64_gap() {
+        let size_before_gap = aarch64::MMIO64_MEM_START - aarch64::DRAM_MEM_START;
+        let layout = aarch64::dram_layout(size_before_gap + PAGE_SIZE)
+            .expect("split aarch64 layout should be valid");
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let mut mapper = CountingMapper {
+            maps: 0,
+            drop_count: Arc::clone(&drop_count),
+        };
+        let memory = GuestMemory::allocate_with_mapper(&layout, PAGE_SIZE, &mut mapper)
+            .expect("fake guest memory allocation should succeed");
+        let access_range = range(aarch64::MMIO64_MEM_START - 1, 2);
+
+        assert_eq!(
+            memory.validate_mapped_range(access_range),
+            Err(GuestMemoryAccessError::UnmappedRange {
+                range: access_range
+            })
+        );
+        assert_eq!(mapper.maps, 2);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 0);
+
+        drop(memory);
+
+        assert_eq!(drop_count.load(Ordering::Relaxed), 2);
     }
 
     #[test]
