@@ -1234,6 +1234,14 @@ mod tests {
     }
 
     #[test]
+    fn aarch64_initrd_load_address_returns_none_when_rounded_size_overflows() {
+        let layout = aarch64::dram_layout(aarch64::FDT_MAX_SIZE + PAGE_SIZE)
+            .expect("fdt layout should be valid");
+
+        assert_eq!(aarch64::initrd_load_address(&layout, u64::MAX), Ok(None));
+    }
+
+    #[test]
     fn guest_memory_allocates_small_layout() {
         let page_size = host_page_size().expect("host page size should be available for tests");
         let layout = GuestMemoryLayout::new(vec![range(0, page_size)])
@@ -1368,6 +1376,31 @@ mod tests {
             })
         );
         assert_eq!(destination, [0x55]);
+    }
+
+    #[test]
+    fn guest_memory_access_rejects_fully_unmapped_ranges_without_partial_read() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let mut memory = allocate_memory(vec![range(page_size, page_size)]);
+
+        for address in [GuestAddress::new(0), GuestAddress::new(2 * page_size)] {
+            let access_range = range(address.raw_value(), 1);
+            let mut destination = [0x55];
+
+            assert_eq!(
+                memory.write_slice(&[0xaa], address),
+                Err(GuestMemoryAccessError::UnmappedRange {
+                    range: access_range
+                })
+            );
+            assert_eq!(
+                memory.read_slice(&mut destination, address),
+                Err(GuestMemoryAccessError::UnmappedRange {
+                    range: access_range
+                })
+            );
+            assert_eq!(destination, [0x55]);
+        }
     }
 
     #[test]
