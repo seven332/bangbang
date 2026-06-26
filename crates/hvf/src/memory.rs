@@ -75,6 +75,9 @@ pub enum HvfGuestMemoryMappingError {
         range: GuestMemoryRange,
         alignment: usize,
     },
+    NullHostAddress {
+        range: GuestMemoryRange,
+    },
     UnalignedHostSize {
         range: GuestMemoryRange,
         host_size: usize,
@@ -125,6 +128,9 @@ impl fmt::Display for HvfGuestMemoryMappingError {
                     f,
                     "host address for guest memory range {range} is not aligned to {alignment} bytes"
                 )
+            }
+            Self::NullHostAddress { range } => {
+                write!(f, "host address for guest memory range {range} is null")
             }
             Self::UnalignedHostSize {
                 range,
@@ -193,6 +199,7 @@ impl std::error::Error for HvfGuestMemoryMappingError {
             | Self::SizeTooLarge { .. }
             | Self::UnalignedGuestRange { .. }
             | Self::UnalignedHostAddress { .. }
+            | Self::NullHostAddress { .. }
             | Self::UnalignedHostSize { .. }
             | Self::HostSizeMismatch { .. } => None,
         }
@@ -463,12 +470,8 @@ fn validate_map_request(
     let size = usize::try_from(range.size())
         .map_err(|_| HvfGuestMemoryMappingError::SizeTooLarge { range })?;
 
-    if host_size != size {
-        return Err(HvfGuestMemoryMappingError::HostSizeMismatch {
-            range,
-            host_size,
-            expected_size: size,
-        });
+    if host_address == 0 {
+        return Err(HvfGuestMemoryMappingError::NullHostAddress { range });
     }
 
     if !host_size.is_multiple_of(alignment) {
@@ -476,6 +479,14 @@ fn validate_map_request(
             range,
             host_size,
             alignment,
+        });
+    }
+
+    if host_size != size {
+        return Err(HvfGuestMemoryMappingError::HostSizeMismatch {
+            range,
+            host_size,
+            expected_size: size,
         });
     }
 
@@ -598,6 +609,43 @@ mod tests {
             err,
             HvfGuestMemoryMappingError::UnalignedHostAddress { range, alignment: error_alignment }
                 if range == guest_range && error_alignment == alignment
+        ));
+    }
+
+    #[test]
+    fn validate_map_request_rejects_null_host_address() {
+        let page_size = page_size();
+        let alignment = usize::try_from(page_size).expect("page size should fit usize");
+        let guest_range = range(0, page_size);
+
+        let err = validate_map_request(guest_range, 0, alignment, page_size)
+            .expect_err("null host address should be rejected");
+
+        assert!(matches!(
+            err,
+            HvfGuestMemoryMappingError::NullHostAddress { range } if range == guest_range
+        ));
+    }
+
+    #[test]
+    fn validate_map_request_rejects_unaligned_host_size() {
+        let page_size = page_size();
+        let alignment = usize::try_from(page_size).expect("page size should fit usize");
+        let guest_range = range(0, page_size);
+        let host_size = alignment + 1;
+
+        let err = validate_map_request(guest_range, alignment, host_size, page_size)
+            .expect_err("unaligned host size should be rejected");
+
+        assert!(matches!(
+            err,
+            HvfGuestMemoryMappingError::UnalignedHostSize {
+                range,
+                host_size: error_host_size,
+                alignment: error_alignment,
+            } if range == guest_range
+                && error_host_size == host_size
+                && error_alignment == alignment
         ));
     }
 
