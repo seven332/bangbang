@@ -7,7 +7,8 @@ the current scaffold implements all listed API behavior.
 The current repository defines crate boundaries, endpoint names, a minimal
 HTTP-over-Unix-socket API server for `GET /` and `GET /version`, a backend-neutral VM
 trait, a minimal read-only VMM action/data model, backend-neutral guest
-physical address and aarch64 DRAM layout primitives, a minimal
+physical address and aarch64 DRAM layout/access primitives, arm64 boot
+placement helpers, a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
 create/destroy wrapper, typed HVF exit surface, narrow vCPU register wrappers,
 anonymous guest memory allocation for validated runtime layouts, HVF guest
@@ -214,8 +215,9 @@ setup, memory size, and block device I/O when those surfaces are implemented.
 The runtime crate models the backend-neutral guest physical address space used
 by later allocation, HVF mapping, boot, and device work. The current model
 contains guest physical addresses, checked RAM ranges, ordered non-overlapping
-layouts, the first aarch64 DRAM layout helper, and owned anonymous host memory
-allocation for validated page-aligned layouts.
+layouts, the first aarch64 DRAM layout and boot placement helpers, safe byte
+slice access by guest address, and owned anonymous host memory allocation for
+validated page-aligned layouts.
 
 The aarch64 layout helper follows Firecracker's `v1.16.0` ARM layout shape:
 
@@ -231,6 +233,21 @@ runtime ownership cleanup. It preserves each guest range with its host mapping
 for HVF map/unmap work. It does not use Firecracker's `vm-memory` crate; future
 device-memory, dirty-tracking, snapshot, or file-backed-memory work should
 evaluate the right abstraction from its concrete requirements.
+
+Guest memory byte access validates the whole requested guest address range
+before copying. Overflow, unmapped holes, and the aarch64 MMIO64 gap fail
+without partial copies, while zero-length reads and writes are no-ops. This
+gives later boot-loading code a safe runtime-owned path for copying kernel,
+initrd, command line, and FDT bytes without exposing additional raw host-memory
+pointers.
+
+The first arm64 placement helpers match Firecracker's published aarch64 layout
+shape: system memory occupies the first 2 MiB of DRAM, the kernel load address
+starts at `0x8020_0000`, the command-line size constant is 2048 bytes, the FDT
+window is 2 MiB at the end of the first DRAM range when there is room, and
+initrd placement is page-aligned immediately before the FDT window when it fits.
+A zero-byte initrd resolves to the FDT address, matching Firecracker's helper
+behavior.
 
 The HVF backend can map allocated guest memory regions into an existing
 Hypervisor.framework VM with read/write/execute guest RAM permissions. The
