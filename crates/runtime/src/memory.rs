@@ -237,10 +237,10 @@ impl GuestMemory {
             // SAFETY: `validate_mapped_range` proved the whole requested guest
             // range is backed by live mappings. `access_segment` bounds this
             // segment to `region`, and the destination pointer is within that
-            // mapping. The safe API provides no way to alias `source` with the
-            // private anonymous mapping mutably.
+            // mapping. `ptr::copy` permits overlap if `source` was derived from
+            // the same guest mapping through a raw host pointer.
             unsafe {
-                ptr::copy_nonoverlapping(source_segment.as_ptr(), destination, segment.size);
+                ptr::copy(source_segment.as_ptr(), destination, segment.size);
             }
 
             remaining = next_remaining;
@@ -283,9 +283,10 @@ impl GuestMemory {
             // SAFETY: `validate_mapped_range` proved the whole requested guest
             // range is backed by live mappings. `access_segment` bounds this
             // segment to `region`, and the source pointer is within that
-            // mapping. The destination is a caller-provided mutable slice.
+            // mapping. `ptr::copy` permits overlap if `destination` was derived
+            // from the same guest mapping through a raw host pointer.
             unsafe {
-                ptr::copy_nonoverlapping(source, destination_segment.as_mut_ptr(), segment.size);
+                ptr::copy(source, destination_segment.as_mut_ptr(), segment.size);
             }
 
             remaining = next_remaining;
