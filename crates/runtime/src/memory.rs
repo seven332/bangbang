@@ -1,3 +1,4 @@
+use std::collections::TryReserveError;
 use std::ffi::c_void;
 use std::fmt;
 use std::io;
@@ -169,10 +170,16 @@ impl GuestMemory {
         page_size: u64,
         mapper: &mut impl AnonymousMapper,
     ) -> Result<Self, GuestMemoryAllocationError> {
-        let ranges = validated_allocation_ranges(layout, page_size)?;
-        let mut regions = Vec::with_capacity(ranges.len());
+        validate_allocation_ranges(layout, page_size)?;
+        let mut regions = Vec::new();
+        regions
+            .try_reserve_exact(layout.ranges().len())
+            .map_err(
+                |source| GuestMemoryAllocationError::RegionMetadataAllocationFailed { source },
+            )?;
 
-        for (range, host_size) in ranges {
+        for range in layout.ranges().iter().copied() {
+            let host_size = allocation_host_size(range)?;
             regions.push(GuestMemoryRegion {
                 range,
                 mapping: mapper.map(host_size)?,
@@ -227,6 +234,7 @@ pub enum GuestMemoryAllocationError {
     InvalidLayout(GuestMemoryError),
     InvalidHostPageSize,
     SizeTooLarge { range: GuestMemoryRange },
+    RegionMetadataAllocationFailed { source: TryReserveError },
     AnonymousMmapFailed { size: usize, source: io::Error },
     AnonymousMmapReturnedNull { size: usize },
 }
@@ -242,6 +250,12 @@ impl fmt::Display for GuestMemoryAllocationError {
                 write!(
                     f,
                     "guest memory range {range} is too large to allocate on this host"
+                )
+            }
+            Self::RegionMetadataAllocationFailed { source } => {
+                write!(
+                    f,
+                    "failed to reserve guest memory region metadata: {source}"
                 )
             }
             Self::AnonymousMmapFailed { size, source } => {
@@ -264,6 +278,7 @@ impl std::error::Error for GuestMemoryAllocationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidLayout(source) => Some(source),
+            Self::RegionMetadataAllocationFailed { source } => Some(source),
             Self::AnonymousMmapFailed { source, .. } => Some(source),
             Self::InvalidHostPageSize
             | Self::SizeTooLarge { .. }
@@ -400,21 +415,29 @@ fn validate_alignment(alignment: u64) -> Result<(), GuestMemoryError> {
     }
 }
 
-fn validated_allocation_ranges(
+fn validate_allocation_ranges(
     layout: &GuestMemoryLayout,
     page_size: u64,
-) -> Result<Vec<(GuestMemoryRange, usize)>, GuestMemoryAllocationError> {
+) -> Result<(), GuestMemoryAllocationError> {
     validate_host_page_size(page_size)?;
 
-    let mut ranges = Vec::with_capacity(layout.ranges().len());
     for range in layout.ranges().iter().copied() {
-        range.validate_alignment(page_size)?;
-        let host_size = usize::try_from(range.size())
-            .map_err(|_| GuestMemoryAllocationError::SizeTooLarge { range })?;
-        ranges.push((range, host_size));
+        validate_allocation_range(range, page_size)?;
     }
 
-    Ok(ranges)
+    Ok(())
+}
+
+fn validate_allocation_range(
+    range: GuestMemoryRange,
+    page_size: u64,
+) -> Result<usize, GuestMemoryAllocationError> {
+    range.validate_alignment(page_size)?;
+    allocation_host_size(range)
+}
+
+fn allocation_host_size(range: GuestMemoryRange) -> Result<usize, GuestMemoryAllocationError> {
+    usize::try_from(range.size()).map_err(|_| GuestMemoryAllocationError::SizeTooLarge { range })
 }
 
 fn host_page_size() -> Result<u64, GuestMemoryAllocationError> {
@@ -836,6 +859,25 @@ mod tests {
             byte.write(0xab);
             assert_eq!(byte.read(), 0xab);
         }
+    }
+
+    #[test]
+    fn guest_memory_debug_omits_host_address() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let layout = GuestMemoryLayout::new(vec![range(0, page_size)])
+            .expect("page-aligned layout should be valid");
+        let memory =
+            GuestMemory::allocate(&layout).expect("guest memory allocation should succeed");
+        let region = memory
+            .regions()
+            .first()
+            .expect("guest memory should contain one region");
+        let host_address = format!("{:p}", region.host_address().as_ptr());
+
+        let debug = format!("{memory:?}");
+
+        assert!(!debug.contains(&host_address));
+        assert!(debug.contains("host_size"));
     }
 
     #[test]
