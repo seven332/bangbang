@@ -236,7 +236,7 @@ evaluate the right abstraction from its concrete requirements.
 
 Guest memory byte access validates the whole requested guest address range
 before copying. Overflow, unmapped holes, and the aarch64 MMIO64 gap fail
-without a partial write, while zero-length reads and writes are no-ops. This
+without partial copies, while zero-length reads and writes are no-ops. This
 gives later boot-loading code a safe runtime-owned path for copying kernel,
 initrd, command line, and FDT bytes without exposing additional raw host-memory
 pointers.
