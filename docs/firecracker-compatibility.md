@@ -6,12 +6,13 @@ the current scaffold implements all listed API behavior.
 
 The current repository defines crate boundaries, endpoint names, a minimal
 HTTP-over-Unix-socket API server for `GET /` and `GET /version`, a backend-neutral VM
-trait, a minimal read-only VMM action/data model, a minimal
+trait, a minimal read-only VMM action/data model, backend-neutral guest
+physical address and aarch64 DRAM layout primitives, a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
 create/destroy wrapper, typed HVF exit surface, narrow vCPU register wrappers,
 and an initial process startup argument model. There is no broader API request
-body model, guest memory mapping, guest execution, vCPU run loop, MMIO/device
-emulation, boot register setup, or kernel loading yet.
+body model, guest memory allocation or HVF mapping, guest execution, vCPU run
+loop, MMIO/device emulation, boot register setup, or kernel loading yet.
 
 ## Firecracker Model Alignment
 
@@ -205,6 +206,27 @@ User documentation should keep the same support and field-status vocabulary when
 API behavior ships. Security review must cover host paths, socket-like fields,
 device identifiers, and error messages. Performance review must cover boot path
 setup, memory size, and block device I/O when those surfaces are implemented.
+
+## Guest Memory Address Space
+
+The runtime crate models the backend-neutral guest physical address space used
+by later allocation, HVF mapping, boot, and device work. The current model
+contains guest physical addresses, checked RAM ranges, ordered non-overlapping
+layouts, and the first aarch64 DRAM layout helper.
+
+The aarch64 layout helper follows Firecracker's `v1.16.0` ARM layout shape:
+
+- guest RAM starts at `0x8000_0000` (2 GiB)
+- the architectural DRAM maximum is 1022 GiB
+- RAM crossing the 256-512 GiB MMIO64 gap is split around that gap
+- zero requested memory is rejected by the layout helper
+- requests above the architectural maximum are capped inside the layout model
+
+This is only an address-space model. It does not allocate host memory, map
+memory into Hypervisor.framework, write kernel/initrd/FDT payloads, or start a
+guest. Later API and startup work still needs to decide whether an oversized
+`mem_size_mib` request should be rejected before layout construction or should
+preserve Firecracker's architecture-helper truncation behavior.
 
 ## API State and Response Policy
 

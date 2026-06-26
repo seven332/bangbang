@@ -1,5 +1,7 @@
 //! Backend-neutral VM runtime boundary.
 
+pub mod memory;
+
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
