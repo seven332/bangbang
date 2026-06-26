@@ -2,7 +2,7 @@
 
 bangbang is a Rust VMM project for macOS hosts. The public control plane is intended to stay compatible with the Firecracker HTTP API over a Unix domain socket, while the VM backend is built on Apple's Hypervisor.framework.
 
-This repository is currently a scaffold. It defines crate boundaries, an initial Firecracker-compatible API socket, a process startup CLI, a minimal internal VMM action model, a backend trait, a backend-neutral guest address/layout model, anonymous guest memory allocation, and the smallest Hypervisor.framework VM, current-thread vCPU lifecycle, typed exit surface, register wrappers, and cancellable vCPU runner skeleton.
+This repository is currently a scaffold. It defines crate boundaries, an initial Firecracker-compatible API socket, a process startup CLI, a minimal internal VMM action model, a backend trait, a backend-neutral guest address/layout model, anonymous guest memory allocation, and the smallest Hypervisor.framework VM, guest memory map/unmap ownership, current-thread vCPU lifecycle, typed exit surface, register wrappers, and cancellable vCPU runner skeleton.
 
 See [Firecracker Compatibility Scope](docs/firecracker-compatibility.md) for the intended compatibility target and current limitations.
 See [Pull Request Review Guidelines](docs/review-guidelines.md) for the project-specific review standard.
@@ -18,11 +18,10 @@ crates/bangbang   VMM process entrypoint and startup CLI
 
 ## Current Scope
 
-The first target is Apple Silicon macOS. The current scaffold includes HTTP over a Unix domain socket for `GET /` and `GET /version`, routed through a minimal read-only VMM action model. The runtime crate defines guest physical address, range, and aarch64 DRAM layout primitives, and can allocate owned anonymous host memory for validated page-aligned guest memory layouts. The HVF crate can create/destroy a process VM, create/destroy one current-thread vCPU handle, define typed HVF exit snapshots, get/set a narrow set of vCPU registers, and start a thread-owned runner that can cancel a single `hv_vcpu_run` step. It intentionally does not include:
+The first target is Apple Silicon macOS. The current scaffold includes HTTP over a Unix domain socket for `GET /` and `GET /version`, routed through a minimal read-only VMM action model. The runtime crate defines guest physical address, range, and aarch64 DRAM layout primitives, and can allocate owned anonymous host memory for validated page-aligned guest memory layouts. The HVF crate can create/destroy a process VM, map/unmap allocated guest memory with backend-owned cleanup, create/destroy one current-thread vCPU handle, define typed HVF exit snapshots, get/set a narrow set of vCPU registers, and start a thread-owned runner that can cancel a single `hv_vcpu_run` step. It intentionally does not include:
 
 - API endpoints beyond `GET /` and `GET /version`
 - JSON request body models
-- HVF guest memory mapping
 - configured guest execution, continuous vCPU run loops, MMIO/device emulation, or boot register setup
 - kernel loading
 
@@ -82,10 +81,10 @@ cargo test --workspace --all-targets --all-features --locked --exclude bangbang-
 cargo test -p bangbang-hvf --lib --all-features --locked
 ```
 
-On macOS Apple Silicon hosts, `bangbang-hvf` contains real HVF lifecycle and
-runner smoke tests in `crates/hvf/tests/hvf_lifecycle.rs`. The tests are not
-ignored; run the signed test wrapper so host or entitlement failures fail the
-test run:
+On macOS Apple Silicon hosts, `bangbang-hvf` contains real HVF lifecycle,
+guest memory mapping, and runner smoke tests in
+`crates/hvf/tests/hvf_lifecycle.rs`. The tests are not ignored; run the signed
+test wrapper so host or entitlement failures fail the test run:
 
 ```sh
 scripts/run-hvf-tests.sh

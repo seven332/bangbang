@@ -3,8 +3,13 @@ pub(crate) const UNSUPPORTED_TARGET_MESSAGE: &str =
 
 pub(crate) type HvVcpu = u64;
 pub(crate) type HvExitReason = u32;
+pub(crate) type HvMemoryFlags = u64;
 pub(crate) type HvReg = u32;
 pub(crate) type HvSysReg = u16;
+
+pub(crate) const HV_MEMORY_READ: HvMemoryFlags = 1 << 0;
+pub(crate) const HV_MEMORY_WRITE: HvMemoryFlags = 1 << 1;
+pub(crate) const HV_MEMORY_EXEC: HvMemoryFlags = 1 << 2;
 
 pub(crate) const HV_EXIT_REASON_CANCELED: HvExitReason = 0;
 pub(crate) const HV_EXIT_REASON_EXCEPTION: HvExitReason = 1;
@@ -63,10 +68,11 @@ pub(crate) unsafe fn copy_vcpu_exit(
 mod imp {
     use std::ffi::c_void;
     use std::ptr;
+    use std::ptr::NonNull;
 
     use bangbang_runtime::BackendError;
 
-    use super::{CreatedVcpu, HvReg, HvSysReg, HvVcpu, HvVcpuExit};
+    use super::{CreatedVcpu, HvMemoryFlags, HvReg, HvSysReg, HvVcpu, HvVcpuExit};
 
     pub type HvReturn = i32;
     pub type HvVmConfig = *mut c_void;
@@ -86,6 +92,13 @@ mod imp {
     unsafe extern "C" {
         pub fn hv_vm_create(config: HvVmConfig) -> HvReturn;
         pub fn hv_vm_destroy() -> HvReturn;
+        pub fn hv_vm_map(
+            addr: *mut c_void,
+            ipa: u64,
+            size: usize,
+            flags: HvMemoryFlags,
+        ) -> HvReturn;
+        pub fn hv_vm_unmap(ipa: u64, size: usize) -> HvReturn;
         pub fn hv_vcpu_create(
             vcpu: *mut HvVcpu,
             exit: *mut *mut HvVcpuExit,
@@ -142,6 +155,28 @@ mod imp {
     pub fn destroy_vm() -> Result<(), BackendError> {
         // SAFETY: Destroys the process-local VM after vCPUs have been destroyed.
         unsafe { check(hv_vm_destroy(), "hv_vm_destroy") }
+    }
+
+    pub fn map_memory(
+        host_address: NonNull<c_void>,
+        guest_address: u64,
+        size: usize,
+        flags: HvMemoryFlags,
+    ) -> Result<(), BackendError> {
+        // SAFETY: The caller validates page alignment, region size, and VM lifecycle before
+        // mapping this userspace address into the process-local HVF VM.
+        unsafe {
+            check(
+                hv_vm_map(host_address.as_ptr(), guest_address, size, flags),
+                "hv_vm_map",
+            )
+        }
+    }
+
+    pub fn unmap_memory(guest_address: u64, size: usize) -> Result<(), BackendError> {
+        // SAFETY: The caller owns a previously mapped guest physical range for the live
+        // process-local HVF VM and guarantees the range is page aligned.
+        unsafe { check(hv_vm_unmap(guest_address, size), "hv_vm_unmap") }
     }
 
     pub fn create_vcpu() -> Result<CreatedVcpu, BackendError> {
@@ -260,9 +295,12 @@ mod imp {
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 mod imp {
+    use std::ffi::c_void;
+    use std::ptr::NonNull;
+
     use bangbang_runtime::BackendError;
 
-    use super::{CreatedVcpu, HvReg, HvSysReg, HvVcpu, UNSUPPORTED_TARGET_MESSAGE};
+    use super::{CreatedVcpu, HvMemoryFlags, HvReg, HvSysReg, HvVcpu, UNSUPPORTED_TARGET_MESSAGE};
 
     pub fn create_vm() -> Result<(), BackendError> {
         Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
@@ -270,6 +308,19 @@ mod imp {
 
     pub fn destroy_vm() -> Result<(), BackendError> {
         Ok(())
+    }
+
+    pub fn map_memory(
+        _: NonNull<c_void>,
+        _: u64,
+        _: usize,
+        _: HvMemoryFlags,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
+    pub fn unmap_memory(_: u64, _: usize) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
     }
 
     pub fn create_vcpu() -> Result<CreatedVcpu, BackendError> {
