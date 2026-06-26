@@ -10,10 +10,11 @@ trait, a minimal read-only VMM action/data model, backend-neutral guest
 physical address and aarch64 DRAM layout primitives, a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
 create/destroy wrapper, typed HVF exit surface, narrow vCPU register wrappers,
-anonymous guest memory allocation for validated runtime layouts, and an initial
-process startup argument model. There is no broader API request body model, HVF
-guest memory mapping, guest execution, vCPU run loop, MMIO/device emulation,
-boot register setup, or kernel loading yet.
+anonymous guest memory allocation for validated runtime layouts, HVF guest
+memory map/unmap ownership for allocated regions, and an initial process
+startup argument model. There is no broader API request body model, guest
+execution, vCPU run loop, MMIO/device emulation, boot register setup, or kernel
+loading yet.
 
 ## Firecracker Model Alignment
 
@@ -227,16 +228,21 @@ The aarch64 layout helper follows Firecracker's `v1.16.0` ARM layout shape:
 The allocation model creates one anonymous read/write private host memory
 mapping for each validated guest RAM range and releases the mappings with
 runtime ownership cleanup. It preserves each guest range with its host mapping
-for later HVF map/unmap work. It does not use Firecracker's `vm-memory` crate;
-future device-memory, dirty-tracking, snapshot, or file-backed-memory work
-should evaluate the right abstraction from its concrete requirements.
+for HVF map/unmap work. It does not use Firecracker's `vm-memory` crate; future
+device-memory, dirty-tracking, snapshot, or file-backed-memory work should
+evaluate the right abstraction from its concrete requirements.
 
-This still is not executable guest RAM. The runtime does not map allocated
-memory into Hypervisor.framework, write kernel/initrd/FDT payloads, wire
-`mem_size_mib` into public startup behavior, or start a guest. Later API and
-startup work still needs to decide whether an oversized `mem_size_mib` request
-should be rejected before layout construction or should preserve Firecracker's
-architecture-helper truncation behavior.
+The HVF backend can map allocated guest memory regions into an existing
+Hypervisor.framework VM with read/write/execute guest RAM permissions. The
+backend-owned mapping owner consumes the `GuestMemory` allocation, unmaps mapped
+regions on explicit unmap, partial failure, drop, and VM destruction, and keeps
+cleanup local to the backend instance.
+
+This still is not bootable guest RAM. bangbang does not write
+kernel/initrd/FDT payloads, wire `mem_size_mib` into public startup behavior,
+or start a guest. Later API and startup work still needs to decide whether an
+oversized `mem_size_mib` request should be rejected before layout construction
+or should preserve Firecracker's architecture-helper truncation behavior.
 
 ## API State and Response Policy
 
@@ -341,6 +347,9 @@ macOS design work instead of direct implementation:
 
 - KVM-specific VM and vCPU operations need HVF equivalents rather than direct
   KVM ioctl usage.
+- HVF guest RAM is mapped with a backend-owned owner that holds the anonymous
+  host allocation until unmap or VM destruction. It does not yet load payloads,
+  expose device memory helpers, or start guest execution.
 - HVF vCPU handles are thread-affine: creation, register access, run, and
   destroy operations must happen on the owning thread. The current vCPU wrapper
   covers current-thread lifecycle, typed exit surface, and narrow register

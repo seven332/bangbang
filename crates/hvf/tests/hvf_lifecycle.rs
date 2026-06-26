@@ -60,6 +60,41 @@ fn cancels_runner_before_first_run() {
     backend.destroy_vm().expect("VM should be destroyed");
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn maps_guest_memory_and_unmaps_before_destroying_vm() {
+    use bangbang_hvf::{HvfBackend, HvfMemoryPermissions};
+    use bangbang_runtime::VmBackend;
+    use bangbang_runtime::memory::{GuestMemory, aarch64};
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+    let layout = aarch64::dram_layout(host_page_size().expect("host page size should be valid"))
+        .expect("guest memory layout should be valid");
+    let memory = GuestMemory::allocate(&layout).expect("guest memory allocation should succeed");
+
+    backend.create_vm().expect("VM should be created");
+    backend
+        .map_guest_memory(memory, HvfMemoryPermissions::GUEST_RAM)
+        .expect("guest memory should be mapped");
+    assert!(backend.has_guest_memory_mapping());
+    backend
+        .destroy_vm()
+        .expect("VM destruction should unmap guest memory first");
+    assert!(!backend.has_guest_memory_mapping());
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn host_page_size() -> Result<u64, std::num::TryFromIntError> {
+    // SAFETY: `sysconf(_SC_PAGESIZE)` has no pointer arguments and does not
+    // require process-local invariants from Rust.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+
+    u64::try_from(page_size)
+}
+
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 #[test]
 fn requires_macos_apple_silicon() {
