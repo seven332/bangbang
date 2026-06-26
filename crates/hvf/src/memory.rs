@@ -267,6 +267,12 @@ impl HvfGuestMemoryMapping {
         !self.mapped_regions.is_empty()
     }
 
+    // HVF destroys guest mappings with the VM. Use this only after `hv_vm_destroy`
+    // succeeds following an earlier unmap failure.
+    pub(crate) fn release_after_vm_destroy(mut self) {
+        self.mapped_regions.clear();
+    }
+
     fn map_all(
         &mut self,
         permissions: HvfMemoryPermissions,
@@ -751,6 +757,23 @@ mod tests {
 
         assert!(!mapping.has_mapped_regions());
         assert_eq!(mapper.unmap_count(), 2);
+    }
+
+    #[test]
+    fn release_after_vm_destroy_does_not_unmap_again() {
+        let page_size = page_size();
+        let memory = memory_for_ranges(vec![range(0, page_size)]);
+        let mapper = Arc::new(RecordingMapper::default());
+        let mapping = HvfGuestMemoryMapping::map_with_mapper(
+            memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            mapper.clone(),
+        )
+        .expect("guest memory mapping should succeed");
+
+        mapping.release_after_vm_destroy();
+
+        assert_eq!(mapper.unmap_count(), 0);
     }
 
     #[derive(Debug)]

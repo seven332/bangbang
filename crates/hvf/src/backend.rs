@@ -168,11 +168,19 @@ impl VmBackend for HvfBackend {
 impl Drop for HvfBackend {
     fn drop(&mut self) {
         if self.vm_created {
-            if let Some(mut mapping) = self.guest_memory.take() {
-                let _ = mapping.unmap_all();
+            let mut mapping_after_failed_unmap = None;
+
+            if let Some(mut mapping) = self.guest_memory.take()
+                && mapping.unmap_all().is_err()
+            {
+                mapping_after_failed_unmap = Some(mapping);
             }
-            let _ = crate::ffi::destroy_vm();
+            let vm_destroyed = crate::ffi::destroy_vm().is_ok();
             self.vm_created = false;
+
+            if vm_destroyed && let Some(mapping) = mapping_after_failed_unmap {
+                mapping.release_after_vm_destroy();
+            }
         }
     }
 }
