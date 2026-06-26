@@ -5,9 +5,9 @@ use std::io;
 use std::ptr::{self, NonNull};
 
 #[cfg(test)]
-use std::cell::Cell;
+use std::sync::Arc;
 #[cfg(test)]
-use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GuestAddress(u64);
@@ -478,6 +478,16 @@ struct AnonymousMapping {
     kind: AnonymousMappingKind,
 }
 
+// SAFETY: `AnonymousMapping` owns a process-local mmap region. Moving ownership
+// to another thread does not invalidate the mapping, and `munmap` may run from
+// any thread when the owner is dropped.
+unsafe impl Send for AnonymousMapping {}
+
+// SAFETY: Shared references expose only copyable metadata and a raw pointer.
+// Safe Rust cannot mutate the mapped bytes through this type, and unsafe users
+// must uphold the usual raw-pointer aliasing and lifetime requirements.
+unsafe impl Sync for AnonymousMapping {}
+
 impl AnonymousMapping {
     fn map(size: usize) -> Result<Self, GuestMemoryAllocationError> {
         // SAFETY: The call requests a new private anonymous read/write mapping.
@@ -519,7 +529,7 @@ impl AnonymousMapping {
     }
 
     #[cfg(test)]
-    fn test_mapping(size: usize, drop_count: Rc<Cell<usize>>) -> Self {
+    fn test_mapping(size: usize, drop_count: Arc<AtomicUsize>) -> Self {
         Self {
             address: NonNull::<u8>::dangling().cast(),
             size,
@@ -550,7 +560,7 @@ enum AnonymousMappingKind {
     System,
     #[cfg(test)]
     Test {
-        drop_count: Rc<Cell<usize>>,
+        drop_count: Arc<AtomicUsize>,
     },
 }
 
@@ -566,7 +576,7 @@ impl Drop for AnonymousMapping {
             }
             #[cfg(test)]
             AnonymousMappingKind::Test { drop_count } => {
-                drop_count.set(drop_count.get() + 1);
+                drop_count.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -574,9 +584,9 @@ impl Drop for AnonymousMapping {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
     use std::io;
-    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
         AnonymousMapper, AnonymousMapping, GuestAddress, GuestMemory, GuestMemoryAllocationError,
@@ -862,6 +872,14 @@ mod tests {
     }
 
     #[test]
+    fn guest_memory_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<GuestMemory>();
+        assert_send_sync::<super::GuestMemoryRegion>();
+    }
+
+    #[test]
     fn guest_memory_debug_omits_host_address() {
         let page_size = host_page_size().expect("host page size should be available for tests");
         let layout = GuestMemoryLayout::new(vec![range(0, page_size)])
@@ -886,10 +904,10 @@ mod tests {
         let unaligned_range = range(page_size, page_size - 1);
         let layout =
             GuestMemoryLayout::new(vec![unaligned_range]).expect("layout ordering should be valid");
-        let drop_count = Rc::new(Cell::new(0));
+        let drop_count = Arc::new(AtomicUsize::new(0));
         let mut mapper = CountingMapper {
             maps: 0,
-            drop_count: Rc::clone(&drop_count),
+            drop_count: Arc::clone(&drop_count),
         };
 
         let err = GuestMemory::allocate_with_mapper(&layout, page_size, &mut mapper)
@@ -903,7 +921,7 @@ mod tests {
             }) if range == unaligned_range && alignment == page_size
         ));
         assert_eq!(mapper.maps, 0);
-        assert_eq!(drop_count.get(), 0);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -912,10 +930,10 @@ mod tests {
         let unaligned_range = range(page_size, page_size - 1);
         let layout = GuestMemoryLayout::new(vec![range(0, page_size), unaligned_range])
             .expect("layout ordering should be valid");
-        let drop_count = Rc::new(Cell::new(0));
+        let drop_count = Arc::new(AtomicUsize::new(0));
         let mut mapper = CountingMapper {
             maps: 0,
-            drop_count: Rc::clone(&drop_count),
+            drop_count: Arc::clone(&drop_count),
         };
 
         let err = GuestMemory::allocate_with_mapper(&layout, page_size, &mut mapper)
@@ -929,7 +947,7 @@ mod tests {
             }) if range == unaligned_range && alignment == page_size
         ));
         assert_eq!(mapper.maps, 0);
-        assert_eq!(drop_count.get(), 0);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -958,11 +976,11 @@ mod tests {
         let page_size = host_page_size().expect("host page size should be available for tests");
         let layout = GuestMemoryLayout::new(vec![range(0, page_size), range(page_size, page_size)])
             .expect("page-aligned layout should be valid");
-        let drop_count = Rc::new(Cell::new(0));
+        let drop_count = Arc::new(AtomicUsize::new(0));
         let mut mapper = FailingMapper {
             maps: 0,
             fail_on: 2,
-            drop_count: Rc::clone(&drop_count),
+            drop_count: Arc::clone(&drop_count),
         };
 
         let err = GuestMemory::allocate_with_mapper(&layout, page_size, &mut mapper)
@@ -974,13 +992,13 @@ mod tests {
                 if size == usize::try_from(page_size).expect("page size should fit usize")
         ));
         assert_eq!(mapper.maps, 2);
-        assert_eq!(drop_count.get(), 1);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 1);
     }
 
     #[derive(Debug)]
     struct CountingMapper {
         maps: usize,
-        drop_count: Rc<Cell<usize>>,
+        drop_count: Arc<AtomicUsize>,
     }
 
     impl AnonymousMapper for CountingMapper {
@@ -988,7 +1006,7 @@ mod tests {
             self.maps += 1;
             Ok(AnonymousMapping::test_mapping(
                 size,
-                Rc::clone(&self.drop_count),
+                Arc::clone(&self.drop_count),
             ))
         }
     }
@@ -997,7 +1015,7 @@ mod tests {
     struct FailingMapper {
         maps: usize,
         fail_on: usize,
-        drop_count: Rc<Cell<usize>>,
+        drop_count: Arc<AtomicUsize>,
     }
 
     impl AnonymousMapper for FailingMapper {
@@ -1013,7 +1031,7 @@ mod tests {
 
             Ok(AnonymousMapping::test_mapping(
                 size,
-                Rc::clone(&self.drop_count),
+                Arc::clone(&self.drop_count),
             ))
         }
     }
