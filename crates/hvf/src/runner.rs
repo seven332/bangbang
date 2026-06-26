@@ -11,6 +11,7 @@ use crate::exit::HvfVcpuExit;
 use crate::vcpu::HvfVcpuOwner;
 
 const RUNNER_SHUT_DOWN_MESSAGE: &str = "vCPU runner is shut down";
+const RUNNER_SHUTTING_DOWN_MESSAGE: &str = "vCPU runner shutdown is already in progress";
 const RUN_IN_FLIGHT_MESSAGE: &str = "vCPU runner already has a run in flight";
 const RUNNER_STATE_POISONED_MESSAGE: &str = "vCPU runner state lock is poisoned";
 const COMMAND_CHANNEL_CLOSED_MESSAGE: &str = "vCPU runner command channel is closed";
@@ -139,7 +140,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
     }
 
     pub fn cancel(&self) -> Result<(), HvfVcpuRunnerError> {
-        self.ensure_thread_exists()?;
+        self.prepare_cancel()?;
         self.cancel_vcpu()
     }
 
@@ -219,8 +220,13 @@ impl<'vm> HvfVcpuRunner<'vm> {
 
     fn prepare_shutdown(&self) -> Result<(mpsc::Sender<RunnerCommand>, bool), HvfVcpuRunnerError> {
         let mut state = self.lock_state()?;
-        if state.thread.is_none() || state.shutting_down {
+        if state.thread.is_none() {
             return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
+        }
+        if state.shutting_down {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                RUNNER_SHUTTING_DOWN_MESSAGE,
+            ));
         }
 
         state.shutting_down = true;
@@ -234,10 +240,15 @@ impl<'vm> HvfVcpuRunner<'vm> {
         }
     }
 
-    fn ensure_thread_exists(&self) -> Result<(), HvfVcpuRunnerError> {
+    fn prepare_cancel(&self) -> Result<(), HvfVcpuRunnerError> {
         let state = self.lock_state()?;
         if state.thread.is_none() {
             return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
+        }
+        if state.shutting_down {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                RUNNER_SHUTTING_DOWN_MESSAGE,
+            ));
         }
         Ok(())
     }
@@ -527,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_shutdown_rejects_second_shutdown_command() {
+    fn shutdown_in_progress_rejects_second_shutdown_command_and_cancel() {
         let (runner, _, destroyed_receiver) = start_fake_runner();
         let (command_sender, should_cancel) = runner
             .prepare_shutdown()
@@ -540,7 +551,19 @@ mod tests {
         };
         assert_eq!(
             err,
-            HvfVcpuRunnerError::InvalidState(super::RUNNER_SHUT_DOWN_MESSAGE)
+            HvfVcpuRunnerError::InvalidState(super::RUNNER_SHUTTING_DOWN_MESSAGE)
+        );
+        assert_eq!(
+            runner.shutdown(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUNNER_SHUTTING_DOWN_MESSAGE
+            ))
+        );
+        assert_eq!(
+            runner.cancel(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUNNER_SHUTTING_DOWN_MESSAGE
+            ))
         );
 
         let (response_sender, response_receiver) = mpsc::channel();
