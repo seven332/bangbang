@@ -140,7 +140,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
     }
 
     pub fn cancel(&self) -> Result<(), HvfVcpuRunnerError> {
-        self.prepare_cancel()?;
+        let _state = self.prepare_cancel()?;
         self.cancel_vcpu()
     }
 
@@ -170,6 +170,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             Err(err) => Err(err),
         };
         let join_result = join_runner_thread(thread);
+        self.finish_shutdown();
 
         first_error(response_result, join_result)
     }
@@ -220,13 +221,13 @@ impl<'vm> HvfVcpuRunner<'vm> {
 
     fn prepare_shutdown(&self) -> Result<(mpsc::Sender<RunnerCommand>, bool), HvfVcpuRunnerError> {
         let mut state = self.lock_state()?;
-        if state.thread.is_none() {
-            return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
-        }
         if state.shutting_down {
             return Err(HvfVcpuRunnerError::InvalidState(
                 RUNNER_SHUTTING_DOWN_MESSAGE,
             ));
+        }
+        if state.thread.is_none() {
+            return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
         }
 
         state.shutting_down = true;
@@ -240,7 +241,13 @@ impl<'vm> HvfVcpuRunner<'vm> {
         }
     }
 
-    fn prepare_cancel(&self) -> Result<(), HvfVcpuRunnerError> {
+    fn finish_shutdown(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.shutting_down = false;
+        }
+    }
+
+    fn prepare_cancel(&self) -> Result<MutexGuard<'_, RunnerHandleState>, HvfVcpuRunnerError> {
         let state = self.lock_state()?;
         if state.thread.is_none() {
             return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
@@ -250,7 +257,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 RUNNER_SHUTTING_DOWN_MESSAGE,
             ));
         }
-        Ok(())
+        Ok(state)
     }
 
     fn cancel_vcpu(&self) -> Result<(), HvfVcpuRunnerError> {
@@ -417,7 +424,7 @@ fn first_error(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, mpsc};
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::thread;
 
     use bangbang_runtime::BackendError;
@@ -471,6 +478,28 @@ mod tests {
         let (release_run_sender, release_run_receiver) = mpsc::channel();
         let (destroyed_sender, destroyed_receiver) = mpsc::channel();
         let cancel_vcpu = fake_cancel_vcpu(release_run_sender);
+        start_fake_runner_with_cancel(
+            cancel_vcpu,
+            entered_run_sender,
+            release_run_receiver,
+            destroyed_sender,
+            entered_run_receiver,
+            destroyed_receiver,
+        )
+    }
+
+    fn start_fake_runner_with_cancel(
+        cancel_vcpu: CancelVcpu,
+        entered_run_sender: mpsc::Sender<()>,
+        release_run_receiver: mpsc::Receiver<Result<HvfVcpuExit, BackendError>>,
+        destroyed_sender: mpsc::Sender<()>,
+        entered_run_receiver: mpsc::Receiver<()>,
+        destroyed_receiver: mpsc::Receiver<()>,
+    ) -> (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<()>,
+        mpsc::Receiver<()>,
+    ) {
         let started = spawn_runner_thread(move || {
             Ok(FakeVcpu {
                 entered_run_sender,
@@ -485,6 +514,60 @@ mod tests {
             entered_run_receiver,
             destroyed_receiver,
         )
+    }
+
+    #[test]
+    fn cancel_holds_runner_state_until_hvf_exit_request_returns() {
+        let (entered_run_sender, entered_run_receiver) = mpsc::channel();
+        let (_release_run_sender, release_run_receiver) = mpsc::channel();
+        let (destroyed_sender, destroyed_receiver) = mpsc::channel();
+        let (entered_cancel_sender, entered_cancel_receiver) = mpsc::channel();
+        let release_cancel = Arc::new((Mutex::new(false), Condvar::new()));
+        let cancel_release_for_runner = Arc::clone(&release_cancel);
+        let cancel_vcpu = Arc::new(move |_| {
+            entered_cancel_sender
+                .send(())
+                .map_err(|_| BackendError::InvalidState("fake cancel entry receiver closed"))?;
+            let (released, released_changed) = &*cancel_release_for_runner;
+            let mut released = released
+                .lock()
+                .map_err(|_| BackendError::InvalidState("fake cancel release lock poisoned"))?;
+            while !*released {
+                released = released_changed
+                    .wait(released)
+                    .map_err(|_| BackendError::InvalidState("fake cancel release lock poisoned"))?;
+            }
+            Ok(())
+        });
+        let (runner, _, destroyed_receiver) = start_fake_runner_with_cancel(
+            cancel_vcpu,
+            entered_run_sender,
+            release_run_receiver,
+            destroyed_sender,
+            entered_run_receiver,
+            destroyed_receiver,
+        );
+
+        thread::scope(|scope| {
+            let cancel = scope.spawn(|| runner.cancel());
+            entered_cancel_receiver
+                .recv()
+                .expect("cancel should enter fake HVF exit request");
+
+            assert!(runner.state.try_lock().is_err());
+
+            let (released, released_changed) = &*release_cancel;
+            *released
+                .lock()
+                .expect("fake cancel release lock should be lockable") = true;
+            released_changed.notify_one();
+            assert_eq!(cancel.join().expect("cancel thread should join"), Ok(()));
+        });
+
+        runner.shutdown().expect("runner should shut down");
+        destroyed_receiver
+            .recv()
+            .expect("fake vCPU should be destroyed");
     }
 
     #[test]
@@ -565,20 +648,30 @@ mod tests {
                 super::RUNNER_SHUTTING_DOWN_MESSAGE
             ))
         );
+        let thread = runner
+            .take_thread()
+            .expect("runner state should be lockable");
+        assert_eq!(
+            runner.shutdown(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUNNER_SHUTTING_DOWN_MESSAGE
+            ))
+        );
 
         let (response_sender, response_receiver) = mpsc::channel();
         command_sender
             .send(super::RunnerCommand::Shutdown { response_sender })
             .expect("shutdown command should be sent");
-        let thread = runner
-            .take_thread()
-            .expect("runner state should be lockable");
         let response = response_receiver
             .recv()
             .expect("shutdown response should be sent");
 
         assert_eq!(response, Ok(()));
         super::join_runner_thread(thread).expect("runner thread should join");
+        runner.finish_shutdown();
+        runner
+            .shutdown()
+            .expect("completed shutdown should be idempotent");
         destroyed_receiver
             .recv()
             .expect("fake vCPU should be destroyed");
