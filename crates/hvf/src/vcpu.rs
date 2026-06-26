@@ -47,6 +47,7 @@ pub struct HvfVcpu<'vm> {
 
 pub(crate) struct HvfVcpuOwner {
     handle: Option<HvfVcpuHandle>,
+    _not_send_sync: PhantomData<Rc<()>>,
 }
 
 struct HvfVcpuHandle {
@@ -65,6 +66,7 @@ impl HvfVcpuOwner {
                 exit: created.exit,
                 exit_available: false,
             }),
+            _not_send_sync: PhantomData,
         })
     }
 
@@ -250,6 +252,7 @@ mod tests {
                     exit,
                     exit_available,
                 }),
+                _not_send_sync: PhantomData::<Rc<()>>,
             },
             _vm: PhantomData,
             _not_send_sync: PhantomData::<Rc<()>>,
@@ -299,7 +302,10 @@ mod tests {
     #[test]
     fn exit_snapshot_rejects_destroyed_vcpu() {
         let vcpu = HvfVcpu {
-            owner: HvfVcpuOwner { handle: None },
+            owner: HvfVcpuOwner {
+                handle: None,
+                _not_send_sync: PhantomData::<Rc<()>>,
+            },
             _vm: PhantomData,
             _not_send_sync: PhantomData::<Rc<()>>,
         };
@@ -313,7 +319,10 @@ mod tests {
     #[test]
     fn register_access_rejects_destroyed_vcpu() {
         let mut vcpu = HvfVcpu {
-            owner: HvfVcpuOwner { handle: None },
+            owner: HvfVcpuOwner {
+                handle: None,
+                _not_send_sync: PhantomData::<Rc<()>>,
+            },
             _vm: PhantomData,
             _not_send_sync: PhantomData::<Rc<()>>,
         };

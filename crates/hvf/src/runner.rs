@@ -131,17 +131,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
 
     pub fn run_once(&self) -> Result<HvfVcpuExit, HvfVcpuRunnerError> {
         let (response_sender, response_receiver) = mpsc::channel();
-        let command_sender = self.prepare_run_once()?;
-        let _in_flight_run = InFlightRun::new(&self.state);
-
-        if command_sender
-            .send(RunnerCommand::RunOnce { response_sender })
-            .is_err()
-        {
-            return Err(HvfVcpuRunnerError::ChannelClosed(
-                COMMAND_CHANNEL_CLOSED_MESSAGE,
-            ));
-        }
+        let _in_flight_run = self.start_run_once(response_sender)?;
 
         response_receiver
             .recv()
@@ -199,7 +189,10 @@ impl<'vm> HvfVcpuRunner<'vm> {
         })
     }
 
-    fn prepare_run_once(&self) -> Result<mpsc::Sender<RunnerCommand>, HvfVcpuRunnerError> {
+    fn start_run_once(
+        &self,
+        response_sender: mpsc::Sender<Result<HvfVcpuExit, HvfVcpuRunnerError>>,
+    ) -> Result<InFlightRun<'_>, HvfVcpuRunnerError> {
         let mut state = self.lock_state()?;
         if state.thread.is_none() || state.shutting_down {
             return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
@@ -209,8 +202,18 @@ impl<'vm> HvfVcpuRunner<'vm> {
         }
 
         state.in_flight_runs = 1;
+        if self
+            .command_sender
+            .send(RunnerCommand::RunOnce { response_sender })
+            .is_err()
+        {
+            state.in_flight_runs = 0;
+            return Err(HvfVcpuRunnerError::ChannelClosed(
+                COMMAND_CHANNEL_CLOSED_MESSAGE,
+            ));
+        }
 
-        Ok(self.command_sender.clone())
+        Ok(InFlightRun::new(&self.state))
     }
 
     fn prepare_shutdown(&self) -> Result<(mpsc::Sender<RunnerCommand>, bool), HvfVcpuRunnerError> {
