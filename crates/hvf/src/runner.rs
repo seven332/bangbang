@@ -647,6 +647,68 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_cancel_error_keeps_in_flight_run_and_allows_retry() {
+        let (entered_run_sender, entered_run_receiver) = mpsc::channel();
+        let (release_run_sender, release_run_receiver) = mpsc::channel();
+        let (destroyed_sender, destroyed_receiver) = mpsc::channel();
+        let fail_next_cancel = Arc::new(Mutex::new(true));
+        let fail_next_cancel_for_runner = Arc::clone(&fail_next_cancel);
+        let cancel_vcpu = Arc::new(move |_| {
+            let mut fail_next = fail_next_cancel_for_runner
+                .lock()
+                .map_err(|_| BackendError::InvalidState("fake cancel state lock poisoned"))?;
+            if *fail_next {
+                *fail_next = false;
+                return Err(BackendError::InvalidState("fake cancel failed"));
+            }
+
+            release_run_sender
+                .send(Ok(HvfVcpuExit::Canceled))
+                .map_err(|_| BackendError::InvalidState("fake run release receiver closed"))
+        });
+        let (runner, entered_run_receiver, destroyed_receiver) = start_fake_runner_with_cancel(
+            cancel_vcpu,
+            entered_run_sender,
+            release_run_receiver,
+            destroyed_sender,
+            entered_run_receiver,
+            destroyed_receiver,
+        );
+
+        thread::scope(|scope| {
+            let run = scope.spawn(|| runner.run_once());
+            entered_run_receiver
+                .recv()
+                .expect("runner should enter fake run");
+
+            assert_eq!(
+                runner.shutdown(),
+                Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
+                    "fake cancel failed"
+                )))
+            );
+            assert_eq!(
+                runner.run_once(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::RUN_IN_FLIGHT_MESSAGE
+                ))
+            );
+
+            runner
+                .shutdown()
+                .expect("shutdown retry should cancel and join fake run");
+            assert_eq!(
+                run.join().expect("run thread should join"),
+                Ok(HvfVcpuExit::Canceled)
+            );
+        });
+
+        destroyed_receiver
+            .recv()
+            .expect("fake vCPU should be destroyed");
+    }
+
+    #[test]
     fn shutdown_in_progress_rejects_second_shutdown_command_and_cancel() {
         let (runner, _, destroyed_receiver) = start_fake_runner();
         let (command_sender, should_cancel) = runner
