@@ -96,6 +96,8 @@ mod imp {
         pub fn hv_vcpu_set_reg(vcpu: HvVcpu, reg: HvReg, value: u64) -> HvReturn;
         pub fn hv_vcpu_get_sys_reg(vcpu: HvVcpu, reg: HvSysReg, value: *mut u64) -> HvReturn;
         pub fn hv_vcpu_set_sys_reg(vcpu: HvVcpu, reg: HvSysReg, value: u64) -> HvReturn;
+        pub fn hv_vcpu_run(vcpu: HvVcpu) -> HvReturn;
+        pub fn hv_vcpus_exit(vcpus: *mut HvVcpu, vcpu_count: u32) -> HvReturn;
     }
 
     fn hv_return_name(code: HvReturn) -> Option<&'static str> {
@@ -162,6 +164,25 @@ mod imp {
         // SAFETY: The caller owns this current-thread vCPU handle and guarantees it has not
         // already been destroyed.
         unsafe { check(hv_vcpu_destroy(vcpu), "hv_vcpu_destroy") }
+    }
+
+    pub fn run_vcpu(vcpu: HvVcpu) -> Result<(), BackendError> {
+        // SAFETY: The caller owns this current-thread vCPU handle.
+        unsafe { check(hv_vcpu_run(vcpu), "hv_vcpu_run") }
+    }
+
+    pub fn exit_vcpus(vcpus: &mut [HvVcpu]) -> Result<(), BackendError> {
+        let vcpu_count = u32::try_from(vcpus.len())
+            .map_err(|_| BackendError::InvalidState("too many vCPUs to exit"))?;
+
+        // SAFETY: `vcpus.as_mut_ptr()` is valid for `vcpu_count` elements for the duration of
+        // the call, and HVF only uses the ids to request asynchronous exits.
+        unsafe {
+            check(
+                hv_vcpus_exit(vcpus.as_mut_ptr(), vcpu_count),
+                "hv_vcpus_exit",
+            )
+        }
     }
 
     pub fn get_reg(vcpu: HvVcpu, reg: HvReg) -> Result<u64, BackendError> {
@@ -257,6 +278,14 @@ mod imp {
 
     pub fn destroy_vcpu(_: HvVcpu) -> Result<(), BackendError> {
         Ok(())
+    }
+
+    pub fn run_vcpu(_: HvVcpu) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
+    pub fn exit_vcpus(_: &mut [HvVcpu]) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
     }
 
     pub fn get_reg(_: HvVcpu, _: HvReg) -> Result<u64, BackendError> {

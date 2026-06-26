@@ -28,6 +28,29 @@ fn creates_and_destroys_hvf_vcpu() {
     backend.destroy_vm().expect("VM should be destroyed");
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn cancels_runner_before_first_run() {
+    use bangbang_hvf::{HvfBackend, HvfVcpuExit};
+    use bangbang_runtime::VmBackend;
+
+    let mut backend = HvfBackend::new();
+
+    backend.create_vm().expect("VM should be created");
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("vCPU runner should start");
+        runner.cancel().expect("runner should accept cancellation");
+        assert_eq!(
+            runner.run_once().expect("runner should return an exit"),
+            HvfVcpuExit::Canceled
+        );
+        runner.shutdown().expect("runner should shut down");
+    }
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 #[test]
 fn requires_macos_apple_silicon() {

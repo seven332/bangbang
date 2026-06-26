@@ -312,11 +312,17 @@ macOS design work instead of direct implementation:
 - HVF vCPU handles are thread-affine: creation, register access, run, and
   destroy operations must happen on the owning thread. The current vCPU wrapper
   covers current-thread lifecycle, typed exit surface, and narrow register
-  access only; future run-loop work should use a thread-owned runner.
+  access. The current runner skeleton creates a vCPU on a dedicated thread,
+  supports one cancellable `hv_vcpu_run` step at a time, and shuts down by
+  canceling and joining the runner thread.
 - HVF exit snapshots preserve Hypervisor.framework reasons such as canceled,
-  exception, virtual timer activation, and unknown after a future run wrapper
-  marks exit data available. They are not yet produced by guest execution or
-  decoded into MMIO, timer, device, or runtime events.
+  exception, virtual timer activation, and unknown after a run wrapper marks
+  exit data available. They are not yet decoded into MMIO, timer, device, or
+  runtime events.
+- Firecracker's full paused/resumed microVM loop is not implemented yet.
+  bangbang's runner is only the HVF ownership and cancellation primitive needed
+  before guest memory, interrupt, timer, and device work can build the real run
+  loop.
 - Linux seccomp, jailer, cgroups, and namespaces do not directly apply.
 - Linux TAP-based networking needs a macOS-specific design.
 - Snapshot and device behavior may differ when backed by HVF.

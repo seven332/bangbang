@@ -40,9 +40,13 @@ impl HvfSystemRegister {
 }
 
 pub struct HvfVcpu<'vm> {
-    handle: Option<HvfVcpuHandle>,
+    owner: HvfVcpuOwner,
     _vm: PhantomData<&'vm mut HvfBackend>,
     _not_send_sync: PhantomData<Rc<()>>,
+}
+
+pub(crate) struct HvfVcpuOwner {
+    handle: Option<HvfVcpuHandle>,
 }
 
 struct HvfVcpuHandle {
@@ -51,8 +55,8 @@ struct HvfVcpuHandle {
     exit_available: bool,
 }
 
-impl<'vm> HvfVcpu<'vm> {
-    pub(crate) fn new(_: &'vm mut HvfBackend) -> Result<Self, BackendError> {
+impl HvfVcpuOwner {
+    pub(crate) fn new() -> Result<Self, BackendError> {
         let created = crate::ffi::create_vcpu()?;
 
         Ok(Self {
@@ -61,16 +65,30 @@ impl<'vm> HvfVcpu<'vm> {
                 exit: created.exit,
                 exit_available: false,
             }),
-            _vm: PhantomData,
-            _not_send_sync: PhantomData,
         })
     }
 
-    pub fn destroy(&mut self) -> Result<(), BackendError> {
-        self.destroy_inner()
+    pub(crate) fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+        Ok(self.handle()?.vcpu)
     }
 
-    pub fn exit_snapshot(&self) -> Result<HvfVcpuExit, BackendError> {
+    pub(crate) fn destroy(&mut self) -> Result<(), BackendError> {
+        if let Some(handle) = &self.handle {
+            crate::ffi::destroy_vcpu(handle.vcpu)?;
+            self.handle = None;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+        let vcpu = self.raw_vcpu()?;
+
+        crate::ffi::run_vcpu(vcpu)?;
+        self.mark_exit_available()?;
+        self.exit_snapshot()
+    }
+
+    pub(crate) fn exit_snapshot(&self) -> Result<HvfVcpuExit, BackendError> {
         let handle = self.handle()?;
         if !handle.exit_available {
             return Err(BackendError::InvalidState(NO_VCPU_EXIT_MESSAGE));
@@ -83,24 +101,36 @@ impl<'vm> HvfVcpu<'vm> {
         Ok(HvfVcpuExit::from_raw(raw_exit))
     }
 
-    pub fn get_register(&self, register: HvfRegister) -> Result<u64, BackendError> {
+    pub(crate) fn get_register(&self, register: HvfRegister) -> Result<u64, BackendError> {
         crate::ffi::get_reg(self.handle()?.vcpu, register.raw())
     }
 
-    pub fn set_register(&mut self, register: HvfRegister, value: u64) -> Result<(), BackendError> {
+    pub(crate) fn set_register(
+        &mut self,
+        register: HvfRegister,
+        value: u64,
+    ) -> Result<(), BackendError> {
         crate::ffi::set_reg(self.handle()?.vcpu, register.raw(), value)
     }
 
-    pub fn get_system_register(&self, register: HvfSystemRegister) -> Result<u64, BackendError> {
+    pub(crate) fn get_system_register(
+        &self,
+        register: HvfSystemRegister,
+    ) -> Result<u64, BackendError> {
         crate::ffi::get_sys_reg(self.handle()?.vcpu, register.raw())
     }
 
-    pub fn set_system_register(
+    pub(crate) fn set_system_register(
         &mut self,
         register: HvfSystemRegister,
         value: u64,
     ) -> Result<(), BackendError> {
         crate::ffi::set_sys_reg(self.handle()?.vcpu, register.raw(), value)
+    }
+
+    fn mark_exit_available(&mut self) -> Result<(), BackendError> {
+        self.handle_mut()?.exit_available = true;
+        Ok(())
     }
 
     fn handle(&self) -> Result<&HvfVcpuHandle, BackendError> {
@@ -109,36 +139,76 @@ impl<'vm> HvfVcpu<'vm> {
             .ok_or(BackendError::InvalidState(DESTROYED_VCPU_MESSAGE))
     }
 
-    fn destroy_inner(&mut self) -> Result<(), BackendError> {
-        if let Some(handle) = &self.handle {
-            crate::ffi::destroy_vcpu(handle.vcpu)?;
-            self.handle = None;
-        }
-        Ok(())
+    fn handle_mut(&mut self) -> Result<&mut HvfVcpuHandle, BackendError> {
+        self.handle
+            .as_mut()
+            .ok_or(BackendError::InvalidState(DESTROYED_VCPU_MESSAGE))
     }
 }
 
-impl Drop for HvfVcpu<'_> {
+impl Drop for HvfVcpuOwner {
     fn drop(&mut self) {
-        let _ = self.destroy_inner();
+        let _ = self.destroy();
+    }
+}
+
+impl fmt::Debug for HvfVcpuOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (active, has_exit_pointer, exit_available) = match &self.handle {
+            Some(handle) => (true, !handle.exit.is_null(), handle.exit_available),
+            None => (false, false, false),
+        };
+
+        f.debug_struct("HvfVcpuOwner")
+            .field("active", &active)
+            .field("has_exit_pointer", &has_exit_pointer)
+            .field("exit_available", &exit_available)
+            .finish()
+    }
+}
+
+impl<'vm> HvfVcpu<'vm> {
+    pub(crate) fn new(_: &'vm mut HvfBackend) -> Result<Self, BackendError> {
+        Ok(Self {
+            owner: HvfVcpuOwner::new()?,
+            _vm: PhantomData,
+            _not_send_sync: PhantomData,
+        })
+    }
+
+    pub fn destroy(&mut self) -> Result<(), BackendError> {
+        self.owner.destroy()
+    }
+
+    pub fn exit_snapshot(&self) -> Result<HvfVcpuExit, BackendError> {
+        self.owner.exit_snapshot()
+    }
+
+    pub fn get_register(&self, register: HvfRegister) -> Result<u64, BackendError> {
+        self.owner.get_register(register)
+    }
+
+    pub fn set_register(&mut self, register: HvfRegister, value: u64) -> Result<(), BackendError> {
+        self.owner.set_register(register, value)
+    }
+
+    pub fn get_system_register(&self, register: HvfSystemRegister) -> Result<u64, BackendError> {
+        self.owner.get_system_register(register)
+    }
+
+    pub fn set_system_register(
+        &mut self,
+        register: HvfSystemRegister,
+        value: u64,
+    ) -> Result<(), BackendError> {
+        self.owner.set_system_register(register, value)
     }
 }
 
 impl fmt::Debug for HvfVcpu<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (vcpu, has_exit_pointer, exit_available) = match &self.handle {
-            Some(handle) => (
-                Some(handle.vcpu),
-                !handle.exit.is_null(),
-                handle.exit_available,
-            ),
-            None => (None, false, false),
-        };
-
         f.debug_struct("HvfVcpu")
-            .field("vcpu", &vcpu)
-            .field("has_exit_pointer", &has_exit_pointer)
-            .field("exit_available", &exit_available)
+            .field("owner", &self.owner)
             .finish_non_exhaustive()
     }
 }
@@ -154,7 +224,7 @@ mod tests {
 
     use super::{
         DESTROYED_VCPU_MESSAGE, HvfRegister, HvfSystemRegister, HvfVcpu, HvfVcpuHandle,
-        NO_VCPU_EXIT_MESSAGE,
+        HvfVcpuOwner, NO_VCPU_EXIT_MESSAGE,
     };
     use crate::exit::{HvfExceptionExit, HvfVcpuExit};
 
@@ -174,11 +244,13 @@ mod tests {
         exit_available: bool,
     ) -> ManuallyDrop<HvfVcpu<'static>> {
         ManuallyDrop::new(HvfVcpu {
-            handle: Some(HvfVcpuHandle {
-                vcpu: 7,
-                exit,
-                exit_available,
-            }),
+            owner: HvfVcpuOwner {
+                handle: Some(HvfVcpuHandle {
+                    vcpu: 7,
+                    exit,
+                    exit_available,
+                }),
+            },
             _vm: PhantomData,
             _not_send_sync: PhantomData::<Rc<()>>,
         })
@@ -227,7 +299,7 @@ mod tests {
     #[test]
     fn exit_snapshot_rejects_destroyed_vcpu() {
         let vcpu = HvfVcpu {
-            handle: None,
+            owner: HvfVcpuOwner { handle: None },
             _vm: PhantomData,
             _not_send_sync: PhantomData::<Rc<()>>,
         };
@@ -241,7 +313,7 @@ mod tests {
     #[test]
     fn register_access_rejects_destroyed_vcpu() {
         let mut vcpu = HvfVcpu {
-            handle: None,
+            owner: HvfVcpuOwner { handle: None },
             _vm: PhantomData,
             _not_send_sync: PhantomData::<Rc<()>>,
         };
