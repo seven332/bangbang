@@ -15,7 +15,6 @@ Unit tests live next to the code they exercise under each crate’s `src/` tree.
 ## Build, Test, and Development Commands
 
 - `cargo fmt --all -- --check`: verify Rust formatting.
-- `cargo +1.85.0 check --workspace --all-targets --all-features --locked`: verify the declared minimum Rust toolchain.
 - `cargo check --workspace --all-targets --all-features --locked`: type-check the full workspace using the committed lockfile.
 - `cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf`: run non-HVF tests with all targets and features enabled.
 - `cargo test -p bangbang-hvf --lib --all-features --locked`: run unsigned HVF unit tests.
