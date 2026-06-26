@@ -243,10 +243,10 @@ pointers.
 
 The first arm64 placement helpers match Firecracker's published aarch64 layout
 shape: system memory occupies the first 2 MiB of DRAM, the kernel load address
-starts at `0x8020_0000`, command lines are capped at 2048 bytes, the FDT window
-is 2 MiB at the end of the first DRAM range when there is room, and initrd
-placement is page-aligned immediately before the FDT window when it fits. A
-zero-byte initrd resolves to the FDT address, matching Firecracker's helper
+starts at `0x8020_0000`, the command-line size constant is 2048 bytes, the FDT
+window is 2 MiB at the end of the first DRAM range when there is room, and
+initrd placement is page-aligned immediately before the FDT window when it fits.
+A zero-byte initrd resolves to the FDT address, matching Firecracker's helper
 behavior.
 
 The HVF backend can map allocated guest memory regions into an existing
