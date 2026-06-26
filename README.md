@@ -81,10 +81,10 @@ cargo test --workspace --all-targets --all-features --locked --exclude bangbang-
 cargo test -p bangbang-hvf --lib --all-features --locked
 ```
 
-On macOS Apple Silicon hosts, `bangbang-hvf` contains real HVF lifecycle and
-runner smoke tests in `crates/hvf/tests/hvf_lifecycle.rs`. The tests are not
-ignored; run the signed test wrapper so host or entitlement failures fail the
-test run:
+On macOS Apple Silicon hosts, `bangbang-hvf` contains real HVF lifecycle,
+guest memory mapping, and runner smoke tests in
+`crates/hvf/tests/hvf_lifecycle.rs`. The tests are not ignored; run the signed
+test wrapper so host or entitlement failures fail the test run:
 
 ```sh
 scripts/run-hvf-tests.sh

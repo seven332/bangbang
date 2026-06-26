@@ -42,7 +42,7 @@ impl HvfMemoryPermissions {
         Self { bits }
     }
 
-    pub const fn bits(self) -> crate::ffi::HvMemoryFlags {
+    pub(crate) const fn bits(self) -> crate::ffi::HvMemoryFlags {
         self.bits
     }
 
@@ -229,21 +229,13 @@ impl HvfGuestMemoryUnmapFailure {
 }
 
 #[derive(Debug)]
-pub struct HvfGuestMemoryMapping {
+pub(crate) struct HvfGuestMemoryMapping {
     memory: Option<GuestMemory>,
     mapped_regions: Vec<HvfMappedGuestMemoryRegion>,
     mapper: Arc<dyn HvfMemoryMapper>,
 }
 
 impl HvfGuestMemoryMapping {
-    pub fn mapped_region_count(&self) -> usize {
-        self.mapped_regions.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.mapped_regions.is_empty()
-    }
-
     pub(crate) fn map_with_mapper(
         memory: GuestMemory,
         permissions: HvfMemoryPermissions,
@@ -702,7 +694,7 @@ mod tests {
         )
         .expect("guest memory mapping should succeed");
 
-        assert_eq!(mapping.mapped_region_count(), 2);
+        assert_eq!(mapping.mapped_regions.len(), 2);
         let maps = mapper.maps();
         let mut mapped_ranges = maps.iter().map(|(request, _)| request.range);
         assert_eq!(mapped_ranges.next(), Some(range(0, page_size)));
