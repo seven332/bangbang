@@ -584,9 +584,11 @@ impl Drop for AnonymousMapping {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::io;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
 
     use super::{
         AnonymousMapper, AnonymousMapping, GuestAddress, GuestMemory, GuestMemoryAllocationError,
@@ -969,6 +971,35 @@ mod tests {
 
         assert_eq!(first_region.range(), second_region.range());
         assert_ne!(first_region.host_address(), second_region.host_address());
+    }
+
+    #[test]
+    fn guest_memory_allocations_are_independent_across_threads() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let handles = (0..4)
+            .map(|_| {
+                thread::spawn(move || {
+                    let layout = GuestMemoryLayout::new(vec![range(0, page_size)])
+                        .expect("page-aligned layout should be valid");
+
+                    GuestMemory::allocate(&layout).expect("guest memory allocation should succeed")
+                })
+            })
+            .collect::<Vec<_>>();
+        let memories = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("allocation thread should not panic"))
+            .collect::<Vec<_>>();
+        let mut host_addresses = HashSet::new();
+
+        for memory in &memories {
+            let region = memory
+                .regions()
+                .first()
+                .expect("guest memory should contain one region");
+            assert_eq!(region.range(), range(0, page_size));
+            assert!(host_addresses.insert(region.host_address()));
+        }
     }
 
     #[test]
