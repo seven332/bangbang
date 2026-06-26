@@ -83,7 +83,7 @@ mod imp {
     const HV_UNSUPPORTED: HvReturn = 0xfae9400fu32 as HvReturn;
 
     #[link(name = "Hypervisor", kind = "framework")]
-    extern "C" {
+    unsafe extern "C" {
         pub fn hv_vm_create(config: HvVmConfig) -> HvReturn;
         pub fn hv_vm_destroy() -> HvReturn;
         pub fn hv_vcpu_create(
@@ -201,7 +201,7 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
-        use super::{check, HV_BAD_ARGUMENT, HV_DENIED, HV_UNSUPPORTED};
+        use super::{HV_BAD_ARGUMENT, HV_DENIED, HV_UNSUPPORTED, check};
 
         #[test]
         fn check_displays_named_hv_return() {

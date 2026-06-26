@@ -74,6 +74,8 @@ The version response body is Firecracker-shaped JSON:
 
 ## Build
 
+Requires Rust 1.85 or newer for the Rust 2024 edition.
+
 ```sh
 cargo check --workspace --all-targets --all-features --locked
 cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf

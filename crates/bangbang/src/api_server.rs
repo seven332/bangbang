@@ -9,10 +9,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use bangbang_api::http::{
-    parse_request, request_total_len, ApiRequest, HttpResponse, RequestError,
-};
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
+use bangbang_api::http::{
+    ApiRequest, HttpResponse, RequestError, parse_request, request_total_len,
+};
 use bangbang_runtime::{VmmAction, VmmController, VmmData};
 
 const READ_CHUNK_SIZE: usize = 4096;
@@ -717,8 +717,11 @@ mod tests {
             .expect("client should read response");
 
         assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        assert!(response
-            .contains(r#"{"fault_message":"HTTP request payload exceeds the configured limit."}"#));
+        assert!(
+            response.contains(
+                r#"{"fault_message":"HTTP request payload exceeds the configured limit."}"#
+            )
+        );
     }
 
     #[test]
@@ -844,10 +847,12 @@ mod tests {
         let err = ApiServer::bind(&path).expect_err("existing symlink path should fail");
 
         assert_eq!(err, ApiServerError::SocketPathExists);
-        assert!(fs::symlink_metadata(&path)
-            .expect("symlink should remain")
-            .file_type()
-            .is_symlink());
+        assert!(
+            fs::symlink_metadata(&path)
+                .expect("symlink should remain")
+                .file_type()
+                .is_symlink()
+        );
 
         fs::remove_file(path).expect("fixture should clean up");
     }
