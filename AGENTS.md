@@ -32,6 +32,8 @@ Use Rust 2024 edition style and `rustfmt` defaults. Keep modules small and align
 
 Library package names use the `bangbang-*` pattern even when their directory names are shorter, such as `crates/hvf` for `bangbang-hvf`. The executable package is `bangbang` in `crates/bangbang`.
 
+Workspace lints deny Rust warnings, strict rustdoc issues, and selected Clippy lints. Keep test-only Clippy exceptions in `clippy.toml` instead of adding broad inline `allow` attributes.
+
 Unsafe code must stay isolated behind small FFI wrappers, with `SAFETY:` comments explaining each unsafe call.
 
 ## Testing Guidelines

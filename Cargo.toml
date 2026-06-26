@@ -14,7 +14,26 @@ rust-version = "1.85"
 repository = "https://github.com/seven332/bangbang"
 
 [workspace.lints.rust]
-missing_debug_implementations = "warn"
+missing_debug_implementations = "deny"
+warnings = "deny"
 
+[workspace.lints.rustdoc]
+bare_urls = "deny"
+broken_intra_doc_links = "deny"
+invalid_codeblock_attributes = "deny"
+invalid_html_tags = "deny"
+invalid_rust_codeblocks = "deny"
+private_intra_doc_links = "deny"
+redundant_explicit_links = "deny"
+
+# Test-specific exceptions live in clippy.toml.
 [workspace.lints.clippy]
-undocumented_unsafe_blocks = "warn"
+all = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+panic = "deny"
+todo = "deny"
+undocumented_unsafe_blocks = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+unwrap_used = "deny"
