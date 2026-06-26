@@ -83,7 +83,7 @@ impl HvfVcpuOwner {
     }
 
     pub(crate) fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
-        let vcpu = self.raw_vcpu()?;
+        let vcpu = self.prepare_run()?;
 
         crate::ffi::run_vcpu(vcpu)?;
         self.mark_exit_available()?;
@@ -133,6 +133,12 @@ impl HvfVcpuOwner {
     fn mark_exit_available(&mut self) -> Result<(), BackendError> {
         self.handle_mut()?.exit_available = true;
         Ok(())
+    }
+
+    fn prepare_run(&mut self) -> Result<crate::ffi::HvVcpu, BackendError> {
+        let handle = self.handle_mut()?;
+        handle.exit_available = false;
+        Ok(handle.vcpu)
     }
 
     fn handle(&self) -> Result<&HvfVcpuHandle, BackendError> {
@@ -230,6 +236,17 @@ mod tests {
     };
     use crate::exit::{HvfExceptionExit, HvfVcpuExit};
 
+    fn fake_vcpu_owner(exit: *mut crate::ffi::HvVcpuExit, exit_available: bool) -> HvfVcpuOwner {
+        HvfVcpuOwner {
+            handle: Some(HvfVcpuHandle {
+                vcpu: 7,
+                exit,
+                exit_available,
+            }),
+            _not_send_sync: PhantomData::<Rc<()>>,
+        }
+    }
+
     fn raw_exit(reason: u32) -> crate::ffi::HvVcpuExit {
         crate::ffi::HvVcpuExit {
             reason,
@@ -246,14 +263,7 @@ mod tests {
         exit_available: bool,
     ) -> ManuallyDrop<HvfVcpu<'static>> {
         ManuallyDrop::new(HvfVcpu {
-            owner: HvfVcpuOwner {
-                handle: Some(HvfVcpuHandle {
-                    vcpu: 7,
-                    exit,
-                    exit_available,
-                }),
-                _not_send_sync: PhantomData::<Rc<()>>,
-            },
+            owner: fake_vcpu_owner(exit, exit_available),
             _vm: PhantomData,
             _not_send_sync: PhantomData::<Rc<()>>,
         })
@@ -295,6 +305,18 @@ mod tests {
 
         assert_eq!(
             vcpu.exit_snapshot(),
+            Err(BackendError::InvalidState(NO_VCPU_EXIT_MESSAGE))
+        );
+    }
+
+    #[test]
+    fn prepare_run_clears_stale_exit_snapshot() {
+        let mut exit = raw_exit(crate::ffi::HV_EXIT_REASON_EXCEPTION);
+        let mut owner = ManuallyDrop::new(fake_vcpu_owner(ptr::addr_of_mut!(exit), true));
+
+        assert_eq!(owner.prepare_run(), Ok(7));
+        assert_eq!(
+            owner.exit_snapshot(),
             Err(BackendError::InvalidState(NO_VCPU_EXIT_MESSAGE))
         );
     }
