@@ -1,5 +1,6 @@
 use bangbang_runtime::{BackendError, VmBackend};
 
+use crate::runner::{HvfVcpuRunner, HvfVcpuRunnerError};
 use crate::vcpu::HvfVcpu;
 
 #[derive(Debug, Default)]
@@ -30,6 +31,21 @@ impl HvfBackend {
         }
 
         HvfVcpu::new(self)
+    }
+
+    pub fn start_vcpu_runner(&self) -> Result<HvfVcpuRunner<'_>, HvfVcpuRunnerError> {
+        if !Self::is_supported_target() {
+            return Err(BackendError::Unsupported(crate::ffi::UNSUPPORTED_TARGET_MESSAGE).into());
+        }
+
+        if !self.vm_created {
+            return Err(BackendError::InvalidState(
+                "VM must be created before starting a vCPU runner",
+            )
+            .into());
+        }
+
+        HvfVcpuRunner::new(self)
     }
 }
 
@@ -92,6 +108,30 @@ mod tests {
             assert_eq!(
                 err,
                 BackendError::Unsupported(crate::ffi::UNSUPPORTED_TARGET_MESSAGE)
+            );
+        }
+    }
+
+    #[test]
+    fn start_vcpu_runner_before_vm_reports_state_or_target_error() {
+        let backend = HvfBackend::new();
+        let err = backend
+            .start_vcpu_runner()
+            .expect_err("starting a vCPU runner before VM creation should fail");
+
+        if HvfBackend::is_supported_target() {
+            assert_eq!(
+                err,
+                crate::runner::HvfVcpuRunnerError::Backend(BackendError::InvalidState(
+                    "VM must be created before starting a vCPU runner"
+                ))
+            );
+        } else {
+            assert_eq!(
+                err,
+                crate::runner::HvfVcpuRunnerError::Backend(BackendError::Unsupported(
+                    crate::ffi::UNSUPPORTED_TARGET_MESSAGE
+                ))
             );
         }
     }
