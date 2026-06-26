@@ -338,6 +338,42 @@ mod tests {
         assert_eq!(mapper.unmap_count(), 1);
     }
 
+    #[test]
+    fn unmap_guest_memory_keeps_active_mapping_when_unmap_fails() {
+        let page_size = page_size();
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut backend = HvfBackend::new_with_memory_mapper(mapper.clone());
+        backend.vm_created = true;
+
+        backend
+            .map_guest_memory_with_configured_mapper(
+                memory_for_ranges(vec![range(0, page_size)]),
+                HvfMemoryPermissions::GUEST_RAM,
+            )
+            .expect("guest memory mapping should succeed");
+
+        mapper.set_fail_unmap(true);
+        let err = backend
+            .unmap_guest_memory()
+            .expect_err("failed unmap should be reported");
+
+        assert!(matches!(
+            err,
+            crate::memory::HvfGuestMemoryMappingError::UnmapFailed { failures }
+                if failures.len() == 1
+        ));
+        assert!(backend.has_guest_memory_mapping());
+        assert_eq!(mapper.unmap_count(), 1);
+
+        mapper.set_fail_unmap(false);
+        backend
+            .unmap_guest_memory()
+            .expect("retry should clear retained mapping");
+
+        assert!(!backend.has_guest_memory_mapping());
+        assert_eq!(mapper.unmap_count(), 2);
+    }
+
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     #[test]
     fn unsupported_target_rejects_vm_creation() {
@@ -353,12 +389,28 @@ mod tests {
         );
     }
 
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     struct RecordingMapper {
         state: Mutex<RecordingMapperState>,
     }
 
+    impl Default for RecordingMapper {
+        fn default() -> Self {
+            Self::new(false)
+        }
+    }
+
     impl RecordingMapper {
+        fn new(fail_unmap: bool) -> Self {
+            Self {
+                state: Mutex::new(RecordingMapperState {
+                    maps: 0,
+                    unmaps: 0,
+                    fail_unmap,
+                }),
+            }
+        }
+
         fn map_count(&self) -> usize {
             self.state
                 .lock()
@@ -371,6 +423,13 @@ mod tests {
                 .lock()
                 .expect("state lock should not be poisoned")
                 .unmaps
+        }
+
+        fn set_fail_unmap(&self, fail_unmap: bool) {
+            self.state
+                .lock()
+                .expect("state lock should not be poisoned")
+                .fail_unmap = fail_unmap;
         }
     }
 
@@ -388,10 +447,18 @@ mod tests {
         }
 
         fn unmap_region(&self, _: HvfMappedGuestMemoryRegion) -> Result<(), BackendError> {
-            self.state
+            let mut state = self
+                .state
                 .lock()
-                .expect("state lock should not be poisoned")
-                .unmaps += 1;
+                .expect("state lock should not be poisoned");
+            state.unmaps += 1;
+
+            if state.fail_unmap {
+                return Err(BackendError::Hypervisor(
+                    "injected unmap failure".to_string(),
+                ));
+            }
+
             Ok(())
         }
     }
@@ -400,5 +467,6 @@ mod tests {
     struct RecordingMapperState {
         maps: usize,
         unmaps: usize,
+        fail_unmap: bool,
     }
 }
