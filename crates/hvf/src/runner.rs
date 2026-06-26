@@ -174,7 +174,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
         let join_result = join_runner_thread(thread);
         self.finish_shutdown();
 
-        first_error(response_result, join_result)
+        shutdown_result(response_result, join_result)
     }
 
     fn from_started(
@@ -421,13 +421,14 @@ fn join_runner_thread(thread: Option<JoinHandle<()>>) -> Result<(), HvfVcpuRunne
     Ok(())
 }
 
-fn first_error(
+fn shutdown_result(
     first: Result<(), HvfVcpuRunnerError>,
     second: Result<(), HvfVcpuRunnerError>,
 ) -> Result<(), HvfVcpuRunnerError> {
-    match first {
-        Ok(()) => second,
-        Err(err) => Err(err),
+    match (first, second) {
+        (_, Err(HvfVcpuRunnerError::ThreadPanicked)) => Err(HvfVcpuRunnerError::ThreadPanicked),
+        (Err(err), _) => Err(err),
+        (Ok(()), result) => result,
     }
 }
 
@@ -447,6 +448,8 @@ mod tests {
         destroyed_sender: mpsc::Sender<()>,
     }
 
+    struct PanicOnRunVcpu;
+
     impl RunnerVcpu for FakeVcpu {
         fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
             Ok(7)
@@ -465,6 +468,20 @@ mod tests {
             self.destroyed_sender
                 .send(())
                 .map_err(|_| BackendError::InvalidState("fake destroy receiver closed"))
+        }
+    }
+
+    impl RunnerVcpu for PanicOnRunVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            panic!("fake run panic");
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
         }
     }
 
@@ -758,5 +775,21 @@ mod tests {
         };
 
         assert_eq!(err, HvfVcpuRunnerError::ThreadPanicked);
+    }
+
+    #[test]
+    fn shutdown_reports_thread_panic_after_started_runner_exits() {
+        let started =
+            spawn_runner_thread(|| Ok(PanicOnRunVcpu)).expect("panic runner should start");
+        let runner = HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+            .expect("runner should be created");
+
+        assert_eq!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
 }
