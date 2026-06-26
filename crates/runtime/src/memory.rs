@@ -1355,6 +1355,22 @@ mod tests {
     }
 
     #[test]
+    fn guest_memory_read_rejects_address_overflow_without_mutating_destination() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let memory = allocate_memory(vec![range(0, page_size)]);
+        let mut destination = [0x55];
+
+        assert_eq!(
+            memory.read_slice(GuestAddress::new(u64::MAX), &mut destination),
+            Err(GuestMemoryAccessError::AddressOverflow {
+                start: GuestAddress::new(u64::MAX),
+                size: 1
+            })
+        );
+        assert_eq!(destination, [0x55]);
+    }
+
+    #[test]
     fn guest_memory_access_rejects_unmapped_hole_without_partial_write() {
         let page_size = host_page_size().expect("host page size should be available for tests");
         let mut memory =
