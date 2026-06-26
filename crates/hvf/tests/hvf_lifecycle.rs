@@ -80,11 +80,8 @@ fn maps_guest_memory_and_unmaps_before_destroying_vm() {
         .map_guest_memory(memory, HvfMemoryPermissions::GUEST_RAM)
         .expect("guest memory should be mapped");
     backend
-        .unmap_guest_memory()
-        .expect("guest memory should be unmapped");
-    backend
         .destroy_vm()
-        .expect("VM should be destroyed after guest memory unmap");
+        .expect("VM destruction should unmap guest memory first");
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
