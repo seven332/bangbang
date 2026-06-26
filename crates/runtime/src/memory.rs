@@ -1030,6 +1030,25 @@ mod tests {
     }
 
     #[test]
+    fn guest_memory_drop_releases_regions_after_thread_move() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let layout = GuestMemoryLayout::new(vec![range(0, page_size), range(page_size, page_size)])
+            .expect("page-aligned layout should be valid");
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let mut mapper = CountingMapper {
+            maps: 0,
+            drop_count: Arc::clone(&drop_count),
+        };
+        let memory = GuestMemory::allocate_with_mapper(&layout, page_size, &mut mapper)
+            .expect("guest memory allocation should succeed");
+
+        let handle = thread::spawn(move || drop(memory));
+
+        handle.join().expect("drop thread should not panic");
+        assert_eq!(drop_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
     fn guest_memory_partial_allocation_failure_drops_previous_regions() {
         let page_size = host_page_size().expect("host page size should be available for tests");
         let layout = GuestMemoryLayout::new(vec![range(0, page_size), range(page_size, page_size)])
