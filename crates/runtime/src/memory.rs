@@ -757,6 +757,17 @@ mod tests {
     }
 
     #[test]
+    fn guest_memory_layout_rejects_duplicate_start_ranges() {
+        let previous = range(0x1000, 0x1000);
+        let next = range(0x1000, 0x1000);
+
+        assert_eq!(
+            GuestMemoryLayout::new(vec![previous, next]),
+            Err(GuestMemoryError::OverlappingRange { previous, next })
+        );
+    }
+
+    #[test]
     fn aarch64_dram_layout_rejects_zero_requested_size() {
         assert_eq!(aarch64::dram_layout(0), Err(GuestMemoryError::EmptyLayout));
     }
@@ -950,6 +961,30 @@ mod tests {
         ));
         assert_eq!(mapper.maps, 0);
         assert_eq!(drop_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn guest_memory_rejects_invalid_host_page_size_before_allocation() {
+        let layout = GuestMemoryLayout::new(vec![range(0, PAGE_SIZE)])
+            .expect("page-aligned layout should be valid");
+
+        for page_size in [0, 3] {
+            let drop_count = Arc::new(AtomicUsize::new(0));
+            let mut mapper = CountingMapper {
+                maps: 0,
+                drop_count: Arc::clone(&drop_count),
+            };
+
+            let err = GuestMemory::allocate_with_mapper(&layout, page_size, &mut mapper)
+                .expect_err("invalid host page size should fail before allocation");
+
+            assert!(matches!(
+                err,
+                GuestMemoryAllocationError::InvalidHostPageSize
+            ));
+            assert_eq!(mapper.maps, 0);
+            assert_eq!(drop_count.load(Ordering::Relaxed), 0);
+        }
     }
 
     #[test]
