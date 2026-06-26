@@ -5,6 +5,7 @@ edition.workspace = true
 repository.workspace = true
 
 [dependencies]
+libc = "0.2"
 
 [lints]
 workspace = true

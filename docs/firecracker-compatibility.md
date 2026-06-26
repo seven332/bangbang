@@ -10,9 +10,10 @@ trait, a minimal read-only VMM action/data model, backend-neutral guest
 physical address and aarch64 DRAM layout primitives, a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
 create/destroy wrapper, typed HVF exit surface, narrow vCPU register wrappers,
-and an initial process startup argument model. There is no broader API request
-body model, guest memory allocation or HVF mapping, guest execution, vCPU run
-loop, MMIO/device emulation, boot register setup, or kernel loading yet.
+anonymous guest memory allocation for validated runtime layouts, and an initial
+process startup argument model. There is no broader API request body model, HVF
+guest memory mapping, guest execution, vCPU run loop, MMIO/device emulation,
+boot register setup, or kernel loading yet.
 
 ## Firecracker Model Alignment
 
@@ -212,7 +213,8 @@ setup, memory size, and block device I/O when those surfaces are implemented.
 The runtime crate models the backend-neutral guest physical address space used
 by later allocation, HVF mapping, boot, and device work. The current model
 contains guest physical addresses, checked RAM ranges, ordered non-overlapping
-layouts, and the first aarch64 DRAM layout helper.
+layouts, the first aarch64 DRAM layout helper, and owned anonymous host memory
+allocation for validated page-aligned layouts.
 
 The aarch64 layout helper follows Firecracker's `v1.16.0` ARM layout shape:
 
@@ -222,11 +224,19 @@ The aarch64 layout helper follows Firecracker's `v1.16.0` ARM layout shape:
 - zero requested memory is rejected by the layout helper
 - requests above the architectural maximum are capped inside the layout model
 
-This is only an address-space model. It does not allocate host memory, map
-memory into Hypervisor.framework, write kernel/initrd/FDT payloads, or start a
-guest. Later API and startup work still needs to decide whether an oversized
-`mem_size_mib` request should be rejected before layout construction or should
-preserve Firecracker's architecture-helper truncation behavior.
+The allocation model creates one anonymous read/write private host memory
+mapping for each validated guest RAM range and releases the mappings with
+runtime ownership cleanup. It preserves each guest range with its host mapping
+for later HVF map/unmap work. It does not use Firecracker's `vm-memory` crate;
+future device-memory, dirty-tracking, snapshot, or file-backed-memory work
+should evaluate the right abstraction from its concrete requirements.
+
+This still is not executable guest RAM. The runtime does not map allocated
+memory into Hypervisor.framework, write kernel/initrd/FDT payloads, wire
+`mem_size_mib` into public startup behavior, or start a guest. Later API and
+startup work still needs to decide whether an oversized `mem_size_mib` request
+should be rejected before layout construction or should preserve Firecracker's
+architecture-helper truncation behavior.
 
 ## API State and Response Policy
 

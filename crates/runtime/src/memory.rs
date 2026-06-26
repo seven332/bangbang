@@ -1,4 +1,12 @@
+use std::ffi::c_void;
 use std::fmt;
+use std::io;
+use std::ptr::{self, NonNull};
+
+#[cfg(test)]
+use std::cell::Cell;
+#[cfg(test)]
+use std::rc::Rc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GuestAddress(u64);
@@ -143,6 +151,133 @@ impl GuestMemoryLayout {
     }
 }
 
+#[derive(Debug)]
+pub struct GuestMemory {
+    regions: Vec<GuestMemoryRegion>,
+}
+
+impl GuestMemory {
+    pub fn allocate(layout: &GuestMemoryLayout) -> Result<Self, GuestMemoryAllocationError> {
+        let page_size = host_page_size()?;
+        let mut mapper = SystemAnonymousMapper;
+
+        Self::allocate_with_mapper(layout, page_size, &mut mapper)
+    }
+
+    fn allocate_with_mapper(
+        layout: &GuestMemoryLayout,
+        page_size: u64,
+        mapper: &mut impl AnonymousMapper,
+    ) -> Result<Self, GuestMemoryAllocationError> {
+        let ranges = validated_allocation_ranges(layout, page_size)?;
+        let mut regions = Vec::with_capacity(ranges.len());
+
+        for (range, host_size) in ranges {
+            regions.push(GuestMemoryRegion {
+                range,
+                mapping: mapper.map(host_size)?,
+            });
+        }
+
+        Ok(Self { regions })
+    }
+
+    pub fn regions(&self) -> &[GuestMemoryRegion] {
+        &self.regions
+    }
+
+    pub fn total_size(&self) -> u64 {
+        self.regions
+            .iter()
+            .map(|region| region.range().size())
+            .sum::<u64>()
+    }
+}
+
+pub struct GuestMemoryRegion {
+    range: GuestMemoryRange,
+    mapping: AnonymousMapping,
+}
+
+impl GuestMemoryRegion {
+    pub const fn range(&self) -> GuestMemoryRange {
+        self.range
+    }
+
+    pub fn host_address(&self) -> NonNull<c_void> {
+        self.mapping.address()
+    }
+
+    pub const fn host_size(&self) -> usize {
+        self.mapping.size()
+    }
+}
+
+impl fmt::Debug for GuestMemoryRegion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GuestMemoryRegion")
+            .field("range", &self.range)
+            .field("host_size", &self.mapping.size())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+pub enum GuestMemoryAllocationError {
+    InvalidLayout(GuestMemoryError),
+    InvalidHostPageSize,
+    SizeTooLarge { range: GuestMemoryRange },
+    AnonymousMmapFailed { size: usize, source: io::Error },
+    AnonymousMmapReturnedNull { size: usize },
+}
+
+impl fmt::Display for GuestMemoryAllocationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLayout(source) => {
+                write!(f, "invalid guest memory layout for allocation: {source}")
+            }
+            Self::InvalidHostPageSize => f.write_str("host page size is unavailable or invalid"),
+            Self::SizeTooLarge { range } => {
+                write!(
+                    f,
+                    "guest memory range {range} is too large to allocate on this host"
+                )
+            }
+            Self::AnonymousMmapFailed { size, source } => {
+                write!(
+                    f,
+                    "failed to allocate anonymous guest memory mapping of {size} bytes: {source}"
+                )
+            }
+            Self::AnonymousMmapReturnedNull { size } => {
+                write!(
+                    f,
+                    "anonymous guest memory mapping of {size} bytes returned a null address"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for GuestMemoryAllocationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidLayout(source) => Some(source),
+            Self::AnonymousMmapFailed { source, .. } => Some(source),
+            Self::InvalidHostPageSize
+            | Self::SizeTooLarge { .. }
+            | Self::AnonymousMmapReturnedNull { .. } => None,
+        }
+    }
+}
+
+impl From<GuestMemoryError> for GuestMemoryAllocationError {
+    fn from(source: GuestMemoryError) -> Self {
+        Self::InvalidLayout(source)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestMemoryError {
     EmptyLayout,
@@ -265,9 +400,165 @@ fn validate_alignment(alignment: u64) -> Result<(), GuestMemoryError> {
     }
 }
 
+fn validated_allocation_ranges(
+    layout: &GuestMemoryLayout,
+    page_size: u64,
+) -> Result<Vec<(GuestMemoryRange, usize)>, GuestMemoryAllocationError> {
+    validate_host_page_size(page_size)?;
+
+    let mut ranges = Vec::with_capacity(layout.ranges().len());
+    for range in layout.ranges().iter().copied() {
+        range.validate_alignment(page_size)?;
+        let host_size = usize::try_from(range.size())
+            .map_err(|_| GuestMemoryAllocationError::SizeTooLarge { range })?;
+        ranges.push((range, host_size));
+    }
+
+    Ok(ranges)
+}
+
+fn host_page_size() -> Result<u64, GuestMemoryAllocationError> {
+    // SAFETY: `sysconf(_SC_PAGESIZE)` has no pointer arguments and does not
+    // require process-local invariants from Rust.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page_size =
+        u64::try_from(page_size).map_err(|_| GuestMemoryAllocationError::InvalidHostPageSize)?;
+
+    validate_host_page_size(page_size)?;
+    Ok(page_size)
+}
+
+fn validate_host_page_size(page_size: u64) -> Result<(), GuestMemoryAllocationError> {
+    if page_size == 0 || !page_size.is_power_of_two() {
+        Err(GuestMemoryAllocationError::InvalidHostPageSize)
+    } else {
+        Ok(())
+    }
+}
+
+trait AnonymousMapper {
+    fn map(&mut self, size: usize) -> Result<AnonymousMapping, GuestMemoryAllocationError>;
+}
+
+#[derive(Debug)]
+struct SystemAnonymousMapper;
+
+impl AnonymousMapper for SystemAnonymousMapper {
+    fn map(&mut self, size: usize) -> Result<AnonymousMapping, GuestMemoryAllocationError> {
+        AnonymousMapping::map(size)
+    }
+}
+
+struct AnonymousMapping {
+    address: NonNull<c_void>,
+    size: usize,
+    kind: AnonymousMappingKind,
+}
+
+impl AnonymousMapping {
+    fn map(size: usize) -> Result<Self, GuestMemoryAllocationError> {
+        // SAFETY: The call requests a new private anonymous read/write mapping.
+        // `size` was validated from a non-empty guest memory range before this
+        // function is called. No aliasing Rust reference is created here.
+        let address = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+
+        if address == libc::MAP_FAILED {
+            return Err(GuestMemoryAllocationError::AnonymousMmapFailed {
+                size,
+                source: io::Error::last_os_error(),
+            });
+        }
+
+        let Some(address) = NonNull::new(address) else {
+            // SAFETY: `mmap` reported success, so the returned address and size
+            // describe a live mapping even if the address is null.
+            unsafe {
+                let _ = libc::munmap(address, size);
+            }
+
+            return Err(GuestMemoryAllocationError::AnonymousMmapReturnedNull { size });
+        };
+
+        Ok(Self {
+            address,
+            size,
+            kind: AnonymousMappingKind::System,
+        })
+    }
+
+    #[cfg(test)]
+    fn test_mapping(size: usize, drop_count: Rc<Cell<usize>>) -> Self {
+        Self {
+            address: NonNull::<u8>::dangling().cast(),
+            size,
+            kind: AnonymousMappingKind::Test { drop_count },
+        }
+    }
+
+    const fn address(&self) -> NonNull<c_void> {
+        self.address
+    }
+
+    const fn size(&self) -> usize {
+        self.size
+    }
+}
+
+impl fmt::Debug for AnonymousMapping {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnonymousMapping")
+            .field("size", &self.size)
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+enum AnonymousMappingKind {
+    System,
+    #[cfg(test)]
+    Test {
+        drop_count: Rc<Cell<usize>>,
+    },
+}
+
+impl Drop for AnonymousMapping {
+    fn drop(&mut self) {
+        match &self.kind {
+            AnonymousMappingKind::System => {
+                // SAFETY: `AnonymousMapping::map` stores only successful mmap
+                // results, and each `AnonymousMapping` owns exactly one mapping.
+                unsafe {
+                    let _ = libc::munmap(self.address.as_ptr(), self.size);
+                }
+            }
+            #[cfg(test)]
+            AnonymousMappingKind::Test { drop_count } => {
+                drop_count.set(drop_count.get() + 1);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{GuestAddress, GuestMemoryError, GuestMemoryLayout, GuestMemoryRange, aarch64};
+    use std::cell::Cell;
+    use std::io;
+    use std::rc::Rc;
+
+    use super::{
+        AnonymousMapper, AnonymousMapping, GuestAddress, GuestMemory, GuestMemoryAllocationError,
+        GuestMemoryError, GuestMemoryLayout, GuestMemoryRange, aarch64, host_page_size,
+    };
 
     const PAGE_SIZE: u64 = 4096;
 
@@ -515,5 +806,147 @@ mod tests {
             range.end_exclusive().raw_value() <= aarch64::MMIO64_MEM_START
                 || range.start().raw_value() >= aarch64::FIRST_ADDR_PAST_64BITS_MMIO
         }));
+    }
+
+    #[test]
+    fn guest_memory_allocates_small_layout() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let layout = GuestMemoryLayout::new(vec![range(0, page_size)])
+            .expect("page-aligned layout should be valid");
+
+        let memory =
+            GuestMemory::allocate(&layout).expect("guest memory allocation should succeed");
+        let region = memory
+            .regions()
+            .first()
+            .expect("guest memory should contain one region");
+        let page_size_usize =
+            usize::try_from(page_size).expect("host page size should fit in usize");
+
+        assert_eq!(memory.regions().len(), 1);
+        assert_eq!(memory.total_size(), page_size);
+        assert_eq!(region.range(), range(0, page_size));
+        assert_eq!(region.host_size(), page_size_usize);
+        assert_eq!(region.host_address().as_ptr() as usize % page_size_usize, 0);
+
+        let byte = region.host_address().as_ptr().cast::<u8>();
+        // SAFETY: `region` owns a live read/write anonymous mapping of at
+        // least one byte for the duration of this test.
+        unsafe {
+            byte.write(0xab);
+            assert_eq!(byte.read(), 0xab);
+        }
+    }
+
+    #[test]
+    fn guest_memory_rejects_unaligned_layout_before_allocation() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let unaligned_range = range(page_size, page_size - 1);
+        let layout =
+            GuestMemoryLayout::new(vec![unaligned_range]).expect("layout ordering should be valid");
+        let drop_count = Rc::new(Cell::new(0));
+        let mut mapper = CountingMapper {
+            maps: 0,
+            drop_count: Rc::clone(&drop_count),
+        };
+
+        let err = GuestMemory::allocate_with_mapper(&layout, page_size, &mut mapper)
+            .expect_err("unaligned allocation should fail");
+
+        assert!(matches!(
+            err,
+            GuestMemoryAllocationError::InvalidLayout(GuestMemoryError::UnalignedRange {
+                range,
+                alignment,
+            }) if range == unaligned_range && alignment == page_size
+        ));
+        assert_eq!(mapper.maps, 0);
+        assert_eq!(drop_count.get(), 0);
+    }
+
+    #[test]
+    fn guest_memory_allocations_are_independent() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let layout = GuestMemoryLayout::new(vec![range(0, page_size)])
+            .expect("page-aligned layout should be valid");
+
+        let first = GuestMemory::allocate(&layout).expect("first allocation should succeed");
+        let second = GuestMemory::allocate(&layout).expect("second allocation should succeed");
+        let first_region = first
+            .regions()
+            .first()
+            .expect("first allocation should contain one region");
+        let second_region = second
+            .regions()
+            .first()
+            .expect("second allocation should contain one region");
+
+        assert_eq!(first_region.range(), second_region.range());
+        assert_ne!(first_region.host_address(), second_region.host_address());
+    }
+
+    #[test]
+    fn guest_memory_partial_allocation_failure_drops_previous_regions() {
+        let page_size = host_page_size().expect("host page size should be available for tests");
+        let layout = GuestMemoryLayout::new(vec![range(0, page_size), range(page_size, page_size)])
+            .expect("page-aligned layout should be valid");
+        let drop_count = Rc::new(Cell::new(0));
+        let mut mapper = FailingMapper {
+            maps: 0,
+            fail_on: 2,
+            drop_count: Rc::clone(&drop_count),
+        };
+
+        let err = GuestMemory::allocate_with_mapper(&layout, page_size, &mut mapper)
+            .expect_err("second region allocation should fail");
+
+        assert!(matches!(
+            err,
+            GuestMemoryAllocationError::AnonymousMmapFailed { size, .. }
+                if size == usize::try_from(page_size).expect("page size should fit usize")
+        ));
+        assert_eq!(mapper.maps, 2);
+        assert_eq!(drop_count.get(), 1);
+    }
+
+    #[derive(Debug)]
+    struct CountingMapper {
+        maps: usize,
+        drop_count: Rc<Cell<usize>>,
+    }
+
+    impl AnonymousMapper for CountingMapper {
+        fn map(&mut self, size: usize) -> Result<AnonymousMapping, GuestMemoryAllocationError> {
+            self.maps += 1;
+            Ok(AnonymousMapping::test_mapping(
+                size,
+                Rc::clone(&self.drop_count),
+            ))
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingMapper {
+        maps: usize,
+        fail_on: usize,
+        drop_count: Rc<Cell<usize>>,
+    }
+
+    impl AnonymousMapper for FailingMapper {
+        fn map(&mut self, size: usize) -> Result<AnonymousMapping, GuestMemoryAllocationError> {
+            self.maps += 1;
+
+            if self.maps == self.fail_on {
+                return Err(GuestMemoryAllocationError::AnonymousMmapFailed {
+                    size,
+                    source: io::Error::from_raw_os_error(libc::ENOMEM),
+                });
+            }
+
+            Ok(AnonymousMapping::test_mapping(
+                size,
+                Rc::clone(&self.drop_count),
+            ))
+        }
     }
 }
