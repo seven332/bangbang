@@ -1,10 +1,16 @@
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static HVF_LIFECYCLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn creates_and_destroys_hvf_vcpu() {
     use bangbang_hvf::{HvfBackend, HvfRegister};
     use bangbang_runtime::BackendError;
     use bangbang_runtime::VmBackend;
 
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
     let mut backend = HvfBackend::new();
 
     backend.create_vm().expect("VM should be created");
@@ -34,6 +40,9 @@ fn cancels_runner_before_first_run() {
     use bangbang_hvf::{HvfBackend, HvfVcpuExit};
     use bangbang_runtime::VmBackend;
 
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
     let mut backend = HvfBackend::new();
 
     backend.create_vm().expect("VM should be created");
