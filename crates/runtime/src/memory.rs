@@ -252,8 +252,8 @@ impl GuestMemory {
 
     pub fn read_slice(
         &self,
-        guest_address: GuestAddress,
         destination: &mut [u8],
+        guest_address: GuestAddress,
     ) -> Result<(), GuestMemoryAccessError> {
         let Some(range) = access_range(guest_address, destination.len())? else {
             return Ok(());
@@ -1302,7 +1302,7 @@ mod tests {
             .write_slice(&source, address)
             .expect("guest memory write should succeed");
         memory
-            .read_slice(address, &mut destination)
+            .read_slice(&mut destination, address)
             .expect("guest memory read should succeed");
 
         assert_eq!(destination, source);
@@ -1320,7 +1320,7 @@ mod tests {
             .write_slice(&source, address)
             .expect("guest memory write ending at range boundary should succeed");
         memory
-            .read_slice(address, &mut destination)
+            .read_slice(&mut destination, address)
             .expect("guest memory read ending at range boundary should succeed");
 
         assert_eq!(destination, source);
@@ -1336,7 +1336,7 @@ mod tests {
             .write_slice(&[], GuestAddress::new(u64::MAX))
             .expect("zero-length write should not validate address");
         memory
-            .read_slice(GuestAddress::new(u64::MAX), &mut destination)
+            .read_slice(&mut destination, GuestAddress::new(u64::MAX))
             .expect("zero-length read should not validate address");
     }
 
@@ -1361,7 +1361,7 @@ mod tests {
         let mut destination = [0x55];
 
         assert_eq!(
-            memory.read_slice(GuestAddress::new(u64::MAX), &mut destination),
+            memory.read_slice(&mut destination, GuestAddress::new(u64::MAX)),
             Err(GuestMemoryAccessError::AddressOverflow {
                 start: GuestAddress::new(u64::MAX),
                 size: 1
@@ -1387,7 +1387,7 @@ mod tests {
 
         let mut byte = [0xff];
         memory
-            .read_slice(address, &mut byte)
+            .read_slice(&mut byte, address)
             .expect("single-byte read before hole should still succeed");
 
         assert_eq!(byte, [0]);
@@ -1407,7 +1407,7 @@ mod tests {
             .expect("single-byte write before hole should succeed");
 
         assert_eq!(
-            memory.read_slice(address, &mut destination),
+            memory.read_slice(&mut destination, address),
             Err(GuestMemoryAccessError::UnmappedRange {
                 range: access_range
             })
@@ -1427,7 +1427,7 @@ mod tests {
             .write_slice(&source, address)
             .expect("guest memory write should cross adjacent ranges");
         memory
-            .read_slice(address, &mut destination)
+            .read_slice(&mut destination, address)
             .expect("guest memory read should cross adjacent ranges");
 
         assert_eq!(destination, source);
