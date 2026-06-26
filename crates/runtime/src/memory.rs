@@ -1363,6 +1363,47 @@ mod tests {
     }
 
     #[test]
+    fn displays_guest_memory_access_errors() {
+        let access_range = range(0x1000, 0x20);
+
+        assert_eq!(
+            GuestMemoryAccessError::SizeTooLarge { size: 7 }.to_string(),
+            "guest memory access size 7 bytes is too large to represent"
+        );
+        assert_eq!(
+            GuestMemoryAccessError::AddressOverflow {
+                start: GuestAddress::new(0xffff),
+                size: 2
+            }
+            .to_string(),
+            "guest memory access overflows address space: start=0xffff, size=2"
+        );
+        assert_eq!(
+            GuestMemoryAccessError::UnmappedRange {
+                range: access_range
+            }
+            .to_string(),
+            "guest memory access range [0x1000..0x1020) (32 bytes) is not fully mapped"
+        );
+        assert_eq!(
+            GuestMemoryAccessError::SegmentOffsetTooLarge {
+                range: access_range,
+                offset: 5
+            }
+            .to_string(),
+            "guest memory access offset 5 in range [0x1000..0x1020) (32 bytes) is too large for this host"
+        );
+        assert_eq!(
+            GuestMemoryAccessError::SegmentSizeTooLarge {
+                range: access_range,
+                size: 6
+            }
+            .to_string(),
+            "guest memory access segment of 6 bytes in range [0x1000..0x1020) (32 bytes) is too large for this host"
+        );
+    }
+
+    #[test]
     fn guest_memory_read_rejects_address_overflow_without_mutating_destination() {
         let page_size = host_page_size().expect("host page size should be available for tests");
         let memory = allocate_memory(vec![range(0, page_size)]);
