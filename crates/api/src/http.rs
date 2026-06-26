@@ -1,7 +1,7 @@
 use std::fmt;
 
-use crate::route::Endpoint;
 use crate::HTTP_MAX_PAYLOAD_SIZE;
+use crate::route::Endpoint;
 
 const MAX_HEADERS: usize = 32;
 

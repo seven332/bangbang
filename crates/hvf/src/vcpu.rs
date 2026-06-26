@@ -153,7 +153,7 @@ mod tests {
     use bangbang_runtime::BackendError;
 
     use super::{
-        HvfRegister, HvfSystemRegister, HvfVcpu, HvfVcpuHandle, DESTROYED_VCPU_MESSAGE,
+        DESTROYED_VCPU_MESSAGE, HvfRegister, HvfSystemRegister, HvfVcpu, HvfVcpuHandle,
         NO_VCPU_EXIT_MESSAGE,
     };
     use crate::exit::{HvfExceptionExit, HvfVcpuExit};

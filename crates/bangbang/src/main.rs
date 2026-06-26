@@ -11,7 +11,7 @@ use api_server::{ApiServer, ApiServerError};
 use bangbang_hvf::HvfBackend;
 use bangbang_runtime::VmmController;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
-use signal_hook::{low_level, SigId};
+use signal_hook::{SigId, low_level};
 
 const DEFAULT_API_SOCK_PATH: &str = "/tmp/bangbang.socket";
 const DEFAULT_INSTANCE_ID: &str = "anonymous-instance";
@@ -397,8 +397,8 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
 
     use super::{
-        parse_process_args, ApiServerError, Args, Command, ProcessError, ProcessExitCode,
-        StartupConfig, DEFAULT_API_SOCK_PATH, DEFAULT_INSTANCE_ID, MAX_INSTANCE_ID_LEN,
+        ApiServerError, Args, Command, DEFAULT_API_SOCK_PATH, DEFAULT_INSTANCE_ID,
+        MAX_INSTANCE_ID_LEN, ProcessError, ProcessExitCode, StartupConfig, parse_process_args,
     };
 
     fn parse(args: &[&str]) -> Result<Args, String> {
