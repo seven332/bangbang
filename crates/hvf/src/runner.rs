@@ -140,7 +140,9 @@ impl<'vm> HvfVcpuRunner<'vm> {
     }
 
     pub fn cancel(&self) -> Result<(), HvfVcpuRunnerError> {
-        let _state = self.prepare_cancel()?;
+        // Keep the state lock until the HVF exit request returns so shutdown
+        // cannot destroy the vCPU while cancellation uses its raw id.
+        let _state_guard = self.prepare_cancel()?;
         self.cancel_vcpu()
     }
 
