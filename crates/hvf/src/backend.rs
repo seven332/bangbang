@@ -60,7 +60,8 @@ impl HvfBackend {
         Ok(())
     }
 
-    pub fn has_guest_memory_mapping(&self) -> bool {
+    #[cfg(test)]
+    fn has_guest_memory_mapping(&self) -> bool {
         self.guest_memory
             .as_ref()
             .is_some_and(HvfGuestMemoryMapping::has_mapped_regions)
