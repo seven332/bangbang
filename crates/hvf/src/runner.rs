@@ -150,8 +150,9 @@ impl<'vm> HvfVcpuRunner<'vm> {
             Err(err) => return Err(err),
         };
 
-        if should_cancel {
-            self.cancel_vcpu()?;
+        if should_cancel && let Err(err) = self.cancel_vcpu() {
+            self.cancel_shutdown();
+            return Err(err);
         }
 
         let (response_sender, response_receiver) = mpsc::channel();
@@ -218,13 +219,19 @@ impl<'vm> HvfVcpuRunner<'vm> {
 
     fn prepare_shutdown(&self) -> Result<(mpsc::Sender<RunnerCommand>, bool), HvfVcpuRunnerError> {
         let mut state = self.lock_state()?;
-        if state.thread.is_none() {
+        if state.thread.is_none() || state.shutting_down {
             return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
         }
 
         state.shutting_down = true;
 
         Ok((self.command_sender.clone(), state.in_flight_runs > 0))
+    }
+
+    fn cancel_shutdown(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.shutting_down = false;
+        }
     }
 
     fn ensure_thread_exists(&self) -> Result<(), HvfVcpuRunnerError> {
@@ -517,6 +524,41 @@ mod tests {
         runner
             .shutdown()
             .expect("repeated shutdown should be idempotent");
+    }
+
+    #[test]
+    fn prepared_shutdown_rejects_second_shutdown_command() {
+        let (runner, _, destroyed_receiver) = start_fake_runner();
+        let (command_sender, should_cancel) = runner
+            .prepare_shutdown()
+            .expect("first shutdown should be prepared");
+
+        assert!(!should_cancel);
+
+        let Err(err) = runner.prepare_shutdown() else {
+            panic!("second shutdown should not be prepared");
+        };
+        assert_eq!(
+            err,
+            HvfVcpuRunnerError::InvalidState(super::RUNNER_SHUT_DOWN_MESSAGE)
+        );
+
+        let (response_sender, response_receiver) = mpsc::channel();
+        command_sender
+            .send(super::RunnerCommand::Shutdown { response_sender })
+            .expect("shutdown command should be sent");
+        let thread = runner
+            .take_thread()
+            .expect("runner state should be lockable");
+        let response = response_receiver
+            .recv()
+            .expect("shutdown response should be sent");
+
+        assert_eq!(response, Ok(()));
+        super::join_runner_thread(thread).expect("runner thread should join");
+        destroyed_receiver
+            .recv()
+            .expect("fake vCPU should be destroyed");
     }
 
     #[test]
