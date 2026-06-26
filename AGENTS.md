@@ -27,6 +27,8 @@ Use these commands before opening or updating a pull request. For local or self-
 
 ## Coding Style & Naming Conventions
 
+Use the latest stable Rust toolchain; this repository does not declare an MSRV.
+
 Use Rust 2024 edition style and `rustfmt` defaults. Keep modules small and aligned with crate boundaries. Public names should describe stable concepts, not future plans; for example, prefer explicit names like `is_supported_target()` when checking compile-target support only.
 
 Library package names use the `bangbang-*` pattern even when their directory names are shorter, such as `crates/hvf` for `bangbang-hvf`. The executable package is `bangbang` in `crates/bangbang`.
