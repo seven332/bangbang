@@ -345,10 +345,17 @@ where
         .spawn(move || run_runner_thread(command_receiver, startup_sender, create_vcpu))
         .map_err(|err| HvfVcpuRunnerError::ThreadSpawn(err.to_string()))?;
 
-    match startup_receiver
-        .recv()
-        .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
-    {
+    let startup_result = match startup_receiver.recv() {
+        Ok(startup_result) => startup_result,
+        Err(_) => {
+            join_runner_thread(Some(thread))?;
+            return Err(HvfVcpuRunnerError::ChannelClosed(
+                RESPONSE_CHANNEL_CLOSED_MESSAGE,
+            ));
+        }
+    };
+
+    match startup_result {
         Ok(vcpu) => Ok(StartedRunner {
             command_sender,
             vcpu,
@@ -739,5 +746,17 @@ mod tests {
             err,
             HvfVcpuRunnerError::Backend(BackendError::InvalidState("fake startup failed"))
         );
+    }
+
+    #[test]
+    fn startup_panic_is_joined_and_returned_to_caller() {
+        let result = spawn_runner_thread(|| -> Result<FakeVcpu, BackendError> {
+            panic!("fake startup panic");
+        });
+        let Err(err) = result else {
+            panic!("startup panic should be returned");
+        };
+
+        assert_eq!(err, HvfVcpuRunnerError::ThreadPanicked);
     }
 }
