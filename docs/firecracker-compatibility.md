@@ -295,19 +295,21 @@ It intentionally omits serial, RTC, virtio, PCI, vmgenid, vmclock, and other
 device nodes until the corresponding emulation paths exist.
 
 The memory node excludes the first 2 MiB system area from the first DRAM range
-and preserves later DRAM ranges from the runtime layout, but rejects ranges that
-overlap the aarch64 MMIO64 gap or push total guest RAM beyond the aarch64
-maximum. The chosen node carries boot arguments and optional initrd start/end
-properties from loaded boot-source metadata. Direct FDT configuration still
-validates that `bootargs` fits in the 2048-byte aarch64 command-line capacity
-including the trailing NUL byte and contains no embedded NUL bytes. The GIC node
-consumes backend-neutral distributor and redistributor metadata, advertises
-`arm,gic-v3`, and does not emit an ITS/MSI child while the HVF metadata has no
-MSI support. The FDT builder rejects empty or oversized CPU sets, duplicate CPU
-`reg` values, initrd ranges outside guest-advertised memory or overlapping the
-reserved FDT address, and GIC MMIO regions that are invalid, overlap each other,
-or overlap guest RAM. It also rejects unexpected GIC compatibility strings and
-PPI collisions between the GIC maintenance interrupt and timer interrupts.
+and preserves later DRAM ranges from the runtime layout, but direct FDT
+configuration must match the aarch64 DRAM layout helper for its total guest RAM
+size. Sparse layouts, ranges overlapping the aarch64 MMIO64 gap, and total RAM
+beyond the aarch64 maximum are rejected. The chosen node carries boot arguments
+and optional initrd start/end properties from loaded boot-source metadata.
+Direct FDT configuration still validates that `bootargs` fits in the 2048-byte
+aarch64 command-line capacity including the trailing NUL byte and contains no
+embedded NUL bytes. The GIC node consumes backend-neutral distributor and
+redistributor metadata, advertises `arm,gic-v3`, and does not emit an ITS/MSI
+child while the HVF metadata has no MSI support. The FDT builder rejects empty
+or oversized CPU sets, duplicate CPU `reg` values, initrd ranges outside
+guest-advertised memory or overlapping the reserved FDT address, and GIC MMIO
+regions that are invalid, overlap each other, or overlap guest RAM. It also
+rejects unexpected GIC compatibility strings and PPI collisions between the GIC
+maintenance interrupt and timer interrupts.
 
 FDT writes first reject mismatches between the layout used to describe guest RAM
 and the allocated guest memory object. FDT bytes are then built before guest

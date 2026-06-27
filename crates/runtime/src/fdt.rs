@@ -152,6 +152,11 @@ pub enum Arm64FdtError {
         size: u64,
         max_size: u64,
     },
+    UnexpectedDramLayout {
+        range_index: usize,
+        expected: Option<GuestMemoryRange>,
+        actual: Option<GuestMemoryRange>,
+    },
     GuestMemoryOverlapsMmio64 {
         range: GuestMemoryRange,
     },
@@ -252,6 +257,10 @@ impl fmt::Display for Arm64FdtError {
                 f,
                 "arm64 FDT guest memory size {size} bytes exceeds {max_size} byte aarch64 maximum"
             ),
+            Self::UnexpectedDramLayout { range_index, .. } => write!(
+                f,
+                "arm64 FDT guest memory layout does not match the aarch64 DRAM layout at range {range_index}"
+            ),
             Self::GuestMemoryOverlapsMmio64 { range } => write!(
                 f,
                 "arm64 FDT guest memory range {range} overlaps the aarch64 MMIO64 gap"
@@ -348,6 +357,7 @@ impl std::error::Error for Arm64FdtError {
             | Self::NoGuestMemoryAfterSystemArea { .. }
             | Self::InvalidDramStart { .. }
             | Self::GuestMemoryTooLarge { .. }
+            | Self::UnexpectedDramLayout { .. }
             | Self::GuestMemoryOverlapsMmio64 { .. }
             | Self::InitrdNotInGuestMemory { .. }
             | Self::InitrdOverlapsFdt { .. }
@@ -417,7 +427,8 @@ fn validate_config(config: &Arm64FdtConfig<'_>) -> Result<(), Arm64FdtError> {
 
     validate_cpu_regs(config.vcpu_mpidrs)?;
     memory_reg_cells(config.layout)?;
-    validate_guest_memory_size(config.layout)?;
+    let guest_memory_size = validate_guest_memory_size(config.layout)?;
+    validate_aarch64_dram_layout(config.layout, guest_memory_size)?;
     validate_command_line(config.boot.command_line)?;
     validate_gic(config.layout, config.gic)?;
     validate_timer(config.timer)?;
@@ -637,7 +648,7 @@ fn memory_reg_cells(layout: &GuestMemoryLayout) -> Result<Vec<u64>, Arm64FdtErro
     Ok(cells)
 }
 
-fn validate_guest_memory_size(layout: &GuestMemoryLayout) -> Result<(), Arm64FdtError> {
+fn validate_guest_memory_size(layout: &GuestMemoryLayout) -> Result<u64, Arm64FdtError> {
     let mut size = 0u64;
     for range in layout.ranges().iter().copied() {
         size = size
@@ -654,8 +665,33 @@ fn validate_guest_memory_size(layout: &GuestMemoryLayout) -> Result<(), Arm64Fdt
             max_size: aarch64::DRAM_MEM_MAX_SIZE,
         })
     } else {
-        Ok(())
+        Ok(size)
     }
+}
+
+fn validate_aarch64_dram_layout(
+    layout: &GuestMemoryLayout,
+    size: u64,
+) -> Result<(), Arm64FdtError> {
+    let expected_layout =
+        aarch64::dram_layout(size).map_err(|source| Arm64FdtError::InvalidLayout { source })?;
+    let actual_ranges = layout.ranges();
+    let expected_ranges = expected_layout.ranges();
+    let range_count = actual_ranges.len().max(expected_ranges.len());
+
+    for range_index in 0..range_count {
+        let expected = expected_ranges.get(range_index).copied();
+        let actual = actual_ranges.get(range_index).copied();
+        if expected != actual {
+            return Err(Arm64FdtError::UnexpectedDramLayout {
+                range_index,
+                expected,
+                actual,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn memory_reg_cell_count(layout: &GuestMemoryLayout) -> Result<usize, Arm64FdtError> {
@@ -1275,6 +1311,44 @@ mod tests {
             Arm64FdtError::GuestMemoryTooLarge {
                 size: aarch64::DRAM_MEM_MAX_SIZE + 1,
                 max_size: aarch64::DRAM_MEM_MAX_SIZE,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_sparse_memory_layout() {
+        let first_range = GuestMemoryRange::new(
+            GuestAddress::new(aarch64::DRAM_MEM_START),
+            aarch64::SYSTEM_MEM_SIZE + aarch64::GUEST_PAGE_SIZE,
+        )
+        .expect("first sparse test range should be valid");
+        let second_range = GuestMemoryRange::new(
+            GuestAddress::new(
+                aarch64::DRAM_MEM_START + aarch64::SYSTEM_MEM_SIZE + (2 * aarch64::GUEST_PAGE_SIZE),
+            ),
+            aarch64::GUEST_PAGE_SIZE,
+        )
+        .expect("second sparse test range should be valid");
+        let layout = GuestMemoryLayout::new(vec![first_range, second_range])
+            .expect("sparse layout should be structurally valid");
+        let expected_layout = aarch64::dram_layout(layout.total_size())
+            .expect("expected dense aarch64 layout should be valid");
+        let config = test_config(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+        );
+
+        let err = build_arm64_fdt(&config).expect_err("sparse memory layout should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::UnexpectedDramLayout {
+                range_index: 0,
+                expected: Some(expected_layout.ranges()[0]),
+                actual: Some(first_range),
             }
         );
     }
