@@ -941,52 +941,62 @@ mod tests {
     }
 
     fn temp_file(name: &str, bytes: &[u8]) -> TempPath {
-        let path = temp_path(name);
+        let temp = TempPath {
+            path: temp_path(name),
+        };
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&path)
+            .open(temp.as_path())
             .expect("test file should be created");
         file.write_all(bytes).expect("test file should be written");
-        TempPath { path }
+        temp
     }
 
     fn temp_sparse_file(name: &str, size: u64) -> TempPath {
-        let path = temp_path(name);
+        let temp = TempPath {
+            path: temp_path(name),
+        };
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&path)
+            .open(temp.as_path())
             .expect("sparse test file should be created");
         file.set_len(size)
             .expect("sparse test file size should be set");
-        TempPath { path }
+        temp
     }
 
     fn temp_sparse_arm64_image(name: &str, size: u64, text_offset: u64) -> TempPath {
-        let path = temp_path(name);
+        let temp = TempPath {
+            path: temp_path(name),
+        };
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&path)
+            .open(temp.as_path())
             .expect("sparse Image test file should be created");
         let header = arm64_image(text_offset, size, 64);
         file.write_all(&header)
             .expect("sparse Image header should be written");
         file.set_len(size)
             .expect("sparse Image test file size should be set");
-        TempPath { path }
+        temp
     }
 
     fn temp_dir(name: &str) -> TempPath {
-        let path = temp_path(name);
-        fs::create_dir(&path).expect("test directory should be created");
-        TempPath { path }
+        let temp = TempPath {
+            path: temp_path(name),
+        };
+        fs::create_dir(temp.as_path()).expect("test directory should be created");
+        temp
     }
 
     fn temp_fifo(name: &str) -> TempPath {
-        let path = temp_path(name);
-        let c_path = CString::new(path.as_os_str().as_bytes())
+        let temp = TempPath {
+            path: temp_path(name),
+        };
+        let c_path = CString::new(temp.as_path().as_os_str().as_bytes())
             .expect("test FIFO path should not contain NUL");
 
         // SAFETY: `c_path` is a NUL-terminated path built from the test path
@@ -999,7 +1009,7 @@ mod tests {
             );
         }
 
-        TempPath { path }
+        temp
     }
 
     fn missing_path(name: &str) -> PathBuf {
