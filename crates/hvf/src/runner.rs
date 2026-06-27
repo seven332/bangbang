@@ -617,6 +617,8 @@ mod tests {
         fail_next_setup: bool,
     }
 
+    struct PanicOnConfigureVcpu;
+
     struct BlockingConfigureVcpu {
         entered_setup_sender: mpsc::Sender<()>,
         release_setup_receiver: mpsc::Receiver<Result<(), BackendError>>,
@@ -712,6 +714,27 @@ mod tests {
             }
 
             Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for PanicOnConfigureVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            panic!("fake setup panic");
         }
 
         fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
@@ -896,6 +919,22 @@ mod tests {
         );
 
         runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn shutdown_reports_thread_panic_after_arm64_boot_register_setup_panic() {
+        let started =
+            spawn_runner_thread(|| Ok(PanicOnConfigureVcpu)).expect("panic runner should start");
+        let runner = HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+            .expect("runner should be created");
+
+        assert_eq!(
+            runner.configure_arm64_boot_registers(boot_registers()),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
 
     #[test]
