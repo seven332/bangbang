@@ -15,11 +15,11 @@ create/destroy wrapper, typed HVF exit surface, narrow vCPU register wrappers,
 internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, minimal internal
 arm64 FDT generation and guest-memory writes, anonymous guest memory allocation
 for validated runtime layouts, HVF guest memory map/unmap ownership for
-allocated regions, single-vCPU arm64 HVF boot-register setup, and an initial
-process startup argument model.
+allocated regions, an internal MMIO region ownership registry, single-vCPU
+arm64 HVF boot-register setup, and an initial process startup argument model.
 There is no broader API request body model, guest execution, vCPU run loop,
-interrupt injection, MMIO/device emulation, public startup wiring, multi-vCPU
-setup, PSCI behavior, or public boot-source API behavior yet.
+interrupt injection, MMIO exit dispatch, device emulation, public startup
+wiring, multi-vCPU setup, PSCI behavior, or public boot-source API behavior yet.
 
 ## Firecracker Model Alignment
 
@@ -322,6 +322,15 @@ overflowing, or unbacked writes fail before a partial copy. Memory layouts whose
 memory `reg` property alone cannot fit in the FDT window are rejected before FDT
 construction. The write result records the FDT guest address and byte size for
 future boot-register setup.
+
+The runtime crate also contains an internal MMIO region registry for future
+device dispatch. It reuses `GuestMemoryRange`'s end-exclusive semantics instead
+of Firecracker's inclusive-end `BusRange` representation. Region registration
+rejects zero-sized or overflowing ranges and accepts adjacent non-overlapping
+ranges. Lookups validate that the whole access range is owned by one region
+before returning the region owner and offset; accesses that hit a hole, overflow,
+or cross a region boundary are rejected. This is not MMIO exit dispatch or
+device emulation yet.
 
 The HVF backend can map allocated guest memory regions into an existing
 Hypervisor.framework VM with read/write/execute guest RAM permissions. The
