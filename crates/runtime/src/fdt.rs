@@ -765,16 +765,22 @@ fn validate_initrd(layout: &GuestMemoryLayout, initrd: LoadedInitrd) -> Result<(
         return Err(Arm64FdtError::InitrdNotInGuestMemory { range });
     }
 
-    let fdt_address =
-        aarch64::fdt_address(layout).map_err(|source| Arm64FdtError::InvalidLayout { source })?;
-    if range.end_exclusive() > fdt_address {
+    let fdt_range = fdt_reserved_range(layout)?;
+    if range.overlaps(fdt_range) {
         return Err(Arm64FdtError::InitrdOverlapsFdt {
             end_exclusive: range.end_exclusive(),
-            fdt_address,
+            fdt_address: fdt_range.start(),
         });
     }
 
     Ok(())
+}
+
+fn fdt_reserved_range(layout: &GuestMemoryLayout) -> Result<GuestMemoryRange, Arm64FdtError> {
+    let address =
+        aarch64::fdt_address(layout).map_err(|source| Arm64FdtError::InvalidLayout { source })?;
+    GuestMemoryRange::new(address, aarch64::FDT_MAX_SIZE)
+        .map_err(|source| Arm64FdtError::InvalidLayout { source })
 }
 
 fn initrd_range(initrd: LoadedInitrd) -> Result<GuestMemoryRange, Arm64FdtError> {
@@ -1248,6 +1254,37 @@ mod tests {
                     .expect("test initrd end should not overflow"),
                 fdt_address,
             }
+        );
+    }
+
+    #[test]
+    fn accepts_initrd_in_later_dram_range_after_fdt_window() {
+        let layout = aarch64::dram_layout(aarch64::MMIO64_MEM_START - aarch64::DRAM_MEM_START + 1)
+            .expect("split layout should be valid");
+        let second_range = layout.ranges()[1];
+        let initrd = LoadedInitrd {
+            address: second_range.start(),
+            size: second_range.size(),
+        };
+        let config = test_config(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: Some(initrd),
+            },
+        );
+
+        let bytes = build_arm64_fdt(&config).expect("later-range initrd should not overlap FDT");
+        let tree = DeviceTree::load(&bytes).expect("FDT should parse");
+        let chosen = required_node(&tree, "/chosen");
+
+        assert_eq!(
+            chosen.prop_u64("linux,initrd-start").unwrap(),
+            second_range.start().raw_value()
+        );
+        assert_eq!(
+            chosen.prop_u64("linux,initrd-end").unwrap(),
+            second_range.end_exclusive().raw_value()
         );
     }
 
