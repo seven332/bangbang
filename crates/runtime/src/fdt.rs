@@ -148,6 +148,10 @@ pub enum Arm64FdtError {
         actual: GuestAddress,
         expected: GuestAddress,
     },
+    GuestMemoryTooLarge {
+        size: u64,
+        max_size: u64,
+    },
     GuestMemoryOverlapsMmio64 {
         range: GuestMemoryRange,
     },
@@ -244,6 +248,10 @@ impl fmt::Display for Arm64FdtError {
                 f,
                 "arm64 FDT guest memory must start at {expected}, got {actual}"
             ),
+            Self::GuestMemoryTooLarge { size, max_size } => write!(
+                f,
+                "arm64 FDT guest memory size {size} bytes exceeds {max_size} byte aarch64 maximum"
+            ),
             Self::GuestMemoryOverlapsMmio64 { range } => write!(
                 f,
                 "arm64 FDT guest memory range {range} overlaps the aarch64 MMIO64 gap"
@@ -339,6 +347,7 @@ impl std::error::Error for Arm64FdtError {
             | Self::DuplicateCpuReg { .. }
             | Self::NoGuestMemoryAfterSystemArea { .. }
             | Self::InvalidDramStart { .. }
+            | Self::GuestMemoryTooLarge { .. }
             | Self::GuestMemoryOverlapsMmio64 { .. }
             | Self::InitrdNotInGuestMemory { .. }
             | Self::InitrdOverlapsFdt { .. }
@@ -408,6 +417,7 @@ fn validate_config(config: &Arm64FdtConfig<'_>) -> Result<(), Arm64FdtError> {
 
     validate_cpu_regs(config.vcpu_mpidrs)?;
     memory_reg_cells(config.layout)?;
+    validate_guest_memory_size(config.layout)?;
     validate_command_line(config.boot.command_line)?;
     validate_gic(config.layout, config.gic)?;
     validate_timer(config.timer)?;
@@ -625,6 +635,27 @@ fn memory_reg_cells(layout: &GuestMemoryLayout) -> Result<Vec<u64>, Arm64FdtErro
     }
 
     Ok(cells)
+}
+
+fn validate_guest_memory_size(layout: &GuestMemoryLayout) -> Result<(), Arm64FdtError> {
+    let mut size = 0u64;
+    for range in layout.ranges().iter().copied() {
+        size = size
+            .checked_add(range.size())
+            .ok_or(Arm64FdtError::GuestMemoryTooLarge {
+                size: u64::MAX,
+                max_size: aarch64::DRAM_MEM_MAX_SIZE,
+            })?;
+    }
+
+    if size > aarch64::DRAM_MEM_MAX_SIZE {
+        Err(Arm64FdtError::GuestMemoryTooLarge {
+            size,
+            max_size: aarch64::DRAM_MEM_MAX_SIZE,
+        })
+    } else {
+        Ok(())
+    }
 }
 
 fn memory_reg_cell_count(layout: &GuestMemoryLayout) -> Result<usize, Arm64FdtError> {
@@ -1211,6 +1242,39 @@ mod tests {
             err,
             Arm64FdtError::GuestMemoryOverlapsMmio64 {
                 range: mmio64_range,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_memory_larger_than_arm64_dram_max() {
+        let first_size = aarch64::MMIO64_MEM_START - aarch64::DRAM_MEM_START;
+        let second_size = aarch64::DRAM_MEM_MAX_SIZE - first_size + 1;
+        let first_range =
+            GuestMemoryRange::new(GuestAddress::new(aarch64::DRAM_MEM_START), first_size)
+                .expect("first max-size test range should be valid");
+        let second_range = GuestMemoryRange::new(
+            GuestAddress::new(aarch64::FIRST_ADDR_PAST_64BITS_MMIO),
+            second_size,
+        )
+        .expect("second max-size test range should be valid");
+        let layout = GuestMemoryLayout::new(vec![first_range, second_range])
+            .expect("oversized aarch64 layout should be structurally valid");
+        let config = test_config(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+        );
+
+        let err = build_arm64_fdt(&config).expect_err("oversized guest memory should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::GuestMemoryTooLarge {
+                size: aarch64::DRAM_MEM_MAX_SIZE + 1,
+                max_size: aarch64::DRAM_MEM_MAX_SIZE,
             }
         );
     }
