@@ -313,8 +313,10 @@ FDT writes first reject mismatches between the layout used to describe guest RAM
 and the allocated guest memory object. FDT bytes are then built before guest
 memory is touched, checked against the reserved 2 MiB FDT window, and copied
 with `GuestMemory::write_slice` at the aarch64 FDT address. Oversized,
-overflowing, or unbacked writes fail before a partial copy. The write result
-records the FDT guest address and byte size for future boot-register setup.
+overflowing, or unbacked writes fail before a partial copy. Memory layouts whose
+memory `reg` property alone cannot fit in the FDT window are rejected before FDT
+construction. The write result records the FDT guest address and byte size for
+future boot-register setup.
 
 The HVF backend can map allocated guest memory regions into an existing
 Hypervisor.framework VM with read/write/execute guest RAM permissions. The

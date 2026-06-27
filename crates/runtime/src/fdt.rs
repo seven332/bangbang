@@ -23,6 +23,8 @@ const GIC_FDT_IRQ_TYPE_PPI: u32 = 1;
 const IRQ_TYPE_LEVEL_HIGH: u32 = 4;
 const FIRST_PPI_INTID: u32 = 16;
 const FIRST_SPI_INTID: u32 = 32;
+const MEMORY_REG_CELLS_PER_RANGE: usize = 2;
+const MEMORY_REG_CELL_SIZE: usize = 8;
 
 pub const ARM64_FDT_SECURE_PHYSICAL_TIMER_PPI: u32 = 13;
 pub const ARM64_FDT_NON_SECURE_PHYSICAL_TIMER_PPI: u32 = 14;
@@ -585,7 +587,10 @@ fn create_psci_node(fdt: &mut FdtWriter) -> Result<(), Arm64FdtError> {
 }
 
 fn memory_reg_cells(layout: &GuestMemoryLayout) -> Result<Vec<u64>, Arm64FdtError> {
-    let mut cells = Vec::with_capacity(layout.ranges().len().saturating_mul(2));
+    let cell_count = memory_reg_cell_count(layout)?;
+    validate_fdt_size(memory_reg_size_lower_bound(cell_count)?)?;
+
+    let mut cells = Vec::with_capacity(cell_count);
     let mmio64_gap = mmio64_gap_range()?;
     for (range_index, range) in layout.ranges().iter().copied().enumerate() {
         if range_index == 0 {
@@ -620,6 +625,26 @@ fn memory_reg_cells(layout: &GuestMemoryLayout) -> Result<Vec<u64>, Arm64FdtErro
     }
 
     Ok(cells)
+}
+
+fn memory_reg_cell_count(layout: &GuestMemoryLayout) -> Result<usize, Arm64FdtError> {
+    layout
+        .ranges()
+        .len()
+        .checked_mul(MEMORY_REG_CELLS_PER_RANGE)
+        .ok_or(Arm64FdtError::FdtTooLarge {
+            size: usize::MAX,
+            max_size: aarch64::FDT_MAX_SIZE,
+        })
+}
+
+fn memory_reg_size_lower_bound(cell_count: usize) -> Result<usize, Arm64FdtError> {
+    cell_count
+        .checked_mul(MEMORY_REG_CELL_SIZE)
+        .ok_or(Arm64FdtError::FdtTooLarge {
+            size: usize::MAX,
+            max_size: aarch64::FDT_MAX_SIZE,
+        })
 }
 
 fn mmio64_gap_range() -> Result<GuestMemoryRange, Arm64FdtError> {
@@ -1457,13 +1482,13 @@ mod tests {
 
         let err = build_arm64_fdt(&config).expect_err("oversized generated FDT should fail");
 
-        assert!(matches!(
+        assert_eq!(
             err,
             Arm64FdtError::FdtTooLarge {
+                size: layout.ranges().len() * MEMORY_REG_CELLS_PER_RANGE * MEMORY_REG_CELL_SIZE,
                 max_size: aarch64::FDT_MAX_SIZE,
-                ..
             }
-        ));
+        );
     }
 
     #[test]
