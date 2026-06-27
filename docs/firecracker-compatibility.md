@@ -345,7 +345,8 @@ register state: PC points at the loaded kernel entry, X0 points at the FDT
 guest address, X1-X3 are zero, and CPSR/PSTATE is `0x3c5`. The runner path
 performs that setup on the vCPU-owning thread before the first run and rejects
 duplicate setup, setup during shutdown, setup while a run is in flight, and
-setup after a run has started.
+setup after a run has started. If setup fails after partially writing
+registers, the runner rejects guest runs until setup is retried successfully.
 
 bangbang still does not wire `mem_size_mib` into public startup behavior,
 inject interrupts, emulate devices, start a guest, power on secondary vCPUs, or

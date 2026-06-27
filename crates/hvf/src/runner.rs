@@ -15,6 +15,8 @@ const RUNNER_SHUTTING_DOWN_MESSAGE: &str = "vCPU runner shutdown is already in p
 const RUN_IN_FLIGHT_MESSAGE: &str = "vCPU runner already has a run in flight";
 const BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE: &str =
     "vCPU runner already has boot register setup in flight";
+const BOOT_REGISTER_SETUP_FAILED_MESSAGE: &str =
+    "vCPU runner boot register setup failed and must be retried";
 const BOOT_REGISTERS_ALREADY_CONFIGURED_MESSAGE: &str =
     "vCPU runner boot registers are already configured";
 const RUN_ALREADY_STARTED_MESSAGE: &str = "vCPU runner has already started a run";
@@ -79,6 +81,7 @@ struct RunnerHandleState {
     shutting_down: bool,
     in_flight_runs: usize,
     boot_register_setup_in_flight: bool,
+    boot_register_setup_failed: bool,
     boot_registers_configured: bool,
     run_started: bool,
 }
@@ -164,8 +167,15 @@ impl<'vm> HvfVcpuRunner<'vm> {
         let result = response_receiver
             .recv()
             .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?;
-        if result.is_ok() {
-            setup.mark_configured();
+        match &result {
+            Ok(()) => setup.mark_configured(),
+            Err(HvfVcpuRunnerError::Backend(_)) => setup.mark_failed(),
+            Err(
+                HvfVcpuRunnerError::InvalidState(_)
+                | HvfVcpuRunnerError::ThreadSpawn(_)
+                | HvfVcpuRunnerError::ChannelClosed(_)
+                | HvfVcpuRunnerError::ThreadPanicked,
+            ) => {}
         }
 
         result
@@ -231,6 +241,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 shutting_down: false,
                 in_flight_runs: 0,
                 boot_register_setup_in_flight: false,
+                boot_register_setup_failed: false,
                 boot_registers_configured: false,
                 run_started: false,
             }),
@@ -303,6 +314,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.boot_register_setup_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
                 BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.boot_register_setup_failed {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                BOOT_REGISTER_SETUP_FAILED_MESSAGE,
             ));
         }
 
@@ -393,6 +409,7 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                 state.shutting_down,
                 state.in_flight_runs,
                 state.boot_register_setup_in_flight,
+                state.boot_register_setup_failed,
                 state.boot_registers_configured,
                 state.run_started,
             )
@@ -404,6 +421,7 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                 shutting_down,
                 in_flight_runs,
                 boot_register_setup_in_flight,
+                boot_register_setup_failed,
                 boot_registers_configured,
                 run_started,
             )) => f
@@ -415,6 +433,7 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                     "boot_register_setup_in_flight",
                     &boot_register_setup_in_flight,
                 )
+                .field("boot_register_setup_failed", &boot_register_setup_failed)
                 .field("boot_registers_configured", &boot_registers_configured)
                 .field("run_started", &run_started)
                 .finish_non_exhaustive(),
@@ -429,6 +448,7 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
 struct InFlightBootRegisterSetup<'state> {
     state: &'state Mutex<RunnerHandleState>,
     configured: bool,
+    failed: bool,
 }
 
 impl<'state> InFlightBootRegisterSetup<'state> {
@@ -436,11 +456,16 @@ impl<'state> InFlightBootRegisterSetup<'state> {
         Self {
             state,
             configured: false,
+            failed: false,
         }
     }
 
     fn mark_configured(&mut self) {
         self.configured = true;
+    }
+
+    fn mark_failed(&mut self) {
+        self.failed = true;
     }
 }
 
@@ -449,7 +474,10 @@ impl Drop for InFlightBootRegisterSetup<'_> {
         if let Ok(mut state) = self.state.lock() {
             state.boot_register_setup_in_flight = false;
             if self.configured {
+                state.boot_register_setup_failed = false;
                 state.boot_registers_configured = true;
+            } else if self.failed {
+                state.boot_register_setup_failed = true;
             }
         }
     }
@@ -903,6 +931,12 @@ mod tests {
                 .expect("fake vCPU should receive failed boot registers"),
             registers
         );
+        assert_eq!(
+            runner.run_once(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::BOOT_REGISTER_SETUP_FAILED_MESSAGE
+            ))
+        );
 
         assert_eq!(runner.configure_arm64_boot_registers(registers), Ok(()));
         assert_eq!(
@@ -917,6 +951,7 @@ mod tests {
                 super::BOOT_REGISTERS_ALREADY_CONFIGURED_MESSAGE
             ))
         );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
 
         runner.shutdown().expect("runner should shut down");
     }
