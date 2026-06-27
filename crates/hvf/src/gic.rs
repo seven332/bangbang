@@ -13,6 +13,7 @@ const DYNAMIC_SYMBOL_SIZE_MISMATCH_MESSAGE: &str =
 
 const HV_GIC_INT_EL1_VIRTUAL_TIMER: u16 = 27;
 const HV_GIC_INT_EL1_PHYSICAL_TIMER: u16 = 30;
+const FIRST_SPI_INTID: u32 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvfGicRegion {
@@ -279,6 +280,7 @@ fn metadata_from_parameters(parameters: HvfGicParameters) -> Result<HvfGicMetada
             value: parameters.redistributor_size,
         });
     }
+    validate_spi_interrupt_range(parameters.spi_interrupt_range)?;
 
     let distributor = aligned_region_below(
         "distributor",
@@ -330,6 +332,29 @@ fn validate_parameter(
     } else {
         Err(HvfGicError::InvalidParameter { name, value })
     }
+}
+
+fn validate_spi_interrupt_range(range: HvfGicInterruptRange) -> Result<(), HvfGicError> {
+    if range.base < FIRST_SPI_INTID {
+        return Err(HvfGicError::InvalidParameter {
+            name: "spi_interrupt_range.base",
+            value: u64::from(range.base),
+        });
+    }
+    if range.count == 0 {
+        return Err(HvfGicError::InvalidParameter {
+            name: "spi_interrupt_range.count",
+            value: 0,
+        });
+    }
+    if range.base.checked_add(range.count).is_none() {
+        return Err(HvfGicError::InvalidParameter {
+            name: "spi_interrupt_range.end_exclusive",
+            value: u64::from(range.base) + u64::from(range.count),
+        });
+    }
+
+    Ok(())
 }
 
 fn aligned_region_below(
@@ -893,6 +918,60 @@ mod tests {
             HvfGicError::InvalidParameter {
                 name: "redistributor_size",
                 value: 0x2_0000,
+            }
+        );
+    }
+
+    #[test]
+    fn metadata_rejects_non_spi_interrupt_range_base() {
+        let err = metadata_from_parameters(HvfGicParameters {
+            spi_interrupt_range: HvfGicInterruptRange { base: 31, count: 1 },
+            ..default_parameters()
+        })
+        .expect_err("SPI range base below the first SPI INTID should fail");
+
+        assert_eq!(
+            err,
+            HvfGicError::InvalidParameter {
+                name: "spi_interrupt_range.base",
+                value: 31,
+            }
+        );
+    }
+
+    #[test]
+    fn metadata_rejects_zero_spi_interrupt_count_before_config_creation() {
+        let api = FakeGicApi::new(HvfGicParameters {
+            spi_interrupt_range: HvfGicInterruptRange { base: 32, count: 0 },
+            ..default_parameters()
+        });
+
+        assert_eq!(
+            create_gic_with_api(&api),
+            Err(HvfGicError::InvalidParameter {
+                name: "spi_interrupt_range.count",
+                value: 0,
+            })
+        );
+        assert!(!api.created_config());
+    }
+
+    #[test]
+    fn metadata_rejects_spi_interrupt_range_overflow() {
+        let err = metadata_from_parameters(HvfGicParameters {
+            spi_interrupt_range: HvfGicInterruptRange {
+                base: u32::MAX,
+                count: 2,
+            },
+            ..default_parameters()
+        })
+        .expect_err("SPI range end should not overflow");
+
+        assert_eq!(
+            err,
+            HvfGicError::InvalidParameter {
+                name: "spi_interrupt_range.end_exclusive",
+                value: u64::from(u32::MAX) + 2,
             }
         );
     }
