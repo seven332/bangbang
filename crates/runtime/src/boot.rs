@@ -833,10 +833,11 @@ fn memory_contains_range(memory: &GuestMemory, range: GuestMemoryRange) -> bool 
 
 #[cfg(test)]
 mod tests {
-    use std::fs::{self, File};
+    use std::fs::{self, OpenOptions};
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         ARM64_IMAGE_MAGIC, ARM64_IMAGE_MAGIC_OFFSET, ARM64_IMAGE_SIZE_OFFSET,
@@ -878,21 +879,33 @@ mod tests {
 
     fn temp_path(name: &str) -> PathBuf {
         let id = NEXT_TEMP_PATH_ID.fetch_add(1, Ordering::Relaxed);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
         std::env::temp_dir().join(format!(
-            "bangbang-boot-test-{}-{id}-{name}",
-            std::process::id()
+            "bangbang-boot-test-{}-{timestamp}-{id}-{name}",
+            std::process::id(),
         ))
     }
 
     fn temp_file(name: &str, bytes: &[u8]) -> TempPath {
         let path = temp_path(name);
-        fs::write(&path, bytes).expect("test file should be written");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("test file should be created");
+        file.write_all(bytes).expect("test file should be written");
         TempPath { path }
     }
 
     fn temp_sparse_file(name: &str, size: u64) -> TempPath {
         let path = temp_path(name);
-        let file = File::create(&path).expect("sparse test file should be created");
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("sparse test file should be created");
         file.set_len(size)
             .expect("sparse test file size should be set");
         TempPath { path }
@@ -900,7 +913,11 @@ mod tests {
 
     fn temp_sparse_arm64_image(name: &str, size: u64, text_offset: u64) -> TempPath {
         let path = temp_path(name);
-        let mut file = File::create(&path).expect("sparse Image test file should be created");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("sparse Image test file should be created");
         let header = arm64_image(text_offset, size, 64);
         file.write_all(&header)
             .expect("sparse Image header should be written");
@@ -1192,6 +1209,27 @@ mod tests {
         assert!(matches!(
             err,
             BootSourceLoadError::KernelImage(KernelImageError::InvalidMagic { magic: 0 })
+        ));
+    }
+
+    #[test]
+    fn rejects_kernel_text_offset_overflow() {
+        let layout = boot_layout();
+        let mut memory = boot_memory(&layout);
+        let kernel_bytes = arm64_image(u64::MAX, 4096, 4096);
+        let kernel_file = temp_file("overflow-kernel", &kernel_bytes);
+        let source = BootSource::new(kernel_file.as_path());
+
+        let err = source
+            .load(&layout, &mut memory)
+            .expect_err("kernel text offset overflow should fail");
+
+        assert!(matches!(
+            err,
+            BootSourceLoadError::KernelImage(KernelImageError::LoadAddressOverflow {
+                text_offset: u64::MAX,
+                ..
+            })
         ));
     }
 
