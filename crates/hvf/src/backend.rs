@@ -104,8 +104,9 @@ impl HvfBackend {
             ));
         }
 
+        let vcpu = HvfVcpu::new()?;
         self.vcpu_topology_started = true;
-        HvfVcpu::new(self)
+        Ok(vcpu)
     }
 
     pub fn start_vcpu_runner(&mut self) -> Result<HvfVcpuRunner<'_>, HvfVcpuRunnerError> {
@@ -120,8 +121,9 @@ impl HvfBackend {
             .into());
         }
 
+        let runner = HvfVcpuRunner::new()?;
         self.vcpu_topology_started = true;
-        HvfVcpuRunner::new(self)
+        Ok(runner)
     }
 
     fn create_gic_with_configured_creator(&mut self) -> Result<&HvfGicMetadata, HvfGicError> {
