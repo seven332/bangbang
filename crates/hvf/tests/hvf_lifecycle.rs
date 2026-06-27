@@ -36,6 +36,69 @@ fn creates_and_destroys_hvf_vcpu() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn configures_hvf_vcpu_arm64_boot_registers() {
+    use bangbang_hvf::{
+        ARM64_LINUX_BOOT_CPSR, HvfArm64BootRegisters, HvfBackend, HvfRegister, HvfSystemRegister,
+    };
+    use bangbang_runtime::VmBackend;
+    use bangbang_runtime::memory::GuestAddress;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+    let registers = HvfArm64BootRegisters {
+        kernel_entry: GuestAddress::new(0x8028_0000),
+        fdt_address: GuestAddress::new(0x8fe0_0000),
+    };
+
+    backend.create_vm().expect("VM should be created");
+    {
+        let mut vcpu = backend.create_vcpu().expect("vCPU should be created");
+        vcpu.configure_arm64_boot_registers(registers)
+            .expect("boot registers should be configured");
+
+        assert_eq!(
+            vcpu.get_register(HvfRegister::PC)
+                .expect("PC should be read"),
+            registers.kernel_entry.raw_value()
+        );
+        assert_eq!(
+            vcpu.get_register(HvfRegister::X0)
+                .expect("X0 should be read"),
+            registers.fdt_address.raw_value()
+        );
+        assert_eq!(
+            vcpu.get_register(HvfRegister::X1)
+                .expect("X1 should be read"),
+            0
+        );
+        assert_eq!(
+            vcpu.get_register(HvfRegister::X2)
+                .expect("X2 should be read"),
+            0
+        );
+        assert_eq!(
+            vcpu.get_register(HvfRegister::X3)
+                .expect("X3 should be read"),
+            0
+        );
+        assert_eq!(
+            vcpu.get_register(HvfRegister::CPSR)
+                .expect("CPSR should be read"),
+            ARM64_LINUX_BOOT_CPSR
+        );
+        let _mpidr = vcpu
+            .get_system_register(HvfSystemRegister::MPIDR_EL1)
+            .expect("MPIDR_EL1 should be read");
+
+        vcpu.destroy().expect("vCPU should be destroyed");
+    }
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn creates_hvf_gic_before_vcpu() {
     use bangbang_hvf::{HvfBackend, HvfGicMetadata};
     use bangbang_runtime::VmBackend;

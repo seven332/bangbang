@@ -15,10 +15,11 @@ create/destroy wrapper, typed HVF exit surface, narrow vCPU register wrappers,
 internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, minimal internal
 arm64 FDT generation and guest-memory writes, anonymous guest memory allocation
 for validated runtime layouts, HVF guest memory map/unmap ownership for
-allocated regions, and an initial process startup argument model.
+allocated regions, single-vCPU arm64 HVF boot-register setup, and an initial
+process startup argument model.
 There is no broader API request body model, guest execution, vCPU run loop,
-interrupt injection, MMIO/device emulation, boot register setup, or public
-boot-source API behavior yet.
+interrupt injection, MMIO/device emulation, public startup wiring, multi-vCPU
+setup, PSCI behavior, or public boot-source API behavior yet.
 
 ## Firecracker Model Alignment
 
@@ -339,11 +340,19 @@ runtime timer node, and MSI/ITS metadata is intentionally absent until a later
 device path needs it.
 
 This still is not bootable guest RAM. bangbang can now write an internal FDT
-payload, but it does not wire `mem_size_mib` into public startup behavior,
-inject interrupts, configure boot registers, emulate devices, or start a guest.
-Later API and startup work still needs to decide whether an oversized
-`mem_size_mib` request should be rejected before layout construction or should
-preserve Firecracker's architecture-helper truncation behavior.
+payload and configure a single primary HVF vCPU with the arm64 Linux boot
+register state: PC points at the loaded kernel entry, X0 points at the FDT
+guest address, X1-X3 are zero, and CPSR/PSTATE is `0x3c5`. The runner path
+performs that setup on the vCPU-owning thread before the first run and rejects
+duplicate setup, setup during shutdown, setup while a run is in flight, and
+setup after a run has started. If setup fails after partially writing
+registers, the runner rejects guest runs until setup is retried successfully.
+
+bangbang still does not wire `mem_size_mib` into public startup behavior,
+inject interrupts, emulate devices, start a guest, power on secondary vCPUs, or
+implement PSCI. Later API and startup work still needs to decide whether an
+oversized `mem_size_mib` request should be rejected before layout construction
+or should preserve Firecracker's architecture-helper truncation behavior.
 
 ## API State and Response Policy
 
@@ -454,9 +463,11 @@ macOS design work instead of direct implementation:
 - HVF vCPU handles are thread-affine: creation, register access, run, and
   destroy operations must happen on the owning thread. The current vCPU wrapper
   covers current-thread lifecycle, typed exit surface, and narrow register
-  access. The current runner skeleton creates a vCPU on a dedicated thread,
-  supports one cancellable `hv_vcpu_run` step at a time, and shuts down by
-  canceling and joining the runner thread.
+  access, including the single primary arm64 Linux boot-register setup. The
+  current runner skeleton creates a vCPU on a dedicated thread, applies that
+  boot-register setup on the owning thread before the first run, supports one
+  cancellable `hv_vcpu_run` step at a time, and shuts down by canceling and
+  joining the runner thread.
 - HVF exit snapshots preserve Hypervisor.framework reasons such as canceled,
   exception, virtual timer activation, and unknown after a run wrapper marks
   exit data available. They are not yet decoded into MMIO, timer, device, or
