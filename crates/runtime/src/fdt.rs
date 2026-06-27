@@ -4,7 +4,7 @@ use std::fmt;
 
 use vm_fdt::{Error as VmFdtError, FdtWriter};
 
-use crate::boot::{LoadedBootSource, LoadedInitrd};
+use crate::boot::{BootCommandLineError, LoadedBootSource, LoadedInitrd};
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryLayout,
     GuestMemoryRange, aarch64,
@@ -146,6 +146,12 @@ pub enum Arm64FdtError {
         actual: GuestAddress,
         expected: GuestAddress,
     },
+    GuestMemoryOverlapsMmio64 {
+        range: GuestMemoryRange,
+    },
+    InvalidCommandLine {
+        source: BootCommandLineError,
+    },
     InvalidInitrdRange {
         source: GuestMemoryError,
     },
@@ -236,6 +242,13 @@ impl fmt::Display for Arm64FdtError {
                 f,
                 "arm64 FDT guest memory must start at {expected}, got {actual}"
             ),
+            Self::GuestMemoryOverlapsMmio64 { range } => write!(
+                f,
+                "arm64 FDT guest memory range {range} overlaps the aarch64 MMIO64 gap"
+            ),
+            Self::InvalidCommandLine { source } => {
+                write!(f, "invalid arm64 FDT command line: {source}")
+            }
             Self::InvalidInitrdRange { source } => {
                 write!(f, "invalid arm64 FDT initrd range: {source}")
             }
@@ -315,6 +328,7 @@ impl std::error::Error for Arm64FdtError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidLayout { source } => Some(source),
+            Self::InvalidCommandLine { source } => Some(source),
             Self::InvalidInitrdRange { source } => Some(source),
             Self::CreateFdt { source } => Some(source),
             Self::GuestMemoryWrite { source } => Some(source),
@@ -323,6 +337,7 @@ impl std::error::Error for Arm64FdtError {
             | Self::DuplicateCpuReg { .. }
             | Self::NoGuestMemoryAfterSystemArea { .. }
             | Self::InvalidDramStart { .. }
+            | Self::GuestMemoryOverlapsMmio64 { .. }
             | Self::InitrdNotInGuestMemory { .. }
             | Self::InitrdOverlapsFdt { .. }
             | Self::InvalidGicRegion { .. }
@@ -391,6 +406,7 @@ fn validate_config(config: &Arm64FdtConfig<'_>) -> Result<(), Arm64FdtError> {
 
     validate_cpu_regs(config.vcpu_mpidrs)?;
     memory_reg_cells(config.layout)?;
+    validate_command_line(config.boot.command_line)?;
     validate_gic(config.layout, config.gic)?;
     validate_timer(config.timer)?;
     validate_gic_timer_ppis(config.gic, config.timer)?;
@@ -418,6 +434,36 @@ fn validate_cpu_regs(mpidrs: &[u64]) -> Result<(), Arm64FdtError> {
                 });
             }
         }
+    }
+
+    Ok(())
+}
+
+fn validate_command_line(command_line: &str) -> Result<(), Arm64FdtError> {
+    if command_line.as_bytes().contains(&0) {
+        return Err(Arm64FdtError::InvalidCommandLine {
+            source: BootCommandLineError::ContainsNul,
+        });
+    }
+
+    let size_with_nul =
+        command_line
+            .len()
+            .checked_add(1)
+            .ok_or(Arm64FdtError::InvalidCommandLine {
+                source: BootCommandLineError::TooLarge {
+                    size_with_nul: usize::MAX,
+                    max_size: aarch64::CMDLINE_MAX_SIZE,
+                },
+            })?;
+
+    if size_with_nul > aarch64::CMDLINE_MAX_SIZE {
+        return Err(Arm64FdtError::InvalidCommandLine {
+            source: BootCommandLineError::TooLarge {
+                size_with_nul,
+                max_size: aarch64::CMDLINE_MAX_SIZE,
+            },
+        });
     }
 
     Ok(())
@@ -540,6 +586,7 @@ fn create_psci_node(fdt: &mut FdtWriter) -> Result<(), Arm64FdtError> {
 
 fn memory_reg_cells(layout: &GuestMemoryLayout) -> Result<Vec<u64>, Arm64FdtError> {
     let mut cells = Vec::with_capacity(layout.ranges().len().saturating_mul(2));
+    let mmio64_gap = mmio64_gap_range()?;
     for (range_index, range) in layout.ranges().iter().copied().enumerate() {
         if range_index == 0 {
             if range.start().raw_value() != aarch64::SYSTEM_MEM_START {
@@ -554,6 +601,7 @@ fn memory_reg_cells(layout: &GuestMemoryLayout) -> Result<Vec<u64>, Arm64FdtErro
                     system_size: aarch64::SYSTEM_MEM_SIZE,
                 });
             }
+            validate_memory_range_excludes_mmio64_gap(range, mmio64_gap)?;
             let start = range.start().checked_add(aarch64::SYSTEM_MEM_SIZE).ok_or(
                 Arm64FdtError::InvalidLayout {
                     source: GuestMemoryError::AddressOverflow {
@@ -565,12 +613,32 @@ fn memory_reg_cells(layout: &GuestMemoryLayout) -> Result<Vec<u64>, Arm64FdtErro
             cells.push(start.raw_value());
             cells.push(range.size() - aarch64::SYSTEM_MEM_SIZE);
         } else {
+            validate_memory_range_excludes_mmio64_gap(range, mmio64_gap)?;
             cells.push(range.start().raw_value());
             cells.push(range.size());
         }
     }
 
     Ok(cells)
+}
+
+fn mmio64_gap_range() -> Result<GuestMemoryRange, Arm64FdtError> {
+    GuestMemoryRange::new(
+        GuestAddress::new(aarch64::MMIO64_MEM_START),
+        aarch64::MMIO64_MEM_SIZE,
+    )
+    .map_err(|source| Arm64FdtError::InvalidLayout { source })
+}
+
+fn validate_memory_range_excludes_mmio64_gap(
+    range: GuestMemoryRange,
+    mmio64_gap: GuestMemoryRange,
+) -> Result<(), Arm64FdtError> {
+    if range.overlaps(mmio64_gap) {
+        Err(Arm64FdtError::GuestMemoryOverlapsMmio64 { range })
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_initrd(layout: &GuestMemoryLayout, initrd: LoadedInitrd) -> Result<(), Arm64FdtError> {
@@ -929,6 +997,71 @@ mod tests {
     }
 
     #[test]
+    fn accepts_command_line_at_fdt_limit() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let command_line = "x".repeat(aarch64::CMDLINE_MAX_SIZE - 1);
+        let config = test_config(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: &command_line,
+                initrd: None,
+            },
+        );
+
+        let bytes = build_arm64_fdt(&config).expect("max-sized command line should fit");
+        let tree = DeviceTree::load(&bytes).expect("FDT should parse");
+        let chosen = required_node(&tree, "/chosen");
+
+        assert_eq!(chosen.prop_str("bootargs").unwrap(), command_line);
+    }
+
+    #[test]
+    fn rejects_oversized_command_line() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let command_line = "x".repeat(aarch64::CMDLINE_MAX_SIZE);
+        let config = test_config(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: &command_line,
+                initrd: None,
+            },
+        );
+
+        let err = build_arm64_fdt(&config).expect_err("oversized command line should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::InvalidCommandLine {
+                source: BootCommandLineError::TooLarge {
+                    size_with_nul: aarch64::CMDLINE_MAX_SIZE + 1,
+                    max_size: aarch64::CMDLINE_MAX_SIZE,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_command_line_with_nul() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let config = test_config(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1\0debug",
+                initrd: None,
+            },
+        );
+
+        let err = build_arm64_fdt(&config).expect_err("NUL command line should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::InvalidCommandLine {
+                source: BootCommandLineError::ContainsNul,
+            }
+        );
+    }
+
+    #[test]
     fn rejects_empty_initrd_range() {
         let layout = test_layout(TEST_MEMORY_SIZE);
         let address = GuestAddress::new(aarch64::DRAM_MEM_START + aarch64::SYSTEM_MEM_SIZE);
@@ -1022,6 +1155,38 @@ mod tests {
                 aarch64::DRAM_MEM_START + aarch64::SYSTEM_MEM_SIZE,
                 TEST_MEMORY_SIZE - aarch64::SYSTEM_MEM_SIZE,
             ]
+        );
+    }
+
+    #[test]
+    fn rejects_memory_range_overlapping_mmio64_gap() {
+        let first_range = GuestMemoryRange::new(
+            GuestAddress::new(aarch64::DRAM_MEM_START),
+            aarch64::SYSTEM_MEM_SIZE + aarch64::GUEST_PAGE_SIZE,
+        )
+        .expect("first memory range should be valid");
+        let mmio64_range = GuestMemoryRange::new(
+            GuestAddress::new(aarch64::MMIO64_MEM_START),
+            aarch64::GUEST_PAGE_SIZE,
+        )
+        .expect("MMIO64-overlapping test range should be valid");
+        let layout = GuestMemoryLayout::new(vec![first_range, mmio64_range])
+            .expect("test layout should be valid");
+        let config = test_config(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+        );
+
+        let err = build_arm64_fdt(&config).expect_err("MMIO64 gap RAM should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::GuestMemoryOverlapsMmio64 {
+                range: mmio64_range,
+            }
         );
     }
 
@@ -1281,12 +1446,11 @@ mod tests {
 
     #[test]
     fn rejects_oversized_generated_fdt() {
-        let layout = test_layout(TEST_MEMORY_SIZE);
-        let command_line = "x".repeat(aarch64::FDT_MAX_SIZE as usize + 1);
+        let layout = oversized_fdt_layout();
         let config = test_config(
             &layout,
             Arm64FdtBootInfo {
-                command_line: &command_line,
+                command_line: "panic=1",
                 initrd: None,
             },
         );
@@ -1597,6 +1761,27 @@ mod tests {
 
     fn test_layout(size: u64) -> GuestMemoryLayout {
         aarch64::dram_layout(size).expect("test layout should be valid")
+    }
+
+    fn oversized_fdt_layout() -> GuestMemoryLayout {
+        let mut ranges = Vec::new();
+        let mut start = aarch64::DRAM_MEM_START;
+        let first_range_size = aarch64::SYSTEM_MEM_SIZE + aarch64::GUEST_PAGE_SIZE;
+        ranges.push(
+            GuestMemoryRange::new(GuestAddress::new(start), first_range_size)
+                .expect("oversized FDT first range should be valid"),
+        );
+        start += first_range_size;
+
+        for _ in 0..(aarch64::FDT_MAX_SIZE / 16 + 1) {
+            ranges.push(
+                GuestMemoryRange::new(GuestAddress::new(start), 1)
+                    .expect("oversized FDT memory range should be valid"),
+            );
+            start += 1;
+        }
+
+        GuestMemoryLayout::new(ranges).expect("oversized FDT layout should be valid")
     }
 
     fn test_config<'a>(
