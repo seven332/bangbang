@@ -299,7 +299,10 @@ and preserves later DRAM ranges from the runtime layout. The chosen node carries
 boot arguments and optional initrd start/end properties from loaded boot-source
 metadata. The GIC node consumes backend-neutral distributor and redistributor
 metadata, advertises `arm,gic-v3`, and does not emit an ITS/MSI child while the
-HVF metadata has no MSI support.
+HVF metadata has no MSI support. The FDT builder rejects empty or oversized CPU
+sets, duplicate CPU `reg` values, initrd ranges outside guest-advertised memory
+or overlapping the reserved FDT address, and GIC MMIO regions that are invalid,
+overlap each other, or overlap guest RAM.
 
 FDT writes first reject mismatches between the layout used to describe guest RAM
 and the allocated guest memory object. FDT bytes are then built before guest

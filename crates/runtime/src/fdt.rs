@@ -17,6 +17,7 @@ const SIZE_CELLS: u32 = 2;
 const CPU_ADDRESS_CELLS: u32 = 2;
 const CPU_SIZE_CELLS: u32 = 0;
 const CPU_REG_MASK: u64 = 0x7f_ffff;
+const MAX_ARM64_FDT_CPUS: usize = 32;
 const GIC_FDT_IRQ_TYPE_PPI: u32 = 1;
 const IRQ_TYPE_LEVEL_HIGH: u32 = 4;
 const FIRST_PPI_INTID: u32 = 16;
@@ -124,6 +125,10 @@ pub struct Arm64FdtGuestMemoryWrite {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Arm64FdtError {
     MissingCpu,
+    TooManyCpus {
+        count: usize,
+        max: usize,
+    },
     DuplicateCpuReg {
         first_index: usize,
         second_index: usize,
@@ -140,13 +145,28 @@ pub enum Arm64FdtError {
         actual: GuestAddress,
         expected: GuestAddress,
     },
-    InitrdEndOverflow {
-        address: GuestAddress,
-        size: u64,
+    InvalidInitrdRange {
+        source: GuestMemoryError,
+    },
+    InitrdNotInGuestMemory {
+        range: GuestMemoryRange,
+    },
+    InitrdOverlapsFdt {
+        end_exclusive: GuestAddress,
+        fdt_address: GuestAddress,
     },
     InvalidGicRegion {
         name: &'static str,
         region: Arm64FdtRegion,
+    },
+    GicRegionsOverlap {
+        first: &'static str,
+        second: &'static str,
+    },
+    GicRegionOverlapsMemory {
+        name: &'static str,
+        region: Arm64FdtRegion,
+        memory_range: GuestMemoryRange,
     },
     InvalidGicInterruptCells {
         value: u32,
@@ -186,6 +206,9 @@ impl fmt::Display for Arm64FdtError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingCpu => f.write_str("arm64 FDT requires at least one CPU"),
+            Self::TooManyCpus { count, max } => {
+                write!(f, "arm64 FDT supports at most {max} CPUs, got {count}")
+            }
             Self::DuplicateCpuReg {
                 first_index,
                 second_index,
@@ -208,13 +231,35 @@ impl fmt::Display for Arm64FdtError {
                 f,
                 "arm64 FDT guest memory must start at {expected}, got {actual}"
             ),
-            Self::InitrdEndOverflow { address, size } => write!(
+            Self::InvalidInitrdRange { source } => {
+                write!(f, "invalid arm64 FDT initrd range: {source}")
+            }
+            Self::InitrdNotInGuestMemory { range } => write!(
                 f,
-                "initrd FDT end address overflows: start={address}, size={size}"
+                "arm64 FDT initrd range {range} is not fully inside guest memory advertised to the guest"
+            ),
+            Self::InitrdOverlapsFdt {
+                end_exclusive,
+                fdt_address,
+            } => write!(
+                f,
+                "arm64 FDT initrd end address {end_exclusive} overlaps reserved FDT address {fdt_address}"
             ),
             Self::InvalidGicRegion { name, region } => write!(
                 f,
                 "invalid arm64 FDT GIC {name} region: base=0x{:x}, size={}",
+                region.base, region.size
+            ),
+            Self::GicRegionsOverlap { first, second } => {
+                write!(f, "arm64 FDT GIC {first} region overlaps {second} region")
+            }
+            Self::GicRegionOverlapsMemory {
+                name,
+                region,
+                memory_range,
+            } => write!(
+                f,
+                "arm64 FDT GIC {name} region base=0x{:x}, size={} overlaps guest memory range {memory_range}",
                 region.base, region.size
             ),
             Self::InvalidGicInterruptCells { value } => {
@@ -261,14 +306,19 @@ impl std::error::Error for Arm64FdtError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidLayout { source } => Some(source),
+            Self::InvalidInitrdRange { source } => Some(source),
             Self::CreateFdt { source } => Some(source),
             Self::GuestMemoryWrite { source } => Some(source),
             Self::MissingCpu
+            | Self::TooManyCpus { .. }
             | Self::DuplicateCpuReg { .. }
             | Self::NoGuestMemoryAfterSystemArea { .. }
             | Self::InvalidDramStart { .. }
-            | Self::InitrdEndOverflow { .. }
+            | Self::InitrdNotInGuestMemory { .. }
+            | Self::InitrdOverlapsFdt { .. }
             | Self::InvalidGicRegion { .. }
+            | Self::GicRegionsOverlap { .. }
+            | Self::GicRegionOverlapsMemory { .. }
             | Self::InvalidGicInterruptCells { .. }
             | Self::InvalidPpi { .. }
             | Self::DuplicatePpi { .. }
@@ -322,19 +372,19 @@ fn validate_config(config: &Arm64FdtConfig<'_>) -> Result<(), Arm64FdtError> {
     if config.vcpu_mpidrs.is_empty() {
         return Err(Arm64FdtError::MissingCpu);
     }
+    if config.vcpu_mpidrs.len() > MAX_ARM64_FDT_CPUS {
+        return Err(Arm64FdtError::TooManyCpus {
+            count: config.vcpu_mpidrs.len(),
+            max: MAX_ARM64_FDT_CPUS,
+        });
+    }
 
     validate_cpu_regs(config.vcpu_mpidrs)?;
     memory_reg_cells(config.layout)?;
-    validate_gic(config.gic)?;
+    validate_gic(config.layout, config.gic)?;
     validate_timer(config.timer)?;
     if let Some(initrd) = config.boot.initrd {
-        initrd
-            .address
-            .checked_add(initrd.size)
-            .ok_or(Arm64FdtError::InitrdEndOverflow {
-                address: initrd.address,
-                size: initrd.size,
-            })?;
+        validate_initrd(config.layout, initrd)?;
     }
 
     Ok(())
@@ -403,14 +453,7 @@ fn create_chosen_node(
     fdt.property_string("bootargs", boot.command_line)?;
 
     if let Some(initrd) = boot.initrd {
-        let initrd_end =
-            initrd
-                .address
-                .checked_add(initrd.size)
-                .ok_or(Arm64FdtError::InitrdEndOverflow {
-                    address: initrd.address,
-                    size: initrd.size,
-                })?;
+        let initrd_end = initrd_range(initrd)?.end_exclusive();
         fdt.property_u64("linux,initrd-start", initrd.address.raw_value())?;
         fdt.property_u64("linux,initrd-end", initrd_end.raw_value())?;
     }
@@ -519,9 +562,77 @@ fn memory_reg_cells(layout: &GuestMemoryLayout) -> Result<Vec<u64>, Arm64FdtErro
     Ok(cells)
 }
 
-fn validate_gic(gic: Arm64FdtGic) -> Result<(), Arm64FdtError> {
-    validate_gic_region("distributor", gic.distributor)?;
-    validate_gic_region("redistributor", gic.redistributor)?;
+fn validate_initrd(layout: &GuestMemoryLayout, initrd: LoadedInitrd) -> Result<(), Arm64FdtError> {
+    let range = initrd_range(initrd)?;
+    if !is_range_in_guest_memory_node(layout, range)? {
+        return Err(Arm64FdtError::InitrdNotInGuestMemory { range });
+    }
+
+    let fdt_address =
+        aarch64::fdt_address(layout).map_err(|source| Arm64FdtError::InvalidLayout { source })?;
+    if range.end_exclusive() > fdt_address {
+        return Err(Arm64FdtError::InitrdOverlapsFdt {
+            end_exclusive: range.end_exclusive(),
+            fdt_address,
+        });
+    }
+
+    Ok(())
+}
+
+fn initrd_range(initrd: LoadedInitrd) -> Result<GuestMemoryRange, Arm64FdtError> {
+    GuestMemoryRange::new(initrd.address, initrd.size)
+        .map_err(|source| Arm64FdtError::InvalidInitrdRange { source })
+}
+
+fn is_range_in_guest_memory_node(
+    layout: &GuestMemoryLayout,
+    range: GuestMemoryRange,
+) -> Result<bool, Arm64FdtError> {
+    for (range_index, memory_range) in layout.ranges().iter().copied().enumerate() {
+        let start = if range_index == 0 {
+            memory_range
+                .start()
+                .checked_add(aarch64::SYSTEM_MEM_SIZE)
+                .ok_or(Arm64FdtError::InvalidLayout {
+                    source: GuestMemoryError::AddressOverflow {
+                        start: memory_range.start(),
+                        size: aarch64::SYSTEM_MEM_SIZE,
+                    },
+                })?
+        } else {
+            memory_range.start()
+        };
+
+        if start <= range.start() && range.end_exclusive() <= memory_range.end_exclusive() {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn validate_gic(layout: &GuestMemoryLayout, gic: Arm64FdtGic) -> Result<(), Arm64FdtError> {
+    let distributor = validate_gic_region("distributor", gic.distributor)?;
+    let redistributor = validate_gic_region("redistributor", gic.redistributor)?;
+    validate_gic_regions_do_not_overlap(
+        "distributor",
+        distributor,
+        "redistributor",
+        redistributor,
+    )?;
+    validate_gic_region_does_not_overlap_memory(
+        layout,
+        "distributor",
+        gic.distributor,
+        distributor,
+    )?;
+    validate_gic_region_does_not_overlap_memory(
+        layout,
+        "redistributor",
+        gic.redistributor,
+        redistributor,
+    )?;
 
     if gic.interrupt_cells != 3 {
         return Err(Arm64FdtError::InvalidGicInterruptCells {
@@ -538,12 +649,47 @@ fn validate_gic(gic: Arm64FdtGic) -> Result<(), Arm64FdtError> {
     Ok(())
 }
 
-fn validate_gic_region(name: &'static str, region: Arm64FdtRegion) -> Result<(), Arm64FdtError> {
-    if region.size == 0 || region.base.checked_add(region.size).is_none() {
-        Err(Arm64FdtError::InvalidGicRegion { name, region })
+fn validate_gic_region(
+    name: &'static str,
+    region: Arm64FdtRegion,
+) -> Result<GuestMemoryRange, Arm64FdtError> {
+    GuestMemoryRange::new(GuestAddress::new(region.base), region.size)
+        .map_err(|_| Arm64FdtError::InvalidGicRegion { name, region })
+}
+
+fn validate_gic_regions_do_not_overlap(
+    first_name: &'static str,
+    first: GuestMemoryRange,
+    second_name: &'static str,
+    second: GuestMemoryRange,
+) -> Result<(), Arm64FdtError> {
+    if first.overlaps(second) {
+        Err(Arm64FdtError::GicRegionsOverlap {
+            first: first_name,
+            second: second_name,
+        })
     } else {
         Ok(())
     }
+}
+
+fn validate_gic_region_does_not_overlap_memory(
+    layout: &GuestMemoryLayout,
+    name: &'static str,
+    region: Arm64FdtRegion,
+    gic_range: GuestMemoryRange,
+) -> Result<(), Arm64FdtError> {
+    for memory_range in layout.ranges().iter().copied() {
+        if gic_range.overlaps(memory_range) {
+            return Err(Arm64FdtError::GicRegionOverlapsMemory {
+                name,
+                region,
+                memory_range,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_timer(timer: Arm64FdtTimerInterrupts) -> Result<(), Arm64FdtError> {
@@ -741,6 +887,78 @@ mod tests {
     }
 
     #[test]
+    fn rejects_empty_initrd_range() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let address = GuestAddress::new(aarch64::DRAM_MEM_START + aarch64::SYSTEM_MEM_SIZE);
+        let config = test_config(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: Some(LoadedInitrd { address, size: 0 }),
+            },
+        );
+
+        let err = build_arm64_fdt(&config).expect_err("empty initrd range should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::InvalidInitrdRange {
+                source: GuestMemoryError::EmptyRange { start: address },
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_initrd_outside_guest_memory_node() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let range = GuestMemoryRange::new(GuestAddress::new(aarch64::DRAM_MEM_START), 0x1000)
+            .expect("test initrd range should be valid");
+        let config = test_config(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: Some(LoadedInitrd {
+                    address: range.start(),
+                    size: range.size(),
+                }),
+            },
+        );
+
+        let err =
+            build_arm64_fdt(&config).expect_err("initrd outside advertised memory should fail");
+
+        assert_eq!(err, Arm64FdtError::InitrdNotInGuestMemory { range });
+    }
+
+    #[test]
+    fn rejects_initrd_overlapping_fdt() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let fdt_address = aarch64::fdt_address(&layout).expect("FDT address should resolve");
+        let config = test_config(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: Some(LoadedInitrd {
+                    address: fdt_address,
+                    size: 1,
+                }),
+            },
+        );
+
+        let err = build_arm64_fdt(&config).expect_err("initrd overlapping FDT should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::InitrdOverlapsFdt {
+                end_exclusive: fdt_address
+                    .checked_add(1)
+                    .expect("test initrd end should not overflow"),
+                fdt_address,
+            }
+        );
+    }
+
+    #[test]
     fn memory_node_excludes_reserved_system_area() {
         let layout = test_layout(TEST_MEMORY_SIZE);
         let config = test_config(
@@ -818,6 +1036,70 @@ mod tests {
         );
         assert_eq!(prop_u32_cells(intc, "interrupts"), vec![1, 9, 4]);
         assert!(intc.children.is_empty());
+    }
+
+    #[test]
+    fn rejects_overlapping_gic_regions() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let config = Arm64FdtConfig {
+            gic: Arm64FdtGic {
+                redistributor: Arm64FdtRegion {
+                    base: 0x3ffe_0000,
+                    size: 0x2_0000,
+                },
+                ..test_gic()
+            },
+            ..test_config(
+                &layout,
+                Arm64FdtBootInfo {
+                    command_line: "panic=1",
+                    initrd: None,
+                },
+            )
+        };
+
+        let err = build_arm64_fdt(&config).expect_err("overlapping GIC regions should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::GicRegionsOverlap {
+                first: "distributor",
+                second: "redistributor",
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_gic_region_overlapping_guest_memory() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let region = Arm64FdtRegion {
+            base: aarch64::DRAM_MEM_START,
+            size: 0x1000,
+        };
+        let config = Arm64FdtConfig {
+            gic: Arm64FdtGic {
+                distributor: region,
+                ..test_gic()
+            },
+            ..test_config(
+                &layout,
+                Arm64FdtBootInfo {
+                    command_line: "panic=1",
+                    initrd: None,
+                },
+            )
+        };
+
+        let err = build_arm64_fdt(&config).expect_err("GIC region overlapping memory should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::GicRegionOverlapsMemory {
+                name: "distributor",
+                region,
+                memory_range: layout.ranges()[0],
+            }
+        );
     }
 
     #[test]
@@ -1099,6 +1381,32 @@ mod tests {
         let err = build_arm64_fdt(&config).expect_err("missing CPU should fail");
 
         assert_eq!(err, Arm64FdtError::MissingCpu);
+    }
+
+    #[test]
+    fn rejects_too_many_cpus() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let mpidrs: Vec<u64> = (0..=MAX_ARM64_FDT_CPUS as u64).collect();
+        let config = Arm64FdtConfig {
+            vcpu_mpidrs: &mpidrs,
+            ..test_config(
+                &layout,
+                Arm64FdtBootInfo {
+                    command_line: "panic=1",
+                    initrd: None,
+                },
+            )
+        };
+
+        let err = build_arm64_fdt(&config).expect_err("too many CPUs should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::TooManyCpus {
+                count: MAX_ARM64_FDT_CPUS + 1,
+                max: MAX_ARM64_FDT_CPUS,
+            }
+        );
     }
 
     #[test]
