@@ -300,6 +300,8 @@ configuration must match the aarch64 DRAM layout helper for its total guest RAM
 size. Sparse layouts, ranges overlapping the aarch64 MMIO64 gap, and total RAM
 beyond the aarch64 maximum are rejected. The chosen node carries boot arguments
 and optional initrd start/end properties from loaded boot-source metadata.
+Firecracker's `rng-seed` and `linux,pci-probe-only` chosen properties are
+deferred until guest startup and device work need them.
 Direct FDT configuration still validates that `bootargs` fits in the 2048-byte
 aarch64 command-line capacity including the trailing NUL byte and contains no
 embedded NUL bytes. The GIC node consumes backend-neutral distributor and
