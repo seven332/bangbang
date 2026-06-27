@@ -38,6 +38,10 @@ Reviewers should confirm the PR body lists the checks that were run. If any
 command is intentionally skipped, the PR should explain why the skipped command
 does not add useful signal for that change.
 
+Do not list verification commands that were not actually run on the reviewed
+head. If a command is copied from a template, either run it or remove it from
+the PR body.
+
 Add targeted smoke tests when the PR changes process startup, CLI behavior, API
 socket serving, signal handling, filesystem cleanup, FFI, or platform gating.
 For example, API server changes should usually be exercised with a real Unix
@@ -59,11 +63,30 @@ Check boundary inputs: empty values, duplicate options, invalid UTF-8, malformed
 HTTP headers, oversized payloads, missing bodies, duplicate identifiers, and
 path-like values that must not be echoed in errors.
 
+For address, size, and range logic, review the exact range semantics. Tests
+should cover both accepted boundary values such as `end_exclusive == limit` and
+the first rejected value past the limit. Documentation must use the same
+inclusive or exclusive language as the implementation.
+
+For prevalidated operations, verify failure atomicity where practical.
+Validation, read, placement, and range failures should not partially mutate
+guest memory, destination buffers, configuration state, or accepted metadata.
+
 ## Security Review
 
 Treat CLI values, API request bodies, identifiers, host paths, and guest input as
 untrusted. Review validation, redaction, and ownership checks before any input
 can affect host resources or VM state.
+
+Host path handling should be reviewed per resource type instead of assuming one
+resource covers another. For example, kernel, initrd, block-device, and socket
+paths each need their own missing-path, empty-path, non-regular-file, and
+redacted-error coverage when those surfaces are introduced.
+
+File-backed inputs should reject directories and special files before payload
+reads. If a path may reference a FIFO, device node, socket, or replaced inode,
+review whether open/read behavior can block, follow an unsafe replacement, or
+leak the path through errors.
 
 The API socket is currently an unauthenticated local control interface. PRs
 touching socket behavior must cover filesystem permission assumptions, stale
@@ -102,15 +125,33 @@ Test public behavior where practical, and add narrower unit tests for parsing,
 error formatting, state transitions, FFI wrappers, and edge cases.
 
 Use real isolated filesystem or Unix socket fixtures when reviewing IO behavior.
+Fixtures should have unique names, robust cleanup, and no shared global paths so
+parallel test processes do not interfere with each other. When cleanup ownership
+matters, tests should prove a process does not delete a path or resource it no
+longer owns.
+
 Avoid arbitrary sleeps, broad fake clocks, or tests that only verify
 implementation details. If platform or privilege requirements make a test unsafe
 for normal CI, gate it clearly and document what remains unverified.
+
+When a fix covers a shared helper, add at least one test through a public or
+resource-specific path that proves the affected behavior. Boundary tests should
+usually include exact-fit success, one-over failure, overflow failure, and
+no-partial-mutation assertions for failed reads or writes.
 
 ## Documentation Expectations
 
 Behavior changes should update user-facing docs and compatibility docs in the
 same PR. Document security boundaries, host-platform differences, unsupported
 features, and validation policy when they are part of the changed surface.
+
+Avoid overstating scaffold behavior: if a PR adds constants, internal helpers,
+or planning docs without public API behavior, describe that narrower state
+explicitly.
+
+Documentation should match implemented boundary wording. Prefer precise phrases
+such as "must not overlap" over stricter wording such as "must end before" when
+end-exclusive equality is accepted.
 
 Do not add generic `Follow-Up Work` sections for routine gaps. Prefer linked
 issues for planned work, and keep PR docs focused on the behavior being merged.
