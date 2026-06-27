@@ -612,6 +612,11 @@ mod tests {
         configured_sender: mpsc::Sender<HvfArm64BootRegisters>,
     }
 
+    struct FailingOnceConfigureVcpu {
+        configured_sender: mpsc::Sender<HvfArm64BootRegisters>,
+        fail_next_setup: bool,
+    }
+
     struct BlockingConfigureVcpu {
         entered_setup_sender: mpsc::Sender<()>,
         release_setup_receiver: mpsc::Receiver<Result<(), BackendError>>,
@@ -678,6 +683,35 @@ mod tests {
             self.configured_sender
                 .send(registers)
                 .map_err(|_| BackendError::InvalidState("fake setup receiver closed"))
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for FailingOnceConfigureVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            self.configured_sender
+                .send(registers)
+                .map_err(|_| BackendError::InvalidState("fake setup receiver closed"))?;
+            if self.fail_next_setup {
+                self.fail_next_setup = false;
+                return Err(BackendError::InvalidState("fake setup failed"));
+            }
+
+            Ok(())
         }
 
         fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
@@ -818,6 +852,50 @@ mod tests {
         destroyed_receiver
             .recv()
             .expect("fake vCPU should be destroyed");
+    }
+
+    #[test]
+    fn failed_arm64_boot_register_setup_can_be_retried() {
+        let registers = boot_registers();
+        let (configured_sender, configured_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(FailingOnceConfigureVcpu {
+                configured_sender,
+                fail_next_setup: true,
+            })
+        })
+        .expect("fake runner should start");
+        let runner = HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+            .expect("runner should be created");
+
+        assert_eq!(
+            runner.configure_arm64_boot_registers(registers),
+            Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
+                "fake setup failed"
+            )))
+        );
+        assert_eq!(
+            configured_receiver
+                .recv()
+                .expect("fake vCPU should receive failed boot registers"),
+            registers
+        );
+
+        assert_eq!(runner.configure_arm64_boot_registers(registers), Ok(()));
+        assert_eq!(
+            configured_receiver
+                .recv()
+                .expect("fake vCPU should receive retried boot registers"),
+            registers
+        );
+        assert_eq!(
+            runner.configure_arm64_boot_registers(registers),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::BOOT_REGISTERS_ALREADY_CONFIGURED_MESSAGE
+            ))
+        );
+
+        runner.shutdown().expect("runner should shut down");
     }
 
     #[test]
