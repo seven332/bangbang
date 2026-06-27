@@ -167,6 +167,11 @@ pub enum Arm64FdtError {
         size: usize,
         max_size: u64,
     },
+    GuestMemoryLayoutMismatch {
+        range_index: usize,
+        expected: Option<GuestMemoryRange>,
+        actual: Option<GuestMemoryRange>,
+    },
     GuestMemoryWrite {
         source: GuestMemoryAccessError,
     },
@@ -228,6 +233,10 @@ impl fmt::Display for Arm64FdtError {
                     "arm64 FDT size {size} bytes exceeds reserved {max_size} byte window"
                 )
             }
+            Self::GuestMemoryLayoutMismatch { range_index, .. } => write!(
+                f,
+                "arm64 FDT guest memory layout does not match allocated memory at range {range_index}"
+            ),
             Self::GuestMemoryWrite { source } => {
                 write!(f, "failed to write arm64 FDT into guest memory: {source}")
             }
@@ -251,7 +260,8 @@ impl std::error::Error for Arm64FdtError {
             | Self::DuplicatePpi { .. }
             | Self::InvalidPpiIntid { .. }
             | Self::UnsupportedMsi
-            | Self::FdtTooLarge { .. } => None,
+            | Self::FdtTooLarge { .. }
+            | Self::GuestMemoryLayoutMismatch { .. } => None,
         }
     }
 }
@@ -289,6 +299,7 @@ pub fn write_arm64_fdt(
     config: &Arm64FdtConfig<'_>,
     memory: &mut GuestMemory,
 ) -> Result<Arm64FdtGuestMemoryWrite, Arm64FdtError> {
+    validate_guest_memory_matches_layout(config.layout, memory)?;
     let bytes = build_arm64_fdt(config)?;
     write_arm64_fdt_bytes(config.layout, memory, &bytes)
 }
@@ -569,6 +580,29 @@ fn write_arm64_fdt_bytes(
         address,
         size: bytes.len(),
     })
+}
+
+fn validate_guest_memory_matches_layout(
+    layout: &GuestMemoryLayout,
+    memory: &GuestMemory,
+) -> Result<(), Arm64FdtError> {
+    let layout_ranges = layout.ranges();
+    let memory_regions = memory.regions();
+    let range_count = layout_ranges.len().max(memory_regions.len());
+
+    for range_index in 0..range_count {
+        let expected = layout_ranges.get(range_index).copied();
+        let actual = memory_regions.get(range_index).map(|region| region.range());
+        if expected != actual {
+            return Err(Arm64FdtError::GuestMemoryLayoutMismatch {
+                range_index,
+                expected,
+                actual,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn size_as_u64(size: usize) -> u64 {
@@ -878,16 +912,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unbacked_guest_memory_write_without_partial_mutation() {
+    fn rejects_mismatched_guest_memory_layout_without_partial_mutation() {
         let layout = test_layout(TEST_MEMORY_SIZE);
-        let memory_layout = GuestMemoryLayout::new(vec![
-            GuestMemoryRange::new(
-                GuestAddress::new(aarch64::DRAM_MEM_START),
-                aarch64::FDT_MAX_SIZE,
-            )
-            .expect("mapped prefix should be valid"),
-        ])
-        .expect("mapped prefix layout should be valid");
+        let memory_range = GuestMemoryRange::new(
+            GuestAddress::new(aarch64::DRAM_MEM_START),
+            aarch64::FDT_MAX_SIZE,
+        )
+        .expect("mapped prefix should be valid");
+        let memory_layout = GuestMemoryLayout::new(vec![memory_range])
+            .expect("mapped prefix layout should be valid");
         let mut memory =
             GuestMemory::allocate(&memory_layout).expect("mapped prefix should allocate");
         let mut before = vec![0; 16];
@@ -902,15 +935,56 @@ mod tests {
             },
         );
 
-        let err =
-            write_arm64_fdt(&config, &mut memory).expect_err("unbacked FDT write should fail");
+        let err = write_arm64_fdt(&config, &mut memory)
+            .expect_err("mismatched guest memory layout should fail before write");
 
-        assert!(matches!(
+        assert_eq!(
+            err,
+            Arm64FdtError::GuestMemoryLayoutMismatch {
+                range_index: 0,
+                expected: Some(layout.ranges()[0]),
+                actual: Some(memory_range),
+            }
+        );
+        let mut after = vec![0; before.len()];
+        memory
+            .read_slice(&mut after, GuestAddress::new(aarch64::DRAM_MEM_START))
+            .expect("mapped prefix should remain readable");
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn raw_fdt_write_rejects_unbacked_guest_memory_without_partial_mutation() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let fdt_address = aarch64::fdt_address(&layout).expect("FDT address should resolve");
+        let memory_layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(
+                GuestAddress::new(aarch64::DRAM_MEM_START),
+                aarch64::FDT_MAX_SIZE,
+            )
+            .expect("mapped prefix should be valid"),
+        ])
+        .expect("mapped prefix layout should be valid");
+        let mut memory =
+            GuestMemory::allocate(&memory_layout).expect("mapped prefix should allocate");
+        let mut before = vec![0; 16];
+        memory
+            .read_slice(&mut before, GuestAddress::new(aarch64::DRAM_MEM_START))
+            .expect("initial bytes should read");
+        let bytes = vec![0xa5; 256];
+
+        let err = write_arm64_fdt_bytes(&layout, &mut memory, &bytes)
+            .expect_err("unbacked raw FDT write should fail");
+
+        assert_eq!(
             err,
             Arm64FdtError::GuestMemoryWrite {
-                source: GuestMemoryAccessError::UnmappedRange { .. }
+                source: GuestMemoryAccessError::UnmappedRange {
+                    range: GuestMemoryRange::new(fdt_address, 256)
+                        .expect("FDT write range should be valid"),
+                },
             }
-        ));
+        );
         let mut after = vec![0; before.len()];
         memory
             .read_slice(&mut after, GuestAddress::new(aarch64::DRAM_MEM_START))

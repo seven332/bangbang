@@ -301,11 +301,12 @@ metadata. The GIC node consumes backend-neutral distributor and redistributor
 metadata, advertises `arm,gic-v3`, and does not emit an ITS/MSI child while the
 HVF metadata has no MSI support.
 
-FDT bytes are built before guest memory is touched, checked against the reserved
-2 MiB FDT window, and then copied with `GuestMemory::write_slice` at the
-aarch64 FDT address. Oversized, overflowing, or unbacked writes fail before a
-partial copy. The write result records the FDT guest address and byte size for
-future boot-register setup.
+FDT writes first reject mismatches between the layout used to describe guest RAM
+and the allocated guest memory object. FDT bytes are then built before guest
+memory is touched, checked against the reserved 2 MiB FDT window, and copied
+with `GuestMemory::write_slice` at the aarch64 FDT address. Oversized,
+overflowing, or unbacked writes fail before a partial copy. The write result
+records the FDT guest address and byte size for future boot-register setup.
 
 The HVF backend can map allocated guest memory regions into an existing
 Hypervisor.framework VM with read/write/execute guest RAM permissions. The
