@@ -258,8 +258,8 @@ This is not wired to `PUT /boot-source` yet; it exists so later API and startup
 work can validate and load payloads through an explicit runtime boundary.
 
 When boot arguments are omitted, the runtime uses Firecracker's default aarch64
-kernel command line. Custom boot arguments are trimmed, must fit in the
-2048-byte aarch64 command-line capacity including the trailing NUL byte, and
+kernel command line. Custom boot arguments are preserved verbatim, must fit in
+the 2048-byte aarch64 command-line capacity including the trailing NUL byte, and
 must not contain embedded NUL bytes. The validated bytes are retained for later
 FDT work, but this scaffold still does not write a command line into guest
 memory.
