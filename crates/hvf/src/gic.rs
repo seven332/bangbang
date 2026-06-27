@@ -13,6 +13,7 @@ const DYNAMIC_SYMBOL_SIZE_MISMATCH_MESSAGE: &str =
 
 const HV_GIC_INT_EL1_VIRTUAL_TIMER: u16 = 27;
 const HV_GIC_INT_EL1_PHYSICAL_TIMER: u16 = 30;
+const FIRST_PPI_INTID: u32 = 16;
 const FIRST_SPI_INTID: u32 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,6 +282,7 @@ fn metadata_from_parameters(parameters: HvfGicParameters) -> Result<HvfGicMetada
         });
     }
     validate_spi_interrupt_range(parameters.spi_interrupt_range)?;
+    validate_timer_interrupts(parameters.timer_interrupts)?;
 
     let distributor = aligned_region_below(
         "distributor",
@@ -355,6 +357,30 @@ fn validate_spi_interrupt_range(range: HvfGicInterruptRange) -> Result<(), HvfGi
     }
 
     Ok(())
+}
+
+fn validate_timer_interrupts(timers: HvfGicTimerInterrupts) -> Result<(), HvfGicError> {
+    validate_ppi_intid("el1_virtual_timer_intid", timers.el1_virtual_timer_intid)?;
+    validate_ppi_intid("el1_physical_timer_intid", timers.el1_physical_timer_intid)?;
+    if timers.el1_virtual_timer_intid == timers.el1_physical_timer_intid {
+        return Err(HvfGicError::InvalidParameter {
+            name: "timer_interrupts",
+            value: u64::from(timers.el1_virtual_timer_intid),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_ppi_intid(name: &'static str, intid: u32) -> Result<(), HvfGicError> {
+    if (FIRST_PPI_INTID..FIRST_SPI_INTID).contains(&intid) {
+        Ok(())
+    } else {
+        Err(HvfGicError::InvalidParameter {
+            name,
+            value: u64::from(intid),
+        })
+    }
 }
 
 fn aligned_region_below(
@@ -1017,6 +1043,66 @@ mod tests {
             HvfGicError::InvalidParameter {
                 name: "spi_interrupt_range.end_exclusive",
                 value: u64::from(u32::MAX) + 2,
+            }
+        );
+    }
+
+    #[test]
+    fn metadata_rejects_non_ppi_timer_interrupts_before_config_creation() {
+        let api = FakeGicApi::new(HvfGicParameters {
+            timer_interrupts: HvfGicTimerInterrupts {
+                el1_virtual_timer_intid: 15,
+                ..default_parameters().timer_interrupts
+            },
+            ..default_parameters()
+        });
+
+        assert_eq!(
+            create_gic_with_api(&api),
+            Err(HvfGicError::InvalidParameter {
+                name: "el1_virtual_timer_intid",
+                value: 15,
+            })
+        );
+        assert!(!api.created_config());
+    }
+
+    #[test]
+    fn metadata_rejects_timer_interrupts_in_spi_range() {
+        let err = metadata_from_parameters(HvfGicParameters {
+            timer_interrupts: HvfGicTimerInterrupts {
+                el1_physical_timer_intid: 32,
+                ..default_parameters().timer_interrupts
+            },
+            ..default_parameters()
+        })
+        .expect_err("timer interrupt INTIDs should be PPIs");
+
+        assert_eq!(
+            err,
+            HvfGicError::InvalidParameter {
+                name: "el1_physical_timer_intid",
+                value: 32,
+            }
+        );
+    }
+
+    #[test]
+    fn metadata_rejects_duplicate_timer_interrupts() {
+        let err = metadata_from_parameters(HvfGicParameters {
+            timer_interrupts: HvfGicTimerInterrupts {
+                el1_virtual_timer_intid: 27,
+                el1_physical_timer_intid: 27,
+            },
+            ..default_parameters()
+        })
+        .expect_err("timer interrupt INTIDs should be distinct");
+
+        assert_eq!(
+            err,
+            HvfGicError::InvalidParameter {
+                name: "timer_interrupts",
+                value: 27,
             }
         );
     }
