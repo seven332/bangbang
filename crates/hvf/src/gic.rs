@@ -788,6 +788,51 @@ mod dynamic {
             }
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use std::ffi::c_void;
+        use std::ptr::NonNull;
+
+        use super::load_symbol;
+        use crate::gic::{DYNAMIC_SYMBOL_SIZE_MISMATCH_MESSAGE, HvfGicError};
+
+        fn default_symbols() -> NonNull<c_void> {
+            NonNull::new(libc::RTLD_DEFAULT).expect("RTLD_DEFAULT should be non-null")
+        }
+
+        #[test]
+        fn load_symbol_reports_missing_symbol() {
+            type MissingSymbol = unsafe extern "C" fn();
+
+            let err = load_symbol::<MissingSymbol>(
+                default_symbols(),
+                c"bangbang_hvf_missing_test_symbol",
+                "bangbang_hvf_missing_test_symbol",
+            )
+            .expect_err("missing dynamic symbol should fail");
+
+            assert_eq!(
+                err,
+                HvfGicError::MissingSymbol("bangbang_hvf_missing_test_symbol")
+            );
+        }
+
+        #[test]
+        fn load_symbol_rejects_size_mismatch() {
+            let err = load_symbol::<u8>(
+                default_symbols(),
+                c"bangbang_hvf_missing_test_symbol",
+                "bangbang_hvf_missing_test_symbol",
+            )
+            .expect_err("non-pointer-sized symbol type should fail before dlsym");
+
+            assert_eq!(
+                err,
+                HvfGicError::InvalidState(DYNAMIC_SYMBOL_SIZE_MISMATCH_MESSAGE)
+            );
+        }
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
