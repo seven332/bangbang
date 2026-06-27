@@ -476,7 +476,7 @@ pub fn load_boot_source(
 fn validate_command_line(
     boot_args: Option<&str>,
 ) -> Result<KernelCommandLine, BootSourceLoadError> {
-    let text = boot_args.unwrap_or(DEFAULT_KERNEL_COMMAND_LINE).trim();
+    let text = boot_args.unwrap_or(DEFAULT_KERNEL_COMMAND_LINE);
     if text.as_bytes().contains(&0) {
         return Err(BootSourceLoadError::CommandLine(
             BootCommandLineError::ContainsNul,
@@ -1112,7 +1112,7 @@ mod tests {
         let mut memory = boot_memory(&layout);
         let kernel_bytes = arm64_image(TEST_KERNEL_TEXT_OFFSET, 4096, 4096);
         let kernel_file = temp_file("kernel", &kernel_bytes);
-        let source = BootSource::new(kernel_file.as_path()).with_boot_args("   ");
+        let source = BootSource::new(kernel_file.as_path()).with_boot_args("");
 
         let loaded = source
             .load(&layout, &mut memory)
@@ -1120,6 +1120,22 @@ mod tests {
 
         assert_eq!(loaded.command_line.as_str(), "");
         assert_eq!(loaded.command_line.as_bytes_with_nul(), b"\0");
+    }
+
+    #[test]
+    fn preserves_custom_command_line_whitespace() {
+        let layout = boot_layout();
+        let mut memory = boot_memory(&layout);
+        let kernel_bytes = arm64_image(TEST_KERNEL_TEXT_OFFSET, 4096, 4096);
+        let kernel_file = temp_file("kernel", &kernel_bytes);
+        let source = BootSource::new(kernel_file.as_path()).with_boot_args(" console=hvc0 ");
+
+        let loaded = source
+            .load(&layout, &mut memory)
+            .expect("custom command line should preserve whitespace");
+
+        assert_eq!(loaded.command_line.as_str(), " console=hvc0 ");
+        assert_eq!(loaded.command_line.as_bytes_with_nul(), b" console=hvc0 \0");
     }
 
     #[test]
@@ -1154,6 +1170,25 @@ mod tests {
         let err = source
             .load(&layout, &mut memory)
             .expect_err("oversized command line should fail");
+
+        assert!(matches!(
+            err,
+            BootSourceLoadError::CommandLine(BootCommandLineError::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_command_line_over_limit_without_trimming() {
+        let layout = boot_layout();
+        let mut memory = boot_memory(&layout);
+        let kernel_bytes = arm64_image(TEST_KERNEL_TEXT_OFFSET, 4096, 4096);
+        let kernel_file = temp_file("kernel", &kernel_bytes);
+        let boot_args = format!("{} ", "a".repeat(aarch64::CMDLINE_MAX_SIZE - 1));
+        let source = BootSource::new(kernel_file.as_path()).with_boot_args(boot_args);
+
+        let err = source
+            .load(&layout, &mut memory)
+            .expect_err("oversized command line with trailing whitespace should fail");
 
         assert!(matches!(
             err,
