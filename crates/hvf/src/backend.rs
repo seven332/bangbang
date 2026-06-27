@@ -572,6 +572,20 @@ mod tests {
         );
     }
 
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    #[test]
+    fn unsupported_target_rejects_gic_creation() {
+        let mut backend = HvfBackend::new();
+
+        assert_eq!(
+            backend.create_gic(),
+            Err(crate::gic::HvfGicError::Unsupported(
+                crate::ffi::UNSUPPORTED_TARGET_MESSAGE
+            ))
+        );
+        assert_eq!(backend.gic_metadata(), None);
+    }
+
     #[derive(Debug)]
     struct RecordingMapper {
         state: Mutex<RecordingMapperState>,
