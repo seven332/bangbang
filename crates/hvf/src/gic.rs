@@ -3,6 +3,10 @@
 use std::fmt;
 
 use bangbang_runtime::BackendError;
+use bangbang_runtime::fdt::{
+    Arm64FdtError, Arm64FdtGic, Arm64FdtInterruptRange, Arm64FdtMsi, Arm64FdtRegion,
+    Arm64FdtTimerInterrupts,
+};
 
 const GIC_REQUIRES_MACOS_15_MESSAGE: &str =
     "Hypervisor.framework GIC APIs require macOS 15.0 or newer";
@@ -69,6 +73,51 @@ impl HvfGicMetadata {
     pub const FDT_COMPATIBILITY: &'static str = "arm,gic-v3";
     pub const FDT_INTERRUPT_CELLS: u32 = 3;
     pub const FDT_MAINTENANCE_IRQ: u32 = 9;
+
+    pub fn arm64_fdt_gic(&self) -> Arm64FdtGic {
+        Arm64FdtGic {
+            distributor: self.distributor.into(),
+            redistributor: self.redistributor.region.into(),
+            compatibility: Self::FDT_COMPATIBILITY,
+            interrupt_cells: Self::FDT_INTERRUPT_CELLS,
+            maintenance_irq: Self::FDT_MAINTENANCE_IRQ,
+            msi: self.msi.map(Into::into),
+        }
+    }
+
+    pub fn arm64_fdt_timer_interrupts(&self) -> Result<Arm64FdtTimerInterrupts, Arm64FdtError> {
+        Arm64FdtTimerInterrupts::from_el1_timer_intids(
+            self.timer_interrupts.el1_virtual_timer_intid,
+            self.timer_interrupts.el1_physical_timer_intid,
+        )
+    }
+}
+
+impl From<HvfGicRegion> for Arm64FdtRegion {
+    fn from(region: HvfGicRegion) -> Self {
+        Self {
+            base: region.base,
+            size: region.size,
+        }
+    }
+}
+
+impl From<HvfGicInterruptRange> for Arm64FdtInterruptRange {
+    fn from(range: HvfGicInterruptRange) -> Self {
+        Self {
+            base: range.base,
+            count: range.count,
+        }
+    }
+}
+
+impl From<HvfGicMsiMetadata> for Arm64FdtMsi {
+    fn from(metadata: HvfGicMsiMetadata) -> Self {
+        Self {
+            region: metadata.region.into(),
+            interrupt_range: metadata.interrupt_range.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -869,11 +918,16 @@ mod tests {
     use std::sync::Mutex;
 
     use bangbang_runtime::BackendError;
+    use bangbang_runtime::fdt::{
+        ARM64_FDT_HYPERVISOR_TIMER_PPI, ARM64_FDT_NON_SECURE_PHYSICAL_TIMER_PPI,
+        ARM64_FDT_SECURE_PHYSICAL_TIMER_PPI, ARM64_FDT_VIRTUAL_TIMER_PPI, Arm64FdtError,
+        Arm64FdtInterruptRange, Arm64FdtMsi, Arm64FdtRegion, Arm64FdtTimerInterrupts,
+    };
 
     use super::{
         GicConfigGuard, HV_GIC_INT_EL1_PHYSICAL_TIMER, HV_GIC_INT_EL1_VIRTUAL_TIMER, HvfGicApi,
-        HvfGicError, HvfGicInterruptRange, HvfGicMetadata, HvfGicParameters, HvfGicRegion,
-        HvfGicTimerInterrupts, create_gic_with_api, metadata_from_parameters,
+        HvfGicError, HvfGicInterruptRange, HvfGicMetadata, HvfGicMsiMetadata, HvfGicParameters,
+        HvfGicRegion, HvfGicTimerInterrupts, create_gic_with_api, metadata_from_parameters,
     };
 
     const DIST_SIZE: u64 = 0x1_0000;
@@ -922,6 +976,128 @@ mod tests {
         assert_eq!(HvfGicMetadata::FDT_COMPATIBILITY, "arm,gic-v3");
         assert_eq!(HvfGicMetadata::FDT_INTERRUPT_CELLS, 3);
         assert_eq!(HvfGicMetadata::FDT_MAINTENANCE_IRQ, 9);
+    }
+
+    #[test]
+    fn metadata_converts_to_arm64_fdt_gic_input() {
+        let metadata = metadata_from_parameters(default_parameters())
+            .expect("default GIC parameters should produce metadata");
+
+        let fdt_gic = metadata.arm64_fdt_gic();
+
+        assert_eq!(
+            fdt_gic.distributor,
+            Arm64FdtRegion {
+                base: 0x3fff_0000,
+                size: DIST_SIZE,
+            }
+        );
+        assert_eq!(
+            fdt_gic.redistributor,
+            Arm64FdtRegion {
+                base: 0x3ffd_0000,
+                size: REDIST_REGION_SIZE,
+            }
+        );
+        assert_eq!(fdt_gic.compatibility, "arm,gic-v3");
+        assert_eq!(fdt_gic.interrupt_cells, 3);
+        assert_eq!(fdt_gic.maintenance_irq, 9);
+        assert_eq!(fdt_gic.msi, None);
+    }
+
+    #[test]
+    fn metadata_converts_optional_msi_to_arm64_fdt_input() {
+        let mut metadata = metadata_from_parameters(default_parameters())
+            .expect("default GIC parameters should produce metadata");
+        metadata.msi = Some(HvfGicMsiMetadata {
+            region: HvfGicRegion {
+                base: 0x3ffc_0000,
+                size: 0x1_0000,
+            },
+            interrupt_range: HvfGicInterruptRange {
+                base: 128,
+                count: 32,
+            },
+        });
+
+        assert_eq!(
+            metadata.arm64_fdt_gic().msi,
+            Some(Arm64FdtMsi {
+                region: Arm64FdtRegion {
+                    base: 0x3ffc_0000,
+                    size: 0x1_0000,
+                },
+                interrupt_range: Arm64FdtInterruptRange {
+                    base: 128,
+                    count: 32,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn metadata_converts_hvf_timer_intids_to_fdt_ppis() {
+        let metadata = metadata_from_parameters(default_parameters())
+            .expect("default GIC parameters should produce metadata");
+
+        let timers = metadata
+            .arm64_fdt_timer_interrupts()
+            .expect("validated HVF timer INTIDs should map to FDT PPIs");
+
+        assert_eq!(
+            timers,
+            Arm64FdtTimerInterrupts {
+                secure_physical: ARM64_FDT_SECURE_PHYSICAL_TIMER_PPI,
+                non_secure_physical: ARM64_FDT_NON_SECURE_PHYSICAL_TIMER_PPI,
+                virtual_timer: ARM64_FDT_VIRTUAL_TIMER_PPI,
+                hypervisor: ARM64_FDT_HYPERVISOR_TIMER_PPI,
+            }
+        );
+    }
+
+    #[test]
+    fn metadata_timer_conversion_rejects_publicly_constructed_non_ppi_intids() {
+        let mut metadata = metadata_from_parameters(default_parameters())
+            .expect("default GIC parameters should produce metadata");
+        metadata.timer_interrupts = HvfGicTimerInterrupts {
+            el1_virtual_timer_intid: 15,
+            el1_physical_timer_intid: 30,
+        };
+
+        let err = metadata
+            .arm64_fdt_timer_interrupts()
+            .expect_err("non-PPI timer INTID should fail conversion");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::InvalidPpiIntid {
+                name: "el1_virtual_timer_intid",
+                intid: 15,
+            }
+        );
+    }
+
+    #[test]
+    fn metadata_timer_conversion_rejects_publicly_constructed_duplicate_intids() {
+        let mut metadata = metadata_from_parameters(default_parameters())
+            .expect("default GIC parameters should produce metadata");
+        metadata.timer_interrupts = HvfGicTimerInterrupts {
+            el1_virtual_timer_intid: 27,
+            el1_physical_timer_intid: 27,
+        };
+
+        let err = metadata
+            .arm64_fdt_timer_interrupts()
+            .expect_err("duplicate timer INTIDs should fail conversion");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::DuplicatePpi {
+                first: "non_secure_physical_timer",
+                second: "virtual_timer",
+                value: 11,
+            }
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 bangbang is a Rust VMM project for macOS hosts. The public control plane is intended to stay compatible with the Firecracker HTTP API over a Unix domain socket, while the VM backend is built on Apple's Hypervisor.framework.
 
-This repository is currently a scaffold. It defines crate boundaries, an initial Firecracker-compatible API socket, a process startup CLI, a minimal internal VMM action model, a backend trait, a backend-neutral guest address/layout model, anonymous guest memory allocation and byte access, arm64 boot placement helpers, internal boot-source validation with arm64 kernel/initrd payload loading, and the smallest Hypervisor.framework VM, GIC boot metadata, guest memory map/unmap ownership, current-thread vCPU lifecycle, typed exit surface, register wrappers, and cancellable vCPU runner skeleton.
+This repository is currently a scaffold. It defines crate boundaries, an initial Firecracker-compatible API socket, a process startup CLI, a minimal internal VMM action model, a backend trait, a backend-neutral guest address/layout model, anonymous guest memory allocation and byte access, arm64 boot placement helpers, internal boot-source validation with arm64 kernel/initrd payload loading, minimal arm64 FDT generation and guest-memory writes, and the smallest Hypervisor.framework VM, GIC boot metadata, guest memory map/unmap ownership, current-thread vCPU lifecycle, typed exit surface, register wrappers, and cancellable vCPU runner skeleton.
 
 See [Firecracker Compatibility Scope](docs/firecracker-compatibility.md) for the intended compatibility target and current limitations.
 See [Pull Request Review Guidelines](docs/review-guidelines.md) for the project-specific review standard.
@@ -18,12 +18,12 @@ crates/bangbang   VMM process entrypoint and startup CLI
 
 ## Current Scope
 
-The first target is Apple Silicon macOS. The current scaffold includes HTTP over a Unix domain socket for `GET /` and `GET /version`, routed through a minimal read-only VMM action model. The runtime crate defines guest physical address, range, and aarch64 DRAM layout primitives, can allocate owned anonymous host memory for validated page-aligned guest memory layouts, can safely read/write byte slices by guest address, exposes the first arm64 kernel/FDT/initrd placement helpers, and can internally validate a Firecracker-shaped boot source before loading a supported arm64 Linux `Image` kernel plus optional non-empty initrd into guest memory. The HVF crate can create/destroy a process VM, create macOS 15+ GIC v3 boot metadata without MSI/ITS, map/unmap allocated guest memory with backend-owned cleanup, create/destroy one current-thread vCPU handle, define typed HVF exit snapshots, get/set a narrow set of vCPU registers, and start a thread-owned runner that can cancel a single `hv_vcpu_run` step. It intentionally does not include:
+The first target is Apple Silicon macOS. The current scaffold includes HTTP over a Unix domain socket for `GET /` and `GET /version`, routed through a minimal read-only VMM action model. The runtime crate defines guest physical address, range, and aarch64 DRAM layout primitives, can allocate owned anonymous host memory for validated page-aligned guest memory layouts, can safely read/write byte slices by guest address, exposes the first arm64 kernel/FDT/initrd placement helpers, can internally validate a Firecracker-shaped boot source before loading a supported arm64 Linux `Image` kernel plus optional non-empty initrd into guest memory, and can build/write a minimal Firecracker-shaped arm64 FDT from loaded boot metadata and backend-neutral interrupt-controller metadata. The HVF crate can create/destroy a process VM, create macOS 15+ GIC v3 boot metadata without MSI/ITS, convert that metadata for the runtime FDT path, map/unmap allocated guest memory with backend-owned cleanup, create/destroy one current-thread vCPU handle, define typed HVF exit snapshots, get/set a narrow set of vCPU registers, and start a thread-owned runner that can cancel a single `hv_vcpu_run` step. It intentionally does not include:
 
 - API endpoints beyond `GET /` and `GET /version`
 - public JSON request body models for machine config, boot source, drives, or actions
 - public `/boot-source` behavior
-- command-line or FDT writes into guest memory
+- public command-line or FDT configuration behavior
 - interrupt injection, configured guest execution, continuous vCPU run loops, MMIO/device emulation, or boot register setup
 
 ## Process CLI
