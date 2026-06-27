@@ -1078,6 +1078,29 @@ mod tests {
     }
 
     #[test]
+    fn metadata_timer_conversion_rejects_publicly_constructed_duplicate_intids() {
+        let mut metadata = metadata_from_parameters(default_parameters())
+            .expect("default GIC parameters should produce metadata");
+        metadata.timer_interrupts = HvfGicTimerInterrupts {
+            el1_virtual_timer_intid: 27,
+            el1_physical_timer_intid: 27,
+        };
+
+        let err = metadata
+            .arm64_fdt_timer_interrupts()
+            .expect_err("duplicate timer INTIDs should fail conversion");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::DuplicatePpi {
+                first: "non_secure_physical_timer",
+                second: "virtual_timer",
+                value: 11,
+            }
+        );
+    }
+
+    #[test]
     fn metadata_aligns_regions_down_to_sdk_alignment() {
         let parameters = HvfGicParameters {
             distributor_size: 0x1_1000,

@@ -101,7 +101,7 @@ impl Arm64FdtTimerInterrupts {
         el1_virtual_timer_intid: u32,
         el1_physical_timer_intid: u32,
     ) -> Result<Self, Arm64FdtError> {
-        Ok(Self {
+        let timer = Self {
             secure_physical: ARM64_FDT_SECURE_PHYSICAL_TIMER_PPI,
             non_secure_physical: ppi_from_intid(
                 "el1_physical_timer_intid",
@@ -109,7 +109,9 @@ impl Arm64FdtTimerInterrupts {
             )?,
             virtual_timer: ppi_from_intid("el1_virtual_timer_intid", el1_virtual_timer_intid)?,
             hypervisor: ARM64_FDT_HYPERVISOR_TIMER_PPI,
-        })
+        };
+        validate_timer(timer)?;
+        Ok(timer)
     }
 }
 
@@ -129,6 +131,10 @@ pub enum Arm64FdtError {
         first_range: GuestMemoryRange,
         system_size: u64,
     },
+    InvalidDramStart {
+        actual: GuestAddress,
+        expected: GuestAddress,
+    },
     InitrdEndOverflow {
         address: GuestAddress,
         size: u64,
@@ -142,6 +148,11 @@ pub enum Arm64FdtError {
     },
     InvalidPpi {
         name: &'static str,
+        value: u32,
+    },
+    DuplicatePpi {
+        first: &'static str,
+        second: &'static str,
         value: u32,
     },
     InvalidPpiIntid {
@@ -175,6 +186,10 @@ impl fmt::Display for Arm64FdtError {
                 f,
                 "guest memory first range {first_range} does not leave RAM after the reserved {system_size} byte system area"
             ),
+            Self::InvalidDramStart { actual, expected } => write!(
+                f,
+                "arm64 FDT guest memory must start at {expected}, got {actual}"
+            ),
             Self::InitrdEndOverflow { address, size } => write!(
                 f,
                 "initrd FDT end address overflows: start={address}, size={size}"
@@ -193,6 +208,14 @@ impl fmt::Display for Arm64FdtError {
                     "arm64 FDT {name} PPI value must be below 16, got {value}"
                 )
             }
+            Self::DuplicatePpi {
+                first,
+                second,
+                value,
+            } => write!(
+                f,
+                "arm64 FDT timer PPIs must be distinct: {first} and {second} both use {value}"
+            ),
             Self::InvalidPpiIntid { name, intid } => write!(
                 f,
                 "arm64 FDT {name} INTID must be in the PPI range [16, 32), got {intid}"
@@ -220,10 +243,12 @@ impl std::error::Error for Arm64FdtError {
             Self::GuestMemoryWrite { source } => Some(source),
             Self::MissingCpu
             | Self::NoGuestMemoryAfterSystemArea { .. }
+            | Self::InvalidDramStart { .. }
             | Self::InitrdEndOverflow { .. }
             | Self::InvalidGicRegion { .. }
             | Self::InvalidGicInterruptCells { .. }
             | Self::InvalidPpi { .. }
+            | Self::DuplicatePpi { .. }
             | Self::InvalidPpiIntid { .. }
             | Self::UnsupportedMsi
             | Self::FdtTooLarge { .. } => None,
@@ -411,6 +436,12 @@ fn memory_reg_cells(layout: &GuestMemoryLayout) -> Result<Vec<u64>, Arm64FdtErro
     let mut cells = Vec::with_capacity(layout.ranges().len().saturating_mul(2));
     for (range_index, range) in layout.ranges().iter().copied().enumerate() {
         if range_index == 0 {
+            if range.start().raw_value() != aarch64::SYSTEM_MEM_START {
+                return Err(Arm64FdtError::InvalidDramStart {
+                    actual: range.start(),
+                    expected: GuestAddress::new(aarch64::SYSTEM_MEM_START),
+                });
+            }
             if range.size() <= aarch64::SYSTEM_MEM_SIZE {
                 return Err(Arm64FdtError::NoGuestMemoryAfterSystemArea {
                     first_range: range,
@@ -468,6 +499,7 @@ fn validate_timer(timer: Arm64FdtTimerInterrupts) -> Result<(), Arm64FdtError> {
     validate_ppi("non_secure_physical_timer", timer.non_secure_physical)?;
     validate_ppi("virtual_timer", timer.virtual_timer)?;
     validate_ppi("hypervisor_timer", timer.hypervisor)?;
+    validate_distinct_timer_ppis(timer)?;
     Ok(())
 }
 
@@ -477,6 +509,29 @@ fn validate_ppi(name: &'static str, value: u32) -> Result<(), Arm64FdtError> {
     } else {
         Err(Arm64FdtError::InvalidPpi { name, value })
     }
+}
+
+fn validate_distinct_timer_ppis(timer: Arm64FdtTimerInterrupts) -> Result<(), Arm64FdtError> {
+    let values = [
+        ("secure_physical_timer", timer.secure_physical),
+        ("non_secure_physical_timer", timer.non_secure_physical),
+        ("virtual_timer", timer.virtual_timer),
+        ("hypervisor_timer", timer.hypervisor),
+    ];
+
+    for (left_index, (left_name, left_value)) in values.iter().copied().enumerate() {
+        for (right_name, right_value) in values.iter().copied().skip(left_index + 1) {
+            if left_value == right_value {
+                return Err(Arm64FdtError::DuplicatePpi {
+                    first: left_name,
+                    second: right_name,
+                    value: left_value,
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn ppi_from_intid(name: &'static str, intid: u32) -> Result<u32, Arm64FdtError> {
@@ -887,6 +942,32 @@ mod tests {
     }
 
     #[test]
+    fn rejects_layout_that_does_not_start_at_arm64_dram_start() {
+        let start = GuestAddress::new(aarch64::DRAM_MEM_START + aarch64::GUEST_PAGE_SIZE);
+        let layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(start, TEST_MEMORY_SIZE).expect("test range should be valid"),
+        ])
+        .expect("test layout should be valid");
+        let config = test_config(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+        );
+
+        let err = build_arm64_fdt(&config).expect_err("unexpected DRAM start should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::InvalidDramStart {
+                actual: start,
+                expected: GuestAddress::new(aarch64::SYSTEM_MEM_START),
+            }
+        );
+    }
+
+    #[test]
     fn rejects_missing_cpus() {
         let layout = test_layout(TEST_MEMORY_SIZE);
         let config = Arm64FdtConfig {
@@ -906,6 +987,37 @@ mod tests {
     }
 
     #[test]
+    fn rejects_duplicate_timer_ppis() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let config = Arm64FdtConfig {
+            timer: Arm64FdtTimerInterrupts {
+                secure_physical: 13,
+                non_secure_physical: 13,
+                virtual_timer: 11,
+                hypervisor: 10,
+            },
+            ..test_config(
+                &layout,
+                Arm64FdtBootInfo {
+                    command_line: "panic=1",
+                    initrd: None,
+                },
+            )
+        };
+
+        let err = build_arm64_fdt(&config).expect_err("duplicate timer PPI should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::DuplicatePpi {
+                first: "secure_physical_timer",
+                second: "non_secure_physical_timer",
+                value: 13,
+            }
+        );
+    }
+
+    #[test]
     fn rejects_invalid_timer_intids() {
         let err = Arm64FdtTimerInterrupts::from_el1_timer_intids(15, 30)
             .expect_err("non-PPI virtual timer INTID should fail");
@@ -915,6 +1027,21 @@ mod tests {
             Arm64FdtError::InvalidPpiIntid {
                 name: "el1_virtual_timer_intid",
                 intid: 15,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_timer_intids() {
+        let err = Arm64FdtTimerInterrupts::from_el1_timer_intids(27, 27)
+            .expect_err("duplicate timer INTIDs should fail after PPI mapping");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::DuplicatePpi {
+                first: "non_secure_physical_timer",
+                second: "virtual_timer",
+                value: 11,
             }
         );
     }
