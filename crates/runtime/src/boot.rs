@@ -1214,6 +1214,32 @@ mod tests {
     }
 
     #[test]
+    fn loads_kernel_ending_at_fdt_boundary() {
+        let kernel_size = 4 * aarch64::GUEST_PAGE_SIZE;
+        let layout =
+            aarch64::dram_layout(aarch64::SYSTEM_MEM_SIZE + aarch64::FDT_MAX_SIZE + kernel_size)
+                .expect("boundary test memory layout should be valid");
+        let mut memory = boot_memory(&layout);
+        let kernel_bytes = arm64_image(
+            0,
+            kernel_size,
+            usize::try_from(kernel_size).expect("boundary kernel size should fit usize"),
+        );
+        let kernel_file = temp_file("boundary-kernel", &kernel_bytes);
+        let source = BootSource::new(kernel_file.as_path());
+
+        let loaded = source
+            .load(&layout, &mut memory)
+            .expect("kernel ending at FDT boundary should load");
+
+        assert_eq!(loaded.kernel.load_address, aarch64::kernel_load_address());
+        assert_eq!(
+            guest_address_add(loaded.kernel.load_address, loaded.kernel.size),
+            aarch64::fdt_address(&layout).expect("boundary FDT address should be valid")
+        );
+    }
+
+    #[test]
     fn rejects_kernel_that_would_overlap_fdt() {
         let layout =
             aarch64::dram_layout(4 << 20).expect("small test memory layout should be valid");
