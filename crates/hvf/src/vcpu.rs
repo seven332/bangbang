@@ -3,12 +3,25 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 
 use bangbang_runtime::BackendError;
+use bangbang_runtime::memory::GuestAddress;
 
 use crate::backend::HvfBackend;
 use crate::exit::HvfVcpuExit;
 
 const DESTROYED_VCPU_MESSAGE: &str = "vCPU has already been destroyed";
 const NO_VCPU_EXIT_MESSAGE: &str = "vCPU has not exited yet";
+
+/// CPSR/PSTATE value used for the primary arm64 Linux boot vCPU.
+pub const ARM64_LINUX_BOOT_CPSR: u64 = 0x3c5;
+
+/// Guest addresses used to initialize the primary arm64 Linux boot vCPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64BootRegisters {
+    /// Guest address loaded into PC before the first vCPU run.
+    pub kernel_entry: GuestAddress,
+    /// Guest address loaded into X0 before the first vCPU run.
+    pub fdt_address: GuestAddress,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HvfRegister(u32);
@@ -30,6 +43,7 @@ impl HvfRegister {
 pub struct HvfSystemRegister(u16);
 
 impl HvfSystemRegister {
+    pub const MPIDR_EL1: Self = Self(crate::ffi::HV_SYS_REG_MPIDR_EL1);
     pub const SPSR_EL1: Self = Self(crate::ffi::HV_SYS_REG_SPSR_EL1);
     pub const ELR_EL1: Self = Self(crate::ffi::HV_SYS_REG_ELR_EL1);
     pub const SP_EL1: Self = Self(crate::ffi::HV_SYS_REG_SP_EL1);
@@ -113,6 +127,15 @@ impl HvfVcpuOwner {
         value: u64,
     ) -> Result<(), BackendError> {
         crate::ffi::set_reg(self.handle()?.vcpu, register.raw(), value)
+    }
+
+    pub(crate) fn configure_arm64_boot_registers(
+        &mut self,
+        registers: HvfArm64BootRegisters,
+    ) -> Result<(), BackendError> {
+        configure_arm64_boot_registers_with(registers, |register, value| {
+            self.set_register(register, value)
+        })
     }
 
     pub(crate) fn get_system_register(
@@ -200,6 +223,14 @@ impl<'vm> HvfVcpu<'vm> {
         self.owner.set_register(register, value)
     }
 
+    /// Configure the primary arm64 Linux boot-register state on this current-thread vCPU.
+    pub fn configure_arm64_boot_registers(
+        &mut self,
+        registers: HvfArm64BootRegisters,
+    ) -> Result<(), BackendError> {
+        self.owner.configure_arm64_boot_registers(registers)
+    }
+
     pub fn get_system_register(&self, register: HvfSystemRegister) -> Result<u64, BackendError> {
         self.owner.get_system_register(register)
     }
@@ -221,6 +252,24 @@ impl fmt::Debug for HvfVcpu<'_> {
     }
 }
 
+fn configure_arm64_boot_registers_with(
+    registers: HvfArm64BootRegisters,
+    mut set_register: impl FnMut(HvfRegister, u64) -> Result<(), BackendError>,
+) -> Result<(), BackendError> {
+    for (register, value) in [
+        (HvfRegister::PC, registers.kernel_entry.raw_value()),
+        (HvfRegister::X0, registers.fdt_address.raw_value()),
+        (HvfRegister::X1, 0),
+        (HvfRegister::X2, 0),
+        (HvfRegister::X3, 0),
+        (HvfRegister::CPSR, ARM64_LINUX_BOOT_CPSR),
+    ] {
+        set_register(register, value)?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::marker::PhantomData;
@@ -229,10 +278,12 @@ mod tests {
     use std::rc::Rc;
 
     use bangbang_runtime::BackendError;
+    use bangbang_runtime::memory::GuestAddress;
 
     use super::{
-        DESTROYED_VCPU_MESSAGE, HvfRegister, HvfSystemRegister, HvfVcpu, HvfVcpuHandle,
-        HvfVcpuOwner, NO_VCPU_EXIT_MESSAGE,
+        ARM64_LINUX_BOOT_CPSR, DESTROYED_VCPU_MESSAGE, HvfArm64BootRegisters, HvfRegister,
+        HvfSystemRegister, HvfVcpu, HvfVcpuHandle, HvfVcpuOwner, NO_VCPU_EXIT_MESSAGE,
+        configure_arm64_boot_registers_with,
     };
     use crate::exit::{HvfExceptionExit, HvfVcpuExit};
 
@@ -255,6 +306,13 @@ mod tests {
                 virtual_address: 0xdef,
                 physical_address: 0x123,
             },
+        }
+    }
+
+    fn boot_registers() -> HvfArm64BootRegisters {
+        HvfArm64BootRegisters {
+            kernel_entry: GuestAddress::new(0x8028_0000),
+            fdt_address: GuestAddress::new(0x8fe0_0000),
         }
     }
 
@@ -364,6 +422,59 @@ mod tests {
         assert_eq!(
             vcpu.set_system_register(HvfSystemRegister::SP_EL1, 0),
             Err(BackendError::InvalidState(DESTROYED_VCPU_MESSAGE))
+        );
+        assert_eq!(
+            vcpu.configure_arm64_boot_registers(boot_registers()),
+            Err(BackendError::InvalidState(DESTROYED_VCPU_MESSAGE))
+        );
+    }
+
+    #[test]
+    fn arm64_boot_register_setup_writes_linux_boot_state() {
+        let mut writes = Vec::new();
+
+        configure_arm64_boot_registers_with(boot_registers(), |register, value| {
+            writes.push((register, value));
+            Ok(())
+        })
+        .expect("boot register setup should succeed");
+
+        assert_eq!(
+            writes,
+            vec![
+                (HvfRegister::PC, 0x8028_0000),
+                (HvfRegister::X0, 0x8fe0_0000),
+                (HvfRegister::X1, 0),
+                (HvfRegister::X2, 0),
+                (HvfRegister::X3, 0),
+                (HvfRegister::CPSR, ARM64_LINUX_BOOT_CPSR),
+            ]
+        );
+    }
+
+    #[test]
+    fn arm64_boot_register_setup_stops_after_register_error() {
+        let mut writes = Vec::new();
+
+        let result = configure_arm64_boot_registers_with(boot_registers(), |register, value| {
+            writes.push((register, value));
+            if register == HvfRegister::X0 {
+                Err(BackendError::InvalidState("fake register write failed"))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert_eq!(
+            result,
+            Err(BackendError::InvalidState("fake register write failed"))
+        );
+        assert_eq!(
+            writes,
+            vec![
+                (HvfRegister::PC, 0x8028_0000),
+                (HvfRegister::X0, 0x8fe0_0000),
+            ]
         );
     }
 }

@@ -8,11 +8,16 @@ use bangbang_runtime::BackendError;
 
 use crate::backend::HvfBackend;
 use crate::exit::HvfVcpuExit;
-use crate::vcpu::HvfVcpuOwner;
+use crate::vcpu::{HvfArm64BootRegisters, HvfVcpuOwner};
 
 const RUNNER_SHUT_DOWN_MESSAGE: &str = "vCPU runner is shut down";
 const RUNNER_SHUTTING_DOWN_MESSAGE: &str = "vCPU runner shutdown is already in progress";
 const RUN_IN_FLIGHT_MESSAGE: &str = "vCPU runner already has a run in flight";
+const BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE: &str =
+    "vCPU runner already has boot register setup in flight";
+const BOOT_REGISTERS_ALREADY_CONFIGURED_MESSAGE: &str =
+    "vCPU runner boot registers are already configured";
+const RUN_ALREADY_STARTED_MESSAGE: &str = "vCPU runner has already started a run";
 const RUNNER_STATE_POISONED_MESSAGE: &str = "vCPU runner state lock is poisoned";
 const COMMAND_CHANNEL_CLOSED_MESSAGE: &str = "vCPU runner command channel is closed";
 const RESPONSE_CHANNEL_CLOSED_MESSAGE: &str = "vCPU runner response channel is closed";
@@ -73,9 +78,16 @@ struct RunnerHandleState {
     thread: Option<JoinHandle<()>>,
     shutting_down: bool,
     in_flight_runs: usize,
+    boot_register_setup_in_flight: bool,
+    boot_registers_configured: bool,
+    run_started: bool,
 }
 
 enum RunnerCommand {
+    ConfigureArm64BootRegisters {
+        registers: HvfArm64BootRegisters,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    },
     RunOnce {
         response_sender: mpsc::Sender<Result<HvfVcpuExit, HvfVcpuRunnerError>>,
     },
@@ -92,6 +104,10 @@ struct StartedRunner {
 
 trait RunnerVcpu {
     fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError>;
+    fn configure_arm64_boot_registers(
+        &mut self,
+        registers: HvfArm64BootRegisters,
+    ) -> Result<(), BackendError>;
     fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError>;
     fn destroy(&mut self) -> Result<(), BackendError>;
 }
@@ -113,6 +129,13 @@ impl RunnerVcpu for RealRunnerVcpu {
         self.owner.raw_vcpu()
     }
 
+    fn configure_arm64_boot_registers(
+        &mut self,
+        registers: HvfArm64BootRegisters,
+    ) -> Result<(), BackendError> {
+        self.owner.configure_arm64_boot_registers(registers)
+    }
+
     fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
         self.owner.run_once()
     }
@@ -128,6 +151,24 @@ impl<'vm> HvfVcpuRunner<'vm> {
             spawn_runner_thread(RealRunnerVcpu::create)?,
             real_cancel_vcpu(),
         )
+    }
+
+    /// Configure the primary arm64 Linux boot-register state on the vCPU-owning runner thread.
+    pub fn configure_arm64_boot_registers(
+        &self,
+        registers: HvfArm64BootRegisters,
+    ) -> Result<(), HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        let mut setup = self.start_arm64_boot_register_setup(registers, response_sender)?;
+
+        let result = response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?;
+        if result.is_ok() {
+            setup.mark_configured();
+        }
+
+        result
     }
 
     pub fn run_once(&self) -> Result<HvfVcpuExit, HvfVcpuRunnerError> {
@@ -189,9 +230,63 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 thread: Some(started.thread),
                 shutting_down: false,
                 in_flight_runs: 0,
+                boot_register_setup_in_flight: false,
+                boot_registers_configured: false,
+                run_started: false,
             }),
             _vm: PhantomData,
         })
+    }
+
+    fn start_arm64_boot_register_setup(
+        &self,
+        registers: HvfArm64BootRegisters,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    ) -> Result<InFlightBootRegisterSetup<'_>, HvfVcpuRunnerError> {
+        let mut state = self.lock_state()?;
+        if state.thread.is_none() {
+            return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
+        }
+        if state.shutting_down {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                RUNNER_SHUTTING_DOWN_MESSAGE,
+            ));
+        }
+        if state.in_flight_runs > 0 {
+            return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
+        }
+        if state.boot_register_setup_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.run_started {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                RUN_ALREADY_STARTED_MESSAGE,
+            ));
+        }
+        if state.boot_registers_configured {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                BOOT_REGISTERS_ALREADY_CONFIGURED_MESSAGE,
+            ));
+        }
+
+        state.boot_register_setup_in_flight = true;
+        if self
+            .command_sender
+            .send(RunnerCommand::ConfigureArm64BootRegisters {
+                registers,
+                response_sender,
+            })
+            .is_err()
+        {
+            state.boot_register_setup_in_flight = false;
+            return Err(HvfVcpuRunnerError::ChannelClosed(
+                COMMAND_CHANNEL_CLOSED_MESSAGE,
+            ));
+        }
+
+        Ok(InFlightBootRegisterSetup::new(&self.state))
     }
 
     fn start_run_once(
@@ -205,6 +300,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.in_flight_runs > 0 {
             return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
         }
+        if state.boot_register_setup_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE,
+            ));
+        }
 
         state.in_flight_runs = 1;
         if self
@@ -217,6 +317,8 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 COMMAND_CHANNEL_CLOSED_MESSAGE,
             ));
         }
+
+        state.run_started = true;
 
         Ok(InFlightRun::new(&self.state))
     }
@@ -290,20 +392,65 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                 state.thread.is_some(),
                 state.shutting_down,
                 state.in_flight_runs,
+                state.boot_register_setup_in_flight,
+                state.boot_registers_configured,
+                state.run_started,
             )
         });
 
         match state {
-            Ok((active, shutting_down, in_flight_runs)) => f
+            Ok((
+                active,
+                shutting_down,
+                in_flight_runs,
+                boot_register_setup_in_flight,
+                boot_registers_configured,
+                run_started,
+            )) => f
                 .debug_struct("HvfVcpuRunner")
                 .field("active", &active)
                 .field("shutting_down", &shutting_down)
                 .field("in_flight_runs", &in_flight_runs)
+                .field(
+                    "boot_register_setup_in_flight",
+                    &boot_register_setup_in_flight,
+                )
+                .field("boot_registers_configured", &boot_registers_configured)
+                .field("run_started", &run_started)
                 .finish_non_exhaustive(),
             Err(_) => f
                 .debug_struct("HvfVcpuRunner")
                 .field("state", &RUNNER_STATE_POISONED_MESSAGE)
                 .finish_non_exhaustive(),
+        }
+    }
+}
+
+struct InFlightBootRegisterSetup<'state> {
+    state: &'state Mutex<RunnerHandleState>,
+    configured: bool,
+}
+
+impl<'state> InFlightBootRegisterSetup<'state> {
+    fn new(state: &'state Mutex<RunnerHandleState>) -> Self {
+        Self {
+            state,
+            configured: false,
+        }
+    }
+
+    fn mark_configured(&mut self) {
+        self.configured = true;
+    }
+}
+
+impl Drop for InFlightBootRegisterSetup<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.boot_register_setup_in_flight = false;
+            if self.configured {
+                state.boot_registers_configured = true;
+            }
         }
     }
 }
@@ -398,6 +545,15 @@ fn run_runner_thread<C, V>(
 
     while let Ok(command) = command_receiver.recv() {
         match command {
+            RunnerCommand::ConfigureArm64BootRegisters {
+                registers,
+                response_sender,
+            } => {
+                let result = vcpu
+                    .configure_arm64_boot_registers(registers)
+                    .map_err(HvfVcpuRunnerError::Backend);
+                let _ = response_sender.send(result);
+            }
             RunnerCommand::RunOnce { response_sender } => {
                 let result = vcpu.run_once().map_err(HvfVcpuRunnerError::Backend);
                 let _ = response_sender.send(result);
@@ -438,9 +594,11 @@ mod tests {
     use std::thread;
 
     use bangbang_runtime::BackendError;
+    use bangbang_runtime::memory::GuestAddress;
 
     use super::{CancelVcpu, HvfVcpuRunner, HvfVcpuRunnerError, RunnerVcpu, spawn_runner_thread};
     use crate::exit::HvfVcpuExit;
+    use crate::vcpu::HvfArm64BootRegisters;
 
     struct FakeVcpu {
         entered_run_sender: mpsc::Sender<()>,
@@ -450,9 +608,25 @@ mod tests {
 
     struct PanicOnRunVcpu;
 
+    struct ConfigureRecordingVcpu {
+        configured_sender: mpsc::Sender<HvfArm64BootRegisters>,
+    }
+
+    struct BlockingConfigureVcpu {
+        entered_setup_sender: mpsc::Sender<()>,
+        release_setup_receiver: mpsc::Receiver<Result<(), BackendError>>,
+    }
+
     impl RunnerVcpu for FakeVcpu {
         fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
             Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
         }
 
         fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
@@ -476,12 +650,75 @@ mod tests {
             Ok(7)
         }
 
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
         fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
             panic!("fake run panic");
         }
 
         fn destroy(&mut self) -> Result<(), BackendError> {
             Ok(())
+        }
+    }
+
+    impl RunnerVcpu for ConfigureRecordingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            self.configured_sender
+                .send(registers)
+                .map_err(|_| BackendError::InvalidState("fake setup receiver closed"))
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for BlockingConfigureVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            self.entered_setup_sender
+                .send(())
+                .map_err(|_| BackendError::InvalidState("fake setup entry receiver closed"))?;
+            self.release_setup_receiver
+                .recv()
+                .map_err(|_| BackendError::InvalidState("fake setup release sender closed"))?
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    fn boot_registers() -> HvfArm64BootRegisters {
+        HvfArm64BootRegisters {
+            kernel_entry: GuestAddress::new(0x8028_0000),
+            fdt_address: GuestAddress::new(0x8fe0_0000),
         }
     }
 
@@ -540,6 +777,195 @@ mod tests {
             entered_run_receiver,
             destroyed_receiver,
         )
+    }
+
+    #[test]
+    fn configures_arm64_boot_registers_before_first_run() {
+        let registers = boot_registers();
+        let (configured_sender, configured_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || Ok(ConfigureRecordingVcpu { configured_sender }))
+            .expect("fake runner should start");
+        let runner = HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+            .expect("runner should be created");
+
+        assert_eq!(runner.configure_arm64_boot_registers(registers), Ok(()));
+        assert_eq!(
+            configured_receiver
+                .recv()
+                .expect("fake vCPU should receive boot registers"),
+            registers
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn duplicate_arm64_boot_register_setup_is_rejected() {
+        let (runner, _, destroyed_receiver) = start_fake_runner();
+
+        assert_eq!(
+            runner.configure_arm64_boot_registers(boot_registers()),
+            Ok(())
+        );
+        assert_eq!(
+            runner.configure_arm64_boot_registers(boot_registers()),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::BOOT_REGISTERS_ALREADY_CONFIGURED_MESSAGE
+            ))
+        );
+
+        runner.shutdown().expect("runner should shut down");
+        destroyed_receiver
+            .recv()
+            .expect("fake vCPU should be destroyed");
+    }
+
+    #[test]
+    fn arm64_boot_register_setup_after_shutdown_is_rejected() {
+        let (runner, _, destroyed_receiver) = start_fake_runner();
+
+        runner.shutdown().expect("runner should shut down");
+        destroyed_receiver
+            .recv()
+            .expect("fake vCPU should be destroyed");
+
+        assert_eq!(
+            runner.configure_arm64_boot_registers(boot_registers()),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUNNER_SHUT_DOWN_MESSAGE
+            ))
+        );
+    }
+
+    #[test]
+    fn arm64_boot_register_setup_during_shutdown_is_rejected() {
+        let (runner, _, destroyed_receiver) = start_fake_runner();
+        let (command_sender, should_cancel) = runner
+            .prepare_shutdown()
+            .expect("first shutdown should be prepared");
+
+        assert!(!should_cancel);
+        assert_eq!(
+            runner.configure_arm64_boot_registers(boot_registers()),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUNNER_SHUTTING_DOWN_MESSAGE
+            ))
+        );
+
+        let thread = runner
+            .take_thread()
+            .expect("runner state should be lockable");
+        let (response_sender, response_receiver) = mpsc::channel();
+        command_sender
+            .send(super::RunnerCommand::Shutdown { response_sender })
+            .expect("shutdown command should be sent");
+        assert_eq!(
+            response_receiver
+                .recv()
+                .expect("shutdown response should be sent"),
+            Ok(())
+        );
+        super::join_runner_thread(thread).expect("runner thread should join");
+        runner.finish_shutdown();
+        destroyed_receiver
+            .recv()
+            .expect("fake vCPU should be destroyed");
+    }
+
+    #[test]
+    fn arm64_boot_register_setup_during_run_is_rejected() {
+        let (runner, entered_run_receiver, destroyed_receiver) = start_fake_runner();
+
+        thread::scope(|scope| {
+            let run = scope.spawn(|| runner.run_once());
+            entered_run_receiver
+                .recv()
+                .expect("runner should enter fake run");
+
+            assert_eq!(
+                runner.configure_arm64_boot_registers(boot_registers()),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::RUN_IN_FLIGHT_MESSAGE
+                ))
+            );
+
+            runner.cancel().expect("cancel should release fake run");
+            assert_eq!(
+                run.join().expect("run thread should join"),
+                Ok(HvfVcpuExit::Canceled)
+            );
+        });
+
+        runner.shutdown().expect("runner should shut down");
+        destroyed_receiver
+            .recv()
+            .expect("fake vCPU should be destroyed");
+    }
+
+    #[test]
+    fn arm64_boot_register_setup_after_run_started_is_rejected() {
+        let (runner, entered_run_receiver, destroyed_receiver) = start_fake_runner();
+
+        thread::scope(|scope| {
+            let run = scope.spawn(|| runner.run_once());
+            entered_run_receiver
+                .recv()
+                .expect("runner should enter fake run");
+
+            runner.cancel().expect("cancel should release fake run");
+            assert_eq!(
+                run.join().expect("run thread should join"),
+                Ok(HvfVcpuExit::Canceled)
+            );
+        });
+
+        assert_eq!(
+            runner.configure_arm64_boot_registers(boot_registers()),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUN_ALREADY_STARTED_MESSAGE
+            ))
+        );
+
+        runner.shutdown().expect("runner should shut down");
+        destroyed_receiver
+            .recv()
+            .expect("fake vCPU should be destroyed");
+    }
+
+    #[test]
+    fn run_during_arm64_boot_register_setup_is_rejected() {
+        let (entered_setup_sender, entered_setup_receiver) = mpsc::channel();
+        let (release_setup_sender, release_setup_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(BlockingConfigureVcpu {
+                entered_setup_sender,
+                release_setup_receiver,
+            })
+        })
+        .expect("fake runner should start");
+        let runner = HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+            .expect("runner should be created");
+
+        thread::scope(|scope| {
+            let setup = scope.spawn(|| runner.configure_arm64_boot_registers(boot_registers()));
+            entered_setup_receiver
+                .recv()
+                .expect("runner should enter fake setup");
+
+            assert_eq!(
+                runner.run_once(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE
+                ))
+            );
+
+            release_setup_sender
+                .send(Ok(()))
+                .expect("setup release should be sent");
+            assert_eq!(setup.join().expect("setup thread should join"), Ok(()));
+        });
+
+        runner.shutdown().expect("runner should shut down");
     }
 
     #[test]

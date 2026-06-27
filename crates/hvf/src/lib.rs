@@ -16,4 +16,6 @@ pub use gic::{
 };
 pub use memory::{HvfGuestMemoryMappingError, HvfGuestMemoryUnmapFailure, HvfMemoryPermissions};
 pub use runner::{HvfVcpuRunner, HvfVcpuRunnerError};
-pub use vcpu::{HvfRegister, HvfSystemRegister, HvfVcpu};
+pub use vcpu::{
+    ARM64_LINUX_BOOT_CPSR, HvfArm64BootRegisters, HvfRegister, HvfSystemRegister, HvfVcpu,
+};
