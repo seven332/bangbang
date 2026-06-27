@@ -1257,6 +1257,27 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_regular_initrd_file() {
+        let layout = boot_layout();
+        let mut memory = boot_memory(&layout);
+        let kernel_bytes = arm64_image(TEST_KERNEL_TEXT_OFFSET, 4096, 4096);
+        let kernel_file = temp_file("kernel", &kernel_bytes);
+        let initrd_dir = temp_dir("initrd-dir");
+        let source = BootSource::new(kernel_file.as_path()).with_initrd_path(initrd_dir.as_path());
+
+        let err = source
+            .load(&layout, &mut memory)
+            .expect_err("directory initrd path should fail");
+
+        assert!(matches!(
+            err,
+            BootSourceLoadError::NonRegularFile {
+                payload: BootPayloadKind::Initrd
+            }
+        ));
+    }
+
+    #[test]
     fn rejects_initrd_that_cannot_fit() {
         let layout = boot_layout();
         let mut memory = boot_memory(&layout);
@@ -1314,6 +1335,10 @@ mod tests {
                 ..
             }
         ));
+        assert!(
+            !err.to_string()
+                .contains(missing_initrd.to_string_lossy().as_ref())
+        );
 
         let expected_load_address =
             guest_address_add(aarch64::kernel_load_address(), TEST_KERNEL_TEXT_OFFSET);

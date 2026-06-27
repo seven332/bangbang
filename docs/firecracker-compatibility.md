@@ -268,7 +268,7 @@ The internal loader supports the arm64 Linux `Image` header shape used by
 Firecracker's aarch64 boot path. It validates the Image magic, text offset, and
 legacy zero-size image behavior, then copies the complete kernel file into
 guest memory at `kernel_load_address + text_offset`. The kernel range must be
-fully backed by guest memory and must end before the reserved FDT address.
+fully backed by guest memory and must not overlap the reserved FDT address.
 
 An explicitly configured initrd must be a non-empty regular file. It is placed
 with the aarch64 initrd helper immediately before the FDT reservation, must be
