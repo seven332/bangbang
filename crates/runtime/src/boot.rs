@@ -485,17 +485,9 @@ fn validate_command_line(
             BootCommandLineError::ContainsNul,
         ));
     }
-    let text = canonical_command_line_text(text)?;
+    let command_line = canonical_command_line(text)?;
 
-    let size_with_nul = text
-        .len()
-        .checked_add(1)
-        .ok_or(BootSourceLoadError::CommandLine(
-            BootCommandLineError::TooLarge {
-                size_with_nul: usize::MAX,
-                max_size: aarch64::CMDLINE_MAX_SIZE,
-            },
-        ))?;
+    let size_with_nul = command_line.size_with_nul()?;
 
     if size_with_nul > aarch64::CMDLINE_MAX_SIZE {
         return Err(BootSourceLoadError::CommandLine(
@@ -506,6 +498,7 @@ fn validate_command_line(
         ));
     }
 
+    let text = command_line.to_text();
     let mut bytes_with_nul = Vec::from(text.as_bytes());
     bytes_with_nul.push(0);
 
@@ -515,7 +508,53 @@ fn validate_command_line(
     })
 }
 
-fn canonical_command_line_text(raw: &str) -> Result<String, BootSourceLoadError> {
+#[derive(Debug, Clone, Copy)]
+struct CanonicalCommandLine<'a> {
+    boot_args: &'a str,
+    init_args: &'a str,
+}
+
+impl CanonicalCommandLine<'_> {
+    fn size_with_nul(self) -> Result<usize, BootSourceLoadError> {
+        let mut size_with_nul =
+            self.boot_args
+                .len()
+                .checked_add(1)
+                .ok_or(BootSourceLoadError::CommandLine(
+                    BootCommandLineError::TooLarge {
+                        size_with_nul: usize::MAX,
+                        max_size: aarch64::CMDLINE_MAX_SIZE,
+                    },
+                ))?;
+
+        if !self.init_args.is_empty() {
+            size_with_nul = size_with_nul
+                .checked_add(INIT_ARGS_SEPARATOR.len())
+                .and_then(|size| size.checked_add(self.init_args.len()))
+                .ok_or(BootSourceLoadError::CommandLine(
+                    BootCommandLineError::TooLarge {
+                        size_with_nul: usize::MAX,
+                        max_size: aarch64::CMDLINE_MAX_SIZE,
+                    },
+                ))?;
+        }
+
+        Ok(size_with_nul)
+    }
+
+    fn to_text(self) -> String {
+        if self.init_args.is_empty() {
+            self.boot_args.to_string()
+        } else {
+            format!(
+                "{}{}{}",
+                self.boot_args, INIT_ARGS_SEPARATOR, self.init_args
+            )
+        }
+    }
+}
+
+fn canonical_command_line(raw: &str) -> Result<CanonicalCommandLine<'_>, BootSourceLoadError> {
     let (boot_args, init_args) = split_command_line(raw);
     let boot_args = boot_args.trim();
     let init_args = init_args.trim();
@@ -526,11 +565,10 @@ fn canonical_command_line_text(raw: &str) -> Result<String, BootSourceLoadError>
         ));
     }
 
-    if init_args.is_empty() {
-        Ok(boot_args.to_string())
-    } else {
-        Ok(format!("{boot_args}{INIT_ARGS_SEPARATOR}{init_args}"))
-    }
+    Ok(CanonicalCommandLine {
+        boot_args,
+        init_args,
+    })
 }
 
 fn split_command_line(raw: &str) -> (&str, &str) {
@@ -931,7 +969,7 @@ mod tests {
         ARM64_IMAGE_MAGIC, ARM64_IMAGE_MAGIC_OFFSET, ARM64_IMAGE_SIZE_OFFSET,
         ARM64_IMAGE_TEXT_OFFSET_OFFSET, ARM64_LEGACY_TEXT_OFFSET, BootCommandLineError,
         BootPayloadKind, BootSource, BootSourceLoadError, DEFAULT_KERNEL_COMMAND_LINE,
-        KernelImageError,
+        INIT_ARGS_SEPARATOR, KernelImageError,
     };
     use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, aarch64};
 
@@ -1235,6 +1273,28 @@ mod tests {
     }
 
     #[test]
+    fn accepts_command_line_with_init_args_at_exact_limit() {
+        let layout = boot_layout();
+        let mut memory = boot_memory(&layout);
+        let kernel_bytes = arm64_image(TEST_KERNEL_TEXT_OFFSET, 4096, 4096);
+        let kernel_file = temp_file("kernel", &kernel_bytes);
+        let init_args = "/init";
+        let boot_args =
+            "a".repeat(aarch64::CMDLINE_MAX_SIZE - INIT_ARGS_SEPARATOR.len() - init_args.len() - 1);
+        let source =
+            BootSource::new(kernel_file.as_path()).with_boot_args(format!("{boot_args} -- /init"));
+
+        let loaded = source
+            .load(&layout, &mut memory)
+            .expect("exact command line with init args should load");
+
+        assert_eq!(
+            loaded.command_line.as_bytes_with_nul().len(),
+            aarch64::CMDLINE_MAX_SIZE
+        );
+    }
+
+    #[test]
     fn rejects_command_line_over_limit() {
         let layout = boot_layout();
         let mut memory = boot_memory(&layout);
@@ -1246,6 +1306,28 @@ mod tests {
         let err = source
             .load(&layout, &mut memory)
             .expect_err("oversized command line should fail");
+
+        assert!(matches!(
+            err,
+            BootSourceLoadError::CommandLine(BootCommandLineError::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_command_line_with_init_args_over_limit() {
+        let layout = boot_layout();
+        let mut memory = boot_memory(&layout);
+        let kernel_bytes = arm64_image(TEST_KERNEL_TEXT_OFFSET, 4096, 4096);
+        let kernel_file = temp_file("kernel", &kernel_bytes);
+        let init_args = "/init";
+        let boot_args =
+            "a".repeat(aarch64::CMDLINE_MAX_SIZE - INIT_ARGS_SEPARATOR.len() - init_args.len());
+        let source =
+            BootSource::new(kernel_file.as_path()).with_boot_args(format!("{boot_args} -- /init"));
+
+        let err = source
+            .load(&layout, &mut memory)
+            .expect_err("oversized command line with init args should fail");
 
         assert!(matches!(
             err,
