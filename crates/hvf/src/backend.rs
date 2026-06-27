@@ -3,6 +3,7 @@ use std::sync::Arc;
 use bangbang_runtime::memory::GuestMemory;
 use bangbang_runtime::{BackendError, VmBackend};
 
+use crate::gic::{HvfGicCreator, HvfGicError, HvfGicMetadata, RealHvfGicCreator};
 use crate::memory::{
     HvfGuestMemoryMapping, HvfGuestMemoryMappingError, HvfMemoryMapper, HvfMemoryPermissions,
     RealHvfMemoryMapper,
@@ -12,12 +13,18 @@ use crate::vcpu::HvfVcpu;
 
 const VM_NOT_CREATED_FOR_MEMORY_MESSAGE: &str = "VM must be created before mapping guest memory";
 const GUEST_MEMORY_ALREADY_MAPPED_MESSAGE: &str = "guest memory is already mapped";
+const VM_NOT_CREATED_FOR_GIC_MESSAGE: &str = "VM must be created before creating a GIC";
+const GIC_ALREADY_CREATED_MESSAGE: &str = "GIC is already created";
+const VCPU_TOPOLOGY_ALREADY_STARTED_MESSAGE: &str = "GIC must be created before creating vCPUs";
 
 #[derive(Debug)]
 pub struct HvfBackend {
     vm_created: bool,
     guest_memory: Option<HvfGuestMemoryMapping>,
+    gic: Option<HvfGicMetadata>,
+    vcpu_topology_started: bool,
     memory_mapper: Arc<dyn HvfMemoryMapper>,
+    gic_creator: Arc<dyn HvfGicCreator>,
 }
 
 impl Default for HvfBackend {
@@ -25,7 +32,10 @@ impl Default for HvfBackend {
         Self {
             vm_created: false,
             guest_memory: None,
+            gic: None,
+            vcpu_topology_started: false,
             memory_mapper: Arc::new(RealHvfMemoryMapper),
+            gic_creator: Arc::new(RealHvfGicCreator),
         }
     }
 }
@@ -60,6 +70,20 @@ impl HvfBackend {
         Ok(())
     }
 
+    pub fn create_gic(&mut self) -> Result<&HvfGicMetadata, HvfGicError> {
+        if !Self::is_supported_target() {
+            return Err(HvfGicError::Unsupported(
+                crate::ffi::UNSUPPORTED_TARGET_MESSAGE,
+            ));
+        }
+
+        self.create_gic_with_configured_creator()
+    }
+
+    pub fn gic_metadata(&self) -> Option<&HvfGicMetadata> {
+        self.gic.as_ref()
+    }
+
     #[cfg(test)]
     fn has_guest_memory_mapping(&self) -> bool {
         self.guest_memory
@@ -80,10 +104,11 @@ impl HvfBackend {
             ));
         }
 
+        self.vcpu_topology_started = true;
         HvfVcpu::new(self)
     }
 
-    pub fn start_vcpu_runner(&self) -> Result<HvfVcpuRunner<'_>, HvfVcpuRunnerError> {
+    pub fn start_vcpu_runner(&mut self) -> Result<HvfVcpuRunner<'_>, HvfVcpuRunnerError> {
         if !Self::is_supported_target() {
             return Err(BackendError::Unsupported(crate::ffi::UNSUPPORTED_TARGET_MESSAGE).into());
         }
@@ -95,7 +120,36 @@ impl HvfBackend {
             .into());
         }
 
+        self.vcpu_topology_started = true;
         HvfVcpuRunner::new(self)
+    }
+
+    fn create_gic_with_configured_creator(&mut self) -> Result<&HvfGicMetadata, HvfGicError> {
+        if !self.vm_created {
+            return Err(HvfGicError::InvalidState(VM_NOT_CREATED_FOR_GIC_MESSAGE));
+        }
+
+        if self.gic.is_some() {
+            return Err(HvfGicError::InvalidState(GIC_ALREADY_CREATED_MESSAGE));
+        }
+
+        if self.vcpu_topology_started {
+            return Err(HvfGicError::InvalidState(
+                VCPU_TOPOLOGY_ALREADY_STARTED_MESSAGE,
+            ));
+        }
+
+        let metadata = self.gic_creator.create_gic()?;
+        self.gic = Some(metadata);
+
+        self.gic
+            .as_ref()
+            .ok_or(HvfGicError::InvalidState("created GIC metadata is missing"))
+    }
+
+    fn clear_vm_owned_state(&mut self) {
+        self.gic = None;
+        self.vcpu_topology_started = false;
     }
 
     fn map_guest_memory_with_configured_mapper(
@@ -139,7 +193,22 @@ impl HvfBackend {
         Self {
             vm_created: false,
             guest_memory: None,
+            gic: None,
+            vcpu_topology_started: false,
             memory_mapper,
+            gic_creator: Arc::new(RealHvfGicCreator),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_gic_creator(gic_creator: Arc<dyn HvfGicCreator>) -> Self {
+        Self {
+            vm_created: false,
+            guest_memory: None,
+            gic: None,
+            vcpu_topology_started: false,
+            memory_mapper: Arc::new(RealHvfMemoryMapper),
+            gic_creator,
         }
     }
 }
@@ -161,6 +230,7 @@ impl VmBackend for HvfBackend {
                 .map_err(|err| BackendError::Hypervisor(err.to_string()))?;
             crate::ffi::destroy_vm()?;
             self.vm_created = false;
+            self.clear_vm_owned_state();
         }
         Ok(())
     }
@@ -178,6 +248,7 @@ impl Drop for HvfBackend {
             }
             let vm_destroyed = crate::ffi::destroy_vm().is_ok();
             self.vm_created = false;
+            self.clear_vm_owned_state();
 
             if vm_destroyed && let Some(mapping) = mapping_after_failed_unmap {
                 mapping.release_after_vm_destroy();
@@ -217,6 +288,31 @@ mod tests {
         host_page_size().expect("host page size should be available for tests")
     }
 
+    fn gic_metadata() -> crate::gic::HvfGicMetadata {
+        crate::gic::HvfGicMetadata {
+            distributor: crate::gic::HvfGicRegion {
+                base: 0x3fff_0000,
+                size: 0x1_0000,
+            },
+            redistributor: crate::gic::HvfGicRedistributor {
+                region: crate::gic::HvfGicRegion {
+                    base: 0x3ffd_0000,
+                    size: 0x2_0000,
+                },
+                single_redistributor_size: 0x2_0000,
+            },
+            spi_interrupt_range: crate::gic::HvfGicInterruptRange {
+                base: 32,
+                count: 96,
+            },
+            timer_interrupts: crate::gic::HvfGicTimerInterrupts {
+                el1_virtual_timer_intid: 27,
+                el1_physical_timer_intid: 30,
+            },
+            msi: None,
+        }
+    }
+
     #[test]
     fn supported_target_matches_compile_target() {
         assert_eq!(
@@ -247,7 +343,7 @@ mod tests {
 
     #[test]
     fn start_vcpu_runner_before_vm_reports_state_or_target_error() {
-        let backend = HvfBackend::new();
+        let mut backend = HvfBackend::new();
         let err = backend
             .start_vcpu_runner()
             .expect_err("starting a vCPU runner before VM creation should fail");
@@ -267,6 +363,90 @@ mod tests {
                 ))
             );
         }
+    }
+
+    #[test]
+    fn create_gic_before_vm_reports_state_error_without_calling_creator() {
+        let creator = Arc::new(RecordingGicCreator::with_metadata(gic_metadata()));
+        let mut backend = HvfBackend::new_with_gic_creator(creator.clone());
+
+        assert_eq!(
+            backend.create_gic_with_configured_creator(),
+            Err(crate::gic::HvfGicError::InvalidState(
+                super::VM_NOT_CREATED_FOR_GIC_MESSAGE
+            ))
+        );
+        assert_eq!(creator.create_count(), 0);
+        assert_eq!(backend.gic_metadata(), None);
+    }
+
+    #[test]
+    fn duplicate_gic_creation_is_rejected_without_calling_creator_again() {
+        let creator = Arc::new(RecordingGicCreator::with_metadata(gic_metadata()));
+        let mut backend = HvfBackend::new_with_gic_creator(creator.clone());
+        backend.vm_created = true;
+
+        assert_eq!(
+            backend.create_gic_with_configured_creator(),
+            Ok(&gic_metadata())
+        );
+        assert_eq!(
+            backend.create_gic_with_configured_creator(),
+            Err(crate::gic::HvfGicError::InvalidState(
+                super::GIC_ALREADY_CREATED_MESSAGE
+            ))
+        );
+        assert_eq!(creator.create_count(), 1);
+        assert_eq!(backend.gic_metadata(), Some(&gic_metadata()));
+    }
+
+    #[test]
+    fn failed_gic_creation_does_not_store_metadata() {
+        let creator = Arc::new(RecordingGicCreator::with_error(
+            crate::gic::HvfGicError::Backend(BackendError::Hypervisor(
+                "injected GIC failure".to_string(),
+            )),
+        ));
+        let mut backend = HvfBackend::new_with_gic_creator(creator.clone());
+        backend.vm_created = true;
+
+        assert_eq!(
+            backend.create_gic_with_configured_creator(),
+            Err(crate::gic::HvfGicError::Backend(BackendError::Hypervisor(
+                "injected GIC failure".to_string()
+            )))
+        );
+        assert_eq!(creator.create_count(), 1);
+        assert_eq!(backend.gic_metadata(), None);
+    }
+
+    #[test]
+    fn gic_creation_after_vcpu_topology_started_is_rejected() {
+        let creator = Arc::new(RecordingGicCreator::with_metadata(gic_metadata()));
+        let mut backend = HvfBackend::new_with_gic_creator(creator.clone());
+        backend.vm_created = true;
+        backend.vcpu_topology_started = true;
+
+        assert_eq!(
+            backend.create_gic_with_configured_creator(),
+            Err(crate::gic::HvfGicError::InvalidState(
+                super::VCPU_TOPOLOGY_ALREADY_STARTED_MESSAGE
+            ))
+        );
+        assert_eq!(creator.create_count(), 0);
+        assert_eq!(backend.gic_metadata(), None);
+    }
+
+    #[test]
+    fn clearing_vm_owned_state_removes_gic_metadata_and_topology_flag() {
+        let mut backend = HvfBackend::new();
+        backend.gic = Some(gic_metadata());
+        backend.vcpu_topology_started = true;
+
+        backend.clear_vm_owned_state();
+
+        assert_eq!(backend.gic_metadata(), None);
+        assert!(!backend.vcpu_topology_started);
     }
 
     #[test]
@@ -469,5 +649,44 @@ mod tests {
         maps: usize,
         unmaps: usize,
         fail_unmap: bool,
+    }
+
+    #[derive(Debug)]
+    struct RecordingGicCreator {
+        result: Result<crate::gic::HvfGicMetadata, crate::gic::HvfGicError>,
+        create_count: Mutex<usize>,
+    }
+
+    impl RecordingGicCreator {
+        fn with_metadata(metadata: crate::gic::HvfGicMetadata) -> Self {
+            Self {
+                result: Ok(metadata),
+                create_count: Mutex::new(0),
+            }
+        }
+
+        fn with_error(error: crate::gic::HvfGicError) -> Self {
+            Self {
+                result: Err(error),
+                create_count: Mutex::new(0),
+            }
+        }
+
+        fn create_count(&self) -> usize {
+            *self
+                .create_count
+                .lock()
+                .expect("create count lock should not be poisoned")
+        }
+    }
+
+    impl crate::gic::HvfGicCreator for RecordingGicCreator {
+        fn create_gic(&self) -> Result<crate::gic::HvfGicMetadata, crate::gic::HvfGicError> {
+            *self
+                .create_count
+                .lock()
+                .expect("create count lock should not be poisoned") += 1;
+            self.result.clone()
+        }
     }
 }

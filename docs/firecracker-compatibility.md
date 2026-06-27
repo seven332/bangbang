@@ -12,11 +12,12 @@ placement helpers, internal boot-source validation and arm64 kernel/initrd
 payload loading, a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
 create/destroy wrapper, typed HVF exit surface, narrow vCPU register wrappers,
-anonymous guest memory allocation for validated runtime layouts, HVF guest
-memory map/unmap ownership for allocated regions, and an initial process
-startup argument model. There is no broader API request body model, guest
-execution, vCPU run loop, MMIO/device emulation, boot register setup, FDT
-generation, or public boot-source API behavior yet.
+internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, anonymous guest
+memory allocation for validated runtime layouts, HVF guest memory map/unmap
+ownership for allocated regions, and an initial process startup argument model.
+There is no broader API request body model, guest execution, vCPU run loop,
+interrupt injection, MMIO/device emulation, boot register setup, FDT generation,
+or public boot-source API behavior yet.
 
 ## Firecracker Model Alignment
 
@@ -289,9 +290,18 @@ backend-owned mapping owner consumes the `GuestMemory` allocation, unmaps mapped
 regions on explicit unmap, partial failure, drop, and VM destruction, and keeps
 cleanup local to the backend instance.
 
+On macOS 15.0 or newer, the HVF backend can create a GIC v3 device after VM
+creation and before vCPU creation. It dynamically resolves the macOS 15 GIC
+symbols so older hosts can return structured unsupported errors instead of
+failing at process load time. The backend exposes internal boot metadata for the
+future FDT path: distributor and redistributor regions below the 1 GiB MMIO32
+boundary, the supported SPI range, timer interrupt IDs, and the `arm,gic-v3`
+compatibility shape. MSI/ITS metadata is intentionally absent until a later
+device path needs it.
+
 This still is not bootable guest RAM. bangbang does not write FDT payloads, wire
-`mem_size_mib` into public startup behavior, configure boot registers, or start
-a guest. Later API and startup work still needs to decide whether an oversized
+`mem_size_mib` into public startup behavior, inject interrupts, configure boot
+registers, or start a guest. Later API and startup work still needs to decide whether an oversized
 `mem_size_mib` request should be rejected before layout construction or should
 preserve Firecracker's architecture-helper truncation behavior.
 
