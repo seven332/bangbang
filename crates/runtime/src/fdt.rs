@@ -18,6 +18,7 @@ const CPU_ADDRESS_CELLS: u32 = 2;
 const CPU_SIZE_CELLS: u32 = 0;
 const CPU_REG_MASK: u64 = 0x7f_ffff;
 const MAX_ARM64_FDT_CPUS: usize = 32;
+const GIC_COMPATIBILITY: &str = "arm,gic-v3";
 const GIC_FDT_IRQ_TYPE_PPI: u32 = 1;
 const IRQ_TYPE_LEVEL_HIGH: u32 = 4;
 const FIRST_PPI_INTID: u32 = 16;
@@ -168,6 +169,10 @@ pub enum Arm64FdtError {
         region: Arm64FdtRegion,
         memory_range: GuestMemoryRange,
     },
+    InvalidGicCompatibility {
+        value: &'static str,
+        expected: &'static str,
+    },
     InvalidGicInterruptCells {
         value: u32,
     },
@@ -262,6 +267,10 @@ impl fmt::Display for Arm64FdtError {
                 "arm64 FDT GIC {name} region base=0x{:x}, size={} overlaps guest memory range {memory_range}",
                 region.base, region.size
             ),
+            Self::InvalidGicCompatibility { value, expected } => write!(
+                f,
+                "arm64 FDT GIC compatible must be {expected}, got {value}"
+            ),
             Self::InvalidGicInterruptCells { value } => {
                 write!(f, "arm64 FDT GIC #interrupt-cells must be 3, got {value}")
             }
@@ -277,7 +286,7 @@ impl fmt::Display for Arm64FdtError {
                 value,
             } => write!(
                 f,
-                "arm64 FDT timer PPIs must be distinct: {first} and {second} both use {value}"
+                "arm64 FDT PPIs must be distinct: {first} and {second} both use {value}"
             ),
             Self::InvalidPpiIntid { name, intid } => write!(
                 f,
@@ -319,6 +328,7 @@ impl std::error::Error for Arm64FdtError {
             | Self::InvalidGicRegion { .. }
             | Self::GicRegionsOverlap { .. }
             | Self::GicRegionOverlapsMemory { .. }
+            | Self::InvalidGicCompatibility { .. }
             | Self::InvalidGicInterruptCells { .. }
             | Self::InvalidPpi { .. }
             | Self::DuplicatePpi { .. }
@@ -383,6 +393,7 @@ fn validate_config(config: &Arm64FdtConfig<'_>) -> Result<(), Arm64FdtError> {
     memory_reg_cells(config.layout)?;
     validate_gic(config.layout, config.gic)?;
     validate_timer(config.timer)?;
+    validate_gic_timer_ppis(config.gic, config.timer)?;
     if let Some(initrd) = config.boot.initrd {
         validate_initrd(config.layout, initrd)?;
     }
@@ -634,6 +645,13 @@ fn validate_gic(layout: &GuestMemoryLayout, gic: Arm64FdtGic) -> Result<(), Arm6
         redistributor,
     )?;
 
+    if gic.compatibility != GIC_COMPATIBILITY {
+        return Err(Arm64FdtError::InvalidGicCompatibility {
+            value: gic.compatibility,
+            expected: GIC_COMPATIBILITY,
+        });
+    }
+
     if gic.interrupt_cells != 3 {
         return Err(Arm64FdtError::InvalidGicInterruptCells {
             value: gic.interrupt_cells,
@@ -644,6 +662,30 @@ fn validate_gic(layout: &GuestMemoryLayout, gic: Arm64FdtGic) -> Result<(), Arm6
 
     if gic.msi.is_some() {
         return Err(Arm64FdtError::UnsupportedMsi);
+    }
+
+    Ok(())
+}
+
+fn validate_gic_timer_ppis(
+    gic: Arm64FdtGic,
+    timer: Arm64FdtTimerInterrupts,
+) -> Result<(), Arm64FdtError> {
+    let timer_ppis = [
+        ("secure_physical_timer", timer.secure_physical),
+        ("non_secure_physical_timer", timer.non_secure_physical),
+        ("virtual_timer", timer.virtual_timer),
+        ("hypervisor_timer", timer.hypervisor),
+    ];
+
+    for (timer_name, timer_ppi) in timer_ppis {
+        if gic.maintenance_irq == timer_ppi {
+            return Err(Arm64FdtError::DuplicatePpi {
+                first: "maintenance_irq",
+                second: timer_name,
+                value: timer_ppi,
+            });
+        }
     }
 
     Ok(())
@@ -1103,6 +1145,63 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unexpected_gic_compatibility() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let config = Arm64FdtConfig {
+            gic: Arm64FdtGic {
+                compatibility: "arm,gic-v2",
+                ..test_gic()
+            },
+            ..test_config(
+                &layout,
+                Arm64FdtBootInfo {
+                    command_line: "panic=1",
+                    initrd: None,
+                },
+            )
+        };
+
+        let err = build_arm64_fdt(&config).expect_err("unexpected GIC compatible should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::InvalidGicCompatibility {
+                value: "arm,gic-v2",
+                expected: GIC_COMPATIBILITY,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_gic_maintenance_irq_reusing_timer_ppi() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let config = Arm64FdtConfig {
+            gic: Arm64FdtGic {
+                maintenance_irq: ARM64_FDT_SECURE_PHYSICAL_TIMER_PPI,
+                ..test_gic()
+            },
+            ..test_config(
+                &layout,
+                Arm64FdtBootInfo {
+                    command_line: "panic=1",
+                    initrd: None,
+                },
+            )
+        };
+
+        let err = build_arm64_fdt(&config).expect_err("reused maintenance PPI should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::DuplicatePpi {
+                first: "maintenance_irq",
+                second: "secure_physical_timer",
+                value: ARM64_FDT_SECURE_PHYSICAL_TIMER_PPI,
+            }
+        );
+    }
+
+    #[test]
     fn timer_node_uses_firecracker_ppi_cells() {
         let layout = test_layout(TEST_MEMORY_SIZE);
         let config = test_config(
@@ -1523,7 +1622,7 @@ mod tests {
                 base: 0x3ffd_0000,
                 size: 0x2_0000,
             },
-            compatibility: "arm,gic-v3",
+            compatibility: GIC_COMPATIBILITY,
             interrupt_cells: 3,
             maintenance_irq: 9,
             msi: None,

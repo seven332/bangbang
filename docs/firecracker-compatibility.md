@@ -302,7 +302,9 @@ metadata, advertises `arm,gic-v3`, and does not emit an ITS/MSI child while the
 HVF metadata has no MSI support. The FDT builder rejects empty or oversized CPU
 sets, duplicate CPU `reg` values, initrd ranges outside guest-advertised memory
 or overlapping the reserved FDT address, and GIC MMIO regions that are invalid,
-overlap each other, or overlap guest RAM.
+overlap each other, or overlap guest RAM. It also rejects unexpected GIC
+compatibility strings and PPI collisions between the GIC maintenance interrupt
+and timer interrupts.
 
 FDT writes first reject mismatches between the layout used to describe guest RAM
 and the allocated guest memory object. FDT bytes are then built before guest
