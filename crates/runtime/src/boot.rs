@@ -1321,6 +1321,54 @@ mod tests {
         ));
     }
 
+    fn initrd_size_change_after_prepare_error(new_size: u64) -> BootSourceLoadError {
+        let layout = boot_layout();
+        let memory = boot_memory(&layout);
+        let initrd_bytes = b"initrd";
+        let initrd_file = temp_file("resized-initrd", initrd_bytes);
+        let prepared = super::prepare_initrd_payload(initrd_file.as_path(), &layout, &memory)
+            .expect("initial valid initrd should prepare");
+        let file = OpenOptions::new()
+            .write(true)
+            .open(initrd_file.as_path())
+            .expect("prepared initrd file should reopen for resize");
+
+        file.set_len(new_size)
+            .expect("prepared initrd file should resize");
+        drop(file);
+
+        super::read_payload_file(prepared.file, BootPayloadKind::Initrd, prepared.loaded.size)
+            .expect_err("resized initrd should be rejected after final read")
+    }
+
+    #[test]
+    fn rejects_initrd_grown_after_prepare() {
+        let err = initrd_size_change_after_prepare_error(7);
+
+        assert!(matches!(
+            err,
+            BootSourceLoadError::PayloadSizeChanged {
+                payload: BootPayloadKind::Initrd,
+                expected_size: 6,
+                actual_size: 7
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_initrd_shrunk_after_prepare() {
+        let err = initrd_size_change_after_prepare_error(5);
+
+        assert!(matches!(
+            err,
+            BootSourceLoadError::PayloadSizeChanged {
+                payload: BootPayloadKind::Initrd,
+                expected_size: 6,
+                actual_size: 5
+            }
+        ));
+    }
+
     #[test]
     fn rejects_kernel_text_offset_overflow() {
         let layout = boot_layout();
