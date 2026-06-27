@@ -1,5 +1,6 @@
 //! Backend-neutral VM runtime boundary.
 
+pub mod boot;
 pub mod memory;
 
 use std::fmt;

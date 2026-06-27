@@ -8,14 +8,15 @@ The current repository defines crate boundaries, endpoint names, a minimal
 HTTP-over-Unix-socket API server for `GET /` and `GET /version`, a backend-neutral VM
 trait, a minimal read-only VMM action/data model, backend-neutral guest
 physical address and aarch64 DRAM layout/access primitives, arm64 boot
-placement helpers, a minimal
+placement helpers, internal boot-source validation and arm64 kernel/initrd
+payload loading, a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
 create/destroy wrapper, typed HVF exit surface, narrow vCPU register wrappers,
 anonymous guest memory allocation for validated runtime layouts, HVF guest
 memory map/unmap ownership for allocated regions, and an initial process
 startup argument model. There is no broader API request body model, guest
-execution, vCPU run loop, MMIO/device emulation, boot register setup, or kernel
-loading yet.
+execution, vCPU run loop, MMIO/device emulation, boot register setup, FDT
+generation, or public boot-source API behavior yet.
 
 ## Firecracker Model Alignment
 
@@ -177,9 +178,9 @@ exist.
 
 | Endpoint | Field | Handling | Notes |
 | --- | --- | --- | --- |
-| `PUT /boot-source` | `kernel_image_path` | required | Host path to the kernel image; future validation must check access without leaking sensitive path details. |
-| `PUT /boot-source` | `initrd_path` | optional | Host path to an initrd; future validation follows the kernel path policy. |
-| `PUT /boot-source` | `boot_args` | optional | Firecracker uses its default kernel command line when omitted; later work should define size and character validation. |
+| `PUT /boot-source` | `kernel_image_path` | required | Host path to the kernel image; future API validation must check access without leaking sensitive path details. The internal runtime loader already validates this shape. |
+| `PUT /boot-source` | `initrd_path` | optional | Host path to an initrd; future API validation follows the kernel path policy. The internal runtime loader rejects explicitly configured empty initrd files. |
+| `PUT /boot-source` | `boot_args` | optional | Firecracker uses its default kernel command line when omitted. The internal runtime loader validates the 2048-byte aarch64 limit including the trailing NUL byte and rejects embedded NUL bytes. |
 | `PUT /boot-source` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /machine-config` | `vcpu_count` | required | Firecracker bounds this to `1..=32`; HVF work must also account for host CPU and thread limits. |
 | `PUT /machine-config` | `mem_size_mib` | required | Drives guest memory allocation and mapping; later work must cover bounds and startup performance. |
@@ -249,17 +250,48 @@ initrd placement is page-aligned immediately before the FDT window when it fits.
 A zero-byte initrd resolves to the FDT address, matching Firecracker's helper
 behavior.
 
+## Internal Boot Source and Payload Loading
+
+The runtime crate has an internal, Firecracker-shaped boot-source model with a
+required kernel image path, optional initrd path, and optional boot arguments.
+This is not wired to `PUT /boot-source` yet; it exists so later API and startup
+work can validate and load payloads through an explicit runtime boundary.
+
+When boot arguments are omitted, the runtime uses Firecracker's default aarch64
+kernel command line. Custom boot arguments are trimmed, must fit in the
+2048-byte aarch64 command-line capacity including the trailing NUL byte, and
+must not contain embedded NUL bytes. The validated bytes are retained for later
+FDT work, but this scaffold still does not write a command line into guest
+memory.
+
+The internal loader supports the arm64 Linux `Image` header shape used by
+Firecracker's aarch64 boot path. It validates the Image magic, text offset, and
+legacy zero-size image behavior, then copies the complete kernel file into
+guest memory at `kernel_load_address + text_offset`. The kernel range must be
+fully backed by guest memory and must end before the reserved FDT address.
+
+An explicitly configured initrd must be a non-empty regular file. It is placed
+with the aarch64 initrd helper immediately before the FDT reservation, must be
+fully backed by guest memory, and must not overlap the loaded kernel range.
+Host path and file errors stay structured so future API code can redact paths
+from user-facing messages.
+
+The loader intentionally uses bangbang's safe `GuestMemory::write_slice` API and
+does not expose new raw host-memory pointers. Direct `linux-loader`/`vm-memory`
+integration is deferred until the project decides whether to add a narrow
+adapter or adopt `vm-memory` more broadly.
+
 The HVF backend can map allocated guest memory regions into an existing
 Hypervisor.framework VM with read/write/execute guest RAM permissions. The
 backend-owned mapping owner consumes the `GuestMemory` allocation, unmaps mapped
 regions on explicit unmap, partial failure, drop, and VM destruction, and keeps
 cleanup local to the backend instance.
 
-This still is not bootable guest RAM. bangbang does not write
-kernel/initrd/FDT payloads, wire `mem_size_mib` into public startup behavior,
-or start a guest. Later API and startup work still needs to decide whether an
-oversized `mem_size_mib` request should be rejected before layout construction
-or should preserve Firecracker's architecture-helper truncation behavior.
+This still is not bootable guest RAM. bangbang does not write FDT payloads, wire
+`mem_size_mib` into public startup behavior, configure boot registers, or start
+a guest. Later API and startup work still needs to decide whether an oversized
+`mem_size_mib` request should be rejected before layout construction or should
+preserve Firecracker's architecture-helper truncation behavior.
 
 ## API State and Response Policy
 
