@@ -1,7 +1,9 @@
 use std::collections::TryReserveError;
 use std::fmt;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::memory::{
@@ -567,8 +569,7 @@ fn open_payload_file(
         return Err(BootSourceLoadError::EmptyPath { payload });
     }
 
-    let file =
-        File::open(path).map_err(|source| BootSourceLoadError::OpenFile { payload, source })?;
+    let file = open_payload_file_read_only(path, payload)?;
     let metadata = file
         .metadata()
         .map_err(|source| BootSourceLoadError::ReadMetadata { payload, source })?;
@@ -583,6 +584,23 @@ fn open_payload_file(
     }
 
     Ok((file, size))
+}
+
+fn open_payload_file_read_only(
+    path: &Path,
+    payload: BootPayloadKind,
+) -> Result<File, BootSourceLoadError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+
+    options
+        .open(path)
+        .map_err(|source| BootSourceLoadError::OpenFile { payload, source })
 }
 
 fn read_payload_file(
@@ -865,8 +883,10 @@ fn memory_contains_range(memory: &GuestMemory, range: GuestMemoryRange) -> bool 
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CString;
     use std::fs::{self, OpenOptions};
-    use std::io::Write;
+    use std::io::{self, Write};
+    use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -961,6 +981,24 @@ mod tests {
     fn temp_dir(name: &str) -> TempPath {
         let path = temp_path(name);
         fs::create_dir(&path).expect("test directory should be created");
+        TempPath { path }
+    }
+
+    fn temp_fifo(name: &str) -> TempPath {
+        let path = temp_path(name);
+        let c_path = CString::new(path.as_os_str().as_bytes())
+            .expect("test FIFO path should not contain NUL");
+
+        // SAFETY: `c_path` is a NUL-terminated path built from the test path
+        // and lives for the duration of the call.
+        let result = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        if result != 0 {
+            panic!(
+                "test FIFO should be created: {}",
+                io::Error::last_os_error()
+            );
+        }
+
         TempPath { path }
     }
 
@@ -1180,6 +1218,25 @@ mod tests {
         let err = source
             .load(&layout, &mut memory)
             .expect_err("directory kernel path should fail");
+
+        assert!(matches!(
+            err,
+            BootSourceLoadError::NonRegularFile {
+                payload: BootPayloadKind::Kernel
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_fifo_kernel_without_blocking() {
+        let layout = boot_layout();
+        let mut memory = boot_memory(&layout);
+        let kernel_fifo = temp_fifo("kernel-fifo");
+        let source = BootSource::new(kernel_fifo.as_path());
+
+        let err = source
+            .load(&layout, &mut memory)
+            .expect_err("FIFO kernel path should fail without blocking");
 
         assert!(matches!(
             err,
@@ -1489,6 +1546,27 @@ mod tests {
         let err = source
             .load(&layout, &mut memory)
             .expect_err("directory initrd path should fail");
+
+        assert!(matches!(
+            err,
+            BootSourceLoadError::NonRegularFile {
+                payload: BootPayloadKind::Initrd
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_fifo_initrd_without_blocking() {
+        let layout = boot_layout();
+        let mut memory = boot_memory(&layout);
+        let kernel_bytes = arm64_image(TEST_KERNEL_TEXT_OFFSET, 4096, 4096);
+        let kernel_file = temp_file("kernel", &kernel_bytes);
+        let initrd_fifo = temp_fifo("initrd-fifo");
+        let source = BootSource::new(kernel_file.as_path()).with_initrd_path(initrd_fifo.as_path());
+
+        let err = source
+            .load(&layout, &mut memory)
+            .expect_err("FIFO initrd path should fail without blocking");
 
         assert!(matches!(
             err,
