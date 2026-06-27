@@ -1430,6 +1430,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_empty_initrd_path() {
+        let layout = boot_layout();
+        let mut memory = boot_memory(&layout);
+        let kernel_bytes = arm64_image(TEST_KERNEL_TEXT_OFFSET, 4096, 4096);
+        let kernel_file = temp_file("kernel", &kernel_bytes);
+        let source = BootSource::new(kernel_file.as_path()).with_initrd_path(PathBuf::new());
+
+        let err = source
+            .load(&layout, &mut memory)
+            .expect_err("empty initrd path should fail");
+
+        assert!(matches!(
+            err,
+            BootSourceLoadError::EmptyPath {
+                payload: BootPayloadKind::Initrd
+            }
+        ));
+    }
+
+    #[test]
     fn rejects_non_regular_kernel_file() {
         let layout = boot_layout();
         let mut memory = boot_memory(&layout);
@@ -1665,6 +1685,28 @@ mod tests {
                 text_offset: u64::MAX,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn rejects_kernel_range_end_overflow() {
+        let layout = boot_layout();
+        let mut memory = boot_memory(&layout);
+        let text_offset = u64::MAX - aarch64::kernel_load_address().raw_value() - 1;
+        let kernel_bytes = arm64_image(text_offset, 4096, 4096);
+        let kernel_file = temp_file("range-overflow-kernel", &kernel_bytes);
+        let source = BootSource::new(kernel_file.as_path());
+
+        let err = source
+            .load(&layout, &mut memory)
+            .expect_err("kernel range end overflow should fail");
+
+        assert!(matches!(
+            err,
+            BootSourceLoadError::PayloadRangeInvalid {
+                payload: BootPayloadKind::Kernel,
+                ..
+            }
         ));
     }
 
