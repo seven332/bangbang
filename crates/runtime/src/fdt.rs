@@ -280,7 +280,7 @@ impl fmt::Display for Arm64FdtError {
                 fdt_address,
             } => write!(
                 f,
-                "arm64 FDT initrd end address {end_exclusive} overlaps reserved FDT address {fdt_address}"
+                "arm64 FDT initrd range ending at {end_exclusive} overlaps reserved FDT window starting at {fdt_address}"
             ),
             Self::InvalidGicRegion { name, region } => write!(
                 f,
@@ -1254,6 +1254,16 @@ mod tests {
                     .expect("test initrd end should not overflow"),
                 fdt_address,
             }
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "arm64 FDT initrd range ending at {} overlaps reserved FDT window starting at {}",
+                fdt_address
+                    .checked_add(1)
+                    .expect("test initrd end should not overflow"),
+                fdt_address
+            )
         );
     }
 
