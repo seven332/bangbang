@@ -12,12 +12,13 @@ placement helpers, internal boot-source validation and arm64 kernel/initrd
 payload loading, a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
 create/destroy wrapper, typed HVF exit surface, narrow vCPU register wrappers,
-internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, anonymous guest
-memory allocation for validated runtime layouts, HVF guest memory map/unmap
-ownership for allocated regions, and an initial process startup argument model.
+internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, minimal internal
+arm64 FDT generation and guest-memory writes, anonymous guest memory allocation
+for validated runtime layouts, HVF guest memory map/unmap ownership for
+allocated regions, and an initial process startup argument model.
 There is no broader API request body model, guest execution, vCPU run loop,
-interrupt injection, MMIO/device emulation, boot register setup, FDT generation,
-or public boot-source API behavior yet.
+interrupt injection, MMIO/device emulation, boot register setup, or public
+boot-source API behavior yet.
 
 ## Firecracker Model Alignment
 
@@ -264,8 +265,9 @@ command-line parsing shape: leading and trailing boot/init-argument whitespace
 is trimmed, the first unquoted ` -- ` separates init args, and the normalized
 bytes must fit in the 2048-byte aarch64 command-line capacity including the
 trailing NUL byte. Embedded NUL bytes and init args without boot args are
-rejected. The validated bytes are retained for later FDT work, but this scaffold
-still does not write a command line into guest memory.
+rejected. The validated command-line text is now available to the internal FDT
+builder as the `chosen.bootargs` property, but this remains internal and is not
+wired to public API behavior yet.
 
 The internal loader supports the arm64 Linux `Image` header shape used by
 Firecracker's aarch64 boot path. It validates the Image magic, text offset, and
@@ -284,6 +286,27 @@ does not expose new raw host-memory pointers. Direct `linux-loader`/`vm-memory`
 integration is deferred until the project decides whether to add a narrow
 adapter or adopt `vm-memory` more broadly.
 
+## Internal arm64 FDT Generation
+
+The runtime crate can build a minimal Firecracker-shaped arm64 FDT using the
+same `vm-fdt` writer crate that Firecracker uses. The generated tree currently
+contains root properties, CPU data, memory, chosen, timer, PSCI, and GIC nodes.
+It intentionally omits serial, RTC, virtio, PCI, vmgenid, vmclock, and other
+device nodes until the corresponding emulation paths exist.
+
+The memory node excludes the first 2 MiB system area from the first DRAM range
+and preserves later DRAM ranges from the runtime layout. The chosen node carries
+boot arguments and optional initrd start/end properties from loaded boot-source
+metadata. The GIC node consumes backend-neutral distributor and redistributor
+metadata, advertises `arm,gic-v3`, and does not emit an ITS/MSI child while the
+HVF metadata has no MSI support.
+
+FDT bytes are built before guest memory is touched, checked against the reserved
+2 MiB FDT window, and then copied with `GuestMemory::write_slice` at the
+aarch64 FDT address. Oversized, overflowing, or unbacked writes fail before a
+partial copy. The write result records the FDT guest address and byte size for
+future boot-register setup.
+
 The HVF backend can map allocated guest memory regions into an existing
 Hypervisor.framework VM with read/write/execute guest RAM permissions. The
 backend-owned mapping owner consumes the `GuestMemory` allocation, unmaps mapped
@@ -296,12 +319,14 @@ symbols so older hosts can return structured unsupported errors instead of
 failing at process load time. The backend exposes internal boot metadata for the
 future FDT path: distributor and redistributor regions below the 1 GiB MMIO32
 boundary, the supported SPI range, timer interrupt IDs, and the `arm,gic-v3`
-compatibility shape. MSI/ITS metadata is intentionally absent until a later
+compatibility shape. HVF timer INTIDs are converted to FDT PPI cells for the
+runtime timer node, and MSI/ITS metadata is intentionally absent until a later
 device path needs it.
 
-This still is not bootable guest RAM. bangbang does not write FDT payloads, wire
-`mem_size_mib` into public startup behavior, inject interrupts, configure boot
-registers, or start a guest. Later API and startup work still needs to decide whether an oversized
+This still is not bootable guest RAM. bangbang can now write an internal FDT
+payload, but it does not wire `mem_size_mib` into public startup behavior,
+inject interrupts, configure boot registers, emulate devices, or start a guest.
+Later API and startup work still needs to decide whether an oversized
 `mem_size_mib` request should be rejected before layout construction or should
 preserve Firecracker's architecture-helper truncation behavior.
 
