@@ -1273,6 +1273,54 @@ mod tests {
         ));
     }
 
+    fn kernel_size_change_after_prepare_error(new_size: u64) -> BootSourceLoadError {
+        let layout = boot_layout();
+        let memory = boot_memory(&layout);
+        let kernel_bytes = arm64_image(TEST_KERNEL_TEXT_OFFSET, 4096, 4096);
+        let kernel_file = temp_file("resized-kernel", &kernel_bytes);
+        let prepared = super::prepare_kernel_payload(kernel_file.as_path(), &layout, &memory)
+            .expect("initial valid kernel should prepare");
+        let file = OpenOptions::new()
+            .write(true)
+            .open(kernel_file.as_path())
+            .expect("prepared kernel file should reopen for resize");
+
+        file.set_len(new_size)
+            .expect("prepared kernel file should resize");
+        drop(file);
+
+        super::load_kernel_payload(prepared.file, prepared.size, &layout, &memory)
+            .expect_err("resized kernel should be rejected after final read")
+    }
+
+    #[test]
+    fn rejects_kernel_grown_after_prepare() {
+        let err = kernel_size_change_after_prepare_error(4097);
+
+        assert!(matches!(
+            err,
+            BootSourceLoadError::PayloadSizeChanged {
+                payload: BootPayloadKind::Kernel,
+                expected_size: 4096,
+                actual_size: 4097
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_kernel_shrunk_after_prepare() {
+        let err = kernel_size_change_after_prepare_error(4095);
+
+        assert!(matches!(
+            err,
+            BootSourceLoadError::PayloadSizeChanged {
+                payload: BootPayloadKind::Kernel,
+                expected_size: 4096,
+                actual_size: 4095
+            }
+        ));
+    }
+
     #[test]
     fn rejects_kernel_text_offset_overflow() {
         let layout = boot_layout();
