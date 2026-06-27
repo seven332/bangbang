@@ -123,7 +123,7 @@ impl RunnerVcpu for RealRunnerVcpu {
 }
 
 impl<'vm> HvfVcpuRunner<'vm> {
-    pub(crate) fn new(_: &'vm HvfBackend) -> Result<Self, HvfVcpuRunnerError> {
+    pub(crate) fn new() -> Result<Self, HvfVcpuRunnerError> {
         Self::from_started(
             spawn_runner_thread(RealRunnerVcpu::create)?,
             real_cancel_vcpu(),

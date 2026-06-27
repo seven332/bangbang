@@ -176,7 +176,7 @@ impl fmt::Debug for HvfVcpuOwner {
 }
 
 impl<'vm> HvfVcpu<'vm> {
-    pub(crate) fn new(_: &'vm mut HvfBackend) -> Result<Self, BackendError> {
+    pub(crate) fn new() -> Result<Self, BackendError> {
         Ok(Self {
             owner: HvfVcpuOwner::new()?,
             _vm: PhantomData,
