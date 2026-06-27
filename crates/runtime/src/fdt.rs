@@ -124,6 +124,11 @@ pub struct Arm64FdtGuestMemoryWrite {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Arm64FdtError {
     MissingCpu,
+    DuplicateCpuReg {
+        first_index: usize,
+        second_index: usize,
+        reg: u64,
+    },
     InvalidLayout {
         source: GuestMemoryError,
     },
@@ -181,6 +186,14 @@ impl fmt::Display for Arm64FdtError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingCpu => f.write_str("arm64 FDT requires at least one CPU"),
+            Self::DuplicateCpuReg {
+                first_index,
+                second_index,
+                reg,
+            } => write!(
+                f,
+                "arm64 FDT CPU reg values must be distinct: CPU {first_index} and CPU {second_index} both use 0x{reg:x}"
+            ),
             Self::InvalidLayout { source } => {
                 write!(f, "invalid arm64 FDT memory layout: {source}")
             }
@@ -251,6 +264,7 @@ impl std::error::Error for Arm64FdtError {
             Self::CreateFdt { source } => Some(source),
             Self::GuestMemoryWrite { source } => Some(source),
             Self::MissingCpu
+            | Self::DuplicateCpuReg { .. }
             | Self::NoGuestMemoryAfterSystemArea { .. }
             | Self::InvalidDramStart { .. }
             | Self::InitrdEndOverflow { .. }
@@ -309,6 +323,7 @@ fn validate_config(config: &Arm64FdtConfig<'_>) -> Result<(), Arm64FdtError> {
         return Err(Arm64FdtError::MissingCpu);
     }
 
+    validate_cpu_regs(config.vcpu_mpidrs)?;
     memory_reg_cells(config.layout)?;
     validate_gic(config.gic)?;
     validate_timer(config.timer)?;
@@ -325,6 +340,28 @@ fn validate_config(config: &Arm64FdtConfig<'_>) -> Result<(), Arm64FdtError> {
     Ok(())
 }
 
+fn validate_cpu_regs(mpidrs: &[u64]) -> Result<(), Arm64FdtError> {
+    for (first_index, first_reg) in mpidrs.iter().copied().map(cpu_reg).enumerate() {
+        for (second_index, second_reg) in mpidrs
+            .iter()
+            .copied()
+            .map(cpu_reg)
+            .enumerate()
+            .skip(first_index + 1)
+        {
+            if first_reg == second_reg {
+                return Err(Arm64FdtError::DuplicateCpuReg {
+                    first_index,
+                    second_index,
+                    reg: first_reg,
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn create_cpu_nodes(fdt: &mut FdtWriter, mpidrs: &[u64]) -> Result<(), Arm64FdtError> {
     let cpus = fdt.begin_node("cpus")?;
     fdt.property_u32("#address-cells", CPU_ADDRESS_CELLS)?;
@@ -335,12 +372,16 @@ fn create_cpu_nodes(fdt: &mut FdtWriter, mpidrs: &[u64]) -> Result<(), Arm64FdtE
         fdt.property_string("device_type", "cpu")?;
         fdt.property_string("compatible", "arm,arm-v8")?;
         fdt.property_string("enable-method", "psci")?;
-        fdt.property_u64("reg", mpidr & CPU_REG_MASK)?;
+        fdt.property_u64("reg", cpu_reg(mpidr))?;
         fdt.end_node(cpu)?;
     }
 
     fdt.end_node(cpus)?;
     Ok(())
+}
+
+const fn cpu_reg(mpidr: u64) -> u64 {
+    mpidr & CPU_REG_MASK
 }
 
 fn create_memory_node(
@@ -1058,6 +1099,33 @@ mod tests {
         let err = build_arm64_fdt(&config).expect_err("missing CPU should fail");
 
         assert_eq!(err, Arm64FdtError::MissingCpu);
+    }
+
+    #[test]
+    fn rejects_duplicate_cpu_reg_values() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let mpidrs = [0, CPU_REG_MASK + 1];
+        let config = Arm64FdtConfig {
+            vcpu_mpidrs: &mpidrs,
+            ..test_config(
+                &layout,
+                Arm64FdtBootInfo {
+                    command_line: "panic=1",
+                    initrd: None,
+                },
+            )
+        };
+
+        let err = build_arm64_fdt(&config).expect_err("duplicate CPU reg should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::DuplicateCpuReg {
+                first_index: 0,
+                second_index: 1,
+                reg: 0,
+            }
+        );
     }
 
     #[test]
