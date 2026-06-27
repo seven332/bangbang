@@ -20,6 +20,7 @@ const ARM64_IMAGE_MAGIC_OFFSET: usize = 56;
 const ARM64_IMAGE_MAGIC: u32 = 0x644d_5241;
 const ARM64_LEGACY_TEXT_OFFSET: u64 = 0x80000;
 const ARM64_BASE_ALIGNMENT: u64 = 0x20_0000;
+const INIT_ARGS_SEPARATOR: &str = " -- ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootSource {
@@ -318,6 +319,7 @@ impl std::error::Error for BootSourceLoadError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootCommandLineError {
     ContainsNul,
+    MissingBootArgs,
     TooLarge {
         size_with_nul: usize,
         max_size: usize,
@@ -328,6 +330,7 @@ impl fmt::Display for BootCommandLineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ContainsNul => f.write_str("contains a NUL byte"),
+            Self::MissingBootArgs => f.write_str("contains init args without boot args"),
             Self::TooLarge {
                 size_with_nul,
                 max_size,
@@ -482,6 +485,7 @@ fn validate_command_line(
             BootCommandLineError::ContainsNul,
         ));
     }
+    let text = canonical_command_line_text(text)?;
 
     let size_with_nul = text
         .len()
@@ -506,9 +510,41 @@ fn validate_command_line(
     bytes_with_nul.push(0);
 
     Ok(KernelCommandLine {
-        text: text.to_string(),
+        text,
         bytes_with_nul,
     })
+}
+
+fn canonical_command_line_text(raw: &str) -> Result<String, BootSourceLoadError> {
+    let (boot_args, init_args) = split_command_line(raw);
+    let boot_args = boot_args.trim();
+    let init_args = init_args.trim();
+
+    if boot_args.is_empty() && !init_args.is_empty() {
+        return Err(BootSourceLoadError::CommandLine(
+            BootCommandLineError::MissingBootArgs,
+        ));
+    }
+
+    if init_args.is_empty() {
+        Ok(boot_args.to_string())
+    } else {
+        Ok(format!("{boot_args}{INIT_ARGS_SEPARATOR}{init_args}"))
+    }
+}
+
+fn split_command_line(raw: &str) -> (&str, &str) {
+    match raw
+        .match_indices(INIT_ARGS_SEPARATOR)
+        .find(|(index, _)| separator_is_outside_double_quotes(&raw[..*index]))
+    {
+        Some((index, _)) => (&raw[..index], &raw[(index + INIT_ARGS_SEPARATOR.len())..]),
+        None => (raw, ""),
+    }
+}
+
+fn separator_is_outside_double_quotes(prefix: &str) -> bool {
+    prefix.matches('"').count().is_multiple_of(2)
 }
 
 fn prepare_kernel_payload(
@@ -1112,7 +1148,7 @@ mod tests {
         let mut memory = boot_memory(&layout);
         let kernel_bytes = arm64_image(TEST_KERNEL_TEXT_OFFSET, 4096, 4096);
         let kernel_file = temp_file("kernel", &kernel_bytes);
-        let source = BootSource::new(kernel_file.as_path()).with_boot_args("");
+        let source = BootSource::new(kernel_file.as_path()).with_boot_args("   ");
 
         let loaded = source
             .load(&layout, &mut memory)
@@ -1123,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_custom_command_line_whitespace() {
+    fn trims_custom_command_line_whitespace() {
         let layout = boot_layout();
         let mut memory = boot_memory(&layout);
         let kernel_bytes = arm64_image(TEST_KERNEL_TEXT_OFFSET, 4096, 4096);
@@ -1132,10 +1168,50 @@ mod tests {
 
         let loaded = source
             .load(&layout, &mut memory)
-            .expect("custom command line should preserve whitespace");
+            .expect("custom command line should trim whitespace");
 
-        assert_eq!(loaded.command_line.as_str(), " console=hvc0 ");
-        assert_eq!(loaded.command_line.as_bytes_with_nul(), b" console=hvc0 \0");
+        assert_eq!(loaded.command_line.as_str(), "console=hvc0");
+        assert_eq!(loaded.command_line.as_bytes_with_nul(), b"console=hvc0\0");
+    }
+
+    #[test]
+    fn normalizes_custom_command_line_init_args_separator() {
+        let layout = boot_layout();
+        let mut memory = boot_memory(&layout);
+        let kernel_bytes = arm64_image(TEST_KERNEL_TEXT_OFFSET, 4096, 4096);
+        let kernel_file = temp_file("kernel", &kernel_bytes);
+        let source =
+            BootSource::new(kernel_file.as_path()).with_boot_args(" console=hvc0  --  /init ");
+
+        let loaded = source
+            .load(&layout, &mut memory)
+            .expect("custom command line should normalize init args separator");
+
+        assert_eq!(loaded.command_line.as_str(), "console=hvc0 -- /init");
+        assert_eq!(
+            loaded.command_line.as_bytes_with_nul(),
+            b"console=hvc0 -- /init\0"
+        );
+    }
+
+    #[test]
+    fn keeps_quoted_init_args_separator_in_boot_args() {
+        let layout = boot_layout();
+        let mut memory = boot_memory(&layout);
+        let kernel_bytes = arm64_image(TEST_KERNEL_TEXT_OFFSET, 4096, 4096);
+        let kernel_file = temp_file("kernel", &kernel_bytes);
+        let source =
+            BootSource::new(kernel_file.as_path()).with_boot_args(" a=\"b -- c\" d -- /init ");
+
+        let loaded = source
+            .load(&layout, &mut memory)
+            .expect("quoted init args separator should stay in boot args");
+
+        assert_eq!(loaded.command_line.as_str(), "a=\"b -- c\" d -- /init");
+        assert_eq!(
+            loaded.command_line.as_bytes_with_nul(),
+            b"a=\"b -- c\" d -- /init\0"
+        );
     }
 
     #[test]
@@ -1178,7 +1254,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_command_line_over_limit_without_trimming() {
+    fn trims_custom_command_line_before_size_check() {
         let layout = boot_layout();
         let mut memory = boot_memory(&layout);
         let kernel_bytes = arm64_image(TEST_KERNEL_TEXT_OFFSET, 4096, 4096);
@@ -1186,13 +1262,31 @@ mod tests {
         let boot_args = format!("{} ", "a".repeat(aarch64::CMDLINE_MAX_SIZE - 1));
         let source = BootSource::new(kernel_file.as_path()).with_boot_args(boot_args);
 
+        let loaded = source
+            .load(&layout, &mut memory)
+            .expect("command line should be sized after trimming");
+
+        assert_eq!(
+            loaded.command_line.as_bytes_with_nul().len(),
+            aarch64::CMDLINE_MAX_SIZE
+        );
+    }
+
+    #[test]
+    fn rejects_init_args_without_boot_args() {
+        let layout = boot_layout();
+        let mut memory = boot_memory(&layout);
+        let kernel_bytes = arm64_image(TEST_KERNEL_TEXT_OFFSET, 4096, 4096);
+        let kernel_file = temp_file("kernel", &kernel_bytes);
+        let source = BootSource::new(kernel_file.as_path()).with_boot_args(" -- /init");
+
         let err = source
             .load(&layout, &mut memory)
-            .expect_err("oversized command line with trailing whitespace should fail");
+            .expect_err("init args without boot args should fail");
 
         assert!(matches!(
             err,
-            BootSourceLoadError::CommandLine(BootCommandLineError::TooLarge { .. })
+            BootSourceLoadError::CommandLine(BootCommandLineError::MissingBootArgs)
         ));
     }
 
