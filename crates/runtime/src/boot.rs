@@ -392,6 +392,13 @@ impl std::error::Error for KernelImageError {}
 #[derive(Debug)]
 struct PreparedKernelPayload {
     file: File,
+    size: u64,
+    loaded: LoadedKernel,
+}
+
+#[derive(Debug)]
+struct KernelPayload {
+    bytes: Vec<u8>,
     loaded: LoadedKernel,
 }
 
@@ -414,16 +421,21 @@ pub fn load_boot_source(
     memory: &mut GuestMemory,
 ) -> Result<LoadedBootSource, BootSourceLoadError> {
     let command_line = validate_command_line(source.boot_args())?;
-    let kernel = prepare_kernel_payload(source.kernel_image_path(), layout, memory)?;
+    let prepared_kernel = prepare_kernel_payload(source.kernel_image_path(), layout, memory)?;
     let initrd = match source.initrd_path() {
         Some(path) => Some(prepare_initrd_payload(path, layout, memory)?),
         None => None,
     };
+
+    if let Some(initrd_payload) = &initrd {
+        validate_payloads_do_not_overlap(&prepared_kernel.loaded, &initrd_payload.loaded)?;
+    }
+
+    let kernel = load_kernel_payload(prepared_kernel.file, prepared_kernel.size, layout, memory)?;
     if let Some(initrd_payload) = &initrd {
         validate_payloads_do_not_overlap(&kernel.loaded, &initrd_payload.loaded)?;
     }
 
-    let kernel_bytes = read_payload_file(kernel.file, BootPayloadKind::Kernel, kernel.loaded.size)?;
     let initrd_bytes = match initrd {
         Some(initrd_payload) => Some((
             read_payload_file(
@@ -437,7 +449,7 @@ pub fn load_boot_source(
     };
 
     memory
-        .write_slice(&kernel_bytes, kernel.loaded.load_address)
+        .write_slice(&kernel.bytes, kernel.loaded.load_address)
         .map_err(|source| BootSourceLoadError::GuestMemoryWrite {
             payload: BootPayloadKind::Kernel,
             source,
@@ -511,46 +523,9 @@ fn prepare_kernel_payload(
         BootPayloadKind::Kernel,
     )?;
     let header = read_arm64_image_header(&mut file, size)?;
-    let base_address = aarch64::kernel_load_address();
+    let loaded = loaded_kernel_from_arm64_header(header, size, layout, memory)?;
 
-    if !base_address
-        .raw_value()
-        .is_multiple_of(ARM64_BASE_ALIGNMENT)
-    {
-        return Err(BootSourceLoadError::KernelImage(
-            KernelImageError::BaseAddressNotAligned {
-                address: base_address,
-                alignment: ARM64_BASE_ALIGNMENT,
-            },
-        ));
-    }
-
-    let text_offset = if header.image_size == 0 {
-        ARM64_LEGACY_TEXT_OFFSET
-    } else {
-        header.text_offset
-    };
-    let load_address =
-        base_address
-            .checked_add(text_offset)
-            .ok_or(BootSourceLoadError::KernelImage(
-                KernelImageError::LoadAddressOverflow {
-                    base_address,
-                    text_offset,
-                },
-            ))?;
-
-    validate_kernel_range(layout, memory, load_address, size, BootPayloadKind::Kernel)?;
-
-    Ok(PreparedKernelPayload {
-        file,
-        loaded: LoadedKernel {
-            base_address,
-            load_address,
-            entry_address: load_address,
-            size,
-        },
-    })
+    Ok(PreparedKernelPayload { file, size, loaded })
 }
 
 fn prepare_initrd_payload(
@@ -569,6 +544,19 @@ fn prepare_initrd_payload(
         file,
         loaded: LoadedInitrd { address, size },
     })
+}
+
+fn load_kernel_payload(
+    file: File,
+    size: u64,
+    layout: &GuestMemoryLayout,
+    memory: &GuestMemory,
+) -> Result<KernelPayload, BootSourceLoadError> {
+    let bytes = read_payload_file(file, BootPayloadKind::Kernel, size)?;
+    let header = parse_arm64_image_header(&bytes)?;
+    let loaded = loaded_kernel_from_arm64_header(header, size, layout, memory)?;
+
+    Ok(KernelPayload { bytes, loaded })
 }
 
 fn open_payload_file(
@@ -612,19 +600,18 @@ fn read_payload_file(
                 payload,
                 size: expected_size,
             })?;
-    let expected_size_usize = usize::try_from(expected_size).map_err(|_| {
-        BootSourceLoadError::PayloadTooLargeForHost {
+    let read_limit_usize =
+        usize::try_from(read_limit).map_err(|_| BootSourceLoadError::PayloadTooLargeForHost {
             payload,
-            size: expected_size,
-        }
-    })?;
+            size: read_limit,
+        })?;
     let mut bytes = Vec::new();
     bytes
-        .try_reserve_exact(expected_size_usize)
+        .try_reserve_exact(read_limit_usize)
         .map_err(
             |source| BootSourceLoadError::PayloadBufferAllocationFailed {
                 payload,
-                size: expected_size_usize,
+                size: read_limit_usize,
                 source,
             },
         )?;
@@ -697,6 +684,51 @@ fn parse_arm64_image_header(bytes: &[u8]) -> Result<Arm64ImageHeader, BootSource
     }
 
     Ok(header)
+}
+
+fn loaded_kernel_from_arm64_header(
+    header: Arm64ImageHeader,
+    size: u64,
+    layout: &GuestMemoryLayout,
+    memory: &GuestMemory,
+) -> Result<LoadedKernel, BootSourceLoadError> {
+    let base_address = aarch64::kernel_load_address();
+
+    if !base_address
+        .raw_value()
+        .is_multiple_of(ARM64_BASE_ALIGNMENT)
+    {
+        return Err(BootSourceLoadError::KernelImage(
+            KernelImageError::BaseAddressNotAligned {
+                address: base_address,
+                alignment: ARM64_BASE_ALIGNMENT,
+            },
+        ));
+    }
+
+    let text_offset = if header.image_size == 0 {
+        ARM64_LEGACY_TEXT_OFFSET
+    } else {
+        header.text_offset
+    };
+    let load_address =
+        base_address
+            .checked_add(text_offset)
+            .ok_or(BootSourceLoadError::KernelImage(
+                KernelImageError::LoadAddressOverflow {
+                    base_address,
+                    text_offset,
+                },
+            ))?;
+
+    validate_kernel_range(layout, memory, load_address, size, BootPayloadKind::Kernel)?;
+
+    Ok(LoadedKernel {
+        base_address,
+        load_address,
+        entry_address: load_address,
+        size,
+    })
 }
 
 fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64, BootSourceLoadError> {
@@ -1205,6 +1237,35 @@ mod tests {
         let err = source
             .load(&layout, &mut memory)
             .expect_err("invalid kernel magic should fail");
+
+        assert!(matches!(
+            err,
+            BootSourceLoadError::KernelImage(KernelImageError::InvalidMagic { magic: 0 })
+        ));
+    }
+
+    #[test]
+    fn rejects_kernel_changed_after_prepare() {
+        let layout = boot_layout();
+        let memory = boot_memory(&layout);
+        let kernel_bytes = arm64_image(TEST_KERNEL_TEXT_OFFSET, 4096, 4096);
+        let kernel_file = temp_file("changed-kernel", &kernel_bytes);
+        let prepared = super::prepare_kernel_payload(kernel_file.as_path(), &layout, &memory)
+            .expect("initial valid kernel should prepare");
+        let mut changed_kernel_bytes = kernel_bytes;
+        write_u32_le(&mut changed_kernel_bytes, ARM64_IMAGE_MAGIC_OFFSET, 0);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(kernel_file.as_path())
+            .expect("prepared kernel file should reopen for overwrite");
+
+        file.write_all(&changed_kernel_bytes)
+            .expect("changed kernel should be written");
+        drop(file);
+
+        let err = super::load_kernel_payload(prepared.file, prepared.size, &layout, &memory)
+            .expect_err("changed kernel should be rejected after final read");
 
         assert!(matches!(
             err,
