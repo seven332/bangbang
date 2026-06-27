@@ -382,8 +382,13 @@ impl From<VmFdtError> for Arm64FdtError {
     }
 }
 
+#[derive(Debug)]
+struct ValidatedArm64FdtConfig {
+    memory_reg_cells: Vec<u64>,
+}
+
 pub fn build_arm64_fdt(config: &Arm64FdtConfig<'_>) -> Result<Vec<u8>, Arm64FdtError> {
-    validate_config(config)?;
+    let validated = validate_config(config)?;
 
     let mut fdt = FdtWriter::new()?;
     let root = fdt.begin_node("")?;
@@ -393,7 +398,7 @@ pub fn build_arm64_fdt(config: &Arm64FdtConfig<'_>) -> Result<Vec<u8>, Arm64FdtE
     fdt.property_u32("interrupt-parent", GIC_PHANDLE)?;
 
     create_cpu_nodes(&mut fdt, config.vcpu_mpidrs)?;
-    create_memory_node(&mut fdt, config.layout)?;
+    create_memory_node(&mut fdt, &validated.memory_reg_cells)?;
     create_chosen_node(&mut fdt, config.boot)?;
     create_gic_node(&mut fdt, config.gic)?;
     create_timer_node(&mut fdt, config.timer)?;
@@ -414,7 +419,7 @@ pub fn write_arm64_fdt(
     write_arm64_fdt_bytes(config.layout, memory, &bytes)
 }
 
-fn validate_config(config: &Arm64FdtConfig<'_>) -> Result<(), Arm64FdtError> {
+fn validate_config(config: &Arm64FdtConfig<'_>) -> Result<ValidatedArm64FdtConfig, Arm64FdtError> {
     if config.vcpu_mpidrs.is_empty() {
         return Err(Arm64FdtError::MissingCpu);
     }
@@ -426,9 +431,8 @@ fn validate_config(config: &Arm64FdtConfig<'_>) -> Result<(), Arm64FdtError> {
     }
 
     validate_cpu_regs(config.vcpu_mpidrs)?;
-    memory_reg_cells(config.layout)?;
-    let guest_memory_size = validate_guest_memory_size(config.layout)?;
-    validate_aarch64_dram_layout(config.layout, guest_memory_size)?;
+    validate_memory_layout(config.layout)?;
+    let memory_reg_cells = memory_reg_cells(config.layout)?;
     validate_command_line(config.boot.command_line)?;
     validate_gic(config.layout, config.gic)?;
     validate_timer(config.timer)?;
@@ -437,7 +441,7 @@ fn validate_config(config: &Arm64FdtConfig<'_>) -> Result<(), Arm64FdtError> {
         validate_initrd(config.layout, initrd)?;
     }
 
-    Ok(())
+    Ok(ValidatedArm64FdtConfig { memory_reg_cells })
 }
 
 fn validate_cpu_regs(mpidrs: &[u64]) -> Result<(), Arm64FdtError> {
@@ -497,12 +501,13 @@ fn create_cpu_nodes(fdt: &mut FdtWriter, mpidrs: &[u64]) -> Result<(), Arm64FdtE
     fdt.property_u32("#address-cells", CPU_ADDRESS_CELLS)?;
     fdt.property_u32("#size-cells", CPU_SIZE_CELLS)?;
 
-    for (cpu_index, mpidr) in mpidrs.iter().copied().enumerate() {
-        let cpu = fdt.begin_node(&format!("cpu@{cpu_index:x}"))?;
+    for mpidr in mpidrs.iter().copied() {
+        let reg = cpu_reg(mpidr);
+        let cpu = fdt.begin_node(&format!("cpu@{reg:x}"))?;
         fdt.property_string("device_type", "cpu")?;
         fdt.property_string("compatible", "arm,arm-v8")?;
         fdt.property_string("enable-method", "psci")?;
-        fdt.property_u64("reg", cpu_reg(mpidr))?;
+        fdt.property_u64("reg", reg)?;
         fdt.end_node(cpu)?;
     }
 
@@ -514,13 +519,10 @@ const fn cpu_reg(mpidr: u64) -> u64 {
     mpidr & CPU_REG_MASK
 }
 
-fn create_memory_node(
-    fdt: &mut FdtWriter,
-    layout: &GuestMemoryLayout,
-) -> Result<(), Arm64FdtError> {
+fn create_memory_node(fdt: &mut FdtWriter, reg_cells: &[u64]) -> Result<(), Arm64FdtError> {
     let memory = fdt.begin_node("memory@ram")?;
     fdt.property_string("device_type", "memory")?;
-    fdt.property_array_u64("reg", &memory_reg_cells(layout)?)?;
+    fdt.property_array_u64("reg", reg_cells)?;
     fdt.end_node(memory)?;
     Ok(())
 }
@@ -607,11 +609,19 @@ fn create_psci_node(fdt: &mut FdtWriter) -> Result<(), Arm64FdtError> {
     Ok(())
 }
 
-fn memory_reg_cells(layout: &GuestMemoryLayout) -> Result<Vec<u64>, Arm64FdtError> {
-    let cell_count = memory_reg_cell_count(layout)?;
-    validate_fdt_size(memory_reg_size_lower_bound(cell_count)?)?;
+fn validate_memory_layout(layout: &GuestMemoryLayout) -> Result<(), Arm64FdtError> {
+    validate_memory_reg_size(layout)?;
+    validate_memory_ranges(layout)?;
+    let guest_memory_size = validate_guest_memory_size(layout)?;
+    validate_aarch64_dram_layout(layout, guest_memory_size)
+}
 
-    let mut cells = Vec::with_capacity(cell_count);
+fn validate_memory_reg_size(layout: &GuestMemoryLayout) -> Result<(), Arm64FdtError> {
+    let cell_count = memory_reg_cell_count(layout)?;
+    validate_fdt_size(memory_reg_size_lower_bound(cell_count)?)
+}
+
+fn validate_memory_ranges(layout: &GuestMemoryLayout) -> Result<(), Arm64FdtError> {
     let mmio64_gap = mmio64_gap_range()?;
     for (range_index, range) in layout.ranges().iter().copied().enumerate() {
         if range_index == 0 {
@@ -627,7 +637,18 @@ fn memory_reg_cells(layout: &GuestMemoryLayout) -> Result<Vec<u64>, Arm64FdtErro
                     system_size: aarch64::SYSTEM_MEM_SIZE,
                 });
             }
-            validate_memory_range_excludes_mmio64_gap(range, mmio64_gap)?;
+        }
+
+        validate_memory_range_excludes_mmio64_gap(range, mmio64_gap)?;
+    }
+
+    Ok(())
+}
+
+fn memory_reg_cells(layout: &GuestMemoryLayout) -> Result<Vec<u64>, Arm64FdtError> {
+    let mut cells = Vec::with_capacity(memory_reg_cell_count(layout)?);
+    for (range_index, range) in layout.ranges().iter().copied().enumerate() {
+        if range_index == 0 {
             let start = range.start().checked_add(aarch64::SYSTEM_MEM_SIZE).ok_or(
                 Arm64FdtError::InvalidLayout {
                     source: GuestMemoryError::AddressOverflow {
@@ -637,9 +658,14 @@ fn memory_reg_cells(layout: &GuestMemoryLayout) -> Result<Vec<u64>, Arm64FdtErro
                 },
             )?;
             cells.push(start.raw_value());
-            cells.push(range.size() - aarch64::SYSTEM_MEM_SIZE);
+            let size = range.size().checked_sub(aarch64::SYSTEM_MEM_SIZE).ok_or(
+                Arm64FdtError::NoGuestMemoryAfterSystemArea {
+                    first_range: range,
+                    system_size: aarch64::SYSTEM_MEM_SIZE,
+                },
+            )?;
+            cells.push(size);
         } else {
-            validate_memory_range_excludes_mmio64_gap(range, mmio64_gap)?;
             cells.push(range.start().raw_value());
             cells.push(range.size());
         }
@@ -1860,6 +1886,35 @@ mod tests {
                 reg: 0,
             }
         );
+    }
+
+    #[test]
+    fn cpu_node_names_use_cpu_reg_values() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let mpidrs = [0, 2];
+        let config = Arm64FdtConfig {
+            vcpu_mpidrs: &mpidrs,
+            ..test_config(
+                &layout,
+                Arm64FdtBootInfo {
+                    command_line: "panic=1",
+                    initrd: None,
+                },
+            )
+        };
+
+        let bytes = build_arm64_fdt(&config).expect("FDT should be built");
+        let tree = DeviceTree::load(&bytes).expect("FDT should parse");
+
+        assert_eq!(
+            required_node(&tree, "/cpus/cpu@0").prop_u64("reg").unwrap(),
+            0
+        );
+        assert_eq!(
+            required_node(&tree, "/cpus/cpu@2").prop_u64("reg").unwrap(),
+            2
+        );
+        assert!(tree.find("/cpus/cpu@1").is_none());
     }
 
     #[test]
