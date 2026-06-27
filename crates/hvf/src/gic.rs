@@ -1183,6 +1183,37 @@ mod tests {
     }
 
     #[test]
+    fn create_gic_releases_config_after_create_failure() {
+        let api = FakeGicApi::default().with_failure("hv_gic_create");
+
+        assert_eq!(
+            create_gic_with_api(&api),
+            Err(HvfGicError::Backend(BackendError::Hypervisor(
+                "injected hv_gic_create failure".to_string()
+            )))
+        );
+        assert_eq!(
+            api.calls(),
+            vec![
+                "hv_gic_get_distributor_size",
+                "hv_gic_get_distributor_base_alignment",
+                "hv_gic_get_redistributor_region_size",
+                "hv_gic_get_redistributor_size",
+                "hv_gic_get_redistributor_base_alignment",
+                "hv_gic_get_spi_interrupt_range",
+                "hv_gic_get_intid",
+                "hv_gic_get_intid",
+                "hv_gic_config_create",
+                "hv_gic_config_set_distributor_base",
+                "hv_gic_config_set_redistributor_base",
+                "hv_gic_create",
+                "os_release",
+            ]
+        );
+        assert_eq!(api.released_configs(), vec![1]);
+    }
+
+    #[test]
     fn config_guard_releases_on_drop() {
         let api = FakeGicApi::default();
 
