@@ -5,6 +5,7 @@ bangbang is a Rust VMM project for macOS hosts. The public control plane is inte
 This repository is currently a scaffold. It defines crate boundaries, an initial Firecracker-compatible API socket, a process startup CLI, a minimal internal VMM action model, a backend trait, a backend-neutral guest address/layout model, anonymous guest memory allocation and byte access, arm64 boot placement helpers, internal boot-source validation with arm64 kernel/initrd payload loading, minimal arm64 FDT generation and guest-memory writes, and the smallest Hypervisor.framework VM, GIC boot metadata, guest memory map/unmap ownership, current-thread vCPU lifecycle, typed exit surface, register wrappers, and cancellable vCPU runner skeleton.
 
 See [Firecracker Compatibility Scope](docs/firecracker-compatibility.md) for the intended compatibility target and current limitations.
+See [Pull Request Workflow](docs/pull-request-workflow.md) for the issue-to-PR development flow.
 See [Pull Request Review Guidelines](docs/review-guidelines.md) for the project-specific review standard.
 
 ## Layout
