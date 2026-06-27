@@ -306,6 +306,27 @@ mod tests {
     }
 
     #[test]
+    fn region_creation_rejects_one_byte_at_max_address() {
+        let err = MmioRegion::new(id(1), address(u64::MAX), 1)
+            .expect_err("end-exclusive max-address range should fail");
+
+        assert_eq!(
+            err,
+            GuestMemoryError::AddressOverflow {
+                start: address(u64::MAX),
+                size: 1
+            }
+        );
+    }
+
+    #[test]
+    fn mmio_bus_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<MmioBus>();
+    }
+
+    #[test]
     fn insertion_keeps_regions_sorted() {
         let mut bus = MmioBus::new();
 
@@ -512,6 +533,18 @@ mod tests {
 
         assert_eq!(access.range(), range(0x10fc, 4));
         assert_eq!(access.offset(), 0xfc);
+    }
+
+    #[test]
+    fn lookup_succeeds_for_whole_region() {
+        let mut bus = MmioBus::new();
+        insert(&mut bus, 1, 0x1000, 0x100);
+
+        let access = lookup(&bus, 0x1000, 0x100);
+
+        assert_eq!(access.region_id(), id(1));
+        assert_eq!(access.range(), range(0x1000, 0x100));
+        assert_eq!(access.offset(), 0);
     }
 
     #[test]
