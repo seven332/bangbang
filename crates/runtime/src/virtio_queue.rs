@@ -3,7 +3,7 @@
 use std::collections::TryReserveError;
 use std::fmt;
 
-use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError};
+use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryRange};
 
 pub const VIRTQUEUE_DESCRIPTOR_SIZE: usize = 16;
 pub const VIRTQUEUE_DESCRIPTOR_ALIGNMENT: u64 = 16;
@@ -115,7 +115,7 @@ pub fn read_descriptor_chain(
 ) -> Result<VirtqueueDescriptorChain, VirtqueueDescriptorChainError> {
     validate_queue_size(queue_size)?;
     validate_descriptor_table_alignment(descriptor_table)?;
-    validate_descriptor_table_range(descriptor_table, queue_size)?;
+    validate_descriptor_table_range(memory, descriptor_table, queue_size)?;
     validate_descriptor_index(head_index, queue_size).map_err(|_| {
         VirtqueueDescriptorChainError::InvalidHeadIndex {
             head_index,
@@ -185,6 +185,11 @@ pub enum VirtqueueDescriptorChainError {
         descriptor_table: GuestAddress,
         queue_size: u16,
     },
+    DescriptorTableAccess {
+        descriptor_table: GuestAddress,
+        queue_size: u16,
+        source: GuestMemoryAccessError,
+    },
     DescriptorRead {
         index: u16,
         source: GuestMemoryAccessError,
@@ -243,6 +248,16 @@ impl fmt::Display for VirtqueueDescriptorChainError {
                     "virtqueue descriptor table address {descriptor_table} with queue size {queue_size} overflows address space"
                 )
             }
+            Self::DescriptorTableAccess {
+                descriptor_table,
+                queue_size,
+                source,
+            } => {
+                write!(
+                    f,
+                    "virtqueue descriptor table address {descriptor_table} with queue size {queue_size} is not fully mapped: {source}"
+                )
+            }
             Self::DescriptorRead { index, source } => {
                 write!(f, "failed to read virtqueue descriptor {index}: {source}")
             }
@@ -284,6 +299,7 @@ impl fmt::Display for VirtqueueDescriptorChainError {
 impl std::error::Error for VirtqueueDescriptorChainError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::DescriptorTableAccess { source, .. } => Some(source),
             Self::DescriptorRead { source, .. } => Some(source),
             Self::DescriptorChainAllocationFailed { source, .. } => Some(source),
             Self::InvalidQueueSize { .. }
@@ -322,16 +338,28 @@ fn validate_descriptor_table_alignment(
 }
 
 fn validate_descriptor_table_range(
+    memory: &GuestMemory,
     descriptor_table: GuestAddress,
     queue_size: u16,
 ) -> Result<(), VirtqueueDescriptorChainError> {
     let table_size = u64::from(queue_size) * VIRTQUEUE_DESCRIPTOR_SIZE_U64;
-    descriptor_table.checked_add(table_size).ok_or(
+    let table_range = GuestMemoryRange::new(descriptor_table, table_size).map_err(|_| {
         VirtqueueDescriptorChainError::DescriptorTableRangeOverflow {
             descriptor_table,
             queue_size,
-        },
-    )?;
+        }
+    })?;
+
+    memory
+        .validate_mapped_range(table_range)
+        .map_err(
+            |source| VirtqueueDescriptorChainError::DescriptorTableAccess {
+                descriptor_table,
+                queue_size,
+                source,
+            },
+        )?;
+
     Ok(())
 }
 
@@ -696,15 +724,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unmapped_descriptor_read() {
+    fn rejects_unmapped_descriptor_table() {
         let memory = guest_memory(0x4000);
 
         let err = read_descriptor_chain(&memory, GuestAddress::new(0x4000), 1, 0)
             .expect_err("descriptor table outside mapped memory should fail");
 
         match err {
-            VirtqueueDescriptorChainError::DescriptorRead { index, source } => {
-                assert_eq!(index, 0);
+            VirtqueueDescriptorChainError::DescriptorTableAccess {
+                descriptor_table,
+                queue_size,
+                source,
+            } => {
+                assert_eq!(descriptor_table, GuestAddress::new(0x4000));
+                assert_eq!(queue_size, 1);
                 assert!(matches!(
                     source,
                     GuestMemoryAccessError::UnmappedRange { .. }
@@ -712,6 +745,25 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_partially_mapped_descriptor_table_before_first_descriptor_read() {
+        let mut memory = guest_memory(0x4000);
+        let table = GuestAddress::new(0x3ff0);
+        write_descriptor(&mut memory, table, 0, 0x2000, 0x20, 0, 0);
+
+        let err = read_descriptor_chain(&memory, table, 2, 0)
+            .expect_err("partially mapped descriptor table should fail");
+
+        assert!(matches!(
+            err,
+            VirtqueueDescriptorChainError::DescriptorTableAccess {
+                descriptor_table,
+                queue_size: 2,
+                source: GuestMemoryAccessError::UnmappedRange { .. }
+            } if descriptor_table == table
+        ));
     }
 
     #[test]

@@ -296,7 +296,10 @@ impl GuestMemory {
         Ok(())
     }
 
-    fn validate_mapped_range(&self, range: GuestMemoryRange) -> Result<(), GuestMemoryAccessError> {
+    pub(crate) fn validate_mapped_range(
+        &self,
+        range: GuestMemoryRange,
+    ) -> Result<(), GuestMemoryAccessError> {
         let mut current = range.start();
         for region in &self.regions {
             if region.range().end_exclusive() <= current {
