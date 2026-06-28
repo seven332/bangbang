@@ -22,8 +22,9 @@ model plus handler dispatch boundary, an internal virtio-mmio register/access
 decoder, feature/status, queue, queue notification, and interrupt
 status/acknowledgement register state, a composed runtime handler that routes
 common register accesses through those state models and exposes drained queue
-notifications, plus virtqueue descriptor-chain validator, available-ring read
-model, and used-ring write model for future device handlers, an internal
+notifications and delegated device-configuration accesses, plus virtqueue
+descriptor-chain validator, available-ring read model, and used-ring write
+model for future device handlers, an internal
 backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, and an initial process startup argument model.
 There is no broader API request body model, guest execution, continuous vCPU run loop,
@@ -377,7 +378,10 @@ boundary. A composed backend-neutral register handler routes checked common
 register reads and writes through those state models, implements the runtime
 MMIO handler boundary, and exposes the notification drain without exposing
 mutable nested state. Device-configuration accesses are classified by offset and
-length, but concrete config-space behavior, device-backed notification
+length and can be delegated through a backend-neutral config handler; config
+writes are delegated only after the `DRIVER` status bit is set and while
+`FAILED` and `DEVICE_NEEDS_RESET` are clear. Concrete
+device config layouts, config generation policy, device-backed notification
 dispatch, device activation, and real virtio devices are still deferred. The
 virtqueue model can publish one used-ring completion element with validated
 layout, mapped-memory checks, wrapping, and release ordering, but batching,
