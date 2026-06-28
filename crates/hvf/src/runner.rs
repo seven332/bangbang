@@ -1866,6 +1866,42 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_mmio_access_during_arm64_boot_register_setup_is_rejected() {
+        let (entered_setup_sender, entered_setup_receiver) = mpsc::channel();
+        let (release_setup_sender, release_setup_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(BlockingConfigureVcpu {
+                entered_setup_sender,
+                release_setup_receiver,
+            })
+        })
+        .expect("fake runner should start");
+        let runner = HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+            .expect("runner should be created");
+
+        thread::scope(|scope| {
+            let setup = scope.spawn(|| runner.configure_arm64_boot_registers(boot_registers()));
+            entered_setup_receiver
+                .recv()
+                .expect("runner should enter fake setup");
+
+            assert_eq!(
+                runner.dispatch_mmio_access(resolved_mmio_access(), shared_dispatcher()),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE
+                ))
+            );
+
+            release_setup_sender
+                .send(Ok(()))
+                .expect("setup release should be sent");
+            assert_eq!(setup.join().expect("setup thread should join"), Ok(()));
+        });
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
     fn concurrent_mmio_dispatch_is_rejected_without_queueing() {
         let access = resolved_mmio_access();
         let (entered_dispatch_sender, entered_dispatch_receiver) = mpsc::channel();
