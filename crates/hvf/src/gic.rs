@@ -1,13 +1,16 @@
 //! HVF GIC v3 creation and metadata for later boot/FDT setup.
 
 use std::fmt;
+use std::sync::Mutex;
 
 use bangbang_runtime::BackendError;
 use bangbang_runtime::fdt::{
     Arm64FdtError, Arm64FdtGic, Arm64FdtInterruptRange, Arm64FdtMsi, Arm64FdtRegion,
     Arm64FdtTimerInterrupts,
 };
-use bangbang_runtime::interrupt::{GuestInterruptLine, GuestInterruptLineError};
+use bangbang_runtime::interrupt::{
+    GuestInterruptLine, GuestInterruptLineError, InterruptSignalError, InterruptSink,
+};
 
 const GIC_REQUIRES_MACOS_15_MESSAGE: &str =
     "Hypervisor.framework GIC APIs require macOS 15.0 or newer";
@@ -15,6 +18,7 @@ const MMIO32_MEM_START: u64 = 1 << 30;
 const DRAM_MEM_START: u64 = bangbang_runtime::memory::aarch64::DRAM_MEM_START;
 const DYNAMIC_SYMBOL_SIZE_MISMATCH_MESSAGE: &str =
     "function pointer size does not match a dynamic symbol pointer";
+const GIC_SPI_SIGNALER_LOCK_POISONED_MESSAGE: &str = "HVF GIC SPI signaler lock is poisoned";
 
 const HV_GIC_INT_EL1_VIRTUAL_TIMER: u16 = 27;
 const HV_GIC_INT_EL1_PHYSICAL_TIMER: u16 = 30;
@@ -221,6 +225,123 @@ impl HvfGicInterruptLineAllocator {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HvfGicSpiSignalError {
+    Backend(HvfGicError),
+    InvalidRange(HvfGicError),
+    LineOutOfRange {
+        line: GuestInterruptLine,
+        range: HvfGicInterruptRange,
+    },
+    Signal {
+        line: GuestInterruptLine,
+        level: bool,
+        source: HvfGicError,
+    },
+    InvalidState(&'static str),
+}
+
+impl fmt::Display for HvfGicSpiSignalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Backend(source) => {
+                write!(f, "failed to initialize HVF GIC SPI signaler: {source}")
+            }
+            Self::InvalidRange(source) => {
+                write!(f, "invalid HVF GIC SPI signal range: {source}")
+            }
+            Self::LineOutOfRange { line, range } => {
+                write!(
+                    f,
+                    "guest interrupt line {line} is outside HVF GIC SPI range base={} count={}",
+                    range.base, range.count
+                )
+            }
+            Self::Signal {
+                line,
+                level,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to set HVF GIC SPI interrupt line {line} to level {level}: {source}"
+                )
+            }
+            Self::InvalidState(message) => {
+                write!(f, "invalid HVF GIC SPI signaler state: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HvfGicSpiSignalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Backend(source) | Self::InvalidRange(source) | Self::Signal { source, .. } => {
+                Some(source)
+            }
+            Self::LineOutOfRange { .. } | Self::InvalidState(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct HvfGicSpiSignaler {
+    range: HvfGicInterruptRange,
+    api: Mutex<Box<dyn HvfGicSpiSignalApi + Send>>,
+}
+
+impl HvfGicSpiSignaler {
+    pub fn from_metadata(metadata: &HvfGicMetadata) -> Result<Self, HvfGicSpiSignalError> {
+        validate_spi_interrupt_range(metadata.spi_interrupt_range)
+            .map_err(HvfGicSpiSignalError::InvalidRange)?;
+        let api = real_gic_spi_signal_api().map_err(HvfGicSpiSignalError::Backend)?;
+
+        Self::with_api(metadata.spi_interrupt_range, api)
+    }
+
+    pub const fn range(&self) -> HvfGicInterruptRange {
+        self.range
+    }
+
+    pub fn set_level(
+        &self,
+        line: GuestInterruptLine,
+        level: bool,
+    ) -> Result<(), HvfGicSpiSignalError> {
+        validate_spi_signal_line(self.range, line)?;
+
+        let api = self.api.lock().map_err(|_| {
+            HvfGicSpiSignalError::InvalidState(GIC_SPI_SIGNALER_LOCK_POISONED_MESSAGE)
+        })?;
+        api.set_spi(line.raw_value(), level)
+            .map_err(|source| HvfGicSpiSignalError::Signal {
+                line,
+                level,
+                source,
+            })
+    }
+
+    fn with_api(
+        range: HvfGicInterruptRange,
+        api: impl HvfGicSpiSignalApi + Send + 'static,
+    ) -> Result<Self, HvfGicSpiSignalError> {
+        validate_spi_interrupt_range(range).map_err(HvfGicSpiSignalError::InvalidRange)?;
+
+        Ok(Self {
+            range,
+            api: Mutex::new(Box::new(api)),
+        })
+    }
+}
+
+impl InterruptSink for HvfGicSpiSignaler {
+    fn signal(&self, line: GuestInterruptLine) -> Result<(), InterruptSignalError> {
+        self.set_level(line, true)
+            .map_err(|source| InterruptSignalError::new(source.to_string()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HvfGicError {
     Backend(BackendError),
     Unsupported(&'static str),
@@ -343,6 +464,10 @@ struct HvfGicParameters {
     timer_interrupts: HvfGicTimerInterrupts,
 }
 
+trait HvfGicSpiSignalApi: fmt::Debug {
+    fn set_spi(&self, intid: u32, level: bool) -> Result<(), HvfGicError>;
+}
+
 trait HvfGicApi {
     type Config;
 
@@ -368,6 +493,31 @@ trait HvfGicApi {
 impl HvfGicCreator for RealHvfGicCreator {
     fn create_gic(&self) -> Result<HvfGicMetadata, HvfGicError> {
         create_real_gic()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn real_gic_spi_signal_api() -> Result<LoadedHvfGicSpiSignalApi, HvfGicError> {
+    LoadedHvfGicSpiSignalApi::load()
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn real_gic_spi_signal_api() -> Result<UnsupportedHvfGicSpiSignalApi, HvfGicError> {
+    Err(HvfGicError::Unsupported(
+        crate::ffi::UNSUPPORTED_TARGET_MESSAGE,
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[derive(Debug)]
+struct UnsupportedHvfGicSpiSignalApi;
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+impl HvfGicSpiSignalApi for UnsupportedHvfGicSpiSignalApi {
+    fn set_spi(&self, _: u32, _: bool) -> Result<(), HvfGicError> {
+        Err(HvfGicError::Unsupported(
+            crate::ffi::UNSUPPORTED_TARGET_MESSAGE,
+        ))
     }
 }
 
@@ -506,6 +656,21 @@ fn validate_spi_interrupt_range(range: HvfGicInterruptRange) -> Result<(), HvfGi
     }
 
     Ok(())
+}
+
+fn validate_spi_signal_line(
+    range: HvfGicInterruptRange,
+    line: GuestInterruptLine,
+) -> Result<(), HvfGicSpiSignalError> {
+    validate_spi_interrupt_range(range).map_err(HvfGicSpiSignalError::InvalidRange)?;
+
+    let raw_line = line.raw_value();
+    let end_exclusive = range.base + range.count;
+    if (range.base..end_exclusive).contains(&raw_line) {
+        Ok(())
+    } else {
+        Err(HvfGicSpiSignalError::LineOutOfRange { line, range })
+    }
 }
 
 fn validate_timer_interrupts(timers: HvfGicTimerInterrupts) -> Result<(), HvfGicError> {
@@ -664,6 +829,7 @@ mod dynamic {
     type HvGicConfigCreate = unsafe extern "C" fn() -> *mut c_void;
     type HvGicSetBase = unsafe extern "C" fn(*mut c_void, u64) -> HvReturn;
     type HvGicCreate = unsafe extern "C" fn(*mut c_void) -> HvReturn;
+    type HvGicSetSpi = unsafe extern "C" fn(u32, bool) -> HvReturn;
     type HvGicGetSize = unsafe extern "C" fn(*mut usize) -> HvReturn;
     type HvGicGetSpiRange = unsafe extern "C" fn(*mut u32, *mut u32) -> HvReturn;
     type HvGicGetIntid = unsafe extern "C" fn(u16, *mut u32) -> HvReturn;
@@ -677,9 +843,19 @@ mod dynamic {
         symbols: HvfGicSymbols,
     }
 
+    pub(super) struct LoadedHvfGicSpiSignalApi {
+        _library: DynamicLibrary,
+        symbols: HvfGicSpiSignalSymbols,
+    }
+
     struct DynamicLibrary {
         handle: NonNull<c_void>,
     }
+
+    // SAFETY: The handle is owned by `DynamicLibrary`, closed exactly once on
+    // drop, and loaded function symbols cannot outlive the owner that keeps
+    // the framework loaded.
+    unsafe impl Send for DynamicLibrary {}
 
     #[derive(Clone, Copy)]
     struct HvfGicSymbols {
@@ -695,6 +871,11 @@ mod dynamic {
         get_spi_interrupt_range: HvGicGetSpiRange,
         get_intid: HvGicGetIntid,
         os_release: OsRelease,
+    }
+
+    #[derive(Clone, Copy)]
+    struct HvfGicSpiSignalSymbols {
+        set_spi: HvGicSetSpi,
     }
 
     impl LoadedHvfGicApi {
@@ -727,6 +908,25 @@ mod dynamic {
     impl fmt::Debug for LoadedHvfGicApi {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("LoadedHvfGicApi").finish_non_exhaustive()
+        }
+    }
+
+    impl LoadedHvfGicSpiSignalApi {
+        pub(super) fn load() -> Result<Self, HvfGicError> {
+            let library = DynamicLibrary::open(HYPERVISOR_FRAMEWORK_PATH)?;
+            let symbols = HvfGicSpiSignalSymbols::load(library.handle())?;
+
+            Ok(Self {
+                _library: library,
+                symbols,
+            })
+        }
+    }
+
+    impl fmt::Debug for LoadedHvfGicSpiSignalApi {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("LoadedHvfGicSpiSignalApi")
+                .finish_non_exhaustive()
         }
     }
 
@@ -819,6 +1019,14 @@ mod dynamic {
                     c"os_release",
                     "os_release",
                 )?,
+            })
+        }
+    }
+
+    impl HvfGicSpiSignalSymbols {
+        fn load(library: NonNull<c_void>) -> Result<Self, HvfGicError> {
+            Ok(Self {
+                set_spi: load_symbol(library, c"hv_gic_set_spi", "hv_gic_set_spi")?,
             })
         }
     }
@@ -964,6 +1172,15 @@ mod dynamic {
         }
     }
 
+    impl super::HvfGicSpiSignalApi for LoadedHvfGicSpiSignalApi {
+        fn set_spi(&self, intid: u32, level: bool) -> Result<(), HvfGicError> {
+            // SAFETY: `intid` and `level` are plain values, and range validation
+            // is performed before public callers reach this wrapper.
+            unsafe { crate::ffi::check((self.symbols.set_spi)(intid, level), "hv_gic_set_spi")? };
+            Ok(())
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use std::ffi::c_void;
@@ -1011,12 +1228,12 @@ mod dynamic {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use dynamic::LoadedHvfGicApi;
+use dynamic::{LoadedHvfGicApi, LoadedHvfGicSpiSignalApi};
 
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Barrier, Mutex};
 
     use bangbang_runtime::BackendError;
     use bangbang_runtime::fdt::{
@@ -1024,12 +1241,13 @@ mod tests {
         ARM64_FDT_SECURE_PHYSICAL_TIMER_PPI, ARM64_FDT_VIRTUAL_TIMER_PPI, Arm64FdtError,
         Arm64FdtInterruptRange, Arm64FdtMsi, Arm64FdtRegion, Arm64FdtTimerInterrupts,
     };
-    use bangbang_runtime::interrupt::GuestInterruptLineError;
+    use bangbang_runtime::interrupt::{GuestInterruptLine, GuestInterruptLineError, InterruptSink};
 
     use super::{
-        GicConfigGuard, HV_GIC_INT_EL1_PHYSICAL_TIMER, HV_GIC_INT_EL1_VIRTUAL_TIMER, HvfGicApi,
-        HvfGicError, HvfGicInterruptLineAllocator, HvfGicInterruptRange, HvfGicMetadata,
-        HvfGicMsiMetadata, HvfGicParameters, HvfGicRegion, HvfGicTimerInterrupts,
+        GIC_SPI_SIGNALER_LOCK_POISONED_MESSAGE, GicConfigGuard, HV_GIC_INT_EL1_PHYSICAL_TIMER,
+        HV_GIC_INT_EL1_VIRTUAL_TIMER, HvfGicApi, HvfGicError, HvfGicInterruptLineAllocator,
+        HvfGicInterruptRange, HvfGicMetadata, HvfGicMsiMetadata, HvfGicParameters, HvfGicRegion,
+        HvfGicSpiSignalError, HvfGicSpiSignaler, HvfGicTimerInterrupts,
         HvfInterruptLineAllocationError, create_gic_with_api, metadata_from_parameters,
     };
 
@@ -1334,6 +1552,327 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
 
         assert_send_sync::<HvfGicInterruptLineAllocator>();
+    }
+
+    #[test]
+    fn spi_signaler_sets_high_level_at_range_base() {
+        let api = FakeGicApi::default();
+        let range = HvfGicInterruptRange { base: 32, count: 2 };
+        let signaler = HvfGicSpiSignaler::with_api(range, api.clone())
+            .expect("valid SPI range should create a signaler");
+
+        signaler
+            .set_level(line(32), true)
+            .expect("base SPI line should signal");
+
+        assert_eq!(signaler.range(), range);
+        assert_eq!(api.spi_signals(), vec![(32, true)]);
+        assert_eq!(api.calls(), vec!["hv_gic_set_spi"]);
+    }
+
+    #[test]
+    fn spi_signaler_sets_low_level_at_last_range_line() {
+        let api = FakeGicApi::default();
+        let signaler =
+            HvfGicSpiSignaler::with_api(HvfGicInterruptRange { base: 32, count: 2 }, api.clone())
+                .expect("valid SPI range should create a signaler");
+
+        signaler
+            .set_level(line(33), false)
+            .expect("last SPI line should signal");
+
+        assert_eq!(api.spi_signals(), vec![(33, false)]);
+    }
+
+    #[test]
+    fn spi_signaler_rejects_line_before_range_without_calling_hvf() {
+        let api = FakeGicApi::default();
+        let signaler =
+            HvfGicSpiSignaler::with_api(HvfGicInterruptRange { base: 32, count: 2 }, api.clone())
+                .expect("valid SPI range should create a signaler");
+
+        assert_eq!(
+            signaler
+                .set_level(line(31), true)
+                .expect_err("line before range should fail"),
+            HvfGicSpiSignalError::LineOutOfRange {
+                line: line(31),
+                range: HvfGicInterruptRange { base: 32, count: 2 },
+            }
+        );
+        assert!(api.calls().is_empty());
+        assert!(api.spi_signals().is_empty());
+    }
+
+    #[test]
+    fn spi_signaler_rejects_end_exclusive_line_without_calling_hvf() {
+        let api = FakeGicApi::default();
+        let signaler =
+            HvfGicSpiSignaler::with_api(HvfGicInterruptRange { base: 32, count: 2 }, api.clone())
+                .expect("valid SPI range should create a signaler");
+
+        assert_eq!(
+            signaler
+                .set_level(line(34), true)
+                .expect_err("end-exclusive line should fail"),
+            HvfGicSpiSignalError::LineOutOfRange {
+                line: line(34),
+                range: HvfGicInterruptRange { base: 32, count: 2 },
+            }
+        );
+        assert!(api.calls().is_empty());
+        assert!(api.spi_signals().is_empty());
+    }
+
+    #[test]
+    fn spi_signaler_rejects_invalid_range_before_calling_hvf() {
+        let api = FakeGicApi::default();
+
+        assert_eq!(
+            HvfGicSpiSignaler::with_api(HvfGicInterruptRange { base: 32, count: 0 }, api.clone())
+                .expect_err("invalid range should fail before creating signaler"),
+            HvfGicSpiSignalError::InvalidRange(HvfGicError::InvalidParameter {
+                name: "spi_interrupt_range.count",
+                value: 0,
+            })
+        );
+        assert!(api.calls().is_empty());
+        assert!(api.spi_signals().is_empty());
+    }
+
+    #[test]
+    fn spi_signaler_from_metadata_rejects_invalid_range_before_backend_lookup() {
+        let mut metadata =
+            metadata_from_parameters(default_parameters()).expect("default metadata should build");
+        metadata.spi_interrupt_range = HvfGicInterruptRange { base: 32, count: 0 };
+
+        assert_eq!(
+            HvfGicSpiSignaler::from_metadata(&metadata)
+                .expect_err("invalid metadata range should fail before loading the backend"),
+            HvfGicSpiSignalError::InvalidRange(HvfGicError::InvalidParameter {
+                name: "spi_interrupt_range.count",
+                value: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn spi_signaler_accepts_last_non_overflowing_range() {
+        let api = FakeGicApi::default();
+        let signaler = HvfGicSpiSignaler::with_api(
+            HvfGicInterruptRange {
+                base: u32::MAX - 1,
+                count: 1,
+            },
+            api.clone(),
+        )
+        .expect("last non-overflowing SPI range should create a signaler");
+
+        signaler
+            .set_level(line(u32::MAX - 1), true)
+            .expect("last non-overflowing SPI line should signal");
+
+        assert_eq!(api.spi_signals(), vec![(u32::MAX - 1, true)]);
+    }
+
+    #[test]
+    fn spi_signaler_rejects_overflowing_range_before_calling_hvf() {
+        let api = FakeGicApi::default();
+
+        assert_eq!(
+            HvfGicSpiSignaler::with_api(
+                HvfGicInterruptRange {
+                    base: u32::MAX - 1,
+                    count: 2,
+                },
+                api.clone(),
+            )
+            .expect_err("overflowing range should fail before creating signaler"),
+            HvfGicSpiSignalError::InvalidRange(HvfGicError::InvalidParameter {
+                name: "spi_interrupt_range.end_exclusive",
+                value: u64::from(u32::MAX) + 1,
+            })
+        );
+        assert!(api.calls().is_empty());
+        assert!(api.spi_signals().is_empty());
+    }
+
+    #[test]
+    fn spi_signaler_preserves_backend_signal_failure_source() {
+        let api = FakeGicApi::default().with_failure("hv_gic_set_spi");
+        let signaler =
+            HvfGicSpiSignaler::with_api(HvfGicInterruptRange { base: 32, count: 2 }, api.clone())
+                .expect("valid SPI range should create a signaler");
+
+        let err = signaler
+            .set_level(line(32), true)
+            .expect_err("backend failure should propagate");
+
+        assert_eq!(
+            err,
+            HvfGicSpiSignalError::Signal {
+                line: line(32),
+                level: true,
+                source: HvfGicError::Backend(BackendError::Hypervisor(
+                    "injected hv_gic_set_spi failure".to_string()
+                )),
+            }
+        );
+        assert_eq!(
+            err.source().map(ToString::to_string),
+            Some("hypervisor error: injected hv_gic_set_spi failure".to_string())
+        );
+        assert_eq!(api.calls(), vec!["hv_gic_set_spi"]);
+        assert!(api.spi_signals().is_empty());
+    }
+
+    #[test]
+    fn spi_signaler_interrupt_sink_asserts_high_level() {
+        let api = FakeGicApi::default();
+        let signaler =
+            HvfGicSpiSignaler::with_api(HvfGicInterruptRange { base: 32, count: 2 }, api.clone())
+                .expect("valid SPI range should create a signaler");
+
+        InterruptSink::signal(&signaler, line(32)).expect("sink should assert SPI high");
+
+        assert_eq!(api.spi_signals(), vec![(32, true)]);
+    }
+
+    #[test]
+    fn spi_signaler_interrupt_sink_maps_typed_errors_to_runtime_signal_error() {
+        let api = FakeGicApi::default();
+        let signaler =
+            HvfGicSpiSignaler::with_api(HvfGicInterruptRange { base: 32, count: 1 }, api.clone())
+                .expect("valid SPI range should create a signaler");
+
+        let err = InterruptSink::signal(&signaler, line(33))
+            .expect_err("sink should convert typed signal failure");
+
+        assert_eq!(
+            err.message(),
+            "guest interrupt line 33 is outside HVF GIC SPI range base=32 count=1"
+        );
+        assert!(api.calls().is_empty());
+    }
+
+    #[test]
+    fn spi_signaler_supports_concurrent_sink_calls() {
+        let api = FakeGicApi::default();
+        let signaler = Arc::new(
+            HvfGicSpiSignaler::with_api(HvfGicInterruptRange { base: 32, count: 4 }, api.clone())
+                .expect("valid SPI range should create a signaler"),
+        );
+        let barrier = Arc::new(Barrier::new(4));
+        let mut handles = Vec::new();
+
+        for raw_line in 32..36 {
+            let signaler = Arc::clone(&signaler);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                InterruptSink::signal(&*signaler, line(raw_line))
+                    .expect("concurrent sink signal should succeed");
+            }));
+        }
+
+        for handle in handles {
+            handle
+                .join()
+                .expect("concurrent signal thread should finish");
+        }
+
+        let mut signals = api.spi_signals();
+        signals.sort_unstable();
+        assert_eq!(
+            signals,
+            vec![(32, true), (33, true), (34, true), (35, true)]
+        );
+    }
+
+    #[test]
+    fn spi_signaler_reports_poisoned_api_lock_without_deadlock() {
+        let signaler =
+            HvfGicSpiSignaler::with_api(HvfGicInterruptRange { base: 32, count: 1 }, PanicGicApi)
+                .expect("valid SPI range should create a signaler");
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = signaler.set_level(line(32), true);
+        }));
+
+        assert!(panic_result.is_err());
+        assert_eq!(
+            signaler
+                .set_level(line(32), true)
+                .expect_err("poisoned lock should become typed invalid state"),
+            HvfGicSpiSignalError::InvalidState(GIC_SPI_SIGNALER_LOCK_POISONED_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn displays_spi_signal_errors() {
+        let invalid_range = HvfGicSpiSignalError::InvalidRange(HvfGicError::InvalidParameter {
+            name: "spi_interrupt_range.count",
+            value: 0,
+        });
+        assert_eq!(
+            invalid_range.to_string(),
+            "invalid HVF GIC SPI signal range: invalid Hypervisor.framework GIC parameter spi_interrupt_range.count=0"
+        );
+        assert_eq!(
+            invalid_range.source().map(ToString::to_string),
+            Some(
+                "invalid Hypervisor.framework GIC parameter spi_interrupt_range.count=0"
+                    .to_string()
+            )
+        );
+
+        let line_out_of_range = HvfGicSpiSignalError::LineOutOfRange {
+            line: line(40),
+            range: HvfGicInterruptRange { base: 32, count: 4 },
+        };
+        assert_eq!(
+            line_out_of_range.to_string(),
+            "guest interrupt line 40 is outside HVF GIC SPI range base=32 count=4"
+        );
+        assert!(line_out_of_range.source().is_none());
+
+        let signal = HvfGicSpiSignalError::Signal {
+            line: line(32),
+            level: true,
+            source: HvfGicError::Backend(BackendError::Hypervisor("backend failed".to_string())),
+        };
+        assert_eq!(
+            signal.to_string(),
+            "failed to set HVF GIC SPI interrupt line 32 to level true: hypervisor error: backend failed"
+        );
+        assert_eq!(
+            signal.source().map(ToString::to_string),
+            Some("hypervisor error: backend failed".to_string())
+        );
+
+        let backend = HvfGicSpiSignalError::Backend(HvfGicError::Unsupported("not available"));
+        assert_eq!(
+            backend.to_string(),
+            "failed to initialize HVF GIC SPI signaler: unsupported GIC setup: not available"
+        );
+        assert_eq!(
+            backend.source().map(ToString::to_string),
+            Some("unsupported GIC setup: not available".to_string())
+        );
+
+        let invalid_state =
+            HvfGicSpiSignalError::InvalidState(GIC_SPI_SIGNALER_LOCK_POISONED_MESSAGE);
+        assert_eq!(
+            invalid_state.to_string(),
+            "invalid HVF GIC SPI signaler state: HVF GIC SPI signaler lock is poisoned"
+        );
+        assert!(invalid_state.source().is_none());
+    }
+
+    #[test]
+    fn spi_signaler_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<HvfGicSpiSignaler>();
     }
 
     #[test]
@@ -1699,10 +2238,14 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
+    fn line(value: u32) -> GuestInterruptLine {
+        GuestInterruptLine::new(value).expect("test interrupt line should be valid")
+    }
+
+    #[derive(Debug, Clone)]
     struct FakeGicApi {
         parameters: HvfGicParameters,
-        state: Mutex<FakeGicApiState>,
+        state: Arc<Mutex<FakeGicApiState>>,
     }
 
     impl Default for FakeGicApi {
@@ -1715,13 +2258,14 @@ mod tests {
         fn new(parameters: HvfGicParameters) -> Self {
             Self {
                 parameters,
-                state: Mutex::new(FakeGicApiState {
+                state: Arc::new(Mutex::new(FakeGicApiState {
                     calls: Vec::new(),
                     next_config: 1,
                     released_configs: Vec::new(),
+                    spi_signals: Vec::new(),
                     failure: None,
                     created_config: false,
-                }),
+                })),
             }
         }
 
@@ -1749,6 +2293,14 @@ mod tests {
                 .clone()
         }
 
+        fn spi_signals(&self) -> Vec<(u32, bool)> {
+            self.state
+                .lock()
+                .expect("fake GIC API state should be lockable")
+                .spi_signals
+                .clone()
+        }
+
         fn created_config(&self) -> bool {
             self.state
                 .lock()
@@ -1770,6 +2322,34 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    impl super::HvfGicSpiSignalApi for FakeGicApi {
+        fn set_spi(&self, intid: u32, level: bool) -> Result<(), HvfGicError> {
+            let mut state = self
+                .state
+                .lock()
+                .expect("fake GIC API state should be lockable");
+            state.calls.push("hv_gic_set_spi");
+
+            if state.failure == Some("hv_gic_set_spi") {
+                Err(HvfGicError::Backend(BackendError::Hypervisor(
+                    "injected hv_gic_set_spi failure".to_string(),
+                )))
+            } else {
+                state.spi_signals.push((intid, level));
+                Ok(())
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct PanicGicApi;
+
+    impl super::HvfGicSpiSignalApi for PanicGicApi {
+        fn set_spi(&self, _: u32, _: bool) -> Result<(), HvfGicError> {
+            panic!("injected hv_gic_set_spi panic");
         }
     }
 
@@ -1861,6 +2441,7 @@ mod tests {
         calls: Vec<&'static str>,
         next_config: u64,
         released_configs: Vec<u64>,
+        spi_signals: Vec<(u32, bool)>,
         failure: Option<&'static str>,
         created_config: bool,
     }

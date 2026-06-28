@@ -14,7 +14,7 @@ Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
 create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding,
 registry resolution, vCPU exit classification, single resolved HVF MMIO
 exit dispatch/completion through runtime handlers, explicit runner-thread MMIO
-handling commands, narrow vCPU register wrappers, internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, HVF SPI interrupt-line allocation, minimal internal
+handling commands, narrow vCPU register wrappers, internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, HVF SPI interrupt-line allocation and signaling, minimal internal
 arm64 FDT generation and guest-memory writes, anonymous guest memory allocation
 for validated runtime layouts, HVF guest memory map/unmap ownership for
 allocated regions, an internal MMIO region ownership registry and operation/data
@@ -22,7 +22,7 @@ model plus handler dispatch boundary, an internal backend-neutral interrupt
 line/status/trigger model, single-vCPU arm64 HVF boot-register setup, and an
 initial process startup argument model.
 There is no broader API request body model, guest execution, continuous vCPU run loop,
-interrupt injection, device-backed runner-loop MMIO handling, real device
+complete interrupt delivery, device-backed runner-loop MMIO handling, real device
 emulation, public startup wiring, multi-vCPU setup, PSCI behavior, or public
 boot-source API behavior yet.
 
@@ -352,10 +352,11 @@ It can validate nonzero guest interrupt lines, represent queue and
 configuration pending-status bits, acknowledge selected pending bits, and let a
 device-facing trigger record pending state before delegating backend signaling
 to an injected sink. The HVF crate can allocate deterministic guest interrupt
-lines from the validated GIC SPI range. This follows Firecracker's separation
-between device-facing interrupt triggers and KVM-specific irqfd/GSI routing,
-but it is not yet HVF GIC injection, interrupt masking, virtio-mmio register
-behavior, or guest-visible delivery.
+lines from the validated GIC SPI range and signal validated SPI levels through
+`hv_gic_set_spi`. This follows Firecracker's separation between device-facing
+interrupt triggers and KVM-specific irqfd/GSI routing, but it is not yet
+interrupt masking, virtio-mmio register behavior, runner-loop interrupt
+dispatch, or guest-visible device delivery.
 
 The HVF backend can decode candidate MMIO accesses from arm64 data-abort
 exception exits. The decoder converts supported ESR and IPA metadata into a
@@ -390,7 +391,9 @@ symbols so older hosts can return structured unsupported errors instead of
 failing at process load time. The backend exposes internal boot metadata for the
 future FDT path: distributor and redistributor regions below the 1 GiB MMIO32
 boundary, the supported SPI range, timer interrupt IDs, and the `arm,gic-v3`
-compatibility shape. HVF timer INTIDs are converted to FDT PPI cells for the
+compatibility shape. An internal SPI signaler validates guest interrupt lines
+against that supported range before setting explicit GIC SPI levels with
+`hv_gic_set_spi`. HVF timer INTIDs are converted to FDT PPI cells for the
 runtime timer node, and MSI/ITS metadata is intentionally absent until a later
 device path needs it.
 
@@ -410,7 +413,7 @@ shared dispatcher. These commands reject overlapping runs, boot-register setup,
 or MMIO dispatches. They do not yet form a continuous guest run loop.
 
 bangbang still does not wire `mem_size_mib` into public startup behavior,
-inject interrupts, emulate devices, start a guest, power on secondary vCPUs, or
+wire device interrupts into guest execution, emulate devices, start a guest, power on secondary vCPUs, or
 implement PSCI. Later API and startup work still needs to decide whether an
 oversized `mem_size_mib` request should be rejected before layout construction
 or should preserve Firecracker's architecture-helper truncation behavior.
@@ -548,9 +551,10 @@ macOS design work instead of direct implementation:
   before guest memory, interrupt, timer, and device work can build the real run
   loop.
 - Device-facing interrupt triggers are backend-neutral runtime state today, and
-  HVF interrupt-line allocation is limited to deterministic SPI allocation from
-  GIC metadata. HVF GIC injection, masking, and runner-loop interrupt delivery
-  still need macOS-specific backend work.
+  HVF interrupt-line support can allocate deterministic SPI lines from GIC
+  metadata and set validated SPI levels through `hv_gic_set_spi`. Masking,
+  runner-loop interrupt delivery, and real device wiring still need
+  macOS-specific backend work.
 - Linux seccomp, jailer, cgroups, and namespaces do not directly apply.
 - Linux TAP-based networking needs a macOS-specific design.
 - Snapshot and device behavior may differ when backed by HVF.
