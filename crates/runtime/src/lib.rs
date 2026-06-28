@@ -1,5 +1,6 @@
 //! Backend-neutral VM runtime boundary.
 
+pub mod block;
 pub mod boot;
 pub mod fdt;
 pub mod interrupt;
