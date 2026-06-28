@@ -325,9 +325,10 @@ memory `reg` property alone cannot fit in the FDT window are rejected before FDT
 construction. The write result records the FDT guest address and byte size for
 future boot-register setup.
 
-The runtime crate also contains an internal MMIO region registry and operation
-model for future device dispatch. It reuses `GuestMemoryRange`'s end-exclusive
-semantics instead of Firecracker's inclusive-end `BusRange` representation.
+The runtime crate also contains an internal MMIO region registry, operation
+model, and handler dispatch boundary for future real devices. It reuses
+`GuestMemoryRange`'s end-exclusive semantics instead of Firecracker's
+inclusive-end `BusRange` representation.
 Region registration rejects zero-sized or overflowing ranges and accepts
 adjacent non-overlapping ranges. Lookups validate that the whole access range is
 owned by one region before returning the region owner and offset; accesses that
@@ -344,10 +345,10 @@ exception exits. The decoder converts supported ESR and IPA metadata into a
 checked access range, direction, width, register number, and read-extension
 metadata while the raw exit snapshot still preserves FAR. Unsupported exception
 classes, missing instruction-syndrome metadata, table-walk aborts,
-cache-maintenance aborts, and overflowing access ranges fail closed before later
-dispatch can route them. Decoded accesses can also be resolved against the
-runtime MMIO registry to identify the owning region, offset, and preserved HVF
-access metadata for future device dispatch. Whole vCPU exits can be classified
+cache-maintenance aborts, and overflowing access ranges fail closed before
+runtime dispatch or later HVF completion can use them. Decoded accesses can also
+be resolved against the runtime MMIO registry to identify the owning region,
+offset, and preserved HVF access metadata. Whole vCPU exits can be classified
 into resolved MMIO, virtual-timer, canceled, or unknown events while preserving
 typed decode and bus-resolution errors. Runtime MMIO operations can be
 dispatched to internal handlers after lookup, but HVF exits are still not
