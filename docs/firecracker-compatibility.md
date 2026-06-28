@@ -22,14 +22,14 @@ model plus handler dispatch boundary, an internal virtio-mmio register/access
 decoder, feature/status, queue, queue notification, and interrupt
 status/acknowledgement register state, a composed runtime handler that routes
 common register accesses through those state models and exposes drained queue
-notifications and delegated device-configuration accesses, plus virtqueue
-descriptor-chain validator, available-ring read model, and used-ring write
-model for future device handlers, an internal
+notifications, delegated device-configuration accesses, and a `DRIVER_OK`
+activation hook, plus virtqueue descriptor-chain validator, available-ring read
+model, and used-ring write model for future device handlers, an internal
 backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, and an initial process startup argument model.
 There is no broader API request body model, guest execution, continuous vCPU run loop,
 complete interrupt delivery, queue notification dispatch, completion dispatch,
-device-backed feature negotiation and activation, indirect descriptor support,
+device-backed feature negotiation, real device activation effects, indirect descriptor support,
 device-backed runner-loop MMIO handling, real device emulation, public startup
 wiring, multi-vCPU setup, PSCI behavior, or public boot-source API behavior yet.
 
@@ -380,9 +380,11 @@ MMIO handler boundary, and exposes the notification drain without exposing
 mutable nested state. Device-configuration accesses are classified by offset and
 length and can be delegated through a backend-neutral config handler; config
 writes are delegated only after the `DRIVER` status bit is set and while
-`FAILED` and `DEVICE_NEEDS_RESET` are clear. Concrete
-device config layouts, config generation policy, device-backed notification
-dispatch, device activation, and real virtio devices are still deferred. The
+`FAILED` and `DEVICE_NEEDS_RESET` are clear. The composed handler can invoke a
+backend-neutral activation hook when `DRIVER_OK` is accepted; activation failure
+marks the device as needing reset, but concrete device activation effects,
+device config layouts, config generation policy, and device-backed notification
+dispatch are still deferred. The
 virtqueue model can publish one used-ring completion element with validated
 layout, mapped-memory checks, wrapping, and release ordering, but batching,
 event-index notification suppression, and device-backed completion loops are
