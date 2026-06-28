@@ -21,9 +21,9 @@ allocated regions, an internal MMIO region ownership registry and operation/data
 model plus handler dispatch boundary, an internal virtio-mmio register/access
 decoder, feature/status, queue, queue notification, and interrupt
 status/acknowledgement register state, a composed runtime handler that routes
-common register accesses through those state models, plus virtqueue
-descriptor-chain validator, available-ring read model, and used-ring write
-model for future device handlers, an internal
+common register accesses through those state models and exposes drained queue
+notifications, plus virtqueue descriptor-chain validator, available-ring read
+model, and used-ring write model for future device handlers, an internal
 backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, and an initial process startup argument model.
 There is no broader API request body model, guest execution, continuous vCPU run loop,
@@ -367,15 +367,17 @@ plus reset-on-zero behavior. A separate backend-neutral queue-register model
 tracks selected queue state, validates queue sizes, records queue ready state,
 and composes descriptor, driver, and device ring address halves with the
 alignment required by the virtqueue model. A queue-notification register model
-records valid `QueueNotify` writes after `DRIVER_OK` and rejects notifications
-for unsupported queues or invalid device states. A separate backend-neutral
-interrupt register model can expose pending queue/configuration interrupt bits
-through `InterruptStatus` and clear selected bits through `InterruptAck` after
+records valid `QueueNotify` writes after `DRIVER_OK`, rejects notifications for
+unsupported queues or invalid device states, and can drain the coalesced pending
+queue indexes for future device handlers. A separate backend-neutral interrupt
+register model can expose pending queue/configuration interrupt bits through
+`InterruptStatus` and clear selected bits through `InterruptAck` after
 `DRIVER_OK`, while rejecting unknown acknowledgement bits at the checked runtime
 boundary. A composed backend-neutral register handler routes checked common
-register reads and writes through those state models and implements the runtime
-MMIO handler boundary. Device-configuration accesses are classified by offset
-and length, but concrete config-space behavior, device-backed notification
+register reads and writes through those state models, implements the runtime
+MMIO handler boundary, and exposes the notification drain without exposing
+mutable nested state. Device-configuration accesses are classified by offset and
+length, but concrete config-space behavior, device-backed notification
 dispatch, device activation, and real virtio devices are still deferred. The
 virtqueue model can publish one used-ring completion element with validated
 layout, mapped-memory checks, wrapping, and release ordering, but batching,
