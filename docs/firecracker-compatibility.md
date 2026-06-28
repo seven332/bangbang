@@ -11,8 +11,9 @@ trait, a minimal VMM action/data model, backend-neutral guest
 physical address and aarch64 DRAM layout/access primitives, arm64 boot
 placement helpers, internal boot-source validation and arm64 kernel/initrd
 payload loading, an internal Firecracker-shaped drive configuration validation
-model, a host-file backing access layer, an internal virtio-block config-space
-capacity model, an internal virtio-block request parser, single-request
+model, a host-file backing access layer, an internal configured block-device
+preparation helper, an internal virtio-block config-space capacity model, an
+internal virtio-block request parser, single-request
 executor, queue dispatcher, MMIO queue-state bridge, resettable activation
 state, notification/interrupt-status dispatch helper, and a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
@@ -41,9 +42,10 @@ complete interrupt delivery, public startup or HVF runner-loop wiring for block
 queue notifications, backend interrupt signaling, device-backed feature
 negotiation, indirect descriptor support, device-backed runner-loop MMIO
 handling, real device emulation, multi-vCPU setup, PSCI behavior, or public
-boot-source or actions configuration behavior yet. Drive configuration is
-recorded only as pre-boot VM state; host-file opening, block-device attachment,
-boot selection, and runtime hotplug remain deferred.
+boot-source or actions configuration behavior yet. Public drive configuration is
+recorded only as pre-boot VM state; a separate internal runtime helper can
+prepare owned block-device resources from that stored configuration, but
+block-device attachment, boot selection, and runtime hotplug remain deferred.
 
 ## Firecracker Model Alignment
 
@@ -385,6 +387,14 @@ rejects read-only writes before mutating the file. Backing errors also avoid
 echoing `path_on_host`. This host-file opening path is internal and not invoked
 by public drive configuration yet.
 
+The runtime crate can prepare owned internal block-device resources from a
+validated list of stored drive configs. Preparation opens each backing file,
+derives the virtio-block config space, builds an inactive `VirtioBlockDevice`,
+uses the drive ID as the fixed 20-byte virtio device ID with zero padding or
+truncation, and preserves the configured drive order. If a later config fails
+to prepare, the source drive configs remain unchanged and the error identifies
+the drive ID without echoing `path_on_host`.
+
 The runtime crate can derive an internal virtio-block configuration space from
 the backing length. It reports capacity as full 512-byte sectors, matching
 Firecracker's truncation of non-sector-aligned tails, exposes the virtio block
@@ -395,10 +405,10 @@ The config handler supports bounded read-only capacity reads through the
 existing virtio-mmio device-configuration path and rejects config writes.
 
 The runtime model is wired to successful pre-boot `PUT /drives/{drive_id}` VMM
-configuration storage. It still does not open the configured host path through
-the API, select a root block device for boot, wire active block notification
-dispatch into startup or HVF runner loops, implement rate limiting, support
-vhost-user-block sockets, or use an async I/O engine.
+configuration storage. It still does not call block-device preparation through
+the API, select a root block device for boot, register MMIO devices, wire active
+block notification dispatch into startup or HVF runner loops, implement rate
+limiting, support vhost-user-block sockets, or use an async I/O engine.
 
 ## Internal arm64 FDT Generation
 
@@ -604,7 +614,7 @@ The first API implementation should model the same broad stages as Firecracker:
 | `GET /machine-config` | supported target; `200` JSON | supported target; `200` JSON | Returns machine configuration and defaulted values. |
 | `PUT /machine-config` | supported target; `204` empty response on success | unsupported after start; `400` `fault_message` | Pre-boot-only configuration. |
 | `PUT /boot-source` | supported target; `204` empty response on success | unsupported after start; `400` `fault_message` | Host path errors must avoid leaking sensitive path details. |
-| `PUT /drives/{drive_id}` | supported target; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config only; host-file opening, block attachment, and runtime hotplug remain deferred. |
+| `PUT /drives/{drive_id}` | supported target; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config only; the internal block-device preparation helper is not invoked by the API path, and block attachment plus runtime hotplug remain deferred. |
 | `PUT /actions` with `InstanceStart` | supported target; `204` empty response on successful transition | unsupported after start; `400` `fault_message` | Startup validation failures should also use `400` `fault_message`. |
 | `PUT /actions` with `FlushMetrics` | unsupported before start; `400` `fault_message` | deferred until metrics support exists; future success should use `204` empty response | Firecracker treats this as runtime-only; tied to observability work. |
 | `PUT /actions` with `SendCtrlAltDel` | intentionally unsupported; `400` `fault_message` | intentionally unsupported; `400` `fault_message` | Firecracker rejects this on aarch64; bangbang's first target is Apple Silicon. |
