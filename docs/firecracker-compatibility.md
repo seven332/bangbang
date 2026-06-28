@@ -11,7 +11,7 @@ physical address and aarch64 DRAM layout/access primitives, arm64 boot
 placement helpers, internal boot-source validation and arm64 kernel/initrd
 payload loading, an internal Firecracker-shaped drive configuration validation
 model, a host-file backing access layer, an internal virtio-block config-space
-capacity model, a minimal
+capacity model, an internal virtio-block request parser, a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
 create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding,
 registry resolution, vCPU exit classification, single resolved HVF MMIO
@@ -31,7 +31,7 @@ backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, and an initial process startup argument model.
 There is no broader API request body model, guest execution, continuous vCPU run loop,
 complete interrupt delivery, queue notification dispatch, completion dispatch,
-device-backed feature negotiation, real block request handling, real device
+device-backed feature negotiation, real block request execution, real device
 activation effects, indirect descriptor support,
 device-backed runner-loop MMIO handling, real device emulation, public startup
 wiring, multi-vCPU setup, PSCI behavior, or public boot-source, drives, or
@@ -230,6 +230,18 @@ API behavior ships. Security review must cover host paths, socket-like fields,
 device identifiers, and error messages. Performance review must cover boot path
 setup, memory size, and block device I/O when those surfaces are implemented.
 
+## Internal Virtio-Block Request Parsing
+
+The runtime crate can parse internal virtio-block request descriptor chains from
+guest memory for future device handlers. It reads the 16-byte header, classifies
+`IN`, `OUT`, `FLUSH`, `GET_ID`, and unsupported request types, validates
+data/status descriptor direction and length, checks 512-byte sector alignment and
+capacity bounds for `IN`/`OUT`, and checks the 20-byte minimum `GET_ID` buffer.
+
+This is not public `/drives` behavior and does not execute parsed requests,
+touch host backing files, write status bytes, publish used-ring entries, signal
+interrupts, or support indirect descriptors yet.
+
 ## Guest Memory Address Space
 
 The runtime crate models the backend-neutral guest physical address space used
@@ -333,8 +345,9 @@ The config handler supports bounded read-only capacity reads through the
 existing virtio-mmio device-configuration path and rejects config writes.
 
 This model is not wired to `PUT /drives/{drive_id}` yet and does not select a
-root block device, process guest queue requests, implement cache flushes or
-rate limiting, support vhost-user-block sockets, or use an async I/O engine.
+root block device, execute or complete guest queue requests, implement cache
+flushes or rate limiting, support vhost-user-block sockets, or use an async I/O
+engine.
 
 ## Internal arm64 FDT Generation
 
