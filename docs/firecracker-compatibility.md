@@ -19,11 +19,11 @@ arm64 FDT generation and guest-memory writes, anonymous guest memory allocation
 for validated runtime layouts, HVF guest memory map/unmap ownership for
 allocated regions, an internal MMIO region ownership registry and operation/data
 model plus handler dispatch boundary, an internal virtio-mmio register/access
-decoder, feature/status and queue register state, plus virtqueue descriptor-chain
-validator, available-ring read model, and used-ring write model for future
-device handlers, an internal backend-neutral interrupt line/status/trigger
-model, single-vCPU arm64 HVF boot-register setup, and an initial process
-startup argument model.
+decoder, feature/status, queue, and interrupt status/acknowledgement register
+state, plus virtqueue descriptor-chain validator, available-ring read model,
+and used-ring write model for future device handlers, an internal
+backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
+boot-register setup, and an initial process startup argument model.
 There is no broader API request body model, guest execution, continuous vCPU run loop,
 complete interrupt delivery, queue notification/completion dispatch,
 device-backed feature negotiation and activation, indirect descriptor support,
@@ -364,10 +364,13 @@ driver state, and enforce the cumulative VirtIO status transition sequence
 plus reset-on-zero behavior. A separate backend-neutral queue-register model
 tracks selected queue state, validates queue sizes, records queue ready state,
 and composes descriptor, driver, and device ring address halves with the
-alignment required by the virtqueue model. Device-configuration accesses are
-classified by offset and length, but concrete config-space behavior,
-notification handling, interrupt acknowledgement, device activation, and real
-virtio devices are still deferred. The virtqueue model can publish one
+alignment required by the virtqueue model. A separate backend-neutral interrupt
+register model can expose pending queue/configuration interrupt bits through
+`InterruptStatus` and clear selected bits through `InterruptAck` after
+`DRIVER_OK`, while rejecting unknown acknowledgement bits at the checked runtime
+boundary. Device-configuration accesses are classified by offset and length,
+but concrete config-space behavior, notification handling, device activation,
+and real virtio devices are still deferred. The virtqueue model can publish one
 used-ring completion element with validated layout, mapped-memory checks,
 wrapping, and release ordering, but batching, event-index notification
 suppression, and device-backed completion loops are still deferred.
