@@ -1127,10 +1127,6 @@ impl fmt::Display for VirtioMmioQueueNotificationError {
 impl std::error::Error for VirtioMmioQueueNotificationError {}
 
 pub trait VirtioMmioDeviceConfigHandler: fmt::Debug + Send {
-    fn requires_device_config_write_status(&self) -> bool {
-        true
-    }
-
     fn read_device_config(
         &self,
         access: VirtioMmioDeviceConfigAccess,
@@ -1147,10 +1143,6 @@ pub trait VirtioMmioDeviceConfigHandler: fmt::Debug + Send {
 pub struct UnsupportedVirtioMmioDeviceConfig;
 
 impl VirtioMmioDeviceConfigHandler for UnsupportedVirtioMmioDeviceConfig {
-    fn requires_device_config_write_status(&self) -> bool {
-        false
-    }
-
     fn read_device_config(
         &self,
         access: VirtioMmioDeviceConfigAccess,
@@ -1224,6 +1216,7 @@ pub struct VirtioMmioRegisterHandler<C = UnsupportedVirtioMmioDeviceConfig> {
     queue_notifications: VirtioMmioQueueNotificationRegisters,
     interrupts: VirtioMmioInterruptRegisters,
     device_config: C,
+    requires_device_config_write_status: bool,
 }
 
 impl VirtioMmioRegisterHandler<UnsupportedVirtioMmioDeviceConfig> {
@@ -1248,13 +1241,14 @@ impl VirtioMmioRegisterHandler<UnsupportedVirtioMmioDeviceConfig> {
         config_generation: u32,
         queue_max_sizes: &[u16],
     ) -> Result<Self, VirtioMmioRegisterHandlerError> {
-        Self::with_vendor_id_and_config_generation_and_device_config(
+        Self::with_vendor_id_and_config_generation_and_device_config_status_gate(
             device_id,
             vendor_id,
             device_features,
             config_generation,
             queue_max_sizes,
             UnsupportedVirtioMmioDeviceConfig,
+            false,
         )
     }
 }
@@ -1266,13 +1260,14 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C> {
         queue_max_sizes: &[u16],
         device_config: C,
     ) -> Result<Self, VirtioMmioRegisterHandlerError> {
-        Self::with_vendor_id_and_config_generation_and_device_config(
+        Self::with_vendor_id_and_config_generation_and_device_config_status_gate(
             device_id,
             VIRTIO_MMIO_VENDOR_ID,
             device_features,
             0,
             queue_max_sizes,
             device_config,
+            true,
         )
     }
 
@@ -1283,6 +1278,26 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C> {
         config_generation: u32,
         queue_max_sizes: &[u16],
         device_config: C,
+    ) -> Result<Self, VirtioMmioRegisterHandlerError> {
+        Self::with_vendor_id_and_config_generation_and_device_config_status_gate(
+            device_id,
+            vendor_id,
+            device_features,
+            config_generation,
+            queue_max_sizes,
+            device_config,
+            true,
+        )
+    }
+
+    fn with_vendor_id_and_config_generation_and_device_config_status_gate(
+        device_id: u32,
+        vendor_id: u32,
+        device_features: u64,
+        config_generation: u32,
+        queue_max_sizes: &[u16],
+        device_config: C,
+        requires_device_config_write_status: bool,
     ) -> Result<Self, VirtioMmioRegisterHandlerError> {
         let queues = VirtioMmioQueueRegisters::new(queue_max_sizes).map_err(|source| {
             VirtioMmioRegisterHandlerError::QueueRegisterInitialization { source }
@@ -1304,6 +1319,7 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C> {
             queue_notifications,
             interrupts: VirtioMmioInterruptRegisters::new(),
             device_config,
+            requires_device_config_write_status,
         })
     }
 
@@ -1536,7 +1552,7 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C> {
         access: VirtioMmioDeviceConfigAccess,
         data: MmioAccessBytes,
     ) -> Result<(), VirtioMmioRegisterHandlerError> {
-        if self.device_config.requires_device_config_write_status() {
+        if self.requires_device_config_write_status {
             validate_device_config_write_status(self.device.status())?;
         }
 
