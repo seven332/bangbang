@@ -18,8 +18,9 @@ handling commands, narrow vCPU register wrappers, internal macOS 15+ HVF GIC v3 
 arm64 FDT generation and guest-memory writes, anonymous guest memory allocation
 for validated runtime layouts, HVF guest memory map/unmap ownership for
 allocated regions, an internal MMIO region ownership registry and operation/data
-model plus handler dispatch boundary, single-vCPU arm64 HVF boot-register
-setup, and an initial process startup argument model.
+model plus handler dispatch boundary, an internal backend-neutral interrupt
+line/status/trigger model, single-vCPU arm64 HVF boot-register setup, and an
+initial process startup argument model.
 There is no broader API request body model, guest execution, continuous vCPU run loop,
 interrupt injection, device-backed runner-loop MMIO handling, real device
 emulation, public startup wiring, multi-vCPU setup, PSCI behavior, or public
@@ -346,6 +347,15 @@ dispatcher, and dispatch or complete it on the vCPU-owning thread. This is
 still not continuous run-loop policy, real device emulation, or interrupt
 delivery.
 
+The runtime crate also contains backend-neutral interrupt signaling groundwork.
+It can validate nonzero guest interrupt lines, represent queue and
+configuration pending-status bits, acknowledge selected pending bits, and let a
+device-facing trigger record pending state before delegating backend signaling
+to an injected sink. This follows Firecracker's separation between
+device-facing interrupt triggers and KVM-specific irqfd/GSI routing, but it is
+not yet HVF GIC injection, interrupt-line allocation, virtio-mmio register
+behavior, or guest-visible delivery.
+
 The HVF backend can decode candidate MMIO accesses from arm64 data-abort
 exception exits. The decoder converts supported ESR and IPA metadata into a
 checked access range, direction, width, register number, and read-extension
@@ -536,6 +546,9 @@ macOS design work instead of direct implementation:
   bangbang's runner is only the HVF ownership and cancellation primitive needed
   before guest memory, interrupt, timer, and device work can build the real run
   loop.
+- Device-facing interrupt triggers are backend-neutral runtime state today.
+  HVF GIC injection, line allocation, masking, and runner-loop interrupt
+  delivery still need macOS-specific backend work.
 - Linux seccomp, jailer, cgroups, and namespaces do not directly apply.
 - Linux TAP-based networking needs a macOS-specific design.
 - Snapshot and device behavior may differ when backed by HVF.
