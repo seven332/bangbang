@@ -4,11 +4,11 @@ use std::rc::Rc;
 
 use bangbang_runtime::BackendError;
 use bangbang_runtime::memory::GuestAddress;
-use bangbang_runtime::mmio::{MmioAccessBytes, MmioOperation};
+use bangbang_runtime::mmio::{MmioAccessBytes, MmioDispatchOutcome, MmioDispatcher, MmioOperation};
 
 use crate::backend::HvfBackend;
 use crate::exit::{HvfResolvedMmioAccess, HvfVcpuExit};
-use crate::mmio::HvfMmioCompletionError;
+use crate::mmio::{HvfMmioCompletionError, HvfMmioDispatchError, HvfMmioRegisterAccess};
 
 const DESTROYED_VCPU_MESSAGE: &str = "vCPU has already been destroyed";
 const NO_VCPU_EXIT_MESSAGE: &str = "vCPU has not exited yet";
@@ -165,6 +165,14 @@ impl HvfVcpuOwner {
         })
     }
 
+    pub(crate) fn dispatch_mmio_access(
+        &mut self,
+        access: HvfResolvedMmioAccess,
+        dispatcher: &mut MmioDispatcher,
+    ) -> Result<MmioDispatchOutcome, HvfMmioDispatchError> {
+        crate::mmio::dispatch_mmio_access(access, dispatcher, self)
+    }
+
     pub(crate) fn get_system_register(
         &self,
         register: HvfSystemRegister,
@@ -201,6 +209,16 @@ impl HvfVcpuOwner {
         self.handle
             .as_mut()
             .ok_or(BackendError::InvalidState(DESTROYED_VCPU_MESSAGE))
+    }
+}
+
+impl HvfMmioRegisterAccess for HvfVcpuOwner {
+    fn read_register(&mut self, register: HvfRegister) -> Result<u64, BackendError> {
+        self.get_register(register)
+    }
+
+    fn write_register(&mut self, register: HvfRegister, value: u64) -> Result<(), BackendError> {
+        self.set_register(register, value)
     }
 }
 
@@ -273,6 +291,15 @@ impl<'vm> HvfVcpu<'vm> {
         data: MmioAccessBytes,
     ) -> Result<(), HvfMmioCompletionError> {
         self.owner.complete_mmio_read(access, data)
+    }
+
+    /// Dispatch one resolved HVF MMIO access through runtime handlers and complete read data.
+    pub fn dispatch_mmio_access(
+        &mut self,
+        access: HvfResolvedMmioAccess,
+        dispatcher: &mut MmioDispatcher,
+    ) -> Result<MmioDispatchOutcome, HvfMmioDispatchError> {
+        self.owner.dispatch_mmio_access(access, dispatcher)
     }
 
     pub fn get_system_register(&self, register: HvfSystemRegister) -> Result<u64, BackendError> {

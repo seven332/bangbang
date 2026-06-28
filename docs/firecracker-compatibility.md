@@ -12,7 +12,9 @@ placement helpers, internal boot-source validation and arm64 kernel/initrd
 payload loading, a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
 create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding,
-registry resolution, vCPU exit classification, and HVF MMIO operation/read-completion helpers, narrow vCPU register wrappers, internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, minimal internal
+registry resolution, vCPU exit classification, and single resolved HVF MMIO
+exit dispatch/completion through runtime handlers, narrow vCPU register
+wrappers, internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, minimal internal
 arm64 FDT generation and guest-memory writes, anonymous guest memory allocation
 for validated runtime layouts, HVF guest memory map/unmap ownership for
 allocated regions, an internal MMIO region ownership registry and operation/data
@@ -337,9 +339,9 @@ can be wrapped as a read or write operation with bounded 1-, 2-, 4-, or 8-byte
 data, and write construction rejects data whose length does not match the
 resolved access size. A runtime dispatcher can route those checked operations
 to registered internal handlers by region owner. HVF-specific helpers can now
-build those runtime operations from resolved HVF MMIO exits and complete read
-results back into the trapped guest GPR. This is still not continuous run-loop
-policy, real device emulation, or interrupt delivery.
+dispatch one resolved HVF MMIO exit through those runtime handlers and complete
+successful read results back into the trapped guest GPR. This is still not
+continuous run-loop policy, real device emulation, or interrupt delivery.
 
 The HVF backend can decode candidate MMIO accesses from arm64 data-abort
 exception exits. The decoder converts supported ESR and IPA metadata into a
@@ -351,10 +353,11 @@ runtime dispatch or later HVF completion can use them. Decoded accesses can also
 be resolved against the runtime MMIO registry to identify the owning region,
 offset, and preserved HVF access metadata. Whole vCPU exits can be classified
 into resolved MMIO, virtual-timer, canceled, or unknown events while preserving
-typed decode and bus-resolution errors. Resolved HVF MMIO exits can be
-converted into runtime read/write operations by reading the trapped guest GPR
-for writes, and runtime read data can be completed back into the trapped guest
-GPR with zero/sign extension and 32-bit or 64-bit target width handling.
+typed decode and bus-resolution errors. A single resolved HVF MMIO exit can be
+converted into a runtime read/write operation by reading the trapped guest GPR
+for writes, dispatched to a runtime handler, and completed back into the
+trapped guest GPR for successful reads with zero/sign extension and 32-bit or
+64-bit target width handling.
 Guest GPR 31 is rejected explicitly so it is not confused with HVF's PC
 register. There is still no continuous run-loop policy, interrupt delivery, or
 real device emulation.
@@ -499,21 +502,20 @@ macOS design work instead of direct implementation:
 - HVF vCPU handles are thread-affine: creation, register access, run, and
   destroy operations must happen on the owning thread. The current vCPU wrapper
   covers current-thread lifecycle, typed exit surface, narrow register access,
-  MMIO operation/read-completion helpers, and the single primary arm64 Linux
-  boot-register setup. The
-  current runner skeleton creates a vCPU on a dedicated thread, applies that
-  boot-register setup on the owning thread before the first run, supports one
-  cancellable `hv_vcpu_run` step at a time, and shuts down by canceling and
-  joining the runner thread.
+  single resolved MMIO exit dispatch/completion, and the single primary arm64
+  Linux boot-register setup. The current runner skeleton creates a vCPU on a
+  dedicated thread, applies that boot-register setup on the owning thread before
+  the first run, supports one cancellable `hv_vcpu_run` step at a time, and
+  shuts down by canceling and joining the runner thread.
 - HVF exit snapshots preserve Hypervisor.framework reasons such as canceled,
   exception, virtual timer activation, and unknown after a run wrapper marks
   exit data available. Candidate arm64 MMIO data-abort exceptions can be decoded
   into checked access metadata and resolved against the internal MMIO registry.
   Checked runtime MMIO operations can be dispatched to registered internal
-  handlers. Resolved HVF exits can be converted into runtime MMIO operations,
-  and runtime MMIO read results can be completed back into guest GPRs, but the
-  runner does not yet perform automatic dispatch/completion or translate exits
-  into interrupt/runtime events.
+  handlers. A single resolved HVF exit can be converted into a runtime MMIO
+  operation, dispatched through those handlers, and completed back into guest
+  GPRs for successful reads, but the runner does not yet perform automatic
+  dispatch/completion or translate exits into interrupt/runtime events.
 - Firecracker's full paused/resumed microVM loop is not implemented yet.
   bangbang's runner is only the HVF ownership and cancellation primitive needed
   before guest memory, interrupt, timer, and device work can build the real run

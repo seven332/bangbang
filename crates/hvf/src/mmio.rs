@@ -4,7 +4,10 @@ use std::fmt;
 
 use bangbang_runtime::{
     BackendError,
-    mmio::{MmioAccessBytes, MmioAccessBytesError, MmioOperation, MmioOperationError},
+    mmio::{
+        MmioAccessBytes, MmioAccessBytesError, MmioDispatchError, MmioDispatchOutcome,
+        MmioDispatcher, MmioOperation, MmioOperationError,
+    },
 };
 
 use crate::exit::{
@@ -41,6 +44,45 @@ pub enum HvfMmioCompletionError {
     Operation {
         source: MmioOperationError,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HvfMmioDispatchError {
+    Operation { source: HvfMmioCompletionError },
+    Dispatch { source: MmioDispatchError },
+    Completion { source: HvfMmioCompletionError },
+}
+
+impl fmt::Display for HvfMmioDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Operation { source } => {
+                write!(f, "failed to prepare HVF MMIO operation: {source}")
+            }
+            Self::Dispatch { source } => {
+                write!(f, "failed to dispatch HVF MMIO operation: {source}")
+            }
+            Self::Completion { source } => {
+                write!(f, "failed to complete HVF MMIO read: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HvfMmioDispatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Operation { source } => Some(source),
+            Self::Dispatch { source } => Some(source),
+            Self::Completion { source } => Some(source),
+        }
+    }
+}
+
+pub(crate) trait HvfMmioRegisterAccess {
+    fn read_register(&mut self, register: HvfRegister) -> Result<u64, BackendError>;
+
+    fn write_register(&mut self, register: HvfRegister, value: u64) -> Result<(), BackendError>;
 }
 
 impl fmt::Display for HvfMmioCompletionError {
@@ -160,6 +202,27 @@ pub(crate) fn complete_mmio_read(
         .map_err(|source| HvfMmioCompletionError::RegisterWriteFailed { register, source })
 }
 
+pub(crate) fn dispatch_mmio_access(
+    access: HvfResolvedMmioAccess,
+    dispatcher: &mut MmioDispatcher,
+    registers: &mut impl HvfMmioRegisterAccess,
+) -> Result<MmioDispatchOutcome, HvfMmioDispatchError> {
+    let operation = build_mmio_operation(access, |register| registers.read_register(register))
+        .map_err(|source| HvfMmioDispatchError::Operation { source })?;
+    let outcome = dispatcher
+        .dispatch(operation)
+        .map_err(|source| HvfMmioDispatchError::Dispatch { source })?;
+
+    if let MmioDispatchOutcome::Read { data } = outcome {
+        complete_mmio_read(access, data, |register, value| {
+            registers.write_register(register, value)
+        })
+        .map_err(|source| HvfMmioDispatchError::Completion { source })?;
+    }
+
+    Ok(outcome)
+}
+
 fn mmio_gpr(register: HvfMmioRegister) -> Result<HvfRegister, HvfMmioCompletionError> {
     HvfRegister::general_purpose(register.raw_value())
         .ok_or(HvfMmioCompletionError::UnsupportedRegister { register })
@@ -223,19 +286,25 @@ fn sign_extended_read_value(data: MmioAccessBytes) -> u64 {
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
+    use std::sync::{Arc, Mutex};
 
     use bangbang_runtime::{
         BackendError,
         memory::GuestAddress,
-        mmio::{MmioBus, MmioOperation, MmioRegionId},
+        mmio::{
+            MmioAccess, MmioBus, MmioDispatchError, MmioDispatchOutcome, MmioDispatcher,
+            MmioHandler, MmioHandlerError, MmioOperation, MmioRegionId,
+        },
     };
 
-    use super::{build_mmio_operation, complete_mmio_read};
+    use super::{
+        HvfMmioRegisterAccess, build_mmio_operation, complete_mmio_read, dispatch_mmio_access,
+    };
     use crate::exit::{
         HvfExceptionExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
         HvfMmioRegisterWidth, HvfResolvedVcpuExit, HvfVcpuExit,
     };
-    use crate::mmio::HvfMmioCompletionError;
+    use crate::mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
     use crate::vcpu::HvfRegister;
 
     const ESR_EC_DATA_ABORT_LOWER_EL: u64 = 0x24;
@@ -307,6 +376,112 @@ mod tests {
 
     fn bytes(value: &[u8]) -> bangbang_runtime::mmio::MmioAccessBytes {
         bangbang_runtime::mmio::MmioAccessBytes::new(value).expect("test bytes should be valid")
+    }
+
+    #[derive(Debug)]
+    struct FakeRegisters {
+        read_result: Result<u64, BackendError>,
+        write_result: Result<(), BackendError>,
+        reads: Vec<HvfRegister>,
+        writes: Vec<(HvfRegister, u64)>,
+    }
+
+    impl FakeRegisters {
+        fn new(
+            read_result: Result<u64, BackendError>,
+            write_result: Result<(), BackendError>,
+        ) -> Self {
+            Self {
+                read_result,
+                write_result,
+                reads: Vec::new(),
+                writes: Vec::new(),
+            }
+        }
+    }
+
+    impl HvfMmioRegisterAccess for FakeRegisters {
+        fn read_register(&mut self, register: HvfRegister) -> Result<u64, BackendError> {
+            self.reads.push(register);
+            self.read_result.clone()
+        }
+
+        fn write_register(
+            &mut self,
+            register: HvfRegister,
+            value: u64,
+        ) -> Result<(), BackendError> {
+            self.writes.push((register, value));
+            self.write_result.clone()
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingHandlerState {
+        reads: Vec<MmioAccess>,
+        writes: Vec<(MmioAccess, bangbang_runtime::mmio::MmioAccessBytes)>,
+    }
+
+    #[derive(Debug)]
+    struct RecordingHandler {
+        state: Arc<Mutex<RecordingHandlerState>>,
+        read_result: Result<bangbang_runtime::mmio::MmioAccessBytes, MmioHandlerError>,
+        write_result: Result<(), MmioHandlerError>,
+    }
+
+    impl MmioHandler for RecordingHandler {
+        fn read(
+            &mut self,
+            access: MmioAccess,
+        ) -> Result<bangbang_runtime::mmio::MmioAccessBytes, MmioHandlerError> {
+            self.state
+                .lock()
+                .expect("handler state lock should not be poisoned")
+                .reads
+                .push(access);
+            self.read_result.clone()
+        }
+
+        fn write(
+            &mut self,
+            access: MmioAccess,
+            data: bangbang_runtime::mmio::MmioAccessBytes,
+        ) -> Result<(), MmioHandlerError> {
+            self.state
+                .lock()
+                .expect("handler state lock should not be poisoned")
+                .writes
+                .push((access, data));
+            self.write_result.clone()
+        }
+    }
+
+    fn dispatcher_with_handler(
+        read_result: Result<bangbang_runtime::mmio::MmioAccessBytes, MmioHandlerError>,
+        write_result: Result<(), MmioHandlerError>,
+    ) -> (MmioDispatcher, Arc<Mutex<RecordingHandlerState>>) {
+        let mut dispatcher = dispatcher_without_handler();
+        let state = Arc::new(Mutex::new(RecordingHandlerState::default()));
+        dispatcher
+            .register_handler(
+                MmioRegionId::new(7),
+                RecordingHandler {
+                    state: Arc::clone(&state),
+                    read_result,
+                    write_result,
+                },
+            )
+            .expect("test handler should register");
+
+        (dispatcher, state)
+    }
+
+    fn dispatcher_without_handler() -> MmioDispatcher {
+        let mut dispatcher = MmioDispatcher::new();
+        dispatcher
+            .insert_region(MmioRegionId::new(7), GuestAddress::new(0x1000), 0x100)
+            .expect("test dispatcher region should insert");
+        dispatcher
     }
 
     #[test]
@@ -641,6 +816,260 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_read_access_calls_handler_and_completes_register() {
+        let access = resolved_access(
+            HvfMmioAccessSize::Word,
+            HvfMmioDirection::Read,
+            2,
+            false,
+            HvfMmioRegisterWidth::Bits64,
+        );
+        let data = bytes(&[0x78, 0x56, 0x34, 0x12]);
+        let (mut dispatcher, state) = dispatcher_with_handler(Ok(data), Ok(()));
+        let mut registers = FakeRegisters::new(
+            Err(BackendError::InvalidState("read register should not run")),
+            Ok(()),
+        );
+
+        let outcome = dispatch_mmio_access(access, &mut dispatcher, &mut registers)
+            .expect("read access should dispatch and complete");
+
+        assert_eq!(outcome, MmioDispatchOutcome::Read { data });
+        assert!(registers.reads.is_empty());
+        assert_eq!(
+            registers.writes,
+            vec![(
+                HvfRegister::general_purpose(2).expect("register should map"),
+                0x1234_5678
+            )]
+        );
+
+        let state = state
+            .lock()
+            .expect("handler state lock should not be poisoned");
+        assert_eq!(state.reads, vec![access.runtime_access()]);
+        assert!(state.writes.is_empty());
+    }
+
+    #[test]
+    fn dispatch_write_access_calls_handler_with_register_bytes() {
+        let access = resolved_access(
+            HvfMmioAccessSize::Halfword,
+            HvfMmioDirection::Write,
+            5,
+            false,
+            HvfMmioRegisterWidth::Bits64,
+        );
+        let (mut dispatcher, state) = dispatcher_with_handler(Ok(bytes(&[0, 0])), Ok(()));
+        let mut registers = FakeRegisters::new(Ok(0x1122_3344_5566_7788), Ok(()));
+
+        let outcome = dispatch_mmio_access(access, &mut dispatcher, &mut registers)
+            .expect("write access should dispatch");
+
+        assert_eq!(outcome, MmioDispatchOutcome::Write);
+        assert_eq!(
+            registers.reads,
+            vec![HvfRegister::general_purpose(5).expect("register should map")]
+        );
+        assert!(registers.writes.is_empty());
+
+        let state = state
+            .lock()
+            .expect("handler state lock should not be poisoned");
+        assert!(state.reads.is_empty());
+        assert_eq!(
+            state.writes,
+            vec![(access.runtime_access(), bytes(&[0x88, 0x77]))]
+        );
+    }
+
+    #[test]
+    fn dispatch_rejects_unsupported_read_register_before_handler() {
+        let access = resolved_access(
+            HvfMmioAccessSize::Byte,
+            HvfMmioDirection::Read,
+            31,
+            false,
+            HvfMmioRegisterWidth::Bits64,
+        );
+        let (mut dispatcher, state) = dispatcher_with_handler(Ok(bytes(&[0])), Ok(()));
+        let mut registers = FakeRegisters::new(
+            Err(BackendError::InvalidState("read register should not run")),
+            Ok(()),
+        );
+
+        let err = dispatch_mmio_access(access, &mut dispatcher, &mut registers)
+            .expect_err("unsupported read register should fail before dispatch");
+
+        assert_eq!(
+            err,
+            HvfMmioDispatchError::Operation {
+                source: HvfMmioCompletionError::UnsupportedRegister {
+                    register: HvfMmioRegister::new(31).expect("register should exist")
+                }
+            }
+        );
+        assert!(registers.reads.is_empty());
+        assert!(registers.writes.is_empty());
+
+        let state = state
+            .lock()
+            .expect("handler state lock should not be poisoned");
+        assert!(state.reads.is_empty());
+        assert!(state.writes.is_empty());
+    }
+
+    #[test]
+    fn dispatch_preserves_write_register_read_error_before_handler() {
+        let access = resolved_access(
+            HvfMmioAccessSize::Word,
+            HvfMmioDirection::Write,
+            3,
+            false,
+            HvfMmioRegisterWidth::Bits32,
+        );
+        let (mut dispatcher, state) = dispatcher_with_handler(Ok(bytes(&[0, 0, 0, 0])), Ok(()));
+        let source = BackendError::InvalidState("fake register read failed");
+        let mut registers = FakeRegisters::new(Err(source.clone()), Ok(()));
+
+        let err = dispatch_mmio_access(access, &mut dispatcher, &mut registers)
+            .expect_err("register read failure should fail before dispatch");
+
+        assert_eq!(
+            err,
+            HvfMmioDispatchError::Operation {
+                source: HvfMmioCompletionError::RegisterReadFailed {
+                    register: HvfRegister::general_purpose(3).expect("register should map"),
+                    source: source.clone()
+                }
+            }
+        );
+        assert_eq!(
+            registers.reads,
+            vec![HvfRegister::general_purpose(3).expect("register should map")]
+        );
+        assert!(registers.writes.is_empty());
+
+        let state = state
+            .lock()
+            .expect("handler state lock should not be poisoned");
+        assert!(state.reads.is_empty());
+        assert!(state.writes.is_empty());
+    }
+
+    #[test]
+    fn dispatch_failure_does_not_complete_read() {
+        let access = resolved_access(
+            HvfMmioAccessSize::Byte,
+            HvfMmioDirection::Read,
+            1,
+            false,
+            HvfMmioRegisterWidth::Bits64,
+        );
+        let mut dispatcher = dispatcher_without_handler();
+        let mut registers = FakeRegisters::new(
+            Err(BackendError::InvalidState("read register should not run")),
+            Ok(()),
+        );
+
+        let err = dispatch_mmio_access(access, &mut dispatcher, &mut registers)
+            .expect_err("missing handler should fail dispatch");
+
+        assert_eq!(
+            err,
+            HvfMmioDispatchError::Dispatch {
+                source: MmioDispatchError::MissingHandler {
+                    region_id: MmioRegionId::new(7)
+                }
+            }
+        );
+        assert!(registers.reads.is_empty());
+        assert!(registers.writes.is_empty());
+    }
+
+    #[test]
+    fn dispatch_read_completion_failure_preserves_handler_side_effect() {
+        let access = resolved_access(
+            HvfMmioAccessSize::Byte,
+            HvfMmioDirection::Read,
+            4,
+            false,
+            HvfMmioRegisterWidth::Bits64,
+        );
+        let (mut dispatcher, state) = dispatcher_with_handler(Ok(bytes(&[0xaa])), Ok(()));
+        let source = BackendError::InvalidState("fake register write failed");
+        let mut registers = FakeRegisters::new(
+            Err(BackendError::InvalidState("read register should not run")),
+            Err(source.clone()),
+        );
+
+        let err = dispatch_mmio_access(access, &mut dispatcher, &mut registers)
+            .expect_err("register write failure should surface after dispatch");
+
+        assert_eq!(
+            err,
+            HvfMmioDispatchError::Completion {
+                source: HvfMmioCompletionError::RegisterWriteFailed {
+                    register: HvfRegister::general_purpose(4).expect("register should map"),
+                    source: source.clone()
+                }
+            }
+        );
+        assert!(registers.reads.is_empty());
+        assert_eq!(
+            registers.writes,
+            vec![(
+                HvfRegister::general_purpose(4).expect("register should map"),
+                0xaa
+            )]
+        );
+
+        let state = state
+            .lock()
+            .expect("handler state lock should not be poisoned");
+        assert_eq!(state.reads, vec![access.runtime_access()]);
+        assert!(state.writes.is_empty());
+    }
+
+    #[test]
+    fn dispatch_read_length_mismatch_does_not_complete_read() {
+        let access = resolved_access(
+            HvfMmioAccessSize::Word,
+            HvfMmioDirection::Read,
+            1,
+            false,
+            HvfMmioRegisterWidth::Bits64,
+        );
+        let (mut dispatcher, state) = dispatcher_with_handler(Ok(bytes(&[0])), Ok(()));
+        let mut registers = FakeRegisters::new(
+            Err(BackendError::InvalidState("read register should not run")),
+            Ok(()),
+        );
+
+        let err = dispatch_mmio_access(access, &mut dispatcher, &mut registers)
+            .expect_err("short read data should fail dispatch");
+
+        assert_eq!(
+            err,
+            HvfMmioDispatchError::Dispatch {
+                source: MmioDispatchError::ReadDataLengthMismatch {
+                    access: access.runtime_access(),
+                    expected: 4,
+                    actual: 1
+                }
+            }
+        );
+        assert!(registers.reads.is_empty());
+        assert!(registers.writes.is_empty());
+
+        let state = state
+            .lock()
+            .expect("handler state lock should not be poisoned");
+        assert_eq!(state.reads, vec![access.runtime_access()]);
+        assert!(state.writes.is_empty());
+    }
+
+    #[test]
     fn displays_completion_errors() {
         let err = HvfMmioCompletionError::UnsupportedRegister {
             register: HvfMmioRegister::new(31).expect("register should exist"),
@@ -665,6 +1094,39 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "HVF MMIO read completion for range [0x1040..0x1044) (4 bytes) returned 2 bytes; expected 4"
+        );
+    }
+
+    #[test]
+    fn displays_dispatch_errors() {
+        let dispatch_source = MmioDispatchError::MissingHandler {
+            region_id: MmioRegionId::new(7),
+        };
+        let err = HvfMmioDispatchError::Dispatch {
+            source: dispatch_source.clone(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "failed to dispatch HVF MMIO operation: MMIO access for region id=7 has no registered handler"
+        );
+        assert_eq!(
+            err.source().and_then(|source| source.downcast_ref()),
+            Some(&dispatch_source)
+        );
+
+        let completion_source = HvfMmioCompletionError::UnsupportedRegister {
+            register: HvfMmioRegister::new(31).expect("register should exist"),
+        };
+        let err = HvfMmioDispatchError::Operation {
+            source: completion_source.clone(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "failed to prepare HVF MMIO operation: HVF MMIO access uses unsupported guest GPR 31"
+        );
+        assert_eq!(
+            err.source().and_then(|source| source.downcast_ref()),
+            Some(&completion_source)
         );
     }
 }
