@@ -11,8 +11,8 @@ physical address and aarch64 DRAM layout/access primitives, arm64 boot
 placement helpers, internal boot-source validation and arm64 kernel/initrd
 payload loading, a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
-create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding
-and registry resolution, narrow vCPU register wrappers, internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, minimal internal
+create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding,
+registry resolution, and vCPU exit classification, narrow vCPU register wrappers, internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, minimal internal
 arm64 FDT generation and guest-memory writes, anonymous guest memory allocation
 for validated runtime layouts, HVF guest memory map/unmap ownership for
 allocated regions, an internal MMIO region ownership registry, single-vCPU
@@ -340,8 +340,10 @@ classes, missing instruction-syndrome metadata, table-walk aborts,
 cache-maintenance aborts, and overflowing access ranges fail closed before later
 dispatch can route them. Decoded accesses can also be resolved against the
 runtime MMIO registry to identify the owning region, offset, and preserved HVF
-access metadata for future device dispatch. This is still not device dispatch,
-read completion, interrupt delivery, or device emulation.
+access metadata for future device dispatch. Whole vCPU exits can be classified
+into resolved MMIO, virtual-timer, canceled, or unknown events while preserving
+typed decode and bus-resolution errors. This is still not device dispatch, read
+completion, interrupt delivery, or device emulation.
 
 The HVF backend can map allocated guest memory regions into an existing
 Hypervisor.framework VM with read/write/execute guest RAM permissions. The
