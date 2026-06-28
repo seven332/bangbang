@@ -11,8 +11,8 @@ physical address and aarch64 DRAM layout/access primitives, arm64 boot
 placement helpers, internal boot-source validation and arm64 kernel/initrd
 payload loading, a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
-create/destroy wrapper, typed HVF exit surface, narrow vCPU register wrappers,
-internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, minimal internal
+create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding,
+narrow vCPU register wrappers, internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, minimal internal
 arm64 FDT generation and guest-memory writes, anonymous guest memory allocation
 for validated runtime layouts, HVF guest memory map/unmap ownership for
 allocated regions, an internal MMIO region ownership registry, single-vCPU
@@ -332,6 +332,15 @@ before returning the region owner and offset; accesses that hit a hole, overflow
 or cross a region boundary are rejected. This is not MMIO exit dispatch or
 device emulation yet.
 
+The HVF backend can decode candidate MMIO accesses from arm64 data-abort
+exception exits. The decoder converts supported ESR and IPA metadata into a
+checked access range, direction, width, register number, and read-extension
+metadata while the raw exit snapshot still preserves FAR. Unsupported exception
+classes, missing instruction-syndrome metadata, table-walk aborts,
+cache-maintenance aborts, and overflowing access ranges fail closed before later
+dispatch can route them. This is still not device dispatch, read completion,
+interrupt delivery, or device emulation.
+
 The HVF backend can map allocated guest memory regions into an existing
 Hypervisor.framework VM with read/write/execute guest RAM permissions. The
 backend-owned mapping owner consumes the `GuestMemory` allocation, unmaps mapped
@@ -479,8 +488,10 @@ macOS design work instead of direct implementation:
   joining the runner thread.
 - HVF exit snapshots preserve Hypervisor.framework reasons such as canceled,
   exception, virtual timer activation, and unknown after a run wrapper marks
-  exit data available. They are not yet decoded into MMIO, timer, device, or
-  runtime events.
+  exit data available. Candidate arm64 MMIO data-abort exceptions can be decoded
+  into checked access metadata, but they are not yet routed into devices,
+  completed back into guest registers, or translated into interrupt/runtime
+  events.
 - Firecracker's full paused/resumed microVM loop is not implemented yet.
   bangbang's runner is only the HVF ownership and cancellation primitive needed
   before guest memory, interrupt, timer, and device work can build the real run
