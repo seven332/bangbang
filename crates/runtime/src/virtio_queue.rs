@@ -148,7 +148,16 @@ pub fn read_descriptor_chain(
         descriptors.push(descriptor);
 
         match next_index {
-            Some(index) => current_index = index,
+            Some(index) => {
+                validate_descriptor_index(index, queue_size).map_err(|_| {
+                    VirtqueueDescriptorChainError::InvalidNextIndex {
+                        index: current_index,
+                        next_index: index,
+                        queue_size,
+                    }
+                })?;
+                current_index = index;
+            }
             None => return Ok(VirtqueueDescriptorChain { descriptors }),
         }
     }
@@ -352,16 +361,8 @@ fn read_descriptor(
     let address = GuestAddress::new(raw.address);
     let len = raw.len;
     let flags = VirtqueueDescriptorFlags::new(raw.flags);
-    let next = raw.next;
     let next_index = if flags.has_next() {
-        validate_descriptor_index(next, queue_size).map_err(|_| {
-            VirtqueueDescriptorChainError::InvalidNextIndex {
-                index,
-                next_index: next,
-                queue_size,
-            }
-        })?;
-        Some(next)
+        Some(raw.next)
     } else {
         None
     };
@@ -694,6 +695,28 @@ mod tests {
 
         let err = read_descriptor_chain(&memory, TABLE, 8, 0)
             .expect_err("indirect descriptor should fail");
+
+        assert!(matches!(
+            err,
+            VirtqueueDescriptorChainError::UnsupportedIndirectDescriptor { index: 0 }
+        ));
+    }
+
+    #[test]
+    fn rejects_unsupported_indirect_descriptor_before_invalid_next_index() {
+        let mut memory = guest_memory(0x4000);
+        write_descriptor(
+            &mut memory,
+            TABLE,
+            0,
+            0x2000,
+            0x40,
+            VIRTQUEUE_DESC_F_INDIRECT | VIRTQUEUE_DESC_F_NEXT,
+            8,
+        );
+
+        let err = read_descriptor_chain(&memory, TABLE, 8, 0)
+            .expect_err("indirect descriptor should fail before next validation");
 
         assert!(matches!(
             err,
