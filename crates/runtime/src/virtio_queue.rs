@@ -9,6 +9,7 @@ use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemo
 pub const VIRTQUEUE_DESCRIPTOR_SIZE: usize = 16;
 pub const VIRTQUEUE_DESCRIPTOR_ALIGNMENT: u64 = 16;
 pub const VIRTQUEUE_AVAILABLE_RING_ALIGNMENT: u64 = 2;
+pub const VIRTQUEUE_USED_RING_ALIGNMENT: u64 = 4;
 pub const VIRTQUEUE_DESC_F_NEXT: u16 = 0x1;
 pub const VIRTQUEUE_DESC_F_WRITE: u16 = 0x2;
 pub const VIRTQUEUE_DESC_F_INDIRECT: u16 = 0x4;
@@ -19,10 +20,16 @@ const VIRTQUEUE_AVAILABLE_RING_ENTRY_SIZE_U64: u64 = 2;
 const VIRTQUEUE_AVAILABLE_RING_USED_EVENT_SIZE_U64: u64 = 2;
 const VIRTQUEUE_AVAILABLE_RING_IDX_OFFSET: u64 = 2;
 const VIRTQUEUE_AVAILABLE_RING_RING_OFFSET: u64 = 4;
+const VIRTQUEUE_USED_RING_HEADER_SIZE_U64: u64 = 4;
+const VIRTQUEUE_USED_RING_ELEMENT_SIZE_U64: u64 = 8;
+const VIRTQUEUE_USED_RING_AVAIL_EVENT_SIZE_U64: u64 = 2;
+const VIRTQUEUE_USED_RING_IDX_OFFSET: u64 = 2;
+const VIRTQUEUE_USED_RING_RING_OFFSET: u64 = 4;
 const DESCRIPTOR_ADDR_SIZE: usize = 8;
 const DESCRIPTOR_LEN_SIZE: usize = 4;
 const DESCRIPTOR_FLAGS_SIZE: usize = 2;
 const U16_FIELD_SIZE: usize = 2;
+const U32_FIELD_SIZE: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtqueueDescriptorFlags(u16);
@@ -279,6 +286,177 @@ impl VirtqueueAvailableRing {
         self.next_avail = self.next_avail.wrapping_add(1);
 
         Ok(Some(chain))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtqueueUsedRing {
+    used_ring: GuestAddress,
+    queue_size: u16,
+    next_used: u16,
+}
+
+impl VirtqueueUsedRing {
+    pub fn new(used_ring: GuestAddress, queue_size: u16) -> Result<Self, VirtqueueUsedRingError> {
+        Self::with_next_used(used_ring, queue_size, 0)
+    }
+
+    pub fn with_next_used(
+        used_ring: GuestAddress,
+        queue_size: u16,
+        next_used: u16,
+    ) -> Result<Self, VirtqueueUsedRingError> {
+        validate_used_ring_queue_size(queue_size)?;
+        validate_used_ring_alignment(used_ring)?;
+        used_ring_size(used_ring, queue_size)?;
+
+        Ok(Self {
+            used_ring,
+            queue_size,
+            next_used,
+        })
+    }
+
+    pub const fn used_ring(&self) -> GuestAddress {
+        self.used_ring
+    }
+
+    pub const fn queue_size(&self) -> u16 {
+        self.queue_size
+    }
+
+    pub const fn next_used(&self) -> u16 {
+        self.next_used
+    }
+
+    pub fn publish_used_element(
+        &mut self,
+        memory: &mut GuestMemory,
+        descriptor_head: u16,
+        len: u32,
+    ) -> Result<(), VirtqueueUsedRingError> {
+        validate_used_ring_descriptor_head(descriptor_head, self.queue_size)?;
+        validate_used_ring_range(memory, self.used_ring, self.queue_size)?;
+
+        let ring_index = self.next_used % self.queue_size;
+        let entry_address = used_ring_entry_address(self.used_ring, self.queue_size, ring_index)?;
+        let next_used = self.next_used.wrapping_add(1);
+
+        write_used_ring_element(
+            memory,
+            self.used_ring,
+            self.queue_size,
+            entry_address,
+            descriptor_head,
+            len,
+        )?;
+
+        // Match Firecracker's ordering point before making a used entry
+        // visible by advancing UsedRing.idx.
+        fence(Ordering::Release);
+
+        let index_address = used_ring_offset_address(
+            self.used_ring,
+            self.queue_size,
+            VIRTQUEUE_USED_RING_IDX_OFFSET,
+        )?;
+        write_used_ring_u16(
+            memory,
+            self.used_ring,
+            self.queue_size,
+            index_address,
+            next_used,
+        )?;
+
+        self.next_used = next_used;
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtqueueUsedRingError {
+    InvalidQueueSize {
+        queue_size: u16,
+    },
+    UnalignedUsedRing {
+        used_ring: GuestAddress,
+        alignment: u64,
+    },
+    InvalidDescriptorHead {
+        descriptor_head: u16,
+        queue_size: u16,
+    },
+    UsedRingRangeOverflow {
+        used_ring: GuestAddress,
+        queue_size: u16,
+    },
+    UsedRingAccess {
+        used_ring: GuestAddress,
+        queue_size: u16,
+        source: GuestMemoryAccessError,
+    },
+}
+
+impl fmt::Display for VirtqueueUsedRingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidQueueSize { queue_size } => {
+                write!(
+                    f,
+                    "virtqueue size {queue_size} must be a nonzero power of two"
+                )
+            }
+            Self::UnalignedUsedRing {
+                used_ring,
+                alignment,
+            } => {
+                write!(
+                    f,
+                    "virtqueue used ring address {used_ring} is not aligned to {alignment} bytes"
+                )
+            }
+            Self::InvalidDescriptorHead {
+                descriptor_head,
+                queue_size,
+            } => {
+                write!(
+                    f,
+                    "virtqueue used descriptor head {descriptor_head} is outside queue size {queue_size}"
+                )
+            }
+            Self::UsedRingRangeOverflow {
+                used_ring,
+                queue_size,
+            } => {
+                write!(
+                    f,
+                    "virtqueue used ring address {used_ring} with queue size {queue_size} overflows address space"
+                )
+            }
+            Self::UsedRingAccess {
+                used_ring,
+                queue_size,
+                source,
+            } => {
+                write!(
+                    f,
+                    "virtqueue used ring address {used_ring} with queue size {queue_size} is not fully mapped: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtqueueUsedRingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::UsedRingAccess { source, .. } => Some(source),
+            Self::InvalidQueueSize { .. }
+            | Self::UnalignedUsedRing { .. }
+            | Self::InvalidDescriptorHead { .. }
+            | Self::UsedRingRangeOverflow { .. } => None,
+        }
     }
 }
 
@@ -567,6 +745,14 @@ fn validate_available_ring_queue_size(queue_size: u16) -> Result<(), VirtqueueAv
     }
 }
 
+fn validate_used_ring_queue_size(queue_size: u16) -> Result<(), VirtqueueUsedRingError> {
+    if is_valid_queue_size(queue_size) {
+        Ok(())
+    } else {
+        Err(VirtqueueUsedRingError::InvalidQueueSize { queue_size })
+    }
+}
+
 fn validate_descriptor_table_alignment(
     descriptor_table: GuestAddress,
 ) -> Result<(), VirtqueueDescriptorChainError> {
@@ -611,6 +797,20 @@ fn validate_available_ring_alignment(
         Err(VirtqueueAvailableRingError::UnalignedAvailableRing {
             available_ring,
             alignment: VIRTQUEUE_AVAILABLE_RING_ALIGNMENT,
+        })
+    }
+}
+
+fn validate_used_ring_alignment(used_ring: GuestAddress) -> Result<(), VirtqueueUsedRingError> {
+    if used_ring
+        .raw_value()
+        .is_multiple_of(VIRTQUEUE_USED_RING_ALIGNMENT)
+    {
+        Ok(())
+    } else {
+        Err(VirtqueueUsedRingError::UnalignedUsedRing {
+            used_ring,
+            alignment: VIRTQUEUE_USED_RING_ALIGNMENT,
         })
     }
 }
@@ -665,6 +865,30 @@ fn validate_available_ring_range(
     Ok(())
 }
 
+fn validate_used_ring_range(
+    memory: &GuestMemory,
+    used_ring: GuestAddress,
+    queue_size: u16,
+) -> Result<(), VirtqueueUsedRingError> {
+    let ring_size = used_ring_size(used_ring, queue_size)?;
+    let ring_range = GuestMemoryRange::new(used_ring, ring_size).map_err(|_| {
+        VirtqueueUsedRingError::UsedRingRangeOverflow {
+            used_ring,
+            queue_size,
+        }
+    })?;
+
+    memory.validate_mapped_range(ring_range).map_err(|source| {
+        VirtqueueUsedRingError::UsedRingAccess {
+            used_ring,
+            queue_size,
+            source,
+        }
+    })?;
+
+    Ok(())
+}
+
 fn validate_descriptor_index(
     index: u16,
     queue_size: u16,
@@ -675,6 +899,20 @@ fn validate_descriptor_index(
         Err(VirtqueueDescriptorChainError::InvalidNextIndex {
             index,
             next_index: index,
+            queue_size,
+        })
+    }
+}
+
+fn validate_used_ring_descriptor_head(
+    descriptor_head: u16,
+    queue_size: u16,
+) -> Result<(), VirtqueueUsedRingError> {
+    if descriptor_head < queue_size {
+        Ok(())
+    } else {
+        Err(VirtqueueUsedRingError::InvalidDescriptorHead {
+            descriptor_head,
             queue_size,
         })
     }
@@ -708,6 +946,31 @@ fn available_ring_size(
     Ok(ring_size)
 }
 
+fn used_ring_size(used_ring: GuestAddress, queue_size: u16) -> Result<u64, VirtqueueUsedRingError> {
+    let entry_bytes = u64::from(queue_size)
+        .checked_mul(VIRTQUEUE_USED_RING_ELEMENT_SIZE_U64)
+        .ok_or(VirtqueueUsedRingError::UsedRingRangeOverflow {
+            used_ring,
+            queue_size,
+        })?;
+    let ring_size = VIRTQUEUE_USED_RING_HEADER_SIZE_U64
+        .checked_add(entry_bytes)
+        .and_then(|size| size.checked_add(VIRTQUEUE_USED_RING_AVAIL_EVENT_SIZE_U64))
+        .ok_or(VirtqueueUsedRingError::UsedRingRangeOverflow {
+            used_ring,
+            queue_size,
+        })?;
+
+    used_ring
+        .checked_add(ring_size)
+        .ok_or(VirtqueueUsedRingError::UsedRingRangeOverflow {
+            used_ring,
+            queue_size,
+        })?;
+
+    Ok(ring_size)
+}
+
 fn available_ring_offset_address(
     available_ring: GuestAddress,
     queue_size: u16,
@@ -737,6 +1000,35 @@ fn available_ring_entry_address(
     available_ring_offset_address(available_ring, queue_size, entry_offset)
 }
 
+fn used_ring_offset_address(
+    used_ring: GuestAddress,
+    queue_size: u16,
+    offset: u64,
+) -> Result<GuestAddress, VirtqueueUsedRingError> {
+    used_ring
+        .checked_add(offset)
+        .ok_or(VirtqueueUsedRingError::UsedRingRangeOverflow {
+            used_ring,
+            queue_size,
+        })
+}
+
+fn used_ring_entry_address(
+    used_ring: GuestAddress,
+    queue_size: u16,
+    ring_index: u16,
+) -> Result<GuestAddress, VirtqueueUsedRingError> {
+    let entry_offset = u64::from(ring_index)
+        .checked_mul(VIRTQUEUE_USED_RING_ELEMENT_SIZE_U64)
+        .and_then(|offset| offset.checked_add(VIRTQUEUE_USED_RING_RING_OFFSET))
+        .ok_or(VirtqueueUsedRingError::UsedRingRangeOverflow {
+            used_ring,
+            queue_size,
+        })?;
+
+    used_ring_offset_address(used_ring, queue_size, entry_offset)
+}
+
 fn read_available_ring_u16(
     memory: &GuestMemory,
     available_ring: GuestAddress,
@@ -748,6 +1040,44 @@ fn read_available_ring_u16(
         queue_size,
         source,
     })
+}
+
+fn write_used_ring_element(
+    memory: &mut GuestMemory,
+    used_ring: GuestAddress,
+    queue_size: u16,
+    address: GuestAddress,
+    descriptor_head: u16,
+    len: u32,
+) -> Result<(), VirtqueueUsedRingError> {
+    let mut element = [0; U32_FIELD_SIZE * 2];
+    let (id_bytes, len_bytes) = element.split_at_mut(U32_FIELD_SIZE);
+    id_bytes.copy_from_slice(&u32::from(descriptor_head).to_le_bytes());
+    len_bytes.copy_from_slice(&len.to_le_bytes());
+
+    memory
+        .write_slice(&element, address)
+        .map_err(|source| VirtqueueUsedRingError::UsedRingAccess {
+            used_ring,
+            queue_size,
+            source,
+        })
+}
+
+fn write_used_ring_u16(
+    memory: &mut GuestMemory,
+    used_ring: GuestAddress,
+    queue_size: u16,
+    address: GuestAddress,
+    value: u16,
+) -> Result<(), VirtqueueUsedRingError> {
+    memory
+        .write_slice(&value.to_le_bytes(), address)
+        .map_err(|source| VirtqueueUsedRingError::UsedRingAccess {
+            used_ring,
+            queue_size,
+            source,
+        })
 }
 
 fn read_u16(memory: &GuestMemory, address: GuestAddress) -> Result<u16, GuestMemoryAccessError> {
@@ -847,8 +1177,10 @@ mod tests {
         VIRTQUEUE_AVAILABLE_RING_IDX_OFFSET, VIRTQUEUE_AVAILABLE_RING_RING_OFFSET,
         VIRTQUEUE_DESC_F_INDIRECT, VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE,
         VIRTQUEUE_DESCRIPTOR_ALIGNMENT, VIRTQUEUE_DESCRIPTOR_SIZE, VIRTQUEUE_DESCRIPTOR_SIZE_U64,
-        VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptorChainError,
-        VirtqueueDescriptorFlags, read_descriptor_chain,
+        VIRTQUEUE_USED_RING_ALIGNMENT, VIRTQUEUE_USED_RING_ELEMENT_SIZE_U64,
+        VIRTQUEUE_USED_RING_IDX_OFFSET, VIRTQUEUE_USED_RING_RING_OFFSET, VirtqueueAvailableRing,
+        VirtqueueAvailableRingError, VirtqueueDescriptorChainError, VirtqueueDescriptorFlags,
+        VirtqueueUsedRing, VirtqueueUsedRingError, read_descriptor_chain,
     };
     use crate::memory::{
         GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryLayout, GuestMemoryRange,
@@ -856,6 +1188,7 @@ mod tests {
 
     const TABLE: GuestAddress = GuestAddress::new(0x1000);
     const AVAIL: GuestAddress = GuestAddress::new(0x2000);
+    const USED: GuestAddress = GuestAddress::new(0x2800);
 
     fn guest_memory(size: u64) -> GuestMemory {
         let range = GuestMemoryRange::new(GuestAddress::new(0), size)
@@ -913,6 +1246,22 @@ mod tests {
             .expect("u16 field should write");
     }
 
+    fn read_u16_field(memory: &GuestMemory, address: GuestAddress) -> u16 {
+        let mut bytes = [0; 2];
+        memory
+            .read_slice(&mut bytes, address)
+            .expect("u16 field should read");
+        u16::from_le_bytes(bytes)
+    }
+
+    fn read_u32_field(memory: &GuestMemory, address: GuestAddress) -> u32 {
+        let mut bytes = [0; 4];
+        memory
+            .read_slice(&mut bytes, address)
+            .expect("u32 field should read");
+        u32::from_le_bytes(bytes)
+    }
+
     fn write_available_index(memory: &mut GuestMemory, available_ring: GuestAddress, index: u16) {
         write_u16(
             memory,
@@ -938,11 +1287,21 @@ mod tests {
         write_u16(memory, entry, head_index);
     }
 
+    fn used_ring_entry_address(used_ring: GuestAddress, ring_index: u16) -> GuestAddress {
+        used_ring
+            .checked_add(
+                VIRTQUEUE_USED_RING_RING_OFFSET
+                    + u64::from(ring_index) * VIRTQUEUE_USED_RING_ELEMENT_SIZE_U64,
+            )
+            .expect("used ring entry address should not overflow")
+    }
+
     #[test]
     fn exposes_virtqueue_descriptor_constants() {
         assert_eq!(VIRTQUEUE_DESCRIPTOR_SIZE, 16);
         assert_eq!(VIRTQUEUE_DESCRIPTOR_ALIGNMENT, 16);
         assert_eq!(VIRTQUEUE_AVAILABLE_RING_ALIGNMENT, 2);
+        assert_eq!(VIRTQUEUE_USED_RING_ALIGNMENT, 4);
         assert_eq!(VIRTQUEUE_DESC_F_NEXT, 0x1);
         assert_eq!(VIRTQUEUE_DESC_F_WRITE, 0x2);
         assert_eq!(VIRTQUEUE_DESC_F_INDIRECT, 0x4);
@@ -970,6 +1329,16 @@ mod tests {
         assert_eq!(queue.available_ring(), AVAIL);
         assert_eq!(queue.queue_size(), 8);
         assert_eq!(queue.next_avail(), 3);
+    }
+
+    #[test]
+    fn used_ring_accessors_expose_queue_state() {
+        let queue =
+            VirtqueueUsedRing::with_next_used(USED, 8, 3).expect("used ring should be valid");
+
+        assert_eq!(queue.used_ring(), USED);
+        assert_eq!(queue.queue_size(), 8);
+        assert_eq!(queue.next_used(), 3);
     }
 
     #[test]
@@ -1243,6 +1612,243 @@ mod tests {
         let access_err = queue
             .pop_descriptor_chain(&memory)
             .expect_err("unmapped available ring should fail");
+        assert!(access_err.source().is_some());
+    }
+
+    #[test]
+    fn publishes_used_element_and_advances_used_index() {
+        let mut memory = guest_memory(0x4000);
+        let mut queue = VirtqueueUsedRing::new(USED, 8).expect("used ring should be valid");
+
+        queue
+            .publish_used_element(&mut memory, 2, 0x1234)
+            .expect("used element should publish");
+
+        let entry = used_ring_entry_address(USED, 0);
+        assert_eq!(read_u32_field(&memory, entry), 2);
+        assert_eq!(
+            read_u32_field(
+                &memory,
+                entry
+                    .checked_add(4)
+                    .expect("used element len address should not overflow")
+            ),
+            0x1234
+        );
+        assert_eq!(
+            read_u16_field(
+                &memory,
+                USED.checked_add(VIRTQUEUE_USED_RING_IDX_OFFSET)
+                    .expect("used index address should not overflow")
+            ),
+            1
+        );
+        assert_eq!(queue.next_used(), 1);
+    }
+
+    #[test]
+    fn wraps_used_ring_slot_and_index() {
+        let mut memory = guest_memory(0x4000);
+        let mut queue = VirtqueueUsedRing::with_next_used(USED, 8, u16::MAX)
+            .expect("used ring should be valid");
+
+        queue
+            .publish_used_element(&mut memory, 7, 0x55)
+            .expect("wrapped used element should publish");
+
+        let entry = used_ring_entry_address(USED, 7);
+        assert_eq!(read_u32_field(&memory, entry), 7);
+        assert_eq!(
+            read_u32_field(
+                &memory,
+                entry
+                    .checked_add(4)
+                    .expect("used element len address should not overflow")
+            ),
+            0x55
+        );
+        assert_eq!(
+            read_u16_field(
+                &memory,
+                USED.checked_add(VIRTQUEUE_USED_RING_IDX_OFFSET)
+                    .expect("used index address should not overflow")
+            ),
+            0
+        );
+        assert_eq!(queue.next_used(), 0);
+    }
+
+    #[test]
+    fn rejects_invalid_used_ring_queue_sizes() {
+        assert!(matches!(
+            VirtqueueUsedRing::new(USED, 0),
+            Err(VirtqueueUsedRingError::InvalidQueueSize { queue_size: 0 })
+        ));
+        assert!(matches!(
+            VirtqueueUsedRing::new(USED, 3),
+            Err(VirtqueueUsedRingError::InvalidQueueSize { queue_size: 3 })
+        ));
+    }
+
+    #[test]
+    fn rejects_unaligned_used_ring_address() {
+        let used_ring = GuestAddress::new(0x2802);
+
+        let err =
+            VirtqueueUsedRing::new(used_ring, 8).expect_err("unaligned used ring should fail");
+
+        assert!(matches!(
+            err,
+            VirtqueueUsedRingError::UnalignedUsedRing {
+                used_ring: ring,
+                alignment: VIRTQUEUE_USED_RING_ALIGNMENT
+            } if ring == used_ring
+        ));
+    }
+
+    #[test]
+    fn rejects_used_ring_range_overflow() {
+        let used_ring = GuestAddress::new(u64::MAX - 11);
+
+        let err = VirtqueueUsedRing::new(used_ring, 1).expect_err("used ring overflow should fail");
+
+        assert!(matches!(
+            err,
+            VirtqueueUsedRingError::UsedRingRangeOverflow {
+                used_ring: ring,
+                queue_size: 1
+            } if ring == used_ring
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_descriptor_head_without_advancing_or_writing() {
+        let mut memory = guest_memory(0x4000);
+        let mut queue =
+            VirtqueueUsedRing::with_next_used(USED, 8, 3).expect("used ring should be valid");
+
+        let err = queue
+            .publish_used_element(&mut memory, 8, 0x1234)
+            .expect_err("out-of-range descriptor head should fail");
+
+        assert!(matches!(
+            err,
+            VirtqueueUsedRingError::InvalidDescriptorHead {
+                descriptor_head: 8,
+                queue_size: 8
+            }
+        ));
+        assert_eq!(queue.next_used(), 3);
+        assert_eq!(
+            read_u16_field(
+                &memory,
+                USED.checked_add(VIRTQUEUE_USED_RING_IDX_OFFSET)
+                    .expect("used index address should not overflow")
+            ),
+            0
+        );
+
+        let entry = used_ring_entry_address(USED, 3);
+        assert_eq!(read_u32_field(&memory, entry), 0);
+        assert_eq!(
+            read_u32_field(
+                &memory,
+                entry
+                    .checked_add(4)
+                    .expect("used element len address should not overflow")
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn rejects_unmapped_used_ring_before_writing() {
+        let mut memory = guest_memory(0x4000);
+        let used_ring = GuestAddress::new(0x4000);
+        let mut queue =
+            VirtqueueUsedRing::new(used_ring, 1).expect("used ring metadata should be valid");
+
+        let err = queue
+            .publish_used_element(&mut memory, 0, 0x10)
+            .expect_err("unmapped used ring should fail");
+
+        assert!(matches!(
+            err,
+            VirtqueueUsedRingError::UsedRingAccess {
+                used_ring: ring,
+                queue_size: 1,
+                source: GuestMemoryAccessError::UnmappedRange { .. }
+            } if ring == used_ring
+        ));
+        assert_eq!(queue.next_used(), 0);
+    }
+
+    #[test]
+    fn rejects_partially_mapped_used_ring_before_writing() {
+        let mut memory = guest_memory(0x4000);
+        let used_ring = GuestAddress::new(0x3ff4);
+        let mut queue =
+            VirtqueueUsedRing::new(used_ring, 1).expect("used ring metadata should be valid");
+
+        let err = queue
+            .publish_used_element(&mut memory, 0, 0x10)
+            .expect_err("partially mapped used ring should fail");
+
+        assert!(matches!(
+            err,
+            VirtqueueUsedRingError::UsedRingAccess {
+                used_ring: ring,
+                queue_size: 1,
+                source: GuestMemoryAccessError::UnmappedRange { .. }
+            } if ring == used_ring
+        ));
+        assert_eq!(queue.next_used(), 0);
+    }
+
+    #[test]
+    fn accepts_used_ring_near_memory_boundary() {
+        let mut memory = guest_memory(0x4000);
+        let used_ring = GuestAddress::new(0x3ff0);
+        let mut queue =
+            VirtqueueUsedRing::new(used_ring, 1).expect("used ring metadata should be valid");
+
+        queue
+            .publish_used_element(&mut memory, 0, 0x20)
+            .expect("used ring near boundary should publish");
+
+        let entry = used_ring_entry_address(used_ring, 0);
+        assert_eq!(read_u32_field(&memory, entry), 0);
+        assert_eq!(
+            read_u32_field(
+                &memory,
+                entry
+                    .checked_add(4)
+                    .expect("used element len address should not overflow")
+            ),
+            0x20
+        );
+        assert_eq!(queue.next_used(), 1);
+    }
+
+    #[test]
+    fn used_ring_errors_display_and_preserve_sources() {
+        let err = VirtqueueUsedRingError::InvalidDescriptorHead {
+            descriptor_head: 8,
+            queue_size: 8,
+        };
+        assert_eq!(
+            err.to_string(),
+            "virtqueue used descriptor head 8 is outside queue size 8"
+        );
+        assert!(err.source().is_none());
+
+        let mut memory = guest_memory(0x4000);
+        let used_ring = GuestAddress::new(0x4000);
+        let mut queue =
+            VirtqueueUsedRing::new(used_ring, 1).expect("used ring metadata should be valid");
+        let access_err = queue
+            .publish_used_element(&mut memory, 0, 0x10)
+            .expect_err("unmapped used ring should fail");
         assert!(access_err.source().is_some());
     }
 
