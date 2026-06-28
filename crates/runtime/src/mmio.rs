@@ -1,4 +1,4 @@
-//! Backend-neutral MMIO region ownership and lookup.
+//! Backend-neutral MMIO region ownership, lookup, and operation metadata.
 
 use std::fmt;
 
@@ -70,6 +70,181 @@ impl MmioAccess {
         self.region.id()
     }
 }
+
+pub const MAX_MMIO_ACCESS_BYTES: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmioOperationKind {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MmioAccessBytes {
+    bytes: [u8; MAX_MMIO_ACCESS_BYTES],
+    len: usize,
+}
+
+impl MmioAccessBytes {
+    pub fn new(bytes: &[u8]) -> Result<Self, MmioAccessBytesError> {
+        validate_mmio_access_byte_len(bytes.len())?;
+
+        let mut copied = [0; MAX_MMIO_ACCESS_BYTES];
+        let (destination, _) = copied.split_at_mut(bytes.len());
+        destination.copy_from_slice(bytes);
+
+        Ok(Self {
+            bytes: copied,
+            len: bytes.len(),
+        })
+    }
+
+    pub fn zeroed(len: usize) -> Result<Self, MmioAccessBytesError> {
+        validate_mmio_access_byte_len(len)?;
+
+        Ok(Self {
+            bytes: [0; MAX_MMIO_ACCESS_BYTES],
+            len,
+        })
+    }
+
+    pub const fn len(self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        let (bytes, _) = self.bytes.split_at(self.len);
+        bytes
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmioAccessBytesError {
+    Empty,
+    UnsupportedLength { len: usize },
+    TooLarge { len: usize, max: usize },
+}
+
+impl fmt::Display for MmioAccessBytesError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("MMIO access bytes cannot be empty"),
+            Self::UnsupportedLength { len } => {
+                write!(
+                    f,
+                    "unsupported MMIO access byte length {len}; supported lengths are 1, 2, 4, or 8"
+                )
+            }
+            Self::TooLarge { len, max } => {
+                write!(f, "MMIO access byte length {len} exceeds the maximum {max}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MmioAccessBytesError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmioOperation {
+    Read {
+        access: MmioAccess,
+        data: MmioAccessBytes,
+    },
+    Write {
+        access: MmioAccess,
+        data: MmioAccessBytes,
+    },
+}
+
+impl MmioOperation {
+    pub fn read(access: MmioAccess) -> Result<Self, MmioOperationError> {
+        let len = mmio_operation_len(access)?;
+
+        Ok(Self::Read {
+            access,
+            data: MmioAccessBytes {
+                bytes: [0; MAX_MMIO_ACCESS_BYTES],
+                len,
+            },
+        })
+    }
+
+    pub fn write(access: MmioAccess, data: MmioAccessBytes) -> Result<Self, MmioOperationError> {
+        let expected = mmio_operation_len(access)?;
+        if data.len() != expected {
+            return Err(MmioOperationError::DataLengthMismatch {
+                access,
+                expected,
+                actual: data.len(),
+            });
+        }
+
+        Ok(Self::Write { access, data })
+    }
+
+    pub const fn kind(self) -> MmioOperationKind {
+        match self {
+            Self::Read { .. } => MmioOperationKind::Read,
+            Self::Write { .. } => MmioOperationKind::Write,
+        }
+    }
+
+    pub const fn access(self) -> MmioAccess {
+        match self {
+            Self::Read { access, .. } | Self::Write { access, .. } => access,
+        }
+    }
+
+    pub const fn data(self) -> MmioAccessBytes {
+        match self {
+            Self::Read { data, .. } | Self::Write { data, .. } => data,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmioOperationError {
+    UnsupportedAccessSize {
+        access: MmioAccess,
+        size: u64,
+    },
+    DataLengthMismatch {
+        access: MmioAccess,
+        expected: usize,
+        actual: usize,
+    },
+}
+
+impl fmt::Display for MmioOperationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedAccessSize { access, size } => {
+                write!(
+                    f,
+                    "unsupported MMIO operation size {size} for range {}; supported sizes are 1, 2, 4, or 8 bytes",
+                    access.range()
+                )
+            }
+            Self::DataLengthMismatch {
+                access,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "MMIO operation data length {actual} does not match access size {expected} for range {}",
+                    access.range()
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for MmioOperationError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MmioBus {
@@ -247,9 +422,37 @@ const fn range_contains_range(container: GuestMemoryRange, candidate: GuestMemor
         && candidate.end_exclusive().raw_value() <= container.end_exclusive().raw_value()
 }
 
+fn validate_mmio_access_byte_len(len: usize) -> Result<(), MmioAccessBytesError> {
+    match len {
+        0 => Err(MmioAccessBytesError::Empty),
+        1 | 2 | 4 | MAX_MMIO_ACCESS_BYTES => Ok(()),
+        len if len > MAX_MMIO_ACCESS_BYTES => Err(MmioAccessBytesError::TooLarge {
+            len,
+            max: MAX_MMIO_ACCESS_BYTES,
+        }),
+        len => Err(MmioAccessBytesError::UnsupportedLength { len }),
+    }
+}
+
+fn mmio_operation_len(access: MmioAccess) -> Result<usize, MmioOperationError> {
+    match access.range().size() {
+        1 => Ok(1),
+        2 => Ok(2),
+        4 => Ok(4),
+        8 => Ok(MAX_MMIO_ACCESS_BYTES),
+        size => Err(MmioOperationError::UnsupportedAccessSize { access, size }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MmioAccess, MmioBus, MmioBusError, MmioRegion, MmioRegionId};
+    use std::error::Error as _;
+
+    use super::{
+        MAX_MMIO_ACCESS_BYTES, MmioAccess, MmioAccessBytes, MmioAccessBytesError, MmioBus,
+        MmioBusError, MmioOperation, MmioOperationError, MmioOperationKind, MmioRegion,
+        MmioRegionId,
+    };
     use crate::memory::{GuestAddress, GuestMemoryError, GuestMemoryRange};
 
     fn id(value: u64) -> MmioRegionId {
@@ -276,6 +479,12 @@ mod tests {
     fn lookup(bus: &MmioBus, start: u64, size: u64) -> MmioAccess {
         bus.lookup(address(start), size)
             .expect("test lookup should succeed")
+    }
+
+    fn lookup_access(start: u64, size: u64) -> MmioAccess {
+        let mut bus = MmioBus::new();
+        insert(&mut bus, 1, start, 0x100);
+        lookup(&bus, start, size)
     }
 
     #[test]
@@ -678,6 +887,133 @@ mod tests {
     }
 
     #[test]
+    fn access_bytes_copy_from_slice_preserves_data() {
+        let mut source = [1, 2, 3, 4];
+        let bytes = MmioAccessBytes::new(&source).expect("access bytes should be valid");
+
+        source.fill(0xff);
+
+        assert_eq!(bytes.len(), 4);
+        assert!(!bytes.is_empty());
+        assert_eq!(bytes.as_slice(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn access_bytes_zeroed_returns_requested_length() {
+        let bytes =
+            MmioAccessBytes::zeroed(MAX_MMIO_ACCESS_BYTES).expect("zeroed bytes should be valid");
+
+        assert_eq!(bytes.len(), MAX_MMIO_ACCESS_BYTES);
+        assert_eq!(bytes.as_slice(), &[0; MAX_MMIO_ACCESS_BYTES]);
+    }
+
+    #[test]
+    fn access_bytes_reject_empty_data() {
+        assert_eq!(
+            MmioAccessBytes::new(&[]).expect_err("empty bytes should fail"),
+            MmioAccessBytesError::Empty
+        );
+        assert_eq!(
+            MmioAccessBytes::zeroed(0).expect_err("zeroed empty bytes should fail"),
+            MmioAccessBytesError::Empty
+        );
+    }
+
+    #[test]
+    fn access_bytes_reject_unsupported_length() {
+        assert_eq!(
+            MmioAccessBytes::new(&[1, 2, 3]).expect_err("three-byte data should fail"),
+            MmioAccessBytesError::UnsupportedLength { len: 3 }
+        );
+        assert_eq!(
+            MmioAccessBytes::zeroed(3).expect_err("three-byte zeroed data should fail"),
+            MmioAccessBytesError::UnsupportedLength { len: 3 }
+        );
+    }
+
+    #[test]
+    fn access_bytes_reject_oversized_data() {
+        assert_eq!(
+            MmioAccessBytes::new(&[0; MAX_MMIO_ACCESS_BYTES + 1])
+                .expect_err("oversized bytes should fail"),
+            MmioAccessBytesError::TooLarge {
+                len: MAX_MMIO_ACCESS_BYTES + 1,
+                max: MAX_MMIO_ACCESS_BYTES
+            }
+        );
+        assert_eq!(
+            MmioAccessBytes::zeroed(MAX_MMIO_ACCESS_BYTES + 1)
+                .expect_err("oversized zeroed bytes should fail"),
+            MmioAccessBytesError::TooLarge {
+                len: MAX_MMIO_ACCESS_BYTES + 1,
+                max: MAX_MMIO_ACCESS_BYTES
+            }
+        );
+    }
+
+    #[test]
+    fn read_operation_creates_zeroed_data_for_access_size() {
+        let access = lookup_access(0x2000, 4);
+        let operation = MmioOperation::read(access).expect("read operation should be valid");
+
+        assert_eq!(operation.kind(), MmioOperationKind::Read);
+        assert_eq!(operation.access(), access);
+        assert_eq!(operation.data().len(), 4);
+        assert_eq!(operation.data().as_slice(), &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn write_operation_preserves_access_and_data() {
+        let access = lookup_access(0x3000, 4);
+        let data = MmioAccessBytes::new(&[1, 2, 3, 4]).expect("write data should be valid");
+        let operation =
+            MmioOperation::write(access, data).expect("write operation should be valid");
+
+        assert_eq!(operation.kind(), MmioOperationKind::Write);
+        assert_eq!(operation.access(), access);
+        assert_eq!(operation.data(), data);
+    }
+
+    #[test]
+    fn write_operation_rejects_data_length_mismatch() {
+        let access = lookup_access(0x4000, 4);
+        let data = MmioAccessBytes::new(&[1, 2]).expect("write data should be valid");
+        let err =
+            MmioOperation::write(access, data).expect_err("mismatched data length should fail");
+
+        assert_eq!(
+            err,
+            MmioOperationError::DataLengthMismatch {
+                access,
+                expected: 4,
+                actual: 2
+            }
+        );
+    }
+
+    #[test]
+    fn operation_rejects_unsupported_access_size() {
+        let access = lookup_access(0x5000, 3);
+        let err = MmioOperation::read(access).expect_err("three-byte access should fail");
+
+        assert_eq!(
+            err,
+            MmioOperationError::UnsupportedAccessSize { access, size: 3 }
+        );
+    }
+
+    #[test]
+    fn operation_rejects_access_larger_than_maximum() {
+        let access = lookup_access(0x6000, 16);
+        let err = MmioOperation::read(access).expect_err("oversized access should fail");
+
+        assert_eq!(
+            err,
+            MmioOperationError::UnsupportedAccessSize { access, size: 16 }
+        );
+    }
+
+    #[test]
     fn displays_mmio_bus_errors() {
         let err = MmioBusError::UnownedAccess {
             range: range(0x1000, 4),
@@ -687,5 +1023,32 @@ mod tests {
             err.to_string(),
             "MMIO access range [0x1000..0x1004) (4 bytes) is not owned by any region"
         );
+    }
+
+    #[test]
+    fn displays_access_bytes_errors() {
+        let err = MmioAccessBytesError::TooLarge { len: 9, max: 8 };
+
+        assert_eq!(
+            err.to_string(),
+            "MMIO access byte length 9 exceeds the maximum 8"
+        );
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn displays_operation_errors() {
+        let access = lookup_access(0x7000, 4);
+        let err = MmioOperationError::DataLengthMismatch {
+            access,
+            expected: 4,
+            actual: 2,
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "MMIO operation data length 2 does not match access size 4 for range [0x7000..0x7004) (4 bytes)"
+        );
+        assert!(err.source().is_none());
     }
 }

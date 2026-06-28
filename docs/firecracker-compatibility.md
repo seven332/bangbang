@@ -15,8 +15,9 @@ create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding,
 registry resolution, and vCPU exit classification, narrow vCPU register wrappers, internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, minimal internal
 arm64 FDT generation and guest-memory writes, anonymous guest memory allocation
 for validated runtime layouts, HVF guest memory map/unmap ownership for
-allocated regions, an internal MMIO region ownership registry, single-vCPU
-arm64 HVF boot-register setup, and an initial process startup argument model.
+allocated regions, an internal MMIO region ownership registry and operation/data
+model, single-vCPU arm64 HVF boot-register setup, and an initial process startup
+argument model.
 There is no broader API request body model, guest execution, vCPU run loop,
 interrupt injection, MMIO exit dispatch, device emulation, public startup
 wiring, multi-vCPU setup, PSCI behavior, or public boot-source API behavior yet.
@@ -323,14 +324,17 @@ memory `reg` property alone cannot fit in the FDT window are rejected before FDT
 construction. The write result records the FDT guest address and byte size for
 future boot-register setup.
 
-The runtime crate also contains an internal MMIO region registry for future
-device dispatch. It reuses `GuestMemoryRange`'s end-exclusive semantics instead
-of Firecracker's inclusive-end `BusRange` representation. Region registration
-rejects zero-sized or overflowing ranges and accepts adjacent non-overlapping
-ranges. Lookups validate that the whole access range is owned by one region
-before returning the region owner and offset; accesses that hit a hole, overflow,
-or cross a region boundary are rejected. This is not MMIO exit dispatch or
-device emulation yet.
+The runtime crate also contains an internal MMIO region registry and operation
+model for future device dispatch. It reuses `GuestMemoryRange`'s end-exclusive
+semantics instead of Firecracker's inclusive-end `BusRange` representation.
+Region registration rejects zero-sized or overflowing ranges and accepts
+adjacent non-overlapping ranges. Lookups validate that the whole access range is
+owned by one region before returning the region owner and offset; accesses that
+hit a hole, overflow, or cross a region boundary are rejected. A resolved access
+can be wrapped as a read or write operation with bounded 1-, 2-, 4-, or 8-byte
+data, and write construction rejects data whose length does not match the
+resolved access size. This is still not MMIO exit dispatch, device emulation,
+guest register completion, or interrupt delivery.
 
 The HVF backend can decode candidate MMIO accesses from arm64 data-abort
 exception exits. The decoder converts supported ESR and IPA metadata into a
