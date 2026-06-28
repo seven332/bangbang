@@ -386,6 +386,9 @@ fn handle_api_request(request: ApiRequest, vmm: &mut VmmController) -> HttpRespo
             handle_instance_info(vmm.handle_action(VmmAction::GetVmInstanceInfo))
         }
         ApiRequest::GetVersion => handle_vmm_version(vmm.handle_action(VmmAction::GetVmmVersion)),
+        ApiRequest::PutDrive(_) => {
+            HttpResponse::fault("The requested operation is not supported: PutDrive")
+        }
     }
 }
 
@@ -697,6 +700,42 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
         assert!(response.contains(r#"{"fault_message":"Invalid request method and/or path."}"#));
+    }
+
+    #[test]
+    fn returns_fault_for_unwired_drive_request() {
+        let path = unique_socket_path("drive-unwired");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+        let body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "/tmp/rootfs.ext4",
+            "is_root_device": true
+        }"#;
+        let request = format!(
+            "PUT /drives/rootfs HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        client
+            .write_all(request.as_bytes())
+            .expect("client should write request");
+        let mut vmm = test_controller();
+        server
+            .serve_next(&mut vmm)
+            .expect("server should handle one request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("client should read response");
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(
+            response.contains(
+                r#"{"fault_message":"The requested operation is not supported: PutDrive"}"#
+            )
+        );
     }
 
     #[test]

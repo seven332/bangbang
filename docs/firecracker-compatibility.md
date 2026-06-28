@@ -5,7 +5,9 @@ is a planning reference for future API, VMM, and backend work; it does not mean
 the current scaffold implements all listed API behavior.
 
 The current repository defines crate boundaries, endpoint names, a minimal
-HTTP-over-Unix-socket API server for `GET /` and `GET /version`, a backend-neutral VM
+HTTP-over-Unix-socket API server for `GET /` and `GET /version`, a strict
+Firecracker-shaped `PUT /drives/{drive_id}` request parser that is not yet
+wired to successful VMM configuration behavior, a backend-neutral VM
 trait, a minimal read-only VMM action/data model, backend-neutral guest
 physical address and aarch64 DRAM layout/access primitives, arm64 boot
 placement helpers, internal boot-source validation and arm64 kernel/initrd
@@ -34,12 +36,12 @@ notification dispatch helper with virtio-mmio queue interrupt-status updates
 for future device handlers, an internal
 backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, and an initial process startup argument model.
-There is no broader API request body model, guest execution, continuous vCPU run loop,
+There is no broader API request body model beyond the initial drive parser, guest execution, continuous vCPU run loop,
 complete interrupt delivery, public startup or HVF runner-loop wiring for block
 queue notifications, backend interrupt signaling, device-backed feature
 negotiation, indirect descriptor support, device-backed runner-loop MMIO
 handling, real device emulation, multi-vCPU setup, PSCI behavior, or public
-boot-source, drives, or actions API behavior yet.
+boot-source, drives, or actions configuration behavior yet.
 
 ## Firecracker Model Alignment
 
@@ -212,8 +214,8 @@ exist.
 | `PUT /machine-config` | `track_dirty_pages` | optional when `false`; deferred when `true` | Explicit `false` matches Firecracker's default; enabling dirty tracking belongs with snapshot support. |
 | `PUT /machine-config` | `huge_pages` | optional when `None`; rejected for `2M` | Explicit `None` matches Firecracker's default; Linux hugetlbfs does not directly apply to the macOS target. |
 | `PUT /machine-config` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
-| `PUT /drives/{drive_id}` | path `drive_id` | required | The internal model validates this as nonempty alphanumeric or `_`, matching Firecracker's `checked_id` rule; public API parsing is not wired yet. |
-| `PUT /drives/{drive_id}` | body `drive_id` | required | The internal model requires this to match the path `drive_id`. |
+| `PUT /drives/{drive_id}` | path `drive_id` | required | The API parser captures this value, and the internal model validates it as nonempty alphanumeric or `_`, matching Firecracker's `checked_id` rule. |
+| `PUT /drives/{drive_id}` | body `drive_id` | required | The API parser rejects requests where this does not match the path `drive_id`. |
 | `PUT /drives/{drive_id}` | `is_root_device` | required | Identifies whether this drive is the boot device. |
 | `PUT /drives/{drive_id}` | `path_on_host` | required initially | The internal model rejects empty paths without opening or statting the path; future validation must cover access, file type, and path redaction in errors. |
 | `PUT /drives/{drive_id}` | `is_read_only` | optional | The internal model defaults omitted virtio-block drives to read-write. |
@@ -354,6 +356,13 @@ adapter or adopt `vm-memory` more broadly.
 
 ## Internal Drive Configuration
 
+The API crate has a strict Firecracker-shaped `PUT /drives/{drive_id}` request
+parser and body model. It accepts the documented drive fields, rejects unknown
+fields, rejects malformed or incomplete JSON bodies, rejects extra path
+segments, and rejects path/body `drive_id` mismatches without echoing host paths.
+The running API server still returns an unsupported-operation fault for parsed
+drive requests because VMM action and state wiring is deferred.
+
 The runtime crate has an internal, Firecracker-shaped drive configuration model
 for the initial virtio-block subset. It validates path and body `drive_id`
 values as nonempty alphanumeric strings with `_`, requires the two IDs to
@@ -381,10 +390,10 @@ device id and one 256-entry queue shape, always advertises
 The config handler supports bounded read-only capacity reads through the
 existing virtio-mmio device-configuration path and rejects config writes.
 
-This model is not wired to `PUT /drives/{drive_id}` yet and does not select a
-root block device, wire active block notification dispatch into startup or HVF
-runner loops, implement rate limiting, support vhost-user-block sockets, or use
-an async I/O engine.
+The runtime model is not wired to successful `PUT /drives/{drive_id}` VMM
+configuration yet and does not select a root block device, wire active block
+notification dispatch into startup or HVF runner loops, implement rate limiting,
+support vhost-user-block sockets, or use an async I/O engine.
 
 ## Internal arm64 FDT Generation
 
