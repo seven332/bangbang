@@ -234,9 +234,10 @@ setup, memory size, and block device I/O when those surfaces are implemented.
 
 The runtime crate can parse internal virtio-block request descriptor chains from
 guest memory for future device handlers. It reads the 16-byte header, classifies
-`IN`, `OUT`, `FLUSH`, `GET_ID`, and unsupported request types, validates
-data/status descriptor direction and length, checks 512-byte sector alignment and
-capacity bounds for `IN`/`OUT`, and checks the 20-byte minimum `GET_ID` buffer.
+`IN`, `OUT`, `FLUSH`, `GET_ID`, and unsupported request types, validates the
+required data/status descriptor direction and length rules, checks 512-byte
+sector alignment and capacity bounds for `IN`/`OUT`, and checks the 20-byte
+minimum `GET_ID` buffer.
 
 This is not public `/drives` behavior and does not execute parsed requests,
 touch host backing files, write status bytes, publish used-ring entries, signal
