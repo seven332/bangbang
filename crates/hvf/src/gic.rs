@@ -292,6 +292,8 @@ pub struct HvfGicSpiSignaler {
 
 impl HvfGicSpiSignaler {
     pub fn from_metadata(metadata: &HvfGicMetadata) -> Result<Self, HvfGicSpiSignalError> {
+        validate_spi_interrupt_range(metadata.spi_interrupt_range)
+            .map_err(HvfGicSpiSignalError::InvalidRange)?;
         let api = real_gic_spi_signal_api().map_err(HvfGicSpiSignalError::Backend)?;
 
         Self::with_api(metadata.spi_interrupt_range, api)
@@ -1636,6 +1638,22 @@ mod tests {
         );
         assert!(api.calls().is_empty());
         assert!(api.spi_signals().is_empty());
+    }
+
+    #[test]
+    fn spi_signaler_from_metadata_rejects_invalid_range_before_backend_lookup() {
+        let mut metadata =
+            metadata_from_parameters(default_parameters()).expect("default metadata should build");
+        metadata.spi_interrupt_range = HvfGicInterruptRange { base: 32, count: 0 };
+
+        assert_eq!(
+            HvfGicSpiSignaler::from_metadata(&metadata)
+                .expect_err("invalid metadata range should fail before loading the backend"),
+            HvfGicSpiSignalError::InvalidRange(HvfGicError::InvalidParameter {
+                name: "spi_interrupt_range.count",
+                value: 0,
+            })
+        );
     }
 
     #[test]
