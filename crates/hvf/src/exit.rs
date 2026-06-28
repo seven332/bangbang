@@ -2,7 +2,10 @@
 
 use std::fmt;
 
-use bangbang_runtime::memory::{GuestAddress, GuestMemoryError, GuestMemoryRange};
+use bangbang_runtime::{
+    memory::{GuestAddress, GuestMemoryError, GuestMemoryRange},
+    mmio::{MmioAccess, MmioBus, MmioBusError, MmioRegionId},
+};
 
 const ESR_EC_SHIFT: u64 = 26;
 const ESR_EC_MASK: u64 = 0x3f;
@@ -86,6 +89,20 @@ pub struct HvfMmioAccess {
 }
 
 impl HvfMmioAccess {
+    pub fn resolve(self, bus: &MmioBus) -> Result<HvfResolvedMmioAccess, HvfMmioResolveError> {
+        let runtime_access = bus
+            .lookup(self.address(), self.size().bytes())
+            .map_err(|source| HvfMmioResolveError::BusLookup {
+                access: self,
+                source,
+            })?;
+
+        Ok(HvfResolvedMmioAccess {
+            hvf_access: self,
+            runtime_access,
+        })
+    }
+
     pub const fn address(self) -> GuestAddress {
         self.range.start()
     }
@@ -112,6 +129,54 @@ impl HvfMmioAccess {
 
     pub const fn register_width(self) -> HvfMmioRegisterWidth {
         self.register_width
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfResolvedMmioAccess {
+    hvf_access: HvfMmioAccess,
+    runtime_access: MmioAccess,
+}
+
+impl HvfResolvedMmioAccess {
+    pub const fn hvf_access(self) -> HvfMmioAccess {
+        self.hvf_access
+    }
+
+    pub const fn runtime_access(self) -> MmioAccess {
+        self.runtime_access
+    }
+
+    pub const fn region_id(self) -> MmioRegionId {
+        self.runtime_access.region_id()
+    }
+
+    pub const fn offset(self) -> u64 {
+        self.runtime_access.offset()
+    }
+
+    pub const fn range(self) -> GuestMemoryRange {
+        self.runtime_access.range()
+    }
+
+    pub const fn direction(self) -> HvfMmioDirection {
+        self.hvf_access.direction()
+    }
+
+    pub const fn size(self) -> HvfMmioAccessSize {
+        self.hvf_access.size()
+    }
+
+    pub const fn register(self) -> HvfMmioRegister {
+        self.hvf_access.register()
+    }
+
+    pub const fn sign_extend(self) -> bool {
+        self.hvf_access.sign_extend()
+    }
+
+    pub const fn register_width(self) -> HvfMmioRegisterWidth {
+        self.hvf_access.register_width()
     }
 }
 
@@ -237,6 +302,37 @@ impl std::error::Error for HvfMmioDecodeError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfMmioResolveError {
+    BusLookup {
+        access: HvfMmioAccess,
+        source: MmioBusError,
+    },
+}
+
+impl fmt::Display for HvfMmioResolveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BusLookup { access, source } => {
+                write!(
+                    f,
+                    "failed to resolve HVF MMIO access at {} with size {}: {source}",
+                    access.address(),
+                    access.size().bytes()
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for HvfMmioResolveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BusLookup { source, .. } => Some(source),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HvfVcpuExit {
     Canceled,
     Exception(HvfExceptionExit),
@@ -268,13 +364,18 @@ fn exception_class(syndrome: u64) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as _;
+
     use super::{
         ESR_EC_DATA_ABORT_LOWER_EL, ESR_EC_SHIFT, ESR_ISS_CM, ESR_ISS_ISV, ESR_ISS_S1PTW,
         ESR_ISS_SAS_SHIFT, ESR_ISS_SF, ESR_ISS_SRT_SHIFT, ESR_ISS_SSE, ESR_ISS_WNR,
         HvfExceptionExit, HvfMmioAccessSize, HvfMmioDecodeError, HvfMmioDirection, HvfMmioRegister,
-        HvfMmioRegisterWidth, HvfVcpuExit,
+        HvfMmioRegisterWidth, HvfMmioResolveError, HvfVcpuExit,
     };
-    use bangbang_runtime::memory::{GuestAddress, GuestMemoryError, GuestMemoryRange};
+    use bangbang_runtime::{
+        memory::{GuestAddress, GuestMemoryError, GuestMemoryRange},
+        mmio::{MmioBus, MmioBusError, MmioRegion, MmioRegionId},
+    };
 
     fn raw_exit(reason: u32) -> crate::ffi::HvVcpuExit {
         crate::ffi::HvVcpuExit {
@@ -320,6 +421,15 @@ mod tests {
 
     fn range(start: u64, size: u64) -> GuestMemoryRange {
         GuestMemoryRange::new(GuestAddress::new(start), size).expect("test range should be valid")
+    }
+
+    fn region_id(value: u64) -> MmioRegionId {
+        MmioRegionId::new(value)
+    }
+
+    fn insert_region(bus: &mut MmioBus, id: u64, start: u64, size: u64) -> MmioRegion {
+        bus.insert(region_id(id), GuestAddress::new(start), size)
+            .expect("test MMIO region should insert")
     }
 
     #[test]
@@ -493,6 +603,180 @@ mod tests {
 
         assert!(access.sign_extend());
         assert_eq!(access.register_width(), HvfMmioRegisterWidth::Bits64);
+    }
+
+    #[test]
+    fn resolves_mmio_read_access_against_runtime_bus() {
+        let mut bus = MmioBus::new();
+        let region = insert_region(&mut bus, 7, 0x1000, 0x100);
+        let register = HvfMmioRegister::new(5).expect("register should be valid");
+        let access = exception_exit(
+            data_abort_syndrome(
+                HvfMmioAccessSize::Halfword,
+                HvfMmioDirection::Read,
+                register,
+            ) | ESR_ISS_SSE
+                | ESR_ISS_SF,
+            0x1040,
+        )
+        .decode_mmio_access()
+        .expect("read access should decode");
+
+        let resolved = access.resolve(&bus).expect("access should resolve");
+
+        assert_eq!(resolved.hvf_access(), access);
+        assert_eq!(resolved.runtime_access().region(), region);
+        assert_eq!(resolved.region_id(), region_id(7));
+        assert_eq!(resolved.offset(), 0x40);
+        assert_eq!(resolved.range(), range(0x1040, 2));
+        assert_eq!(resolved.direction(), HvfMmioDirection::Read);
+        assert_eq!(resolved.size(), HvfMmioAccessSize::Halfword);
+        assert_eq!(resolved.register(), register);
+        assert!(resolved.sign_extend());
+        assert_eq!(resolved.register_width(), HvfMmioRegisterWidth::Bits64);
+    }
+
+    #[test]
+    fn resolves_mmio_write_access_against_runtime_bus() {
+        let mut bus = MmioBus::new();
+        insert_region(&mut bus, 9, 0x2000, 0x100);
+        let register = HvfMmioRegister::new(6).expect("register should be valid");
+        let access = exception_exit(
+            data_abort_syndrome(HvfMmioAccessSize::Word, HvfMmioDirection::Write, register),
+            0x2080,
+        )
+        .decode_mmio_access()
+        .expect("write access should decode");
+
+        let resolved = access.resolve(&bus).expect("access should resolve");
+
+        assert_eq!(resolved.region_id(), region_id(9));
+        assert_eq!(resolved.offset(), 0x80);
+        assert_eq!(resolved.range(), range(0x2080, 4));
+        assert_eq!(resolved.direction(), HvfMmioDirection::Write);
+        assert_eq!(resolved.size(), HvfMmioAccessSize::Word);
+        assert_eq!(resolved.register(), register);
+        assert!(!resolved.sign_extend());
+        assert_eq!(resolved.register_width(), HvfMmioRegisterWidth::Bits32);
+    }
+
+    #[test]
+    fn rejects_unowned_mmio_access_resolution() {
+        let bus = MmioBus::new();
+        let access = exception_exit(
+            data_abort_syndrome(
+                HvfMmioAccessSize::Word,
+                HvfMmioDirection::Read,
+                HvfMmioRegister::new(1).expect("register should be valid"),
+            ),
+            0x3000,
+        )
+        .decode_mmio_access()
+        .expect("access should decode");
+
+        let err = access
+            .resolve(&bus)
+            .expect_err("unowned access should fail");
+
+        assert_eq!(
+            err,
+            HvfMmioResolveError::BusLookup {
+                access,
+                source: MmioBusError::UnownedAccess {
+                    range: range(0x3000, 4)
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_mmio_access_crossing_adjacent_runtime_regions() {
+        let mut bus = MmioBus::new();
+        insert_region(&mut bus, 1, 0x1000, 0x100);
+        insert_region(&mut bus, 2, 0x1100, 0x100);
+        let access = exception_exit(
+            data_abort_syndrome(
+                HvfMmioAccessSize::Halfword,
+                HvfMmioDirection::Read,
+                HvfMmioRegister::new(1).expect("register should be valid"),
+            ),
+            0x10ff,
+        )
+        .decode_mmio_access()
+        .expect("access should decode");
+
+        let err = access
+            .resolve(&bus)
+            .expect_err("cross-region access should fail");
+
+        assert_eq!(
+            err,
+            HvfMmioResolveError::BusLookup {
+                access,
+                source: MmioBusError::UnownedAccess {
+                    range: range(0x10ff, 2)
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn preserves_runtime_overflow_error_during_mmio_resolution() {
+        let bus = MmioBus::new();
+        let access = super::HvfMmioAccess {
+            range: range(u64::MAX - 1, 1),
+            size: HvfMmioAccessSize::Halfword,
+            direction: HvfMmioDirection::Read,
+            register: HvfMmioRegister::new(1).expect("register should be valid"),
+            sign_extend: false,
+            register_width: HvfMmioRegisterWidth::Bits32,
+        };
+
+        let err = access
+            .resolve(&bus)
+            .expect_err("overflowing runtime lookup should fail");
+
+        assert_eq!(
+            err,
+            HvfMmioResolveError::BusLookup {
+                access,
+                source: MmioBusError::InvalidAccessRange {
+                    start: GuestAddress::new(u64::MAX - 1),
+                    size: 2,
+                    source: GuestMemoryError::AddressOverflow {
+                        start: GuestAddress::new(u64::MAX - 1),
+                        size: 2
+                    }
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn displays_mmio_resolution_errors() {
+        let access = exception_exit(
+            data_abort_syndrome(
+                HvfMmioAccessSize::Word,
+                HvfMmioDirection::Read,
+                HvfMmioRegister::new(1).expect("register should be valid"),
+            ),
+            0x3000,
+        )
+        .decode_mmio_access()
+        .expect("access should decode");
+        let source = MmioBusError::UnownedAccess {
+            range: range(0x3000, 4),
+        };
+        let err = HvfMmioResolveError::BusLookup { access, source };
+
+        assert_eq!(
+            err.to_string(),
+            "failed to resolve HVF MMIO access at 0x3000 with size 4: MMIO access range [0x3000..0x3004) (4 bytes) is not owned by any region"
+        );
+        assert_eq!(
+            err.source().and_then(|source| source.downcast_ref()),
+            Some(&source)
+        );
     }
 
     #[test]

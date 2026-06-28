@@ -11,8 +11,8 @@ physical address and aarch64 DRAM layout/access primitives, arm64 boot
 placement helpers, internal boot-source validation and arm64 kernel/initrd
 payload loading, a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
-create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding,
-narrow vCPU register wrappers, internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, minimal internal
+create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding
+and registry resolution, narrow vCPU register wrappers, internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, minimal internal
 arm64 FDT generation and guest-memory writes, anonymous guest memory allocation
 for validated runtime layouts, HVF guest memory map/unmap ownership for
 allocated regions, an internal MMIO region ownership registry, single-vCPU
@@ -338,8 +338,10 @@ checked access range, direction, width, register number, and read-extension
 metadata while the raw exit snapshot still preserves FAR. Unsupported exception
 classes, missing instruction-syndrome metadata, table-walk aborts,
 cache-maintenance aborts, and overflowing access ranges fail closed before later
-dispatch can route them. This is still not device dispatch, read completion,
-interrupt delivery, or device emulation.
+dispatch can route them. Decoded accesses can also be resolved against the
+runtime MMIO registry to identify the owning region, offset, and preserved HVF
+access metadata for future device dispatch. This is still not device dispatch,
+read completion, interrupt delivery, or device emulation.
 
 The HVF backend can map allocated guest memory regions into an existing
 Hypervisor.framework VM with read/write/execute guest RAM permissions. The
@@ -489,9 +491,9 @@ macOS design work instead of direct implementation:
 - HVF exit snapshots preserve Hypervisor.framework reasons such as canceled,
   exception, virtual timer activation, and unknown after a run wrapper marks
   exit data available. Candidate arm64 MMIO data-abort exceptions can be decoded
-  into checked access metadata, but they are not yet routed into devices,
-  completed back into guest registers, or translated into interrupt/runtime
-  events.
+  into checked access metadata and resolved against the internal MMIO registry,
+  but they are not yet routed into devices, completed back into guest registers,
+  or translated into interrupt/runtime events.
 - Firecracker's full paused/resumed microVM loop is not implemented yet.
   bangbang's runner is only the HVF ownership and cancellation primitive needed
   before guest memory, interrupt, timer, and device work can build the real run
