@@ -1597,6 +1597,10 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
         &self.activation
     }
 
+    pub(crate) fn activation_handler_mut(&mut self) -> &mut A {
+        &mut self.activation
+    }
+
     pub const fn is_device_activated(&self) -> bool {
         self.device_activated
     }
