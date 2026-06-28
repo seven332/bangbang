@@ -19,13 +19,14 @@ arm64 FDT generation and guest-memory writes, anonymous guest memory allocation
 for validated runtime layouts, HVF guest memory map/unmap ownership for
 allocated regions, an internal MMIO region ownership registry and operation/data
 model plus handler dispatch boundary, an internal virtio-mmio register/access
-decoder plus virtqueue descriptor-chain validator, available-ring read model,
-and used-ring write model for future device handlers, an internal backend-neutral
-interrupt line/status/trigger model, single-vCPU arm64 HVF boot-register setup,
-and an initial process startup argument model.
+decoder, feature/status register state, plus virtqueue descriptor-chain
+validator, available-ring read model, and used-ring write model for future
+device handlers, an internal backend-neutral interrupt line/status/trigger
+model, single-vCPU arm64 HVF boot-register setup, and an initial process
+startup argument model.
 There is no broader API request body model, guest execution, continuous vCPU run loop,
 complete interrupt delivery, queue notification/completion dispatch,
-feature negotiation, indirect descriptor support,
+device-backed feature negotiation and activation, indirect descriptor support,
 device-backed runner-loop MMIO handling, real device emulation, public startup
 wiring, multi-vCPU setup, PSCI behavior, or public boot-source API behavior yet.
 
@@ -356,13 +357,17 @@ transport window. The generic register decoder accepts only exact 4-byte reads
 or writes at the Firecracker-supported common register offsets and rejects
 unsupported offsets, unsupported widths, cross-register accesses, and accesses
 outside the 4 KiB virtio-mmio device window before future device-specific state
-can be mutated. Device-configuration accesses are classified by offset and
-length, but concrete config-space behavior, feature negotiation, notification
-handling, interrupt acknowledgement, and real virtio devices are still
-deferred. The virtqueue model can publish one used-ring completion element with
-validated layout, mapped-memory checks, wrapping, and release ordering, but
-batching, event-index notification suppression, and device-backed completion
-loops are still deferred.
+can be mutated. A backend-neutral common-register state model can return
+Firecracker-shaped identity values, expose selected 32-bit device feature
+pages, accept selected driver feature pages only in the pre-`FEATURES_OK`
+driver state, and enforce the cumulative VirtIO status transition sequence
+plus reset-on-zero behavior. Device-configuration accesses are classified by
+offset and length, but concrete config-space behavior, queue register state,
+notification handling, interrupt acknowledgement, device activation, and real
+virtio devices are still deferred. The virtqueue model can publish one
+used-ring completion element with validated layout, mapped-memory checks,
+wrapping, and release ordering, but batching, event-index notification
+suppression, and device-backed completion loops are still deferred.
 
 The runtime crate also contains backend-neutral interrupt signaling groundwork.
 It can validate nonzero guest interrupt lines, represent queue and
@@ -372,8 +377,8 @@ to an injected sink. The HVF crate can allocate deterministic guest interrupt
 lines from the validated GIC SPI range and signal validated SPI levels through
 `hv_gic_set_spi`. This follows Firecracker's separation between device-facing
 interrupt triggers and KVM-specific irqfd/GSI routing, but it is not yet
-interrupt masking, stateful guest-visible virtio-mmio register behavior,
-runner-loop interrupt dispatch, or guest-visible device delivery.
+interrupt masking, queue/device-backed virtio-mmio handling, runner-loop
+interrupt dispatch, or guest-visible device delivery.
 
 The HVF backend can decode candidate MMIO accesses from arm64 data-abort
 exception exits. The decoder converts supported ESR and IPA metadata into a

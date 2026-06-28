@@ -12,8 +12,298 @@ pub const VIRTIO_MMIO_MAGIC_VALUE: u32 = 0x7472_6976;
 pub const VIRTIO_MMIO_VERSION: u32 = 2;
 pub const VIRTIO_MMIO_VENDOR_ID: u32 = 0;
 pub const VIRTIO_MMIO_REGISTER_ACCESS_SIZE: usize = 4;
+pub const VIRTIO_MMIO_FEATURE_VERSION_1: u32 = 32;
+pub const VIRTIO_MMIO_VERSION_1_FEATURE: u64 = 1_u64 << VIRTIO_MMIO_FEATURE_VERSION_1;
+pub const VIRTIO_DEVICE_STATUS_INIT: u32 = 0x00;
+pub const VIRTIO_DEVICE_STATUS_ACKNOWLEDGE: u32 = 0x01;
+pub const VIRTIO_DEVICE_STATUS_DRIVER: u32 = 0x02;
+pub const VIRTIO_DEVICE_STATUS_DRIVER_OK: u32 = 0x04;
+pub const VIRTIO_DEVICE_STATUS_FEATURES_OK: u32 = 0x08;
+pub const VIRTIO_DEVICE_STATUS_DEVICE_NEEDS_RESET: u32 = 0x40;
+pub const VIRTIO_DEVICE_STATUS_FAILED: u32 = 0x80;
 
 const VIRTIO_MMIO_REGISTER_ACCESS_SIZE_U64: u64 = 4;
+const VIRTIO_MMIO_FEATURE_SELECTOR_MAX: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioMmioDeviceRegisters {
+    device_id: u32,
+    vendor_id: u32,
+    device_features: u64,
+    config_generation: u32,
+    device_features_select: u32,
+    driver_features_select: u32,
+    driver_features: u64,
+    status: u32,
+}
+
+impl VirtioMmioDeviceRegisters {
+    pub const fn new(device_id: u32, device_features: u64) -> Self {
+        Self::with_vendor_id_and_config_generation(
+            device_id,
+            VIRTIO_MMIO_VENDOR_ID,
+            device_features,
+            0,
+        )
+    }
+
+    pub const fn with_vendor_id_and_config_generation(
+        device_id: u32,
+        vendor_id: u32,
+        device_features: u64,
+        config_generation: u32,
+    ) -> Self {
+        Self {
+            device_id,
+            vendor_id,
+            device_features: device_features | VIRTIO_MMIO_VERSION_1_FEATURE,
+            config_generation,
+            device_features_select: 0,
+            driver_features_select: 0,
+            driver_features: 0,
+            status: VIRTIO_DEVICE_STATUS_INIT,
+        }
+    }
+
+    pub const fn device_id(self) -> u32 {
+        self.device_id
+    }
+
+    pub const fn vendor_id(self) -> u32 {
+        self.vendor_id
+    }
+
+    pub const fn device_features(self) -> u64 {
+        self.device_features
+    }
+
+    pub const fn config_generation(self) -> u32 {
+        self.config_generation
+    }
+
+    pub const fn device_features_select(self) -> u32 {
+        self.device_features_select
+    }
+
+    pub const fn driver_features_select(self) -> u32 {
+        self.driver_features_select
+    }
+
+    pub const fn driver_features(self) -> u64 {
+        self.driver_features
+    }
+
+    pub const fn status(self) -> u32 {
+        self.status
+    }
+
+    pub fn read_register(
+        &self,
+        register: VirtioMmioRegister,
+    ) -> Result<u32, VirtioMmioRegisterStateError> {
+        match register {
+            VirtioMmioRegister::MagicValue => Ok(VIRTIO_MMIO_MAGIC_VALUE),
+            VirtioMmioRegister::Version => Ok(VIRTIO_MMIO_VERSION),
+            VirtioMmioRegister::DeviceId => Ok(self.device_id),
+            VirtioMmioRegister::VendorId => Ok(self.vendor_id),
+            VirtioMmioRegister::DeviceFeatures => {
+                feature_word(self.device_features, self.device_features_select)
+            }
+            VirtioMmioRegister::Status => Ok(self.status),
+            VirtioMmioRegister::ConfigGeneration => Ok(self.config_generation),
+            VirtioMmioRegister::DeviceFeaturesSel
+            | VirtioMmioRegister::DriverFeatures
+            | VirtioMmioRegister::DriverFeaturesSel
+            | VirtioMmioRegister::QueueSel
+            | VirtioMmioRegister::QueueNumMax
+            | VirtioMmioRegister::QueueNum
+            | VirtioMmioRegister::QueueReady
+            | VirtioMmioRegister::QueueNotify
+            | VirtioMmioRegister::InterruptStatus
+            | VirtioMmioRegister::InterruptAck
+            | VirtioMmioRegister::QueueDescLow
+            | VirtioMmioRegister::QueueDescHigh
+            | VirtioMmioRegister::QueueDriverLow
+            | VirtioMmioRegister::QueueDriverHigh
+            | VirtioMmioRegister::QueueDeviceLow
+            | VirtioMmioRegister::QueueDeviceHigh => {
+                Err(VirtioMmioRegisterStateError::UnsupportedRegisterRead { register })
+            }
+        }
+    }
+
+    pub fn write_register(
+        &mut self,
+        register: VirtioMmioRegister,
+        value: u32,
+    ) -> Result<(), VirtioMmioRegisterStateError> {
+        match register {
+            VirtioMmioRegister::DeviceFeaturesSel => {
+                validate_feature_selector(value)?;
+                self.device_features_select = value;
+                Ok(())
+            }
+            VirtioMmioRegister::DriverFeaturesSel => {
+                validate_feature_selector(value)?;
+                self.driver_features_select = value;
+                Ok(())
+            }
+            VirtioMmioRegister::DriverFeatures => self.write_driver_features(value),
+            VirtioMmioRegister::Status => self.set_status(value),
+            VirtioMmioRegister::MagicValue
+            | VirtioMmioRegister::Version
+            | VirtioMmioRegister::DeviceId
+            | VirtioMmioRegister::VendorId
+            | VirtioMmioRegister::DeviceFeatures
+            | VirtioMmioRegister::QueueSel
+            | VirtioMmioRegister::QueueNumMax
+            | VirtioMmioRegister::QueueNum
+            | VirtioMmioRegister::QueueReady
+            | VirtioMmioRegister::QueueNotify
+            | VirtioMmioRegister::InterruptStatus
+            | VirtioMmioRegister::InterruptAck
+            | VirtioMmioRegister::QueueDescLow
+            | VirtioMmioRegister::QueueDescHigh
+            | VirtioMmioRegister::QueueDriverLow
+            | VirtioMmioRegister::QueueDriverHigh
+            | VirtioMmioRegister::QueueDeviceLow
+            | VirtioMmioRegister::QueueDeviceHigh
+            | VirtioMmioRegister::ConfigGeneration => {
+                Err(VirtioMmioRegisterStateError::UnsupportedRegisterWrite { register })
+            }
+        }
+    }
+
+    pub fn set_status(&mut self, status: u32) -> Result<(), VirtioMmioRegisterStateError> {
+        if (status & VIRTIO_DEVICE_STATUS_FAILED) != 0 {
+            self.status |= VIRTIO_DEVICE_STATUS_FAILED;
+            return Ok(());
+        }
+
+        if status == VIRTIO_DEVICE_STATUS_INIT {
+            self.reset();
+            return Ok(());
+        }
+
+        if is_valid_status_transition(self.status, status) {
+            self.status = status;
+            Ok(())
+        } else {
+            Err(VirtioMmioRegisterStateError::InvalidStatusTransition {
+                current: self.status,
+                requested: status,
+            })
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.device_features_select = 0;
+        self.driver_features_select = 0;
+        self.driver_features = 0;
+        self.status = VIRTIO_DEVICE_STATUS_INIT;
+    }
+
+    fn write_driver_features(&mut self, value: u32) -> Result<(), VirtioMmioRegisterStateError> {
+        if !self.can_write_driver_features() {
+            return Err(VirtioMmioRegisterStateError::DriverFeaturesNotWritable {
+                status: self.status,
+            });
+        }
+
+        let supported = feature_word(self.device_features, self.driver_features_select)?;
+        let unsupported = value & !supported;
+        if unsupported != 0 {
+            return Err(VirtioMmioRegisterStateError::UnsupportedDriverFeatures {
+                selector: self.driver_features_select,
+                requested: value,
+                supported,
+                unsupported,
+            });
+        }
+
+        self.driver_features |= selected_feature_bits(self.driver_features_select, value)?;
+        Ok(())
+    }
+
+    const fn can_write_driver_features(self) -> bool {
+        self.status
+            & (VIRTIO_DEVICE_STATUS_DRIVER
+                | VIRTIO_DEVICE_STATUS_FEATURES_OK
+                | VIRTIO_DEVICE_STATUS_FAILED
+                | VIRTIO_DEVICE_STATUS_DEVICE_NEEDS_RESET)
+            == VIRTIO_DEVICE_STATUS_DRIVER
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioMmioRegisterStateError {
+    UnsupportedRegisterRead {
+        register: VirtioMmioRegister,
+    },
+    UnsupportedRegisterWrite {
+        register: VirtioMmioRegister,
+    },
+    UnsupportedFeaturePage {
+        selector: u32,
+    },
+    DriverFeaturesNotWritable {
+        status: u32,
+    },
+    UnsupportedDriverFeatures {
+        selector: u32,
+        requested: u32,
+        supported: u32,
+        unsupported: u32,
+    },
+    InvalidStatusTransition {
+        current: u32,
+        requested: u32,
+    },
+}
+
+impl fmt::Display for VirtioMmioRegisterStateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedRegisterRead { register } => {
+                write!(f, "unsupported virtio-mmio state read from {register}")
+            }
+            Self::UnsupportedRegisterWrite { register } => {
+                write!(f, "unsupported virtio-mmio state write to {register}")
+            }
+            Self::UnsupportedFeaturePage { selector } => {
+                write!(
+                    f,
+                    "unsupported virtio-mmio feature selector page {selector}; supported pages are 0..={VIRTIO_MMIO_FEATURE_SELECTOR_MAX}"
+                )
+            }
+            Self::DriverFeaturesNotWritable { status } => {
+                write!(
+                    f,
+                    "virtio-mmio driver features cannot be written while status is 0x{status:x}"
+                )
+            }
+            Self::UnsupportedDriverFeatures {
+                selector,
+                requested,
+                supported,
+                unsupported,
+            } => {
+                write!(
+                    f,
+                    "virtio-mmio driver feature page {selector} requested 0x{requested:x}, including unsupported bits 0x{unsupported:x}; supported bits are 0x{supported:x}"
+                )
+            }
+            Self::InvalidStatusTransition { current, requested } => {
+                write!(
+                    f,
+                    "invalid virtio-mmio device status transition: 0x{current:x} -> 0x{requested:x}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioMmioRegisterStateError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VirtioMmioRegister {
@@ -445,15 +735,72 @@ const fn register_slot_offset(offset: u64) -> u64 {
     offset / VIRTIO_MMIO_REGISTER_ACCESS_SIZE_U64 * VIRTIO_MMIO_REGISTER_ACCESS_SIZE_U64
 }
 
+fn feature_word(features: u64, selector: u32) -> Result<u32, VirtioMmioRegisterStateError> {
+    match selector {
+        0 => Ok((features & u64::from(u32::MAX)) as u32),
+        1 => Ok((features >> 32) as u32),
+        _ => Err(VirtioMmioRegisterStateError::UnsupportedFeaturePage { selector }),
+    }
+}
+
+fn selected_feature_bits(selector: u32, value: u32) -> Result<u64, VirtioMmioRegisterStateError> {
+    match selector {
+        0 => Ok(u64::from(value)),
+        1 => Ok(u64::from(value) << 32),
+        _ => Err(VirtioMmioRegisterStateError::UnsupportedFeaturePage { selector }),
+    }
+}
+
+fn validate_feature_selector(selector: u32) -> Result<(), VirtioMmioRegisterStateError> {
+    if selector <= VIRTIO_MMIO_FEATURE_SELECTOR_MAX {
+        Ok(())
+    } else {
+        Err(VirtioMmioRegisterStateError::UnsupportedFeaturePage { selector })
+    }
+}
+
+const fn is_valid_status_transition(current: u32, requested: u32) -> bool {
+    match current {
+        VIRTIO_DEVICE_STATUS_INIT => requested == VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE => {
+            requested == VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER
+        }
+        status if status == VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER => {
+            requested
+                == VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+                    | VIRTIO_DEVICE_STATUS_DRIVER
+                    | VIRTIO_DEVICE_STATUS_FEATURES_OK
+        }
+        status
+            if status
+                == VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+                    | VIRTIO_DEVICE_STATUS_DRIVER
+                    | VIRTIO_DEVICE_STATUS_FEATURES_OK =>
+        {
+            requested
+                == VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+                    | VIRTIO_DEVICE_STATUS_DRIVER
+                    | VIRTIO_DEVICE_STATUS_FEATURES_OK
+                    | VIRTIO_DEVICE_STATUS_DRIVER_OK
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
 
     use super::{
-        VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VIRTIO_MMIO_MAGIC_VALUE,
-        VIRTIO_MMIO_NOTIFY_OFFSET, VIRTIO_MMIO_REGISTER_ACCESS_SIZE,
-        VIRTIO_MMIO_REGISTER_SPACE_SIZE, VIRTIO_MMIO_VENDOR_ID, VIRTIO_MMIO_VERSION,
-        VirtioMmioAccess, VirtioMmioAccessError, VirtioMmioRegister, decode_virtio_mmio_access,
+        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
+        VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FAILED,
+        VIRTIO_DEVICE_STATUS_FEATURES_OK, VIRTIO_DEVICE_STATUS_INIT,
+        VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+        VIRTIO_MMIO_FEATURE_VERSION_1, VIRTIO_MMIO_MAGIC_VALUE, VIRTIO_MMIO_NOTIFY_OFFSET,
+        VIRTIO_MMIO_REGISTER_ACCESS_SIZE, VIRTIO_MMIO_REGISTER_SPACE_SIZE, VIRTIO_MMIO_VENDOR_ID,
+        VIRTIO_MMIO_VERSION, VIRTIO_MMIO_VERSION_1_FEATURE, VirtioMmioAccess,
+        VirtioMmioAccessError, VirtioMmioDeviceRegisters, VirtioMmioRegister,
+        VirtioMmioRegisterStateError, decode_virtio_mmio_access,
     };
     use crate::memory::GuestAddress;
     use crate::mmio::{MmioAccessBytes, MmioBus, MmioOperation, MmioOperationKind, MmioRegionId};
@@ -490,6 +837,30 @@ mod tests {
         decode_virtio_mmio_access(operation).expect("virtio-mmio access should decode")
     }
 
+    fn advance_to_driver_status(registers: &mut VirtioMmioDeviceRegisters) {
+        registers
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
+            .expect("ACKNOWLEDGE status transition should succeed");
+        registers
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            )
+            .expect("DRIVER status transition should succeed");
+    }
+
+    fn advance_to_features_ok_status(registers: &mut VirtioMmioDeviceRegisters) {
+        advance_to_driver_status(registers);
+        registers
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+                    | VIRTIO_DEVICE_STATUS_DRIVER
+                    | VIRTIO_DEVICE_STATUS_FEATURES_OK,
+            )
+            .expect("FEATURES_OK status transition should succeed");
+    }
+
     #[test]
     fn exposes_firecracker_compatible_constants() {
         assert_eq!(VIRTIO_MMIO_DEVICE_WINDOW_SIZE, 0x1000);
@@ -500,6 +871,324 @@ mod tests {
         assert_eq!(VIRTIO_MMIO_VERSION, 2);
         assert_eq!(VIRTIO_MMIO_VENDOR_ID, 0);
         assert_eq!(VIRTIO_MMIO_REGISTER_ACCESS_SIZE, 4);
+        assert_eq!(VIRTIO_MMIO_FEATURE_VERSION_1, 32);
+        assert_eq!(VIRTIO_MMIO_VERSION_1_FEATURE, 1_u64 << 32);
+    }
+
+    #[test]
+    fn device_registers_read_identity_and_initial_state() {
+        let registers =
+            VirtioMmioDeviceRegisters::with_vendor_id_and_config_generation(7, 0x1234, 0x2a, 9);
+
+        assert_eq!(registers.device_id(), 7);
+        assert_eq!(registers.vendor_id(), 0x1234);
+        assert_eq!(
+            registers.device_features(),
+            VIRTIO_MMIO_VERSION_1_FEATURE | 0x2a
+        );
+        assert_eq!(registers.config_generation(), 9);
+        assert_eq!(registers.device_features_select(), 0);
+        assert_eq!(registers.driver_features_select(), 0);
+        assert_eq!(registers.driver_features(), 0);
+        assert_eq!(registers.status(), VIRTIO_DEVICE_STATUS_INIT);
+        assert_eq!(
+            registers.read_register(VirtioMmioRegister::MagicValue),
+            Ok(VIRTIO_MMIO_MAGIC_VALUE)
+        );
+        assert_eq!(
+            registers.read_register(VirtioMmioRegister::Version),
+            Ok(VIRTIO_MMIO_VERSION)
+        );
+        assert_eq!(registers.read_register(VirtioMmioRegister::DeviceId), Ok(7));
+        assert_eq!(
+            registers.read_register(VirtioMmioRegister::VendorId),
+            Ok(0x1234)
+        );
+        assert_eq!(
+            registers.read_register(VirtioMmioRegister::DeviceFeatures),
+            Ok(0x2a)
+        );
+        assert_eq!(
+            registers.read_register(VirtioMmioRegister::Status),
+            Ok(VIRTIO_DEVICE_STATUS_INIT)
+        );
+        assert_eq!(
+            registers.read_register(VirtioMmioRegister::ConfigGeneration),
+            Ok(9)
+        );
+    }
+
+    #[test]
+    fn device_registers_select_and_read_feature_pages() {
+        let mut registers = VirtioMmioDeviceRegisters::new(7, 0x0000_0004_0000_002a);
+
+        assert_eq!(
+            registers.read_register(VirtioMmioRegister::DeviceFeatures),
+            Ok(0x2a)
+        );
+
+        registers
+            .write_register(VirtioMmioRegister::DeviceFeaturesSel, 1)
+            .expect("feature selector page 1 should be valid");
+
+        assert_eq!(registers.device_features_select(), 1);
+        assert_eq!(
+            registers.read_register(VirtioMmioRegister::DeviceFeatures),
+            Ok(0x5)
+        );
+
+        let err = registers
+            .write_register(VirtioMmioRegister::DeviceFeaturesSel, 2)
+            .expect_err("unsupported device feature selector should fail");
+        assert_eq!(
+            err,
+            VirtioMmioRegisterStateError::UnsupportedFeaturePage { selector: 2 }
+        );
+        assert_eq!(registers.device_features_select(), 1);
+    }
+
+    #[test]
+    fn device_registers_accept_supported_driver_features_in_driver_state() {
+        let mut registers = VirtioMmioDeviceRegisters::new(7, 0x0000_0004_0000_002a);
+        advance_to_driver_status(&mut registers);
+
+        registers
+            .write_register(VirtioMmioRegister::DriverFeatures, 0x2a)
+            .expect("supported page 0 driver features should be accepted");
+        assert_eq!(registers.driver_features(), 0x2a);
+
+        registers
+            .write_register(VirtioMmioRegister::DriverFeaturesSel, 1)
+            .expect("driver feature selector page 1 should be valid");
+        registers
+            .write_register(VirtioMmioRegister::DriverFeatures, 0x5)
+            .expect("supported page 1 driver features should be accepted");
+
+        assert_eq!(registers.driver_features(), 0x2a | u64::from(0x5_u32) << 32);
+    }
+
+    #[test]
+    fn device_registers_reject_driver_features_outside_driver_state() {
+        let mut registers = VirtioMmioDeviceRegisters::new(7, 0x2a);
+
+        let err = registers
+            .write_register(VirtioMmioRegister::DriverFeatures, 0x2a)
+            .expect_err("driver features should not be writable before DRIVER status");
+        assert_eq!(
+            err,
+            VirtioMmioRegisterStateError::DriverFeaturesNotWritable {
+                status: VIRTIO_DEVICE_STATUS_INIT,
+            }
+        );
+        assert_eq!(registers.driver_features(), 0);
+
+        advance_to_features_ok_status(&mut registers);
+        let err = registers
+            .write_register(VirtioMmioRegister::DriverFeatures, 0x2a)
+            .expect_err("driver features should not be writable after FEATURES_OK");
+        assert_eq!(
+            err,
+            VirtioMmioRegisterStateError::DriverFeaturesNotWritable {
+                status: VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+                    | VIRTIO_DEVICE_STATUS_DRIVER
+                    | VIRTIO_DEVICE_STATUS_FEATURES_OK,
+            }
+        );
+    }
+
+    #[test]
+    fn device_registers_reject_unsupported_driver_feature_pages_and_bits() {
+        let mut registers = VirtioMmioDeviceRegisters::new(7, 0x2a);
+        advance_to_driver_status(&mut registers);
+
+        let err = registers
+            .write_register(VirtioMmioRegister::DriverFeaturesSel, 3)
+            .expect_err("unsupported driver feature selector should fail");
+        assert_eq!(
+            err,
+            VirtioMmioRegisterStateError::UnsupportedFeaturePage { selector: 3 }
+        );
+        assert_eq!(registers.driver_features_select(), 0);
+
+        let err = registers
+            .write_register(VirtioMmioRegister::DriverFeatures, 0x80)
+            .expect_err("unsupported driver feature bits should fail");
+        assert_eq!(
+            err,
+            VirtioMmioRegisterStateError::UnsupportedDriverFeatures {
+                selector: 0,
+                requested: 0x80,
+                supported: 0x2a,
+                unsupported: 0x80,
+            }
+        );
+        assert_eq!(registers.driver_features(), 0);
+    }
+
+    #[test]
+    fn device_registers_follow_status_state_machine() {
+        let mut registers = VirtioMmioDeviceRegisters::new(7, 0);
+
+        registers
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
+            .expect("ACKNOWLEDGE transition should succeed");
+        assert_eq!(registers.status(), VIRTIO_DEVICE_STATUS_ACKNOWLEDGE);
+
+        registers
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            )
+            .expect("DRIVER transition should succeed");
+        assert_eq!(
+            registers.status(),
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER
+        );
+
+        registers
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+                    | VIRTIO_DEVICE_STATUS_DRIVER
+                    | VIRTIO_DEVICE_STATUS_FEATURES_OK,
+            )
+            .expect("FEATURES_OK transition should succeed");
+        assert_eq!(
+            registers.status(),
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+                | VIRTIO_DEVICE_STATUS_DRIVER
+                | VIRTIO_DEVICE_STATUS_FEATURES_OK
+        );
+
+        registers
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+                    | VIRTIO_DEVICE_STATUS_DRIVER
+                    | VIRTIO_DEVICE_STATUS_FEATURES_OK
+                    | VIRTIO_DEVICE_STATUS_DRIVER_OK,
+            )
+            .expect("DRIVER_OK transition should succeed");
+        assert_eq!(
+            registers.status(),
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+                | VIRTIO_DEVICE_STATUS_DRIVER
+                | VIRTIO_DEVICE_STATUS_FEATURES_OK
+                | VIRTIO_DEVICE_STATUS_DRIVER_OK
+        );
+    }
+
+    #[test]
+    fn device_registers_reject_invalid_status_transitions() {
+        let mut registers = VirtioMmioDeviceRegisters::new(7, 0);
+
+        let err = registers
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            )
+            .expect_err("skipping ACKNOWLEDGE should fail");
+        assert_eq!(
+            err,
+            VirtioMmioRegisterStateError::InvalidStatusTransition {
+                current: VIRTIO_DEVICE_STATUS_INIT,
+                requested: VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            }
+        );
+        assert_eq!(registers.status(), VIRTIO_DEVICE_STATUS_INIT);
+
+        advance_to_features_ok_status(&mut registers);
+        let err = registers
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            )
+            .expect_err("clearing FEATURES_OK without reset should fail");
+        assert_eq!(
+            err,
+            VirtioMmioRegisterStateError::InvalidStatusTransition {
+                current: VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+                    | VIRTIO_DEVICE_STATUS_DRIVER
+                    | VIRTIO_DEVICE_STATUS_FEATURES_OK,
+                requested: VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            }
+        );
+    }
+
+    #[test]
+    fn device_registers_or_failed_status_and_reset_to_init() {
+        let mut registers =
+            VirtioMmioDeviceRegisters::with_vendor_id_and_config_generation(7, 0x1234, 0x2a, 3);
+        advance_to_driver_status(&mut registers);
+        registers
+            .write_register(VirtioMmioRegister::DriverFeatures, 0x2a)
+            .expect("driver feature write should succeed before reset");
+        registers
+            .write_register(VirtioMmioRegister::DeviceFeaturesSel, 1)
+            .expect("device feature selector should update before reset");
+
+        registers
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_FAILED)
+            .expect("FAILED should be ORed into status");
+        assert_eq!(
+            registers.status(),
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+                | VIRTIO_DEVICE_STATUS_DRIVER
+                | VIRTIO_DEVICE_STATUS_FAILED
+        );
+
+        registers
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_INIT)
+            .expect("writing INIT should reset common transport state");
+        assert_eq!(registers.status(), VIRTIO_DEVICE_STATUS_INIT);
+        assert_eq!(registers.driver_features(), 0);
+        assert_eq!(registers.device_features_select(), 0);
+        assert_eq!(registers.driver_features_select(), 0);
+        assert_eq!(registers.config_generation(), 3);
+        assert_eq!(registers.vendor_id(), 0x1234);
+    }
+
+    #[test]
+    fn device_registers_reject_out_of_scope_register_accesses() {
+        let mut registers = VirtioMmioDeviceRegisters::new(7, 0);
+
+        assert_eq!(
+            registers.read_register(VirtioMmioRegister::QueueReady),
+            Err(VirtioMmioRegisterStateError::UnsupportedRegisterRead {
+                register: VirtioMmioRegister::QueueReady,
+            })
+        );
+        assert_eq!(
+            registers.write_register(VirtioMmioRegister::QueueNotify, 0),
+            Err(VirtioMmioRegisterStateError::UnsupportedRegisterWrite {
+                register: VirtioMmioRegister::QueueNotify,
+            })
+        );
+        assert_eq!(
+            registers.write_register(VirtioMmioRegister::MagicValue, 0),
+            Err(VirtioMmioRegisterStateError::UnsupportedRegisterWrite {
+                register: VirtioMmioRegister::MagicValue,
+            })
+        );
+    }
+
+    #[test]
+    fn device_register_state_errors_display_and_preserve_sources() {
+        let err = VirtioMmioRegisterStateError::UnsupportedFeaturePage { selector: 2 };
+        assert_eq!(
+            err.to_string(),
+            "unsupported virtio-mmio feature selector page 2; supported pages are 0..=1"
+        );
+        assert!(err.source().is_none());
+
+        let err = VirtioMmioRegisterStateError::InvalidStatusTransition {
+            current: VIRTIO_DEVICE_STATUS_INIT,
+            requested: VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+        };
+        assert_eq!(
+            err.to_string(),
+            "invalid virtio-mmio device status transition: 0x0 -> 0x3"
+        );
     }
 
     #[test]
