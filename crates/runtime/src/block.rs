@@ -9,10 +9,11 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryRange};
-use crate::mmio::{MmioAccessBytes, MmioAccessBytesError};
+use crate::mmio::{MmioAccessBytes, MmioAccessBytesError, MmioHandlerError};
 use crate::virtio_mmio::{
+    VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError, VirtioMmioDeviceActivationHandler,
     VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError, VirtioMmioDeviceConfigHandler,
-    VirtioMmioQueueState,
+    VirtioMmioQueueRegisterError, VirtioMmioQueueState,
 };
 use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
@@ -1920,6 +1921,143 @@ impl std::error::Error for BlockFileBackingError {
     }
 }
 
+#[derive(Debug)]
+pub struct VirtioBlockDevice {
+    backing: BlockFileBacking,
+    device_id: VirtioBlockDeviceId,
+    active_queue: Option<VirtioBlockQueue>,
+}
+
+impl VirtioBlockDevice {
+    pub fn new(backing: BlockFileBacking, device_id: VirtioBlockDeviceId) -> Self {
+        Self {
+            backing,
+            device_id,
+            active_queue: None,
+        }
+    }
+
+    pub fn backing(&self) -> &BlockFileBacking {
+        &self.backing
+    }
+
+    pub fn device_id(&self) -> VirtioBlockDeviceId {
+        self.device_id
+    }
+
+    pub fn is_activated(&self) -> bool {
+        self.active_queue.is_some()
+    }
+
+    pub fn active_queue(&self) -> Option<&VirtioBlockQueue> {
+        self.active_queue.as_ref()
+    }
+
+    pub fn active_queue_mut(&mut self) -> Option<&mut VirtioBlockQueue> {
+        self.active_queue.as_mut()
+    }
+
+    pub fn activate_block(
+        &mut self,
+        activation: VirtioMmioDeviceActivation<'_>,
+    ) -> Result<(), VirtioBlockDeviceActivationError> {
+        if self.active_queue.is_some() {
+            return Err(VirtioBlockDeviceActivationError::AlreadyActive);
+        }
+
+        let queue_index = 0;
+        let queue = activation
+            .queue(queue_index)
+            .map_err(|source| VirtioBlockDeviceActivationError::QueueMetadata {
+                queue_index,
+                source,
+            })
+            .and_then(|queue| {
+                VirtioBlockQueue::from_mmio_queue_state(queue).map_err(|source| {
+                    VirtioBlockDeviceActivationError::QueueBuild {
+                        queue_index,
+                        source,
+                    }
+                })
+            })?;
+        self.active_queue = Some(queue);
+
+        Ok(())
+    }
+
+    pub fn reset(&mut self) {
+        self.active_queue = None;
+    }
+}
+
+impl VirtioMmioDeviceActivationHandler for VirtioBlockDevice {
+    fn activate(
+        &mut self,
+        activation: VirtioMmioDeviceActivation<'_>,
+    ) -> Result<(), VirtioMmioDeviceActivationError> {
+        self.activate_block(activation).map_err(Into::into)
+    }
+
+    fn reset(&mut self) {
+        VirtioBlockDevice::reset(self);
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioBlockDeviceActivationError {
+    AlreadyActive,
+    QueueMetadata {
+        queue_index: u32,
+        source: VirtioMmioQueueRegisterError,
+    },
+    QueueBuild {
+        queue_index: u32,
+        source: VirtioBlockQueueBuildError,
+    },
+}
+
+impl fmt::Display for VirtioBlockDeviceActivationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyActive => f.write_str("virtio-block device is already active"),
+            Self::QueueMetadata {
+                queue_index,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to read virtio-block queue {queue_index} activation metadata: {source}"
+                )
+            }
+            Self::QueueBuild {
+                queue_index,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to activate virtio-block queue {queue_index}: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioBlockDeviceActivationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::QueueMetadata { source, .. } => Some(source),
+            Self::QueueBuild { source, .. } => Some(source),
+            Self::AlreadyActive => None,
+        }
+    }
+}
+
+impl From<VirtioBlockDeviceActivationError> for VirtioMmioDeviceActivationError {
+    fn from(source: VirtioBlockDeviceActivationError) -> Self {
+        MmioHandlerError::new(source.to_string()).into()
+    }
+}
+
 fn validate_drive_id(source: DriveIdSource, drive_id: &str) -> Result<(), DriveConfigError> {
     if drive_id.is_empty() {
         return Err(DriveConfigError::EmptyDriveId { source });
@@ -1955,7 +2093,9 @@ mod tests {
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
         VIRTIO_DEVICE_STATUS_FEATURES_OK, VIRTIO_MMIO_DEVICE_CONFIG_OFFSET,
-        VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioQueueRegisters, VirtioMmioRegister,
+        VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation,
+        VirtioMmioDeviceActivationError, VirtioMmioDeviceActivationHandler,
+        VirtioMmioDeviceRegisters, VirtioMmioQueueRegisters, VirtioMmioRegister,
         VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
     };
     use crate::virtio_queue::{
@@ -1974,7 +2114,8 @@ mod tests {
         VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT, VIRTIO_BLOCK_SECTOR_SIZE,
         VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK, VIRTIO_BLOCK_STATUS_SIZE,
         VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1, VIRTIO_RING_FEATURE_EVENT_IDX,
-        VirtioBlockConfigSpace, VirtioBlockDeviceId, VirtioBlockQueue, VirtioBlockQueueBuildError,
+        VirtioBlockConfigSpace, VirtioBlockDevice, VirtioBlockDeviceActivationError,
+        VirtioBlockDeviceId, VirtioBlockQueue, VirtioBlockQueueBuildError,
         VirtioBlockQueueDispatchError, VirtioBlockRequest, VirtioBlockRequestCompletion,
         VirtioBlockRequestError, VirtioBlockRequestExecutionError,
         VirtioBlockRequestExecutionOutcome, VirtioBlockRequestType, normalize_completion_status,
@@ -2365,6 +2506,15 @@ mod tests {
     }
 
     fn configured_mmio_queue(size: u16, ready: bool) -> VirtioMmioQueueRegisters {
+        configured_mmio_queue_with_device_ring(size, guest_address_low(TEST_USED_RING), 0, ready)
+    }
+
+    fn configured_mmio_queue_with_device_ring(
+        size: u16,
+        device_ring_low: u32,
+        device_ring_high: u32,
+        ready: bool,
+    ) -> VirtioMmioQueueRegisters {
         let mut queues =
             VirtioMmioQueueRegisters::new(&[TEST_QUEUE_SIZE]).expect("queue table should build");
         queues
@@ -2391,10 +2541,17 @@ mod tests {
         queues
             .write_register(
                 VirtioMmioRegister::QueueDeviceLow,
-                guest_address_low(TEST_USED_RING),
+                device_ring_low,
                 QUEUE_CONFIG_STATUS,
             )
             .expect("queue device ring should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDeviceHigh,
+                device_ring_high,
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("queue device ring high should write");
 
         if ready {
             queues
@@ -2403,6 +2560,13 @@ mod tests {
         }
 
         queues
+    }
+
+    fn block_device_registers() -> VirtioMmioDeviceRegisters {
+        VirtioMmioDeviceRegisters::new(
+            VIRTIO_BLOCK_DEVICE_ID,
+            VirtioBlockConfigSpace::new(VIRTIO_BLOCK_SECTOR_SIZE, false).available_features(),
+        )
     }
 
     fn write_queued_request(
@@ -3755,46 +3919,8 @@ mod tests {
 
     #[test]
     fn block_queue_from_mmio_queue_state_wraps_used_ring_error() {
-        let mut queues =
-            VirtioMmioQueueRegisters::new(&[TEST_QUEUE_SIZE]).expect("queue table should build");
-        queues
-            .write_register(
-                VirtioMmioRegister::QueueNum,
-                u32::from(TEST_QUEUE_SIZE),
-                QUEUE_CONFIG_STATUS,
-            )
-            .expect("queue size should write");
-        queues
-            .write_register(
-                VirtioMmioRegister::QueueDescLow,
-                guest_address_low(TEST_DESCRIPTOR_TABLE),
-                QUEUE_CONFIG_STATUS,
-            )
-            .expect("queue descriptor table should write");
-        queues
-            .write_register(
-                VirtioMmioRegister::QueueDriverLow,
-                guest_address_low(TEST_AVAILABLE_RING),
-                QUEUE_CONFIG_STATUS,
-            )
-            .expect("queue driver ring should write");
-        queues
-            .write_register(
-                VirtioMmioRegister::QueueDeviceLow,
-                u32::MAX - 3,
-                QUEUE_CONFIG_STATUS,
-            )
-            .expect("queue device ring low should write");
-        queues
-            .write_register(
-                VirtioMmioRegister::QueueDeviceHigh,
-                u32::MAX,
-                QUEUE_CONFIG_STATUS,
-            )
-            .expect("queue device ring high should write");
-        queues
-            .write_register(VirtioMmioRegister::QueueReady, 1, QUEUE_CONFIG_STATUS)
-            .expect("queue ready should write");
+        let queues =
+            configured_mmio_queue_with_device_ring(TEST_QUEUE_SIZE, u32::MAX - 3, u32::MAX, true);
 
         let error = VirtioBlockQueue::from_mmio_queue_state(
             queues.queue(0).expect("queue state should exist"),
@@ -3814,6 +3940,182 @@ mod tests {
             }
             other => panic!("expected used ring overflow, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn block_device_activation_builds_active_queue() {
+        let file = temp_file("block-device-activate.img", &sector_payload(0x11));
+        let backing = open_backing(file.as_path(), false).expect("backing should open");
+        let mut device = VirtioBlockDevice::new(backing, TEST_DEVICE_ID);
+        let queues = configured_mmio_queue(4, true);
+        let registers = block_device_registers();
+
+        VirtioMmioDeviceActivationHandler::activate(
+            &mut device,
+            VirtioMmioDeviceActivation::new(&registers, &queues),
+        )
+        .expect("block device should activate");
+
+        let queue = device
+            .active_queue()
+            .expect("active queue should be stored");
+        assert!(device.is_activated());
+        assert_eq!(device.device_id(), TEST_DEVICE_ID);
+        assert_eq!(device.backing().len(), VIRTIO_BLOCK_SECTOR_SIZE);
+        assert!(!device.backing().is_read_only());
+        assert_eq!(
+            queue.available_ring().descriptor_table(),
+            TEST_DESCRIPTOR_TABLE
+        );
+        assert_eq!(queue.available_ring().available_ring(), TEST_AVAILABLE_RING);
+        assert_eq!(queue.available_ring().queue_size(), 4);
+        assert_eq!(queue.used_ring().used_ring(), TEST_USED_RING);
+        assert_eq!(queue.used_ring().queue_size(), 4);
+    }
+
+    #[test]
+    fn block_device_activation_rejects_not_ready_queue_without_stale_state() {
+        let file = temp_file("block-device-not-ready.img", &sector_payload(0x22));
+        let backing = open_backing(file.as_path(), false).expect("backing should open");
+        let mut device = VirtioBlockDevice::new(backing, TEST_DEVICE_ID);
+        let queues = configured_mmio_queue(TEST_QUEUE_SIZE, false);
+        let registers = block_device_registers();
+
+        let error = device
+            .activate_block(VirtioMmioDeviceActivation::new(&registers, &queues))
+            .expect_err("not-ready queue should not activate");
+
+        assert!(matches!(
+            error,
+            VirtioBlockDeviceActivationError::QueueBuild {
+                queue_index: 0,
+                source: VirtioBlockQueueBuildError::QueueNotReady,
+            }
+        ));
+        assert!(device.active_queue().is_none());
+        assert!(!device.is_activated());
+    }
+
+    #[test]
+    fn block_device_activation_rejects_invalid_used_ring_without_stale_state() {
+        let file = temp_file("block-device-invalid-used.img", &sector_payload(0x33));
+        let backing = open_backing(file.as_path(), false).expect("backing should open");
+        let mut device = VirtioBlockDevice::new(backing, TEST_DEVICE_ID);
+        let queues =
+            configured_mmio_queue_with_device_ring(TEST_QUEUE_SIZE, u32::MAX - 3, u32::MAX, true);
+        let registers = block_device_registers();
+
+        let error = device
+            .activate_block(VirtioMmioDeviceActivation::new(&registers, &queues))
+            .expect_err("invalid used ring should not activate");
+
+        match error {
+            VirtioBlockDeviceActivationError::QueueBuild {
+                queue_index: 0,
+                source: VirtioBlockQueueBuildError::UsedRing { source },
+            } => match source {
+                VirtqueueUsedRingError::UsedRingRangeOverflow {
+                    used_ring,
+                    queue_size,
+                } => {
+                    assert_eq!(used_ring, GuestAddress::new(u64::MAX - 3));
+                    assert_eq!(queue_size, TEST_QUEUE_SIZE);
+                }
+                other => panic!("expected used ring overflow, got {other:?}"),
+            },
+            other => panic!("expected queue build error, got {other:?}"),
+        }
+        assert!(device.active_queue().is_none());
+        assert!(!device.is_activated());
+    }
+
+    #[test]
+    fn block_device_activation_reset_clears_active_queue_and_allows_retry() {
+        let file = temp_file("block-device-reset.img", &sector_payload(0x44));
+        let backing = open_backing(file.as_path(), false).expect("backing should open");
+        let mut device = VirtioBlockDevice::new(backing, TEST_DEVICE_ID);
+        let registers = block_device_registers();
+        let first_queues = configured_mmio_queue(4, true);
+
+        device
+            .activate_block(VirtioMmioDeviceActivation::new(&registers, &first_queues))
+            .expect("first activation should succeed");
+        assert!(device.is_activated());
+
+        VirtioMmioDeviceActivationHandler::reset(&mut device);
+
+        assert!(!device.is_activated());
+        assert!(device.active_queue().is_none());
+
+        let second_queues = configured_mmio_queue(TEST_QUEUE_SIZE, true);
+        device
+            .activate_block(VirtioMmioDeviceActivation::new(&registers, &second_queues))
+            .expect("second activation should succeed after reset");
+
+        assert_eq!(
+            device
+                .active_queue()
+                .expect("active queue should be present")
+                .available_ring()
+                .queue_size(),
+            TEST_QUEUE_SIZE
+        );
+    }
+
+    #[test]
+    fn block_device_activation_rejects_duplicate_activation_without_replacing_queue() {
+        let file = temp_file("block-device-duplicate.img", &sector_payload(0x55));
+        let backing = open_backing(file.as_path(), false).expect("backing should open");
+        let mut device = VirtioBlockDevice::new(backing, TEST_DEVICE_ID);
+        let registers = block_device_registers();
+        let first_queues = configured_mmio_queue(4, true);
+        let second_queues = configured_mmio_queue(TEST_QUEUE_SIZE, true);
+
+        device
+            .activate_block(VirtioMmioDeviceActivation::new(&registers, &first_queues))
+            .expect("first activation should succeed");
+
+        let error = device
+            .activate_block(VirtioMmioDeviceActivation::new(&registers, &second_queues))
+            .expect_err("duplicate activation should fail");
+
+        assert!(matches!(
+            error,
+            VirtioBlockDeviceActivationError::AlreadyActive
+        ));
+        assert_eq!(
+            device
+                .active_queue()
+                .expect("original queue should remain active")
+                .available_ring()
+                .queue_size(),
+            4
+        );
+    }
+
+    #[test]
+    fn block_device_activation_trait_error_is_generic_handler_error() {
+        let file = temp_file("block-device-trait-error.img", &sector_payload(0x66));
+        let backing = open_backing(file.as_path(), false).expect("backing should open");
+        let mut device = VirtioBlockDevice::new(backing, TEST_DEVICE_ID);
+        let queues = configured_mmio_queue(TEST_QUEUE_SIZE, false);
+        let registers = block_device_registers();
+
+        let error = VirtioMmioDeviceActivationHandler::activate(
+            &mut device,
+            VirtioMmioDeviceActivation::new(&registers, &queues),
+        )
+        .expect_err("trait activation should fail with generic handler error");
+
+        match error {
+            VirtioMmioDeviceActivationError::Handler { source } => {
+                assert_eq!(
+                    source.to_string(),
+                    "failed to activate virtio-block queue 0: virtio-block queue is not ready"
+                );
+            }
+        }
+        assert!(device.active_queue().is_none());
     }
 
     #[test]
