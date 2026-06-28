@@ -10,7 +10,7 @@ trait, a minimal read-only VMM action/data model, backend-neutral guest
 physical address and aarch64 DRAM layout/access primitives, arm64 boot
 placement helpers, internal boot-source validation and arm64 kernel/initrd
 payload loading, an internal Firecracker-shaped drive configuration validation
-model, a minimal
+model and host-file backing access layer, a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
 create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding,
 registry resolution, vCPU exit classification, single resolved HVF MMIO
@@ -30,7 +30,8 @@ backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, and an initial process startup argument model.
 There is no broader API request body model, guest execution, continuous vCPU run loop,
 complete interrupt delivery, queue notification dispatch, completion dispatch,
-device-backed feature negotiation, real device activation effects, indirect descriptor support,
+device-backed feature negotiation, virtio-block config space, real block request
+handling, real device activation effects, indirect descriptor support,
 device-backed runner-loop MMIO handling, real device emulation, public startup
 wiring, multi-vCPU setup, PSCI behavior, or public boot-source, drives, or
 actions API behavior yet.
@@ -312,10 +313,19 @@ and normalizes omitted `is_read_only` to read-write.
 The internal model accepts omitted/default `cache_type=Unsafe` and
 `io_engine=Sync`, and rejects `Writeback`, `Async`, configured rate limiters,
 and configured sockets as unsupported. Displayed errors avoid echoing
-`path_on_host` so future API code can preserve host path redaction. This model
-is not wired to `PUT /drives/{drive_id}` yet and does not create host-file
-backing, select a root block device, expose virtio-block config space, or
-process block I/O.
+`path_on_host` so future API code can preserve host path redaction.
+
+The runtime crate can also open the normalized `path_on_host` as a regular
+host file, preserve the configured read-only mode, report byte length, and
+perform bounded positioned reads/writes for later virtio-block request
+handling. It rejects non-regular backing paths before data I/O and rejects
+read-only writes before mutating the file. Backing errors also avoid echoing
+`path_on_host`.
+
+This model is not wired to `PUT /drives/{drive_id}` yet and does not select a
+root block device, expose virtio-block config space, process guest queue
+requests, implement cache flushes or rate limiting, support vhost-user-block
+sockets, or use an async I/O engine.
 
 ## Internal arm64 FDT Generation
 
