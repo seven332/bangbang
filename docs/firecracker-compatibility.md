@@ -9,7 +9,8 @@ HTTP-over-Unix-socket API server for `GET /` and `GET /version`, a backend-neutr
 trait, a minimal read-only VMM action/data model, backend-neutral guest
 physical address and aarch64 DRAM layout/access primitives, arm64 boot
 placement helpers, internal boot-source validation and arm64 kernel/initrd
-payload loading, a minimal
+payload loading, an internal Firecracker-shaped drive configuration validation
+model, a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
 create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding,
 registry resolution, vCPU exit classification, single resolved HVF MMIO
@@ -31,7 +32,8 @@ There is no broader API request body model, guest execution, continuous vCPU run
 complete interrupt delivery, queue notification dispatch, completion dispatch,
 device-backed feature negotiation, real device activation effects, indirect descriptor support,
 device-backed runner-loop MMIO handling, real device emulation, public startup
-wiring, multi-vCPU setup, PSCI behavior, or public boot-source API behavior yet.
+wiring, multi-vCPU setup, PSCI behavior, or public boot-source, drives, or
+actions API behavior yet.
 
 ## Firecracker Model Alignment
 
@@ -204,16 +206,16 @@ exist.
 | `PUT /machine-config` | `track_dirty_pages` | optional when `false`; deferred when `true` | Explicit `false` matches Firecracker's default; enabling dirty tracking belongs with snapshot support. |
 | `PUT /machine-config` | `huge_pages` | optional when `None`; rejected for `2M` | Explicit `None` matches Firecracker's default; Linux hugetlbfs does not directly apply to the macOS target. |
 | `PUT /machine-config` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
-| `PUT /drives/{drive_id}` | path `drive_id` | required | Must be nonempty and contain only alphanumeric characters or `_`. |
-| `PUT /drives/{drive_id}` | body `drive_id` | required | Must match the path `drive_id`. |
+| `PUT /drives/{drive_id}` | path `drive_id` | required | The internal model validates this as nonempty alphanumeric or `_`, matching Firecracker's `checked_id` rule; public API parsing is not wired yet. |
+| `PUT /drives/{drive_id}` | body `drive_id` | required | The internal model requires this to match the path `drive_id`. |
 | `PUT /drives/{drive_id}` | `is_root_device` | required | Identifies whether this drive is the boot device. |
-| `PUT /drives/{drive_id}` | `path_on_host` | required initially | Host path for the initial virtio-block target; future validation must cover access, file type, and path redaction in errors. |
-| `PUT /drives/{drive_id}` | `is_read_only` | optional | Firecracker defaults omitted virtio-block drives to read-write; future validation should keep write intent clear in errors and user documentation. |
+| `PUT /drives/{drive_id}` | `path_on_host` | required initially | The internal model rejects empty paths without opening or statting the path; future validation must cover access, file type, and path redaction in errors. |
+| `PUT /drives/{drive_id}` | `is_read_only` | optional | The internal model defaults omitted virtio-block drives to read-write. |
 | `PUT /drives/{drive_id}` | `partuuid` | optional | Only meaningful for root-device boot selection. |
-| `PUT /drives/{drive_id}` | `cache_type` | optional when `Unsafe`; deferred when `Writeback` | Explicit `Unsafe` matches Firecracker's default and avoids advertising guest flush support; `Writeback` needs macOS-specific correctness and performance review. |
-| `PUT /drives/{drive_id}` | `rate_limiter` | optional when absent or `null`; deferred when configured | Non-null rate limiting is tied to future block I/O performance work in #13. |
-| `PUT /drives/{drive_id}` | `io_engine` | optional when `Sync`; rejected when `Async` | Explicit `Sync` matches Firecracker's default; `Async` is tied to Linux io_uring and does not directly map to the first macOS target. |
-| `PUT /drives/{drive_id}` | `socket` | optional when absent or `null`; deferred when set | Vhost-user-block is outside the first tier; future validation must cover socket path ownership and permissions. |
+| `PUT /drives/{drive_id}` | `cache_type` | optional when `Unsafe`; deferred when `Writeback` | The internal model accepts omitted/default `Unsafe` and rejects `Writeback` as unsupported. |
+| `PUT /drives/{drive_id}` | `rate_limiter` | optional when absent or `null`; deferred when configured | The internal model rejects configured rate limiters; non-null rate limiting is tied to future block I/O performance work in #13. |
+| `PUT /drives/{drive_id}` | `io_engine` | optional when `Sync`; rejected when `Async` | The internal model accepts omitted/default `Sync` and rejects `Async`; `Async` is tied to Linux io_uring and does not directly map to the first macOS target. |
+| `PUT /drives/{drive_id}` | `socket` | optional when absent or `null`; deferred when set | The internal model rejects configured sockets; vhost-user-block is outside the first tier. |
 | `PUT /drives/{drive_id}` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /actions` | `action_type=InstanceStart` | required initially | The only initial action target. |
 | `PUT /actions` | `action_type=FlushMetrics` | deferred | Depends on logger and metrics support. |
@@ -298,6 +300,22 @@ The loader intentionally uses bangbang's safe `GuestMemory::write_slice` API and
 does not expose new raw host-memory pointers. Direct `linux-loader`/`vm-memory`
 integration is deferred until the project decides whether to add a narrow
 adapter or adopt `vm-memory` more broadly.
+
+## Internal Drive Configuration
+
+The runtime crate has an internal, Firecracker-shaped drive configuration model
+for the initial virtio-block subset. It validates path and body `drive_id`
+values as nonempty alphanumeric strings with `_`, requires the two IDs to
+match, rejects an empty `path_on_host` without opening or statting host files,
+and normalizes omitted `is_read_only` to read-write.
+
+The internal model accepts omitted/default `cache_type=Unsafe` and
+`io_engine=Sync`, and rejects `Writeback`, `Async`, configured rate limiters,
+and configured sockets as unsupported. Displayed errors avoid echoing
+`path_on_host` so future API code can preserve host path redaction. This model
+is not wired to `PUT /drives/{drive_id}` yet and does not create host-file
+backing, select a root block device, expose virtio-block config space, or
+process block I/O.
 
 ## Internal arm64 FDT Generation
 
