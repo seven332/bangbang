@@ -11,8 +11,11 @@ use std::time::{Duration, Instant};
 
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_api::http::{
-    ApiRequest, HttpResponse, RequestError, parse_request, request_total_len,
+    ApiRequest, DriveCacheType as ApiDriveCacheType, DriveConfigRequest,
+    DriveIoEngine as ApiDriveIoEngine, HttpResponse, RequestError, parse_request,
+    request_total_len,
 };
+use bangbang_runtime::block::{DriveCacheType, DriveConfigInput, DriveIoEngine};
 use bangbang_runtime::{VmmAction, VmmController, VmmData};
 
 const READ_CHUNK_SIZE: usize = 4096;
@@ -386,16 +389,16 @@ fn handle_api_request(request: ApiRequest, vmm: &mut VmmController) -> HttpRespo
             handle_instance_info(vmm.handle_action(VmmAction::GetVmInstanceInfo))
         }
         ApiRequest::GetVersion => handle_vmm_version(vmm.handle_action(VmmAction::GetVmmVersion)),
-        ApiRequest::PutDrive(_) => {
-            HttpResponse::fault("The requested operation is not supported: PutDrive")
-        }
+        ApiRequest::PutDrive(config) => handle_empty(vmm.handle_action(VmmAction::PutDrive(
+            drive_config_input_from_request(config.as_ref()),
+        ))),
     }
 }
 
 fn handle_vmm_version(result: Result<VmmData, bangbang_runtime::VmmActionError>) -> HttpResponse {
     match result {
         Ok(VmmData::VmmVersion(version)) => HttpResponse::version(&version),
-        Ok(VmmData::InstanceInformation(_)) => {
+        Ok(VmmData::Empty | VmmData::InstanceInformation(_)) => {
             HttpResponse::fault("version request returned unexpected VMM data.")
         }
         Err(err) => HttpResponse::fault(&err.to_string()),
@@ -408,11 +411,57 @@ fn handle_instance_info(result: Result<VmmData, bangbang_runtime::VmmActionError
             let state = info.state.to_string();
             HttpResponse::instance_info(&info.id, &state, &info.vmm_version, &info.app_name)
         }
-        Ok(VmmData::VmmVersion(_)) => {
+        Ok(VmmData::Empty | VmmData::VmmVersion(_)) => {
             HttpResponse::fault("instance info request returned unexpected VMM data.")
         }
         Err(err) => HttpResponse::fault(&err.to_string()),
     }
+}
+
+fn handle_empty(result: Result<VmmData, bangbang_runtime::VmmActionError>) -> HttpResponse {
+    match result {
+        Ok(VmmData::Empty) => HttpResponse::no_content(),
+        Ok(VmmData::InstanceInformation(_) | VmmData::VmmVersion(_)) => {
+            HttpResponse::fault("no-content request returned unexpected VMM data.")
+        }
+        Err(err) => HttpResponse::fault(&err.to_string()),
+    }
+}
+
+fn drive_config_input_from_request(config: &DriveConfigRequest) -> DriveConfigInput {
+    let mut input = DriveConfigInput::new(
+        config.path_drive_id(),
+        config.body_drive_id(),
+        config.path_on_host(),
+        config.is_root_device(),
+    );
+
+    if let Some(is_read_only) = config.is_read_only() {
+        input = input.with_is_read_only(is_read_only);
+    }
+    if let Some(partuuid) = config.partuuid() {
+        input = input.with_partuuid(partuuid);
+    }
+    if let Some(cache_type) = config.cache_type() {
+        input = input.with_cache_type(match cache_type {
+            ApiDriveCacheType::Unsafe => DriveCacheType::Unsafe,
+            ApiDriveCacheType::Writeback => DriveCacheType::Writeback,
+        });
+    }
+    if let Some(io_engine) = config.io_engine() {
+        input = input.with_io_engine(match io_engine {
+            ApiDriveIoEngine::Sync => DriveIoEngine::Sync,
+            ApiDriveIoEngine::Async => DriveIoEngine::Async,
+        });
+    }
+    if config.rate_limiter_configured() {
+        input = input.with_rate_limiter_configured();
+    }
+    if let Some(socket) = config.socket() {
+        input = input.with_socket(socket);
+    }
+
+    input
 }
 
 fn read_request(stream: &mut UnixStream, timeout: Duration) -> Result<RequestRead, ApiServerError> {
@@ -703,13 +752,55 @@ mod tests {
     }
 
     #[test]
-    fn returns_fault_for_unwired_drive_request() {
-        let path = unique_socket_path("drive-unwired");
+    fn configures_drive_over_unix_socket() {
+        let path = unique_socket_path("drive-config");
         let server = ApiServer::bind(&path).expect("server should bind");
         let mut client = UnixStream::connect(&path).expect("client should connect");
         let body = r#"{
             "drive_id": "rootfs",
             "path_on_host": "/tmp/rootfs.ext4",
+            "is_root_device": true,
+            "is_read_only": true,
+            "partuuid": "0eaa91a0-01"
+        }"#;
+        let request = format!(
+            "PUT /drives/rootfs HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        client
+            .write_all(request.as_bytes())
+            .expect("client should write request");
+        let mut vmm = test_controller();
+        server
+            .serve_next(&mut vmm)
+            .expect("server should handle one request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("client should read response");
+
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(response.contains("Content-Length: 0\r\n"));
+        assert!(response.ends_with("\r\n\r\n"));
+        assert_eq!(vmm.drive_configs().len(), 1);
+        let config = &vmm.drive_configs()[0];
+        assert_eq!(config.drive_id(), "rootfs");
+        assert_eq!(config.path_on_host(), PathBuf::from("/tmp/rootfs.ext4"));
+        assert!(config.is_root_device());
+        assert!(config.is_read_only());
+        assert_eq!(config.partuuid(), Some("0eaa91a0-01"));
+    }
+
+    #[test]
+    fn returns_fault_for_invalid_drive_config_without_storing() {
+        let path = unique_socket_path("drive-invalid");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+        let body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "",
             "is_root_device": true
         }"#;
         let request = format!(
@@ -731,11 +822,43 @@ mod tests {
             .expect("client should read response");
 
         assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        assert!(
-            response.contains(
-                r#"{"fault_message":"The requested operation is not supported: PutDrive"}"#
-            )
+        assert!(response.contains(r#"{"fault_message":"drive path_on_host must not be empty"}"#));
+        assert!(vmm.drive_configs().is_empty());
+    }
+
+    #[test]
+    fn returns_fault_for_unsupported_drive_socket_without_leaking_path() {
+        let path = unique_socket_path("drive-socket");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+        let body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "/tmp/rootfs.ext4",
+            "is_root_device": true,
+            "socket": "/tmp/private-vhost.sock"
+        }"#;
+        let request = format!(
+            "PUT /drives/rootfs HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
         );
+
+        client
+            .write_all(request.as_bytes())
+            .expect("client should write request");
+        let mut vmm = test_controller();
+        server
+            .serve_next(&mut vmm)
+            .expect("server should handle one request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("client should read response");
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.contains(r#"{"fault_message":"drive socket is not supported"}"#));
+        assert!(!response.contains("/tmp/private-vhost.sock"));
+        assert!(vmm.drive_configs().is_empty());
     }
 
     #[test]
