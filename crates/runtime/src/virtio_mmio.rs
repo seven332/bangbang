@@ -912,6 +912,217 @@ impl fmt::Display for VirtioMmioQueueRegisterError {
 
 impl std::error::Error for VirtioMmioQueueRegisterError {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioMmioQueueNotificationRegisters {
+    pending_notifications: Vec<bool>,
+}
+
+impl VirtioMmioQueueNotificationRegisters {
+    pub fn new(queue_count: usize) -> Result<Self, VirtioMmioQueueNotificationError> {
+        if queue_count == 0 {
+            return Err(VirtioMmioQueueNotificationError::EmptyQueueTable);
+        }
+
+        Ok(Self {
+            pending_notifications: vec![false; queue_count],
+        })
+    }
+
+    pub fn queue_count(&self) -> usize {
+        self.pending_notifications.len()
+    }
+
+    pub fn is_queue_notification_pending(
+        &self,
+        queue_index: u32,
+    ) -> Result<bool, VirtioMmioQueueNotificationError> {
+        let index = self.queue_index(queue_index)?;
+        self.pending_notifications
+            .get(index)
+            .copied()
+            .ok_or_else(|| self.invalid_queue_index(queue_index))
+    }
+
+    pub fn pending_queue_notifications(&self) -> Vec<usize> {
+        self.pending_notifications
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, is_pending)| *is_pending)
+            .map(|(queue_index, _)| queue_index)
+            .collect()
+    }
+
+    pub fn take_pending_queue_notifications(&mut self) -> Vec<usize> {
+        let pending_notifications = self.pending_queue_notifications();
+        self.reset();
+        pending_notifications
+    }
+
+    pub fn read_register(
+        &self,
+        register: VirtioMmioRegister,
+    ) -> Result<u32, VirtioMmioQueueNotificationError> {
+        match register {
+            VirtioMmioRegister::MagicValue
+            | VirtioMmioRegister::Version
+            | VirtioMmioRegister::DeviceId
+            | VirtioMmioRegister::VendorId
+            | VirtioMmioRegister::DeviceFeatures
+            | VirtioMmioRegister::DeviceFeaturesSel
+            | VirtioMmioRegister::DriverFeatures
+            | VirtioMmioRegister::DriverFeaturesSel
+            | VirtioMmioRegister::QueueSel
+            | VirtioMmioRegister::QueueNumMax
+            | VirtioMmioRegister::QueueNum
+            | VirtioMmioRegister::QueueReady
+            | VirtioMmioRegister::QueueNotify
+            | VirtioMmioRegister::InterruptStatus
+            | VirtioMmioRegister::InterruptAck
+            | VirtioMmioRegister::Status
+            | VirtioMmioRegister::QueueDescLow
+            | VirtioMmioRegister::QueueDescHigh
+            | VirtioMmioRegister::QueueDriverLow
+            | VirtioMmioRegister::QueueDriverHigh
+            | VirtioMmioRegister::QueueDeviceLow
+            | VirtioMmioRegister::QueueDeviceHigh
+            | VirtioMmioRegister::ConfigGeneration => {
+                Err(VirtioMmioQueueNotificationError::UnsupportedRegisterRead { register })
+            }
+        }
+    }
+
+    pub fn write_register(
+        &mut self,
+        register: VirtioMmioRegister,
+        value: u32,
+        status: u32,
+    ) -> Result<(), VirtioMmioQueueNotificationError> {
+        match register {
+            VirtioMmioRegister::QueueNotify => self.write_queue_notify(value, status),
+            VirtioMmioRegister::MagicValue
+            | VirtioMmioRegister::Version
+            | VirtioMmioRegister::DeviceId
+            | VirtioMmioRegister::VendorId
+            | VirtioMmioRegister::DeviceFeatures
+            | VirtioMmioRegister::DeviceFeaturesSel
+            | VirtioMmioRegister::DriverFeatures
+            | VirtioMmioRegister::DriverFeaturesSel
+            | VirtioMmioRegister::QueueSel
+            | VirtioMmioRegister::QueueNumMax
+            | VirtioMmioRegister::QueueNum
+            | VirtioMmioRegister::QueueReady
+            | VirtioMmioRegister::InterruptStatus
+            | VirtioMmioRegister::InterruptAck
+            | VirtioMmioRegister::Status
+            | VirtioMmioRegister::QueueDescLow
+            | VirtioMmioRegister::QueueDescHigh
+            | VirtioMmioRegister::QueueDriverLow
+            | VirtioMmioRegister::QueueDriverHigh
+            | VirtioMmioRegister::QueueDeviceLow
+            | VirtioMmioRegister::QueueDeviceHigh
+            | VirtioMmioRegister::ConfigGeneration => {
+                Err(VirtioMmioQueueNotificationError::UnsupportedRegisterWrite { register })
+            }
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.pending_notifications.fill(false);
+    }
+
+    fn write_queue_notify(
+        &mut self,
+        queue_index: u32,
+        status: u32,
+    ) -> Result<(), VirtioMmioQueueNotificationError> {
+        validate_queue_notification_status(status)?;
+
+        let index = self.queue_index(queue_index)?;
+        let queue_count = self.queue_count();
+        let pending = self.pending_notifications.get_mut(index).ok_or(
+            VirtioMmioQueueNotificationError::InvalidQueueIndex {
+                queue_index,
+                queue_count,
+            },
+        )?;
+        *pending = true;
+        Ok(())
+    }
+
+    fn queue_index(&self, queue_index: u32) -> Result<usize, VirtioMmioQueueNotificationError> {
+        let index =
+            usize::try_from(queue_index).map_err(|_| self.invalid_queue_index(queue_index))?;
+        if index < self.queue_count() {
+            Ok(index)
+        } else {
+            Err(self.invalid_queue_index(queue_index))
+        }
+    }
+
+    fn invalid_queue_index(&self, queue_index: u32) -> VirtioMmioQueueNotificationError {
+        VirtioMmioQueueNotificationError::InvalidQueueIndex {
+            queue_index,
+            queue_count: self.queue_count(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioMmioQueueNotificationError {
+    EmptyQueueTable,
+    InvalidQueueIndex {
+        queue_index: u32,
+        queue_count: usize,
+    },
+    UnsupportedRegisterRead {
+        register: VirtioMmioRegister,
+    },
+    UnsupportedRegisterWrite {
+        register: VirtioMmioRegister,
+    },
+    QueueNotifyNotWritable {
+        status: u32,
+    },
+}
+
+impl fmt::Display for VirtioMmioQueueNotificationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyQueueTable => f.write_str("virtio-mmio queue table cannot be empty"),
+            Self::InvalidQueueIndex {
+                queue_index,
+                queue_count,
+            } => {
+                write!(
+                    f,
+                    "virtio-mmio queue notification index {queue_index} is outside queue table size {queue_count}"
+                )
+            }
+            Self::UnsupportedRegisterRead { register } => {
+                write!(
+                    f,
+                    "unsupported virtio-mmio queue notification state read from {register}"
+                )
+            }
+            Self::UnsupportedRegisterWrite { register } => {
+                write!(
+                    f,
+                    "unsupported virtio-mmio queue notification state write to {register}"
+                )
+            }
+            Self::QueueNotifyNotWritable { status } => {
+                write!(
+                    f,
+                    "virtio-mmio queue notification cannot be written while status is 0x{status:x}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioMmioQueueNotificationError {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VirtioMmioRegister {
     MagicValue,
@@ -1428,6 +1639,14 @@ fn validate_interrupt_ack_status(status: u32) -> Result<(), VirtioMmioInterruptR
     }
 }
 
+fn validate_queue_notification_status(status: u32) -> Result<(), VirtioMmioQueueNotificationError> {
+    if (status & VIRTIO_DEVICE_STATUS_DRIVER_OK) == VIRTIO_DEVICE_STATUS_DRIVER_OK {
+        Ok(())
+    } else {
+        Err(VirtioMmioQueueNotificationError::QueueNotifyNotWritable { status })
+    }
+}
+
 fn validate_queue_size(
     queue_index: u32,
     value: u32,
@@ -1506,8 +1725,10 @@ mod tests {
         VIRTIO_MMIO_REGISTER_ACCESS_SIZE, VIRTIO_MMIO_REGISTER_SPACE_SIZE, VIRTIO_MMIO_VENDOR_ID,
         VIRTIO_MMIO_VERSION, VIRTIO_MMIO_VERSION_1_FEATURE, VirtioMmioAccess,
         VirtioMmioAccessError, VirtioMmioDeviceRegisters, VirtioMmioInterruptRegisterError,
-        VirtioMmioInterruptRegisters, VirtioMmioQueueRegisterError, VirtioMmioQueueRegisters,
-        VirtioMmioRegister, VirtioMmioRegisterStateError, decode_virtio_mmio_access,
+        VirtioMmioInterruptRegisters, VirtioMmioQueueNotificationError,
+        VirtioMmioQueueNotificationRegisters, VirtioMmioQueueRegisterError,
+        VirtioMmioQueueRegisters, VirtioMmioRegister, VirtioMmioRegisterStateError,
+        decode_virtio_mmio_access,
     };
     use crate::interrupt::{DeviceInterruptKind, DeviceInterruptStatusError};
     use crate::memory::GuestAddress;
@@ -2475,6 +2696,173 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "virtio-mmio queue 0 QueueDriverLow address 0x1001 is not aligned to 2 bytes"
+        );
+    }
+
+    #[test]
+    fn queue_notification_registers_initialize_and_validate_queue_count() {
+        assert_eq!(
+            VirtioMmioQueueNotificationRegisters::new(0),
+            Err(VirtioMmioQueueNotificationError::EmptyQueueTable)
+        );
+
+        let notifications =
+            VirtioMmioQueueNotificationRegisters::new(2).expect("notifications should build");
+        assert_eq!(notifications.queue_count(), 2);
+        assert!(notifications.pending_queue_notifications().is_empty());
+        assert_eq!(notifications.is_queue_notification_pending(0), Ok(false));
+        assert_eq!(notifications.is_queue_notification_pending(1), Ok(false));
+        assert_eq!(
+            notifications.is_queue_notification_pending(2),
+            Err(VirtioMmioQueueNotificationError::InvalidQueueIndex {
+                queue_index: 2,
+                queue_count: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn queue_notify_records_and_drains_pending_notifications() {
+        let mut notifications =
+            VirtioMmioQueueNotificationRegisters::new(3).expect("notifications should build");
+
+        notifications
+            .write_register(VirtioMmioRegister::QueueNotify, 2, DRIVER_OK_STATUS)
+            .expect("queue notification should write after DRIVER_OK");
+        notifications
+            .write_register(VirtioMmioRegister::QueueNotify, 0, DRIVER_OK_STATUS)
+            .expect("queue notification should write after DRIVER_OK");
+
+        assert_eq!(notifications.is_queue_notification_pending(0), Ok(true));
+        assert_eq!(notifications.is_queue_notification_pending(1), Ok(false));
+        assert_eq!(notifications.is_queue_notification_pending(2), Ok(true));
+        assert_eq!(notifications.pending_queue_notifications(), vec![0, 2]);
+        assert_eq!(notifications.take_pending_queue_notifications(), vec![0, 2]);
+        assert!(notifications.pending_queue_notifications().is_empty());
+    }
+
+    #[test]
+    fn queue_notify_coalesces_duplicate_pending_notifications() {
+        let mut notifications =
+            VirtioMmioQueueNotificationRegisters::new(1).expect("notifications should build");
+
+        notifications
+            .write_register(VirtioMmioRegister::QueueNotify, 0, DRIVER_OK_STATUS)
+            .expect("first queue notification should write");
+        notifications
+            .write_register(VirtioMmioRegister::QueueNotify, 0, DRIVER_OK_STATUS)
+            .expect("duplicate queue notification should write");
+
+        assert_eq!(notifications.pending_queue_notifications(), vec![0]);
+    }
+
+    #[test]
+    fn queue_notify_allows_status_with_driver_ok_bit() {
+        let mut notifications =
+            VirtioMmioQueueNotificationRegisters::new(1).expect("notifications should build");
+        let failed_driver_ok_status = DRIVER_OK_STATUS | VIRTIO_DEVICE_STATUS_FAILED;
+
+        notifications
+            .write_register(VirtioMmioRegister::QueueNotify, 0, failed_driver_ok_status)
+            .expect("queue notification should require only the DRIVER_OK bit");
+
+        assert_eq!(notifications.pending_queue_notifications(), vec![0]);
+    }
+
+    #[test]
+    fn queue_notify_requires_driver_ok_status_before_queue_index_check() {
+        let mut notifications =
+            VirtioMmioQueueNotificationRegisters::new(1).expect("notifications should build");
+
+        let err = notifications
+            .write_register(VirtioMmioRegister::QueueNotify, 2, QUEUE_CONFIG_STATUS)
+            .expect_err("queue notification before DRIVER_OK should fail before index check");
+
+        assert_eq!(
+            err,
+            VirtioMmioQueueNotificationError::QueueNotifyNotWritable {
+                status: QUEUE_CONFIG_STATUS,
+            }
+        );
+        assert!(notifications.pending_queue_notifications().is_empty());
+    }
+
+    #[test]
+    fn queue_notify_rejects_invalid_queue_index_without_mutation() {
+        let mut notifications =
+            VirtioMmioQueueNotificationRegisters::new(2).expect("notifications should build");
+        notifications
+            .write_register(VirtioMmioRegister::QueueNotify, 1, DRIVER_OK_STATUS)
+            .expect("valid queue notification should write");
+
+        let err = notifications
+            .write_register(VirtioMmioRegister::QueueNotify, 2, DRIVER_OK_STATUS)
+            .expect_err("out-of-range queue notification should fail");
+
+        assert_eq!(
+            err,
+            VirtioMmioQueueNotificationError::InvalidQueueIndex {
+                queue_index: 2,
+                queue_count: 2,
+            }
+        );
+        assert_eq!(notifications.pending_queue_notifications(), vec![1]);
+    }
+
+    #[test]
+    fn queue_notification_registers_reset_pending_notifications() {
+        let mut notifications =
+            VirtioMmioQueueNotificationRegisters::new(2).expect("notifications should build");
+        notifications
+            .write_register(VirtioMmioRegister::QueueNotify, 0, DRIVER_OK_STATUS)
+            .expect("queue notification should write");
+        notifications
+            .write_register(VirtioMmioRegister::QueueNotify, 1, DRIVER_OK_STATUS)
+            .expect("queue notification should write");
+
+        notifications.reset();
+
+        assert!(notifications.pending_queue_notifications().is_empty());
+        assert_eq!(notifications.is_queue_notification_pending(0), Ok(false));
+    }
+
+    #[test]
+    fn queue_notification_registers_reject_unsupported_register_accesses() {
+        let mut notifications =
+            VirtioMmioQueueNotificationRegisters::new(1).expect("notifications should build");
+
+        assert_eq!(
+            notifications.read_register(VirtioMmioRegister::QueueNotify),
+            Err(VirtioMmioQueueNotificationError::UnsupportedRegisterRead {
+                register: VirtioMmioRegister::QueueNotify,
+            })
+        );
+        assert_eq!(
+            notifications.write_register(VirtioMmioRegister::Status, 0, DRIVER_OK_STATUS),
+            Err(VirtioMmioQueueNotificationError::UnsupportedRegisterWrite {
+                register: VirtioMmioRegister::Status,
+            })
+        );
+    }
+
+    #[test]
+    fn queue_notification_errors_display_and_preserve_sources() {
+        let err = VirtioMmioQueueNotificationError::InvalidQueueIndex {
+            queue_index: 4,
+            queue_count: 2,
+        };
+        assert_eq!(
+            err.to_string(),
+            "virtio-mmio queue notification index 4 is outside queue table size 2"
+        );
+        assert!(err.source().is_none());
+
+        let err = VirtioMmioQueueNotificationError::QueueNotifyNotWritable {
+            status: QUEUE_CONFIG_STATUS,
+        };
+        assert_eq!(
+            err.to_string(),
+            "virtio-mmio queue notification cannot be written while status is 0xb"
         );
     }
 
