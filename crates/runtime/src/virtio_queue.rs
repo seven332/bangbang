@@ -572,6 +572,40 @@ mod tests {
     }
 
     #[test]
+    fn ignores_next_index_without_next_flag() {
+        let mut memory = guest_memory(0x4000);
+        write_descriptor(&mut memory, TABLE, 0, 0x2000, 0x20, 0, 8);
+
+        let chain = read_descriptor_chain(&memory, TABLE, 8, 0)
+            .expect("stale next field without next flag should be ignored");
+
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain.descriptors()[0].next_index(), None);
+    }
+
+    #[test]
+    fn accepts_chain_with_queue_size_descriptors() {
+        let mut memory = guest_memory(0x4000);
+        write_descriptor(
+            &mut memory,
+            TABLE,
+            0,
+            0x2000,
+            0x20,
+            VIRTQUEUE_DESC_F_NEXT,
+            1,
+        );
+        write_descriptor(&mut memory, TABLE, 1, 0x3000, 0x20, 0, 0);
+
+        let chain = read_descriptor_chain(&memory, TABLE, 2, 0)
+            .expect("chain with exactly queue_size descriptors should read");
+
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain.descriptors()[0].next_index(), Some(1));
+        assert_eq!(chain.descriptors()[1].next_index(), None);
+    }
+
+    #[test]
     fn rejects_invalid_queue_sizes() {
         let memory = guest_memory(0x4000);
 
