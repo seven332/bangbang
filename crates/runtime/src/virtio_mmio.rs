@@ -2,7 +2,12 @@
 
 use std::fmt;
 
+use crate::memory::GuestAddress;
 use crate::mmio::{MmioOperation, MmioOperationKind};
+use crate::virtio_queue::{
+    VIRTQUEUE_AVAILABLE_RING_ALIGNMENT, VIRTQUEUE_DESCRIPTOR_ALIGNMENT,
+    VIRTQUEUE_USED_RING_ALIGNMENT,
+};
 
 pub const VIRTIO_MMIO_DEVICE_WINDOW_SIZE: u64 = 0x1000;
 pub const VIRTIO_MMIO_REGISTER_SPACE_SIZE: u64 = 0x100;
@@ -304,6 +309,440 @@ impl fmt::Display for VirtioMmioRegisterStateError {
 }
 
 impl std::error::Error for VirtioMmioRegisterStateError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioMmioQueueRegisters {
+    queue_select: u32,
+    queues: Vec<VirtioMmioQueueState>,
+}
+
+impl VirtioMmioQueueRegisters {
+    pub fn new(queue_max_sizes: &[u16]) -> Result<Self, VirtioMmioQueueRegisterError> {
+        if queue_max_sizes.is_empty() {
+            return Err(VirtioMmioQueueRegisterError::EmptyQueueTable);
+        }
+
+        let mut queues = Vec::with_capacity(queue_max_sizes.len());
+        for (queue_index, max_size) in queue_max_sizes.iter().copied().enumerate() {
+            validate_queue_max_size(queue_index, max_size)?;
+            queues.push(VirtioMmioQueueState::new(max_size));
+        }
+
+        Ok(Self {
+            queue_select: 0,
+            queues,
+        })
+    }
+
+    pub const fn queue_select(&self) -> u32 {
+        self.queue_select
+    }
+
+    pub fn queue_count(&self) -> usize {
+        self.queues.len()
+    }
+
+    pub fn selected_queue(&self) -> Result<&VirtioMmioQueueState, VirtioMmioQueueRegisterError> {
+        self.queue(self.queue_select)
+    }
+
+    pub fn queue(
+        &self,
+        queue_index: u32,
+    ) -> Result<&VirtioMmioQueueState, VirtioMmioQueueRegisterError> {
+        let index = self.queue_index(queue_index)?;
+        self.queues
+            .get(index)
+            .ok_or_else(|| self.invalid_queue_index(queue_index))
+    }
+
+    pub fn read_register(
+        &self,
+        register: VirtioMmioRegister,
+    ) -> Result<u32, VirtioMmioQueueRegisterError> {
+        match register {
+            VirtioMmioRegister::QueueNumMax => Ok(u32::from(self.selected_queue()?.max_size())),
+            VirtioMmioRegister::QueueReady => Ok(queue_ready_value(self.selected_queue()?.ready())),
+            VirtioMmioRegister::MagicValue
+            | VirtioMmioRegister::Version
+            | VirtioMmioRegister::DeviceId
+            | VirtioMmioRegister::VendorId
+            | VirtioMmioRegister::DeviceFeatures
+            | VirtioMmioRegister::DeviceFeaturesSel
+            | VirtioMmioRegister::DriverFeatures
+            | VirtioMmioRegister::DriverFeaturesSel
+            | VirtioMmioRegister::QueueSel
+            | VirtioMmioRegister::QueueNum
+            | VirtioMmioRegister::QueueNotify
+            | VirtioMmioRegister::InterruptStatus
+            | VirtioMmioRegister::InterruptAck
+            | VirtioMmioRegister::Status
+            | VirtioMmioRegister::QueueDescLow
+            | VirtioMmioRegister::QueueDescHigh
+            | VirtioMmioRegister::QueueDriverLow
+            | VirtioMmioRegister::QueueDriverHigh
+            | VirtioMmioRegister::QueueDeviceLow
+            | VirtioMmioRegister::QueueDeviceHigh
+            | VirtioMmioRegister::ConfigGeneration => {
+                Err(VirtioMmioQueueRegisterError::UnsupportedRegisterRead { register })
+            }
+        }
+    }
+
+    pub fn write_register(
+        &mut self,
+        register: VirtioMmioRegister,
+        value: u32,
+        status: u32,
+    ) -> Result<(), VirtioMmioQueueRegisterError> {
+        match register {
+            VirtioMmioRegister::QueueSel => self.select_queue(value),
+            VirtioMmioRegister::QueueNum => self.write_queue_size(value, status),
+            VirtioMmioRegister::QueueReady => self.write_queue_ready(value, status),
+            VirtioMmioRegister::QueueDescLow => {
+                self.write_queue_address_low(QueueAddressKind::DescriptorTable, value, status)
+            }
+            VirtioMmioRegister::QueueDescHigh => {
+                self.write_queue_address_high(QueueAddressKind::DescriptorTable, value, status)
+            }
+            VirtioMmioRegister::QueueDriverLow => {
+                self.write_queue_address_low(QueueAddressKind::DriverRing, value, status)
+            }
+            VirtioMmioRegister::QueueDriverHigh => {
+                self.write_queue_address_high(QueueAddressKind::DriverRing, value, status)
+            }
+            VirtioMmioRegister::QueueDeviceLow => {
+                self.write_queue_address_low(QueueAddressKind::DeviceRing, value, status)
+            }
+            VirtioMmioRegister::QueueDeviceHigh => {
+                self.write_queue_address_high(QueueAddressKind::DeviceRing, value, status)
+            }
+            VirtioMmioRegister::MagicValue
+            | VirtioMmioRegister::Version
+            | VirtioMmioRegister::DeviceId
+            | VirtioMmioRegister::VendorId
+            | VirtioMmioRegister::DeviceFeatures
+            | VirtioMmioRegister::DeviceFeaturesSel
+            | VirtioMmioRegister::DriverFeatures
+            | VirtioMmioRegister::DriverFeaturesSel
+            | VirtioMmioRegister::QueueNumMax
+            | VirtioMmioRegister::QueueNotify
+            | VirtioMmioRegister::InterruptStatus
+            | VirtioMmioRegister::InterruptAck
+            | VirtioMmioRegister::Status
+            | VirtioMmioRegister::ConfigGeneration => {
+                Err(VirtioMmioQueueRegisterError::UnsupportedRegisterWrite { register })
+            }
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.queue_select = 0;
+        for queue in &mut self.queues {
+            queue.reset();
+        }
+    }
+
+    fn select_queue(&mut self, queue_index: u32) -> Result<(), VirtioMmioQueueRegisterError> {
+        self.queue_index(queue_index)?;
+        self.queue_select = queue_index;
+        Ok(())
+    }
+
+    fn write_queue_size(
+        &mut self,
+        value: u32,
+        status: u32,
+    ) -> Result<(), VirtioMmioQueueRegisterError> {
+        validate_queue_config_status(status)?;
+
+        let queue = self.selected_queue()?;
+        let max_size = queue.max_size();
+        let queue_index = self.queue_select;
+        let queue_size = validate_queue_size(queue_index, value, max_size)?;
+
+        self.selected_queue_mut()?.size = queue_size;
+        Ok(())
+    }
+
+    fn write_queue_ready(
+        &mut self,
+        value: u32,
+        status: u32,
+    ) -> Result<(), VirtioMmioQueueRegisterError> {
+        validate_queue_config_status(status)?;
+
+        let ready = validate_queue_ready_value(self.queue_select, value)?;
+        self.selected_queue_mut()?.ready = ready;
+        Ok(())
+    }
+
+    fn write_queue_address_low(
+        &mut self,
+        kind: QueueAddressKind,
+        value: u32,
+        status: u32,
+    ) -> Result<(), VirtioMmioQueueRegisterError> {
+        validate_queue_config_status(status)?;
+
+        let current = self.selected_queue()?.address(kind);
+        let candidate = replace_address_low(current, value);
+        validate_queue_address(self.queue_select, kind, candidate)?;
+
+        self.selected_queue_mut()?.set_address(kind, candidate);
+        Ok(())
+    }
+
+    fn write_queue_address_high(
+        &mut self,
+        kind: QueueAddressKind,
+        value: u32,
+        status: u32,
+    ) -> Result<(), VirtioMmioQueueRegisterError> {
+        validate_queue_config_status(status)?;
+
+        let current = self.selected_queue()?.address(kind);
+        let candidate = replace_address_high(current, value);
+        validate_queue_address(self.queue_select, kind, candidate)?;
+
+        self.selected_queue_mut()?.set_address(kind, candidate);
+        Ok(())
+    }
+
+    fn selected_queue_mut(
+        &mut self,
+    ) -> Result<&mut VirtioMmioQueueState, VirtioMmioQueueRegisterError> {
+        let queue_index = self.queue_select;
+        let index = self.queue_index(queue_index)?;
+        let queue_count = self.queue_count();
+        self.queues
+            .get_mut(index)
+            .ok_or(VirtioMmioQueueRegisterError::InvalidQueueIndex {
+                queue_index,
+                queue_count,
+            })
+    }
+
+    fn queue_index(&self, queue_index: u32) -> Result<usize, VirtioMmioQueueRegisterError> {
+        let index =
+            usize::try_from(queue_index).map_err(|_| self.invalid_queue_index(queue_index))?;
+        if index < self.queue_count() {
+            Ok(index)
+        } else {
+            Err(self.invalid_queue_index(queue_index))
+        }
+    }
+
+    fn invalid_queue_index(&self, queue_index: u32) -> VirtioMmioQueueRegisterError {
+        VirtioMmioQueueRegisterError::InvalidQueueIndex {
+            queue_index,
+            queue_count: self.queue_count(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioMmioQueueState {
+    max_size: u16,
+    size: u16,
+    ready: bool,
+    descriptor_table: GuestAddress,
+    driver_ring: GuestAddress,
+    device_ring: GuestAddress,
+}
+
+impl VirtioMmioQueueState {
+    const fn new(max_size: u16) -> Self {
+        Self {
+            max_size,
+            size: 0,
+            ready: false,
+            descriptor_table: GuestAddress::new(0),
+            driver_ring: GuestAddress::new(0),
+            device_ring: GuestAddress::new(0),
+        }
+    }
+
+    pub const fn max_size(self) -> u16 {
+        self.max_size
+    }
+
+    pub const fn size(self) -> u16 {
+        self.size
+    }
+
+    pub const fn ready(self) -> bool {
+        self.ready
+    }
+
+    pub const fn descriptor_table(self) -> GuestAddress {
+        self.descriptor_table
+    }
+
+    pub const fn driver_ring(self) -> GuestAddress {
+        self.driver_ring
+    }
+
+    pub const fn device_ring(self) -> GuestAddress {
+        self.device_ring
+    }
+
+    const fn address(self, kind: QueueAddressKind) -> GuestAddress {
+        match kind {
+            QueueAddressKind::DescriptorTable => self.descriptor_table,
+            QueueAddressKind::DriverRing => self.driver_ring,
+            QueueAddressKind::DeviceRing => self.device_ring,
+        }
+    }
+
+    fn set_address(&mut self, kind: QueueAddressKind, address: GuestAddress) {
+        match kind {
+            QueueAddressKind::DescriptorTable => self.descriptor_table = address,
+            QueueAddressKind::DriverRing => self.driver_ring = address,
+            QueueAddressKind::DeviceRing => self.device_ring = address,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.size = 0;
+        self.ready = false;
+        self.descriptor_table = GuestAddress::new(0);
+        self.driver_ring = GuestAddress::new(0);
+        self.device_ring = GuestAddress::new(0);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueAddressKind {
+    DescriptorTable,
+    DriverRing,
+    DeviceRing,
+}
+
+impl QueueAddressKind {
+    const fn register(self) -> VirtioMmioRegister {
+        match self {
+            Self::DescriptorTable => VirtioMmioRegister::QueueDescLow,
+            Self::DriverRing => VirtioMmioRegister::QueueDriverLow,
+            Self::DeviceRing => VirtioMmioRegister::QueueDeviceLow,
+        }
+    }
+
+    const fn alignment(self) -> u64 {
+        match self {
+            Self::DescriptorTable => VIRTQUEUE_DESCRIPTOR_ALIGNMENT,
+            Self::DriverRing => VIRTQUEUE_AVAILABLE_RING_ALIGNMENT,
+            Self::DeviceRing => VIRTQUEUE_USED_RING_ALIGNMENT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioMmioQueueRegisterError {
+    EmptyQueueTable,
+    InvalidQueueMaxSize {
+        queue_index: usize,
+        max_size: u16,
+    },
+    InvalidQueueIndex {
+        queue_index: u32,
+        queue_count: usize,
+    },
+    UnsupportedRegisterRead {
+        register: VirtioMmioRegister,
+    },
+    UnsupportedRegisterWrite {
+        register: VirtioMmioRegister,
+    },
+    QueueConfigNotWritable {
+        status: u32,
+    },
+    InvalidQueueSize {
+        queue_index: u32,
+        queue_size: u32,
+        max_size: u16,
+    },
+    InvalidQueueReadyValue {
+        queue_index: u32,
+        value: u32,
+    },
+    UnalignedQueueAddress {
+        queue_index: u32,
+        register: VirtioMmioRegister,
+        address: GuestAddress,
+        alignment: u64,
+    },
+}
+
+impl fmt::Display for VirtioMmioQueueRegisterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyQueueTable => f.write_str("virtio-mmio queue table cannot be empty"),
+            Self::InvalidQueueMaxSize {
+                queue_index,
+                max_size,
+            } => {
+                write!(
+                    f,
+                    "virtio-mmio queue {queue_index} max size {max_size} must be a nonzero power of two"
+                )
+            }
+            Self::InvalidQueueIndex {
+                queue_index,
+                queue_count,
+            } => {
+                write!(
+                    f,
+                    "virtio-mmio queue index {queue_index} is outside queue table size {queue_count}"
+                )
+            }
+            Self::UnsupportedRegisterRead { register } => {
+                write!(
+                    f,
+                    "unsupported virtio-mmio queue state read from {register}"
+                )
+            }
+            Self::UnsupportedRegisterWrite { register } => {
+                write!(f, "unsupported virtio-mmio queue state write to {register}")
+            }
+            Self::QueueConfigNotWritable { status } => {
+                write!(
+                    f,
+                    "virtio-mmio queue configuration cannot be written while status is 0x{status:x}"
+                )
+            }
+            Self::InvalidQueueSize {
+                queue_index,
+                queue_size,
+                max_size,
+            } => {
+                write!(
+                    f,
+                    "virtio-mmio queue {queue_index} size {queue_size} must be a nonzero power of two not exceeding max size {max_size}"
+                )
+            }
+            Self::InvalidQueueReadyValue { queue_index, value } => {
+                write!(
+                    f,
+                    "virtio-mmio queue {queue_index} ready value {value} must be 0 or 1"
+                )
+            }
+            Self::UnalignedQueueAddress {
+                queue_index,
+                register,
+                address,
+                alignment,
+            } => {
+                write!(
+                    f,
+                    "virtio-mmio queue {queue_index} {register} address {address} is not aligned to {alignment} bytes"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioMmioQueueRegisterError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VirtioMmioRegister {
@@ -787,6 +1226,97 @@ const fn is_valid_status_transition(current: u32, requested: u32) -> bool {
     }
 }
 
+fn validate_queue_max_size(
+    queue_index: usize,
+    max_size: u16,
+) -> Result<(), VirtioMmioQueueRegisterError> {
+    if max_size != 0 && max_size.is_power_of_two() {
+        Ok(())
+    } else {
+        Err(VirtioMmioQueueRegisterError::InvalidQueueMaxSize {
+            queue_index,
+            max_size,
+        })
+    }
+}
+
+fn validate_queue_config_status(status: u32) -> Result<(), VirtioMmioQueueRegisterError> {
+    if status
+        == VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+            | VIRTIO_DEVICE_STATUS_DRIVER
+            | VIRTIO_DEVICE_STATUS_FEATURES_OK
+    {
+        Ok(())
+    } else {
+        Err(VirtioMmioQueueRegisterError::QueueConfigNotWritable { status })
+    }
+}
+
+fn validate_queue_size(
+    queue_index: u32,
+    value: u32,
+    max_size: u16,
+) -> Result<u16, VirtioMmioQueueRegisterError> {
+    let queue_size =
+        u16::try_from(value).map_err(|_| VirtioMmioQueueRegisterError::InvalidQueueSize {
+            queue_index,
+            queue_size: value,
+            max_size,
+        })?;
+
+    if queue_size != 0 && queue_size.is_power_of_two() && queue_size <= max_size {
+        Ok(queue_size)
+    } else {
+        Err(VirtioMmioQueueRegisterError::InvalidQueueSize {
+            queue_index,
+            queue_size: value,
+            max_size,
+        })
+    }
+}
+
+fn validate_queue_ready_value(
+    queue_index: u32,
+    value: u32,
+) -> Result<bool, VirtioMmioQueueRegisterError> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(VirtioMmioQueueRegisterError::InvalidQueueReadyValue { queue_index, value }),
+    }
+}
+
+fn queue_ready_value(ready: bool) -> u32 {
+    if ready { 1 } else { 0 }
+}
+
+fn replace_address_low(current: GuestAddress, value: u32) -> GuestAddress {
+    GuestAddress::new((current.raw_value() & !u64::from(u32::MAX)) | u64::from(value))
+}
+
+fn replace_address_high(current: GuestAddress, value: u32) -> GuestAddress {
+    GuestAddress::new((current.raw_value() & u64::from(u32::MAX)) | (u64::from(value) << 32))
+}
+
+fn validate_queue_address(
+    queue_index: u32,
+    kind: QueueAddressKind,
+    address: GuestAddress,
+) -> Result<(), VirtioMmioQueueRegisterError> {
+    let alignment = kind.alignment();
+    let is_aligned = address.is_aligned(alignment).unwrap_or(false);
+    if is_aligned {
+        Ok(())
+    } else {
+        Err(VirtioMmioQueueRegisterError::UnalignedQueueAddress {
+            queue_index,
+            register: kind.register(),
+            address,
+            alignment,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
@@ -799,13 +1329,17 @@ mod tests {
         VIRTIO_MMIO_FEATURE_VERSION_1, VIRTIO_MMIO_MAGIC_VALUE, VIRTIO_MMIO_NOTIFY_OFFSET,
         VIRTIO_MMIO_REGISTER_ACCESS_SIZE, VIRTIO_MMIO_REGISTER_SPACE_SIZE, VIRTIO_MMIO_VENDOR_ID,
         VIRTIO_MMIO_VERSION, VIRTIO_MMIO_VERSION_1_FEATURE, VirtioMmioAccess,
-        VirtioMmioAccessError, VirtioMmioDeviceRegisters, VirtioMmioRegister,
-        VirtioMmioRegisterStateError, decode_virtio_mmio_access,
+        VirtioMmioAccessError, VirtioMmioDeviceRegisters, VirtioMmioQueueRegisterError,
+        VirtioMmioQueueRegisters, VirtioMmioRegister, VirtioMmioRegisterStateError,
+        decode_virtio_mmio_access,
     };
     use crate::memory::GuestAddress;
     use crate::mmio::{MmioAccessBytes, MmioBus, MmioOperation, MmioOperationKind, MmioRegionId};
 
     const BASE: u64 = 0x1000_0000;
+    const QUEUE_CONFIG_STATUS: u32 = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+        | VIRTIO_DEVICE_STATUS_DRIVER
+        | VIRTIO_DEVICE_STATUS_FEATURES_OK;
 
     fn read_operation(offset: u64, len: u64) -> MmioOperation {
         let access = access(offset, len);
@@ -1188,6 +1722,360 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "invalid virtio-mmio device status transition: 0x0 -> 0x3"
+        );
+    }
+
+    #[test]
+    fn queue_registers_initialize_and_validate_queue_table() {
+        assert_eq!(
+            VirtioMmioQueueRegisters::new(&[]),
+            Err(VirtioMmioQueueRegisterError::EmptyQueueTable)
+        );
+        assert_eq!(
+            VirtioMmioQueueRegisters::new(&[0]),
+            Err(VirtioMmioQueueRegisterError::InvalidQueueMaxSize {
+                queue_index: 0,
+                max_size: 0,
+            })
+        );
+        assert_eq!(
+            VirtioMmioQueueRegisters::new(&[8, 3]),
+            Err(VirtioMmioQueueRegisterError::InvalidQueueMaxSize {
+                queue_index: 1,
+                max_size: 3,
+            })
+        );
+
+        let queues = VirtioMmioQueueRegisters::new(&[8, 16]).expect("queue table should build");
+
+        assert_eq!(queues.queue_count(), 2);
+        assert_eq!(queues.queue_select(), 0);
+        let selected = queues
+            .selected_queue()
+            .expect("selected queue should exist");
+        assert_eq!(selected.max_size(), 8);
+        assert_eq!(selected.size(), 0);
+        assert!(!selected.ready());
+        assert_eq!(selected.descriptor_table(), GuestAddress::new(0));
+        assert_eq!(selected.driver_ring(), GuestAddress::new(0));
+        assert_eq!(selected.device_ring(), GuestAddress::new(0));
+    }
+
+    #[test]
+    fn queue_registers_select_and_read_selected_queue() {
+        let mut queues = VirtioMmioQueueRegisters::new(&[8, 16]).expect("queue table should build");
+
+        assert_eq!(queues.read_register(VirtioMmioRegister::QueueNumMax), Ok(8));
+        assert_eq!(queues.read_register(VirtioMmioRegister::QueueReady), Ok(0));
+
+        queues
+            .write_register(VirtioMmioRegister::QueueSel, 1, VIRTIO_DEVICE_STATUS_INIT)
+            .expect("queue 1 should select");
+        assert_eq!(queues.queue_select(), 1);
+        assert_eq!(
+            queues.read_register(VirtioMmioRegister::QueueNumMax),
+            Ok(16)
+        );
+
+        let err = queues
+            .write_register(VirtioMmioRegister::QueueSel, 2, VIRTIO_DEVICE_STATUS_INIT)
+            .expect_err("out-of-range queue select should fail");
+        assert_eq!(
+            err,
+            VirtioMmioQueueRegisterError::InvalidQueueIndex {
+                queue_index: 2,
+                queue_count: 2,
+            }
+        );
+        assert_eq!(queues.queue_select(), 1);
+    }
+
+    #[test]
+    fn queue_registers_gate_configuration_writes_on_status() {
+        let mut queues = VirtioMmioQueueRegisters::new(&[8]).expect("queue table should build");
+
+        let err = queues
+            .write_register(VirtioMmioRegister::QueueNum, 8, VIRTIO_DEVICE_STATUS_INIT)
+            .expect_err("queue size should not write before FEATURES_OK");
+        assert_eq!(
+            err,
+            VirtioMmioQueueRegisterError::QueueConfigNotWritable {
+                status: VIRTIO_DEVICE_STATUS_INIT,
+            }
+        );
+        assert_eq!(
+            queues.selected_queue().expect("queue should exist").size(),
+            0
+        );
+
+        let driver_ok_status = QUEUE_CONFIG_STATUS | VIRTIO_DEVICE_STATUS_DRIVER_OK;
+        let err = queues
+            .write_register(VirtioMmioRegister::QueueReady, 1, driver_ok_status)
+            .expect_err("queue ready should not write after DRIVER_OK");
+        assert_eq!(
+            err,
+            VirtioMmioQueueRegisterError::QueueConfigNotWritable {
+                status: driver_ok_status,
+            }
+        );
+        assert!(!queues.selected_queue().expect("queue should exist").ready());
+    }
+
+    #[test]
+    fn queue_registers_validate_queue_size_without_partial_mutation() {
+        let mut queues = VirtioMmioQueueRegisters::new(&[8]).expect("queue table should build");
+
+        queues
+            .write_register(VirtioMmioRegister::QueueNum, 4, QUEUE_CONFIG_STATUS)
+            .expect("valid queue size should write");
+        assert_eq!(
+            queues.selected_queue().expect("queue should exist").size(),
+            4
+        );
+
+        for invalid_size in [0, 3, 16, 65_536] {
+            let err = queues
+                .write_register(
+                    VirtioMmioRegister::QueueNum,
+                    invalid_size,
+                    QUEUE_CONFIG_STATUS,
+                )
+                .expect_err("invalid queue size should fail");
+            assert_eq!(
+                err,
+                VirtioMmioQueueRegisterError::InvalidQueueSize {
+                    queue_index: 0,
+                    queue_size: invalid_size,
+                    max_size: 8,
+                }
+            );
+            assert_eq!(
+                queues.selected_queue().expect("queue should exist").size(),
+                4
+            );
+        }
+    }
+
+    #[test]
+    fn queue_registers_validate_ready_values_without_partial_mutation() {
+        let mut queues = VirtioMmioQueueRegisters::new(&[8]).expect("queue table should build");
+
+        queues
+            .write_register(VirtioMmioRegister::QueueReady, 1, QUEUE_CONFIG_STATUS)
+            .expect("ready value 1 should write");
+        assert!(queues.selected_queue().expect("queue should exist").ready());
+        assert_eq!(queues.read_register(VirtioMmioRegister::QueueReady), Ok(1));
+
+        let err = queues
+            .write_register(VirtioMmioRegister::QueueReady, 2, QUEUE_CONFIG_STATUS)
+            .expect_err("ready value outside 0/1 should fail");
+        assert_eq!(
+            err,
+            VirtioMmioQueueRegisterError::InvalidQueueReadyValue {
+                queue_index: 0,
+                value: 2,
+            }
+        );
+        assert!(queues.selected_queue().expect("queue should exist").ready());
+
+        queues
+            .write_register(VirtioMmioRegister::QueueReady, 0, QUEUE_CONFIG_STATUS)
+            .expect("ready value 0 should write");
+        assert!(!queues.selected_queue().expect("queue should exist").ready());
+    }
+
+    #[test]
+    fn queue_registers_compose_address_halves_and_validate_alignment() {
+        let mut queues = VirtioMmioQueueRegisters::new(&[8]).expect("queue table should build");
+
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDescLow,
+                0x1000,
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("aligned descriptor table low address should write");
+        queues
+            .write_register(VirtioMmioRegister::QueueDescHigh, 1, QUEUE_CONFIG_STATUS)
+            .expect("descriptor table high address should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDriverLow,
+                0x2002,
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("aligned driver ring address should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDeviceLow,
+                0x3004,
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("aligned device ring address should write");
+
+        let queue = queues.selected_queue().expect("queue should exist");
+        assert_eq!(queue.descriptor_table(), GuestAddress::new(0x1_0000_1000));
+        assert_eq!(queue.driver_ring(), GuestAddress::new(0x2002));
+        assert_eq!(queue.device_ring(), GuestAddress::new(0x3004));
+
+        let err = queues
+            .write_register(
+                VirtioMmioRegister::QueueDescLow,
+                0x1001,
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect_err("unaligned descriptor table should fail");
+        assert_eq!(
+            err,
+            VirtioMmioQueueRegisterError::UnalignedQueueAddress {
+                queue_index: 0,
+                register: VirtioMmioRegister::QueueDescLow,
+                address: GuestAddress::new(0x1_0000_1001),
+                alignment: 16,
+            }
+        );
+        assert_eq!(
+            queues
+                .selected_queue()
+                .expect("queue should exist")
+                .descriptor_table(),
+            GuestAddress::new(0x1_0000_1000)
+        );
+
+        let err = queues
+            .write_register(
+                VirtioMmioRegister::QueueDriverLow,
+                0x2001,
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect_err("unaligned driver ring should fail");
+        assert_eq!(
+            err,
+            VirtioMmioQueueRegisterError::UnalignedQueueAddress {
+                queue_index: 0,
+                register: VirtioMmioRegister::QueueDriverLow,
+                address: GuestAddress::new(0x2001),
+                alignment: 2,
+            }
+        );
+        assert_eq!(
+            queues
+                .selected_queue()
+                .expect("queue should exist")
+                .driver_ring(),
+            GuestAddress::new(0x2002)
+        );
+
+        let err = queues
+            .write_register(
+                VirtioMmioRegister::QueueDeviceLow,
+                0x3002,
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect_err("unaligned device ring should fail");
+        assert_eq!(
+            err,
+            VirtioMmioQueueRegisterError::UnalignedQueueAddress {
+                queue_index: 0,
+                register: VirtioMmioRegister::QueueDeviceLow,
+                address: GuestAddress::new(0x3002),
+                alignment: 4,
+            }
+        );
+        assert_eq!(
+            queues
+                .selected_queue()
+                .expect("queue should exist")
+                .device_ring(),
+            GuestAddress::new(0x3004)
+        );
+    }
+
+    #[test]
+    fn queue_registers_reset_selected_queue_and_preserve_max_sizes() {
+        let mut queues = VirtioMmioQueueRegisters::new(&[8, 16]).expect("queue table should build");
+        queues
+            .write_register(VirtioMmioRegister::QueueSel, 1, VIRTIO_DEVICE_STATUS_INIT)
+            .expect("queue 1 should select");
+        queues
+            .write_register(VirtioMmioRegister::QueueNum, 16, QUEUE_CONFIG_STATUS)
+            .expect("queue size should write");
+        queues
+            .write_register(VirtioMmioRegister::QueueReady, 1, QUEUE_CONFIG_STATUS)
+            .expect("queue ready should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDeviceLow,
+                0x4000,
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("device ring address should write");
+
+        queues.reset();
+
+        assert_eq!(queues.queue_select(), 0);
+        assert_eq!(queues.queue(0).expect("queue 0 should exist").max_size(), 8);
+        let queue_1 = queues.queue(1).expect("queue 1 should exist");
+        assert_eq!(queue_1.max_size(), 16);
+        assert_eq!(queue_1.size(), 0);
+        assert!(!queue_1.ready());
+        assert_eq!(queue_1.device_ring(), GuestAddress::new(0));
+    }
+
+    #[test]
+    fn queue_registers_reject_unsupported_register_accesses() {
+        let mut queues = VirtioMmioQueueRegisters::new(&[8]).expect("queue table should build");
+
+        assert_eq!(
+            queues.read_register(VirtioMmioRegister::Status),
+            Err(VirtioMmioQueueRegisterError::UnsupportedRegisterRead {
+                register: VirtioMmioRegister::Status,
+            })
+        );
+        assert_eq!(
+            queues.write_register(
+                VirtioMmioRegister::QueueNotify,
+                0,
+                VIRTIO_DEVICE_STATUS_INIT,
+            ),
+            Err(VirtioMmioQueueRegisterError::UnsupportedRegisterWrite {
+                register: VirtioMmioRegister::QueueNotify,
+            })
+        );
+        assert_eq!(
+            queues.write_register(
+                VirtioMmioRegister::QueueNumMax,
+                0,
+                VIRTIO_DEVICE_STATUS_INIT,
+            ),
+            Err(VirtioMmioQueueRegisterError::UnsupportedRegisterWrite {
+                register: VirtioMmioRegister::QueueNumMax,
+            })
+        );
+    }
+
+    #[test]
+    fn queue_register_errors_display_and_preserve_sources() {
+        let err = VirtioMmioQueueRegisterError::InvalidQueueSize {
+            queue_index: 1,
+            queue_size: 12,
+            max_size: 8,
+        };
+        assert_eq!(
+            err.to_string(),
+            "virtio-mmio queue 1 size 12 must be a nonzero power of two not exceeding max size 8"
+        );
+        assert!(err.source().is_none());
+
+        let err = VirtioMmioQueueRegisterError::UnalignedQueueAddress {
+            queue_index: 0,
+            register: VirtioMmioRegister::QueueDriverLow,
+            address: GuestAddress::new(0x1001),
+            alignment: 2,
+        };
+        assert_eq!(
+            err.to_string(),
+            "virtio-mmio queue 0 QueueDriverLow address 0x1001 is not aligned to 2 bytes"
         );
     }
 
