@@ -434,19 +434,19 @@ mod tests {
     }
 
     #[test]
-    fn decodes_access_ending_at_max_exclusive_address() {
+    fn decodes_largest_access_ending_at_max_exclusive_address() {
         let access = exception_exit(
             data_abort_syndrome(
-                HvfMmioAccessSize::Byte,
+                HvfMmioAccessSize::Doubleword,
                 HvfMmioDirection::Read,
                 HvfMmioRegister::new(0).expect("register should be valid"),
             ),
-            u64::MAX - 1,
+            u64::MAX - 8,
         )
         .decode_mmio_access()
         .expect("access ending at max exclusive address should decode");
 
-        assert_eq!(access.range(), range(u64::MAX - 1, 1));
+        assert_eq!(access.range(), range(u64::MAX - 8, 8));
     }
 
     #[test]
