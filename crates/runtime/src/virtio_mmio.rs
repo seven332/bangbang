@@ -1965,6 +1965,23 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_ack_allows_status_with_driver_ok_bit() {
+        let mut registers = VirtioMmioInterruptRegisters::new();
+        let failed_driver_ok_status = DRIVER_OK_STATUS | VIRTIO_DEVICE_STATUS_FAILED;
+
+        registers.mark_pending(DeviceInterruptKind::Queue);
+        registers
+            .write_register(
+                VirtioMmioRegister::InterruptAck,
+                DeviceInterruptKind::Queue.status().bits(),
+                failed_driver_ok_status,
+            )
+            .expect("interrupt ack should require only the DRIVER_OK bit");
+
+        assert!(registers.pending_status().is_empty());
+    }
+
+    #[test]
     fn interrupt_ack_empty_mask_is_noop() {
         let mut registers = VirtioMmioInterruptRegisters::new();
 
