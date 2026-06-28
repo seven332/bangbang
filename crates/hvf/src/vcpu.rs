@@ -4,9 +4,11 @@ use std::rc::Rc;
 
 use bangbang_runtime::BackendError;
 use bangbang_runtime::memory::GuestAddress;
+use bangbang_runtime::mmio::{MmioAccessBytes, MmioOperation};
 
 use crate::backend::HvfBackend;
-use crate::exit::HvfVcpuExit;
+use crate::exit::{HvfResolvedMmioAccess, HvfVcpuExit};
+use crate::mmio::HvfMmioCompletionError;
 
 const DESTROYED_VCPU_MESSAGE: &str = "vCPU has already been destroyed";
 const NO_VCPU_EXIT_MESSAGE: &str = "vCPU has not exited yet";
@@ -33,6 +35,14 @@ impl HvfRegister {
     pub const X3: Self = Self(crate::ffi::HV_REG_X3);
     pub const PC: Self = Self(crate::ffi::HV_REG_PC);
     pub const CPSR: Self = Self(crate::ffi::HV_REG_CPSR);
+
+    pub(crate) const fn general_purpose(value: u8) -> Option<Self> {
+        if value <= 30 {
+            Some(Self(crate::ffi::HV_REG_X0 + value as u32))
+        } else {
+            None
+        }
+    }
 
     pub const fn raw(self) -> u32 {
         self.0
@@ -138,6 +148,23 @@ impl HvfVcpuOwner {
         })
     }
 
+    pub(crate) fn mmio_operation(
+        &self,
+        access: HvfResolvedMmioAccess,
+    ) -> Result<MmioOperation, HvfMmioCompletionError> {
+        crate::mmio::build_mmio_operation(access, |register| self.get_register(register))
+    }
+
+    pub(crate) fn complete_mmio_read(
+        &mut self,
+        access: HvfResolvedMmioAccess,
+        data: MmioAccessBytes,
+    ) -> Result<(), HvfMmioCompletionError> {
+        crate::mmio::complete_mmio_read(access, data, |register, value| {
+            self.set_register(register, value)
+        })
+    }
+
     pub(crate) fn get_system_register(
         &self,
         register: HvfSystemRegister,
@@ -229,6 +256,23 @@ impl<'vm> HvfVcpu<'vm> {
         registers: HvfArm64BootRegisters,
     ) -> Result<(), BackendError> {
         self.owner.configure_arm64_boot_registers(registers)
+    }
+
+    /// Build the runtime MMIO operation represented by a resolved HVF exit.
+    pub fn mmio_operation(
+        &self,
+        access: HvfResolvedMmioAccess,
+    ) -> Result<MmioOperation, HvfMmioCompletionError> {
+        self.owner.mmio_operation(access)
+    }
+
+    /// Complete an HVF MMIO read exit by writing the runtime read data into the trapped GPR.
+    pub fn complete_mmio_read(
+        &mut self,
+        access: HvfResolvedMmioAccess,
+        data: MmioAccessBytes,
+    ) -> Result<(), HvfMmioCompletionError> {
+        self.owner.complete_mmio_read(access, data)
     }
 
     pub fn get_system_register(&self, register: HvfSystemRegister) -> Result<u64, BackendError> {
@@ -476,5 +520,19 @@ mod tests {
                 (HvfRegister::X0, 0x8fe0_0000),
             ]
         );
+    }
+
+    #[test]
+    fn general_purpose_register_mapping_excludes_pc() {
+        assert_eq!(
+            HvfRegister::general_purpose(0).map(HvfRegister::raw),
+            Some(crate::ffi::HV_REG_X0)
+        );
+        assert_eq!(
+            HvfRegister::general_purpose(30).map(HvfRegister::raw),
+            Some(crate::ffi::HV_REG_X0 + 30)
+        );
+        assert_eq!(HvfRegister::general_purpose(31), None);
+        assert_ne!(crate::ffi::HV_REG_X0 + 30, HvfRegister::PC.raw());
     }
 }
