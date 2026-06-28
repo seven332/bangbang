@@ -2,19 +2,27 @@
 
 use std::collections::TryReserveError;
 use std::fmt;
+use std::sync::atomic::{Ordering, fence};
 
 use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryRange};
 
 pub const VIRTQUEUE_DESCRIPTOR_SIZE: usize = 16;
 pub const VIRTQUEUE_DESCRIPTOR_ALIGNMENT: u64 = 16;
+pub const VIRTQUEUE_AVAILABLE_RING_ALIGNMENT: u64 = 2;
 pub const VIRTQUEUE_DESC_F_NEXT: u16 = 0x1;
 pub const VIRTQUEUE_DESC_F_WRITE: u16 = 0x2;
 pub const VIRTQUEUE_DESC_F_INDIRECT: u16 = 0x4;
 
 const VIRTQUEUE_DESCRIPTOR_SIZE_U64: u64 = 16;
+const VIRTQUEUE_AVAILABLE_RING_HEADER_SIZE_U64: u64 = 4;
+const VIRTQUEUE_AVAILABLE_RING_ENTRY_SIZE_U64: u64 = 2;
+const VIRTQUEUE_AVAILABLE_RING_USED_EVENT_SIZE_U64: u64 = 2;
+const VIRTQUEUE_AVAILABLE_RING_IDX_OFFSET: u64 = 2;
+const VIRTQUEUE_AVAILABLE_RING_RING_OFFSET: u64 = 4;
 const DESCRIPTOR_ADDR_SIZE: usize = 8;
 const DESCRIPTOR_LEN_SIZE: usize = 4;
 const DESCRIPTOR_FLAGS_SIZE: usize = 2;
+const U16_FIELD_SIZE: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtqueueDescriptorFlags(u16);
@@ -168,6 +176,232 @@ pub fn read_descriptor_chain(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtqueueAvailableRing {
+    descriptor_table: GuestAddress,
+    available_ring: GuestAddress,
+    queue_size: u16,
+    next_avail: u16,
+}
+
+impl VirtqueueAvailableRing {
+    pub fn new(
+        descriptor_table: GuestAddress,
+        available_ring: GuestAddress,
+        queue_size: u16,
+    ) -> Result<Self, VirtqueueAvailableRingError> {
+        Self::with_next_avail(descriptor_table, available_ring, queue_size, 0)
+    }
+
+    pub fn with_next_avail(
+        descriptor_table: GuestAddress,
+        available_ring: GuestAddress,
+        queue_size: u16,
+        next_avail: u16,
+    ) -> Result<Self, VirtqueueAvailableRingError> {
+        validate_available_ring_queue_size(queue_size)?;
+        validate_available_ring_descriptor_table_alignment(descriptor_table)?;
+        validate_available_ring_alignment(available_ring)?;
+        available_ring_size(available_ring, queue_size)?;
+
+        Ok(Self {
+            descriptor_table,
+            available_ring,
+            queue_size,
+            next_avail,
+        })
+    }
+
+    pub const fn descriptor_table(&self) -> GuestAddress {
+        self.descriptor_table
+    }
+
+    pub const fn available_ring(&self) -> GuestAddress {
+        self.available_ring
+    }
+
+    pub const fn queue_size(&self) -> u16 {
+        self.queue_size
+    }
+
+    pub const fn next_avail(&self) -> u16 {
+        self.next_avail
+    }
+
+    pub fn pop_descriptor_chain(
+        &mut self,
+        memory: &GuestMemory,
+    ) -> Result<Option<VirtqueueDescriptorChain>, VirtqueueAvailableRingError> {
+        validate_descriptor_table_range(memory, self.descriptor_table, self.queue_size)
+            .map_err(|source| VirtqueueAvailableRingError::DescriptorTable { source })?;
+        validate_available_ring_range(memory, self.available_ring, self.queue_size)?;
+
+        let available_index_address = available_ring_offset_address(
+            self.available_ring,
+            self.queue_size,
+            VIRTQUEUE_AVAILABLE_RING_IDX_OFFSET,
+        )?;
+        let available_index = read_available_ring_u16(
+            memory,
+            self.available_ring,
+            self.queue_size,
+            available_index_address,
+        )?;
+        let available_len = available_index.wrapping_sub(self.next_avail);
+
+        if available_len > self.queue_size {
+            return Err(VirtqueueAvailableRingError::AvailableRingLengthTooLarge {
+                queue_size: self.queue_size,
+                available_len,
+            });
+        }
+
+        if available_len == 0 {
+            return Ok(None);
+        }
+
+        // Match Firecracker's ordering point between the observed available
+        // index and the selected ring-entry read.
+        fence(Ordering::Acquire);
+
+        let ring_index = self.next_avail % self.queue_size;
+        let head_address =
+            available_ring_entry_address(self.available_ring, self.queue_size, ring_index)?;
+        let head_index =
+            read_available_ring_u16(memory, self.available_ring, self.queue_size, head_address)?;
+        let chain =
+            read_descriptor_chain(memory, self.descriptor_table, self.queue_size, head_index)
+                .map_err(|source| VirtqueueAvailableRingError::DescriptorChain {
+                    head_index,
+                    source,
+                })?;
+
+        self.next_avail = self.next_avail.wrapping_add(1);
+
+        Ok(Some(chain))
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtqueueAvailableRingError {
+    InvalidQueueSize {
+        queue_size: u16,
+    },
+    UnalignedDescriptorTable {
+        descriptor_table: GuestAddress,
+        alignment: u64,
+    },
+    UnalignedAvailableRing {
+        available_ring: GuestAddress,
+        alignment: u64,
+    },
+    AvailableRingRangeOverflow {
+        available_ring: GuestAddress,
+        queue_size: u16,
+    },
+    AvailableRingAccess {
+        available_ring: GuestAddress,
+        queue_size: u16,
+        source: GuestMemoryAccessError,
+    },
+    AvailableRingLengthTooLarge {
+        queue_size: u16,
+        available_len: u16,
+    },
+    DescriptorTable {
+        source: VirtqueueDescriptorChainError,
+    },
+    DescriptorChain {
+        head_index: u16,
+        source: VirtqueueDescriptorChainError,
+    },
+}
+
+impl fmt::Display for VirtqueueAvailableRingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidQueueSize { queue_size } => {
+                write!(
+                    f,
+                    "virtqueue size {queue_size} must be a nonzero power of two"
+                )
+            }
+            Self::UnalignedDescriptorTable {
+                descriptor_table,
+                alignment,
+            } => {
+                write!(
+                    f,
+                    "virtqueue descriptor table address {descriptor_table} is not aligned to {alignment} bytes"
+                )
+            }
+            Self::UnalignedAvailableRing {
+                available_ring,
+                alignment,
+            } => {
+                write!(
+                    f,
+                    "virtqueue available ring address {available_ring} is not aligned to {alignment} bytes"
+                )
+            }
+            Self::AvailableRingRangeOverflow {
+                available_ring,
+                queue_size,
+            } => {
+                write!(
+                    f,
+                    "virtqueue available ring address {available_ring} with queue size {queue_size} overflows address space"
+                )
+            }
+            Self::AvailableRingAccess {
+                available_ring,
+                queue_size,
+                source,
+            } => {
+                write!(
+                    f,
+                    "virtqueue available ring address {available_ring} with queue size {queue_size} is not fully mapped: {source}"
+                )
+            }
+            Self::AvailableRingLengthTooLarge {
+                queue_size,
+                available_len,
+            } => {
+                write!(
+                    f,
+                    "virtqueue available ring reports {available_len} descriptors, exceeding queue size {queue_size}"
+                )
+            }
+            Self::DescriptorTable { source } => {
+                write!(
+                    f,
+                    "virtqueue descriptor table is invalid before available-ring read: {source}"
+                )
+            }
+            Self::DescriptorChain { head_index, source } => {
+                write!(
+                    f,
+                    "failed to read virtqueue descriptor chain from available head {head_index}: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtqueueAvailableRingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AvailableRingAccess { source, .. } => Some(source),
+            Self::DescriptorTable { source } | Self::DescriptorChain { source, .. } => Some(source),
+            Self::InvalidQueueSize { .. }
+            | Self::UnalignedDescriptorTable { .. }
+            | Self::UnalignedAvailableRing { .. }
+            | Self::AvailableRingRangeOverflow { .. }
+            | Self::AvailableRingLengthTooLarge { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum VirtqueueDescriptorChainError {
     InvalidQueueSize {
@@ -313,11 +547,23 @@ impl std::error::Error for VirtqueueDescriptorChainError {
     }
 }
 
+fn is_valid_queue_size(queue_size: u16) -> bool {
+    queue_size != 0 && queue_size.is_power_of_two()
+}
+
 fn validate_queue_size(queue_size: u16) -> Result<(), VirtqueueDescriptorChainError> {
-    if queue_size == 0 || !queue_size.is_power_of_two() {
-        Err(VirtqueueDescriptorChainError::InvalidQueueSize { queue_size })
-    } else {
+    if is_valid_queue_size(queue_size) {
         Ok(())
+    } else {
+        Err(VirtqueueDescriptorChainError::InvalidQueueSize { queue_size })
+    }
+}
+
+fn validate_available_ring_queue_size(queue_size: u16) -> Result<(), VirtqueueAvailableRingError> {
+    if is_valid_queue_size(queue_size) {
+        Ok(())
+    } else {
+        Err(VirtqueueAvailableRingError::InvalidQueueSize { queue_size })
     }
 }
 
@@ -333,6 +579,38 @@ fn validate_descriptor_table_alignment(
         Err(VirtqueueDescriptorChainError::UnalignedDescriptorTable {
             descriptor_table,
             alignment: VIRTQUEUE_DESCRIPTOR_ALIGNMENT,
+        })
+    }
+}
+
+fn validate_available_ring_descriptor_table_alignment(
+    descriptor_table: GuestAddress,
+) -> Result<(), VirtqueueAvailableRingError> {
+    if descriptor_table
+        .raw_value()
+        .is_multiple_of(VIRTQUEUE_DESCRIPTOR_ALIGNMENT)
+    {
+        Ok(())
+    } else {
+        Err(VirtqueueAvailableRingError::UnalignedDescriptorTable {
+            descriptor_table,
+            alignment: VIRTQUEUE_DESCRIPTOR_ALIGNMENT,
+        })
+    }
+}
+
+fn validate_available_ring_alignment(
+    available_ring: GuestAddress,
+) -> Result<(), VirtqueueAvailableRingError> {
+    if available_ring
+        .raw_value()
+        .is_multiple_of(VIRTQUEUE_AVAILABLE_RING_ALIGNMENT)
+    {
+        Ok(())
+    } else {
+        Err(VirtqueueAvailableRingError::UnalignedAvailableRing {
+            available_ring,
+            alignment: VIRTQUEUE_AVAILABLE_RING_ALIGNMENT,
         })
     }
 }
@@ -363,6 +641,30 @@ fn validate_descriptor_table_range(
     Ok(())
 }
 
+fn validate_available_ring_range(
+    memory: &GuestMemory,
+    available_ring: GuestAddress,
+    queue_size: u16,
+) -> Result<(), VirtqueueAvailableRingError> {
+    let ring_size = available_ring_size(available_ring, queue_size)?;
+    let ring_range = GuestMemoryRange::new(available_ring, ring_size).map_err(|_| {
+        VirtqueueAvailableRingError::AvailableRingRangeOverflow {
+            available_ring,
+            queue_size,
+        }
+    })?;
+
+    memory.validate_mapped_range(ring_range).map_err(|source| {
+        VirtqueueAvailableRingError::AvailableRingAccess {
+            available_ring,
+            queue_size,
+            source,
+        }
+    })?;
+
+    Ok(())
+}
+
 fn validate_descriptor_index(
     index: u16,
     queue_size: u16,
@@ -376,6 +678,82 @@ fn validate_descriptor_index(
             queue_size,
         })
     }
+}
+
+fn available_ring_size(
+    available_ring: GuestAddress,
+    queue_size: u16,
+) -> Result<u64, VirtqueueAvailableRingError> {
+    let entry_bytes = u64::from(queue_size)
+        .checked_mul(VIRTQUEUE_AVAILABLE_RING_ENTRY_SIZE_U64)
+        .ok_or(VirtqueueAvailableRingError::AvailableRingRangeOverflow {
+            available_ring,
+            queue_size,
+        })?;
+    let ring_size = VIRTQUEUE_AVAILABLE_RING_HEADER_SIZE_U64
+        .checked_add(entry_bytes)
+        .and_then(|size| size.checked_add(VIRTQUEUE_AVAILABLE_RING_USED_EVENT_SIZE_U64))
+        .ok_or(VirtqueueAvailableRingError::AvailableRingRangeOverflow {
+            available_ring,
+            queue_size,
+        })?;
+
+    available_ring.checked_add(ring_size).ok_or(
+        VirtqueueAvailableRingError::AvailableRingRangeOverflow {
+            available_ring,
+            queue_size,
+        },
+    )?;
+
+    Ok(ring_size)
+}
+
+fn available_ring_offset_address(
+    available_ring: GuestAddress,
+    queue_size: u16,
+    offset: u64,
+) -> Result<GuestAddress, VirtqueueAvailableRingError> {
+    available_ring.checked_add(offset).ok_or(
+        VirtqueueAvailableRingError::AvailableRingRangeOverflow {
+            available_ring,
+            queue_size,
+        },
+    )
+}
+
+fn available_ring_entry_address(
+    available_ring: GuestAddress,
+    queue_size: u16,
+    ring_index: u16,
+) -> Result<GuestAddress, VirtqueueAvailableRingError> {
+    let entry_offset = u64::from(ring_index)
+        .checked_mul(VIRTQUEUE_AVAILABLE_RING_ENTRY_SIZE_U64)
+        .and_then(|offset| offset.checked_add(VIRTQUEUE_AVAILABLE_RING_RING_OFFSET))
+        .ok_or(VirtqueueAvailableRingError::AvailableRingRangeOverflow {
+            available_ring,
+            queue_size,
+        })?;
+
+    available_ring_offset_address(available_ring, queue_size, entry_offset)
+}
+
+fn read_available_ring_u16(
+    memory: &GuestMemory,
+    available_ring: GuestAddress,
+    queue_size: u16,
+    address: GuestAddress,
+) -> Result<u16, VirtqueueAvailableRingError> {
+    read_u16(memory, address).map_err(|source| VirtqueueAvailableRingError::AvailableRingAccess {
+        available_ring,
+        queue_size,
+        source,
+    })
+}
+
+fn read_u16(memory: &GuestMemory, address: GuestAddress) -> Result<u16, GuestMemoryAccessError> {
+    let mut bytes = [0; U16_FIELD_SIZE];
+    memory.read_slice(&mut bytes, address)?;
+    Ok(u16::from_le_bytes(bytes))
 }
 
 fn read_descriptor(
@@ -465,15 +843,19 @@ mod tests {
     use std::error::Error as _;
 
     use super::{
+        VIRTQUEUE_AVAILABLE_RING_ALIGNMENT, VIRTQUEUE_AVAILABLE_RING_ENTRY_SIZE_U64,
+        VIRTQUEUE_AVAILABLE_RING_IDX_OFFSET, VIRTQUEUE_AVAILABLE_RING_RING_OFFSET,
         VIRTQUEUE_DESC_F_INDIRECT, VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE,
         VIRTQUEUE_DESCRIPTOR_ALIGNMENT, VIRTQUEUE_DESCRIPTOR_SIZE, VIRTQUEUE_DESCRIPTOR_SIZE_U64,
-        VirtqueueDescriptorChainError, VirtqueueDescriptorFlags, read_descriptor_chain,
+        VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptorChainError,
+        VirtqueueDescriptorFlags, read_descriptor_chain,
     };
     use crate::memory::{
         GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryLayout, GuestMemoryRange,
     };
 
     const TABLE: GuestAddress = GuestAddress::new(0x1000);
+    const AVAIL: GuestAddress = GuestAddress::new(0x2000);
 
     fn guest_memory(size: u64) -> GuestMemory {
         let range = GuestMemoryRange::new(GuestAddress::new(0), size)
@@ -525,10 +907,42 @@ mod tests {
             .expect("descriptor next field should write");
     }
 
+    fn write_u16(memory: &mut GuestMemory, address: GuestAddress, value: u16) {
+        memory
+            .write_slice(&value.to_le_bytes(), address)
+            .expect("u16 field should write");
+    }
+
+    fn write_available_index(memory: &mut GuestMemory, available_ring: GuestAddress, index: u16) {
+        write_u16(
+            memory,
+            available_ring
+                .checked_add(VIRTQUEUE_AVAILABLE_RING_IDX_OFFSET)
+                .expect("available index address should not overflow"),
+            index,
+        );
+    }
+
+    fn write_available_head(
+        memory: &mut GuestMemory,
+        available_ring: GuestAddress,
+        ring_index: u16,
+        head_index: u16,
+    ) {
+        let entry = available_ring
+            .checked_add(
+                VIRTQUEUE_AVAILABLE_RING_RING_OFFSET
+                    + u64::from(ring_index) * VIRTQUEUE_AVAILABLE_RING_ENTRY_SIZE_U64,
+            )
+            .expect("available ring entry address should not overflow");
+        write_u16(memory, entry, head_index);
+    }
+
     #[test]
     fn exposes_virtqueue_descriptor_constants() {
         assert_eq!(VIRTQUEUE_DESCRIPTOR_SIZE, 16);
         assert_eq!(VIRTQUEUE_DESCRIPTOR_ALIGNMENT, 16);
+        assert_eq!(VIRTQUEUE_AVAILABLE_RING_ALIGNMENT, 2);
         assert_eq!(VIRTQUEUE_DESC_F_NEXT, 0x1);
         assert_eq!(VIRTQUEUE_DESC_F_WRITE, 0x2);
         assert_eq!(VIRTQUEUE_DESC_F_INDIRECT, 0x4);
@@ -545,6 +959,291 @@ mod tests {
         assert!(flags.has_next());
         assert!(flags.is_write_only());
         assert!(!flags.is_indirect());
+    }
+
+    #[test]
+    fn available_ring_accessors_expose_queue_state() {
+        let queue = VirtqueueAvailableRing::with_next_avail(TABLE, AVAIL, 8, 3)
+            .expect("available ring should be valid");
+
+        assert_eq!(queue.descriptor_table(), TABLE);
+        assert_eq!(queue.available_ring(), AVAIL);
+        assert_eq!(queue.queue_size(), 8);
+        assert_eq!(queue.next_avail(), 3);
+    }
+
+    #[test]
+    fn returns_none_for_empty_available_ring_without_advancing() {
+        let mut memory = guest_memory(0x4000);
+        write_available_index(&mut memory, AVAIL, 0);
+        let mut queue =
+            VirtqueueAvailableRing::new(TABLE, AVAIL, 8).expect("available ring should be valid");
+
+        let chain = queue
+            .pop_descriptor_chain(&memory)
+            .expect("empty available ring should not fail");
+
+        assert!(chain.is_none());
+        assert_eq!(queue.next_avail(), 0);
+    }
+
+    #[test]
+    fn pops_available_descriptor_chain_and_advances_next_avail() {
+        let mut memory = guest_memory(0x4000);
+        write_descriptor(&mut memory, TABLE, 2, 0x3000, 0x40, 0, 0);
+        write_available_index(&mut memory, AVAIL, 1);
+        write_available_head(&mut memory, AVAIL, 0, 2);
+        let mut queue =
+            VirtqueueAvailableRing::new(TABLE, AVAIL, 8).expect("available ring should be valid");
+
+        let chain = queue
+            .pop_descriptor_chain(&memory)
+            .expect("available descriptor chain should pop")
+            .expect("available ring should contain one head");
+
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain.descriptors()[0].index(), 2);
+        assert_eq!(chain.descriptors()[0].address(), GuestAddress::new(0x3000));
+        assert_eq!(queue.next_avail(), 1);
+    }
+
+    #[test]
+    fn does_not_advance_next_avail_when_available_head_is_malformed() {
+        let mut memory = guest_memory(0x4000);
+        write_available_index(&mut memory, AVAIL, 1);
+        write_available_head(&mut memory, AVAIL, 0, 8);
+        let mut queue =
+            VirtqueueAvailableRing::new(TABLE, AVAIL, 8).expect("available ring should be valid");
+
+        let err = queue
+            .pop_descriptor_chain(&memory)
+            .expect_err("out-of-range available head should fail");
+
+        match err {
+            VirtqueueAvailableRingError::DescriptorChain { head_index, source } => {
+                assert_eq!(head_index, 8);
+                assert!(matches!(
+                    source,
+                    VirtqueueDescriptorChainError::InvalidHeadIndex {
+                        head_index: 8,
+                        queue_size: 8
+                    }
+                ));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(queue.next_avail(), 0);
+    }
+
+    #[test]
+    fn wraps_next_avail_when_popping_available_descriptor_chain() {
+        let mut memory = guest_memory(0x4000);
+        write_descriptor(&mut memory, TABLE, 1, 0x3000, 0x40, 0, 0);
+        write_available_index(&mut memory, AVAIL, 0);
+        write_available_head(&mut memory, AVAIL, 7, 1);
+        let mut queue = VirtqueueAvailableRing::with_next_avail(TABLE, AVAIL, 8, u16::MAX)
+            .expect("available ring should be valid");
+
+        let chain = queue
+            .pop_descriptor_chain(&memory)
+            .expect("wrapped available descriptor chain should pop")
+            .expect("available ring should contain one head");
+
+        assert_eq!(chain.descriptors()[0].index(), 1);
+        assert_eq!(queue.next_avail(), 0);
+    }
+
+    #[test]
+    fn rejects_available_ring_length_greater_than_queue_size() {
+        let mut memory = guest_memory(0x4000);
+        write_available_index(&mut memory, AVAIL, 9);
+        let mut queue =
+            VirtqueueAvailableRing::new(TABLE, AVAIL, 8).expect("available ring should be valid");
+
+        let err = queue
+            .pop_descriptor_chain(&memory)
+            .expect_err("overfull available ring should fail");
+
+        assert!(matches!(
+            err,
+            VirtqueueAvailableRingError::AvailableRingLengthTooLarge {
+                queue_size: 8,
+                available_len: 9
+            }
+        ));
+        assert_eq!(queue.next_avail(), 0);
+    }
+
+    #[test]
+    fn rejects_invalid_available_ring_queue_sizes() {
+        assert!(matches!(
+            VirtqueueAvailableRing::new(TABLE, AVAIL, 0),
+            Err(VirtqueueAvailableRingError::InvalidQueueSize { queue_size: 0 })
+        ));
+        assert!(matches!(
+            VirtqueueAvailableRing::new(TABLE, AVAIL, 3),
+            Err(VirtqueueAvailableRingError::InvalidQueueSize { queue_size: 3 })
+        ));
+    }
+
+    #[test]
+    fn rejects_unaligned_available_ring_descriptor_table() {
+        let table = GuestAddress::new(0x1001);
+
+        let err = VirtqueueAvailableRing::new(table, AVAIL, 8)
+            .expect_err("unaligned descriptor table should fail");
+
+        assert!(matches!(
+            err,
+            VirtqueueAvailableRingError::UnalignedDescriptorTable {
+                descriptor_table,
+                alignment: VIRTQUEUE_DESCRIPTOR_ALIGNMENT
+            } if descriptor_table == table
+        ));
+    }
+
+    #[test]
+    fn rejects_unaligned_available_ring_address() {
+        let available_ring = GuestAddress::new(0x2001);
+
+        let err = VirtqueueAvailableRing::new(TABLE, available_ring, 8)
+            .expect_err("unaligned available ring should fail");
+
+        assert!(matches!(
+            err,
+            VirtqueueAvailableRingError::UnalignedAvailableRing {
+                available_ring: ring,
+                alignment: VIRTQUEUE_AVAILABLE_RING_ALIGNMENT
+            } if ring == available_ring
+        ));
+    }
+
+    #[test]
+    fn rejects_available_ring_range_overflow() {
+        let available_ring = GuestAddress::new(u64::MAX - 5);
+
+        let err = VirtqueueAvailableRing::new(TABLE, available_ring, 1)
+            .expect_err("available ring range overflow should fail");
+
+        assert!(matches!(
+            err,
+            VirtqueueAvailableRingError::AvailableRingRangeOverflow {
+                available_ring: ring,
+                queue_size: 1
+            } if ring == available_ring
+        ));
+    }
+
+    #[test]
+    fn rejects_unmapped_available_ring_before_reading_index() {
+        let memory = guest_memory(0x4000);
+        let available_ring = GuestAddress::new(0x4000);
+        let mut queue = VirtqueueAvailableRing::new(TABLE, available_ring, 1)
+            .expect("available ring metadata should be valid");
+
+        let err = queue
+            .pop_descriptor_chain(&memory)
+            .expect_err("unmapped available ring should fail");
+
+        assert!(matches!(
+            err,
+            VirtqueueAvailableRingError::AvailableRingAccess {
+                available_ring: ring,
+                queue_size: 1,
+                source: GuestMemoryAccessError::UnmappedRange { .. }
+            } if ring == available_ring
+        ));
+        assert_eq!(queue.next_avail(), 0);
+    }
+
+    #[test]
+    fn rejects_unmapped_available_ring_descriptor_table_before_reading_index() {
+        let mut memory = guest_memory(0x4000);
+        let table = GuestAddress::new(0x4000);
+        write_available_index(&mut memory, AVAIL, 2);
+        let mut queue = VirtqueueAvailableRing::new(table, AVAIL, 1)
+            .expect("available ring metadata should be valid");
+
+        let err = queue
+            .pop_descriptor_chain(&memory)
+            .expect_err("unmapped descriptor table should fail before ring read");
+
+        match err {
+            VirtqueueAvailableRingError::DescriptorTable { source } => {
+                assert!(matches!(
+                    source,
+                    VirtqueueDescriptorChainError::DescriptorTableAccess {
+                        descriptor_table,
+                        queue_size: 1,
+                        source: GuestMemoryAccessError::UnmappedRange { .. }
+                    } if descriptor_table == table
+                ));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(queue.next_avail(), 0);
+    }
+
+    #[test]
+    fn rejects_partially_mapped_available_ring_before_reading_index() {
+        let memory = guest_memory(0x4000);
+        let available_ring = GuestAddress::new(0x3ffa);
+        let mut queue = VirtqueueAvailableRing::new(TABLE, available_ring, 1)
+            .expect("available ring metadata should be valid");
+
+        let err = queue
+            .pop_descriptor_chain(&memory)
+            .expect_err("partially mapped available ring should fail");
+
+        assert!(matches!(
+            err,
+            VirtqueueAvailableRingError::AvailableRingAccess {
+                available_ring: ring,
+                queue_size: 1,
+                source: GuestMemoryAccessError::UnmappedRange { .. }
+            } if ring == available_ring
+        ));
+    }
+
+    #[test]
+    fn accepts_available_ring_ending_at_memory_boundary() {
+        let mut memory = guest_memory(0x4000);
+        let available_ring = GuestAddress::new(0x3ff8);
+        write_descriptor(&mut memory, TABLE, 0, 0x3000, 0x40, 0, 0);
+        write_available_index(&mut memory, available_ring, 1);
+        write_available_head(&mut memory, available_ring, 0, 0);
+        let mut queue = VirtqueueAvailableRing::new(TABLE, available_ring, 1)
+            .expect("available ring metadata should be valid");
+
+        let chain = queue
+            .pop_descriptor_chain(&memory)
+            .expect("available ring ending at boundary should pop")
+            .expect("available ring should contain one head");
+
+        assert_eq!(chain.descriptors()[0].index(), 0);
+        assert_eq!(queue.next_avail(), 1);
+    }
+
+    #[test]
+    fn available_ring_errors_display_and_preserve_sources() {
+        let err = VirtqueueAvailableRingError::AvailableRingLengthTooLarge {
+            queue_size: 8,
+            available_len: 9,
+        };
+        assert_eq!(
+            err.to_string(),
+            "virtqueue available ring reports 9 descriptors, exceeding queue size 8"
+        );
+        assert!(err.source().is_none());
+
+        let memory = guest_memory(0x4000);
+        let available_ring = GuestAddress::new(0x4000);
+        let mut queue = VirtqueueAvailableRing::new(TABLE, available_ring, 1)
+            .expect("available ring metadata should be valid");
+        let access_err = queue
+            .pop_descriptor_chain(&memory)
+            .expect_err("unmapped available ring should fail");
+        assert!(access_err.source().is_some());
     }
 
     #[test]
