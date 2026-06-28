@@ -1,5 +1,6 @@
 //! Backend-neutral block-device configuration model.
 
+use std::collections::TryReserveError;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -7,7 +8,7 @@ use std::io;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError};
+use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryRange};
 use crate::mmio::{MmioAccessBytes, MmioAccessBytesError};
 use crate::virtio_mmio::{
     VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError, VirtioMmioDeviceConfigHandler,
@@ -532,6 +533,7 @@ impl VirtioBlockStatusDescriptor {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtioBlockRequest {
+    descriptor_head: u16,
     request_type: VirtioBlockRequestType,
     sector: u64,
     data: Option<VirtioBlockDataDescriptor>,
@@ -564,11 +566,16 @@ impl VirtioBlockRequest {
         let status = validate_status_descriptor(status_descriptor)?;
 
         Ok(Self {
+            descriptor_head: header.index(),
             request_type,
             sector: header_data.sector,
             data,
             status,
         })
+    }
+
+    pub const fn descriptor_head(&self) -> u16 {
+        self.descriptor_head
     }
 
     pub const fn request_type(&self) -> VirtioBlockRequestType {
@@ -586,6 +593,446 @@ impl VirtioBlockRequest {
     pub const fn status(&self) -> VirtioBlockStatusDescriptor {
         self.status
     }
+
+    pub fn execute(
+        &self,
+        memory: &mut GuestMemory,
+        backing: &BlockFileBacking,
+        device_id: VirtioBlockDeviceId,
+    ) -> VirtioBlockRequestExecution {
+        let (status_code, bytes_written_to_guest, outcome) =
+            match self.execute_side_effects(memory, backing, device_id) {
+                Ok(bytes_written_to_guest) => (
+                    VIRTIO_BLOCK_STATUS_OK,
+                    bytes_written_to_guest,
+                    VirtioBlockRequestExecutionOutcome::Ok,
+                ),
+                Err(VirtioBlockRequestExecutionError::UnsupportedRequest { request_type }) => (
+                    VIRTIO_BLOCK_STATUS_UNSUPPORTED,
+                    0,
+                    VirtioBlockRequestExecutionOutcome::Unsupported { request_type },
+                ),
+                Err(error) => (
+                    VIRTIO_BLOCK_STATUS_IOERR,
+                    0,
+                    VirtioBlockRequestExecutionOutcome::IoError { error },
+                ),
+            };
+
+        self.finish_execution(memory, status_code, bytes_written_to_guest, outcome)
+    }
+
+    fn execute_side_effects(
+        &self,
+        memory: &mut GuestMemory,
+        backing: &BlockFileBacking,
+        device_id: VirtioBlockDeviceId,
+    ) -> Result<u32, VirtioBlockRequestExecutionError> {
+        match self.request_type {
+            VirtioBlockRequestType::In => self.execute_in(memory, backing),
+            VirtioBlockRequestType::Out => self.execute_out(memory, backing),
+            VirtioBlockRequestType::Flush => self.execute_flush(backing),
+            VirtioBlockRequestType::GetDeviceId => self.execute_get_device_id(memory, device_id),
+            VirtioBlockRequestType::Unsupported(request_type) => {
+                Err(VirtioBlockRequestExecutionError::UnsupportedRequest { request_type })
+            }
+        }
+    }
+
+    fn execute_in(
+        &self,
+        memory: &mut GuestMemory,
+        backing: &BlockFileBacking,
+    ) -> Result<u32, VirtioBlockRequestExecutionError> {
+        let data = self.required_data_descriptor()?;
+        validate_guest_data_write(memory, self.request_type, data)?;
+        let mut buffer = request_data_buffer(data.len())?;
+        backing
+            .read_at(self.byte_offset()?, &mut buffer)
+            .map_err(|source| VirtioBlockRequestExecutionError::Backing {
+                request_type: self.request_type,
+                source,
+            })?;
+        memory
+            .write_slice(&buffer, data.address())
+            .map_err(
+                |source| VirtioBlockRequestExecutionError::GuestMemoryWrite {
+                    request_type: self.request_type,
+                    address: data.address(),
+                    len: data.len(),
+                    source,
+                },
+            )?;
+        Ok(data.len())
+    }
+
+    fn execute_out(
+        &self,
+        memory: &GuestMemory,
+        backing: &BlockFileBacking,
+    ) -> Result<u32, VirtioBlockRequestExecutionError> {
+        let data = self.required_data_descriptor()?;
+        let mut buffer = request_data_buffer(data.len())?;
+        memory
+            .read_slice(&mut buffer, data.address())
+            .map_err(|source| VirtioBlockRequestExecutionError::GuestMemoryRead {
+                request_type: self.request_type,
+                address: data.address(),
+                len: data.len(),
+                source,
+            })?;
+        backing
+            .write_at(self.byte_offset()?, &buffer)
+            .map_err(|source| VirtioBlockRequestExecutionError::Backing {
+                request_type: self.request_type,
+                source,
+            })?;
+        Ok(0)
+    }
+
+    fn execute_flush(
+        &self,
+        backing: &BlockFileBacking,
+    ) -> Result<u32, VirtioBlockRequestExecutionError> {
+        backing
+            .flush()
+            .map_err(|source| VirtioBlockRequestExecutionError::Backing {
+                request_type: self.request_type,
+                source,
+            })?;
+        Ok(0)
+    }
+
+    fn execute_get_device_id(
+        &self,
+        memory: &mut GuestMemory,
+        device_id: VirtioBlockDeviceId,
+    ) -> Result<u32, VirtioBlockRequestExecutionError> {
+        let data = self.required_data_descriptor()?;
+        memory
+            .write_slice(device_id.as_bytes(), data.address())
+            .map_err(
+                |source| VirtioBlockRequestExecutionError::GuestMemoryWrite {
+                    request_type: self.request_type,
+                    address: data.address(),
+                    len: VIRTIO_BLOCK_ID_BYTES,
+                    source,
+                },
+            )?;
+        Ok(VIRTIO_BLOCK_ID_BYTES)
+    }
+
+    fn required_data_descriptor(
+        &self,
+    ) -> Result<VirtioBlockDataDescriptor, VirtioBlockRequestExecutionError> {
+        self.data
+            .ok_or(VirtioBlockRequestExecutionError::MissingDataDescriptor {
+                request_type: self.request_type,
+            })
+    }
+
+    fn byte_offset(&self) -> Result<u64, VirtioBlockRequestExecutionError> {
+        self.sector.checked_mul(VIRTIO_BLOCK_SECTOR_SIZE).ok_or(
+            VirtioBlockRequestExecutionError::SectorOffsetOverflow {
+                sector: self.sector,
+            },
+        )
+    }
+
+    fn finish_execution(
+        &self,
+        memory: &mut GuestMemory,
+        status_code: u8,
+        bytes_written_to_guest: u32,
+        outcome: VirtioBlockRequestExecutionOutcome,
+    ) -> VirtioBlockRequestExecution {
+        match write_request_status(memory, self.status, status_code) {
+            Ok(()) => {
+                let completion = VirtioBlockRequestCompletion::new(
+                    self.descriptor_head,
+                    bytes_written_to_guest.saturating_add(VIRTIO_BLOCK_STATUS_SIZE),
+                );
+                VirtioBlockRequestExecution::new(completion, status_code, outcome)
+            }
+            Err(source) => {
+                let completion = VirtioBlockRequestCompletion::new(self.descriptor_head, 0);
+                VirtioBlockRequestExecution::new(
+                    completion,
+                    status_code,
+                    VirtioBlockRequestExecutionOutcome::StatusWriteFailed {
+                        status_code,
+                        source,
+                    },
+                )
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioBlockDeviceId {
+    bytes: [u8; VIRTIO_BLOCK_ID_BYTES as usize],
+}
+
+impl VirtioBlockDeviceId {
+    pub const fn new(bytes: [u8; VIRTIO_BLOCK_ID_BYTES as usize]) -> Self {
+        Self { bytes }
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let mut id = [0; VIRTIO_BLOCK_ID_BYTES as usize];
+        for (destination, source) in id.iter_mut().zip(bytes.iter().copied()) {
+            *destination = source;
+        }
+        Self { bytes: id }
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; VIRTIO_BLOCK_ID_BYTES as usize] {
+        &self.bytes
+    }
+}
+
+impl Default for VirtioBlockDeviceId {
+    fn default() -> Self {
+        Self {
+            bytes: [0; VIRTIO_BLOCK_ID_BYTES as usize],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioBlockRequestCompletion {
+    descriptor_head: u16,
+    bytes_written_to_guest: u32,
+}
+
+impl VirtioBlockRequestCompletion {
+    pub const fn new(descriptor_head: u16, bytes_written_to_guest: u32) -> Self {
+        Self {
+            descriptor_head,
+            bytes_written_to_guest,
+        }
+    }
+
+    pub const fn descriptor_head(self) -> u16 {
+        self.descriptor_head
+    }
+
+    pub const fn bytes_written_to_guest(self) -> u32 {
+        self.bytes_written_to_guest
+    }
+}
+
+#[derive(Debug)]
+pub struct VirtioBlockRequestExecution {
+    completion: VirtioBlockRequestCompletion,
+    status_code: u8,
+    outcome: VirtioBlockRequestExecutionOutcome,
+}
+
+impl VirtioBlockRequestExecution {
+    pub const fn new(
+        completion: VirtioBlockRequestCompletion,
+        status_code: u8,
+        outcome: VirtioBlockRequestExecutionOutcome,
+    ) -> Self {
+        Self {
+            completion,
+            status_code,
+            outcome,
+        }
+    }
+
+    pub const fn completion(&self) -> VirtioBlockRequestCompletion {
+        self.completion
+    }
+
+    pub const fn status_code(&self) -> u8 {
+        self.status_code
+    }
+
+    pub const fn outcome(&self) -> &VirtioBlockRequestExecutionOutcome {
+        &self.outcome
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioBlockRequestExecutionOutcome {
+    Ok,
+    IoError {
+        error: VirtioBlockRequestExecutionError,
+    },
+    Unsupported {
+        request_type: u32,
+    },
+    StatusWriteFailed {
+        status_code: u8,
+        source: GuestMemoryAccessError,
+    },
+}
+
+#[derive(Debug)]
+pub enum VirtioBlockRequestExecutionError {
+    MissingDataDescriptor {
+        request_type: VirtioBlockRequestType,
+    },
+    SectorOffsetOverflow {
+        sector: u64,
+    },
+    DataLengthTooLarge {
+        len: u32,
+    },
+    BufferAllocationFailed {
+        len: u32,
+        source: TryReserveError,
+    },
+    GuestMemoryRead {
+        request_type: VirtioBlockRequestType,
+        address: GuestAddress,
+        len: u32,
+        source: GuestMemoryAccessError,
+    },
+    GuestMemoryWrite {
+        request_type: VirtioBlockRequestType,
+        address: GuestAddress,
+        len: u32,
+        source: GuestMemoryAccessError,
+    },
+    Backing {
+        request_type: VirtioBlockRequestType,
+        source: BlockFileBackingError,
+    },
+    UnsupportedRequest {
+        request_type: u32,
+    },
+}
+
+impl fmt::Display for VirtioBlockRequestExecutionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingDataDescriptor { request_type } => {
+                write!(
+                    f,
+                    "virtio-block {request_type} request is missing a data descriptor"
+                )
+            }
+            Self::SectorOffsetOverflow { sector } => {
+                write!(
+                    f,
+                    "virtio-block request sector {sector} overflows byte offset"
+                )
+            }
+            Self::DataLengthTooLarge { len } => {
+                write!(f, "virtio-block request data length {len} is too large")
+            }
+            Self::BufferAllocationFailed { len, source } => {
+                write!(
+                    f,
+                    "failed to allocate virtio-block request buffer of {len} bytes: {source}"
+                )
+            }
+            Self::GuestMemoryRead {
+                request_type,
+                address,
+                len,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to read {len} bytes from guest memory at {address} for virtio-block {request_type} request: {source}"
+                )
+            }
+            Self::GuestMemoryWrite {
+                request_type,
+                address,
+                len,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to write {len} bytes to guest memory at {address} for virtio-block {request_type} request: {source}"
+                )
+            }
+            Self::Backing {
+                request_type,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to access block backing for virtio-block {request_type} request: {source}"
+                )
+            }
+            Self::UnsupportedRequest { request_type } => {
+                write!(f, "unsupported virtio-block request type {request_type}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioBlockRequestExecutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BufferAllocationFailed { source, .. } => Some(source),
+            Self::GuestMemoryRead { source, .. } | Self::GuestMemoryWrite { source, .. } => {
+                Some(source)
+            }
+            Self::Backing { source, .. } => Some(source),
+            Self::MissingDataDescriptor { .. }
+            | Self::SectorOffsetOverflow { .. }
+            | Self::DataLengthTooLarge { .. }
+            | Self::UnsupportedRequest { .. } => None,
+        }
+    }
+}
+
+fn request_data_buffer(len: u32) -> Result<Vec<u8>, VirtioBlockRequestExecutionError> {
+    let len_usize = usize::try_from(len)
+        .map_err(|_| VirtioBlockRequestExecutionError::DataLengthTooLarge { len })?;
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(len_usize).map_err(|source| {
+        VirtioBlockRequestExecutionError::BufferAllocationFailed { len, source }
+    })?;
+    buffer.resize(len_usize, 0);
+    Ok(buffer)
+}
+
+fn validate_guest_data_write(
+    memory: &GuestMemory,
+    request_type: VirtioBlockRequestType,
+    data: VirtioBlockDataDescriptor,
+) -> Result<(), VirtioBlockRequestExecutionError> {
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    let size = u64::from(data.len());
+    let range = GuestMemoryRange::new(data.address(), size).map_err(|_| {
+        VirtioBlockRequestExecutionError::GuestMemoryWrite {
+            request_type,
+            address: data.address(),
+            len: data.len(),
+            source: GuestMemoryAccessError::AddressOverflow {
+                start: data.address(),
+                size,
+            },
+        }
+    })?;
+    memory.validate_mapped_range(range).map_err(|source| {
+        VirtioBlockRequestExecutionError::GuestMemoryWrite {
+            request_type,
+            address: data.address(),
+            len: data.len(),
+            source,
+        }
+    })
+}
+
+fn write_request_status(
+    memory: &mut GuestMemory,
+    status: VirtioBlockStatusDescriptor,
+    status_code: u8,
+) -> Result<(), GuestMemoryAccessError> {
+    memory.write_slice(&[status_code], status.address())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1002,6 +1449,12 @@ impl BlockFileBacking {
             .write_all_at(src, offset)
             .map_err(|source| BlockFileBackingError::WriteFile { source })
     }
+
+    pub fn flush(&self) -> Result<(), BlockFileBackingError> {
+        self.file
+            .sync_all()
+            .map_err(|source| BlockFileBackingError::FlushFile { source })
+    }
 }
 
 fn open_block_file(path: &Path, is_read_only: bool) -> Result<File, BlockFileBackingError> {
@@ -1068,6 +1521,9 @@ pub enum BlockFileBackingError {
     WriteFile {
         source: io::Error,
     },
+    FlushFile {
+        source: io::Error,
+    },
 }
 
 impl fmt::Display for BlockFileBackingError {
@@ -1098,6 +1554,9 @@ impl fmt::Display for BlockFileBackingError {
             Self::ReadOnlyWrite => f.write_str("block backing file is read-only"),
             Self::ReadFile { source } => write!(f, "failed to read block backing file: {source}"),
             Self::WriteFile { source } => write!(f, "failed to write block backing file: {source}"),
+            Self::FlushFile { source } => {
+                write!(f, "failed to flush block backing file: {source}")
+            }
         }
     }
 }
@@ -1108,7 +1567,8 @@ impl std::error::Error for BlockFileBackingError {
             Self::OpenFile { source }
             | Self::ReadMetadata { source }
             | Self::ReadFile { source }
-            | Self::WriteFile { source } => Some(source),
+            | Self::WriteFile { source }
+            | Self::FlushFile { source } => Some(source),
             Self::NonRegularFile
             | Self::AccessLengthTooLarge { .. }
             | Self::AccessOverflow { .. }
@@ -1170,8 +1630,9 @@ mod tests {
         VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT, VIRTIO_BLOCK_SECTOR_SIZE,
         VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK, VIRTIO_BLOCK_STATUS_SIZE,
         VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1, VIRTIO_RING_FEATURE_EVENT_IDX,
-        VirtioBlockConfigSpace, VirtioBlockRequest, VirtioBlockRequestError,
-        VirtioBlockRequestType,
+        VirtioBlockConfigSpace, VirtioBlockDeviceId, VirtioBlockRequest,
+        VirtioBlockRequestCompletion, VirtioBlockRequestError, VirtioBlockRequestExecutionError,
+        VirtioBlockRequestExecutionOutcome, VirtioBlockRequestType,
     };
 
     static NEXT_TEMP_PATH_ID: AtomicUsize = AtomicUsize::new(0);
@@ -1182,6 +1643,7 @@ mod tests {
     const HEADER_ADDR: GuestAddress = GuestAddress::new(0x2000);
     const DATA_ADDR: GuestAddress = GuestAddress::new(0x3000);
     const STATUS_ADDR: GuestAddress = GuestAddress::new(0x4000);
+    const TEST_DEVICE_ID: VirtioBlockDeviceId = VirtioBlockDeviceId::new(*b"bangbang-test-id-000");
 
     #[derive(Debug)]
     struct TempPath {
@@ -1470,6 +1932,35 @@ mod tests {
         chain: &VirtqueueDescriptorChain,
     ) -> Result<VirtioBlockRequest, VirtioBlockRequestError> {
         VirtioBlockRequest::parse(memory, chain, 16)
+    }
+
+    fn parse_request_with_capacity(
+        memory: &GuestMemory,
+        chain: &VirtqueueDescriptorChain,
+        backing: &BlockFileBacking,
+    ) -> VirtioBlockRequest {
+        VirtioBlockRequest::parse(memory, chain, backing.len() >> VIRTIO_BLOCK_SECTOR_SHIFT)
+            .expect("request should parse for backing capacity")
+    }
+
+    fn read_guest_bytes(memory: &GuestMemory, address: GuestAddress, len: usize) -> Vec<u8> {
+        let mut bytes = vec![0; len];
+        memory
+            .read_slice(&mut bytes, address)
+            .expect("guest bytes should read");
+        bytes
+    }
+
+    fn read_status(memory: &GuestMemory) -> u8 {
+        let mut status = [0];
+        memory
+            .read_slice(&mut status, STATUS_ADDR)
+            .expect("status should read");
+        status[0]
+    }
+
+    fn sector_payload(byte: u8) -> Vec<u8> {
+        vec![byte; VIRTIO_BLOCK_SECTOR_SIZE as usize]
     }
 
     #[test]
@@ -2304,6 +2795,379 @@ mod tests {
             .read_slice(&mut status, STATUS_ADDR)
             .expect("status sentinel should read");
         assert_eq!(status, [0xaa]);
+    }
+
+    #[test]
+    fn device_id_from_bytes_truncates_and_zero_pads() {
+        let short = VirtioBlockDeviceId::from_bytes(b"id");
+        let mut expected_short = [0; VIRTIO_BLOCK_ID_BYTES as usize];
+        expected_short[0] = b'i';
+        expected_short[1] = b'd';
+        assert_eq!(short.as_bytes(), &expected_short);
+
+        let long = VirtioBlockDeviceId::from_bytes(b"01234567890123456789extra");
+        assert_eq!(long.as_bytes(), b"01234567890123456789");
+    }
+
+    #[test]
+    fn executes_read_request_into_guest_memory() {
+        let mut memory = request_memory();
+        let payload = sector_payload(0x5a);
+        let mut file_bytes = vec![0; (VIRTIO_BLOCK_SECTOR_SIZE * 4) as usize];
+        let offset = (VIRTIO_BLOCK_SECTOR_SIZE * 2) as usize;
+        file_bytes[offset..offset + payload.len()].copy_from_slice(&payload);
+        let file = temp_file("execute-read.img", &file_bytes);
+        let backing = open_backing(file.as_path(), true).expect("backing should open");
+        let chain = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            2,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::writable(DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as u32, Some(2)),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+        let request = parse_request_with_capacity(&memory, &chain, &backing);
+
+        let execution = request.execute(&mut memory, &backing, TEST_DEVICE_ID);
+
+        assert_eq!(request.descriptor_head(), 0);
+        assert_eq!(
+            execution.completion(),
+            VirtioBlockRequestCompletion::new(
+                0,
+                VIRTIO_BLOCK_SECTOR_SIZE as u32 + VIRTIO_BLOCK_STATUS_SIZE,
+            )
+        );
+        assert_eq!(execution.status_code(), VIRTIO_BLOCK_STATUS_OK);
+        assert!(matches!(
+            execution.outcome(),
+            VirtioBlockRequestExecutionOutcome::Ok
+        ));
+        assert_eq!(
+            read_guest_bytes(&memory, DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as usize),
+            payload
+        );
+        assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_OK);
+    }
+
+    #[test]
+    fn executes_write_request_into_backing_file() {
+        let mut memory = request_memory();
+        let payload = sector_payload(0x37);
+        memory
+            .write_slice(&payload, DATA_ADDR)
+            .expect("guest data should write");
+        let file = temp_file(
+            "execute-write.img",
+            &vec![0; (VIRTIO_BLOCK_SECTOR_SIZE * 4) as usize],
+        );
+        let backing = open_backing(file.as_path(), false).expect("backing should open");
+        let chain = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_OUT,
+            3,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::readable(DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as u32, Some(2)),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+        let request = parse_request_with_capacity(&memory, &chain, &backing);
+
+        let execution = request.execute(&mut memory, &backing, TEST_DEVICE_ID);
+
+        let offset = (VIRTIO_BLOCK_SECTOR_SIZE * 3) as usize;
+        let written_file = fs::read(file.as_path()).expect("file should read");
+        assert_eq!(
+            execution.completion(),
+            VirtioBlockRequestCompletion::new(0, VIRTIO_BLOCK_STATUS_SIZE)
+        );
+        assert_eq!(execution.status_code(), VIRTIO_BLOCK_STATUS_OK);
+        assert!(matches!(
+            execution.outcome(),
+            VirtioBlockRequestExecutionOutcome::Ok
+        ));
+        assert_eq!(
+            &written_file[offset..offset + payload.len()],
+            payload.as_slice()
+        );
+        assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_OK);
+    }
+
+    #[test]
+    fn executes_flush_request() {
+        let mut memory = request_memory();
+        let file = temp_file("execute-flush.img", &sector_payload(0x11));
+        let backing = open_backing(file.as_path(), false).expect("backing should open");
+        let chain = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
+            0,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+        let request = parse_request_with_capacity(&memory, &chain, &backing);
+
+        let execution = request.execute(&mut memory, &backing, TEST_DEVICE_ID);
+
+        assert_eq!(
+            execution.completion(),
+            VirtioBlockRequestCompletion::new(0, VIRTIO_BLOCK_STATUS_SIZE)
+        );
+        assert_eq!(execution.status_code(), VIRTIO_BLOCK_STATUS_OK);
+        assert!(matches!(
+            execution.outcome(),
+            VirtioBlockRequestExecutionOutcome::Ok
+        ));
+        assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_OK);
+    }
+
+    #[test]
+    fn executes_get_device_id_request() {
+        let mut memory = request_memory();
+        memory
+            .write_slice(&[0xaa; 24], DATA_ADDR)
+            .expect("guest data sentinel should write");
+        let file = temp_file("execute-get-id.img", &sector_payload(0x22));
+        let backing = open_backing(file.as_path(), true).expect("backing should open");
+        let chain = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_GET_ID,
+            0,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::writable(DATA_ADDR, 24, Some(2)),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+        let request = parse_request_with_capacity(&memory, &chain, &backing);
+
+        let execution = request.execute(&mut memory, &backing, TEST_DEVICE_ID);
+
+        let data = read_guest_bytes(&memory, DATA_ADDR, 24);
+        assert_eq!(
+            execution.completion(),
+            VirtioBlockRequestCompletion::new(0, VIRTIO_BLOCK_ID_BYTES + VIRTIO_BLOCK_STATUS_SIZE,)
+        );
+        assert_eq!(execution.status_code(), VIRTIO_BLOCK_STATUS_OK);
+        assert!(matches!(
+            execution.outcome(),
+            VirtioBlockRequestExecutionOutcome::Ok
+        ));
+        assert_eq!(
+            &data[..VIRTIO_BLOCK_ID_BYTES as usize],
+            TEST_DEVICE_ID.as_bytes()
+        );
+        assert_eq!(&data[VIRTIO_BLOCK_ID_BYTES as usize..], &[0xaa; 4]);
+        assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_OK);
+    }
+
+    #[test]
+    fn unsupported_request_writes_unsupported_status_without_touching_data() {
+        let mut memory = request_memory();
+        memory
+            .write_slice(b"sentinel", DATA_ADDR)
+            .expect("guest sentinel should write");
+        let file = temp_file("execute-unsupported.img", &[]);
+        let backing = open_backing(file.as_path(), true).expect("backing should open");
+        let chain = request_chain(
+            &mut memory,
+            99,
+            0,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::readable(DATA_ADDR, 8, Some(2)),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+        let request = parse_request_with_capacity(&memory, &chain, &backing);
+
+        let execution = request.execute(&mut memory, &backing, TEST_DEVICE_ID);
+
+        assert_eq!(
+            execution.completion(),
+            VirtioBlockRequestCompletion::new(0, VIRTIO_BLOCK_STATUS_SIZE)
+        );
+        assert_eq!(execution.status_code(), VIRTIO_BLOCK_STATUS_UNSUPPORTED);
+        assert!(matches!(
+            execution.outcome(),
+            VirtioBlockRequestExecutionOutcome::Unsupported { request_type: 99 }
+        ));
+        assert_eq!(read_guest_bytes(&memory, DATA_ADDR, 8), b"sentinel");
+        assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_UNSUPPORTED);
+    }
+
+    #[test]
+    fn read_only_write_returns_io_error_status_without_mutating_file() {
+        let mut memory = request_memory();
+        let payload = sector_payload(0x44);
+        memory
+            .write_slice(&payload, DATA_ADDR)
+            .expect("guest data should write");
+        let original = sector_payload(0x33);
+        let file = temp_file("execute-readonly-write.img", &original);
+        let backing = open_backing(file.as_path(), true).expect("backing should open");
+        let chain = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_OUT,
+            0,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::readable(DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as u32, Some(2)),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+        let request = parse_request_with_capacity(&memory, &chain, &backing);
+
+        let execution = request.execute(&mut memory, &backing, TEST_DEVICE_ID);
+
+        assert_eq!(
+            execution.completion(),
+            VirtioBlockRequestCompletion::new(0, VIRTIO_BLOCK_STATUS_SIZE)
+        );
+        assert_eq!(execution.status_code(), VIRTIO_BLOCK_STATUS_IOERR);
+        match execution.outcome() {
+            VirtioBlockRequestExecutionOutcome::IoError {
+                error:
+                    VirtioBlockRequestExecutionError::Backing {
+                        request_type,
+                        source,
+                    },
+            } => {
+                assert_eq!(*request_type, VirtioBlockRequestType::Out);
+                assert_eq!(source.to_string(), "block backing file is read-only");
+            }
+            other => panic!("expected read-only backing error, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read(file.as_path()).expect("file should read"),
+            original
+        );
+        assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_IOERR);
+    }
+
+    #[test]
+    fn unmapped_read_data_returns_io_error_status() {
+        let mut memory = request_memory();
+        let file = temp_file("execute-unmapped-data.img", &sector_payload(0x55));
+        let backing = open_backing(file.as_path(), true).expect("backing should open");
+        let chain = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            0,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::writable(
+                    GuestAddress::new(TEST_MEMORY_SIZE),
+                    VIRTIO_BLOCK_SECTOR_SIZE as u32,
+                    Some(2),
+                ),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+        let request = parse_request_with_capacity(&memory, &chain, &backing);
+
+        let execution = request.execute(&mut memory, &backing, TEST_DEVICE_ID);
+
+        assert_eq!(
+            execution.completion(),
+            VirtioBlockRequestCompletion::new(0, VIRTIO_BLOCK_STATUS_SIZE)
+        );
+        assert_eq!(execution.status_code(), VIRTIO_BLOCK_STATUS_IOERR);
+        assert!(matches!(
+            execution.outcome(),
+            VirtioBlockRequestExecutionOutcome::IoError {
+                error: VirtioBlockRequestExecutionError::GuestMemoryWrite { .. }
+            }
+        ));
+        assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_IOERR);
+    }
+
+    #[test]
+    fn unmapped_status_returns_zero_completion_bytes() {
+        let mut memory = request_memory();
+        let payload = sector_payload(0x66);
+        let file = temp_file("execute-unmapped-status.img", &payload);
+        let backing = open_backing(file.as_path(), true).expect("backing should open");
+        let chain = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            0,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::writable(DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as u32, Some(2)),
+                TestDescriptor::writable(
+                    GuestAddress::new(TEST_MEMORY_SIZE),
+                    VIRTIO_BLOCK_STATUS_SIZE,
+                    None,
+                ),
+            ],
+        );
+        let request = parse_request_with_capacity(&memory, &chain, &backing);
+
+        let execution = request.execute(&mut memory, &backing, TEST_DEVICE_ID);
+
+        assert_eq!(
+            execution.completion(),
+            VirtioBlockRequestCompletion::new(0, 0)
+        );
+        assert_eq!(execution.status_code(), VIRTIO_BLOCK_STATUS_OK);
+        assert!(matches!(
+            execution.outcome(),
+            VirtioBlockRequestExecutionOutcome::StatusWriteFailed {
+                status_code: VIRTIO_BLOCK_STATUS_OK,
+                ..
+            }
+        ));
+        assert_eq!(
+            read_guest_bytes(&memory, DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as usize),
+            payload
+        );
+    }
+
+    #[test]
+    fn executes_request_ending_at_capacity_boundary() {
+        let mut memory = request_memory();
+        let payload = sector_payload(0x77);
+        let mut file_bytes = vec![0; (VIRTIO_BLOCK_SECTOR_SIZE * 16) as usize];
+        let offset = (VIRTIO_BLOCK_SECTOR_SIZE * 15) as usize;
+        file_bytes[offset..offset + payload.len()].copy_from_slice(&payload);
+        let file = temp_file("execute-boundary.img", &file_bytes);
+        let backing = open_backing(file.as_path(), true).expect("backing should open");
+        let chain = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            15,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::writable(DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as u32, Some(2)),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+        let request = parse_request_with_capacity(&memory, &chain, &backing);
+
+        let execution = request.execute(&mut memory, &backing, TEST_DEVICE_ID);
+
+        assert_eq!(
+            execution.completion(),
+            VirtioBlockRequestCompletion::new(
+                0,
+                VIRTIO_BLOCK_SECTOR_SIZE as u32 + VIRTIO_BLOCK_STATUS_SIZE,
+            )
+        );
+        assert!(matches!(
+            execution.outcome(),
+            VirtioBlockRequestExecutionOutcome::Ok
+        ));
+        assert_eq!(
+            read_guest_bytes(&memory, DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as usize),
+            payload
+        );
+        assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_OK);
     }
 
     #[test]
