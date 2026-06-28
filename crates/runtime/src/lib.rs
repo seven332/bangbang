@@ -3,6 +3,7 @@
 pub mod boot;
 pub mod fdt;
 pub mod memory;
+pub mod mmio;
 
 use std::fmt;
 
