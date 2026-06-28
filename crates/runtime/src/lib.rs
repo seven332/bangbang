@@ -2,6 +2,7 @@
 
 pub mod boot;
 pub mod fdt;
+pub mod interrupt;
 pub mod memory;
 pub mod mmio;
 
