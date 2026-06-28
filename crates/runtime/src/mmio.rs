@@ -346,7 +346,10 @@ impl MmioDispatcher {
         &mut self,
         operation: MmioOperation,
     ) -> Result<MmioDispatchOutcome, MmioDispatchError> {
-        let region_id = operation.access().region_id();
+        let access = operation.access();
+        self.validate_operation_access(access)?;
+
+        let region_id = access.region_id();
         let handler = self
             .handlers
             .get_mut(&region_id)
@@ -386,6 +389,27 @@ impl MmioDispatcher {
             }
         }
     }
+
+    fn validate_operation_access(&self, access: MmioAccess) -> Result<(), MmioDispatchError> {
+        let resolved = self
+            .bus
+            .lookup(access.range().start(), access.range().size())
+            .map_err(|source| MmioDispatchError::UnregisteredAccess {
+                range: access.range(),
+                region_id: access.region_id(),
+                source: Box::new(source),
+            })?;
+
+        if resolved != access {
+            return Err(MmioDispatchError::AccessMismatch {
+                range: access.range(),
+                expected_region_id: resolved.region_id(),
+                actual_region_id: access.region_id(),
+            });
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for MmioDispatcher {
@@ -401,6 +425,16 @@ pub enum MmioDispatchError {
     },
     MissingHandler {
         region_id: MmioRegionId,
+    },
+    UnregisteredAccess {
+        range: GuestMemoryRange,
+        region_id: MmioRegionId,
+        source: Box<MmioBusError>,
+    },
+    AccessMismatch {
+        range: GuestMemoryRange,
+        expected_region_id: MmioRegionId,
+        actual_region_id: MmioRegionId,
     },
     HandlerFailed {
         region_id: MmioRegionId,
@@ -427,6 +461,26 @@ impl fmt::Display for MmioDispatchError {
                 write!(
                     f,
                     "MMIO access for region id={region_id} has no registered handler"
+                )
+            }
+            Self::UnregisteredAccess {
+                range,
+                region_id,
+                source,
+            } => {
+                write!(
+                    f,
+                    "MMIO dispatch access range {range} for region id={region_id} is not registered in this dispatcher: {source}"
+                )
+            }
+            Self::AccessMismatch {
+                range,
+                expected_region_id,
+                actual_region_id,
+            } => {
+                write!(
+                    f,
+                    "MMIO dispatch access range {range} resolved to region id={expected_region_id} but operation uses region id={actual_region_id}"
                 )
             }
             Self::HandlerFailed {
@@ -457,9 +511,11 @@ impl fmt::Display for MmioDispatchError {
 impl std::error::Error for MmioDispatchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::UnregisteredAccess { source, .. } => Some(source),
             Self::HandlerFailed { source, .. } => Some(source),
             Self::DuplicateHandler { .. }
             | Self::MissingHandler { .. }
+            | Self::AccessMismatch { .. }
             | Self::ReadDataLengthMismatch { .. } => None,
         }
     }
@@ -1417,7 +1473,12 @@ mod tests {
     #[test]
     fn dispatcher_rejects_missing_handler() {
         let mut dispatcher = MmioDispatcher::new();
-        let access = lookup_access(0x3000, 4);
+        dispatcher
+            .insert_region(id(1), address(0x3000), 0x100)
+            .expect("dispatcher region insert should succeed");
+        let access = dispatcher
+            .lookup(address(0x3000), 4)
+            .expect("dispatcher lookup should succeed");
         let operation = MmioOperation::read(access).expect("read operation should be valid");
 
         let err = dispatcher
@@ -1430,6 +1491,64 @@ mod tests {
                 region_id: access.region_id()
             }
         );
+    }
+
+    #[test]
+    fn dispatcher_rejects_unregistered_operation_access() {
+        let mut dispatcher = MmioDispatcher::new();
+        let (_, handler) = ScriptedHandler::returning(&[0, 0, 0, 0]);
+        dispatcher
+            .register_handler(id(1), handler)
+            .expect("handler registration should succeed");
+        let access = lookup_access(0x3000, 4);
+        let operation = MmioOperation::read(access).expect("read operation should be valid");
+
+        let err = dispatcher
+            .dispatch(operation)
+            .expect_err("foreign access should fail before handler dispatch");
+
+        assert_eq!(
+            err,
+            MmioDispatchError::UnregisteredAccess {
+                range: access.range(),
+                region_id: access.region_id(),
+                source: Box::new(MmioBusError::UnownedAccess {
+                    range: range(0x3000, 4)
+                })
+            }
+        );
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn dispatcher_rejects_operation_access_mismatch() {
+        let mut dispatcher = MmioDispatcher::new();
+        dispatcher
+            .insert_region(id(2), address(0x3000), 0x100)
+            .expect("dispatcher region insert should succeed");
+        let (_, handler) = ScriptedHandler::returning(&[0, 0, 0, 0]);
+        dispatcher
+            .register_handler(id(1), handler)
+            .expect("handler registration should succeed");
+        let actual = lookup_access(0x3000, 4);
+        let expected = dispatcher
+            .lookup(address(0x3000), 4)
+            .expect("dispatcher lookup should succeed");
+        let operation = MmioOperation::read(actual).expect("read operation should be valid");
+
+        let err = dispatcher
+            .dispatch(operation)
+            .expect_err("mismatched access should fail before handler dispatch");
+
+        assert_eq!(
+            err,
+            MmioDispatchError::AccessMismatch {
+                range: actual.range(),
+                expected_region_id: expected.region_id(),
+                actual_region_id: actual.region_id()
+            }
+        );
+        assert!(err.source().is_none());
     }
 
     #[test]
@@ -1617,6 +1736,37 @@ mod tests {
             MmioDispatchError::MissingHandler { region_id: id(9) }.to_string(),
             "MMIO access for region id=9 has no registered handler"
         );
+
+        let access = lookup_access(0x7000, 4);
+        let unregistered = MmioDispatchError::UnregisteredAccess {
+            range: access.range(),
+            region_id: access.region_id(),
+            source: Box::new(MmioBusError::UnownedAccess {
+                range: range(0x7000, 4),
+            }),
+        };
+        assert_eq!(
+            unregistered.to_string(),
+            "MMIO dispatch access range [0x7000..0x7004) (4 bytes) for region id=1 is not registered in this dispatcher: MMIO access range [0x7000..0x7004) (4 bytes) is not owned by any region"
+        );
+        assert!(unregistered.source().is_some());
+
+        let expected = lookup_access(0x8000, 4);
+        let actual = {
+            let mut bus = MmioBus::new();
+            insert(&mut bus, 2, 0x8000, 0x100);
+            lookup(&bus, 0x8000, 4)
+        };
+        let mismatch = MmioDispatchError::AccessMismatch {
+            range: actual.range(),
+            expected_region_id: expected.region_id(),
+            actual_region_id: actual.region_id(),
+        };
+        assert_eq!(
+            mismatch.to_string(),
+            "MMIO dispatch access range [0x8000..0x8004) (4 bytes) resolved to region id=1 but operation uses region id=2"
+        );
+        assert!(mismatch.source().is_none());
 
         let access = lookup_access(0x8000, 4);
         let mismatch = MmioDispatchError::ReadDataLengthMismatch {
