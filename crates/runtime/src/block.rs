@@ -8,6 +8,7 @@ use std::io;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+use crate::interrupt::DeviceInterruptKind;
 use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryRange};
 use crate::mmio::{MmioAccessBytes, MmioAccessBytesError, MmioHandlerError};
 use crate::virtio_mmio::{
@@ -2039,8 +2040,20 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioBlockD
         memory: &mut GuestMemory,
     ) -> Result<VirtioBlockDeviceNotificationDispatch, VirtioBlockDeviceNotificationError> {
         let drained_notifications = self.take_pending_queue_notifications();
-        self.activation_handler_mut()
-            .dispatch_drained_queue_notifications(memory, drained_notifications)
+        let dispatch = self
+            .activation_handler_mut()
+            .dispatch_drained_queue_notifications(memory, drained_notifications);
+        let needs_queue_interrupt = match &dispatch {
+            Ok(dispatch) => dispatch.needs_queue_interrupt(),
+            Err(error) => error
+                .completed_dispatch()
+                .is_some_and(VirtioBlockQueueDispatch::needs_queue_interrupt),
+        };
+        if needs_queue_interrupt {
+            self.mark_interrupt_pending(DeviceInterruptKind::Queue);
+        }
+
+        dispatch
     }
 }
 
@@ -2245,6 +2258,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crate::interrupt::DeviceInterruptKind;
     use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
     use crate::mmio::{MmioAccess, MmioAccessBytes, MmioBus, MmioRegionId};
     use crate::virtio_mmio::{
@@ -2513,6 +2527,25 @@ mod tests {
         handler
             .write_register(VirtioMmioRegister::Status, DRIVER_OK_STATUS)
             .expect("DRIVER_OK should activate block device");
+    }
+
+    fn read_interrupt_status(
+        handler: &VirtioMmioRegisterHandler<VirtioBlockConfigSpace, VirtioBlockDevice>,
+    ) -> u32 {
+        handler
+            .read_register(VirtioMmioRegister::InterruptStatus)
+            .expect("interrupt status should read")
+    }
+
+    fn acknowledge_queue_interrupt(
+        handler: &mut VirtioMmioRegisterHandler<VirtioBlockConfigSpace, VirtioBlockDevice>,
+    ) {
+        handler
+            .write_register(
+                VirtioMmioRegister::InterruptAck,
+                DeviceInterruptKind::Queue.status().bits(),
+            )
+            .expect("queue interrupt acknowledgement should write");
     }
 
     fn read_block_config(
@@ -4431,6 +4464,7 @@ mod tests {
         assert_eq!(dispatch.drained_notifications(), []);
         assert!(dispatch.queue_dispatch().is_none());
         assert!(!dispatch.needs_queue_interrupt());
+        assert_eq!(read_interrupt_status(&handler), 0);
         assert!(handler.pending_queue_notifications().is_empty());
         let active_queue = handler
             .activation_handler()
@@ -4464,6 +4498,7 @@ mod tests {
         assert_eq!(dispatch.successful_requests(), 0);
         assert!(!notification.needs_queue_interrupt());
         assert!(!dispatch.needs_queue_interrupt());
+        assert_eq!(read_interrupt_status(&handler), 0);
         assert!(handler.pending_queue_notifications().is_empty());
         let active_queue = handler
             .activation_handler()
@@ -4508,6 +4543,7 @@ mod tests {
         ));
         assert_eq!(error.drained_notifications(), [0]);
         assert!(error.completed_dispatch().is_none());
+        assert_eq!(read_interrupt_status(&handler), 0);
         assert!(handler.pending_queue_notifications().is_empty());
         assert!(!handler.activation_handler().is_activated());
     }
@@ -4547,6 +4583,12 @@ mod tests {
         assert_eq!(dispatch.successful_requests(), 1);
         assert!(notification.needs_queue_interrupt());
         assert!(dispatch.needs_queue_interrupt());
+        assert_eq!(
+            read_interrupt_status(&handler),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        acknowledge_queue_interrupt(&mut handler);
+        assert_eq!(read_interrupt_status(&handler), 0);
         assert!(handler.pending_queue_notifications().is_empty());
         assert_eq!(
             read_guest_bytes(&memory, DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as usize),
@@ -4596,6 +4638,7 @@ mod tests {
             .expect("queue dispatch error should preserve partial summary");
         assert_eq!(completed_dispatch.processed_requests(), 0);
         assert!(!completed_dispatch.needs_queue_interrupt());
+        assert_eq!(read_interrupt_status(&handler), 0);
         assert!(handler.pending_queue_notifications().is_empty());
     }
 
@@ -4642,6 +4685,10 @@ mod tests {
         assert_eq!(completed_dispatch.processed_requests(), 1);
         assert_eq!(completed_dispatch.successful_requests(), 1);
         assert!(completed_dispatch.needs_queue_interrupt());
+        assert_eq!(
+            read_interrupt_status(&handler),
+            DeviceInterruptKind::Queue.status().bits()
+        );
         assert!(handler.pending_queue_notifications().is_empty());
         let active_queue = handler
             .activation_handler()
@@ -4673,6 +4720,7 @@ mod tests {
 
         assert_eq!(dispatch.drained_notifications(), []);
         assert!(dispatch.queue_dispatch().is_none());
+        assert_eq!(read_interrupt_status(&handler), 0);
         assert!(!handler.activation_handler().is_activated());
         assert!(handler.pending_queue_notifications().is_empty());
     }
@@ -4703,6 +4751,7 @@ mod tests {
             }
             other => panic!("expected unsupported queue error, got {other:?}"),
         }
+        assert_eq!(read_interrupt_status(&handler), 0);
         assert!(handler.pending_queue_notifications().is_empty());
         let active_queue = handler
             .activation_handler()
@@ -4752,6 +4801,7 @@ mod tests {
             }
             other => panic!("expected unsupported queue error, got {other:?}"),
         }
+        assert_eq!(read_interrupt_status(&handler), 0);
         assert!(handler.pending_queue_notifications().is_empty());
         assert_ne!(
             read_guest_bytes(&memory, DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as usize),
