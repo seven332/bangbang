@@ -18,13 +18,14 @@ handling commands, narrow vCPU register wrappers, internal macOS 15+ HVF GIC v3 
 arm64 FDT generation and guest-memory writes, anonymous guest memory allocation
 for validated runtime layouts, HVF guest memory map/unmap ownership for
 allocated regions, an internal MMIO region ownership registry and operation/data
-model plus handler dispatch boundary, an internal backend-neutral interrupt
+model plus handler dispatch boundary, an internal virtio-mmio register/access
+decoder for future device handlers, an internal backend-neutral interrupt
 line/status/trigger model, single-vCPU arm64 HVF boot-register setup, and an
 initial process startup argument model.
 There is no broader API request body model, guest execution, continuous vCPU run loop,
-complete interrupt delivery, device-backed runner-loop MMIO handling, real device
-emulation, public startup wiring, multi-vCPU setup, PSCI behavior, or public
-boot-source API behavior yet.
+complete interrupt delivery, virtqueue walking, feature negotiation,
+device-backed runner-loop MMIO handling, real device emulation, public startup
+wiring, multi-vCPU setup, PSCI behavior, or public boot-source API behavior yet.
 
 ## Firecracker Model Alignment
 
@@ -347,6 +348,17 @@ dispatcher, and dispatch or complete it on the vCPU-owning thread. This is
 still not continuous run-loop policy, real device emulation, or interrupt
 delivery.
 
+The runtime crate can decode checked MMIO operations into typed virtio-mmio
+generic-register or device-configuration accesses for the Firecracker `v1.16.0`
+transport window. The generic register decoder accepts only exact 4-byte reads
+or writes at the Firecracker-supported common register offsets and rejects
+unsupported offsets, unsupported widths, cross-register accesses, and accesses
+outside the 4 KiB virtio-mmio device window before future device-specific state
+can be mutated. Device-configuration accesses are classified by offset and
+length, but concrete config-space behavior, feature negotiation, virtqueue
+walking, notification handling, interrupt acknowledgement, and real virtio
+devices are still deferred.
+
 The runtime crate also contains backend-neutral interrupt signaling groundwork.
 It can validate nonzero guest interrupt lines, represent queue and
 configuration pending-status bits, acknowledge selected pending bits, and let a
@@ -355,8 +367,8 @@ to an injected sink. The HVF crate can allocate deterministic guest interrupt
 lines from the validated GIC SPI range and signal validated SPI levels through
 `hv_gic_set_spi`. This follows Firecracker's separation between device-facing
 interrupt triggers and KVM-specific irqfd/GSI routing, but it is not yet
-interrupt masking, virtio-mmio register behavior, runner-loop interrupt
-dispatch, or guest-visible device delivery.
+interrupt masking, stateful guest-visible virtio-mmio register behavior,
+runner-loop interrupt dispatch, or guest-visible device delivery.
 
 The HVF backend can decode candidate MMIO accesses from arm64 data-abort
 exception exits. The decoder converts supported ESR and IPA metadata into a
