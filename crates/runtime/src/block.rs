@@ -3426,7 +3426,7 @@ mod tests {
     }
 
     #[test]
-    fn prepares_read_only_block_device() {
+    fn prepared_block_devices_prepare_read_only_block_device() {
         let file = temp_file("prepared-ro.img", &[0; 1024]);
         let mut configs = DriveConfigs::new();
         configs
@@ -3458,7 +3458,7 @@ mod tests {
     }
 
     #[test]
-    fn prepares_read_write_block_device() {
+    fn prepared_block_devices_prepare_read_write_block_device() {
         let file = temp_file("prepared-rw.img", b"abc");
         let mut configs = DriveConfigs::new();
         configs
