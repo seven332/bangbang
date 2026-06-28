@@ -260,8 +260,8 @@ fn drive_path_id(path: &str) -> Option<&str> {
     if rest.is_empty()
         || rest.contains('/')
         || !rest
-            .bytes()
-            .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+            .chars()
+            .all(|character| character == '_' || character.is_alphanumeric())
     {
         return None;
     }
@@ -670,6 +670,24 @@ mod tests {
         };
         assert_eq!(config.cache_type(), Some(DriveCacheType::Writeback));
         assert_eq!(config.io_engine(), Some(DriveIoEngine::Async));
+    }
+
+    #[test]
+    fn parses_put_drive_with_firecracker_id_character_set() {
+        let body = r#"{
+            "drive_id": "root_é1",
+            "path_on_host": "/tmp/rootfs.ext4",
+            "is_root_device": true
+        }"#;
+        let request = request_with_body("PUT", "/drives/root_é1", body);
+
+        let parsed = parse_request(&request).expect("drive request should parse");
+
+        let ApiRequest::PutDrive(config) = parsed else {
+            panic!("expected drive request");
+        };
+        assert_eq!(config.path_drive_id(), "root_é1");
+        assert_eq!(config.body_drive_id(), "root_é1");
     }
 
     #[test]
