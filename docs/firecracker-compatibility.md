@@ -502,12 +502,11 @@ macOS design work instead of direct implementation:
 - HVF vCPU handles are thread-affine: creation, register access, run, and
   destroy operations must happen on the owning thread. The current vCPU wrapper
   covers current-thread lifecycle, typed exit surface, narrow register access,
-  single resolved MMIO exit dispatch/completion, and the single primary arm64 Linux
-  boot-register setup. The
-  current runner skeleton creates a vCPU on a dedicated thread, applies that
-  boot-register setup on the owning thread before the first run, supports one
-  cancellable `hv_vcpu_run` step at a time, and shuts down by canceling and
-  joining the runner thread.
+  single resolved MMIO exit dispatch/completion, and the single primary arm64
+  Linux boot-register setup. The current runner skeleton creates a vCPU on a
+  dedicated thread, applies that boot-register setup on the owning thread before
+  the first run, supports one cancellable `hv_vcpu_run` step at a time, and
+  shuts down by canceling and joining the runner thread.
 - HVF exit snapshots preserve Hypervisor.framework reasons such as canceled,
   exception, virtual timer activation, and unknown after a run wrapper marks
   exit data available. Candidate arm64 MMIO data-abort exceptions can be decoded
