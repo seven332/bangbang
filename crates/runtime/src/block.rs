@@ -4600,9 +4600,63 @@ mod tests {
     }
 
     #[test]
+    fn block_device_notification_dispatch_preserves_partial_queue_dispatch_error() {
+        let mut memory = request_memory();
+        let file = temp_file(
+            "block-notify-partial-dispatch-error.img",
+            &sector_payload(0x76),
+        );
+        let backing = open_backing(file.as_path(), false).expect("backing should open");
+        let mut handler = block_notification_handler(backing, &VIRTIO_BLOCK_QUEUE_SIZES);
+        configure_block_notification_handler_queue(&mut handler, 4, TEST_USED_RING);
+        activate_block_notification_handler(&mut handler);
+        write_queued_request(
+            &mut memory,
+            0,
+            VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
+            0,
+            HEADER_ADDR,
+            None,
+            STATUS_ADDR,
+        );
+        write_available_heads(&mut memory, &[0, TEST_QUEUE_SIZE]);
+        handler
+            .write_register(VirtioMmioRegister::QueueNotify, 0)
+            .expect("queue notification should write");
+
+        let error = handler
+            .dispatch_block_queue_notifications(&mut memory)
+            .expect_err("invalid second available head should fail notification dispatch");
+
+        match &error {
+            VirtioBlockDeviceNotificationError::QueueDispatch {
+                source: VirtioBlockQueueDispatchError::AvailableRing { .. },
+                ..
+            } => {}
+            other => panic!("expected available ring dispatch error, got {other:?}"),
+        }
+        assert_eq!(error.drained_notifications(), [0]);
+        let completed_dispatch = error
+            .completed_dispatch()
+            .expect("queue dispatch error should preserve partial summary");
+        assert_eq!(completed_dispatch.processed_requests(), 1);
+        assert_eq!(completed_dispatch.successful_requests(), 1);
+        assert!(completed_dispatch.needs_queue_interrupt());
+        assert!(handler.pending_queue_notifications().is_empty());
+        let active_queue = handler
+            .activation_handler()
+            .active_queue()
+            .expect("block queue should remain active");
+        assert_eq!(active_queue.available_ring().next_avail(), 1);
+        assert_eq!(active_queue.used_ring().next_used(), 1);
+        assert_eq!(read_used_index(&memory), 1);
+        assert_eq!(read_used_element(&memory, 0), (0, VIRTIO_BLOCK_STATUS_SIZE));
+    }
+
+    #[test]
     fn block_device_notification_dispatch_reset_clears_active_queue_and_notification() {
         let mut memory = request_memory();
-        let file = temp_file("block-notify-reset.img", &sector_payload(0x76));
+        let file = temp_file("block-notify-reset.img", &sector_payload(0x77));
         let backing = open_backing(file.as_path(), true).expect("backing should open");
         let mut handler = block_notification_handler(backing, &VIRTIO_BLOCK_QUEUE_SIZES);
         configure_block_notification_handler_queue(&mut handler, 4, TEST_USED_RING);
@@ -4626,7 +4680,7 @@ mod tests {
     #[test]
     fn block_device_notification_dispatch_rejects_unsupported_queue_notification() {
         let mut memory = request_memory();
-        let file = temp_file("block-notify-unsupported-queue.img", &sector_payload(0x77));
+        let file = temp_file("block-notify-unsupported-queue.img", &sector_payload(0x78));
         let backing = open_backing(file.as_path(), true).expect("backing should open");
         let mut handler = block_notification_handler(backing, &[TEST_QUEUE_SIZE, TEST_QUEUE_SIZE]);
         configure_block_notification_handler_queue(&mut handler, 4, TEST_USED_RING);
@@ -4661,7 +4715,7 @@ mod tests {
     #[test]
     fn block_device_notification_dispatch_rejects_mixed_unsupported_queue_without_dispatch() {
         let mut memory = request_memory();
-        let payload = sector_payload(0x78);
+        let payload = sector_payload(0x79);
         let file = temp_file("block-notify-mixed-unsupported-queue.img", &payload);
         let backing = open_backing(file.as_path(), true).expect("backing should open");
         let mut handler = block_notification_handler(backing, &[TEST_QUEUE_SIZE, TEST_QUEUE_SIZE]);
