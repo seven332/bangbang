@@ -2092,7 +2092,8 @@ mod tests {
     use crate::mmio::{MmioAccess, MmioAccessBytes, MmioBus, MmioRegionId};
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
-        VIRTIO_DEVICE_STATUS_FEATURES_OK, VIRTIO_MMIO_DEVICE_CONFIG_OFFSET,
+        VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
+        VIRTIO_DEVICE_STATUS_INIT, VIRTIO_MMIO_DEVICE_CONFIG_OFFSET,
         VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation,
         VirtioMmioDeviceActivationError, VirtioMmioDeviceActivationHandler,
         VirtioMmioDeviceRegisters, VirtioMmioQueueRegisters, VirtioMmioRegister,
@@ -2141,6 +2142,7 @@ mod tests {
     const QUEUE_CONFIG_STATUS: u32 = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
         | VIRTIO_DEVICE_STATUS_DRIVER
         | VIRTIO_DEVICE_STATUS_FEATURES_OK;
+    const DRIVER_OK_STATUS: u32 = QUEUE_CONFIG_STATUS | VIRTIO_DEVICE_STATUS_DRIVER_OK;
 
     #[derive(Debug)]
     struct TempPath {
@@ -3971,6 +3973,77 @@ mod tests {
         assert_eq!(queue.available_ring().queue_size(), 4);
         assert_eq!(queue.used_ring().used_ring(), TEST_USED_RING);
         assert_eq!(queue.used_ring().queue_size(), 4);
+    }
+
+    #[test]
+    fn block_device_activation_runs_through_mmio_register_handler_and_reset() {
+        let file = temp_file("block-device-mmio-handler.img", &sector_payload(0x12));
+        let backing = open_backing(file.as_path(), false).expect("backing should open");
+        let config = VirtioBlockConfigSpace::from_backing(&backing);
+        let device = VirtioBlockDevice::new(backing, TEST_DEVICE_ID);
+        let mut handler = VirtioMmioRegisterHandler::with_device_config_and_activation(
+            VIRTIO_BLOCK_DEVICE_ID,
+            config.available_features(),
+            &VIRTIO_BLOCK_QUEUE_SIZES,
+            config,
+            device,
+        )
+        .expect("block register handler should build");
+        handler
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
+            .expect("status should accept ACKNOWLEDGE");
+        handler
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            )
+            .expect("status should accept DRIVER");
+        handler
+            .write_register(VirtioMmioRegister::Status, QUEUE_CONFIG_STATUS)
+            .expect("status should accept FEATURES_OK");
+        handler
+            .write_register(VirtioMmioRegister::QueueNum, 4)
+            .expect("queue size should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueDescLow,
+                guest_address_low(TEST_DESCRIPTOR_TABLE),
+            )
+            .expect("queue descriptor table should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueDriverLow,
+                guest_address_low(TEST_AVAILABLE_RING),
+            )
+            .expect("queue driver ring should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueDeviceLow,
+                guest_address_low(TEST_USED_RING),
+            )
+            .expect("queue device ring should write");
+        handler
+            .write_register(VirtioMmioRegister::QueueReady, 1)
+            .expect("queue ready should write");
+
+        handler
+            .write_register(VirtioMmioRegister::Status, DRIVER_OK_STATUS)
+            .expect("DRIVER_OK should activate block device");
+
+        assert!(handler.is_device_activated());
+        let active_queue = handler
+            .activation_handler()
+            .active_queue()
+            .expect("block device should store active queue");
+        assert_eq!(active_queue.available_ring().queue_size(), 4);
+        assert_eq!(active_queue.used_ring().used_ring(), TEST_USED_RING);
+
+        handler
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_INIT)
+            .expect("INIT status should reset block activation state");
+
+        assert!(!handler.is_device_activated());
+        assert!(handler.activation_handler().active_queue().is_none());
     }
 
     #[test]
