@@ -1264,6 +1264,8 @@ pub trait VirtioMmioDeviceActivationHandler: fmt::Debug + Send {
         &mut self,
         activation: VirtioMmioDeviceActivation<'_>,
     ) -> Result<(), VirtioMmioDeviceActivationError>;
+
+    fn reset(&mut self) {}
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1743,10 +1745,15 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
 
     pub fn reset(&mut self) {
         self.device.reset();
+        self.reset_active_state();
+    }
+
+    fn reset_active_state(&mut self) {
         self.queues.reset();
         self.queue_notifications.reset();
         self.interrupts.reset();
         self.device_activated = false;
+        self.activation.reset();
     }
 
     fn write_device_register(
@@ -1761,10 +1768,7 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
             )?;
 
         if register == VirtioMmioRegister::Status && value == VIRTIO_DEVICE_STATUS_INIT {
-            self.queues.reset();
-            self.queue_notifications.reset();
-            self.interrupts.reset();
-            self.device_activated = false;
+            self.reset_active_state();
         }
 
         if register == VirtioMmioRegister::Status
@@ -2867,6 +2871,9 @@ mod tests {
     struct TestDeviceActivation {
         activations: Vec<RecordedDeviceActivation>,
         attempts: usize,
+        resets: usize,
+        partial_state: bool,
+        record_partial_state_before_error: bool,
         error: Option<MmioHandlerError>,
     }
 
@@ -2875,6 +2882,9 @@ mod tests {
             Self {
                 activations: Vec::new(),
                 attempts: 0,
+                resets: 0,
+                partial_state: false,
+                record_partial_state_before_error: false,
                 error: None,
             }
         }
@@ -2886,6 +2896,9 @@ mod tests {
             activation: VirtioMmioDeviceActivation<'_>,
         ) -> Result<(), VirtioMmioDeviceActivationError> {
             self.attempts += 1;
+            if self.record_partial_state_before_error {
+                self.partial_state = true;
+            }
             if let Some(source) = &self.error {
                 return Err(source.clone().into());
             }
@@ -2905,6 +2918,11 @@ mod tests {
                 queues,
             });
             Ok(())
+        }
+
+        fn reset(&mut self) {
+            self.resets += 1;
+            self.partial_state = false;
         }
     }
 
@@ -4321,6 +4339,52 @@ mod tests {
     }
 
     #[test]
+    fn register_handler_explicit_reset_calls_activation_reset() {
+        let activation = TestDeviceActivation::new();
+        let mut handler = VirtioMmioRegisterHandler::with_activation(7, 0x2a, &[8], activation)
+            .expect("handler should build");
+        configure_handler_for_activation(&mut handler).expect("handler should be configurable");
+        write_register_u32(
+            &mut handler,
+            VirtioMmioRegister::Status.offset(),
+            DRIVER_OK_STATUS,
+        )
+        .expect("DRIVER_OK status should activate");
+
+        handler.reset();
+
+        assert_eq!(
+            handler.device_registers().status(),
+            VIRTIO_DEVICE_STATUS_INIT
+        );
+        assert!(!handler.is_device_activated());
+        assert_eq!(handler.activation_handler().attempts, 1);
+        assert_eq!(handler.activation_handler().resets, 1);
+    }
+
+    #[test]
+    fn register_handler_status_reset_before_activation_calls_activation_reset() {
+        let activation = TestDeviceActivation::new();
+        let mut handler = VirtioMmioRegisterHandler::with_activation(7, 0x2a, &[8], activation)
+            .expect("handler should build");
+
+        write_register_u32(
+            &mut handler,
+            VirtioMmioRegister::Status.offset(),
+            VIRTIO_DEVICE_STATUS_INIT,
+        )
+        .expect("INIT status should reset handler state");
+
+        assert_eq!(
+            handler.device_registers().status(),
+            VIRTIO_DEVICE_STATUS_INIT
+        );
+        assert!(!handler.is_device_activated());
+        assert_eq!(handler.activation_handler().attempts, 0);
+        assert_eq!(handler.activation_handler().resets, 1);
+    }
+
+    #[test]
     fn register_handler_invokes_activation_on_driver_ok() {
         let activation = TestDeviceActivation::new();
         let mut handler = VirtioMmioRegisterHandler::with_activation(7, 0x2a, &[8], activation)
@@ -4407,6 +4471,7 @@ mod tests {
         .expect("INIT status should reset activation state");
 
         assert!(!handler.is_device_activated());
+        assert_eq!(handler.activation_handler().resets, 1);
         configure_handler_for_activation(&mut handler).expect("handler should reconfigure");
         write_register_u32(
             &mut handler,
@@ -4418,6 +4483,7 @@ mod tests {
         assert!(handler.is_device_activated());
         assert_eq!(handler.activation_handler().attempts, 2);
         assert_eq!(handler.activation_handler().activations.len(), 2);
+        assert_eq!(handler.activation_handler().resets, 1);
     }
 
     #[test]
@@ -4465,6 +4531,41 @@ mod tests {
         assert!(!handler.is_device_activated());
         assert_eq!(handler.activation_handler().attempts, 1);
         assert!(handler.activation_handler().activations.is_empty());
+    }
+
+    #[test]
+    fn register_handler_status_reset_after_activation_failure_calls_activation_reset() {
+        let source = MmioHandlerError::new("activation failed");
+        let mut activation = TestDeviceActivation::new();
+        activation.error = Some(source);
+        activation.record_partial_state_before_error = true;
+        let mut handler = VirtioMmioRegisterHandler::with_activation(7, 0x2a, &[8], activation)
+            .expect("handler should build");
+        configure_handler_for_activation(&mut handler).expect("handler should be configurable");
+
+        write_register_u32(
+            &mut handler,
+            VirtioMmioRegister::Status.offset(),
+            DRIVER_OK_STATUS,
+        )
+        .expect_err("activation failure should be reported");
+        assert!(handler.activation_handler().partial_state);
+
+        write_register_u32(
+            &mut handler,
+            VirtioMmioRegister::Status.offset(),
+            VIRTIO_DEVICE_STATUS_INIT,
+        )
+        .expect("INIT status should reset failed activation state");
+
+        assert_eq!(
+            handler.device_registers().status(),
+            VIRTIO_DEVICE_STATUS_INIT
+        );
+        assert!(!handler.is_device_activated());
+        assert_eq!(handler.activation_handler().attempts, 1);
+        assert_eq!(handler.activation_handler().resets, 1);
+        assert!(!handler.activation_handler().partial_state);
     }
 
     #[test]
