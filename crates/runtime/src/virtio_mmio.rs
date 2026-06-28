@@ -33,6 +33,10 @@ pub const VIRTIO_DEVICE_STATUS_FAILED: u32 = 0x80;
 
 const VIRTIO_MMIO_REGISTER_ACCESS_SIZE_U64: u64 = 4;
 const VIRTIO_MMIO_FEATURE_SELECTOR_MAX: u32 = 1;
+const VIRTIO_DEVICE_DRIVER_OK_STATUS: u32 = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+    | VIRTIO_DEVICE_STATUS_DRIVER
+    | VIRTIO_DEVICE_STATUS_FEATURES_OK
+    | VIRTIO_DEVICE_STATUS_DRIVER_OK;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtioMmioDeviceRegisters {
@@ -210,6 +214,10 @@ impl VirtioMmioDeviceRegisters {
         self.driver_features_select = 0;
         self.driver_features = 0;
         self.status = VIRTIO_DEVICE_STATUS_INIT;
+    }
+
+    fn mark_device_needs_reset(&mut self) {
+        self.status |= VIRTIO_DEVICE_STATUS_DEVICE_NEEDS_RESET;
     }
 
     fn write_driver_features(&mut self, value: u32) -> Result<(), VirtioMmioRegisterStateError> {
@@ -1209,17 +1217,136 @@ impl std::error::Error for VirtioMmioDeviceConfigError {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct VirtioMmioDeviceActivation<'a> {
+    device: &'a VirtioMmioDeviceRegisters,
+    queues: &'a VirtioMmioQueueRegisters,
+}
+
+impl<'a> VirtioMmioDeviceActivation<'a> {
+    pub const fn new(
+        device: &'a VirtioMmioDeviceRegisters,
+        queues: &'a VirtioMmioQueueRegisters,
+    ) -> Self {
+        Self { device, queues }
+    }
+
+    pub const fn device_registers(self) -> &'a VirtioMmioDeviceRegisters {
+        self.device
+    }
+
+    pub const fn queue_registers(self) -> &'a VirtioMmioQueueRegisters {
+        self.queues
+    }
+
+    pub const fn status(self) -> u32 {
+        self.device.status()
+    }
+
+    pub const fn driver_features(self) -> u64 {
+        self.device.driver_features()
+    }
+
+    pub fn queue_count(self) -> usize {
+        self.queues.queue_count()
+    }
+
+    pub fn queue(
+        self,
+        queue_index: u32,
+    ) -> Result<&'a VirtioMmioQueueState, VirtioMmioQueueRegisterError> {
+        self.queues.queue(queue_index)
+    }
+}
+
+pub trait VirtioMmioDeviceActivationHandler: fmt::Debug + Send {
+    fn activate(
+        &mut self,
+        activation: VirtioMmioDeviceActivation<'_>,
+    ) -> Result<(), VirtioMmioDeviceActivationError>;
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NoopVirtioMmioDeviceActivation;
+
+impl VirtioMmioDeviceActivationHandler for NoopVirtioMmioDeviceActivation {
+    fn activate(
+        &mut self,
+        _activation: VirtioMmioDeviceActivation<'_>,
+    ) -> Result<(), VirtioMmioDeviceActivationError> {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VirtioMmioRegisterHandler<C = UnsupportedVirtioMmioDeviceConfig> {
+pub enum VirtioMmioDeviceActivationError {
+    Handler { source: MmioHandlerError },
+}
+
+impl From<MmioHandlerError> for VirtioMmioDeviceActivationError {
+    fn from(source: MmioHandlerError) -> Self {
+        Self::Handler { source }
+    }
+}
+
+impl fmt::Display for VirtioMmioDeviceActivationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Handler { source } => {
+                write!(f, "virtio-mmio device activation handler failed: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioMmioDeviceActivationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Handler { source } => Some(source),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioMmioRegisterHandler<
+    C = UnsupportedVirtioMmioDeviceConfig,
+    A = NoopVirtioMmioDeviceActivation,
+> {
     device: VirtioMmioDeviceRegisters,
     queues: VirtioMmioQueueRegisters,
     queue_notifications: VirtioMmioQueueNotificationRegisters,
     interrupts: VirtioMmioInterruptRegisters,
     device_config: C,
+    activation: A,
+    device_activated: bool,
     requires_device_config_write_status: bool,
 }
 
-impl VirtioMmioRegisterHandler<UnsupportedVirtioMmioDeviceConfig> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VirtioMmioRegisterHandlerIdentity {
+    device_id: u32,
+    vendor_id: u32,
+    device_features: u64,
+    config_generation: u32,
+}
+
+impl VirtioMmioRegisterHandlerIdentity {
+    const fn new(
+        device_id: u32,
+        vendor_id: u32,
+        device_features: u64,
+        config_generation: u32,
+    ) -> Self {
+        Self {
+            device_id,
+            vendor_id,
+            device_features,
+            config_generation,
+        }
+    }
+}
+
+impl VirtioMmioRegisterHandler<UnsupportedVirtioMmioDeviceConfig, NoopVirtioMmioDeviceActivation> {
     pub fn new(
         device_id: u32,
         device_features: u64,
@@ -1242,18 +1369,23 @@ impl VirtioMmioRegisterHandler<UnsupportedVirtioMmioDeviceConfig> {
         queue_max_sizes: &[u16],
     ) -> Result<Self, VirtioMmioRegisterHandlerError> {
         Self::with_vendor_id_and_config_generation_and_device_config_status_gate(
-            device_id,
-            vendor_id,
-            device_features,
-            config_generation,
+            VirtioMmioRegisterHandlerIdentity::new(
+                device_id,
+                vendor_id,
+                device_features,
+                config_generation,
+            ),
             queue_max_sizes,
             UnsupportedVirtioMmioDeviceConfig,
+            NoopVirtioMmioDeviceActivation,
             false,
         )
     }
 }
 
-impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C> {
+impl<C: VirtioMmioDeviceConfigHandler>
+    VirtioMmioRegisterHandler<C, NoopVirtioMmioDeviceActivation>
+{
     pub fn with_device_config(
         device_id: u32,
         device_features: u64,
@@ -1261,12 +1393,15 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C> {
         device_config: C,
     ) -> Result<Self, VirtioMmioRegisterHandlerError> {
         Self::with_vendor_id_and_config_generation_and_device_config_status_gate(
-            device_id,
-            VIRTIO_MMIO_VENDOR_ID,
-            device_features,
-            0,
+            VirtioMmioRegisterHandlerIdentity::new(
+                device_id,
+                VIRTIO_MMIO_VENDOR_ID,
+                device_features,
+                0,
+            ),
             queue_max_sizes,
             device_config,
+            NoopVirtioMmioDeviceActivation,
             true,
         )
     }
@@ -1280,23 +1415,118 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C> {
         device_config: C,
     ) -> Result<Self, VirtioMmioRegisterHandlerError> {
         Self::with_vendor_id_and_config_generation_and_device_config_status_gate(
-            device_id,
-            vendor_id,
-            device_features,
-            config_generation,
+            VirtioMmioRegisterHandlerIdentity::new(
+                device_id,
+                vendor_id,
+                device_features,
+                config_generation,
+            ),
             queue_max_sizes,
             device_config,
+            NoopVirtioMmioDeviceActivation,
+            true,
+        )
+    }
+}
+
+impl<A: VirtioMmioDeviceActivationHandler>
+    VirtioMmioRegisterHandler<UnsupportedVirtioMmioDeviceConfig, A>
+{
+    pub fn with_activation(
+        device_id: u32,
+        device_features: u64,
+        queue_max_sizes: &[u16],
+        activation: A,
+    ) -> Result<Self, VirtioMmioRegisterHandlerError> {
+        Self::with_vendor_id_and_config_generation_and_device_config_status_gate(
+            VirtioMmioRegisterHandlerIdentity::new(
+                device_id,
+                VIRTIO_MMIO_VENDOR_ID,
+                device_features,
+                0,
+            ),
+            queue_max_sizes,
+            UnsupportedVirtioMmioDeviceConfig,
+            activation,
+            false,
+        )
+    }
+
+    pub fn with_vendor_id_and_config_generation_and_activation(
+        device_id: u32,
+        vendor_id: u32,
+        device_features: u64,
+        config_generation: u32,
+        queue_max_sizes: &[u16],
+        activation: A,
+    ) -> Result<Self, VirtioMmioRegisterHandlerError> {
+        Self::with_vendor_id_and_config_generation_and_device_config_status_gate(
+            VirtioMmioRegisterHandlerIdentity::new(
+                device_id,
+                vendor_id,
+                device_features,
+                config_generation,
+            ),
+            queue_max_sizes,
+            UnsupportedVirtioMmioDeviceConfig,
+            activation,
+            false,
+        )
+    }
+}
+
+impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
+    VirtioMmioRegisterHandler<C, A>
+{
+    pub fn with_device_config_and_activation(
+        device_id: u32,
+        device_features: u64,
+        queue_max_sizes: &[u16],
+        device_config: C,
+        activation: A,
+    ) -> Result<Self, VirtioMmioRegisterHandlerError> {
+        Self::with_vendor_id_and_config_generation_and_device_config_status_gate(
+            VirtioMmioRegisterHandlerIdentity::new(
+                device_id,
+                VIRTIO_MMIO_VENDOR_ID,
+                device_features,
+                0,
+            ),
+            queue_max_sizes,
+            device_config,
+            activation,
             true,
         )
     }
 
-    fn with_vendor_id_and_config_generation_and_device_config_status_gate(
+    pub fn with_vendor_id_and_config_generation_and_device_config_and_activation(
         device_id: u32,
         vendor_id: u32,
         device_features: u64,
         config_generation: u32,
         queue_max_sizes: &[u16],
         device_config: C,
+        activation: A,
+    ) -> Result<Self, VirtioMmioRegisterHandlerError> {
+        Self::with_vendor_id_and_config_generation_and_device_config_status_gate(
+            VirtioMmioRegisterHandlerIdentity::new(
+                device_id,
+                vendor_id,
+                device_features,
+                config_generation,
+            ),
+            queue_max_sizes,
+            device_config,
+            activation,
+            true,
+        )
+    }
+
+    fn with_vendor_id_and_config_generation_and_device_config_status_gate(
+        identity: VirtioMmioRegisterHandlerIdentity,
+        queue_max_sizes: &[u16],
+        device_config: C,
+        activation: A,
         requires_device_config_write_status: bool,
     ) -> Result<Self, VirtioMmioRegisterHandlerError> {
         let queues = VirtioMmioQueueRegisters::new(queue_max_sizes).map_err(|source| {
@@ -1310,15 +1540,17 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C> {
 
         Ok(Self {
             device: VirtioMmioDeviceRegisters::with_vendor_id_and_config_generation(
-                device_id,
-                vendor_id,
-                device_features,
-                config_generation,
+                identity.device_id,
+                identity.vendor_id,
+                identity.device_features,
+                identity.config_generation,
             ),
             queues,
             queue_notifications,
             interrupts: VirtioMmioInterruptRegisters::new(),
             device_config,
+            activation,
+            device_activated: false,
             requires_device_config_write_status,
         })
     }
@@ -1357,6 +1589,14 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C> {
 
     pub const fn device_config_handler(&self) -> &C {
         &self.device_config
+    }
+
+    pub const fn activation_handler(&self) -> &A {
+        &self.activation
+    }
+
+    pub const fn is_device_activated(&self) -> bool {
+        self.device_activated
     }
 
     pub fn mark_interrupt_pending(&mut self, kind: DeviceInterruptKind) {
@@ -1506,6 +1746,7 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C> {
         self.queues.reset();
         self.queue_notifications.reset();
         self.interrupts.reset();
+        self.device_activated = false;
     }
 
     fn write_device_register(
@@ -1523,9 +1764,34 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C> {
             self.queues.reset();
             self.queue_notifications.reset();
             self.interrupts.reset();
+            self.device_activated = false;
+        }
+
+        if register == VirtioMmioRegister::Status
+            && self.device.status() == VIRTIO_DEVICE_DRIVER_OK_STATUS
+            && !self.device_activated
+        {
+            self.activate_device()?;
         }
 
         Ok(())
+    }
+
+    fn activate_device(&mut self) -> Result<(), VirtioMmioRegisterHandlerError> {
+        let activation = VirtioMmioDeviceActivation::new(&self.device, &self.queues);
+        match self.activation.activate(activation) {
+            Ok(()) => {
+                self.device_activated = true;
+                Ok(())
+            }
+            Err(source) => {
+                self.device.mark_device_needs_reset();
+                Err(VirtioMmioRegisterHandlerError::DeviceActivation {
+                    status: self.device.status(),
+                    source,
+                })
+            }
+        }
     }
 
     fn read_device_config(
@@ -1562,7 +1828,9 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C> {
     }
 }
 
-impl<C: VirtioMmioDeviceConfigHandler> MmioHandler for VirtioMmioRegisterHandler<C> {
+impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler> MmioHandler
+    for VirtioMmioRegisterHandler<C, A>
+{
     fn read(&mut self, access: MmioAccess) -> Result<MmioAccessBytes, MmioHandlerError> {
         self.read_access(access).map_err(MmioHandlerError::from)
     }
@@ -1618,6 +1886,10 @@ pub enum VirtioMmioRegisterHandlerError {
     },
     DeviceConfigWriteNotWritable {
         status: u32,
+    },
+    DeviceActivation {
+        status: u32,
+        source: VirtioMmioDeviceActivationError,
     },
     UnsupportedRegisterRead {
         register: VirtioMmioRegister,
@@ -1736,6 +2008,12 @@ impl fmt::Display for VirtioMmioRegisterHandlerError {
                     "virtio-mmio device config cannot be written while status is 0x{status:x}"
                 )
             }
+            Self::DeviceActivation { status, source } => {
+                write!(
+                    f,
+                    "virtio-mmio device activation failed while status is 0x{status:x}: {source}"
+                )
+            }
             Self::UnsupportedRegisterRead { register } => {
                 write!(
                     f,
@@ -1811,6 +2089,7 @@ impl std::error::Error for VirtioMmioRegisterHandlerError {
             Self::DeviceConfigRead { source, .. } | Self::DeviceConfigWrite { source, .. } => {
                 Some(source)
             }
+            Self::DeviceActivation { source, .. } => Some(source),
             Self::InterruptRegisterRead { source, .. }
             | Self::InterruptRegisterWrite { source, .. } => Some(source),
             Self::RegisterWriteDataLength { .. }
@@ -2485,19 +2764,21 @@ mod tests {
     use std::error::Error as _;
 
     use super::{
-        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
-        VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FAILED,
+        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DEVICE_NEEDS_RESET,
+        VIRTIO_DEVICE_STATUS_DRIVER, VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FAILED,
         VIRTIO_DEVICE_STATUS_FEATURES_OK, VIRTIO_DEVICE_STATUS_INIT,
         VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
         VIRTIO_MMIO_FEATURE_VERSION_1, VIRTIO_MMIO_MAGIC_VALUE, VIRTIO_MMIO_NOTIFY_OFFSET,
         VIRTIO_MMIO_REGISTER_ACCESS_SIZE, VIRTIO_MMIO_REGISTER_SPACE_SIZE, VIRTIO_MMIO_VENDOR_ID,
         VIRTIO_MMIO_VERSION, VIRTIO_MMIO_VERSION_1_FEATURE, VirtioMmioAccess,
-        VirtioMmioAccessError, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
-        VirtioMmioDeviceConfigHandler, VirtioMmioDeviceRegisters, VirtioMmioInterruptRegisterError,
-        VirtioMmioInterruptRegisters, VirtioMmioQueueNotificationError,
-        VirtioMmioQueueNotificationRegisters, VirtioMmioQueueRegisterError,
-        VirtioMmioQueueRegisters, VirtioMmioRegister, VirtioMmioRegisterHandler,
-        VirtioMmioRegisterHandlerError, VirtioMmioRegisterStateError, decode_virtio_mmio_access,
+        VirtioMmioAccessError, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
+        VirtioMmioDeviceActivationHandler, VirtioMmioDeviceConfigAccess,
+        VirtioMmioDeviceConfigError, VirtioMmioDeviceConfigHandler, VirtioMmioDeviceRegisters,
+        VirtioMmioInterruptRegisterError, VirtioMmioInterruptRegisters,
+        VirtioMmioQueueNotificationError, VirtioMmioQueueNotificationRegisters,
+        VirtioMmioQueueRegisterError, VirtioMmioQueueRegisters, VirtioMmioQueueState,
+        VirtioMmioRegister, VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
+        VirtioMmioRegisterStateError, decode_virtio_mmio_access,
     };
     use crate::interrupt::{DeviceInterruptKind, DeviceInterruptStatusError};
     use crate::memory::GuestAddress;
@@ -2575,6 +2856,58 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedDeviceActivation {
+        status: u32,
+        driver_features: u64,
+        queues: Vec<VirtioMmioQueueState>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TestDeviceActivation {
+        activations: Vec<RecordedDeviceActivation>,
+        attempts: usize,
+        error: Option<MmioHandlerError>,
+    }
+
+    impl TestDeviceActivation {
+        fn new() -> Self {
+            Self {
+                activations: Vec::new(),
+                attempts: 0,
+                error: None,
+            }
+        }
+    }
+
+    impl VirtioMmioDeviceActivationHandler for TestDeviceActivation {
+        fn activate(
+            &mut self,
+            activation: VirtioMmioDeviceActivation<'_>,
+        ) -> Result<(), VirtioMmioDeviceActivationError> {
+            self.attempts += 1;
+            if let Some(source) = &self.error {
+                return Err(source.clone().into());
+            }
+
+            let mut queues = Vec::with_capacity(activation.queue_count());
+            for index in 0..activation.queue_count() {
+                let queue_index = u32::try_from(index).expect("test queue index should fit u32");
+                queues.push(
+                    *activation
+                        .queue(queue_index)
+                        .expect("test activation queue should exist"),
+                );
+            }
+            self.activations.push(RecordedDeviceActivation {
+                status: activation.status(),
+                driver_features: activation.driver_features(),
+                queues,
+            });
+            Ok(())
+        }
+    }
+
     fn read_operation(offset: u64, len: u64) -> MmioOperation {
         let access = access(offset, len);
         MmioOperation::read(access).expect("read operation should be valid")
@@ -2589,8 +2922,8 @@ mod tests {
         MmioOperation::write(access, data).expect("write operation should be valid")
     }
 
-    fn read_register_u32<C: VirtioMmioDeviceConfigHandler>(
-        handler: &VirtioMmioRegisterHandler<C>,
+    fn read_register_u32<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>(
+        handler: &VirtioMmioRegisterHandler<C, A>,
         offset: u64,
     ) -> Result<u32, VirtioMmioRegisterHandlerError> {
         let data = handler.read_access(access(offset, 4))?;
@@ -2601,8 +2934,11 @@ mod tests {
         Ok(u32::from_le_bytes(bytes))
     }
 
-    fn write_register_u32<C: VirtioMmioDeviceConfigHandler>(
-        handler: &mut VirtioMmioRegisterHandler<C>,
+    fn write_register_u32<
+        C: VirtioMmioDeviceConfigHandler,
+        A: VirtioMmioDeviceActivationHandler,
+    >(
+        handler: &mut VirtioMmioRegisterHandler<C, A>,
         offset: u64,
         value: u32,
     ) -> Result<(), VirtioMmioRegisterHandlerError> {
@@ -2611,8 +2947,11 @@ mod tests {
         handler.write_access(access(offset, 4), data)
     }
 
-    fn advance_handler_to_features_ok<C: VirtioMmioDeviceConfigHandler>(
-        handler: &mut VirtioMmioRegisterHandler<C>,
+    fn advance_handler_to_features_ok<
+        C: VirtioMmioDeviceConfigHandler,
+        A: VirtioMmioDeviceActivationHandler,
+    >(
+        handler: &mut VirtioMmioRegisterHandler<C, A>,
     ) -> Result<(), VirtioMmioRegisterHandlerError> {
         advance_handler_to_driver(handler)?;
         write_register_u32(
@@ -2622,8 +2961,11 @@ mod tests {
         )
     }
 
-    fn advance_handler_to_driver<C: VirtioMmioDeviceConfigHandler>(
-        handler: &mut VirtioMmioRegisterHandler<C>,
+    fn advance_handler_to_driver<
+        C: VirtioMmioDeviceConfigHandler,
+        A: VirtioMmioDeviceActivationHandler,
+    >(
+        handler: &mut VirtioMmioRegisterHandler<C, A>,
     ) -> Result<(), VirtioMmioRegisterHandlerError> {
         write_register_u32(
             handler,
@@ -2637,8 +2979,11 @@ mod tests {
         )
     }
 
-    fn advance_handler_to_driver_ok<C: VirtioMmioDeviceConfigHandler>(
-        handler: &mut VirtioMmioRegisterHandler<C>,
+    fn advance_handler_to_driver_ok<
+        C: VirtioMmioDeviceConfigHandler,
+        A: VirtioMmioDeviceActivationHandler,
+    >(
+        handler: &mut VirtioMmioRegisterHandler<C, A>,
     ) -> Result<(), VirtioMmioRegisterHandlerError> {
         advance_handler_to_features_ok(handler)?;
         write_register_u32(
@@ -2646,6 +2991,26 @@ mod tests {
             VirtioMmioRegister::Status.offset(),
             DRIVER_OK_STATUS,
         )
+    }
+
+    fn configure_handler_for_activation<
+        C: VirtioMmioDeviceConfigHandler,
+        A: VirtioMmioDeviceActivationHandler,
+    >(
+        handler: &mut VirtioMmioRegisterHandler<C, A>,
+    ) -> Result<(), VirtioMmioRegisterHandlerError> {
+        advance_handler_to_driver(handler)?;
+        write_register_u32(handler, VirtioMmioRegister::DriverFeatures.offset(), 0x2a)?;
+        write_register_u32(
+            handler,
+            VirtioMmioRegister::Status.offset(),
+            QUEUE_CONFIG_STATUS,
+        )?;
+        write_register_u32(handler, VirtioMmioRegister::QueueNum.offset(), 8)?;
+        write_register_u32(handler, VirtioMmioRegister::QueueReady.offset(), 1)?;
+        write_register_u32(handler, VirtioMmioRegister::QueueDescLow.offset(), 0x1000)?;
+        write_register_u32(handler, VirtioMmioRegister::QueueDriverLow.offset(), 0x2000)?;
+        write_register_u32(handler, VirtioMmioRegister::QueueDeviceLow.offset(), 0x3000)
     }
 
     fn access(offset: u64, len: u64) -> crate::mmio::MmioAccess {
@@ -3953,6 +4318,164 @@ mod tests {
 
         assert!(handler.pending_queue_notifications().is_empty());
         assert_eq!(handler.is_queue_notification_pending(0), Ok(false));
+    }
+
+    #[test]
+    fn register_handler_invokes_activation_on_driver_ok() {
+        let activation = TestDeviceActivation::new();
+        let mut handler = VirtioMmioRegisterHandler::with_activation(7, 0x2a, &[8], activation)
+            .expect("handler should build");
+        configure_handler_for_activation(&mut handler).expect("handler should be configurable");
+
+        write_register_u32(
+            &mut handler,
+            VirtioMmioRegister::Status.offset(),
+            DRIVER_OK_STATUS,
+        )
+        .expect("DRIVER_OK status should activate");
+
+        assert!(handler.is_device_activated());
+        let activations = &handler.activation_handler().activations;
+        assert_eq!(activations.len(), 1);
+        let activation = activations
+            .first()
+            .expect("activation should have been recorded");
+        assert_eq!(activation.status, DRIVER_OK_STATUS);
+        assert_eq!(activation.driver_features, 0x2a);
+        assert_eq!(activation.queues.len(), 1);
+        let queue = activation
+            .queues
+            .first()
+            .expect("activation should include queue zero");
+        assert_eq!(queue.max_size(), 8);
+        assert_eq!(queue.size(), 8);
+        assert!(queue.ready());
+        assert_eq!(queue.descriptor_table(), GuestAddress::new(0x1000));
+        assert_eq!(queue.driver_ring(), GuestAddress::new(0x2000));
+        assert_eq!(queue.device_ring(), GuestAddress::new(0x3000));
+    }
+
+    #[test]
+    fn register_handler_does_not_duplicate_activation_in_active_cycle() {
+        let activation = TestDeviceActivation::new();
+        let mut handler = VirtioMmioRegisterHandler::with_activation(7, 0x2a, &[8], activation)
+            .expect("handler should build");
+        configure_handler_for_activation(&mut handler).expect("handler should be configurable");
+        write_register_u32(
+            &mut handler,
+            VirtioMmioRegister::Status.offset(),
+            DRIVER_OK_STATUS,
+        )
+        .expect("DRIVER_OK status should activate");
+
+        assert_eq!(
+            write_register_u32(
+                &mut handler,
+                VirtioMmioRegister::Status.offset(),
+                DRIVER_OK_STATUS,
+            ),
+            Err(VirtioMmioRegisterHandlerError::DeviceRegisterWrite {
+                register: VirtioMmioRegister::Status,
+                source: VirtioMmioRegisterStateError::InvalidStatusTransition {
+                    current: DRIVER_OK_STATUS,
+                    requested: DRIVER_OK_STATUS,
+                },
+            })
+        );
+        assert_eq!(handler.activation_handler().attempts, 1);
+        assert_eq!(handler.activation_handler().activations.len(), 1);
+        assert!(handler.is_device_activated());
+    }
+
+    #[test]
+    fn register_handler_reset_allows_activation_retry() {
+        let activation = TestDeviceActivation::new();
+        let mut handler = VirtioMmioRegisterHandler::with_activation(7, 0x2a, &[8], activation)
+            .expect("handler should build");
+        configure_handler_for_activation(&mut handler).expect("handler should be configurable");
+        write_register_u32(
+            &mut handler,
+            VirtioMmioRegister::Status.offset(),
+            DRIVER_OK_STATUS,
+        )
+        .expect("first DRIVER_OK status should activate");
+        write_register_u32(
+            &mut handler,
+            VirtioMmioRegister::Status.offset(),
+            VIRTIO_DEVICE_STATUS_INIT,
+        )
+        .expect("INIT status should reset activation state");
+
+        assert!(!handler.is_device_activated());
+        configure_handler_for_activation(&mut handler).expect("handler should reconfigure");
+        write_register_u32(
+            &mut handler,
+            VirtioMmioRegister::Status.offset(),
+            DRIVER_OK_STATUS,
+        )
+        .expect("second DRIVER_OK status should activate");
+
+        assert!(handler.is_device_activated());
+        assert_eq!(handler.activation_handler().attempts, 2);
+        assert_eq!(handler.activation_handler().activations.len(), 2);
+    }
+
+    #[test]
+    fn register_handler_activation_failure_requires_device_reset() {
+        let source = MmioHandlerError::new("activation failed");
+        let mut activation = TestDeviceActivation::new();
+        activation.error = Some(source.clone());
+        let mut handler = VirtioMmioRegisterHandler::with_activation(7, 0x2a, &[8], activation)
+            .expect("handler should build");
+        configure_handler_for_activation(&mut handler).expect("handler should be configurable");
+
+        let err = write_register_u32(
+            &mut handler,
+            VirtioMmioRegister::Status.offset(),
+            DRIVER_OK_STATUS,
+        )
+        .expect_err("activation failure should be reported");
+        assert_eq!(
+            err,
+            VirtioMmioRegisterHandlerError::DeviceActivation {
+                status: DRIVER_OK_STATUS | VIRTIO_DEVICE_STATUS_DEVICE_NEEDS_RESET,
+                source: VirtioMmioDeviceActivationError::Handler {
+                    source: source.clone(),
+                },
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "virtio-mmio device activation failed while status is 0x4f: virtio-mmio device activation handler failed: activation failed"
+        );
+        assert_eq!(
+            err.source().map(ToString::to_string),
+            Some("virtio-mmio device activation handler failed: activation failed".to_string())
+        );
+        assert_eq!(
+            err.source()
+                .and_then(std::error::Error::source)
+                .map(ToString::to_string),
+            Some(source.to_string())
+        );
+        assert_eq!(
+            handler.device_registers().status(),
+            DRIVER_OK_STATUS | VIRTIO_DEVICE_STATUS_DEVICE_NEEDS_RESET
+        );
+        assert!(!handler.is_device_activated());
+        assert_eq!(handler.activation_handler().attempts, 1);
+        assert!(handler.activation_handler().activations.is_empty());
+    }
+
+    #[test]
+    fn register_handler_default_activation_is_noop() {
+        let mut handler =
+            VirtioMmioRegisterHandler::new(7, 0x2a, &[8]).expect("handler should build");
+
+        advance_handler_to_driver_ok(&mut handler).expect("default activation should succeed");
+
+        assert!(handler.is_device_activated());
+        assert_eq!(handler.device_registers().status(), DRIVER_OK_STATUS);
     }
 
     #[test]
