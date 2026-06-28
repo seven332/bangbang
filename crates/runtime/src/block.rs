@@ -4441,9 +4441,42 @@ mod tests {
     }
 
     #[test]
+    fn block_device_notification_dispatch_empty_queue_has_no_interrupt() {
+        let mut memory = request_memory();
+        let file = temp_file("block-notify-empty-queue.img", &sector_payload(0x72));
+        let backing = open_backing(file.as_path(), true).expect("backing should open");
+        let mut handler = block_notification_handler(backing, &VIRTIO_BLOCK_QUEUE_SIZES);
+        configure_block_notification_handler_queue(&mut handler, 4, TEST_USED_RING);
+        activate_block_notification_handler(&mut handler);
+        handler
+            .write_register(VirtioMmioRegister::QueueNotify, 0)
+            .expect("queue notification should write");
+
+        let notification = handler
+            .dispatch_block_queue_notifications(&mut memory)
+            .expect("empty queue notification dispatch should succeed");
+
+        assert_eq!(notification.drained_notifications(), [0]);
+        let dispatch = notification
+            .queue_dispatch()
+            .expect("queue dispatch summary should be present");
+        assert_eq!(dispatch.processed_requests(), 0);
+        assert_eq!(dispatch.successful_requests(), 0);
+        assert!(!notification.needs_queue_interrupt());
+        assert!(!dispatch.needs_queue_interrupt());
+        assert!(handler.pending_queue_notifications().is_empty());
+        let active_queue = handler
+            .activation_handler()
+            .active_queue()
+            .expect("block queue should remain active");
+        assert_eq!(active_queue.available_ring().next_avail(), 0);
+        assert_eq!(active_queue.used_ring().next_used(), 0);
+    }
+
+    #[test]
     fn block_device_notification_dispatch_rejects_pending_notification_without_activation() {
         let mut memory = request_memory();
-        let file = temp_file("block-notify-inactive.img", &sector_payload(0x72));
+        let file = temp_file("block-notify-inactive.img", &sector_payload(0x73));
         let backing = open_backing(file.as_path(), true).expect("backing should open");
         let mut handler = block_notification_handler(backing, &VIRTIO_BLOCK_QUEUE_SIZES);
         handler
@@ -4482,7 +4515,7 @@ mod tests {
     #[test]
     fn block_device_notification_dispatch_executes_queued_request() {
         let mut memory = request_memory();
-        let payload = sector_payload(0x73);
+        let payload = sector_payload(0x74);
         let file = temp_file("block-notify-read.img", &payload);
         let backing = open_backing(file.as_path(), true).expect("backing should open");
         let mut handler = block_notification_handler(backing, &VIRTIO_BLOCK_QUEUE_SIZES);
@@ -4532,7 +4565,7 @@ mod tests {
     #[test]
     fn block_device_notification_dispatch_preserves_queue_dispatch_error() {
         let mut memory = request_memory();
-        let file = temp_file("block-notify-dispatch-error.img", &sector_payload(0x74));
+        let file = temp_file("block-notify-dispatch-error.img", &sector_payload(0x75));
         let backing = open_backing(file.as_path(), true).expect("backing should open");
         let mut handler = block_notification_handler(backing, &VIRTIO_BLOCK_QUEUE_SIZES);
         configure_block_notification_handler_queue(&mut handler, 4, TEST_USED_RING);
@@ -4569,7 +4602,7 @@ mod tests {
     #[test]
     fn block_device_notification_dispatch_reset_clears_active_queue_and_notification() {
         let mut memory = request_memory();
-        let file = temp_file("block-notify-reset.img", &sector_payload(0x75));
+        let file = temp_file("block-notify-reset.img", &sector_payload(0x76));
         let backing = open_backing(file.as_path(), true).expect("backing should open");
         let mut handler = block_notification_handler(backing, &VIRTIO_BLOCK_QUEUE_SIZES);
         configure_block_notification_handler_queue(&mut handler, 4, TEST_USED_RING);
@@ -4593,7 +4626,7 @@ mod tests {
     #[test]
     fn block_device_notification_dispatch_rejects_unsupported_queue_notification() {
         let mut memory = request_memory();
-        let file = temp_file("block-notify-unsupported-queue.img", &sector_payload(0x76));
+        let file = temp_file("block-notify-unsupported-queue.img", &sector_payload(0x77));
         let backing = open_backing(file.as_path(), true).expect("backing should open");
         let mut handler = block_notification_handler(backing, &[TEST_QUEUE_SIZE, TEST_QUEUE_SIZE]);
         configure_block_notification_handler_queue(&mut handler, 4, TEST_USED_RING);
@@ -4617,6 +4650,59 @@ mod tests {
             other => panic!("expected unsupported queue error, got {other:?}"),
         }
         assert!(handler.pending_queue_notifications().is_empty());
+        let active_queue = handler
+            .activation_handler()
+            .active_queue()
+            .expect("block queue should remain active");
+        assert_eq!(active_queue.available_ring().next_avail(), 0);
+        assert_eq!(active_queue.used_ring().next_used(), 0);
+    }
+
+    #[test]
+    fn block_device_notification_dispatch_rejects_mixed_unsupported_queue_without_dispatch() {
+        let mut memory = request_memory();
+        let payload = sector_payload(0x78);
+        let file = temp_file("block-notify-mixed-unsupported-queue.img", &payload);
+        let backing = open_backing(file.as_path(), true).expect("backing should open");
+        let mut handler = block_notification_handler(backing, &[TEST_QUEUE_SIZE, TEST_QUEUE_SIZE]);
+        configure_block_notification_handler_queue(&mut handler, 4, TEST_USED_RING);
+        activate_block_notification_handler(&mut handler);
+        write_queued_request(
+            &mut memory,
+            0,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            0,
+            HEADER_ADDR,
+            Some((DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as u32, true)),
+            STATUS_ADDR,
+        );
+        write_available_heads(&mut memory, &[0]);
+        handler
+            .write_register(VirtioMmioRegister::QueueNotify, 0)
+            .expect("queue zero notification should write");
+        handler
+            .write_register(VirtioMmioRegister::QueueNotify, 1)
+            .expect("queue one notification should write");
+
+        let error = handler
+            .dispatch_block_queue_notifications(&mut memory)
+            .expect_err("unsupported queue should prevent partial notification dispatch");
+
+        match error {
+            VirtioBlockDeviceNotificationError::UnsupportedQueue {
+                queue_index,
+                drained_notifications,
+            } => {
+                assert_eq!(queue_index, 1);
+                assert_eq!(drained_notifications, vec![0, 1]);
+            }
+            other => panic!("expected unsupported queue error, got {other:?}"),
+        }
+        assert!(handler.pending_queue_notifications().is_empty());
+        assert_ne!(
+            read_guest_bytes(&memory, DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as usize),
+            payload
+        );
         let active_queue = handler
             .activation_handler()
             .active_queue()
