@@ -761,7 +761,9 @@ mod tests {
             "path_on_host": "/tmp/rootfs.ext4",
             "is_root_device": true,
             "is_read_only": true,
-            "partuuid": "0eaa91a0-01"
+            "partuuid": "0eaa91a0-01",
+            "cache_type": "Unsafe",
+            "io_engine": "Sync"
         }"#;
         let request = format!(
             "PUT /drives/rootfs HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
@@ -791,6 +793,8 @@ mod tests {
         assert!(config.is_root_device());
         assert!(config.is_read_only());
         assert_eq!(config.partuuid(), Some("0eaa91a0-01"));
+        assert_eq!(config.cache_type(), DriveCacheType::Unsafe);
+        assert_eq!(config.io_engine(), DriveIoEngine::Sync);
     }
 
     #[test]
@@ -858,6 +862,76 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
         assert!(response.contains(r#"{"fault_message":"drive socket is not supported"}"#));
         assert!(!response.contains("/tmp/private-vhost.sock"));
+        assert!(vmm.drive_configs().is_empty());
+    }
+
+    #[test]
+    fn returns_fault_for_unsupported_drive_cache_without_storing() {
+        let path = unique_socket_path("drive-cache");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+        let body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "/tmp/rootfs.ext4",
+            "is_root_device": true,
+            "cache_type": "Writeback"
+        }"#;
+        let request = format!(
+            "PUT /drives/rootfs HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        client
+            .write_all(request.as_bytes())
+            .expect("client should write request");
+        let mut vmm = test_controller();
+        server
+            .serve_next(&mut vmm)
+            .expect("server should handle one request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("client should read response");
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(
+            response.contains(r#"{"fault_message":"drive cache_type Writeback is not supported"}"#)
+        );
+        assert!(vmm.drive_configs().is_empty());
+    }
+
+    #[test]
+    fn returns_fault_for_unsupported_drive_io_engine_without_storing() {
+        let path = unique_socket_path("drive-io");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+        let body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "/tmp/rootfs.ext4",
+            "is_root_device": true,
+            "io_engine": "Async"
+        }"#;
+        let request = format!(
+            "PUT /drives/rootfs HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        client
+            .write_all(request.as_bytes())
+            .expect("client should write request");
+        let mut vmm = test_controller();
+        server
+            .serve_next(&mut vmm)
+            .expect("server should handle one request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("client should read response");
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.contains(r#"{"fault_message":"drive io_engine Async is not supported"}"#));
         assert!(vmm.drive_configs().is_empty());
     }
 
