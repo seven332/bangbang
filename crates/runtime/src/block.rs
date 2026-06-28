@@ -2078,6 +2078,122 @@ impl VirtioBlockDevice {
     }
 }
 
+#[derive(Debug)]
+pub struct PreparedBlockDevice {
+    drive_id: String,
+    config_space: VirtioBlockConfigSpace,
+    device: VirtioBlockDevice,
+}
+
+impl PreparedBlockDevice {
+    fn from_config(config: &DriveConfig) -> Result<Self, PreparedBlockDeviceError> {
+        let backing = BlockFileBacking::open(config).map_err(|source| {
+            PreparedBlockDeviceError::OpenBacking {
+                drive_id: config.drive_id().to_string(),
+                source,
+            }
+        })?;
+        let config_space = VirtioBlockConfigSpace::from_backing(&backing);
+        let device_id = VirtioBlockDeviceId::from_bytes(config.drive_id().as_bytes());
+        let device = VirtioBlockDevice::new(backing, device_id);
+
+        Ok(Self {
+            drive_id: config.drive_id().to_string(),
+            config_space,
+            device,
+        })
+    }
+
+    pub fn drive_id(&self) -> &str {
+        &self.drive_id
+    }
+
+    pub const fn config_space(&self) -> VirtioBlockConfigSpace {
+        self.config_space
+    }
+
+    pub fn device(&self) -> &VirtioBlockDevice {
+        &self.device
+    }
+
+    pub fn device_mut(&mut self) -> &mut VirtioBlockDevice {
+        &mut self.device
+    }
+
+    pub fn into_parts(self) -> (String, VirtioBlockConfigSpace, VirtioBlockDevice) {
+        (self.drive_id, self.config_space, self.device)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct PreparedBlockDevices {
+    devices: Vec<PreparedBlockDevice>,
+}
+
+impl PreparedBlockDevices {
+    pub fn from_configs(configs: &DriveConfigs) -> Result<Self, PreparedBlockDeviceError> {
+        let mut devices = Vec::new();
+        devices
+            .try_reserve_exact(configs.as_slice().len())
+            .map_err(|source| PreparedBlockDeviceError::AllocateDevices { source })?;
+
+        for config in configs.as_slice() {
+            devices.push(PreparedBlockDevice::from_config(config)?);
+        }
+
+        Ok(Self { devices })
+    }
+
+    pub fn as_slice(&self) -> &[PreparedBlockDevice] {
+        &self.devices
+    }
+
+    pub fn len(&self) -> usize {
+        self.devices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.devices.is_empty()
+    }
+
+    pub fn into_vec(self) -> Vec<PreparedBlockDevice> {
+        self.devices
+    }
+}
+
+#[derive(Debug)]
+pub enum PreparedBlockDeviceError {
+    AllocateDevices {
+        source: TryReserveError,
+    },
+    OpenBacking {
+        drive_id: String,
+        source: BlockFileBackingError,
+    },
+}
+
+impl fmt::Display for PreparedBlockDeviceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AllocateDevices { source } => {
+                write!(f, "failed to allocate prepared block devices: {source}")
+            }
+            Self::OpenBacking { drive_id, source } => {
+                write!(f, "failed to prepare block device {drive_id}: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PreparedBlockDeviceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AllocateDevices { source } => Some(source),
+            Self::OpenBacking { source, .. } => Some(source),
+        }
+    }
+}
+
 impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioBlockDevice> {
     pub fn dispatch_block_queue_notifications(
         &mut self,
@@ -2322,10 +2438,10 @@ mod tests {
 
     use super::{
         BlockFileBacking, BlockFileBackingError, DriveCacheType, DriveConfig, DriveConfigError,
-        DriveConfigInput, DriveConfigs, DriveIdSource, DriveIoEngine,
-        VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE, VIRTIO_BLOCK_DEVICE_ID, VIRTIO_BLOCK_FEATURE_READ_ONLY,
-        VIRTIO_BLOCK_ID_BYTES, VIRTIO_BLOCK_QUEUE_COUNT, VIRTIO_BLOCK_QUEUE_SIZE,
-        VIRTIO_BLOCK_QUEUE_SIZES, VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
+        DriveConfigInput, DriveConfigs, DriveIdSource, DriveIoEngine, PreparedBlockDeviceError,
+        PreparedBlockDevices, VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE, VIRTIO_BLOCK_DEVICE_ID,
+        VIRTIO_BLOCK_FEATURE_READ_ONLY, VIRTIO_BLOCK_ID_BYTES, VIRTIO_BLOCK_QUEUE_COUNT,
+        VIRTIO_BLOCK_QUEUE_SIZE, VIRTIO_BLOCK_QUEUE_SIZES, VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
         VIRTIO_BLOCK_REQUEST_TYPE_FLUSH, VIRTIO_BLOCK_REQUEST_TYPE_GET_ID,
         VIRTIO_BLOCK_REQUEST_TYPE_IN, VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT,
         VIRTIO_BLOCK_SECTOR_SIZE, VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK,
@@ -2470,7 +2586,16 @@ mod tests {
     }
 
     fn config_for_path(path: impl Into<PathBuf>, is_read_only: bool) -> DriveConfig {
-        DriveConfigInput::new("rootfs", "rootfs", path, false)
+        config_for_drive("rootfs", path, false, is_read_only)
+    }
+
+    fn config_for_drive(
+        drive_id: &str,
+        path: impl Into<PathBuf>,
+        is_root_device: bool,
+        is_read_only: bool,
+    ) -> DriveConfig {
+        DriveConfigInput::new(drive_id, drive_id, path, is_root_device)
             .with_is_read_only(is_read_only)
             .validate()
             .expect("drive config should validate")
@@ -3286,6 +3411,219 @@ mod tests {
         assert_eq!(err, DriveConfigError::EmptyPathOnHost);
         assert_eq!(configs.as_slice().len(), 1);
         assert_eq!(configs.as_slice()[0].drive_id(), "rootfs");
+    }
+
+    #[test]
+    fn prepared_block_devices_accept_empty_configs() {
+        let configs = DriveConfigs::new();
+
+        let prepared =
+            PreparedBlockDevices::from_configs(&configs).expect("empty configs should prepare");
+
+        assert!(prepared.is_empty());
+        assert_eq!(prepared.len(), 0);
+        assert!(prepared.into_vec().is_empty());
+    }
+
+    #[test]
+    fn prepares_read_only_block_device() {
+        let file = temp_file("prepared-ro.img", &[0; 1024]);
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(
+                DriveConfigInput::new("rootfs", "rootfs", file.as_path(), true)
+                    .with_is_read_only(true),
+            )
+            .expect("root drive config should insert");
+
+        let prepared = PreparedBlockDevices::from_configs(&configs)
+            .expect("read-only block device should prepare");
+
+        assert_eq!(prepared.len(), 1);
+        let device = &prepared.as_slice()[0];
+        assert_eq!(device.drive_id(), "rootfs");
+        assert_eq!(device.config_space().capacity_sectors(), 2);
+        assert!(device.config_space().is_read_only());
+        assert_eq!(
+            device.device().device_id(),
+            VirtioBlockDeviceId::from_bytes(b"rootfs")
+        );
+        assert_eq!(device.device().backing().len(), 1024);
+        assert!(device.device().backing().is_read_only());
+        assert!(matches!(
+            device.device().backing().write_at(0, b"x"),
+            Err(BlockFileBackingError::ReadOnlyWrite),
+        ));
+        assert!(!device.device().is_activated());
+    }
+
+    #[test]
+    fn prepares_read_write_block_device() {
+        let file = temp_file("prepared-rw.img", b"abc");
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new("data", "data", file.as_path(), false))
+            .expect("data drive config should insert");
+
+        let prepared = PreparedBlockDevices::from_configs(&configs)
+            .expect("read-write block device should prepare");
+
+        let device = &prepared.as_slice()[0];
+        assert_eq!(device.drive_id(), "data");
+        assert!(!device.config_space().is_read_only());
+        assert!(!device.device().backing().is_read_only());
+        device
+            .device()
+            .backing()
+            .write_at(1, b"Z")
+            .expect("read-write prepared backing should write");
+        assert_eq!(fs::read(file.as_path()).expect("file should read"), b"aZc");
+    }
+
+    #[test]
+    fn prepared_block_devices_preserve_drive_config_order() {
+        let root_file = temp_file("prepared-root.img", &[0; 512]);
+        let data_file = temp_file("prepared-data.img", &[0; 512]);
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new(
+                "data",
+                "data",
+                data_file.as_path(),
+                false,
+            ))
+            .expect("data drive config should insert");
+        configs
+            .insert(DriveConfigInput::new(
+                "rootfs",
+                "rootfs",
+                root_file.as_path(),
+                true,
+            ))
+            .expect("root drive config should insert");
+
+        let prepared = PreparedBlockDevices::from_configs(&configs)
+            .expect("ordered block devices should prepare");
+
+        assert_eq!(prepared.as_slice()[0].drive_id(), "rootfs");
+        assert_eq!(prepared.as_slice()[1].drive_id(), "data");
+    }
+
+    #[test]
+    fn prepared_block_devices_derive_device_id_from_drive_id() {
+        let short_file = temp_file("prepared-short-id.img", &[0; 512]);
+        let long_file = temp_file("prepared-long-id.img", &[0; 512]);
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new(
+                "id",
+                "id",
+                short_file.as_path(),
+                false,
+            ))
+            .expect("short drive config should insert");
+        configs
+            .insert(DriveConfigInput::new(
+                "01234567890123456789extra",
+                "01234567890123456789extra",
+                long_file.as_path(),
+                false,
+            ))
+            .expect("long drive config should insert");
+
+        let prepared =
+            PreparedBlockDevices::from_configs(&configs).expect("block devices should prepare");
+
+        let short_id = prepared.as_slice()[0].device().device_id();
+        let mut expected_short = [0; VIRTIO_BLOCK_ID_BYTES as usize];
+        expected_short[0] = b'i';
+        expected_short[1] = b'd';
+        assert_eq!(short_id.as_bytes(), &expected_short);
+        assert_eq!(
+            prepared.as_slice()[1].device().device_id().as_bytes(),
+            b"01234567890123456789",
+        );
+    }
+
+    #[test]
+    fn prepared_block_devices_reject_missing_backing_without_path_leak() {
+        let path = missing_path("secret-prepared-missing.img");
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new("rootfs", "rootfs", &path, false))
+            .expect("missing path is still a valid stored config");
+
+        let err = PreparedBlockDevices::from_configs(&configs)
+            .expect_err("missing backing should fail preparation");
+
+        match &err {
+            PreparedBlockDeviceError::OpenBacking { drive_id, source } => {
+                assert_eq!(drive_id, "rootfs");
+                assert!(matches!(source, BlockFileBackingError::OpenFile { .. }));
+            }
+            PreparedBlockDeviceError::AllocateDevices { .. } => {
+                panic!("missing path should not fail allocation")
+            }
+        }
+        assert!(err.source().is_some());
+        assert!(!err.to_string().contains("secret-prepared-missing"));
+    }
+
+    #[test]
+    fn prepared_block_devices_reject_directory_without_path_leak() {
+        let dir = temp_dir("secret-prepared-dir.img");
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new(
+                "rootfs",
+                "rootfs",
+                dir.as_path(),
+                false,
+            ))
+            .expect("directory path is still a valid stored config");
+
+        let err = PreparedBlockDevices::from_configs(&configs)
+            .expect_err("directory backing should fail preparation");
+
+        match &err {
+            PreparedBlockDeviceError::OpenBacking { drive_id, source } => {
+                assert_eq!(drive_id, "rootfs");
+                assert!(matches!(
+                    source,
+                    BlockFileBackingError::OpenFile { .. } | BlockFileBackingError::NonRegularFile
+                ));
+            }
+            PreparedBlockDeviceError::AllocateDevices { .. } => {
+                panic!("directory should not fail allocation")
+            }
+        }
+        assert!(!err.to_string().contains("secret-prepared-dir"));
+    }
+
+    #[test]
+    fn prepared_block_devices_fail_without_mutating_drive_configs() {
+        let file = temp_file("prepared-valid.img", &[0; 512]);
+        let missing = missing_path("secret-prepared-partial.img");
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new(
+                "rootfs",
+                "rootfs",
+                file.as_path(),
+                true,
+            ))
+            .expect("valid config should insert");
+        configs
+            .insert(DriveConfigInput::new("data", "data", &missing, false))
+            .expect("missing path is still a valid stored config");
+
+        let err = PreparedBlockDevices::from_configs(&configs)
+            .expect_err("missing second backing should fail preparation");
+
+        assert!(matches!(err, PreparedBlockDeviceError::OpenBacking { .. }));
+        assert_eq!(configs.as_slice().len(), 2);
+        assert_eq!(configs.as_slice()[0].drive_id(), "rootfs");
+        assert_eq!(configs.as_slice()[1].drive_id(), "data");
     }
 
     #[test]
