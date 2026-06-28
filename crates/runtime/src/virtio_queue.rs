@@ -767,6 +767,19 @@ mod tests {
     }
 
     #[test]
+    fn accepts_descriptor_table_ending_at_memory_boundary() {
+        let mut memory = guest_memory(0x4000);
+        let table = GuestAddress::new(0x3ff0);
+        write_descriptor(&mut memory, table, 0, 0x2000, 0x20, 0, 0);
+
+        let chain = read_descriptor_chain(&memory, table, 1, 0)
+            .expect("descriptor table ending at memory boundary should read");
+
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain.descriptors()[0].address(), GuestAddress::new(0x2000));
+    }
+
+    #[test]
     fn rejects_unsupported_indirect_descriptor() {
         let mut memory = guest_memory(0x4000);
         write_descriptor(
