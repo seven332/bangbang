@@ -20,7 +20,7 @@ pub use gic::{
     HvfGicRegion, HvfGicTimerInterrupts,
 };
 pub use memory::{HvfGuestMemoryMappingError, HvfGuestMemoryUnmapFailure, HvfMemoryPermissions};
-pub use mmio::HvfMmioCompletionError;
+pub use mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
 pub use runner::{HvfVcpuRunner, HvfVcpuRunnerError};
 pub use vcpu::{
     ARM64_LINUX_BOOT_CPSR, HvfArm64BootRegisters, HvfRegister, HvfSystemRegister, HvfVcpu,
