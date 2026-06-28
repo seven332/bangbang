@@ -11,7 +11,8 @@ mod vcpu;
 pub use backend::HvfBackend;
 pub use exit::{
     HvfExceptionExit, HvfMmioAccess, HvfMmioAccessSize, HvfMmioDecodeError, HvfMmioDirection,
-    HvfMmioRegister, HvfMmioRegisterWidth, HvfMmioResolveError, HvfResolvedMmioAccess, HvfVcpuExit,
+    HvfMmioRegister, HvfMmioRegisterWidth, HvfMmioResolveError, HvfResolvedMmioAccess,
+    HvfResolvedVcpuExit, HvfVcpuExit, HvfVcpuExitResolveError,
 };
 pub use gic::{
     HvfGicError, HvfGicInterruptRange, HvfGicMetadata, HvfGicMsiMetadata, HvfGicRedistributor,

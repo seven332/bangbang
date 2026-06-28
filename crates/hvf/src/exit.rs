@@ -341,6 +341,26 @@ pub enum HvfVcpuExit {
 }
 
 impl HvfVcpuExit {
+    pub fn resolve_with_mmio_bus(
+        self,
+        bus: &MmioBus,
+    ) -> Result<HvfResolvedVcpuExit, HvfVcpuExitResolveError> {
+        match self {
+            Self::Canceled => Ok(HvfResolvedVcpuExit::Canceled),
+            Self::Exception(exit) => {
+                let access = exit
+                    .decode_mmio_access()
+                    .map_err(|source| HvfVcpuExitResolveError::MmioDecode { exit, source })?;
+                let access = access
+                    .resolve(bus)
+                    .map_err(|source| HvfVcpuExitResolveError::MmioResolve { source })?;
+                Ok(HvfResolvedVcpuExit::Mmio(access))
+            }
+            Self::VtimerActivated => Ok(HvfResolvedVcpuExit::VtimerActivated),
+            Self::Unknown { reason } => Ok(HvfResolvedVcpuExit::Unknown { reason }),
+        }
+    }
+
     pub(crate) fn from_raw(exit: crate::ffi::HvVcpuExit) -> Self {
         match exit.reason {
             crate::ffi::HV_EXIT_REASON_CANCELED => Self::Canceled,
@@ -358,6 +378,50 @@ impl HvfVcpuExit {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfResolvedVcpuExit {
+    Canceled,
+    Mmio(HvfResolvedMmioAccess),
+    VtimerActivated,
+    Unknown { reason: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfVcpuExitResolveError {
+    MmioDecode {
+        exit: HvfExceptionExit,
+        source: HvfMmioDecodeError,
+    },
+    MmioResolve {
+        source: HvfMmioResolveError,
+    },
+}
+
+impl fmt::Display for HvfVcpuExitResolveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MmioDecode { source, .. } => {
+                write!(
+                    f,
+                    "failed to decode HVF vCPU exception exit as MMIO: {source}"
+                )
+            }
+            Self::MmioResolve { source } => {
+                write!(f, "failed to resolve HVF vCPU MMIO exit: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HvfVcpuExitResolveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MmioDecode { source, .. } => Some(source),
+            Self::MmioResolve { source } => Some(source),
+        }
+    }
+}
+
 fn exception_class(syndrome: u64) -> u8 {
     ((syndrome >> ESR_EC_SHIFT) & ESR_EC_MASK) as u8
 }
@@ -370,7 +434,8 @@ mod tests {
         ESR_EC_DATA_ABORT_LOWER_EL, ESR_EC_SHIFT, ESR_ISS_CM, ESR_ISS_ISV, ESR_ISS_S1PTW,
         ESR_ISS_SAS_SHIFT, ESR_ISS_SF, ESR_ISS_SRT_SHIFT, ESR_ISS_SSE, ESR_ISS_WNR,
         HvfExceptionExit, HvfMmioAccessSize, HvfMmioDecodeError, HvfMmioDirection, HvfMmioRegister,
-        HvfMmioRegisterWidth, HvfMmioResolveError, HvfVcpuExit,
+        HvfMmioRegisterWidth, HvfMmioResolveError, HvfResolvedVcpuExit, HvfVcpuExit,
+        HvfVcpuExitResolveError,
     };
     use bangbang_runtime::{
         memory::{GuestAddress, GuestMemoryError, GuestMemoryRange},
@@ -658,6 +723,158 @@ mod tests {
         assert_eq!(resolved.register(), register);
         assert!(!resolved.sign_extend());
         assert_eq!(resolved.register_width(), HvfMmioRegisterWidth::Bits32);
+    }
+
+    #[test]
+    fn resolves_vcpu_mmio_read_exit_against_runtime_bus() {
+        let mut bus = MmioBus::new();
+        insert_region(&mut bus, 11, 0x4000, 0x100);
+        let register = HvfMmioRegister::new(7).expect("register should be valid");
+        let resolved = HvfVcpuExit::Exception(exception_exit(
+            data_abort_syndrome(
+                HvfMmioAccessSize::Doubleword,
+                HvfMmioDirection::Read,
+                register,
+            ) | ESR_ISS_SF,
+            0x4040,
+        ))
+        .resolve_with_mmio_bus(&bus)
+        .expect("vCPU MMIO read exit should resolve");
+
+        let HvfResolvedVcpuExit::Mmio(access) = resolved else {
+            panic!("expected resolved MMIO exit, got {resolved:?}");
+        };
+        assert_eq!(access.region_id(), region_id(11));
+        assert_eq!(access.offset(), 0x40);
+        assert_eq!(access.range(), range(0x4040, 8));
+        assert_eq!(access.direction(), HvfMmioDirection::Read);
+        assert_eq!(access.size(), HvfMmioAccessSize::Doubleword);
+        assert_eq!(access.register(), register);
+        assert_eq!(access.register_width(), HvfMmioRegisterWidth::Bits64);
+    }
+
+    #[test]
+    fn resolves_vcpu_mmio_write_exit_against_runtime_bus() {
+        let mut bus = MmioBus::new();
+        insert_region(&mut bus, 12, 0x5000, 0x100);
+        let register = HvfMmioRegister::new(8).expect("register should be valid");
+        let resolved = HvfVcpuExit::Exception(exception_exit(
+            data_abort_syndrome(HvfMmioAccessSize::Word, HvfMmioDirection::Write, register),
+            0x5080,
+        ))
+        .resolve_with_mmio_bus(&bus)
+        .expect("vCPU MMIO write exit should resolve");
+
+        let HvfResolvedVcpuExit::Mmio(access) = resolved else {
+            panic!("expected resolved MMIO exit, got {resolved:?}");
+        };
+        assert_eq!(access.region_id(), region_id(12));
+        assert_eq!(access.offset(), 0x80);
+        assert_eq!(access.range(), range(0x5080, 4));
+        assert_eq!(access.direction(), HvfMmioDirection::Write);
+        assert_eq!(access.size(), HvfMmioAccessSize::Word);
+        assert_eq!(access.register(), register);
+    }
+
+    #[test]
+    fn resolves_non_mmio_vcpu_exits_without_bus_lookup() {
+        let bus = MmioBus::new();
+
+        assert_eq!(
+            HvfVcpuExit::Canceled.resolve_with_mmio_bus(&bus),
+            Ok(HvfResolvedVcpuExit::Canceled)
+        );
+        assert_eq!(
+            HvfVcpuExit::VtimerActivated.resolve_with_mmio_bus(&bus),
+            Ok(HvfResolvedVcpuExit::VtimerActivated)
+        );
+        assert_eq!(
+            HvfVcpuExit::Unknown { reason: 99 }.resolve_with_mmio_bus(&bus),
+            Ok(HvfResolvedVcpuExit::Unknown { reason: 99 })
+        );
+    }
+
+    #[test]
+    fn rejects_vcpu_exception_exit_when_mmio_decode_fails() {
+        let bus = MmioBus::new();
+        let exit = exception_exit(ESR_ISS_ISV, 0x1000);
+        let err = HvfVcpuExit::Exception(exit)
+            .resolve_with_mmio_bus(&bus)
+            .expect_err("unsupported exception should not resolve");
+
+        assert_eq!(
+            err,
+            HvfVcpuExitResolveError::MmioDecode {
+                exit,
+                source: HvfMmioDecodeError::UnsupportedExceptionClass { exception_class: 0 }
+            }
+        );
+        assert_eq!(
+            err.source().and_then(|source| source.downcast_ref()),
+            Some(&HvfMmioDecodeError::UnsupportedExceptionClass { exception_class: 0 })
+        );
+    }
+
+    #[test]
+    fn rejects_vcpu_mmio_exit_when_runtime_bus_resolution_fails() {
+        let bus = MmioBus::new();
+        let register = HvfMmioRegister::new(1).expect("register should be valid");
+        let syndrome =
+            data_abort_syndrome(HvfMmioAccessSize::Word, HvfMmioDirection::Read, register);
+        let exit = exception_exit(syndrome, 0x6000);
+        let access = exit.decode_mmio_access().expect("access should decode");
+        let err = HvfVcpuExit::Exception(exit)
+            .resolve_with_mmio_bus(&bus)
+            .expect_err("unowned MMIO exit should not resolve");
+        let source = HvfMmioResolveError::BusLookup {
+            access,
+            source: MmioBusError::UnownedAccess {
+                range: range(0x6000, 4),
+            },
+        };
+
+        assert_eq!(err, HvfVcpuExitResolveError::MmioResolve { source });
+        assert_eq!(
+            err.source().and_then(|source| source.downcast_ref()),
+            Some(&source)
+        );
+    }
+
+    #[test]
+    fn displays_vcpu_exit_resolution_errors() {
+        let err = HvfVcpuExitResolveError::MmioDecode {
+            exit: exception_exit(ESR_ISS_ISV, 0x1000),
+            source: HvfMmioDecodeError::UnsupportedExceptionClass { exception_class: 0 },
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "failed to decode HVF vCPU exception exit as MMIO: unsupported HVF exception class 0x0 for MMIO decode"
+        );
+
+        let access = exception_exit(
+            data_abort_syndrome(
+                HvfMmioAccessSize::Word,
+                HvfMmioDirection::Read,
+                HvfMmioRegister::new(1).expect("register should be valid"),
+            ),
+            0x7000,
+        )
+        .decode_mmio_access()
+        .expect("access should decode");
+        let err = HvfVcpuExitResolveError::MmioResolve {
+            source: HvfMmioResolveError::BusLookup {
+                access,
+                source: MmioBusError::UnownedAccess {
+                    range: range(0x7000, 4),
+                },
+            },
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "failed to resolve HVF vCPU MMIO exit: failed to resolve HVF MMIO access at 0x7000 with size 4: MMIO access range [0x7000..0x7004) (4 bytes) is not owned by any region"
+        );
     }
 
     #[test]
