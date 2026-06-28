@@ -1190,6 +1190,22 @@ impl VirtioMmioRegisterHandler {
         &self.queue_notifications
     }
 
+    pub fn is_queue_notification_pending(
+        &self,
+        queue_index: u32,
+    ) -> Result<bool, VirtioMmioQueueNotificationError> {
+        self.queue_notifications
+            .is_queue_notification_pending(queue_index)
+    }
+
+    pub fn pending_queue_notifications(&self) -> Vec<usize> {
+        self.queue_notifications.pending_queue_notifications()
+    }
+
+    pub fn take_pending_queue_notifications(&mut self) -> Vec<usize> {
+        self.queue_notifications.take_pending_queue_notifications()
+    }
+
     pub const fn interrupt_registers(&self) -> &VirtioMmioInterruptRegisters {
         &self.interrupts
     }
@@ -3502,6 +3518,39 @@ mod tests {
     }
 
     #[test]
+    fn register_handler_drains_queue_notifications() {
+        let mut handler =
+            VirtioMmioRegisterHandler::new(7, 0x2a, &[8, 16]).expect("handler should build");
+        advance_handler_to_driver_ok(&mut handler).expect("handler should reach DRIVER_OK");
+
+        assert_eq!(handler.is_queue_notification_pending(1), Ok(false));
+        assert!(handler.pending_queue_notifications().is_empty());
+
+        write_register_u32(&mut handler, VirtioMmioRegister::QueueNotify.offset(), 1)
+            .expect("queue notify should write");
+
+        assert_eq!(handler.is_queue_notification_pending(1), Ok(true));
+        assert_eq!(handler.pending_queue_notifications(), vec![1]);
+        assert_eq!(handler.take_pending_queue_notifications(), vec![1]);
+        assert_eq!(handler.is_queue_notification_pending(1), Ok(false));
+        assert!(handler.take_pending_queue_notifications().is_empty());
+    }
+
+    #[test]
+    fn register_handler_queue_notification_drain_rejects_invalid_queue_index() {
+        let handler =
+            VirtioMmioRegisterHandler::new(7, 0x2a, &[8, 16]).expect("handler should build");
+
+        assert_eq!(
+            handler.is_queue_notification_pending(2),
+            Err(VirtioMmioQueueNotificationError::InvalidQueueIndex {
+                queue_index: 2,
+                queue_count: 2,
+            })
+        );
+    }
+
+    #[test]
     fn register_handler_status_reset_clears_composed_substates() {
         let mut handler =
             VirtioMmioRegisterHandler::new(7, 0x2a, &[8]).expect("handler should build");
@@ -3537,13 +3586,22 @@ mod tests {
             .expect("selected queue should exist after reset");
         assert_eq!(queue.size(), 0);
         assert!(!queue.ready());
-        assert!(
-            handler
-                .queue_notification_registers()
-                .pending_queue_notifications()
-                .is_empty()
-        );
+        assert!(handler.pending_queue_notifications().is_empty());
         assert!(handler.interrupt_registers().pending_status().is_empty());
+    }
+
+    #[test]
+    fn register_handler_explicit_reset_clears_pending_queue_notifications() {
+        let mut handler =
+            VirtioMmioRegisterHandler::new(7, 0x2a, &[8]).expect("handler should build");
+        advance_handler_to_driver_ok(&mut handler).expect("handler should reach DRIVER_OK");
+        write_register_u32(&mut handler, VirtioMmioRegister::QueueNotify.offset(), 0)
+            .expect("queue notify should write");
+
+        handler.reset();
+
+        assert!(handler.pending_queue_notifications().is_empty());
+        assert_eq!(handler.is_queue_notification_pending(0), Ok(false));
     }
 
     #[test]
