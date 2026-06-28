@@ -4293,18 +4293,27 @@ mod tests {
 
     #[test]
     fn block_mmio_devices_reject_overlapping_address_stride() {
-        let file = temp_file("block-mmio-overlap.img", &[0; 512]);
+        let root_file = temp_file("block-mmio-overlap-root.img", &[0; 512]);
+        let data_file = temp_file("block-mmio-overlap-data.img", &[0; 512]);
         let mut configs = DriveConfigs::new();
         configs
             .insert(DriveConfigInput::new(
                 "rootfs",
                 "rootfs",
-                file.as_path(),
+                root_file.as_path(),
                 true,
             ))
             .expect("root drive config should insert");
+        configs
+            .insert(DriveConfigInput::new(
+                "data",
+                "data",
+                data_file.as_path(),
+                false,
+            ))
+            .expect("data drive config should insert");
         let prepared =
-            PreparedBlockDevices::from_configs(&configs).expect("block device should prepare");
+            PreparedBlockDevices::from_configs(&configs).expect("block devices should prepare");
 
         let err = prepared
             .register_mmio(
@@ -4321,18 +4330,27 @@ mod tests {
 
     #[test]
     fn block_mmio_devices_reject_duplicate_region_id_stride() {
-        let file = temp_file("block-mmio-duplicate-id.img", &[0; 512]);
+        let root_file = temp_file("block-mmio-duplicate-id-root.img", &[0; 512]);
+        let data_file = temp_file("block-mmio-duplicate-id-data.img", &[0; 512]);
         let mut configs = DriveConfigs::new();
         configs
             .insert(DriveConfigInput::new(
                 "rootfs",
                 "rootfs",
-                file.as_path(),
+                root_file.as_path(),
                 true,
             ))
             .expect("root drive config should insert");
+        configs
+            .insert(DriveConfigInput::new(
+                "data",
+                "data",
+                data_file.as_path(),
+                false,
+            ))
+            .expect("data drive config should insert");
         let prepared =
-            PreparedBlockDevices::from_configs(&configs).expect("block device should prepare");
+            PreparedBlockDevices::from_configs(&configs).expect("block devices should prepare");
 
         let err = prepared
             .register_mmio(
