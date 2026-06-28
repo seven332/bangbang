@@ -602,12 +602,14 @@ impl VirtioBlockRequest {
     ) -> VirtioBlockRequestExecution {
         let (status_code, bytes_written_to_guest, outcome) =
             match self.execute_side_effects(memory, backing, device_id) {
-                Ok(bytes_written_to_guest) => (
+                Ok(VirtioBlockRequestSideEffect::Completed {
+                    bytes_written_to_guest,
+                }) => (
                     VIRTIO_BLOCK_STATUS_OK,
                     bytes_written_to_guest,
                     VirtioBlockRequestExecutionOutcome::Ok,
                 ),
-                Err(VirtioBlockRequestExecutionError::UnsupportedRequest { request_type }) => (
+                Ok(VirtioBlockRequestSideEffect::Unsupported { request_type }) => (
                     VIRTIO_BLOCK_STATUS_UNSUPPORTED,
                     0,
                     VirtioBlockRequestExecutionOutcome::Unsupported { request_type },
@@ -627,14 +629,22 @@ impl VirtioBlockRequest {
         memory: &mut GuestMemory,
         backing: &BlockFileBacking,
         device_id: VirtioBlockDeviceId,
-    ) -> Result<u32, VirtioBlockRequestExecutionError> {
+    ) -> Result<VirtioBlockRequestSideEffect, VirtioBlockRequestExecutionError> {
         match self.request_type {
-            VirtioBlockRequestType::In => self.execute_in(memory, backing),
-            VirtioBlockRequestType::Out => self.execute_out(memory, backing),
-            VirtioBlockRequestType::Flush => self.execute_flush(backing),
-            VirtioBlockRequestType::GetDeviceId => self.execute_get_device_id(memory, device_id),
+            VirtioBlockRequestType::In => Ok(VirtioBlockRequestSideEffect::Completed {
+                bytes_written_to_guest: self.execute_in(memory, backing)?,
+            }),
+            VirtioBlockRequestType::Out => Ok(VirtioBlockRequestSideEffect::Completed {
+                bytes_written_to_guest: self.execute_out(memory, backing)?,
+            }),
+            VirtioBlockRequestType::Flush => Ok(VirtioBlockRequestSideEffect::Completed {
+                bytes_written_to_guest: self.execute_flush(backing)?,
+            }),
+            VirtioBlockRequestType::GetDeviceId => Ok(VirtioBlockRequestSideEffect::Completed {
+                bytes_written_to_guest: self.execute_get_device_id(memory, device_id)?,
+            }),
             VirtioBlockRequestType::Unsupported(request_type) => {
-                Err(VirtioBlockRequestExecutionError::UnsupportedRequest { request_type })
+                Ok(VirtioBlockRequestSideEffect::Unsupported { request_type })
             }
         }
     }
@@ -770,6 +780,12 @@ impl VirtioBlockRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VirtioBlockRequestSideEffect {
+    Completed { bytes_written_to_guest: u32 },
+    Unsupported { request_type: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtioBlockDeviceId {
     bytes: [u8; VIRTIO_BLOCK_ID_BYTES as usize],
 }
@@ -902,9 +918,6 @@ pub enum VirtioBlockRequestExecutionError {
         request_type: VirtioBlockRequestType,
         source: BlockFileBackingError,
     },
-    UnsupportedRequest {
-        request_type: u32,
-    },
 }
 
 impl fmt::Display for VirtioBlockRequestExecutionError {
@@ -962,9 +975,6 @@ impl fmt::Display for VirtioBlockRequestExecutionError {
                     "failed to access block backing for virtio-block {request_type} request: {source}"
                 )
             }
-            Self::UnsupportedRequest { request_type } => {
-                write!(f, "unsupported virtio-block request type {request_type}")
-            }
         }
     }
 }
@@ -979,8 +989,7 @@ impl std::error::Error for VirtioBlockRequestExecutionError {
             Self::Backing { source, .. } => Some(source),
             Self::MissingDataDescriptor { .. }
             | Self::SectorOffsetOverflow { .. }
-            | Self::DataLengthTooLarge { .. }
-            | Self::UnsupportedRequest { .. } => None,
+            | Self::DataLengthTooLarge { .. } => None,
         }
     }
 }
