@@ -3754,6 +3754,69 @@ mod tests {
     }
 
     #[test]
+    fn block_queue_from_mmio_queue_state_wraps_used_ring_error() {
+        let mut queues =
+            VirtioMmioQueueRegisters::new(&[TEST_QUEUE_SIZE]).expect("queue table should build");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueNum,
+                u32::from(TEST_QUEUE_SIZE),
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("queue size should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDescLow,
+                guest_address_low(TEST_DESCRIPTOR_TABLE),
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("queue descriptor table should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDriverLow,
+                guest_address_low(TEST_AVAILABLE_RING),
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("queue driver ring should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDeviceLow,
+                u32::MAX - 3,
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("queue device ring low should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDeviceHigh,
+                u32::MAX,
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("queue device ring high should write");
+        queues
+            .write_register(VirtioMmioRegister::QueueReady, 1, QUEUE_CONFIG_STATUS)
+            .expect("queue ready should write");
+
+        let error = VirtioBlockQueue::from_mmio_queue_state(
+            queues.queue(0).expect("queue state should exist"),
+        )
+        .expect_err("overflowing used ring should not build");
+
+        match error {
+            VirtioBlockQueueBuildError::UsedRing {
+                source:
+                    VirtqueueUsedRingError::UsedRingRangeOverflow {
+                        used_ring,
+                        queue_size,
+                    },
+            } => {
+                assert_eq!(used_ring, GuestAddress::new(u64::MAX - 3));
+                assert_eq!(queue_size, TEST_QUEUE_SIZE);
+            }
+            other => panic!("expected used ring overflow, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn block_queue_build_errors_display_and_preserve_sources() {
         let available = VirtioBlockQueueBuildError::AvailableRing {
             source: VirtqueueAvailableRingError::InvalidQueueSize { queue_size: 0 },
