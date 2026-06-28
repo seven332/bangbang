@@ -1,20 +1,29 @@
 use std::fmt;
 
+use serde::Deserialize;
+
 use crate::HTTP_MAX_PAYLOAD_SIZE;
 use crate::route::Endpoint;
 
 const MAX_HEADERS: usize = 32;
+const RATE_LIMITER_BANDWIDTH_FIELD: &str = "bandwidth";
+const RATE_LIMITER_OPS_FIELD: &str = "ops";
+const TOKEN_BUCKET_SIZE_FIELD: &str = "size";
+const TOKEN_BUCKET_ONE_TIME_BURST_FIELD: &str = "one_time_burst";
+const TOKEN_BUCKET_REFILL_TIME_FIELD: &str = "refill_time";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiRequest {
     GetInstanceInfo,
     GetVersion,
+    PutDrive(Box<DriveConfigRequest>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestError {
     GetRequestBody,
     InvalidPathMethod,
+    MismatchedDriveId,
     MalformedRequest,
     PayloadTooLarge,
 }
@@ -24,6 +33,7 @@ impl RequestError {
         match self {
             Self::GetRequestBody => "GET request cannot have a body.",
             Self::InvalidPathMethod => "Invalid request method and/or path.",
+            Self::MismatchedDriveId => "path drive_id must match body drive_id.",
             Self::MalformedRequest => "Malformed HTTP request.",
             Self::PayloadTooLarge => "HTTP request payload exceeds the configured limit.",
         }
@@ -37,6 +47,94 @@ impl fmt::Display for RequestError {
 }
 
 impl std::error::Error for RequestError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriveConfigRequest {
+    path_drive_id: String,
+    body_drive_id: String,
+    path_on_host: String,
+    is_root_device: bool,
+    is_read_only: Option<bool>,
+    partuuid: Option<String>,
+    cache_type: Option<DriveCacheType>,
+    io_engine: Option<DriveIoEngine>,
+    rate_limiter_configured: bool,
+    socket: Option<String>,
+}
+
+impl DriveConfigRequest {
+    pub fn path_drive_id(&self) -> &str {
+        &self.path_drive_id
+    }
+
+    pub fn body_drive_id(&self) -> &str {
+        &self.body_drive_id
+    }
+
+    pub fn path_on_host(&self) -> &str {
+        &self.path_on_host
+    }
+
+    pub const fn is_root_device(&self) -> bool {
+        self.is_root_device
+    }
+
+    pub const fn is_read_only(&self) -> Option<bool> {
+        self.is_read_only
+    }
+
+    pub fn partuuid(&self) -> Option<&str> {
+        self.partuuid.as_deref()
+    }
+
+    pub const fn cache_type(&self) -> Option<DriveCacheType> {
+        self.cache_type
+    }
+
+    pub const fn io_engine(&self) -> Option<DriveIoEngine> {
+        self.io_engine
+    }
+
+    pub const fn rate_limiter_configured(&self) -> bool {
+        self.rate_limiter_configured
+    }
+
+    pub fn socket(&self) -> Option<&str> {
+        self.socket.as_deref()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum DriveCacheType {
+    Unsafe,
+    Writeback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum DriveIoEngine {
+    Sync,
+    Async,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DriveConfigRequestBody {
+    drive_id: String,
+    path_on_host: String,
+    is_root_device: bool,
+    #[serde(default)]
+    is_read_only: Option<bool>,
+    #[serde(default)]
+    partuuid: Option<String>,
+    #[serde(default)]
+    cache_type: Option<DriveCacheType>,
+    #[serde(default, rename = "io_engine")]
+    io_engine: Option<DriveIoEngine>,
+    #[serde(default)]
+    rate_limiter: Option<serde_json::Value>,
+    #[serde(default)]
+    socket: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusCode {
@@ -144,11 +242,118 @@ pub fn parse_request(bytes: &[u8]) -> Result<ApiRequest, RequestError> {
         return Err(RequestError::GetRequestBody);
     }
 
+    if method == "PUT"
+        && let Some(path_drive_id) = drive_path_id(path)
+    {
+        return parse_drive_config_request(path_drive_id, body);
+    }
+
     match (method, path) {
         ("GET", "/") => Ok(ApiRequest::GetInstanceInfo),
         ("GET", "/version") => Ok(ApiRequest::GetVersion),
         _ => Err(RequestError::InvalidPathMethod),
     }
+}
+
+fn drive_path_id(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/drives/")?;
+    if rest.is_empty()
+        || rest.contains('/')
+        || !rest
+            .chars()
+            .all(|character| character == '_' || character.is_alphanumeric())
+    {
+        return None;
+    }
+
+    Some(rest)
+}
+
+fn parse_drive_config_request(
+    path_drive_id: &str,
+    body: &[u8],
+) -> Result<ApiRequest, RequestError> {
+    let body = serde_json::from_slice::<DriveConfigRequestBody>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+    if path_drive_id != body.drive_id {
+        return Err(RequestError::MismatchedDriveId);
+    }
+    let rate_limiter_configured = match &body.rate_limiter {
+        Some(rate_limiter) => {
+            validate_rate_limiter_config(rate_limiter)?;
+            true
+        }
+        None => false,
+    };
+
+    Ok(ApiRequest::PutDrive(Box::new(DriveConfigRequest {
+        path_drive_id: path_drive_id.to_string(),
+        body_drive_id: body.drive_id,
+        path_on_host: body.path_on_host,
+        is_root_device: body.is_root_device,
+        is_read_only: body.is_read_only,
+        partuuid: body.partuuid,
+        cache_type: body.cache_type,
+        io_engine: body.io_engine,
+        rate_limiter_configured,
+        socket: body.socket,
+    })))
+}
+
+fn validate_rate_limiter_config(value: &serde_json::Value) -> Result<(), RequestError> {
+    let rate_limiter = value.as_object().ok_or(RequestError::MalformedRequest)?;
+    for key in rate_limiter.keys() {
+        if key != RATE_LIMITER_BANDWIDTH_FIELD && key != RATE_LIMITER_OPS_FIELD {
+            return Err(RequestError::MalformedRequest);
+        }
+    }
+
+    if let Some(bucket) = rate_limiter.get(RATE_LIMITER_BANDWIDTH_FIELD) {
+        validate_token_bucket(bucket)?;
+    }
+    if let Some(bucket) = rate_limiter.get(RATE_LIMITER_OPS_FIELD) {
+        validate_token_bucket(bucket)?;
+    }
+
+    Ok(())
+}
+
+fn validate_token_bucket(value: &serde_json::Value) -> Result<(), RequestError> {
+    if value.is_null() {
+        return Ok(());
+    }
+
+    let bucket = value.as_object().ok_or(RequestError::MalformedRequest)?;
+    for key in bucket.keys() {
+        if key != TOKEN_BUCKET_SIZE_FIELD
+            && key != TOKEN_BUCKET_ONE_TIME_BURST_FIELD
+            && key != TOKEN_BUCKET_REFILL_TIME_FIELD
+        {
+            return Err(RequestError::MalformedRequest);
+        }
+    }
+
+    require_u64_field(bucket, TOKEN_BUCKET_SIZE_FIELD)?;
+    require_u64_field(bucket, TOKEN_BUCKET_REFILL_TIME_FIELD)?;
+    if let Some(value) = bucket.get(TOKEN_BUCKET_ONE_TIME_BURST_FIELD)
+        && !value.is_null()
+        && value.as_u64().is_none()
+    {
+        return Err(RequestError::MalformedRequest);
+    }
+
+    Ok(())
+}
+
+fn require_u64_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<(), RequestError> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .map(|_| ())
+        .ok_or(RequestError::MalformedRequest)
 }
 
 pub fn request_total_len(bytes: &[u8]) -> Result<Option<usize>, RequestError> {
@@ -300,6 +505,7 @@ impl From<ApiRequest> for Endpoint {
         match request {
             ApiRequest::GetInstanceInfo => Self::DescribeInstance,
             ApiRequest::GetVersion => Self::Version,
+            ApiRequest::PutDrive(_) => Self::Drive,
         }
     }
 }
@@ -309,6 +515,14 @@ mod tests {
     use super::*;
 
     const VERSION: &str = "0.1.0";
+
+    fn request_with_body(method: &str, path: &str, body: &str) -> Vec<u8> {
+        format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
 
     #[test]
     fn parses_get_instance_info() {
@@ -356,6 +570,319 @@ mod tests {
 
         assert_eq!(parse_request(request), Ok(ApiRequest::GetVersion));
         assert_eq!(request_total_len(request), Ok(Some(request.len())));
+    }
+
+    #[test]
+    fn parses_put_drive_with_minimal_body() {
+        let body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "/tmp/rootfs.ext4",
+            "is_root_device": true
+        }"#;
+        let request = request_with_body("PUT", "/drives/rootfs", body);
+
+        let parsed = parse_request(&request).expect("drive request should parse");
+
+        let ApiRequest::PutDrive(config) = parsed else {
+            panic!("expected drive request");
+        };
+        assert_eq!(config.path_drive_id(), "rootfs");
+        assert_eq!(config.body_drive_id(), "rootfs");
+        assert_eq!(config.path_on_host(), "/tmp/rootfs.ext4");
+        assert!(config.is_root_device());
+        assert_eq!(config.is_read_only(), None);
+        assert_eq!(config.partuuid(), None);
+        assert_eq!(config.cache_type(), None);
+        assert_eq!(config.io_engine(), None);
+        assert!(!config.rate_limiter_configured());
+        assert_eq!(config.socket(), None);
+        assert_eq!(request_total_len(&request), Ok(Some(request.len())));
+    }
+
+    #[test]
+    fn parses_put_drive_with_complete_body() {
+        let body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "/tmp/rootfs.ext4",
+            "is_root_device": true,
+            "is_read_only": true,
+            "partuuid": "0eaa91a0-01",
+            "cache_type": "Unsafe",
+            "io_engine": "Sync",
+            "rate_limiter": {
+                "bandwidth": {
+                    "size": 0,
+                    "one_time_burst": 0,
+                    "refill_time": 0
+                }
+            },
+            "socket": "/tmp/vhost.sock"
+        }"#;
+        let request = request_with_body("PUT", "/drives/rootfs", body);
+
+        let parsed = parse_request(&request).expect("drive request should parse");
+
+        let ApiRequest::PutDrive(config) = parsed else {
+            panic!("expected drive request");
+        };
+        assert_eq!(config.path_drive_id(), "rootfs");
+        assert_eq!(config.body_drive_id(), "rootfs");
+        assert_eq!(config.path_on_host(), "/tmp/rootfs.ext4");
+        assert!(config.is_root_device());
+        assert_eq!(config.is_read_only(), Some(true));
+        assert_eq!(config.partuuid(), Some("0eaa91a0-01"));
+        assert_eq!(config.cache_type(), Some(DriveCacheType::Unsafe));
+        assert_eq!(config.io_engine(), Some(DriveIoEngine::Sync));
+        assert!(config.rate_limiter_configured());
+        assert_eq!(config.socket(), Some("/tmp/vhost.sock"));
+    }
+
+    #[test]
+    fn parses_put_drive_with_deferred_field_nulls() {
+        let body = r#"{
+            "drive_id": "data",
+            "path_on_host": "/tmp/data.ext4",
+            "is_root_device": false,
+            "rate_limiter": null,
+            "socket": null
+        }"#;
+        let request = request_with_body("PUT", "/drives/data", body);
+
+        let parsed = parse_request(&request).expect("drive request should parse");
+
+        let ApiRequest::PutDrive(config) = parsed else {
+            panic!("expected drive request");
+        };
+        assert!(!config.rate_limiter_configured());
+        assert_eq!(config.socket(), None);
+    }
+
+    #[test]
+    fn parses_put_drive_with_deferred_cache_and_io_values() {
+        let body = r#"{
+            "drive_id": "data",
+            "path_on_host": "/tmp/data.ext4",
+            "is_root_device": false,
+            "cache_type": "Writeback",
+            "io_engine": "Async"
+        }"#;
+        let request = request_with_body("PUT", "/drives/data", body);
+
+        let parsed = parse_request(&request).expect("drive request should parse");
+
+        let ApiRequest::PutDrive(config) = parsed else {
+            panic!("expected drive request");
+        };
+        assert_eq!(config.cache_type(), Some(DriveCacheType::Writeback));
+        assert_eq!(config.io_engine(), Some(DriveIoEngine::Async));
+    }
+
+    #[test]
+    fn parses_put_drive_with_firecracker_id_character_set() {
+        let body = r#"{
+            "drive_id": "root_é1",
+            "path_on_host": "/tmp/rootfs.ext4",
+            "is_root_device": true
+        }"#;
+        let request = request_with_body("PUT", "/drives/root_é1", body);
+
+        let parsed = parse_request(&request).expect("drive request should parse");
+
+        let ApiRequest::PutDrive(config) = parsed else {
+            panic!("expected drive request");
+        };
+        assert_eq!(config.path_drive_id(), "root_é1");
+        assert_eq!(config.body_drive_id(), "root_é1");
+    }
+
+    #[test]
+    fn rejects_put_drive_mismatched_body_id() {
+        let body = r#"{
+            "drive_id": "scratch",
+            "path_on_host": "/tmp/rootfs.ext4",
+            "is_root_device": true
+        }"#;
+        let request = request_with_body("PUT", "/drives/rootfs", body);
+
+        assert_eq!(
+            parse_request(&request),
+            Err(RequestError::MismatchedDriveId)
+        );
+    }
+
+    #[test]
+    fn rejects_put_drive_without_path_id() {
+        let body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "/tmp/rootfs.ext4",
+            "is_root_device": true
+        }"#;
+
+        assert_eq!(
+            parse_request(&request_with_body("PUT", "/drives", body)),
+            Err(RequestError::InvalidPathMethod)
+        );
+        assert_eq!(
+            parse_request(&request_with_body("PUT", "/drives/", body)),
+            Err(RequestError::InvalidPathMethod)
+        );
+    }
+
+    #[test]
+    fn rejects_put_drive_extra_path_segment() {
+        let body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "/tmp/rootfs.ext4",
+            "is_root_device": true
+        }"#;
+
+        assert_eq!(
+            parse_request(&request_with_body("PUT", "/drives/rootfs/extra", body)),
+            Err(RequestError::InvalidPathMethod)
+        );
+    }
+
+    #[test]
+    fn rejects_put_drive_invalid_path_id() {
+        let body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "/tmp/rootfs.ext4",
+            "is_root_device": true
+        }"#;
+
+        assert_eq!(
+            parse_request(&request_with_body("PUT", "/drives/root-fs", body)),
+            Err(RequestError::InvalidPathMethod)
+        );
+        assert_eq!(
+            parse_request(&request_with_body("PUT", "/drives/rootfs?debug=true", body)),
+            Err(RequestError::InvalidPathMethod)
+        );
+    }
+
+    #[test]
+    fn rejects_put_drive_with_empty_body() {
+        let request = b"PUT /drives/rootfs HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+
+        assert_eq!(parse_request(request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_put_drive_with_malformed_json() {
+        let request = request_with_body("PUT", "/drives/rootfs", "{");
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_put_drive_missing_required_field() {
+        let body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "/tmp/rootfs.ext4"
+        }"#;
+        let request = request_with_body("PUT", "/drives/rootfs", body);
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_put_drive_invalid_field_type() {
+        let body = r#"{
+            "drive_id": 1000,
+            "path_on_host": "/tmp/rootfs.ext4",
+            "is_root_device": true
+        }"#;
+        let request = request_with_body("PUT", "/drives/rootfs", body);
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_put_drive_unknown_field() {
+        let body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "/tmp/rootfs.ext4",
+            "is_root_device": true,
+            "unknown": true
+        }"#;
+        let request = request_with_body("PUT", "/drives/rootfs", body);
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_put_drive_unknown_cache_value() {
+        let body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "/tmp/rootfs.ext4",
+            "is_root_device": true,
+            "cache_type": "Unknown"
+        }"#;
+        let request = request_with_body("PUT", "/drives/rootfs", body);
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_put_drive_invalid_rate_limiter_type() {
+        let body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "/tmp/rootfs.ext4",
+            "is_root_device": true,
+            "rate_limiter": "unsupported"
+        }"#;
+        let request = request_with_body("PUT", "/drives/rootfs", body);
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn parses_put_drive_with_null_rate_limiter_buckets() {
+        let body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "/tmp/rootfs.ext4",
+            "is_root_device": true,
+            "rate_limiter": {
+                "bandwidth": null,
+                "ops": {
+                    "size": 100,
+                    "one_time_burst": null,
+                    "refill_time": 1000
+                }
+            }
+        }"#;
+        let request = request_with_body("PUT", "/drives/rootfs", body);
+
+        let parsed = parse_request(&request).expect("drive request should parse");
+
+        let ApiRequest::PutDrive(config) = parsed else {
+            panic!("expected drive request");
+        };
+        assert!(config.rate_limiter_configured());
+    }
+
+    #[test]
+    fn rejects_put_drive_invalid_rate_limiter_bucket() {
+        let body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "/tmp/rootfs.ext4",
+            "is_root_device": true,
+            "rate_limiter": {
+                "ops": {
+                    "size": 100
+                }
+            }
+        }"#;
+        let request = request_with_body("PUT", "/drives/rootfs", body);
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_get_drive_with_body() {
+        let request = request_with_body("GET", "/drives/rootfs", "{}");
+
+        assert_eq!(parse_request(&request), Err(RequestError::GetRequestBody));
     }
 
     #[test]
@@ -514,5 +1041,17 @@ mod tests {
             Endpoint::DescribeInstance
         );
         assert_eq!(Endpoint::from(ApiRequest::GetVersion), Endpoint::Version);
+        let request = parse_request(&request_with_body(
+            "PUT",
+            "/drives/rootfs",
+            r#"{
+                "drive_id": "rootfs",
+                "path_on_host": "/tmp/rootfs.ext4",
+                "is_root_device": true
+            }"#,
+        ))
+        .expect("drive request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::Drive);
     }
 }
