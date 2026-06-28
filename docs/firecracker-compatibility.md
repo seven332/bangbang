@@ -19,12 +19,12 @@ arm64 FDT generation and guest-memory writes, anonymous guest memory allocation
 for validated runtime layouts, HVF guest memory map/unmap ownership for
 allocated regions, an internal MMIO region ownership registry and operation/data
 model plus handler dispatch boundary, an internal virtio-mmio register/access
-decoder plus virtqueue descriptor-chain validator and available-ring read model
-for future device handlers, an internal backend-neutral interrupt line/status/trigger
-model, single-vCPU arm64 HVF boot-register setup, and an initial process startup
-argument model.
+decoder plus virtqueue descriptor-chain validator, available-ring read model,
+and used-ring write model for future device handlers, an internal backend-neutral
+interrupt line/status/trigger model, single-vCPU arm64 HVF boot-register setup,
+and an initial process startup argument model.
 There is no broader API request body model, guest execution, continuous vCPU run loop,
-complete interrupt delivery, used-ring handling, queue notification/completion,
+complete interrupt delivery, queue notification/completion dispatch,
 feature negotiation, indirect descriptor support,
 device-backed runner-loop MMIO handling, real device emulation, public startup
 wiring, multi-vCPU setup, PSCI behavior, or public boot-source API behavior yet.
@@ -357,9 +357,12 @@ or writes at the Firecracker-supported common register offsets and rejects
 unsupported offsets, unsupported widths, cross-register accesses, and accesses
 outside the 4 KiB virtio-mmio device window before future device-specific state
 can be mutated. Device-configuration accesses are classified by offset and
-length, but concrete config-space behavior, feature negotiation, used-ring
-writes, notification handling, interrupt acknowledgement, and real virtio
-devices are still deferred.
+length, but concrete config-space behavior, feature negotiation, notification
+handling, interrupt acknowledgement, and real virtio devices are still
+deferred. The virtqueue model can publish one used-ring completion element with
+validated layout, mapped-memory checks, wrapping, and release ordering, but
+batching, event-index notification suppression, and device-backed completion
+loops are still deferred.
 
 The runtime crate also contains backend-neutral interrupt signaling groundwork.
 It can validate nonzero guest interrupt lines, represent queue and
