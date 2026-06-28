@@ -16,8 +16,9 @@ pub use exit::{
     HvfResolvedVcpuExit, HvfVcpuExit, HvfVcpuExitResolveError,
 };
 pub use gic::{
-    HvfGicError, HvfGicInterruptRange, HvfGicMetadata, HvfGicMsiMetadata, HvfGicRedistributor,
-    HvfGicRegion, HvfGicTimerInterrupts,
+    HvfGicError, HvfGicInterruptLineAllocator, HvfGicInterruptRange, HvfGicMetadata,
+    HvfGicMsiMetadata, HvfGicRedistributor, HvfGicRegion, HvfGicTimerInterrupts,
+    HvfInterruptLineAllocationError,
 };
 pub use memory::{HvfGuestMemoryMappingError, HvfGuestMemoryUnmapFailure, HvfMemoryPermissions};
 pub use mmio::{HvfMmioCompletionError, HvfMmioDispatchError};

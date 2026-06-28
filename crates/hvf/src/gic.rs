@@ -7,6 +7,7 @@ use bangbang_runtime::fdt::{
     Arm64FdtError, Arm64FdtGic, Arm64FdtInterruptRange, Arm64FdtMsi, Arm64FdtRegion,
     Arm64FdtTimerInterrupts,
 };
+use bangbang_runtime::interrupt::{GuestInterruptLine, GuestInterruptLineError};
 
 const GIC_REQUIRES_MACOS_15_MESSAGE: &str =
     "Hypervisor.framework GIC APIs require macOS 15.0 or newer";
@@ -117,6 +118,105 @@ impl From<HvfGicMsiMetadata> for Arm64FdtMsi {
             region: metadata.region.into(),
             interrupt_range: metadata.interrupt_range.into(),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HvfInterruptLineAllocationError {
+    InvalidRange(HvfGicError),
+    InvalidLine(GuestInterruptLineError),
+    Exhausted { range: HvfGicInterruptRange },
+}
+
+impl fmt::Display for HvfInterruptLineAllocationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRange(source) => {
+                write!(
+                    f,
+                    "invalid HVF GIC interrupt line allocation range: {source}"
+                )
+            }
+            Self::InvalidLine(source) => {
+                write!(f, "invalid HVF GIC interrupt line: {source}")
+            }
+            Self::Exhausted { range } => {
+                write!(
+                    f,
+                    "HVF GIC SPI interrupt range base={} count={} is exhausted",
+                    range.base, range.count
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for HvfInterruptLineAllocationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidRange(source) => Some(source),
+            Self::InvalidLine(source) => Some(source),
+            Self::Exhausted { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct HvfGicInterruptLineAllocator {
+    range: HvfGicInterruptRange,
+    next: u32,
+    remaining: u32,
+}
+
+impl HvfGicInterruptLineAllocator {
+    pub fn new(range: HvfGicInterruptRange) -> Result<Self, HvfInterruptLineAllocationError> {
+        validate_spi_interrupt_range(range)
+            .map_err(HvfInterruptLineAllocationError::InvalidRange)?;
+
+        Ok(Self {
+            range,
+            next: range.base,
+            remaining: range.count,
+        })
+    }
+
+    pub fn from_metadata(
+        metadata: &HvfGicMetadata,
+    ) -> Result<Self, HvfInterruptLineAllocationError> {
+        Self::new(metadata.spi_interrupt_range)
+    }
+
+    pub const fn range(&self) -> HvfGicInterruptRange {
+        self.range
+    }
+
+    pub const fn remaining(&self) -> u32 {
+        self.remaining
+    }
+
+    pub const fn is_exhausted(&self) -> bool {
+        self.remaining == 0
+    }
+
+    pub fn allocate(&mut self) -> Result<GuestInterruptLine, HvfInterruptLineAllocationError> {
+        if self.remaining == 0 {
+            return Err(HvfInterruptLineAllocationError::Exhausted { range: self.range });
+        }
+
+        let raw_line = self.next;
+        let next = raw_line.checked_add(1).ok_or_else(|| {
+            HvfInterruptLineAllocationError::InvalidRange(HvfGicError::InvalidParameter {
+                name: "spi_interrupt_range.end_exclusive",
+                value: u64::from(raw_line) + 1,
+            })
+        })?;
+        let line = GuestInterruptLine::new(raw_line)
+            .map_err(HvfInterruptLineAllocationError::InvalidLine)?;
+
+        self.next = next;
+        self.remaining -= 1;
+
+        Ok(line)
     }
 }
 
@@ -915,6 +1015,7 @@ use dynamic::LoadedHvfGicApi;
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as _;
     use std::sync::Mutex;
 
     use bangbang_runtime::BackendError;
@@ -923,11 +1024,13 @@ mod tests {
         ARM64_FDT_SECURE_PHYSICAL_TIMER_PPI, ARM64_FDT_VIRTUAL_TIMER_PPI, Arm64FdtError,
         Arm64FdtInterruptRange, Arm64FdtMsi, Arm64FdtRegion, Arm64FdtTimerInterrupts,
     };
+    use bangbang_runtime::interrupt::GuestInterruptLineError;
 
     use super::{
         GicConfigGuard, HV_GIC_INT_EL1_PHYSICAL_TIMER, HV_GIC_INT_EL1_VIRTUAL_TIMER, HvfGicApi,
-        HvfGicError, HvfGicInterruptRange, HvfGicMetadata, HvfGicMsiMetadata, HvfGicParameters,
-        HvfGicRegion, HvfGicTimerInterrupts, create_gic_with_api, metadata_from_parameters,
+        HvfGicError, HvfGicInterruptLineAllocator, HvfGicInterruptRange, HvfGicMetadata,
+        HvfGicMsiMetadata, HvfGicParameters, HvfGicRegion, HvfGicTimerInterrupts,
+        HvfInterruptLineAllocationError, create_gic_with_api, metadata_from_parameters,
     };
 
     const DIST_SIZE: u64 = 0x1_0000;
@@ -1053,6 +1156,166 @@ mod tests {
                 hypervisor: ARM64_FDT_HYPERVISOR_TIMER_PPI,
             }
         );
+    }
+
+    #[test]
+    fn interrupt_line_allocator_uses_metadata_spi_range() {
+        let metadata = metadata_from_parameters(default_parameters())
+            .expect("default GIC parameters should produce metadata");
+        let mut allocator = HvfGicInterruptLineAllocator::from_metadata(&metadata)
+            .expect("validated GIC metadata should produce an allocator");
+
+        assert_eq!(
+            allocator.range(),
+            HvfGicInterruptRange {
+                base: 32,
+                count: 96,
+            }
+        );
+        assert_eq!(allocator.remaining(), 96);
+        assert!(!allocator.is_exhausted());
+
+        let line = allocator
+            .allocate()
+            .expect("first SPI interrupt line should allocate");
+
+        assert_eq!(line.raw_value(), 32);
+        assert_eq!(allocator.remaining(), 95);
+    }
+
+    #[test]
+    fn interrupt_line_allocator_allocates_first_last_and_exhausts() {
+        let range = HvfGicInterruptRange { base: 40, count: 2 };
+        let mut allocator = HvfGicInterruptLineAllocator::new(range)
+            .expect("valid SPI range should produce an allocator");
+
+        assert_eq!(
+            allocator
+                .allocate()
+                .expect("first line should allocate")
+                .raw_value(),
+            40
+        );
+        assert_eq!(
+            allocator
+                .allocate()
+                .expect("last line should allocate")
+                .raw_value(),
+            41
+        );
+        assert_eq!(allocator.remaining(), 0);
+        assert!(allocator.is_exhausted());
+        assert_eq!(
+            allocator.allocate(),
+            Err(HvfInterruptLineAllocationError::Exhausted { range })
+        );
+    }
+
+    #[test]
+    fn interrupt_line_allocator_does_not_repeat_lines() {
+        let mut allocator =
+            HvfGicInterruptLineAllocator::new(HvfGicInterruptRange { base: 32, count: 3 })
+                .expect("valid SPI range should produce an allocator");
+        let first = allocator
+            .allocate()
+            .expect("first line should allocate")
+            .raw_value();
+        let second = allocator
+            .allocate()
+            .expect("second line should allocate")
+            .raw_value();
+        let third = allocator
+            .allocate()
+            .expect("third line should allocate")
+            .raw_value();
+
+        assert_eq!([first, second, third], [32, 33, 34]);
+    }
+
+    #[test]
+    fn interrupt_line_allocator_rejects_base_below_spi_range() {
+        assert_eq!(
+            HvfGicInterruptLineAllocator::new(HvfGicInterruptRange { base: 31, count: 1 })
+                .expect_err("base below SPI range should fail"),
+            HvfInterruptLineAllocationError::InvalidRange(HvfGicError::InvalidParameter {
+                name: "spi_interrupt_range.base",
+                value: 31,
+            })
+        );
+    }
+
+    #[test]
+    fn interrupt_line_allocator_rejects_zero_count() {
+        assert_eq!(
+            HvfGicInterruptLineAllocator::new(HvfGicInterruptRange { base: 32, count: 0 })
+                .expect_err("zero-count range should fail"),
+            HvfInterruptLineAllocationError::InvalidRange(HvfGicError::InvalidParameter {
+                name: "spi_interrupt_range.count",
+                value: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn interrupt_line_allocator_rejects_overflowing_range() {
+        assert_eq!(
+            HvfGicInterruptLineAllocator::new(HvfGicInterruptRange {
+                base: u32::MAX,
+                count: 2,
+            })
+            .expect_err("overflowing range should fail"),
+            HvfInterruptLineAllocationError::InvalidRange(HvfGicError::InvalidParameter {
+                name: "spi_interrupt_range.end_exclusive",
+                value: u64::from(u32::MAX) + 2,
+            })
+        );
+    }
+
+    #[test]
+    fn displays_interrupt_line_allocation_errors() {
+        let invalid_range =
+            HvfInterruptLineAllocationError::InvalidRange(HvfGicError::InvalidParameter {
+                name: "spi_interrupt_range.count",
+                value: 0,
+            });
+        assert_eq!(
+            invalid_range.to_string(),
+            "invalid HVF GIC interrupt line allocation range: invalid Hypervisor.framework GIC parameter spi_interrupt_range.count=0"
+        );
+        assert_eq!(
+            invalid_range.source().map(ToString::to_string),
+            Some(
+                "invalid Hypervisor.framework GIC parameter spi_interrupt_range.count=0"
+                    .to_string()
+            )
+        );
+
+        let invalid_line =
+            HvfInterruptLineAllocationError::InvalidLine(GuestInterruptLineError::Zero);
+        assert_eq!(
+            invalid_line.to_string(),
+            "invalid HVF GIC interrupt line: guest interrupt line 0 is invalid"
+        );
+        assert_eq!(
+            invalid_line.source().map(ToString::to_string),
+            Some("guest interrupt line 0 is invalid".to_string())
+        );
+
+        let exhausted = HvfInterruptLineAllocationError::Exhausted {
+            range: HvfGicInterruptRange { base: 32, count: 1 },
+        };
+        assert_eq!(
+            exhausted.to_string(),
+            "HVF GIC SPI interrupt range base=32 count=1 is exhausted"
+        );
+        assert!(exhausted.source().is_none());
+    }
+
+    #[test]
+    fn interrupt_line_allocator_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<HvfGicInterruptLineAllocator>();
     }
 
     #[test]
