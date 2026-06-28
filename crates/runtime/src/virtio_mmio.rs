@@ -4,7 +4,10 @@ use std::fmt;
 
 use crate::interrupt::{DeviceInterruptKind, DeviceInterruptStatus, DeviceInterruptStatusError};
 use crate::memory::GuestAddress;
-use crate::mmio::{MmioOperation, MmioOperationKind};
+use crate::mmio::{
+    MmioAccess, MmioAccessBytes, MmioAccessBytesError, MmioHandler, MmioHandlerError,
+    MmioOperation, MmioOperationError, MmioOperationKind,
+};
 use crate::virtio_queue::{
     VIRTQUEUE_AVAILABLE_RING_ALIGNMENT, VIRTQUEUE_DESCRIPTOR_ALIGNMENT,
     VIRTQUEUE_USED_RING_ALIGNMENT,
@@ -1123,6 +1126,461 @@ impl fmt::Display for VirtioMmioQueueNotificationError {
 
 impl std::error::Error for VirtioMmioQueueNotificationError {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioMmioRegisterHandler {
+    device: VirtioMmioDeviceRegisters,
+    queues: VirtioMmioQueueRegisters,
+    queue_notifications: VirtioMmioQueueNotificationRegisters,
+    interrupts: VirtioMmioInterruptRegisters,
+}
+
+impl VirtioMmioRegisterHandler {
+    pub fn new(
+        device_id: u32,
+        device_features: u64,
+        queue_max_sizes: &[u16],
+    ) -> Result<Self, VirtioMmioRegisterHandlerError> {
+        Self::with_vendor_id_and_config_generation(
+            device_id,
+            VIRTIO_MMIO_VENDOR_ID,
+            device_features,
+            0,
+            queue_max_sizes,
+        )
+    }
+
+    pub fn with_vendor_id_and_config_generation(
+        device_id: u32,
+        vendor_id: u32,
+        device_features: u64,
+        config_generation: u32,
+        queue_max_sizes: &[u16],
+    ) -> Result<Self, VirtioMmioRegisterHandlerError> {
+        let queues = VirtioMmioQueueRegisters::new(queue_max_sizes).map_err(|source| {
+            VirtioMmioRegisterHandlerError::QueueRegisterInitialization { source }
+        })?;
+        let queue_count = queues.queue_count();
+        let queue_notifications =
+            VirtioMmioQueueNotificationRegisters::new(queue_count).map_err(|source| {
+                VirtioMmioRegisterHandlerError::QueueNotificationInitialization { source }
+            })?;
+
+        Ok(Self {
+            device: VirtioMmioDeviceRegisters::with_vendor_id_and_config_generation(
+                device_id,
+                vendor_id,
+                device_features,
+                config_generation,
+            ),
+            queues,
+            queue_notifications,
+            interrupts: VirtioMmioInterruptRegisters::new(),
+        })
+    }
+
+    pub const fn device_registers(&self) -> &VirtioMmioDeviceRegisters {
+        &self.device
+    }
+
+    pub const fn queue_registers(&self) -> &VirtioMmioQueueRegisters {
+        &self.queues
+    }
+
+    pub const fn queue_notification_registers(&self) -> &VirtioMmioQueueNotificationRegisters {
+        &self.queue_notifications
+    }
+
+    pub const fn interrupt_registers(&self) -> &VirtioMmioInterruptRegisters {
+        &self.interrupts
+    }
+
+    pub fn mark_interrupt_pending(&mut self, kind: DeviceInterruptKind) {
+        self.interrupts.mark_pending(kind);
+    }
+
+    pub fn read_access(
+        &self,
+        access: MmioAccess,
+    ) -> Result<MmioAccessBytes, VirtioMmioRegisterHandlerError> {
+        let operation = MmioOperation::read(access)
+            .map_err(|source| VirtioMmioRegisterHandlerError::InvalidOperation { source })?;
+        match decode_virtio_mmio_access(&operation)
+            .map_err(|source| VirtioMmioRegisterHandlerError::DecodeAccess { source })?
+        {
+            VirtioMmioAccess::Register(register_access) => {
+                let value = self.read_register(register_access.register())?;
+                register_read_data(value)
+            }
+            VirtioMmioAccess::DeviceConfig(config_access) => Err(
+                VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead {
+                    offset: config_access.offset(),
+                    len: config_access.len(),
+                },
+            ),
+        }
+    }
+
+    pub fn write_access(
+        &mut self,
+        access: MmioAccess,
+        data: MmioAccessBytes,
+    ) -> Result<(), VirtioMmioRegisterHandlerError> {
+        let operation = MmioOperation::write(access, data)
+            .map_err(|source| VirtioMmioRegisterHandlerError::InvalidOperation { source })?;
+        match decode_virtio_mmio_access(&operation)
+            .map_err(|source| VirtioMmioRegisterHandlerError::DecodeAccess { source })?
+        {
+            VirtioMmioAccess::Register(register_access) => {
+                self.write_register(register_access.register(), register_write_value(data)?)
+            }
+            VirtioMmioAccess::DeviceConfig(config_access) => Err(
+                VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigWrite {
+                    offset: config_access.offset(),
+                    len: config_access.len(),
+                },
+            ),
+        }
+    }
+
+    pub fn read_register(
+        &self,
+        register: VirtioMmioRegister,
+    ) -> Result<u32, VirtioMmioRegisterHandlerError> {
+        match register {
+            VirtioMmioRegister::MagicValue
+            | VirtioMmioRegister::Version
+            | VirtioMmioRegister::DeviceId
+            | VirtioMmioRegister::VendorId
+            | VirtioMmioRegister::DeviceFeatures
+            | VirtioMmioRegister::Status
+            | VirtioMmioRegister::ConfigGeneration => {
+                self.device.read_register(register).map_err(|source| {
+                    VirtioMmioRegisterHandlerError::DeviceRegisterRead { register, source }
+                })
+            }
+            VirtioMmioRegister::QueueNumMax | VirtioMmioRegister::QueueReady => {
+                self.queues.read_register(register).map_err(|source| {
+                    VirtioMmioRegisterHandlerError::QueueRegisterRead { register, source }
+                })
+            }
+            VirtioMmioRegister::InterruptStatus => {
+                self.interrupts.read_register(register).map_err(|source| {
+                    VirtioMmioRegisterHandlerError::InterruptRegisterRead { register, source }
+                })
+            }
+            VirtioMmioRegister::DeviceFeaturesSel
+            | VirtioMmioRegister::DriverFeatures
+            | VirtioMmioRegister::DriverFeaturesSel
+            | VirtioMmioRegister::QueueSel
+            | VirtioMmioRegister::QueueNum
+            | VirtioMmioRegister::QueueNotify
+            | VirtioMmioRegister::InterruptAck
+            | VirtioMmioRegister::QueueDescLow
+            | VirtioMmioRegister::QueueDescHigh
+            | VirtioMmioRegister::QueueDriverLow
+            | VirtioMmioRegister::QueueDriverHigh
+            | VirtioMmioRegister::QueueDeviceLow
+            | VirtioMmioRegister::QueueDeviceHigh => {
+                Err(VirtioMmioRegisterHandlerError::UnsupportedRegisterRead { register })
+            }
+        }
+    }
+
+    pub fn write_register(
+        &mut self,
+        register: VirtioMmioRegister,
+        value: u32,
+    ) -> Result<(), VirtioMmioRegisterHandlerError> {
+        match register {
+            VirtioMmioRegister::DeviceFeaturesSel
+            | VirtioMmioRegister::DriverFeatures
+            | VirtioMmioRegister::DriverFeaturesSel
+            | VirtioMmioRegister::Status => self.write_device_register(register, value),
+            VirtioMmioRegister::QueueSel
+            | VirtioMmioRegister::QueueNum
+            | VirtioMmioRegister::QueueReady
+            | VirtioMmioRegister::QueueDescLow
+            | VirtioMmioRegister::QueueDescHigh
+            | VirtioMmioRegister::QueueDriverLow
+            | VirtioMmioRegister::QueueDriverHigh
+            | VirtioMmioRegister::QueueDeviceLow
+            | VirtioMmioRegister::QueueDeviceHigh => self
+                .queues
+                .write_register(register, value, self.device.status())
+                .map_err(
+                    |source| VirtioMmioRegisterHandlerError::QueueRegisterWrite {
+                        register,
+                        source,
+                    },
+                ),
+            VirtioMmioRegister::QueueNotify => self
+                .queue_notifications
+                .write_register(register, value, self.device.status())
+                .map_err(
+                    |source| VirtioMmioRegisterHandlerError::QueueNotificationWrite {
+                        register,
+                        source,
+                    },
+                ),
+            VirtioMmioRegister::InterruptAck => self
+                .interrupts
+                .write_register(register, value, self.device.status())
+                .map_err(
+                    |source| VirtioMmioRegisterHandlerError::InterruptRegisterWrite {
+                        register,
+                        source,
+                    },
+                ),
+            VirtioMmioRegister::MagicValue
+            | VirtioMmioRegister::Version
+            | VirtioMmioRegister::DeviceId
+            | VirtioMmioRegister::VendorId
+            | VirtioMmioRegister::DeviceFeatures
+            | VirtioMmioRegister::QueueNumMax
+            | VirtioMmioRegister::InterruptStatus
+            | VirtioMmioRegister::ConfigGeneration => {
+                Err(VirtioMmioRegisterHandlerError::UnsupportedRegisterWrite { register })
+            }
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.device.reset();
+        self.queues.reset();
+        self.queue_notifications.reset();
+        self.interrupts.reset();
+    }
+
+    fn write_device_register(
+        &mut self,
+        register: VirtioMmioRegister,
+        value: u32,
+    ) -> Result<(), VirtioMmioRegisterHandlerError> {
+        self.device
+            .write_register(register, value)
+            .map_err(
+                |source| VirtioMmioRegisterHandlerError::DeviceRegisterWrite { register, source },
+            )?;
+
+        if register == VirtioMmioRegister::Status && value == VIRTIO_DEVICE_STATUS_INIT {
+            self.queues.reset();
+            self.queue_notifications.reset();
+            self.interrupts.reset();
+        }
+
+        Ok(())
+    }
+}
+
+impl MmioHandler for VirtioMmioRegisterHandler {
+    fn read(&mut self, access: MmioAccess) -> Result<MmioAccessBytes, MmioHandlerError> {
+        self.read_access(access).map_err(MmioHandlerError::from)
+    }
+
+    fn write(&mut self, access: MmioAccess, data: MmioAccessBytes) -> Result<(), MmioHandlerError> {
+        self.write_access(access, data)
+            .map_err(MmioHandlerError::from)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioMmioRegisterHandlerError {
+    QueueRegisterInitialization {
+        source: VirtioMmioQueueRegisterError,
+    },
+    QueueNotificationInitialization {
+        source: VirtioMmioQueueNotificationError,
+    },
+    InvalidOperation {
+        source: MmioOperationError,
+    },
+    DecodeAccess {
+        source: VirtioMmioAccessError,
+    },
+    RegisterReadData {
+        source: MmioAccessBytesError,
+    },
+    RegisterWriteDataLength {
+        len: usize,
+    },
+    UnsupportedDeviceConfigRead {
+        offset: u64,
+        len: usize,
+    },
+    UnsupportedDeviceConfigWrite {
+        offset: u64,
+        len: usize,
+    },
+    UnsupportedRegisterRead {
+        register: VirtioMmioRegister,
+    },
+    UnsupportedRegisterWrite {
+        register: VirtioMmioRegister,
+    },
+    DeviceRegisterRead {
+        register: VirtioMmioRegister,
+        source: VirtioMmioRegisterStateError,
+    },
+    DeviceRegisterWrite {
+        register: VirtioMmioRegister,
+        source: VirtioMmioRegisterStateError,
+    },
+    QueueRegisterRead {
+        register: VirtioMmioRegister,
+        source: VirtioMmioQueueRegisterError,
+    },
+    QueueRegisterWrite {
+        register: VirtioMmioRegister,
+        source: VirtioMmioQueueRegisterError,
+    },
+    QueueNotificationWrite {
+        register: VirtioMmioRegister,
+        source: VirtioMmioQueueNotificationError,
+    },
+    InterruptRegisterRead {
+        register: VirtioMmioRegister,
+        source: VirtioMmioInterruptRegisterError,
+    },
+    InterruptRegisterWrite {
+        register: VirtioMmioRegister,
+        source: VirtioMmioInterruptRegisterError,
+    },
+}
+
+impl fmt::Display for VirtioMmioRegisterHandlerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::QueueRegisterInitialization { source } => {
+                write!(
+                    f,
+                    "failed to initialize virtio-mmio queue registers: {source}"
+                )
+            }
+            Self::QueueNotificationInitialization { source } => {
+                write!(
+                    f,
+                    "failed to initialize virtio-mmio queue notification registers: {source}"
+                )
+            }
+            Self::InvalidOperation { source } => {
+                write!(f, "invalid virtio-mmio MMIO operation: {source}")
+            }
+            Self::DecodeAccess { source } => {
+                write!(f, "failed to decode virtio-mmio MMIO access: {source}")
+            }
+            Self::RegisterReadData { source } => {
+                write!(
+                    f,
+                    "failed to build virtio-mmio register read data: {source}"
+                )
+            }
+            Self::RegisterWriteDataLength { len } => {
+                write!(
+                    f,
+                    "virtio-mmio register write data length {len} cannot be decoded as a 4-byte value"
+                )
+            }
+            Self::UnsupportedDeviceConfigRead { offset, len } => {
+                write!(
+                    f,
+                    "unsupported virtio-mmio device config read at offset 0x{offset:x} with length {len}"
+                )
+            }
+            Self::UnsupportedDeviceConfigWrite { offset, len } => {
+                write!(
+                    f,
+                    "unsupported virtio-mmio device config write at offset 0x{offset:x} with length {len}"
+                )
+            }
+            Self::UnsupportedRegisterRead { register } => {
+                write!(
+                    f,
+                    "unsupported virtio-mmio register handler read from {register}"
+                )
+            }
+            Self::UnsupportedRegisterWrite { register } => {
+                write!(
+                    f,
+                    "unsupported virtio-mmio register handler write to {register}"
+                )
+            }
+            Self::DeviceRegisterRead { register, source } => {
+                write!(
+                    f,
+                    "virtio-mmio device register {register} read failed: {source}"
+                )
+            }
+            Self::DeviceRegisterWrite { register, source } => {
+                write!(
+                    f,
+                    "virtio-mmio device register {register} write failed: {source}"
+                )
+            }
+            Self::QueueRegisterRead { register, source } => {
+                write!(
+                    f,
+                    "virtio-mmio queue register {register} read failed: {source}"
+                )
+            }
+            Self::QueueRegisterWrite { register, source } => {
+                write!(
+                    f,
+                    "virtio-mmio queue register {register} write failed: {source}"
+                )
+            }
+            Self::QueueNotificationWrite { register, source } => {
+                write!(
+                    f,
+                    "virtio-mmio queue notification register {register} write failed: {source}"
+                )
+            }
+            Self::InterruptRegisterRead { register, source } => {
+                write!(
+                    f,
+                    "virtio-mmio interrupt register {register} read failed: {source}"
+                )
+            }
+            Self::InterruptRegisterWrite { register, source } => {
+                write!(
+                    f,
+                    "virtio-mmio interrupt register {register} write failed: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioMmioRegisterHandlerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::QueueRegisterInitialization { source }
+            | Self::QueueRegisterRead { source, .. }
+            | Self::QueueRegisterWrite { source, .. } => Some(source),
+            Self::QueueNotificationInitialization { source }
+            | Self::QueueNotificationWrite { source, .. } => Some(source),
+            Self::InvalidOperation { source } => Some(source),
+            Self::DecodeAccess { source } => Some(source),
+            Self::RegisterReadData { source } => Some(source),
+            Self::DeviceRegisterRead { source, .. } | Self::DeviceRegisterWrite { source, .. } => {
+                Some(source)
+            }
+            Self::InterruptRegisterRead { source, .. }
+            | Self::InterruptRegisterWrite { source, .. } => Some(source),
+            Self::RegisterWriteDataLength { .. }
+            | Self::UnsupportedDeviceConfigRead { .. }
+            | Self::UnsupportedDeviceConfigWrite { .. }
+            | Self::UnsupportedRegisterRead { .. }
+            | Self::UnsupportedRegisterWrite { .. } => None,
+        }
+    }
+}
+
+impl From<VirtioMmioRegisterHandlerError> for MmioHandlerError {
+    fn from(error: VirtioMmioRegisterHandlerError) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VirtioMmioRegister {
     MagicValue,
@@ -1553,6 +2011,19 @@ const fn register_slot_offset(offset: u64) -> u64 {
     offset / VIRTIO_MMIO_REGISTER_ACCESS_SIZE_U64 * VIRTIO_MMIO_REGISTER_ACCESS_SIZE_U64
 }
 
+fn register_read_data(value: u32) -> Result<MmioAccessBytes, VirtioMmioRegisterHandlerError> {
+    MmioAccessBytes::new(&value.to_le_bytes())
+        .map_err(|source| VirtioMmioRegisterHandlerError::RegisterReadData { source })
+}
+
+fn register_write_value(data: MmioAccessBytes) -> Result<u32, VirtioMmioRegisterHandlerError> {
+    let bytes: [u8; VIRTIO_MMIO_REGISTER_ACCESS_SIZE] = data
+        .as_slice()
+        .try_into()
+        .map_err(|_| VirtioMmioRegisterHandlerError::RegisterWriteDataLength { len: data.len() })?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
 fn feature_word(features: u64, selector: u32) -> Result<u32, VirtioMmioRegisterStateError> {
     match selector {
         0 => Ok((features & u64::from(u32::MAX)) as u32),
@@ -1727,12 +2198,15 @@ mod tests {
         VirtioMmioAccessError, VirtioMmioDeviceRegisters, VirtioMmioInterruptRegisterError,
         VirtioMmioInterruptRegisters, VirtioMmioQueueNotificationError,
         VirtioMmioQueueNotificationRegisters, VirtioMmioQueueRegisterError,
-        VirtioMmioQueueRegisters, VirtioMmioRegister, VirtioMmioRegisterStateError,
-        decode_virtio_mmio_access,
+        VirtioMmioQueueRegisters, VirtioMmioRegister, VirtioMmioRegisterHandler,
+        VirtioMmioRegisterHandlerError, VirtioMmioRegisterStateError, decode_virtio_mmio_access,
     };
     use crate::interrupt::{DeviceInterruptKind, DeviceInterruptStatusError};
     use crate::memory::GuestAddress;
-    use crate::mmio::{MmioAccessBytes, MmioBus, MmioOperation, MmioOperationKind, MmioRegionId};
+    use crate::mmio::{
+        MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioDispatcher, MmioOperation,
+        MmioOperationKind, MmioRegionId,
+    };
 
     const BASE: u64 = 0x1000_0000;
     const QUEUE_CONFIG_STATUS: u32 = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
@@ -1752,6 +2226,59 @@ mod tests {
         );
         let data = MmioAccessBytes::new(bytes).expect("write bytes should be valid");
         MmioOperation::write(access, data).expect("write operation should be valid")
+    }
+
+    fn read_register_u32(
+        handler: &VirtioMmioRegisterHandler,
+        offset: u64,
+    ) -> Result<u32, VirtioMmioRegisterHandlerError> {
+        let data = handler.read_access(access(offset, 4))?;
+        let bytes: [u8; VIRTIO_MMIO_REGISTER_ACCESS_SIZE] = data
+            .as_slice()
+            .try_into()
+            .expect("register read should return four bytes");
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn write_register_u32(
+        handler: &mut VirtioMmioRegisterHandler,
+        offset: u64,
+        value: u32,
+    ) -> Result<(), VirtioMmioRegisterHandlerError> {
+        let data =
+            MmioAccessBytes::new(&value.to_le_bytes()).expect("register bytes should be valid");
+        handler.write_access(access(offset, 4), data)
+    }
+
+    fn advance_handler_to_features_ok(
+        handler: &mut VirtioMmioRegisterHandler,
+    ) -> Result<(), VirtioMmioRegisterHandlerError> {
+        write_register_u32(
+            handler,
+            VirtioMmioRegister::Status.offset(),
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+        )?;
+        write_register_u32(
+            handler,
+            VirtioMmioRegister::Status.offset(),
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+        )?;
+        write_register_u32(
+            handler,
+            VirtioMmioRegister::Status.offset(),
+            QUEUE_CONFIG_STATUS,
+        )
+    }
+
+    fn advance_handler_to_driver_ok(
+        handler: &mut VirtioMmioRegisterHandler,
+    ) -> Result<(), VirtioMmioRegisterHandlerError> {
+        advance_handler_to_features_ok(handler)?;
+        write_register_u32(
+            handler,
+            VirtioMmioRegister::Status.offset(),
+            DRIVER_OK_STATUS,
+        )
     }
 
     fn access(offset: u64, len: u64) -> crate::mmio::MmioAccess {
@@ -2863,6 +3390,282 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "virtio-mmio queue notification cannot be written while status is 0xb"
+        );
+    }
+
+    #[test]
+    fn register_handler_reads_common_queue_and_interrupt_registers() {
+        let mut handler =
+            VirtioMmioRegisterHandler::new(7, 0x2a, &[8]).expect("handler should build");
+
+        assert_eq!(
+            read_register_u32(&handler, VirtioMmioRegister::MagicValue.offset()),
+            Ok(VIRTIO_MMIO_MAGIC_VALUE)
+        );
+        assert_eq!(
+            read_register_u32(&handler, VirtioMmioRegister::Version.offset()),
+            Ok(VIRTIO_MMIO_VERSION)
+        );
+        assert_eq!(
+            read_register_u32(&handler, VirtioMmioRegister::DeviceId.offset()),
+            Ok(7)
+        );
+        assert_eq!(
+            read_register_u32(&handler, VirtioMmioRegister::QueueNumMax.offset()),
+            Ok(8)
+        );
+
+        handler.mark_interrupt_pending(DeviceInterruptKind::Queue);
+        assert_eq!(
+            read_register_u32(&handler, VirtioMmioRegister::InterruptStatus.offset()),
+            Ok(DeviceInterruptKind::Queue.status().bits())
+        );
+    }
+
+    #[test]
+    fn register_handler_routes_common_and_queue_writes() {
+        let mut handler =
+            VirtioMmioRegisterHandler::new(7, 0x2a, &[8]).expect("handler should build");
+
+        write_register_u32(
+            &mut handler,
+            VirtioMmioRegister::Status.offset(),
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+        )
+        .expect("ACKNOWLEDGE status should write");
+        write_register_u32(
+            &mut handler,
+            VirtioMmioRegister::Status.offset(),
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+        )
+        .expect("DRIVER status should write");
+        write_register_u32(
+            &mut handler,
+            VirtioMmioRegister::DriverFeatures.offset(),
+            0x2a,
+        )
+        .expect("driver features should write");
+        write_register_u32(
+            &mut handler,
+            VirtioMmioRegister::Status.offset(),
+            QUEUE_CONFIG_STATUS,
+        )
+        .expect("FEATURES_OK status should write");
+        write_register_u32(&mut handler, VirtioMmioRegister::QueueNum.offset(), 8)
+            .expect("queue size should write");
+        write_register_u32(&mut handler, VirtioMmioRegister::QueueReady.offset(), 1)
+            .expect("queue ready should write");
+
+        assert_eq!(handler.device_registers().driver_features(), 0x2a);
+        let queue = handler
+            .queue_registers()
+            .selected_queue()
+            .expect("selected queue should exist");
+        assert_eq!(queue.size(), 8);
+        assert!(queue.ready());
+        assert_eq!(
+            read_register_u32(&handler, VirtioMmioRegister::QueueReady.offset()),
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn register_handler_routes_queue_notifications_and_interrupt_acks() {
+        let mut handler =
+            VirtioMmioRegisterHandler::new(7, 0x2a, &[8]).expect("handler should build");
+        advance_handler_to_driver_ok(&mut handler).expect("handler should reach DRIVER_OK");
+
+        write_register_u32(&mut handler, VirtioMmioRegister::QueueNotify.offset(), 0)
+            .expect("queue notify should write");
+        assert_eq!(
+            handler
+                .queue_notification_registers()
+                .pending_queue_notifications(),
+            vec![0]
+        );
+
+        handler.mark_interrupt_pending(DeviceInterruptKind::Queue);
+        assert_eq!(
+            read_register_u32(&handler, VirtioMmioRegister::InterruptStatus.offset()),
+            Ok(DeviceInterruptKind::Queue.status().bits())
+        );
+        write_register_u32(
+            &mut handler,
+            VirtioMmioRegister::InterruptAck.offset(),
+            DeviceInterruptKind::Queue.status().bits(),
+        )
+        .expect("interrupt ack should write");
+        assert_eq!(
+            read_register_u32(&handler, VirtioMmioRegister::InterruptStatus.offset()),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn register_handler_status_reset_clears_composed_substates() {
+        let mut handler =
+            VirtioMmioRegisterHandler::new(7, 0x2a, &[8]).expect("handler should build");
+        advance_handler_to_features_ok(&mut handler).expect("handler should reach FEATURES_OK");
+        write_register_u32(&mut handler, VirtioMmioRegister::QueueNum.offset(), 8)
+            .expect("queue size should write");
+        write_register_u32(&mut handler, VirtioMmioRegister::QueueReady.offset(), 1)
+            .expect("queue ready should write");
+        write_register_u32(
+            &mut handler,
+            VirtioMmioRegister::Status.offset(),
+            DRIVER_OK_STATUS,
+        )
+        .expect("handler should reach DRIVER_OK");
+        write_register_u32(&mut handler, VirtioMmioRegister::QueueNotify.offset(), 0)
+            .expect("queue notify should write");
+        handler.mark_interrupt_pending(DeviceInterruptKind::Queue);
+
+        write_register_u32(
+            &mut handler,
+            VirtioMmioRegister::Status.offset(),
+            VIRTIO_DEVICE_STATUS_INIT,
+        )
+        .expect("INIT status should reset composed state");
+
+        assert_eq!(
+            handler.device_registers().status(),
+            VIRTIO_DEVICE_STATUS_INIT
+        );
+        let queue = handler
+            .queue_registers()
+            .selected_queue()
+            .expect("selected queue should exist after reset");
+        assert_eq!(queue.size(), 0);
+        assert!(!queue.ready());
+        assert!(
+            handler
+                .queue_notification_registers()
+                .pending_queue_notifications()
+                .is_empty()
+        );
+        assert!(handler.interrupt_registers().pending_status().is_empty());
+    }
+
+    #[test]
+    fn register_handler_rejects_device_config_and_unsupported_register_accesses() {
+        let mut handler =
+            VirtioMmioRegisterHandler::new(7, 0x2a, &[8]).expect("handler should build");
+
+        assert_eq!(
+            handler.read_access(access(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, 4)),
+            Err(VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead { offset: 0, len: 4 })
+        );
+        assert_eq!(
+            write_register_u32(&mut handler, VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, 0),
+            Err(VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigWrite { offset: 0, len: 4 })
+        );
+        assert_eq!(
+            handler.read_register(VirtioMmioRegister::DriverFeatures),
+            Err(VirtioMmioRegisterHandlerError::UnsupportedRegisterRead {
+                register: VirtioMmioRegister::DriverFeatures,
+            })
+        );
+        assert_eq!(
+            handler.write_register(VirtioMmioRegister::MagicValue, 0),
+            Err(VirtioMmioRegisterHandlerError::UnsupportedRegisterWrite {
+                register: VirtioMmioRegister::MagicValue,
+            })
+        );
+    }
+
+    #[test]
+    fn register_handler_invalid_write_preserves_substate() {
+        let mut handler =
+            VirtioMmioRegisterHandler::new(7, 0x2a, &[8]).expect("handler should build");
+        advance_handler_to_features_ok(&mut handler).expect("handler should reach FEATURES_OK");
+        write_register_u32(&mut handler, VirtioMmioRegister::QueueNum.offset(), 4)
+            .expect("valid queue size should write");
+
+        let err = write_register_u32(&mut handler, VirtioMmioRegister::QueueNum.offset(), 16)
+            .expect_err("oversized queue should fail");
+
+        assert_eq!(
+            err,
+            VirtioMmioRegisterHandlerError::QueueRegisterWrite {
+                register: VirtioMmioRegister::QueueNum,
+                source: VirtioMmioQueueRegisterError::InvalidQueueSize {
+                    queue_index: 0,
+                    queue_size: 16,
+                    max_size: 8,
+                },
+            }
+        );
+        assert_eq!(
+            handler
+                .queue_registers()
+                .selected_queue()
+                .expect("queue should exist")
+                .size(),
+            4
+        );
+    }
+
+    #[test]
+    fn register_handler_implements_mmio_handler_for_dispatcher() {
+        let mut dispatcher = MmioDispatcher::new();
+        dispatcher
+            .insert_region(
+                MmioRegionId::new(3),
+                GuestAddress::new(BASE),
+                VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+            )
+            .expect("virtio-mmio region should insert");
+        dispatcher
+            .register_handler(
+                MmioRegionId::new(3),
+                VirtioMmioRegisterHandler::new(7, 0x2a, &[8]).expect("handler should build"),
+            )
+            .expect("handler should register");
+        let access = dispatcher
+            .lookup(
+                GuestAddress::new(BASE + VirtioMmioRegister::MagicValue.offset()),
+                4,
+            )
+            .expect("register access should resolve");
+
+        let outcome = dispatcher
+            .dispatch(MmioOperation::read(access).expect("read operation should be valid"))
+            .expect("dispatcher should route read to handler");
+
+        assert_eq!(
+            outcome,
+            MmioDispatchOutcome::Read {
+                data: MmioAccessBytes::new(&VIRTIO_MMIO_MAGIC_VALUE.to_le_bytes())
+                    .expect("magic read bytes should be valid"),
+            }
+        );
+    }
+
+    #[test]
+    fn register_handler_errors_display_and_preserve_sources() {
+        let handler = VirtioMmioRegisterHandler::new(7, 0x2a, &[8]).expect("handler should build");
+        let err = handler
+            .read_access(access(0x18, 4))
+            .expect_err("reserved read offset should fail");
+
+        assert_eq!(
+            err.to_string(),
+            "failed to decode virtio-mmio MMIO access: unsupported virtio-mmio read register offset 0x18"
+        );
+        assert_eq!(
+            err.source().map(ToString::to_string),
+            Some("unsupported virtio-mmio read register offset 0x18".to_string())
+        );
+
+        let err = VirtioMmioRegisterHandler::new(7, 0x2a, &[])
+            .expect_err("empty queue table should fail handler construction");
+        assert_eq!(
+            err.to_string(),
+            "failed to initialize virtio-mmio queue registers: virtio-mmio queue table cannot be empty"
+        );
+        assert_eq!(
+            err.source().map(ToString::to_string),
+            Some("virtio-mmio queue table cannot be empty".to_string())
         );
     }
 
