@@ -193,6 +193,48 @@ impl DriveConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DriveConfigs {
+    configs: Vec<DriveConfig>,
+}
+
+impl DriveConfigs {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn as_slice(&self) -> &[DriveConfig] {
+        &self.configs
+    }
+
+    pub fn insert(&mut self, input: DriveConfigInput) -> Result<(), DriveConfigError> {
+        let config = input.validate()?;
+        if config.is_root_device()
+            && self.configs.iter().any(|existing| {
+                existing.is_root_device() && existing.drive_id() != config.drive_id()
+            })
+        {
+            return Err(DriveConfigError::RootDeviceAlreadyConfigured);
+        }
+
+        if let Some(index) = self
+            .configs
+            .iter()
+            .position(|existing| existing.drive_id() == config.drive_id())
+        {
+            self.configs.remove(index);
+        }
+
+        if config.is_root_device() {
+            self.configs.insert(0, config);
+        } else {
+            self.configs.push(config);
+        }
+
+        Ok(())
+    }
+}
+
 impl TryFrom<DriveConfigInput> for DriveConfig {
     type Error = DriveConfigError;
 
@@ -309,6 +351,7 @@ pub enum DriveConfigError {
     },
     UnsupportedRateLimiter,
     UnsupportedSocket,
+    RootDeviceAlreadyConfigured,
 }
 
 impl fmt::Display for DriveConfigError {
@@ -331,6 +374,7 @@ impl fmt::Display for DriveConfigError {
             }
             Self::UnsupportedRateLimiter => f.write_str("drive rate_limiter is not supported"),
             Self::UnsupportedSocket => f.write_str("drive socket is not supported"),
+            Self::RootDeviceAlreadyConfigured => f.write_str("a root drive is already configured"),
         }
     }
 }
@@ -2278,19 +2322,20 @@ mod tests {
 
     use super::{
         BlockFileBacking, BlockFileBackingError, DriveCacheType, DriveConfig, DriveConfigError,
-        DriveConfigInput, DriveIdSource, DriveIoEngine, VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE,
-        VIRTIO_BLOCK_DEVICE_ID, VIRTIO_BLOCK_FEATURE_READ_ONLY, VIRTIO_BLOCK_ID_BYTES,
-        VIRTIO_BLOCK_QUEUE_COUNT, VIRTIO_BLOCK_QUEUE_SIZE, VIRTIO_BLOCK_QUEUE_SIZES,
-        VIRTIO_BLOCK_REQUEST_HEADER_SIZE, VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
-        VIRTIO_BLOCK_REQUEST_TYPE_GET_ID, VIRTIO_BLOCK_REQUEST_TYPE_IN,
-        VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT, VIRTIO_BLOCK_SECTOR_SIZE,
-        VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK, VIRTIO_BLOCK_STATUS_SIZE,
-        VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1, VIRTIO_RING_FEATURE_EVENT_IDX,
-        VirtioBlockConfigSpace, VirtioBlockDevice, VirtioBlockDeviceActivationError,
-        VirtioBlockDeviceId, VirtioBlockDeviceNotificationError, VirtioBlockQueue,
-        VirtioBlockQueueBuildError, VirtioBlockQueueDispatchError, VirtioBlockRequest,
-        VirtioBlockRequestCompletion, VirtioBlockRequestError, VirtioBlockRequestExecutionError,
-        VirtioBlockRequestExecutionOutcome, VirtioBlockRequestType, normalize_completion_status,
+        DriveConfigInput, DriveConfigs, DriveIdSource, DriveIoEngine,
+        VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE, VIRTIO_BLOCK_DEVICE_ID, VIRTIO_BLOCK_FEATURE_READ_ONLY,
+        VIRTIO_BLOCK_ID_BYTES, VIRTIO_BLOCK_QUEUE_COUNT, VIRTIO_BLOCK_QUEUE_SIZE,
+        VIRTIO_BLOCK_QUEUE_SIZES, VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
+        VIRTIO_BLOCK_REQUEST_TYPE_FLUSH, VIRTIO_BLOCK_REQUEST_TYPE_GET_ID,
+        VIRTIO_BLOCK_REQUEST_TYPE_IN, VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT,
+        VIRTIO_BLOCK_SECTOR_SIZE, VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK,
+        VIRTIO_BLOCK_STATUS_SIZE, VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1,
+        VIRTIO_RING_FEATURE_EVENT_IDX, VirtioBlockConfigSpace, VirtioBlockDevice,
+        VirtioBlockDeviceActivationError, VirtioBlockDeviceId, VirtioBlockDeviceNotificationError,
+        VirtioBlockQueue, VirtioBlockQueueBuildError, VirtioBlockQueueDispatchError,
+        VirtioBlockRequest, VirtioBlockRequestCompletion, VirtioBlockRequestError,
+        VirtioBlockRequestExecutionError, VirtioBlockRequestExecutionOutcome,
+        VirtioBlockRequestType, normalize_completion_status,
     };
 
     static NEXT_TEMP_PATH_ID: AtomicUsize = AtomicUsize::new(0);
@@ -3138,6 +3183,109 @@ mod tests {
 
         assert_eq!(err.to_string(), "drive rate_limiter is not supported");
         assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn drive_configs_insert_validated_config() {
+        let mut configs = DriveConfigs::new();
+
+        configs
+            .insert(input())
+            .expect("minimal drive config should be stored");
+
+        assert_eq!(configs.as_slice().len(), 1);
+        let config = &configs.as_slice()[0];
+        assert_eq!(config.drive_id(), "rootfs");
+        assert_eq!(config.path_on_host(), PathBuf::from("/tmp/rootfs.ext4"));
+    }
+
+    #[test]
+    fn drive_configs_replace_duplicate_drive_id() {
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(input())
+            .expect("initial drive config should be stored");
+
+        configs
+            .insert(
+                DriveConfigInput::new("rootfs", "rootfs", "/tmp/replaced.ext4", true)
+                    .with_is_read_only(true),
+            )
+            .expect("duplicate drive id should replace existing config");
+
+        assert_eq!(configs.as_slice().len(), 1);
+        let config = &configs.as_slice()[0];
+        assert_eq!(config.drive_id(), "rootfs");
+        assert_eq!(config.path_on_host(), PathBuf::from("/tmp/replaced.ext4"));
+        assert!(config.is_root_device());
+        assert!(config.is_read_only());
+    }
+
+    #[test]
+    fn drive_configs_keep_root_drive_first() {
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new(
+                "data",
+                "data",
+                "/tmp/data.ext4",
+                false,
+            ))
+            .expect("data drive config should be stored");
+        configs
+            .insert(DriveConfigInput::new(
+                "rootfs",
+                "rootfs",
+                "/tmp/rootfs.ext4",
+                true,
+            ))
+            .expect("root drive config should be stored");
+
+        assert_eq!(configs.as_slice()[0].drive_id(), "rootfs");
+        assert_eq!(configs.as_slice()[1].drive_id(), "data");
+    }
+
+    #[test]
+    fn drive_configs_reject_second_root_without_mutating() {
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new(
+                "rootfs",
+                "rootfs",
+                "/tmp/rootfs.ext4",
+                true,
+            ))
+            .expect("root drive config should be stored");
+
+        let err = configs
+            .insert(DriveConfigInput::new(
+                "data",
+                "data",
+                "/tmp/data.ext4",
+                true,
+            ))
+            .expect_err("second root drive should fail");
+
+        assert_eq!(err, DriveConfigError::RootDeviceAlreadyConfigured);
+        assert_eq!(err.to_string(), "a root drive is already configured");
+        assert_eq!(configs.as_slice().len(), 1);
+        assert_eq!(configs.as_slice()[0].drive_id(), "rootfs");
+    }
+
+    #[test]
+    fn drive_configs_reject_invalid_input_without_mutating() {
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(input())
+            .expect("initial drive config should be stored");
+
+        let err = configs
+            .insert(DriveConfigInput::new("data", "data", PathBuf::new(), false))
+            .expect_err("invalid drive config should fail");
+
+        assert_eq!(err, DriveConfigError::EmptyPathOnHost);
+        assert_eq!(configs.as_slice().len(), 1);
+        assert_eq!(configs.as_slice()[0].drive_id(), "rootfs");
     }
 
     #[test]

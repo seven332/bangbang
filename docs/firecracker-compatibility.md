@@ -5,10 +5,9 @@ is a planning reference for future API, VMM, and backend work; it does not mean
 the current scaffold implements all listed API behavior.
 
 The current repository defines crate boundaries, endpoint names, a minimal
-HTTP-over-Unix-socket API server for `GET /` and `GET /version`, a strict
-Firecracker-shaped `PUT /drives/{drive_id}` request parser that is not yet
-wired to successful VMM configuration behavior, a backend-neutral VM
-trait, a minimal read-only VMM action/data model, backend-neutral guest
+HTTP-over-Unix-socket API server for `GET /`, `GET /version`, and pre-boot
+`PUT /drives/{drive_id}` configuration storage, a backend-neutral VM
+trait, a minimal VMM action/data model, backend-neutral guest
 physical address and aarch64 DRAM layout/access primitives, arm64 boot
 placement helpers, internal boot-source validation and arm64 kernel/initrd
 payload loading, an internal Firecracker-shaped drive configuration validation
@@ -36,12 +35,15 @@ notification dispatch helper with virtio-mmio queue interrupt-status updates
 for future device handlers, an internal
 backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, and an initial process startup argument model.
-There is no broader API request body model beyond the initial drive parser, guest execution, continuous vCPU run loop,
+There is no broader API request body model beyond the initial drive
+configuration body, guest execution, continuous vCPU run loop,
 complete interrupt delivery, public startup or HVF runner-loop wiring for block
 queue notifications, backend interrupt signaling, device-backed feature
 negotiation, indirect descriptor support, device-backed runner-loop MMIO
 handling, real device emulation, multi-vCPU setup, PSCI behavior, or public
-boot-source, drives, or actions configuration behavior yet.
+boot-source or actions configuration behavior yet. Drive configuration is
+recorded only as pre-boot VM state; host-file opening, block-device attachment,
+boot selection, and runtime hotplug remain deferred.
 
 ## Firecracker Model Alignment
 
@@ -50,17 +52,17 @@ manages one microVM. Future API work should keep the control plane outside the
 guest execution fast path.
 
 The intended public control plane is Firecracker-style HTTP over a Unix domain
-socket. The implemented `GET /` and `GET /version` requests already map
-through a minimal internal VMM action/data boundary. Future API requests should
-map to explicit VMM actions and VM state transitions, but this document only
-defines the initial scope.
+socket. The implemented `GET /`, `GET /version`, and pre-boot
+`PUT /drives/{drive_id}` requests already map through a minimal internal VMM
+action/data boundary. Future API requests should map to explicit VMM actions
+and VM state transitions, but this document only defines the initial scope.
 
 ## Process Startup CLI
 
 The current `bangbang` executable parses only the first process-lifecycle
 arguments and starts the first API socket surface. It binds a Unix socket and
-serves `GET /` and `GET /version`, but does not load a configuration file or
-start a guest.
+serves `GET /`, `GET /version`, and pre-boot `PUT /drives/{drive_id}`
+configuration storage, but does not load a configuration file or start a guest.
 
 | Argument | Current behavior | Compatibility notes |
 | --- | --- | --- |
@@ -217,7 +219,7 @@ exist.
 | `PUT /drives/{drive_id}` | path `drive_id` | required | The API parser captures this value, and the internal model validates it as nonempty alphanumeric or `_`, matching Firecracker's `checked_id` rule. |
 | `PUT /drives/{drive_id}` | body `drive_id` | required | The API parser rejects requests where this does not match the path `drive_id`. |
 | `PUT /drives/{drive_id}` | `is_root_device` | required | Identifies whether this drive is the boot device. |
-| `PUT /drives/{drive_id}` | `path_on_host` | required initially | The internal model rejects empty paths without opening or statting the path; future validation must cover access, file type, and path redaction in errors. |
+| `PUT /drives/{drive_id}` | `path_on_host` | required | The API/VMM path records this value only after rejecting empty paths; it does not open or stat the path yet. Future validation must cover access, file type, and path redaction in errors. |
 | `PUT /drives/{drive_id}` | `is_read_only` | optional | The internal model defaults omitted virtio-block drives to read-write. |
 | `PUT /drives/{drive_id}` | `partuuid` | optional | Only meaningful for root-device boot selection. |
 | `PUT /drives/{drive_id}` | `cache_type` | optional when `Unsafe`; deferred when `Writeback` | The internal model accepts omitted/default `Unsafe` and rejects `Writeback` as unsupported. |
@@ -360,8 +362,9 @@ The API crate has a strict Firecracker-shaped `PUT /drives/{drive_id}` request
 parser and body model. It accepts the documented drive fields, rejects unknown
 fields, rejects malformed or incomplete JSON bodies, rejects extra path
 segments, and rejects path/body `drive_id` mismatches without echoing host paths.
-The running API server still returns an unsupported-operation fault for parsed
-drive requests because VMM action and state wiring is deferred.
+The running API server converts parsed drive requests into a VMM action; valid
+pre-boot requests are recorded as VM configuration state and return `204 No
+Content`.
 
 The runtime crate has an internal, Firecracker-shaped drive configuration model
 for the initial virtio-block subset. It validates path and body `drive_id`
@@ -379,7 +382,8 @@ host file, preserve the configured read-only mode, report byte length, and
 perform bounded positioned reads/writes and flushes for internal virtio-block
 request execution. It rejects non-regular backing paths before data I/O and
 rejects read-only writes before mutating the file. Backing errors also avoid
-echoing `path_on_host`.
+echoing `path_on_host`. This host-file opening path is internal and not invoked
+by public drive configuration yet.
 
 The runtime crate can derive an internal virtio-block configuration space from
 the backing length. It reports capacity as full 512-byte sectors, matching
@@ -390,10 +394,11 @@ device id and one 256-entry queue shape, always advertises
 The config handler supports bounded read-only capacity reads through the
 existing virtio-mmio device-configuration path and rejects config writes.
 
-The runtime model is not wired to successful `PUT /drives/{drive_id}` VMM
-configuration yet and does not select a root block device, wire active block
-notification dispatch into startup or HVF runner loops, implement rate limiting,
-support vhost-user-block sockets, or use an async I/O engine.
+The runtime model is wired to successful pre-boot `PUT /drives/{drive_id}` VMM
+configuration storage. It still does not open the configured host path through
+the API, select a root block device for boot, wire active block notification
+dispatch into startup or HVF runner loops, implement rate limiting, support
+vhost-user-block sockets, or use an async I/O engine.
 
 ## Internal arm64 FDT Generation
 
@@ -562,16 +567,18 @@ or should preserve Firecracker's architecture-helper truncation behavior.
 
 ## API State and Response Policy
 
-The current scaffold implements the first HTTP API behavior for `GET /` and
-`GET /version`.
+The current scaffold implements the first HTTP API behavior for `GET /`,
+`GET /version`, and pre-boot `PUT /drives/{drive_id}` configuration storage.
 The policy below is the compatibility target for future request parsing, VMM
 action mapping, state validation, and golden API tests.
 
-The implemented `GET /version` path currently flows through the minimal
-read-only VMM action model as `GetVmmVersion` and returns VMM version data.
-The implemented `GET /` path flows through the same boundary as
-`GetVmInstanceInfo` and returns Firecracker-shaped instance information. The
-state currently remains `Not started` until real startup behavior exists.
+The implemented `GET /version` path flows through the minimal VMM action model
+as `GetVmmVersion` and returns VMM version data. The implemented `GET /` path
+flows through the same boundary as `GetVmInstanceInfo` and returns
+Firecracker-shaped instance information. The implemented pre-boot drive path
+flows through `PutDrive` and records validated configuration state. The
+instance state currently remains `Not started` until real startup behavior
+exists.
 
 ### Initial API State Model
 
@@ -597,7 +604,7 @@ The first API implementation should model the same broad stages as Firecracker:
 | `GET /machine-config` | supported target; `200` JSON | supported target; `200` JSON | Returns machine configuration and defaulted values. |
 | `PUT /machine-config` | supported target; `204` empty response on success | unsupported after start; `400` `fault_message` | Pre-boot-only configuration. |
 | `PUT /boot-source` | supported target; `204` empty response on success | unsupported after start; `400` `fault_message` | Host path errors must avoid leaking sensitive path details. |
-| `PUT /drives/{drive_id}` | supported target; `204` empty response on success | unsupported after start; `400` `fault_message` | Runtime hotplug remains deferred. |
+| `PUT /drives/{drive_id}` | supported target; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config only; host-file opening, block attachment, and runtime hotplug remain deferred. |
 | `PUT /actions` with `InstanceStart` | supported target; `204` empty response on successful transition | unsupported after start; `400` `fault_message` | Startup validation failures should also use `400` `fault_message`. |
 | `PUT /actions` with `FlushMetrics` | unsupported before start; `400` `fault_message` | deferred until metrics support exists; future success should use `204` empty response | Firecracker treats this as runtime-only; tied to observability work. |
 | `PUT /actions` with `SendCtrlAltDel` | intentionally unsupported; `400` `fault_message` | intentionally unsupported; `400` `fault_message` | Firecracker rejects this on aarch64; bangbang's first target is Apple Silicon. |

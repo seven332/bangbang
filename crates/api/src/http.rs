@@ -139,6 +139,7 @@ struct DriveConfigRequestBody {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusCode {
     Ok,
+    NoContent,
     BadRequest,
 }
 
@@ -146,6 +147,7 @@ impl StatusCode {
     pub const fn as_u16(self) -> u16 {
         match self {
             Self::Ok => 200,
+            Self::NoContent => 204,
             Self::BadRequest => 400,
         }
     }
@@ -153,6 +155,7 @@ impl StatusCode {
     const fn reason_phrase(self) -> &'static str {
         match self {
             Self::Ok => "OK",
+            Self::NoContent => "No Content",
             Self::BadRequest => "Bad Request",
         }
     }
@@ -198,6 +201,13 @@ impl HttpResponse {
         }
     }
 
+    pub fn no_content() -> Self {
+        Self {
+            status: StatusCode::NoContent,
+            body: String::new(),
+        }
+    }
+
     pub const fn status(&self) -> StatusCode {
         self.status
     }
@@ -207,10 +217,17 @@ impl HttpResponse {
     }
 
     pub fn to_http_bytes(&self) -> Vec<u8> {
+        let content_type = if self.body.is_empty() {
+            ""
+        } else {
+            "Content-Type: application/json\r\n"
+        };
+
         format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 {} {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
             self.status.as_u16(),
             self.status.reason_phrase(),
+            content_type,
             self.body.len(),
             self.body
         )
@@ -1023,6 +1040,14 @@ mod tests {
     }
 
     #[test]
+    fn no_content_response_has_empty_body() {
+        let response = HttpResponse::no_content();
+
+        assert_eq!(response.status(), StatusCode::NoContent);
+        assert_eq!(response.body(), "");
+    }
+
+    #[test]
     fn response_bytes_include_http_headers() {
         let response = HttpResponse::version(VERSION);
         let bytes = response.to_http_bytes();
@@ -1032,6 +1057,18 @@ mod tests {
         assert!(text.contains("Content-Type: application/json\r\n"));
         assert!(text.contains(&format!("Content-Length: {}\r\n", response.body().len())));
         assert!(text.ends_with(r#"{"firecracker_version":"0.1.0"}"#));
+    }
+
+    #[test]
+    fn no_content_response_bytes_have_zero_length_and_no_json_body() {
+        let response = HttpResponse::no_content();
+        let bytes = response.to_http_bytes();
+        let text = std::str::from_utf8(&bytes).expect("response should be utf-8");
+
+        assert!(text.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(!text.contains("Content-Type: application/json\r\n"));
+        assert!(text.contains("Content-Length: 0\r\n"));
+        assert!(text.ends_with("\r\n\r\n"));
     }
 
     #[test]
