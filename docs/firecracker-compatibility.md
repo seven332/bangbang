@@ -19,7 +19,7 @@ arm64 FDT generation and guest-memory writes, anonymous guest memory allocation
 for validated runtime layouts, HVF guest memory map/unmap ownership for
 allocated regions, an internal MMIO region ownership registry and operation/data
 model plus handler dispatch boundary, an internal virtio-mmio register/access
-decoder, feature/status register state, plus virtqueue descriptor-chain
+decoder, feature/status and queue register state, plus virtqueue descriptor-chain
 validator, available-ring read model, and used-ring write model for future
 device handlers, an internal backend-neutral interrupt line/status/trigger
 model, single-vCPU arm64 HVF boot-register setup, and an initial process
@@ -361,8 +361,11 @@ can be mutated. A backend-neutral common-register state model can return
 Firecracker-shaped identity values, expose selected 32-bit device feature
 pages, accept selected driver feature pages only in the pre-`FEATURES_OK`
 driver state, and enforce the cumulative VirtIO status transition sequence
-plus reset-on-zero behavior. Device-configuration accesses are classified by
-offset and length, but concrete config-space behavior, queue register state,
+plus reset-on-zero behavior. A separate backend-neutral queue-register model
+tracks selected queue state, validates queue sizes, records queue ready state,
+and composes descriptor, driver, and device ring address halves with the
+alignment required by the virtqueue model. Device-configuration accesses are
+classified by offset and length, but concrete config-space behavior,
 notification handling, interrupt acknowledgement, device activation, and real
 virtio devices are still deferred. The virtqueue model can publish one
 used-ring completion element with validated layout, mapped-memory checks,
