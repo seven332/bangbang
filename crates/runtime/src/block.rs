@@ -9,12 +9,18 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::interrupt::DeviceInterruptKind;
-use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryRange};
-use crate::mmio::{MmioAccessBytes, MmioAccessBytesError, MmioHandlerError};
+use crate::memory::{
+    GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryRange,
+};
+use crate::mmio::{
+    MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
+    MmioHandlerError, MmioRegion, MmioRegionId,
+};
 use crate::virtio_mmio::{
-    VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError, VirtioMmioDeviceActivationHandler,
-    VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError, VirtioMmioDeviceConfigHandler,
-    VirtioMmioQueueRegisterError, VirtioMmioQueueState, VirtioMmioRegisterHandler,
+    VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
+    VirtioMmioDeviceActivationHandler, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
+    VirtioMmioDeviceConfigHandler, VirtioMmioQueueRegisterError, VirtioMmioQueueState,
+    VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
 };
 use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
@@ -2159,6 +2165,13 @@ impl PreparedBlockDevices {
     pub fn into_vec(self) -> Vec<PreparedBlockDevice> {
         self.devices
     }
+
+    pub fn register_mmio(
+        self,
+        layout: BlockMmioLayout,
+    ) -> Result<BlockMmioDevices, BlockMmioRegistrationError> {
+        BlockMmioDevices::from_prepared(self, layout)
+    }
 }
 
 #[derive(Debug)]
@@ -2190,6 +2203,435 @@ impl std::error::Error for PreparedBlockDeviceError {
         match self {
             Self::AllocateDevices { source } => Some(source),
             Self::OpenBacking { source, .. } => Some(source),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockMmioLayout {
+    base_address: GuestAddress,
+    base_region_id: MmioRegionId,
+    address_stride: u64,
+    region_id_stride: u64,
+}
+
+impl BlockMmioLayout {
+    pub const fn new(base_address: GuestAddress, base_region_id: MmioRegionId) -> Self {
+        Self {
+            base_address,
+            base_region_id,
+            address_stride: VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+            region_id_stride: 1,
+        }
+    }
+
+    pub const fn base_address(self) -> GuestAddress {
+        self.base_address
+    }
+
+    pub const fn base_region_id(self) -> MmioRegionId {
+        self.base_region_id
+    }
+
+    pub const fn address_stride(self) -> u64 {
+        self.address_stride
+    }
+
+    pub const fn region_id_stride(self) -> u64 {
+        self.region_id_stride
+    }
+
+    pub const fn with_address_stride(mut self, address_stride: u64) -> Self {
+        self.address_stride = address_stride;
+        self
+    }
+
+    pub const fn with_region_id_stride(mut self, region_id_stride: u64) -> Self {
+        self.region_id_stride = region_id_stride;
+        self
+    }
+
+    fn validate(self) -> Result<(), BlockMmioRegistrationError> {
+        if self.address_stride < VIRTIO_MMIO_DEVICE_WINDOW_SIZE {
+            return Err(BlockMmioRegistrationError::AddressStrideTooSmall {
+                stride: self.address_stride,
+                minimum: VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+            });
+        }
+
+        if self.region_id_stride == 0 {
+            return Err(BlockMmioRegistrationError::DuplicateRegionIdStride {
+                region_id: self.base_region_id,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn placement(
+        self,
+        index: usize,
+    ) -> Result<BlockMmioDevicePlacement, BlockMmioRegistrationError> {
+        let device_index = u64::try_from(index)
+            .map_err(|_| BlockMmioRegistrationError::DeviceIndexTooLarge { index })?;
+        let address_offset = device_index.checked_mul(self.address_stride).ok_or(
+            BlockMmioRegistrationError::AddressOffsetOverflow {
+                device_index,
+                stride: self.address_stride,
+            },
+        )?;
+        let address = self.base_address.checked_add(address_offset).ok_or(
+            BlockMmioRegistrationError::AddressOverflow {
+                base_address: self.base_address,
+                offset: address_offset,
+            },
+        )?;
+        let region_id_offset = device_index.checked_mul(self.region_id_stride).ok_or(
+            BlockMmioRegistrationError::RegionIdOffsetOverflow {
+                device_index,
+                stride: self.region_id_stride,
+            },
+        )?;
+        let region_id = self
+            .base_region_id
+            .raw_value()
+            .checked_add(region_id_offset)
+            .map(MmioRegionId::new)
+            .ok_or(BlockMmioRegistrationError::RegionIdOverflow {
+                base_region_id: self.base_region_id,
+                offset: region_id_offset,
+            })?;
+        let region = MmioRegion::new(region_id, address, VIRTIO_MMIO_DEVICE_WINDOW_SIZE).map_err(
+            |source| BlockMmioRegistrationError::InvalidRegion {
+                region_id,
+                address,
+                source,
+            },
+        )?;
+
+        Ok(BlockMmioDevicePlacement {
+            index,
+            address,
+            region_id,
+            region,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockMmioDevicePlacement {
+    index: usize,
+    address: GuestAddress,
+    region_id: MmioRegionId,
+    region: MmioRegion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockMmioDeviceRegistration {
+    index: usize,
+    drive_id: String,
+    region: MmioRegion,
+}
+
+impl BlockMmioDeviceRegistration {
+    pub const fn index(&self) -> usize {
+        self.index
+    }
+
+    pub fn drive_id(&self) -> &str {
+        &self.drive_id
+    }
+
+    pub const fn region(&self) -> MmioRegion {
+        self.region
+    }
+
+    pub const fn region_id(&self) -> MmioRegionId {
+        self.region.id()
+    }
+
+    pub const fn address(&self) -> GuestAddress {
+        self.region.range().start()
+    }
+}
+
+#[derive(Debug)]
+pub struct BlockMmioDevices {
+    dispatcher: MmioDispatcher,
+    registrations: Vec<BlockMmioDeviceRegistration>,
+}
+
+impl BlockMmioDevices {
+    pub fn from_prepared(
+        prepared: PreparedBlockDevices,
+        layout: BlockMmioLayout,
+    ) -> Result<Self, BlockMmioRegistrationError> {
+        layout.validate()?;
+
+        let prepared_devices = prepared.into_vec();
+        let mut registrations = Vec::new();
+        registrations
+            .try_reserve_exact(prepared_devices.len())
+            .map_err(|source| BlockMmioRegistrationError::AllocateRegistrations { source })?;
+        let mut placements = Vec::new();
+        placements
+            .try_reserve_exact(prepared_devices.len())
+            .map_err(|source| BlockMmioRegistrationError::AllocatePlacements { source })?;
+        for index in 0..prepared_devices.len() {
+            placements.push(layout.placement(index)?);
+        }
+
+        let mut dispatcher = MmioDispatcher::new();
+        for (prepared_device, placement) in prepared_devices.into_iter().zip(placements) {
+            let (drive_id, config_space, device) = prepared_device.into_parts();
+            let handler = VirtioMmioRegisterHandler::with_device_config_and_activation(
+                VIRTIO_BLOCK_DEVICE_ID,
+                config_space.available_features(),
+                &VIRTIO_BLOCK_QUEUE_SIZES,
+                config_space,
+                device,
+            )
+            .map_err(|source| BlockMmioRegistrationError::BuildHandler {
+                drive_id: drive_id.clone(),
+                region_id: placement.region_id,
+                source,
+            })?;
+            let region = dispatcher
+                .insert_region(
+                    placement.region_id,
+                    placement.address,
+                    VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+                )
+                .map_err(|source| BlockMmioRegistrationError::InsertRegion {
+                    drive_id: drive_id.clone(),
+                    region_id: placement.region_id,
+                    address: placement.address,
+                    source,
+                })?;
+            dispatcher
+                .register_handler(placement.region_id, handler)
+                .map_err(|source| BlockMmioRegistrationError::RegisterHandler {
+                    drive_id: drive_id.clone(),
+                    region_id: placement.region_id,
+                    source,
+                })?;
+            debug_assert_eq!(region, placement.region);
+            registrations.push(BlockMmioDeviceRegistration {
+                index: placement.index,
+                drive_id,
+                region,
+            });
+        }
+
+        Ok(Self {
+            dispatcher,
+            registrations,
+        })
+    }
+
+    pub fn dispatcher(&self) -> &MmioDispatcher {
+        &self.dispatcher
+    }
+
+    pub fn dispatcher_mut(&mut self) -> &mut MmioDispatcher {
+        &mut self.dispatcher
+    }
+
+    pub fn registrations(&self) -> &[BlockMmioDeviceRegistration] {
+        &self.registrations
+    }
+
+    pub fn len(&self) -> usize {
+        self.registrations.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.registrations.is_empty()
+    }
+
+    pub fn into_parts(self) -> (MmioDispatcher, Vec<BlockMmioDeviceRegistration>) {
+        (self.dispatcher, self.registrations)
+    }
+}
+
+#[derive(Debug)]
+pub enum BlockMmioRegistrationError {
+    AddressStrideTooSmall {
+        stride: u64,
+        minimum: u64,
+    },
+    DuplicateRegionIdStride {
+        region_id: MmioRegionId,
+    },
+    DeviceIndexTooLarge {
+        index: usize,
+    },
+    AddressOffsetOverflow {
+        device_index: u64,
+        stride: u64,
+    },
+    AddressOverflow {
+        base_address: GuestAddress,
+        offset: u64,
+    },
+    RegionIdOffsetOverflow {
+        device_index: u64,
+        stride: u64,
+    },
+    RegionIdOverflow {
+        base_region_id: MmioRegionId,
+        offset: u64,
+    },
+    AllocateRegistrations {
+        source: TryReserveError,
+    },
+    AllocatePlacements {
+        source: TryReserveError,
+    },
+    InvalidRegion {
+        region_id: MmioRegionId,
+        address: GuestAddress,
+        source: GuestMemoryError,
+    },
+    BuildHandler {
+        drive_id: String,
+        region_id: MmioRegionId,
+        source: VirtioMmioRegisterHandlerError,
+    },
+    InsertRegion {
+        drive_id: String,
+        region_id: MmioRegionId,
+        address: GuestAddress,
+        source: MmioBusError,
+    },
+    RegisterHandler {
+        drive_id: String,
+        region_id: MmioRegionId,
+        source: MmioDispatchError,
+    },
+}
+
+impl fmt::Display for BlockMmioRegistrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AddressStrideTooSmall { stride, minimum } => {
+                write!(
+                    f,
+                    "block MMIO address stride {stride} is smaller than the required device window size {minimum}"
+                )
+            }
+            Self::DuplicateRegionIdStride { region_id } => {
+                write!(
+                    f,
+                    "block MMIO region id stride cannot be 0 because it would duplicate region id={region_id}"
+                )
+            }
+            Self::DeviceIndexTooLarge { index } => {
+                write!(f, "block MMIO device index {index} does not fit in u64")
+            }
+            Self::AddressOffsetOverflow {
+                device_index,
+                stride,
+            } => {
+                write!(
+                    f,
+                    "block MMIO address offset overflows for device index {device_index} with stride {stride}"
+                )
+            }
+            Self::AddressOverflow {
+                base_address,
+                offset,
+            } => {
+                write!(
+                    f,
+                    "block MMIO address overflows from base {base_address} with offset {offset}"
+                )
+            }
+            Self::RegionIdOffsetOverflow {
+                device_index,
+                stride,
+            } => {
+                write!(
+                    f,
+                    "block MMIO region id offset overflows for device index {device_index} with stride {stride}"
+                )
+            }
+            Self::RegionIdOverflow {
+                base_region_id,
+                offset,
+            } => {
+                write!(
+                    f,
+                    "block MMIO region id overflows from base id={base_region_id} with offset {offset}"
+                )
+            }
+            Self::AllocateRegistrations { source } => {
+                write!(f, "failed to allocate block MMIO registrations: {source}")
+            }
+            Self::AllocatePlacements { source } => {
+                write!(f, "failed to allocate block MMIO placements: {source}")
+            }
+            Self::InvalidRegion {
+                region_id,
+                address,
+                source,
+            } => {
+                write!(
+                    f,
+                    "invalid block MMIO region id={region_id} at {address}: {source}"
+                )
+            }
+            Self::BuildHandler {
+                drive_id,
+                region_id,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to build block MMIO handler for drive {drive_id} region id={region_id}: {source}"
+                )
+            }
+            Self::InsertRegion {
+                drive_id,
+                region_id,
+                address,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to insert block MMIO region for drive {drive_id} region id={region_id} at {address}: {source}"
+                )
+            }
+            Self::RegisterHandler {
+                drive_id,
+                region_id,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to register block MMIO handler for drive {drive_id} region id={region_id}: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for BlockMmioRegistrationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AllocateRegistrations { source } => Some(source),
+            Self::AllocatePlacements { source } => Some(source),
+            Self::InvalidRegion { source, .. } => Some(source),
+            Self::BuildHandler { source, .. } => Some(source),
+            Self::InsertRegion { source, .. } => Some(source),
+            Self::RegisterHandler { source, .. } => Some(source),
+            Self::AddressStrideTooSmall { .. }
+            | Self::DuplicateRegionIdStride { .. }
+            | Self::DeviceIndexTooLarge { .. }
+            | Self::AddressOffsetOverflow { .. }
+            | Self::AddressOverflow { .. }
+            | Self::RegionIdOffsetOverflow { .. }
+            | Self::RegionIdOverflow { .. } => None,
         }
     }
 }
@@ -2420,12 +2862,14 @@ mod tests {
 
     use crate::interrupt::DeviceInterruptKind;
     use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
-    use crate::mmio::{MmioAccess, MmioAccessBytes, MmioBus, MmioRegionId};
+    use crate::mmio::{
+        MmioAccess, MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioOperation, MmioRegionId,
+    };
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
         VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
         VIRTIO_DEVICE_STATUS_INIT, VIRTIO_MMIO_DEVICE_CONFIG_OFFSET,
-        VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation,
+        VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VIRTIO_MMIO_MAGIC_VALUE, VirtioMmioDeviceActivation,
         VirtioMmioDeviceActivationError, VirtioMmioDeviceActivationHandler,
         VirtioMmioDeviceRegisters, VirtioMmioQueueRegisters, VirtioMmioRegister,
         VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
@@ -2437,7 +2881,8 @@ mod tests {
     };
 
     use super::{
-        BlockFileBacking, BlockFileBackingError, DriveCacheType, DriveConfig, DriveConfigError,
+        BlockFileBacking, BlockFileBackingError, BlockMmioDevices, BlockMmioLayout,
+        BlockMmioRegistrationError, DriveCacheType, DriveConfig, DriveConfigError,
         DriveConfigInput, DriveConfigs, DriveIdSource, DriveIoEngine, PreparedBlockDeviceError,
         PreparedBlockDevices, VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE, VIRTIO_BLOCK_DEVICE_ID,
         VIRTIO_BLOCK_FEATURE_READ_ONLY, VIRTIO_BLOCK_ID_BYTES, VIRTIO_BLOCK_QUEUE_COUNT,
@@ -2750,6 +3195,43 @@ mod tests {
                 u64::try_from(bytes.len()).expect("test byte length should fit in u64"),
             ),
             MmioAccessBytes::new(bytes).expect("test write bytes should be valid"),
+        )
+    }
+
+    fn dispatch_block_mmio_read(
+        devices: &mut BlockMmioDevices,
+        device_index: usize,
+        offset: u64,
+        len: u64,
+    ) -> MmioAccessBytes {
+        let address = devices.registrations()[device_index]
+            .address()
+            .checked_add(offset)
+            .expect("test MMIO address should not overflow");
+        let access = devices
+            .dispatcher()
+            .lookup(address, len)
+            .expect("test MMIO access should resolve");
+        match devices
+            .dispatcher_mut()
+            .dispatch(MmioOperation::read(access).expect("test read operation should be valid"))
+            .expect("test MMIO read should dispatch")
+        {
+            MmioDispatchOutcome::Read { data } => data,
+            MmioDispatchOutcome::Write => panic!("read operation should not produce write outcome"),
+        }
+    }
+
+    fn dispatch_block_mmio_read_u32(
+        devices: &mut BlockMmioDevices,
+        device_index: usize,
+        offset: u64,
+    ) -> u32 {
+        let data = dispatch_block_mmio_read(devices, device_index, offset, 4);
+        u32::from_le_bytes(
+            data.as_slice()
+                .try_into()
+                .expect("test MMIO read should return 4 bytes"),
         )
     }
 
@@ -3655,6 +4137,334 @@ mod tests {
         assert_eq!(configs.as_slice().len(), 2);
         assert_eq!(configs.as_slice()[0].drive_id(), "rootfs");
         assert_eq!(configs.as_slice()[1].drive_id(), "data");
+    }
+
+    #[test]
+    fn block_mmio_devices_accept_empty_prepared_devices() {
+        let configs = DriveConfigs::new();
+        let prepared =
+            PreparedBlockDevices::from_configs(&configs).expect("empty configs should prepare");
+
+        let devices = prepared
+            .register_mmio(BlockMmioLayout::new(
+                GuestAddress::new(TEST_MMIO_BASE),
+                MmioRegionId::new(10),
+            ))
+            .expect("empty prepared block devices should register");
+
+        assert!(devices.is_empty());
+        assert_eq!(devices.len(), 0);
+        assert!(devices.registrations().is_empty());
+        assert!(devices.dispatcher().regions().is_empty());
+    }
+
+    #[test]
+    fn block_mmio_devices_register_one_prepared_device() {
+        let file = temp_file("block-mmio-one.img", &[0; 1024]);
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new(
+                "rootfs",
+                "rootfs",
+                file.as_path(),
+                true,
+            ))
+            .expect("root drive config should insert");
+        let prepared =
+            PreparedBlockDevices::from_configs(&configs).expect("block device should prepare");
+
+        let mut devices = prepared
+            .register_mmio(BlockMmioLayout::new(
+                GuestAddress::new(TEST_MMIO_BASE),
+                MmioRegionId::new(10),
+            ))
+            .expect("block MMIO device should register");
+
+        assert_eq!(devices.len(), 1);
+        let registration = &devices.registrations()[0];
+        assert_eq!(registration.index(), 0);
+        assert_eq!(registration.drive_id(), "rootfs");
+        assert_eq!(registration.region_id(), MmioRegionId::new(10));
+        assert_eq!(registration.address(), GuestAddress::new(TEST_MMIO_BASE));
+        assert_eq!(
+            registration.region().range().size(),
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE
+        );
+        assert_eq!(devices.dispatcher().regions().len(), 1);
+        assert_eq!(devices.dispatcher().regions()[0], registration.region());
+        assert_eq!(
+            dispatch_block_mmio_read_u32(&mut devices, 0, VirtioMmioRegister::MagicValue.offset()),
+            VIRTIO_MMIO_MAGIC_VALUE,
+        );
+        assert_eq!(
+            dispatch_block_mmio_read_u32(&mut devices, 0, VirtioMmioRegister::DeviceId.offset()),
+            VIRTIO_BLOCK_DEVICE_ID,
+        );
+    }
+
+    #[test]
+    fn block_mmio_devices_preserve_prepared_drive_order_and_layout() {
+        let root_file = temp_file("block-mmio-root.img", &[0; 512]);
+        let data_file = temp_file("block-mmio-data.img", &[0; 512]);
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new(
+                "data",
+                "data",
+                data_file.as_path(),
+                false,
+            ))
+            .expect("data drive config should insert");
+        configs
+            .insert(DriveConfigInput::new(
+                "rootfs",
+                "rootfs",
+                root_file.as_path(),
+                true,
+            ))
+            .expect("root drive config should insert");
+        let prepared =
+            PreparedBlockDevices::from_configs(&configs).expect("block devices should prepare");
+
+        let devices = prepared
+            .register_mmio(
+                BlockMmioLayout::new(GuestAddress::new(TEST_MMIO_BASE), MmioRegionId::new(20))
+                    .with_address_stride(VIRTIO_MMIO_DEVICE_WINDOW_SIZE * 2)
+                    .with_region_id_stride(3),
+            )
+            .expect("block MMIO devices should register");
+
+        assert_eq!(devices.registrations()[0].drive_id(), "rootfs");
+        assert_eq!(devices.registrations()[0].index(), 0);
+        assert_eq!(
+            devices.registrations()[0].region_id(),
+            MmioRegionId::new(20)
+        );
+        assert_eq!(
+            devices.registrations()[0].address(),
+            GuestAddress::new(TEST_MMIO_BASE),
+        );
+        assert_eq!(devices.registrations()[1].drive_id(), "data");
+        assert_eq!(devices.registrations()[1].index(), 1);
+        assert_eq!(
+            devices.registrations()[1].region_id(),
+            MmioRegionId::new(23)
+        );
+        assert_eq!(
+            devices.registrations()[1].address(),
+            GuestAddress::new(TEST_MMIO_BASE + VIRTIO_MMIO_DEVICE_WINDOW_SIZE * 2),
+        );
+    }
+
+    #[test]
+    fn block_mmio_devices_dispatch_read_only_config_space() {
+        let file = temp_file("block-mmio-read-only.img", &[0; 1024]);
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(
+                DriveConfigInput::new("rootfs", "rootfs", file.as_path(), true)
+                    .with_is_read_only(true),
+            )
+            .expect("root drive config should insert");
+        let prepared =
+            PreparedBlockDevices::from_configs(&configs).expect("block device should prepare");
+        let mut devices = prepared
+            .register_mmio(BlockMmioLayout::new(
+                GuestAddress::new(TEST_MMIO_BASE),
+                MmioRegionId::new(30),
+            ))
+            .expect("block MMIO device should register");
+
+        let low_features = dispatch_block_mmio_read_u32(
+            &mut devices,
+            0,
+            VirtioMmioRegister::DeviceFeatures.offset(),
+        );
+        assert_ne!(low_features & (1 << VIRTIO_BLOCK_FEATURE_READ_ONLY), 0);
+
+        let capacity = dispatch_block_mmio_read(
+            &mut devices,
+            0,
+            VIRTIO_MMIO_DEVICE_CONFIG_OFFSET,
+            VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE as u64,
+        );
+        assert_eq!(capacity.as_slice(), &2_u64.to_le_bytes());
+    }
+
+    #[test]
+    fn block_mmio_devices_reject_overlapping_address_stride() {
+        let root_file = temp_file("block-mmio-overlap-root.img", &[0; 512]);
+        let data_file = temp_file("block-mmio-overlap-data.img", &[0; 512]);
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new(
+                "rootfs",
+                "rootfs",
+                root_file.as_path(),
+                true,
+            ))
+            .expect("root drive config should insert");
+        configs
+            .insert(DriveConfigInput::new(
+                "data",
+                "data",
+                data_file.as_path(),
+                false,
+            ))
+            .expect("data drive config should insert");
+        let prepared =
+            PreparedBlockDevices::from_configs(&configs).expect("block devices should prepare");
+
+        let err = prepared
+            .register_mmio(
+                BlockMmioLayout::new(GuestAddress::new(TEST_MMIO_BASE), MmioRegionId::new(40))
+                    .with_address_stride(VIRTIO_MMIO_DEVICE_WINDOW_SIZE - 1),
+            )
+            .expect_err("overlapping block MMIO layout should fail");
+
+        assert!(matches!(
+            err,
+            BlockMmioRegistrationError::AddressStrideTooSmall { .. },
+        ));
+    }
+
+    #[test]
+    fn block_mmio_devices_reject_duplicate_region_id_stride() {
+        let root_file = temp_file("block-mmio-duplicate-id-root.img", &[0; 512]);
+        let data_file = temp_file("block-mmio-duplicate-id-data.img", &[0; 512]);
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new(
+                "rootfs",
+                "rootfs",
+                root_file.as_path(),
+                true,
+            ))
+            .expect("root drive config should insert");
+        configs
+            .insert(DriveConfigInput::new(
+                "data",
+                "data",
+                data_file.as_path(),
+                false,
+            ))
+            .expect("data drive config should insert");
+        let prepared =
+            PreparedBlockDevices::from_configs(&configs).expect("block devices should prepare");
+
+        let err = prepared
+            .register_mmio(
+                BlockMmioLayout::new(GuestAddress::new(TEST_MMIO_BASE), MmioRegionId::new(50))
+                    .with_region_id_stride(0),
+            )
+            .expect_err("duplicate block MMIO region id layout should fail");
+
+        assert!(matches!(
+            err,
+            BlockMmioRegistrationError::DuplicateRegionIdStride { .. },
+        ));
+    }
+
+    #[test]
+    fn block_mmio_devices_reject_address_overflow_without_returning_bundle() {
+        let root_file = temp_file("block-mmio-overflow-root.img", &[0; 512]);
+        let data_file = temp_file("block-mmio-overflow-data.img", &[0; 512]);
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new(
+                "rootfs",
+                "rootfs",
+                root_file.as_path(),
+                true,
+            ))
+            .expect("root drive config should insert");
+        configs
+            .insert(DriveConfigInput::new(
+                "data",
+                "data",
+                data_file.as_path(),
+                false,
+            ))
+            .expect("data drive config should insert");
+        let prepared =
+            PreparedBlockDevices::from_configs(&configs).expect("block devices should prepare");
+
+        let err = prepared
+            .register_mmio(
+                BlockMmioLayout::new(GuestAddress::new(TEST_MMIO_BASE), MmioRegionId::new(60))
+                    .with_address_stride(u64::MAX),
+            )
+            .expect_err("overflowing block MMIO layout should fail");
+
+        assert!(matches!(
+            err,
+            BlockMmioRegistrationError::AddressOverflow { .. },
+        ));
+    }
+
+    #[test]
+    fn block_mmio_devices_reject_region_range_overflow() {
+        let file = temp_file("block-mmio-range-overflow.img", &[0; 512]);
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new(
+                "rootfs",
+                "rootfs",
+                file.as_path(),
+                true,
+            ))
+            .expect("root drive config should insert");
+        let prepared =
+            PreparedBlockDevices::from_configs(&configs).expect("block device should prepare");
+
+        let err = prepared
+            .register_mmio(BlockMmioLayout::new(
+                GuestAddress::new(u64::MAX),
+                MmioRegionId::new(70),
+            ))
+            .expect_err("overflowing block MMIO region range should fail");
+
+        assert!(matches!(
+            err,
+            BlockMmioRegistrationError::InvalidRegion { .. },
+        ));
+    }
+
+    #[test]
+    fn block_mmio_devices_reject_region_id_overflow() {
+        let root_file = temp_file("block-mmio-region-id-root.img", &[0; 512]);
+        let data_file = temp_file("block-mmio-region-id-data.img", &[0; 512]);
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new(
+                "rootfs",
+                "rootfs",
+                root_file.as_path(),
+                true,
+            ))
+            .expect("root drive config should insert");
+        configs
+            .insert(DriveConfigInput::new(
+                "data",
+                "data",
+                data_file.as_path(),
+                false,
+            ))
+            .expect("data drive config should insert");
+        let prepared =
+            PreparedBlockDevices::from_configs(&configs).expect("block devices should prepare");
+
+        let err = prepared
+            .register_mmio(BlockMmioLayout::new(
+                GuestAddress::new(TEST_MMIO_BASE),
+                MmioRegionId::new(u64::MAX),
+            ))
+            .expect_err("overflowing block MMIO region id should fail");
+
+        assert!(matches!(
+            err,
+            BlockMmioRegistrationError::RegionIdOverflow { .. },
+        ));
     }
 
     #[test]
