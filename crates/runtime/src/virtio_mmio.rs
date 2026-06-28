@@ -589,6 +589,19 @@ mod tests {
     }
 
     #[test]
+    fn classifies_device_config_access_ending_at_window_boundary() {
+        let access = decode(&read_operation(0xff8, 8));
+        let VirtioMmioAccess::DeviceConfig(config_access) = access else {
+            panic!("expected device config read");
+        };
+
+        assert_eq!(config_access.kind(), MmioOperationKind::Read);
+        assert_eq!(config_access.offset(), 0xef8);
+        assert_eq!(config_access.absolute_offset(), 0xff8);
+        assert_eq!(config_access.len(), 8);
+    }
+
+    #[test]
     fn rejects_register_access_with_unsupported_size() {
         let err = decode_virtio_mmio_access(&read_operation(0x00, 2))
             .expect_err("two-byte generic register read should fail");
@@ -600,6 +613,29 @@ mod tests {
                 offset: 0x00,
                 len: 2,
                 expected: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_reserved_generic_register_offsets() {
+        let read_err = decode_virtio_mmio_access(&read_operation(0x18, 4))
+            .expect_err("reserved generic register read should fail");
+        assert_eq!(
+            read_err,
+            VirtioMmioAccessError::UnsupportedRegisterOffset {
+                kind: MmioOperationKind::Read,
+                offset: 0x18,
+            }
+        );
+
+        let write_err = decode_virtio_mmio_access(&write_operation(0x18, &[1, 2, 3, 4]))
+            .expect_err("reserved generic register write should fail");
+        assert_eq!(
+            write_err,
+            VirtioMmioAccessError::UnsupportedRegisterOffset {
+                kind: MmioOperationKind::Write,
+                offset: 0x18,
             }
         );
     }
@@ -640,6 +676,22 @@ mod tests {
                 len: 4,
                 register_offset: 0x00,
                 register_size: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_first_offset_past_device_window() {
+        let err = decode_virtio_mmio_access(&read_operation(VIRTIO_MMIO_DEVICE_WINDOW_SIZE, 1))
+            .expect_err("access starting after device window should fail");
+
+        assert_eq!(
+            err,
+            VirtioMmioAccessError::AccessOutsideDeviceWindow {
+                kind: MmioOperationKind::Read,
+                offset: VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+                len: 1,
+                window_size: VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
             }
         );
     }
