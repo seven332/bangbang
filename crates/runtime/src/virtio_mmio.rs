@@ -1941,6 +1941,54 @@ mod tests {
                 .descriptor_table(),
             GuestAddress::new(0x1_0000_1000)
         );
+
+        let err = queues
+            .write_register(
+                VirtioMmioRegister::QueueDriverLow,
+                0x2001,
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect_err("unaligned driver ring should fail");
+        assert_eq!(
+            err,
+            VirtioMmioQueueRegisterError::UnalignedQueueAddress {
+                queue_index: 0,
+                register: VirtioMmioRegister::QueueDriverLow,
+                address: GuestAddress::new(0x2001),
+                alignment: 2,
+            }
+        );
+        assert_eq!(
+            queues
+                .selected_queue()
+                .expect("queue should exist")
+                .driver_ring(),
+            GuestAddress::new(0x2002)
+        );
+
+        let err = queues
+            .write_register(
+                VirtioMmioRegister::QueueDeviceLow,
+                0x3002,
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect_err("unaligned device ring should fail");
+        assert_eq!(
+            err,
+            VirtioMmioQueueRegisterError::UnalignedQueueAddress {
+                queue_index: 0,
+                register: VirtioMmioRegister::QueueDeviceLow,
+                address: GuestAddress::new(0x3002),
+                alignment: 4,
+            }
+        );
+        assert_eq!(
+            queues
+                .selected_queue()
+                .expect("queue should exist")
+                .device_ring(),
+            GuestAddress::new(0x3004)
+        );
     }
 
     #[test]
