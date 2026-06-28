@@ -1,4 +1,4 @@
-//! Backend-neutral virtqueue descriptor-chain parsing.
+//! Backend-neutral virtqueue descriptor-chain and ring helpers.
 
 use std::collections::TryReserveError;
 use std::fmt;
