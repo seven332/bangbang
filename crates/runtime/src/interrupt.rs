@@ -237,7 +237,7 @@ impl std::error::Error for DeviceInterruptTriggerError {
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Barrier, Mutex};
 
     use super::{
         DeviceInterruptKind, DeviceInterruptStatus, DeviceInterruptStatusError,
@@ -341,6 +341,10 @@ mod tests {
             DeviceInterruptStatus::from_bits(4),
             Err(DeviceInterruptStatusError::UnknownBits { bits: 4 })
         );
+        assert_eq!(
+            DeviceInterruptStatus::from_bits(5),
+            Err(DeviceInterruptStatusError::UnknownBits { bits: 4 })
+        );
     }
 
     #[test]
@@ -348,6 +352,10 @@ mod tests {
         let mut expected = DeviceInterruptKind::Queue.status();
         expected.insert(DeviceInterruptKind::Config);
 
+        assert_eq!(
+            DeviceInterruptStatus::from_bits(0),
+            Ok(DeviceInterruptStatus::empty())
+        );
         assert_eq!(DeviceInterruptStatus::from_bits(3), Ok(expected));
     }
 
@@ -414,6 +422,47 @@ mod tests {
                 .lock()
                 .expect("recorded interrupt lines lock should not be poisoned"),
             vec![line(32), line(32)]
+        );
+    }
+
+    #[test]
+    fn concurrent_triggers_share_pending_status_and_signal_each_time() {
+        const WORKERS: usize = 8;
+
+        let (trigger, lines) = trigger();
+        let start = Arc::new(Barrier::new(WORKERS));
+        let mut workers = Vec::with_capacity(WORKERS);
+
+        for _ in 0..WORKERS {
+            let trigger = trigger.clone();
+            let start = Arc::clone(&start);
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                trigger
+                    .trigger(DeviceInterruptKind::Queue)
+                    .expect("concurrent queue interrupt should signal");
+            }));
+        }
+
+        for worker in workers {
+            worker
+                .join()
+                .expect("concurrent interrupt trigger thread should finish");
+        }
+
+        assert_eq!(
+            trigger.pending_status(),
+            DeviceInterruptKind::Queue.status()
+        );
+
+        let recorded_lines = lines
+            .lock()
+            .expect("recorded interrupt lines lock should not be poisoned");
+        assert_eq!(recorded_lines.len(), WORKERS);
+        assert!(
+            recorded_lines
+                .iter()
+                .all(|recorded_line| *recorded_line == line(32))
         );
     }
 
