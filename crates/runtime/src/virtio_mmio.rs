@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use crate::interrupt::{DeviceInterruptKind, DeviceInterruptStatus, DeviceInterruptStatusError};
 use crate::memory::GuestAddress;
 use crate::mmio::{MmioOperation, MmioOperationKind};
 use crate::virtio_queue::{
@@ -309,6 +310,173 @@ impl fmt::Display for VirtioMmioRegisterStateError {
 }
 
 impl std::error::Error for VirtioMmioRegisterStateError {}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VirtioMmioInterruptRegisters {
+    pending_status: DeviceInterruptStatus,
+}
+
+impl VirtioMmioInterruptRegisters {
+    pub const fn new() -> Self {
+        Self {
+            pending_status: DeviceInterruptStatus::empty(),
+        }
+    }
+
+    pub const fn pending_status(self) -> DeviceInterruptStatus {
+        self.pending_status
+    }
+
+    pub fn mark_pending(&mut self, kind: DeviceInterruptKind) {
+        self.pending_status.insert(kind);
+    }
+
+    pub fn read_register(
+        &self,
+        register: VirtioMmioRegister,
+    ) -> Result<u32, VirtioMmioInterruptRegisterError> {
+        match register {
+            VirtioMmioRegister::InterruptStatus => Ok(self.pending_status.bits()),
+            VirtioMmioRegister::MagicValue
+            | VirtioMmioRegister::Version
+            | VirtioMmioRegister::DeviceId
+            | VirtioMmioRegister::VendorId
+            | VirtioMmioRegister::DeviceFeatures
+            | VirtioMmioRegister::DeviceFeaturesSel
+            | VirtioMmioRegister::DriverFeatures
+            | VirtioMmioRegister::DriverFeaturesSel
+            | VirtioMmioRegister::QueueSel
+            | VirtioMmioRegister::QueueNumMax
+            | VirtioMmioRegister::QueueNum
+            | VirtioMmioRegister::QueueReady
+            | VirtioMmioRegister::QueueNotify
+            | VirtioMmioRegister::InterruptAck
+            | VirtioMmioRegister::Status
+            | VirtioMmioRegister::QueueDescLow
+            | VirtioMmioRegister::QueueDescHigh
+            | VirtioMmioRegister::QueueDriverLow
+            | VirtioMmioRegister::QueueDriverHigh
+            | VirtioMmioRegister::QueueDeviceLow
+            | VirtioMmioRegister::QueueDeviceHigh
+            | VirtioMmioRegister::ConfigGeneration => {
+                Err(VirtioMmioInterruptRegisterError::UnsupportedRegisterRead { register })
+            }
+        }
+    }
+
+    pub fn write_register(
+        &mut self,
+        register: VirtioMmioRegister,
+        value: u32,
+        status: u32,
+    ) -> Result<(), VirtioMmioInterruptRegisterError> {
+        match register {
+            VirtioMmioRegister::InterruptAck => self.write_interrupt_ack(value, status),
+            VirtioMmioRegister::MagicValue
+            | VirtioMmioRegister::Version
+            | VirtioMmioRegister::DeviceId
+            | VirtioMmioRegister::VendorId
+            | VirtioMmioRegister::DeviceFeatures
+            | VirtioMmioRegister::DeviceFeaturesSel
+            | VirtioMmioRegister::DriverFeatures
+            | VirtioMmioRegister::DriverFeaturesSel
+            | VirtioMmioRegister::QueueSel
+            | VirtioMmioRegister::QueueNumMax
+            | VirtioMmioRegister::QueueNum
+            | VirtioMmioRegister::QueueReady
+            | VirtioMmioRegister::QueueNotify
+            | VirtioMmioRegister::InterruptStatus
+            | VirtioMmioRegister::Status
+            | VirtioMmioRegister::QueueDescLow
+            | VirtioMmioRegister::QueueDescHigh
+            | VirtioMmioRegister::QueueDriverLow
+            | VirtioMmioRegister::QueueDriverHigh
+            | VirtioMmioRegister::QueueDeviceLow
+            | VirtioMmioRegister::QueueDeviceHigh
+            | VirtioMmioRegister::ConfigGeneration => {
+                Err(VirtioMmioInterruptRegisterError::UnsupportedRegisterWrite { register })
+            }
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.pending_status = DeviceInterruptStatus::empty();
+    }
+
+    fn write_interrupt_ack(
+        &mut self,
+        value: u32,
+        status: u32,
+    ) -> Result<(), VirtioMmioInterruptRegisterError> {
+        validate_interrupt_ack_status(status)?;
+
+        let ack = DeviceInterruptStatus::from_bits(value).map_err(|source| {
+            VirtioMmioInterruptRegisterError::InvalidInterruptAck { value, source }
+        })?;
+
+        self.pending_status.clear(ack);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioMmioInterruptRegisterError {
+    UnsupportedRegisterRead {
+        register: VirtioMmioRegister,
+    },
+    UnsupportedRegisterWrite {
+        register: VirtioMmioRegister,
+    },
+    InterruptAckNotWritable {
+        status: u32,
+    },
+    InvalidInterruptAck {
+        value: u32,
+        source: DeviceInterruptStatusError,
+    },
+}
+
+impl fmt::Display for VirtioMmioInterruptRegisterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedRegisterRead { register } => {
+                write!(
+                    f,
+                    "unsupported virtio-mmio interrupt state read from {register}"
+                )
+            }
+            Self::UnsupportedRegisterWrite { register } => {
+                write!(
+                    f,
+                    "unsupported virtio-mmio interrupt state write to {register}"
+                )
+            }
+            Self::InterruptAckNotWritable { status } => {
+                write!(
+                    f,
+                    "virtio-mmio interrupt acknowledgement cannot be written while status is 0x{status:x}"
+                )
+            }
+            Self::InvalidInterruptAck { value, source } => {
+                write!(
+                    f,
+                    "virtio-mmio interrupt acknowledgement value 0x{value:x} is invalid: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioMmioInterruptRegisterError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidInterruptAck { source, .. } => Some(source),
+            Self::UnsupportedRegisterRead { .. }
+            | Self::UnsupportedRegisterWrite { .. }
+            | Self::InterruptAckNotWritable { .. } => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtioMmioQueueRegisters {
@@ -1252,6 +1420,14 @@ fn validate_queue_config_status(status: u32) -> Result<(), VirtioMmioQueueRegist
     }
 }
 
+fn validate_interrupt_ack_status(status: u32) -> Result<(), VirtioMmioInterruptRegisterError> {
+    if (status & VIRTIO_DEVICE_STATUS_DRIVER_OK) == VIRTIO_DEVICE_STATUS_DRIVER_OK {
+        Ok(())
+    } else {
+        Err(VirtioMmioInterruptRegisterError::InterruptAckNotWritable { status })
+    }
+}
+
 fn validate_queue_size(
     queue_index: u32,
     value: u32,
@@ -1329,10 +1505,11 @@ mod tests {
         VIRTIO_MMIO_FEATURE_VERSION_1, VIRTIO_MMIO_MAGIC_VALUE, VIRTIO_MMIO_NOTIFY_OFFSET,
         VIRTIO_MMIO_REGISTER_ACCESS_SIZE, VIRTIO_MMIO_REGISTER_SPACE_SIZE, VIRTIO_MMIO_VENDOR_ID,
         VIRTIO_MMIO_VERSION, VIRTIO_MMIO_VERSION_1_FEATURE, VirtioMmioAccess,
-        VirtioMmioAccessError, VirtioMmioDeviceRegisters, VirtioMmioQueueRegisterError,
-        VirtioMmioQueueRegisters, VirtioMmioRegister, VirtioMmioRegisterStateError,
-        decode_virtio_mmio_access,
+        VirtioMmioAccessError, VirtioMmioDeviceRegisters, VirtioMmioInterruptRegisterError,
+        VirtioMmioInterruptRegisters, VirtioMmioQueueRegisterError, VirtioMmioQueueRegisters,
+        VirtioMmioRegister, VirtioMmioRegisterStateError, decode_virtio_mmio_access,
     };
+    use crate::interrupt::{DeviceInterruptKind, DeviceInterruptStatusError};
     use crate::memory::GuestAddress;
     use crate::mmio::{MmioAccessBytes, MmioBus, MmioOperation, MmioOperationKind, MmioRegionId};
 
@@ -1340,6 +1517,7 @@ mod tests {
     const QUEUE_CONFIG_STATUS: u32 = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
         | VIRTIO_DEVICE_STATUS_DRIVER
         | VIRTIO_DEVICE_STATUS_FEATURES_OK;
+    const DRIVER_OK_STATUS: u32 = QUEUE_CONFIG_STATUS | VIRTIO_DEVICE_STATUS_DRIVER_OK;
 
     fn read_operation(offset: u64, len: u64) -> MmioOperation {
         let access = access(offset, len);
@@ -1722,6 +1900,210 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "invalid virtio-mmio device status transition: 0x0 -> 0x3"
+        );
+    }
+
+    #[test]
+    fn interrupt_registers_read_empty_status() {
+        let registers = VirtioMmioInterruptRegisters::new();
+
+        assert!(registers.pending_status().is_empty());
+        assert_eq!(
+            registers
+                .read_register(VirtioMmioRegister::InterruptStatus)
+                .expect("interrupt status read should succeed"),
+            0
+        );
+    }
+
+    #[test]
+    fn interrupt_registers_read_queue_and_config_pending_bits() {
+        let mut registers = VirtioMmioInterruptRegisters::new();
+        let mut expected = DeviceInterruptKind::Queue.status();
+        expected.insert(DeviceInterruptKind::Config);
+
+        registers.mark_pending(DeviceInterruptKind::Queue);
+        registers.mark_pending(DeviceInterruptKind::Config);
+
+        assert_eq!(registers.pending_status(), expected);
+        assert_eq!(
+            registers
+                .read_register(VirtioMmioRegister::InterruptStatus)
+                .expect("interrupt status read should succeed"),
+            expected.bits()
+        );
+    }
+
+    #[test]
+    fn interrupt_ack_clears_selected_pending_bits() {
+        let mut registers = VirtioMmioInterruptRegisters::new();
+
+        registers.mark_pending(DeviceInterruptKind::Queue);
+        registers.mark_pending(DeviceInterruptKind::Config);
+        registers
+            .write_register(
+                VirtioMmioRegister::InterruptAck,
+                DeviceInterruptKind::Queue.status().bits(),
+                DRIVER_OK_STATUS,
+            )
+            .expect("queue interrupt ack should succeed");
+
+        assert_eq!(
+            registers.pending_status(),
+            DeviceInterruptKind::Config.status()
+        );
+
+        registers
+            .write_register(
+                VirtioMmioRegister::InterruptAck,
+                DeviceInterruptKind::Config.status().bits(),
+                DRIVER_OK_STATUS,
+            )
+            .expect("config interrupt ack should succeed");
+
+        assert!(registers.pending_status().is_empty());
+    }
+
+    #[test]
+    fn interrupt_ack_empty_mask_is_noop() {
+        let mut registers = VirtioMmioInterruptRegisters::new();
+
+        registers.mark_pending(DeviceInterruptKind::Config);
+        registers
+            .write_register(VirtioMmioRegister::InterruptAck, 0, DRIVER_OK_STATUS)
+            .expect("empty interrupt ack should succeed");
+
+        assert_eq!(
+            registers.pending_status(),
+            DeviceInterruptKind::Config.status()
+        );
+    }
+
+    #[test]
+    fn interrupt_ack_requires_driver_ok_status() {
+        let mut registers = VirtioMmioInterruptRegisters::new();
+
+        registers.mark_pending(DeviceInterruptKind::Queue);
+        let err = registers
+            .write_register(
+                VirtioMmioRegister::InterruptAck,
+                DeviceInterruptKind::Queue.status().bits(),
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect_err("interrupt ack before DRIVER_OK should fail");
+
+        assert_eq!(
+            err,
+            VirtioMmioInterruptRegisterError::InterruptAckNotWritable {
+                status: QUEUE_CONFIG_STATUS,
+            }
+        );
+        assert_eq!(
+            registers.pending_status(),
+            DeviceInterruptKind::Queue.status()
+        );
+    }
+
+    #[test]
+    fn interrupt_ack_checks_status_before_ack_bits() {
+        let mut registers = VirtioMmioInterruptRegisters::new();
+
+        registers.mark_pending(DeviceInterruptKind::Queue);
+        let err = registers
+            .write_register(VirtioMmioRegister::InterruptAck, 0x5, QUEUE_CONFIG_STATUS)
+            .expect_err("interrupt ack before DRIVER_OK should fail before parsing bits");
+
+        assert_eq!(
+            err,
+            VirtioMmioInterruptRegisterError::InterruptAckNotWritable {
+                status: QUEUE_CONFIG_STATUS,
+            }
+        );
+        assert_eq!(
+            registers.pending_status(),
+            DeviceInterruptKind::Queue.status()
+        );
+    }
+
+    #[test]
+    fn interrupt_ack_rejects_unknown_bits_without_mutating_state() {
+        let mut registers = VirtioMmioInterruptRegisters::new();
+        let mut expected = DeviceInterruptKind::Queue.status();
+        expected.insert(DeviceInterruptKind::Config);
+
+        registers.mark_pending(DeviceInterruptKind::Queue);
+        registers.mark_pending(DeviceInterruptKind::Config);
+        let err = registers
+            .write_register(VirtioMmioRegister::InterruptAck, 0x5, DRIVER_OK_STATUS)
+            .expect_err("unknown interrupt ack bits should fail");
+
+        assert_eq!(
+            err,
+            VirtioMmioInterruptRegisterError::InvalidInterruptAck {
+                value: 0x5,
+                source: DeviceInterruptStatusError::UnknownBits { bits: 0x4 },
+            }
+        );
+        assert_eq!(registers.pending_status(), expected);
+    }
+
+    #[test]
+    fn interrupt_registers_reset_pending_status() {
+        let mut registers = VirtioMmioInterruptRegisters::new();
+
+        registers.mark_pending(DeviceInterruptKind::Queue);
+        registers.mark_pending(DeviceInterruptKind::Config);
+        registers.reset();
+
+        assert!(registers.pending_status().is_empty());
+        assert_eq!(
+            registers
+                .read_register(VirtioMmioRegister::InterruptStatus)
+                .expect("interrupt status read should succeed after reset"),
+            0
+        );
+    }
+
+    #[test]
+    fn interrupt_registers_reject_unsupported_register_accesses() {
+        let mut registers = VirtioMmioInterruptRegisters::new();
+
+        assert_eq!(
+            registers.read_register(VirtioMmioRegister::Status),
+            Err(VirtioMmioInterruptRegisterError::UnsupportedRegisterRead {
+                register: VirtioMmioRegister::Status,
+            })
+        );
+        assert_eq!(
+            registers.write_register(VirtioMmioRegister::InterruptStatus, 0, DRIVER_OK_STATUS),
+            Err(VirtioMmioInterruptRegisterError::UnsupportedRegisterWrite {
+                register: VirtioMmioRegister::InterruptStatus,
+            })
+        );
+    }
+
+    #[test]
+    fn interrupt_register_errors_display_and_preserve_sources() {
+        let err = VirtioMmioInterruptRegisterError::InterruptAckNotWritable {
+            status: QUEUE_CONFIG_STATUS,
+        };
+        assert_eq!(
+            err.to_string(),
+            "virtio-mmio interrupt acknowledgement cannot be written while status is 0xb"
+        );
+        assert!(err.source().is_none());
+
+        let err = VirtioMmioInterruptRegisterError::InvalidInterruptAck {
+            value: 0x5,
+            source: DeviceInterruptStatusError::UnknownBits { bits: 0x4 },
+        };
+        assert_eq!(
+            err.to_string(),
+            "virtio-mmio interrupt acknowledgement value 0x5 is invalid: unknown device interrupt status bits 0x4"
+        );
+        assert_eq!(
+            err.source().map(ToString::to_string),
+            Some("unknown device interrupt status bits 0x4".to_string())
         );
     }
 
