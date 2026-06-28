@@ -1126,15 +1126,107 @@ impl fmt::Display for VirtioMmioQueueNotificationError {
 
 impl std::error::Error for VirtioMmioQueueNotificationError {}
 
+pub trait VirtioMmioDeviceConfigHandler: fmt::Debug + Send {
+    fn requires_device_config_write_status(&self) -> bool {
+        true
+    }
+
+    fn read_device_config(
+        &self,
+        access: VirtioMmioDeviceConfigAccess,
+    ) -> Result<MmioAccessBytes, VirtioMmioDeviceConfigError>;
+
+    fn write_device_config(
+        &mut self,
+        access: VirtioMmioDeviceConfigAccess,
+        data: MmioAccessBytes,
+    ) -> Result<(), VirtioMmioDeviceConfigError>;
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UnsupportedVirtioMmioDeviceConfig;
+
+impl VirtioMmioDeviceConfigHandler for UnsupportedVirtioMmioDeviceConfig {
+    fn requires_device_config_write_status(&self) -> bool {
+        false
+    }
+
+    fn read_device_config(
+        &self,
+        access: VirtioMmioDeviceConfigAccess,
+    ) -> Result<MmioAccessBytes, VirtioMmioDeviceConfigError> {
+        Err(VirtioMmioDeviceConfigError::UnsupportedRead {
+            offset: access.offset(),
+            len: access.len(),
+        })
+    }
+
+    fn write_device_config(
+        &mut self,
+        access: VirtioMmioDeviceConfigAccess,
+        _data: MmioAccessBytes,
+    ) -> Result<(), VirtioMmioDeviceConfigError> {
+        Err(VirtioMmioDeviceConfigError::UnsupportedWrite {
+            offset: access.offset(),
+            len: access.len(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VirtioMmioRegisterHandler {
+pub enum VirtioMmioDeviceConfigError {
+    UnsupportedRead { offset: u64, len: usize },
+    UnsupportedWrite { offset: u64, len: usize },
+    Handler { source: MmioHandlerError },
+}
+
+impl From<MmioHandlerError> for VirtioMmioDeviceConfigError {
+    fn from(source: MmioHandlerError) -> Self {
+        Self::Handler { source }
+    }
+}
+
+impl fmt::Display for VirtioMmioDeviceConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedRead { offset, len } => {
+                write!(
+                    f,
+                    "unsupported virtio-mmio device config read at offset 0x{offset:x} with length {len}"
+                )
+            }
+            Self::UnsupportedWrite { offset, len } => {
+                write!(
+                    f,
+                    "unsupported virtio-mmio device config write at offset 0x{offset:x} with length {len}"
+                )
+            }
+            Self::Handler { source } => {
+                write!(f, "virtio-mmio device config handler failed: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioMmioDeviceConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Handler { source } => Some(source),
+            Self::UnsupportedRead { .. } | Self::UnsupportedWrite { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioMmioRegisterHandler<C = UnsupportedVirtioMmioDeviceConfig> {
     device: VirtioMmioDeviceRegisters,
     queues: VirtioMmioQueueRegisters,
     queue_notifications: VirtioMmioQueueNotificationRegisters,
     interrupts: VirtioMmioInterruptRegisters,
+    device_config: C,
 }
 
-impl VirtioMmioRegisterHandler {
+impl VirtioMmioRegisterHandler<UnsupportedVirtioMmioDeviceConfig> {
     pub fn new(
         device_id: u32,
         device_features: u64,
@@ -1156,6 +1248,42 @@ impl VirtioMmioRegisterHandler {
         config_generation: u32,
         queue_max_sizes: &[u16],
     ) -> Result<Self, VirtioMmioRegisterHandlerError> {
+        Self::with_vendor_id_and_config_generation_and_device_config(
+            device_id,
+            vendor_id,
+            device_features,
+            config_generation,
+            queue_max_sizes,
+            UnsupportedVirtioMmioDeviceConfig,
+        )
+    }
+}
+
+impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C> {
+    pub fn with_device_config(
+        device_id: u32,
+        device_features: u64,
+        queue_max_sizes: &[u16],
+        device_config: C,
+    ) -> Result<Self, VirtioMmioRegisterHandlerError> {
+        Self::with_vendor_id_and_config_generation_and_device_config(
+            device_id,
+            VIRTIO_MMIO_VENDOR_ID,
+            device_features,
+            0,
+            queue_max_sizes,
+            device_config,
+        )
+    }
+
+    pub fn with_vendor_id_and_config_generation_and_device_config(
+        device_id: u32,
+        vendor_id: u32,
+        device_features: u64,
+        config_generation: u32,
+        queue_max_sizes: &[u16],
+        device_config: C,
+    ) -> Result<Self, VirtioMmioRegisterHandlerError> {
         let queues = VirtioMmioQueueRegisters::new(queue_max_sizes).map_err(|source| {
             VirtioMmioRegisterHandlerError::QueueRegisterInitialization { source }
         })?;
@@ -1175,6 +1303,7 @@ impl VirtioMmioRegisterHandler {
             queues,
             queue_notifications,
             interrupts: VirtioMmioInterruptRegisters::new(),
+            device_config,
         })
     }
 
@@ -1210,6 +1339,10 @@ impl VirtioMmioRegisterHandler {
         &self.interrupts
     }
 
+    pub const fn device_config_handler(&self) -> &C {
+        &self.device_config
+    }
+
     pub fn mark_interrupt_pending(&mut self, kind: DeviceInterruptKind) {
         self.interrupts.mark_pending(kind);
     }
@@ -1227,12 +1360,7 @@ impl VirtioMmioRegisterHandler {
                 let value = self.read_register(register_access.register())?;
                 register_read_data(value)
             }
-            VirtioMmioAccess::DeviceConfig(config_access) => Err(
-                VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead {
-                    offset: config_access.offset(),
-                    len: config_access.len(),
-                },
-            ),
+            VirtioMmioAccess::DeviceConfig(config_access) => self.read_device_config(config_access),
         }
     }
 
@@ -1249,12 +1377,9 @@ impl VirtioMmioRegisterHandler {
             VirtioMmioAccess::Register(register_access) => {
                 self.write_register(register_access.register(), register_write_value(data)?)
             }
-            VirtioMmioAccess::DeviceConfig(config_access) => Err(
-                VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigWrite {
-                    offset: config_access.offset(),
-                    len: config_access.len(),
-                },
-            ),
+            VirtioMmioAccess::DeviceConfig(config_access) => {
+                self.write_device_config(config_access, data)
+            }
         }
     }
 
@@ -1386,9 +1511,42 @@ impl VirtioMmioRegisterHandler {
 
         Ok(())
     }
+
+    fn read_device_config(
+        &self,
+        access: VirtioMmioDeviceConfigAccess,
+    ) -> Result<MmioAccessBytes, VirtioMmioRegisterHandlerError> {
+        let data = self
+            .device_config
+            .read_device_config(access)
+            .map_err(|source| map_device_config_read_error(access, source))?;
+        if data.len() == access.len() {
+            Ok(data)
+        } else {
+            Err(VirtioMmioRegisterHandlerError::DeviceConfigReadDataLength {
+                offset: access.offset(),
+                expected: access.len(),
+                actual: data.len(),
+            })
+        }
+    }
+
+    fn write_device_config(
+        &mut self,
+        access: VirtioMmioDeviceConfigAccess,
+        data: MmioAccessBytes,
+    ) -> Result<(), VirtioMmioRegisterHandlerError> {
+        if self.device_config.requires_device_config_write_status() {
+            validate_device_config_write_status(self.device.status())?;
+        }
+
+        self.device_config
+            .write_device_config(access, data)
+            .map_err(|source| map_device_config_write_error(access, source))
+    }
 }
 
-impl MmioHandler for VirtioMmioRegisterHandler {
+impl<C: VirtioMmioDeviceConfigHandler> MmioHandler for VirtioMmioRegisterHandler<C> {
     fn read(&mut self, access: MmioAccess) -> Result<MmioAccessBytes, MmioHandlerError> {
         self.read_access(access).map_err(MmioHandlerError::from)
     }
@@ -1399,7 +1557,7 @@ impl MmioHandler for VirtioMmioRegisterHandler {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VirtioMmioRegisterHandlerError {
     QueueRegisterInitialization {
         source: VirtioMmioQueueRegisterError,
@@ -1426,6 +1584,24 @@ pub enum VirtioMmioRegisterHandlerError {
     UnsupportedDeviceConfigWrite {
         offset: u64,
         len: usize,
+    },
+    DeviceConfigRead {
+        offset: u64,
+        len: usize,
+        source: VirtioMmioDeviceConfigError,
+    },
+    DeviceConfigWrite {
+        offset: u64,
+        len: usize,
+        source: VirtioMmioDeviceConfigError,
+    },
+    DeviceConfigReadDataLength {
+        offset: u64,
+        expected: usize,
+        actual: usize,
+    },
+    DeviceConfigWriteNotWritable {
+        status: u32,
     },
     UnsupportedRegisterRead {
         register: VirtioMmioRegister,
@@ -1508,6 +1684,42 @@ impl fmt::Display for VirtioMmioRegisterHandlerError {
                     "unsupported virtio-mmio device config write at offset 0x{offset:x} with length {len}"
                 )
             }
+            Self::DeviceConfigRead {
+                offset,
+                len,
+                source,
+            } => {
+                write!(
+                    f,
+                    "virtio-mmio device config read at offset 0x{offset:x} with length {len} failed: {source}"
+                )
+            }
+            Self::DeviceConfigWrite {
+                offset,
+                len,
+                source,
+            } => {
+                write!(
+                    f,
+                    "virtio-mmio device config write at offset 0x{offset:x} with length {len} failed: {source}"
+                )
+            }
+            Self::DeviceConfigReadDataLength {
+                offset,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "virtio-mmio device config read at offset 0x{offset:x} returned {actual} bytes; expected {expected}"
+                )
+            }
+            Self::DeviceConfigWriteNotWritable { status } => {
+                write!(
+                    f,
+                    "virtio-mmio device config cannot be written while status is 0x{status:x}"
+                )
+            }
             Self::UnsupportedRegisterRead { register } => {
                 write!(
                     f,
@@ -1580,11 +1792,16 @@ impl std::error::Error for VirtioMmioRegisterHandlerError {
             Self::DeviceRegisterRead { source, .. } | Self::DeviceRegisterWrite { source, .. } => {
                 Some(source)
             }
+            Self::DeviceConfigRead { source, .. } | Self::DeviceConfigWrite { source, .. } => {
+                Some(source)
+            }
             Self::InterruptRegisterRead { source, .. }
             | Self::InterruptRegisterWrite { source, .. } => Some(source),
             Self::RegisterWriteDataLength { .. }
             | Self::UnsupportedDeviceConfigRead { .. }
             | Self::UnsupportedDeviceConfigWrite { .. }
+            | Self::DeviceConfigReadDataLength { .. }
+            | Self::DeviceConfigWriteNotWritable { .. }
             | Self::UnsupportedRegisterRead { .. }
             | Self::UnsupportedRegisterWrite { .. } => None,
         }
@@ -2027,6 +2244,44 @@ const fn register_slot_offset(offset: u64) -> u64 {
     offset / VIRTIO_MMIO_REGISTER_ACCESS_SIZE_U64 * VIRTIO_MMIO_REGISTER_ACCESS_SIZE_U64
 }
 
+fn map_device_config_read_error(
+    access: VirtioMmioDeviceConfigAccess,
+    source: VirtioMmioDeviceConfigError,
+) -> VirtioMmioRegisterHandlerError {
+    match source {
+        VirtioMmioDeviceConfigError::UnsupportedRead { .. } => {
+            VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead {
+                offset: access.offset(),
+                len: access.len(),
+            }
+        }
+        source => VirtioMmioRegisterHandlerError::DeviceConfigRead {
+            offset: access.offset(),
+            len: access.len(),
+            source,
+        },
+    }
+}
+
+fn map_device_config_write_error(
+    access: VirtioMmioDeviceConfigAccess,
+    source: VirtioMmioDeviceConfigError,
+) -> VirtioMmioRegisterHandlerError {
+    match source {
+        VirtioMmioDeviceConfigError::UnsupportedWrite { .. } => {
+            VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigWrite {
+                offset: access.offset(),
+                len: access.len(),
+            }
+        }
+        source => VirtioMmioRegisterHandlerError::DeviceConfigWrite {
+            offset: access.offset(),
+            len: access.len(),
+            source,
+        },
+    }
+}
+
 fn register_read_data(value: u32) -> Result<MmioAccessBytes, VirtioMmioRegisterHandlerError> {
     MmioAccessBytes::new(&value.to_le_bytes())
         .map_err(|source| VirtioMmioRegisterHandlerError::RegisterReadData { source })
@@ -2126,6 +2381,16 @@ fn validate_interrupt_ack_status(status: u32) -> Result<(), VirtioMmioInterruptR
     }
 }
 
+fn validate_device_config_write_status(status: u32) -> Result<(), VirtioMmioRegisterHandlerError> {
+    if (status & VIRTIO_DEVICE_STATUS_DRIVER) == VIRTIO_DEVICE_STATUS_DRIVER
+        && (status & (VIRTIO_DEVICE_STATUS_FAILED | VIRTIO_DEVICE_STATUS_DEVICE_NEEDS_RESET)) == 0
+    {
+        Ok(())
+    } else {
+        Err(VirtioMmioRegisterHandlerError::DeviceConfigWriteNotWritable { status })
+    }
+}
+
 fn validate_queue_notification_status(status: u32) -> Result<(), VirtioMmioQueueNotificationError> {
     if (status & VIRTIO_DEVICE_STATUS_DRIVER_OK) == VIRTIO_DEVICE_STATUS_DRIVER_OK {
         Ok(())
@@ -2211,7 +2476,8 @@ mod tests {
         VIRTIO_MMIO_FEATURE_VERSION_1, VIRTIO_MMIO_MAGIC_VALUE, VIRTIO_MMIO_NOTIFY_OFFSET,
         VIRTIO_MMIO_REGISTER_ACCESS_SIZE, VIRTIO_MMIO_REGISTER_SPACE_SIZE, VIRTIO_MMIO_VENDOR_ID,
         VIRTIO_MMIO_VERSION, VIRTIO_MMIO_VERSION_1_FEATURE, VirtioMmioAccess,
-        VirtioMmioAccessError, VirtioMmioDeviceRegisters, VirtioMmioInterruptRegisterError,
+        VirtioMmioAccessError, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
+        VirtioMmioDeviceConfigHandler, VirtioMmioDeviceRegisters, VirtioMmioInterruptRegisterError,
         VirtioMmioInterruptRegisters, VirtioMmioQueueNotificationError,
         VirtioMmioQueueNotificationRegisters, VirtioMmioQueueRegisterError,
         VirtioMmioQueueRegisters, VirtioMmioRegister, VirtioMmioRegisterHandler,
@@ -2220,8 +2486,8 @@ mod tests {
     use crate::interrupt::{DeviceInterruptKind, DeviceInterruptStatusError};
     use crate::memory::GuestAddress;
     use crate::mmio::{
-        MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioDispatcher, MmioOperation,
-        MmioOperationKind, MmioRegionId,
+        MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioDispatcher, MmioHandlerError,
+        MmioOperation, MmioOperationKind, MmioRegionId,
     };
 
     const BASE: u64 = 0x1000_0000;
@@ -2229,6 +2495,69 @@ mod tests {
         | VIRTIO_DEVICE_STATUS_DRIVER
         | VIRTIO_DEVICE_STATUS_FEATURES_OK;
     const DRIVER_OK_STATUS: u32 = QUEUE_CONFIG_STATUS | VIRTIO_DEVICE_STATUS_DRIVER_OK;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TestDeviceConfig {
+        bytes: Vec<u8>,
+        writes: Vec<(VirtioMmioDeviceConfigAccess, MmioAccessBytes)>,
+        read_error: Option<MmioHandlerError>,
+        write_error: Option<MmioHandlerError>,
+        short_read: bool,
+    }
+
+    impl TestDeviceConfig {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                bytes,
+                writes: Vec::new(),
+                read_error: None,
+                write_error: None,
+                short_read: false,
+            }
+        }
+    }
+
+    impl VirtioMmioDeviceConfigHandler for TestDeviceConfig {
+        fn read_device_config(
+            &self,
+            access: VirtioMmioDeviceConfigAccess,
+        ) -> Result<MmioAccessBytes, VirtioMmioDeviceConfigError> {
+            if let Some(source) = &self.read_error {
+                return Err(source.clone().into());
+            }
+
+            let start = usize::try_from(access.offset())
+                .map_err(|_| MmioHandlerError::new("test config offset does not fit usize"))?;
+            let end = start
+                .checked_add(access.len())
+                .ok_or_else(|| MmioHandlerError::new("test config read range overflows"))?;
+            let bytes = self
+                .bytes
+                .get(start..end)
+                .ok_or_else(|| MmioHandlerError::new("test config read is outside data"))?;
+            let returned_len = if self.short_read {
+                bytes.len().saturating_sub(1)
+            } else {
+                bytes.len()
+            };
+            MmioAccessBytes::new(&bytes[..returned_len]).map_err(|source| {
+                MmioHandlerError::new(format!("test config read bytes failed: {source}")).into()
+            })
+        }
+
+        fn write_device_config(
+            &mut self,
+            access: VirtioMmioDeviceConfigAccess,
+            data: MmioAccessBytes,
+        ) -> Result<(), VirtioMmioDeviceConfigError> {
+            if let Some(source) = &self.write_error {
+                return Err(source.clone().into());
+            }
+
+            self.writes.push((access, data));
+            Ok(())
+        }
+    }
 
     fn read_operation(offset: u64, len: u64) -> MmioOperation {
         let access = access(offset, len);
@@ -2244,8 +2573,8 @@ mod tests {
         MmioOperation::write(access, data).expect("write operation should be valid")
     }
 
-    fn read_register_u32(
-        handler: &VirtioMmioRegisterHandler,
+    fn read_register_u32<C: VirtioMmioDeviceConfigHandler>(
+        handler: &VirtioMmioRegisterHandler<C>,
         offset: u64,
     ) -> Result<u32, VirtioMmioRegisterHandlerError> {
         let data = handler.read_access(access(offset, 4))?;
@@ -2256,8 +2585,8 @@ mod tests {
         Ok(u32::from_le_bytes(bytes))
     }
 
-    fn write_register_u32(
-        handler: &mut VirtioMmioRegisterHandler,
+    fn write_register_u32<C: VirtioMmioDeviceConfigHandler>(
+        handler: &mut VirtioMmioRegisterHandler<C>,
         offset: u64,
         value: u32,
     ) -> Result<(), VirtioMmioRegisterHandlerError> {
@@ -2266,8 +2595,8 @@ mod tests {
         handler.write_access(access(offset, 4), data)
     }
 
-    fn advance_handler_to_features_ok(
-        handler: &mut VirtioMmioRegisterHandler,
+    fn advance_handler_to_features_ok<C: VirtioMmioDeviceConfigHandler>(
+        handler: &mut VirtioMmioRegisterHandler<C>,
     ) -> Result<(), VirtioMmioRegisterHandlerError> {
         write_register_u32(
             handler,
@@ -2286,8 +2615,8 @@ mod tests {
         )
     }
 
-    fn advance_handler_to_driver_ok(
-        handler: &mut VirtioMmioRegisterHandler,
+    fn advance_handler_to_driver_ok<C: VirtioMmioDeviceConfigHandler>(
+        handler: &mut VirtioMmioRegisterHandler<C>,
     ) -> Result<(), VirtioMmioRegisterHandlerError> {
         advance_handler_to_features_ok(handler)?;
         write_register_u32(
@@ -3602,6 +3931,120 @@ mod tests {
 
         assert!(handler.pending_queue_notifications().is_empty());
         assert_eq!(handler.is_queue_notification_pending(0), Ok(false));
+    }
+
+    #[test]
+    fn register_handler_delegates_device_config_reads_and_writes() {
+        let config = TestDeviceConfig::new(vec![0x11, 0x22, 0x33, 0x44, 0x55]);
+        let mut handler = VirtioMmioRegisterHandler::with_device_config(7, 0x2a, &[8], config)
+            .expect("handler should build");
+
+        let read = handler
+            .read_access(access(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET + 1, 2))
+            .expect("device config read should delegate");
+        assert_eq!(read.as_slice(), &[0x22, 0x33]);
+
+        advance_handler_to_features_ok(&mut handler).expect("handler should reach FEATURES_OK");
+        let write_data = MmioAccessBytes::new(&[0xaa, 0xbb]).expect("write bytes should build");
+        handler
+            .write_access(access(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET + 3, 2), write_data)
+            .expect("device config write should delegate");
+
+        let writes = &handler.device_config_handler().writes;
+        assert_eq!(writes.len(), 1);
+        let (write_access, written_data) = writes.first().expect("write should be recorded");
+        assert_eq!(write_access.kind(), MmioOperationKind::Write);
+        assert_eq!(write_access.offset(), 3);
+        assert_eq!(
+            write_access.absolute_offset(),
+            VIRTIO_MMIO_DEVICE_CONFIG_OFFSET + 3
+        );
+        assert_eq!(write_access.len(), 2);
+        assert_eq!(*written_data, write_data);
+    }
+
+    #[test]
+    fn register_handler_rejects_device_config_write_before_driver_status() {
+        let config = TestDeviceConfig::new(vec![0; 4]);
+        let mut handler = VirtioMmioRegisterHandler::with_device_config(7, 0x2a, &[8], config)
+            .expect("handler should build");
+        let write_data = MmioAccessBytes::new(&[0xaa]).expect("write bytes should build");
+
+        assert_eq!(
+            handler.write_access(access(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, 1), write_data),
+            Err(
+                VirtioMmioRegisterHandlerError::DeviceConfigWriteNotWritable {
+                    status: VIRTIO_DEVICE_STATUS_INIT,
+                }
+            )
+        );
+        assert!(handler.device_config_handler().writes.is_empty());
+    }
+
+    #[test]
+    fn register_handler_propagates_device_config_handler_errors() {
+        let read_source = MmioHandlerError::new("read failed");
+        let write_source = MmioHandlerError::new("write failed");
+        let mut config = TestDeviceConfig::new(vec![0; 8]);
+        config.read_error = Some(read_source.clone());
+        config.write_error = Some(write_source.clone());
+        let mut handler = VirtioMmioRegisterHandler::with_device_config(7, 0x2a, &[8], config)
+            .expect("handler should build");
+
+        let read_err = handler
+            .read_access(access(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET + 2, 2))
+            .expect_err("device config read failure should propagate");
+        assert_eq!(
+            read_err,
+            VirtioMmioRegisterHandlerError::DeviceConfigRead {
+                offset: 2,
+                len: 2,
+                source: VirtioMmioDeviceConfigError::Handler {
+                    source: read_source.clone(),
+                },
+            }
+        );
+        assert_eq!(
+            read_err.source().map(ToString::to_string),
+            Some("virtio-mmio device config handler failed: read failed".to_string())
+        );
+        assert_eq!(
+            read_err
+                .source()
+                .and_then(std::error::Error::source)
+                .map(ToString::to_string),
+            Some(read_source.to_string())
+        );
+
+        advance_handler_to_features_ok(&mut handler).expect("handler should reach FEATURES_OK");
+        let write_data = MmioAccessBytes::new(&[0xaa]).expect("write bytes should build");
+        assert_eq!(
+            handler.write_access(access(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET + 4, 1), write_data),
+            Err(VirtioMmioRegisterHandlerError::DeviceConfigWrite {
+                offset: 4,
+                len: 1,
+                source: VirtioMmioDeviceConfigError::Handler {
+                    source: write_source,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn register_handler_rejects_mismatched_device_config_read_length() {
+        let mut config = TestDeviceConfig::new(vec![0x11, 0x22]);
+        config.short_read = true;
+        let handler = VirtioMmioRegisterHandler::with_device_config(7, 0x2a, &[8], config)
+            .expect("handler should build");
+
+        assert_eq!(
+            handler.read_access(access(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, 2)),
+            Err(VirtioMmioRegisterHandlerError::DeviceConfigReadDataLength {
+                offset: 0,
+                expected: 2,
+                actual: 1,
+            })
+        );
     }
 
     #[test]
