@@ -3601,6 +3601,37 @@ mod tests {
     }
 
     #[test]
+    fn prepared_block_devices_reject_fifo_without_blocking_or_path_leak() {
+        let fifo = temp_fifo("secret-prepared-fifo.img");
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new(
+                "rootfs",
+                "rootfs",
+                fifo.as_path(),
+                false,
+            ))
+            .expect("FIFO path is still a valid stored config");
+
+        let err = PreparedBlockDevices::from_configs(&configs)
+            .expect_err("FIFO backing should fail preparation");
+
+        match &err {
+            PreparedBlockDeviceError::OpenBacking { drive_id, source } => {
+                assert_eq!(drive_id, "rootfs");
+                assert!(matches!(
+                    source,
+                    BlockFileBackingError::OpenFile { .. } | BlockFileBackingError::NonRegularFile
+                ));
+            }
+            PreparedBlockDeviceError::AllocateDevices { .. } => {
+                panic!("FIFO should not fail allocation")
+            }
+        }
+        assert!(!err.to_string().contains("secret-prepared-fifo"));
+    }
+
+    #[test]
     fn prepared_block_devices_fail_without_mutating_drive_configs() {
         let file = temp_file("prepared-valid.img", &[0; 512]);
         let missing = missing_path("secret-prepared-partial.img");
