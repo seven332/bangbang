@@ -319,6 +319,10 @@ fn validate_rate_limiter_config(value: &serde_json::Value) -> Result<(), Request
 }
 
 fn validate_token_bucket(value: &serde_json::Value) -> Result<(), RequestError> {
+    if value.is_null() {
+        return Ok(());
+    }
+
     let bucket = value.as_object().ok_or(RequestError::MalformedRequest)?;
     for key in bucket.keys() {
         if key != TOKEN_BUCKET_SIZE_FIELD
@@ -332,6 +336,7 @@ fn validate_token_bucket(value: &serde_json::Value) -> Result<(), RequestError> 
     require_u64_field(bucket, TOKEN_BUCKET_SIZE_FIELD)?;
     require_u64_field(bucket, TOKEN_BUCKET_REFILL_TIME_FIELD)?;
     if let Some(value) = bucket.get(TOKEN_BUCKET_ONE_TIME_BURST_FIELD)
+        && !value.is_null()
         && value.as_u64().is_none()
     {
         return Err(RequestError::MalformedRequest);
@@ -829,6 +834,31 @@ mod tests {
         let request = request_with_body("PUT", "/drives/rootfs", body);
 
         assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn parses_put_drive_with_null_rate_limiter_buckets() {
+        let body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "/tmp/rootfs.ext4",
+            "is_root_device": true,
+            "rate_limiter": {
+                "bandwidth": null,
+                "ops": {
+                    "size": 100,
+                    "one_time_burst": null,
+                    "refill_time": 1000
+                }
+            }
+        }"#;
+        let request = request_with_body("PUT", "/drives/rootfs", body);
+
+        let parsed = parse_request(&request).expect("drive request should parse");
+
+        let ApiRequest::PutDrive(config) = parsed else {
+            panic!("expected drive request");
+        };
+        assert!(config.rate_limiter_configured());
     }
 
     #[test]
