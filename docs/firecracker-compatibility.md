@@ -13,7 +13,7 @@ payload loading, an internal Firecracker-shaped drive configuration validation
 model, a host-file backing access layer, an internal virtio-block config-space
 capacity model, an internal virtio-block request parser, single-request
 executor, queue dispatcher, MMIO queue-state bridge, resettable activation
-state, notification dispatch helper, and a minimal
+state, notification/interrupt-status dispatch helper, and a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
 create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding,
 registry resolution, vCPU exit classification, single resolved HVF MMIO
@@ -30,7 +30,8 @@ notifications, delegated device-configuration accesses, and a `DRIVER_OK`
 activation hook with reset callback, plus virtqueue descriptor-chain validator,
 available-ring read model, used-ring write model, and internal virtio-block
 queue construction, drain, resettable active queue ownership, and active queue
-notification dispatch helper for future device handlers, an internal
+notification dispatch helper with virtio-mmio queue interrupt-status updates
+for future device handlers, an internal
 backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, and an initial process startup argument model.
 There is no broader API request body model, guest execution, continuous vCPU run loop,
@@ -270,7 +271,9 @@ queue on virtio-mmio reset.
 The composed runtime handler can drain recorded virtio-mmio queue notifications
 and dispatch queue 0 through the active internal block queue. The dispatch
 summary preserves the drained notification list, reports queue-interrupt
-intent, and surfaces queue-dispatch errors with partial completion metadata.
+intent, marks the virtio-mmio queue interrupt status bit when completed work
+needs an interrupt, and surfaces queue-dispatch errors with partial completion
+metadata.
 
 This is not public `/drives` behavior and does not wire block queue
 notifications into process startup or HVF runner loops, signal backend
