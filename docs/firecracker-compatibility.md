@@ -367,8 +367,8 @@ to an injected sink. The HVF crate can allocate deterministic guest interrupt
 lines from the validated GIC SPI range and signal validated SPI levels through
 `hv_gic_set_spi`. This follows Firecracker's separation between device-facing
 interrupt triggers and KVM-specific irqfd/GSI routing, but it is not yet
-interrupt masking, virtio-mmio register behavior, runner-loop interrupt
-dispatch, or guest-visible device delivery.
+interrupt masking, stateful guest-visible virtio-mmio register behavior,
+runner-loop interrupt dispatch, or guest-visible device delivery.
 
 The HVF backend can decode candidate MMIO accesses from arm64 data-abort
 exception exits. The decoder converts supported ESR and IPA metadata into a
