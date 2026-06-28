@@ -3797,6 +3797,72 @@ mod tests {
     }
 
     #[test]
+    fn block_queue_dispatch_unsupported_request_updates_summary() {
+        let mut memory = request_memory();
+        memory
+            .write_slice(b"sentinel", DATA_ADDR)
+            .expect("guest data sentinel should write");
+        let file = temp_file("queue-unsupported.img", &[]);
+        let backing = open_backing(file.as_path(), true).expect("backing should open");
+        write_queued_request(
+            &mut memory,
+            0,
+            99,
+            0,
+            HEADER_ADDR,
+            Some((DATA_ADDR, 8, false)),
+            STATUS_ADDR,
+        );
+        write_available_heads(&mut memory, &[0]);
+        let mut queue = block_queue();
+
+        let dispatch = queue
+            .dispatch(&mut memory, &backing, TEST_DEVICE_ID)
+            .expect("unsupported request should publish completion");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.unsupported_requests(), 1);
+        assert_eq!(dispatch.successful_requests(), 0);
+        assert_eq!(dispatch.io_errors(), 0);
+        assert_eq!(read_guest_bytes(&memory, DATA_ADDR, 8), b"sentinel");
+        assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_UNSUPPORTED);
+        assert_eq!(read_used_element(&memory, 0), (0, VIRTIO_BLOCK_STATUS_SIZE));
+    }
+
+    #[test]
+    fn block_queue_dispatch_status_write_failure_updates_summary() {
+        let mut memory = request_memory();
+        let payload = sector_payload(0x31);
+        let file = temp_file("queue-status-failure.img", &payload);
+        let backing = open_backing(file.as_path(), true).expect("backing should open");
+        write_queued_request(
+            &mut memory,
+            0,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            0,
+            HEADER_ADDR,
+            Some((DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as u32, true)),
+            GuestAddress::new(TEST_MEMORY_SIZE),
+        );
+        write_available_heads(&mut memory, &[0]);
+        let mut queue = block_queue();
+
+        let dispatch = queue
+            .dispatch(&mut memory, &backing, TEST_DEVICE_ID)
+            .expect("status write failure should publish zero-length completion");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.status_write_failures(), 1);
+        assert_eq!(dispatch.successful_requests(), 0);
+        assert_eq!(dispatch.io_errors(), 0);
+        assert_eq!(
+            read_guest_bytes(&memory, DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as usize),
+            payload
+        );
+        assert_eq!(read_used_element(&memory, 0), (0, 0));
+    }
+
+    #[test]
     fn block_queue_dispatch_used_ring_failure_preserves_used_index() {
         let mut memory = request_memory();
         let file = temp_file("queue-used-failure.img", &sector_payload(0x55));
