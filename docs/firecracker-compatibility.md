@@ -13,15 +13,15 @@ payload loading, a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
 create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding,
 registry resolution, vCPU exit classification, and single resolved HVF MMIO
-exit dispatch/completion through runtime handlers, narrow vCPU register
-wrappers, internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, minimal internal
+exit dispatch/completion through runtime handlers including an explicit
+runner-thread command, narrow vCPU register wrappers, internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, minimal internal
 arm64 FDT generation and guest-memory writes, anonymous guest memory allocation
 for validated runtime layouts, HVF guest memory map/unmap ownership for
 allocated regions, an internal MMIO region ownership registry and operation/data
 model plus handler dispatch boundary, single-vCPU arm64 HVF boot-register
 setup, and an initial process startup argument model.
 There is no broader API request body model, guest execution, vCPU run loop,
-interrupt injection, automatic runner-level MMIO dispatch/completion, real device
+interrupt injection, automatic runner-loop MMIO exit resolution/dispatch, real device
 emulation, public startup wiring, multi-vCPU setup, PSCI behavior, or public
 boot-source API behavior yet.
 
@@ -386,6 +386,11 @@ performs that setup on the vCPU-owning thread before the first run and rejects
 duplicate setup, setup during shutdown, setup while a run is in flight, and
 setup after a run has started. If setup fails after partially writing
 registers, the runner rejects guest runs until setup is retried successfully.
+The runner also exposes an explicit single-exit MMIO dispatch command that
+runs on the vCPU-owning thread after a run has started, shares dispatcher state
+through a caller-provided mutex, and rejects dispatch while a run, boot-register
+setup, or another MMIO dispatch is in flight. It does not yet automatically
+translate vCPU exits into MMIO dispatch commands.
 
 bangbang still does not wire `mem_size_mib` into public startup behavior,
 inject interrupts, emulate devices, start a guest, power on secondary vCPUs, or
@@ -505,17 +510,20 @@ macOS design work instead of direct implementation:
   single resolved MMIO exit dispatch/completion, and the single primary arm64
   Linux boot-register setup. The current runner skeleton creates a vCPU on a
   dedicated thread, applies that boot-register setup on the owning thread before
-  the first run, supports one cancellable `hv_vcpu_run` step at a time, and
-  shuts down by canceling and joining the runner thread.
+  the first run, explicitly dispatches one resolved MMIO access through a shared
+  runtime dispatcher on the owning thread, supports one cancellable
+  `hv_vcpu_run` step at a time, and shuts down by canceling and joining the
+  runner thread.
 - HVF exit snapshots preserve Hypervisor.framework reasons such as canceled,
   exception, virtual timer activation, and unknown after a run wrapper marks
   exit data available. Candidate arm64 MMIO data-abort exceptions can be decoded
   into checked access metadata and resolved against the internal MMIO registry.
   Checked runtime MMIO operations can be dispatched to registered internal
   handlers. A single resolved HVF exit can be converted into a runtime MMIO
-  operation, dispatched through those handlers, and completed back into guest
-  GPRs for successful reads, but the runner does not yet perform automatic
-  dispatch/completion or translate exits into interrupt/runtime events.
+  operation, dispatched through those handlers on the current thread or through
+  an explicit runner-thread command, and completed back into guest GPRs for
+  successful reads, but the runner does not yet automatically resolve exits or
+  translate them into interrupt/runtime events.
 - Firecracker's full paused/resumed microVM loop is not implemented yet.
   bangbang's runner is only the HVF ownership and cancellation primitive needed
   before guest memory, interrupt, timer, and device work can build the real run

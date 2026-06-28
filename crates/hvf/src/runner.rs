@@ -1,18 +1,22 @@
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread::{self, JoinHandle};
 
 use bangbang_runtime::BackendError;
+use bangbang_runtime::mmio::{MmioDispatchOutcome, MmioDispatcher};
 
 use crate::backend::HvfBackend;
-use crate::exit::HvfVcpuExit;
+use crate::exit::{HvfResolvedMmioAccess, HvfVcpuExit};
+use crate::mmio::HvfMmioDispatchError;
 use crate::vcpu::{HvfArm64BootRegisters, HvfVcpuOwner};
 
 const RUNNER_SHUT_DOWN_MESSAGE: &str = "vCPU runner is shut down";
 const RUNNER_SHUTTING_DOWN_MESSAGE: &str = "vCPU runner shutdown is already in progress";
 const RUN_IN_FLIGHT_MESSAGE: &str = "vCPU runner already has a run in flight";
+const MMIO_DISPATCH_IN_FLIGHT_MESSAGE: &str = "vCPU runner already has MMIO dispatch in flight";
+const RUN_NOT_STARTED_MESSAGE: &str = "vCPU runner has not started a run";
 const BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE: &str =
     "vCPU runner already has boot register setup in flight";
 const BOOT_REGISTER_SETUP_FAILED_MESSAGE: &str =
@@ -21,14 +25,18 @@ const BOOT_REGISTERS_ALREADY_CONFIGURED_MESSAGE: &str =
     "vCPU runner boot registers are already configured";
 const RUN_ALREADY_STARTED_MESSAGE: &str = "vCPU runner has already started a run";
 const RUNNER_STATE_POISONED_MESSAGE: &str = "vCPU runner state lock is poisoned";
+const MMIO_DISPATCHER_BUSY_MESSAGE: &str = "vCPU runner MMIO dispatcher lock is busy";
+const MMIO_DISPATCHER_POISONED_MESSAGE: &str = "vCPU runner MMIO dispatcher lock is poisoned";
 const COMMAND_CHANNEL_CLOSED_MESSAGE: &str = "vCPU runner command channel is closed";
 const RESPONSE_CHANNEL_CLOSED_MESSAGE: &str = "vCPU runner response channel is closed";
 
 type CancelVcpu = Arc<dyn Fn(crate::ffi::HvVcpu) -> Result<(), BackendError> + Send + Sync>;
+type SharedMmioDispatcher = Arc<Mutex<MmioDispatcher>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HvfVcpuRunnerError {
     Backend(BackendError),
+    MmioDispatch(HvfMmioDispatchError),
     InvalidState(&'static str),
     ThreadSpawn(String),
     ChannelClosed(&'static str),
@@ -39,6 +47,7 @@ impl fmt::Display for HvfVcpuRunnerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Backend(err) => write!(f, "{err}"),
+            Self::MmioDispatch(err) => write!(f, "{err}"),
             Self::InvalidState(message) => write!(f, "invalid vCPU runner state: {message}"),
             Self::ThreadSpawn(message) => {
                 write!(f, "failed to spawn vCPU runner thread: {message}")
@@ -53,6 +62,7 @@ impl std::error::Error for HvfVcpuRunnerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Backend(err) => Some(err),
+            Self::MmioDispatch(err) => Some(err),
             Self::InvalidState(_)
             | Self::ThreadSpawn(_)
             | Self::ChannelClosed(_)
@@ -64,6 +74,12 @@ impl std::error::Error for HvfVcpuRunnerError {
 impl From<BackendError> for HvfVcpuRunnerError {
     fn from(err: BackendError) -> Self {
         Self::Backend(err)
+    }
+}
+
+impl From<HvfMmioDispatchError> for HvfVcpuRunnerError {
+    fn from(err: HvfMmioDispatchError) -> Self {
+        Self::MmioDispatch(err)
     }
 }
 
@@ -80,6 +96,7 @@ struct RunnerHandleState {
     thread: Option<JoinHandle<()>>,
     shutting_down: bool,
     in_flight_runs: usize,
+    mmio_dispatch_in_flight: bool,
     boot_register_setup_in_flight: bool,
     boot_register_setup_failed: bool,
     boot_registers_configured: bool,
@@ -93,6 +110,11 @@ enum RunnerCommand {
     },
     RunOnce {
         response_sender: mpsc::Sender<Result<HvfVcpuExit, HvfVcpuRunnerError>>,
+    },
+    DispatchMmioAccess {
+        access: HvfResolvedMmioAccess,
+        dispatcher: SharedMmioDispatcher,
+        response_sender: mpsc::Sender<Result<MmioDispatchOutcome, HvfVcpuRunnerError>>,
     },
     Shutdown {
         response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
@@ -112,6 +134,11 @@ trait RunnerVcpu {
         registers: HvfArm64BootRegisters,
     ) -> Result<(), BackendError>;
     fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError>;
+    fn dispatch_mmio_access(
+        &mut self,
+        access: HvfResolvedMmioAccess,
+        dispatcher: &mut MmioDispatcher,
+    ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError>;
     fn destroy(&mut self) -> Result<(), BackendError>;
 }
 
@@ -143,6 +170,16 @@ impl RunnerVcpu for RealRunnerVcpu {
         self.owner.run_once()
     }
 
+    fn dispatch_mmio_access(
+        &mut self,
+        access: HvfResolvedMmioAccess,
+        dispatcher: &mut MmioDispatcher,
+    ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+        self.owner
+            .dispatch_mmio_access(access, dispatcher)
+            .map_err(HvfVcpuRunnerError::MmioDispatch)
+    }
+
     fn destroy(&mut self) -> Result<(), BackendError> {
         self.owner.destroy()
     }
@@ -172,6 +209,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             Err(HvfVcpuRunnerError::Backend(_)) => setup.mark_failed(),
             Err(
                 HvfVcpuRunnerError::InvalidState(_)
+                | HvfVcpuRunnerError::MmioDispatch(_)
                 | HvfVcpuRunnerError::ThreadSpawn(_)
                 | HvfVcpuRunnerError::ChannelClosed(_)
                 | HvfVcpuRunnerError::ThreadPanicked,
@@ -184,6 +222,20 @@ impl<'vm> HvfVcpuRunner<'vm> {
     pub fn run_once(&self) -> Result<HvfVcpuExit, HvfVcpuRunnerError> {
         let (response_sender, response_receiver) = mpsc::channel();
         let _in_flight_run = self.start_run_once(response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    /// Dispatch one resolved HVF MMIO access on the vCPU-owning runner thread.
+    pub fn dispatch_mmio_access(
+        &self,
+        access: HvfResolvedMmioAccess,
+        dispatcher: Arc<Mutex<MmioDispatcher>>,
+    ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        let _in_flight_dispatch = self.start_mmio_dispatch(access, dispatcher, response_sender)?;
 
         response_receiver
             .recv()
@@ -240,6 +292,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 thread: Some(started.thread),
                 shutting_down: false,
                 in_flight_runs: 0,
+                mmio_dispatch_in_flight: false,
                 boot_register_setup_in_flight: false,
                 boot_register_setup_failed: false,
                 boot_registers_configured: false,
@@ -265,6 +318,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         }
         if state.in_flight_runs > 0 {
             return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
+        }
+        if state.mmio_dispatch_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                MMIO_DISPATCH_IN_FLIGHT_MESSAGE,
+            ));
         }
         if state.boot_register_setup_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
@@ -311,6 +369,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.in_flight_runs > 0 {
             return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
         }
+        if state.mmio_dispatch_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                MMIO_DISPATCH_IN_FLIGHT_MESSAGE,
+            ));
+        }
         if state.boot_register_setup_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
                 BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE,
@@ -337,6 +400,62 @@ impl<'vm> HvfVcpuRunner<'vm> {
         state.run_started = true;
 
         Ok(InFlightRun::new(&self.state))
+    }
+
+    fn start_mmio_dispatch(
+        &self,
+        access: HvfResolvedMmioAccess,
+        dispatcher: SharedMmioDispatcher,
+        response_sender: mpsc::Sender<Result<MmioDispatchOutcome, HvfVcpuRunnerError>>,
+    ) -> Result<InFlightMmioDispatch<'_>, HvfVcpuRunnerError> {
+        let mut state = self.lock_state()?;
+        if state.thread.is_none() {
+            return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
+        }
+        if state.shutting_down {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                RUNNER_SHUTTING_DOWN_MESSAGE,
+            ));
+        }
+        if state.in_flight_runs > 0 {
+            return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
+        }
+        if state.boot_register_setup_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.boot_register_setup_failed {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                BOOT_REGISTER_SETUP_FAILED_MESSAGE,
+            ));
+        }
+        if !state.run_started {
+            return Err(HvfVcpuRunnerError::InvalidState(RUN_NOT_STARTED_MESSAGE));
+        }
+        if state.mmio_dispatch_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                MMIO_DISPATCH_IN_FLIGHT_MESSAGE,
+            ));
+        }
+
+        state.mmio_dispatch_in_flight = true;
+        if self
+            .command_sender
+            .send(RunnerCommand::DispatchMmioAccess {
+                access,
+                dispatcher,
+                response_sender,
+            })
+            .is_err()
+        {
+            state.mmio_dispatch_in_flight = false;
+            return Err(HvfVcpuRunnerError::ChannelClosed(
+                COMMAND_CHANNEL_CLOSED_MESSAGE,
+            ));
+        }
+
+        Ok(InFlightMmioDispatch::new(&self.state))
     }
 
     fn prepare_shutdown(&self) -> Result<(mpsc::Sender<RunnerCommand>, bool), HvfVcpuRunnerError> {
@@ -377,6 +496,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 RUNNER_SHUTTING_DOWN_MESSAGE,
             ));
         }
+        if state.mmio_dispatch_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                MMIO_DISPATCH_IN_FLIGHT_MESSAGE,
+            ));
+        }
         Ok(state)
     }
 
@@ -408,6 +532,7 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                 state.thread.is_some(),
                 state.shutting_down,
                 state.in_flight_runs,
+                state.mmio_dispatch_in_flight,
                 state.boot_register_setup_in_flight,
                 state.boot_register_setup_failed,
                 state.boot_registers_configured,
@@ -420,6 +545,7 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                 active,
                 shutting_down,
                 in_flight_runs,
+                mmio_dispatch_in_flight,
                 boot_register_setup_in_flight,
                 boot_register_setup_failed,
                 boot_registers_configured,
@@ -429,6 +555,7 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                 .field("active", &active)
                 .field("shutting_down", &shutting_down)
                 .field("in_flight_runs", &in_flight_runs)
+                .field("mmio_dispatch_in_flight", &mmio_dispatch_in_flight)
                 .field(
                     "boot_register_setup_in_flight",
                     &boot_register_setup_in_flight,
@@ -497,6 +624,24 @@ impl Drop for InFlightRun<'_> {
     fn drop(&mut self) {
         if let Ok(mut state) = self.state.lock() {
             state.in_flight_runs = state.in_flight_runs.saturating_sub(1);
+        }
+    }
+}
+
+struct InFlightMmioDispatch<'state> {
+    state: &'state Mutex<RunnerHandleState>,
+}
+
+impl<'state> InFlightMmioDispatch<'state> {
+    fn new(state: &'state Mutex<RunnerHandleState>) -> Self {
+        Self { state }
+    }
+}
+
+impl Drop for InFlightMmioDispatch<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.mmio_dispatch_in_flight = false;
         }
     }
 }
@@ -586,6 +731,14 @@ fn run_runner_thread<C, V>(
                 let result = vcpu.run_once().map_err(HvfVcpuRunnerError::Backend);
                 let _ = response_sender.send(result);
             }
+            RunnerCommand::DispatchMmioAccess {
+                access,
+                dispatcher,
+                response_sender,
+            } => {
+                let result = dispatch_mmio_access_on_runner_thread(&mut vcpu, access, &dispatcher);
+                let _ = response_sender.send(result);
+            }
             RunnerCommand::Shutdown { response_sender } => {
                 let result = vcpu.destroy().map_err(HvfVcpuRunnerError::Backend);
                 let _ = response_sender.send(result);
@@ -593,6 +746,21 @@ fn run_runner_thread<C, V>(
             }
         }
     }
+}
+
+fn dispatch_mmio_access_on_runner_thread(
+    vcpu: &mut impl RunnerVcpu,
+    access: HvfResolvedMmioAccess,
+    dispatcher: &SharedMmioDispatcher,
+) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+    let mut dispatcher = dispatcher.try_lock().map_err(|err| match err {
+        TryLockError::WouldBlock => HvfVcpuRunnerError::InvalidState(MMIO_DISPATCHER_BUSY_MESSAGE),
+        TryLockError::Poisoned(_) => {
+            HvfVcpuRunnerError::InvalidState(MMIO_DISPATCHER_POISONED_MESSAGE)
+        }
+    })?;
+
+    vcpu.dispatch_mmio_access(access, &mut dispatcher)
 }
 
 fn join_runner_thread(thread: Option<JoinHandle<()>>) -> Result<(), HvfVcpuRunnerError> {
@@ -623,10 +791,23 @@ mod tests {
 
     use bangbang_runtime::BackendError;
     use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::mmio::{MmioDispatchOutcome, MmioDispatcher, MmioRegionId};
 
     use super::{CancelVcpu, HvfVcpuRunner, HvfVcpuRunnerError, RunnerVcpu, spawn_runner_thread};
-    use crate::exit::HvfVcpuExit;
+    use crate::exit::{
+        HvfExceptionExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
+        HvfResolvedMmioAccess, HvfResolvedVcpuExit, HvfVcpuExit,
+    };
+    use crate::mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
     use crate::vcpu::HvfArm64BootRegisters;
+
+    const ESR_EC_DATA_ABORT_LOWER_EL: u64 = 0x24;
+    const ESR_EC_SHIFT: u64 = 26;
+    const ESR_ISS_ISV: u64 = 1 << 24;
+    const ESR_ISS_SAS_SHIFT: u64 = 22;
+    const ESR_ISS_SRT_SHIFT: u64 = 16;
+    const ESR_ISS_WNR: u64 = 1 << 6;
+    const ESR_ISS_SF: u64 = 1 << 15;
 
     struct FakeVcpu {
         entered_run_sender: mpsc::Sender<()>,
@@ -652,6 +833,22 @@ mod tests {
         release_setup_receiver: mpsc::Receiver<Result<(), BackendError>>,
     }
 
+    struct MmioDispatchRecordingVcpu {
+        dispatched_sender: mpsc::Sender<HvfResolvedMmioAccess>,
+        result: Result<MmioDispatchOutcome, HvfVcpuRunnerError>,
+    }
+
+    struct BlockingMmioDispatchVcpu {
+        entered_dispatch_sender: mpsc::Sender<()>,
+        release_dispatch_receiver: mpsc::Receiver<Result<MmioDispatchOutcome, HvfVcpuRunnerError>>,
+    }
+
+    fn unsupported_mmio_dispatch() -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+        Err(HvfVcpuRunnerError::InvalidState(
+            "fake vCPU does not support MMIO dispatch",
+        ))
+    }
+
     impl RunnerVcpu for FakeVcpu {
         fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
             Ok(7)
@@ -671,6 +868,14 @@ mod tests {
             self.release_run_receiver
                 .recv()
                 .map_err(|_| BackendError::InvalidState("fake run release sender closed"))?
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
         }
 
         fn destroy(&mut self) -> Result<(), BackendError> {
@@ -696,6 +901,14 @@ mod tests {
             panic!("fake run panic");
         }
 
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
         fn destroy(&mut self) -> Result<(), BackendError> {
             Ok(())
         }
@@ -717,6 +930,14 @@ mod tests {
 
         fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
             Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
         }
 
         fn destroy(&mut self) -> Result<(), BackendError> {
@@ -748,6 +969,14 @@ mod tests {
             Ok(HvfVcpuExit::Canceled)
         }
 
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
         fn destroy(&mut self) -> Result<(), BackendError> {
             Ok(())
         }
@@ -767,6 +996,14 @@ mod tests {
 
         fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
             Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
         }
 
         fn destroy(&mut self) -> Result<(), BackendError> {
@@ -795,6 +1032,84 @@ mod tests {
             Ok(HvfVcpuExit::Canceled)
         }
 
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for MmioDispatchRecordingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            access: HvfResolvedMmioAccess,
+            dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            self.dispatched_sender.send(access).map_err(|_| {
+                HvfVcpuRunnerError::InvalidState("fake MMIO dispatch receiver closed")
+            })?;
+            dispatcher
+                .insert_region(MmioRegionId::new(99), GuestAddress::new(0x3000), 0x100)
+                .map_err(|_| HvfVcpuRunnerError::InvalidState("fake dispatcher mutation failed"))?;
+
+            self.result.clone()
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for BlockingMmioDispatchVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            self.entered_dispatch_sender.send(()).map_err(|_| {
+                HvfVcpuRunnerError::InvalidState("fake MMIO dispatch entry receiver closed")
+            })?;
+            self.release_dispatch_receiver.recv().map_err(|_| {
+                HvfVcpuRunnerError::InvalidState("fake MMIO dispatch release sender closed")
+            })?
+        }
+
         fn destroy(&mut self) -> Result<(), BackendError> {
             Ok(())
         }
@@ -805,6 +1120,59 @@ mod tests {
             kernel_entry: GuestAddress::new(0x8028_0000),
             fdt_address: GuestAddress::new(0x8fe0_0000),
         }
+    }
+
+    fn resolved_mmio_access() -> HvfResolvedMmioAccess {
+        let mut dispatcher = MmioDispatcher::new();
+        dispatcher
+            .insert_region(MmioRegionId::new(7), GuestAddress::new(0x1000), 0x100)
+            .expect("test region should insert");
+        let register = HvfMmioRegister::new(1).expect("test register should decode");
+        let exit = HvfVcpuExit::Exception(HvfExceptionExit {
+            syndrome: data_abort_syndrome(
+                HvfMmioAccessSize::Byte,
+                HvfMmioDirection::Read,
+                register,
+            ),
+            virtual_address: 0x2000,
+            physical_address: 0x1040,
+        });
+
+        let resolved = exit
+            .resolve_with_mmio_bus(dispatcher.bus())
+            .expect("test access should resolve");
+        let HvfResolvedVcpuExit::Mmio(access) = resolved else {
+            panic!("expected MMIO exit");
+        };
+        access
+    }
+
+    fn data_abort_syndrome(
+        size: HvfMmioAccessSize,
+        direction: HvfMmioDirection,
+        register: HvfMmioRegister,
+    ) -> u64 {
+        let size_bits = match size {
+            HvfMmioAccessSize::Byte => 0,
+            HvfMmioAccessSize::Halfword => 1,
+            HvfMmioAccessSize::Word => 2,
+            HvfMmioAccessSize::Doubleword => 3,
+        };
+        let write_bit = match direction {
+            HvfMmioDirection::Read => 0,
+            HvfMmioDirection::Write => ESR_ISS_WNR,
+        };
+
+        (ESR_EC_DATA_ABORT_LOWER_EL << ESR_EC_SHIFT)
+            | ESR_ISS_ISV
+            | (size_bits << ESR_ISS_SAS_SHIFT)
+            | (u64::from(register.raw_value()) << ESR_ISS_SRT_SHIFT)
+            | write_bit
+            | ESR_ISS_SF
+    }
+
+    fn shared_dispatcher() -> Arc<Mutex<MmioDispatcher>> {
+        Arc::new(Mutex::new(MmioDispatcher::new()))
     }
 
     fn fake_cancel_vcpu(
@@ -833,6 +1201,28 @@ mod tests {
             destroyed_sender,
             entered_run_receiver,
             destroyed_receiver,
+        )
+    }
+
+    fn start_dispatch_recording_runner(
+        result: Result<MmioDispatchOutcome, HvfVcpuRunnerError>,
+    ) -> (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<HvfResolvedMmioAccess>,
+    ) {
+        let (dispatched_sender, dispatched_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(MmioDispatchRecordingVcpu {
+                dispatched_sender,
+                result,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            dispatched_receiver,
         )
     }
 
@@ -1368,6 +1758,295 @@ mod tests {
         });
 
         runner.shutdown().expect("runner should shut down");
+        destroyed_receiver
+            .recv()
+            .expect("fake vCPU should be destroyed");
+    }
+
+    #[test]
+    fn dispatch_mmio_access_runs_on_runner_thread_and_preserves_dispatcher_state() {
+        let access = resolved_mmio_access();
+        let (runner, dispatched_receiver) =
+            start_dispatch_recording_runner(Ok(MmioDispatchOutcome::Write));
+        let dispatcher = shared_dispatcher();
+
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        assert_eq!(
+            runner.dispatch_mmio_access(access, Arc::clone(&dispatcher)),
+            Ok(MmioDispatchOutcome::Write)
+        );
+        assert_eq!(
+            dispatched_receiver
+                .recv()
+                .expect("fake vCPU should receive dispatch"),
+            access
+        );
+        assert_eq!(
+            dispatcher
+                .lock()
+                .expect("dispatcher lock should not be poisoned")
+                .regions()[0]
+                .id(),
+            MmioRegionId::new(99)
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn dispatch_mmio_access_preserves_mmio_dispatch_errors() {
+        let access = resolved_mmio_access();
+        let source = HvfMmioDispatchError::Operation {
+            source: HvfMmioCompletionError::UnsupportedRegister {
+                register: HvfMmioRegister::new(31).expect("test register should decode"),
+            },
+        };
+        let (runner, dispatched_receiver) =
+            start_dispatch_recording_runner(Err(HvfVcpuRunnerError::MmioDispatch(source.clone())));
+
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        assert_eq!(
+            runner.dispatch_mmio_access(access, shared_dispatcher()),
+            Err(HvfVcpuRunnerError::MmioDispatch(source))
+        );
+        assert_eq!(
+            dispatched_receiver
+                .recv()
+                .expect("fake vCPU should receive dispatch"),
+            access
+        );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn dispatch_mmio_access_before_first_run_is_rejected() {
+        let (runner, dispatched_receiver) =
+            start_dispatch_recording_runner(Ok(MmioDispatchOutcome::Write));
+
+        assert_eq!(
+            runner.dispatch_mmio_access(resolved_mmio_access(), shared_dispatcher()),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUN_NOT_STARTED_MESSAGE
+            ))
+        );
+        assert!(dispatched_receiver.try_recv().is_err());
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn dispatch_mmio_access_during_run_is_rejected() {
+        let (runner, entered_run_receiver, destroyed_receiver) = start_fake_runner();
+
+        thread::scope(|scope| {
+            let run = scope.spawn(|| runner.run_once());
+            entered_run_receiver
+                .recv()
+                .expect("runner should enter fake run");
+
+            assert_eq!(
+                runner.dispatch_mmio_access(resolved_mmio_access(), shared_dispatcher()),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::RUN_IN_FLIGHT_MESSAGE
+                ))
+            );
+
+            runner.cancel().expect("cancel should release fake run");
+            assert_eq!(
+                run.join().expect("run thread should join"),
+                Ok(HvfVcpuExit::Canceled)
+            );
+        });
+
+        runner.shutdown().expect("runner should shut down");
+        destroyed_receiver
+            .recv()
+            .expect("fake vCPU should be destroyed");
+    }
+
+    #[test]
+    fn dispatch_mmio_access_during_arm64_boot_register_setup_is_rejected() {
+        let (entered_setup_sender, entered_setup_receiver) = mpsc::channel();
+        let (release_setup_sender, release_setup_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(BlockingConfigureVcpu {
+                entered_setup_sender,
+                release_setup_receiver,
+            })
+        })
+        .expect("fake runner should start");
+        let runner = HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+            .expect("runner should be created");
+
+        thread::scope(|scope| {
+            let setup = scope.spawn(|| runner.configure_arm64_boot_registers(boot_registers()));
+            entered_setup_receiver
+                .recv()
+                .expect("runner should enter fake setup");
+
+            assert_eq!(
+                runner.dispatch_mmio_access(resolved_mmio_access(), shared_dispatcher()),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE
+                ))
+            );
+
+            release_setup_sender
+                .send(Ok(()))
+                .expect("setup release should be sent");
+            assert_eq!(setup.join().expect("setup thread should join"), Ok(()));
+        });
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn concurrent_mmio_dispatch_is_rejected_without_queueing() {
+        let access = resolved_mmio_access();
+        let (entered_dispatch_sender, entered_dispatch_receiver) = mpsc::channel();
+        let (release_dispatch_sender, release_dispatch_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(BlockingMmioDispatchVcpu {
+                entered_dispatch_sender,
+                release_dispatch_receiver,
+            })
+        })
+        .expect("fake runner should start");
+        let runner = HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+            .expect("runner should be created");
+
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        thread::scope(|scope| {
+            let first_dispatch =
+                scope.spawn(|| runner.dispatch_mmio_access(access, shared_dispatcher()));
+            entered_dispatch_receiver
+                .recv()
+                .expect("runner should enter fake MMIO dispatch");
+
+            assert_eq!(
+                runner.dispatch_mmio_access(access, shared_dispatcher()),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::MMIO_DISPATCH_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.run_once(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::MMIO_DISPATCH_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.cancel(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::MMIO_DISPATCH_IN_FLIGHT_MESSAGE
+                ))
+            );
+
+            release_dispatch_sender
+                .send(Ok(MmioDispatchOutcome::Write))
+                .expect("dispatch release should be sent");
+            assert_eq!(
+                first_dispatch.join().expect("dispatch thread should join"),
+                Ok(MmioDispatchOutcome::Write)
+            );
+        });
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn dispatch_mmio_access_reports_poisoned_dispatcher_lock() {
+        let (runner, _) = start_dispatch_recording_runner(Ok(MmioDispatchOutcome::Write));
+        let dispatcher = shared_dispatcher();
+
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        let _ = std::panic::catch_unwind({
+            let dispatcher = Arc::clone(&dispatcher);
+            move || {
+                let _guard = dispatcher
+                    .lock()
+                    .expect("dispatcher lock should not be poisoned yet");
+                panic!("poison test dispatcher");
+            }
+        });
+
+        assert_eq!(
+            runner.dispatch_mmio_access(resolved_mmio_access(), dispatcher),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::MMIO_DISPATCHER_POISONED_MESSAGE
+            ))
+        );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn dispatch_mmio_access_rejects_busy_dispatcher_lock_without_blocking() {
+        let (runner, _) = start_dispatch_recording_runner(Ok(MmioDispatchOutcome::Write));
+        let dispatcher = shared_dispatcher();
+
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        let dispatcher_guard = dispatcher
+            .lock()
+            .expect("dispatcher lock should not be poisoned");
+        assert_eq!(
+            runner.dispatch_mmio_access(resolved_mmio_access(), Arc::clone(&dispatcher)),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::MMIO_DISPATCHER_BUSY_MESSAGE
+            ))
+        );
+        drop(dispatcher_guard);
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn dispatch_mmio_access_after_shutdown_is_rejected() {
+        let (runner, _) = start_dispatch_recording_runner(Ok(MmioDispatchOutcome::Write));
+
+        runner.shutdown().expect("runner should shut down");
+        assert_eq!(
+            runner.dispatch_mmio_access(resolved_mmio_access(), shared_dispatcher()),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUNNER_SHUT_DOWN_MESSAGE
+            ))
+        );
+    }
+
+    #[test]
+    fn dispatch_mmio_access_during_shutdown_is_rejected() {
+        let (runner, _, destroyed_receiver) = start_fake_runner();
+        let (command_sender, should_cancel) = runner
+            .prepare_shutdown()
+            .expect("first shutdown should be prepared");
+
+        assert!(!should_cancel);
+        assert_eq!(
+            runner.dispatch_mmio_access(resolved_mmio_access(), shared_dispatcher()),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUNNER_SHUTTING_DOWN_MESSAGE
+            ))
+        );
+
+        let thread = runner
+            .take_thread()
+            .expect("runner state should be lockable");
+        let (response_sender, response_receiver) = mpsc::channel();
+        command_sender
+            .send(super::RunnerCommand::Shutdown { response_sender })
+            .expect("shutdown command should be sent");
+        assert_eq!(
+            response_receiver
+                .recv()
+                .expect("shutdown response should be sent"),
+            Ok(())
+        );
+        super::join_runner_thread(thread).expect("runner thread should join");
+        runner.finish_shutdown();
         destroyed_receiver
             .recv()
             .expect("fake vCPU should be destroyed");
