@@ -12,7 +12,8 @@ placement helpers, internal boot-source validation and arm64 kernel/initrd
 payload loading, an internal Firecracker-shaped drive configuration validation
 model, a host-file backing access layer, an internal virtio-block config-space
 capacity model, an internal virtio-block request parser, single-request
-executor, queue dispatcher, and MMIO queue-state bridge, a minimal
+executor, queue dispatcher, MMIO queue-state bridge, and resettable activation
+state, a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
 create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding,
 registry resolution, vCPU exit classification, single resolved HVF MMIO
@@ -28,13 +29,13 @@ common register accesses through those state models and exposes drained queue
 notifications, delegated device-configuration accesses, and a `DRIVER_OK`
 activation hook with reset callback, plus virtqueue descriptor-chain validator,
 available-ring read model, used-ring write model, and internal virtio-block
-queue construction and drain for future device handlers, an internal
+queue construction and drain plus resettable active queue ownership for future device handlers, an internal
 backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, and an initial process startup argument model.
 There is no broader API request body model, guest execution, continuous vCPU run loop,
 complete interrupt delivery, MMIO queue-notification-to-device dispatch,
 backend interrupt signaling, device-backed feature negotiation, real block
-device activation effects, indirect descriptor support,
+request dispatch from notifications, indirect descriptor support,
 device-backed runner-loop MMIO handling, real device emulation, public startup
 wiring, multi-vCPU setup, PSCI behavior, or public boot-source, drives, or
 actions API behavior yet.
@@ -260,9 +261,15 @@ guest-selected descriptor table, driver ring, device ring, and queue size. The
 builder rejects not-ready queues and wraps invalid ring metadata before guest
 memory is touched.
 
+The runtime crate also has an internal virtio-block device state that owns the
+host-file backing, fixed 20-byte device ID, and optional active queue. It can
+activate queue 0 from a `DRIVER_OK` virtio-mmio activation snapshot, reject
+duplicate activation without replacing the existing queue, and clear the active
+queue on virtio-mmio reset.
+
 This is not public `/drives` behavior and does not dispatch MMIO queue
-notifications to a block device, signal backend interrupts, wire a block device
-activation path, or support indirect descriptors yet.
+notifications to a block device, signal backend interrupts, execute requests
+from an active device notification path, or support indirect descriptors yet.
 
 ## Guest Memory Address Space
 
@@ -367,7 +374,7 @@ The config handler supports bounded read-only capacity reads through the
 existing virtio-mmio device-configuration path and rejects config writes.
 
 This model is not wired to `PUT /drives/{drive_id}` yet and does not select a
-root block device, wire activated queues to guest request dispatch/completion,
+root block device, wire active queues to guest request dispatch/completion,
 implement rate limiting, support vhost-user-block sockets, or use an async I/O
 engine.
 
