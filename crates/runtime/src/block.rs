@@ -7,6 +7,22 @@ use std::io;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+use crate::mmio::{MmioAccessBytes, MmioAccessBytesError};
+use crate::virtio_mmio::{
+    VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError, VirtioMmioDeviceConfigHandler,
+};
+
+pub const VIRTIO_BLOCK_DEVICE_ID: u32 = 2;
+pub const VIRTIO_BLOCK_QUEUE_COUNT: usize = 1;
+pub const VIRTIO_BLOCK_QUEUE_SIZE: u16 = 256;
+pub const VIRTIO_BLOCK_QUEUE_SIZES: [u16; VIRTIO_BLOCK_QUEUE_COUNT] = [VIRTIO_BLOCK_QUEUE_SIZE];
+pub const VIRTIO_BLOCK_SECTOR_SHIFT: u32 = 9;
+pub const VIRTIO_BLOCK_SECTOR_SIZE: u64 = 1 << VIRTIO_BLOCK_SECTOR_SHIFT;
+pub const VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE: usize = 8;
+pub const VIRTIO_BLOCK_FEATURE_READ_ONLY: u32 = 5;
+pub const VIRTIO_RING_FEATURE_EVENT_IDX: u32 = 29;
+pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriveConfigInput {
     path_drive_id: String,
@@ -302,6 +318,106 @@ impl fmt::Display for DriveConfigError {
 
 impl std::error::Error for DriveConfigError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioBlockConfigSpace {
+    capacity_sectors: u64,
+    is_read_only: bool,
+}
+
+impl VirtioBlockConfigSpace {
+    pub const fn new(backing_len: u64, is_read_only: bool) -> Self {
+        Self {
+            capacity_sectors: backing_len >> VIRTIO_BLOCK_SECTOR_SHIFT,
+            is_read_only,
+        }
+    }
+
+    pub fn from_backing(backing: &BlockFileBacking) -> Self {
+        Self::new(backing.len(), backing.is_read_only())
+    }
+
+    pub const fn capacity_sectors(self) -> u64 {
+        self.capacity_sectors
+    }
+
+    pub const fn is_read_only(self) -> bool {
+        self.is_read_only
+    }
+
+    pub const fn available_features(self) -> u64 {
+        let features = virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
+            | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX);
+        if self.is_read_only {
+            features | virtio_feature_bit(VIRTIO_BLOCK_FEATURE_READ_ONLY)
+        } else {
+            features
+        }
+    }
+
+    const fn capacity_bytes(self) -> [u8; VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE] {
+        self.capacity_sectors.to_le_bytes()
+    }
+}
+
+impl VirtioMmioDeviceConfigHandler for VirtioBlockConfigSpace {
+    fn read_device_config(
+        &self,
+        access: VirtioMmioDeviceConfigAccess,
+    ) -> Result<MmioAccessBytes, VirtioMmioDeviceConfigError> {
+        let capacity = self.capacity_bytes();
+        let bytes = read_virtio_block_capacity_bytes(&capacity, access)?;
+        MmioAccessBytes::new(bytes).map_err(config_bytes_error)
+    }
+
+    fn write_device_config(
+        &mut self,
+        access: VirtioMmioDeviceConfigAccess,
+        _data: MmioAccessBytes,
+    ) -> Result<(), VirtioMmioDeviceConfigError> {
+        Err(VirtioMmioDeviceConfigError::UnsupportedWrite {
+            offset: access.offset(),
+            len: access.len(),
+        })
+    }
+}
+
+const fn virtio_feature_bit(feature: u32) -> u64 {
+    1_u64 << feature
+}
+
+fn read_virtio_block_capacity_bytes(
+    capacity: &[u8; VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE],
+    access: VirtioMmioDeviceConfigAccess,
+) -> Result<&[u8], VirtioMmioDeviceConfigError> {
+    let offset = usize::try_from(access.offset()).map_err(|_| {
+        VirtioMmioDeviceConfigError::UnsupportedRead {
+            offset: access.offset(),
+            len: access.len(),
+        }
+    })?;
+    let Some(end) = offset.checked_add(access.len()) else {
+        return Err(VirtioMmioDeviceConfigError::UnsupportedRead {
+            offset: access.offset(),
+            len: access.len(),
+        });
+    };
+
+    capacity
+        .get(offset..end)
+        .ok_or(VirtioMmioDeviceConfigError::UnsupportedRead {
+            offset: access.offset(),
+            len: access.len(),
+        })
+}
+
+fn config_bytes_error(source: MmioAccessBytesError) -> VirtioMmioDeviceConfigError {
+    VirtioMmioDeviceConfigError::Handler {
+        source: crate::mmio::MmioHandlerError::new(format!(
+            "virtio-block config access bytes failed: {source}"
+        )),
+    }
+}
+
 #[derive(Debug)]
 pub struct BlockFileBacking {
     file: File,
@@ -510,12 +626,25 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crate::memory::GuestAddress;
+    use crate::mmio::{MmioAccess, MmioAccessBytes, MmioBus, MmioRegionId};
+    use crate::virtio_mmio::{
+        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
+        VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioRegister,
+        VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
+    };
+
     use super::{
         BlockFileBacking, BlockFileBackingError, DriveCacheType, DriveConfig, DriveConfigError,
-        DriveConfigInput, DriveIdSource, DriveIoEngine,
+        DriveConfigInput, DriveIdSource, DriveIoEngine, VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE,
+        VIRTIO_BLOCK_DEVICE_ID, VIRTIO_BLOCK_FEATURE_READ_ONLY, VIRTIO_BLOCK_QUEUE_COUNT,
+        VIRTIO_BLOCK_QUEUE_SIZE, VIRTIO_BLOCK_QUEUE_SIZES, VIRTIO_BLOCK_SECTOR_SHIFT,
+        VIRTIO_BLOCK_SECTOR_SIZE, VIRTIO_FEATURE_VERSION_1, VIRTIO_RING_FEATURE_EVENT_IDX,
+        VirtioBlockConfigSpace,
     };
 
     static NEXT_TEMP_PATH_ID: AtomicUsize = AtomicUsize::new(0);
+    const TEST_MMIO_BASE: u64 = 0x1000_0000;
 
     #[derive(Debug)]
     struct TempPath {
@@ -638,6 +767,65 @@ mod tests {
         is_read_only: bool,
     ) -> Result<BlockFileBacking, BlockFileBackingError> {
         BlockFileBacking::open(&config_for_path(path, is_read_only))
+    }
+
+    fn virtio_mmio_access(offset: u64, len: u64) -> MmioAccess {
+        let mut bus = MmioBus::new();
+        bus.insert(
+            MmioRegionId::new(1),
+            GuestAddress::new(TEST_MMIO_BASE),
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+        )
+        .expect("virtio-mmio region should insert");
+        bus.lookup(GuestAddress::new(TEST_MMIO_BASE + offset), len)
+            .expect("virtio-mmio access should resolve")
+    }
+
+    fn block_config_handler(
+        config: VirtioBlockConfigSpace,
+    ) -> VirtioMmioRegisterHandler<VirtioBlockConfigSpace> {
+        VirtioMmioRegisterHandler::with_device_config(
+            VIRTIO_BLOCK_DEVICE_ID,
+            config.available_features(),
+            &VIRTIO_BLOCK_QUEUE_SIZES,
+            config,
+        )
+        .expect("block config handler should build")
+    }
+
+    fn read_block_config(
+        config: VirtioBlockConfigSpace,
+        offset: u64,
+        len: u64,
+    ) -> Result<MmioAccessBytes, VirtioMmioRegisterHandlerError> {
+        block_config_handler(config).read_access(virtio_mmio_access(
+            VIRTIO_MMIO_DEVICE_CONFIG_OFFSET + offset,
+            len,
+        ))
+    }
+
+    fn write_block_config_after_driver(
+        config: VirtioBlockConfigSpace,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), VirtioMmioRegisterHandlerError> {
+        let mut handler = block_config_handler(config);
+        handler
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
+            .expect("status should accept ACKNOWLEDGE");
+        handler
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            )
+            .expect("status should accept DRIVER");
+        handler.write_access(
+            virtio_mmio_access(
+                VIRTIO_MMIO_DEVICE_CONFIG_OFFSET + offset,
+                u64::try_from(bytes.len()).expect("test byte length should fit in u64"),
+            ),
+            MmioAccessBytes::new(bytes).expect("test write bytes should be valid"),
+        )
     }
 
     #[test]
@@ -851,6 +1039,138 @@ mod tests {
 
         assert_eq!(err.to_string(), "drive rate_limiter is not supported");
         assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn virtio_block_constants_match_firecracker_shape() {
+        assert_eq!(VIRTIO_BLOCK_DEVICE_ID, 2);
+        assert_eq!(VIRTIO_BLOCK_QUEUE_COUNT, 1);
+        assert_eq!(VIRTIO_BLOCK_QUEUE_SIZE, 256);
+        assert_eq!(VIRTIO_BLOCK_QUEUE_SIZES, [256]);
+        assert_eq!(VIRTIO_BLOCK_SECTOR_SHIFT, 9);
+        assert_eq!(VIRTIO_BLOCK_SECTOR_SIZE, 512);
+        assert_eq!(VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE, 8);
+        assert_eq!(VIRTIO_BLOCK_FEATURE_READ_ONLY, 5);
+        assert_eq!(VIRTIO_RING_FEATURE_EVENT_IDX, 29);
+        assert_eq!(VIRTIO_FEATURE_VERSION_1, 32);
+    }
+
+    #[test]
+    fn config_space_reports_sector_capacity() {
+        let config = VirtioBlockConfigSpace::new(4096, false);
+
+        assert_eq!(config.capacity_sectors(), 8);
+        assert!(!config.is_read_only());
+    }
+
+    #[test]
+    fn config_space_truncates_unaligned_tail() {
+        assert_eq!(
+            VirtioBlockConfigSpace::new(511, false).capacity_sectors(),
+            0
+        );
+        assert_eq!(
+            VirtioBlockConfigSpace::new(512, false).capacity_sectors(),
+            1
+        );
+        assert_eq!(
+            VirtioBlockConfigSpace::new(4097, false).capacity_sectors(),
+            8
+        );
+    }
+
+    #[test]
+    fn config_space_tracks_read_only_feature() {
+        let base_features =
+            (1_u64 << VIRTIO_FEATURE_VERSION_1) | (1_u64 << VIRTIO_RING_FEATURE_EVENT_IDX);
+
+        assert_eq!(
+            VirtioBlockConfigSpace::new(512, false).available_features(),
+            base_features
+        );
+        assert_eq!(
+            VirtioBlockConfigSpace::new(512, true).available_features(),
+            base_features | (1_u64 << VIRTIO_BLOCK_FEATURE_READ_ONLY)
+        );
+    }
+
+    #[test]
+    fn config_space_can_be_derived_from_backing() {
+        let file = temp_file("config-space.img", &[0; 1024]);
+        let backing = open_backing(file.as_path(), true).expect("backing should open");
+        let config = VirtioBlockConfigSpace::from_backing(&backing);
+
+        assert_eq!(config.capacity_sectors(), 2);
+        assert!(config.is_read_only());
+    }
+
+    #[test]
+    fn config_space_reads_full_and_partial_capacity() {
+        let sectors = 0x0102_0304_u64;
+        let config = VirtioBlockConfigSpace::new(sectors << VIRTIO_BLOCK_SECTOR_SHIFT, false);
+        let expected = sectors.to_le_bytes();
+
+        assert_eq!(
+            read_block_config(config, 0, 8)
+                .expect("full capacity read should succeed")
+                .as_slice(),
+            expected.as_slice()
+        );
+        assert_eq!(
+            read_block_config(config, 1, 2)
+                .expect("partial capacity read should succeed")
+                .as_slice(),
+            &[0x03, 0x02]
+        );
+        assert_eq!(
+            read_block_config(config, 4, 4)
+                .expect("high capacity word read should succeed")
+                .as_slice(),
+            &[0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn config_space_reads_ending_at_capacity_boundary() {
+        let config = VirtioBlockConfigSpace::new(u64::MAX, false);
+        let expected = config.capacity_sectors().to_le_bytes();
+
+        assert_eq!(
+            read_block_config(config, 7, 1)
+                .expect("last capacity byte should read")
+                .as_slice(),
+            expected.get(7..8).expect("test slice should exist")
+        );
+        assert_eq!(
+            read_block_config(config, 4, 4)
+                .expect("read ending at capacity boundary should succeed")
+                .as_slice(),
+            expected.get(4..8).expect("test slice should exist")
+        );
+    }
+
+    #[test]
+    fn config_space_rejects_out_of_bounds_reads() {
+        let config = VirtioBlockConfigSpace::new(512, false);
+
+        assert!(matches!(
+            read_block_config(config, 8, 1),
+            Err(VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead { offset: 8, len: 1 })
+        ));
+        assert!(matches!(
+            read_block_config(config, 7, 2),
+            Err(VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead { offset: 7, len: 2 })
+        ));
+    }
+
+    #[test]
+    fn config_space_rejects_writes_after_driver_status() {
+        let config = VirtioBlockConfigSpace::new(512, false);
+
+        assert!(matches!(
+            write_block_config_after_driver(config, 0, &[1, 2, 3, 4]),
+            Err(VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigWrite { offset: 0, len: 4 })
+        ));
     }
 
     #[test]

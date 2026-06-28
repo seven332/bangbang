@@ -10,7 +10,8 @@ trait, a minimal read-only VMM action/data model, backend-neutral guest
 physical address and aarch64 DRAM layout/access primitives, arm64 boot
 placement helpers, internal boot-source validation and arm64 kernel/initrd
 payload loading, an internal Firecracker-shaped drive configuration validation
-model and host-file backing access layer, a minimal
+model, a host-file backing access layer, an internal virtio-block config-space
+capacity model, a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
 create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding,
 registry resolution, vCPU exit classification, single resolved HVF MMIO
@@ -30,8 +31,8 @@ backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, and an initial process startup argument model.
 There is no broader API request body model, guest execution, continuous vCPU run loop,
 complete interrupt delivery, queue notification dispatch, completion dispatch,
-device-backed feature negotiation, virtio-block config space, real block request
-handling, real device activation effects, indirect descriptor support,
+device-backed feature negotiation, real block request handling, real device
+activation effects, indirect descriptor support,
 device-backed runner-loop MMIO handling, real device emulation, public startup
 wiring, multi-vCPU setup, PSCI behavior, or public boot-source, drives, or
 actions API behavior yet.
@@ -322,10 +323,17 @@ handling. It rejects non-regular backing paths before data I/O and rejects
 read-only writes before mutating the file. Backing errors also avoid echoing
 `path_on_host`.
 
+The runtime crate can derive an internal virtio-block configuration space from
+the backing length. It reports capacity as full 512-byte sectors, matching
+Firecracker's truncation of non-sector-aligned tails, exposes the virtio block
+device id and one 256-entry queue shape, and advertises `VIRTIO_F_VERSION_1`,
+`VIRTIO_RING_F_EVENT_IDX`, and `VIRTIO_BLK_F_RO` only for read-only drives.
+The config handler supports bounded read-only capacity reads through the
+existing virtio-mmio device-configuration path and rejects config writes.
+
 This model is not wired to `PUT /drives/{drive_id}` yet and does not select a
-root block device, expose virtio-block config space, process guest queue
-requests, implement cache flushes or rate limiting, support vhost-user-block
-sockets, or use an async I/O engine.
+root block device, process guest queue requests, implement cache flushes or
+rate limiting, support vhost-user-block sockets, or use an async I/O engine.
 
 ## Internal arm64 FDT Generation
 
