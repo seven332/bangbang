@@ -1257,16 +1257,34 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_line_allocator_accepts_last_non_overflowing_range() {
+        let mut allocator = HvfGicInterruptLineAllocator::new(HvfGicInterruptRange {
+            base: u32::MAX - 1,
+            count: 1,
+        })
+        .expect("last non-overflowing SPI range should allocate");
+
+        assert_eq!(
+            allocator
+                .allocate()
+                .expect("single line should allocate")
+                .raw_value(),
+            u32::MAX - 1
+        );
+        assert!(allocator.is_exhausted());
+    }
+
+    #[test]
     fn interrupt_line_allocator_rejects_overflowing_range() {
         assert_eq!(
             HvfGicInterruptLineAllocator::new(HvfGicInterruptRange {
-                base: u32::MAX,
+                base: u32::MAX - 1,
                 count: 2,
             })
             .expect_err("overflowing range should fail"),
             HvfInterruptLineAllocationError::InvalidRange(HvfGicError::InvalidParameter {
                 name: "spi_interrupt_range.end_exclusive",
-                value: u64::from(u32::MAX) + 2,
+                value: u64::from(u32::MAX) + 1,
             })
         );
     }
