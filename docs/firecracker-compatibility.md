@@ -326,8 +326,9 @@ read-only writes before mutating the file. Backing errors also avoid echoing
 The runtime crate can derive an internal virtio-block configuration space from
 the backing length. It reports capacity as full 512-byte sectors, matching
 Firecracker's truncation of non-sector-aligned tails, exposes the virtio block
-device id and one 256-entry queue shape, and advertises `VIRTIO_F_VERSION_1`,
-`VIRTIO_RING_F_EVENT_IDX`, and `VIRTIO_BLK_F_RO` only for read-only drives.
+device id and one 256-entry queue shape, always advertises
+`VIRTIO_F_VERSION_1` and `VIRTIO_RING_F_EVENT_IDX`, and advertises
+`VIRTIO_BLK_F_RO` only for read-only drives.
 The config handler supports bounded read-only capacity reads through the
 existing virtio-mmio device-configuration path and rejects config writes.
 
