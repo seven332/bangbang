@@ -16,11 +16,12 @@ registry resolution, and vCPU exit classification, narrow vCPU register wrappers
 arm64 FDT generation and guest-memory writes, anonymous guest memory allocation
 for validated runtime layouts, HVF guest memory map/unmap ownership for
 allocated regions, an internal MMIO region ownership registry and operation/data
-model, single-vCPU arm64 HVF boot-register setup, and an initial process startup
-argument model.
+model plus handler dispatch boundary, single-vCPU arm64 HVF boot-register
+setup, and an initial process startup argument model.
 There is no broader API request body model, guest execution, vCPU run loop,
-interrupt injection, MMIO exit dispatch, device emulation, public startup
-wiring, multi-vCPU setup, PSCI behavior, or public boot-source API behavior yet.
+interrupt injection, HVF guest register completion for MMIO exits, real device
+emulation, public startup wiring, multi-vCPU setup, PSCI behavior, or public
+boot-source API behavior yet.
 
 ## Firecracker Model Alignment
 
@@ -324,30 +325,35 @@ memory `reg` property alone cannot fit in the FDT window are rejected before FDT
 construction. The write result records the FDT guest address and byte size for
 future boot-register setup.
 
-The runtime crate also contains an internal MMIO region registry and operation
-model for future device dispatch. It reuses `GuestMemoryRange`'s end-exclusive
-semantics instead of Firecracker's inclusive-end `BusRange` representation.
+The runtime crate also contains an internal MMIO region registry, operation
+model, and handler dispatch boundary for future real devices. It reuses
+`GuestMemoryRange`'s end-exclusive semantics instead of Firecracker's
+inclusive-end `BusRange` representation.
 Region registration rejects zero-sized or overflowing ranges and accepts
 adjacent non-overlapping ranges. Lookups validate that the whole access range is
 owned by one region before returning the region owner and offset; accesses that
 hit a hole, overflow, or cross a region boundary are rejected. A resolved access
 can be wrapped as a read or write operation with bounded 1-, 2-, 4-, or 8-byte
 data, and write construction rejects data whose length does not match the
-resolved access size. This is still not MMIO exit dispatch, device emulation,
-guest register completion, or interrupt delivery.
+resolved access size. A runtime dispatcher can route those checked operations
+to registered internal handlers by region owner. This is still not HVF guest
+register completion, continuous run-loop policy, real device emulation, or
+interrupt delivery.
 
 The HVF backend can decode candidate MMIO accesses from arm64 data-abort
 exception exits. The decoder converts supported ESR and IPA metadata into a
 checked access range, direction, width, register number, and read-extension
 metadata while the raw exit snapshot still preserves FAR. Unsupported exception
 classes, missing instruction-syndrome metadata, table-walk aborts,
-cache-maintenance aborts, and overflowing access ranges fail closed before later
-dispatch can route them. Decoded accesses can also be resolved against the
-runtime MMIO registry to identify the owning region, offset, and preserved HVF
-access metadata for future device dispatch. Whole vCPU exits can be classified
+cache-maintenance aborts, and overflowing access ranges fail closed before
+runtime dispatch or later HVF completion can use them. Decoded accesses can also
+be resolved against the runtime MMIO registry to identify the owning region,
+offset, and preserved HVF access metadata. Whole vCPU exits can be classified
 into resolved MMIO, virtual-timer, canceled, or unknown events while preserving
-typed decode and bus-resolution errors. This is still not device dispatch, read
-completion, interrupt delivery, or device emulation.
+typed decode and bus-resolution errors. Runtime MMIO operations can be
+dispatched to internal handlers after lookup, but HVF exits are still not
+completed back into guest registers and there is no continuous run-loop policy,
+interrupt delivery, or real device emulation.
 
 The HVF backend can map allocated guest memory regions into an existing
 Hypervisor.framework VM with read/write/execute guest RAM permissions. The
@@ -497,9 +503,10 @@ macOS design work instead of direct implementation:
 - HVF exit snapshots preserve Hypervisor.framework reasons such as canceled,
   exception, virtual timer activation, and unknown after a run wrapper marks
   exit data available. Candidate arm64 MMIO data-abort exceptions can be decoded
-  into checked access metadata and resolved against the internal MMIO registry,
-  but they are not yet routed into devices, completed back into guest registers,
-  or translated into interrupt/runtime events.
+  into checked access metadata and resolved against the internal MMIO registry.
+  Checked runtime MMIO operations can be dispatched to registered internal
+  handlers, but HVF exits are not yet completed back into guest registers or
+  translated into interrupt/runtime events.
 - Firecracker's full paused/resumed microVM loop is not implemented yet.
   bangbang's runner is only the HVF ownership and cancellation primitive needed
   before guest memory, interrupt, timer, and device work can build the real run
