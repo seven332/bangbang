@@ -2614,6 +2614,17 @@ mod tests {
     fn advance_handler_to_features_ok<C: VirtioMmioDeviceConfigHandler>(
         handler: &mut VirtioMmioRegisterHandler<C>,
     ) -> Result<(), VirtioMmioRegisterHandlerError> {
+        advance_handler_to_driver(handler)?;
+        write_register_u32(
+            handler,
+            VirtioMmioRegister::Status.offset(),
+            QUEUE_CONFIG_STATUS,
+        )
+    }
+
+    fn advance_handler_to_driver<C: VirtioMmioDeviceConfigHandler>(
+        handler: &mut VirtioMmioRegisterHandler<C>,
+    ) -> Result<(), VirtioMmioRegisterHandlerError> {
         write_register_u32(
             handler,
             VirtioMmioRegister::Status.offset(),
@@ -2623,11 +2634,6 @@ mod tests {
             handler,
             VirtioMmioRegister::Status.offset(),
             VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
-        )?;
-        write_register_u32(
-            handler,
-            VirtioMmioRegister::Status.offset(),
-            QUEUE_CONFIG_STATUS,
         )
     }
 
@@ -3991,6 +3997,48 @@ mod tests {
             Err(
                 VirtioMmioRegisterHandlerError::DeviceConfigWriteNotWritable {
                     status: VIRTIO_DEVICE_STATUS_INIT,
+                }
+            )
+        );
+        assert!(handler.device_config_handler().writes.is_empty());
+    }
+
+    #[test]
+    fn register_handler_allows_device_config_write_after_driver_status() {
+        let config = TestDeviceConfig::new(vec![0; 4]);
+        let mut handler = VirtioMmioRegisterHandler::with_device_config(7, 0x2a, &[8], config)
+            .expect("handler should build");
+        advance_handler_to_driver(&mut handler).expect("handler should reach DRIVER");
+        let write_data = MmioAccessBytes::new(&[0xaa]).expect("write bytes should build");
+
+        handler
+            .write_access(access(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, 1), write_data)
+            .expect("device config write should delegate after DRIVER");
+
+        assert_eq!(handler.device_config_handler().writes.len(), 1);
+    }
+
+    #[test]
+    fn register_handler_rejects_device_config_write_after_failed_status() {
+        let config = TestDeviceConfig::new(vec![0; 4]);
+        let mut handler = VirtioMmioRegisterHandler::with_device_config(7, 0x2a, &[8], config)
+            .expect("handler should build");
+        advance_handler_to_driver(&mut handler).expect("handler should reach DRIVER");
+        write_register_u32(
+            &mut handler,
+            VirtioMmioRegister::Status.offset(),
+            VIRTIO_DEVICE_STATUS_FAILED,
+        )
+        .expect("FAILED status should write");
+        let write_data = MmioAccessBytes::new(&[0xaa]).expect("write bytes should build");
+
+        assert_eq!(
+            handler.write_access(access(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, 1), write_data),
+            Err(
+                VirtioMmioRegisterHandlerError::DeviceConfigWriteNotWritable {
+                    status: VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+                        | VIRTIO_DEVICE_STATUS_DRIVER
+                        | VIRTIO_DEVICE_STATUS_FAILED,
                 }
             )
         );

@@ -379,7 +379,8 @@ register reads and writes through those state models, implements the runtime
 MMIO handler boundary, and exposes the notification drain without exposing
 mutable nested state. Device-configuration accesses are classified by offset and
 length and can be delegated through a backend-neutral config handler; config
-writes are gated on the driver-ready status state before delegation. Concrete
+writes are delegated only after the `DRIVER` status bit is set and while
+`FAILED` and `DEVICE_NEEDS_RESET` are clear. Concrete
 device config layouts, config generation policy, device-backed notification
 dispatch, device activation, and real virtio devices are still deferred. The
 virtqueue model can publish one used-ring completion element with validated
