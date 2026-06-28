@@ -12,7 +12,7 @@ placement helpers, internal boot-source validation and arm64 kernel/initrd
 payload loading, an internal Firecracker-shaped drive configuration validation
 model, a host-file backing access layer, an internal virtio-block config-space
 capacity model, an internal virtio-block request parser, single-request
-executor, and queue dispatcher, a minimal
+executor, queue dispatcher, and MMIO queue-state bridge, a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
 create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding,
 registry resolution, vCPU exit classification, single resolved HVF MMIO
@@ -27,8 +27,8 @@ status/acknowledgement register state, a composed runtime handler that routes
 common register accesses through those state models and exposes drained queue
 notifications, delegated device-configuration accesses, and a `DRIVER_OK`
 activation hook, plus virtqueue descriptor-chain validator, available-ring read
-model, used-ring write model, and internal virtio-block queue drain for future
-device handlers, an internal
+model, used-ring write model, and internal virtio-block queue construction and
+drain for future device handlers, an internal
 backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, and an initial process startup argument model.
 There is no broader API request body model, guest execution, continuous vCPU run loop,
@@ -255,6 +255,10 @@ completion elements, and returning queue-interrupt intent when at least one
 completion is published. Parse failures after a valid descriptor head publish a
 zero-length used element, matching Firecracker's discard shape for malformed
 block requests.
+The queue can be built from a ready `VirtioMmioQueueState` by reusing the
+guest-selected descriptor table, driver ring, device ring, and queue size. The
+builder rejects not-ready queues and wraps invalid ring metadata before guest
+memory is touched.
 
 This is not public `/drives` behavior and does not dispatch MMIO queue
 notifications to a block device, signal backend interrupts, wire a block device
@@ -363,8 +367,9 @@ The config handler supports bounded read-only capacity reads through the
 existing virtio-mmio device-configuration path and rejects config writes.
 
 This model is not wired to `PUT /drives/{drive_id}` yet and does not select a
-root block device, dispatch or complete guest queue requests, implement rate
-limiting, support vhost-user-block sockets, or use an async I/O engine.
+root block device, wire activated queues to guest request dispatch/completion,
+implement rate limiting, support vhost-user-block sockets, or use an async I/O
+engine.
 
 ## Internal arm64 FDT Generation
 
@@ -451,7 +456,9 @@ writes are delegated only after the `DRIVER` status bit is set and while
 backend-neutral activation hook when `DRIVER_OK` is accepted; activation failure
 marks the device as needing reset, but concrete device activation effects,
 device config layouts, config generation policy, and device-backed notification
-dispatch are still deferred. The
+dispatch are still deferred. Activated queue metadata can now feed the internal
+virtio-block queue builder, but selecting a concrete block queue and owning its
+lifecycle remain deferred. The
 virtqueue model can publish one used-ring completion element with validated
 layout, mapped-memory checks, wrapping, and release ordering, but batching,
 event-index notification suppression, and device-backed completion loops are

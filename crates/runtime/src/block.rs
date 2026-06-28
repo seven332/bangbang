@@ -12,6 +12,7 @@ use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemo
 use crate::mmio::{MmioAccessBytes, MmioAccessBytesError};
 use crate::virtio_mmio::{
     VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError, VirtioMmioDeviceConfigHandler,
+    VirtioMmioQueueState,
 };
 use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
@@ -1011,6 +1012,43 @@ impl std::error::Error for VirtioBlockRequestExecutionError {
     }
 }
 
+#[derive(Debug)]
+pub enum VirtioBlockQueueBuildError {
+    QueueNotReady,
+    AvailableRing { source: VirtqueueAvailableRingError },
+    UsedRing { source: VirtqueueUsedRingError },
+}
+
+impl fmt::Display for VirtioBlockQueueBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::QueueNotReady => f.write_str("virtio-block queue is not ready"),
+            Self::AvailableRing { source } => {
+                write!(
+                    f,
+                    "failed to build virtio-block available ring from queue state: {source}"
+                )
+            }
+            Self::UsedRing { source } => {
+                write!(
+                    f,
+                    "failed to build virtio-block used ring from queue state: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioBlockQueueBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AvailableRing { source } => Some(source),
+            Self::UsedRing { source } => Some(source),
+            Self::QueueNotReady => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtioBlockQueue {
     available: VirtqueueAvailableRing,
@@ -1020,6 +1058,25 @@ pub struct VirtioBlockQueue {
 impl VirtioBlockQueue {
     pub const fn new(available: VirtqueueAvailableRing, used: VirtqueueUsedRing) -> Self {
         Self { available, used }
+    }
+
+    pub fn from_mmio_queue_state(
+        queue: &VirtioMmioQueueState,
+    ) -> Result<Self, VirtioBlockQueueBuildError> {
+        if !queue.ready() {
+            return Err(VirtioBlockQueueBuildError::QueueNotReady);
+        }
+
+        let available = VirtqueueAvailableRing::new(
+            queue.descriptor_table(),
+            queue.driver_ring(),
+            queue.size(),
+        )
+        .map_err(|source| VirtioBlockQueueBuildError::AvailableRing { source })?;
+        let used = VirtqueueUsedRing::new(queue.device_ring(), queue.size())
+            .map_err(|source| VirtioBlockQueueBuildError::UsedRing { source })?;
+
+        Ok(Self::new(available, used))
     }
 
     pub const fn available_ring(&self) -> &VirtqueueAvailableRing {
@@ -1897,12 +1954,14 @@ mod tests {
     use crate::mmio::{MmioAccess, MmioAccessBytes, MmioBus, MmioRegionId};
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
-        VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioRegister,
+        VIRTIO_DEVICE_STATUS_FEATURES_OK, VIRTIO_MMIO_DEVICE_CONFIG_OFFSET,
+        VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioQueueRegisters, VirtioMmioRegister,
         VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
     };
     use crate::virtio_queue::{
         VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
-        VirtqueueAvailableRing, VirtqueueDescriptorChain, VirtqueueUsedRing, read_descriptor_chain,
+        VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptorChain,
+        VirtqueueUsedRing, VirtqueueUsedRingError, read_descriptor_chain,
     };
 
     use super::{
@@ -1915,7 +1974,7 @@ mod tests {
         VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT, VIRTIO_BLOCK_SECTOR_SIZE,
         VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK, VIRTIO_BLOCK_STATUS_SIZE,
         VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1, VIRTIO_RING_FEATURE_EVENT_IDX,
-        VirtioBlockConfigSpace, VirtioBlockDeviceId, VirtioBlockQueue,
+        VirtioBlockConfigSpace, VirtioBlockDeviceId, VirtioBlockQueue, VirtioBlockQueueBuildError,
         VirtioBlockQueueDispatchError, VirtioBlockRequest, VirtioBlockRequestCompletion,
         VirtioBlockRequestError, VirtioBlockRequestExecutionError,
         VirtioBlockRequestExecutionOutcome, VirtioBlockRequestType, normalize_completion_status,
@@ -1938,6 +1997,9 @@ mod tests {
     const DATA_ADDR: GuestAddress = GuestAddress::new(0x3000);
     const STATUS_ADDR: GuestAddress = GuestAddress::new(0x4000);
     const TEST_DEVICE_ID: VirtioBlockDeviceId = VirtioBlockDeviceId::new(*b"bangbang-test-id-000");
+    const QUEUE_CONFIG_STATUS: u32 = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+        | VIRTIO_DEVICE_STATUS_DRIVER
+        | VIRTIO_DEVICE_STATUS_FEATURES_OK;
 
     #[derive(Debug)]
     struct TempPath {
@@ -2296,6 +2358,51 @@ mod tests {
         let used = VirtqueueUsedRing::new(TEST_USED_RING, TEST_QUEUE_SIZE)
             .expect("used ring should build");
         VirtioBlockQueue::new(available, used)
+    }
+
+    fn guest_address_low(address: GuestAddress) -> u32 {
+        u32::try_from(address.raw_value()).expect("test address should fit in queue low register")
+    }
+
+    fn configured_mmio_queue(size: u16, ready: bool) -> VirtioMmioQueueRegisters {
+        let mut queues =
+            VirtioMmioQueueRegisters::new(&[TEST_QUEUE_SIZE]).expect("queue table should build");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueNum,
+                u32::from(size),
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("queue size should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDescLow,
+                guest_address_low(TEST_DESCRIPTOR_TABLE),
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("queue descriptor table should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDriverLow,
+                guest_address_low(TEST_AVAILABLE_RING),
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("queue driver ring should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDeviceLow,
+                guest_address_low(TEST_USED_RING),
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("queue device ring should write");
+
+        if ready {
+            queues
+                .write_register(VirtioMmioRegister::QueueReady, 1, QUEUE_CONFIG_STATUS)
+                .expect("queue ready should write");
+        }
+
+        queues
     }
 
     fn write_queued_request(
@@ -3580,6 +3687,101 @@ mod tests {
         assert_eq!(
             read_guest_bytes(&memory, DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as usize),
             payload
+        );
+    }
+
+    #[test]
+    fn block_queue_from_mmio_queue_state_uses_configured_queue_metadata() {
+        let queues = configured_mmio_queue(4, true);
+
+        let queue = VirtioBlockQueue::from_mmio_queue_state(
+            queues.queue(0).expect("queue state should exist"),
+        )
+        .expect("block queue should build from ready mmio queue state");
+
+        assert_eq!(
+            queue.available_ring().descriptor_table(),
+            TEST_DESCRIPTOR_TABLE
+        );
+        assert_eq!(queue.available_ring().available_ring(), TEST_AVAILABLE_RING);
+        assert_eq!(queue.available_ring().queue_size(), 4);
+        assert_eq!(queue.available_ring().next_avail(), 0);
+        assert_eq!(queue.used_ring().used_ring(), TEST_USED_RING);
+        assert_eq!(queue.used_ring().queue_size(), 4);
+        assert_eq!(queue.used_ring().next_used(), 0);
+    }
+
+    #[test]
+    fn block_queue_from_mmio_queue_state_rejects_not_ready_queue() {
+        let queues = configured_mmio_queue(TEST_QUEUE_SIZE, false);
+
+        let error = VirtioBlockQueue::from_mmio_queue_state(
+            queues.queue(0).expect("queue state should exist"),
+        )
+        .expect_err("not-ready queue should not build");
+
+        assert!(matches!(error, VirtioBlockQueueBuildError::QueueNotReady));
+        assert_eq!(error.to_string(), "virtio-block queue is not ready");
+        assert!(error.source().is_none());
+    }
+
+    #[test]
+    fn block_queue_from_mmio_queue_state_wraps_available_ring_error() {
+        let mut queues =
+            VirtioMmioQueueRegisters::new(&[TEST_QUEUE_SIZE]).expect("queue table should build");
+        queues
+            .write_register(VirtioMmioRegister::QueueReady, 1, QUEUE_CONFIG_STATUS)
+            .expect("queue ready should write");
+
+        let error = VirtioBlockQueue::from_mmio_queue_state(
+            queues.queue(0).expect("queue state should exist"),
+        )
+        .expect_err("zero-size queue should not build");
+
+        assert!(matches!(
+            error,
+            VirtioBlockQueueBuildError::AvailableRing {
+                source: VirtqueueAvailableRingError::InvalidQueueSize { queue_size: 0 }
+            }
+        ));
+        assert_eq!(
+            error
+                .source()
+                .expect("source should be preserved")
+                .to_string(),
+            "virtqueue size 0 must be a nonzero power of two"
+        );
+    }
+
+    #[test]
+    fn block_queue_build_errors_display_and_preserve_sources() {
+        let available = VirtioBlockQueueBuildError::AvailableRing {
+            source: VirtqueueAvailableRingError::InvalidQueueSize { queue_size: 0 },
+        };
+        let used = VirtioBlockQueueBuildError::UsedRing {
+            source: VirtqueueUsedRingError::InvalidQueueSize { queue_size: 0 },
+        };
+
+        assert_eq!(
+            available.to_string(),
+            "failed to build virtio-block available ring from queue state: virtqueue size 0 must be a nonzero power of two"
+        );
+        assert_eq!(
+            available
+                .source()
+                .expect("available ring source should be present")
+                .to_string(),
+            "virtqueue size 0 must be a nonzero power of two"
+        );
+        assert_eq!(
+            used.to_string(),
+            "failed to build virtio-block used ring from queue state: virtqueue size 0 must be a nonzero power of two"
+        );
+        assert_eq!(
+            used.source()
+                .expect("used ring source should be present")
+                .to_string(),
+            "virtqueue size 0 must be a nonzero power of two"
         );
     }
 
