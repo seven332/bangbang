@@ -1,5 +1,6 @@
 //! Backend-neutral MMIO region ownership, lookup, and operation metadata.
 
+use std::collections::{BTreeMap, btree_map::Entry};
 use std::fmt;
 
 use crate::memory::{GuestAddress, GuestMemoryError, GuestMemoryRange};
@@ -77,6 +78,15 @@ pub const MAX_MMIO_ACCESS_BYTES: usize = 8;
 pub enum MmioOperationKind {
     Read,
     Write,
+}
+
+impl fmt::Display for MmioOperationKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read => f.write_str("read"),
+            Self::Write => f.write_str("write"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +255,215 @@ impl fmt::Display for MmioOperationError {
 }
 
 impl std::error::Error for MmioOperationError {}
+
+pub trait MmioHandler: fmt::Debug + Send {
+    fn read(&mut self, access: MmioAccess) -> Result<MmioAccessBytes, MmioHandlerError>;
+
+    fn write(&mut self, access: MmioAccess, data: MmioAccessBytes) -> Result<(), MmioHandlerError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MmioHandlerError {
+    message: String,
+}
+
+impl MmioHandlerError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for MmioHandlerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for MmioHandlerError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmioDispatchOutcome {
+    Read { data: MmioAccessBytes },
+    Write,
+}
+
+#[derive(Debug)]
+pub struct MmioDispatcher {
+    bus: MmioBus,
+    handlers: BTreeMap<MmioRegionId, Box<dyn MmioHandler>>,
+}
+
+impl MmioDispatcher {
+    pub fn new() -> Self {
+        Self {
+            bus: MmioBus::new(),
+            handlers: BTreeMap::new(),
+        }
+    }
+
+    pub fn bus(&self) -> &MmioBus {
+        &self.bus
+    }
+
+    pub fn regions(&self) -> &[MmioRegion] {
+        self.bus.regions()
+    }
+
+    pub fn insert_region(
+        &mut self,
+        id: MmioRegionId,
+        start: GuestAddress,
+        size: u64,
+    ) -> Result<MmioRegion, MmioBusError> {
+        self.bus.insert(id, start, size)
+    }
+
+    pub fn lookup(&self, start: GuestAddress, size: u64) -> Result<MmioAccess, MmioBusError> {
+        self.bus.lookup(start, size)
+    }
+
+    pub fn register_handler(
+        &mut self,
+        region_id: MmioRegionId,
+        handler: impl MmioHandler + 'static,
+    ) -> Result<(), MmioDispatchError> {
+        match self.handlers.entry(region_id) {
+            Entry::Vacant(entry) => {
+                entry.insert(Box::new(handler));
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(MmioDispatchError::DuplicateHandler { region_id }),
+        }
+    }
+
+    pub fn dispatch(
+        &mut self,
+        operation: MmioOperation,
+    ) -> Result<MmioDispatchOutcome, MmioDispatchError> {
+        let region_id = operation.access().region_id();
+        let handler = self
+            .handlers
+            .get_mut(&region_id)
+            .ok_or(MmioDispatchError::MissingHandler { region_id })?;
+
+        match operation {
+            MmioOperation::Read { access, data } => {
+                let expected = data.len();
+                let data =
+                    handler
+                        .read(access)
+                        .map_err(|source| MmioDispatchError::HandlerFailed {
+                            region_id,
+                            kind: MmioOperationKind::Read,
+                            source,
+                        })?;
+                if data.len() != expected {
+                    return Err(MmioDispatchError::ReadDataLengthMismatch {
+                        access,
+                        expected,
+                        actual: data.len(),
+                    });
+                }
+
+                Ok(MmioDispatchOutcome::Read { data })
+            }
+            MmioOperation::Write { access, data } => {
+                handler
+                    .write(access, data)
+                    .map_err(|source| MmioDispatchError::HandlerFailed {
+                        region_id,
+                        kind: MmioOperationKind::Write,
+                        source,
+                    })?;
+
+                Ok(MmioDispatchOutcome::Write)
+            }
+        }
+    }
+}
+
+impl Default for MmioDispatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MmioDispatchError {
+    DuplicateHandler {
+        region_id: MmioRegionId,
+    },
+    MissingHandler {
+        region_id: MmioRegionId,
+    },
+    HandlerFailed {
+        region_id: MmioRegionId,
+        kind: MmioOperationKind,
+        source: MmioHandlerError,
+    },
+    ReadDataLengthMismatch {
+        access: MmioAccess,
+        expected: usize,
+        actual: usize,
+    },
+}
+
+impl fmt::Display for MmioDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateHandler { region_id } => {
+                write!(
+                    f,
+                    "MMIO handler for region id={region_id} is already registered"
+                )
+            }
+            Self::MissingHandler { region_id } => {
+                write!(
+                    f,
+                    "MMIO access for region id={region_id} has no registered handler"
+                )
+            }
+            Self::HandlerFailed {
+                region_id,
+                kind,
+                source,
+            } => {
+                write!(
+                    f,
+                    "MMIO {kind} handler for region id={region_id} failed: {source}"
+                )
+            }
+            Self::ReadDataLengthMismatch {
+                access,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "MMIO read handler returned {actual} bytes for range {}; expected {expected}",
+                    access.range()
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for MmioDispatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::HandlerFailed { source, .. } => Some(source),
+            Self::DuplicateHandler { .. }
+            | Self::MissingHandler { .. }
+            | Self::ReadDataLengthMismatch { .. } => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MmioBus {
@@ -447,10 +666,12 @@ fn mmio_operation_len(access: MmioAccess) -> Result<usize, MmioOperationError> {
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
+    use std::sync::{Arc, Mutex};
 
     use super::{
         MAX_MMIO_ACCESS_BYTES, MmioAccess, MmioAccessBytes, MmioAccessBytesError, MmioBus,
-        MmioBusError, MmioOperation, MmioOperationError, MmioOperationKind, MmioRegion,
+        MmioBusError, MmioDispatchError, MmioDispatchOutcome, MmioDispatcher, MmioHandler,
+        MmioHandlerError, MmioOperation, MmioOperationError, MmioOperationKind, MmioRegion,
         MmioRegionId,
     };
     use crate::memory::{GuestAddress, GuestMemoryError, GuestMemoryRange};
@@ -485,6 +706,76 @@ mod tests {
         let mut bus = MmioBus::new();
         insert(&mut bus, 1, start, 0x100);
         lookup(&bus, start, size)
+    }
+
+    #[derive(Debug, Default)]
+    struct HandlerState {
+        reads: Vec<MmioAccess>,
+        writes: Vec<(MmioAccess, MmioAccessBytes)>,
+    }
+
+    #[derive(Debug)]
+    struct ScriptedHandler {
+        state: Arc<Mutex<HandlerState>>,
+        read_result: Result<MmioAccessBytes, MmioHandlerError>,
+        write_result: Result<(), MmioHandlerError>,
+    }
+
+    impl ScriptedHandler {
+        fn returning(bytes: &[u8]) -> (Arc<Mutex<HandlerState>>, Self) {
+            let state = Arc::new(Mutex::new(HandlerState::default()));
+            (
+                Arc::clone(&state),
+                Self {
+                    state,
+                    read_result: Ok(
+                        MmioAccessBytes::new(bytes).expect("scripted read bytes should be valid")
+                    ),
+                    write_result: Ok(()),
+                },
+            )
+        }
+
+        fn failing(
+            read_result: Result<MmioAccessBytes, MmioHandlerError>,
+            write_result: Result<(), MmioHandlerError>,
+        ) -> (Arc<Mutex<HandlerState>>, Self) {
+            let state = Arc::new(Mutex::new(HandlerState::default()));
+            (
+                Arc::clone(&state),
+                Self {
+                    state,
+                    read_result,
+                    write_result,
+                },
+            )
+        }
+    }
+
+    impl MmioHandler for ScriptedHandler {
+        fn read(&mut self, access: MmioAccess) -> Result<MmioAccessBytes, MmioHandlerError> {
+            self.state
+                .lock()
+                .expect("handler state lock should not be poisoned")
+                .reads
+                .push(access);
+
+            self.read_result.clone()
+        }
+
+        fn write(
+            &mut self,
+            access: MmioAccess,
+            data: MmioAccessBytes,
+        ) -> Result<(), MmioHandlerError> {
+            self.state
+                .lock()
+                .expect("handler state lock should not be poisoned")
+                .writes
+                .push((access, data));
+
+            self.write_result.clone()
+        }
     }
 
     #[test]
@@ -1014,6 +1305,264 @@ mod tests {
     }
 
     #[test]
+    fn dispatcher_is_send() {
+        fn assert_send<T: Send>() {}
+
+        assert_send::<MmioDispatcher>();
+    }
+
+    #[test]
+    fn dispatcher_delegates_region_registration_and_lookup() {
+        let mut dispatcher = MmioDispatcher::new();
+        let region = dispatcher
+            .insert_region(id(7), address(0x1000), 0x100)
+            .expect("dispatcher region insert should succeed");
+
+        assert_eq!(dispatcher.bus().regions(), &[region]);
+        assert_eq!(dispatcher.regions(), &[region]);
+        assert_eq!(
+            dispatcher
+                .lookup(address(0x1040), 4)
+                .expect("dispatcher lookup should succeed"),
+            MmioAccess {
+                region,
+                range: range(0x1040, 4),
+                offset: 0x40
+            }
+        );
+    }
+
+    #[test]
+    fn dispatcher_dispatches_read_to_registered_handler() {
+        let mut dispatcher = MmioDispatcher::new();
+        dispatcher
+            .insert_region(id(7), address(0x1000), 0x100)
+            .expect("dispatcher region insert should succeed");
+        let (state, handler) = ScriptedHandler::returning(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        dispatcher
+            .register_handler(id(7), handler)
+            .expect("handler registration should succeed");
+        let access = dispatcher
+            .lookup(address(0x1040), 4)
+            .expect("dispatcher lookup should succeed");
+
+        let outcome = dispatcher
+            .dispatch(MmioOperation::read(access).expect("read operation should be valid"))
+            .expect("read dispatch should succeed");
+
+        assert_eq!(
+            outcome,
+            MmioDispatchOutcome::Read {
+                data: MmioAccessBytes::new(&[0xaa, 0xbb, 0xcc, 0xdd])
+                    .expect("read bytes should be valid")
+            }
+        );
+        assert_eq!(
+            state
+                .lock()
+                .expect("handler state lock should not be poisoned")
+                .reads,
+            [access]
+        );
+    }
+
+    #[test]
+    fn dispatcher_dispatches_write_to_registered_handler() {
+        let mut dispatcher = MmioDispatcher::new();
+        dispatcher
+            .insert_region(id(7), address(0x2000), 0x100)
+            .expect("dispatcher region insert should succeed");
+        let (state, handler) = ScriptedHandler::returning(&[0]);
+        dispatcher
+            .register_handler(id(7), handler)
+            .expect("handler registration should succeed");
+        let access = dispatcher
+            .lookup(address(0x2040), 4)
+            .expect("dispatcher lookup should succeed");
+        let data = MmioAccessBytes::new(&[1, 2, 3, 4]).expect("write bytes should be valid");
+
+        let outcome = dispatcher
+            .dispatch(MmioOperation::write(access, data).expect("write operation should be valid"))
+            .expect("write dispatch should succeed");
+
+        assert_eq!(outcome, MmioDispatchOutcome::Write);
+        assert_eq!(
+            state
+                .lock()
+                .expect("handler state lock should not be poisoned")
+                .writes,
+            [(access, data)]
+        );
+    }
+
+    #[test]
+    fn dispatcher_rejects_duplicate_handlers() {
+        let mut dispatcher = MmioDispatcher::new();
+        let (_, first) = ScriptedHandler::returning(&[0]);
+        let (_, second) = ScriptedHandler::returning(&[0]);
+
+        dispatcher
+            .register_handler(id(3), first)
+            .expect("first handler registration should succeed");
+        let err = dispatcher
+            .register_handler(id(3), second)
+            .expect_err("duplicate handler should fail");
+
+        assert_eq!(
+            err,
+            MmioDispatchError::DuplicateHandler { region_id: id(3) }
+        );
+    }
+
+    #[test]
+    fn dispatcher_rejects_missing_handler() {
+        let mut dispatcher = MmioDispatcher::new();
+        let access = lookup_access(0x3000, 4);
+        let operation = MmioOperation::read(access).expect("read operation should be valid");
+
+        let err = dispatcher
+            .dispatch(operation)
+            .expect_err("missing handler should fail");
+
+        assert_eq!(
+            err,
+            MmioDispatchError::MissingHandler {
+                region_id: access.region_id()
+            }
+        );
+    }
+
+    #[test]
+    fn dispatcher_surfaces_read_handler_failure() {
+        let handler_error = MmioHandlerError::new("read failed");
+        let mut dispatcher = MmioDispatcher::new();
+        dispatcher
+            .insert_region(id(4), address(0x4000), 0x100)
+            .expect("dispatcher region insert should succeed");
+        let (_, handler) = ScriptedHandler::failing(Err(handler_error.clone()), Ok(()));
+        dispatcher
+            .register_handler(id(4), handler)
+            .expect("handler registration should succeed");
+        let access = dispatcher
+            .lookup(address(0x4000), 4)
+            .expect("dispatcher lookup should succeed");
+
+        let err = dispatcher
+            .dispatch(MmioOperation::read(access).expect("read operation should be valid"))
+            .expect_err("handler failure should fail dispatch");
+
+        assert_eq!(
+            err,
+            MmioDispatchError::HandlerFailed {
+                region_id: id(4),
+                kind: MmioOperationKind::Read,
+                source: handler_error
+            }
+        );
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn dispatcher_surfaces_write_handler_failure() {
+        let handler_error = MmioHandlerError::new("write failed");
+        let mut dispatcher = MmioDispatcher::new();
+        dispatcher
+            .insert_region(id(5), address(0x5000), 0x100)
+            .expect("dispatcher region insert should succeed");
+        let (_, handler) = ScriptedHandler::failing(
+            Ok(MmioAccessBytes::new(&[0, 0, 0, 0]).expect("read bytes should be valid")),
+            Err(handler_error.clone()),
+        );
+        dispatcher
+            .register_handler(id(5), handler)
+            .expect("handler registration should succeed");
+        let access = dispatcher
+            .lookup(address(0x5000), 4)
+            .expect("dispatcher lookup should succeed");
+        let data = MmioAccessBytes::new(&[1, 2, 3, 4]).expect("write bytes should be valid");
+
+        let err = dispatcher
+            .dispatch(MmioOperation::write(access, data).expect("write operation should be valid"))
+            .expect_err("handler failure should fail dispatch");
+
+        assert_eq!(
+            err,
+            MmioDispatchError::HandlerFailed {
+                region_id: id(5),
+                kind: MmioOperationKind::Write,
+                source: handler_error
+            }
+        );
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn dispatcher_rejects_mismatched_read_data_length() {
+        let mut dispatcher = MmioDispatcher::new();
+        dispatcher
+            .insert_region(id(6), address(0x6000), 0x100)
+            .expect("dispatcher region insert should succeed");
+        let (_, handler) = ScriptedHandler::returning(&[1, 2]);
+        dispatcher
+            .register_handler(id(6), handler)
+            .expect("handler registration should succeed");
+        let access = dispatcher
+            .lookup(address(0x6000), 4)
+            .expect("dispatcher lookup should succeed");
+
+        let err = dispatcher
+            .dispatch(MmioOperation::read(access).expect("read operation should be valid"))
+            .expect_err("short read data should fail dispatch");
+
+        assert_eq!(
+            err,
+            MmioDispatchError::ReadDataLengthMismatch {
+                access,
+                expected: 4,
+                actual: 2
+            }
+        );
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn dispatcher_allows_one_handler_for_multiple_owner_regions() {
+        let mut dispatcher = MmioDispatcher::new();
+        dispatcher
+            .insert_region(id(8), address(0x8000), 0x100)
+            .expect("first region insert should succeed");
+        dispatcher
+            .insert_region(id(8), address(0x9000), 0x100)
+            .expect("second region insert should succeed");
+        let (state, handler) = ScriptedHandler::returning(&[0]);
+        dispatcher
+            .register_handler(id(8), handler)
+            .expect("handler registration should succeed");
+        let first = dispatcher
+            .lookup(address(0x8004), 1)
+            .expect("first region lookup should succeed");
+        let second = dispatcher
+            .lookup(address(0x9008), 1)
+            .expect("second region lookup should succeed");
+        let data = MmioAccessBytes::new(&[0xee]).expect("write bytes should be valid");
+
+        dispatcher
+            .dispatch(MmioOperation::write(first, data).expect("first write should be valid"))
+            .expect("first write dispatch should succeed");
+        dispatcher
+            .dispatch(MmioOperation::write(second, data).expect("second write should be valid"))
+            .expect("second write dispatch should succeed");
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("handler state lock should not be poisoned")
+                .writes,
+            [(first, data), (second, data)]
+        );
+    }
+
+    #[test]
     fn displays_mmio_bus_errors() {
         let err = MmioBusError::UnownedAccess {
             range: range(0x1000, 4),
@@ -1034,6 +1583,52 @@ mod tests {
             "MMIO access byte length 9 exceeds the maximum 8"
         );
         assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn displays_handler_and_dispatch_errors() {
+        let handler_error = MmioHandlerError::new("device failed");
+        assert_eq!(handler_error.message(), "device failed");
+        assert_eq!(handler_error.to_string(), "device failed");
+        assert!(handler_error.source().is_none());
+
+        let handler_failure = MmioDispatchError::HandlerFailed {
+            region_id: id(9),
+            kind: MmioOperationKind::Write,
+            source: handler_error,
+        };
+        assert_eq!(
+            handler_failure.to_string(),
+            "MMIO write handler for region id=9 failed: device failed"
+        );
+        assert_eq!(
+            handler_failure
+                .source()
+                .expect("handler failure should preserve source")
+                .to_string(),
+            "device failed"
+        );
+
+        assert_eq!(
+            MmioDispatchError::DuplicateHandler { region_id: id(9) }.to_string(),
+            "MMIO handler for region id=9 is already registered"
+        );
+        assert_eq!(
+            MmioDispatchError::MissingHandler { region_id: id(9) }.to_string(),
+            "MMIO access for region id=9 has no registered handler"
+        );
+
+        let access = lookup_access(0x8000, 4);
+        let mismatch = MmioDispatchError::ReadDataLengthMismatch {
+            access,
+            expected: 4,
+            actual: 2,
+        };
+        assert_eq!(
+            mismatch.to_string(),
+            "MMIO read handler returned 2 bytes for range [0x8000..0x8004) (4 bytes); expected 4"
+        );
+        assert!(mismatch.source().is_none());
     }
 
     #[test]
