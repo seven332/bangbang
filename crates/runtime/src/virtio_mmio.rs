@@ -2712,6 +2712,13 @@ mod tests {
         assert!(notifications.pending_queue_notifications().is_empty());
         assert_eq!(notifications.is_queue_notification_pending(0), Ok(false));
         assert_eq!(notifications.is_queue_notification_pending(1), Ok(false));
+        assert_eq!(
+            notifications.is_queue_notification_pending(2),
+            Err(VirtioMmioQueueNotificationError::InvalidQueueIndex {
+                queue_index: 2,
+                queue_count: 2,
+            })
+        );
     }
 
     #[test]
