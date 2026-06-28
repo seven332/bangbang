@@ -6,6 +6,11 @@ use crate::HTTP_MAX_PAYLOAD_SIZE;
 use crate::route::Endpoint;
 
 const MAX_HEADERS: usize = 32;
+const RATE_LIMITER_BANDWIDTH_FIELD: &str = "bandwidth";
+const RATE_LIMITER_OPS_FIELD: &str = "ops";
+const TOKEN_BUCKET_SIZE_FIELD: &str = "size";
+const TOKEN_BUCKET_ONE_TIME_BURST_FIELD: &str = "one_time_burst";
+const TOKEN_BUCKET_REFILL_TIME_FIELD: &str = "refill_time";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiRequest {
@@ -273,6 +278,13 @@ fn parse_drive_config_request(
     if path_drive_id != body.drive_id {
         return Err(RequestError::MismatchedDriveId);
     }
+    let rate_limiter_configured = match &body.rate_limiter {
+        Some(rate_limiter) => {
+            validate_rate_limiter_config(rate_limiter)?;
+            true
+        }
+        None => false,
+    };
 
     Ok(ApiRequest::PutDrive(Box::new(DriveConfigRequest {
         path_drive_id: path_drive_id.to_string(),
@@ -283,9 +295,60 @@ fn parse_drive_config_request(
         partuuid: body.partuuid,
         cache_type: body.cache_type,
         io_engine: body.io_engine,
-        rate_limiter_configured: body.rate_limiter.is_some(),
+        rate_limiter_configured,
         socket: body.socket,
     })))
+}
+
+fn validate_rate_limiter_config(value: &serde_json::Value) -> Result<(), RequestError> {
+    let rate_limiter = value.as_object().ok_or(RequestError::MalformedRequest)?;
+    for key in rate_limiter.keys() {
+        if key != RATE_LIMITER_BANDWIDTH_FIELD && key != RATE_LIMITER_OPS_FIELD {
+            return Err(RequestError::MalformedRequest);
+        }
+    }
+
+    if let Some(bucket) = rate_limiter.get(RATE_LIMITER_BANDWIDTH_FIELD) {
+        validate_token_bucket(bucket)?;
+    }
+    if let Some(bucket) = rate_limiter.get(RATE_LIMITER_OPS_FIELD) {
+        validate_token_bucket(bucket)?;
+    }
+
+    Ok(())
+}
+
+fn validate_token_bucket(value: &serde_json::Value) -> Result<(), RequestError> {
+    let bucket = value.as_object().ok_or(RequestError::MalformedRequest)?;
+    for key in bucket.keys() {
+        if key != TOKEN_BUCKET_SIZE_FIELD
+            && key != TOKEN_BUCKET_ONE_TIME_BURST_FIELD
+            && key != TOKEN_BUCKET_REFILL_TIME_FIELD
+        {
+            return Err(RequestError::MalformedRequest);
+        }
+    }
+
+    require_u64_field(bucket, TOKEN_BUCKET_SIZE_FIELD)?;
+    require_u64_field(bucket, TOKEN_BUCKET_REFILL_TIME_FIELD)?;
+    if let Some(value) = bucket.get(TOKEN_BUCKET_ONE_TIME_BURST_FIELD)
+        && value.as_u64().is_none()
+    {
+        return Err(RequestError::MalformedRequest);
+    }
+
+    Ok(())
+}
+
+fn require_u64_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<(), RequestError> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .map(|_| ())
+        .ok_or(RequestError::MalformedRequest)
 }
 
 pub fn request_total_len(bytes: &[u8]) -> Result<Option<usize>, RequestError> {
@@ -731,6 +794,36 @@ mod tests {
             "path_on_host": "/tmp/rootfs.ext4",
             "is_root_device": true,
             "cache_type": "Unknown"
+        }"#;
+        let request = request_with_body("PUT", "/drives/rootfs", body);
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_put_drive_invalid_rate_limiter_type() {
+        let body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "/tmp/rootfs.ext4",
+            "is_root_device": true,
+            "rate_limiter": "unsupported"
+        }"#;
+        let request = request_with_body("PUT", "/drives/rootfs", body);
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_put_drive_invalid_rate_limiter_bucket() {
+        let body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "/tmp/rootfs.ext4",
+            "is_root_device": true,
+            "rate_limiter": {
+                "ops": {
+                    "size": 100
+                }
+            }
         }"#;
         let request = request_with_body("PUT", "/drives/rootfs", body);
 
