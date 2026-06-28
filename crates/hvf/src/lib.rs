@@ -9,7 +9,10 @@ mod runner;
 mod vcpu;
 
 pub use backend::HvfBackend;
-pub use exit::{HvfExceptionExit, HvfVcpuExit};
+pub use exit::{
+    HvfExceptionExit, HvfMmioAccess, HvfMmioAccessSize, HvfMmioDecodeError, HvfMmioDirection,
+    HvfMmioRegister, HvfMmioRegisterWidth, HvfVcpuExit,
+};
 pub use gic::{
     HvfGicError, HvfGicInterruptRange, HvfGicMetadata, HvfGicMsiMetadata, HvfGicRedistributor,
     HvfGicRegion, HvfGicTimerInterrupts,
