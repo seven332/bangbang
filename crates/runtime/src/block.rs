@@ -13,7 +13,10 @@ use crate::mmio::{MmioAccessBytes, MmioAccessBytesError};
 use crate::virtio_mmio::{
     VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError, VirtioMmioDeviceConfigHandler,
 };
-use crate::virtio_queue::{VirtqueueDescriptor, VirtqueueDescriptorChain};
+use crate::virtio_queue::{
+    VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
+    VirtqueueDescriptorChain, VirtqueueUsedRing, VirtqueueUsedRingError,
+};
 
 pub const VIRTIO_BLOCK_DEVICE_ID: u32 = 2;
 pub const VIRTIO_BLOCK_QUEUE_COUNT: usize = 1;
@@ -1008,6 +1011,220 @@ impl std::error::Error for VirtioBlockRequestExecutionError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioBlockQueue {
+    available: VirtqueueAvailableRing,
+    used: VirtqueueUsedRing,
+}
+
+impl VirtioBlockQueue {
+    pub const fn new(available: VirtqueueAvailableRing, used: VirtqueueUsedRing) -> Self {
+        Self { available, used }
+    }
+
+    pub const fn available_ring(&self) -> &VirtqueueAvailableRing {
+        &self.available
+    }
+
+    pub const fn used_ring(&self) -> &VirtqueueUsedRing {
+        &self.used
+    }
+
+    pub fn dispatch(
+        &mut self,
+        memory: &mut GuestMemory,
+        backing: &BlockFileBacking,
+        device_id: VirtioBlockDeviceId,
+    ) -> Result<VirtioBlockQueueDispatch, VirtioBlockQueueDispatchError> {
+        let mut dispatch = VirtioBlockQueueDispatch::default();
+        let capacity_sectors = backing.len() >> VIRTIO_BLOCK_SECTOR_SHIFT;
+        while let Some(chain) = self
+            .available
+            .pop_descriptor_chain(memory)
+            .map_err(|source| VirtioBlockQueueDispatchError::AvailableRing { source })?
+        {
+            let descriptor_head = descriptor_chain_head(&chain)?;
+            let (completion, outcome) =
+                match VirtioBlockRequest::parse(memory, &chain, capacity_sectors) {
+                    Ok(request) => {
+                        let execution = request.execute(memory, backing, device_id);
+                        (
+                            execution.completion(),
+                            VirtioBlockQueueDispatchOutcome::from_execution(&execution),
+                        )
+                    }
+                    Err(source) => (
+                        VirtioBlockRequestCompletion::new(descriptor_head, 0),
+                        VirtioBlockQueueDispatchOutcome::ParseError(source),
+                    ),
+                };
+
+            self.used
+                .publish_used_element(
+                    memory,
+                    completion.descriptor_head(),
+                    completion.bytes_written_to_guest(),
+                )
+                .map_err(|source| VirtioBlockQueueDispatchError::UsedRing {
+                    descriptor_head: completion.descriptor_head(),
+                    bytes_written_to_guest: completion.bytes_written_to_guest(),
+                    source,
+                })?;
+            dispatch.record(outcome);
+        }
+
+        Ok(dispatch)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VirtioBlockQueueDispatch {
+    processed_requests: usize,
+    successful_requests: usize,
+    parse_failures: usize,
+    io_errors: usize,
+    unsupported_requests: usize,
+    status_write_failures: usize,
+    first_parse_failure: Option<VirtioBlockRequestError>,
+}
+
+impl VirtioBlockQueueDispatch {
+    pub const fn processed_requests(&self) -> usize {
+        self.processed_requests
+    }
+
+    pub const fn successful_requests(&self) -> usize {
+        self.successful_requests
+    }
+
+    pub const fn parse_failures(&self) -> usize {
+        self.parse_failures
+    }
+
+    pub const fn first_parse_failure(&self) -> Option<&VirtioBlockRequestError> {
+        self.first_parse_failure.as_ref()
+    }
+
+    pub const fn io_errors(&self) -> usize {
+        self.io_errors
+    }
+
+    pub const fn unsupported_requests(&self) -> usize {
+        self.unsupported_requests
+    }
+
+    pub const fn status_write_failures(&self) -> usize {
+        self.status_write_failures
+    }
+
+    pub const fn needs_queue_interrupt(&self) -> bool {
+        self.processed_requests != 0
+    }
+
+    fn record(&mut self, outcome: VirtioBlockQueueDispatchOutcome) {
+        self.processed_requests += 1;
+        match outcome {
+            VirtioBlockQueueDispatchOutcome::Ok => {
+                self.successful_requests += 1;
+            }
+            VirtioBlockQueueDispatchOutcome::ParseError(source) => {
+                self.parse_failures += 1;
+                if self.first_parse_failure.is_none() {
+                    self.first_parse_failure = Some(source);
+                }
+            }
+            VirtioBlockQueueDispatchOutcome::IoError => {
+                self.io_errors += 1;
+            }
+            VirtioBlockQueueDispatchOutcome::Unsupported => {
+                self.unsupported_requests += 1;
+            }
+            VirtioBlockQueueDispatchOutcome::StatusWriteFailed => {
+                self.status_write_failures += 1;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VirtioBlockQueueDispatchOutcome {
+    Ok,
+    ParseError(VirtioBlockRequestError),
+    IoError,
+    Unsupported,
+    StatusWriteFailed,
+}
+
+impl VirtioBlockQueueDispatchOutcome {
+    const fn from_execution(execution: &VirtioBlockRequestExecution) -> Self {
+        match execution.outcome() {
+            VirtioBlockRequestExecutionOutcome::Ok => Self::Ok,
+            VirtioBlockRequestExecutionOutcome::IoError { .. } => Self::IoError,
+            VirtioBlockRequestExecutionOutcome::Unsupported { .. } => Self::Unsupported,
+            VirtioBlockRequestExecutionOutcome::StatusWriteFailed { .. } => Self::StatusWriteFailed,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioBlockQueueDispatchError {
+    AvailableRing {
+        source: VirtqueueAvailableRingError,
+    },
+    EmptyDescriptorChain,
+    UsedRing {
+        descriptor_head: u16,
+        bytes_written_to_guest: u32,
+        source: VirtqueueUsedRingError,
+    },
+}
+
+impl fmt::Display for VirtioBlockQueueDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AvailableRing { source } => {
+                write!(
+                    f,
+                    "failed to pop virtio-block available descriptor chain: {source}"
+                )
+            }
+            Self::EmptyDescriptorChain => {
+                f.write_str("virtio-block queue produced an empty descriptor chain")
+            }
+            Self::UsedRing {
+                descriptor_head,
+                bytes_written_to_guest,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to publish virtio-block used descriptor head {descriptor_head} with length {bytes_written_to_guest}: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioBlockQueueDispatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AvailableRing { source } => Some(source),
+            Self::UsedRing { source, .. } => Some(source),
+            Self::EmptyDescriptorChain => None,
+        }
+    }
+}
+
+fn descriptor_chain_head(
+    chain: &VirtqueueDescriptorChain,
+) -> Result<u16, VirtioBlockQueueDispatchError> {
+    chain
+        .descriptors()
+        .first()
+        .map(|descriptor| descriptor.index())
+        .ok_or(VirtioBlockQueueDispatchError::EmptyDescriptorChain)
+}
+
 fn normalize_completion_status(
     status_code: u8,
     bytes_written_to_guest: u32,
@@ -1659,7 +1876,7 @@ mod tests {
     };
     use crate::virtio_queue::{
         VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
-        VirtqueueDescriptorChain, read_descriptor_chain,
+        VirtqueueAvailableRing, VirtqueueDescriptorChain, VirtqueueUsedRing, read_descriptor_chain,
     };
 
     use super::{
@@ -1672,16 +1889,25 @@ mod tests {
         VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT, VIRTIO_BLOCK_SECTOR_SIZE,
         VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK, VIRTIO_BLOCK_STATUS_SIZE,
         VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1, VIRTIO_RING_FEATURE_EVENT_IDX,
-        VirtioBlockConfigSpace, VirtioBlockDeviceId, VirtioBlockRequest,
-        VirtioBlockRequestCompletion, VirtioBlockRequestError, VirtioBlockRequestExecutionError,
+        VirtioBlockConfigSpace, VirtioBlockDeviceId, VirtioBlockQueue,
+        VirtioBlockQueueDispatchError, VirtioBlockRequest, VirtioBlockRequestCompletion,
+        VirtioBlockRequestError, VirtioBlockRequestExecutionError,
         VirtioBlockRequestExecutionOutcome, VirtioBlockRequestType, normalize_completion_status,
     };
 
     static NEXT_TEMP_PATH_ID: AtomicUsize = AtomicUsize::new(0);
     const TEST_MMIO_BASE: u64 = 0x1000_0000;
     const TEST_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x1000);
+    const TEST_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x5000);
+    const TEST_USED_RING: GuestAddress = GuestAddress::new(0x6000);
     const TEST_QUEUE_SIZE: u16 = 8;
     const TEST_MEMORY_SIZE: u64 = 0x10_000;
+    const TEST_AVAILABLE_RING_IDX_OFFSET: u64 = 2;
+    const TEST_AVAILABLE_RING_RING_OFFSET: u64 = 4;
+    const TEST_AVAILABLE_RING_ENTRY_SIZE: u64 = 2;
+    const TEST_USED_RING_IDX_OFFSET: u64 = 2;
+    const TEST_USED_RING_RING_OFFSET: u64 = 4;
+    const TEST_USED_RING_ELEMENT_SIZE: u64 = 8;
     const HEADER_ADDR: GuestAddress = GuestAddress::new(0x2000);
     const DATA_ADDR: GuestAddress = GuestAddress::new(0x3000);
     const STATUS_ADDR: GuestAddress = GuestAddress::new(0x4000);
@@ -1949,6 +2175,146 @@ mod tests {
         memory
             .write_slice(&bytes, descriptor_address)
             .expect("descriptor should write");
+    }
+
+    fn write_guest_u16(memory: &mut GuestMemory, address: GuestAddress, value: u16) {
+        memory
+            .write_slice(&value.to_le_bytes(), address)
+            .expect("u16 field should write");
+    }
+
+    fn read_guest_u16(memory: &GuestMemory, address: GuestAddress) -> u16 {
+        let mut bytes = [0; 2];
+        memory
+            .read_slice(&mut bytes, address)
+            .expect("u16 field should read");
+        u16::from_le_bytes(bytes)
+    }
+
+    fn read_guest_u32(memory: &GuestMemory, address: GuestAddress) -> u32 {
+        let mut bytes = [0; 4];
+        memory
+            .read_slice(&mut bytes, address)
+            .expect("u32 field should read");
+        u32::from_le_bytes(bytes)
+    }
+
+    fn available_ring_idx_address() -> GuestAddress {
+        TEST_AVAILABLE_RING
+            .checked_add(TEST_AVAILABLE_RING_IDX_OFFSET)
+            .expect("available idx address should not overflow")
+    }
+
+    fn available_ring_entry_address(ring_index: u16) -> GuestAddress {
+        TEST_AVAILABLE_RING
+            .checked_add(
+                TEST_AVAILABLE_RING_RING_OFFSET
+                    + u64::from(ring_index) * TEST_AVAILABLE_RING_ENTRY_SIZE,
+            )
+            .expect("available entry address should not overflow")
+    }
+
+    fn used_ring_idx_address() -> GuestAddress {
+        TEST_USED_RING
+            .checked_add(TEST_USED_RING_IDX_OFFSET)
+            .expect("used idx address should not overflow")
+    }
+
+    fn used_ring_entry_address(ring_index: u16) -> GuestAddress {
+        TEST_USED_RING
+            .checked_add(
+                TEST_USED_RING_RING_OFFSET + u64::from(ring_index) * TEST_USED_RING_ELEMENT_SIZE,
+            )
+            .expect("used entry address should not overflow")
+    }
+
+    fn write_available_heads(memory: &mut GuestMemory, heads: &[u16]) {
+        for (ring_index, head) in heads.iter().copied().enumerate() {
+            write_guest_u16(
+                memory,
+                available_ring_entry_address(
+                    u16::try_from(ring_index).expect("test ring index should fit in u16"),
+                ),
+                head,
+            );
+        }
+        write_guest_u16(
+            memory,
+            available_ring_idx_address(),
+            u16::try_from(heads.len()).expect("test available length should fit in u16"),
+        );
+    }
+
+    fn read_used_index(memory: &GuestMemory) -> u16 {
+        read_guest_u16(memory, used_ring_idx_address())
+    }
+
+    fn read_used_element(memory: &GuestMemory, ring_index: u16) -> (u32, u32) {
+        let entry = used_ring_entry_address(ring_index);
+        let len_address = entry
+            .checked_add(4)
+            .expect("used element len address should not overflow");
+        (
+            read_guest_u32(memory, entry),
+            read_guest_u32(memory, len_address),
+        )
+    }
+
+    fn block_queue() -> VirtioBlockQueue {
+        let available = VirtqueueAvailableRing::new(
+            TEST_DESCRIPTOR_TABLE,
+            TEST_AVAILABLE_RING,
+            TEST_QUEUE_SIZE,
+        )
+        .expect("available ring should build");
+        let used = VirtqueueUsedRing::new(TEST_USED_RING, TEST_QUEUE_SIZE)
+            .expect("used ring should build");
+        VirtioBlockQueue::new(available, used)
+    }
+
+    fn write_queued_request(
+        memory: &mut GuestMemory,
+        descriptor_head: u16,
+        request_type: u32,
+        sector: u64,
+        header_address: GuestAddress,
+        data: Option<(GuestAddress, u32, bool)>,
+        status_address: GuestAddress,
+    ) {
+        write_request_header(memory, header_address, request_type, sector);
+        let data_index = descriptor_head
+            .checked_add(1)
+            .expect("test data descriptor index should not overflow");
+        let status_index = if data.is_some() {
+            descriptor_head
+                .checked_add(2)
+                .expect("test status descriptor index should not overflow")
+        } else {
+            data_index
+        };
+
+        write_descriptor(
+            memory,
+            descriptor_head,
+            TestDescriptor::readable(
+                header_address,
+                VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
+                Some(data_index),
+            ),
+        );
+        if let Some((data_address, data_len, is_write_only)) = data {
+            let descriptor = if is_write_only {
+                TestDescriptor::writable(data_address, data_len, Some(status_index))
+            } else {
+                TestDescriptor::readable(data_address, data_len, Some(status_index))
+            };
+            write_descriptor(memory, data_index, descriptor);
+        }
+        write_descriptor(
+            memory,
+            status_index,
+            TestDescriptor::writable(status_address, VIRTIO_BLOCK_STATUS_SIZE, None),
+        );
     }
 
     fn request_chain(
@@ -3230,6 +3596,275 @@ mod tests {
             payload
         );
         assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_OK);
+    }
+
+    #[test]
+    fn block_queue_dispatch_empty_queue_is_noop() {
+        let mut memory = request_memory();
+        let file = temp_file("queue-empty.img", &[]);
+        let backing = open_backing(file.as_path(), true).expect("backing should open");
+        let mut queue = block_queue();
+
+        let dispatch = queue
+            .dispatch(&mut memory, &backing, TEST_DEVICE_ID)
+            .expect("empty queue dispatch should succeed");
+
+        assert_eq!(dispatch.processed_requests(), 0);
+        assert_eq!(dispatch.successful_requests(), 0);
+        assert_eq!(dispatch.parse_failures(), 0);
+        assert_eq!(dispatch.io_errors(), 0);
+        assert!(!dispatch.needs_queue_interrupt());
+        assert_eq!(queue.available_ring().next_avail(), 0);
+        assert_eq!(queue.used_ring().next_used(), 0);
+        assert_eq!(read_used_index(&memory), 0);
+    }
+
+    #[test]
+    fn block_queue_dispatch_executes_read_and_publishes_used_element() {
+        let mut memory = request_memory();
+        let payload = sector_payload(0x8a);
+        let file = temp_file("queue-read.img", &payload);
+        let backing = open_backing(file.as_path(), true).expect("backing should open");
+        write_queued_request(
+            &mut memory,
+            0,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            0,
+            HEADER_ADDR,
+            Some((DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as u32, true)),
+            STATUS_ADDR,
+        );
+        write_available_heads(&mut memory, &[0]);
+        let mut queue = block_queue();
+
+        let dispatch = queue
+            .dispatch(&mut memory, &backing, TEST_DEVICE_ID)
+            .expect("read queue dispatch should succeed");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_requests(), 1);
+        assert_eq!(dispatch.parse_failures(), 0);
+        assert_eq!(dispatch.io_errors(), 0);
+        assert_eq!(dispatch.unsupported_requests(), 0);
+        assert_eq!(dispatch.status_write_failures(), 0);
+        assert!(dispatch.needs_queue_interrupt());
+        assert_eq!(
+            read_guest_bytes(&memory, DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as usize),
+            payload
+        );
+        assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_OK);
+        assert_eq!(queue.available_ring().next_avail(), 1);
+        assert_eq!(queue.used_ring().next_used(), 1);
+        assert_eq!(read_used_index(&memory), 1);
+        assert_eq!(
+            read_used_element(&memory, 0),
+            (
+                0,
+                VIRTIO_BLOCK_SECTOR_SIZE as u32 + VIRTIO_BLOCK_STATUS_SIZE,
+            )
+        );
+    }
+
+    #[test]
+    fn block_queue_dispatch_drains_multiple_requests() {
+        let mut memory = request_memory();
+        let file = temp_file("queue-multiple.img", &sector_payload(0x9b));
+        let backing = open_backing(file.as_path(), false).expect("backing should open");
+        let second_header = HEADER_ADDR
+            .checked_add(0x100)
+            .expect("second header address should not overflow");
+        let second_status = STATUS_ADDR
+            .checked_add(0x100)
+            .expect("second status address should not overflow");
+        write_queued_request(
+            &mut memory,
+            0,
+            VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
+            0,
+            HEADER_ADDR,
+            None,
+            STATUS_ADDR,
+        );
+        write_queued_request(
+            &mut memory,
+            2,
+            VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
+            0,
+            second_header,
+            None,
+            second_status,
+        );
+        write_available_heads(&mut memory, &[0, 2]);
+        let mut queue = block_queue();
+
+        let dispatch = queue
+            .dispatch(&mut memory, &backing, TEST_DEVICE_ID)
+            .expect("multi-request queue dispatch should succeed");
+
+        assert_eq!(dispatch.processed_requests(), 2);
+        assert_eq!(dispatch.successful_requests(), 2);
+        assert_eq!(dispatch.parse_failures(), 0);
+        assert!(dispatch.needs_queue_interrupt());
+        assert_eq!(queue.available_ring().next_avail(), 2);
+        assert_eq!(queue.used_ring().next_used(), 2);
+        assert_eq!(read_used_index(&memory), 2);
+        assert_eq!(read_used_element(&memory, 0), (0, VIRTIO_BLOCK_STATUS_SIZE));
+        assert_eq!(read_used_element(&memory, 1), (2, VIRTIO_BLOCK_STATUS_SIZE));
+        assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_OK);
+        assert_eq!(
+            read_guest_bytes(&memory, second_status, 1),
+            [VIRTIO_BLOCK_STATUS_OK]
+        );
+    }
+
+    #[test]
+    fn block_queue_dispatch_parse_failure_publishes_zero_length_used_element() {
+        let mut memory = request_memory();
+        memory
+            .write_slice(&[0xaa], STATUS_ADDR)
+            .expect("status sentinel should write");
+        let file = temp_file("queue-parse-failure.img", &sector_payload(0x10));
+        let backing = open_backing(file.as_path(), true).expect("backing should open");
+        write_queued_request(
+            &mut memory,
+            0,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            0,
+            HEADER_ADDR,
+            Some((DATA_ADDR, 1, true)),
+            STATUS_ADDR,
+        );
+        write_available_heads(&mut memory, &[0]);
+        let mut queue = block_queue();
+
+        let dispatch = queue
+            .dispatch(&mut memory, &backing, TEST_DEVICE_ID)
+            .expect("parse failure should still publish used entry");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_requests(), 0);
+        assert_eq!(dispatch.parse_failures(), 1);
+        assert!(matches!(
+            dispatch.first_parse_failure(),
+            Some(VirtioBlockRequestError::InvalidDataLength {
+                request_type: VirtioBlockRequestType::In,
+                len: 1,
+            })
+        ));
+        assert_eq!(dispatch.io_errors(), 0);
+        assert_eq!(queue.available_ring().next_avail(), 1);
+        assert_eq!(queue.used_ring().next_used(), 1);
+        assert_eq!(read_used_element(&memory, 0), (0, 0));
+        assert_eq!(read_status(&memory), 0xaa);
+    }
+
+    #[test]
+    fn block_queue_dispatch_execution_failure_still_publishes_completion() {
+        let mut memory = request_memory();
+        let payload = sector_payload(0x24);
+        memory
+            .write_slice(&payload, DATA_ADDR)
+            .expect("guest data should write");
+        let original = sector_payload(0x42);
+        let file = temp_file("queue-execution-failure.img", &original);
+        let backing = open_backing(file.as_path(), true).expect("backing should open");
+        write_queued_request(
+            &mut memory,
+            0,
+            VIRTIO_BLOCK_REQUEST_TYPE_OUT,
+            0,
+            HEADER_ADDR,
+            Some((DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as u32, false)),
+            STATUS_ADDR,
+        );
+        write_available_heads(&mut memory, &[0]);
+        let mut queue = block_queue();
+
+        let dispatch = queue
+            .dispatch(&mut memory, &backing, TEST_DEVICE_ID)
+            .expect("execution failure should still publish completion");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_requests(), 0);
+        assert_eq!(dispatch.io_errors(), 1);
+        assert_eq!(dispatch.parse_failures(), 0);
+        assert_eq!(read_used_element(&memory, 0), (0, VIRTIO_BLOCK_STATUS_SIZE));
+        assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_IOERR);
+        assert_eq!(
+            fs::read(file.as_path()).expect("file should read"),
+            original
+        );
+    }
+
+    #[test]
+    fn block_queue_dispatch_used_ring_failure_preserves_used_index() {
+        let mut memory = request_memory();
+        let file = temp_file("queue-used-failure.img", &sector_payload(0x55));
+        let backing = open_backing(file.as_path(), false).expect("backing should open");
+        write_queued_request(
+            &mut memory,
+            0,
+            VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
+            0,
+            HEADER_ADDR,
+            None,
+            STATUS_ADDR,
+        );
+        write_available_heads(&mut memory, &[0]);
+        let available = VirtqueueAvailableRing::new(
+            TEST_DESCRIPTOR_TABLE,
+            TEST_AVAILABLE_RING,
+            TEST_QUEUE_SIZE,
+        )
+        .expect("available ring should build");
+        let unmapped_used_ring = GuestAddress::new(TEST_MEMORY_SIZE);
+        let used = VirtqueueUsedRing::new(unmapped_used_ring, TEST_QUEUE_SIZE)
+            .expect("used ring metadata should build");
+        let mut queue = VirtioBlockQueue::new(available, used);
+
+        let error = queue
+            .dispatch(&mut memory, &backing, TEST_DEVICE_ID)
+            .expect_err("unmapped used ring should fail dispatch");
+
+        match error {
+            VirtioBlockQueueDispatchError::UsedRing {
+                descriptor_head,
+                bytes_written_to_guest,
+                ..
+            } => {
+                assert_eq!(descriptor_head, 0);
+                assert_eq!(bytes_written_to_guest, VIRTIO_BLOCK_STATUS_SIZE);
+            }
+            other => panic!("expected used ring error, got {other:?}"),
+        }
+        assert_eq!(queue.available_ring().next_avail(), 1);
+        assert_eq!(queue.used_ring().next_used(), 0);
+        assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_OK);
+    }
+
+    #[test]
+    fn block_queue_dispatch_available_ring_failure_preserves_available_index() {
+        let mut memory = request_memory();
+        let file = temp_file("queue-available-failure.img", &sector_payload(0x66));
+        let backing = open_backing(file.as_path(), true).expect("backing should open");
+        write_guest_u16(
+            &mut memory,
+            available_ring_idx_address(),
+            TEST_QUEUE_SIZE + 1,
+        );
+        let mut queue = block_queue();
+
+        let error = queue
+            .dispatch(&mut memory, &backing, TEST_DEVICE_ID)
+            .expect_err("invalid available length should fail dispatch");
+
+        assert!(matches!(
+            error,
+            VirtioBlockQueueDispatchError::AvailableRing { .. }
+        ));
+        assert_eq!(queue.available_ring().next_avail(), 0);
+        assert_eq!(queue.used_ring().next_used(), 0);
+        assert_eq!(read_used_index(&memory), 0);
     }
 
     #[test]

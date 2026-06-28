@@ -11,8 +11,8 @@ physical address and aarch64 DRAM layout/access primitives, arm64 boot
 placement helpers, internal boot-source validation and arm64 kernel/initrd
 payload loading, an internal Firecracker-shaped drive configuration validation
 model, a host-file backing access layer, an internal virtio-block config-space
-capacity model, an internal virtio-block request parser and single-request
-executor, a minimal
+capacity model, an internal virtio-block request parser, single-request
+executor, and queue dispatcher, a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
 create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding,
 registry resolution, vCPU exit classification, single resolved HVF MMIO
@@ -27,13 +27,14 @@ status/acknowledgement register state, a composed runtime handler that routes
 common register accesses through those state models and exposes drained queue
 notifications, delegated device-configuration accesses, and a `DRIVER_OK`
 activation hook, plus virtqueue descriptor-chain validator, available-ring read
-model, and used-ring write model for future device handlers, an internal
+model, used-ring write model, and internal virtio-block queue drain for future
+device handlers, an internal
 backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, and an initial process startup argument model.
 There is no broader API request body model, guest execution, continuous vCPU run loop,
-complete interrupt delivery, queue notification dispatch, completion dispatch,
-device-backed feature negotiation, queue-driven block request dispatch, real device
-activation effects, indirect descriptor support,
+complete interrupt delivery, MMIO queue-notification-to-device dispatch,
+backend interrupt signaling, device-backed feature negotiation, real block
+device activation effects, indirect descriptor support,
 device-backed runner-loop MMIO handling, real device emulation, public startup
 wiring, multi-vCPU setup, PSCI behavior, or public boot-source, drives, or
 actions API behavior yet.
@@ -231,7 +232,7 @@ API behavior ships. Security review must cover host paths, socket-like fields,
 device identifiers, and error messages. Performance review must cover boot path
 setup, memory size, and block device I/O when those surfaces are implemented.
 
-## Internal Virtio-Block Request Parsing And Execution
+## Internal Virtio-Block Request And Queue Dispatch
 
 The runtime crate can parse internal virtio-block request descriptor chains from
 guest memory for future device handlers. It reads the 16-byte header, classifies
@@ -246,11 +247,18 @@ guest memory, `OUT` writes guest memory into the host backing, `FLUSH` syncs the
 host backing, `GET_ID` writes a fixed 20-byte device ID, and unsupported request
 types write the virtio unsupported status. Completion metadata records the head
 descriptor index and the bytes written to guest memory, including the status
-byte when status writing succeeds, for later used-ring publication.
+byte when status writing succeeds.
 
-This is not public `/drives` behavior and does not poll available rings,
-publish used-ring entries, signal interrupts, wire a block device activation
-path, or support indirect descriptors yet.
+The runtime crate can drain an internal virtio-block queue by popping available
+descriptor chains, parsing and executing each request, publishing used-ring
+completion elements, and returning queue-interrupt intent when at least one
+completion is published. Parse failures after a valid descriptor head publish a
+zero-length used element, matching Firecracker's discard shape for malformed
+block requests.
+
+This is not public `/drives` behavior and does not dispatch MMIO queue
+notifications to a block device, signal backend interrupts, wire a block device
+activation path, or support indirect descriptors yet.
 
 ## Guest Memory Address Space
 
