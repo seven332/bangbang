@@ -401,8 +401,8 @@ internal `MmioDispatcher`. This assigns deterministic 4 KiB virtio-mmio device
 windows and region IDs from an explicit layout, registers one composed
 virtio-mmio block handler per prepared device, and returns read-only
 registration metadata. Invalid address strides, duplicate region-id strides,
-address overflows, region-id overflows, or dispatcher registration failures do
-not expose a partially registered returned bundle.
+address or region-range overflows, region-id overflows, or dispatcher
+registration failures do not expose a partially registered returned bundle.
 
 The runtime crate can derive an internal virtio-block configuration space from
 the backing length. It reports capacity as full 512-byte sectors, matching
