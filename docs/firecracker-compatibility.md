@@ -12,16 +12,16 @@ placement helpers, internal boot-source validation and arm64 kernel/initrd
 payload loading, a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
 create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding,
-registry resolution, vCPU exit classification, and single resolved HVF MMIO
-exit dispatch/completion through runtime handlers including an explicit
-runner-thread command, narrow vCPU register wrappers, internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, minimal internal
+registry resolution, vCPU exit classification, single resolved HVF MMIO
+exit dispatch/completion through runtime handlers, explicit runner-thread MMIO
+handling commands, narrow vCPU register wrappers, internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, minimal internal
 arm64 FDT generation and guest-memory writes, anonymous guest memory allocation
 for validated runtime layouts, HVF guest memory map/unmap ownership for
 allocated regions, an internal MMIO region ownership registry and operation/data
 model plus handler dispatch boundary, single-vCPU arm64 HVF boot-register
 setup, and an initial process startup argument model.
-There is no broader API request body model, guest execution, vCPU run loop,
-interrupt injection, automatic runner-loop MMIO exit resolution/dispatch, real device
+There is no broader API request body model, guest execution, continuous vCPU run loop,
+interrupt injection, device-backed runner-loop MMIO handling, real device
 emulation, public startup wiring, multi-vCPU setup, PSCI behavior, or public
 boot-source API behavior yet.
 
@@ -340,8 +340,11 @@ data, and write construction rejects data whose length does not match the
 resolved access size. A runtime dispatcher can route those checked operations
 to registered internal handlers by region owner. HVF-specific helpers can now
 dispatch one resolved HVF MMIO exit through those runtime handlers and complete
-successful read results back into the trapped guest GPR. This is still not
-continuous run-loop policy, real device emulation, or interrupt delivery.
+successful read results back into the trapped guest GPR. The runner can also
+perform one `hv_vcpu_run` step, resolve a resulting MMIO exit against a shared
+dispatcher, and dispatch or complete it on the vCPU-owning thread. This is
+still not continuous run-loop policy, real device emulation, or interrupt
+delivery.
 
 The HVF backend can decode candidate MMIO accesses from arm64 data-abort
 exception exits. The decoder converts supported ESR and IPA metadata into a
@@ -359,8 +362,10 @@ for writes, dispatched to a runtime handler, and completed back into the
 trapped guest GPR for successful reads with zero/sign extension and 32-bit or
 64-bit target width handling.
 Guest GPR 31 is rejected explicitly so it is not confused with HVF's PC
-register. There is still no continuous run-loop policy, interrupt delivery, or
-real device emulation.
+register. The runner uses a non-blocking dispatcher lock after a run step
+returns an MMIO exception; it does not hold the dispatcher while `hv_vcpu_run`
+is blocked. There is still no continuous run-loop policy, interrupt delivery,
+or real device emulation.
 
 The HVF backend can map allocated guest memory regions into an existing
 Hypervisor.framework VM with read/write/execute guest RAM permissions. The
@@ -386,11 +391,12 @@ performs that setup on the vCPU-owning thread before the first run and rejects
 duplicate setup, setup during shutdown, setup while a run is in flight, and
 setup after a run has started. If setup fails after partially writing
 registers, the runner rejects guest runs until setup is retried successfully.
-The runner also exposes an explicit single-exit MMIO dispatch command that
-runs on the vCPU-owning thread after a run has started, shares dispatcher state
-through a caller-provided mutex, and rejects dispatch while a run, boot-register
-setup, or another MMIO dispatch is in flight. It does not yet automatically
-translate vCPU exits into MMIO dispatch commands.
+The runner also exposes explicit single-exit MMIO commands that run on the
+vCPU-owning thread. One command dispatches an already resolved MMIO access
+after a run has started, and another command starts one vCPU run, resolves a
+resulting MMIO exit, and dispatches or completes it through a caller-provided
+shared dispatcher. These commands reject overlapping runs, boot-register setup,
+or MMIO dispatches. They do not yet form a continuous guest run loop.
 
 bangbang still does not wire `mem_size_mib` into public startup behavior,
 inject interrupts, emulate devices, start a guest, power on secondary vCPUs, or
@@ -511,7 +517,8 @@ macOS design work instead of direct implementation:
   Linux boot-register setup. The current runner skeleton creates a vCPU on a
   dedicated thread, applies that boot-register setup on the owning thread before
   the first run, explicitly dispatches one resolved MMIO access through a shared
-  runtime dispatcher on the owning thread, supports one cancellable
+  runtime dispatcher on the owning thread, runs once and handles a resulting
+  MMIO exit through that dispatcher, supports one cancellable
   `hv_vcpu_run` step at a time, and shuts down by canceling and joining the
   runner thread.
 - HVF exit snapshots preserve Hypervisor.framework reasons such as canceled,
@@ -522,8 +529,9 @@ macOS design work instead of direct implementation:
   handlers. A single resolved HVF exit can be converted into a runtime MMIO
   operation, dispatched through those handlers on the current thread or through
   an explicit runner-thread command, and completed back into guest GPRs for
-  successful reads, but the runner does not yet automatically resolve exits or
-  translate them into interrupt/runtime events.
+  successful reads. The runner can perform that path for one run step, but it
+  does not yet provide a continuous loop or translate exits into interrupt or
+  runtime events.
 - Firecracker's full paused/resumed microVM loop is not implemented yet.
   bangbang's runner is only the HVF ownership and cancellation primitive needed
   before guest memory, interrupt, timer, and device work can build the real run
