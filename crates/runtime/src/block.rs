@@ -4431,6 +4431,43 @@ mod tests {
     }
 
     #[test]
+    fn block_mmio_devices_reject_region_id_overflow() {
+        let root_file = temp_file("block-mmio-region-id-root.img", &[0; 512]);
+        let data_file = temp_file("block-mmio-region-id-data.img", &[0; 512]);
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new(
+                "rootfs",
+                "rootfs",
+                root_file.as_path(),
+                true,
+            ))
+            .expect("root drive config should insert");
+        configs
+            .insert(DriveConfigInput::new(
+                "data",
+                "data",
+                data_file.as_path(),
+                false,
+            ))
+            .expect("data drive config should insert");
+        let prepared =
+            PreparedBlockDevices::from_configs(&configs).expect("block devices should prepare");
+
+        let err = prepared
+            .register_mmio(BlockMmioLayout::new(
+                GuestAddress::new(TEST_MMIO_BASE),
+                MmioRegionId::new(u64::MAX),
+            ))
+            .expect_err("overflowing block MMIO region id should fail");
+
+        assert!(matches!(
+            err,
+            BlockMmioRegistrationError::RegionIdOverflow { .. },
+        ));
+    }
+
+    #[test]
     fn virtio_block_constants_match_firecracker_shape() {
         assert_eq!(VIRTIO_BLOCK_DEVICE_ID, 2);
         assert_eq!(VIRTIO_BLOCK_QUEUE_COUNT, 1);
