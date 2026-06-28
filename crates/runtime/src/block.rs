@@ -7,10 +7,12 @@ use std::io;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError};
 use crate::mmio::{MmioAccessBytes, MmioAccessBytesError};
 use crate::virtio_mmio::{
     VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError, VirtioMmioDeviceConfigHandler,
 };
+use crate::virtio_queue::{VirtqueueDescriptor, VirtqueueDescriptorChain};
 
 pub const VIRTIO_BLOCK_DEVICE_ID: u32 = 2;
 pub const VIRTIO_BLOCK_QUEUE_COUNT: usize = 1;
@@ -22,6 +24,16 @@ pub const VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE: usize = 8;
 pub const VIRTIO_BLOCK_FEATURE_READ_ONLY: u32 = 5;
 pub const VIRTIO_RING_FEATURE_EVENT_IDX: u32 = 29;
 pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
+pub const VIRTIO_BLOCK_REQUEST_HEADER_SIZE: u32 = 16;
+pub const VIRTIO_BLOCK_STATUS_SIZE: u32 = 1;
+pub const VIRTIO_BLOCK_ID_BYTES: u32 = 20;
+pub const VIRTIO_BLOCK_REQUEST_TYPE_IN: u32 = 0;
+pub const VIRTIO_BLOCK_REQUEST_TYPE_OUT: u32 = 1;
+pub const VIRTIO_BLOCK_REQUEST_TYPE_FLUSH: u32 = 4;
+pub const VIRTIO_BLOCK_REQUEST_TYPE_GET_ID: u32 = 8;
+pub const VIRTIO_BLOCK_STATUS_OK: u8 = 0;
+pub const VIRTIO_BLOCK_STATUS_IOERR: u8 = 1;
+pub const VIRTIO_BLOCK_STATUS_UNSUPPORTED: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriveConfigInput {
@@ -418,6 +430,516 @@ fn config_bytes_error(source: MmioAccessBytesError) -> VirtioMmioDeviceConfigErr
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioBlockRequestType {
+    In,
+    Out,
+    Flush,
+    GetDeviceId,
+    Unsupported(u32),
+}
+
+impl VirtioBlockRequestType {
+    pub const fn raw_value(self) -> u32 {
+        match self {
+            Self::In => VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            Self::Out => VIRTIO_BLOCK_REQUEST_TYPE_OUT,
+            Self::Flush => VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
+            Self::GetDeviceId => VIRTIO_BLOCK_REQUEST_TYPE_GET_ID,
+            Self::Unsupported(value) => value,
+        }
+    }
+}
+
+impl From<u32> for VirtioBlockRequestType {
+    fn from(value: u32) -> Self {
+        match value {
+            VIRTIO_BLOCK_REQUEST_TYPE_IN => Self::In,
+            VIRTIO_BLOCK_REQUEST_TYPE_OUT => Self::Out,
+            VIRTIO_BLOCK_REQUEST_TYPE_FLUSH => Self::Flush,
+            VIRTIO_BLOCK_REQUEST_TYPE_GET_ID => Self::GetDeviceId,
+            value => Self::Unsupported(value),
+        }
+    }
+}
+
+impl fmt::Display for VirtioBlockRequestType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::In => f.write_str("In"),
+            Self::Out => f.write_str("Out"),
+            Self::Flush => f.write_str("Flush"),
+            Self::GetDeviceId => f.write_str("GetDeviceId"),
+            Self::Unsupported(value) => write!(f, "Unsupported({value})"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioBlockDataDescriptor {
+    index: u16,
+    address: GuestAddress,
+    len: u32,
+    is_write_only: bool,
+}
+
+impl VirtioBlockDataDescriptor {
+    pub const fn index(self) -> u16 {
+        self.index
+    }
+
+    pub const fn address(self) -> GuestAddress {
+        self.address
+    }
+
+    pub const fn len(self) -> u32 {
+        self.len
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    pub const fn is_write_only(self) -> bool {
+        self.is_write_only
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioBlockStatusDescriptor {
+    index: u16,
+    address: GuestAddress,
+    len: u32,
+}
+
+impl VirtioBlockStatusDescriptor {
+    pub const fn index(self) -> u16 {
+        self.index
+    }
+
+    pub const fn address(self) -> GuestAddress {
+        self.address
+    }
+
+    pub const fn len(self) -> u32 {
+        self.len
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioBlockRequest {
+    request_type: VirtioBlockRequestType,
+    sector: u64,
+    data: Option<VirtioBlockDataDescriptor>,
+    status: VirtioBlockStatusDescriptor,
+}
+
+impl VirtioBlockRequest {
+    pub fn parse(
+        memory: &GuestMemory,
+        chain: &VirtqueueDescriptorChain,
+        capacity_sectors: u64,
+    ) -> Result<Self, VirtioBlockRequestError> {
+        let header = descriptor_at(chain, 0, 1)?;
+        validate_header_descriptor(header)?;
+        let header_data = read_virtio_block_request_header(memory, header)?;
+        let request_type = VirtioBlockRequestType::from(header_data.request_type);
+        let (data, status_descriptor) =
+            split_virtio_block_request_descriptors(chain, request_type)?;
+
+        if let Some(data) = data {
+            validate_data_descriptor_direction(request_type, data)?;
+            validate_data_descriptor_length(
+                request_type,
+                data,
+                header_data.sector,
+                capacity_sectors,
+            )?;
+        }
+
+        let status = validate_status_descriptor(status_descriptor)?;
+
+        Ok(Self {
+            request_type,
+            sector: header_data.sector,
+            data,
+            status,
+        })
+    }
+
+    pub const fn request_type(&self) -> VirtioBlockRequestType {
+        self.request_type
+    }
+
+    pub const fn sector(&self) -> u64 {
+        self.sector
+    }
+
+    pub const fn data(&self) -> Option<VirtioBlockDataDescriptor> {
+        self.data
+    }
+
+    pub const fn status(&self) -> VirtioBlockStatusDescriptor {
+        self.status
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VirtioBlockRequestHeader {
+    request_type: u32,
+    sector: u64,
+}
+
+fn descriptor_at(
+    chain: &VirtqueueDescriptorChain,
+    index: usize,
+    expected: usize,
+) -> Result<&VirtqueueDescriptor, VirtioBlockRequestError> {
+    chain
+        .descriptors()
+        .get(index)
+        .ok_or(VirtioBlockRequestError::DescriptorChainTooShort {
+            expected,
+            actual: chain.len(),
+        })
+}
+
+fn validate_header_descriptor(
+    descriptor: &VirtqueueDescriptor,
+) -> Result<(), VirtioBlockRequestError> {
+    if descriptor.is_write_only() {
+        return Err(VirtioBlockRequestError::HeaderDescriptorWriteOnly {
+            index: descriptor.index(),
+        });
+    }
+
+    if descriptor.len() < VIRTIO_BLOCK_REQUEST_HEADER_SIZE {
+        return Err(VirtioBlockRequestError::HeaderDescriptorTooSmall {
+            index: descriptor.index(),
+            len: descriptor.len(),
+            min: VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
+        });
+    }
+
+    Ok(())
+}
+
+fn read_virtio_block_request_header(
+    memory: &GuestMemory,
+    descriptor: &VirtqueueDescriptor,
+) -> Result<VirtioBlockRequestHeader, VirtioBlockRequestError> {
+    let mut bytes = [0; VIRTIO_BLOCK_REQUEST_HEADER_SIZE as usize];
+    memory
+        .read_slice(&mut bytes, descriptor.address())
+        .map_err(|source| VirtioBlockRequestError::ReadHeader {
+            address: descriptor.address(),
+            source,
+        })?;
+
+    Ok(VirtioBlockRequestHeader {
+        request_type: u32::from_le_bytes(header_field(&bytes, 0)?),
+        sector: u64::from_le_bytes(header_field(&bytes, 8)?),
+    })
+}
+
+fn header_field<const N: usize>(
+    bytes: &[u8; VIRTIO_BLOCK_REQUEST_HEADER_SIZE as usize],
+    offset: usize,
+) -> Result<[u8; N], VirtioBlockRequestError> {
+    let Some(end) = offset.checked_add(N) else {
+        return Err(VirtioBlockRequestError::InvalidHeaderLayout);
+    };
+    let Some(source) = bytes.get(offset..end) else {
+        return Err(VirtioBlockRequestError::InvalidHeaderLayout);
+    };
+    let mut field = [0; N];
+    field.copy_from_slice(source);
+    Ok(field)
+}
+
+fn split_virtio_block_request_descriptors(
+    chain: &VirtqueueDescriptorChain,
+    request_type: VirtioBlockRequestType,
+) -> Result<(Option<VirtioBlockDataDescriptor>, &VirtqueueDescriptor), VirtioBlockRequestError> {
+    let second = descriptor_at(chain, 1, 2)?;
+    if request_type == VirtioBlockRequestType::Flush && chain.len() == 2 {
+        return Ok((None, second));
+    }
+
+    let data = data_descriptor(second);
+    let status = descriptor_at(chain, 2, 3)?;
+    Ok((Some(data), status))
+}
+
+fn data_descriptor(descriptor: &VirtqueueDescriptor) -> VirtioBlockDataDescriptor {
+    VirtioBlockDataDescriptor {
+        index: descriptor.index(),
+        address: descriptor.address(),
+        len: descriptor.len(),
+        is_write_only: descriptor.is_write_only(),
+    }
+}
+
+fn validate_data_descriptor_direction(
+    request_type: VirtioBlockRequestType,
+    descriptor: VirtioBlockDataDescriptor,
+) -> Result<(), VirtioBlockRequestError> {
+    match request_type {
+        VirtioBlockRequestType::Out if descriptor.is_write_only() => {
+            Err(VirtioBlockRequestError::DataDescriptorWriteOnly {
+                request_type,
+                index: descriptor.index(),
+            })
+        }
+        VirtioBlockRequestType::In | VirtioBlockRequestType::GetDeviceId
+            if !descriptor.is_write_only() =>
+        {
+            Err(VirtioBlockRequestError::DataDescriptorReadOnly {
+                request_type,
+                index: descriptor.index(),
+            })
+        }
+        VirtioBlockRequestType::In
+        | VirtioBlockRequestType::Out
+        | VirtioBlockRequestType::Flush
+        | VirtioBlockRequestType::GetDeviceId
+        | VirtioBlockRequestType::Unsupported(_) => Ok(()),
+    }
+}
+
+fn validate_data_descriptor_length(
+    request_type: VirtioBlockRequestType,
+    descriptor: VirtioBlockDataDescriptor,
+    sector: u64,
+    capacity_sectors: u64,
+) -> Result<(), VirtioBlockRequestError> {
+    match request_type {
+        VirtioBlockRequestType::In | VirtioBlockRequestType::Out => {
+            if !descriptor
+                .len()
+                .is_multiple_of(VIRTIO_BLOCK_SECTOR_SIZE as u32)
+            {
+                return Err(VirtioBlockRequestError::InvalidDataLength {
+                    request_type,
+                    len: descriptor.len(),
+                });
+            }
+
+            let sectors_len = u64::from(descriptor.len()) >> VIRTIO_BLOCK_SECTOR_SHIFT;
+            let end = sector.checked_add(sectors_len).ok_or(
+                VirtioBlockRequestError::SectorRangeOverflow {
+                    sector,
+                    sectors_len,
+                },
+            )?;
+            if end > capacity_sectors {
+                return Err(VirtioBlockRequestError::SectorRangeOutOfBounds {
+                    sector,
+                    sectors_len,
+                    capacity_sectors,
+                });
+            }
+
+            Ok(())
+        }
+        VirtioBlockRequestType::GetDeviceId if descriptor.len() < VIRTIO_BLOCK_ID_BYTES => {
+            Err(VirtioBlockRequestError::InvalidDataLength {
+                request_type,
+                len: descriptor.len(),
+            })
+        }
+        VirtioBlockRequestType::Flush
+        | VirtioBlockRequestType::GetDeviceId
+        | VirtioBlockRequestType::Unsupported(_) => Ok(()),
+    }
+}
+
+fn validate_status_descriptor(
+    descriptor: &VirtqueueDescriptor,
+) -> Result<VirtioBlockStatusDescriptor, VirtioBlockRequestError> {
+    if !descriptor.is_write_only() {
+        return Err(VirtioBlockRequestError::StatusDescriptorReadOnly {
+            index: descriptor.index(),
+        });
+    }
+
+    if descriptor.len() < VIRTIO_BLOCK_STATUS_SIZE {
+        return Err(VirtioBlockRequestError::StatusDescriptorTooSmall {
+            index: descriptor.index(),
+            len: descriptor.len(),
+            min: VIRTIO_BLOCK_STATUS_SIZE,
+        });
+    }
+
+    Ok(VirtioBlockStatusDescriptor {
+        index: descriptor.index(),
+        address: descriptor.address(),
+        len: descriptor.len(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VirtioBlockRequestError {
+    DescriptorChainTooShort {
+        expected: usize,
+        actual: usize,
+    },
+    HeaderDescriptorWriteOnly {
+        index: u16,
+    },
+    HeaderDescriptorTooSmall {
+        index: u16,
+        len: u32,
+        min: u32,
+    },
+    InvalidHeaderLayout,
+    ReadHeader {
+        address: GuestAddress,
+        source: GuestMemoryAccessError,
+    },
+    DataDescriptorWriteOnly {
+        request_type: VirtioBlockRequestType,
+        index: u16,
+    },
+    DataDescriptorReadOnly {
+        request_type: VirtioBlockRequestType,
+        index: u16,
+    },
+    InvalidDataLength {
+        request_type: VirtioBlockRequestType,
+        len: u32,
+    },
+    SectorRangeOverflow {
+        sector: u64,
+        sectors_len: u64,
+    },
+    SectorRangeOutOfBounds {
+        sector: u64,
+        sectors_len: u64,
+        capacity_sectors: u64,
+    },
+    StatusDescriptorReadOnly {
+        index: u16,
+    },
+    StatusDescriptorTooSmall {
+        index: u16,
+        len: u32,
+        min: u32,
+    },
+}
+
+impl fmt::Display for VirtioBlockRequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DescriptorChainTooShort { expected, actual } => {
+                write!(
+                    f,
+                    "virtio-block request descriptor chain has {actual} descriptors; expected at least {expected}"
+                )
+            }
+            Self::HeaderDescriptorWriteOnly { index } => {
+                write!(
+                    f,
+                    "virtio-block request header descriptor {index} is write-only"
+                )
+            }
+            Self::HeaderDescriptorTooSmall { index, len, min } => {
+                write!(
+                    f,
+                    "virtio-block request header descriptor {index} has length {len}; expected at least {min}"
+                )
+            }
+            Self::InvalidHeaderLayout => {
+                f.write_str("virtio-block request header layout is invalid")
+            }
+            Self::ReadHeader { address, source } => {
+                write!(
+                    f,
+                    "failed to read virtio-block request header at {address}: {source}"
+                )
+            }
+            Self::DataDescriptorWriteOnly {
+                request_type,
+                index,
+            } => {
+                write!(
+                    f,
+                    "virtio-block {request_type} request data descriptor {index} is write-only"
+                )
+            }
+            Self::DataDescriptorReadOnly {
+                request_type,
+                index,
+            } => {
+                write!(
+                    f,
+                    "virtio-block {request_type} request data descriptor {index} is read-only"
+                )
+            }
+            Self::InvalidDataLength { request_type, len } => {
+                write!(
+                    f,
+                    "virtio-block {request_type} request data length {len} is invalid"
+                )
+            }
+            Self::SectorRangeOverflow {
+                sector,
+                sectors_len,
+            } => {
+                write!(
+                    f,
+                    "virtio-block request sector range overflows: sector={sector}, sectors_len={sectors_len}"
+                )
+            }
+            Self::SectorRangeOutOfBounds {
+                sector,
+                sectors_len,
+                capacity_sectors,
+            } => {
+                write!(
+                    f,
+                    "virtio-block request sector range exceeds capacity: sector={sector}, sectors_len={sectors_len}, capacity_sectors={capacity_sectors}"
+                )
+            }
+            Self::StatusDescriptorReadOnly { index } => {
+                write!(
+                    f,
+                    "virtio-block request status descriptor {index} is read-only"
+                )
+            }
+            Self::StatusDescriptorTooSmall { index, len, min } => {
+                write!(
+                    f,
+                    "virtio-block request status descriptor {index} has length {len}; expected at least {min}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioBlockRequestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ReadHeader { source, .. } => Some(source),
+            Self::DescriptorChainTooShort { .. }
+            | Self::HeaderDescriptorWriteOnly { .. }
+            | Self::HeaderDescriptorTooSmall { .. }
+            | Self::InvalidHeaderLayout
+            | Self::DataDescriptorWriteOnly { .. }
+            | Self::DataDescriptorReadOnly { .. }
+            | Self::InvalidDataLength { .. }
+            | Self::SectorRangeOverflow { .. }
+            | Self::SectorRangeOutOfBounds { .. }
+            | Self::StatusDescriptorReadOnly { .. }
+            | Self::StatusDescriptorTooSmall { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct BlockFileBacking {
     file: File,
@@ -626,25 +1148,40 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::memory::GuestAddress;
+    use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
     use crate::mmio::{MmioAccess, MmioAccessBytes, MmioBus, MmioRegionId};
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
         VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioRegister,
         VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
     };
+    use crate::virtio_queue::{
+        VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
+        VirtqueueDescriptorChain, read_descriptor_chain,
+    };
 
     use super::{
         BlockFileBacking, BlockFileBackingError, DriveCacheType, DriveConfig, DriveConfigError,
         DriveConfigInput, DriveIdSource, DriveIoEngine, VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE,
-        VIRTIO_BLOCK_DEVICE_ID, VIRTIO_BLOCK_FEATURE_READ_ONLY, VIRTIO_BLOCK_QUEUE_COUNT,
-        VIRTIO_BLOCK_QUEUE_SIZE, VIRTIO_BLOCK_QUEUE_SIZES, VIRTIO_BLOCK_SECTOR_SHIFT,
-        VIRTIO_BLOCK_SECTOR_SIZE, VIRTIO_FEATURE_VERSION_1, VIRTIO_RING_FEATURE_EVENT_IDX,
-        VirtioBlockConfigSpace,
+        VIRTIO_BLOCK_DEVICE_ID, VIRTIO_BLOCK_FEATURE_READ_ONLY, VIRTIO_BLOCK_ID_BYTES,
+        VIRTIO_BLOCK_QUEUE_COUNT, VIRTIO_BLOCK_QUEUE_SIZE, VIRTIO_BLOCK_QUEUE_SIZES,
+        VIRTIO_BLOCK_REQUEST_HEADER_SIZE, VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
+        VIRTIO_BLOCK_REQUEST_TYPE_GET_ID, VIRTIO_BLOCK_REQUEST_TYPE_IN,
+        VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT, VIRTIO_BLOCK_SECTOR_SIZE,
+        VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK, VIRTIO_BLOCK_STATUS_SIZE,
+        VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1, VIRTIO_RING_FEATURE_EVENT_IDX,
+        VirtioBlockConfigSpace, VirtioBlockRequest, VirtioBlockRequestError,
+        VirtioBlockRequestType,
     };
 
     static NEXT_TEMP_PATH_ID: AtomicUsize = AtomicUsize::new(0);
     const TEST_MMIO_BASE: u64 = 0x1000_0000;
+    const TEST_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x1000);
+    const TEST_QUEUE_SIZE: u16 = 8;
+    const TEST_MEMORY_SIZE: u64 = 0x10_000;
+    const HEADER_ADDR: GuestAddress = GuestAddress::new(0x2000);
+    const DATA_ADDR: GuestAddress = GuestAddress::new(0x3000);
+    const STATUS_ADDR: GuestAddress = GuestAddress::new(0x4000);
 
     #[derive(Debug)]
     struct TempPath {
@@ -826,6 +1363,113 @@ mod tests {
             ),
             MmioAccessBytes::new(bytes).expect("test write bytes should be valid"),
         )
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct TestDescriptor {
+        address: GuestAddress,
+        len: u32,
+        flags: u16,
+        next: u16,
+    }
+
+    impl TestDescriptor {
+        const fn readable(address: GuestAddress, len: u32, next: Option<u16>) -> Self {
+            let (flags, next_index) = match next {
+                Some(index) => (VIRTQUEUE_DESC_F_NEXT, index),
+                None => (0, 0),
+            };
+            Self {
+                address,
+                len,
+                flags,
+                next: next_index,
+            }
+        }
+
+        const fn writable(address: GuestAddress, len: u32, next: Option<u16>) -> Self {
+            let (flags, next_index) = match next {
+                Some(index) => (VIRTQUEUE_DESC_F_WRITE | VIRTQUEUE_DESC_F_NEXT, index),
+                None => (VIRTQUEUE_DESC_F_WRITE, 0),
+            };
+            Self {
+                address,
+                len,
+                flags,
+                next: next_index,
+            }
+        }
+    }
+
+    fn request_memory() -> GuestMemory {
+        let layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(GuestAddress::new(0), TEST_MEMORY_SIZE)
+                .expect("test range should be valid"),
+        ])
+        .expect("test layout should be valid");
+        GuestMemory::allocate(&layout).expect("test guest memory should allocate")
+    }
+
+    fn write_request_header(
+        memory: &mut GuestMemory,
+        address: GuestAddress,
+        request_type: u32,
+        sector: u64,
+    ) {
+        let mut bytes = [0; VIRTIO_BLOCK_REQUEST_HEADER_SIZE as usize];
+        let (request_type_bytes, tail) = bytes.split_at_mut(4);
+        let (_reserved, sector_bytes) = tail.split_at_mut(4);
+        request_type_bytes.copy_from_slice(&request_type.to_le_bytes());
+        sector_bytes.copy_from_slice(&sector.to_le_bytes());
+        memory
+            .write_slice(&bytes, address)
+            .expect("request header should write");
+    }
+
+    fn write_descriptor(memory: &mut GuestMemory, index: u16, descriptor: TestDescriptor) {
+        let mut bytes = [0; VIRTQUEUE_DESCRIPTOR_SIZE];
+        let (address_bytes, tail) = bytes.split_at_mut(8);
+        let (len_bytes, tail) = tail.split_at_mut(4);
+        let (flags_bytes, next_bytes) = tail.split_at_mut(2);
+        address_bytes.copy_from_slice(&descriptor.address.raw_value().to_le_bytes());
+        len_bytes.copy_from_slice(&descriptor.len.to_le_bytes());
+        flags_bytes.copy_from_slice(&descriptor.flags.to_le_bytes());
+        next_bytes.copy_from_slice(&descriptor.next.to_le_bytes());
+
+        let descriptor_address = TEST_DESCRIPTOR_TABLE
+            .checked_add(
+                u64::from(index)
+                    * u64::try_from(VIRTQUEUE_DESCRIPTOR_SIZE).expect("descriptor size should fit"),
+            )
+            .expect("descriptor address should not overflow");
+        memory
+            .write_slice(&bytes, descriptor_address)
+            .expect("descriptor should write");
+    }
+
+    fn request_chain(
+        memory: &mut GuestMemory,
+        request_type: u32,
+        sector: u64,
+        descriptors: &[TestDescriptor],
+    ) -> VirtqueueDescriptorChain {
+        write_request_header(memory, HEADER_ADDR, request_type, sector);
+        for (index, descriptor) in descriptors.iter().copied().enumerate() {
+            write_descriptor(
+                memory,
+                u16::try_from(index).expect("test descriptor index should fit in u16"),
+                descriptor,
+            );
+        }
+        read_descriptor_chain(memory, TEST_DESCRIPTOR_TABLE, TEST_QUEUE_SIZE, 0)
+            .expect("descriptor chain should read")
+    }
+
+    fn parse_request(
+        memory: &GuestMemory,
+        chain: &VirtqueueDescriptorChain,
+    ) -> Result<VirtioBlockRequest, VirtioBlockRequestError> {
+        VirtioBlockRequest::parse(memory, chain, 16)
     }
 
     #[test]
@@ -1053,6 +1697,16 @@ mod tests {
         assert_eq!(VIRTIO_BLOCK_FEATURE_READ_ONLY, 5);
         assert_eq!(VIRTIO_RING_FEATURE_EVENT_IDX, 29);
         assert_eq!(VIRTIO_FEATURE_VERSION_1, 32);
+        assert_eq!(VIRTIO_BLOCK_REQUEST_HEADER_SIZE, 16);
+        assert_eq!(VIRTIO_BLOCK_STATUS_SIZE, 1);
+        assert_eq!(VIRTIO_BLOCK_ID_BYTES, 20);
+        assert_eq!(VIRTIO_BLOCK_REQUEST_TYPE_IN, 0);
+        assert_eq!(VIRTIO_BLOCK_REQUEST_TYPE_OUT, 1);
+        assert_eq!(VIRTIO_BLOCK_REQUEST_TYPE_FLUSH, 4);
+        assert_eq!(VIRTIO_BLOCK_REQUEST_TYPE_GET_ID, 8);
+        assert_eq!(VIRTIO_BLOCK_STATUS_OK, 0);
+        assert_eq!(VIRTIO_BLOCK_STATUS_IOERR, 1);
+        assert_eq!(VIRTIO_BLOCK_STATUS_UNSUPPORTED, 2);
     }
 
     #[test]
@@ -1171,6 +1825,485 @@ mod tests {
             write_block_config_after_driver(config, 0, &[1, 2, 3, 4]),
             Err(VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigWrite { offset: 0, len: 4 })
         ));
+    }
+
+    #[test]
+    fn parses_read_request() {
+        let mut memory = request_memory();
+        let chain = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            2,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::writable(DATA_ADDR, 512, Some(2)),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+
+        let request = parse_request(&memory, &chain).expect("read request should parse");
+        let data = request.data().expect("read request should have data");
+        let status = request.status();
+
+        assert_eq!(request.request_type(), VirtioBlockRequestType::In);
+        assert_eq!(request.sector(), 2);
+        assert_eq!(data.index(), 1);
+        assert_eq!(data.address(), DATA_ADDR);
+        assert_eq!(data.len(), 512);
+        assert!(data.is_write_only());
+        assert_eq!(status.index(), 2);
+        assert_eq!(status.address(), STATUS_ADDR);
+        assert_eq!(status.len(), VIRTIO_BLOCK_STATUS_SIZE);
+    }
+
+    #[test]
+    fn parses_write_request() {
+        let mut memory = request_memory();
+        let chain = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_OUT,
+            3,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::readable(DATA_ADDR, 1024, Some(2)),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+
+        let request = parse_request(&memory, &chain).expect("write request should parse");
+        let data = request.data().expect("write request should have data");
+
+        assert_eq!(request.request_type(), VirtioBlockRequestType::Out);
+        assert_eq!(request.sector(), 3);
+        assert_eq!(data.len(), 1024);
+        assert!(!data.is_write_only());
+    }
+
+    #[test]
+    fn parses_flush_request_without_data_descriptor() {
+        let mut memory = request_memory();
+        let chain = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
+            0,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+
+        let request = parse_request(&memory, &chain).expect("flush request should parse");
+
+        assert_eq!(request.request_type(), VirtioBlockRequestType::Flush);
+        assert_eq!(request.data(), None);
+        assert_eq!(request.status().address(), STATUS_ADDR);
+    }
+
+    #[test]
+    fn parses_flush_request_with_data_descriptor() {
+        let mut memory = request_memory();
+        let chain = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
+            0,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::readable(DATA_ADDR, 13, Some(2)),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+
+        let request = parse_request(&memory, &chain).expect("flush request should parse");
+        let data = request.data().expect("flush request should keep data");
+
+        assert_eq!(request.request_type(), VirtioBlockRequestType::Flush);
+        assert_eq!(data.address(), DATA_ADDR);
+        assert_eq!(data.len(), 13);
+        assert_eq!(request.status().address(), STATUS_ADDR);
+    }
+
+    #[test]
+    fn parses_without_touching_data_or_status_memory() {
+        let mut memory = request_memory();
+        let unmapped_address = GuestAddress::new(TEST_MEMORY_SIZE);
+        let unmapped_data = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            0,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::writable(unmapped_address, 512, Some(2)),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+
+        let request =
+            parse_request(&memory, &unmapped_data).expect("unmapped data should not fail parsing");
+        assert_eq!(
+            request.data().expect("request should keep data").address(),
+            unmapped_address
+        );
+
+        let unmapped_status = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            0,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::writable(DATA_ADDR, 512, Some(2)),
+                TestDescriptor::writable(unmapped_address, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+
+        let request = parse_request(&memory, &unmapped_status)
+            .expect("unmapped status should not fail parsing");
+        assert_eq!(request.status().address(), unmapped_address);
+    }
+
+    #[test]
+    fn parses_get_device_id_request() {
+        let mut memory = request_memory();
+        let chain = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_GET_ID,
+            0,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::writable(DATA_ADDR, VIRTIO_BLOCK_ID_BYTES, Some(2)),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+
+        let request = parse_request(&memory, &chain).expect("get-id request should parse");
+
+        assert_eq!(request.request_type(), VirtioBlockRequestType::GetDeviceId);
+        assert_eq!(
+            request.data().expect("get-id should have data").len(),
+            VIRTIO_BLOCK_ID_BYTES
+        );
+    }
+
+    #[test]
+    fn preserves_unsupported_request_type() {
+        let mut memory = request_memory();
+        let chain = request_chain(
+            &mut memory,
+            99,
+            0,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::readable(DATA_ADDR, 7, Some(2)),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+
+        let request = parse_request(&memory, &chain).expect("unsupported request should parse");
+
+        assert_eq!(
+            request.request_type(),
+            VirtioBlockRequestType::Unsupported(99)
+        );
+        assert_eq!(request.request_type().raw_value(), 99);
+        assert_eq!(
+            request
+                .data()
+                .expect("unsupported request keeps data metadata")
+                .len(),
+            7
+        );
+    }
+
+    #[test]
+    fn rejects_short_request_chains() {
+        let mut memory = request_memory();
+        let header_only = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            0,
+            &[TestDescriptor::readable(
+                HEADER_ADDR,
+                VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
+                None,
+            )],
+        );
+
+        assert_eq!(
+            parse_request(&memory, &header_only),
+            Err(VirtioBlockRequestError::DescriptorChainTooShort {
+                expected: 2,
+                actual: 1,
+            })
+        );
+
+        let missing_status = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            0,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::writable(DATA_ADDR, 512, None),
+            ],
+        );
+
+        assert_eq!(
+            parse_request(&memory, &missing_status),
+            Err(VirtioBlockRequestError::DescriptorChainTooShort {
+                expected: 3,
+                actual: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_header_descriptors() {
+        let mut memory = request_memory();
+        let write_only_header = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            0,
+            &[
+                TestDescriptor::writable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::writable(DATA_ADDR, 512, Some(2)),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+
+        assert_eq!(
+            parse_request(&memory, &write_only_header),
+            Err(VirtioBlockRequestError::HeaderDescriptorWriteOnly { index: 0 })
+        );
+
+        let short_header = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            0,
+            &[
+                TestDescriptor::readable(
+                    HEADER_ADDR,
+                    VIRTIO_BLOCK_REQUEST_HEADER_SIZE - 1,
+                    Some(1),
+                ),
+                TestDescriptor::writable(DATA_ADDR, 512, Some(2)),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+
+        assert_eq!(
+            parse_request(&memory, &short_header),
+            Err(VirtioBlockRequestError::HeaderDescriptorTooSmall {
+                index: 0,
+                len: VIRTIO_BLOCK_REQUEST_HEADER_SIZE - 1,
+                min: VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_data_descriptor_direction() {
+        let mut memory = request_memory();
+        let read_with_readable_data = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            0,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::readable(DATA_ADDR, 512, Some(2)),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+
+        assert_eq!(
+            parse_request(&memory, &read_with_readable_data),
+            Err(VirtioBlockRequestError::DataDescriptorReadOnly {
+                request_type: VirtioBlockRequestType::In,
+                index: 1,
+            })
+        );
+
+        let write_with_write_only_data = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_OUT,
+            0,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::writable(DATA_ADDR, 512, Some(2)),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+
+        assert_eq!(
+            parse_request(&memory, &write_with_write_only_data),
+            Err(VirtioBlockRequestError::DataDescriptorWriteOnly {
+                request_type: VirtioBlockRequestType::Out,
+                index: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_status_descriptors() {
+        let mut memory = request_memory();
+        let readable_status = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            0,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::writable(DATA_ADDR, 512, Some(2)),
+                TestDescriptor::readable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+
+        assert_eq!(
+            parse_request(&memory, &readable_status),
+            Err(VirtioBlockRequestError::StatusDescriptorReadOnly { index: 2 })
+        );
+
+        let short_status = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            0,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::writable(DATA_ADDR, 512, Some(2)),
+                TestDescriptor::writable(STATUS_ADDR, 0, None),
+            ],
+        );
+
+        assert_eq!(
+            parse_request(&memory, &short_status),
+            Err(VirtioBlockRequestError::StatusDescriptorTooSmall {
+                index: 2,
+                len: 0,
+                min: VIRTIO_BLOCK_STATUS_SIZE,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_data_lengths_and_ranges() {
+        let mut memory = request_memory();
+        let unaligned_data = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            0,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::writable(DATA_ADDR, 1, Some(2)),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+
+        assert_eq!(
+            parse_request(&memory, &unaligned_data),
+            Err(VirtioBlockRequestError::InvalidDataLength {
+                request_type: VirtioBlockRequestType::In,
+                len: 1,
+            })
+        );
+
+        let short_get_id = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_GET_ID,
+            0,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::writable(DATA_ADDR, VIRTIO_BLOCK_ID_BYTES - 1, Some(2)),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+
+        assert_eq!(
+            parse_request(&memory, &short_get_id),
+            Err(VirtioBlockRequestError::InvalidDataLength {
+                request_type: VirtioBlockRequestType::GetDeviceId,
+                len: VIRTIO_BLOCK_ID_BYTES - 1,
+            })
+        );
+
+        let overflowing_range = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            u64::MAX,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::writable(DATA_ADDR, 512, Some(2)),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+
+        assert_eq!(
+            parse_request(&memory, &overflowing_range),
+            Err(VirtioBlockRequestError::SectorRangeOverflow {
+                sector: u64::MAX,
+                sectors_len: 1,
+            })
+        );
+
+        let exact_capacity_end = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            15,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::writable(DATA_ADDR, 512, Some(2)),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+
+        parse_request(&memory, &exact_capacity_end)
+            .expect("request ending exactly at capacity should parse");
+
+        let out_of_bounds = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            15,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::writable(DATA_ADDR, 1024, Some(2)),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+
+        assert_eq!(
+            parse_request(&memory, &out_of_bounds),
+            Err(VirtioBlockRequestError::SectorRangeOutOfBounds {
+                sector: 15,
+                sectors_len: 2,
+                capacity_sectors: 16,
+            })
+        );
+    }
+
+    #[test]
+    fn header_read_error_does_not_mutate_status() {
+        let mut memory = request_memory();
+        memory
+            .write_slice(&[0xaa], STATUS_ADDR)
+            .expect("status sentinel should write");
+        let chain = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            0,
+            &[
+                TestDescriptor::readable(
+                    GuestAddress::new(TEST_MEMORY_SIZE),
+                    VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
+                    Some(1),
+                ),
+                TestDescriptor::writable(DATA_ADDR, 512, Some(2)),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+
+        let err = parse_request(&memory, &chain).expect_err("unmapped header should fail");
+        assert!(matches!(err, VirtioBlockRequestError::ReadHeader { .. }));
+
+        let mut status = [0];
+        memory
+            .read_slice(&mut status, STATUS_ADDR)
+            .expect("status sentinel should read");
+        assert_eq!(status, [0xaa]);
     }
 
     #[test]
