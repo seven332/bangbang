@@ -1815,6 +1815,7 @@ mod tests {
                 .expect("fake vCPU should receive dispatch"),
             access
         );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
 
         runner.shutdown().expect("runner should shut down");
     }
@@ -1977,6 +1978,7 @@ mod tests {
                 super::MMIO_DISPATCHER_POISONED_MESSAGE
             ))
         );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
 
         runner.shutdown().expect("runner should shut down");
     }
@@ -1997,6 +1999,7 @@ mod tests {
             ))
         );
         drop(dispatcher_guard);
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
 
         runner.shutdown().expect("runner should shut down");
     }
