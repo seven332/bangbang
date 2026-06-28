@@ -6,6 +6,7 @@ pub mod interrupt;
 pub mod memory;
 pub mod mmio;
 pub mod virtio_mmio;
+pub mod virtio_queue;
 
 use std::fmt;
 
