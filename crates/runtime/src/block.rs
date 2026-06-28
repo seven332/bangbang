@@ -2240,6 +2240,20 @@ mod tests {
             })
         );
 
+        let exact_capacity_end = request_chain(
+            &mut memory,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            15,
+            &[
+                TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+                TestDescriptor::writable(DATA_ADDR, 512, Some(2)),
+                TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+            ],
+        );
+
+        parse_request(&memory, &exact_capacity_end)
+            .expect("request ending exactly at capacity should parse");
+
         let out_of_bounds = request_chain(
             &mut memory,
             VIRTIO_BLOCK_REQUEST_TYPE_IN,
