@@ -621,6 +621,8 @@ impl VirtioBlockRequest {
                 ),
             };
 
+        let (status_code, bytes_written_to_guest, outcome) =
+            normalize_completion_status(status_code, bytes_written_to_guest, outcome);
         self.finish_execution(memory, status_code, bytes_written_to_guest, outcome)
     }
 
@@ -760,7 +762,7 @@ impl VirtioBlockRequest {
             Ok(()) => {
                 let completion = VirtioBlockRequestCompletion::new(
                     self.descriptor_head,
-                    bytes_written_to_guest.saturating_add(VIRTIO_BLOCK_STATUS_SIZE),
+                    bytes_written_to_guest + VIRTIO_BLOCK_STATUS_SIZE,
                 );
                 VirtioBlockRequestExecution::new(completion, status_code, outcome)
             }
@@ -898,6 +900,9 @@ pub enum VirtioBlockRequestExecutionError {
     DataLengthTooLarge {
         len: u32,
     },
+    CompletionLengthOverflow {
+        bytes_written_to_guest: u32,
+    },
     BufferAllocationFailed {
         len: u32,
         source: TryReserveError,
@@ -937,6 +942,14 @@ impl fmt::Display for VirtioBlockRequestExecutionError {
             }
             Self::DataLengthTooLarge { len } => {
                 write!(f, "virtio-block request data length {len} is too large")
+            }
+            Self::CompletionLengthOverflow {
+                bytes_written_to_guest,
+            } => {
+                write!(
+                    f,
+                    "virtio-block request completion length overflows after {bytes_written_to_guest} guest bytes"
+                )
             }
             Self::BufferAllocationFailed { len, source } => {
                 write!(
@@ -989,8 +1002,28 @@ impl std::error::Error for VirtioBlockRequestExecutionError {
             Self::Backing { source, .. } => Some(source),
             Self::MissingDataDescriptor { .. }
             | Self::SectorOffsetOverflow { .. }
-            | Self::DataLengthTooLarge { .. } => None,
+            | Self::DataLengthTooLarge { .. }
+            | Self::CompletionLengthOverflow { .. } => None,
         }
+    }
+}
+
+fn normalize_completion_status(
+    status_code: u8,
+    bytes_written_to_guest: u32,
+    outcome: VirtioBlockRequestExecutionOutcome,
+) -> (u8, u32, VirtioBlockRequestExecutionOutcome) {
+    match bytes_written_to_guest.checked_add(VIRTIO_BLOCK_STATUS_SIZE) {
+        Some(_) => (status_code, bytes_written_to_guest, outcome),
+        None => (
+            VIRTIO_BLOCK_STATUS_IOERR,
+            0,
+            VirtioBlockRequestExecutionOutcome::IoError {
+                error: VirtioBlockRequestExecutionError::CompletionLengthOverflow {
+                    bytes_written_to_guest,
+                },
+            },
+        ),
     }
 }
 
@@ -1641,7 +1674,7 @@ mod tests {
         VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1, VIRTIO_RING_FEATURE_EVENT_IDX,
         VirtioBlockConfigSpace, VirtioBlockDeviceId, VirtioBlockRequest,
         VirtioBlockRequestCompletion, VirtioBlockRequestError, VirtioBlockRequestExecutionError,
-        VirtioBlockRequestExecutionOutcome, VirtioBlockRequestType,
+        VirtioBlockRequestExecutionOutcome, VirtioBlockRequestType, normalize_completion_status,
     };
 
     static NEXT_TEMP_PATH_ID: AtomicUsize = AtomicUsize::new(0);
@@ -2816,6 +2849,26 @@ mod tests {
 
         let long = VirtioBlockDeviceId::from_bytes(b"01234567890123456789extra");
         assert_eq!(long.as_bytes(), b"01234567890123456789");
+    }
+
+    #[test]
+    fn completion_length_overflow_maps_to_io_error_status() {
+        let (status_code, bytes_written_to_guest, outcome) = normalize_completion_status(
+            VIRTIO_BLOCK_STATUS_OK,
+            u32::MAX,
+            VirtioBlockRequestExecutionOutcome::Ok,
+        );
+
+        assert_eq!(status_code, VIRTIO_BLOCK_STATUS_IOERR);
+        assert_eq!(bytes_written_to_guest, 0);
+        assert!(matches!(
+            outcome,
+            VirtioBlockRequestExecutionOutcome::IoError {
+                error: VirtioBlockRequestExecutionError::CompletionLengthOverflow {
+                    bytes_written_to_guest: u32::MAX,
+                }
+            }
+        ));
     }
 
     #[test]
