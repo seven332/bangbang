@@ -19,11 +19,11 @@ arm64 FDT generation and guest-memory writes, anonymous guest memory allocation
 for validated runtime layouts, HVF guest memory map/unmap ownership for
 allocated regions, an internal MMIO region ownership registry and operation/data
 model plus handler dispatch boundary, an internal virtio-mmio register/access
-decoder for future device handlers, an internal backend-neutral interrupt
+decoder and virtqueue descriptor-chain validator for future device handlers, an internal backend-neutral interrupt
 line/status/trigger model, single-vCPU arm64 HVF boot-register setup, and an
 initial process startup argument model.
 There is no broader API request body model, guest execution, continuous vCPU run loop,
-complete interrupt delivery, virtqueue walking, feature negotiation,
+complete interrupt delivery, avail/used virtqueue ring handling, queue notification/completion, feature negotiation, indirect descriptor support,
 device-backed runner-loop MMIO handling, real device emulation, public startup
 wiring, multi-vCPU setup, PSCI behavior, or public boot-source API behavior yet.
 
