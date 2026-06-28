@@ -1041,9 +1041,16 @@ impl VirtioBlockQueue {
         while let Some(chain) = self
             .available
             .pop_descriptor_chain(memory)
-            .map_err(|source| VirtioBlockQueueDispatchError::AvailableRing { source })?
+            .map_err(|source| VirtioBlockQueueDispatchError::AvailableRing {
+                completed_dispatch: Box::new(dispatch.clone()),
+                source,
+            })?
         {
-            let descriptor_head = descriptor_chain_head(&chain)?;
+            let descriptor_head = descriptor_chain_head(&chain).ok_or_else(|| {
+                VirtioBlockQueueDispatchError::EmptyDescriptorChain {
+                    completed_dispatch: Box::new(dispatch.clone()),
+                }
+            })?;
             let (completion, outcome) =
                 match VirtioBlockRequest::parse(memory, &chain, capacity_sectors) {
                     Ok(request) => {
@@ -1066,6 +1073,7 @@ impl VirtioBlockQueue {
                     completion.bytes_written_to_guest(),
                 )
                 .map_err(|source| VirtioBlockQueueDispatchError::UsedRing {
+                    completed_dispatch: Box::new(dispatch.clone()),
                     descriptor_head: completion.descriptor_head(),
                     bytes_written_to_guest: completion.bytes_written_to_guest(),
                     source,
@@ -1169,10 +1177,14 @@ impl VirtioBlockQueueDispatchOutcome {
 #[derive(Debug)]
 pub enum VirtioBlockQueueDispatchError {
     AvailableRing {
+        completed_dispatch: Box<VirtioBlockQueueDispatch>,
         source: VirtqueueAvailableRingError,
     },
-    EmptyDescriptorChain,
+    EmptyDescriptorChain {
+        completed_dispatch: Box<VirtioBlockQueueDispatch>,
+    },
     UsedRing {
+        completed_dispatch: Box<VirtioBlockQueueDispatch>,
         descriptor_head: u16,
         bytes_written_to_guest: u32,
         source: VirtqueueUsedRingError,
@@ -1182,19 +1194,20 @@ pub enum VirtioBlockQueueDispatchError {
 impl fmt::Display for VirtioBlockQueueDispatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::AvailableRing { source } => {
+            Self::AvailableRing { source, .. } => {
                 write!(
                     f,
                     "failed to pop virtio-block available descriptor chain: {source}"
                 )
             }
-            Self::EmptyDescriptorChain => {
+            Self::EmptyDescriptorChain { .. } => {
                 f.write_str("virtio-block queue produced an empty descriptor chain")
             }
             Self::UsedRing {
                 descriptor_head,
                 bytes_written_to_guest,
                 source,
+                ..
             } => {
                 write!(
                     f,
@@ -1208,21 +1221,34 @@ impl fmt::Display for VirtioBlockQueueDispatchError {
 impl std::error::Error for VirtioBlockQueueDispatchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::AvailableRing { source } => Some(source),
+            Self::AvailableRing { source, .. } => Some(source),
             Self::UsedRing { source, .. } => Some(source),
-            Self::EmptyDescriptorChain => None,
+            Self::EmptyDescriptorChain { .. } => None,
         }
     }
 }
 
-fn descriptor_chain_head(
-    chain: &VirtqueueDescriptorChain,
-) -> Result<u16, VirtioBlockQueueDispatchError> {
+impl VirtioBlockQueueDispatchError {
+    pub const fn completed_dispatch(&self) -> &VirtioBlockQueueDispatch {
+        match self {
+            Self::AvailableRing {
+                completed_dispatch, ..
+            }
+            | Self::EmptyDescriptorChain {
+                completed_dispatch, ..
+            }
+            | Self::UsedRing {
+                completed_dispatch, ..
+            } => completed_dispatch,
+        }
+    }
+}
+
+fn descriptor_chain_head(chain: &VirtqueueDescriptorChain) -> Option<u16> {
     chain
         .descriptors()
         .first()
         .map(|descriptor| descriptor.index())
-        .ok_or(VirtioBlockQueueDispatchError::EmptyDescriptorChain)
 }
 
 fn normalize_completion_status(
@@ -3931,6 +3957,41 @@ mod tests {
         assert_eq!(queue.available_ring().next_avail(), 0);
         assert_eq!(queue.used_ring().next_used(), 0);
         assert_eq!(read_used_index(&memory), 0);
+    }
+
+    #[test]
+    fn block_queue_dispatch_available_ring_failure_reports_completed_dispatch() {
+        let mut memory = request_memory();
+        let file = temp_file("queue-partial-available-failure.img", &sector_payload(0x77));
+        let backing = open_backing(file.as_path(), false).expect("backing should open");
+        write_queued_request(
+            &mut memory,
+            0,
+            VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
+            0,
+            HEADER_ADDR,
+            None,
+            STATUS_ADDR,
+        );
+        write_available_heads(&mut memory, &[0, TEST_QUEUE_SIZE]);
+        let mut queue = block_queue();
+
+        let error = queue
+            .dispatch(&mut memory, &backing, TEST_DEVICE_ID)
+            .expect_err("invalid second available head should fail dispatch");
+
+        let completed_dispatch = error.completed_dispatch();
+        assert_eq!(completed_dispatch.processed_requests(), 1);
+        assert_eq!(completed_dispatch.successful_requests(), 1);
+        assert!(completed_dispatch.needs_queue_interrupt());
+        assert!(matches!(
+            error,
+            VirtioBlockQueueDispatchError::AvailableRing { .. }
+        ));
+        assert_eq!(queue.available_ring().next_avail(), 1);
+        assert_eq!(queue.used_ring().next_used(), 1);
+        assert_eq!(read_used_index(&memory), 1);
+        assert_eq!(read_used_element(&memory, 0), (0, VIRTIO_BLOCK_STATUS_SIZE));
     }
 
     #[test]
