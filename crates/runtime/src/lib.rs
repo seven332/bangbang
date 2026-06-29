@@ -6,6 +6,7 @@ pub mod fdt;
 pub mod interrupt;
 pub mod machine;
 pub mod memory;
+pub mod metrics;
 pub mod mmio;
 pub mod serial;
 pub mod startup;
@@ -66,6 +67,7 @@ pub enum VmmAction {
     FlushMetrics,
     PutBootSource(boot::BootSourceConfigInput),
     PutMachineConfig(machine::MachineConfigInput),
+    PutMetrics(metrics::MetricsConfigInput),
     PutDrive(block::DriveConfigInput),
 }
 
@@ -80,6 +82,7 @@ impl VmmAction {
             Self::FlushMetrics => "FlushMetrics",
             Self::PutBootSource(_) => "PutBootSource",
             Self::PutMachineConfig(_) => "PutMachineConfig",
+            Self::PutMetrics(_) => "PutMetrics",
             Self::PutDrive(_) => "PutDrive",
         }
     }
@@ -139,6 +142,8 @@ pub enum VmmActionError {
     BootSourceConfig(boot::BootSourceConfigError),
     DriveConfig(block::DriveConfigError),
     MachineConfig(machine::MachineConfigError),
+    MetricsConfig(metrics::MetricsConfigError),
+    MetricsFlush(metrics::MetricsFlushError),
 }
 
 impl fmt::Display for VmmActionError {
@@ -160,6 +165,8 @@ impl fmt::Display for VmmActionError {
             Self::BootSourceConfig(err) => write!(f, "{err}"),
             Self::DriveConfig(err) => write!(f, "{err}"),
             Self::MachineConfig(err) => write!(f, "{err}"),
+            Self::MetricsConfig(err) => write!(f, "{err}"),
+            Self::MetricsFlush(err) => write!(f, "{err}"),
         }
     }
 }
@@ -171,6 +178,8 @@ impl std::error::Error for VmmActionError {
             Self::BootSourceConfig(err) => Some(err),
             Self::DriveConfig(err) => Some(err),
             Self::MachineConfig(err) => Some(err),
+            Self::MetricsConfig(err) => Some(err),
+            Self::MetricsFlush(err) => Some(err),
             Self::MissingBootSource
             | Self::UnsupportedAction(_)
             | Self::UnsupportedState { .. } => None,
@@ -178,12 +187,13 @@ impl std::error::Error for VmmActionError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct VmmController {
     instance_info: InstanceInfo,
     machine_config: machine::MachineConfig,
     boot_source_config: Option<boot::BootSourceConfig>,
     drive_configs: block::DriveConfigs,
+    metrics_state: metrics::MetricsState,
 }
 
 impl VmmController {
@@ -202,6 +212,7 @@ impl VmmController {
             machine_config: machine::MachineConfig::default(),
             boot_source_config: None,
             drive_configs: block::DriveConfigs::new(),
+            metrics_state: metrics::MetricsState::default(),
         }
     }
 
@@ -273,7 +284,19 @@ impl VmmController {
                 self.preflight_instance_start()?;
                 Err(VmmActionError::UnsupportedAction(action_name))
             }
-            VmmAction::FlushMetrics => Err(VmmActionError::UnsupportedAction(action_name)),
+            VmmAction::FlushMetrics => {
+                if self.instance_info.state != InstanceState::Running {
+                    return Err(VmmActionError::UnsupportedState {
+                        action: action_name,
+                        state: self.instance_info.state,
+                    });
+                }
+
+                self.metrics_state
+                    .flush()
+                    .map_err(VmmActionError::MetricsFlush)?;
+                Ok(VmmData::Empty)
+            }
             VmmAction::PutBootSource(config) => {
                 if self.instance_info.state != InstanceState::NotStarted {
                     return Err(VmmActionError::UnsupportedState {
@@ -299,6 +322,20 @@ impl VmmController {
                 }
 
                 self.machine_config = config.validate().map_err(VmmActionError::MachineConfig)?;
+
+                Ok(VmmData::Empty)
+            }
+            VmmAction::PutMetrics(config) => {
+                if self.instance_info.state != InstanceState::NotStarted {
+                    return Err(VmmActionError::UnsupportedState {
+                        action: action_name,
+                        state: self.instance_info.state,
+                    });
+                }
+
+                self.metrics_state
+                    .configure(config)
+                    .map_err(VmmActionError::MetricsConfig)?;
 
                 Ok(VmmData::Empty)
             }
@@ -348,7 +385,9 @@ pub trait VmBackend: fmt::Debug {
 mod tests {
     use std::cell::Cell;
     use std::error::Error as _;
+    use std::fs;
     use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         BackendError, InstanceState, VmmAction, VmmActionError, VmmController, VmmData,
@@ -357,6 +396,7 @@ mod tests {
             BootCommandLineError, BootPayloadKind, BootSourceConfigError, BootSourceConfigInput,
         },
         machine::{DEFAULT_MEM_SIZE_MIB, DEFAULT_VCPU_COUNT, MachineConfigInput},
+        metrics::{MetricsConfigError, MetricsConfigInput},
     };
 
     fn drive_input(id: &str, path: &str, is_root_device: bool) -> DriveConfigInput {
@@ -365,6 +405,17 @@ mod tests {
 
     fn boot_source_input(kernel_image_path: &str) -> BootSourceConfigInput {
         BootSourceConfigInput::new(kernel_image_path)
+    }
+
+    fn unique_metrics_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bangbang-runtime-metrics-test-{}-{nanos}-{name}",
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -859,21 +910,178 @@ mod tests {
     }
 
     #[test]
-    fn flush_metrics_is_explicitly_unsupported_without_mutating() {
+    fn flush_metrics_rejects_not_started_state_without_mutating() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
 
         let err = controller
             .handle_action(VmmAction::FlushMetrics)
-            .expect_err("flush metrics should remain unsupported");
+            .expect_err("pre-boot flush metrics should fail");
 
         assert_eq!(
             err,
-            VmmActionError::UnsupportedAction(VmmAction::FlushMetrics.name())
+            VmmActionError::UnsupportedState {
+                action: VmmAction::FlushMetrics.name(),
+                state: InstanceState::NotStarted,
+            }
         );
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
         assert_eq!(controller.machine_config().vcpu_count(), DEFAULT_VCPU_COUNT);
         assert!(controller.boot_source_config().is_none());
         assert!(controller.drive_configs().is_empty());
+    }
+
+    #[test]
+    fn flush_metrics_after_start_without_configuration_is_noop() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller
+            .commit_instance_start()
+            .expect("start commit should set running state");
+
+        assert_eq!(
+            controller.handle_action(VmmAction::FlushMetrics),
+            Ok(VmmData::Empty)
+        );
+        assert_eq!(controller.instance_info().state, InstanceState::Running);
+    }
+
+    #[test]
+    fn handles_put_metrics_config_before_start_and_flushes_after_start() {
+        let path = unique_metrics_path("configured");
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
+        assert_eq!(
+            controller.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(&path))),
+            Ok(VmmData::Empty)
+        );
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller
+            .commit_instance_start()
+            .expect("start commit should set running state");
+        assert_eq!(
+            controller.handle_action(VmmAction::FlushMetrics),
+            Ok(VmmData::Empty)
+        );
+
+        assert_eq!(controller.instance_info().state, InstanceState::Running);
+        let output = fs::read_to_string(&path).expect("metrics output should be readable");
+        assert_eq!(output, "{\"vmm\":{\"metrics_flush_count\":1}}\n");
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn flush_metrics_before_start_with_configuration_does_not_write() {
+        let path = unique_metrics_path("configured-preboot");
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(&path)))
+            .expect("metrics config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::FlushMetrics)
+            .expect_err("pre-boot metrics flush should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::UnsupportedState {
+                action: VmmAction::FlushMetrics.name(),
+                state: InstanceState::NotStarted,
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("metrics output should be readable"),
+            ""
+        );
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn put_metrics_rejects_duplicate_configuration_without_replacing_sink() {
+        let first_path = unique_metrics_path("first");
+        let second_path = unique_metrics_path("second");
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(&first_path)))
+            .expect("initial metrics config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(&second_path)))
+            .expect_err("duplicate metrics config should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::MetricsConfig(MetricsConfigError::AlreadyInitialized)
+        );
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller
+            .commit_instance_start()
+            .expect("start commit should set running state");
+        controller
+            .handle_action(VmmAction::FlushMetrics)
+            .expect("flush should still use original metrics sink");
+        let first_output =
+            fs::read_to_string(&first_path).expect("first metrics output should be readable");
+        assert_eq!(first_output, "{\"vmm\":{\"metrics_flush_count\":1}}\n");
+        assert!(!second_path.exists());
+        fs::remove_file(first_path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn put_metrics_rejects_running_state_without_mutating() {
+        let path = unique_metrics_path("running");
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller
+            .commit_instance_start()
+            .expect("start commit should set running state");
+
+        let err = controller
+            .handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(&path)))
+            .expect_err("runtime metrics config should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::UnsupportedState {
+                action: VmmAction::PutMetrics(MetricsConfigInput::new(&path)).name(),
+                state: InstanceState::Running,
+            }
+        );
+        assert_eq!(
+            controller.handle_action(VmmAction::FlushMetrics),
+            Ok(VmmData::Empty)
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn put_metrics_rejects_empty_path_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
+        let err = controller
+            .handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+                PathBuf::new(),
+            )))
+            .expect_err("empty metrics path should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::MetricsConfig(MetricsConfigError::EmptyPath)
+        );
+        assert_eq!(
+            controller.handle_action(VmmAction::FlushMetrics),
+            Err(VmmActionError::UnsupportedState {
+                action: VmmAction::FlushMetrics.name(),
+                state: InstanceState::NotStarted,
+            })
+        );
     }
 
     #[test]
