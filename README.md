@@ -126,9 +126,10 @@ curl --unix-socket /tmp/bangbang.socket \
 ```
 
 The request body is parsed and routed to the VMM action model. `InstanceStart`
-validates stored boot-source and state preflight first, but action execution is
-not implemented yet and successful preflight currently returns `400 Bad Request`
-with a `fault_message` body.
+validates stored boot-source and state preflight first. Without a stored boot
+source, it returns a missing boot-source fault before attempting execution.
+Action execution is not implemented yet, so successful preflight currently
+returns `400 Bad Request` with a `fault_message` body.
 
 ## Exit Status
 
