@@ -473,6 +473,29 @@ mod tests {
     }
 
     #[test]
+    fn instance_start_preflight_rejects_paused_state() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller.instance_info.state = InstanceState::Paused;
+
+        let err = controller
+            .preflight_instance_start()
+            .expect_err("paused state should fail preflight");
+
+        assert_eq!(
+            err,
+            VmmActionError::UnsupportedState {
+                action: VmmAction::InstanceStart.name(),
+                state: InstanceState::Paused,
+            }
+        );
+        assert_eq!(controller.instance_info().state, InstanceState::Paused);
+        assert!(controller.boot_source_config().is_some());
+    }
+
+    #[test]
     fn commit_instance_start_sets_running_after_preflight_requirements() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         controller
