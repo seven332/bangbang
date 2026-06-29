@@ -1494,6 +1494,7 @@ fn shutdown_result(
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{self, AssertUnwindSafe};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::thread;
 
@@ -1600,6 +1601,57 @@ mod tests {
         Err(HvfVcpuRunnerError::InvalidState(
             "fake vCPU does not support MMIO dispatch",
         ))
+    }
+
+    fn start_panic_notifying_runner<C, V>(
+        create_vcpu: C,
+    ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<()>)
+    where
+        C: FnOnce() -> Result<V, BackendError> + Send + 'static,
+        V: RunnerVcpu + 'static,
+    {
+        let (command_sender, command_receiver) = mpsc::channel();
+        let (startup_sender, startup_receiver) = mpsc::channel();
+        let (runner_unwind_sender, runner_unwind_receiver) = mpsc::channel();
+        let thread = thread::Builder::new()
+            .name("bangbang-hvf-vcpu".to_string())
+            .spawn(move || {
+                let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                    super::run_runner_thread(command_receiver, startup_sender, create_vcpu);
+                }));
+                let _ = runner_unwind_sender.send(());
+                if let Err(payload) = result {
+                    panic::resume_unwind(payload);
+                }
+            })
+            .expect("panic-notifying runner thread should spawn");
+
+        let startup_result = match startup_receiver.recv() {
+            Ok(startup_result) => startup_result,
+            Err(_) => {
+                super::join_runner_thread(Some(thread))
+                    .expect("panic-notifying startup failure should join");
+                panic!("panic-notifying runner startup channel should not close");
+            }
+        };
+        let vcpu = startup_result.expect("panic-notifying runner should start");
+        let started = super::StartedRunner {
+            command_sender,
+            vcpu,
+            thread,
+        };
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            runner_unwind_receiver,
+        )
+    }
+
+    fn wait_for_panic_notifying_runner_unwind(runner_unwind_receiver: mpsc::Receiver<()>) {
+        runner_unwind_receiver
+            .recv()
+            .expect("panic-notifying runner should unwind");
     }
 
     impl RunnerVcpu for FakeVcpu {
@@ -2697,10 +2749,8 @@ mod tests {
 
     #[test]
     fn shutdown_reports_thread_panic_after_vtimer_mask_panic() {
-        let started =
-            spawn_runner_thread(|| Ok(PanicOnVtimerMaskVcpu)).expect("panic runner should start");
-        let runner = HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
-            .expect("runner should be created");
+        let (runner, runner_unwind_receiver) =
+            start_panic_notifying_runner(|| Ok(PanicOnVtimerMaskVcpu));
 
         assert_eq!(
             runner.get_vtimer_mask(),
@@ -2708,6 +2758,7 @@ mod tests {
                 super::RESPONSE_CHANNEL_CLOSED_MESSAGE
             ))
         );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
 
@@ -2878,10 +2929,8 @@ mod tests {
 
     #[test]
     fn shutdown_reports_thread_panic_after_gic_ppi_pending_panic() {
-        let started = spawn_runner_thread(|| Ok(PanicOnGicPpiPendingVcpu))
-            .expect("panic runner should start");
-        let runner = HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
-            .expect("runner should be created");
+        let (runner, runner_unwind_receiver) =
+            start_panic_notifying_runner(|| Ok(PanicOnGicPpiPendingVcpu));
 
         assert_eq!(
             runner.set_gic_ppi_pending(27),
@@ -2889,6 +2938,7 @@ mod tests {
                 super::RESPONSE_CHANNEL_CLOSED_MESSAGE
             ))
         );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
 
@@ -3247,10 +3297,8 @@ mod tests {
 
     #[test]
     fn shutdown_reports_thread_panic_after_arm64_boot_register_setup_panic() {
-        let started =
-            spawn_runner_thread(|| Ok(PanicOnConfigureVcpu)).expect("panic runner should start");
-        let runner = HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
-            .expect("runner should be created");
+        let (runner, runner_unwind_receiver) =
+            start_panic_notifying_runner(|| Ok(PanicOnConfigureVcpu));
 
         assert_eq!(
             runner.configure_arm64_boot_registers(boot_registers()),
@@ -3258,6 +3306,7 @@ mod tests {
                 super::RESPONSE_CHANNEL_CLOSED_MESSAGE
             ))
         );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
 
@@ -4595,10 +4644,7 @@ mod tests {
 
     #[test]
     fn shutdown_reports_thread_panic_after_started_runner_exits() {
-        let started =
-            spawn_runner_thread(|| Ok(PanicOnRunVcpu)).expect("panic runner should start");
-        let runner = HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
-            .expect("runner should be created");
+        let (runner, runner_unwind_receiver) = start_panic_notifying_runner(|| Ok(PanicOnRunVcpu));
 
         assert_eq!(
             runner.run_once(),
@@ -4606,6 +4652,7 @@ mod tests {
                 super::RESPONSE_CHANNEL_CLOSED_MESSAGE
             ))
         );
+        wait_for_panic_notifying_runner_unwind(runner_unwind_receiver);
         assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
     }
 }
