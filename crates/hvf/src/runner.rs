@@ -1786,6 +1786,13 @@ mod tests {
     }
 
     #[test]
+    fn run_cancel_handle_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<super::HvfVcpuRunCancelHandle>();
+    }
+
+    #[test]
     fn reads_mpidr_on_runner_thread() {
         let runner = start_mpidr_recording_runner(0x8000_0000, false);
 
