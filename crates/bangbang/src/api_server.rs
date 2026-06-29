@@ -24,6 +24,7 @@ use bangbang_runtime::{VmmAction, VmmController, VmmData};
 
 const READ_CHUNK_SIZE: usize = 4096;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+const BOOT_SOURCE_UNSUPPORTED_MESSAGE: &str = "boot source API is not supported yet.";
 static NEXT_TEMP_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -396,6 +397,7 @@ fn handle_api_request(request: ApiRequest, vmm: &mut VmmController) -> HttpRespo
         ApiRequest::GetMachineConfig => {
             handle_machine_config(vmm.handle_action(VmmAction::GetMachineConfig))
         }
+        ApiRequest::PutBootSource(_) => HttpResponse::fault(BOOT_SOURCE_UNSUPPORTED_MESSAGE),
         ApiRequest::PutMachineConfig(config) => handle_empty(vmm.handle_action(
             VmmAction::PutMachineConfig(machine_config_input_from_request(config.as_ref())),
         )),
@@ -768,6 +770,41 @@ mod tests {
         );
         assert_eq!(vmm.machine_config().vcpu_count(), 2);
         assert_eq!(vmm.machine_config().mem_size_mib(), 256);
+    }
+
+    #[test]
+    fn returns_fault_for_boot_source_until_storage_exists() {
+        let mut vmm = test_controller();
+        let machine_body = r#"{"vcpu_count":2,"mem_size_mib":256}"#;
+        let machine_request = format!(
+            "PUT /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{machine_body}",
+            machine_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(machine_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let boot_body = r#"{"kernel_image_path":"/tmp/private-vmlinux"}"#;
+        let boot_request = format!(
+            "PUT /boot-source HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{boot_body}",
+            boot_body.len()
+        );
+
+        let response = handle_request_bytes(boot_request.as_bytes(), &mut vmm);
+
+        assert_eq!(
+            response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+        assert_eq!(
+            response.body(),
+            r#"{"fault_message":"boot source API is not supported yet."}"#
+        );
+        assert!(!response.body().contains("/tmp/private-vmlinux"));
+        assert_eq!(vmm.machine_config().vcpu_count(), 2);
+        assert_eq!(vmm.machine_config().mem_size_mib(), 256);
+        assert!(vmm.drive_configs().is_empty());
     }
 
     #[test]
