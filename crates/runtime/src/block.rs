@@ -2141,7 +2141,9 @@ impl PreparedBlockDevices {
         Self::from_config_slice(configs.as_slice())
     }
 
-    pub fn from_config_slice(configs: &[DriveConfig]) -> Result<Self, PreparedBlockDeviceError> {
+    pub(crate) fn from_config_slice(
+        configs: &[DriveConfig],
+    ) -> Result<Self, PreparedBlockDeviceError> {
         let mut devices = Vec::new();
         devices
             .try_reserve_exact(configs.len())
