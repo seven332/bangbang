@@ -644,12 +644,14 @@ It can validate nonzero guest interrupt lines, represent queue and
 configuration pending-status bits, acknowledge selected pending bits, and let a
 device-facing trigger record pending state before delegating backend signaling
 to an injected sink. The HVF crate can allocate deterministic guest interrupt
-lines from the validated GIC SPI range and signal validated SPI levels through
-`hv_gic_set_spi`. Internal HVF boot sessions use that signal path for block
-queue interrupts after boot-runtime notification dispatch. This follows
-Firecracker's separation between device-facing interrupt triggers and
-KVM-specific irqfd/GSI routing, but it is not yet device interrupt masking,
-runner-loop interrupt dispatch, or guest-visible device delivery.
+lines from the validated GIC SPI range, signal validated SPI levels through
+`hv_gic_set_spi`, and set or clear validated GIC PPI pending bits through
+redistributor pending registers on the vCPU-owning thread. Internal HVF boot
+sessions use the SPI signal path for block queue interrupts after boot-runtime
+notification dispatch. This follows Firecracker's separation between
+device-facing interrupt triggers and KVM-specific irqfd/GSI routing, but it is
+not yet device interrupt masking, timer EOI policy, runner-loop interrupt
+dispatch, or guest-visible device delivery.
 
 The HVF backend can decode candidate MMIO accesses from arm64 data-abort
 exception exits. The decoder converts supported ESR and IPA metadata into a
@@ -689,9 +691,11 @@ future FDT path: distributor and redistributor regions below the 1 GiB MMIO32
 boundary, the supported SPI range, timer interrupt IDs, and the `arm,gic-v3`
 compatibility shape. An internal SPI signaler validates guest interrupt lines
 against that supported range before setting explicit GIC SPI levels with
-`hv_gic_set_spi`. HVF timer INTIDs are converted to FDT PPI cells for the
-runtime timer node, and MSI/ITS metadata is intentionally absent until a later
-device path needs it.
+`hv_gic_set_spi`. A narrow internal PPI pending primitive validates real GIC
+PPI INTIDs before writing `GICR_ISPENDR0` or `GICR_ICPENDR0` through
+`hv_gic_set_redistributor_reg` on the vCPU-owning thread. HVF timer INTIDs are
+converted to FDT PPI cells for the runtime timer node, and MSI/ITS metadata is
+intentionally absent until a later device path needs it.
 
 This still is not public guest startup. bangbang can now write an internal FDT
 payload, create an internal single-vCPU HVF arm64 boot session, read the primary
@@ -699,7 +703,8 @@ runner-owned vCPU `MPIDR_EL1` for boot metadata, allocate deterministic block
 and optional serial SPI interrupt lines, map the assembled guest memory into
 HVF, and configure a single primary HVF vCPU with the arm64 Linux boot register
 state: PC points at the loaded kernel entry, X0 points at the FDT guest address,
-X1-X3 are zero, and CPSR/PSTATE is `0x3c5`. The runner path performs metadata
+X1-X3 are zero, and CPSR/PSTATE is `0x3c5`. The runner path sets deterministic
+single-vCPU `MPIDR_EL1` affinity before redistributor access, performs metadata
 reads and boot-register setup on the vCPU-owning thread, rejects duplicate setup,
 setup during shutdown, setup while a run is in flight, and setup after a run has
 started. If setup fails after partially writing registers, the runner rejects
@@ -709,9 +714,12 @@ vCPU-owning thread. One command dispatches an already resolved MMIO access after
 a run has started, and another command starts one vCPU run, resolves a resulting
 MMIO exit, and dispatches or completes it through a caller-provided shared
 dispatcher. The virtual timer mask commands expose HVF's explicit mask bit after
-`HV_EXIT_REASON_VTIMER_ACTIVATED`; full timer PPI injection and EOI-based unmask
-policy remain future work. These commands reject overlapping metadata reads,
-runs, boot-register setup, MMIO dispatches, or virtual timer mask operations.
+`HV_EXIT_REASON_VTIMER_ACTIVATED`; GIC PPI pending commands can set or clear a
+validated timer PPI bit on the runner thread. Full timer delivery policy,
+including when to assert the PPI and how to detect EOI-based unmasking, remains
+future work. These commands reject overlapping metadata reads, runs,
+boot-register setup, MMIO dispatches, virtual timer mask operations, or GIC PPI
+pending operations.
 They do not yet form a continuous guest run loop. The boot session can run one vCPU
 step through the runner with its per-session shared MMIO dispatcher, so a
 resulting MMIO exit is handled on the vCPU-owning thread without global state.

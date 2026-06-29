@@ -207,6 +207,35 @@ fn cancels_runner_before_first_run() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn sets_and_clears_runner_gic_ppi_pending() {
+    use bangbang_hvf::HvfBackend;
+    use bangbang_runtime::VmBackend;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let mut backend = HvfBackend::new();
+
+    backend.create_vm().expect("VM should be created");
+    let metadata = *backend.create_gic().expect("GIC should be created");
+    let virtual_timer_intid = metadata.timer_interrupts.el1_virtual_timer_intid;
+    {
+        let runner = backend
+            .start_vcpu_runner()
+            .expect("vCPU runner should start");
+        runner
+            .set_gic_ppi_pending(virtual_timer_intid)
+            .expect("runner GIC PPI pending bit should be set");
+        runner
+            .clear_gic_ppi_pending(virtual_timer_intid)
+            .expect("runner GIC PPI pending bit should be cleared");
+        runner.shutdown().expect("runner should shut down");
+    }
+    backend.destroy_vm().expect("VM should be destroyed");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn maps_guest_memory_and_unmaps_before_destroying_vm() {
     use bangbang_hvf::{HvfBackend, HvfMemoryPermissions};
     use bangbang_runtime::VmBackend;

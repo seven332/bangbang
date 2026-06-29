@@ -9,6 +9,7 @@ use bangbang_runtime::mmio::{MmioDispatchOutcome, MmioDispatcher};
 
 use crate::backend::HvfBackend;
 use crate::exit::{HvfResolvedMmioAccess, HvfVcpuExit, HvfVcpuExitResolveError};
+use crate::gic::{HvfGicError, HvfGicPpiPendingWriter, validate_gic_ppi_pending_intid};
 use crate::mmio::HvfMmioDispatchError;
 use crate::vcpu::{HvfArm64BootRegisters, HvfSystemRegister, HvfVcpuOwner};
 
@@ -27,6 +28,8 @@ const RUN_ALREADY_STARTED_MESSAGE: &str = "vCPU runner has already started a run
 const METADATA_READ_IN_FLIGHT_MESSAGE: &str = "vCPU runner already has metadata read in flight";
 const VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE: &str =
     "vCPU runner already has virtual timer mask operation in flight";
+const GIC_PPI_PENDING_OPERATION_IN_FLIGHT_MESSAGE: &str =
+    "vCPU runner already has GIC PPI pending operation in flight";
 const RUNNER_STATE_POISONED_MESSAGE: &str = "vCPU runner state lock is poisoned";
 const MMIO_DISPATCHER_BUSY_MESSAGE: &str = "vCPU runner MMIO dispatcher lock is busy";
 const MMIO_DISPATCHER_POISONED_MESSAGE: &str = "vCPU runner MMIO dispatcher lock is poisoned";
@@ -40,6 +43,7 @@ type RunnerState = Arc<Mutex<RunnerHandleState>>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HvfVcpuRunnerError {
     Backend(BackendError),
+    Gic(HvfGicError),
     VcpuExitResolve(HvfVcpuExitResolveError),
     MmioDispatch(HvfMmioDispatchError),
     InvalidState(&'static str),
@@ -65,6 +69,7 @@ impl fmt::Display for HvfVcpuRunnerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Backend(err) => write!(f, "{err}"),
+            Self::Gic(err) => write!(f, "{err}"),
             Self::VcpuExitResolve(err) => write!(f, "{err}"),
             Self::MmioDispatch(err) => write!(f, "{err}"),
             Self::InvalidState(message) => write!(f, "invalid vCPU runner state: {message}"),
@@ -81,6 +86,7 @@ impl std::error::Error for HvfVcpuRunnerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Backend(err) => Some(err),
+            Self::Gic(err) => Some(err),
             Self::VcpuExitResolve(err) => Some(err),
             Self::MmioDispatch(err) => Some(err),
             Self::InvalidState(_)
@@ -94,6 +100,12 @@ impl std::error::Error for HvfVcpuRunnerError {
 impl From<BackendError> for HvfVcpuRunnerError {
     fn from(err: BackendError) -> Self {
         Self::Backend(err)
+    }
+}
+
+impl From<HvfGicError> for HvfVcpuRunnerError {
+    fn from(err: HvfGicError) -> Self {
+        Self::Gic(err)
     }
 }
 
@@ -151,6 +163,7 @@ struct RunnerHandleState {
     boot_register_setup_in_flight: bool,
     metadata_read_in_flight: bool,
     vtimer_mask_operation_in_flight: bool,
+    gic_ppi_pending_operation_in_flight: bool,
     boot_register_setup_failed: bool,
     boot_registers_configured: bool,
     run_started: bool,
@@ -181,6 +194,11 @@ enum RunnerCommand {
     },
     SetVtimerMask {
         masked: bool,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    },
+    SetGicPpiPending {
+        intid: u32,
+        pending: bool,
         response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
     },
     Shutdown {
@@ -221,17 +239,30 @@ trait RunnerVcpu {
             "vCPU does not support virtual timer mask writes",
         ))
     }
+    fn set_gic_ppi_pending(&mut self, _intid: u32, _pending: bool) -> Result<(), HvfGicError> {
+        Err(HvfGicError::InvalidState(
+            "vCPU does not support GIC PPI pending control",
+        ))
+    }
     fn destroy(&mut self) -> Result<(), BackendError>;
 }
 
 struct RealRunnerVcpu {
     owner: HvfVcpuOwner,
+    gic_ppi_pending_writer: Option<HvfGicPpiPendingWriter>,
 }
 
 impl RealRunnerVcpu {
     fn create() -> Result<Self, BackendError> {
+        let mut owner = HvfVcpuOwner::new()?;
+        // Hypervisor.framework GIC redistributor access requires vCPU
+        // affinity before the topology is finalized. The current runner owns a
+        // single primary vCPU, so affinity 0 is the deterministic topology.
+        owner.set_system_register(HvfSystemRegister::MPIDR_EL1, 0)?;
+
         Ok(Self {
-            owner: HvfVcpuOwner::new()?,
+            owner,
+            gic_ppi_pending_writer: None,
         })
     }
 }
@@ -274,6 +305,21 @@ impl RunnerVcpu for RealRunnerVcpu {
         self.owner.set_vtimer_mask(masked)
     }
 
+    fn set_gic_ppi_pending(&mut self, intid: u32, pending: bool) -> Result<(), HvfGicError> {
+        validate_gic_ppi_pending_intid(intid)?;
+        if self.gic_ppi_pending_writer.is_none() {
+            self.gic_ppi_pending_writer = Some(HvfGicPpiPendingWriter::new()?);
+        }
+        let writer = self
+            .gic_ppi_pending_writer
+            .as_ref()
+            .ok_or(HvfGicError::InvalidState(
+                "GIC PPI pending writer was not initialized",
+            ))?;
+
+        self.owner.set_gic_ppi_pending(writer, intid, pending)
+    }
+
     fn destroy(&mut self) -> Result<(), BackendError> {
         self.owner.destroy()
     }
@@ -302,7 +348,8 @@ impl<'vm> HvfVcpuRunner<'vm> {
             Ok(()) => setup.mark_configured(),
             Err(HvfVcpuRunnerError::Backend(_)) => setup.mark_failed(),
             Err(
-                HvfVcpuRunnerError::InvalidState(_)
+                HvfVcpuRunnerError::Gic(_)
+                | HvfVcpuRunnerError::InvalidState(_)
                 | HvfVcpuRunnerError::VcpuExitResolve(_)
                 | HvfVcpuRunnerError::MmioDispatch(_)
                 | HvfVcpuRunnerError::ThreadSpawn(_)
@@ -393,6 +440,26 @@ impl<'vm> HvfVcpuRunner<'vm> {
             .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
     }
 
+    /// Set a GIC PPI pending bit on the vCPU-owning runner thread.
+    pub fn set_gic_ppi_pending(&self, intid: u32) -> Result<(), HvfVcpuRunnerError> {
+        self.set_gic_ppi_pending_to(intid, true)
+    }
+
+    /// Clear a GIC PPI pending bit on the vCPU-owning runner thread.
+    pub fn clear_gic_ppi_pending(&self, intid: u32) -> Result<(), HvfVcpuRunnerError> {
+        self.set_gic_ppi_pending_to(intid, false)
+    }
+
+    fn set_gic_ppi_pending_to(&self, intid: u32, pending: bool) -> Result<(), HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        let _in_flight_operation =
+            self.start_gic_ppi_pending_operation(intid, pending, response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
     pub fn shutdown(&self) -> Result<(), HvfVcpuRunnerError> {
         let (command_sender, should_cancel) = match self.prepare_shutdown() {
             Ok(prepared_shutdown) => prepared_shutdown,
@@ -440,6 +507,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 boot_register_setup_in_flight: false,
                 metadata_read_in_flight: false,
                 vtimer_mask_operation_in_flight: false,
+                gic_ppi_pending_operation_in_flight: false,
                 boot_register_setup_failed: false,
                 boot_registers_configured: false,
                 run_started: false,
@@ -483,6 +551,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.vtimer_mask_operation_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
                 VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.gic_ppi_pending_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                GIC_PPI_PENDING_OPERATION_IN_FLIGHT_MESSAGE,
             ));
         }
         if state.run_started {
@@ -545,6 +618,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE,
             ));
         }
+        if state.gic_ppi_pending_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                GIC_PPI_PENDING_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
         if state.boot_register_setup_failed {
             return Err(HvfVcpuRunnerError::InvalidState(
                 BOOT_REGISTER_SETUP_FAILED_MESSAGE,
@@ -598,6 +676,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.vtimer_mask_operation_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
                 VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.gic_ppi_pending_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                GIC_PPI_PENDING_OPERATION_IN_FLIGHT_MESSAGE,
             ));
         }
         if state.boot_register_setup_failed {
@@ -657,6 +740,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.vtimer_mask_operation_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
                 VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.gic_ppi_pending_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                GIC_PPI_PENDING_OPERATION_IN_FLIGHT_MESSAGE,
             ));
         }
         if state.boot_register_setup_failed {
@@ -726,6 +814,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.vtimer_mask_operation_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
                 VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.gic_ppi_pending_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                GIC_PPI_PENDING_OPERATION_IN_FLIGHT_MESSAGE,
             ));
         }
 
@@ -805,6 +898,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE,
             ));
         }
+        if state.gic_ppi_pending_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                GIC_PPI_PENDING_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
 
         state.vtimer_mask_operation_in_flight = true;
         if self.command_sender.send(command(response_sender)).is_err() {
@@ -815,6 +913,70 @@ impl<'vm> HvfVcpuRunner<'vm> {
         }
 
         Ok(InFlightVtimerMaskOperation::new(&self.state))
+    }
+
+    fn start_gic_ppi_pending_operation(
+        &self,
+        intid: u32,
+        pending: bool,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    ) -> Result<InFlightGicPpiPendingOperation, HvfVcpuRunnerError> {
+        let mut state = self.lock_state()?;
+        if state.thread.is_none() {
+            return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
+        }
+        if state.shutting_down {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                RUNNER_SHUTTING_DOWN_MESSAGE,
+            ));
+        }
+        if state.in_flight_runs > 0 {
+            return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
+        }
+        if state.mmio_dispatch_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                MMIO_DISPATCH_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.boot_register_setup_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.metadata_read_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                METADATA_READ_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.vtimer_mask_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.gic_ppi_pending_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                GIC_PPI_PENDING_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        validate_gic_ppi_pending_intid(intid)?;
+
+        state.gic_ppi_pending_operation_in_flight = true;
+        if self
+            .command_sender
+            .send(RunnerCommand::SetGicPpiPending {
+                intid,
+                pending,
+                response_sender,
+            })
+            .is_err()
+        {
+            state.gic_ppi_pending_operation_in_flight = false;
+            return Err(HvfVcpuRunnerError::ChannelClosed(
+                COMMAND_CHANNEL_CLOSED_MESSAGE,
+            ));
+        }
+
+        Ok(InFlightGicPpiPendingOperation::new(&self.state))
     }
 
     fn prepare_shutdown(&self) -> Result<(mpsc::Sender<RunnerCommand>, bool), HvfVcpuRunnerError> {
@@ -835,6 +997,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.vtimer_mask_operation_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
                 VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.gic_ppi_pending_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                GIC_PPI_PENDING_OPERATION_IN_FLIGHT_MESSAGE,
             ));
         }
 
@@ -895,6 +1062,11 @@ fn prepare_cancel(
             VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE,
         ));
     }
+    if state.gic_ppi_pending_operation_in_flight {
+        return Err(HvfVcpuRunnerError::InvalidState(
+            GIC_PPI_PENDING_OPERATION_IN_FLIGHT_MESSAGE,
+        ));
+    }
     Ok(state)
 }
 
@@ -930,6 +1102,7 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                 state.boot_register_setup_in_flight,
                 state.metadata_read_in_flight,
                 state.vtimer_mask_operation_in_flight,
+                state.gic_ppi_pending_operation_in_flight,
                 state.boot_register_setup_failed,
                 state.boot_registers_configured,
                 state.run_started,
@@ -945,6 +1118,7 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                 boot_register_setup_in_flight,
                 metadata_read_in_flight,
                 vtimer_mask_operation_in_flight,
+                gic_ppi_pending_operation_in_flight,
                 boot_register_setup_failed,
                 boot_registers_configured,
                 run_started,
@@ -962,6 +1136,10 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                 .field(
                     "vtimer_mask_operation_in_flight",
                     &vtimer_mask_operation_in_flight,
+                )
+                .field(
+                    "gic_ppi_pending_operation_in_flight",
+                    &gic_ppi_pending_operation_in_flight,
                 )
                 .field("boot_register_setup_failed", &boot_register_setup_failed)
                 .field("boot_registers_configured", &boot_registers_configured)
@@ -1100,6 +1278,26 @@ impl Drop for InFlightVtimerMaskOperation {
     }
 }
 
+struct InFlightGicPpiPendingOperation {
+    state: RunnerState,
+}
+
+impl InFlightGicPpiPendingOperation {
+    fn new(state: &RunnerState) -> Self {
+        Self {
+            state: Arc::clone(state),
+        }
+    }
+}
+
+impl Drop for InFlightGicPpiPendingOperation {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.gic_ppi_pending_operation_in_flight = false;
+        }
+    }
+}
+
 fn spawn_runner_thread<C, V>(create_vcpu: C) -> Result<StartedRunner, HvfVcpuRunnerError>
 where
     C: FnOnce() -> Result<V, BackendError> + Send + 'static,
@@ -1210,6 +1408,16 @@ fn run_runner_thread<C, V>(
                     .map_err(HvfVcpuRunnerError::Backend);
                 let _ = response_sender.send(result);
             }
+            RunnerCommand::SetGicPpiPending {
+                intid,
+                pending,
+                response_sender,
+            } => {
+                let result = vcpu
+                    .set_gic_ppi_pending(intid, pending)
+                    .map_err(HvfVcpuRunnerError::Gic);
+                let _ = response_sender.send(result);
+            }
             RunnerCommand::Shutdown { response_sender } => {
                 let result = vcpu.destroy().map_err(HvfVcpuRunnerError::Backend);
                 let _ = response_sender.send(result);
@@ -1301,6 +1509,7 @@ mod tests {
         HvfExceptionExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
         HvfResolvedMmioAccess, HvfResolvedVcpuExit, HvfVcpuExit, HvfVcpuExitResolveError,
     };
+    use crate::gic::HvfGicError;
     use crate::mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
     use crate::vcpu::HvfArm64BootRegisters;
 
@@ -1358,6 +1567,18 @@ mod tests {
     }
 
     struct PanicOnVtimerMaskVcpu;
+
+    struct GicPpiPendingRecordingVcpu {
+        operation_sender: mpsc::Sender<(u32, bool)>,
+        fail_next_operation: bool,
+    }
+
+    struct BlockingGicPpiPendingVcpu {
+        entered_operation_sender: mpsc::Sender<()>,
+        release_operation_receiver: mpsc::Receiver<Result<(), HvfGicError>>,
+    }
+
+    struct PanicOnGicPpiPendingVcpu;
 
     struct MmioDispatchRecordingVcpu {
         dispatched_sender: mpsc::Sender<HvfResolvedMmioAccess>,
@@ -1772,6 +1993,119 @@ mod tests {
         }
     }
 
+    impl RunnerVcpu for GicPpiPendingRecordingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn set_gic_ppi_pending(&mut self, intid: u32, pending: bool) -> Result<(), HvfGicError> {
+            if self.fail_next_operation {
+                self.fail_next_operation = false;
+                Err(HvfGicError::InvalidState(
+                    "fake GIC PPI pending operation failed",
+                ))
+            } else {
+                self.operation_sender
+                    .send((intid, pending))
+                    .map_err(|_| HvfGicError::InvalidState("fake GIC PPI receiver closed"))
+            }
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for BlockingGicPpiPendingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn set_gic_ppi_pending(&mut self, _intid: u32, _pending: bool) -> Result<(), HvfGicError> {
+            self.entered_operation_sender
+                .send(())
+                .map_err(|_| HvfGicError::InvalidState("fake GIC PPI entry receiver closed"))?;
+            self.release_operation_receiver
+                .recv()
+                .map_err(|_| HvfGicError::InvalidState("fake GIC PPI release sender closed"))?
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for PanicOnGicPpiPendingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn set_gic_ppi_pending(&mut self, _intid: u32, _pending: bool) -> Result<(), HvfGicError> {
+            panic!("fake GIC PPI pending panic");
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
     impl RunnerVcpu for MmioDispatchRecordingVcpu {
         fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
             Ok(7)
@@ -2126,6 +2460,48 @@ mod tests {
         )
     }
 
+    fn start_gic_ppi_pending_recording_runner(
+        fail_next_operation: bool,
+    ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<(u32, bool)>) {
+        let (operation_sender, operation_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(GicPpiPendingRecordingVcpu {
+                operation_sender,
+                fail_next_operation,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            operation_receiver,
+        )
+    }
+
+    fn start_blocking_gic_ppi_pending_runner() -> (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<Result<(), HvfGicError>>,
+    ) {
+        let (entered_operation_sender, entered_operation_receiver) = mpsc::channel();
+        let (release_operation_sender, release_operation_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(BlockingGicPpiPendingVcpu {
+                entered_operation_sender,
+                release_operation_receiver,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            entered_operation_receiver,
+            release_operation_sender,
+        )
+    }
+
     fn start_fake_runner_with_cancel(
         cancel_vcpu: CancelVcpu,
         entered_run_sender: mpsc::Sender<()>,
@@ -2282,6 +2658,18 @@ mod tests {
                 ))
             );
             assert_eq!(
+                runner.set_gic_ppi_pending(27),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.clear_gic_ppi_pending(27),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
                 runner.cancel(),
                 Err(HvfVcpuRunnerError::InvalidState(
                     super::VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE
@@ -2316,6 +2704,187 @@ mod tests {
 
         assert_eq!(
             runner.get_vtimer_mask(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
+    fn sets_and_clears_gic_ppi_pending_on_runner_thread() {
+        let (runner, operation_receiver) = start_gic_ppi_pending_recording_runner(false);
+
+        assert_eq!(runner.set_gic_ppi_pending(27), Ok(()));
+        assert_eq!(runner.clear_gic_ppi_pending(27), Ok(()));
+
+        assert_eq!(
+            operation_receiver
+                .recv()
+                .expect("fake vCPU should receive set operation"),
+            (27, true)
+        );
+        assert_eq!(
+            operation_receiver
+                .recv()
+                .expect("fake vCPU should receive clear operation"),
+            (27, false)
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn failed_gic_ppi_pending_command_can_be_retried_without_stale_state() {
+        let (runner, operation_receiver) = start_gic_ppi_pending_recording_runner(true);
+
+        assert_eq!(
+            runner.set_gic_ppi_pending(27),
+            Err(HvfVcpuRunnerError::Gic(HvfGicError::InvalidState(
+                "fake GIC PPI pending operation failed"
+            )))
+        );
+        assert_eq!(runner.set_gic_ppi_pending(27), Ok(()));
+        assert_eq!(
+            operation_receiver
+                .recv()
+                .expect("fake vCPU should receive retried operation"),
+            (27, true)
+        );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn invalid_gic_ppi_pending_intid_is_rejected_without_queueing() {
+        let (runner, operation_receiver) = start_gic_ppi_pending_recording_runner(false);
+
+        assert_eq!(
+            runner.set_gic_ppi_pending(15),
+            Err(HvfVcpuRunnerError::Gic(HvfGicError::InvalidParameter {
+                name: "ppi_intid",
+                value: 15,
+            }))
+        );
+        assert_eq!(
+            runner.clear_gic_ppi_pending(32),
+            Err(HvfVcpuRunnerError::Gic(HvfGicError::InvalidParameter {
+                name: "ppi_intid",
+                value: 32,
+            }))
+        );
+        assert_eq!(
+            operation_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn commands_during_gic_ppi_pending_operation_are_rejected_without_queueing() {
+        let (runner, entered_operation_receiver, release_operation_sender) =
+            start_blocking_gic_ppi_pending_runner();
+
+        thread::scope(|scope| {
+            let operation = scope.spawn(|| runner.set_gic_ppi_pending(27));
+            entered_operation_receiver
+                .recv()
+                .expect("runner should enter fake GIC PPI pending operation");
+
+            assert_eq!(
+                runner.set_gic_ppi_pending(27),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::GIC_PPI_PENDING_OPERATION_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.clear_gic_ppi_pending(27),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::GIC_PPI_PENDING_OPERATION_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.run_once(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::GIC_PPI_PENDING_OPERATION_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.run_once_and_handle_mmio(shared_dispatcher()),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::GIC_PPI_PENDING_OPERATION_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.dispatch_mmio_access(resolved_mmio_access(), shared_dispatcher()),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::GIC_PPI_PENDING_OPERATION_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.configure_arm64_boot_registers(boot_registers()),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::GIC_PPI_PENDING_OPERATION_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.mpidr_el1(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::GIC_PPI_PENDING_OPERATION_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.get_vtimer_mask(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::GIC_PPI_PENDING_OPERATION_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.set_vtimer_mask(false),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::GIC_PPI_PENDING_OPERATION_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.cancel(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::GIC_PPI_PENDING_OPERATION_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.shutdown(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::GIC_PPI_PENDING_OPERATION_IN_FLIGHT_MESSAGE
+                ))
+            );
+
+            release_operation_sender
+                .send(Ok(()))
+                .expect("GIC PPI pending release should be sent");
+            assert_eq!(
+                operation
+                    .join()
+                    .expect("GIC PPI pending thread should join"),
+                Ok(())
+            );
+        });
+
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn shutdown_reports_thread_panic_after_gic_ppi_pending_panic() {
+        let started = spawn_runner_thread(|| Ok(PanicOnGicPpiPendingVcpu))
+            .expect("panic runner should start");
+        let runner = HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+            .expect("runner should be created");
+
+        assert_eq!(
+            runner.set_gic_ppi_pending(27),
             Err(HvfVcpuRunnerError::ChannelClosed(
                 super::RESPONSE_CHANNEL_CLOSED_MESSAGE
             ))
@@ -2371,6 +2940,18 @@ mod tests {
             );
             assert_eq!(
                 runner.set_vtimer_mask(false),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::METADATA_READ_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.set_gic_ppi_pending(27),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::METADATA_READ_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.clear_gic_ppi_pending(27),
                 Err(HvfVcpuRunnerError::InvalidState(
                     super::METADATA_READ_IN_FLIGHT_MESSAGE
                 ))
@@ -2436,6 +3017,26 @@ mod tests {
     }
 
     #[test]
+    fn gic_ppi_pending_operation_after_shutdown_is_rejected() {
+        let (runner, _operation_receiver) = start_gic_ppi_pending_recording_runner(false);
+
+        runner.shutdown().expect("runner should shut down");
+
+        assert_eq!(
+            runner.set_gic_ppi_pending(27),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUNNER_SHUT_DOWN_MESSAGE
+            ))
+        );
+        assert_eq!(
+            runner.clear_gic_ppi_pending(27),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUNNER_SHUT_DOWN_MESSAGE
+            ))
+        );
+    }
+
+    #[test]
     fn mpidr_read_during_shutdown_is_rejected() {
         let (runner, _, destroyed_receiver) = start_fake_runner();
         let (command_sender, should_cancel) = runner
@@ -2486,6 +3087,47 @@ mod tests {
         );
         assert_eq!(
             runner.set_vtimer_mask(true),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUNNER_SHUTTING_DOWN_MESSAGE
+            ))
+        );
+
+        let thread = runner
+            .take_thread()
+            .expect("runner state should be lockable");
+        let (response_sender, response_receiver) = mpsc::channel();
+        command_sender
+            .send(super::RunnerCommand::Shutdown { response_sender })
+            .expect("shutdown command should be sent");
+        assert_eq!(
+            response_receiver
+                .recv()
+                .expect("shutdown response should be sent"),
+            Ok(())
+        );
+        super::join_runner_thread(thread).expect("runner thread should join");
+        runner.finish_shutdown();
+        destroyed_receiver
+            .recv()
+            .expect("fake vCPU should be destroyed");
+    }
+
+    #[test]
+    fn gic_ppi_pending_operation_during_shutdown_is_rejected() {
+        let (runner, _, destroyed_receiver) = start_fake_runner();
+        let (command_sender, should_cancel) = runner
+            .prepare_shutdown()
+            .expect("first shutdown should be prepared");
+
+        assert!(!should_cancel);
+        assert_eq!(
+            runner.set_gic_ppi_pending(27),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUNNER_SHUTTING_DOWN_MESSAGE
+            ))
+        );
+        assert_eq!(
+            runner.clear_gic_ppi_pending(27),
             Err(HvfVcpuRunnerError::InvalidState(
                 super::RUNNER_SHUTTING_DOWN_MESSAGE
             ))
@@ -2705,6 +3347,18 @@ mod tests {
                     super::RUN_IN_FLIGHT_MESSAGE
                 ))
             );
+            assert_eq!(
+                runner.set_gic_ppi_pending(27),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::RUN_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.clear_gic_ppi_pending(27),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::RUN_IN_FLIGHT_MESSAGE
+                ))
+            );
 
             runner.cancel().expect("cancel should release fake run");
             assert_eq!(
@@ -2771,6 +3425,18 @@ mod tests {
 
             assert_eq!(
                 runner.run_once(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.set_gic_ppi_pending(27),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.clear_gic_ppi_pending(27),
                 Err(HvfVcpuRunnerError::InvalidState(
                     super::BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE
                 ))
@@ -3096,6 +3762,18 @@ mod tests {
                 super::RUNNER_SHUTTING_DOWN_MESSAGE
             ))
         );
+        assert_eq!(
+            runner.set_gic_ppi_pending(27),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUNNER_SHUTTING_DOWN_MESSAGE
+            ))
+        );
+        assert_eq!(
+            runner.clear_gic_ppi_pending(27),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUNNER_SHUTTING_DOWN_MESSAGE
+            ))
+        );
         let cancel_handle = runner.run_cancel_handle();
         assert_eq!(
             cancel_handle.cancel(),
@@ -3412,6 +4090,18 @@ mod tests {
                     super::RUN_IN_FLIGHT_MESSAGE
                 ))
             );
+            assert_eq!(
+                runner.set_gic_ppi_pending(27),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::RUN_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.clear_gic_ppi_pending(27),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::RUN_IN_FLIGHT_MESSAGE
+                ))
+            );
 
             runner.cancel().expect("cancel should release fake run");
             assert_eq!(
@@ -3657,6 +4347,18 @@ mod tests {
                     super::BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE
                 ))
             );
+            assert_eq!(
+                runner.set_gic_ppi_pending(27),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.clear_gic_ppi_pending(27),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE
+                ))
+            );
 
             release_setup_sender
                 .send(Ok(()))
@@ -3722,6 +4424,18 @@ mod tests {
             );
             assert_eq!(
                 runner.set_vtimer_mask(false),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::MMIO_DISPATCH_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.set_gic_ppi_pending(27),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::MMIO_DISPATCH_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.clear_gic_ppi_pending(27),
                 Err(HvfVcpuRunnerError::InvalidState(
                     super::MMIO_DISPATCH_IN_FLIGHT_MESSAGE
                 ))
