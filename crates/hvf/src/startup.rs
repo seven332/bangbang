@@ -406,14 +406,28 @@ impl OwnedHvfArm64BootSession {
         &self.runtime_resources
     }
 
+    /// Return a cloned handle to the runner-compatible MMIO dispatcher.
+    ///
+    /// The dispatcher is local to this boot session. It is shared only so
+    /// vCPU-runner commands can dispatch MMIO on the runner thread. Keep cloned
+    /// handles scoped to runner commands so dispatcher-owned device resources
+    /// are released with the session.
     pub fn mmio_dispatcher(&self) -> Arc<Mutex<MmioDispatcher>> {
         Arc::clone(&self.mmio_dispatcher)
     }
 
+    /// Borrow the guest memory mapped for this prepared boot session.
+    ///
+    /// This is internal startup plumbing for later runner-loop work; it does not
+    /// make public `InstanceStart` succeed.
     pub fn guest_memory(&self) -> Result<&GuestMemory, HvfGuestMemoryMappingError> {
         self.backend.mapped_guest_memory()
     }
 
+    /// Mutably borrow the guest memory mapped for this prepared boot session.
+    ///
+    /// The HVF backend remains the mapping owner, so shutdown and drop still
+    /// unmap the memory through the backend.
     pub fn guest_memory_mut(&mut self) -> Result<&mut GuestMemory, HvfGuestMemoryMappingError> {
         self.backend.mapped_guest_memory_mut()
     }
