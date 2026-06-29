@@ -110,6 +110,8 @@ mod imp {
         pub fn hv_vcpu_set_reg(vcpu: HvVcpu, reg: HvReg, value: u64) -> HvReturn;
         pub fn hv_vcpu_get_sys_reg(vcpu: HvVcpu, reg: HvSysReg, value: *mut u64) -> HvReturn;
         pub fn hv_vcpu_set_sys_reg(vcpu: HvVcpu, reg: HvSysReg, value: u64) -> HvReturn;
+        pub fn hv_vcpu_get_vtimer_mask(vcpu: HvVcpu, vtimer_is_masked: *mut bool) -> HvReturn;
+        pub fn hv_vcpu_set_vtimer_mask(vcpu: HvVcpu, vtimer_is_masked: bool) -> HvReturn;
         pub fn hv_vcpu_run(vcpu: HvVcpu) -> HvReturn;
         pub fn hv_vcpus_exit(vcpus: *mut HvVcpu, vcpu_count: u32) -> HvReturn;
     }
@@ -256,6 +258,31 @@ mod imp {
         unsafe { check(hv_vcpu_set_sys_reg(vcpu, reg, value), "hv_vcpu_set_sys_reg") }
     }
 
+    pub fn get_vtimer_mask(vcpu: HvVcpu) -> Result<bool, BackendError> {
+        let mut value = false;
+
+        // SAFETY: The caller owns this current-thread vCPU handle, and `value` is a valid
+        // out-pointer for the duration of the call.
+        unsafe {
+            check(
+                hv_vcpu_get_vtimer_mask(vcpu, &mut value),
+                "hv_vcpu_get_vtimer_mask",
+            )?
+        };
+
+        Ok(value)
+    }
+
+    pub fn set_vtimer_mask(vcpu: HvVcpu, masked: bool) -> Result<(), BackendError> {
+        // SAFETY: The caller owns this current-thread vCPU handle.
+        unsafe {
+            check(
+                hv_vcpu_set_vtimer_mask(vcpu, masked),
+                "hv_vcpu_set_vtimer_mask",
+            )
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::{HV_BAD_ARGUMENT, HV_DENIED, HV_UNSUPPORTED, check};
@@ -353,6 +380,14 @@ mod imp {
     }
 
     pub fn set_sys_reg(_: HvVcpu, _: HvSysReg, _: u64) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
+    pub fn get_vtimer_mask(_: HvVcpu) -> Result<bool, BackendError> {
+        Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
+    }
+
+    pub fn set_vtimer_mask(_: HvVcpu, _: bool) -> Result<(), BackendError> {
         Err(BackendError::Unsupported(UNSUPPORTED_TARGET_MESSAGE))
     }
 }

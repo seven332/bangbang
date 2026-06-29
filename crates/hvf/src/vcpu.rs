@@ -188,6 +188,14 @@ impl HvfVcpuOwner {
         crate::ffi::set_sys_reg(self.handle()?.vcpu, register.raw(), value)
     }
 
+    pub(crate) fn get_vtimer_mask(&self) -> Result<bool, BackendError> {
+        crate::ffi::get_vtimer_mask(self.handle()?.vcpu)
+    }
+
+    pub(crate) fn set_vtimer_mask(&mut self, masked: bool) -> Result<(), BackendError> {
+        crate::ffi::set_vtimer_mask(self.handle()?.vcpu, masked)
+    }
+
     fn mark_exit_available(&mut self) -> Result<(), BackendError> {
         self.handle_mut()?.exit_available = true;
         Ok(())
@@ -312,6 +320,16 @@ impl<'vm> HvfVcpu<'vm> {
         value: u64,
     ) -> Result<(), BackendError> {
         self.owner.set_system_register(register, value)
+    }
+
+    /// Read whether HVF's ARM virtual timer exit is masked for this current-thread vCPU.
+    pub fn get_vtimer_mask(&self) -> Result<bool, BackendError> {
+        self.owner.get_vtimer_mask()
+    }
+
+    /// Set whether HVF should suppress ARM virtual timer activated exits for this vCPU.
+    pub fn set_vtimer_mask(&mut self, masked: bool) -> Result<(), BackendError> {
+        self.owner.set_vtimer_mask(masked)
     }
 }
 
@@ -496,6 +514,14 @@ mod tests {
         );
         assert_eq!(
             vcpu.configure_arm64_boot_registers(boot_registers()),
+            Err(BackendError::InvalidState(DESTROYED_VCPU_MESSAGE))
+        );
+        assert_eq!(
+            vcpu.get_vtimer_mask(),
+            Err(BackendError::InvalidState(DESTROYED_VCPU_MESSAGE))
+        );
+        assert_eq!(
+            vcpu.set_vtimer_mask(false),
             Err(BackendError::InvalidState(DESTROYED_VCPU_MESSAGE))
         );
     }

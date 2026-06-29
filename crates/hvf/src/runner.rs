@@ -25,6 +25,8 @@ const BOOT_REGISTERS_ALREADY_CONFIGURED_MESSAGE: &str =
     "vCPU runner boot registers are already configured";
 const RUN_ALREADY_STARTED_MESSAGE: &str = "vCPU runner has already started a run";
 const METADATA_READ_IN_FLIGHT_MESSAGE: &str = "vCPU runner already has metadata read in flight";
+const VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE: &str =
+    "vCPU runner already has virtual timer mask operation in flight";
 const RUNNER_STATE_POISONED_MESSAGE: &str = "vCPU runner state lock is poisoned";
 const MMIO_DISPATCHER_BUSY_MESSAGE: &str = "vCPU runner MMIO dispatcher lock is busy";
 const MMIO_DISPATCHER_POISONED_MESSAGE: &str = "vCPU runner MMIO dispatcher lock is poisoned";
@@ -148,6 +150,7 @@ struct RunnerHandleState {
     mmio_dispatch_in_flight: bool,
     boot_register_setup_in_flight: bool,
     metadata_read_in_flight: bool,
+    vtimer_mask_operation_in_flight: bool,
     boot_register_setup_failed: bool,
     boot_registers_configured: bool,
     run_started: bool,
@@ -172,6 +175,13 @@ enum RunnerCommand {
     },
     ReadMpidrEl1 {
         response_sender: mpsc::Sender<Result<u64, HvfVcpuRunnerError>>,
+    },
+    GetVtimerMask {
+        response_sender: mpsc::Sender<Result<bool, HvfVcpuRunnerError>>,
+    },
+    SetVtimerMask {
+        masked: bool,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
     },
     Shutdown {
         response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
@@ -199,6 +209,16 @@ trait RunnerVcpu {
     fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
         Err(BackendError::InvalidState(
             "vCPU does not support MPIDR_EL1 reads",
+        ))
+    }
+    fn get_vtimer_mask(&mut self) -> Result<bool, BackendError> {
+        Err(BackendError::InvalidState(
+            "vCPU does not support virtual timer mask reads",
+        ))
+    }
+    fn set_vtimer_mask(&mut self, _masked: bool) -> Result<(), BackendError> {
+        Err(BackendError::InvalidState(
+            "vCPU does not support virtual timer mask writes",
         ))
     }
     fn destroy(&mut self) -> Result<(), BackendError>;
@@ -244,6 +264,14 @@ impl RunnerVcpu for RealRunnerVcpu {
 
     fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
         self.owner.get_system_register(HvfSystemRegister::MPIDR_EL1)
+    }
+
+    fn get_vtimer_mask(&mut self) -> Result<bool, BackendError> {
+        self.owner.get_vtimer_mask()
+    }
+
+    fn set_vtimer_mask(&mut self, masked: bool) -> Result<(), BackendError> {
+        self.owner.set_vtimer_mask(masked)
     }
 
     fn destroy(&mut self) -> Result<(), BackendError> {
@@ -345,6 +373,26 @@ impl<'vm> HvfVcpuRunner<'vm> {
             .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
     }
 
+    /// Read the HVF virtual timer mask on the vCPU-owning runner thread.
+    pub fn get_vtimer_mask(&self) -> Result<bool, HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        let _in_flight_operation = self.start_get_vtimer_mask(response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
+    /// Set the HVF virtual timer mask on the vCPU-owning runner thread.
+    pub fn set_vtimer_mask(&self, masked: bool) -> Result<(), HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        let _in_flight_operation = self.start_set_vtimer_mask(masked, response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
     pub fn shutdown(&self) -> Result<(), HvfVcpuRunnerError> {
         let (command_sender, should_cancel) = match self.prepare_shutdown() {
             Ok(prepared_shutdown) => prepared_shutdown,
@@ -391,6 +439,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 mmio_dispatch_in_flight: false,
                 boot_register_setup_in_flight: false,
                 metadata_read_in_flight: false,
+                vtimer_mask_operation_in_flight: false,
                 boot_register_setup_failed: false,
                 boot_registers_configured: false,
                 run_started: false,
@@ -429,6 +478,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.metadata_read_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
                 METADATA_READ_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.vtimer_mask_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE,
             ));
         }
         if state.run_started {
@@ -486,6 +540,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 METADATA_READ_IN_FLIGHT_MESSAGE,
             ));
         }
+        if state.vtimer_mask_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
         if state.boot_register_setup_failed {
             return Err(HvfVcpuRunnerError::InvalidState(
                 BOOT_REGISTER_SETUP_FAILED_MESSAGE,
@@ -534,6 +593,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.metadata_read_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
                 METADATA_READ_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.vtimer_mask_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE,
             ));
         }
         if state.boot_register_setup_failed {
@@ -588,6 +652,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.metadata_read_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
                 METADATA_READ_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.vtimer_mask_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE,
             ));
         }
         if state.boot_register_setup_failed {
@@ -654,6 +723,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 METADATA_READ_IN_FLIGHT_MESSAGE,
             ));
         }
+        if state.vtimer_mask_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
 
         state.metadata_read_in_flight = true;
         if self
@@ -670,6 +744,79 @@ impl<'vm> HvfVcpuRunner<'vm> {
         Ok(InFlightMetadataRead::new(&self.state))
     }
 
+    fn start_get_vtimer_mask(
+        &self,
+        response_sender: mpsc::Sender<Result<bool, HvfVcpuRunnerError>>,
+    ) -> Result<InFlightVtimerMaskOperation, HvfVcpuRunnerError> {
+        self.start_vtimer_mask_operation(
+            |response_sender| RunnerCommand::GetVtimerMask { response_sender },
+            response_sender,
+        )
+    }
+
+    fn start_set_vtimer_mask(
+        &self,
+        masked: bool,
+        response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
+    ) -> Result<InFlightVtimerMaskOperation, HvfVcpuRunnerError> {
+        self.start_vtimer_mask_operation(
+            |response_sender| RunnerCommand::SetVtimerMask {
+                masked,
+                response_sender,
+            },
+            response_sender,
+        )
+    }
+
+    fn start_vtimer_mask_operation<T>(
+        &self,
+        command: impl FnOnce(mpsc::Sender<Result<T, HvfVcpuRunnerError>>) -> RunnerCommand,
+        response_sender: mpsc::Sender<Result<T, HvfVcpuRunnerError>>,
+    ) -> Result<InFlightVtimerMaskOperation, HvfVcpuRunnerError> {
+        let mut state = self.lock_state()?;
+        if state.thread.is_none() {
+            return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
+        }
+        if state.shutting_down {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                RUNNER_SHUTTING_DOWN_MESSAGE,
+            ));
+        }
+        if state.in_flight_runs > 0 {
+            return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
+        }
+        if state.mmio_dispatch_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                MMIO_DISPATCH_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.boot_register_setup_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.metadata_read_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                METADATA_READ_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.vtimer_mask_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE,
+            ));
+        }
+
+        state.vtimer_mask_operation_in_flight = true;
+        if self.command_sender.send(command(response_sender)).is_err() {
+            state.vtimer_mask_operation_in_flight = false;
+            return Err(HvfVcpuRunnerError::ChannelClosed(
+                COMMAND_CHANNEL_CLOSED_MESSAGE,
+            ));
+        }
+
+        Ok(InFlightVtimerMaskOperation::new(&self.state))
+    }
+
     fn prepare_shutdown(&self) -> Result<(mpsc::Sender<RunnerCommand>, bool), HvfVcpuRunnerError> {
         let mut state = self.lock_state()?;
         if state.shutting_down {
@@ -683,6 +830,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.metadata_read_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
                 METADATA_READ_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.vtimer_mask_operation_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE,
             ));
         }
 
@@ -738,6 +890,11 @@ fn prepare_cancel(
             METADATA_READ_IN_FLIGHT_MESSAGE,
         ));
     }
+    if state.vtimer_mask_operation_in_flight {
+        return Err(HvfVcpuRunnerError::InvalidState(
+            VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE,
+        ));
+    }
     Ok(state)
 }
 
@@ -772,6 +929,7 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                 state.mmio_dispatch_in_flight,
                 state.boot_register_setup_in_flight,
                 state.metadata_read_in_flight,
+                state.vtimer_mask_operation_in_flight,
                 state.boot_register_setup_failed,
                 state.boot_registers_configured,
                 state.run_started,
@@ -786,6 +944,7 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                 mmio_dispatch_in_flight,
                 boot_register_setup_in_flight,
                 metadata_read_in_flight,
+                vtimer_mask_operation_in_flight,
                 boot_register_setup_failed,
                 boot_registers_configured,
                 run_started,
@@ -800,6 +959,10 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                     &boot_register_setup_in_flight,
                 )
                 .field("metadata_read_in_flight", &metadata_read_in_flight)
+                .field(
+                    "vtimer_mask_operation_in_flight",
+                    &vtimer_mask_operation_in_flight,
+                )
                 .field("boot_register_setup_failed", &boot_register_setup_failed)
                 .field("boot_registers_configured", &boot_registers_configured)
                 .field("run_started", &run_started)
@@ -917,6 +1080,26 @@ impl Drop for InFlightMetadataRead {
     }
 }
 
+struct InFlightVtimerMaskOperation {
+    state: RunnerState,
+}
+
+impl InFlightVtimerMaskOperation {
+    fn new(state: &RunnerState) -> Self {
+        Self {
+            state: Arc::clone(state),
+        }
+    }
+}
+
+impl Drop for InFlightVtimerMaskOperation {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.vtimer_mask_operation_in_flight = false;
+        }
+    }
+}
+
 fn spawn_runner_thread<C, V>(create_vcpu: C) -> Result<StartedRunner, HvfVcpuRunnerError>
 where
     C: FnOnce() -> Result<V, BackendError> + Send + 'static,
@@ -1012,6 +1195,19 @@ fn run_runner_thread<C, V>(
             }
             RunnerCommand::ReadMpidrEl1 { response_sender } => {
                 let result = vcpu.mpidr_el1().map_err(HvfVcpuRunnerError::Backend);
+                let _ = response_sender.send(result);
+            }
+            RunnerCommand::GetVtimerMask { response_sender } => {
+                let result = vcpu.get_vtimer_mask().map_err(HvfVcpuRunnerError::Backend);
+                let _ = response_sender.send(result);
+            }
+            RunnerCommand::SetVtimerMask {
+                masked,
+                response_sender,
+            } => {
+                let result = vcpu
+                    .set_vtimer_mask(masked)
+                    .map_err(HvfVcpuRunnerError::Backend);
                 let _ = response_sender.send(result);
             }
             RunnerCommand::Shutdown { response_sender } => {
@@ -1149,6 +1345,19 @@ mod tests {
         entered_read_sender: mpsc::Sender<()>,
         release_read_receiver: mpsc::Receiver<Result<u64, BackendError>>,
     }
+
+    struct VtimerMaskRecordingVcpu {
+        masked: bool,
+        fail_next_get: bool,
+        fail_next_set: bool,
+    }
+
+    struct BlockingVtimerMaskVcpu {
+        entered_get_sender: mpsc::Sender<()>,
+        release_get_receiver: mpsc::Receiver<Result<bool, BackendError>>,
+    }
+
+    struct PanicOnVtimerMaskVcpu;
 
     struct MmioDispatchRecordingVcpu {
         dispatched_sender: mpsc::Sender<HvfResolvedMmioAccess>,
@@ -1437,6 +1646,125 @@ mod tests {
             self.release_read_receiver
                 .recv()
                 .map_err(|_| BackendError::InvalidState("fake MPIDR release sender closed"))?
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for VtimerMaskRecordingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn get_vtimer_mask(&mut self) -> Result<bool, BackendError> {
+            if self.fail_next_get {
+                self.fail_next_get = false;
+                Err(BackendError::InvalidState("fake vtimer mask read failed"))
+            } else {
+                Ok(self.masked)
+            }
+        }
+
+        fn set_vtimer_mask(&mut self, masked: bool) -> Result<(), BackendError> {
+            if self.fail_next_set {
+                self.fail_next_set = false;
+                Err(BackendError::InvalidState("fake vtimer mask write failed"))
+            } else {
+                self.masked = masked;
+                Ok(())
+            }
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for BlockingVtimerMaskVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn get_vtimer_mask(&mut self) -> Result<bool, BackendError> {
+            self.entered_get_sender.send(()).map_err(|_| {
+                BackendError::InvalidState("fake vtimer mask entry receiver closed")
+            })?;
+            self.release_get_receiver
+                .recv()
+                .map_err(|_| BackendError::InvalidState("fake vtimer mask release sender closed"))?
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for PanicOnVtimerMaskVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn get_vtimer_mask(&mut self) -> Result<bool, BackendError> {
+            panic!("fake vtimer mask panic");
         }
 
         fn destroy(&mut self) -> Result<(), BackendError> {
@@ -1757,6 +2085,47 @@ mod tests {
         )
     }
 
+    fn start_vtimer_mask_recording_runner(
+        masked: bool,
+        fail_next_get: bool,
+        fail_next_set: bool,
+    ) -> HvfVcpuRunner<'static> {
+        let started = spawn_runner_thread(move || {
+            Ok(VtimerMaskRecordingVcpu {
+                masked,
+                fail_next_get,
+                fail_next_set,
+            })
+        })
+        .expect("fake runner should start");
+
+        HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+            .expect("runner should be created")
+    }
+
+    fn start_blocking_vtimer_mask_runner() -> (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<Result<bool, BackendError>>,
+    ) {
+        let (entered_get_sender, entered_get_receiver) = mpsc::channel();
+        let (release_get_sender, release_get_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(BlockingVtimerMaskVcpu {
+                entered_get_sender,
+                release_get_receiver,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            entered_get_receiver,
+            release_get_sender,
+        )
+    }
+
     fn start_fake_runner_with_cancel(
         cancel_vcpu: CancelVcpu,
         entered_run_sender: mpsc::Sender<()>,
@@ -1819,6 +2188,142 @@ mod tests {
     }
 
     #[test]
+    fn reads_and_sets_vtimer_mask_on_runner_thread() {
+        let runner = start_vtimer_mask_recording_runner(false, false, false);
+
+        assert_eq!(runner.get_vtimer_mask(), Ok(false));
+        assert_eq!(runner.set_vtimer_mask(true), Ok(()));
+        assert_eq!(runner.get_vtimer_mask(), Ok(true));
+        assert_eq!(runner.set_vtimer_mask(false), Ok(()));
+        assert_eq!(runner.get_vtimer_mask(), Ok(false));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn failed_vtimer_mask_commands_can_be_retried_without_stale_state() {
+        let get_runner = start_vtimer_mask_recording_runner(true, true, false);
+        let set_runner = start_vtimer_mask_recording_runner(false, false, true);
+
+        assert_eq!(
+            get_runner.get_vtimer_mask(),
+            Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
+                "fake vtimer mask read failed"
+            )))
+        );
+        assert_eq!(get_runner.get_vtimer_mask(), Ok(true));
+        assert_eq!(get_runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        assert_eq!(
+            set_runner.set_vtimer_mask(true),
+            Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
+                "fake vtimer mask write failed"
+            )))
+        );
+        assert_eq!(set_runner.set_vtimer_mask(true), Ok(()));
+        assert_eq!(set_runner.get_vtimer_mask(), Ok(true));
+        assert_eq!(set_runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        get_runner.shutdown().expect("runner should shut down");
+        set_runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn commands_during_vtimer_mask_operation_are_rejected_without_queueing() {
+        let (runner, entered_get_receiver, release_get_sender) =
+            start_blocking_vtimer_mask_runner();
+
+        thread::scope(|scope| {
+            let read = scope.spawn(|| runner.get_vtimer_mask());
+            entered_get_receiver
+                .recv()
+                .expect("runner should enter fake vtimer mask read");
+
+            assert_eq!(
+                runner.get_vtimer_mask(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.set_vtimer_mask(false),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.run_once(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.run_once_and_handle_mmio(shared_dispatcher()),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.dispatch_mmio_access(resolved_mmio_access(), shared_dispatcher()),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.configure_arm64_boot_registers(boot_registers()),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.mpidr_el1(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.cancel(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.shutdown(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::VTIMER_MASK_OPERATION_IN_FLIGHT_MESSAGE
+                ))
+            );
+
+            release_get_sender
+                .send(Ok(true))
+                .expect("vtimer mask release should be sent");
+            assert_eq!(
+                read.join().expect("vtimer mask read thread should join"),
+                Ok(true)
+            );
+        });
+
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn shutdown_reports_thread_panic_after_vtimer_mask_panic() {
+        let started =
+            spawn_runner_thread(|| Ok(PanicOnVtimerMaskVcpu)).expect("panic runner should start");
+        let runner = HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+            .expect("runner should be created");
+
+        assert_eq!(
+            runner.get_vtimer_mask(),
+            Err(HvfVcpuRunnerError::ChannelClosed(
+                super::RESPONSE_CHANNEL_CLOSED_MESSAGE
+            ))
+        );
+        assert_eq!(runner.shutdown(), Err(HvfVcpuRunnerError::ThreadPanicked));
+    }
+
+    #[test]
     fn commands_during_mpidr_read_are_rejected_without_queueing() {
         let (runner, entered_read_receiver, release_read_sender) = start_blocking_mpidr_runner();
 
@@ -1854,6 +2359,18 @@ mod tests {
             );
             assert_eq!(
                 runner.configure_arm64_boot_registers(boot_registers()),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::METADATA_READ_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.get_vtimer_mask(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::METADATA_READ_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.set_vtimer_mask(false),
                 Err(HvfVcpuRunnerError::InvalidState(
                     super::METADATA_READ_IN_FLIGHT_MESSAGE
                 ))
@@ -1899,6 +2416,26 @@ mod tests {
     }
 
     #[test]
+    fn vtimer_mask_operation_after_shutdown_is_rejected() {
+        let runner = start_vtimer_mask_recording_runner(false, false, false);
+
+        runner.shutdown().expect("runner should shut down");
+
+        assert_eq!(
+            runner.get_vtimer_mask(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUNNER_SHUT_DOWN_MESSAGE
+            ))
+        );
+        assert_eq!(
+            runner.set_vtimer_mask(true),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUNNER_SHUT_DOWN_MESSAGE
+            ))
+        );
+    }
+
+    #[test]
     fn mpidr_read_during_shutdown_is_rejected() {
         let (runner, _, destroyed_receiver) = start_fake_runner();
         let (command_sender, should_cancel) = runner
@@ -1908,6 +2445,47 @@ mod tests {
         assert!(!should_cancel);
         assert_eq!(
             runner.mpidr_el1(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUNNER_SHUTTING_DOWN_MESSAGE
+            ))
+        );
+
+        let thread = runner
+            .take_thread()
+            .expect("runner state should be lockable");
+        let (response_sender, response_receiver) = mpsc::channel();
+        command_sender
+            .send(super::RunnerCommand::Shutdown { response_sender })
+            .expect("shutdown command should be sent");
+        assert_eq!(
+            response_receiver
+                .recv()
+                .expect("shutdown response should be sent"),
+            Ok(())
+        );
+        super::join_runner_thread(thread).expect("runner thread should join");
+        runner.finish_shutdown();
+        destroyed_receiver
+            .recv()
+            .expect("fake vCPU should be destroyed");
+    }
+
+    #[test]
+    fn vtimer_mask_operation_during_shutdown_is_rejected() {
+        let (runner, _, destroyed_receiver) = start_fake_runner();
+        let (command_sender, should_cancel) = runner
+            .prepare_shutdown()
+            .expect("first shutdown should be prepared");
+
+        assert!(!should_cancel);
+        assert_eq!(
+            runner.get_vtimer_mask(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUNNER_SHUTTING_DOWN_MESSAGE
+            ))
+        );
+        assert_eq!(
+            runner.set_vtimer_mask(true),
             Err(HvfVcpuRunnerError::InvalidState(
                 super::RUNNER_SHUTTING_DOWN_MESSAGE
             ))
@@ -2111,6 +2689,18 @@ mod tests {
             );
             assert_eq!(
                 runner.mpidr_el1(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::RUN_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.get_vtimer_mask(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::RUN_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.set_vtimer_mask(false),
                 Err(HvfVcpuRunnerError::InvalidState(
                     super::RUN_IN_FLIGHT_MESSAGE
                 ))
@@ -2810,6 +3400,18 @@ mod tests {
                     super::RUN_IN_FLIGHT_MESSAGE
                 ))
             );
+            assert_eq!(
+                runner.get_vtimer_mask(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::RUN_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.set_vtimer_mask(false),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::RUN_IN_FLIGHT_MESSAGE
+                ))
+            );
 
             runner.cancel().expect("cancel should release fake run");
             assert_eq!(
@@ -3043,6 +3645,18 @@ mod tests {
                     super::BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE
                 ))
             );
+            assert_eq!(
+                runner.get_vtimer_mask(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.set_vtimer_mask(false),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE
+                ))
+            );
 
             release_setup_sender
                 .send(Ok(()))
@@ -3096,6 +3710,18 @@ mod tests {
             );
             assert_eq!(
                 runner.mpidr_el1(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::MMIO_DISPATCH_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.get_vtimer_mask(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::MMIO_DISPATCH_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.set_vtimer_mask(false),
                 Err(HvfVcpuRunnerError::InvalidState(
                     super::MMIO_DISPATCH_IN_FLIGHT_MESSAGE
                 ))

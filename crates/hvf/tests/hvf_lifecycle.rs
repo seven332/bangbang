@@ -29,6 +29,19 @@ fn creates_and_destroys_hvf_vcpu() {
                 .expect("vCPU register should be read"),
             0x1234
         );
+        vcpu.set_vtimer_mask(true)
+            .expect("vCPU vtimer mask should be set");
+        assert!(
+            vcpu.get_vtimer_mask()
+                .expect("vCPU vtimer mask should be read")
+        );
+        vcpu.set_vtimer_mask(false)
+            .expect("vCPU vtimer mask should be cleared");
+        assert!(
+            !vcpu
+                .get_vtimer_mask()
+                .expect("vCPU vtimer mask should be read")
+        );
         vcpu.destroy().expect("vCPU should be destroyed");
         vcpu.destroy()
             .expect("destroyed vCPU should remain destroyed");
@@ -166,6 +179,22 @@ fn cancels_runner_before_first_run() {
         let runner = backend
             .start_vcpu_runner()
             .expect("vCPU runner should start");
+        runner
+            .set_vtimer_mask(true)
+            .expect("runner vtimer mask should be set");
+        assert!(
+            runner
+                .get_vtimer_mask()
+                .expect("runner vtimer mask should be read")
+        );
+        runner
+            .set_vtimer_mask(false)
+            .expect("runner vtimer mask should be cleared");
+        assert!(
+            !runner
+                .get_vtimer_mask()
+                .expect("runner vtimer mask should be read")
+        );
         runner.cancel().expect("runner should accept cancellation");
         assert_eq!(
             runner.run_once().expect("runner should return an exit"),
