@@ -354,6 +354,98 @@ fn prepares_internal_hvf_arm64_boot_session() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn prepares_owned_hvf_arm64_boot_session() {
+    use bangbang_hvf::{HvfArm64BootSessionConfig, OwnedHvfArm64BootSession};
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::BlockMmioLayout;
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::mmio::MmioRegionId;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel =
+        TempFile::new("owned-session-kernel", &image).expect("temp kernel should be created");
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("boot source config should be stored");
+    let config = HvfArm64BootSessionConfig::new(BlockMmioLayout::new(
+        GuestAddress::new(0x4000_0000),
+        MmioRegionId::new(1),
+    ));
+
+    let mut session = OwnedHvfArm64BootSession::new(&controller, config.clone())
+        .expect("owned HVF arm64 boot session should prepare");
+
+    let mmio_dispatcher = session.mmio_dispatcher();
+    assert!(
+        mmio_dispatcher
+            .try_lock()
+            .expect("owned session MMIO dispatcher should lock")
+            .regions()
+            .is_empty()
+    );
+    assert!(session.block_interrupt_lines().is_empty());
+    assert_eq!(
+        session
+            .guest_memory()
+            .expect("owned session should expose mapped guest memory")
+            .total_size(),
+        session.runtime_resources().layout.total_size()
+    );
+    let mut fdt_magic = [0; 4];
+    session
+        .guest_memory()
+        .expect("owned session should expose mapped guest memory")
+        .read_slice(&mut fdt_magic, session.runtime_resources().fdt.address)
+        .expect("mapped guest memory should contain the written FDT");
+    assert_eq!(u32::from_be_bytes(fdt_magic), 0xd00d_feed);
+    assert_eq!(
+        session.boot_registers().kernel_entry,
+        session
+            .runtime_resources()
+            .loaded_boot_source
+            .kernel
+            .entry_address
+    );
+    assert_eq!(
+        session.boot_registers().fdt_address,
+        session.runtime_resources().fdt.address
+    );
+    let run_cancel_handle = session.run_cancel_handle();
+    drop(run_cancel_handle);
+    let run_loop_control = session.run_loop_control();
+    let run_loop_stop_token = run_loop_control.stop_token();
+    run_loop_control
+        .request_stop()
+        .expect("owned HVF boot-session run-loop stop should request vCPU cancellation");
+    assert!(run_loop_stop_token.is_stop_requested());
+    session
+        .shutdown()
+        .expect("owned HVF arm64 boot session should shut down");
+    drop(session);
+
+    let mut second_session = OwnedHvfArm64BootSession::new(&controller, config)
+        .expect("second owned HVF arm64 boot session should prepare after shutdown");
+    assert_eq!(
+        second_session
+            .guest_memory_mut()
+            .expect("second owned session should expose mutable mapped guest memory")
+            .total_size(),
+        second_session.runtime_resources().layout.total_size()
+    );
+    second_session
+        .shutdown()
+        .expect("second owned HVF arm64 boot session should shut down");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn rejects_boot_session_on_existing_hvf_vm_without_destroying_it() {
     use bangbang_hvf::{HvfArm64BootSessionConfig, HvfArm64BootSessionError, HvfBackend};
     use bangbang_runtime::VmBackend;
