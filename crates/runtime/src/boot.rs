@@ -121,6 +121,111 @@ impl fmt::Display for BootPayloadKind {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootSourceConfigInput {
+    kernel_image_path: PathBuf,
+    initrd_path: Option<PathBuf>,
+    boot_args: Option<String>,
+}
+
+impl BootSourceConfigInput {
+    pub fn new(kernel_image_path: impl Into<PathBuf>) -> Self {
+        Self {
+            kernel_image_path: kernel_image_path.into(),
+            initrd_path: None,
+            boot_args: None,
+        }
+    }
+
+    pub fn with_initrd_path(mut self, initrd_path: impl Into<PathBuf>) -> Self {
+        self.initrd_path = Some(initrd_path.into());
+        self
+    }
+
+    pub fn with_boot_args(mut self, boot_args: impl Into<String>) -> Self {
+        self.boot_args = Some(boot_args.into());
+        self
+    }
+
+    pub fn validate(self) -> Result<BootSourceConfig, BootSourceConfigError> {
+        BootSourceConfig::try_from(self)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootSourceConfig {
+    kernel_image_path: PathBuf,
+    initrd_path: Option<PathBuf>,
+    boot_args: Option<String>,
+}
+
+impl BootSourceConfig {
+    pub fn kernel_image_path(&self) -> &Path {
+        &self.kernel_image_path
+    }
+
+    pub fn initrd_path(&self) -> Option<&Path> {
+        self.initrd_path.as_deref()
+    }
+
+    pub fn boot_args(&self) -> Option<&str> {
+        self.boot_args.as_deref()
+    }
+}
+
+impl TryFrom<BootSourceConfigInput> for BootSourceConfig {
+    type Error = BootSourceConfigError;
+
+    fn try_from(input: BootSourceConfigInput) -> Result<Self, Self::Error> {
+        if input.kernel_image_path.as_os_str().is_empty() {
+            return Err(BootSourceConfigError::EmptyPath {
+                payload: BootPayloadKind::Kernel,
+            });
+        }
+        if input
+            .initrd_path
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(BootSourceConfigError::EmptyPath {
+                payload: BootPayloadKind::Initrd,
+            });
+        }
+        validate_command_line_text(input.boot_args.as_deref())
+            .map_err(BootSourceConfigError::CommandLine)?;
+
+        Ok(Self {
+            kernel_image_path: input.kernel_image_path,
+            initrd_path: input.initrd_path,
+            boot_args: input.boot_args,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootSourceConfigError {
+    EmptyPath { payload: BootPayloadKind },
+    CommandLine(BootCommandLineError),
+}
+
+impl fmt::Display for BootSourceConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyPath { payload } => write!(f, "{payload} path must not be empty"),
+            Self::CommandLine(err) => write!(f, "kernel command line is invalid: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for BootSourceConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CommandLine(err) => Some(err),
+            Self::EmptyPath { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum BootSourceLoadError {
     EmptyPath {
@@ -479,23 +584,25 @@ pub fn load_boot_source(
 fn validate_command_line(
     boot_args: Option<&str>,
 ) -> Result<KernelCommandLine, BootSourceLoadError> {
+    validate_command_line_text(boot_args).map_err(BootSourceLoadError::CommandLine)
+}
+
+fn validate_command_line_text(
+    boot_args: Option<&str>,
+) -> Result<KernelCommandLine, BootCommandLineError> {
     let text = boot_args.unwrap_or(DEFAULT_KERNEL_COMMAND_LINE);
     if text.as_bytes().contains(&0) {
-        return Err(BootSourceLoadError::CommandLine(
-            BootCommandLineError::ContainsNul,
-        ));
+        return Err(BootCommandLineError::ContainsNul);
     }
     let command_line = canonical_command_line(text)?;
 
     let size_with_nul = command_line.size_with_nul()?;
 
     if size_with_nul > aarch64::CMDLINE_MAX_SIZE {
-        return Err(BootSourceLoadError::CommandLine(
-            BootCommandLineError::TooLarge {
-                size_with_nul,
-                max_size: aarch64::CMDLINE_MAX_SIZE,
-            },
-        ));
+        return Err(BootCommandLineError::TooLarge {
+            size_with_nul,
+            max_size: aarch64::CMDLINE_MAX_SIZE,
+        });
     }
 
     let text = command_line.to_text();
@@ -515,28 +622,24 @@ struct CanonicalCommandLine<'a> {
 }
 
 impl CanonicalCommandLine<'_> {
-    fn size_with_nul(self) -> Result<usize, BootSourceLoadError> {
+    fn size_with_nul(self) -> Result<usize, BootCommandLineError> {
         let mut size_with_nul =
             self.boot_args
                 .len()
                 .checked_add(1)
-                .ok_or(BootSourceLoadError::CommandLine(
-                    BootCommandLineError::TooLarge {
-                        size_with_nul: usize::MAX,
-                        max_size: aarch64::CMDLINE_MAX_SIZE,
-                    },
-                ))?;
+                .ok_or(BootCommandLineError::TooLarge {
+                    size_with_nul: usize::MAX,
+                    max_size: aarch64::CMDLINE_MAX_SIZE,
+                })?;
 
         if !self.init_args.is_empty() {
             size_with_nul = size_with_nul
                 .checked_add(INIT_ARGS_SEPARATOR.len())
                 .and_then(|size| size.checked_add(self.init_args.len()))
-                .ok_or(BootSourceLoadError::CommandLine(
-                    BootCommandLineError::TooLarge {
-                        size_with_nul: usize::MAX,
-                        max_size: aarch64::CMDLINE_MAX_SIZE,
-                    },
-                ))?;
+                .ok_or(BootCommandLineError::TooLarge {
+                    size_with_nul: usize::MAX,
+                    max_size: aarch64::CMDLINE_MAX_SIZE,
+                })?;
         }
 
         Ok(size_with_nul)
@@ -554,15 +657,13 @@ impl CanonicalCommandLine<'_> {
     }
 }
 
-fn canonical_command_line(raw: &str) -> Result<CanonicalCommandLine<'_>, BootSourceLoadError> {
+fn canonical_command_line(raw: &str) -> Result<CanonicalCommandLine<'_>, BootCommandLineError> {
     let (boot_args, init_args) = split_command_line(raw);
     let boot_args = boot_args.trim();
     let init_args = init_args.trim();
 
     if boot_args.is_empty() && !init_args.is_empty() {
-        return Err(BootSourceLoadError::CommandLine(
-            BootCommandLineError::MissingBootArgs,
-        ));
+        return Err(BootCommandLineError::MissingBootArgs);
     }
 
     Ok(CanonicalCommandLine {
@@ -968,8 +1069,8 @@ mod tests {
     use super::{
         ARM64_IMAGE_MAGIC, ARM64_IMAGE_MAGIC_OFFSET, ARM64_IMAGE_SIZE_OFFSET,
         ARM64_IMAGE_TEXT_OFFSET_OFFSET, ARM64_LEGACY_TEXT_OFFSET, BootCommandLineError,
-        BootPayloadKind, BootSource, BootSourceLoadError, DEFAULT_KERNEL_COMMAND_LINE,
-        INIT_ARGS_SEPARATOR, KernelImageError,
+        BootPayloadKind, BootSource, BootSourceConfigError, BootSourceConfigInput,
+        BootSourceLoadError, DEFAULT_KERNEL_COMMAND_LINE, INIT_ARGS_SEPARATOR, KernelImageError,
     };
     use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, aarch64};
 
@@ -1121,6 +1222,66 @@ mod tests {
         address
             .checked_add(offset)
             .expect("test guest address addition should not overflow")
+    }
+
+    #[test]
+    fn boot_source_config_accepts_minimal_input() {
+        let config = BootSourceConfigInput::new("/tmp/vmlinux")
+            .validate()
+            .expect("minimal boot source should validate");
+
+        assert_eq!(config.kernel_image_path(), PathBuf::from("/tmp/vmlinux"));
+        assert_eq!(config.initrd_path(), None);
+        assert_eq!(config.boot_args(), None);
+    }
+
+    #[test]
+    fn boot_source_config_accepts_initrd_and_boot_args() {
+        let config = BootSourceConfigInput::new("/tmp/vmlinux")
+            .with_initrd_path("/tmp/initrd.img")
+            .with_boot_args(" console=hvc0 -- /init ")
+            .validate()
+            .expect("complete boot source should validate");
+
+        assert_eq!(config.kernel_image_path(), PathBuf::from("/tmp/vmlinux"));
+        assert_eq!(config.initrd_path(), Some(Path::new("/tmp/initrd.img")));
+        assert_eq!(config.boot_args(), Some(" console=hvc0 -- /init "));
+    }
+
+    #[test]
+    fn boot_source_config_rejects_empty_paths() {
+        assert_eq!(
+            BootSourceConfigInput::new(PathBuf::new()).validate(),
+            Err(BootSourceConfigError::EmptyPath {
+                payload: BootPayloadKind::Kernel,
+            })
+        );
+        assert_eq!(
+            BootSourceConfigInput::new("/tmp/vmlinux")
+                .with_initrd_path(PathBuf::new())
+                .validate(),
+            Err(BootSourceConfigError::EmptyPath {
+                payload: BootPayloadKind::Initrd,
+            })
+        );
+    }
+
+    #[test]
+    fn boot_source_config_rejects_invalid_boot_args_without_echoing_values() {
+        let err = BootSourceConfigInput::new("/tmp/vmlinux")
+            .with_boot_args("secret\0debug")
+            .validate()
+            .expect_err("invalid boot args should fail");
+
+        assert_eq!(
+            err,
+            BootSourceConfigError::CommandLine(BootCommandLineError::ContainsNul)
+        );
+        assert_eq!(
+            err.to_string(),
+            "kernel command line is invalid: contains a NUL byte"
+        );
+        assert!(!err.to_string().contains("secret"));
     }
 
     #[test]
