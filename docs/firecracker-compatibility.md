@@ -769,7 +769,8 @@ or should preserve Firecracker's architecture-helper truncation behavior.
 The current scaffold implements the first HTTP API behavior for `GET /`,
 `GET /version`, `GET /vm/config`, pre-boot `/machine-config` configuration
 storage, and pre-boot `PUT /boot-source` and `PUT /drives/{drive_id}` configuration storage, plus
-VMM-routed `PUT /actions` preflight and unsupported action handling. The
+process-routed `PUT /actions` startup preparation and unsupported action
+handling. The
 policy below is the compatibility target for future request parsing, VMM action
 mapping, state validation, and golden API tests.
 
