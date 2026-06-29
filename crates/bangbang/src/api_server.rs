@@ -22,7 +22,9 @@ use bangbang_runtime::machine::{
     MachineConfig, MachineConfigCpuTemplate as RuntimeMachineConfigCpuTemplate,
     MachineConfigHugePages as RuntimeMachineConfigHugePages, MachineConfigInput,
 };
-use bangbang_runtime::{VmConfiguration, VmmAction, VmmController, VmmData};
+use bangbang_runtime::{VmConfiguration, VmmAction, VmmData};
+
+use crate::vmm::VmmRequestHandler;
 
 const READ_CHUNK_SIZE: usize = 4096;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -88,7 +90,7 @@ impl ApiServer {
 
     pub(crate) fn run_until(
         &self,
-        vmm: &mut VmmController,
+        vmm: &mut impl VmmRequestHandler,
         shutdown_wakeup: &mut UnixStream,
     ) -> Result<(), ApiServerError> {
         self.listener
@@ -112,7 +114,7 @@ impl ApiServer {
         }
     }
 
-    fn serve_next(&self, vmm: &mut VmmController) -> Result<(), ApiServerError> {
+    fn serve_next(&self, vmm: &mut impl VmmRequestHandler) -> Result<(), ApiServerError> {
         let (mut stream, _) = self
             .listener
             .accept()
@@ -366,7 +368,7 @@ enum RequestRead {
 
 fn handle_connection(
     stream: &mut UnixStream,
-    vmm: &mut VmmController,
+    vmm: &mut impl VmmRequestHandler,
 ) -> Result<(), ApiServerError> {
     stream
         .set_write_timeout(Some(CONNECTION_TIMEOUT))
@@ -382,14 +384,14 @@ fn handle_connection(
         .map_err(|err| ApiServerError::Connection(err.kind()))
 }
 
-fn handle_request_bytes(bytes: &[u8], vmm: &mut VmmController) -> HttpResponse {
+fn handle_request_bytes(bytes: &[u8], vmm: &mut impl VmmRequestHandler) -> HttpResponse {
     match parse_request(bytes) {
         Ok(request) => handle_api_request(request, vmm),
         Err(err) => HttpResponse::fault(err.fault_message()),
     }
 }
 
-fn handle_api_request(request: ApiRequest, vmm: &mut VmmController) -> HttpResponse {
+fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> HttpResponse {
     match request {
         ApiRequest::GetInstanceInfo => {
             handle_instance_info(vmm.handle_action(VmmAction::GetVmInstanceInfo))
@@ -709,12 +711,57 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use bangbang_runtime::BackendError;
+
+    use crate::vmm::{InstanceStartExecutor, ProcessVmm};
+
     use super::*;
 
     const VERSION: &str = "0.1.0";
 
-    fn test_controller() -> VmmController {
-        VmmController::new("demo-1", VERSION, "bangbang")
+    #[derive(Debug, Clone)]
+    struct TestInstanceStarter {
+        result: Result<(), BackendError>,
+    }
+
+    impl TestInstanceStarter {
+        const fn success() -> Self {
+            Self { result: Ok(()) }
+        }
+
+        const fn failure() -> Self {
+            Self {
+                result: Err(BackendError::InvalidState("test startup failed")),
+            }
+        }
+    }
+
+    impl InstanceStartExecutor for TestInstanceStarter {
+        type Session = ();
+
+        fn start(
+            &mut self,
+            _controller: &bangbang_runtime::VmmController,
+        ) -> Result<Self::Session, BackendError> {
+            self.result.clone()
+        }
+    }
+
+    fn test_controller() -> ProcessVmm<TestInstanceStarter> {
+        test_controller_with_starter(TestInstanceStarter::failure())
+    }
+
+    fn test_controller_with_starter(
+        starter: TestInstanceStarter,
+    ) -> ProcessVmm<TestInstanceStarter> {
+        ProcessVmm::with_starter("demo-1", VERSION, "bangbang", starter)
+    }
+
+    fn test_controller_with_id_and_version(
+        id: &str,
+        version: &str,
+    ) -> ProcessVmm<TestInstanceStarter> {
+        ProcessVmm::with_starter(id, version, "bangbang", TestInstanceStarter::failure())
     }
 
     fn unique_socket_path(name: &str) -> PathBuf {
@@ -726,7 +773,7 @@ mod tests {
     }
 
     fn put_action_over_socket(
-        vmm: &mut VmmController,
+        vmm: &mut impl VmmRequestHandler,
         socket_name: &str,
         action_type: &str,
     ) -> String {
@@ -808,7 +855,7 @@ mod tests {
 
     #[test]
     fn dispatches_version_request_through_vmm_controller() {
-        let mut vmm = VmmController::new("demo-1", "9.9.9", "bangbang");
+        let mut vmm = test_controller_with_id_and_version("demo-1", "9.9.9");
 
         let response = handle_request_bytes(
             b"GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -821,7 +868,7 @@ mod tests {
 
     #[test]
     fn dispatches_instance_info_request_through_vmm_controller() {
-        let mut vmm = VmmController::new("demo-9", "9.9.9", "bangbang");
+        let mut vmm = test_controller_with_id_and_version("demo-9", "9.9.9");
 
         let response = handle_request_bytes(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", &mut vmm);
 
@@ -1130,7 +1177,7 @@ mod tests {
     }
 
     #[test]
-    fn returns_fault_for_configured_instance_start_without_mutating_state() {
+    fn returns_fault_for_configured_instance_start_failure_without_mutating_state() {
         let mut vmm = test_controller();
         let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
         let boot_request = format!(
@@ -1146,7 +1193,7 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
         assert!(response.contains(
-            r#"{"fault_message":"The requested operation is not supported: InstanceStart"}"#
+            r#"{"fault_message":"failed to start microVM: invalid backend state: test startup failed"}"#
         ));
         assert_eq!(
             vmm.instance_info().state,
@@ -1160,6 +1207,37 @@ mod tests {
             Path::new("/tmp/original-vmlinux")
         );
         assert!(vmm.drive_configs().is_empty());
+    }
+
+    #[test]
+    fn configured_instance_start_success_commits_running_over_socket() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_request = format!(
+            "PUT /boot-source HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{boot_body}",
+            boot_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let response = put_action_over_socket(&mut vmm, "start-ok", "InstanceStart");
+
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(response.contains("Content-Length: 0\r\n"));
+        assert!(response.ends_with("\r\n\r\n"));
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::Running
+        );
+        assert!(vmm.has_started_session());
+
+        let second_response = put_action_over_socket(&mut vmm, "start-second", "InstanceStart");
+        assert!(second_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(second_response.contains(
+            r#"{"fault_message":"The requested operation is not supported in Running state: InstanceStart"}"#
+        ));
     }
 
     #[test]

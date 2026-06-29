@@ -255,8 +255,8 @@ impl HvfArm64BootSession<'_> {
 
     /// Borrow the guest memory mapped for this prepared boot session.
     ///
-    /// This is internal startup plumbing for later runner-loop work; it does not
-    /// make public `InstanceStart` succeed.
+    /// This is startup preparation plumbing; it does not enter a continuous
+    /// guest run loop or prove guest boot.
     pub fn guest_memory(&self) -> Result<&GuestMemory, HvfGuestMemoryMappingError> {
         self.backend.mapped_guest_memory()
     }
@@ -283,16 +283,16 @@ impl HvfArm64BootSession<'_> {
 
     /// Run the boot session's primary vCPU once with runner-thread MMIO handling.
     ///
-    /// This is internal startup plumbing for later runner-loop work. It does not
-    /// dispatch boot block notifications or make public `InstanceStart` succeed.
+    /// This is runner-loop plumbing. It does not dispatch boot block
+    /// notifications or enter a continuous guest run loop.
     pub fn run_once_and_handle_mmio(&self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
         run_boot_session_vcpu_step(&self.runner, &self.mmio_dispatcher)
     }
 
     /// Return a handle that can request cancellation of an in-flight vCPU run step.
     ///
-    /// This is internal startup plumbing for later runner-loop work. It does not
-    /// shut down the boot session or make public `InstanceStart` succeed.
+    /// This is runner-loop plumbing. It does not shut down the boot session or
+    /// enter a continuous guest run loop.
     pub fn run_cancel_handle(&self) -> HvfVcpuRunCancelHandle {
         self.runner.run_cancel_handle()
     }
@@ -300,7 +300,7 @@ impl HvfArm64BootSession<'_> {
     /// Return a control handle for the bounded internal boot-session run loop.
     ///
     /// Stop requests use the existing runner cancellation boundary. This remains
-    /// internal startup plumbing and does not make public `InstanceStart` succeed.
+    /// internal runner-loop plumbing and does not start an unbounded guest loop.
     pub fn run_loop_control(&self) -> HvfArm64BootRunLoopControl {
         HvfArm64BootRunLoopControl::new(self.run_cancel_handle())
     }
@@ -418,8 +418,8 @@ impl OwnedHvfArm64BootSession {
 
     /// Borrow the guest memory mapped for this prepared boot session.
     ///
-    /// This is internal startup plumbing for later runner-loop work; it does not
-    /// make public `InstanceStart` succeed.
+    /// This is startup preparation plumbing; it does not enter a continuous
+    /// guest run loop or prove guest boot.
     pub fn guest_memory(&self) -> Result<&GuestMemory, HvfGuestMemoryMappingError> {
         self.backend.mapped_guest_memory()
     }
