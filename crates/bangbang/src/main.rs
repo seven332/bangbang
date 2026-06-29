@@ -325,12 +325,32 @@ fn os_arg_into_string(arg: OsString) -> Result<String, String> {
 }
 
 fn print_help() {
-    println!(
-        "bangbang {}\n\nUsage:\n  bangbang [OPTIONS]\n\nOptions:\n      --api-sock <PATH>  Unix domain socket path for the API server [default: {}]\n      --id <ID>          MicroVM unique identifier [default: {}]\n                         Accepts 1-64 bytes, ASCII alphanumeric or '-'\n  -V, --version          Print version\n  -h, --help             Print help\n\nCurrent scope:\n  Serves GET /, GET /version, and pre-boot PUT /drives/{{drive_id}} config over the API socket; VM startup is not implemented yet.",
+    println!("{}", help_text());
+}
+
+fn help_text() -> String {
+    format!(
+        concat!(
+            "bangbang {}\n\n",
+            "Usage:\n",
+            "  bangbang [OPTIONS]\n\n",
+            "Options:\n",
+            "      --api-sock <PATH>  Unix domain socket path for the API server [default: {}]\n",
+            "      --id <ID>          MicroVM unique identifier [default: {}]\n",
+            "                         Accepts 1-64 bytes, ASCII alphanumeric or '-'\n",
+            "  -V, --version          Print version\n",
+            "  -h, --help             Print help\n\n",
+            "Current scope:\n",
+            "  Serves GET /, GET /version, GET /machine-config, pre-boot PUT /machine-config, ",
+            "pre-boot PUT /boot-source, and pre-boot PUT /drives/{{drive_id}} ",
+            "configuration storage over the API ",
+            "socket; PUT /actions is parsed and routed but execution remains unsupported; ",
+            "VM startup is not implemented yet."
+        ),
         env!("CARGO_PKG_VERSION"),
         DEFAULT_API_SOCK_PATH,
         DEFAULT_INSTANCE_ID
-    );
+    )
 }
 
 fn take_value(args: &[String], index: usize, name: &str) -> Result<String, String> {
@@ -483,6 +503,20 @@ mod tests {
         let args = parse(&["--help"]).expect("help arg should parse");
 
         assert_eq!(args.command, Command::Help);
+    }
+
+    #[test]
+    fn help_text_lists_current_api_scope() {
+        let help = super::help_text();
+
+        assert!(help.contains("Serves GET /, GET /version"));
+        assert!(help.contains("GET /machine-config"));
+        assert!(help.contains("pre-boot PUT /machine-config"));
+        assert!(help.contains("pre-boot PUT /boot-source"));
+        assert!(help.contains("pre-boot PUT /drives/{drive_id} configuration storage"));
+        assert!(help.contains("PUT /actions is parsed and routed"));
+        assert!(help.contains("execution remains unsupported"));
+        assert!(help.contains("VM startup is not implemented yet"));
     }
 
     #[test]
