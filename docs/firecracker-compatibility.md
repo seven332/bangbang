@@ -42,16 +42,17 @@ block notification dispatch with per-device metadata, an internal backend-neutra
 interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, internal HVF single-vCPU arm64 boot-session preparation
 with a runner-compatible shared MMIO dispatcher, controlled mapped guest-memory
-access, and boot block queue interrupt signaling, and an initial process startup
-argument model.
+access, one-step runner-thread MMIO handling, and boot block queue interrupt
+signaling, and an initial process startup argument model.
 There is no broader API request body model beyond the initial boot-source,
-drive configuration, machine-configuration, and actions bodies, guest execution, continuous vCPU run loop,
-complete interrupt delivery, public startup or HVF runner-loop wiring for block
-queue notifications or serial output, serial/backend interrupt wiring beyond
-the internal boot block notification path, device-backed feature negotiation,
-indirect descriptor support, device-backed runner-loop MMIO handling, complete
-device emulation, multi-vCPU setup, PSCI behavior, public
-boot-source loading/startup behavior, or successful actions execution behavior yet. Public drive configuration is
+drive configuration, machine-configuration, and actions bodies, public guest
+execution, continuous vCPU run loop, complete interrupt delivery, public
+startup, HVF runner-loop notification scheduling or serial output,
+serial/backend interrupt wiring beyond the internal boot block notification
+path, device-backed feature negotiation, indirect descriptor support,
+device-backed runner-loop MMIO scheduling, complete device emulation,
+multi-vCPU setup, PSCI behavior, public boot-source loading/startup behavior,
+or successful actions execution behavior yet. Public drive configuration is
 recorded only as pre-boot VM state; separate internal runtime helpers can
 prepare owned block-device resources from that stored configuration and
 register prepared resources in an internal MMIO dispatcher, but public
@@ -706,15 +707,15 @@ dispatches an already resolved MMIO access after a run has started, and another
 command starts one vCPU run, resolves a resulting MMIO exit, and dispatches or
 completes it through a caller-provided shared dispatcher. These commands reject
 overlapping metadata reads, runs, boot-register setup, or MMIO dispatches. They
-do not yet form a continuous guest run loop. The boot session can also dispatch
-pending boot block queue notifications against mapped guest memory and signal
-the corresponding block SPI line when the runtime dispatch summary reports
-queue-interrupt intent; per-device results preserve dispatch, lookup, and signal
-failures for later runner-loop policy. The boot session owns a per-session
-runner-compatible shared MMIO dispatcher so later runner commands can dispatch
-MMIO on the vCPU-owning thread without global state; boot notification dispatch
-locks that dispatcher only while draining runtime notifications and releases it
-before HVF GIC signaling.
+do not yet form a continuous guest run loop. The boot session can run one vCPU
+step through the runner with its per-session shared MMIO dispatcher, so a
+resulting MMIO exit is handled on the vCPU-owning thread without global state.
+The boot session can also dispatch pending boot block queue notifications
+against mapped guest memory and signal the corresponding block SPI line when
+the runtime dispatch summary reports queue-interrupt intent; per-device results
+preserve dispatch, lookup, and signal failures for later runner-loop policy.
+Boot notification dispatch locks the shared dispatcher only while draining
+runtime notifications and releases it before HVF GIC signaling.
 
 bangbang still does not wire `mem_size_mib` into public startup behavior,
 wire device interrupts into public guest execution, emulate devices, start a guest, power on secondary vCPUs, or
@@ -856,9 +857,9 @@ macOS design work instead of direct implementation:
   handlers. A single resolved HVF exit can be converted into a runtime MMIO
   operation, dispatched through those handlers on the current thread or through
   an explicit runner-thread command, and completed back into guest GPRs for
-  successful reads. The runner can perform that path for one run step, but it
-  does not yet provide a continuous loop or translate exits into interrupt or
-  runtime events.
+  successful reads. The runner and boot session can perform that path for one
+  run step, but they do not yet provide a continuous loop or translate exits
+  into interrupt or runtime events.
 - Firecracker's full paused/resumed microVM loop is not implemented yet.
   bangbang's runner is only the HVF ownership and cancellation primitive needed
   before guest memory, interrupt, timer, and device work can build the real run

@@ -23,7 +23,7 @@ pub use gic::{
 };
 pub use memory::{HvfGuestMemoryMappingError, HvfGuestMemoryUnmapFailure, HvfMemoryPermissions};
 pub use mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
-pub use runner::{HvfVcpuRunner, HvfVcpuRunnerError};
+pub use runner::{HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError};
 pub use startup::{
     HvfArm64BootBlockNotificationDispatch, HvfArm64BootBlockNotificationDispatchError,
     HvfArm64BootBlockNotificationDispatches, HvfArm64BootInterruptLinePurpose,
