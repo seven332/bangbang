@@ -270,9 +270,14 @@ where
             return;
         };
 
-        let _ = self.control.request_stop();
+        let stop_requested = self.control.request_stop().is_ok();
         drop(self.session_release_sender.take());
-        let _ = worker.join();
+
+        // A stop error can mean an in-flight vCPU run was not canceled; avoid
+        // turning cleanup into an unbounded join in that error path.
+        if stop_requested || worker.is_finished() {
+            let _ = worker.join();
+        }
     }
 }
 
