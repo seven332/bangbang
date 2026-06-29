@@ -26,7 +26,7 @@ use crate::gic::{
     HvfGicSpiSignaler, HvfInterruptLineAllocationError,
 };
 use crate::memory::{HvfGuestMemoryMappingError, HvfMemoryPermissions};
-use crate::runner::{HvfVcpuRunner, HvfVcpuRunnerError};
+use crate::runner::{HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError};
 use crate::vcpu::HvfArm64BootRegisters;
 
 const SINGLE_VCPU_COUNT: u8 = 1;
@@ -157,6 +157,14 @@ impl HvfArm64BootSession<'_> {
 
     pub const fn boot_registers(&self) -> HvfArm64BootRegisters {
         self.boot_registers
+    }
+
+    /// Run the boot session's primary vCPU once with runner-thread MMIO handling.
+    ///
+    /// This is internal startup plumbing for later runner-loop work. It does not
+    /// dispatch boot block notifications or make public `InstanceStart` succeed.
+    pub fn run_once_and_handle_mmio(&self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
+        run_boot_session_vcpu_step(&self.runner, &self.mmio_dispatcher)
     }
 
     pub fn dispatch_block_queue_notifications_and_signal_interrupts(
@@ -340,6 +348,29 @@ impl fmt::Display for HvfArm64BootMmioDispatcherError {
 }
 
 impl std::error::Error for HvfArm64BootMmioDispatcherError {}
+
+trait BootSessionRunStepRunner {
+    fn run_once_and_handle_mmio(
+        &self,
+        dispatcher: Arc<Mutex<MmioDispatcher>>,
+    ) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError>;
+}
+
+impl BootSessionRunStepRunner for HvfVcpuRunner<'_> {
+    fn run_once_and_handle_mmio(
+        &self,
+        dispatcher: Arc<Mutex<MmioDispatcher>>,
+    ) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
+        HvfVcpuRunner::run_once_and_handle_mmio(self, dispatcher)
+    }
+}
+
+fn run_boot_session_vcpu_step(
+    runner: &impl BootSessionRunStepRunner,
+    dispatcher: &Arc<Mutex<MmioDispatcher>>,
+) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
+    runner.run_once_and_handle_mmio(Arc::clone(dispatcher))
+}
 
 fn lock_boot_mmio_dispatcher(
     dispatcher: &Arc<Mutex<MmioDispatcher>>,
@@ -773,9 +804,11 @@ mod tests {
         HvfArm64BootBlockNotificationDispatchError, HvfArm64BootInterruptLinePurpose,
         HvfArm64BootMmioDispatcherError, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
         HvfArm64BootSessionError, allocate_interrupt_lines, collect_block_notification_dispatches,
-        lock_boot_mmio_dispatcher, signal_block_queue_interrupts, validate_single_vcpu,
+        lock_boot_mmio_dispatcher, run_boot_session_vcpu_step, signal_block_queue_interrupts,
+        validate_single_vcpu,
     };
     use crate::gic::{HvfGicInterruptRange, HvfGicMetadata, HvfGicRedistributor, HvfGicRegion};
+    use crate::runner::{HvfVcpuRunStepOutcome, HvfVcpuRunnerError};
 
     static NEXT_TEST_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -872,6 +905,53 @@ mod tests {
         ) -> Result<(), MmioHandlerError> {
             Err(MmioHandlerError::new("wrong handler write"))
         }
+    }
+
+    type RecordedRunStepDispatchers = Arc<Mutex<Vec<Arc<Mutex<MmioDispatcher>>>>>;
+
+    #[derive(Debug)]
+    struct RecordingBootSessionRunStepRunner {
+        result: Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError>,
+        dispatchers: RecordedRunStepDispatchers,
+    }
+
+    impl RecordingBootSessionRunStepRunner {
+        fn new(
+            result: Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError>,
+        ) -> (Self, RecordedRunStepDispatchers) {
+            let dispatchers = Arc::new(Mutex::new(Vec::new()));
+
+            (
+                Self {
+                    result,
+                    dispatchers: Arc::clone(&dispatchers),
+                },
+                dispatchers,
+            )
+        }
+    }
+
+    impl super::BootSessionRunStepRunner for RecordingBootSessionRunStepRunner {
+        fn run_once_and_handle_mmio(
+            &self,
+            dispatcher: Arc<Mutex<MmioDispatcher>>,
+        ) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
+            self.dispatchers
+                .lock()
+                .expect("recorded dispatcher list should lock")
+                .push(dispatcher);
+
+            self.result.clone()
+        }
+    }
+
+    fn recorded_run_step_dispatchers(
+        dispatchers: &RecordedRunStepDispatchers,
+    ) -> Vec<Arc<Mutex<MmioDispatcher>>> {
+        dispatchers
+            .lock()
+            .expect("recorded dispatcher list should lock")
+            .clone()
     }
 
     fn gic_with_spi_range(base: u32, count: u32) -> HvfGicMetadata {
@@ -1600,6 +1680,45 @@ mod tests {
         assert!(!device.queue_interrupt_signaled());
         assert!(device.signal_error().is_none());
         assert!(recorded_lines(&lines).is_empty());
+    }
+
+    #[test]
+    fn boot_session_run_step_delegates_with_session_dispatcher() {
+        let dispatcher = Arc::new(Mutex::new(MmioDispatcher::new()));
+        let (runner, recorded_dispatchers) =
+            RecordingBootSessionRunStepRunner::new(Ok(HvfVcpuRunStepOutcome::Canceled));
+
+        let result = run_boot_session_vcpu_step(&runner, &dispatcher);
+
+        assert_eq!(result, Ok(HvfVcpuRunStepOutcome::Canceled));
+        let recorded = recorded_run_step_dispatchers(&recorded_dispatchers);
+        assert_eq!(recorded.len(), 1);
+        let recorded_dispatcher = recorded.first().expect("one dispatcher should be recorded");
+        assert!(Arc::ptr_eq(recorded_dispatcher, &dispatcher));
+        assert!(
+            dispatcher
+                .try_lock()
+                .expect("delegated run step should not keep dispatcher locked")
+                .regions()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn boot_session_run_step_preserves_runner_error() {
+        let dispatcher = Arc::new(Mutex::new(MmioDispatcher::new()));
+        let source = HvfVcpuRunnerError::InvalidState("fake boot-session run step failed");
+        let (runner, recorded_dispatchers) =
+            RecordingBootSessionRunStepRunner::new(Err(source.clone()));
+
+        let err = run_boot_session_vcpu_step(&runner, &dispatcher)
+            .expect_err("runner error should be returned");
+
+        assert_eq!(err, source);
+        let recorded = recorded_run_step_dispatchers(&recorded_dispatchers);
+        assert_eq!(recorded.len(), 1);
+        let recorded_dispatcher = recorded.first().expect("one dispatcher should be recorded");
+        assert!(Arc::ptr_eq(recorded_dispatcher, &dispatcher));
     }
 
     #[test]
