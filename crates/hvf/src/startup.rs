@@ -5,19 +5,24 @@ use std::fmt;
 
 use bangbang_runtime::block::BlockMmioLayout;
 use bangbang_runtime::fdt::Arm64FdtError;
-use bangbang_runtime::interrupt::GuestInterruptLine;
+use bangbang_runtime::interrupt::{
+    DeviceInterruptKind, DeviceInterruptTriggerError, GuestInterruptLine, InterruptSink,
+};
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
 use bangbang_runtime::mmio::MmioRegionId;
 use bangbang_runtime::serial::SharedSerialOutputBuffer;
 use bangbang_runtime::startup::{
-    Arm64BootResourceConfig, Arm64BootResourceError, Arm64BootResources, Arm64BootRuntimeResources,
+    Arm64BootBlockNotificationDispatch, Arm64BootBlockNotificationDispatchError,
+    Arm64BootBlockNotificationDispatches, Arm64BootResourceConfig, Arm64BootResourceError,
+    Arm64BootResources, Arm64BootRuntimeResources,
     Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig,
 };
 use bangbang_runtime::{BackendError, VmBackend, VmmController};
 
 use crate::backend::HvfBackend;
 use crate::gic::{
-    HvfGicError, HvfGicInterruptLineAllocator, HvfGicMetadata, HvfInterruptLineAllocationError,
+    HvfGicError, HvfGicInterruptLineAllocator, HvfGicMetadata, HvfGicSpiSignalError,
+    HvfGicSpiSignaler, HvfInterruptLineAllocationError,
 };
 use crate::memory::{HvfGuestMemoryMappingError, HvfMemoryPermissions};
 use crate::runner::{HvfVcpuRunner, HvfVcpuRunnerError};
@@ -141,12 +146,211 @@ impl HvfArm64BootSession<'_> {
     pub const fn boot_registers(&self) -> HvfArm64BootRegisters {
         self.boot_registers
     }
+
+    pub fn dispatch_block_queue_notifications_and_signal_interrupts(
+        &mut self,
+    ) -> Result<HvfArm64BootBlockNotificationDispatches, HvfArm64BootBlockNotificationDispatchError>
+    {
+        let dispatches = self
+            .runtime_resources
+            .dispatch_block_queue_notifications(self.backend.mapped_guest_memory_mut().map_err(
+                |source| HvfArm64BootBlockNotificationDispatchError::MapGuestMemory { source },
+            )?)
+            .map_err(|source| {
+                HvfArm64BootBlockNotificationDispatchError::DispatchNotifications { source }
+            })?;
+
+        if !dispatches.needs_queue_interrupt() {
+            return collect_block_notification_dispatches(dispatches);
+        }
+
+        let signaler = HvfGicSpiSignaler::from_metadata(&self.gic).map_err(|source| {
+            HvfArm64BootBlockNotificationDispatchError::CreateSignalSink { source }
+        })?;
+
+        signal_block_queue_interrupts(dispatches, &signaler)
+    }
 }
 
 impl Drop for HvfArm64BootSession<'_> {
     fn drop(&mut self) {
         let _ = self.shutdown();
     }
+}
+
+#[derive(Debug)]
+pub struct HvfArm64BootBlockNotificationDispatches {
+    devices: Vec<HvfArm64BootBlockNotificationDispatch>,
+}
+
+impl HvfArm64BootBlockNotificationDispatches {
+    fn new(devices: Vec<HvfArm64BootBlockNotificationDispatch>) -> Self {
+        Self { devices }
+    }
+
+    pub fn as_slice(&self) -> &[HvfArm64BootBlockNotificationDispatch] {
+        &self.devices
+    }
+
+    pub fn len(&self) -> usize {
+        self.devices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.devices.is_empty()
+    }
+
+    pub fn has_signal_failure(&self) -> bool {
+        self.devices
+            .iter()
+            .any(|device| device.signal_error().is_some())
+    }
+}
+
+#[derive(Debug)]
+pub struct HvfArm64BootBlockNotificationDispatch {
+    dispatch: Arm64BootBlockNotificationDispatch,
+    signal_error: Option<DeviceInterruptTriggerError>,
+}
+
+impl HvfArm64BootBlockNotificationDispatch {
+    fn new(
+        dispatch: Arm64BootBlockNotificationDispatch,
+        signal_error: Option<DeviceInterruptTriggerError>,
+    ) -> Self {
+        Self {
+            dispatch,
+            signal_error,
+        }
+    }
+
+    pub const fn dispatch(&self) -> &Arm64BootBlockNotificationDispatch {
+        &self.dispatch
+    }
+
+    pub const fn signal_error(&self) -> Option<&DeviceInterruptTriggerError> {
+        self.signal_error.as_ref()
+    }
+
+    pub fn queue_interrupt_signaled(&self) -> bool {
+        self.dispatch.needs_queue_interrupt() && self.signal_error.is_none()
+    }
+}
+
+#[derive(Debug)]
+pub enum HvfArm64BootBlockNotificationDispatchError {
+    MapGuestMemory {
+        source: HvfGuestMemoryMappingError,
+    },
+    DispatchNotifications {
+        source: Arm64BootBlockNotificationDispatchError,
+    },
+    CreateSignalSink {
+        source: HvfGicSpiSignalError,
+    },
+    ResultAllocation {
+        source: TryReserveError,
+    },
+}
+
+impl fmt::Display for HvfArm64BootBlockNotificationDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MapGuestMemory { source } => {
+                write!(
+                    f,
+                    "failed to borrow HVF boot-session guest memory for block notifications: {source}"
+                )
+            }
+            Self::DispatchNotifications { source } => {
+                write!(
+                    f,
+                    "failed to dispatch boot block queue notifications: {source}"
+                )
+            }
+            Self::CreateSignalSink { source } => {
+                write!(
+                    f,
+                    "failed to create HVF boot block interrupt signaler: {source}"
+                )
+            }
+            Self::ResultAllocation { source } => {
+                write!(
+                    f,
+                    "failed to allocate HVF boot block notification results: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for HvfArm64BootBlockNotificationDispatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MapGuestMemory { source } => Some(source),
+            Self::DispatchNotifications { source } => Some(source),
+            Self::CreateSignalSink { source } => Some(source),
+            Self::ResultAllocation { source } => Some(source),
+        }
+    }
+}
+
+fn collect_block_notification_dispatches(
+    dispatches: Arm64BootBlockNotificationDispatches,
+) -> Result<HvfArm64BootBlockNotificationDispatches, HvfArm64BootBlockNotificationDispatchError> {
+    let runtime_dispatches = dispatches.into_vec();
+    let mut devices = Vec::new();
+    devices
+        .try_reserve_exact(runtime_dispatches.len())
+        .map_err(
+            |source| HvfArm64BootBlockNotificationDispatchError::ResultAllocation { source },
+        )?;
+
+    for dispatch in runtime_dispatches {
+        devices.push(HvfArm64BootBlockNotificationDispatch::new(dispatch, None));
+    }
+
+    Ok(HvfArm64BootBlockNotificationDispatches::new(devices))
+}
+
+fn signal_block_queue_interrupts(
+    dispatches: Arm64BootBlockNotificationDispatches,
+    signaler: &dyn InterruptSink,
+) -> Result<HvfArm64BootBlockNotificationDispatches, HvfArm64BootBlockNotificationDispatchError> {
+    let runtime_dispatches = dispatches.into_vec();
+    let mut devices = Vec::new();
+    devices
+        .try_reserve_exact(runtime_dispatches.len())
+        .map_err(
+            |source| HvfArm64BootBlockNotificationDispatchError::ResultAllocation { source },
+        )?;
+
+    for dispatch in runtime_dispatches {
+        let signal_error = if dispatch.needs_queue_interrupt() {
+            signal_queue_interrupt(dispatch.device().fdt_device.interrupt_line, signaler).err()
+        } else {
+            None
+        };
+        devices.push(HvfArm64BootBlockNotificationDispatch::new(
+            dispatch,
+            signal_error,
+        ));
+    }
+
+    Ok(HvfArm64BootBlockNotificationDispatches::new(devices))
+}
+
+fn signal_queue_interrupt(
+    line: GuestInterruptLine,
+    signaler: &dyn InterruptSink,
+) -> Result<(), DeviceInterruptTriggerError> {
+    signaler
+        .signal(line)
+        .map_err(|source| DeviceInterruptTriggerError::Signal {
+            line,
+            kind: DeviceInterruptKind::Queue,
+            source,
+        })
 }
 
 #[derive(Debug)]
@@ -469,20 +673,147 @@ fn allocate_interrupt_lines(
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as _;
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
     use bangbang_runtime::VmmAction;
-    use bangbang_runtime::block::BlockMmioLayout;
+    use bangbang_runtime::block::{
+        BlockMmioLayout, DriveConfigInput, VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
+        VIRTIO_BLOCK_REQUEST_TYPE_FLUSH, VIRTIO_BLOCK_REQUEST_TYPE_IN, VIRTIO_BLOCK_SECTOR_SIZE,
+        VIRTIO_BLOCK_STATUS_OK, VIRTIO_BLOCK_STATUS_SIZE,
+    };
     use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::fdt::{Arm64FdtGic, Arm64FdtRegion, Arm64FdtTimerInterrupts};
+    use bangbang_runtime::interrupt::{
+        DeviceInterruptKind, GuestInterruptLine, InterruptSignalError, InterruptSink,
+    };
     use bangbang_runtime::machine::MachineConfigInput;
-    use bangbang_runtime::memory::GuestAddress;
-    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::memory::{GuestAddress, GuestMemory};
+    use bangbang_runtime::mmio::{
+        MmioAccess, MmioAccessBytes, MmioDispatchOutcome, MmioHandler, MmioHandlerError,
+        MmioOperation, MmioRegionId,
+    };
     use bangbang_runtime::serial::SharedSerialOutputBuffer;
+    use bangbang_runtime::startup::{
+        Arm64BootBlockNotificationDispatches, Arm64BootResourceConfig, Arm64BootResources,
+        Arm64BootRuntimeResources,
+    };
+    use bangbang_runtime::virtio_mmio::{
+        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
+        VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK, VirtioMmioRegister,
+    };
+    use bangbang_runtime::virtio_queue::{
+        VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
+    };
 
     use super::{
-        HvfArm64BootInterruptLinePurpose, HvfArm64BootSerialDeviceConfig,
-        HvfArm64BootSessionConfig, HvfArm64BootSessionError, allocate_interrupt_lines,
-        validate_single_vcpu,
+        HvfArm64BootBlockNotificationDispatchError, HvfArm64BootInterruptLinePurpose,
+        HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig, HvfArm64BootSessionError,
+        allocate_interrupt_lines, collect_block_notification_dispatches,
+        signal_block_queue_interrupts, validate_single_vcpu,
     };
     use crate::gic::{HvfGicInterruptRange, HvfGicMetadata, HvfGicRedistributor, HvfGicRegion};
+
+    static NEXT_TEST_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+    const TEST_MEMORY_MIB: u64 = 8;
+    const ARM64_IMAGE_HEADER_SIZE: usize = 64;
+    const ARM64_IMAGE_TEXT_OFFSET_OFFSET: usize = 8;
+    const ARM64_IMAGE_SIZE_OFFSET: usize = 16;
+    const ARM64_IMAGE_MAGIC_OFFSET: usize = 56;
+    const ARM64_IMAGE_MAGIC: u32 = 0x644d_5241;
+    const TEST_BLOCK_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_0000);
+    const TEST_QUEUE_SIZE: u16 = 4;
+    const TEST_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x8040_0000);
+    const TEST_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x8041_0000);
+    const TEST_USED_RING: GuestAddress = GuestAddress::new(0x8042_0000);
+    const HEADER_ADDR: GuestAddress = GuestAddress::new(0x8043_0000);
+    const DATA_ADDR: GuestAddress = GuestAddress::new(0x8044_0000);
+    const STATUS_ADDR: GuestAddress = GuestAddress::new(0x8045_0000);
+    const TEST_AVAILABLE_RING_IDX_OFFSET: u64 = 2;
+    const TEST_AVAILABLE_RING_RING_OFFSET: u64 = 4;
+    const TEST_AVAILABLE_RING_ENTRY_SIZE: u64 = 2;
+    const QUEUE_CONFIG_STATUS: u32 = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+        | VIRTIO_DEVICE_STATUS_DRIVER
+        | VIRTIO_DEVICE_STATUS_FEATURES_OK;
+    const DRIVER_OK_STATUS: u32 = QUEUE_CONFIG_STATUS | VIRTIO_DEVICE_STATUS_DRIVER_OK;
+
+    struct TempFile {
+        path: PathBuf,
+    }
+
+    impl TempFile {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct RecordingSink {
+        lines: Arc<Mutex<Vec<GuestInterruptLine>>>,
+        result: Result<(), InterruptSignalError>,
+    }
+
+    impl RecordingSink {
+        fn successful() -> (Arc<Mutex<Vec<GuestInterruptLine>>>, Arc<dyn InterruptSink>) {
+            let lines = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::new(Self {
+                lines: Arc::clone(&lines),
+                result: Ok(()),
+            });
+
+            (lines, sink)
+        }
+
+        fn failing(
+            message: &'static str,
+        ) -> (Arc<Mutex<Vec<GuestInterruptLine>>>, Arc<dyn InterruptSink>) {
+            let lines = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::new(Self {
+                lines: Arc::clone(&lines),
+                result: Err(InterruptSignalError::new(message)),
+            });
+
+            (lines, sink)
+        }
+    }
+
+    impl InterruptSink for RecordingSink {
+        fn signal(&self, line: GuestInterruptLine) -> Result<(), InterruptSignalError> {
+            self.lines
+                .lock()
+                .expect("recording sink lock should not be poisoned")
+                .push(line);
+            self.result.clone()
+        }
+    }
+
+    #[derive(Debug)]
+    struct WrongBlockHandler;
+
+    impl MmioHandler for WrongBlockHandler {
+        fn read(&mut self, _access: MmioAccess) -> Result<MmioAccessBytes, MmioHandlerError> {
+            Err(MmioHandlerError::new("wrong handler read"))
+        }
+
+        fn write(
+            &mut self,
+            _access: MmioAccess,
+            _data: MmioAccessBytes,
+        ) -> Result<(), MmioHandlerError> {
+            Err(MmioHandlerError::new("wrong handler write"))
+        }
+    }
 
     fn gic_with_spi_range(base: u32, count: u32) -> HvfGicMetadata {
         HvfGicMetadata {
@@ -518,6 +849,660 @@ mod tests {
 
     fn line_values(lines: &[bangbang_runtime::interrupt::GuestInterruptLine]) -> Vec<u32> {
         lines.iter().map(|line| line.raw_value()).collect()
+    }
+
+    fn line(value: u32) -> GuestInterruptLine {
+        GuestInterruptLine::new(value).expect("test interrupt line should be valid")
+    }
+
+    fn recorded_lines(lines: &Arc<Mutex<Vec<GuestInterruptLine>>>) -> Vec<u32> {
+        lines
+            .lock()
+            .expect("recorded interrupt lines should be readable")
+            .iter()
+            .map(|line| line.raw_value())
+            .collect()
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        let id = NEXT_TEST_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "bangbang-hvf-startup-{name}-{}-{id}",
+            std::process::id()
+        ))
+    }
+
+    fn temp_file(name: &str, bytes: &[u8]) -> TempFile {
+        let path = temp_path(name);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("test file should be created");
+        file.write_all(bytes)
+            .expect("test file bytes should be written");
+        TempFile { path }
+    }
+
+    fn arm64_image() -> Vec<u8> {
+        let mut bytes = vec![0xaa; ARM64_IMAGE_HEADER_SIZE];
+        write_u64_le(&mut bytes, ARM64_IMAGE_TEXT_OFFSET_OFFSET, 0);
+        write_u64_le(
+            &mut bytes,
+            ARM64_IMAGE_SIZE_OFFSET,
+            ARM64_IMAGE_HEADER_SIZE as u64,
+        );
+        write_u32_le(&mut bytes, ARM64_IMAGE_MAGIC_OFFSET, ARM64_IMAGE_MAGIC);
+        bytes
+    }
+
+    fn write_u64_le(bytes: &mut [u8], offset: usize, value: u64) {
+        let end = offset + std::mem::size_of::<u64>();
+        bytes[offset..end].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_u32_le(bytes: &mut [u8], offset: usize, value: u32) {
+        let end = offset + std::mem::size_of::<u32>();
+        bytes[offset..end].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn controller_with_kernel(kernel: &Path) -> bangbang_runtime::VmmController {
+        let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(
+                1,
+                TEST_MEMORY_MIB,
+            )))
+            .expect("machine config should be stored");
+        controller
+            .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+                kernel.to_path_buf(),
+            )))
+            .expect("boot source should be stored");
+        controller
+    }
+
+    fn add_drive(
+        controller: &mut bangbang_runtime::VmmController,
+        id: &str,
+        path: &Path,
+        is_root_device: bool,
+    ) {
+        controller
+            .handle_action(VmmAction::PutDrive(DriveConfigInput::new(
+                id,
+                id,
+                path.to_path_buf(),
+                is_root_device,
+            )))
+            .expect("drive config should be stored");
+    }
+
+    fn valid_boot_resource_config(lines: &[GuestInterruptLine]) -> Arm64BootResourceConfig<'_> {
+        Arm64BootResourceConfig {
+            vcpu_mpidrs: &[0],
+            gic: valid_fdt_gic(),
+            timer: Arm64FdtTimerInterrupts::firecracker_default(),
+            serial_device: None,
+            block_mmio_layout: BlockMmioLayout::new(TEST_BLOCK_MMIO_BASE, MmioRegionId::new(1)),
+            block_interrupt_lines: lines,
+        }
+    }
+
+    fn valid_fdt_gic() -> Arm64FdtGic {
+        Arm64FdtGic {
+            distributor: Arm64FdtRegion {
+                base: 0x3ffc_0000,
+                size: 0x1_0000,
+            },
+            redistributor: Arm64FdtRegion {
+                base: 0x3ffd_0000,
+                size: 0x2_0000,
+            },
+            compatibility: "arm,gic-v3",
+            interrupt_cells: 3,
+            maintenance_irq: 9,
+            msi: None,
+        }
+    }
+
+    fn boot_runtime_without_drives() -> (GuestMemory, Arm64BootRuntimeResources) {
+        let kernel = temp_file("kernel-no-drives", &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            valid_boot_resource_config(&[]),
+        )
+        .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+
+        (parts.memory, parts.runtime)
+    }
+
+    fn boot_runtime_with_drives(
+        drives: &[(&str, &[u8], bool)],
+    ) -> (GuestMemory, Arm64BootRuntimeResources) {
+        let kernel = temp_file("kernel-with-drives", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        let mut blocks = Vec::new();
+        blocks
+            .try_reserve_exact(drives.len())
+            .expect("test block files should reserve");
+
+        for (id, bytes, is_root_device) in drives {
+            let block = temp_file(id, bytes);
+            add_drive(&mut controller, id, block.path(), *is_root_device);
+            blocks.push(block);
+        }
+
+        let interrupt_lines: Vec<_> = (0..drives.len())
+            .map(|index| {
+                line(32 + u32::try_from(index).expect("test block device index should fit in u32"))
+            })
+            .collect();
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            valid_boot_resource_config(&interrupt_lines),
+        )
+        .expect("boot resources should assemble");
+        drop(blocks);
+        let parts = resources.into_parts();
+
+        (parts.memory, parts.runtime)
+    }
+
+    fn dispatch_boot_block_notifications(
+        memory: &mut GuestMemory,
+        runtime: &mut Arm64BootRuntimeResources,
+    ) -> Arm64BootBlockNotificationDispatches {
+        runtime
+            .dispatch_block_queue_notifications(memory)
+            .expect("block notification dispatch result should allocate")
+    }
+
+    fn write_boot_block_mmio_u32(
+        runtime: &mut Arm64BootRuntimeResources,
+        device_index: usize,
+        register: VirtioMmioRegister,
+        value: u32,
+    ) {
+        let address = runtime.block_devices[device_index]
+            .registration
+            .address()
+            .checked_add(register.offset())
+            .expect("test MMIO address should not overflow");
+        let access = runtime
+            .mmio_dispatcher
+            .lookup(address, 4)
+            .expect("block MMIO access should resolve");
+        let data = MmioAccessBytes::new(&value.to_le_bytes()).expect("u32 bytes should be valid");
+        let outcome = runtime
+            .mmio_dispatcher
+            .dispatch(MmioOperation::write(access, data).expect("u32 write should be valid"))
+            .expect("block MMIO write should dispatch");
+
+        assert_eq!(outcome, MmioDispatchOutcome::Write);
+    }
+
+    fn read_boot_block_mmio_u32(
+        runtime: &mut Arm64BootRuntimeResources,
+        device_index: usize,
+        register: VirtioMmioRegister,
+    ) -> u32 {
+        let address = runtime.block_devices[device_index]
+            .registration
+            .address()
+            .checked_add(register.offset())
+            .expect("test MMIO address should not overflow");
+        let access = runtime
+            .mmio_dispatcher
+            .lookup(address, 4)
+            .expect("block MMIO access should resolve");
+        let outcome = runtime
+            .mmio_dispatcher
+            .dispatch(MmioOperation::read(access).expect("u32 read should be valid"))
+            .expect("block MMIO read should dispatch");
+
+        match outcome {
+            MmioDispatchOutcome::Read { data } => u32::from_le_bytes(
+                data.as_slice()
+                    .try_into()
+                    .expect("u32 read should return four bytes"),
+            ),
+            MmioDispatchOutcome::Write => panic!("read operation should not return write outcome"),
+        }
+    }
+
+    fn configure_boot_block_queue(
+        runtime: &mut Arm64BootRuntimeResources,
+        device_index: usize,
+        device_ring: GuestAddress,
+    ) {
+        write_boot_block_mmio_u32(
+            runtime,
+            device_index,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+        );
+        write_boot_block_mmio_u32(
+            runtime,
+            device_index,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+        );
+        write_boot_block_mmio_u32(
+            runtime,
+            device_index,
+            VirtioMmioRegister::Status,
+            QUEUE_CONFIG_STATUS,
+        );
+        write_boot_block_mmio_u32(
+            runtime,
+            device_index,
+            VirtioMmioRegister::QueueNum,
+            u32::from(TEST_QUEUE_SIZE),
+        );
+        write_boot_block_mmio_u32(
+            runtime,
+            device_index,
+            VirtioMmioRegister::QueueDescLow,
+            guest_address_low(TEST_DESCRIPTOR_TABLE),
+        );
+        write_boot_block_mmio_u32(
+            runtime,
+            device_index,
+            VirtioMmioRegister::QueueDriverLow,
+            guest_address_low(TEST_AVAILABLE_RING),
+        );
+        write_boot_block_mmio_u32(
+            runtime,
+            device_index,
+            VirtioMmioRegister::QueueDeviceLow,
+            guest_address_low(device_ring),
+        );
+        write_boot_block_mmio_u32(runtime, device_index, VirtioMmioRegister::QueueReady, 1);
+        write_boot_block_mmio_u32(
+            runtime,
+            device_index,
+            VirtioMmioRegister::Status,
+            DRIVER_OK_STATUS,
+        );
+    }
+
+    fn notify_boot_block_queue(runtime: &mut Arm64BootRuntimeResources, device_index: usize) {
+        write_boot_block_mmio_u32(runtime, device_index, VirtioMmioRegister::QueueNotify, 0);
+    }
+
+    fn guest_address_low(address: GuestAddress) -> u32 {
+        u32::try_from(address.raw_value()).expect("test address should fit in low queue register")
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct TestDescriptor {
+        address: GuestAddress,
+        len: u32,
+        flags: u16,
+        next: u16,
+    }
+
+    impl TestDescriptor {
+        const fn readable(address: GuestAddress, len: u32, next: Option<u16>) -> Self {
+            let (flags, next_index) = match next {
+                Some(index) => (VIRTQUEUE_DESC_F_NEXT, index),
+                None => (0, 0),
+            };
+            Self {
+                address,
+                len,
+                flags,
+                next: next_index,
+            }
+        }
+
+        const fn writable(address: GuestAddress, len: u32, next: Option<u16>) -> Self {
+            let (flags, next_index) = match next {
+                Some(index) => (VIRTQUEUE_DESC_F_WRITE | VIRTQUEUE_DESC_F_NEXT, index),
+                None => (VIRTQUEUE_DESC_F_WRITE, 0),
+            };
+            Self {
+                address,
+                len,
+                flags,
+                next: next_index,
+            }
+        }
+    }
+
+    fn write_queued_read_request(memory: &mut GuestMemory) {
+        write_request_header(memory, HEADER_ADDR, VIRTIO_BLOCK_REQUEST_TYPE_IN, 0);
+        write_descriptor(
+            memory,
+            0,
+            TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+        );
+        write_descriptor(
+            memory,
+            1,
+            TestDescriptor::writable(DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as u32, Some(2)),
+        );
+        write_descriptor(memory, 2, TestDescriptor::writable(STATUS_ADDR, 1, None));
+        write_available_heads(memory, &[0]);
+    }
+
+    fn write_partially_invalid_queued_flush_request(memory: &mut GuestMemory) {
+        write_request_header(memory, HEADER_ADDR, VIRTIO_BLOCK_REQUEST_TYPE_FLUSH, 0);
+        write_descriptor(
+            memory,
+            0,
+            TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+        );
+        write_descriptor(
+            memory,
+            1,
+            TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+        );
+        write_available_heads(memory, &[0, TEST_QUEUE_SIZE]);
+    }
+
+    fn write_request_header(
+        memory: &mut GuestMemory,
+        address: GuestAddress,
+        request_type: u32,
+        sector: u64,
+    ) {
+        let mut bytes = [0; VIRTIO_BLOCK_REQUEST_HEADER_SIZE as usize];
+        let (request_type_bytes, tail) = bytes.split_at_mut(4);
+        let (_reserved, sector_bytes) = tail.split_at_mut(4);
+        request_type_bytes.copy_from_slice(&request_type.to_le_bytes());
+        sector_bytes.copy_from_slice(&sector.to_le_bytes());
+        memory
+            .write_slice(&bytes, address)
+            .expect("request header should write");
+    }
+
+    fn write_descriptor(memory: &mut GuestMemory, index: u16, descriptor: TestDescriptor) {
+        let mut bytes = [0; VIRTQUEUE_DESCRIPTOR_SIZE];
+        let (address_bytes, tail) = bytes.split_at_mut(8);
+        let (len_bytes, tail) = tail.split_at_mut(4);
+        let (flags_bytes, next_bytes) = tail.split_at_mut(2);
+        address_bytes.copy_from_slice(&descriptor.address.raw_value().to_le_bytes());
+        len_bytes.copy_from_slice(&descriptor.len.to_le_bytes());
+        flags_bytes.copy_from_slice(&descriptor.flags.to_le_bytes());
+        next_bytes.copy_from_slice(&descriptor.next.to_le_bytes());
+
+        let descriptor_address = TEST_DESCRIPTOR_TABLE
+            .checked_add(
+                u64::from(index)
+                    * u64::try_from(VIRTQUEUE_DESCRIPTOR_SIZE).expect("descriptor size should fit"),
+            )
+            .expect("descriptor address should not overflow");
+        memory
+            .write_slice(&bytes, descriptor_address)
+            .expect("descriptor should write");
+    }
+
+    fn write_guest_u16(memory: &mut GuestMemory, address: GuestAddress, value: u16) {
+        memory
+            .write_slice(&value.to_le_bytes(), address)
+            .expect("u16 field should write");
+    }
+
+    fn read_guest_bytes(memory: &GuestMemory, address: GuestAddress, len: usize) -> Vec<u8> {
+        let mut bytes = vec![0; len];
+        memory
+            .read_slice(&mut bytes, address)
+            .expect("guest bytes should read");
+        bytes
+    }
+
+    fn available_ring_idx_address() -> GuestAddress {
+        TEST_AVAILABLE_RING
+            .checked_add(TEST_AVAILABLE_RING_IDX_OFFSET)
+            .expect("available idx address should not overflow")
+    }
+
+    fn available_ring_entry_address(ring_index: u16) -> GuestAddress {
+        TEST_AVAILABLE_RING
+            .checked_add(
+                TEST_AVAILABLE_RING_RING_OFFSET
+                    + u64::from(ring_index) * TEST_AVAILABLE_RING_ENTRY_SIZE,
+            )
+            .expect("available entry address should not overflow")
+    }
+
+    fn write_available_heads(memory: &mut GuestMemory, heads: &[u16]) {
+        for (ring_index, head) in heads.iter().copied().enumerate() {
+            write_guest_u16(
+                memory,
+                available_ring_entry_address(
+                    u16::try_from(ring_index).expect("test ring index should fit in u16"),
+                ),
+                head,
+            );
+        }
+        write_guest_u16(
+            memory,
+            available_ring_idx_address(),
+            u16::try_from(heads.len()).expect("test available length should fit in u16"),
+        );
+    }
+
+    #[test]
+    fn block_notification_signal_dispatch_accepts_empty_devices() {
+        let (mut memory, mut runtime) = boot_runtime_without_drives();
+        let dispatches = dispatch_boot_block_notifications(&mut memory, &mut runtime);
+        let result = collect_block_notification_dispatches(dispatches)
+            .expect("empty dispatch result should collect");
+
+        assert!(result.is_empty());
+        assert_eq!(result.len(), 0);
+        assert!(!result.has_signal_failure());
+    }
+
+    #[test]
+    fn block_notification_signal_dispatch_skips_noop_device() {
+        let (mut memory, mut runtime) = boot_runtime_with_drives(&[("rootfs", &[0x5a; 512], true)]);
+        configure_boot_block_queue(&mut runtime, 0, TEST_USED_RING);
+        let dispatches = dispatch_boot_block_notifications(&mut memory, &mut runtime);
+        let (lines, sink) = RecordingSink::successful();
+
+        let result = signal_block_queue_interrupts(dispatches, sink.as_ref())
+            .expect("noop dispatch should collect");
+
+        assert_eq!(result.len(), 1);
+        let device = &result.as_slice()[0];
+        assert_eq!(device.dispatch().device().registration.drive_id(), "rootfs");
+        assert!(!device.dispatch().needs_queue_interrupt());
+        assert!(!device.queue_interrupt_signaled());
+        assert!(device.signal_error().is_none());
+        assert!(recorded_lines(&lines).is_empty());
+    }
+
+    #[test]
+    fn block_notification_signal_dispatch_signals_queued_request() {
+        let payload = vec![0x74; VIRTIO_BLOCK_SECTOR_SIZE as usize];
+        let (mut memory, mut runtime) =
+            boot_runtime_with_drives(&[("rootfs", payload.as_slice(), true)]);
+        configure_boot_block_queue(&mut runtime, 0, TEST_USED_RING);
+        write_queued_read_request(&mut memory);
+        notify_boot_block_queue(&mut runtime, 0);
+        let dispatches = dispatch_boot_block_notifications(&mut memory, &mut runtime);
+        let (lines, sink) = RecordingSink::successful();
+
+        let result = signal_block_queue_interrupts(dispatches, sink.as_ref())
+            .expect("queued dispatch should collect");
+
+        assert_eq!(result.len(), 1);
+        let device = &result.as_slice()[0];
+        assert!(device.dispatch().needs_queue_interrupt());
+        assert!(device.queue_interrupt_signaled());
+        assert!(device.signal_error().is_none());
+        assert_eq!(recorded_lines(&lines), vec![32]);
+        assert_eq!(
+            read_boot_block_mmio_u32(&mut runtime, 0, VirtioMmioRegister::InterruptStatus),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        assert_eq!(
+            read_guest_bytes(&memory, DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as usize),
+            payload
+        );
+        assert_eq!(
+            read_guest_bytes(&memory, STATUS_ADDR, 1),
+            [VIRTIO_BLOCK_STATUS_OK]
+        );
+    }
+
+    #[test]
+    fn block_notification_signal_dispatch_keeps_multiple_devices_independent() {
+        let first_payload = [0x11; 512];
+        let second_payload = vec![0x22; VIRTIO_BLOCK_SECTOR_SIZE as usize];
+        let (mut memory, mut runtime) = boot_runtime_with_drives(&[
+            ("rootfs", first_payload.as_slice(), true),
+            ("data", second_payload.as_slice(), false),
+        ]);
+        configure_boot_block_queue(&mut runtime, 0, TEST_USED_RING);
+        configure_boot_block_queue(&mut runtime, 1, TEST_USED_RING);
+        write_queued_read_request(&mut memory);
+        notify_boot_block_queue(&mut runtime, 1);
+        let dispatches = dispatch_boot_block_notifications(&mut memory, &mut runtime);
+        let (lines, sink) = RecordingSink::successful();
+
+        let result = signal_block_queue_interrupts(dispatches, sink.as_ref())
+            .expect("multi-device dispatch should collect");
+
+        assert_eq!(result.len(), 2);
+        let first = &result.as_slice()[0];
+        let second = &result.as_slice()[1];
+        assert_eq!(first.dispatch().device().registration.drive_id(), "rootfs");
+        assert_eq!(second.dispatch().device().registration.drive_id(), "data");
+        assert!(!first.queue_interrupt_signaled());
+        assert!(second.queue_interrupt_signaled());
+        assert_eq!(recorded_lines(&lines), vec![33]);
+        assert_eq!(
+            read_boot_block_mmio_u32(&mut runtime, 0, VirtioMmioRegister::InterruptStatus),
+            0
+        );
+        assert_eq!(
+            read_boot_block_mmio_u32(&mut runtime, 1, VirtioMmioRegister::InterruptStatus),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        assert_eq!(
+            read_guest_bytes(&memory, DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as usize),
+            second_payload
+        );
+    }
+
+    #[test]
+    fn block_notification_signal_dispatch_preserves_partial_error_interrupt_intent() {
+        let (mut memory, mut runtime) = boot_runtime_with_drives(&[("rootfs", &[0x5a; 512], true)]);
+        configure_boot_block_queue(&mut runtime, 0, TEST_USED_RING);
+        write_partially_invalid_queued_flush_request(&mut memory);
+        notify_boot_block_queue(&mut runtime, 0);
+        let dispatches = dispatch_boot_block_notifications(&mut memory, &mut runtime);
+        let (lines, sink) = RecordingSink::successful();
+
+        let result = signal_block_queue_interrupts(dispatches, sink.as_ref())
+            .expect("partial dispatch result should collect");
+
+        let device = &result.as_slice()[0];
+        assert!(device.dispatch().needs_queue_interrupt());
+        assert!(device.queue_interrupt_signaled());
+        assert!(device.dispatch().outcome().dispatch_error().is_some());
+        assert_eq!(recorded_lines(&lines), vec![32]);
+        assert_eq!(
+            read_guest_bytes(&memory, STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE as usize),
+            [VIRTIO_BLOCK_STATUS_OK]
+        );
+    }
+
+    #[test]
+    fn block_notification_signal_dispatch_preserves_signal_failure_per_device() {
+        let payload = vec![0x74; VIRTIO_BLOCK_SECTOR_SIZE as usize];
+        let (mut memory, mut runtime) =
+            boot_runtime_with_drives(&[("rootfs", payload.as_slice(), true)]);
+        configure_boot_block_queue(&mut runtime, 0, TEST_USED_RING);
+        write_queued_read_request(&mut memory);
+        notify_boot_block_queue(&mut runtime, 0);
+        let dispatches = dispatch_boot_block_notifications(&mut memory, &mut runtime);
+        let (lines, sink) = RecordingSink::failing("injected signal failure");
+
+        let result = signal_block_queue_interrupts(dispatches, sink.as_ref())
+            .expect("signal failure should stay per-device");
+
+        let device = &result.as_slice()[0];
+        assert!(result.has_signal_failure());
+        assert!(!device.queue_interrupt_signaled());
+        let err = device
+            .signal_error()
+            .expect("signal failure should be preserved");
+        assert_eq!(
+            err.to_string(),
+            "failed to signal guest interrupt line 32 for queue interrupt: injected signal failure"
+        );
+        assert_eq!(recorded_lines(&lines), vec![32]);
+        assert_eq!(
+            read_boot_block_mmio_u32(&mut runtime, 0, VirtioMmioRegister::InterruptStatus),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+    }
+
+    #[test]
+    fn block_notification_signal_dispatch_preserves_missing_handler_without_signal() {
+        let (mut memory, mut runtime) = boot_runtime_with_drives(&[("rootfs", &[0x5a; 512], true)]);
+        runtime.mmio_dispatcher = bangbang_runtime::mmio::MmioDispatcher::new();
+        let dispatches = dispatch_boot_block_notifications(&mut memory, &mut runtime);
+        let (lines, sink) = RecordingSink::successful();
+
+        let result = signal_block_queue_interrupts(dispatches, sink.as_ref())
+            .expect("missing handler dispatch should collect");
+
+        let device = &result.as_slice()[0];
+        assert!(device.dispatch().outcome().handler_lookup_error().is_some());
+        assert!(!device.queue_interrupt_signaled());
+        assert!(device.signal_error().is_none());
+        assert!(recorded_lines(&lines).is_empty());
+    }
+
+    #[test]
+    fn block_notification_signal_dispatch_preserves_wrong_handler_without_signal() {
+        let (mut memory, mut runtime) = boot_runtime_with_drives(&[("rootfs", &[0x5a; 512], true)]);
+        let region = runtime.block_devices[0].registration.region();
+        runtime.mmio_dispatcher = bangbang_runtime::mmio::MmioDispatcher::new();
+        runtime
+            .mmio_dispatcher
+            .insert_region(region.id(), region.range().start(), region.range().size())
+            .expect("replacement region should insert");
+        runtime
+            .mmio_dispatcher
+            .register_handler(region.id(), WrongBlockHandler)
+            .expect("wrong handler should register");
+        let dispatches = dispatch_boot_block_notifications(&mut memory, &mut runtime);
+        let (lines, sink) = RecordingSink::successful();
+
+        let result = signal_block_queue_interrupts(dispatches, sink.as_ref())
+            .expect("wrong handler dispatch should collect");
+
+        let device = &result.as_slice()[0];
+        assert!(device.dispatch().outcome().handler_lookup_error().is_some());
+        assert!(!device.queue_interrupt_signaled());
+        assert!(device.signal_error().is_none());
+        assert!(recorded_lines(&lines).is_empty());
+    }
+
+    #[test]
+    fn displays_block_notification_dispatch_errors() {
+        let err = HvfArm64BootBlockNotificationDispatchError::MapGuestMemory {
+            source: crate::memory::HvfGuestMemoryMappingError::InvalidState("mapping missing"),
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "failed to borrow HVF boot-session guest memory for block notifications: invalid guest memory mapping state: mapping missing"
+        );
+        assert_eq!(
+            err.source().map(ToString::to_string),
+            Some("invalid guest memory mapping state: mapping missing".to_string())
+        );
     }
 
     #[test]

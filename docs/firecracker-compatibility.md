@@ -41,14 +41,16 @@ configuration with optional serial and block MMIO registration plus boot-runtime
 block notification dispatch with per-device metadata, an internal backend-neutral
 interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, internal HVF single-vCPU arm64 boot-session preparation
-with controlled mapped guest-memory access, and an initial process startup
+with controlled mapped guest-memory access and boot block queue interrupt
+signaling, and an initial process startup
 argument model.
 There is no broader API request body model beyond the initial boot-source,
 drive configuration, machine-configuration, and actions bodies, guest execution, continuous vCPU run loop,
 complete interrupt delivery, public startup or HVF runner-loop wiring for block
-queue notifications or serial output, backend interrupt signaling, device-backed feature
-negotiation, indirect descriptor support, device-backed runner-loop MMIO
-handling, complete device emulation, multi-vCPU setup, PSCI behavior, public
+queue notifications or serial output, serial/backend interrupt wiring beyond
+the internal boot block notification path, device-backed feature negotiation,
+indirect descriptor support, device-backed runner-loop MMIO handling, complete
+device emulation, multi-vCPU setup, PSCI behavior, public
 boot-source loading/startup behavior, or successful actions execution behavior yet. Public drive configuration is
 recorded only as pre-boot VM state; separate internal runtime helpers can
 prepare owned block-device resources from that stored configuration and
@@ -318,11 +320,12 @@ metadata.
 Boot runtime resources can also dispatch pending notifications for registered
 boot block devices by using the same MMIO handler instances that guest register
 writes mutated, while returning drive, region, and interrupt-line metadata for
-later backend interrupt signaling.
+backend interrupt signaling.
 
 This is not public `/drives` behavior and does not wire block queue
-notifications into public startup or HVF runner loops, signal backend
-interrupts, or support indirect descriptors yet.
+notifications into public startup or HVF runner loops, attach block devices to
+public startup, or support indirect descriptors yet. Internal HVF boot sessions
+can consume this dispatch metadata and signal needed block SPI interrupts.
 
 ## Guest Memory Address Space
 
@@ -458,9 +461,10 @@ configuration storage. The public API path still does not call block-device
 preparation, MMIO registration, or FDT device description. The internal
 boot-resource assembly path can do those steps for later startup wiring, but it
 does not select a root block device for boot, wire active block notification
-dispatch into HVF runner loops, signal backend interrupts for block devices,
+dispatch into HVF runner loops, attach block devices to public startup,
 implement rate limiting, support vhost-user-block sockets, or use an async I/O
-engine.
+engine. Internal HVF boot sessions can signal block SPI interrupts after
+boot-runtime block notification dispatch.
 
 ## Internal arm64 FDT Generation
 
@@ -500,8 +504,8 @@ redistributor ranges, or another virtio-mmio range, and that each interrupt
 line is an actual SPI INTID before encoding Firecracker's legacy GSI-style FDT
 cell. The internal boot-resource assembly path composes block MMIO
 registrations and caller-provided interrupt lines into these descriptors, while
-leaving interrupt-line allocation and backend interrupt signaling to later HVF
-startup wiring.
+HVF startup wiring allocates matching block SPI lines and can signal them after
+boot-runtime notification dispatch.
 
 An optional serial node follows Firecracker's aarch64 `ns16550a` shape: the
 builder emits the shared `apb-pclk` fixed-clock node and a `uart@{base:x}` node
@@ -552,7 +556,8 @@ optional serial metadata, and block metadata stay available to the internal
 session. The public API does not invoke it, `PUT /actions` still returns the
 documented unsupported fault, and bangbang does not yet configure vCPU registers
 through the public startup path, run a continuous vCPU loop, signal backend
-interrupts, or prove guest boot with a smoke test.
+interrupts outside the internal boot block notification path, or prove guest
+boot with a smoke test.
 
 The runtime crate also contains an internal MMIO region registry, operation
 model, and handler dispatch boundary for future real devices. It reuses
@@ -623,8 +628,9 @@ concrete device activation effects, device config layouts, config generation
 policy, and general runner-loop device-backed notification dispatch are still
 deferred. Activated queue metadata can now feed the internal virtio-block queue
 builder, and boot runtime resources can dispatch registered block-device queue
-notifications against caller-supplied guest memory, but HVF runner-loop calls
-and backend interrupt signaling remain deferred. The
+notifications against caller-supplied guest memory. Internal HVF boot sessions
+can signal needed block SPI interrupts from those dispatch summaries, but HVF
+runner-loop calls remain deferred. The
 virtqueue model can publish one used-ring completion element with validated
 layout, mapped-memory checks, wrapping, and release ordering, but batching,
 event-index notification suppression, and device-backed completion loops are
@@ -636,10 +642,11 @@ configuration pending-status bits, acknowledge selected pending bits, and let a
 device-facing trigger record pending state before delegating backend signaling
 to an injected sink. The HVF crate can allocate deterministic guest interrupt
 lines from the validated GIC SPI range and signal validated SPI levels through
-`hv_gic_set_spi`. This follows Firecracker's separation between device-facing
-interrupt triggers and KVM-specific irqfd/GSI routing, but it is not yet
-interrupt masking, queue/device-backed virtio-mmio handling, runner-loop
-interrupt dispatch, or guest-visible device delivery.
+`hv_gic_set_spi`. Internal HVF boot sessions use that signal path for block
+queue interrupts after boot-runtime notification dispatch. This follows
+Firecracker's separation between device-facing interrupt triggers and
+KVM-specific irqfd/GSI routing, but it is not yet interrupt masking,
+runner-loop interrupt dispatch, or guest-visible device delivery.
 
 The HVF backend can decode candidate MMIO accesses from arm64 data-abort
 exception exits. The decoder converts supported ESR and IPA metadata into a
@@ -659,8 +666,9 @@ trapped guest GPR for successful reads with zero/sign extension and 32-bit or
 Guest GPR 31 is rejected explicitly so it is not confused with HVF's PC
 register. The runner uses a non-blocking dispatcher lock after a run step
 returns an MMIO exception; it does not hold the dispatcher while `hv_vcpu_run`
-is blocked. There is still no continuous run-loop policy, interrupt delivery,
-or real device emulation.
+is blocked. There is still no continuous run-loop policy, public interrupt
+delivery, or real device emulation beyond the internal boot block notification
+signal step.
 
 The HVF backend can map allocated guest memory regions into an existing
 Hypervisor.framework VM with read/write/execute guest RAM permissions. The
@@ -698,10 +706,14 @@ dispatches an already resolved MMIO access after a run has started, and another
 command starts one vCPU run, resolves a resulting MMIO exit, and dispatches or
 completes it through a caller-provided shared dispatcher. These commands reject
 overlapping metadata reads, runs, boot-register setup, or MMIO dispatches. They
-do not yet form a continuous guest run loop.
+do not yet form a continuous guest run loop. The boot session can also dispatch
+pending boot block queue notifications against mapped guest memory and signal
+the corresponding block SPI line when the runtime dispatch summary reports
+queue-interrupt intent; per-device results preserve dispatch, lookup, and signal
+failures for later runner-loop policy.
 
 bangbang still does not wire `mem_size_mib` into public startup behavior,
-wire device interrupts into guest execution, emulate devices, start a guest, power on secondary vCPUs, or
+wire device interrupts into public guest execution, emulate devices, start a guest, power on secondary vCPUs, or
 implement PSCI. Later API and startup work still needs to decide whether an
 oversized `mem_size_mib` request should be rejected before layout construction
 or should preserve Firecracker's architecture-helper truncation behavior.
@@ -849,8 +861,9 @@ macOS design work instead of direct implementation:
   loop.
 - Device-facing interrupt triggers are backend-neutral runtime state today, and
   HVF interrupt-line support can allocate deterministic SPI lines from GIC
-  metadata and set validated SPI levels through `hv_gic_set_spi`. Masking,
-  runner-loop interrupt delivery, and real device wiring still need
+  metadata and set validated SPI levels through `hv_gic_set_spi`. Internal boot
+  sessions can now use that path for block queue interrupts, while masking,
+  runner-loop interrupt delivery, and public device wiring still need
   macOS-specific backend work.
 - Linux seccomp, jailer, cgroups, and namespaces do not directly apply.
 - Linux TAP-based networking needs a macOS-specific design.
