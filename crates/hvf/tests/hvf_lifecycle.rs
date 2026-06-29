@@ -446,6 +446,54 @@ fn prepares_owned_hvf_arm64_boot_session() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn owned_hvf_arm64_boot_session_cleans_up_after_prepare_error() {
+    use bangbang_hvf::{
+        HvfArm64BootSessionConfig, HvfArm64BootSessionError, OwnedHvfArm64BootSession,
+    };
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::BlockMmioLayout;
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::startup::Arm64BootResourceError;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let config = HvfArm64BootSessionConfig::new(BlockMmioLayout::new(
+        GuestAddress::new(0x4000_0000),
+        MmioRegionId::new(1),
+    ));
+    let empty_controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+
+    let err = OwnedHvfArm64BootSession::new(&empty_controller, config.clone())
+        .expect_err("missing boot source should fail owned HVF session preparation");
+    assert!(matches!(
+        err,
+        HvfArm64BootSessionError::AssembleResources {
+            source: Arm64BootResourceError::MissingBootSource
+        }
+    ));
+
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel =
+        TempFile::new("owned-session-retry-kernel", &image).expect("temp kernel should be created");
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("boot source config should be stored");
+
+    let mut session = OwnedHvfArm64BootSession::new(&controller, config)
+        .expect("owned HVF arm64 boot session should prepare after failed preparation");
+    session
+        .shutdown()
+        .expect("owned HVF arm64 boot session should shut down after retry");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn rejects_boot_session_on_existing_hvf_vm_without_destroying_it() {
     use bangbang_hvf::{HvfArm64BootSessionConfig, HvfArm64BootSessionError, HvfBackend};
     use bangbang_runtime::VmBackend;
