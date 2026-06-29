@@ -231,6 +231,14 @@ fn prepares_internal_hvf_arm64_boot_session() {
         .prepare_arm64_boot_session(&controller, config.clone())
         .expect("internal HVF arm64 boot session should prepare");
 
+    let mmio_dispatcher = session.mmio_dispatcher();
+    assert!(
+        mmio_dispatcher
+            .try_lock()
+            .expect("session MMIO dispatcher should lock")
+            .regions()
+            .is_empty()
+    );
     assert!(session.block_interrupt_lines().is_empty());
     assert_eq!(
         session

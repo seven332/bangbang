@@ -41,8 +41,8 @@ configuration with optional serial and block MMIO registration plus boot-runtime
 block notification dispatch with per-device metadata, an internal backend-neutral
 interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, internal HVF single-vCPU arm64 boot-session preparation
-with controlled mapped guest-memory access and boot block queue interrupt
-signaling, and an initial process startup
+with a runner-compatible shared MMIO dispatcher, controlled mapped guest-memory
+access, and boot block queue interrupt signaling, and an initial process startup
 argument model.
 There is no broader API request body model beyond the initial boot-source,
 drive configuration, machine-configuration, and actions bodies, guest execution, continuous vCPU run loop,
@@ -710,7 +710,11 @@ do not yet form a continuous guest run loop. The boot session can also dispatch
 pending boot block queue notifications against mapped guest memory and signal
 the corresponding block SPI line when the runtime dispatch summary reports
 queue-interrupt intent; per-device results preserve dispatch, lookup, and signal
-failures for later runner-loop policy.
+failures for later runner-loop policy. The boot session owns a per-session
+runner-compatible shared MMIO dispatcher so later runner commands can dispatch
+MMIO on the vCPU-owning thread without global state; boot notification dispatch
+locks that dispatcher only while draining runtime notifications and releases it
+before HVF GIC signaling.
 
 bangbang still does not wire `mem_size_mib` into public startup behavior,
 wire device interrupts into public guest execution, emulate devices, start a guest, power on secondary vCPUs, or
