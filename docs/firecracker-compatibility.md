@@ -37,8 +37,9 @@ available-ring read model, used-ring write model, and internal virtio-block
 queue construction, drain, resettable active queue ownership, and active queue
 notification dispatch helper with virtio-mmio queue interrupt-status updates
 for future device handlers, internal boot-resource assembly from stored VM
-configuration with optional serial and block MMIO registration, an internal
-backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
+configuration with optional serial and block MMIO registration plus boot-runtime
+block notification dispatch with per-device metadata, an internal backend-neutral
+interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, internal HVF single-vCPU arm64 boot-session preparation
 with controlled mapped guest-memory access, and an initial process startup
 argument model.
@@ -314,9 +315,13 @@ summary preserves the drained notification list, reports queue-interrupt
 intent, marks the virtio-mmio queue interrupt status bit when completed work
 needs an interrupt, and surfaces queue-dispatch errors with partial completion
 metadata.
+Boot runtime resources can also dispatch pending notifications for registered
+boot block devices by using the same MMIO handler instances that guest register
+writes mutated, while returning drive, region, and interrupt-line metadata for
+later backend interrupt signaling.
 
 This is not public `/drives` behavior and does not wire block queue
-notifications into process startup or HVF runner loops, signal backend
+notifications into public startup or HVF runner loops, signal backend
 interrupts, or support indirect descriptors yet.
 
 ## Guest Memory Address Space
@@ -615,9 +620,11 @@ backend-neutral activation hook when `DRIVER_OK` is accepted and call its
 reset hook when the virtio-mmio status is reset to zero or the handler is
 explicitly reset. Activation failure marks the device as needing reset, but
 concrete device activation effects, device config layouts, config generation
-policy, and device-backed notification dispatch are still deferred. Activated
-queue metadata can now feed the internal virtio-block queue builder, but
-selecting a concrete block queue and owning its lifecycle remain deferred. The
+policy, and general runner-loop device-backed notification dispatch are still
+deferred. Activated queue metadata can now feed the internal virtio-block queue
+builder, and boot runtime resources can dispatch registered block-device queue
+notifications against caller-supplied guest memory, but HVF runner-loop calls
+and backend interrupt signaling remain deferred. The
 virtqueue model can publish one used-ring completion element with validated
 layout, mapped-memory checks, wrapping, and release ordering, but batching,
 event-index notification suppression, and device-backed completion loops are
