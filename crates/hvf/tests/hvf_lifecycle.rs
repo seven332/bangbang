@@ -428,6 +428,9 @@ fn prepares_owned_hvf_arm64_boot_session() {
     session
         .shutdown()
         .expect("owned HVF arm64 boot session should shut down");
+    session
+        .shutdown()
+        .expect("repeated owned HVF arm64 boot session shutdown should be idempotent");
     drop(session);
 
     let mut second_session = OwnedHvfArm64BootSession::new(&controller, config)
