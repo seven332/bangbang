@@ -812,6 +812,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_put_boot_source_with_null_optional_fields() {
+        let body = r#"{
+            "kernel_image_path": "/tmp/vmlinux",
+            "initrd_path": null,
+            "boot_args": null
+        }"#;
+        let request = request_with_body("PUT", "/boot-source", body);
+
+        let parsed = parse_request(&request).expect("nullable boot-source fields should parse");
+
+        let ApiRequest::PutBootSource(config) = parsed else {
+            panic!("expected boot-source request");
+        };
+        assert_eq!(config.kernel_image_path(), "/tmp/vmlinux");
+        assert_eq!(config.initrd_path(), None);
+        assert_eq!(config.boot_args(), None);
+    }
+
+    #[test]
     fn rejects_put_boot_source_missing_kernel_image_path() {
         let request = request_with_body("PUT", "/boot-source", r#"{"boot_args":"console=ttyS0"}"#);
 
