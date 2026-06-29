@@ -228,10 +228,24 @@ fn prepares_internal_hvf_arm64_boot_session() {
     ));
 
     let mut session = backend
-        .prepare_arm64_boot_session(&controller, config)
+        .prepare_arm64_boot_session(&controller, config.clone())
         .expect("internal HVF arm64 boot session should prepare");
 
     assert!(session.block_interrupt_lines().is_empty());
+    assert_eq!(
+        session
+            .guest_memory()
+            .expect("session should expose mapped guest memory")
+            .total_size(),
+        session.runtime_resources().layout.total_size()
+    );
+    let mut fdt_magic = [0; 4];
+    session
+        .guest_memory()
+        .expect("session should expose mapped guest memory")
+        .read_slice(&mut fdt_magic, session.runtime_resources().fdt.address)
+        .expect("mapped guest memory should contain the written FDT");
+    assert_eq!(u32::from_be_bytes(fdt_magic), 0xd00d_feed);
     assert_eq!(
         session.boot_registers().kernel_entry,
         session
@@ -247,6 +261,21 @@ fn prepares_internal_hvf_arm64_boot_session() {
     session
         .shutdown()
         .expect("internal HVF arm64 boot session should shut down");
+    drop(session);
+
+    let mut second_session = backend
+        .prepare_arm64_boot_session(&controller, config)
+        .expect("second internal HVF arm64 boot session should prepare after shutdown");
+    assert_eq!(
+        second_session
+            .guest_memory_mut()
+            .expect("second session should expose mutable mapped guest memory")
+            .total_size(),
+        second_session.runtime_resources().layout.total_size()
+    );
+    second_session
+        .shutdown()
+        .expect("second internal HVF arm64 boot session should shut down");
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

@@ -24,8 +24,8 @@ registry resolution, vCPU exit classification, single resolved HVF MMIO
 exit dispatch/completion through runtime handlers, explicit runner-thread MMIO
 handling commands, narrow vCPU register wrappers, internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, HVF SPI interrupt-line allocation and signaling, minimal internal
 arm64 FDT generation with optional serial and virtio-mmio device-node descriptors and guest-memory writes, anonymous guest memory allocation
-for validated runtime layouts, HVF guest memory map/unmap ownership for
-allocated regions, an internal MMIO region ownership registry and operation/data
+for validated runtime layouts, HVF guest memory map/unmap ownership and
+controlled mapped-memory access for allocated regions, an internal MMIO region ownership registry and operation/data
 model plus handler dispatch boundary, an internal TX-only serial MMIO output
 handler that captures transmit bytes without global state, an internal virtio-mmio register/access
 decoder, feature/status, queue, queue notification, and interrupt
@@ -39,8 +39,9 @@ notification dispatch helper with virtio-mmio queue interrupt-status updates
 for future device handlers, internal boot-resource assembly from stored VM
 configuration with optional serial and block MMIO registration, an internal
 backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
-boot-register setup, internal HVF single-vCPU arm64 boot-session preparation,
-and an initial process startup argument model.
+boot-register setup, internal HVF single-vCPU arm64 boot-session preparation
+with controlled mapped guest-memory access, and an initial process startup
+argument model.
 There is no broader API request body model beyond the initial boot-source,
 drive configuration, machine-configuration, and actions bodies, guest execution, continuous vCPU run loop,
 complete interrupt delivery, public startup or HVF runner-loop wiring for block
