@@ -259,6 +259,28 @@ impl HttpResponse {
         }
     }
 
+    pub fn machine_config(
+        vcpu_count: u8,
+        mem_size_mib: u64,
+        smt: bool,
+        track_dirty_pages: bool,
+        huge_pages: &str,
+    ) -> Self {
+        let body = serde_json::json!({
+            "huge_pages": huge_pages,
+            "mem_size_mib": mem_size_mib,
+            "smt": smt,
+            "track_dirty_pages": track_dirty_pages,
+            "vcpu_count": vcpu_count,
+        })
+        .to_string();
+
+        Self {
+            status: StatusCode::Ok,
+            body,
+        }
+    }
+
     pub fn fault(message: &str) -> Self {
         let body = serde_json::json!({ "fault_message": message }).to_string();
 
@@ -1300,6 +1322,26 @@ mod tests {
     }
 
     #[test]
+    fn response_body_contains_machine_config() {
+        let response = HttpResponse::machine_config(2, 256, false, false, "None");
+        let body: serde_json::Value =
+            serde_json::from_str(response.body()).expect("body should be JSON");
+
+        assert_eq!(response.status(), StatusCode::Ok);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "huge_pages": "None",
+                "mem_size_mib": 256,
+                "smt": false,
+                "track_dirty_pages": false,
+                "vcpu_count": 2,
+            })
+        );
+        assert_eq!(body.get("cpu_template"), None);
+    }
+
+    #[test]
     fn fault_body_contains_fault_message() {
         let response = HttpResponse::fault("message");
 
@@ -1317,14 +1359,14 @@ mod tests {
 
     #[test]
     fn response_bytes_include_http_headers() {
-        let response = HttpResponse::version(VERSION);
+        let response = HttpResponse::machine_config(1, 128, false, false, "None");
         let bytes = response.to_http_bytes();
         let text = std::str::from_utf8(&bytes).expect("response should be utf-8");
 
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(text.contains("Content-Type: application/json\r\n"));
         assert!(text.contains(&format!("Content-Length: {}\r\n", response.body().len())));
-        assert!(text.ends_with(r#"{"firecracker_version":"0.1.0"}"#));
+        assert!(text.ends_with(response.body()));
     }
 
     #[test]
