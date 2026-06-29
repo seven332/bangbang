@@ -98,6 +98,7 @@ pub enum VmmActionError {
         action: &'static str,
         state: InstanceState,
     },
+    MissingBootSource,
     BootSourceConfig(boot::BootSourceConfigError),
     DriveConfig(block::DriveConfigError),
     MachineConfig(machine::MachineConfigError),
@@ -115,6 +116,9 @@ impl fmt::Display for VmmActionError {
                     "The requested operation is not supported in {state} state: {action}"
                 )
             }
+            Self::MissingBootSource => {
+                f.write_str("boot source must be configured before InstanceStart")
+            }
             Self::BootSourceConfig(err) => write!(f, "{err}"),
             Self::DriveConfig(err) => write!(f, "{err}"),
             Self::MachineConfig(err) => write!(f, "{err}"),
@@ -128,7 +132,9 @@ impl std::error::Error for VmmActionError {
             Self::BootSourceConfig(err) => Some(err),
             Self::DriveConfig(err) => Some(err),
             Self::MachineConfig(err) => Some(err),
-            Self::UnsupportedAction(_) | Self::UnsupportedState { .. } => None,
+            Self::MissingBootSource
+            | Self::UnsupportedAction(_)
+            | Self::UnsupportedState { .. } => None,
         }
     }
 }
@@ -174,6 +180,27 @@ impl VmmController {
 
     pub fn boot_source_config(&self) -> Option<&boot::BootSourceConfig> {
         self.boot_source_config.as_ref()
+    }
+
+    pub fn preflight_instance_start(&self) -> Result<(), VmmActionError> {
+        if self.instance_info.state != InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: VmmAction::InstanceStart.name(),
+                state: self.instance_info.state,
+            });
+        }
+
+        if self.boot_source_config.is_none() {
+            return Err(VmmActionError::MissingBootSource);
+        }
+
+        Ok(())
+    }
+
+    pub fn commit_instance_start(&mut self) -> Result<(), VmmActionError> {
+        self.preflight_instance_start()?;
+        self.instance_info.state = InstanceState::Running;
+        Ok(())
     }
 
     pub fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
@@ -394,6 +421,111 @@ mod tests {
         );
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
         assert_eq!(controller.machine_config().vcpu_count(), 2);
+        assert!(controller.boot_source_config().is_some());
+        assert_eq!(controller.drive_configs().len(), 1);
+    }
+
+    #[test]
+    fn instance_start_preflight_requires_boot_source_without_mutating() {
+        let controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
+        let err = controller
+            .preflight_instance_start()
+            .expect_err("missing boot source should fail preflight");
+
+        assert_eq!(err, VmmActionError::MissingBootSource);
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert!(controller.boot_source_config().is_none());
+    }
+
+    #[test]
+    fn instance_start_preflight_accepts_not_started_with_boot_source() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+
+        assert_eq!(controller.preflight_instance_start(), Ok(()));
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+    }
+
+    #[test]
+    fn instance_start_preflight_rejects_running_state() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller.instance_info.state = InstanceState::Running;
+
+        let err = controller
+            .preflight_instance_start()
+            .expect_err("running state should fail preflight");
+
+        assert_eq!(
+            err,
+            VmmActionError::UnsupportedState {
+                action: VmmAction::InstanceStart.name(),
+                state: InstanceState::Running,
+            }
+        );
+        assert_eq!(controller.instance_info().state, InstanceState::Running);
+        assert!(controller.boot_source_config().is_some());
+    }
+
+    #[test]
+    fn commit_instance_start_sets_running_after_preflight_requirements() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+
+        assert_eq!(controller.commit_instance_start(), Ok(()));
+
+        assert_eq!(controller.instance_info().state, InstanceState::Running);
+        assert!(controller.boot_source_config().is_some());
+    }
+
+    #[test]
+    fn commit_instance_start_rejects_missing_boot_source_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
+        let err = controller
+            .commit_instance_start()
+            .expect_err("missing boot source should fail commit");
+
+        assert_eq!(err, VmmActionError::MissingBootSource);
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+    }
+
+    #[test]
+    fn commit_instance_start_rejects_duplicate_start_without_mutating_config() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller
+            .handle_action(VmmAction::PutDrive(drive_input(
+                "rootfs",
+                "/tmp/rootfs.ext4",
+                true,
+            )))
+            .expect("drive config should be stored");
+        controller
+            .commit_instance_start()
+            .expect("first commit should succeed");
+
+        let err = controller
+            .commit_instance_start()
+            .expect_err("duplicate start should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::UnsupportedState {
+                action: VmmAction::InstanceStart.name(),
+                state: InstanceState::Running,
+            }
+        );
+        assert_eq!(controller.instance_info().state, InstanceState::Running);
         assert!(controller.boot_source_config().is_some());
         assert_eq!(controller.drive_configs().len(), 1);
     }
@@ -786,6 +918,17 @@ mod tests {
             err.to_string(),
             "The requested operation is not supported in Running state: GetVmmVersion"
         );
+    }
+
+    #[test]
+    fn displays_missing_boot_source_error() {
+        let err = VmmActionError::MissingBootSource;
+
+        assert_eq!(
+            err.to_string(),
+            "boot source must be configured before InstanceStart"
+        );
+        assert!(err.source().is_none());
     }
 
     #[test]

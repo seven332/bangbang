@@ -8,7 +8,8 @@ The current repository defines crate boundaries, endpoint names, a minimal
 HTTP-over-Unix-socket API server for `GET /`, `GET /version`,
 `GET /machine-config`, pre-boot `PUT /machine-config` configuration storage,
 pre-boot `PUT /boot-source` configuration storage, and pre-boot `PUT /drives/{drive_id}`
-configuration storage, VMM-routed `PUT /actions` unsupported action handling, a backend-neutral VM trait, a minimal VMM action/data model, backend-neutral guest
+configuration storage, VMM-routed `PUT /actions` unsupported action handling, a backend-neutral VM trait, a minimal VMM action/data model with internal
+`InstanceStart` preflight and successful-start state transition helpers, backend-neutral guest
 physical address and aarch64 DRAM layout/access primitives, arm64 boot
 placement helpers, internal boot-source validation and arm64 kernel/initrd
 payload loading, an internal Firecracker-shaped drive configuration validation
@@ -250,7 +251,7 @@ exist.
 | `PUT /drives/{drive_id}` | `io_engine` | optional when `Sync`; rejected when `Async` | The internal model accepts omitted/default `Sync` and rejects `Async`; `Async` is tied to Linux io_uring and does not directly map to the first macOS target. |
 | `PUT /drives/{drive_id}` | `socket` | optional when absent or `null`; deferred when set | The internal model rejects configured sockets; vhost-user-block is outside the first tier. |
 | `PUT /drives/{drive_id}` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
-| `PUT /actions` | `action_type=InstanceStart` | VMM-routed; execution deferred | Startup execution belongs in a later startup wiring PR. The runtime currently returns an unsupported action fault before mutating state. |
+| `PUT /actions` | `action_type=InstanceStart` | VMM-routed; execution deferred | Startup execution belongs in a later startup wiring PR. The runtime currently returns an unsupported action fault before mutating state; internal preflight/commit helpers exist for later backend wiring. |
 | `PUT /actions` | `action_type=FlushMetrics` | VMM-routed; execution deferred | Depends on logger and metrics support. The runtime currently returns an unsupported action fault before mutating state. |
 | `PUT /actions` | `action_type=SendCtrlAltDel` | intentionally unsupported; parser rejected | Firecracker gates this on x86 keyboard behavior; the first target is Apple Silicon. |
 | `PUT /actions` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
@@ -272,7 +273,9 @@ The API and VMM state path implement the `PUT /actions` field policy above for
 `InstanceStart` and `FlushMetrics` and rejects malformed bodies before VMM state
 mutation. Parsed actions now route to explicit runtime VMM actions, which
 currently return unsupported action faults because startup and metrics execution
-are not wired yet.
+are not wired yet. Separate internal `InstanceStart` helpers can validate that a
+boot source exists in `Not started` state and can mark the instance `Running`
+only after a later backend startup path succeeds.
 `SendCtrlAltDel` is rejected at parse time for the first aarch64 target.
 
 Future implementation PRs should derive unit or golden tests from these tables.
@@ -765,8 +768,10 @@ through `PutDrive` and records validated configuration state. Parsed
 `/boot-source` requests flow through `PutBootSource` and replace stored
 boot-source configuration state. Parsed `/actions` requests flow through
 `InstanceStart` and `FlushMetrics` VMM actions and currently return unsupported
-action faults. The instance state remains `Not started` until real startup
-behavior exists.
+action faults. Internal `InstanceStart` preflight and commit helpers support the
+future backend sequence of validating stored boot-source state before startup and
+marking the instance `Running` only after backend startup succeeds. The public
+instance state remains `Not started` until real startup behavior exists.
 
 ### Initial API State Model
 
@@ -793,7 +798,7 @@ The first API implementation should model the same broad stages as Firecracker:
 | `PUT /machine-config` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Pre-boot-only configuration. The stored values are not applied to startup yet. |
 | `PUT /boot-source` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config only; host path opening/loading and startup use are deferred. Host path errors must avoid leaking sensitive path details when implemented. |
 | `PUT /drives/{drive_id}` | supported target; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config only; the internal block-device preparation and MMIO registration helpers are not invoked by the API path, and block attachment plus runtime hotplug remain deferred. |
-| `PUT /actions` with `InstanceStart` | VMM-routed; currently `400` unsupported `fault_message` | unsupported after start; `400` `fault_message` | Startup validation and successful transition are deferred to later runtime action wiring. |
+| `PUT /actions` with `InstanceStart` | VMM-routed; currently `400` unsupported `fault_message` | unsupported after start; `400` `fault_message` | Internal start preflight/commit exists; public startup execution remains deferred to later runtime action wiring. |
 | `PUT /actions` with `FlushMetrics` | VMM-routed; currently `400` unsupported `fault_message` | deferred until metrics support exists; future success should use `204` empty response | Firecracker treats this as runtime-only; tied to observability work. |
 | `PUT /actions` with `SendCtrlAltDel` | intentionally unsupported; parser returns `400` `fault_message` | intentionally unsupported; `400` `fault_message` | Firecracker rejects this on aarch64; bangbang's first target is Apple Silicon. |
 | Non-initial endpoints from the endpoint matrix | `400` `fault_message` until their capability exists | `400` `fault_message` until their capability exists | Covers planned later and deferred endpoints; a later capability PR may define more specific state behavior. |
