@@ -16,7 +16,8 @@ model, a host-file backing access layer, internal configured block-device
 preparation and MMIO registration helpers, an internal virtio-block
 config-space capacity model, an internal virtio-block request parser, single-request
 executor, queue dispatcher, MMIO queue-state bridge, resettable activation
-state, notification/interrupt-status dispatch helper, and a minimal
+state, notification/interrupt-status dispatch helper, an internal TX-only
+serial MMIO output device model, and a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
 create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding,
 registry resolution, vCPU exit classification, single resolved HVF MMIO
@@ -25,7 +26,8 @@ handling commands, narrow vCPU register wrappers, internal macOS 15+ HVF GIC v3 
 arm64 FDT generation with virtio-mmio device-node descriptors and guest-memory writes, anonymous guest memory allocation
 for validated runtime layouts, HVF guest memory map/unmap ownership for
 allocated regions, an internal MMIO region ownership registry and operation/data
-model plus handler dispatch boundary, an internal virtio-mmio register/access
+model plus handler dispatch boundary, an internal TX-only serial MMIO output
+handler that captures transmit bytes without global state, an internal virtio-mmio register/access
 decoder, feature/status, queue, queue notification, and interrupt
 status/acknowledgement register state, a composed runtime handler that routes
 common register accesses through those state models and exposes drained queue
@@ -41,9 +43,9 @@ boot-register setup, and an initial process startup argument model.
 There is no broader API request body model beyond the initial boot-source,
 drive configuration, machine-configuration, and parser-level actions bodies, guest execution, continuous vCPU run loop,
 complete interrupt delivery, public startup or HVF runner-loop wiring for block
-queue notifications, backend interrupt signaling, device-backed feature
+queue notifications or serial output, backend interrupt signaling, device-backed feature
 negotiation, indirect descriptor support, device-backed runner-loop MMIO
-handling, real device emulation, multi-vCPU setup, PSCI behavior, public
+handling, complete device emulation, multi-vCPU setup, PSCI behavior, public
 boot-source loading/startup behavior, or actions execution behavior yet. Public drive configuration is
 recorded only as pre-boot VM state; separate internal runtime helpers can
 prepare owned block-device resources from that stored configuration and
@@ -543,8 +545,20 @@ dispatch one resolved HVF MMIO exit through those runtime handlers and complete
 successful read results back into the trapped guest GPR. The runner can also
 perform one `hv_vcpu_run` step, resolve a resulting MMIO exit against a shared
 dispatcher, and dispatch or complete it on the vCPU-owning thread. This is
-still not continuous run-loop policy, real device emulation, or interrupt
+still not continuous run-loop policy, complete device emulation, or interrupt
 delivery.
+
+The runtime crate also contains a TX-only `ns16550a`-shaped serial MMIO output
+device model. It supports one-byte transmit-register writes, divisor-latch
+writes when DLAB is set, deterministic status/configuration reads, and explicit
+errors for unsupported widths, invalid offsets, read-only writes, and output
+sink failures. Output is captured through an injected sink instead of global
+state, and the provided in-memory sink has an explicit byte limit, so
+independent device instances do not share guest console data or grow host
+memory without a caller-chosen bound. This is internal groundwork only: the
+public `/serial` endpoint, FDT `uart@...` node, kernel `earlycon` wiring,
+serial input/RX, rate limiting, metrics, host file output configuration, and
+boot-smoke use are still deferred.
 
 The runtime crate can decode checked MMIO operations into typed virtio-mmio
 generic-register or device-configuration accesses for the Firecracker `v1.16.0`

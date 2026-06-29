@@ -7,6 +7,7 @@ pub mod interrupt;
 pub mod machine;
 pub mod memory;
 pub mod mmio;
+pub mod serial;
 pub mod startup;
 pub mod virtio_mmio;
 pub mod virtio_queue;
