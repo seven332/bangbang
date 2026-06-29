@@ -951,7 +951,7 @@ surface:
   `com.apple.security.hypervisor` entitlement before running it; the script
   fails when the host cannot run HVF tests unless CI explicitly uses
   `--allow-unsupported` after build/sign validation
-- boot smoke tests once kernel loading and vCPU execution exist
+- boot smoke tests once a minimal guest boot exposes an observable success signal
 
 ## Security and Performance Scope
 
