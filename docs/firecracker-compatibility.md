@@ -44,17 +44,18 @@ boot-register setup, internal HVF single-vCPU arm64 boot-session preparation
 with a runner-compatible shared MMIO dispatcher, controlled mapped guest-memory
 access, one-step runner-thread MMIO handling, a run-cancellation boundary, a
 virtual-timer-mask control boundary, a bounded internal boot-session run-loop
-pump, boot block queue interrupt signaling, and an initial process startup
-argument model.
+pump, boot block queue interrupt signaling, virtual timer PPI assertion, and an
+initial process startup argument model.
 There is no broader API request body model beyond the initial boot-source,
 drive configuration, machine-configuration, and actions bodies, public guest
 execution, unbounded or public continuous vCPU run loop, complete interrupt
-delivery, including timer PPI delivery, public startup, HVF runner-loop notification
-scheduling or serial output, serial/backend interrupt wiring beyond the internal
-boot block notification path, device-backed feature negotiation, indirect descriptor support,
+delivery, including timer EOI/deactivation-driven unmasking, public startup,
+HVF runner-loop notification scheduling or serial output, serial/backend
+interrupt wiring beyond the internal boot block notification path,
+device-backed feature negotiation, indirect descriptor support,
 device-backed runner-loop MMIO scheduling, complete device emulation,
-multi-vCPU setup, PSCI behavior, public boot-source loading/startup behavior,
-or successful actions execution behavior yet. Public drive configuration is
+multi-vCPU setup, PSCI behavior, public boot-source loading/startup behavior, or
+successful actions execution behavior yet. Public drive configuration is
 recorded only as pre-boot VM state; separate internal runtime helpers can
 prepare owned block-device resources from that stored configuration and
 register prepared resources in an internal MMIO dispatcher, but public
@@ -715,21 +716,23 @@ a run has started, and another command starts one vCPU run, resolves a resulting
 MMIO exit, and dispatches or completes it through a caller-provided shared
 dispatcher. The virtual timer mask commands expose HVF's explicit mask bit after
 `HV_EXIT_REASON_VTIMER_ACTIVATED`; GIC PPI pending commands can set or clear a
-validated timer PPI bit on the runner thread. Full timer delivery policy,
-including when to assert the PPI and how to detect EOI-based unmasking, remains
-future work. These commands reject overlapping metadata reads, runs,
-boot-register setup, MMIO dispatches, virtual timer mask operations, or GIC PPI
-pending operations.
+validated timer PPI bit on the runner thread. The internal boot-session
+run-loop now handles virtual timer exits by asserting the EL1 virtual timer PPI
+through that runner-thread command. Full timer delivery policy, including how to
+detect EOI/deactivation and unmask the HVF virtual timer, remains future work.
+These commands reject overlapping metadata reads, runs, boot-register setup,
+MMIO dispatches, virtual timer mask operations, or GIC PPI pending operations.
 They do not yet form a continuous guest run loop. The boot session can run one vCPU
 step through the runner with its per-session shared MMIO dispatcher, so a
 resulting MMIO exit is handled on the vCPU-owning thread without global state.
 The boot session can also expose a cloneable cancellation-only handle for an
 in-flight run step without exposing the full runner. A bounded internal
 boot-session run-loop pump now composes that one-step path with boot block
-notification dispatch between successful MMIO steps and stops explicitly on a
-step limit, stop-token request, canceled run exit, virtual timer activation,
-unknown run exit, or dispatch error. This is still internal startup plumbing,
-not public `InstanceStart` behavior or the future unbounded guest scheduler.
+notification dispatch between successful MMIO steps and virtual timer PPI
+assertion after virtual timer exits. It stops explicitly on a step limit,
+stop-token request, canceled run exit, unknown run exit, dispatch error, or
+timer handler error. This is still internal startup plumbing, not public
+`InstanceStart` behavior or the future unbounded guest scheduler.
 The boot session can also dispatch pending boot block queue notifications
 against mapped guest memory and signal the corresponding block SPI line when
 the runtime dispatch summary reports queue-interrupt intent; per-device results
@@ -871,7 +874,8 @@ macOS design work instead of direct implementation:
   `hv_vcpu_run` step at a time, exposes a cancellation-only handle for that run
   step, and shuts down by canceling and joining the runner thread. The internal
   boot session can compose those pieces into a bounded run-loop pump that
-  dispatches boot block notifications between successful MMIO steps.
+  dispatches boot block notifications between successful MMIO steps and asserts
+  the EL1 virtual timer PPI after virtual timer exits.
 - HVF exit snapshots preserve Hypervisor.framework reasons such as canceled,
   exception, virtual timer activation, and unknown after a run wrapper marks
   exit data available. Candidate arm64 MMIO data-abort exceptions can be decoded
@@ -892,8 +896,9 @@ macOS design work instead of direct implementation:
   HVF interrupt-line support can allocate deterministic SPI lines from GIC
   metadata and set validated SPI levels through `hv_gic_set_spi`. Internal boot
   sessions can now use that path for block queue interrupts, while device
-  interrupt masking, timer PPI delivery, runner-loop interrupt delivery, and
-  public device wiring still need macOS-specific backend work.
+  interrupt masking, timer EOI/deactivation-driven unmasking, runner-loop
+  interrupt delivery beyond the current internal block/timer paths, and public
+  device wiring still need macOS-specific backend work.
 - Linux seccomp, jailer, cgroups, and namespaces do not directly apply.
 - Linux TAP-based networking needs a macOS-specific design.
 - Snapshot and device behavior may differ when backed by HVF.

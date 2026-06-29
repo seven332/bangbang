@@ -149,7 +149,6 @@ pub enum HvfArm64BootRunLoopOutcome {
     StepLimitReached { steps: usize },
     Stopped { steps: usize },
     Canceled { steps: usize },
-    VtimerActivated { steps: usize },
     Unknown { steps: usize, reason: u32 },
 }
 
@@ -162,6 +161,10 @@ pub enum HvfArm64BootRunLoopError {
     DispatchBlockNotifications {
         steps_completed: usize,
         source: Box<HvfArm64BootBlockNotificationDispatchError>,
+    },
+    HandleVirtualTimer {
+        steps_completed: usize,
+        source: Box<HvfVcpuRunnerError>,
     },
 }
 
@@ -182,6 +185,13 @@ impl fmt::Display for HvfArm64BootRunLoopError {
                 f,
                 "failed to dispatch HVF boot-session block notifications after {steps_completed} completed steps: {source}"
             ),
+            Self::HandleVirtualTimer {
+                steps_completed,
+                source,
+            } => write!(
+                f,
+                "failed to handle HVF boot-session virtual timer after {steps_completed} completed steps: {source}"
+            ),
         }
     }
 }
@@ -191,6 +201,7 @@ impl std::error::Error for HvfArm64BootRunLoopError {
         match self {
             Self::RunStep { source, .. } => Some(source.as_ref()),
             Self::DispatchBlockNotifications { source, .. } => Some(source.as_ref()),
+            Self::HandleVirtualTimer { source, .. } => Some(source.as_ref()),
         }
     }
 }
@@ -501,6 +512,8 @@ fn run_boot_session_vcpu_step(
 trait BootSessionRunLoopSession {
     fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError>;
 
+    fn handle_run_loop_virtual_timer(&mut self) -> Result<(), HvfVcpuRunnerError>;
+
     fn dispatch_run_loop_block_notifications(
         &mut self,
     ) -> Result<HvfArm64BootBlockNotificationDispatches, HvfArm64BootBlockNotificationDispatchError>;
@@ -509,6 +522,11 @@ trait BootSessionRunLoopSession {
 impl BootSessionRunLoopSession for HvfArm64BootSession<'_> {
     fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
         self.run_once_and_handle_mmio()
+    }
+
+    fn handle_run_loop_virtual_timer(&mut self) -> Result<(), HvfVcpuRunnerError> {
+        self.runner
+            .set_gic_ppi_pending(self.gic.timer_interrupts.el1_virtual_timer_intid)
     }
 
     fn dispatch_run_loop_block_notifications(
@@ -549,7 +567,18 @@ fn run_boot_session_loop(
                 return Ok(HvfArm64BootRunLoopOutcome::Canceled { steps });
             }
             HvfVcpuRunStepOutcome::VtimerActivated => {
-                return Ok(HvfArm64BootRunLoopOutcome::VtimerActivated { steps });
+                session.handle_run_loop_virtual_timer().map_err(|source| {
+                    HvfArm64BootRunLoopError::HandleVirtualTimer {
+                        steps_completed: steps,
+                        source: Box::new(source),
+                    }
+                })?;
+                if stop_token.is_stop_requested() {
+                    return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+                }
+                if steps == max_steps {
+                    return Ok(HvfArm64BootRunLoopOutcome::StepLimitReached { steps });
+                }
             }
             HvfVcpuRunStepOutcome::Unknown { reason } => {
                 return Ok(HvfArm64BootRunLoopOutcome::Unknown { steps, reason });
@@ -1176,9 +1205,11 @@ mod tests {
                 HvfArm64BootBlockNotificationDispatchError,
             >,
         >,
+        timer_results: VecDeque<Result<(), HvfVcpuRunnerError>>,
         events: Vec<&'static str>,
         request_stop_on_run: Option<HvfArm64BootRunLoopStopToken>,
         request_stop_on_dispatch: Option<HvfArm64BootRunLoopStopToken>,
+        request_stop_on_timer: Option<HvfArm64BootRunLoopStopToken>,
     }
 
     impl RecordingBootSessionRunLoopSession {
@@ -1186,9 +1217,11 @@ mod tests {
             Self {
                 run_results: run_results.into_iter().map(Ok).collect(),
                 dispatch_results: VecDeque::new(),
+                timer_results: VecDeque::new(),
                 events: Vec::new(),
                 request_stop_on_run: None,
                 request_stop_on_dispatch: None,
+                request_stop_on_timer: None,
             }
         }
 
@@ -1196,14 +1229,20 @@ mod tests {
             Self {
                 run_results: VecDeque::from([Err(source)]),
                 dispatch_results: VecDeque::new(),
+                timer_results: VecDeque::new(),
                 events: Vec::new(),
                 request_stop_on_run: None,
                 request_stop_on_dispatch: None,
+                request_stop_on_timer: None,
             }
         }
 
         fn push_dispatch_error(&mut self, source: HvfArm64BootBlockNotificationDispatchError) {
             self.dispatch_results.push_back(Err(source));
+        }
+
+        fn push_timer_error(&mut self, source: HvfVcpuRunnerError) {
+            self.timer_results.push_back(Err(source));
         }
 
         fn request_stop_on_run(&mut self, stop_token: HvfArm64BootRunLoopStopToken) {
@@ -1212,6 +1251,10 @@ mod tests {
 
         fn request_stop_on_dispatch(&mut self, stop_token: HvfArm64BootRunLoopStopToken) {
             self.request_stop_on_dispatch = Some(stop_token);
+        }
+
+        fn request_stop_on_timer(&mut self, stop_token: HvfArm64BootRunLoopStopToken) {
+            self.request_stop_on_timer = Some(stop_token);
         }
     }
 
@@ -1225,6 +1268,15 @@ mod tests {
             self.run_results
                 .pop_front()
                 .expect("test run result should be queued")
+        }
+
+        fn handle_run_loop_virtual_timer(&mut self) -> Result<(), HvfVcpuRunnerError> {
+            self.events.push("timer");
+            if let Some(stop_token) = self.request_stop_on_timer.take() {
+                stop_token.request_stop();
+            }
+
+            self.timer_results.pop_front().unwrap_or(Ok(()))
         }
 
         fn dispatch_run_loop_block_notifications(
@@ -2196,25 +2248,72 @@ mod tests {
     }
 
     #[test]
-    fn boot_session_run_loop_returns_timer_and_unknown_as_terminal_outcomes() {
+    fn boot_session_run_loop_handles_virtual_timer_until_step_limit() {
         let stop_token = HvfArm64BootRunLoopStopToken::new();
-        let mut timer_session =
+        let mut session = RecordingBootSessionRunLoopSession::new([
+            HvfVcpuRunStepOutcome::VtimerActivated,
+            HvfVcpuRunStepOutcome::VtimerActivated,
+        ]);
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(2))
+            .expect("virtual timer loop should succeed");
+
+        assert_eq!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 2 }
+        );
+        assert_eq!(session.events, ["run", "timer", "run", "timer"]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_preserves_virtual_timer_handler_error() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session =
             RecordingBootSessionRunLoopSession::new([HvfVcpuRunStepOutcome::VtimerActivated]);
-        let mut unknown_session =
+        let source = HvfVcpuRunnerError::InvalidState("fake timer handler failed");
+        session.push_timer_error(source.clone());
+
+        let err = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect_err("virtual timer handler error should stop loop");
+
+        match err {
+            super::HvfArm64BootRunLoopError::HandleVirtualTimer {
+                steps_completed,
+                source: actual,
+            } => {
+                assert_eq!(steps_completed, 1);
+                assert_eq!(*actual, source);
+            }
+            other => panic!("expected virtual timer handler error, got {other:?}"),
+        }
+        assert_eq!(session.events, ["run", "timer"]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_reports_stop_after_virtual_timer_handler() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session =
+            RecordingBootSessionRunLoopSession::new([HvfVcpuRunStepOutcome::VtimerActivated]);
+        session.request_stop_on_timer(stop_token.clone());
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("stop after virtual timer handler should succeed");
+
+        assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Stopped { steps: 1 });
+        assert_eq!(session.events, ["run", "timer"]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_returns_unknown_as_terminal_outcome() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session =
             RecordingBootSessionRunLoopSession::new([HvfVcpuRunStepOutcome::Unknown {
                 reason: 99,
             }]);
 
-        let timer_outcome = run_boot_session_loop(&mut timer_session, &stop_token, max_steps(1))
-            .expect("virtual timer loop should succeed");
-        let unknown_outcome =
-            run_boot_session_loop(&mut unknown_session, &stop_token, max_steps(1))
-                .expect("unknown-exit loop should succeed");
+        let unknown_outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("unknown-exit loop should succeed");
 
-        assert_eq!(
-            timer_outcome,
-            HvfArm64BootRunLoopOutcome::VtimerActivated { steps: 1 }
-        );
         assert_eq!(
             unknown_outcome,
             HvfArm64BootRunLoopOutcome::Unknown {
@@ -2222,8 +2321,7 @@ mod tests {
                 reason: 99
             }
         );
-        assert_eq!(timer_session.events, ["run"]);
-        assert_eq!(unknown_session.events, ["run"]);
+        assert_eq!(session.events, ["run"]);
     }
 
     #[test]
