@@ -7,8 +7,8 @@ the current scaffold implements all listed API behavior.
 The current repository defines crate boundaries, endpoint names, a minimal
 HTTP-over-Unix-socket API server for `GET /`, `GET /version`,
 `GET /vm/config`, `GET /machine-config`, pre-boot `PUT /machine-config`
-configuration storage, pre-boot `PUT /boot-source` configuration storage, and pre-boot `PUT /drives/{drive_id}`
-configuration storage, process-owned `PUT /actions` startup with an internal boot run-loop worker across bounded step windows, a backend-neutral VM trait, a minimal VMM action/data model with internal
+configuration storage, pre-boot `PUT /boot-source` configuration storage, pre-boot `PUT /drives/{drive_id}`
+configuration storage, pre-boot `PUT /metrics` output configuration, process-owned `PUT /actions` startup with an internal boot run-loop worker across bounded step windows, runtime `FlushMetrics` with a minimal per-process metrics sink, a backend-neutral VM trait, a minimal VMM action/data model with internal
 `InstanceStart` preflight, transactional startup executor, and successful-start state transition helpers, backend-neutral guest
 physical address and aarch64 DRAM layout/access primitives, arm64 boot
 placement helpers, internal boot-source validation and arm64 kernel/initrd
@@ -47,9 +47,9 @@ access, one-step runner-thread MMIO handling, a run-cancellation boundary, a
 virtual-timer-mask control boundary, a bounded internal boot-session run-loop
 pump, owned internal boot-session handle, process-level owned startup-session
 wiring with optional serial capture and boot run-loop supervision across bounded step windows with retained internal worker status, boot block queue interrupt signaling,
-virtual timer PPI assertion, and an initial process startup argument model.
+virtual timer PPI assertion, per-controller metrics output state, and an initial process startup argument model.
 There is no broader API request body model beyond the initial boot-source,
-drive configuration, machine-configuration, and actions bodies, public guest
+drive configuration, machine-configuration, metrics, and actions bodies, public guest
 execution beyond internal startup execution across bounded step windows, public run-loop control, complete interrupt
 delivery, including timer EOI/deactivation-driven unmasking,
 HVF runner-loop notification scheduling, public serial output streaming,
@@ -57,8 +57,10 @@ serial/backend interrupt wiring beyond the internal boot block notification
 and retained serial capture paths,
 device-backed feature negotiation, indirect descriptor support,
 device-backed runner-loop MMIO scheduling, complete device emulation,
+full Firecracker metrics counters, periodic metrics flushing, logger integration,
 multi-vCPU setup, PSCI behavior, or successful actions beyond owned `InstanceStart`
-startup with an internal boot run loop across bounded step windows yet. Public drive configuration is
+startup with an internal boot run loop across bounded step windows and runtime
+`FlushMetrics` yet. Public drive configuration is
 recorded as pre-boot VM state and applied only during startup preparation; separate internal runtime helpers can
 prepare owned block-device resources from that stored configuration and
 register prepared resources in an internal MMIO dispatcher, but public
@@ -73,12 +75,13 @@ guest execution fast path.
 The intended public control plane is Firecracker-style HTTP over a Unix domain
 socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
 `GET /machine-config`, pre-boot `PUT /machine-config`, pre-boot
-`PUT /boot-source`, pre-boot `PUT /drives/{drive_id}`, and parsed `PUT /actions` requests
+`PUT /boot-source`, pre-boot `PUT /drives/{drive_id}`, pre-boot
+`PUT /metrics`, and parsed `PUT /actions` requests
 already map through a minimal internal VMM action/data boundary. Validation
 rejects malformed boot-source and actions requests before VMM state mutation.
 Successful `InstanceStart` startup, the `Running` transition, and an internal boot run-loop worker across bounded step windows are implemented with an internal serial MMIO
-console capture path and retained internal active, terminal-outcome, or error worker status; public run-loop control and public serial
-streaming remain deferred.
+console capture path and retained internal active, terminal-outcome, or error worker status. `FlushMetrics` is implemented as a runtime-only minimal JSON-line flush through per-process metrics state; public run-loop control, public serial
+streaming, full Firecracker metrics counters, periodic flush, and logger integration remain deferred.
 
 ## Process Startup CLI
 
@@ -86,9 +89,11 @@ The current `bangbang` executable parses only the first process-lifecycle
 arguments and starts the first API socket surface. It binds a Unix socket and
 serves `GET /`, `GET /version`, `GET /vm/config`, `GET /machine-config`,
 pre-boot `PUT /machine-config`, pre-boot `PUT /boot-source` configuration storage, and
-pre-boot `PUT /drives/{drive_id}` configuration storage, plus process-routed
-`PUT /actions` startup with an internal boot run-loop worker across bounded step windows or
-unsupported faults, but does not load a configuration file or provide public run-loop control.
+pre-boot `PUT /drives/{drive_id}` configuration storage, pre-boot `PUT /metrics`
+output configuration, plus process-routed `PUT /actions` startup and metrics
+flush with an internal boot run-loop worker across bounded step windows or
+state/configuration faults, but does not load a configuration file or provide
+public run-loop control.
 
 | Argument | Current behavior | Compatibility notes |
 | --- | --- | --- |
@@ -97,7 +102,7 @@ unsupported faults, but does not load a configuration file or provide public run
 | `--help`, `-h` | prints help | Help describes the current API socket scope. |
 | `--version`, `-V` | prints version | `-V` is retained from the existing bangbang scaffold. |
 | `--config-file`, `--no-api` | rejected | Deferred until VM configuration models and no-API startup behavior exist. |
-| seccomp, logger, metrics, snapshot, MMDS, boot timer, payload-size, and PCI process flags | rejected | These Firecracker options are Linux-specific, observability-related, or tied to later capability work. They must not be accepted as no-op compatibility shims. |
+| seccomp, logger, metrics CLI, snapshot, MMDS, boot timer, payload-size, and PCI process flags | rejected | These Firecracker options are Linux-specific, observability-related, or tied to later capability work. The API-level `PUT /metrics` subset is supported separately; CLI `--metrics-path` remains deferred. |
 
 bangbang intentionally treats `--id` alphanumeric characters as ASCII only.
 This is stricter than Firecracker `v1.16.0`'s Rust validator, which accepts
@@ -167,10 +172,11 @@ before changing this reference.
 ## Support Level Vocabulary
 
 The current scaffold implements `GET /`, `GET /version`, `GET /vm/config`,
-`GET /machine-config`, pre-boot `PUT /machine-config` configuration storage, and pre-boot
-`PUT /boot-source` and `PUT /drives/{drive_id}` configuration storage over HTTP
-on a Unix domain socket. The support levels below describe compatibility targets
-for future API work:
+`GET /machine-config`, pre-boot `PUT /machine-config` configuration storage, pre-boot
+`PUT /boot-source`, `PUT /drives/{drive_id}`, and `PUT /metrics` configuration
+storage over HTTP on a Unix domain socket, plus runtime `FlushMetrics` after
+successful startup. The support levels below describe compatibility targets for
+future API work:
 
 - supported target: planned for the first boot-oriented API implementation
 - planned later: expected to be compatible later, but outside the first tier
@@ -204,9 +210,10 @@ compatibility targets.
 | `PUT` | `/machine-config` | supported target; implemented | Stores the first vCPU and memory configuration subset before boot; values are applied during startup preparation. |
 | `PUT` | `/boot-source` | supported target; implemented | Stores guest kernel path, optional initrd path, and optional boot arguments before boot; host files are opened during startup preparation. |
 | `PUT` | `/drives/{drive_id}` | supported target; implemented | Stores initial virtio-block device configuration before boot; backing files are opened during startup preparation. |
-| `PUT` | `/actions` | supported target; internal startup execution across bounded step windows implemented | Parses `InstanceStart` and `FlushMetrics` request bodies and routes them through the process VMM owner. `InstanceStart` validates stored boot-source and state preflight, prepares an owned HVF boot session with an internal serial MMIO console on success, starts a process-owned internal boot run-loop worker across bounded step windows, and commits `Running` only after the worker handle is retained; `FlushMetrics` returns unsupported before any VMM state change. |
+| `PUT` | `/metrics` | supported target; minimal subset implemented | Stores process metrics output before boot, opens the configured file/FIFO path with nonblocking output semantics, and omits metrics from `GET /vm/config` because it is not guest configuration. Duplicate initialization returns a fault. |
+| `PUT` | `/actions` | supported target; internal startup execution and minimal metrics flush implemented | Parses `InstanceStart` and `FlushMetrics` request bodies and routes them through the process VMM owner. `InstanceStart` validates stored boot-source and state preflight, prepares an owned HVF boot session with an internal serial MMIO console on success, starts a process-owned internal boot run-loop worker across bounded step windows, and commits `Running` only after the worker handle is retained. `FlushMetrics` is rejected before startup and returns `204 No Content` after startup; configured metrics output receives one minimal JSON line, while unconfigured metrics flush is a no-op success. |
 | `PUT` | `/actions` with `SendCtrlAltDel` | intentionally unsupported; parser rejected | Firecracker gates this action on x86 keyboard behavior; the first bangbang target is Apple Silicon. |
-| `PUT` | `/logger`, `/metrics` | planned later | Tied to observability work in #17. |
+| `PUT` | `/logger` | planned later | Tied to observability work in #17. |
 | `PATCH` | `/machine-config` | deferred | Partial updates belong with later state and validation rules. |
 | `PUT` | `/cpu-config` | deferred | Needs HVF CPU feature design with VM and boot work in #8 and #10. |
 | `PUT` | `/network-interfaces/{iface_id}` | deferred | Tied to virtio network work in #14. |
@@ -255,8 +262,10 @@ exist.
 | `PUT /drives/{drive_id}` | `io_engine` | optional when `Sync`; rejected when `Async` | The internal model accepts omitted/default `Sync` and rejects `Async`; `Async` is tied to Linux io_uring and does not directly map to the first macOS target. |
 | `PUT /drives/{drive_id}` | `socket` | optional when absent or `null`; deferred when set | The internal model rejects configured sockets; vhost-user-block is outside the first tier. |
 | `PUT /drives/{drive_id}` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
+| `PUT /metrics` | `metrics_path` | required | Host path to the metrics output file or FIFO. The runtime opens it as per-process observability state and redacts path details from API-facing open errors. |
+| `PUT /metrics` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /actions` | `action_type=InstanceStart` | process-routed; internal startup execution across bounded step windows implemented | Validates stored boot-source and state preflight first, then attempts owned HVF boot-session preparation with an internal serial MMIO console and starts the process-owned internal boot run-loop worker across bounded step windows. Success returns `204 No Content` and commits `Running`; preparation or worker-start failures return a fault without mutating state. Public run-loop control and public serial streaming remain deferred. |
-| `PUT /actions` | `action_type=FlushMetrics` | VMM-routed; execution deferred | Depends on logger and metrics support. The runtime currently returns an unsupported action fault before mutating state. |
+| `PUT /actions` | `action_type=FlushMetrics` | runtime-only; minimal execution implemented | Rejected before startup. After startup, returns `204 No Content`; if `/metrics` was configured, appends one minimal JSON line, otherwise succeeds without writing. Full Firecracker counters, periodic flush, and logger integration remain deferred. |
 | `PUT /actions` | `action_type=SendCtrlAltDel` | intentionally unsupported; parser rejected | Firecracker gates this on x86 keyboard behavior; the first target is Apple Silicon. |
 | `PUT /actions` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 
@@ -270,8 +279,9 @@ during `InstanceStart` startup.
 without side effects. It includes the stored/default `machine-config`, includes
 `boot-source` only after it is configured, and always includes a `drives` array
 for configured virtio-block drives. Unsupported Firecracker sections such as
-logger, metrics, MMDS, network, vsock, balloon, snapshots, and hotplug are
-omitted until their configuration models exist.
+logger, MMDS, network, vsock, balloon, snapshots, and hotplug are omitted until
+their configuration models exist. Metrics output configuration is also omitted
+because it is process observability state rather than guest configuration.
 
 The API and VMM state path implement the `PUT /boot-source` field policy above.
 Valid pre-boot requests replace the stored boot-source configuration and return
@@ -289,9 +299,14 @@ startup preparation is attempted; when preflight succeeds, the process VMM owner
 prepares an owned HVF boot session, starts a process-owned internal boot
 run-loop worker across bounded step windows, and marks the instance `Running`
 only after that worker handle is retained.
-`FlushMetrics` returns an unsupported action fault because metrics execution is
-not wired yet. Public run-loop control, boot smoke output, and public
-runner loop scheduling remain deferred.
+The API and VMM state path implement the `PUT /metrics` field policy above as a
+pre-boot-only per-process output sink. Duplicate initialization fails without
+replacing the original sink. `FlushMetrics` is runtime-only: it fails before
+startup, succeeds without writing when the sink is unconfigured, and writes one
+minimal JSON line when `/metrics` configured an output path. Public run-loop
+control, boot smoke output, public runner loop scheduling, full Firecracker
+metrics counters, periodic metrics flush, logger integration, and CLI
+`--metrics-path` remain deferred.
 `SendCtrlAltDel` is rejected at parse time for the first aarch64 target.
 
 Future implementation PRs should derive unit or golden tests from these tables.
@@ -776,9 +791,10 @@ or should preserve Firecracker's architecture-helper truncation behavior.
 
 The current scaffold implements the first HTTP API behavior for `GET /`,
 `GET /version`, `GET /vm/config`, pre-boot `/machine-config` configuration
-storage, and pre-boot `PUT /boot-source` and `PUT /drives/{drive_id}` configuration storage, plus
+storage, pre-boot `PUT /boot-source`, `PUT /drives/{drive_id}`, and
+`PUT /metrics` configuration storage, plus
 process-routed `PUT /actions` startup with a bounded internal boot run-loop
-worker and unsupported action handling. The
+worker and runtime metrics flush handling. The
 policy below is the compatibility target for future request parsing, VMM action
 mapping, state validation, and golden API tests.
 
@@ -793,13 +809,16 @@ stored machine configuration state. `GET /vm/config` flows through
 Unsupported top-level sections are omitted until their models exist. The implemented pre-boot drive path flows
 through `PutDrive` and records validated configuration state. Parsed
 `/boot-source` requests flow through `PutBootSource` and replace stored
-boot-source configuration state. Parsed `/actions` requests flow through
+boot-source configuration state. Parsed `/metrics` requests flow through
+`PutMetrics` and initialize per-process metrics output state that is not part of
+guest configuration. Parsed `/actions` requests flow through
 `InstanceStart` and `FlushMetrics` VMM actions. `InstanceStart` first validates
 stored boot-source and state preflight, then the process VMM owner prepares and
 starts an owned HVF boot-session worker with an internal serial MMIO console
 and bounded capture buffer. It marks the instance `Running` only after the
-bounded internal worker handle is retained; `FlushMetrics` currently returns an
-unsupported action fault.
+bounded internal worker handle is retained; `FlushMetrics` fails before startup,
+then succeeds after startup and writes one minimal JSON line only when metrics
+output was configured.
 
 ### Initial API State Model
 
@@ -826,8 +845,9 @@ The first API implementation should model the same broad stages as Firecracker:
 | `PUT /machine-config` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Pre-boot-only configuration. Stored values are applied during startup preparation. |
 | `PUT /boot-source` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config; host paths are opened during startup preparation. Host path errors must avoid leaking sensitive path details. |
 | `PUT /drives/{drive_id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config; startup preparation opens backing files and registers initial block MMIO devices. Runtime hotplug remains deferred. |
+| `PUT /metrics` | implemented; `204` empty response on successful output initialization | unsupported after start; `400` `fault_message` | Metrics output is process observability state, not guest configuration. Duplicate initialization fails. |
 | `PUT /actions` with `InstanceStart` | process-routed; `204` after successful owned HVF startup with internal boot run-loop worker across bounded step windows or `400` preflight/preparation fault | unsupported after start; `400` `fault_message` | Commits `Running` only after the owned HVF boot-session worker with internal serial capture is retained. The worker keeps internal active, terminal-outcome, or error status; public run-loop control and public serial streaming remain deferred. |
-| `PUT /actions` with `FlushMetrics` | VMM-routed; currently `400` unsupported `fault_message` | deferred until metrics support exists; future success should use `204` empty response | Firecracker treats this as runtime-only; tied to observability work. |
+| `PUT /actions` with `FlushMetrics` | VMM-routed; `400` unsupported-state `fault_message` | implemented; `204` empty response | Firecracker treats this as runtime-only. bangbang writes one minimal JSON line when metrics output was configured and otherwise succeeds without writing. |
 | `PUT /actions` with `SendCtrlAltDel` | intentionally unsupported; parser returns `400` `fault_message` | intentionally unsupported; `400` `fault_message` | Firecracker rejects this on aarch64; bangbang's first target is Apple Silicon. |
 | Non-initial endpoints from the endpoint matrix | `400` `fault_message` until their capability exists | `400` `fault_message` until their capability exists | Covers planned later and deferred endpoints; a later capability PR may define more specific state behavior. |
 | Unknown endpoint or invalid method/path | `400` `fault_message` | `400` `fault_message` | Matches Firecracker's parser-level invalid path or method handling. |
@@ -875,7 +895,8 @@ Their eventual support level should follow the endpoint matrix:
 - pmem
 - entropy device configuration
 - serial customization
-- metrics and logger configuration
+- logger configuration, full Firecracker metrics counters, periodic metrics
+  flush, and CLI metrics configuration
 - memory hotplug
 - pause and resume VM state updates
 - PATCH and DELETE hotplug/update behavior

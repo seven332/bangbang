@@ -23,6 +23,7 @@ pub enum ApiRequest {
     PutBootSource(Box<BootSourceRequest>),
     PutDrive(Box<DriveConfigRequest>),
     PutMachineConfig(Box<MachineConfigRequest>),
+    PutMetrics(Box<MetricsConfigRequest>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,6 +178,23 @@ struct MachineConfigRequestBody {
     track_dirty_pages: bool,
     #[serde(default)]
     huge_pages: MachineConfigHugePages,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricsConfigRequest {
+    metrics_path: String,
+}
+
+impl MetricsConfigRequest {
+    pub fn metrics_path(&self) -> &str {
+        &self.metrics_path
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetricsConfigRequestBody {
+    metrics_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -635,6 +653,9 @@ pub fn parse_request(bytes: &[u8]) -> Result<ApiRequest, RequestError> {
     if method == "PUT" && path == "/machine-config" {
         return parse_machine_config_request(body);
     }
+    if method == "PUT" && path == "/metrics" {
+        return parse_metrics_config_request(body);
+    }
 
     match (method, path) {
         ("GET", "/") => Ok(ApiRequest::GetInstanceInfo),
@@ -732,6 +753,15 @@ fn parse_machine_config_request(body: &[u8]) -> Result<ApiRequest, RequestError>
             huge_pages: body.huge_pages,
         },
     )))
+}
+
+fn parse_metrics_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
+    let body = serde_json::from_slice::<MetricsConfigRequestBody>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+
+    Ok(ApiRequest::PutMetrics(Box::new(MetricsConfigRequest {
+        metrics_path: body.metrics_path,
+    })))
 }
 
 fn validate_machine_config_request(body: &MachineConfigRequestBody) -> Result<(), RequestError> {
@@ -959,6 +989,7 @@ impl From<ApiRequest> for Endpoint {
             ApiRequest::PutBootSource(_) => Self::BootSource,
             ApiRequest::PutDrive(_) => Self::Drive,
             ApiRequest::PutMachineConfig(_) => Self::MachineConfig,
+            ApiRequest::PutMetrics(_) => Self::Metrics,
         }
     }
 }
@@ -1423,6 +1454,71 @@ mod tests {
                 Err(RequestError::MalformedRequest)
             );
         }
+    }
+
+    #[test]
+    fn parses_put_metrics() {
+        let body = r#"{"metrics_path":"/tmp/metrics"}"#;
+        let request = request_with_body("PUT", "/metrics", body);
+
+        let parsed = parse_request(&request).expect("metrics request should parse");
+
+        let ApiRequest::PutMetrics(config) = parsed else {
+            panic!("expected metrics request");
+        };
+        assert_eq!(config.metrics_path(), "/tmp/metrics");
+        assert_eq!(request_total_len(&request), Ok(Some(request.len())));
+    }
+
+    #[test]
+    fn rejects_put_metrics_missing_metrics_path() {
+        let request = request_with_body("PUT", "/metrics", "{}");
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_put_metrics_unknown_field() {
+        let request = request_with_body(
+            "PUT",
+            "/metrics",
+            r#"{"metrics_path":"/tmp/metrics","unknown":true}"#,
+        );
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_put_metrics_invalid_field_type() {
+        for body in [
+            r#"{"metrics_path":1}"#,
+            r#"{"metrics_path":null}"#,
+            r#"{"metrics_path":["/tmp/metrics"]}"#,
+        ] {
+            assert_eq!(
+                parse_request(&request_with_body("PUT", "/metrics", body)),
+                Err(RequestError::MalformedRequest)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_put_metrics_empty_body() {
+        let request = request_with_body("PUT", "/metrics", "");
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_unsupported_metrics_method_or_path() {
+        assert_eq!(
+            parse_request(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+            Err(RequestError::InvalidPathMethod)
+        );
+        assert_eq!(
+            parse_request(&request_with_body("PUT", "/metrics/extra", "{}")),
+            Err(RequestError::InvalidPathMethod)
+        );
     }
 
     #[test]
@@ -2086,5 +2182,14 @@ mod tests {
         .expect("machine-config request should parse");
 
         assert_eq!(Endpoint::from(request), Endpoint::MachineConfig);
+
+        let request = parse_request(&request_with_body(
+            "PUT",
+            "/metrics",
+            r#"{"metrics_path":"/tmp/metrics"}"#,
+        ))
+        .expect("metrics request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::Metrics);
     }
 }

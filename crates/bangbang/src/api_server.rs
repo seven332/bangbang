@@ -14,7 +14,7 @@ use bangbang_api::http::{
     ActionRequest, ActionType, ApiRequest, BootSourceRequest, BootSourceResponse,
     DriveCacheType as ApiDriveCacheType, DriveConfigRequest, DriveConfigResponse,
     DriveIoEngine as ApiDriveIoEngine, HttpResponse, MachineConfigRequest, MachineConfigResponse,
-    RequestError, VmConfigResponse, parse_request, request_total_len,
+    MetricsConfigRequest, RequestError, VmConfigResponse, parse_request, request_total_len,
 };
 use bangbang_runtime::block::{DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine};
 use bangbang_runtime::boot::{BootSourceConfig, BootSourceConfigInput};
@@ -22,6 +22,7 @@ use bangbang_runtime::machine::{
     MachineConfig, MachineConfigCpuTemplate as RuntimeMachineConfigCpuTemplate,
     MachineConfigHugePages as RuntimeMachineConfigHugePages, MachineConfigInput,
 };
+use bangbang_runtime::metrics::MetricsConfigInput;
 use bangbang_runtime::{VmConfiguration, VmmAction, VmmData};
 
 use crate::vmm::VmmRequestHandler;
@@ -410,6 +411,9 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PutMachineConfig(config) => handle_empty(vmm.handle_action(
             VmmAction::PutMachineConfig(machine_config_input_from_request(config.as_ref())),
         )),
+        ApiRequest::PutMetrics(config) => handle_empty(vmm.handle_action(VmmAction::PutMetrics(
+            metrics_config_input_from_request(config.as_ref()),
+        ))),
         ApiRequest::PutDrive(config) => handle_empty(vmm.handle_action(VmmAction::PutDrive(
             drive_config_input_from_request(config.as_ref()),
         ))),
@@ -588,6 +592,10 @@ fn machine_config_input_from_request(config: &MachineConfigRequest) -> MachineCo
     }
 
     input
+}
+
+fn metrics_config_input_from_request(config: &MetricsConfigRequest) -> MetricsConfigInput {
+    MetricsConfigInput::new(config.metrics_path())
 }
 
 fn machine_config_huge_pages_name(huge_pages: RuntimeMachineConfigHugePages) -> &'static str {
@@ -1241,13 +1249,36 @@ mod tests {
     }
 
     #[test]
-    fn returns_fault_for_flush_metrics_without_mutating_state() {
+    fn configures_metrics_without_adding_vm_config_section() {
+        let mut vmm = test_controller();
+        let metrics_path = unique_socket_path("metrics-output").with_extension("metrics");
+        let body = format!(r#"{{"metrics_path":"{}"}}"#, metrics_path.to_string_lossy());
+        let request = format!(
+            "PUT /metrics HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        let response = handle_request_bytes(request.as_bytes(), &mut vmm);
+
+        assert_eq!(response.status(), bangbang_api::http::StatusCode::NoContent);
+        let config_response = handle_request_bytes(
+            b"GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &mut vmm,
+        );
+        assert_eq!(config_response.status(), bangbang_api::http::StatusCode::Ok);
+        assert!(!config_response.body().contains("metrics"));
+
+        fs::remove_file(metrics_path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn returns_state_fault_for_preboot_flush_metrics_without_mutating_state() {
         let mut vmm = test_controller();
         let response = put_action_over_socket(&mut vmm, "flush-metrics", "FlushMetrics");
 
         assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
         assert!(response.contains(
-            r#"{"fault_message":"The requested operation is not supported: FlushMetrics"}"#
+            r#"{"fault_message":"The requested operation is not supported in Not started state: FlushMetrics"}"#
         ));
         assert_eq!(
             vmm.instance_info().state,
@@ -1259,6 +1290,69 @@ mod tests {
         );
         assert!(vmm.boot_source_config().is_none());
         assert!(vmm.drive_configs().is_empty());
+    }
+
+    #[test]
+    fn flush_metrics_after_start_without_configuration_is_noop() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_request = format!(
+            "PUT /boot-source HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{boot_body}",
+            boot_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response =
+            put_action_over_socket(&mut vmm, "start-before-flush", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let flush_response = put_action_over_socket(&mut vmm, "flush-unconfigured", "FlushMetrics");
+
+        assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(flush_response.contains("Content-Length: 0\r\n"));
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::Running
+        );
+    }
+
+    #[test]
+    fn configured_metrics_flush_writes_json_line_after_start() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let metrics_path = unique_socket_path("metrics-flush").with_extension("metrics");
+        let metrics_body = format!(r#"{{"metrics_path":"{}"}}"#, metrics_path.to_string_lossy());
+        let metrics_request = format!(
+            "PUT /metrics HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{metrics_body}",
+            metrics_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(metrics_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_request = format!(
+            "PUT /boot-source HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{boot_body}",
+            boot_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response =
+            put_action_over_socket(&mut vmm, "start-with-metrics", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let flush_response = put_action_over_socket(&mut vmm, "flush-configured", "FlushMetrics");
+
+        assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert_eq!(
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+
+        fs::remove_file(metrics_path).expect("fixture should clean up");
     }
 
     #[test]

@@ -6,6 +6,7 @@ pub enum Endpoint {
     Actions,
     BootSource,
     MachineConfig,
+    Metrics,
     Drive,
     NetworkInterface,
     Vsock,
