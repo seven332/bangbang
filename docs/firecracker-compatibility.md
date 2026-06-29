@@ -23,7 +23,7 @@ create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding,
 registry resolution, vCPU exit classification, single resolved HVF MMIO
 exit dispatch/completion through runtime handlers, explicit runner-thread MMIO
 handling commands, narrow vCPU register wrappers, internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, HVF SPI interrupt-line allocation and signaling, minimal internal
-arm64 FDT generation with virtio-mmio device-node descriptors and guest-memory writes, anonymous guest memory allocation
+arm64 FDT generation with optional serial and virtio-mmio device-node descriptors and guest-memory writes, anonymous guest memory allocation
 for validated runtime layouts, HVF guest memory map/unmap ownership for
 allocated regions, an internal MMIO region ownership registry and operation/data
 model plus handler dispatch boundary, an internal TX-only serial MMIO output
@@ -460,9 +460,9 @@ engine.
 The runtime crate can build a minimal Firecracker-shaped arm64 FDT using the
 same `vm-fdt` writer crate that Firecracker uses. The generated tree currently
 contains root properties, CPU data, memory, chosen, timer, PSCI, GIC nodes, and
-optional sorted virtio-mmio device nodes from caller-supplied descriptors. It
-intentionally omits serial, RTC, PCI, vmgenid, vmclock, and other device nodes
-until the corresponding emulation paths exist.
+an optional serial device node plus optional sorted virtio-mmio device nodes
+from caller-supplied descriptors. It intentionally omits RTC, PCI, vmgenid,
+vmclock, and other device nodes until the corresponding emulation paths exist.
 
 The memory node excludes the first 2 MiB system area from the first DRAM range
 and preserves later DRAM ranges from the runtime layout, but direct FDT
@@ -495,6 +495,17 @@ cell. The internal boot-resource assembly path composes block MMIO
 registrations and caller-provided interrupt lines into these descriptors, while
 leaving interrupt-line allocation and backend interrupt signaling to later HVF
 startup wiring.
+
+An optional serial node follows Firecracker's aarch64 `ns16550a` shape: the
+builder emits the shared `apb-pclk` fixed-clock node and a `uart@{base:x}` node
+with `compatible = "ns16550a"`, `reg = [base, size]`,
+`clocks = <apb-pclk>`, `clock-names = "apb_pclk"`, and
+`interrupts = [SPI, line - 32, edge-rising]`. The serial node inherits the root
+`interrupt-parent`, matching Firecracker's serial-specific node shape. Direct
+FDT configuration validates that the serial region is non-empty, does not
+overflow, does not overlap guest RAM, GIC distributor or redistributor ranges,
+or any virtio-mmio range, and that the serial interrupt line is an SPI INTID
+before encoding it.
 
 FDT writes first reject mismatches between the layout used to describe guest RAM
 and the allocated guest memory object. FDT bytes are then built before guest
@@ -555,10 +566,13 @@ errors for unsupported widths, invalid offsets, read-only writes, and output
 sink failures. Output is captured through an injected sink instead of global
 state, and the provided in-memory sink has an explicit byte limit, so
 independent device instances do not share guest console data or grow host
-memory without a caller-chosen bound. This is internal groundwork only: the
-public `/serial` endpoint, FDT `uart@...` node, kernel `earlycon` wiring,
-serial input/RX, rate limiting, metrics, host file output configuration, and
-boot-smoke use are still deferred.
+memory without a caller-chosen bound. The internal arm64 FDT builder can
+describe a caller-provided serial MMIO descriptor as a Firecracker-shaped
+`uart@...` node, but this is still internal groundwork only: startup does not
+register the serial MMIO handler or pass serial FDT metadata yet, and the
+public `/serial` endpoint, kernel `earlycon` wiring, serial input/RX, rate
+limiting, metrics, host file output configuration, and boot-smoke use are still
+deferred.
 
 The runtime crate can decode checked MMIO operations into typed virtio-mmio
 generic-register or device-configuration accesses for the Firecracker `v1.16.0`
