@@ -105,6 +105,10 @@ impl Arm64BootBlockNotificationDispatches {
         &self.devices
     }
 
+    pub fn into_vec(self) -> Vec<Arm64BootBlockNotificationDispatch> {
+        self.devices
+    }
+
     pub fn len(&self) -> usize {
         self.devices.len()
     }
