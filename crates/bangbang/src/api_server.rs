@@ -20,6 +20,7 @@ use bangbang_runtime::{VmmAction, VmmController, VmmData};
 
 const READ_CHUNK_SIZE: usize = 4096;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+const MACHINE_CONFIG_UNSUPPORTED_MESSAGE: &str = "machine configuration API is not supported yet.";
 static NEXT_TEMP_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -389,6 +390,9 @@ fn handle_api_request(request: ApiRequest, vmm: &mut VmmController) -> HttpRespo
             handle_instance_info(vmm.handle_action(VmmAction::GetVmInstanceInfo))
         }
         ApiRequest::GetVersion => handle_vmm_version(vmm.handle_action(VmmAction::GetVmmVersion)),
+        ApiRequest::GetMachineConfig | ApiRequest::PutMachineConfig(_) => {
+            HttpResponse::fault(MACHINE_CONFIG_UNSUPPORTED_MESSAGE)
+        }
         ApiRequest::PutDrive(config) => handle_empty(vmm.handle_action(VmmAction::PutDrive(
             drive_config_input_from_request(config.as_ref()),
         ))),
@@ -638,6 +642,44 @@ mod tests {
     }
 
     #[test]
+    fn returns_fault_for_machine_config_until_storage_exists() {
+        let mut vmm = test_controller();
+
+        let get_response = handle_request_bytes(
+            b"GET /machine-config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &mut vmm,
+        );
+
+        assert_eq!(
+            get_response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+        assert_eq!(
+            get_response.body(),
+            r#"{"fault_message":"machine configuration API is not supported yet."}"#
+        );
+        assert!(vmm.drive_configs().is_empty());
+
+        let body = r#"{"vcpu_count":1,"mem_size_mib":128}"#;
+        let request = format!(
+            "PUT /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        let put_response = handle_request_bytes(request.as_bytes(), &mut vmm);
+
+        assert_eq!(
+            put_response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+        assert_eq!(
+            put_response.body(),
+            r#"{"fault_message":"machine configuration API is not supported yet."}"#
+        );
+        assert!(vmm.drive_configs().is_empty());
+    }
+
+    #[test]
     fn socket_path_cleanup_keeps_replaced_path() {
         let path = unique_socket_path("cln");
         let listener = UnixListener::bind(&path).expect("temporary listener should bind");
@@ -749,6 +791,38 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
         assert!(response.contains(r#"{"fault_message":"Invalid request method and/or path."}"#));
+    }
+
+    #[test]
+    fn returns_machine_config_fault_over_unix_socket() {
+        let path = unique_socket_path("machine-config");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+        let body = r#"{"vcpu_count":1,"mem_size_mib":128}"#;
+        let request = format!(
+            "PUT /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        client
+            .write_all(request.as_bytes())
+            .expect("client should write request");
+        let mut vmm = test_controller();
+        server
+            .serve_next(&mut vmm)
+            .expect("server should handle one request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("client should read response");
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(
+            response
+                .contains(r#"{"fault_message":"machine configuration API is not supported yet."}"#)
+        );
+        assert!(vmm.drive_configs().is_empty());
     }
 
     #[test]
