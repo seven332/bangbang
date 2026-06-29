@@ -443,6 +443,29 @@ mod tests {
     }
 
     #[test]
+    fn instance_start_action_rejects_running_state_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller.instance_info.state = InstanceState::Running;
+
+        let err = controller
+            .handle_action(VmmAction::InstanceStart)
+            .expect_err("running state should fail action preflight");
+
+        assert_eq!(
+            err,
+            VmmActionError::UnsupportedState {
+                action: VmmAction::InstanceStart.name(),
+                state: InstanceState::Running,
+            }
+        );
+        assert_eq!(controller.instance_info().state, InstanceState::Running);
+        assert!(controller.boot_source_config().is_some());
+    }
+
+    #[test]
     fn instance_start_preflight_requires_boot_source_without_mutating() {
         let controller = VmmController::new("demo-1", "0.1.0", "bangbang");
 
