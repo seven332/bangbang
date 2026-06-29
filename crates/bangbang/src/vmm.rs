@@ -1,5 +1,12 @@
+use std::fmt;
+use std::num::NonZeroUsize;
+use std::sync::mpsc;
+use std::thread::{self, JoinHandle};
+
 use bangbang_hvf::{
-    HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig, OwnedHvfArm64BootSession,
+    HvfArm64BootRunLoopControl, HvfArm64BootRunLoopError, HvfArm64BootRunLoopOutcome,
+    HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
+    HvfVcpuRunnerError, OwnedHvfArm64BootSession,
 };
 use bangbang_runtime::block::BlockMmioLayout;
 use bangbang_runtime::memory::GuestAddress;
@@ -20,6 +27,8 @@ const DEFAULT_BLOCK_MMIO_BASE: GuestAddress = GuestAddress::new(0x5000_0000);
 const DEFAULT_BLOCK_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(1);
 const DEFAULT_SERIAL_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_0000);
 const DEFAULT_SERIAL_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(0);
+const DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT: usize = 1024;
+const HVF_BOOT_RUN_LOOP_THREAD_NAME: &str = "bangbang-hvf-boot-loop";
 
 pub(crate) trait InstanceStartExecutor {
     type Session;
@@ -156,12 +165,145 @@ impl HvfInstanceStartExecutor {
 }
 
 impl InstanceStartExecutor for HvfInstanceStartExecutor {
-    type Session = OwnedHvfArm64BootSession;
+    type Session = HvfBootRunLoopSupervisor;
 
     fn start(&mut self, controller: &VmmController) -> Result<Self::Session, BackendError> {
-        OwnedHvfArm64BootSession::new(controller, self.boot_session_config())
-            .map_err(|err| BackendError::Hypervisor(err.to_string()))
+        let session = OwnedHvfArm64BootSession::new(controller, self.boot_session_config())
+            .map_err(|err| BackendError::Hypervisor(err.to_string()))?;
+        HvfBootRunLoopSupervisor::start(session, default_hvf_boot_run_loop_step_limit())
     }
+}
+
+pub(crate) type HvfBootRunLoopSupervisor = BootRunLoopSupervisor<OwnedHvfArm64BootSession>;
+
+pub(crate) trait BootRunLoopControl: Clone + fmt::Debug + Send + Sync + 'static {
+    type Error: fmt::Display + Send + 'static;
+    type StopToken: Clone + Send + Sync + 'static;
+
+    fn stop_token(&self) -> Self::StopToken;
+
+    fn request_stop(&self) -> Result<(), Self::Error>;
+}
+
+impl BootRunLoopControl for HvfArm64BootRunLoopControl {
+    type Error = HvfVcpuRunnerError;
+    type StopToken = HvfArm64BootRunLoopStopToken;
+
+    fn stop_token(&self) -> Self::StopToken {
+        HvfArm64BootRunLoopControl::stop_token(self)
+    }
+
+    fn request_stop(&self) -> Result<(), Self::Error> {
+        HvfArm64BootRunLoopControl::request_stop(self)
+    }
+}
+
+pub(crate) trait BootRunLoopSession: Send + 'static {
+    type Control: BootRunLoopControl;
+    type Error: fmt::Display + Send + 'static;
+    type Outcome: fmt::Debug + Send + 'static;
+
+    fn run_loop_control(&self) -> Self::Control;
+
+    fn run_loop(
+        &mut self,
+        stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
+        max_steps: NonZeroUsize,
+    ) -> Result<Self::Outcome, Self::Error>;
+}
+
+impl BootRunLoopSession for OwnedHvfArm64BootSession {
+    type Control = HvfArm64BootRunLoopControl;
+    type Error = HvfArm64BootRunLoopError;
+    type Outcome = HvfArm64BootRunLoopOutcome;
+
+    fn run_loop_control(&self) -> Self::Control {
+        OwnedHvfArm64BootSession::run_loop_control(self)
+    }
+
+    fn run_loop(
+        &mut self,
+        stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
+        max_steps: NonZeroUsize,
+    ) -> Result<Self::Outcome, Self::Error> {
+        OwnedHvfArm64BootSession::run_loop(self, stop_token, max_steps)
+    }
+}
+
+pub(crate) struct BootRunLoopSupervisor<S>
+where
+    S: BootRunLoopSession,
+{
+    control: S::Control,
+    session_release_sender: Option<mpsc::Sender<()>>,
+    worker: Option<JoinHandle<Result<S::Outcome, S::Error>>>,
+}
+
+impl<S> BootRunLoopSupervisor<S>
+where
+    S: BootRunLoopSession,
+{
+    fn start(mut session: S, max_steps: NonZeroUsize) -> Result<Self, BackendError> {
+        let control = session.run_loop_control();
+        let stop_token = control.stop_token();
+        let (session_release_sender, session_release_receiver) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name(HVF_BOOT_RUN_LOOP_THREAD_NAME.to_owned())
+            .spawn(move || {
+                let result = session.run_loop(&stop_token, max_steps);
+                let _ = session_release_receiver.recv();
+                result
+            })
+            .map_err(|err| {
+                BackendError::Hypervisor(format!("failed to spawn HVF boot run loop: {err}"))
+            })?;
+
+        Ok(Self {
+            control,
+            session_release_sender: Some(session_release_sender),
+            worker: Some(worker),
+        })
+    }
+
+    fn stop_and_join(&mut self) {
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+
+        let stop_requested = self.control.request_stop().is_ok();
+        drop(self.session_release_sender.take());
+
+        // A stop error can mean an in-flight vCPU run was not canceled; avoid
+        // turning cleanup into an unbounded join in that error path.
+        if stop_requested || worker.is_finished() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl<S> Drop for BootRunLoopSupervisor<S>
+where
+    S: BootRunLoopSession,
+{
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
+impl<S> fmt::Debug for BootRunLoopSupervisor<S>
+where
+    S: BootRunLoopSession,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BootRunLoopSupervisor")
+            .field("control", &self.control)
+            .field("worker_active", &self.worker.is_some())
+            .finish()
+    }
+}
+
+fn default_hvf_boot_run_loop_step_limit() -> NonZeroUsize {
+    NonZeroUsize::new(DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT).unwrap_or(NonZeroUsize::MIN)
 }
 
 fn default_hvf_boot_session_config(
@@ -180,9 +322,12 @@ fn default_hvf_boot_session_config(
 
 #[cfg(test)]
 mod tests {
+    use std::fmt;
     use std::fs::{File, remove_file};
+    use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
 
     use bangbang_runtime::block::{DriveConfigInput, DriveConfigs, PreparedBlockDevices};
     use bangbang_runtime::boot::BootSourceConfigInput;
@@ -190,8 +335,10 @@ mod tests {
     use bangbang_runtime::{BackendError, InstanceState, VmmAction, VmmActionError};
 
     use super::{
-        DEFAULT_SERIAL_MMIO_BASE, DEFAULT_SERIAL_MMIO_REGION_ID, HvfInstanceStartExecutor,
-        InstanceStartExecutor, ProcessVmm, default_hvf_boot_session_config,
+        BootRunLoopControl, BootRunLoopSession, BootRunLoopSupervisor,
+        DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT, DEFAULT_SERIAL_MMIO_BASE,
+        DEFAULT_SERIAL_MMIO_REGION_ID, HvfInstanceStartExecutor, InstanceStartExecutor, ProcessVmm,
+        default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
     };
 
     static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -269,6 +416,133 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct FakeRunLoopOutcome;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct FakeRunLoopError;
+
+    impl fmt::Display for FakeRunLoopError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("fake run loop failed")
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct FakeRunLoopStopError;
+
+    impl fmt::Display for FakeRunLoopStopError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("fake run loop stop failed")
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct FakeRunLoopStopToken {
+        stopped: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl FakeRunLoopStopToken {
+        fn request_stop(&self) {
+            let (lock, condition) = &*self.stopped;
+            let mut stopped = lock.lock().expect("stop flag should lock");
+            *stopped = true;
+            condition.notify_all();
+        }
+
+        fn wait_for_stop(&self) {
+            let (lock, condition) = &*self.stopped;
+            let mut stopped = lock.lock().expect("stop flag should lock");
+            while !*stopped {
+                stopped = condition
+                    .wait(stopped)
+                    .expect("stop flag should wait without poisoning");
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct FakeRunLoopControl {
+        stop_token: FakeRunLoopStopToken,
+        request_stop_count: Arc<AtomicU64>,
+    }
+
+    impl FakeRunLoopControl {
+        fn request_stop_count(&self) -> u64 {
+            self.request_stop_count.load(Ordering::SeqCst)
+        }
+    }
+
+    impl BootRunLoopControl for FakeRunLoopControl {
+        type Error = FakeRunLoopStopError;
+        type StopToken = FakeRunLoopStopToken;
+
+        fn stop_token(&self) -> Self::StopToken {
+            self.stop_token.clone()
+        }
+
+        fn request_stop(&self) -> Result<(), Self::Error> {
+            self.request_stop_count.fetch_add(1, Ordering::SeqCst);
+            self.stop_token.request_stop();
+            Ok(())
+        }
+    }
+
+    struct FakeRunLoopSession {
+        control: FakeRunLoopControl,
+        drop_count: Arc<AtomicU64>,
+        max_steps_sender: mpsc::Sender<usize>,
+        wait_for_stop: bool,
+    }
+
+    impl FakeRunLoopSession {
+        fn new(
+            control: FakeRunLoopControl,
+            drop_count: Arc<AtomicU64>,
+            max_steps_sender: mpsc::Sender<usize>,
+        ) -> Self {
+            Self {
+                control,
+                drop_count,
+                max_steps_sender,
+                wait_for_stop: true,
+            }
+        }
+
+        const fn with_wait_for_stop(mut self, wait_for_stop: bool) -> Self {
+            self.wait_for_stop = wait_for_stop;
+            self
+        }
+    }
+
+    impl Drop for FakeRunLoopSession {
+        fn drop(&mut self) {
+            self.drop_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl BootRunLoopSession for FakeRunLoopSession {
+        type Control = FakeRunLoopControl;
+        type Error = FakeRunLoopError;
+        type Outcome = FakeRunLoopOutcome;
+
+        fn run_loop_control(&self) -> Self::Control {
+            self.control.clone()
+        }
+
+        fn run_loop(
+            &mut self,
+            stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
+            max_steps: NonZeroUsize,
+        ) -> Result<Self::Outcome, Self::Error> {
+            let _ = self.max_steps_sender.send(max_steps.get());
+            if self.wait_for_stop {
+                stop_token.wait_for_stop();
+            }
+            Ok(FakeRunLoopOutcome)
+        }
+    }
+
     fn configured_vmm(starter: FakeStarter) -> ProcessVmm<FakeStarter> {
         let mut vmm = ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", starter);
         vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
@@ -329,6 +603,68 @@ mod tests {
                 .iter()
                 .all(|registration| registration.region_id() != serial_region_id)
         );
+    }
+
+    #[test]
+    fn default_hvf_boot_run_loop_step_limit_is_nonzero() {
+        assert_eq!(
+            default_hvf_boot_run_loop_step_limit().get(),
+            DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT
+        );
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_returns_without_waiting_for_stop() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender);
+
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(7).expect("non-zero limit"))
+                .expect("supervisor should start");
+
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            7
+        );
+        assert_eq!(control.request_stop_count(), 0);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 0);
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_retains_session_after_bounded_loop_returns() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_wait_for_stop(false);
+
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(3).expect("non-zero limit"))
+                .expect("supervisor should start");
+
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            3
+        );
+        assert_eq!(drop_count.load(Ordering::SeqCst), 0);
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
