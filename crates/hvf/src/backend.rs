@@ -13,6 +13,7 @@ use crate::vcpu::HvfVcpu;
 
 const VM_NOT_CREATED_FOR_MEMORY_MESSAGE: &str = "VM must be created before mapping guest memory";
 const GUEST_MEMORY_ALREADY_MAPPED_MESSAGE: &str = "guest memory is already mapped";
+const GUEST_MEMORY_NOT_MAPPED_MESSAGE: &str = "guest memory is not mapped";
 const VM_NOT_CREATED_FOR_GIC_MESSAGE: &str = "VM must be created before creating a GIC";
 const GIC_ALREADY_CREATED_MESSAGE: &str = "GIC is already created";
 const VCPU_TOPOLOGY_ALREADY_STARTED_MESSAGE: &str = "GIC must be created before creating vCPUs";
@@ -68,6 +69,26 @@ impl HvfBackend {
 
         self.guest_memory = None;
         Ok(())
+    }
+
+    pub(crate) fn mapped_guest_memory(&self) -> Result<&GuestMemory, HvfGuestMemoryMappingError> {
+        self.guest_memory
+            .as_ref()
+            .ok_or(HvfGuestMemoryMappingError::InvalidState(
+                GUEST_MEMORY_NOT_MAPPED_MESSAGE,
+            ))?
+            .memory()
+    }
+
+    pub(crate) fn mapped_guest_memory_mut(
+        &mut self,
+    ) -> Result<&mut GuestMemory, HvfGuestMemoryMappingError> {
+        self.guest_memory
+            .as_mut()
+            .ok_or(HvfGuestMemoryMappingError::InvalidState(
+                GUEST_MEMORY_NOT_MAPPED_MESSAGE,
+            ))?
+            .memory_mut()
     }
 
     pub fn create_gic(&mut self) -> Result<&HvfGicMetadata, HvfGicError> {
@@ -518,6 +539,61 @@ mod tests {
             )
         ));
         assert!(backend.has_guest_memory_mapping());
+        assert_eq!(mapper.map_count(), 1);
+    }
+
+    #[test]
+    fn mapped_guest_memory_access_requires_mapping() {
+        let mut backend = HvfBackend::new();
+
+        assert!(matches!(
+            backend.mapped_guest_memory(),
+            Err(crate::memory::HvfGuestMemoryMappingError::InvalidState(
+                super::GUEST_MEMORY_NOT_MAPPED_MESSAGE
+            ))
+        ));
+        assert!(matches!(
+            backend.mapped_guest_memory_mut(),
+            Err(crate::memory::HvfGuestMemoryMappingError::InvalidState(
+                super::GUEST_MEMORY_NOT_MAPPED_MESSAGE
+            ))
+        ));
+    }
+
+    #[test]
+    fn mapped_guest_memory_access_borrows_backend_owned_memory() {
+        let page_size = page_size();
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut backend = HvfBackend::new_with_memory_mapper(mapper.clone());
+        backend.vm_created = true;
+        let memory_size = page_size;
+
+        backend
+            .map_guest_memory_with_configured_mapper(
+                memory_for_ranges(vec![range(0, memory_size)]),
+                HvfMemoryPermissions::GUEST_RAM,
+            )
+            .expect("guest memory mapping should succeed");
+        backend
+            .mapped_guest_memory_mut()
+            .expect("mapped guest memory should be mutable")
+            .write_slice(&[0xab], GuestAddress::new(0))
+            .expect("mapped guest memory write should succeed");
+        let mut byte = [0];
+        backend
+            .mapped_guest_memory()
+            .expect("mapped guest memory should be readable")
+            .read_slice(&mut byte, GuestAddress::new(0))
+            .expect("mapped guest memory read should succeed");
+
+        assert_eq!(byte, [0xab]);
+        assert_eq!(
+            backend
+                .mapped_guest_memory()
+                .expect("mapped guest memory should remain available")
+                .total_size(),
+            memory_size
+        );
         assert_eq!(mapper.map_count(), 1);
     }
 

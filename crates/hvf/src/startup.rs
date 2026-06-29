@@ -6,7 +6,7 @@ use std::fmt;
 use bangbang_runtime::block::BlockMmioLayout;
 use bangbang_runtime::fdt::Arm64FdtError;
 use bangbang_runtime::interrupt::GuestInterruptLine;
-use bangbang_runtime::memory::GuestAddress;
+use bangbang_runtime::memory::{GuestAddress, GuestMemory};
 use bangbang_runtime::mmio::MmioRegionId;
 use bangbang_runtime::serial::SharedSerialOutputBuffer;
 use bangbang_runtime::startup::{
@@ -112,6 +112,22 @@ impl HvfArm64BootSession<'_> {
 
     pub fn runtime_resources(&self) -> &Arm64BootRuntimeResources {
         &self.runtime_resources
+    }
+
+    /// Borrow the guest memory mapped for this prepared boot session.
+    ///
+    /// This is internal startup plumbing for later runner-loop work; it does not
+    /// make public `InstanceStart` succeed.
+    pub fn guest_memory(&self) -> Result<&GuestMemory, HvfGuestMemoryMappingError> {
+        self.backend.mapped_guest_memory()
+    }
+
+    /// Mutably borrow the guest memory mapped for this prepared boot session.
+    ///
+    /// The HVF backend remains the mapping owner, so shutdown and drop still
+    /// unmap the memory through the backend.
+    pub fn guest_memory_mut(&mut self) -> Result<&mut GuestMemory, HvfGuestMemoryMappingError> {
+        self.backend.mapped_guest_memory_mut()
     }
 
     pub fn block_interrupt_lines(&self) -> &[GuestInterruptLine] {

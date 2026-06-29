@@ -266,6 +266,22 @@ impl HvfGuestMemoryMapping {
         !self.mapped_regions.is_empty()
     }
 
+    pub(crate) fn memory(&self) -> Result<&GuestMemory, HvfGuestMemoryMappingError> {
+        self.memory
+            .as_ref()
+            .ok_or(HvfGuestMemoryMappingError::InvalidState(
+                "guest memory owner is missing",
+            ))
+    }
+
+    pub(crate) fn memory_mut(&mut self) -> Result<&mut GuestMemory, HvfGuestMemoryMappingError> {
+        self.memory
+            .as_mut()
+            .ok_or(HvfGuestMemoryMappingError::InvalidState(
+                "guest memory owner is missing",
+            ))
+    }
+
     // HVF destroys guest mappings with the VM. Use this only after `hv_vm_destroy`
     // succeeds following an earlier unmap failure.
     pub(crate) fn release_after_vm_destroy(mut self) {
