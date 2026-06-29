@@ -2068,6 +2068,74 @@ mod tests {
     }
 
     #[test]
+    fn accepts_adjacent_virtio_mmio_regions() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let memory_adjacent_base = aarch64::DRAM_MEM_START - 0x1000;
+        let devices = [
+            virtio_mmio_device(0x4000_0000, 0x1000, 32),
+            virtio_mmio_device(0x4000_1000, 0x1000, 33),
+            virtio_mmio_device(memory_adjacent_base, 0x1000, 34),
+        ];
+        let config = test_config_with_virtio_mmio_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            &devices,
+        );
+
+        let bytes = build_arm64_fdt(&config).expect("adjacent device regions should be accepted");
+        let tree = DeviceTree::load(&bytes).expect("FDT should parse");
+        let gic_adjacent = required_node(&tree, "/virtio_mmio@40000000");
+        let device_adjacent = required_node(&tree, "/virtio_mmio@40001000");
+        let memory_adjacent =
+            required_node(&tree, &format!("/virtio_mmio@{memory_adjacent_base:x}"));
+
+        assert_eq!(
+            prop_u64_cells(gic_adjacent, "reg"),
+            vec![0x4000_0000, 0x1000]
+        );
+        assert_eq!(
+            prop_u64_cells(device_adjacent, "reg"),
+            vec![0x4000_1000, 0x1000]
+        );
+        assert_eq!(
+            prop_u64_cells(memory_adjacent, "reg"),
+            vec![memory_adjacent_base, 0x1000]
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_virtio_mmio_regions() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let devices = [
+            virtio_mmio_device(0x4000_0000, 0x1000, 32),
+            virtio_mmio_device(0x4000_0000, 0x1000, 33),
+        ];
+        let config = test_config_with_virtio_mmio_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            &devices,
+        );
+
+        let err = build_arm64_fdt(&config).expect_err("duplicate devices should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::VirtioMmioRegionsOverlap {
+                first_index: 0,
+                second_index: 1,
+                first_region: devices[0].region,
+                second_region: devices[1].region,
+            }
+        );
+    }
+
+    #[test]
     fn rejects_non_spi_virtio_mmio_interrupt_line() {
         let layout = test_layout(TEST_MEMORY_SIZE);
         let devices = [virtio_mmio_device(0x4000_1000, 0x1000, 31)];
