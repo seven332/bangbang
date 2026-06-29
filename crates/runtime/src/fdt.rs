@@ -2598,6 +2598,60 @@ mod tests {
     }
 
     #[test]
+    fn accepts_serial_region_adjacent_to_gic_and_virtio_mmio_regions() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let serial = serial_device(0x4000_0000, 0x1000, 32);
+        let devices = [virtio_mmio_device(0x4000_1000, 0x1000, 33)];
+        let config = test_config_with_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            Some(serial),
+            &devices,
+        );
+
+        let bytes = build_arm64_fdt(&config).expect("adjacent serial region should be accepted");
+        let tree = DeviceTree::load(&bytes).expect("FDT should parse");
+        let serial_node = required_node(&tree, "/uart@40000000");
+        let virtio_node = required_node(&tree, "/virtio_mmio@40001000");
+
+        assert_eq!(
+            prop_u64_cells(serial_node, "reg"),
+            vec![0x4000_0000, 0x1000]
+        );
+        assert_eq!(
+            prop_u64_cells(virtio_node, "reg"),
+            vec![0x4000_1000, 0x1000]
+        );
+    }
+
+    #[test]
+    fn accepts_serial_region_adjacent_to_guest_memory() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let memory_adjacent_base = aarch64::DRAM_MEM_START - 0x1000;
+        let serial = serial_device(memory_adjacent_base, 0x1000, 32);
+        let config = test_config_with_serial_device(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            serial,
+        );
+
+        let bytes = build_arm64_fdt(&config).expect("memory-adjacent serial should be accepted");
+        let tree = DeviceTree::load(&bytes).expect("FDT should parse");
+        let serial_node = required_node(&tree, &format!("/uart@{memory_adjacent_base:x}"));
+
+        assert_eq!(
+            prop_u64_cells(serial_node, "reg"),
+            vec![memory_adjacent_base, 0x1000]
+        );
+    }
+
+    #[test]
     fn rejects_non_spi_serial_interrupt_line() {
         let layout = test_layout(TEST_MEMORY_SIZE);
         let serial = serial_device(0x4000_2000, 0x1000, 31);
