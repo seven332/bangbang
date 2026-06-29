@@ -34,7 +34,8 @@ activation hook with reset callback, plus virtqueue descriptor-chain validator,
 available-ring read model, used-ring write model, and internal virtio-block
 queue construction, drain, resettable active queue ownership, and active queue
 notification dispatch helper with virtio-mmio queue interrupt-status updates
-for future device handlers, an internal
+for future device handlers, internal boot-resource assembly from stored VM
+configuration, an internal
 backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, and an initial process startup argument model.
 There is no broader API request body model beyond the initial boot-source,
@@ -444,10 +445,11 @@ The config handler supports bounded read-only capacity reads through the
 existing virtio-mmio device-configuration path and rejects config writes.
 
 The runtime model is wired to successful pre-boot `PUT /drives/{drive_id}` VMM
-configuration storage. It still does not call block-device preparation, MMIO
-registration, or FDT device description through the API or startup path, select
-a root block device for boot, wire active block notification dispatch into
-startup or HVF runner loops, signal backend interrupts for block devices,
+configuration storage. The public API path still does not call block-device
+preparation, MMIO registration, or FDT device description. The internal
+boot-resource assembly path can do those steps for later startup wiring, but it
+does not select a root block device for boot, wire active block notification
+dispatch into HVF runner loops, signal backend interrupts for block devices,
 implement rate limiting, support vhost-user-block sockets, or use an async I/O
 engine.
 
@@ -487,8 +489,10 @@ at the GIC phandle. Direct FDT configuration validates that each device range is
 non-empty, does not overflow, does not overlap guest RAM, GIC distributor or
 redistributor ranges, or another virtio-mmio range, and that each interrupt
 line is an actual SPI INTID before encoding Firecracker's legacy GSI-style FDT
-cell. Startup code does not yet compose block MMIO registrations and allocated
-interrupt lines into these descriptors.
+cell. The internal boot-resource assembly path composes block MMIO
+registrations and caller-provided interrupt lines into these descriptors, while
+leaving interrupt-line allocation and backend interrupt signaling to later HVF
+startup wiring.
 
 FDT writes first reject mismatches between the layout used to describe guest RAM
 and the allocated guest memory object. FDT bytes are then built before guest
@@ -498,6 +502,29 @@ overflowing, or unbacked writes fail before a partial copy. Memory layouts whose
 memory `reg` property alone cannot fit in the FDT window are rejected before FDT
 construction. The write result records the FDT guest address and byte size for
 future boot-register setup.
+
+## Internal Boot Resource Assembly
+
+The runtime crate can assemble internal arm64 boot resources from stored VMM
+controller configuration and caller-provided backend boot metadata. This path
+requires a configured boot source, applies `mem_size_mib` to the aarch64 DRAM
+layout, allocates guest memory, loads the arm64 Linux `Image` and optional
+initrd, prepares configured block devices, registers their virtio-mmio regions
+in a fresh internal `MmioDispatcher`, pairs those registrations with supplied
+SPI interrupt lines, and writes the arm64 FDT.
+
+The assembled bundle owns the guest memory, loaded boot metadata, FDT write
+metadata, MMIO dispatcher, and block/FDT device metadata needed by later HVF
+startup wiring. It fails with typed errors for missing boot source, memory size
+overflow, layout/allocation failure, boot-source loading failure, block-device
+preparation failure, MMIO registration failure, interrupt-line count mismatch,
+or FDT write failure.
+
+This is still an internal preparation step. The public API does not invoke it,
+`PUT /actions` still returns the documented unsupported fault, and bangbang does
+not yet create an HVF VM from the bundle, map the memory, configure vCPU
+registers through the public startup path, run a continuous vCPU loop, signal
+backend interrupts, or prove guest boot with a smoke test.
 
 The runtime crate also contains an internal MMIO region registry, operation
 model, and handler dispatch boundary for future real devices. It reuses

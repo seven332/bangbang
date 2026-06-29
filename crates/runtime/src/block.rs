@@ -2138,12 +2138,16 @@ pub struct PreparedBlockDevices {
 
 impl PreparedBlockDevices {
     pub fn from_configs(configs: &DriveConfigs) -> Result<Self, PreparedBlockDeviceError> {
+        Self::from_config_slice(configs.as_slice())
+    }
+
+    pub fn from_config_slice(configs: &[DriveConfig]) -> Result<Self, PreparedBlockDeviceError> {
         let mut devices = Vec::new();
         devices
-            .try_reserve_exact(configs.as_slice().len())
+            .try_reserve_exact(configs.len())
             .map_err(|source| PreparedBlockDeviceError::AllocateDevices { source })?;
 
-        for config in configs.as_slice() {
+        for config in configs {
             devices.push(PreparedBlockDevice::from_config(config)?);
         }
 
