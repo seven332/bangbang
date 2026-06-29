@@ -70,6 +70,23 @@ pub struct Arm64BootResources {
     pub block_devices: Vec<Arm64BootBlockDevice>,
 }
 
+#[derive(Debug)]
+pub struct Arm64BootResourceParts {
+    pub memory: GuestMemory,
+    pub runtime: Arm64BootRuntimeResources,
+}
+
+#[derive(Debug)]
+pub struct Arm64BootRuntimeResources {
+    pub machine_config: MachineConfig,
+    pub layout: GuestMemoryLayout,
+    pub loaded_boot_source: LoadedBootSource,
+    pub fdt: Arm64FdtGuestMemoryWrite,
+    pub mmio_dispatcher: MmioDispatcher,
+    pub serial_device: Option<Arm64BootSerialDevice>,
+    pub block_devices: Vec<Arm64BootBlockDevice>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arm64BootBlockDevice {
     pub registration: BlockMmioDeviceRegistration,
@@ -298,6 +315,21 @@ impl Arm64BootResources {
             serial_device,
             block_devices,
         })
+    }
+
+    pub fn into_parts(self) -> Arm64BootResourceParts {
+        Arm64BootResourceParts {
+            memory: self.memory,
+            runtime: Arm64BootRuntimeResources {
+                machine_config: self.machine_config,
+                layout: self.layout,
+                loaded_boot_source: self.loaded_boot_source,
+                fdt: self.fdt,
+                mmio_dispatcher: self.mmio_dispatcher,
+                serial_device: self.serial_device,
+                block_devices: self.block_devices,
+            },
+        }
     }
 }
 
@@ -727,6 +759,58 @@ mod tests {
             .find("/uart@40002000")
             .expect("serial node should be in assembled FDT");
         assert_eq!(serial_node.prop_str("compatible").unwrap(), "ns16550a");
+    }
+
+    #[test]
+    fn boot_resources_split_memory_from_runtime_resources() {
+        let kernel = temp_file("kernel-split", &arm64_image());
+        let block = temp_file("block-split", &[0x5a; 512]);
+        let mut controller = controller_with_kernel(kernel.path());
+        add_drive(&mut controller, "rootfs", block.path());
+        let (serial, _output) =
+            serial_config(TEST_SERIAL_MMIO_BASE, MmioRegionId::new(9), line(33));
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            Arm64BootResourceConfig {
+                serial_device: Some(serial),
+                ..valid_config(&[line(32)])
+            },
+        )
+        .expect("boot resources should assemble");
+        let memory_size = resources.memory.total_size();
+        let layout = resources.layout.clone();
+        let kernel_entry = resources.loaded_boot_source.kernel.entry_address;
+        let fdt = resources.fdt;
+        let block_registration = resources.block_devices[0].registration.clone();
+        let serial_region = resources
+            .serial_device
+            .as_ref()
+            .expect("serial metadata should exist")
+            .region;
+
+        let parts = resources.into_parts();
+
+        assert_eq!(parts.memory.total_size(), memory_size);
+        assert_eq!(parts.runtime.layout, layout);
+        assert_eq!(
+            parts.runtime.loaded_boot_source.kernel.entry_address,
+            kernel_entry
+        );
+        assert_eq!(parts.runtime.fdt, fdt);
+        assert_eq!(parts.runtime.block_devices.len(), 1);
+        assert_eq!(
+            parts.runtime.block_devices[0].registration,
+            block_registration
+        );
+        assert_eq!(
+            parts
+                .runtime
+                .serial_device
+                .as_ref()
+                .expect("serial metadata should split")
+                .region,
+            serial_region
+        );
     }
 
     #[test]

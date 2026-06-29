@@ -7,6 +7,7 @@ mod gic;
 mod memory;
 mod mmio;
 mod runner;
+mod startup;
 mod vcpu;
 
 pub use backend::HvfBackend;
@@ -23,6 +24,10 @@ pub use gic::{
 pub use memory::{HvfGuestMemoryMappingError, HvfGuestMemoryUnmapFailure, HvfMemoryPermissions};
 pub use mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
 pub use runner::{HvfVcpuRunner, HvfVcpuRunnerError};
+pub use startup::{
+    HvfArm64BootInterruptLinePurpose, HvfArm64BootSerialDeviceConfig, HvfArm64BootSession,
+    HvfArm64BootSessionConfig, HvfArm64BootSessionError, HvfArm64BootSessionShutdownError,
+};
 pub use vcpu::{
     ARM64_LINUX_BOOT_CPSR, HvfArm64BootRegisters, HvfRegister, HvfSystemRegister, HvfVcpu,
 };

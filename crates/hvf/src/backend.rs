@@ -84,6 +84,10 @@ impl HvfBackend {
         self.gic.as_ref()
     }
 
+    pub(crate) const fn has_created_vm(&self) -> bool {
+        self.vm_created
+    }
+
     #[cfg(test)]
     fn has_guest_memory_mapping(&self) -> bool {
         self.guest_memory
@@ -110,6 +114,26 @@ impl HvfBackend {
     }
 
     pub fn start_vcpu_runner(&mut self) -> Result<HvfVcpuRunner<'_>, HvfVcpuRunnerError> {
+        self.validate_vcpu_runner_start()?;
+
+        let runner = HvfVcpuRunner::new()?;
+        self.vcpu_topology_started = true;
+        Ok(runner)
+    }
+
+    pub(crate) fn start_session_vcpu_runner<'vm>(
+        &mut self,
+    ) -> Result<HvfVcpuRunner<'vm>, HvfVcpuRunnerError> {
+        // The session object holds the backend borrow separately; keep this
+        // constructor crate-private so arbitrary callers cannot outlive the VM.
+        self.validate_vcpu_runner_start()?;
+
+        let runner = HvfVcpuRunner::new()?;
+        self.vcpu_topology_started = true;
+        Ok(runner)
+    }
+
+    fn validate_vcpu_runner_start(&self) -> Result<(), HvfVcpuRunnerError> {
         if !Self::is_supported_target() {
             return Err(BackendError::Unsupported(crate::ffi::UNSUPPORTED_TARGET_MESSAGE).into());
         }
@@ -121,9 +145,7 @@ impl HvfBackend {
             .into());
         }
 
-        let runner = HvfVcpuRunner::new()?;
-        self.vcpu_topology_started = true;
-        Ok(runner)
+        Ok(())
     }
 
     fn create_gic_with_configured_creator(&mut self) -> Result<&HvfGicMetadata, HvfGicError> {
