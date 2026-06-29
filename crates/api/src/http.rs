@@ -17,6 +17,7 @@ const MAX_MACHINE_CONFIG_VCPUS: u8 = 32;
 pub enum ApiRequest {
     GetInstanceInfo,
     GetMachineConfig,
+    GetVmConfig,
     GetVersion,
     PutAction(Box<ActionRequest>),
     PutBootSource(Box<BootSourceRequest>),
@@ -246,6 +247,118 @@ pub enum DriveIoEngine {
     Async,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineConfigResponse {
+    vcpu_count: u8,
+    mem_size_mib: u64,
+    smt: bool,
+    track_dirty_pages: bool,
+    huge_pages: String,
+}
+
+impl MachineConfigResponse {
+    pub fn new(
+        vcpu_count: u8,
+        mem_size_mib: u64,
+        smt: bool,
+        track_dirty_pages: bool,
+        huge_pages: impl Into<String>,
+    ) -> Self {
+        Self {
+            vcpu_count,
+            mem_size_mib,
+            smt,
+            track_dirty_pages,
+            huge_pages: huge_pages.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootSourceResponse {
+    kernel_image_path: String,
+    initrd_path: Option<String>,
+    boot_args: Option<String>,
+}
+
+impl BootSourceResponse {
+    pub fn new(kernel_image_path: impl Into<String>) -> Self {
+        Self {
+            kernel_image_path: kernel_image_path.into(),
+            initrd_path: None,
+            boot_args: None,
+        }
+    }
+
+    pub fn with_initrd_path(mut self, initrd_path: impl Into<String>) -> Self {
+        self.initrd_path = Some(initrd_path.into());
+        self
+    }
+
+    pub fn with_boot_args(mut self, boot_args: impl Into<String>) -> Self {
+        self.boot_args = Some(boot_args.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriveConfigResponse {
+    drive_id: String,
+    path_on_host: String,
+    is_root_device: bool,
+    is_read_only: bool,
+    partuuid: Option<String>,
+    cache_type: String,
+    io_engine: String,
+}
+
+impl DriveConfigResponse {
+    pub fn new(
+        drive_id: impl Into<String>,
+        path_on_host: impl Into<String>,
+        is_root_device: bool,
+        is_read_only: bool,
+        cache_type: impl Into<String>,
+        io_engine: impl Into<String>,
+    ) -> Self {
+        Self {
+            drive_id: drive_id.into(),
+            path_on_host: path_on_host.into(),
+            is_root_device,
+            is_read_only,
+            partuuid: None,
+            cache_type: cache_type.into(),
+            io_engine: io_engine.into(),
+        }
+    }
+
+    pub fn with_partuuid(mut self, partuuid: impl Into<String>) -> Self {
+        self.partuuid = Some(partuuid.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmConfigResponse {
+    machine_config: MachineConfigResponse,
+    boot_source: Option<BootSourceResponse>,
+    drives: Vec<DriveConfigResponse>,
+}
+
+impl VmConfigResponse {
+    pub fn new(
+        machine_config: MachineConfigResponse,
+        boot_source: Option<BootSourceResponse>,
+        drives: Vec<DriveConfigResponse>,
+    ) -> Self {
+        Self {
+            machine_config,
+            boot_source,
+            drives,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DriveConfigRequestBody {
@@ -344,6 +457,35 @@ impl HttpResponse {
         }
     }
 
+    pub fn vm_config(config: &VmConfigResponse) -> Self {
+        let mut body = serde_json::Map::new();
+        if let Some(boot_source) = &config.boot_source {
+            body.insert(
+                "boot-source".to_string(),
+                boot_source_response_value(boot_source),
+            );
+        }
+        body.insert(
+            "drives".to_string(),
+            serde_json::Value::Array(
+                config
+                    .drives
+                    .iter()
+                    .map(drive_config_response_value)
+                    .collect(),
+            ),
+        );
+        body.insert(
+            "machine-config".to_string(),
+            machine_config_response_value(&config.machine_config),
+        );
+
+        Self {
+            status: StatusCode::Ok,
+            body: serde_json::Value::Object(body).to_string(),
+        }
+    }
+
     pub fn fault(message: &str) -> Self {
         let body = serde_json::json!({ "fault_message": message }).to_string();
 
@@ -385,6 +527,74 @@ impl HttpResponse {
         )
         .into_bytes()
     }
+}
+
+fn machine_config_response_value(config: &MachineConfigResponse) -> serde_json::Value {
+    serde_json::json!({
+        "huge_pages": config.huge_pages.as_str(),
+        "mem_size_mib": config.mem_size_mib,
+        "smt": config.smt,
+        "track_dirty_pages": config.track_dirty_pages,
+        "vcpu_count": config.vcpu_count,
+    })
+}
+
+fn boot_source_response_value(boot_source: &BootSourceResponse) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "kernel_image_path".to_string(),
+        serde_json::Value::String(boot_source.kernel_image_path.clone()),
+    );
+    if let Some(initrd_path) = &boot_source.initrd_path {
+        body.insert(
+            "initrd_path".to_string(),
+            serde_json::Value::String(initrd_path.clone()),
+        );
+    }
+    if let Some(boot_args) = &boot_source.boot_args {
+        body.insert(
+            "boot_args".to_string(),
+            serde_json::Value::String(boot_args.clone()),
+        );
+    }
+
+    serde_json::Value::Object(body)
+}
+
+fn drive_config_response_value(drive: &DriveConfigResponse) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "cache_type".to_string(),
+        serde_json::Value::String(drive.cache_type.clone()),
+    );
+    body.insert(
+        "drive_id".to_string(),
+        serde_json::Value::String(drive.drive_id.clone()),
+    );
+    body.insert(
+        "io_engine".to_string(),
+        serde_json::Value::String(drive.io_engine.clone()),
+    );
+    body.insert(
+        "is_read_only".to_string(),
+        serde_json::Value::Bool(drive.is_read_only),
+    );
+    body.insert(
+        "is_root_device".to_string(),
+        serde_json::Value::Bool(drive.is_root_device),
+    );
+    if let Some(partuuid) = &drive.partuuid {
+        body.insert(
+            "partuuid".to_string(),
+            serde_json::Value::String(partuuid.clone()),
+        );
+    }
+    body.insert(
+        "path_on_host".to_string(),
+        serde_json::Value::String(drive.path_on_host.clone()),
+    );
+
+    serde_json::Value::Object(body)
 }
 
 pub fn parse_request(bytes: &[u8]) -> Result<ApiRequest, RequestError> {
@@ -429,6 +639,7 @@ pub fn parse_request(bytes: &[u8]) -> Result<ApiRequest, RequestError> {
     match (method, path) {
         ("GET", "/") => Ok(ApiRequest::GetInstanceInfo),
         ("GET", "/machine-config") => Ok(ApiRequest::GetMachineConfig),
+        ("GET", "/vm/config") => Ok(ApiRequest::GetVmConfig),
         ("GET", "/version") => Ok(ApiRequest::GetVersion),
         _ => Err(RequestError::InvalidPathMethod),
     }
@@ -742,6 +953,7 @@ impl From<ApiRequest> for Endpoint {
         match request {
             ApiRequest::GetInstanceInfo => Self::DescribeInstance,
             ApiRequest::GetMachineConfig => Self::MachineConfig,
+            ApiRequest::GetVmConfig => Self::VmConfig,
             ApiRequest::GetVersion => Self::Version,
             ApiRequest::PutAction(_) => Self::Actions,
             ApiRequest::PutBootSource(_) => Self::BootSource,
@@ -824,6 +1036,21 @@ mod tests {
     #[test]
     fn rejects_get_machine_config_with_body() {
         let request = request_with_body("GET", "/machine-config", "{}");
+
+        assert_eq!(parse_request(&request), Err(RequestError::GetRequestBody));
+    }
+
+    #[test]
+    fn parses_get_vm_config() {
+        let request = b"GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+        assert_eq!(parse_request(request), Ok(ApiRequest::GetVmConfig));
+        assert_eq!(request_total_len(request), Ok(Some(request.len())));
+    }
+
+    #[test]
+    fn rejects_get_vm_config_with_body() {
+        let request = request_with_body("GET", "/vm/config", "{}");
 
         assert_eq!(parse_request(&request), Err(RequestError::GetRequestBody));
     }
@@ -1653,6 +1880,82 @@ mod tests {
     }
 
     #[test]
+    fn response_body_contains_default_vm_config() {
+        let response = HttpResponse::vm_config(&VmConfigResponse::new(
+            MachineConfigResponse::new(1, 128, false, false, "None"),
+            None,
+            Vec::new(),
+        ));
+        let body: serde_json::Value =
+            serde_json::from_str(response.body()).expect("body should be JSON");
+
+        assert_eq!(response.status(), StatusCode::Ok);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "drives": [],
+                "machine-config": {
+                    "huge_pages": "None",
+                    "mem_size_mib": 128,
+                    "smt": false,
+                    "track_dirty_pages": false,
+                    "vcpu_count": 1,
+                },
+            })
+        );
+        assert_eq!(body.get("boot-source"), None);
+        assert_eq!(body.get("logger"), None);
+    }
+
+    #[test]
+    fn response_body_contains_configured_vm_config() {
+        let boot_source = BootSourceResponse::new("/tmp/vmlinux")
+            .with_initrd_path("/tmp/initrd.img")
+            .with_boot_args("console=hvc0 reboot=k panic=1");
+        let drive =
+            DriveConfigResponse::new("rootfs", "/tmp/rootfs.ext4", true, true, "Unsafe", "Sync")
+                .with_partuuid("0eaa91a0-01");
+        let response = HttpResponse::vm_config(&VmConfigResponse::new(
+            MachineConfigResponse::new(2, 256, false, false, "None"),
+            Some(boot_source),
+            vec![drive],
+        ));
+        let body: serde_json::Value =
+            serde_json::from_str(response.body()).expect("body should be JSON");
+
+        assert_eq!(response.status(), StatusCode::Ok);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "boot-source": {
+                    "boot_args": "console=hvc0 reboot=k panic=1",
+                    "initrd_path": "/tmp/initrd.img",
+                    "kernel_image_path": "/tmp/vmlinux",
+                },
+                "drives": [
+                    {
+                        "cache_type": "Unsafe",
+                        "drive_id": "rootfs",
+                        "io_engine": "Sync",
+                        "is_read_only": true,
+                        "is_root_device": true,
+                        "partuuid": "0eaa91a0-01",
+                        "path_on_host": "/tmp/rootfs.ext4",
+                    },
+                ],
+                "machine-config": {
+                    "huge_pages": "None",
+                    "mem_size_mib": 256,
+                    "smt": false,
+                    "track_dirty_pages": false,
+                    "vcpu_count": 2,
+                },
+            })
+        );
+        assert_eq!(body.get("metrics"), None);
+    }
+
+    #[test]
     fn fault_body_contains_fault_message() {
         let response = HttpResponse::fault("message");
 
@@ -1703,6 +2006,7 @@ mod tests {
             Endpoint::from(ApiRequest::GetMachineConfig),
             Endpoint::MachineConfig
         );
+        assert_eq!(Endpoint::from(ApiRequest::GetVmConfig), Endpoint::VmConfig);
         let request = parse_request(&request_with_body(
             "PUT",
             "/actions",

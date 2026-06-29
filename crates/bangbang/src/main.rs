@@ -341,8 +341,9 @@ fn help_text() -> String {
             "  -V, --version          Print version\n",
             "  -h, --help             Print help\n\n",
             "Current scope:\n",
-            "  Serves GET /, GET /version, GET /machine-config, pre-boot PUT /machine-config, ",
-            "pre-boot PUT /boot-source, and pre-boot PUT /drives/{{drive_id}} ",
+            "  Serves GET /, GET /version, GET /vm/config, GET /machine-config, ",
+            "pre-boot PUT /machine-config, pre-boot PUT /boot-source, and ",
+            "pre-boot PUT /drives/{{drive_id}} ",
             "configuration storage over the API ",
             "socket; PUT /actions is parsed and routed but execution remains unsupported; ",
             "VM startup is not implemented yet."
@@ -510,6 +511,7 @@ mod tests {
         let help = super::help_text();
 
         assert!(help.contains("Serves GET /, GET /version"));
+        assert!(help.contains("GET /vm/config"));
         assert!(help.contains("GET /machine-config"));
         assert!(help.contains("pre-boot PUT /machine-config"));
         assert!(help.contains("pre-boot PUT /boot-source"));
