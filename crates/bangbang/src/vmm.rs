@@ -1,7 +1,10 @@
-use bangbang_hvf::{HvfArm64BootSessionConfig, OwnedHvfArm64BootSession};
+use bangbang_hvf::{
+    HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig, OwnedHvfArm64BootSession,
+};
 use bangbang_runtime::block::BlockMmioLayout;
 use bangbang_runtime::memory::GuestAddress;
 use bangbang_runtime::mmio::MmioRegionId;
+use bangbang_runtime::serial::SharedSerialOutputBuffer;
 use bangbang_runtime::{BackendError, VmmAction, VmmActionError, VmmController, VmmData};
 
 #[cfg(test)]
@@ -15,6 +18,8 @@ use bangbang_runtime::machine::MachineConfig;
 
 const DEFAULT_BLOCK_MMIO_BASE: GuestAddress = GuestAddress::new(0x5000_0000);
 const DEFAULT_BLOCK_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(1);
+const DEFAULT_SERIAL_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_0000);
+const DEFAULT_SERIAL_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(2);
 
 pub(crate) trait InstanceStartExecutor {
     type Session;
@@ -42,7 +47,12 @@ impl ProcessVmm<HvfInstanceStartExecutor> {
         vmm_version: impl Into<String>,
         app_name: impl Into<String>,
     ) -> Self {
-        Self::with_starter(instance_id, vmm_version, app_name, HvfInstanceStartExecutor)
+        Self::with_starter(
+            instance_id,
+            vmm_version,
+            app_name,
+            HvfInstanceStartExecutor::default(),
+        )
     }
 }
 
@@ -134,31 +144,50 @@ where
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct HvfInstanceStartExecutor;
+#[derive(Debug, Clone, Default)]
+pub(crate) struct HvfInstanceStartExecutor {
+    serial_output: SharedSerialOutputBuffer,
+}
+
+impl HvfInstanceStartExecutor {
+    fn boot_session_config(&self) -> HvfArm64BootSessionConfig {
+        default_hvf_boot_session_config(self.serial_output.clone())
+    }
+}
 
 impl InstanceStartExecutor for HvfInstanceStartExecutor {
     type Session = OwnedHvfArm64BootSession;
 
     fn start(&mut self, controller: &VmmController) -> Result<Self::Session, BackendError> {
-        OwnedHvfArm64BootSession::new(controller, default_hvf_boot_session_config())
+        OwnedHvfArm64BootSession::new(controller, self.boot_session_config())
             .map_err(|err| BackendError::Hypervisor(err.to_string()))
     }
 }
 
-const fn default_hvf_boot_session_config() -> HvfArm64BootSessionConfig {
+fn default_hvf_boot_session_config(
+    serial_output: SharedSerialOutputBuffer,
+) -> HvfArm64BootSessionConfig {
     HvfArm64BootSessionConfig::new(BlockMmioLayout::new(
         DEFAULT_BLOCK_MMIO_BASE,
         DEFAULT_BLOCK_MMIO_REGION_ID,
+    ))
+    .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
+        DEFAULT_SERIAL_MMIO_REGION_ID,
+        DEFAULT_SERIAL_MMIO_BASE,
+        serial_output,
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::serial::SerialOutput;
     use bangbang_runtime::{BackendError, InstanceState, VmmAction, VmmActionError};
 
-    use super::{InstanceStartExecutor, ProcessVmm};
+    use super::{
+        DEFAULT_SERIAL_MMIO_BASE, DEFAULT_SERIAL_MMIO_REGION_ID, HvfInstanceStartExecutor,
+        InstanceStartExecutor, ProcessVmm,
+    };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct FakeSession {
@@ -215,6 +244,29 @@ mod tests {
         )))
         .expect("boot source should configure");
         vmm
+    }
+
+    #[test]
+    fn default_hvf_boot_session_config_includes_process_owned_serial_output() {
+        let executor = HvfInstanceStartExecutor::default();
+        let retained_output = executor.serial_output.clone();
+
+        let config = executor.boot_session_config();
+
+        let serial = config
+            .serial_device
+            .expect("default HVF boot config should include serial MMIO");
+        assert_eq!(serial.region_id, DEFAULT_SERIAL_MMIO_REGION_ID);
+        assert_eq!(serial.address, DEFAULT_SERIAL_MMIO_BASE);
+
+        let mut configured_output = serial.output.clone();
+        configured_output
+            .write_byte(b'B')
+            .expect("serial output should accept byte");
+        assert_eq!(
+            retained_output.bytes().expect("serial output should read"),
+            b"B"
+        );
     }
 
     #[test]

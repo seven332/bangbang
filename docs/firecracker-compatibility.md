@@ -45,14 +45,16 @@ boot-register setup, internal HVF single-vCPU arm64 boot-session preparation
 with a runner-compatible shared MMIO dispatcher, controlled mapped guest-memory
 access, one-step runner-thread MMIO handling, a run-cancellation boundary, a
 virtual-timer-mask control boundary, a bounded internal boot-session run-loop
-pump, owned internal boot-session handle, process-level owned startup-session wiring, boot block queue interrupt signaling,
+pump, owned internal boot-session handle, process-level owned startup-session
+wiring with optional serial capture, boot block queue interrupt signaling,
 virtual timer PPI assertion, and an initial process startup argument model.
 There is no broader API request body model beyond the initial boot-source,
 drive configuration, machine-configuration, and actions bodies, public guest
 execution, unbounded or public continuous vCPU run loop, complete interrupt
 delivery, including timer EOI/deactivation-driven unmasking,
-HVF runner-loop notification scheduling or serial output, serial/backend
-interrupt wiring beyond the internal boot block notification path,
+HVF runner-loop notification scheduling, public serial output streaming,
+serial/backend interrupt wiring beyond the internal boot block notification
+and retained serial capture paths,
 device-backed feature negotiation, indirect descriptor support,
 device-backed runner-loop MMIO scheduling, complete device emulation,
 multi-vCPU setup, PSCI behavior, or successful actions beyond owned `InstanceStart`
@@ -75,7 +77,8 @@ socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
 already map through a minimal internal VMM action/data boundary. Validation
 rejects malformed boot-source and actions requests before VMM state mutation.
 Successful `InstanceStart` startup preparation and the `Running` transition are
-implemented; continuous guest execution remains deferred.
+implemented with an internal serial MMIO console capture path; continuous guest
+execution and public serial streaming remain deferred.
 
 ## Process Startup CLI
 
@@ -201,7 +204,7 @@ compatibility targets.
 | `PUT` | `/machine-config` | supported target; implemented | Stores the first vCPU and memory configuration subset before boot; values are applied during startup preparation. |
 | `PUT` | `/boot-source` | supported target; implemented | Stores guest kernel path, optional initrd path, and optional boot arguments before boot; host files are opened during startup preparation. |
 | `PUT` | `/drives/{drive_id}` | supported target; implemented | Stores initial virtio-block device configuration before boot; backing files are opened during startup preparation. |
-| `PUT` | `/actions` | supported target; startup preparation implemented | Parses `InstanceStart` and `FlushMetrics` request bodies and routes them through the process VMM owner. `InstanceStart` validates stored boot-source and state preflight, prepares and retains an owned HVF boot session on success, and commits `Running` only after preparation succeeds; `FlushMetrics` returns unsupported before any VMM state change. |
+| `PUT` | `/actions` | supported target; startup preparation implemented | Parses `InstanceStart` and `FlushMetrics` request bodies and routes them through the process VMM owner. `InstanceStart` validates stored boot-source and state preflight, prepares and retains an owned HVF boot session with an internal serial MMIO console on success, and commits `Running` only after preparation succeeds; `FlushMetrics` returns unsupported before any VMM state change. |
 | `PUT` | `/actions` with `SendCtrlAltDel` | intentionally unsupported; parser rejected | Firecracker gates this action on x86 keyboard behavior; the first bangbang target is Apple Silicon. |
 | `PUT` | `/logger`, `/metrics` | planned later | Tied to observability work in #17. |
 | `PATCH` | `/machine-config` | deferred | Partial updates belong with later state and validation rules. |
@@ -252,7 +255,7 @@ exist.
 | `PUT /drives/{drive_id}` | `io_engine` | optional when `Sync`; rejected when `Async` | The internal model accepts omitted/default `Sync` and rejects `Async`; `Async` is tied to Linux io_uring and does not directly map to the first macOS target. |
 | `PUT /drives/{drive_id}` | `socket` | optional when absent or `null`; deferred when set | The internal model rejects configured sockets; vhost-user-block is outside the first tier. |
 | `PUT /drives/{drive_id}` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
-| `PUT /actions` | `action_type=InstanceStart` | process-routed; startup preparation implemented | Validates stored boot-source and state preflight first, then attempts owned HVF boot-session preparation. Success returns `204 No Content` and commits `Running`; preparation failures return a fault without mutating state. Continuous vCPU execution remains deferred. |
+| `PUT /actions` | `action_type=InstanceStart` | process-routed; startup preparation implemented | Validates stored boot-source and state preflight first, then attempts owned HVF boot-session preparation with an internal serial MMIO console. Success returns `204 No Content` and commits `Running`; preparation failures return a fault without mutating state. Continuous vCPU execution and public serial streaming remain deferred. |
 | `PUT /actions` | `action_type=FlushMetrics` | VMM-routed; execution deferred | Depends on logger and metrics support. The runtime currently returns an unsupported action fault before mutating state. |
 | `PUT /actions` | `action_type=SendCtrlAltDel` | intentionally unsupported; parser rejected | Firecracker gates this on x86 keyboard behavior; the first target is Apple Silicon. |
 | `PUT /actions` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
@@ -741,8 +744,9 @@ step through the runner with its per-session shared MMIO dispatcher, so a
 resulting MMIO exit is handled on the vCPU-owning thread without global state.
 The boot session can also expose a cloneable cancellation-only handle for an
 in-flight run step without exposing the full runner. Public `InstanceStart`
-now retains an owned HVF boot session after successful startup preparation,
-but it still does not enter the bounded runner loop. A bounded internal
+now retains an owned HVF boot session with an internal serial MMIO console after
+successful startup preparation, but it still does not enter the bounded runner
+loop. A bounded internal
 boot-session run-loop pump now composes that one-step path with boot block
 notification dispatch between successful MMIO steps and virtual timer PPI
 assertion after virtual timer exits. It stops explicitly on a step limit,
@@ -788,9 +792,10 @@ through `PutDrive` and records validated configuration state. Parsed
 boot-source configuration state. Parsed `/actions` requests flow through
 `InstanceStart` and `FlushMetrics` VMM actions. `InstanceStart` first validates
 stored boot-source and state preflight, then the process VMM owner prepares and
-retains an owned HVF boot session. It marks the instance `Running` only after
-startup preparation succeeds; `FlushMetrics` currently returns an unsupported
-action fault.
+retains an owned HVF boot session with an internal serial MMIO console and
+bounded capture buffer. It marks the instance `Running` only after startup
+preparation succeeds; `FlushMetrics` currently returns an unsupported action
+fault.
 
 ### Initial API State Model
 
@@ -799,8 +804,8 @@ The first API implementation should model the same broad stages as Firecracker:
 - pre-boot: configuration requests are accepted and stored before guest
   execution starts
 - starting: `PUT /actions` with `InstanceStart` validates the accumulated
-  configuration, prepares the owned HVF startup session, and transitions the
-  process out of pre-boot state on success
+  configuration, prepares the owned HVF startup session with internal serial
+  capture, and transitions the process out of pre-boot state on success
 - runtime: the microVM is running; pre-boot-only configuration requests should
   fail with a Firecracker-shaped unsupported-state error
 - paused/resumed: deferred until `/vm` state update work defines pause and
@@ -817,7 +822,7 @@ The first API implementation should model the same broad stages as Firecracker:
 | `PUT /machine-config` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Pre-boot-only configuration. Stored values are applied during startup preparation. |
 | `PUT /boot-source` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config; host paths are opened during startup preparation. Host path errors must avoid leaking sensitive path details. |
 | `PUT /drives/{drive_id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config; startup preparation opens backing files and registers initial block MMIO devices. Runtime hotplug remains deferred. |
-| `PUT /actions` with `InstanceStart` | process-routed; `204` after successful owned HVF startup preparation or `400` preflight/preparation fault | unsupported after start; `400` `fault_message` | Commits `Running` only after the owned HVF boot session is retained. Continuous vCPU execution remains deferred. |
+| `PUT /actions` with `InstanceStart` | process-routed; `204` after successful owned HVF startup preparation or `400` preflight/preparation fault | unsupported after start; `400` `fault_message` | Commits `Running` only after the owned HVF boot session with internal serial capture is retained. Continuous vCPU execution and public serial streaming remain deferred. |
 | `PUT /actions` with `FlushMetrics` | VMM-routed; currently `400` unsupported `fault_message` | deferred until metrics support exists; future success should use `204` empty response | Firecracker treats this as runtime-only; tied to observability work. |
 | `PUT /actions` with `SendCtrlAltDel` | intentionally unsupported; parser returns `400` `fault_message` | intentionally unsupported; `400` `fault_message` | Firecracker rejects this on aarch64; bangbang's first target is Apple Silicon. |
 | Non-initial endpoints from the endpoint matrix | `400` `fault_message` until their capability exists | `400` `fault_message` until their capability exists | Covers planned later and deferred endpoints; a later capability PR may define more specific state behavior. |
