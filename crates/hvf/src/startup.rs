@@ -563,6 +563,9 @@ fn run_boot_session_loop(
                             source: Box::new(source),
                         },
                     )?;
+                if stop_token.is_stop_requested() {
+                    return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+                }
                 if steps == max_steps {
                     return Ok(HvfArm64BootRunLoopOutcome::StepLimitReached { steps });
                 }
@@ -1175,6 +1178,7 @@ mod tests {
         >,
         events: Vec<&'static str>,
         request_stop_on_run: Option<HvfArm64BootRunLoopStopToken>,
+        request_stop_on_dispatch: Option<HvfArm64BootRunLoopStopToken>,
     }
 
     impl RecordingBootSessionRunLoopSession {
@@ -1184,6 +1188,7 @@ mod tests {
                 dispatch_results: VecDeque::new(),
                 events: Vec::new(),
                 request_stop_on_run: None,
+                request_stop_on_dispatch: None,
             }
         }
 
@@ -1193,6 +1198,7 @@ mod tests {
                 dispatch_results: VecDeque::new(),
                 events: Vec::new(),
                 request_stop_on_run: None,
+                request_stop_on_dispatch: None,
             }
         }
 
@@ -1202,6 +1208,10 @@ mod tests {
 
         fn request_stop_on_run(&mut self, stop_token: HvfArm64BootRunLoopStopToken) {
             self.request_stop_on_run = Some(stop_token);
+        }
+
+        fn request_stop_on_dispatch(&mut self, stop_token: HvfArm64BootRunLoopStopToken) {
+            self.request_stop_on_dispatch = Some(stop_token);
         }
     }
 
@@ -1224,6 +1234,9 @@ mod tests {
             HvfArm64BootBlockNotificationDispatchError,
         > {
             self.events.push("dispatch");
+            if let Some(stop_token) = self.request_stop_on_dispatch.take() {
+                stop_token.request_stop();
+            }
 
             self.dispatch_results.pop_front().unwrap_or_else(|| {
                 Ok(super::HvfArm64BootBlockNotificationDispatches::new(
@@ -2091,6 +2104,19 @@ mod tests {
             HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 2 }
         );
         assert_eq!(session.events, ["run", "dispatch", "run", "dispatch"]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_reports_stop_after_dispatch_before_step_limit() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([mmio_run_step_outcome()]);
+        session.request_stop_on_dispatch(stop_token.clone());
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("stop after dispatch should succeed");
+
+        assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Stopped { steps: 1 });
+        assert_eq!(session.events, ["run", "dispatch"]);
     }
 
     #[test]
