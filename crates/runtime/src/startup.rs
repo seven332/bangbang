@@ -54,6 +54,10 @@ pub enum Arm64BootResourceError {
     MemorySizeOverflow {
         mem_size_mib: u64,
     },
+    MemorySizeExceedsArchitecturalMaximum {
+        requested_size: u64,
+        max_size: u64,
+    },
     MemoryLayout {
         source: GuestMemoryError,
     },
@@ -88,6 +92,13 @@ impl fmt::Display for Arm64BootResourceError {
             Self::MemorySizeOverflow { mem_size_mib } => {
                 write!(f, "machine mem_size_mib {mem_size_mib} overflows bytes")
             }
+            Self::MemorySizeExceedsArchitecturalMaximum {
+                requested_size,
+                max_size,
+            } => write!(
+                f,
+                "machine memory size {requested_size} exceeds arm64 maximum {max_size}"
+            ),
             Self::MemoryLayout { source } => {
                 write!(f, "failed to build guest memory layout: {source}")
             }
@@ -127,6 +138,7 @@ impl std::error::Error for Arm64BootResourceError {
             Self::Fdt { source } => Some(source),
             Self::MissingBootSource
             | Self::MemorySizeOverflow { .. }
+            | Self::MemorySizeExceedsArchitecturalMaximum { .. }
             | Self::BlockInterruptLineCount { .. } => None,
         }
     }
@@ -193,12 +205,20 @@ impl Arm64BootResources {
 }
 
 fn memory_size_bytes(config: MachineConfig) -> Result<u64, Arm64BootResourceError> {
-    config
-        .mem_size_mib()
-        .checked_mul(MIB)
-        .ok_or(Arm64BootResourceError::MemorySizeOverflow {
+    let memory_size = config.mem_size_mib().checked_mul(MIB).ok_or(
+        Arm64BootResourceError::MemorySizeOverflow {
             mem_size_mib: config.mem_size_mib(),
-        })
+        },
+    )?;
+    if memory_size > aarch64::DRAM_MEM_MAX_SIZE {
+        return Err(
+            Arm64BootResourceError::MemorySizeExceedsArchitecturalMaximum {
+                requested_size: memory_size,
+                max_size: aarch64::DRAM_MEM_MAX_SIZE,
+            },
+        );
+    }
+    Ok(memory_size)
 }
 
 fn boot_source_from_config(config: &BootSourceConfig) -> BootSource {
@@ -350,11 +370,15 @@ mod tests {
     }
 
     fn controller_with_kernel(kernel: &Path) -> crate::VmmController {
+        controller_with_kernel_and_memory(kernel, TEST_MEMORY_MIB)
+    }
+
+    fn controller_with_kernel_and_memory(kernel: &Path, mem_size_mib: u64) -> crate::VmmController {
         let mut controller = crate::VmmController::new("test", "0.1.0", "bangbang");
         controller
             .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(
                 1,
-                TEST_MEMORY_MIB,
+                mem_size_mib,
             )))
             .expect("machine config should be stored");
         controller
@@ -489,6 +513,26 @@ mod tests {
                     ..
                 }
             }
+        ));
+    }
+
+    #[test]
+    fn oversized_memory_fails_before_boot_source_load() {
+        let mem_size_mib = aarch64::DRAM_MEM_MAX_SIZE / MIB + 1;
+        let controller = controller_with_kernel_and_memory(
+            &missing_path("oversized-memory-kernel"),
+            mem_size_mib,
+        );
+
+        let err = Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
+            .expect_err("oversized memory should fail");
+
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::MemorySizeExceedsArchitecturalMaximum {
+                requested_size,
+                max_size: aarch64::DRAM_MEM_MAX_SIZE
+            } if requested_size == mem_size_mib * MIB
         ));
     }
 

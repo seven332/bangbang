@@ -516,9 +516,10 @@ SPI interrupt lines, and writes the arm64 FDT.
 The assembled bundle owns the guest memory, loaded boot metadata, FDT write
 metadata, MMIO dispatcher, and block/FDT device metadata needed by later HVF
 startup wiring. It fails with typed errors for missing boot source, memory size
-overflow, layout/allocation failure, boot-source loading failure, block-device
-preparation failure, MMIO registration failure, interrupt-line count mismatch,
-or FDT write failure.
+overflow or a memory size above the arm64 architectural maximum,
+layout/allocation failure, boot-source loading failure, block-device preparation
+failure, MMIO registration failure, interrupt-line count mismatch, or FDT write
+failure.
 
 This is still an internal preparation step. The public API does not invoke it,
 `PUT /actions` still returns the documented unsupported fault, and bangbang does
