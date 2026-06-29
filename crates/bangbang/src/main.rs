@@ -6,12 +6,13 @@ use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 
 mod api_server;
+mod vmm;
 
 use api_server::{ApiServer, ApiServerError};
 use bangbang_hvf::HvfBackend;
-use bangbang_runtime::VmmController;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::{SigId, low_level};
+use vmm::ProcessVmm;
 
 const DEFAULT_API_SOCK_PATH: &str = "/tmp/bangbang.socket";
 const DEFAULT_INSTANCE_ID: &str = "anonymous-instance";
@@ -73,8 +74,8 @@ fn run() -> Result<(), ProcessError> {
 
             let mut shutdown_signal = ShutdownSignal::install()?;
             let server = ApiServer::bind(&config.api_sock).map_err(ProcessError::ApiServer)?;
-            let mut vmm = VmmController::new(config.id, env!("CARGO_PKG_VERSION"), APP_NAME);
-            println!("status: API server listening; VM startup is not implemented yet");
+            let mut vmm = ProcessVmm::new(config.id, env!("CARGO_PKG_VERSION"), APP_NAME);
+            println!("status: API server listening; VM execution loop is not implemented yet");
             let shutdown_wakeup = shutdown_signal.wakeup_reader();
             server
                 .run_until(&mut vmm, shutdown_wakeup)
@@ -345,8 +346,8 @@ fn help_text() -> String {
             "pre-boot PUT /machine-config, pre-boot PUT /boot-source, and ",
             "pre-boot PUT /drives/{{drive_id}} ",
             "configuration storage over the API ",
-            "socket; PUT /actions is parsed and routed but execution remains unsupported; ",
-            "VM startup is not implemented yet."
+            "socket; PUT /actions can prepare an owned HVF startup session for ",
+            "InstanceStart, but continuous VM execution is not implemented yet."
         ),
         env!("CARGO_PKG_VERSION"),
         DEFAULT_API_SOCK_PATH,
@@ -516,9 +517,8 @@ mod tests {
         assert!(help.contains("pre-boot PUT /machine-config"));
         assert!(help.contains("pre-boot PUT /boot-source"));
         assert!(help.contains("pre-boot PUT /drives/{drive_id} configuration storage"));
-        assert!(help.contains("PUT /actions is parsed and routed"));
-        assert!(help.contains("execution remains unsupported"));
-        assert!(help.contains("VM startup is not implemented yet"));
+        assert!(help.contains("PUT /actions can prepare an owned HVF startup session"));
+        assert!(help.contains("continuous VM execution is not implemented yet"));
     }
 
     #[test]
