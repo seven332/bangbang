@@ -48,6 +48,9 @@ pub const VIRTIO_BLOCK_STATUS_OK: u8 = 0;
 pub const VIRTIO_BLOCK_STATUS_IOERR: u8 = 1;
 pub const VIRTIO_BLOCK_STATUS_UNSUPPORTED: u8 = 2;
 
+pub type VirtioBlockMmioHandler =
+    VirtioMmioRegisterHandler<VirtioBlockConfigSpace, VirtioBlockDevice>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriveConfigInput {
     path_drive_id: String,

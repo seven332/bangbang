@@ -1,5 +1,6 @@
 //! Backend-neutral MMIO region ownership, lookup, and operation metadata.
 
+use std::any::{Any, type_name};
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::fmt;
 
@@ -262,6 +263,16 @@ pub trait MmioHandler: fmt::Debug + Send {
     fn write(&mut self, access: MmioAccess, data: MmioAccessBytes) -> Result<(), MmioHandlerError>;
 }
 
+trait StoredMmioHandler: Any + MmioHandler {
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+impl<T: MmioHandler + 'static> StoredMmioHandler for T {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MmioHandlerError {
     message: String,
@@ -287,6 +298,36 @@ impl fmt::Display for MmioHandlerError {
 
 impl std::error::Error for MmioHandlerError {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MmioHandlerLookupError {
+    MissingHandler {
+        region_id: MmioRegionId,
+    },
+    UnexpectedHandlerType {
+        region_id: MmioRegionId,
+        expected: &'static str,
+    },
+}
+
+impl fmt::Display for MmioHandlerLookupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingHandler { region_id } => {
+                write!(f, "missing MMIO handler for region id={region_id}")
+            }
+            Self::UnexpectedHandlerType {
+                region_id,
+                expected,
+            } => write!(
+                f,
+                "MMIO handler for region id={region_id} does not have expected type {expected}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MmioHandlerLookupError {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MmioDispatchOutcome {
     Read { data: MmioAccessBytes },
@@ -296,7 +337,7 @@ pub enum MmioDispatchOutcome {
 #[derive(Debug)]
 pub struct MmioDispatcher {
     bus: MmioBus,
-    handlers: BTreeMap<MmioRegionId, Box<dyn MmioHandler>>,
+    handlers: BTreeMap<MmioRegionId, Box<dyn StoredMmioHandler>>,
 }
 
 impl MmioDispatcher {
@@ -340,6 +381,21 @@ impl MmioDispatcher {
             }
             Entry::Occupied(_) => Err(MmioDispatchError::DuplicateHandler { region_id }),
         }
+    }
+
+    pub(crate) fn handler_mut<T: MmioHandler + 'static>(
+        &mut self,
+        region_id: MmioRegionId,
+    ) -> Result<&mut T, MmioHandlerLookupError> {
+        self.handlers
+            .get_mut(&region_id)
+            .ok_or(MmioHandlerLookupError::MissingHandler { region_id })?
+            .as_any_mut()
+            .downcast_mut::<T>()
+            .ok_or(MmioHandlerLookupError::UnexpectedHandlerType {
+                region_id,
+                expected: type_name::<T>(),
+            })
     }
 
     pub fn dispatch(
@@ -727,8 +783,8 @@ mod tests {
     use super::{
         MAX_MMIO_ACCESS_BYTES, MmioAccess, MmioAccessBytes, MmioAccessBytesError, MmioBus,
         MmioBusError, MmioDispatchError, MmioDispatchOutcome, MmioDispatcher, MmioHandler,
-        MmioHandlerError, MmioOperation, MmioOperationError, MmioOperationKind, MmioRegion,
-        MmioRegionId,
+        MmioHandlerError, MmioHandlerLookupError, MmioOperation, MmioOperationError,
+        MmioOperationKind, MmioRegion, MmioRegionId,
     };
     use crate::memory::{GuestAddress, GuestMemoryError, GuestMemoryRange};
 
@@ -831,6 +887,23 @@ mod tests {
                 .push((access, data));
 
             self.write_result.clone()
+        }
+    }
+
+    #[derive(Debug)]
+    struct OtherHandler;
+
+    impl MmioHandler for OtherHandler {
+        fn read(&mut self, _access: MmioAccess) -> Result<MmioAccessBytes, MmioHandlerError> {
+            Err(MmioHandlerError::new("other handler read should not run"))
+        }
+
+        fn write(
+            &mut self,
+            _access: MmioAccess,
+            _data: MmioAccessBytes,
+        ) -> Result<(), MmioHandlerError> {
+            Err(MmioHandlerError::new("other handler write should not run"))
         }
     }
 
@@ -1489,6 +1562,66 @@ mod tests {
             err,
             MmioDispatchError::MissingHandler {
                 region_id: access.region_id()
+            }
+        );
+    }
+
+    #[test]
+    fn dispatcher_returns_typed_handler() {
+        let mut dispatcher = MmioDispatcher::new();
+        let (state, handler) = ScriptedHandler::returning(&[0]);
+        dispatcher
+            .register_handler(id(9), handler)
+            .expect("handler registration should succeed");
+        let access = lookup_access(0x9000, 1);
+        let data = MmioAccessBytes::new(&[0x5a]).expect("write bytes should be valid");
+
+        dispatcher
+            .handler_mut::<ScriptedHandler>(id(9))
+            .expect("typed handler lookup should succeed")
+            .write(access, data)
+            .expect("typed handler write should succeed");
+
+        assert_eq!(
+            state
+                .lock()
+                .expect("handler state lock should not be poisoned")
+                .writes,
+            [(access, data)]
+        );
+    }
+
+    #[test]
+    fn dispatcher_typed_handler_lookup_reports_missing_handler() {
+        let mut dispatcher = MmioDispatcher::new();
+
+        let err = dispatcher
+            .handler_mut::<ScriptedHandler>(id(9))
+            .expect_err("missing typed handler lookup should fail");
+
+        assert_eq!(
+            err,
+            MmioHandlerLookupError::MissingHandler { region_id: id(9) }
+        );
+    }
+
+    #[test]
+    fn dispatcher_typed_handler_lookup_reports_wrong_type() {
+        let mut dispatcher = MmioDispatcher::new();
+        let (_, handler) = ScriptedHandler::returning(&[0]);
+        dispatcher
+            .register_handler(id(9), handler)
+            .expect("handler registration should succeed");
+
+        let err = dispatcher
+            .handler_mut::<OtherHandler>(id(9))
+            .expect_err("wrong typed handler lookup should fail");
+
+        assert_eq!(
+            err,
+            MmioHandlerLookupError::UnexpectedHandlerType {
+                region_id: id(9),
+                expected: std::any::type_name::<OtherHandler>()
             }
         );
     }

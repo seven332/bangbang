@@ -6,7 +6,8 @@ use std::fmt;
 use crate::VmmController;
 use crate::block::{
     BlockMmioDeviceRegistration, BlockMmioLayout, BlockMmioRegistrationError,
-    PreparedBlockDeviceError, PreparedBlockDevices,
+    PreparedBlockDeviceError, PreparedBlockDevices, VirtioBlockDeviceNotificationDispatch,
+    VirtioBlockDeviceNotificationError, VirtioBlockMmioHandler,
 };
 use crate::boot::{BootSource, BootSourceConfig, BootSourceLoadError, LoadedBootSource};
 use crate::fdt::{
@@ -19,7 +20,10 @@ use crate::machine::MachineConfig;
 use crate::memory::{
     GuestMemory, GuestMemoryAllocationError, GuestMemoryError, GuestMemoryLayout, aarch64,
 };
-use crate::mmio::{MmioBusError, MmioDispatchError, MmioDispatcher, MmioRegion, MmioRegionId};
+use crate::mmio::{
+    MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandlerLookupError, MmioRegion,
+    MmioRegionId,
+};
 use crate::serial::{SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialMmioDevice, SharedSerialOutputBuffer};
 
 const MIB: u64 = 1024 * 1024;
@@ -87,6 +91,122 @@ pub struct Arm64BootRuntimeResources {
     pub block_devices: Vec<Arm64BootBlockDevice>,
 }
 
+#[derive(Debug)]
+pub struct Arm64BootBlockNotificationDispatches {
+    devices: Vec<Arm64BootBlockNotificationDispatch>,
+}
+
+impl Arm64BootBlockNotificationDispatches {
+    fn new(devices: Vec<Arm64BootBlockNotificationDispatch>) -> Self {
+        Self { devices }
+    }
+
+    pub fn as_slice(&self) -> &[Arm64BootBlockNotificationDispatch] {
+        &self.devices
+    }
+
+    pub fn len(&self) -> usize {
+        self.devices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.devices.is_empty()
+    }
+
+    pub fn needs_queue_interrupt(&self) -> bool {
+        self.devices
+            .iter()
+            .any(Arm64BootBlockNotificationDispatch::needs_queue_interrupt)
+    }
+}
+
+#[derive(Debug)]
+pub struct Arm64BootBlockNotificationDispatch {
+    device: Arm64BootBlockDevice,
+    outcome: Arm64BootBlockNotificationOutcome,
+}
+
+impl Arm64BootBlockNotificationDispatch {
+    fn new(device: Arm64BootBlockDevice, outcome: Arm64BootBlockNotificationOutcome) -> Self {
+        Self { device, outcome }
+    }
+
+    pub const fn device(&self) -> &Arm64BootBlockDevice {
+        &self.device
+    }
+
+    pub const fn outcome(&self) -> &Arm64BootBlockNotificationOutcome {
+        &self.outcome
+    }
+
+    pub fn needs_queue_interrupt(&self) -> bool {
+        self.outcome.needs_queue_interrupt()
+    }
+}
+
+#[derive(Debug)]
+pub enum Arm64BootBlockNotificationOutcome {
+    Dispatched(VirtioBlockDeviceNotificationDispatch),
+    DispatchFailed(VirtioBlockDeviceNotificationError),
+    HandlerLookupFailed(MmioHandlerLookupError),
+}
+
+impl Arm64BootBlockNotificationOutcome {
+    pub fn needs_queue_interrupt(&self) -> bool {
+        match self {
+            Self::Dispatched(dispatch) => dispatch.needs_queue_interrupt(),
+            Self::DispatchFailed(source) => source
+                .completed_dispatch()
+                .is_some_and(crate::block::VirtioBlockQueueDispatch::needs_queue_interrupt),
+            Self::HandlerLookupFailed(_) => false,
+        }
+    }
+
+    pub const fn dispatched(&self) -> Option<&VirtioBlockDeviceNotificationDispatch> {
+        match self {
+            Self::Dispatched(dispatch) => Some(dispatch),
+            Self::DispatchFailed(_) | Self::HandlerLookupFailed(_) => None,
+        }
+    }
+
+    pub const fn dispatch_error(&self) -> Option<&VirtioBlockDeviceNotificationError> {
+        match self {
+            Self::DispatchFailed(source) => Some(source),
+            Self::Dispatched(_) | Self::HandlerLookupFailed(_) => None,
+        }
+    }
+
+    pub const fn handler_lookup_error(&self) -> Option<&MmioHandlerLookupError> {
+        match self {
+            Self::HandlerLookupFailed(source) => Some(source),
+            Self::Dispatched(_) | Self::DispatchFailed(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum Arm64BootBlockNotificationDispatchError {
+    ResultAllocation { source: TryReserveError },
+}
+
+impl fmt::Display for Arm64BootBlockNotificationDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ResultAllocation { source } => {
+                write!(f, "failed to allocate block notification results: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Arm64BootBlockNotificationDispatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ResultAllocation { source } => Some(source),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arm64BootBlockDevice {
     pub registration: BlockMmioDeviceRegistration,
@@ -98,6 +218,37 @@ pub struct Arm64BootSerialDevice {
     pub region: MmioRegion,
     pub output: SharedSerialOutputBuffer,
     pub fdt_device: Arm64FdtSerialDevice,
+}
+
+impl Arm64BootRuntimeResources {
+    pub fn dispatch_block_queue_notifications(
+        &mut self,
+        memory: &mut GuestMemory,
+    ) -> Result<Arm64BootBlockNotificationDispatches, Arm64BootBlockNotificationDispatchError> {
+        let mut devices = Vec::new();
+        devices
+            .try_reserve_exact(self.block_devices.len())
+            .map_err(
+                |source| Arm64BootBlockNotificationDispatchError::ResultAllocation { source },
+            )?;
+
+        for device in self.block_devices.iter().cloned() {
+            let region_id = device.registration.region_id();
+            let outcome = match self
+                .mmio_dispatcher
+                .handler_mut::<VirtioBlockMmioHandler>(region_id)
+            {
+                Ok(handler) => match handler.dispatch_block_queue_notifications(memory) {
+                    Ok(dispatch) => Arm64BootBlockNotificationOutcome::Dispatched(dispatch),
+                    Err(source) => Arm64BootBlockNotificationOutcome::DispatchFailed(source),
+                },
+                Err(source) => Arm64BootBlockNotificationOutcome::HandlerLookupFailed(source),
+            };
+            devices.push(Arm64BootBlockNotificationDispatch::new(device, outcome));
+        }
+
+        Ok(Arm64BootBlockNotificationDispatches::new(devices))
+    }
 }
 
 #[derive(Debug)]
@@ -466,17 +617,30 @@ mod tests {
         block_device_metadata,
     };
     use crate::VmmAction;
-    use crate::block::DriveConfigInput;
+    use crate::block::{
+        DriveConfigInput, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
+        VIRTIO_BLOCK_REQUEST_TYPE_IN, VIRTIO_BLOCK_SECTOR_SIZE, VIRTIO_BLOCK_STATUS_OK,
+        VIRTIO_BLOCK_STATUS_SIZE,
+    };
     use crate::boot::{BootPayloadKind, BootSourceConfigInput, BootSourceLoadError};
     use crate::fdt::{Arm64FdtError, Arm64FdtGic, Arm64FdtRegion, Arm64FdtTimerInterrupts};
-    use crate::interrupt::GuestInterruptLine;
+    use crate::interrupt::{DeviceInterruptKind, GuestInterruptLine};
     use crate::machine::MachineConfigInput;
     use crate::memory::{GuestAddress, aarch64};
     use crate::mmio::{
-        MmioAccessBytes, MmioBusError, MmioDispatchOutcome, MmioOperation, MmioRegionId,
+        MmioAccessBytes, MmioBusError, MmioDispatchOutcome, MmioDispatcher, MmioOperation,
+        MmioRegionId,
     };
     use crate::serial::{
-        SERIAL_MMIO_DEVICE_WINDOW_SIZE, SERIAL_TRANSMIT_REGISTER_OFFSET, SharedSerialOutputBuffer,
+        SERIAL_MMIO_DEVICE_WINDOW_SIZE, SERIAL_TRANSMIT_REGISTER_OFFSET, SerialMmioDevice,
+        SharedSerialOutputBuffer,
+    };
+    use crate::virtio_mmio::{
+        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
+        VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK, VirtioMmioRegister,
+    };
+    use crate::virtio_queue::{
+        VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
     };
 
     static NEXT_TEST_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -489,6 +653,20 @@ mod tests {
     const ARM64_IMAGE_MAGIC: u32 = 0x644d_5241;
     const TEST_BLOCK_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_0000);
     const TEST_SERIAL_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_2000);
+    const TEST_QUEUE_SIZE: u16 = 4;
+    const TEST_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x8040_0000);
+    const TEST_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x8041_0000);
+    const TEST_USED_RING: GuestAddress = GuestAddress::new(0x8042_0000);
+    const HEADER_ADDR: GuestAddress = GuestAddress::new(0x8043_0000);
+    const DATA_ADDR: GuestAddress = GuestAddress::new(0x8044_0000);
+    const STATUS_ADDR: GuestAddress = GuestAddress::new(0x8045_0000);
+    const TEST_AVAILABLE_RING_IDX_OFFSET: u64 = 2;
+    const TEST_AVAILABLE_RING_RING_OFFSET: u64 = 4;
+    const TEST_AVAILABLE_RING_ENTRY_SIZE: u64 = 2;
+    const QUEUE_CONFIG_STATUS: u32 = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+        | VIRTIO_DEVICE_STATUS_DRIVER
+        | VIRTIO_DEVICE_STATUS_FEATURES_OK;
+    const DRIVER_OK_STATUS: u32 = QUEUE_CONFIG_STATUS | VIRTIO_DEVICE_STATUS_DRIVER_OK;
 
     struct TempFile {
         path: PathBuf,
@@ -573,12 +751,21 @@ mod tests {
     }
 
     fn add_drive(controller: &mut crate::VmmController, id: &str, path: &Path) {
+        add_drive_with_root(controller, id, path, true);
+    }
+
+    fn add_drive_with_root(
+        controller: &mut crate::VmmController,
+        id: &str,
+        path: &Path,
+        is_root_device: bool,
+    ) {
         controller
             .handle_action(VmmAction::PutDrive(DriveConfigInput::new(
                 id,
                 id,
                 path.to_path_buf(),
-                true,
+                is_root_device,
             )))
             .expect("drive config should be stored");
     }
@@ -644,6 +831,290 @@ mod tests {
             .expect("serial write should dispatch");
 
         assert_eq!(outcome, MmioDispatchOutcome::Write);
+    }
+
+    fn write_boot_block_mmio_u32(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        device_index: usize,
+        register: VirtioMmioRegister,
+        value: u32,
+    ) {
+        try_write_boot_block_mmio_u32(runtime, device_index, register, value)
+            .expect("block MMIO write should dispatch");
+    }
+
+    fn try_write_boot_block_mmio_u32(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        device_index: usize,
+        register: VirtioMmioRegister,
+        value: u32,
+    ) -> Result<MmioDispatchOutcome, crate::mmio::MmioDispatchError> {
+        let address = runtime.block_devices[device_index]
+            .registration
+            .address()
+            .checked_add(register.offset())
+            .expect("test MMIO address should not overflow");
+        let access = runtime
+            .mmio_dispatcher
+            .lookup(address, 4)
+            .expect("block MMIO access should resolve");
+        let data = MmioAccessBytes::new(&value.to_le_bytes()).expect("u32 bytes should be valid");
+        runtime.mmio_dispatcher.dispatch(
+            MmioOperation::write(access, data).expect("u32 write operation should be valid"),
+        )
+    }
+
+    fn read_boot_block_mmio_u32(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        device_index: usize,
+        register: VirtioMmioRegister,
+    ) -> u32 {
+        let address = runtime.block_devices[device_index]
+            .registration
+            .address()
+            .checked_add(register.offset())
+            .expect("test MMIO address should not overflow");
+        let access = runtime
+            .mmio_dispatcher
+            .lookup(address, 4)
+            .expect("block MMIO access should resolve");
+        let outcome = runtime
+            .mmio_dispatcher
+            .dispatch(MmioOperation::read(access).expect("u32 read operation should be valid"))
+            .expect("block MMIO read should dispatch");
+        match outcome {
+            MmioDispatchOutcome::Read { data } => u32::from_le_bytes(
+                data.as_slice()
+                    .try_into()
+                    .expect("u32 read should return four bytes"),
+            ),
+            MmioDispatchOutcome::Write => panic!("read operation should not produce write outcome"),
+        }
+    }
+
+    fn configure_boot_block_queue(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        device_index: usize,
+        device_ring: GuestAddress,
+    ) {
+        write_boot_block_mmio_u32(
+            runtime,
+            device_index,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+        );
+        write_boot_block_mmio_u32(
+            runtime,
+            device_index,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+        );
+        write_boot_block_mmio_u32(
+            runtime,
+            device_index,
+            VirtioMmioRegister::Status,
+            QUEUE_CONFIG_STATUS,
+        );
+        write_boot_block_mmio_u32(
+            runtime,
+            device_index,
+            VirtioMmioRegister::QueueNum,
+            u32::from(TEST_QUEUE_SIZE),
+        );
+        write_boot_block_mmio_u32(
+            runtime,
+            device_index,
+            VirtioMmioRegister::QueueDescLow,
+            guest_address_low(TEST_DESCRIPTOR_TABLE),
+        );
+        write_boot_block_mmio_u32(
+            runtime,
+            device_index,
+            VirtioMmioRegister::QueueDriverLow,
+            guest_address_low(TEST_AVAILABLE_RING),
+        );
+        write_boot_block_mmio_u32(
+            runtime,
+            device_index,
+            VirtioMmioRegister::QueueDeviceLow,
+            guest_address_low(device_ring),
+        );
+        write_boot_block_mmio_u32(runtime, device_index, VirtioMmioRegister::QueueReady, 1);
+        write_boot_block_mmio_u32(
+            runtime,
+            device_index,
+            VirtioMmioRegister::Status,
+            DRIVER_OK_STATUS,
+        );
+    }
+
+    fn notify_boot_block_queue(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        device_index: usize,
+    ) {
+        write_boot_block_mmio_u32(runtime, device_index, VirtioMmioRegister::QueueNotify, 0);
+    }
+
+    fn guest_address_low(address: GuestAddress) -> u32 {
+        u32::try_from(address.raw_value()).expect("test address should fit in low queue register")
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct TestDescriptor {
+        address: GuestAddress,
+        len: u32,
+        flags: u16,
+        next: u16,
+    }
+
+    impl TestDescriptor {
+        const fn readable(address: GuestAddress, len: u32, next: Option<u16>) -> Self {
+            let (flags, next_index) = match next {
+                Some(index) => (VIRTQUEUE_DESC_F_NEXT, index),
+                None => (0, 0),
+            };
+            Self {
+                address,
+                len,
+                flags,
+                next: next_index,
+            }
+        }
+
+        const fn writable(address: GuestAddress, len: u32, next: Option<u16>) -> Self {
+            let (flags, next_index) = match next {
+                Some(index) => (VIRTQUEUE_DESC_F_WRITE | VIRTQUEUE_DESC_F_NEXT, index),
+                None => (VIRTQUEUE_DESC_F_WRITE, 0),
+            };
+            Self {
+                address,
+                len,
+                flags,
+                next: next_index,
+            }
+        }
+    }
+
+    fn write_queued_read_request(memory: &mut crate::memory::GuestMemory) {
+        write_request_header(memory, HEADER_ADDR, VIRTIO_BLOCK_REQUEST_TYPE_IN, 0);
+        write_descriptor(
+            memory,
+            0,
+            TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+        );
+        write_descriptor(
+            memory,
+            1,
+            TestDescriptor::writable(DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as u32, Some(2)),
+        );
+        write_descriptor(memory, 2, TestDescriptor::writable(STATUS_ADDR, 1, None));
+        write_available_heads(memory, &[0]);
+    }
+
+    fn write_partially_invalid_queued_flush_request(memory: &mut crate::memory::GuestMemory) {
+        write_request_header(memory, HEADER_ADDR, VIRTIO_BLOCK_REQUEST_TYPE_FLUSH, 0);
+        write_descriptor(
+            memory,
+            0,
+            TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+        );
+        write_descriptor(
+            memory,
+            1,
+            TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+        );
+        write_available_heads(memory, &[0, TEST_QUEUE_SIZE]);
+    }
+
+    fn write_request_header(
+        memory: &mut crate::memory::GuestMemory,
+        address: GuestAddress,
+        request_type: u32,
+        sector: u64,
+    ) {
+        let mut bytes = [0; VIRTIO_BLOCK_REQUEST_HEADER_SIZE as usize];
+        let (request_type_bytes, tail) = bytes.split_at_mut(4);
+        let (_reserved, sector_bytes) = tail.split_at_mut(4);
+        request_type_bytes.copy_from_slice(&request_type.to_le_bytes());
+        sector_bytes.copy_from_slice(&sector.to_le_bytes());
+        memory
+            .write_slice(&bytes, address)
+            .expect("request header should write");
+    }
+
+    fn write_descriptor(
+        memory: &mut crate::memory::GuestMemory,
+        index: u16,
+        descriptor: TestDescriptor,
+    ) {
+        let mut bytes = [0; VIRTQUEUE_DESCRIPTOR_SIZE];
+        let (address_bytes, tail) = bytes.split_at_mut(8);
+        let (len_bytes, tail) = tail.split_at_mut(4);
+        let (flags_bytes, next_bytes) = tail.split_at_mut(2);
+        address_bytes.copy_from_slice(&descriptor.address.raw_value().to_le_bytes());
+        len_bytes.copy_from_slice(&descriptor.len.to_le_bytes());
+        flags_bytes.copy_from_slice(&descriptor.flags.to_le_bytes());
+        next_bytes.copy_from_slice(&descriptor.next.to_le_bytes());
+
+        let descriptor_address = TEST_DESCRIPTOR_TABLE
+            .checked_add(
+                u64::from(index)
+                    * u64::try_from(VIRTQUEUE_DESCRIPTOR_SIZE).expect("descriptor size should fit"),
+            )
+            .expect("descriptor address should not overflow");
+        memory
+            .write_slice(&bytes, descriptor_address)
+            .expect("descriptor should write");
+    }
+
+    fn write_guest_u16(memory: &mut crate::memory::GuestMemory, address: GuestAddress, value: u16) {
+        memory
+            .write_slice(&value.to_le_bytes(), address)
+            .expect("u16 field should write");
+    }
+
+    fn read_guest_bytes(
+        memory: &crate::memory::GuestMemory,
+        address: GuestAddress,
+        len: usize,
+    ) -> Vec<u8> {
+        let mut bytes = vec![0; len];
+        memory
+            .read_slice(&mut bytes, address)
+            .expect("guest bytes should read");
+        bytes
+    }
+
+    fn available_ring_idx_address() -> GuestAddress {
+        TEST_AVAILABLE_RING
+            .checked_add(TEST_AVAILABLE_RING_IDX_OFFSET)
+            .expect("available idx address should not overflow")
+    }
+
+    fn available_ring_entry_address(ring_index: u16) -> GuestAddress {
+        TEST_AVAILABLE_RING
+            .checked_add(
+                TEST_AVAILABLE_RING_RING_OFFSET
+                    + u64::from(ring_index) * TEST_AVAILABLE_RING_ENTRY_SIZE,
+            )
+            .expect("available entry address should not overflow")
+    }
+
+    fn write_available_heads(memory: &mut crate::memory::GuestMemory, heads: &[u16]) {
+        for (ring_index, head) in heads.iter().copied().enumerate() {
+            write_guest_u16(
+                memory,
+                available_ring_entry_address(
+                    u16::try_from(ring_index).expect("test ring index should fit in u16"),
+                ),
+                head,
+            );
+        }
+        write_guest_u16(
+            memory,
+            available_ring_idx_address(),
+            u16::try_from(heads.len()).expect("test available length should fit in u16"),
+        );
     }
 
     fn read_fdt(resources: &Arm64BootResources) -> DeviceTree {
@@ -810,6 +1281,365 @@ mod tests {
                 .expect("serial metadata should split")
                 .region,
             serial_region
+        );
+    }
+
+    #[test]
+    fn boot_runtime_block_notification_dispatch_accepts_empty_block_devices() {
+        let kernel = temp_file("kernel-empty-block-dispatch", &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+        let resources =
+            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
+                .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut runtime = parts.runtime;
+
+        let dispatches = runtime
+            .dispatch_block_queue_notifications(&mut memory)
+            .expect("empty block dispatch result should allocate");
+
+        assert!(dispatches.is_empty());
+        assert_eq!(dispatches.len(), 0);
+        assert!(!dispatches.needs_queue_interrupt());
+    }
+
+    #[test]
+    fn boot_runtime_block_notification_dispatch_without_pending_notification_is_noop() {
+        let kernel = temp_file("kernel-block-noop-dispatch", &arm64_image());
+        let block = temp_file("block-noop-dispatch", &[0x5a; 512]);
+        let mut controller = controller_with_kernel(kernel.path());
+        add_drive(&mut controller, "rootfs", block.path());
+        let resources =
+            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[line(32)]))
+                .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut runtime = parts.runtime;
+        configure_boot_block_queue(&mut runtime, 0, TEST_USED_RING);
+
+        let dispatches = runtime
+            .dispatch_block_queue_notifications(&mut memory)
+            .expect("block dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 1);
+        assert!(!dispatches.needs_queue_interrupt());
+        let device_dispatch = &dispatches.as_slice()[0];
+        assert_eq!(device_dispatch.device().registration.drive_id(), "rootfs");
+        assert_eq!(device_dispatch.device().fdt_device.interrupt_line, line(32));
+        let dispatch = device_dispatch
+            .outcome()
+            .dispatched()
+            .expect("no pending notification should still dispatch as no-op");
+        assert_eq!(dispatch.drained_notifications(), []);
+        assert!(dispatch.queue_dispatch().is_none());
+        assert!(!device_dispatch.needs_queue_interrupt());
+        assert_eq!(
+            read_boot_block_mmio_u32(&mut runtime, 0, VirtioMmioRegister::InterruptStatus),
+            0
+        );
+    }
+
+    #[test]
+    fn boot_runtime_block_notification_dispatch_executes_queued_request() {
+        let kernel = temp_file("kernel-block-request-dispatch", &arm64_image());
+        let payload = vec![0x74; VIRTIO_BLOCK_SECTOR_SIZE as usize];
+        let block = temp_file("block-request-dispatch", &payload);
+        let mut controller = controller_with_kernel(kernel.path());
+        add_drive(&mut controller, "rootfs", block.path());
+        let resources =
+            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[line(32)]))
+                .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut runtime = parts.runtime;
+        configure_boot_block_queue(&mut runtime, 0, TEST_USED_RING);
+        write_queued_read_request(&mut memory);
+        notify_boot_block_queue(&mut runtime, 0);
+
+        let dispatches = runtime
+            .dispatch_block_queue_notifications(&mut memory)
+            .expect("block dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 1);
+        assert!(dispatches.needs_queue_interrupt());
+        let device_dispatch = &dispatches.as_slice()[0];
+        assert_eq!(device_dispatch.device().registration.index(), 0);
+        assert_eq!(
+            device_dispatch.device().registration.region_id(),
+            MmioRegionId::new(1)
+        );
+        assert_eq!(device_dispatch.device().fdt_device.interrupt_line, line(32));
+        let dispatch = device_dispatch
+            .outcome()
+            .dispatched()
+            .expect("queued notification should dispatch");
+        assert_eq!(dispatch.drained_notifications(), [0]);
+        let queue = dispatch
+            .queue_dispatch()
+            .expect("queue dispatch summary should be present");
+        assert_eq!(queue.processed_requests(), 1);
+        assert_eq!(queue.successful_requests(), 1);
+        assert!(queue.needs_queue_interrupt());
+        assert!(device_dispatch.needs_queue_interrupt());
+        assert_eq!(
+            read_boot_block_mmio_u32(&mut runtime, 0, VirtioMmioRegister::InterruptStatus),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        assert_eq!(
+            read_guest_bytes(&memory, DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as usize),
+            payload
+        );
+        assert_eq!(
+            read_guest_bytes(&memory, STATUS_ADDR, 1),
+            [VIRTIO_BLOCK_STATUS_OK]
+        );
+
+        let second_dispatches = runtime
+            .dispatch_block_queue_notifications(&mut memory)
+            .expect("second block dispatch result should allocate");
+        let second = second_dispatches.as_slice()[0]
+            .outcome()
+            .dispatched()
+            .expect("cleared notification should dispatch as no-op");
+        assert_eq!(second.drained_notifications(), []);
+        assert!(second.queue_dispatch().is_none());
+    }
+
+    #[test]
+    fn boot_runtime_block_notification_dispatch_preserves_device_error_metadata() {
+        let kernel = temp_file("kernel-block-error-dispatch", &arm64_image());
+        let block = temp_file("block-error-dispatch", &[0x5a; 512]);
+        let mut controller = controller_with_kernel(kernel.path());
+        add_drive(&mut controller, "rootfs", block.path());
+        let resources =
+            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[line(32)]))
+                .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut runtime = parts.runtime;
+        write_boot_block_mmio_u32(
+            &mut runtime,
+            0,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+        );
+        write_boot_block_mmio_u32(
+            &mut runtime,
+            0,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+        );
+        write_boot_block_mmio_u32(
+            &mut runtime,
+            0,
+            VirtioMmioRegister::Status,
+            QUEUE_CONFIG_STATUS,
+        );
+        try_write_boot_block_mmio_u32(
+            &mut runtime,
+            0,
+            VirtioMmioRegister::Status,
+            DRIVER_OK_STATUS,
+        )
+        .expect_err("unconfigured block queue activation should fail");
+        notify_boot_block_queue(&mut runtime, 0);
+
+        let dispatches = runtime
+            .dispatch_block_queue_notifications(&mut memory)
+            .expect("block dispatch result should allocate");
+
+        let device_dispatch = &dispatches.as_slice()[0];
+        assert_eq!(device_dispatch.device().registration.drive_id(), "rootfs");
+        assert_eq!(device_dispatch.device().fdt_device.interrupt_line, line(32));
+        let error = device_dispatch
+            .outcome()
+            .dispatch_error()
+            .expect("inactive block notification should be preserved as a device error");
+        assert_eq!(error.drained_notifications(), [0]);
+        assert!(error.completed_dispatch().is_none());
+        assert!(!device_dispatch.needs_queue_interrupt());
+    }
+
+    #[test]
+    fn boot_runtime_block_notification_dispatch_preserves_partial_error_interrupt_intent() {
+        let kernel = temp_file("kernel-block-partial-error-dispatch", &arm64_image());
+        let block = temp_file("block-partial-error-dispatch", &[0x5a; 512]);
+        let mut controller = controller_with_kernel(kernel.path());
+        add_drive(&mut controller, "rootfs", block.path());
+        let resources =
+            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[line(32)]))
+                .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut runtime = parts.runtime;
+        configure_boot_block_queue(&mut runtime, 0, TEST_USED_RING);
+        write_partially_invalid_queued_flush_request(&mut memory);
+        notify_boot_block_queue(&mut runtime, 0);
+
+        let dispatches = runtime
+            .dispatch_block_queue_notifications(&mut memory)
+            .expect("block dispatch result should allocate");
+
+        assert!(dispatches.needs_queue_interrupt());
+        let device_dispatch = &dispatches.as_slice()[0];
+        assert!(device_dispatch.needs_queue_interrupt());
+        let error = device_dispatch
+            .outcome()
+            .dispatch_error()
+            .expect("partial queue failure should be preserved as a device error");
+        assert_eq!(error.drained_notifications(), [0]);
+        let completed = error
+            .completed_dispatch()
+            .expect("partial queue failure should preserve completed dispatch metadata");
+        assert_eq!(completed.processed_requests(), 1);
+        assert_eq!(completed.successful_requests(), 1);
+        assert!(completed.needs_queue_interrupt());
+        assert_eq!(
+            read_boot_block_mmio_u32(&mut runtime, 0, VirtioMmioRegister::InterruptStatus),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        assert_eq!(
+            read_guest_bytes(&memory, STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE as usize),
+            [VIRTIO_BLOCK_STATUS_OK]
+        );
+    }
+
+    #[test]
+    fn boot_runtime_block_notification_dispatch_reports_missing_handler() {
+        let kernel = temp_file("kernel-block-missing-handler", &arm64_image());
+        let block = temp_file("block-missing-handler", &[0x5a; 512]);
+        let mut controller = controller_with_kernel(kernel.path());
+        add_drive(&mut controller, "rootfs", block.path());
+        let resources =
+            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[line(32)]))
+                .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut runtime = parts.runtime;
+        runtime.mmio_dispatcher = MmioDispatcher::new();
+
+        let dispatches = runtime
+            .dispatch_block_queue_notifications(&mut memory)
+            .expect("block dispatch result should allocate");
+
+        let error = dispatches.as_slice()[0]
+            .outcome()
+            .handler_lookup_error()
+            .expect("missing block handler should be reported");
+        assert!(matches!(
+            error,
+            crate::mmio::MmioHandlerLookupError::MissingHandler {
+                region_id
+            } if *region_id == MmioRegionId::new(1)
+        ));
+    }
+
+    #[test]
+    fn boot_runtime_block_notification_dispatch_reports_wrong_handler_type() {
+        let kernel = temp_file("kernel-block-wrong-handler", &arm64_image());
+        let block = temp_file("block-wrong-handler", &[0x5a; 512]);
+        let mut controller = controller_with_kernel(kernel.path());
+        add_drive(&mut controller, "rootfs", block.path());
+        let resources =
+            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[line(32)]))
+                .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut runtime = parts.runtime;
+        let region = runtime.block_devices[0].registration.region();
+        runtime.mmio_dispatcher = MmioDispatcher::new();
+        runtime
+            .mmio_dispatcher
+            .insert_region(region.id(), region.range().start(), region.range().size())
+            .expect("replacement region should insert");
+        runtime
+            .mmio_dispatcher
+            .register_handler(
+                region.id(),
+                SerialMmioDevice::new(SharedSerialOutputBuffer::default()),
+            )
+            .expect("serial handler should register under block region id for test");
+
+        let dispatches = runtime
+            .dispatch_block_queue_notifications(&mut memory)
+            .expect("block dispatch result should allocate");
+
+        let error = dispatches.as_slice()[0]
+            .outcome()
+            .handler_lookup_error()
+            .expect("wrong block handler type should be reported");
+        assert!(matches!(
+            error,
+            crate::mmio::MmioHandlerLookupError::UnexpectedHandlerType {
+                region_id,
+                ..
+            } if *region_id == MmioRegionId::new(1)
+        ));
+    }
+
+    #[test]
+    fn boot_runtime_block_notification_dispatch_keeps_multiple_devices_independent() {
+        let kernel = temp_file("kernel-block-multi-dispatch", &arm64_image());
+        let first_block = temp_file("block-multi-first", &[0x11; 512]);
+        let second_payload = vec![0x22; VIRTIO_BLOCK_SECTOR_SIZE as usize];
+        let second_block = temp_file("block-multi-second", &second_payload);
+        let mut controller = controller_with_kernel(kernel.path());
+        add_drive(&mut controller, "rootfs", first_block.path());
+        add_drive_with_root(&mut controller, "data", second_block.path(), false);
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            valid_config(&[line(32), line(33)]),
+        )
+        .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut runtime = parts.runtime;
+        configure_boot_block_queue(&mut runtime, 0, TEST_USED_RING);
+        configure_boot_block_queue(&mut runtime, 1, TEST_USED_RING);
+        write_queued_read_request(&mut memory);
+        notify_boot_block_queue(&mut runtime, 1);
+
+        let dispatches = runtime
+            .dispatch_block_queue_notifications(&mut memory)
+            .expect("block dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 2);
+        let first = &dispatches.as_slice()[0];
+        let second = &dispatches.as_slice()[1];
+        assert_eq!(first.device().registration.drive_id(), "rootfs");
+        assert_eq!(first.device().fdt_device.interrupt_line, line(32));
+        assert!(!first.needs_queue_interrupt());
+        assert_eq!(
+            first
+                .outcome()
+                .dispatched()
+                .expect("first device should dispatch as no-op")
+                .drained_notifications(),
+            []
+        );
+        assert_eq!(second.device().registration.drive_id(), "data");
+        assert_eq!(second.device().fdt_device.interrupt_line, line(33));
+        assert!(second.needs_queue_interrupt());
+        assert_eq!(
+            second
+                .outcome()
+                .dispatched()
+                .expect("second device should dispatch queued notification")
+                .drained_notifications(),
+            [0]
+        );
+        assert_eq!(
+            read_boot_block_mmio_u32(&mut runtime, 0, VirtioMmioRegister::InterruptStatus),
+            0
+        );
+        assert_eq!(
+            read_boot_block_mmio_u32(&mut runtime, 1, VirtioMmioRegister::InterruptStatus),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        assert_eq!(
+            read_guest_bytes(&memory, DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as usize),
+            second_payload
         );
     }
 
