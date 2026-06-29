@@ -121,10 +121,12 @@ impl HvfArm64BootSession<'_> {
         &self.runtime_resources
     }
 
-    /// Return the runner-compatible MMIO dispatcher owned by this boot session.
+    /// Return a cloned handle to the runner-compatible MMIO dispatcher.
     ///
     /// The dispatcher is local to this boot session. It is shared only so
-    /// vCPU-runner commands can dispatch MMIO on the runner thread.
+    /// vCPU-runner commands can dispatch MMIO on the runner thread. Keep cloned
+    /// handles scoped to runner commands so dispatcher-owned device resources
+    /// are released with the session.
     pub fn mmio_dispatcher(&self) -> Arc<Mutex<MmioDispatcher>> {
         Arc::clone(&self.mmio_dispatcher)
     }
