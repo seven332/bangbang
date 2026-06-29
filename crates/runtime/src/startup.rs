@@ -894,6 +894,55 @@ mod tests {
     }
 
     #[test]
+    fn serial_region_overflow_fails_during_registration() {
+        let kernel = temp_file("kernel-serial-overflow", &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+        let (serial, _output) =
+            serial_config(GuestAddress::new(u64::MAX), MmioRegionId::new(9), line(32));
+        let config = Arm64BootResourceConfig {
+            serial_device: Some(serial),
+            ..valid_config(&[])
+        };
+
+        let err = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect_err("overflowing serial region should fail");
+
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::RegisterSerialMmio { source }
+                if matches!(
+                    source.as_ref(),
+                    Arm64BootSerialMmioRegistrationError::InsertRegion {
+                        source: MmioBusError::InvalidRegionRange { .. },
+                        ..
+                    }
+                )
+        ));
+    }
+
+    #[test]
+    fn serial_non_spi_interrupt_fails_during_fdt_write() {
+        let kernel = temp_file("kernel-serial-non-spi", &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+        let (serial, _output) =
+            serial_config(TEST_SERIAL_MMIO_BASE, MmioRegionId::new(9), line(31));
+        let config = Arm64BootResourceConfig {
+            serial_device: Some(serial),
+            ..valid_config(&[])
+        };
+
+        let err = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect_err("non-SPI serial interrupt should fail");
+
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::Fdt {
+                source: Arm64FdtError::InvalidSerialInterrupt { .. }
+            }
+        ));
+    }
+
+    #[test]
     fn serial_region_overlapping_guest_memory_fails_during_fdt_write() {
         let kernel = temp_file("kernel-serial-overlap-memory", &arm64_image());
         let controller = controller_with_kernel(kernel.path());
