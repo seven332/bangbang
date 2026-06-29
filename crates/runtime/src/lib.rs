@@ -59,6 +59,7 @@ pub enum VmmAction {
     GetVmmVersion,
     GetVmInstanceInfo,
     GetMachineConfig,
+    PutBootSource(boot::BootSourceConfigInput),
     PutMachineConfig(machine::MachineConfigInput),
     PutDrive(block::DriveConfigInput),
 }
@@ -69,6 +70,7 @@ impl VmmAction {
             Self::GetVmmVersion => "GetVmmVersion",
             Self::GetVmInstanceInfo => "GetVmInstanceInfo",
             Self::GetMachineConfig => "GetMachineConfig",
+            Self::PutBootSource(_) => "PutBootSource",
             Self::PutMachineConfig(_) => "PutMachineConfig",
             Self::PutDrive(_) => "PutDrive",
         }
@@ -90,6 +92,7 @@ pub enum VmmActionError {
         action: &'static str,
         state: InstanceState,
     },
+    BootSourceConfig(boot::BootSourceConfigError),
     DriveConfig(block::DriveConfigError),
     MachineConfig(machine::MachineConfigError),
 }
@@ -106,6 +109,7 @@ impl fmt::Display for VmmActionError {
                     "The requested operation is not supported in {state} state: {action}"
                 )
             }
+            Self::BootSourceConfig(err) => write!(f, "{err}"),
             Self::DriveConfig(err) => write!(f, "{err}"),
             Self::MachineConfig(err) => write!(f, "{err}"),
         }
@@ -115,6 +119,7 @@ impl fmt::Display for VmmActionError {
 impl std::error::Error for VmmActionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::BootSourceConfig(err) => Some(err),
             Self::DriveConfig(err) => Some(err),
             Self::MachineConfig(err) => Some(err),
             Self::UnsupportedAction(_) | Self::UnsupportedState { .. } => None,
@@ -126,6 +131,7 @@ impl std::error::Error for VmmActionError {
 pub struct VmmController {
     instance_info: InstanceInfo,
     machine_config: machine::MachineConfig,
+    boot_source_config: Option<boot::BootSourceConfig>,
     drive_configs: block::DriveConfigs,
 }
 
@@ -143,6 +149,7 @@ impl VmmController {
                 app_name,
             ),
             machine_config: machine::MachineConfig::default(),
+            boot_source_config: None,
             drive_configs: block::DriveConfigs::new(),
         }
     }
@@ -159,6 +166,10 @@ impl VmmController {
         self.machine_config
     }
 
+    pub fn boot_source_config(&self) -> Option<&boot::BootSourceConfig> {
+        self.boot_source_config.as_ref()
+    }
+
     pub fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
         let action_name = action.name();
         match action {
@@ -169,6 +180,22 @@ impl VmmController {
                 Ok(VmmData::InstanceInformation(self.instance_info.clone()))
             }
             VmmAction::GetMachineConfig => Ok(VmmData::MachineConfiguration(self.machine_config)),
+            VmmAction::PutBootSource(config) => {
+                if self.instance_info.state != InstanceState::NotStarted {
+                    return Err(VmmActionError::UnsupportedState {
+                        action: action_name,
+                        state: self.instance_info.state,
+                    });
+                }
+
+                self.boot_source_config = Some(
+                    config
+                        .validate()
+                        .map_err(VmmActionError::BootSourceConfig)?,
+                );
+
+                Ok(VmmData::Empty)
+            }
             VmmAction::PutMachineConfig(config) => {
                 if self.instance_info.state != InstanceState::NotStarted {
                     return Err(VmmActionError::UnsupportedState {
@@ -226,16 +253,23 @@ pub trait VmBackend: fmt::Debug {
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::{
         BackendError, InstanceState, VmmAction, VmmActionError, VmmController, VmmData,
         block::{DriveConfigError, DriveConfigInput},
+        boot::{
+            BootCommandLineError, BootPayloadKind, BootSourceConfigError, BootSourceConfigInput,
+        },
         machine::{DEFAULT_MEM_SIZE_MIB, DEFAULT_VCPU_COUNT, MachineConfigInput},
     };
 
     fn drive_input(id: &str, path: &str, is_root_device: bool) -> DriveConfigInput {
         DriveConfigInput::new(id, id, path, is_root_device)
+    }
+
+    fn boot_source_input(kernel_image_path: &str) -> BootSourceConfigInput {
+        BootSourceConfigInput::new(kernel_image_path)
     }
 
     #[test]
@@ -267,6 +301,7 @@ mod tests {
             controller.machine_config().mem_size_mib(),
             DEFAULT_MEM_SIZE_MIB
         );
+        assert_eq!(controller.boot_source_config(), None);
         assert!(controller.drive_configs().is_empty());
     }
 
@@ -380,6 +415,170 @@ mod tests {
         );
         assert_eq!(controller.machine_config().vcpu_count(), 2);
         assert_eq!(controller.machine_config().mem_size_mib(), 256);
+    }
+
+    #[test]
+    fn handles_put_boot_source_config() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
+        assert_eq!(
+            controller.handle_action(VmmAction::PutBootSource(
+                boot_source_input("/tmp/vmlinux")
+                    .with_initrd_path("/tmp/initrd.img")
+                    .with_boot_args("console=hvc0 reboot=k panic=1"),
+            )),
+            Ok(VmmData::Empty)
+        );
+
+        let config = controller
+            .boot_source_config()
+            .expect("boot source config should be stored");
+        assert_eq!(config.kernel_image_path(), Path::new("/tmp/vmlinux"));
+        assert_eq!(config.initrd_path(), Some(Path::new("/tmp/initrd.img")));
+        assert_eq!(config.boot_args(), Some("console=hvc0 reboot=k panic=1"));
+    }
+
+    #[test]
+    fn put_boot_source_config_replaces_previous_config() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(
+                boot_source_input("/tmp/vmlinux")
+                    .with_initrd_path("/tmp/initrd.img")
+                    .with_boot_args("console=hvc0"),
+            ))
+            .expect("initial boot source config should be stored");
+
+        controller
+            .handle_action(VmmAction::PutBootSource(
+                boot_source_input("/tmp/replacement-vmlinux").with_boot_args("console=ttyS0"),
+            ))
+            .expect("replacement boot source config should be stored");
+
+        let config = controller
+            .boot_source_config()
+            .expect("replacement boot source config should be stored");
+        assert_eq!(
+            config.kernel_image_path(),
+            Path::new("/tmp/replacement-vmlinux")
+        );
+        assert_eq!(config.initrd_path(), None);
+        assert_eq!(config.boot_args(), Some("console=ttyS0"));
+    }
+
+    #[test]
+    fn put_boot_source_config_rejects_invalid_input_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input(
+                "/tmp/original-vmlinux",
+            )))
+            .expect("initial boot source config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PutBootSource(
+                boot_source_input("/tmp/private-vmlinux").with_boot_args("secret\0debug"),
+            ))
+            .expect_err("invalid boot source config should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::BootSourceConfig(BootSourceConfigError::CommandLine(
+                BootCommandLineError::ContainsNul,
+            ))
+        );
+        assert_eq!(
+            err.to_string(),
+            "kernel command line is invalid: contains a NUL byte"
+        );
+        assert!(!err.to_string().contains("secret"));
+        assert!(!err.to_string().contains("/tmp/private-vmlinux"));
+
+        let config = controller
+            .boot_source_config()
+            .expect("original boot source config should remain stored");
+        assert_eq!(
+            config.kernel_image_path(),
+            Path::new("/tmp/original-vmlinux")
+        );
+        assert_eq!(config.initrd_path(), None);
+        assert_eq!(config.boot_args(), None);
+    }
+
+    #[test]
+    fn put_boot_source_config_rejects_empty_paths_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input(
+                "/tmp/original-vmlinux",
+            )))
+            .expect("initial boot source config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+                PathBuf::new(),
+            )))
+            .expect_err("empty kernel path should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::BootSourceConfig(BootSourceConfigError::EmptyPath {
+                payload: BootPayloadKind::Kernel,
+            })
+        );
+
+        let err = controller
+            .handle_action(VmmAction::PutBootSource(
+                boot_source_input("/tmp/private-vmlinux").with_initrd_path(PathBuf::new()),
+            ))
+            .expect_err("empty initrd path should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::BootSourceConfig(BootSourceConfigError::EmptyPath {
+                payload: BootPayloadKind::Initrd,
+            })
+        );
+
+        let config = controller
+            .boot_source_config()
+            .expect("original boot source config should remain stored");
+        assert_eq!(
+            config.kernel_image_path(),
+            Path::new("/tmp/original-vmlinux")
+        );
+    }
+
+    #[test]
+    fn put_boot_source_config_rejects_running_state_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input(
+                "/tmp/original-vmlinux",
+            )))
+            .expect("initial boot source config should be stored");
+        controller.instance_info.state = InstanceState::Running;
+
+        let err = controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input(
+                "/tmp/replacement-vmlinux",
+            )))
+            .expect_err("running boot source config should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::UnsupportedState {
+                action: "PutBootSource",
+                state: InstanceState::Running,
+            }
+        );
+        let config = controller
+            .boot_source_config()
+            .expect("original boot source config should remain stored");
+        assert_eq!(
+            config.kernel_image_path(),
+            Path::new("/tmp/original-vmlinux")
+        );
     }
 
     #[test]
@@ -528,6 +727,16 @@ mod tests {
         let err = VmmActionError::DriveConfig(DriveConfigError::EmptyPathOnHost);
 
         assert_eq!(err.to_string(), "drive path_on_host must not be empty");
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn displays_boot_source_config_error() {
+        let err = VmmActionError::BootSourceConfig(BootSourceConfigError::EmptyPath {
+            payload: BootPayloadKind::Kernel,
+        });
+
+        assert_eq!(err.to_string(), "kernel image path must not be empty");
         assert!(err.source().is_some());
     }
 
