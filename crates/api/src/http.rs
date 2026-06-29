@@ -1,6 +1,6 @@
 use std::fmt;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::HTTP_MAX_PAYLOAD_SIZE;
 use crate::route::Endpoint;
@@ -22,6 +22,7 @@ pub enum ApiRequest {
     PutAction(Box<ActionRequest>),
     PutBootSource(Box<BootSourceRequest>),
     PutDrive(Box<DriveConfigRequest>),
+    PutLogger(Box<LoggerConfigRequest>),
     PutMachineConfig(Box<MachineConfigRequest>),
     PutMetrics(Box<MetricsConfigRequest>),
 }
@@ -114,6 +115,80 @@ struct BootSourceRequestBody {
     kernel_image_path: String,
     initrd_path: Option<String>,
     boot_args: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoggerConfigRequest {
+    log_path: Option<String>,
+    level: Option<LoggerLevel>,
+    show_level: Option<bool>,
+    show_log_origin: Option<bool>,
+    module: Option<String>,
+}
+
+impl LoggerConfigRequest {
+    pub fn log_path(&self) -> Option<&str> {
+        self.log_path.as_deref()
+    }
+
+    pub const fn level(&self) -> Option<LoggerLevel> {
+        self.level
+    }
+
+    pub const fn show_level(&self) -> Option<bool> {
+        self.show_level
+    }
+
+    pub const fn show_log_origin(&self) -> Option<bool> {
+        self.show_log_origin
+    }
+
+    pub fn module(&self) -> Option<&str> {
+        self.module.as_deref()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoggerLevel {
+    Off,
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl<'de> Deserialize<'de> for LoggerLevel {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "trace" => Ok(Self::Trace),
+            "debug" => Ok(Self::Debug),
+            "info" => Ok(Self::Info),
+            "warn" | "warning" => Ok(Self::Warn),
+            "error" => Ok(Self::Error),
+            _ => Err(serde::de::Error::custom("invalid logger level")),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoggerConfigRequestBody {
+    #[serde(default)]
+    log_path: Option<String>,
+    #[serde(default)]
+    level: Option<LoggerLevel>,
+    #[serde(default)]
+    show_level: Option<bool>,
+    #[serde(default)]
+    show_log_origin: Option<bool>,
+    #[serde(default)]
+    module: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -650,6 +725,9 @@ pub fn parse_request(bytes: &[u8]) -> Result<ApiRequest, RequestError> {
     if method == "PUT" && path == "/boot-source" {
         return parse_boot_source_request(body);
     }
+    if method == "PUT" && path == "/logger" {
+        return parse_logger_config_request(body);
+    }
     if method == "PUT" && path == "/machine-config" {
         return parse_machine_config_request(body);
     }
@@ -703,6 +781,19 @@ fn parse_boot_source_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
         kernel_image_path: body.kernel_image_path,
         initrd_path: body.initrd_path,
         boot_args: body.boot_args,
+    })))
+}
+
+fn parse_logger_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
+    let body = serde_json::from_slice::<LoggerConfigRequestBody>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+
+    Ok(ApiRequest::PutLogger(Box::new(LoggerConfigRequest {
+        log_path: body.log_path,
+        level: body.level,
+        show_level: body.show_level,
+        show_log_origin: body.show_log_origin,
+        module: body.module,
     })))
 }
 
@@ -988,6 +1079,7 @@ impl From<ApiRequest> for Endpoint {
             ApiRequest::PutAction(_) => Self::Actions,
             ApiRequest::PutBootSource(_) => Self::BootSource,
             ApiRequest::PutDrive(_) => Self::Drive,
+            ApiRequest::PutLogger(_) => Self::Logger,
             ApiRequest::PutMachineConfig(_) => Self::MachineConfig,
             ApiRequest::PutMetrics(_) => Self::Metrics,
         }
@@ -1304,6 +1396,131 @@ mod tests {
                 "/boot-source/extra",
                 r#"{"kernel_image_path":"/tmp/vmlinux"}"#,
             )),
+            Err(RequestError::InvalidPathMethod)
+        );
+    }
+
+    #[test]
+    fn parses_put_logger_with_minimal_body() {
+        let request = request_with_body("PUT", "/logger", "{}");
+
+        let parsed = parse_request(&request).expect("logger request should parse");
+
+        let ApiRequest::PutLogger(config) = parsed else {
+            panic!("expected logger request");
+        };
+        assert_eq!(config.log_path(), None);
+        assert_eq!(config.level(), None);
+        assert_eq!(config.show_level(), None);
+        assert_eq!(config.show_log_origin(), None);
+        assert_eq!(config.module(), None);
+        assert_eq!(request_total_len(&request), Ok(Some(request.len())));
+    }
+
+    #[test]
+    fn parses_put_logger_with_complete_body() {
+        let body = r#"{
+            "log_path": "/tmp/logger",
+            "level": "Warning",
+            "show_level": true,
+            "show_log_origin": true,
+            "module": "api_server::request"
+        }"#;
+        let request = request_with_body("PUT", "/logger", body);
+
+        let parsed = parse_request(&request).expect("logger request should parse");
+
+        let ApiRequest::PutLogger(config) = parsed else {
+            panic!("expected logger request");
+        };
+        assert_eq!(config.log_path(), Some("/tmp/logger"));
+        assert_eq!(config.level(), Some(LoggerLevel::Warn));
+        assert_eq!(config.show_level(), Some(true));
+        assert_eq!(config.show_log_origin(), Some(true));
+        assert_eq!(config.module(), Some("api_server::request"));
+    }
+
+    #[test]
+    fn parses_put_logger_case_insensitive_levels_and_nulls() {
+        for (level, expected) in [
+            ("off", LoggerLevel::Off),
+            ("TRACE", LoggerLevel::Trace),
+            ("Debug", LoggerLevel::Debug),
+            ("info", LoggerLevel::Info),
+            ("warn", LoggerLevel::Warn),
+            ("ERROR", LoggerLevel::Error),
+        ] {
+            let body = format!(r#"{{"level":"{level}"}}"#);
+            let parsed = parse_request(&request_with_body("PUT", "/logger", &body))
+                .expect("logger request should parse");
+            let ApiRequest::PutLogger(config) = parsed else {
+                panic!("expected logger request");
+            };
+            assert_eq!(config.level(), Some(expected));
+        }
+
+        let body = r#"{
+            "log_path": null,
+            "level": null,
+            "show_level": null,
+            "show_log_origin": null,
+            "module": null
+        }"#;
+        let parsed = parse_request(&request_with_body("PUT", "/logger", body))
+            .expect("logger request should parse");
+        let ApiRequest::PutLogger(config) = parsed else {
+            panic!("expected logger request");
+        };
+        assert_eq!(config.log_path(), None);
+        assert_eq!(config.level(), None);
+        assert_eq!(config.show_level(), None);
+        assert_eq!(config.show_log_origin(), None);
+        assert_eq!(config.module(), None);
+    }
+
+    #[test]
+    fn rejects_put_logger_unknown_field() {
+        let request = request_with_body(
+            "PUT",
+            "/logger",
+            r#"{"log_path":"/tmp/log","unknown":true}"#,
+        );
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_put_logger_invalid_field_types() {
+        for body in [
+            r#"{"log_path":1}"#,
+            r#"{"level":1}"#,
+            r#"{"level":"Verbose"}"#,
+            r#"{"show_level":"true"}"#,
+            r#"{"show_log_origin":"true"}"#,
+            r#"{"module":false}"#,
+        ] {
+            assert_eq!(
+                parse_request(&request_with_body("PUT", "/logger", body)),
+                Err(RequestError::MalformedRequest)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_put_logger_empty_body() {
+        let request = request_with_body("PUT", "/logger", "");
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_unsupported_logger_method_or_path() {
+        assert_eq!(
+            parse_request(b"GET /logger HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+            Err(RequestError::InvalidPathMethod)
+        );
+        assert_eq!(
+            parse_request(&request_with_body("PUT", "/logger/extra", "{}")),
             Err(RequestError::InvalidPathMethod)
         );
     }
@@ -2160,6 +2377,11 @@ mod tests {
         .expect("boot-source request should parse");
 
         assert_eq!(Endpoint::from(request), Endpoint::BootSource);
+
+        let request = parse_request(&request_with_body("PUT", "/logger", "{}"))
+            .expect("logger request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::Logger);
 
         let request = parse_request(&request_with_body(
             "PUT",
