@@ -33,6 +33,7 @@ const RESPONSE_CHANNEL_CLOSED_MESSAGE: &str = "vCPU runner response channel is c
 
 type CancelVcpu = Arc<dyn Fn(crate::ffi::HvVcpu) -> Result<(), BackendError> + Send + Sync>;
 type SharedMmioDispatcher = Arc<Mutex<MmioDispatcher>>;
+type RunnerState = Arc<Mutex<RunnerHandleState>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HvfVcpuRunnerError {
@@ -110,8 +111,33 @@ pub struct HvfVcpuRunner<'vm> {
     command_sender: mpsc::Sender<RunnerCommand>,
     vcpu: crate::ffi::HvVcpu,
     cancel_vcpu: CancelVcpu,
-    state: Mutex<RunnerHandleState>,
+    state: RunnerState,
     _vm: PhantomData<&'vm HvfBackend>,
+}
+
+#[derive(Clone)]
+pub struct HvfVcpuRunCancelHandle {
+    vcpu: crate::ffi::HvVcpu,
+    cancel_vcpu: CancelVcpu,
+    state: RunnerState,
+}
+
+impl HvfVcpuRunCancelHandle {
+    /// Request cancellation of the runner's current `hv_vcpu_run` step.
+    pub fn cancel(&self) -> Result<(), HvfVcpuRunnerError> {
+        // Keep the state lock until the HVF exit request returns so shutdown
+        // cannot destroy the vCPU while cancellation uses its raw id.
+        let _state_guard = prepare_cancel(&self.state)?;
+        cancel_vcpu(self.vcpu, &self.cancel_vcpu)
+    }
+}
+
+impl fmt::Debug for HvfVcpuRunCancelHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfVcpuRunCancelHandle")
+            .field("vcpu", &self.vcpu)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -297,10 +323,16 @@ impl<'vm> HvfVcpuRunner<'vm> {
     }
 
     pub fn cancel(&self) -> Result<(), HvfVcpuRunnerError> {
-        // Keep the state lock until the HVF exit request returns so shutdown
-        // cannot destroy the vCPU while cancellation uses its raw id.
-        let _state_guard = self.prepare_cancel()?;
-        self.cancel_vcpu()
+        self.run_cancel_handle().cancel()
+    }
+
+    /// Return a cloneable handle that can request cancellation of an in-flight run step.
+    pub fn run_cancel_handle(&self) -> HvfVcpuRunCancelHandle {
+        HvfVcpuRunCancelHandle {
+            vcpu: self.vcpu,
+            cancel_vcpu: Arc::clone(&self.cancel_vcpu),
+            state: Arc::clone(&self.state),
+        }
     }
 
     /// Read the primary vCPU MPIDR on the vCPU-owning runner thread.
@@ -352,7 +384,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             command_sender: started.command_sender,
             vcpu: started.vcpu,
             cancel_vcpu,
-            state: Mutex::new(RunnerHandleState {
+            state: Arc::new(Mutex::new(RunnerHandleState {
                 thread: Some(started.thread),
                 shutting_down: false,
                 in_flight_runs: 0,
@@ -362,7 +394,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 boot_register_setup_failed: false,
                 boot_registers_configured: false,
                 run_started: false,
-            }),
+            })),
             _vm: PhantomData,
         })
     }
@@ -371,7 +403,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
         &self,
         registers: HvfArm64BootRegisters,
         response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
-    ) -> Result<InFlightBootRegisterSetup<'_>, HvfVcpuRunnerError> {
+    ) -> Result<InFlightBootRegisterSetup, HvfVcpuRunnerError> {
         let mut state = self.lock_state()?;
         if state.thread.is_none() {
             return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
@@ -431,7 +463,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
     fn start_run_once(
         &self,
         response_sender: mpsc::Sender<Result<HvfVcpuExit, HvfVcpuRunnerError>>,
-    ) -> Result<InFlightRun<'_>, HvfVcpuRunnerError> {
+    ) -> Result<InFlightRun, HvfVcpuRunnerError> {
         let mut state = self.lock_state()?;
         if state.thread.is_none() || state.shutting_down {
             return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
@@ -481,7 +513,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
         &self,
         dispatcher: SharedMmioDispatcher,
         response_sender: mpsc::Sender<Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError>>,
-    ) -> Result<InFlightRun<'_>, HvfVcpuRunnerError> {
+    ) -> Result<InFlightRun, HvfVcpuRunnerError> {
         let mut state = self.lock_state()?;
         if state.thread.is_none() || state.shutting_down {
             return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
@@ -535,7 +567,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
         access: HvfResolvedMmioAccess,
         dispatcher: SharedMmioDispatcher,
         response_sender: mpsc::Sender<Result<MmioDispatchOutcome, HvfVcpuRunnerError>>,
-    ) -> Result<InFlightMmioDispatch<'_>, HvfVcpuRunnerError> {
+    ) -> Result<InFlightMmioDispatch, HvfVcpuRunnerError> {
         let mut state = self.lock_state()?;
         if state.thread.is_none() {
             return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
@@ -594,7 +626,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
     fn start_mpidr_el1_read(
         &self,
         response_sender: mpsc::Sender<Result<u64, HvfVcpuRunnerError>>,
-    ) -> Result<InFlightMetadataRead<'_>, HvfVcpuRunnerError> {
+    ) -> Result<InFlightMetadataRead, HvfVcpuRunnerError> {
         let mut state = self.lock_state()?;
         if state.thread.is_none() {
             return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
@@ -671,31 +703,8 @@ impl<'vm> HvfVcpuRunner<'vm> {
         }
     }
 
-    fn prepare_cancel(&self) -> Result<MutexGuard<'_, RunnerHandleState>, HvfVcpuRunnerError> {
-        let state = self.lock_state()?;
-        if state.thread.is_none() {
-            return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
-        }
-        if state.shutting_down {
-            return Err(HvfVcpuRunnerError::InvalidState(
-                RUNNER_SHUTTING_DOWN_MESSAGE,
-            ));
-        }
-        if state.mmio_dispatch_in_flight {
-            return Err(HvfVcpuRunnerError::InvalidState(
-                MMIO_DISPATCH_IN_FLIGHT_MESSAGE,
-            ));
-        }
-        if state.metadata_read_in_flight {
-            return Err(HvfVcpuRunnerError::InvalidState(
-                METADATA_READ_IN_FLIGHT_MESSAGE,
-            ));
-        }
-        Ok(state)
-    }
-
     fn cancel_vcpu(&self) -> Result<(), HvfVcpuRunnerError> {
-        (self.cancel_vcpu)(self.vcpu).map_err(HvfVcpuRunnerError::Backend)
+        cancel_vcpu(self.vcpu, &self.cancel_vcpu)
     }
 
     fn take_thread(&self) -> Result<Option<JoinHandle<()>>, HvfVcpuRunnerError> {
@@ -703,10 +712,48 @@ impl<'vm> HvfVcpuRunner<'vm> {
     }
 
     fn lock_state(&self) -> Result<MutexGuard<'_, RunnerHandleState>, HvfVcpuRunnerError> {
-        self.state
-            .lock()
-            .map_err(|_| HvfVcpuRunnerError::InvalidState(RUNNER_STATE_POISONED_MESSAGE))
+        lock_runner_state(&self.state)
     }
+}
+
+fn prepare_cancel(
+    state: &RunnerState,
+) -> Result<MutexGuard<'_, RunnerHandleState>, HvfVcpuRunnerError> {
+    let state = lock_runner_state(state)?;
+    if state.thread.is_none() {
+        return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
+    }
+    if state.shutting_down {
+        return Err(HvfVcpuRunnerError::InvalidState(
+            RUNNER_SHUTTING_DOWN_MESSAGE,
+        ));
+    }
+    if state.mmio_dispatch_in_flight {
+        return Err(HvfVcpuRunnerError::InvalidState(
+            MMIO_DISPATCH_IN_FLIGHT_MESSAGE,
+        ));
+    }
+    if state.metadata_read_in_flight {
+        return Err(HvfVcpuRunnerError::InvalidState(
+            METADATA_READ_IN_FLIGHT_MESSAGE,
+        ));
+    }
+    Ok(state)
+}
+
+fn cancel_vcpu(
+    vcpu: crate::ffi::HvVcpu,
+    cancel_vcpu: &CancelVcpu,
+) -> Result<(), HvfVcpuRunnerError> {
+    cancel_vcpu(vcpu).map_err(HvfVcpuRunnerError::Backend)
+}
+
+fn lock_runner_state(
+    state: &RunnerState,
+) -> Result<MutexGuard<'_, RunnerHandleState>, HvfVcpuRunnerError> {
+    state
+        .lock()
+        .map_err(|_| HvfVcpuRunnerError::InvalidState(RUNNER_STATE_POISONED_MESSAGE))
 }
 
 impl Drop for HvfVcpuRunner<'_> {
@@ -765,16 +812,16 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
     }
 }
 
-struct InFlightBootRegisterSetup<'state> {
-    state: &'state Mutex<RunnerHandleState>,
+struct InFlightBootRegisterSetup {
+    state: RunnerState,
     configured: bool,
     failed: bool,
 }
 
-impl<'state> InFlightBootRegisterSetup<'state> {
-    fn new(state: &'state Mutex<RunnerHandleState>) -> Self {
+impl InFlightBootRegisterSetup {
+    fn new(state: &RunnerState) -> Self {
         Self {
-            state,
+            state: Arc::clone(state),
             configured: false,
             failed: false,
         }
@@ -789,7 +836,7 @@ impl<'state> InFlightBootRegisterSetup<'state> {
     }
 }
 
-impl Drop for InFlightBootRegisterSetup<'_> {
+impl Drop for InFlightBootRegisterSetup {
     fn drop(&mut self) {
         if let Ok(mut state) = self.state.lock() {
             state.boot_register_setup_in_flight = false;
@@ -803,17 +850,19 @@ impl Drop for InFlightBootRegisterSetup<'_> {
     }
 }
 
-struct InFlightRun<'state> {
-    state: &'state Mutex<RunnerHandleState>,
+struct InFlightRun {
+    state: RunnerState,
 }
 
-impl<'state> InFlightRun<'state> {
-    fn new(state: &'state Mutex<RunnerHandleState>) -> Self {
-        Self { state }
+impl InFlightRun {
+    fn new(state: &RunnerState) -> Self {
+        Self {
+            state: Arc::clone(state),
+        }
     }
 }
 
-impl Drop for InFlightRun<'_> {
+impl Drop for InFlightRun {
     fn drop(&mut self) {
         if let Ok(mut state) = self.state.lock() {
             state.in_flight_runs = state.in_flight_runs.saturating_sub(1);
@@ -821,17 +870,19 @@ impl Drop for InFlightRun<'_> {
     }
 }
 
-struct InFlightMmioDispatch<'state> {
-    state: &'state Mutex<RunnerHandleState>,
+struct InFlightMmioDispatch {
+    state: RunnerState,
 }
 
-impl<'state> InFlightMmioDispatch<'state> {
-    fn new(state: &'state Mutex<RunnerHandleState>) -> Self {
-        Self { state }
+impl InFlightMmioDispatch {
+    fn new(state: &RunnerState) -> Self {
+        Self {
+            state: Arc::clone(state),
+        }
     }
 }
 
-impl Drop for InFlightMmioDispatch<'_> {
+impl Drop for InFlightMmioDispatch {
     fn drop(&mut self) {
         if let Ok(mut state) = self.state.lock() {
             state.mmio_dispatch_in_flight = false;
@@ -846,17 +897,19 @@ fn real_cancel_vcpu() -> CancelVcpu {
     })
 }
 
-struct InFlightMetadataRead<'state> {
-    state: &'state Mutex<RunnerHandleState>,
+struct InFlightMetadataRead {
+    state: RunnerState,
 }
 
-impl<'state> InFlightMetadataRead<'state> {
-    fn new(state: &'state Mutex<RunnerHandleState>) -> Self {
-        Self { state }
+impl InFlightMetadataRead {
+    fn new(state: &RunnerState) -> Self {
+        Self {
+            state: Arc::clone(state),
+        }
     }
 }
 
-impl Drop for InFlightMetadataRead<'_> {
+impl Drop for InFlightMetadataRead {
     fn drop(&mut self) {
         if let Ok(mut state) = self.state.lock() {
             state.metadata_read_in_flight = false;
@@ -2168,7 +2221,8 @@ mod tests {
         );
 
         thread::scope(|scope| {
-            let cancel = scope.spawn(|| runner.cancel());
+            let cancel_handle = runner.run_cancel_handle();
+            let cancel = scope.spawn(move || cancel_handle.cancel());
             entered_cancel_receiver
                 .recv()
                 .expect("cancel should enter fake HVF exit request");
@@ -2208,6 +2262,122 @@ mod tests {
         });
 
         runner.shutdown().expect("runner should shut down");
+        destroyed_receiver
+            .recv()
+            .expect("fake vCPU should be destroyed");
+    }
+
+    #[test]
+    fn cloned_run_cancel_handle_unblocks_in_flight_run() {
+        let (runner, entered_run_receiver, destroyed_receiver) = start_fake_runner();
+        let cancel_handle = runner.run_cancel_handle();
+        let cloned_cancel_handle = cancel_handle.clone();
+
+        thread::scope(|scope| {
+            let run = scope.spawn(|| runner.run_once());
+            entered_run_receiver
+                .recv()
+                .expect("runner should enter fake run");
+
+            cloned_cancel_handle
+                .cancel()
+                .expect("cloned cancel handle should release fake run");
+
+            assert_eq!(
+                run.join().expect("run thread should join"),
+                Ok(HvfVcpuExit::Canceled)
+            );
+        });
+
+        runner.shutdown().expect("runner should shut down");
+        destroyed_receiver
+            .recv()
+            .expect("fake vCPU should be destroyed");
+    }
+
+    #[test]
+    fn run_cancel_handle_after_shutdown_is_rejected_without_calling_hvf_cancel() {
+        let (entered_run_sender, entered_run_receiver) = mpsc::channel();
+        let (release_run_sender, release_run_receiver) = mpsc::channel();
+        let (destroyed_sender, destroyed_receiver) = mpsc::channel();
+        let cancel_calls = Arc::new(Mutex::new(0usize));
+        let cancel_calls_for_runner = Arc::clone(&cancel_calls);
+        let cancel_vcpu = Arc::new(move |_| {
+            *cancel_calls_for_runner
+                .lock()
+                .map_err(|_| BackendError::InvalidState("fake cancel call lock poisoned"))? += 1;
+            release_run_sender
+                .send(Ok(HvfVcpuExit::Canceled))
+                .map_err(|_| BackendError::InvalidState("fake run release receiver closed"))
+        });
+        let (runner, _, destroyed_receiver) = start_fake_runner_with_cancel(
+            cancel_vcpu,
+            entered_run_sender,
+            release_run_receiver,
+            destroyed_sender,
+            entered_run_receiver,
+            destroyed_receiver,
+        );
+        let cancel_handle = runner.run_cancel_handle();
+
+        runner.shutdown().expect("runner should shut down");
+
+        assert_eq!(
+            cancel_handle.cancel(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUNNER_SHUT_DOWN_MESSAGE
+            ))
+        );
+        assert_eq!(
+            *cancel_calls
+                .lock()
+                .expect("fake cancel call count should lock"),
+            0
+        );
+        destroyed_receiver
+            .recv()
+            .expect("fake vCPU should be destroyed");
+    }
+
+    #[test]
+    fn run_cancel_handle_after_runner_drop_is_rejected_without_calling_hvf_cancel() {
+        let (entered_run_sender, entered_run_receiver) = mpsc::channel();
+        let (release_run_sender, release_run_receiver) = mpsc::channel();
+        let (destroyed_sender, destroyed_receiver) = mpsc::channel();
+        let cancel_calls = Arc::new(Mutex::new(0usize));
+        let cancel_calls_for_runner = Arc::clone(&cancel_calls);
+        let cancel_vcpu = Arc::new(move |_| {
+            *cancel_calls_for_runner
+                .lock()
+                .map_err(|_| BackendError::InvalidState("fake cancel call lock poisoned"))? += 1;
+            release_run_sender
+                .send(Ok(HvfVcpuExit::Canceled))
+                .map_err(|_| BackendError::InvalidState("fake run release receiver closed"))
+        });
+        let (runner, _, destroyed_receiver) = start_fake_runner_with_cancel(
+            cancel_vcpu,
+            entered_run_sender,
+            release_run_receiver,
+            destroyed_sender,
+            entered_run_receiver,
+            destroyed_receiver,
+        );
+        let cancel_handle = runner.run_cancel_handle();
+
+        drop(runner);
+
+        assert_eq!(
+            cancel_handle.cancel(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUNNER_SHUT_DOWN_MESSAGE
+            ))
+        );
+        assert_eq!(
+            *cancel_calls
+                .lock()
+                .expect("fake cancel call count should lock"),
+            0
+        );
         destroyed_receiver
             .recv()
             .expect("fake vCPU should be destroyed");
@@ -2325,6 +2495,13 @@ mod tests {
         );
         assert_eq!(
             runner.cancel(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUNNER_SHUTTING_DOWN_MESSAGE
+            ))
+        );
+        let cancel_handle = runner.run_cancel_handle();
+        assert_eq!(
+            cancel_handle.cancel(),
             Err(HvfVcpuRunnerError::InvalidState(
                 super::RUNNER_SHUTTING_DOWN_MESSAGE
             ))
