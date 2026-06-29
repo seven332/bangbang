@@ -26,7 +26,9 @@ use crate::gic::{
     HvfGicSpiSignaler, HvfInterruptLineAllocationError,
 };
 use crate::memory::{HvfGuestMemoryMappingError, HvfMemoryPermissions};
-use crate::runner::{HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError};
+use crate::runner::{
+    HvfVcpuRunCancelHandle, HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
+};
 use crate::vcpu::HvfArm64BootRegisters;
 
 const SINGLE_VCPU_COUNT: u8 = 1;
@@ -165,6 +167,14 @@ impl HvfArm64BootSession<'_> {
     /// dispatch boot block notifications or make public `InstanceStart` succeed.
     pub fn run_once_and_handle_mmio(&self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
         run_boot_session_vcpu_step(&self.runner, &self.mmio_dispatcher)
+    }
+
+    /// Return a handle that can request cancellation of an in-flight vCPU run step.
+    ///
+    /// This is internal startup plumbing for later runner-loop work. It does not
+    /// shut down the boot session or make public `InstanceStart` succeed.
+    pub fn run_cancel_handle(&self) -> HvfVcpuRunCancelHandle {
+        self.runner.run_cancel_handle()
     }
 
     pub fn dispatch_block_queue_notifications_and_signal_interrupts(

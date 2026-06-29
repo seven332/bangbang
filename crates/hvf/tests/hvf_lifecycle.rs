@@ -266,6 +266,8 @@ fn prepares_internal_hvf_arm64_boot_session() {
         session.boot_registers().fdt_address,
         session.runtime_resources().fdt.address
     );
+    let run_cancel_handle = session.run_cancel_handle();
+    drop(run_cancel_handle);
     session
         .shutdown()
         .expect("internal HVF arm64 boot session should shut down");
