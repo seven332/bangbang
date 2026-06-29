@@ -2068,6 +2068,14 @@ mod tests {
     }
 
     #[test]
+    fn boot_session_run_loop_control_types_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<super::HvfArm64BootRunLoopControl>();
+        assert_send_sync::<HvfArm64BootRunLoopStopToken>();
+    }
+
+    #[test]
     fn boot_session_run_loop_dispatches_after_mmio_until_step_limit() {
         let stop_token = HvfArm64BootRunLoopStopToken::new();
         let mut session = RecordingBootSessionRunLoopSession::new([
