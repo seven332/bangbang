@@ -74,7 +74,8 @@ socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
 `PUT /boot-source`, pre-boot `PUT /drives/{drive_id}`, and parsed `PUT /actions` requests
 already map through a minimal internal VMM action/data boundary. Validation
 rejects malformed boot-source and actions requests before VMM state mutation.
-Successful action execution and VM state transitions remain deferred.
+Successful `InstanceStart` startup preparation and the `Running` transition are
+implemented; continuous guest execution remains deferred.
 
 ## Process Startup CLI
 
@@ -82,9 +83,9 @@ The current `bangbang` executable parses only the first process-lifecycle
 arguments and starts the first API socket surface. It binds a Unix socket and
 serves `GET /`, `GET /version`, `GET /vm/config`, `GET /machine-config`,
 pre-boot `PUT /machine-config`, pre-boot `PUT /boot-source` configuration storage, and
-pre-boot `PUT /drives/{drive_id}` configuration storage, plus VMM-routed
-`PUT /actions` preflight or unsupported faults, but does not load a configuration file or
-start a guest.
+pre-boot `PUT /drives/{drive_id}` configuration storage, plus process-routed
+`PUT /actions` startup preparation or unsupported faults, but does not load a
+configuration file or enter a continuous guest execution loop.
 
 | Argument | Current behavior | Compatibility notes |
 | --- | --- | --- |
@@ -797,8 +798,8 @@ The first API implementation should model the same broad stages as Firecracker:
 - pre-boot: configuration requests are accepted and stored before guest
   execution starts
 - starting: `PUT /actions` with `InstanceStart` validates the accumulated
-  configuration, starts guest execution, and transitions the process out of
-  pre-boot state on success
+  configuration, prepares the owned HVF startup session, and transitions the
+  process out of pre-boot state on success
 - runtime: the microVM is running; pre-boot-only configuration requests should
   fail with a Firecracker-shaped unsupported-state error
 - paused/resumed: deferred until `/vm` state update work defines pause and
@@ -881,8 +882,9 @@ macOS design work instead of direct implementation:
 - KVM-specific VM and vCPU operations need HVF equivalents rather than direct
   KVM ioctl usage.
 - HVF guest RAM is mapped with a backend-owned owner that holds the anonymous
-  host allocation until unmap or VM destruction. It does not yet load payloads,
-  expose device memory helpers, or start guest execution.
+  host allocation until unmap or VM destruction. Startup preparation can load
+  payloads into that memory, but public continuous guest execution remains
+  deferred.
 - HVF vCPU handles are thread-affine: creation, register access, run, and
   destroy operations must happen on the owning thread. The current vCPU wrapper
   covers current-thread lifecycle, typed exit surface, narrow register access,

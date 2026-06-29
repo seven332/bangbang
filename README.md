@@ -116,9 +116,9 @@ curl --unix-socket /tmp/bangbang.socket \
   -d '{"kernel_image_path":"/tmp/vmlinux","boot_args":"console=ttyS0 reboot=k panic=1"}'
 ```
 
-Successful boot-source configuration returns `204 No Content`. The paths are
-stored as configuration only; bangbang does not open kernel or initrd files,
-load payloads, build an FDT, configure vCPU registers, or start a guest yet.
+Successful boot-source configuration returns `204 No Content`. During this
+request, the paths are stored as configuration only; `InstanceStart` later opens
+the files and performs startup preparation.
 
 Record a pre-boot drive configuration:
 
@@ -129,8 +129,9 @@ curl --unix-socket /tmp/bangbang.socket \
   -d '{"drive_id":"rootfs","path_on_host":"/tmp/rootfs.ext4","is_root_device":true}'
 ```
 
-Successful drive configuration returns `204 No Content`. The path is stored as
-configuration only; bangbang does not open the file or attach a block device yet.
+Successful drive configuration returns `204 No Content`. During this request,
+the path is stored as configuration only; `InstanceStart` later opens the file
+and prepares the initial block device.
 
 Submit an action request:
 
