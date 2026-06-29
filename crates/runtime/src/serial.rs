@@ -598,6 +598,24 @@ mod tests {
     }
 
     #[test]
+    fn fifo_control_write_is_accepted_without_output() {
+        let mut device = SerialMmioDevice::buffered();
+
+        write(
+            &mut device,
+            super::SERIAL_FIFO_CONTROL_REGISTER_OFFSET,
+            0x07,
+        )
+        .expect("fifo control write should succeed");
+
+        assert_eq!(device.output().bytes(), b"");
+        assert_eq!(
+            read(&mut device, SERIAL_INTERRUPT_IDENTIFICATION_REGISTER_OFFSET),
+            [SERIAL_INTERRUPT_IDENTIFICATION_NO_INTERRUPT_PENDING]
+        );
+    }
+
+    #[test]
     fn unsupported_read_width_returns_error() {
         let mut device = SerialMmioDevice::buffered();
 
@@ -662,6 +680,20 @@ mod tests {
             "serial output failed: serial output buffer reached its 1-byte limit"
         );
         assert_eq!(device.output().bytes(), b"a");
+    }
+
+    #[test]
+    fn buffered_output_with_zero_limit_rejects_first_write() {
+        let mut device = SerialMmioDevice::buffered_with_limit(0);
+
+        let err = write(&mut device, SERIAL_TRANSMIT_REGISTER_OFFSET, b'a')
+            .expect_err("zero-length buffer should reject the first byte");
+
+        assert_eq!(
+            err.message(),
+            "serial output failed: serial output buffer reached its 0-byte limit"
+        );
+        assert_eq!(device.output().bytes(), b"");
     }
 
     #[test]
