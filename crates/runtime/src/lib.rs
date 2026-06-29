@@ -974,6 +974,32 @@ mod tests {
     }
 
     #[test]
+    fn flush_metrics_before_start_with_configuration_does_not_write() {
+        let path = unique_metrics_path("configured-preboot");
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(&path)))
+            .expect("metrics config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::FlushMetrics)
+            .expect_err("pre-boot metrics flush should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::UnsupportedState {
+                action: VmmAction::FlushMetrics.name(),
+                state: InstanceState::NotStarted,
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("metrics output should be readable"),
+            ""
+        );
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
     fn put_metrics_rejects_duplicate_configuration_without_replacing_sink() {
         let first_path = unique_metrics_path("first");
         let second_path = unique_metrics_path("second");
