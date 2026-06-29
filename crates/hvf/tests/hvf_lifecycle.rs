@@ -279,6 +279,9 @@ fn rejects_boot_session_on_existing_hvf_vm_without_destroying_it() {
         err,
         HvfArm64BootSessionError::BackendAlreadyInitialized
     ));
+    let _metadata = backend
+        .create_gic()
+        .expect("existing VM should remain available after rejected session");
     backend
         .destroy_vm()
         .expect("existing VM should remain owned by caller");

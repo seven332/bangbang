@@ -311,6 +311,10 @@ impl HvfBackend {
         controller: &VmmController,
         config: HvfArm64BootSessionConfig,
     ) -> Result<HvfArm64BootSession<'vm>, HvfArm64BootSessionError> {
+        if self.has_created_vm() {
+            return Err(HvfArm64BootSessionError::BackendAlreadyInitialized);
+        }
+
         let prepared = match prepare_arm64_boot_session_parts(self, controller, config) {
             Ok(prepared) => prepared,
             Err(err) => {
@@ -337,9 +341,6 @@ fn prepare_arm64_boot_session_parts<'vm>(
     controller: &VmmController,
     config: HvfArm64BootSessionConfig,
 ) -> Result<PreparedHvfArm64BootSession<'vm>, HvfArm64BootSessionError> {
-    if backend.has_created_vm() {
-        return Err(HvfArm64BootSessionError::BackendAlreadyInitialized);
-    }
     validate_single_vcpu(controller)?;
 
     <HvfBackend as VmBackend>::create_vm(backend)
