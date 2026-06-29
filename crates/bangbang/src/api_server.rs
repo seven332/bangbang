@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_api::http::{
-    ApiRequest, BootSourceRequest, DriveCacheType as ApiDriveCacheType, DriveConfigRequest,
-    DriveIoEngine as ApiDriveIoEngine, HttpResponse, MachineConfigRequest, RequestError,
-    parse_request, request_total_len,
+    ActionRequest, ActionType, ApiRequest, BootSourceRequest, DriveCacheType as ApiDriveCacheType,
+    DriveConfigRequest, DriveIoEngine as ApiDriveIoEngine, HttpResponse, MachineConfigRequest,
+    RequestError, parse_request, request_total_len,
 };
 use bangbang_runtime::block::{DriveCacheType, DriveConfigInput, DriveIoEngine};
 use bangbang_runtime::boot::BootSourceConfigInput;
@@ -25,7 +25,6 @@ use bangbang_runtime::{VmmAction, VmmController, VmmData};
 
 const READ_CHUNK_SIZE: usize = 4096;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
-const ACTIONS_UNSUPPORTED_MESSAGE: &str = "actions API is not supported yet.";
 static NEXT_TEMP_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -398,7 +397,9 @@ fn handle_api_request(request: ApiRequest, vmm: &mut VmmController) -> HttpRespo
         ApiRequest::GetMachineConfig => {
             handle_machine_config(vmm.handle_action(VmmAction::GetMachineConfig))
         }
-        ApiRequest::PutAction(_) => HttpResponse::fault(ACTIONS_UNSUPPORTED_MESSAGE),
+        ApiRequest::PutAction(action) => {
+            handle_empty(vmm.handle_action(action_from_request(action.as_ref())))
+        }
         ApiRequest::PutBootSource(config) => handle_empty(vmm.handle_action(
             VmmAction::PutBootSource(boot_source_input_from_request(config.as_ref())),
         )),
@@ -408,6 +409,13 @@ fn handle_api_request(request: ApiRequest, vmm: &mut VmmController) -> HttpRespo
         ApiRequest::PutDrive(config) => handle_empty(vmm.handle_action(VmmAction::PutDrive(
             drive_config_input_from_request(config.as_ref()),
         ))),
+    }
+}
+
+fn action_from_request(action: &ActionRequest) -> VmmAction {
+    match action.action_type() {
+        ActionType::InstanceStart => VmmAction::InstanceStart,
+        ActionType::FlushMetrics => VmmAction::FlushMetrics,
     }
 }
 
@@ -889,36 +897,51 @@ mod tests {
 
     #[test]
     fn returns_fault_for_actions_without_mutating_state() {
-        let mut vmm = test_controller();
-        let path = unique_socket_path("actions");
-        let server = ApiServer::bind(&path).expect("server should bind");
-        let mut client = UnixStream::connect(&path).expect("client should connect");
-        let body = r#"{"action_type":"InstanceStart"}"#;
-        let request = format!(
-            "PUT /actions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        );
+        for (action_type, expected_fault) in [
+            (
+                "InstanceStart",
+                r#"{"fault_message":"The requested operation is not supported: InstanceStart"}"#,
+            ),
+            (
+                "FlushMetrics",
+                r#"{"fault_message":"The requested operation is not supported: FlushMetrics"}"#,
+            ),
+        ] {
+            let mut vmm = test_controller();
+            let path = unique_socket_path("actions");
+            let server = ApiServer::bind(&path).expect("server should bind");
+            let mut client = UnixStream::connect(&path).expect("client should connect");
+            let body = format!(r#"{{"action_type":"{action_type}"}}"#);
+            let request = format!(
+                "PUT /actions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
 
-        client
-            .write_all(request.as_bytes())
-            .expect("client should write request");
-        server
-            .serve_next(&mut vmm)
-            .expect("server should handle one request");
+            client
+                .write_all(request.as_bytes())
+                .expect("client should write request");
+            server
+                .serve_next(&mut vmm)
+                .expect("server should handle one request");
 
-        let mut response = String::new();
-        client
-            .read_to_string(&mut response)
-            .expect("client should read response");
+            let mut response = String::new();
+            client
+                .read_to_string(&mut response)
+                .expect("client should read response");
 
-        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        assert!(response.contains(r#"{"fault_message":"actions API is not supported yet."}"#));
-        assert_eq!(
-            vmm.instance_info().state,
-            bangbang_runtime::InstanceState::NotStarted
-        );
-        assert!(vmm.boot_source_config().is_none());
-        assert!(vmm.drive_configs().is_empty());
+            assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+            assert!(response.contains(expected_fault));
+            assert_eq!(
+                vmm.instance_info().state,
+                bangbang_runtime::InstanceState::NotStarted
+            );
+            assert_eq!(
+                vmm.machine_config().vcpu_count(),
+                bangbang_runtime::machine::DEFAULT_VCPU_COUNT
+            );
+            assert!(vmm.boot_source_config().is_none());
+            assert!(vmm.drive_configs().is_empty());
+        }
     }
 
     #[test]
