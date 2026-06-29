@@ -642,6 +642,34 @@ mod tests {
         env::temp_dir().join(format!("bb-{name}-{}-{nanos}.sock", std::process::id()))
     }
 
+    fn put_action_over_socket(
+        vmm: &mut VmmController,
+        socket_name: &str,
+        action_type: &str,
+    ) -> String {
+        let path = unique_socket_path(socket_name);
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+        let body = format!(r#"{{"action_type":"{action_type}"}}"#);
+        let request = format!(
+            "PUT /actions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        client
+            .write_all(request.as_bytes())
+            .expect("client should write request");
+        server
+            .serve_next(vmm)
+            .expect("server should handle one request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("client should read response");
+        response
+    }
+
     fn unique_temp_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -896,52 +924,78 @@ mod tests {
     }
 
     #[test]
-    fn returns_fault_for_actions_without_mutating_state() {
-        for (action_type, expected_fault) in [
-            (
-                "InstanceStart",
-                r#"{"fault_message":"The requested operation is not supported: InstanceStart"}"#,
-            ),
-            (
-                "FlushMetrics",
-                r#"{"fault_message":"The requested operation is not supported: FlushMetrics"}"#,
-            ),
-        ] {
-            let mut vmm = test_controller();
-            let path = unique_socket_path("actions");
-            let server = ApiServer::bind(&path).expect("server should bind");
-            let mut client = UnixStream::connect(&path).expect("client should connect");
-            let body = format!(r#"{{"action_type":"{action_type}"}}"#);
-            let request = format!(
-                "PUT /actions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            );
+    fn returns_missing_boot_source_fault_for_instance_start_without_mutating_state() {
+        let mut vmm = test_controller();
+        let response = put_action_over_socket(&mut vmm, "start-missing-boot", "InstanceStart");
 
-            client
-                .write_all(request.as_bytes())
-                .expect("client should write request");
-            server
-                .serve_next(&mut vmm)
-                .expect("server should handle one request");
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.contains(
+            r#"{"fault_message":"boot source must be configured before InstanceStart"}"#
+        ));
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::NotStarted
+        );
+        assert_eq!(
+            vmm.machine_config().vcpu_count(),
+            bangbang_runtime::machine::DEFAULT_VCPU_COUNT
+        );
+        assert!(vmm.boot_source_config().is_none());
+        assert!(vmm.drive_configs().is_empty());
+    }
 
-            let mut response = String::new();
-            client
-                .read_to_string(&mut response)
-                .expect("client should read response");
+    #[test]
+    fn returns_fault_for_configured_instance_start_without_mutating_state() {
+        let mut vmm = test_controller();
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_request = format!(
+            "PUT /boot-source HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{boot_body}",
+            boot_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
 
-            assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-            assert!(response.contains(expected_fault));
-            assert_eq!(
-                vmm.instance_info().state,
-                bangbang_runtime::InstanceState::NotStarted
-            );
-            assert_eq!(
-                vmm.machine_config().vcpu_count(),
-                bangbang_runtime::machine::DEFAULT_VCPU_COUNT
-            );
-            assert!(vmm.boot_source_config().is_none());
-            assert!(vmm.drive_configs().is_empty());
-        }
+        let response = put_action_over_socket(&mut vmm, "start-configured", "InstanceStart");
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.contains(
+            r#"{"fault_message":"The requested operation is not supported: InstanceStart"}"#
+        ));
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::NotStarted
+        );
+        let config = vmm
+            .boot_source_config()
+            .expect("boot source config should remain stored");
+        assert_eq!(
+            config.kernel_image_path(),
+            Path::new("/tmp/original-vmlinux")
+        );
+        assert!(vmm.drive_configs().is_empty());
+    }
+
+    #[test]
+    fn returns_fault_for_flush_metrics_without_mutating_state() {
+        let mut vmm = test_controller();
+        let response = put_action_over_socket(&mut vmm, "flush-metrics", "FlushMetrics");
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.contains(
+            r#"{"fault_message":"The requested operation is not supported: FlushMetrics"}"#
+        ));
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::NotStarted
+        );
+        assert_eq!(
+            vmm.machine_config().vcpu_count(),
+            bangbang_runtime::machine::DEFAULT_VCPU_COUNT
+        );
+        assert!(vmm.boot_source_config().is_none());
+        assert!(vmm.drive_configs().is_empty());
     }
 
     #[test]
