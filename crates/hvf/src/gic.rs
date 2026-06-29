@@ -24,6 +24,8 @@ const HV_GIC_INT_EL1_VIRTUAL_TIMER: u16 = 27;
 const HV_GIC_INT_EL1_PHYSICAL_TIMER: u16 = 30;
 const FIRST_PPI_INTID: u32 = 16;
 const FIRST_SPI_INTID: u32 = 32;
+const HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0: u32 = 0x10200;
+const HV_GIC_REDISTRIBUTOR_REG_GICR_ICPENDR0: u32 = 0x10280;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvfGicRegion {
@@ -468,6 +470,19 @@ trait HvfGicSpiSignalApi: fmt::Debug {
     fn set_spi(&self, intid: u32, level: bool) -> Result<(), HvfGicError>;
 }
 
+pub(crate) struct HvfGicPpiPendingWriter {
+    api: Box<dyn HvfGicPpiPendingApi>,
+}
+
+trait HvfGicPpiPendingApi: fmt::Debug {
+    fn set_redistributor_reg(
+        &self,
+        vcpu: crate::ffi::HvVcpu,
+        reg: u32,
+        value: u64,
+    ) -> Result<(), HvfGicError>;
+}
+
 trait HvfGicApi {
     type Config;
 
@@ -496,9 +511,43 @@ impl HvfGicCreator for RealHvfGicCreator {
     }
 }
 
+impl HvfGicPpiPendingWriter {
+    pub(crate) fn new() -> Result<Self, HvfGicError> {
+        let api = real_gic_ppi_pending_api()?;
+
+        Ok(Self { api: Box::new(api) })
+    }
+
+    pub(crate) fn set_pending(
+        &self,
+        vcpu: crate::ffi::HvVcpu,
+        intid: u32,
+        pending: bool,
+    ) -> Result<(), HvfGicError> {
+        set_ppi_pending_with_api(self.api.as_ref(), vcpu, intid, pending)
+    }
+
+    #[cfg(test)]
+    fn with_api(api: impl HvfGicPpiPendingApi + 'static) -> Self {
+        Self { api: Box::new(api) }
+    }
+}
+
+impl fmt::Debug for HvfGicPpiPendingWriter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HvfGicPpiPendingWriter")
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn real_gic_spi_signal_api() -> Result<LoadedHvfGicSpiSignalApi, HvfGicError> {
     LoadedHvfGicSpiSignalApi::load()
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn real_gic_ppi_pending_api() -> Result<LoadedHvfGicPpiPendingApi, HvfGicError> {
+    LoadedHvfGicPpiPendingApi::load()
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -509,12 +558,37 @@ fn real_gic_spi_signal_api() -> Result<UnsupportedHvfGicSpiSignalApi, HvfGicErro
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn real_gic_ppi_pending_api() -> Result<UnsupportedHvfGicPpiPendingApi, HvfGicError> {
+    Err(HvfGicError::Unsupported(
+        crate::ffi::UNSUPPORTED_TARGET_MESSAGE,
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 #[derive(Debug)]
 struct UnsupportedHvfGicSpiSignalApi;
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[derive(Debug)]
+struct UnsupportedHvfGicPpiPendingApi;
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 impl HvfGicSpiSignalApi for UnsupportedHvfGicSpiSignalApi {
     fn set_spi(&self, _: u32, _: bool) -> Result<(), HvfGicError> {
+        Err(HvfGicError::Unsupported(
+            crate::ffi::UNSUPPORTED_TARGET_MESSAGE,
+        ))
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+impl HvfGicPpiPendingApi for UnsupportedHvfGicPpiPendingApi {
+    fn set_redistributor_reg(
+        &self,
+        _: crate::ffi::HvVcpu,
+        _: u32,
+        _: u64,
+    ) -> Result<(), HvfGicError> {
         Err(HvfGicError::Unsupported(
             crate::ffi::UNSUPPORTED_TARGET_MESSAGE,
         ))
@@ -697,6 +771,28 @@ fn validate_ppi_intid(name: &'static str, intid: u32) -> Result<(), HvfGicError>
     }
 }
 
+pub(crate) fn validate_gic_ppi_pending_intid(intid: u32) -> Result<(), HvfGicError> {
+    validate_ppi_intid("ppi_intid", intid)
+}
+
+fn set_ppi_pending_with_api(
+    api: &dyn HvfGicPpiPendingApi,
+    vcpu: crate::ffi::HvVcpu,
+    intid: u32,
+    pending: bool,
+) -> Result<(), HvfGicError> {
+    validate_gic_ppi_pending_intid(intid)?;
+
+    let reg = if pending {
+        HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0
+    } else {
+        HV_GIC_REDISTRIBUTOR_REG_GICR_ICPENDR0
+    };
+    let value = 1u64 << intid;
+
+    api.set_redistributor_reg(vcpu, reg, value)
+}
+
 fn aligned_region_below(
     region: &'static str,
     limit: u64,
@@ -830,6 +926,7 @@ mod dynamic {
     type HvGicSetBase = unsafe extern "C" fn(*mut c_void, u64) -> HvReturn;
     type HvGicCreate = unsafe extern "C" fn(*mut c_void) -> HvReturn;
     type HvGicSetSpi = unsafe extern "C" fn(u32, bool) -> HvReturn;
+    type HvGicSetRedistributorReg = unsafe extern "C" fn(u64, u32, u64) -> HvReturn;
     type HvGicGetSize = unsafe extern "C" fn(*mut usize) -> HvReturn;
     type HvGicGetSpiRange = unsafe extern "C" fn(*mut u32, *mut u32) -> HvReturn;
     type HvGicGetIntid = unsafe extern "C" fn(u16, *mut u32) -> HvReturn;
@@ -846,6 +943,11 @@ mod dynamic {
     pub(super) struct LoadedHvfGicSpiSignalApi {
         _library: DynamicLibrary,
         symbols: HvfGicSpiSignalSymbols,
+    }
+
+    pub(super) struct LoadedHvfGicPpiPendingApi {
+        _library: DynamicLibrary,
+        symbols: HvfGicPpiPendingSymbols,
     }
 
     struct DynamicLibrary {
@@ -876,6 +978,11 @@ mod dynamic {
     #[derive(Clone, Copy)]
     struct HvfGicSpiSignalSymbols {
         set_spi: HvGicSetSpi,
+    }
+
+    #[derive(Clone, Copy)]
+    struct HvfGicPpiPendingSymbols {
+        set_redistributor_reg: HvGicSetRedistributorReg,
     }
 
     impl LoadedHvfGicApi {
@@ -926,6 +1033,25 @@ mod dynamic {
     impl fmt::Debug for LoadedHvfGicSpiSignalApi {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("LoadedHvfGicSpiSignalApi")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl LoadedHvfGicPpiPendingApi {
+        pub(super) fn load() -> Result<Self, HvfGicError> {
+            let library = DynamicLibrary::open(HYPERVISOR_FRAMEWORK_PATH)?;
+            let symbols = HvfGicPpiPendingSymbols::load(library.handle())?;
+
+            Ok(Self {
+                _library: library,
+                symbols,
+            })
+        }
+    }
+
+    impl fmt::Debug for LoadedHvfGicPpiPendingApi {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("LoadedHvfGicPpiPendingApi")
                 .finish_non_exhaustive()
         }
     }
@@ -1027,6 +1153,18 @@ mod dynamic {
         fn load(library: NonNull<c_void>) -> Result<Self, HvfGicError> {
             Ok(Self {
                 set_spi: load_symbol(library, c"hv_gic_set_spi", "hv_gic_set_spi")?,
+            })
+        }
+    }
+
+    impl HvfGicPpiPendingSymbols {
+        fn load(library: NonNull<c_void>) -> Result<Self, HvfGicError> {
+            Ok(Self {
+                set_redistributor_reg: load_symbol(
+                    library,
+                    c"hv_gic_set_redistributor_reg",
+                    "hv_gic_set_redistributor_reg",
+                )?,
             })
         }
     }
@@ -1181,6 +1319,25 @@ mod dynamic {
         }
     }
 
+    impl super::HvfGicPpiPendingApi for LoadedHvfGicPpiPendingApi {
+        fn set_redistributor_reg(
+            &self,
+            vcpu: crate::ffi::HvVcpu,
+            reg: u32,
+            value: u64,
+        ) -> Result<(), HvfGicError> {
+            // SAFETY: `vcpu` is a live current-thread vCPU id, and callers
+            // validate that `reg` and `value` target only PPI pending writes.
+            unsafe {
+                crate::ffi::check(
+                    (self.symbols.set_redistributor_reg)(vcpu, reg, value),
+                    "hv_gic_set_redistributor_reg",
+                )?
+            };
+            Ok(())
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use std::ffi::c_void;
@@ -1228,7 +1385,7 @@ mod dynamic {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use dynamic::{LoadedHvfGicApi, LoadedHvfGicSpiSignalApi};
+use dynamic::{LoadedHvfGicApi, LoadedHvfGicPpiPendingApi, LoadedHvfGicSpiSignalApi};
 
 #[cfg(test)]
 mod tests {
@@ -1245,10 +1402,12 @@ mod tests {
 
     use super::{
         GIC_SPI_SIGNALER_LOCK_POISONED_MESSAGE, GicConfigGuard, HV_GIC_INT_EL1_PHYSICAL_TIMER,
-        HV_GIC_INT_EL1_VIRTUAL_TIMER, HvfGicApi, HvfGicError, HvfGicInterruptLineAllocator,
-        HvfGicInterruptRange, HvfGicMetadata, HvfGicMsiMetadata, HvfGicParameters, HvfGicRegion,
-        HvfGicSpiSignalError, HvfGicSpiSignaler, HvfGicTimerInterrupts,
-        HvfInterruptLineAllocationError, create_gic_with_api, metadata_from_parameters,
+        HV_GIC_INT_EL1_VIRTUAL_TIMER, HV_GIC_REDISTRIBUTOR_REG_GICR_ICPENDR0,
+        HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0, HvfGicApi, HvfGicError,
+        HvfGicInterruptLineAllocator, HvfGicInterruptRange, HvfGicMetadata, HvfGicMsiMetadata,
+        HvfGicParameters, HvfGicPpiPendingWriter, HvfGicRegion, HvfGicSpiSignalError,
+        HvfGicSpiSignaler, HvfGicTimerInterrupts, HvfInterruptLineAllocationError,
+        create_gic_with_api, metadata_from_parameters,
     };
 
     const DIST_SIZE: u64 = 0x1_0000;
@@ -1876,6 +2035,105 @@ mod tests {
     }
 
     #[test]
+    fn ppi_pending_writer_sets_and_clears_pending_bit() {
+        let api = FakeGicApi::default();
+        let writer = HvfGicPpiPendingWriter::with_api(api.clone());
+
+        writer
+            .set_pending(7, 27, true)
+            .expect("virtual timer PPI should be set pending");
+        writer
+            .set_pending(7, 30, false)
+            .expect("physical timer PPI should be cleared pending");
+
+        assert_eq!(
+            api.ppi_pending_writes(),
+            vec![
+                (7, HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0, 1u64 << 27),
+                (7, HV_GIC_REDISTRIBUTOR_REG_GICR_ICPENDR0, 1u64 << 30),
+            ]
+        );
+        assert_eq!(
+            api.calls(),
+            vec![
+                "hv_gic_set_redistributor_reg",
+                "hv_gic_set_redistributor_reg",
+            ]
+        );
+    }
+
+    #[test]
+    fn ppi_pending_writer_accepts_first_and_last_ppi_intids() {
+        let api = FakeGicApi::default();
+        let writer = HvfGicPpiPendingWriter::with_api(api.clone());
+
+        writer
+            .set_pending(7, 16, true)
+            .expect("first PPI should be accepted");
+        writer
+            .set_pending(7, 31, true)
+            .expect("last PPI should be accepted");
+
+        assert_eq!(
+            api.ppi_pending_writes(),
+            vec![
+                (7, HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0, 1u64 << 16),
+                (7, HV_GIC_REDISTRIBUTOR_REG_GICR_ISPENDR0, 1u64 << 31),
+            ]
+        );
+    }
+
+    #[test]
+    fn ppi_pending_writer_rejects_sgi_and_spi_intids_before_calling_hvf() {
+        let api = FakeGicApi::default();
+        let writer = HvfGicPpiPendingWriter::with_api(api.clone());
+
+        assert_eq!(
+            writer
+                .set_pending(7, 15, true)
+                .expect_err("SGI INTID should be rejected"),
+            HvfGicError::InvalidParameter {
+                name: "ppi_intid",
+                value: 15,
+            }
+        );
+        assert_eq!(
+            writer
+                .set_pending(7, 32, false)
+                .expect_err("SPI INTID should be rejected"),
+            HvfGicError::InvalidParameter {
+                name: "ppi_intid",
+                value: 32,
+            }
+        );
+        assert!(api.calls().is_empty());
+        assert!(api.ppi_pending_writes().is_empty());
+    }
+
+    #[test]
+    fn ppi_pending_writer_preserves_backend_failure_source() {
+        let api = FakeGicApi::default().with_failure("hv_gic_set_redistributor_reg");
+        let writer = HvfGicPpiPendingWriter::with_api(api.clone());
+
+        let err = writer
+            .set_pending(7, 27, true)
+            .expect_err("backend failure should propagate");
+
+        assert_eq!(
+            err,
+            HvfGicError::Backend(BackendError::Hypervisor(
+                "injected hv_gic_set_redistributor_reg failure".to_string()
+            ))
+        );
+        assert_eq!(
+            err.source().map(ToString::to_string),
+            Some("hypervisor error: injected hv_gic_set_redistributor_reg failure".to_string())
+        );
+        assert_eq!(api.calls(), vec!["hv_gic_set_redistributor_reg"]);
+        assert!(api.ppi_pending_writes().is_empty());
+    }
+
+    #[test]
     fn metadata_timer_conversion_rejects_publicly_constructed_non_ppi_intids() {
         let mut metadata = metadata_from_parameters(default_parameters())
             .expect("default GIC parameters should produce metadata");
@@ -2263,6 +2521,7 @@ mod tests {
                     next_config: 1,
                     released_configs: Vec::new(),
                     spi_signals: Vec::new(),
+                    ppi_pending_writes: Vec::new(),
                     failure: None,
                     created_config: false,
                 })),
@@ -2298,6 +2557,14 @@ mod tests {
                 .lock()
                 .expect("fake GIC API state should be lockable")
                 .spi_signals
+                .clone()
+        }
+
+        fn ppi_pending_writes(&self) -> Vec<(crate::ffi::HvVcpu, u32, u64)> {
+            self.state
+                .lock()
+                .expect("fake GIC API state should be lockable")
+                .ppi_pending_writes
                 .clone()
         }
 
@@ -2339,6 +2606,30 @@ mod tests {
                 )))
             } else {
                 state.spi_signals.push((intid, level));
+                Ok(())
+            }
+        }
+    }
+
+    impl super::HvfGicPpiPendingApi for FakeGicApi {
+        fn set_redistributor_reg(
+            &self,
+            vcpu: crate::ffi::HvVcpu,
+            reg: u32,
+            value: u64,
+        ) -> Result<(), HvfGicError> {
+            let mut state = self
+                .state
+                .lock()
+                .expect("fake GIC API state should be lockable");
+            state.calls.push("hv_gic_set_redistributor_reg");
+
+            if state.failure == Some("hv_gic_set_redistributor_reg") {
+                Err(HvfGicError::Backend(BackendError::Hypervisor(
+                    "injected hv_gic_set_redistributor_reg failure".to_string(),
+                )))
+            } else {
+                state.ppi_pending_writes.push((vcpu, reg, value));
                 Ok(())
             }
         }
@@ -2442,6 +2733,7 @@ mod tests {
         next_config: u64,
         released_configs: Vec<u64>,
         spi_signals: Vec<(u32, bool)>,
+        ppi_pending_writes: Vec<(crate::ffi::HvVcpu, u32, u64)>,
         failure: Option<&'static str>,
         created_config: bool,
     }

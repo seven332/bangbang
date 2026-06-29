@@ -8,6 +8,7 @@ use bangbang_runtime::mmio::{MmioAccessBytes, MmioDispatchOutcome, MmioDispatche
 
 use crate::backend::HvfBackend;
 use crate::exit::{HvfResolvedMmioAccess, HvfVcpuExit};
+use crate::gic::{HvfGicError, HvfGicPpiPendingWriter};
 use crate::mmio::{HvfMmioCompletionError, HvfMmioDispatchError, HvfMmioRegisterAccess};
 
 const DESTROYED_VCPU_MESSAGE: &str = "vCPU has already been destroyed";
@@ -194,6 +195,15 @@ impl HvfVcpuOwner {
 
     pub(crate) fn set_vtimer_mask(&mut self, masked: bool) -> Result<(), BackendError> {
         crate::ffi::set_vtimer_mask(self.handle()?.vcpu, masked)
+    }
+
+    pub(crate) fn set_gic_ppi_pending(
+        &mut self,
+        writer: &HvfGicPpiPendingWriter,
+        intid: u32,
+        pending: bool,
+    ) -> Result<(), HvfGicError> {
+        writer.set_pending(self.handle()?.vcpu, intid, pending)
     }
 
     fn mark_exit_available(&mut self) -> Result<(), BackendError> {
