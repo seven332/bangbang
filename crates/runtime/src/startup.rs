@@ -186,6 +186,7 @@ impl Arm64BootResources {
                 vcpu_mpidrs: config.vcpu_mpidrs,
                 gic: config.gic,
                 timer: config.timer,
+                serial_device: None,
                 virtio_mmio_devices: &fdt_devices,
             },
             &mut memory,

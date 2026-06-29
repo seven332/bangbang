@@ -13,6 +13,7 @@ use crate::memory::{
 
 const ROOT_COMPATIBILITY: &str = "linux,dummy-virt";
 const GIC_PHANDLE: u32 = 1;
+const CLOCK_PHANDLE: u32 = 2;
 const ADDRESS_CELLS: u32 = 2;
 const SIZE_CELLS: u32 = 2;
 const CPU_ADDRESS_CELLS: u32 = 2;
@@ -20,6 +21,12 @@ const CPU_SIZE_CELLS: u32 = 0;
 const CPU_REG_MASK: u64 = 0x7f_ffff;
 const MAX_ARM64_FDT_CPUS: usize = 32;
 const GIC_COMPATIBILITY: &str = "arm,gic-v3";
+const SERIAL_COMPATIBILITY: &str = "ns16550a";
+const SERIAL_NODE_PREFIX: &str = "uart";
+const APB_PCLK_NODE_NAME: &str = "apb-pclk";
+const APB_PCLK_CLOCK_NAME: &str = "apb_pclk";
+const APB_PCLK_CLOCK_OUTPUT_NAME: &str = "clk24mhz";
+const APB_PCLK_CLOCK_FREQUENCY: u32 = 24_000_000;
 const VIRTIO_MMIO_COMPATIBILITY: &str = "virtio,mmio";
 const VIRTIO_MMIO_NODE_PREFIX: &str = "virtio_mmio";
 const GIC_FDT_IRQ_TYPE_SPI: u32 = 0;
@@ -58,6 +65,7 @@ pub struct Arm64FdtConfig<'a> {
     pub vcpu_mpidrs: &'a [u64],
     pub gic: Arm64FdtGic,
     pub timer: Arm64FdtTimerInterrupts,
+    pub serial_device: Option<Arm64FdtSerialDevice>,
     pub virtio_mmio_devices: &'a [Arm64FdtVirtioMmioDevice],
 }
 
@@ -99,6 +107,12 @@ pub struct Arm64FdtTimerInterrupts {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Arm64FdtVirtioMmioDevice {
+    pub region: Arm64FdtRegion,
+    pub interrupt_line: GuestInterruptLine,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Arm64FdtSerialDevice {
     pub region: Arm64FdtRegion,
     pub interrupt_line: GuestInterruptLine,
 }
@@ -242,6 +256,26 @@ pub enum Arm64FdtError {
     },
     InvalidVirtioMmioInterrupt {
         index: usize,
+        line: GuestInterruptLine,
+    },
+    InvalidSerialRegion {
+        region: Arm64FdtRegion,
+        source: GuestMemoryError,
+    },
+    SerialRegionOverlapsMemory {
+        region: Arm64FdtRegion,
+        memory_range: GuestMemoryRange,
+    },
+    SerialRegionOverlapsGic {
+        region: Arm64FdtRegion,
+        gic: &'static str,
+    },
+    SerialRegionOverlapsVirtioMmio {
+        region: Arm64FdtRegion,
+        virtio_mmio_index: usize,
+        virtio_mmio_region: Arm64FdtRegion,
+    },
+    InvalidSerialInterrupt {
         line: GuestInterruptLine,
     },
     CreateFdt {
@@ -399,6 +433,37 @@ impl fmt::Display for Arm64FdtError {
                 f,
                 "arm64 FDT virtio-mmio device {index} interrupt line {line} must be an SPI INTID at least {FIRST_SPI_INTID}"
             ),
+            Self::InvalidSerialRegion { region, source } => write!(
+                f,
+                "invalid arm64 FDT serial region base=0x{:x}, size={}: {source}",
+                region.base, region.size
+            ),
+            Self::SerialRegionOverlapsMemory {
+                region,
+                memory_range,
+            } => write!(
+                f,
+                "arm64 FDT serial region base=0x{:x}, size={} overlaps guest memory range {memory_range}",
+                region.base, region.size
+            ),
+            Self::SerialRegionOverlapsGic { region, gic } => write!(
+                f,
+                "arm64 FDT serial region base=0x{:x}, size={} overlaps GIC {gic} region",
+                region.base, region.size
+            ),
+            Self::SerialRegionOverlapsVirtioMmio {
+                region,
+                virtio_mmio_index,
+                virtio_mmio_region,
+            } => write!(
+                f,
+                "arm64 FDT serial region base=0x{:x}, size={} overlaps virtio-mmio device {virtio_mmio_index} region base=0x{:x}, size={}",
+                region.base, region.size, virtio_mmio_region.base, virtio_mmio_region.size
+            ),
+            Self::InvalidSerialInterrupt { line } => write!(
+                f,
+                "arm64 FDT serial interrupt line {line} must be an SPI INTID at least {FIRST_SPI_INTID}"
+            ),
             Self::CreateFdt { source } => write!(f, "failed to create arm64 FDT: {source}"),
             Self::FdtTooLarge { size, max_size } => {
                 write!(
@@ -424,6 +489,7 @@ impl std::error::Error for Arm64FdtError {
             Self::InvalidCommandLine { source } => Some(source),
             Self::InvalidInitrdRange { source } => Some(source),
             Self::InvalidVirtioMmioRegion { source, .. } => Some(source),
+            Self::InvalidSerialRegion { source, .. } => Some(source),
             Self::CreateFdt { source } => Some(source),
             Self::GuestMemoryWrite { source } => Some(source),
             Self::MissingCpu
@@ -449,6 +515,10 @@ impl std::error::Error for Arm64FdtError {
             | Self::VirtioMmioRegionOverlapsGic { .. }
             | Self::VirtioMmioRegionsOverlap { .. }
             | Self::InvalidVirtioMmioInterrupt { .. }
+            | Self::SerialRegionOverlapsMemory { .. }
+            | Self::SerialRegionOverlapsGic { .. }
+            | Self::SerialRegionOverlapsVirtioMmio { .. }
+            | Self::InvalidSerialInterrupt { .. }
             | Self::FdtTooLarge { .. }
             | Self::GuestMemoryLayoutMismatch { .. } => None,
         }
@@ -464,7 +534,14 @@ impl From<VmFdtError> for Arm64FdtError {
 #[derive(Debug)]
 struct ValidatedArm64FdtConfig {
     memory_reg_cells: Vec<u64>,
+    serial_device: Option<ValidatedArm64FdtSerialDevice>,
     virtio_mmio_devices: Vec<ValidatedArm64FdtVirtioMmioDevice>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ValidatedArm64FdtSerialDevice {
+    region: Arm64FdtRegion,
+    interrupt_cell: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -490,7 +567,13 @@ pub fn build_arm64_fdt(config: &Arm64FdtConfig<'_>) -> Result<Vec<u8>, Arm64FdtE
     create_chosen_node(&mut fdt, config.boot)?;
     create_gic_node(&mut fdt, config.gic)?;
     create_timer_node(&mut fdt, config.timer)?;
+    if validated.serial_device.is_some() {
+        create_clock_node(&mut fdt)?;
+    }
     create_psci_node(&mut fdt)?;
+    if let Some(serial_device) = validated.serial_device {
+        create_serial_node(&mut fdt, serial_device)?;
+    }
     create_virtio_mmio_nodes(&mut fdt, &validated.virtio_mmio_devices)?;
 
     fdt.end_node(root)?;
@@ -528,12 +611,19 @@ fn validate_config(config: &Arm64FdtConfig<'_>) -> Result<ValidatedArm64FdtConfi
     validate_gic_timer_ppis(config.gic, config.timer)?;
     let virtio_mmio_devices =
         validate_virtio_mmio_devices(config.layout, config.gic, config.virtio_mmio_devices)?;
+    let serial_device = config
+        .serial_device
+        .map(|device| {
+            validate_serial_device(config.layout, config.gic, device, &virtio_mmio_devices)
+        })
+        .transpose()?;
     if let Some(initrd) = config.boot.initrd {
         validate_initrd(config.layout, initrd)?;
     }
 
     Ok(ValidatedArm64FdtConfig {
         memory_reg_cells,
+        serial_device,
         virtio_mmio_devices,
     })
 }
@@ -695,11 +785,43 @@ fn create_timer_node(
     Ok(())
 }
 
+fn create_clock_node(fdt: &mut FdtWriter) -> Result<(), Arm64FdtError> {
+    let clock = fdt.begin_node(APB_PCLK_NODE_NAME)?;
+    fdt.property_string("compatible", "fixed-clock")?;
+    fdt.property_u32("#clock-cells", 0)?;
+    fdt.property_u32("clock-frequency", APB_PCLK_CLOCK_FREQUENCY)?;
+    fdt.property_string("clock-output-names", APB_PCLK_CLOCK_OUTPUT_NAME)?;
+    fdt.property_phandle(CLOCK_PHANDLE)?;
+    fdt.end_node(clock)?;
+    Ok(())
+}
+
 fn create_psci_node(fdt: &mut FdtWriter) -> Result<(), Arm64FdtError> {
     let psci = fdt.begin_node("psci")?;
     fdt.property_string("compatible", "arm,psci-0.2")?;
     fdt.property_string("method", "hvc")?;
     fdt.end_node(psci)?;
+    Ok(())
+}
+
+fn create_serial_node(
+    fdt: &mut FdtWriter,
+    device: ValidatedArm64FdtSerialDevice,
+) -> Result<(), Arm64FdtError> {
+    let serial = fdt.begin_node(&format!("{SERIAL_NODE_PREFIX}@{:x}", device.region.base))?;
+    fdt.property_string("compatible", SERIAL_COMPATIBILITY)?;
+    fdt.property_array_u64("reg", &[device.region.base, device.region.size])?;
+    fdt.property_u32("clocks", CLOCK_PHANDLE)?;
+    fdt.property_string("clock-names", APB_PCLK_CLOCK_NAME)?;
+    fdt.property_array_u32(
+        "interrupts",
+        &[
+            GIC_FDT_IRQ_TYPE_SPI,
+            device.interrupt_cell,
+            IRQ_TYPE_EDGE_RISING,
+        ],
+    )?;
+    fdt.end_node(serial)?;
     Ok(())
 }
 
@@ -1047,6 +1169,97 @@ fn validate_gic_region_does_not_overlap_memory(
     Ok(())
 }
 
+fn validate_serial_device(
+    layout: &GuestMemoryLayout,
+    gic: Arm64FdtGic,
+    device: Arm64FdtSerialDevice,
+    virtio_mmio_devices: &[ValidatedArm64FdtVirtioMmioDevice],
+) -> Result<ValidatedArm64FdtSerialDevice, Arm64FdtError> {
+    let range = validate_serial_region(device.region)?;
+    validate_serial_region_does_not_overlap_memory(layout, device.region, range)?;
+    validate_serial_region_does_not_overlap_gic(device.region, range, gic)?;
+    validate_serial_region_does_not_overlap_virtio_mmio(device.region, range, virtio_mmio_devices)?;
+
+    Ok(ValidatedArm64FdtSerialDevice {
+        region: device.region,
+        interrupt_cell: serial_interrupt_cell(device.interrupt_line)?,
+    })
+}
+
+fn validate_serial_region(region: Arm64FdtRegion) -> Result<GuestMemoryRange, Arm64FdtError> {
+    GuestMemoryRange::new(GuestAddress::new(region.base), region.size)
+        .map_err(|source| Arm64FdtError::InvalidSerialRegion { region, source })
+}
+
+fn validate_serial_region_does_not_overlap_memory(
+    layout: &GuestMemoryLayout,
+    region: Arm64FdtRegion,
+    serial_range: GuestMemoryRange,
+) -> Result<(), Arm64FdtError> {
+    for memory_range in layout.ranges().iter().copied() {
+        if serial_range.overlaps(memory_range) {
+            return Err(Arm64FdtError::SerialRegionOverlapsMemory {
+                region,
+                memory_range,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_serial_region_does_not_overlap_gic(
+    region: Arm64FdtRegion,
+    serial_range: GuestMemoryRange,
+    gic: Arm64FdtGic,
+) -> Result<(), Arm64FdtError> {
+    let gic_ranges = [
+        (
+            "distributor",
+            validate_gic_region("distributor", gic.distributor)?,
+        ),
+        (
+            "redistributor",
+            validate_gic_region("redistributor", gic.redistributor)?,
+        ),
+    ];
+
+    for (gic_name, gic_range) in gic_ranges {
+        if serial_range.overlaps(gic_range) {
+            return Err(Arm64FdtError::SerialRegionOverlapsGic {
+                region,
+                gic: gic_name,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_serial_region_does_not_overlap_virtio_mmio(
+    region: Arm64FdtRegion,
+    serial_range: GuestMemoryRange,
+    virtio_mmio_devices: &[ValidatedArm64FdtVirtioMmioDevice],
+) -> Result<(), Arm64FdtError> {
+    for device in virtio_mmio_devices {
+        if serial_range.overlaps(device.range) {
+            return Err(Arm64FdtError::SerialRegionOverlapsVirtioMmio {
+                region,
+                virtio_mmio_index: device.index,
+                virtio_mmio_region: device.region,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn serial_interrupt_cell(line: GuestInterruptLine) -> Result<u32, Arm64FdtError> {
+    line.raw_value()
+        .checked_sub(FIRST_SPI_INTID)
+        .ok_or(Arm64FdtError::InvalidSerialInterrupt { line })
+}
+
 fn validate_virtio_mmio_devices(
     layout: &GuestMemoryLayout,
     gic: Arm64FdtGic,
@@ -1314,6 +1527,8 @@ mod tests {
             root_children,
             ["cpus", "memory@ram", "chosen", "intc", "timer", "psci"]
         );
+        assert!(tree.find("/apb-pclk").is_none());
+        assert!(tree.find("/uart@40002000").is_none());
 
         let cpu = required_node(&tree, "/cpus/cpu@0");
         assert_eq!(cpu.prop_str("device_type").unwrap(), "cpu");
@@ -1866,6 +2081,101 @@ mod tests {
     }
 
     #[test]
+    fn serial_node_uses_firecracker_shape() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let serial = serial_device(0x4000_2000, 0x1000, 32);
+        let config = test_config_with_serial_device(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            serial,
+        );
+
+        let bytes = build_arm64_fdt(&config).expect("FDT should be built");
+        let tree = DeviceTree::load(&bytes).expect("FDT should parse");
+        let clock = required_node(&tree, "/apb-pclk");
+        let serial_node = required_node(&tree, "/uart@40002000");
+
+        assert_eq!(clock.prop_str("compatible").unwrap(), "fixed-clock");
+        assert_eq!(clock.prop_u32("#clock-cells").unwrap(), 0);
+        assert_eq!(
+            clock.prop_u32("clock-frequency").unwrap(),
+            APB_PCLK_CLOCK_FREQUENCY
+        );
+        assert_eq!(
+            clock.prop_str("clock-output-names").unwrap(),
+            APB_PCLK_CLOCK_OUTPUT_NAME
+        );
+        assert_eq!(clock.prop_u32("phandle").unwrap(), CLOCK_PHANDLE);
+
+        assert_eq!(serial_node.prop_str("compatible").unwrap(), "ns16550a");
+        assert_eq!(
+            prop_u64_cells(serial_node, "reg"),
+            vec![0x4000_2000, 0x1000]
+        );
+        assert_eq!(serial_node.prop_u32("clocks").unwrap(), CLOCK_PHANDLE);
+        assert_eq!(
+            serial_node.prop_str("clock-names").unwrap(),
+            APB_PCLK_CLOCK_NAME
+        );
+        assert_eq!(prop_u32_cells(serial_node, "interrupts"), vec![0, 0, 1]);
+        assert!(!serial_node.has_prop("interrupt-parent"));
+        assert_eq!(tree.root.prop_u32("interrupt-parent").unwrap(), GIC_PHANDLE);
+    }
+
+    #[test]
+    fn serial_node_is_ordered_before_sorted_virtio_mmio_nodes() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let serial = serial_device(0x4000_2000, 0x1000, 33);
+        let devices = [
+            virtio_mmio_device(0x4000_5000, 0x1000, 35),
+            virtio_mmio_device(0x4000_3000, 0x1000, 34),
+        ];
+        let config = test_config_with_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            Some(serial),
+            &devices,
+        );
+
+        let bytes = build_arm64_fdt(&config).expect("FDT should be built");
+        let tree = DeviceTree::load(&bytes).expect("FDT should parse");
+        let root_children: Vec<&str> = tree
+            .root
+            .children
+            .iter()
+            .map(|child| child.name.as_str())
+            .collect();
+
+        assert_eq!(
+            root_children,
+            [
+                "cpus",
+                "memory@ram",
+                "chosen",
+                "intc",
+                "timer",
+                "apb-pclk",
+                "psci",
+                "uart@40002000",
+                "virtio_mmio@40003000",
+                "virtio_mmio@40005000",
+            ]
+        );
+        let serial_node = required_node(&tree, "/uart@40002000");
+        let first_virtio = required_node(&tree, "/virtio_mmio@40003000");
+        let second_virtio = required_node(&tree, "/virtio_mmio@40005000");
+        assert_eq!(prop_u32_cells(serial_node, "interrupts"), vec![0, 1, 1]);
+        assert_eq!(prop_u32_cells(first_virtio, "interrupts"), vec![0, 2, 1]);
+        assert_eq!(prop_u32_cells(second_virtio, "interrupts"), vec![0, 3, 1]);
+    }
+
+    #[test]
     fn virtio_mmio_node_uses_firecracker_shape() {
         let layout = test_layout(TEST_MEMORY_SIZE);
         let devices = [virtio_mmio_device(0x4000_1000, 0x1000, 32)];
@@ -2155,6 +2465,157 @@ mod tests {
             Arm64FdtError::InvalidVirtioMmioInterrupt {
                 index: 0,
                 line: devices[0].interrupt_line,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_serial_region() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let serial = serial_device(0x4000_2000, 0, 32);
+        let config = test_config_with_serial_device(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            serial,
+        );
+
+        let err = build_arm64_fdt(&config).expect_err("empty serial region should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::InvalidSerialRegion {
+                region: serial.region,
+                source: GuestMemoryError::EmptyRange {
+                    start: GuestAddress::new(0x4000_2000),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_overflowing_serial_region() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let serial = serial_device(u64::MAX, 1, 32);
+        let config = test_config_with_serial_device(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            serial,
+        );
+
+        let err = build_arm64_fdt(&config).expect_err("overflowing serial region should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::InvalidSerialRegion {
+                region: serial.region,
+                source: GuestMemoryError::AddressOverflow {
+                    start: GuestAddress::new(u64::MAX),
+                    size: 1,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_serial_region_overlapping_guest_memory() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let serial = serial_device(aarch64::DRAM_MEM_START, 0x1000, 32);
+        let config = test_config_with_serial_device(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            serial,
+        );
+
+        let err = build_arm64_fdt(&config).expect_err("RAM-overlapping serial should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::SerialRegionOverlapsMemory {
+                region: serial.region,
+                memory_range: layout.ranges()[0],
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_serial_region_overlapping_gic() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let serial = serial_device(0x3fff_0000, 0x1000, 32);
+        let config = test_config_with_serial_device(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            serial,
+        );
+
+        let err = build_arm64_fdt(&config).expect_err("GIC-overlapping serial should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::SerialRegionOverlapsGic {
+                region: serial.region,
+                gic: "distributor",
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_serial_region_overlapping_virtio_mmio_region() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let serial = serial_device(0x4000_2000, 0x1000, 32);
+        let devices = [virtio_mmio_device(0x4000_1000, 0x2000, 33)];
+        let config = test_config_with_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            Some(serial),
+            &devices,
+        );
+
+        let err = build_arm64_fdt(&config).expect_err("virtio-overlapping serial should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::SerialRegionOverlapsVirtioMmio {
+                region: serial.region,
+                virtio_mmio_index: 0,
+                virtio_mmio_region: devices[0].region,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_non_spi_serial_interrupt_line() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let serial = serial_device(0x4000_2000, 0x1000, 31);
+        let config = test_config_with_serial_device(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            serial,
+        );
+
+        let err = build_arm64_fdt(&config).expect_err("non-SPI serial interrupt should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::InvalidSerialInterrupt {
+                line: serial.interrupt_line,
             }
         );
     }
@@ -2587,12 +3048,29 @@ mod tests {
         layout: &'a GuestMemoryLayout,
         boot: Arm64FdtBootInfo<'a>,
     ) -> Arm64FdtConfig<'a> {
-        test_config_with_virtio_mmio_devices(layout, boot, &[])
+        test_config_with_devices(layout, boot, None, &[])
     }
 
     fn test_config_with_virtio_mmio_devices<'a>(
         layout: &'a GuestMemoryLayout,
         boot: Arm64FdtBootInfo<'a>,
+        virtio_mmio_devices: &'a [Arm64FdtVirtioMmioDevice],
+    ) -> Arm64FdtConfig<'a> {
+        test_config_with_devices(layout, boot, None, virtio_mmio_devices)
+    }
+
+    fn test_config_with_serial_device<'a>(
+        layout: &'a GuestMemoryLayout,
+        boot: Arm64FdtBootInfo<'a>,
+        serial_device: Arm64FdtSerialDevice,
+    ) -> Arm64FdtConfig<'a> {
+        test_config_with_devices(layout, boot, Some(serial_device), &[])
+    }
+
+    fn test_config_with_devices<'a>(
+        layout: &'a GuestMemoryLayout,
+        boot: Arm64FdtBootInfo<'a>,
+        serial_device: Option<Arm64FdtSerialDevice>,
         virtio_mmio_devices: &'a [Arm64FdtVirtioMmioDevice],
     ) -> Arm64FdtConfig<'a> {
         Arm64FdtConfig {
@@ -2601,7 +3079,16 @@ mod tests {
             vcpu_mpidrs: TEST_VCPU_MPIDRS,
             gic: test_gic(),
             timer: Arm64FdtTimerInterrupts::firecracker_default(),
+            serial_device,
             virtio_mmio_devices,
+        }
+    }
+
+    fn serial_device(base: u64, size: u64, line: u32) -> Arm64FdtSerialDevice {
+        Arm64FdtSerialDevice {
+            region: Arm64FdtRegion { base, size },
+            interrupt_line: GuestInterruptLine::new(line)
+                .expect("test interrupt line should be nonzero"),
         }
     }
 
