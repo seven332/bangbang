@@ -135,6 +135,7 @@ pub enum VmmActionError {
         state: InstanceState,
     },
     MissingBootSource,
+    InstanceStart(BackendError),
     BootSourceConfig(boot::BootSourceConfigError),
     DriveConfig(block::DriveConfigError),
     MachineConfig(machine::MachineConfigError),
@@ -155,6 +156,7 @@ impl fmt::Display for VmmActionError {
             Self::MissingBootSource => {
                 f.write_str("boot source must be configured before InstanceStart")
             }
+            Self::InstanceStart(err) => write!(f, "failed to start microVM: {err}"),
             Self::BootSourceConfig(err) => write!(f, "{err}"),
             Self::DriveConfig(err) => write!(f, "{err}"),
             Self::MachineConfig(err) => write!(f, "{err}"),
@@ -165,6 +167,7 @@ impl fmt::Display for VmmActionError {
 impl std::error::Error for VmmActionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::InstanceStart(err) => Some(err),
             Self::BootSourceConfig(err) => Some(err),
             Self::DriveConfig(err) => Some(err),
             Self::MachineConfig(err) => Some(err),
@@ -242,9 +245,17 @@ impl VmmController {
     }
 
     pub fn commit_instance_start(&mut self) -> Result<(), VmmActionError> {
+        self.start_instance_with(|_| Ok(())).map(|_| ())
+    }
+
+    pub fn start_instance_with<F>(&mut self, executor: F) -> Result<VmmData, VmmActionError>
+    where
+        F: FnOnce(&VmmController) -> Result<(), BackendError>,
+    {
         self.preflight_instance_start()?;
+        executor(self).map_err(VmmActionError::InstanceStart)?;
         self.instance_info.state = InstanceState::Running;
-        Ok(())
+        Ok(VmmData::Empty)
     }
 
     pub fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
@@ -335,6 +346,7 @@ pub trait VmBackend: fmt::Debug {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::error::Error as _;
     use std::path::{Path, PathBuf};
 
@@ -684,6 +696,119 @@ mod tests {
 
         assert_eq!(controller.commit_instance_start(), Ok(()));
 
+        assert_eq!(controller.instance_info().state, InstanceState::Running);
+        assert!(controller.boot_source_config().is_some());
+    }
+
+    #[test]
+    fn start_instance_with_commits_running_after_executor_success() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 256)))
+            .expect("machine config should be stored");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller
+            .handle_action(VmmAction::PutDrive(drive_input(
+                "rootfs",
+                "/tmp/rootfs.ext4",
+                true,
+            )))
+            .expect("drive config should be stored");
+
+        let data = controller
+            .start_instance_with(|startup_controller| {
+                assert_eq!(
+                    startup_controller.instance_info().state,
+                    InstanceState::NotStarted
+                );
+                assert_eq!(startup_controller.machine_config().vcpu_count(), 2);
+                assert!(startup_controller.boot_source_config().is_some());
+                assert_eq!(startup_controller.drive_configs().len(), 1);
+                Ok(())
+            })
+            .expect("startup executor success should commit running state");
+
+        assert_eq!(data, VmmData::Empty);
+        assert_eq!(controller.instance_info().state, InstanceState::Running);
+        assert_eq!(controller.machine_config().vcpu_count(), 2);
+        assert!(controller.boot_source_config().is_some());
+        assert_eq!(controller.drive_configs().len(), 1);
+    }
+
+    #[test]
+    fn start_instance_with_executor_failure_preserves_state_and_source() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        let source = BackendError::InvalidState("fake startup failed");
+
+        let err = controller
+            .start_instance_with(|_| Err(source.clone()))
+            .expect_err("startup executor failure should be surfaced");
+
+        assert_eq!(err, VmmActionError::InstanceStart(source.clone()));
+        assert_eq!(
+            err.to_string(),
+            "failed to start microVM: invalid backend state: fake startup failed"
+        );
+        let error_source = err.source().expect("startup error should preserve source");
+        assert_eq!(
+            error_source
+                .downcast_ref::<BackendError>()
+                .expect("startup source should be a backend error"),
+            &source
+        );
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert!(controller.boot_source_config().is_some());
+    }
+
+    #[test]
+    fn start_instance_with_missing_boot_source_does_not_invoke_executor() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        let called = Cell::new(false);
+
+        let err = controller
+            .start_instance_with(|_| {
+                called.set(true);
+                Ok(())
+            })
+            .expect_err("missing boot source should fail before executor");
+
+        assert_eq!(err, VmmActionError::MissingBootSource);
+        assert!(!called.get());
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert!(controller.boot_source_config().is_none());
+    }
+
+    #[test]
+    fn start_instance_with_running_state_does_not_invoke_executor() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller
+            .commit_instance_start()
+            .expect("first commit should succeed");
+        let called = Cell::new(false);
+
+        let err = controller
+            .start_instance_with(|_| {
+                called.set(true);
+                Ok(())
+            })
+            .expect_err("running state should fail before executor");
+
+        assert_eq!(
+            err,
+            VmmActionError::UnsupportedState {
+                action: VmmAction::InstanceStart.name(),
+                state: InstanceState::Running,
+            }
+        );
+        assert!(!called.get());
         assert_eq!(controller.instance_info().state, InstanceState::Running);
         assert!(controller.boot_source_config().is_some());
     }
