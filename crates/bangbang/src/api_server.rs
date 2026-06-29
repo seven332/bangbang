@@ -785,23 +785,30 @@ mod tests {
             bangbang_api::http::StatusCode::NoContent
         );
 
+        let path = unique_socket_path("boot-source");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
         let boot_body = r#"{"kernel_image_path":"/tmp/private-vmlinux"}"#;
         let boot_request = format!(
             "PUT /boot-source HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{boot_body}",
             boot_body.len()
         );
 
-        let response = handle_request_bytes(boot_request.as_bytes(), &mut vmm);
+        client
+            .write_all(boot_request.as_bytes())
+            .expect("client should write request");
+        server
+            .serve_next(&mut vmm)
+            .expect("server should handle one request");
 
-        assert_eq!(
-            response.status(),
-            bangbang_api::http::StatusCode::BadRequest
-        );
-        assert_eq!(
-            response.body(),
-            r#"{"fault_message":"boot source API is not supported yet."}"#
-        );
-        assert!(!response.body().contains("/tmp/private-vmlinux"));
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("client should read response");
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.contains(r#"{"fault_message":"boot source API is not supported yet."}"#));
+        assert!(!response.contains("/tmp/private-vmlinux"));
         assert_eq!(vmm.machine_config().vcpu_count(), 2);
         assert_eq!(vmm.machine_config().mem_size_mib(), 256);
         assert!(vmm.drive_configs().is_empty());
