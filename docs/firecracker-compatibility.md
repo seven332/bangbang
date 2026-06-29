@@ -43,14 +43,15 @@ interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, internal HVF single-vCPU arm64 boot-session preparation
 with a runner-compatible shared MMIO dispatcher, controlled mapped guest-memory
 access, one-step runner-thread MMIO handling, a run-cancellation boundary, a
-bounded internal boot-session run-loop pump, boot block queue interrupt
-signaling, and an initial process startup argument model.
+virtual-timer-mask control boundary, a bounded internal boot-session run-loop
+pump, boot block queue interrupt signaling, and an initial process startup
+argument model.
 There is no broader API request body model beyond the initial boot-source,
 drive configuration, machine-configuration, and actions bodies, public guest
 execution, unbounded or public continuous vCPU run loop, complete interrupt
-delivery, public startup, HVF runner-loop notification scheduling or serial output,
-serial/backend interrupt wiring beyond the internal boot block notification
-path, device-backed feature negotiation, indirect descriptor support,
+delivery, including timer PPI delivery, public startup, HVF runner-loop notification
+scheduling or serial output, serial/backend interrupt wiring beyond the internal
+boot block notification path, device-backed feature negotiation, indirect descriptor support,
 device-backed runner-loop MMIO scheduling, complete device emulation,
 multi-vCPU setup, PSCI behavior, public boot-source loading/startup behavior,
 or successful actions execution behavior yet. Public drive configuration is
@@ -647,7 +648,7 @@ lines from the validated GIC SPI range and signal validated SPI levels through
 `hv_gic_set_spi`. Internal HVF boot sessions use that signal path for block
 queue interrupts after boot-runtime notification dispatch. This follows
 Firecracker's separation between device-facing interrupt triggers and
-KVM-specific irqfd/GSI routing, but it is not yet interrupt masking,
+KVM-specific irqfd/GSI routing, but it is not yet device interrupt masking,
 runner-loop interrupt dispatch, or guest-visible device delivery.
 
 The HVF backend can decode candidate MMIO accesses from arm64 data-abort
@@ -703,12 +704,15 @@ reads and boot-register setup on the vCPU-owning thread, rejects duplicate setup
 setup during shutdown, setup while a run is in flight, and setup after a run has
 started. If setup fails after partially writing registers, the runner rejects
 guest runs until setup is retried successfully. The runner also exposes explicit
-single-exit MMIO commands that run on the vCPU-owning thread. One command
-dispatches an already resolved MMIO access after a run has started, and another
-command starts one vCPU run, resolves a resulting MMIO exit, and dispatches or
-completes it through a caller-provided shared dispatcher. These commands reject
-overlapping metadata reads, runs, boot-register setup, or MMIO dispatches. They
-do not yet form a continuous guest run loop. The boot session can run one vCPU
+single-exit MMIO commands and virtual timer mask commands that run on the
+vCPU-owning thread. One command dispatches an already resolved MMIO access after
+a run has started, and another command starts one vCPU run, resolves a resulting
+MMIO exit, and dispatches or completes it through a caller-provided shared
+dispatcher. The virtual timer mask commands expose HVF's explicit mask bit after
+`HV_EXIT_REASON_VTIMER_ACTIVATED`; full timer PPI injection and EOI-based unmask
+policy remain future work. These commands reject overlapping metadata reads,
+runs, boot-register setup, MMIO dispatches, or virtual timer mask operations.
+They do not yet form a continuous guest run loop. The boot session can run one vCPU
 step through the runner with its per-session shared MMIO dispatcher, so a
 resulting MMIO exit is handled on the vCPU-owning thread without global state.
 The boot session can also expose a cloneable cancellation-only handle for an
@@ -852,8 +856,9 @@ macOS design work instead of direct implementation:
   single resolved MMIO exit dispatch/completion, and the single primary arm64
   Linux boot-register setup. The current runner skeleton creates a vCPU on a
   dedicated thread, applies that boot-register setup on the owning thread before
-  the first run, explicitly dispatches one resolved MMIO access through a shared
-  runtime dispatcher on the owning thread, runs once and handles a resulting
+  the first run, gets and sets the HVF virtual timer mask on that owning thread,
+  explicitly dispatches one resolved MMIO access through a shared runtime
+  dispatcher on the owning thread, runs once and handles a resulting
   MMIO exit through that dispatcher, supports one cancellable
   `hv_vcpu_run` step at a time, exposes a cancellation-only handle for that run
   step, and shuts down by canceling and joining the runner thread. The internal
@@ -878,9 +883,9 @@ macOS design work instead of direct implementation:
 - Device-facing interrupt triggers are backend-neutral runtime state today, and
   HVF interrupt-line support can allocate deterministic SPI lines from GIC
   metadata and set validated SPI levels through `hv_gic_set_spi`. Internal boot
-  sessions can now use that path for block queue interrupts, while masking,
-  runner-loop interrupt delivery, and public device wiring still need
-  macOS-specific backend work.
+  sessions can now use that path for block queue interrupts, while device
+  interrupt masking, timer PPI delivery, runner-loop interrupt delivery, and
+  public device wiring still need macOS-specific backend work.
 - Linux seccomp, jailer, cgroups, and namespaces do not directly apply.
 - Linux TAP-based networking needs a macOS-specific design.
 - Snapshot and device behavior may differ when backed by HVF.
