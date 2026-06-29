@@ -724,6 +724,7 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                 state.in_flight_runs,
                 state.mmio_dispatch_in_flight,
                 state.boot_register_setup_in_flight,
+                state.metadata_read_in_flight,
                 state.boot_register_setup_failed,
                 state.boot_registers_configured,
                 state.run_started,
@@ -737,6 +738,7 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                 in_flight_runs,
                 mmio_dispatch_in_flight,
                 boot_register_setup_in_flight,
+                metadata_read_in_flight,
                 boot_register_setup_failed,
                 boot_registers_configured,
                 run_started,
@@ -750,6 +752,7 @@ impl fmt::Debug for HvfVcpuRunner<'_> {
                     "boot_register_setup_in_flight",
                     &boot_register_setup_in_flight,
                 )
+                .field("metadata_read_in_flight", &metadata_read_in_flight)
                 .field("boot_register_setup_failed", &boot_register_setup_failed)
                 .field("boot_registers_configured", &boot_registers_configured)
                 .field("run_started", &run_started)
