@@ -11,17 +11,18 @@ use std::time::{Duration, Instant};
 
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_api::http::{
-    ActionRequest, ActionType, ApiRequest, BootSourceRequest, DriveCacheType as ApiDriveCacheType,
-    DriveConfigRequest, DriveIoEngine as ApiDriveIoEngine, HttpResponse, MachineConfigRequest,
-    RequestError, parse_request, request_total_len,
+    ActionRequest, ActionType, ApiRequest, BootSourceRequest, BootSourceResponse,
+    DriveCacheType as ApiDriveCacheType, DriveConfigRequest, DriveConfigResponse,
+    DriveIoEngine as ApiDriveIoEngine, HttpResponse, MachineConfigRequest, MachineConfigResponse,
+    RequestError, VmConfigResponse, parse_request, request_total_len,
 };
-use bangbang_runtime::block::{DriveCacheType, DriveConfigInput, DriveIoEngine};
-use bangbang_runtime::boot::BootSourceConfigInput;
+use bangbang_runtime::block::{DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine};
+use bangbang_runtime::boot::{BootSourceConfig, BootSourceConfigInput};
 use bangbang_runtime::machine::{
-    MachineConfigCpuTemplate as RuntimeMachineConfigCpuTemplate,
+    MachineConfig, MachineConfigCpuTemplate as RuntimeMachineConfigCpuTemplate,
     MachineConfigHugePages as RuntimeMachineConfigHugePages, MachineConfigInput,
 };
-use bangbang_runtime::{VmmAction, VmmController, VmmData};
+use bangbang_runtime::{VmConfiguration, VmmAction, VmmController, VmmData};
 
 const READ_CHUNK_SIZE: usize = 4096;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -397,6 +398,7 @@ fn handle_api_request(request: ApiRequest, vmm: &mut VmmController) -> HttpRespo
         ApiRequest::GetMachineConfig => {
             handle_machine_config(vmm.handle_action(VmmAction::GetMachineConfig))
         }
+        ApiRequest::GetVmConfig => handle_vm_config(vmm.handle_action(VmmAction::GetVmConfig)),
         ApiRequest::PutAction(action) => {
             handle_empty(vmm.handle_action(action_from_request(action.as_ref())))
         }
@@ -435,9 +437,12 @@ fn boot_source_input_from_request(config: &BootSourceRequest) -> BootSourceConfi
 fn handle_vmm_version(result: Result<VmmData, bangbang_runtime::VmmActionError>) -> HttpResponse {
     match result {
         Ok(VmmData::VmmVersion(version)) => HttpResponse::version(&version),
-        Ok(VmmData::Empty | VmmData::InstanceInformation(_) | VmmData::MachineConfiguration(_)) => {
-            HttpResponse::fault("version request returned unexpected VMM data.")
-        }
+        Ok(
+            VmmData::Empty
+            | VmmData::InstanceInformation(_)
+            | VmmData::MachineConfiguration(_)
+            | VmmData::VmConfiguration(_),
+        ) => HttpResponse::fault("version request returned unexpected VMM data."),
         Err(err) => HttpResponse::fault(&err.to_string()),
     }
 }
@@ -448,9 +453,12 @@ fn handle_instance_info(result: Result<VmmData, bangbang_runtime::VmmActionError
             let state = info.state.to_string();
             HttpResponse::instance_info(&info.id, &state, &info.vmm_version, &info.app_name)
         }
-        Ok(VmmData::Empty | VmmData::VmmVersion(_) | VmmData::MachineConfiguration(_)) => {
-            HttpResponse::fault("instance info request returned unexpected VMM data.")
-        }
+        Ok(
+            VmmData::Empty
+            | VmmData::VmmVersion(_)
+            | VmmData::MachineConfiguration(_)
+            | VmmData::VmConfiguration(_),
+        ) => HttpResponse::fault("instance info request returned unexpected VMM data."),
         Err(err) => HttpResponse::fault(&err.to_string()),
     }
 }
@@ -466,9 +474,27 @@ fn handle_machine_config(
             config.track_dirty_pages(),
             machine_config_huge_pages_name(config.huge_pages()),
         ),
-        Ok(VmmData::Empty | VmmData::VmmVersion(_) | VmmData::InstanceInformation(_)) => {
-            HttpResponse::fault("machine config request returned unexpected VMM data.")
+        Ok(
+            VmmData::Empty
+            | VmmData::VmmVersion(_)
+            | VmmData::InstanceInformation(_)
+            | VmmData::VmConfiguration(_),
+        ) => HttpResponse::fault("machine config request returned unexpected VMM data."),
+        Err(err) => HttpResponse::fault(&err.to_string()),
+    }
+}
+
+fn handle_vm_config(result: Result<VmmData, bangbang_runtime::VmmActionError>) -> HttpResponse {
+    match result {
+        Ok(VmmData::VmConfiguration(config)) => {
+            HttpResponse::vm_config(&vm_config_response_from_runtime(&config))
         }
+        Ok(
+            VmmData::Empty
+            | VmmData::VmmVersion(_)
+            | VmmData::InstanceInformation(_)
+            | VmmData::MachineConfiguration(_),
+        ) => HttpResponse::fault("VM config request returned unexpected VMM data."),
         Err(err) => HttpResponse::fault(&err.to_string()),
     }
 }
@@ -479,10 +505,67 @@ fn handle_empty(result: Result<VmmData, bangbang_runtime::VmmActionError>) -> Ht
         Ok(
             VmmData::InstanceInformation(_)
             | VmmData::VmmVersion(_)
-            | VmmData::MachineConfiguration(_),
+            | VmmData::MachineConfiguration(_)
+            | VmmData::VmConfiguration(_),
         ) => HttpResponse::fault("no-content request returned unexpected VMM data."),
         Err(err) => HttpResponse::fault(&err.to_string()),
     }
+}
+
+fn vm_config_response_from_runtime(config: &VmConfiguration) -> VmConfigResponse {
+    VmConfigResponse::new(
+        machine_config_response_from_runtime(config.machine_config()),
+        config
+            .boot_source_config()
+            .map(boot_source_response_from_runtime),
+        config
+            .drive_configs()
+            .iter()
+            .map(drive_config_response_from_runtime)
+            .collect(),
+    )
+}
+
+fn machine_config_response_from_runtime(config: MachineConfig) -> MachineConfigResponse {
+    MachineConfigResponse::new(
+        config.vcpu_count(),
+        config.mem_size_mib(),
+        config.smt(),
+        config.track_dirty_pages(),
+        machine_config_huge_pages_name(config.huge_pages()),
+    )
+}
+
+fn boot_source_response_from_runtime(config: &BootSourceConfig) -> BootSourceResponse {
+    let mut response = BootSourceResponse::new(path_text(config.kernel_image_path()));
+    if let Some(initrd_path) = config.initrd_path() {
+        response = response.with_initrd_path(path_text(initrd_path));
+    }
+    if let Some(boot_args) = config.boot_args() {
+        response = response.with_boot_args(boot_args);
+    }
+
+    response
+}
+
+fn drive_config_response_from_runtime(config: &DriveConfig) -> DriveConfigResponse {
+    let mut response = DriveConfigResponse::new(
+        config.drive_id(),
+        path_text(config.path_on_host()),
+        config.is_root_device(),
+        config.is_read_only(),
+        config.cache_type().to_string(),
+        config.io_engine().to_string(),
+    );
+    if let Some(partuuid) = config.partuuid() {
+        response = response.with_partuuid(partuuid);
+    }
+
+    response
+}
+
+fn path_text(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
 }
 
 fn machine_config_input_from_request(config: &MachineConfigRequest) -> MachineConfigInput {
@@ -793,6 +876,108 @@ mod tests {
     }
 
     #[test]
+    fn dispatches_vm_config_request_through_vmm_controller() {
+        let mut vmm = test_controller();
+
+        let default_response = handle_request_bytes(
+            b"GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &mut vmm,
+        );
+
+        assert_eq!(
+            default_response.status(),
+            bangbang_api::http::StatusCode::Ok
+        );
+        assert!(default_response.body().contains(r#""drives":[]"#));
+        assert!(default_response.body().contains(r#""machine-config":"#));
+        assert!(default_response.body().contains(r#""vcpu_count":1"#));
+        assert!(!default_response.body().contains(r#""boot-source":"#));
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::NotStarted
+        );
+
+        let machine_body = r#"{"vcpu_count":2,"mem_size_mib":256}"#;
+        let machine_request = format!(
+            "PUT /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{machine_body}",
+            machine_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(machine_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let boot_body = r#"{
+            "kernel_image_path": "/tmp/vmlinux",
+            "initrd_path": "/tmp/initrd.img",
+            "boot_args": "console=hvc0 reboot=k panic=1"
+        }"#;
+        let boot_request = format!(
+            "PUT /boot-source HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{boot_body}",
+            boot_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let drive_body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "/tmp/rootfs.ext4",
+            "is_root_device": true,
+            "is_read_only": true,
+            "partuuid": "0eaa91a0-01"
+        }"#;
+        let drive_request = format!(
+            "PUT /drives/rootfs HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{drive_body}",
+            drive_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(drive_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let response = handle_request_bytes(
+            b"GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &mut vmm,
+        );
+
+        assert_eq!(response.status(), bangbang_api::http::StatusCode::Ok);
+        assert!(response.body().contains(r#""boot-source":"#));
+        assert!(
+            response
+                .body()
+                .contains(r#""kernel_image_path":"/tmp/vmlinux""#)
+        );
+        assert!(
+            response
+                .body()
+                .contains(r#""initrd_path":"/tmp/initrd.img""#)
+        );
+        assert!(
+            response
+                .body()
+                .contains(r#""boot_args":"console=hvc0 reboot=k panic=1""#)
+        );
+        assert!(response.body().contains(r#""machine-config":"#));
+        assert!(response.body().contains(r#""vcpu_count":2"#));
+        assert!(response.body().contains(r#""mem_size_mib":256"#));
+        assert!(response.body().contains(r#""drive_id":"rootfs""#));
+        assert!(
+            response
+                .body()
+                .contains(r#""path_on_host":"/tmp/rootfs.ext4""#)
+        );
+        assert!(response.body().contains(r#""is_root_device":true"#));
+        assert!(response.body().contains(r#""is_read_only":true"#));
+        assert!(response.body().contains(r#""partuuid":"0eaa91a0-01""#));
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::NotStarted
+        );
+    }
+
+    #[test]
     fn invalid_machine_config_request_does_not_mutate_vmm_state() {
         let mut vmm = test_controller();
         let body = r#"{"vcpu_count":2,"mem_size_mib":256}"#;
@@ -1087,6 +1272,60 @@ mod tests {
         assert!(response.contains(r#""state":"Not started""#));
         assert!(response.contains(r#""vmm_version":"0.1.0""#));
         assert!(response.contains(r#""app_name":"bangbang""#));
+    }
+
+    #[test]
+    fn serves_vm_config_over_unix_socket() {
+        let path = unique_socket_path("vm-config");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+        let mut vmm = test_controller();
+        vmm.handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 256)))
+            .expect("machine config should be stored");
+        vmm.handle_action(VmmAction::PutBootSource(
+            BootSourceConfigInput::new("/tmp/vmlinux")
+                .with_initrd_path("/tmp/initrd.img")
+                .with_boot_args("console=hvc0 reboot=k panic=1"),
+        ))
+        .expect("boot source config should be stored");
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new("rootfs", "rootfs", "/tmp/rootfs.ext4", true)
+                .with_is_read_only(true)
+                .with_partuuid("0eaa91a0-01"),
+        ))
+        .expect("drive config should be stored");
+
+        client
+            .write_all(b"GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("client should write request");
+        server
+            .serve_next(&mut vmm)
+            .expect("server should handle one request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("client should read response");
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Content-Type: application/json\r\n"));
+        assert!(response.contains(r#""boot-source":"#));
+        assert!(response.contains(r#""kernel_image_path":"/tmp/vmlinux""#));
+        assert!(response.contains(r#""initrd_path":"/tmp/initrd.img""#));
+        assert!(response.contains(r#""boot_args":"console=hvc0 reboot=k panic=1""#));
+        assert!(response.contains(r#""machine-config":"#));
+        assert!(response.contains(r#""vcpu_count":2"#));
+        assert!(response.contains(r#""mem_size_mib":256"#));
+        assert!(response.contains(r#""drives":["#));
+        assert!(response.contains(r#""drive_id":"rootfs""#));
+        assert!(response.contains(r#""path_on_host":"/tmp/rootfs.ext4""#));
+        assert!(response.contains(r#""is_root_device":true"#));
+        assert!(response.contains(r#""is_read_only":true"#));
+        assert!(response.contains(r#""partuuid":"0eaa91a0-01""#));
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::NotStarted
+        );
     }
 
     #[test]

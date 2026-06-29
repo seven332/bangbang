@@ -61,6 +61,7 @@ pub enum VmmAction {
     GetVmmVersion,
     GetVmInstanceInfo,
     GetMachineConfig,
+    GetVmConfig,
     InstanceStart,
     FlushMetrics,
     PutBootSource(boot::BootSourceConfigInput),
@@ -74,6 +75,7 @@ impl VmmAction {
             Self::GetVmmVersion => "GetVmmVersion",
             Self::GetVmInstanceInfo => "GetVmInstanceInfo",
             Self::GetMachineConfig => "GetMachineConfig",
+            Self::GetVmConfig => "GetVmConfig",
             Self::InstanceStart => "InstanceStart",
             Self::FlushMetrics => "FlushMetrics",
             Self::PutBootSource(_) => "PutBootSource",
@@ -89,6 +91,40 @@ pub enum VmmData {
     VmmVersion(String),
     InstanceInformation(InstanceInfo),
     MachineConfiguration(machine::MachineConfig),
+    VmConfiguration(VmConfiguration),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmConfiguration {
+    machine_config: machine::MachineConfig,
+    boot_source_config: Option<boot::BootSourceConfig>,
+    drive_configs: Vec<block::DriveConfig>,
+}
+
+impl VmConfiguration {
+    pub fn new(
+        machine_config: machine::MachineConfig,
+        boot_source_config: Option<boot::BootSourceConfig>,
+        drive_configs: Vec<block::DriveConfig>,
+    ) -> Self {
+        Self {
+            machine_config,
+            boot_source_config,
+            drive_configs,
+        }
+    }
+
+    pub const fn machine_config(&self) -> machine::MachineConfig {
+        self.machine_config
+    }
+
+    pub fn boot_source_config(&self) -> Option<&boot::BootSourceConfig> {
+        self.boot_source_config.as_ref()
+    }
+
+    pub fn drive_configs(&self) -> &[block::DriveConfig] {
+        &self.drive_configs
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +218,14 @@ impl VmmController {
         self.boot_source_config.as_ref()
     }
 
+    pub fn vm_config(&self) -> VmConfiguration {
+        VmConfiguration::new(
+            self.machine_config,
+            self.boot_source_config.clone(),
+            self.drive_configs.as_slice().to_vec(),
+        )
+    }
+
     pub fn preflight_instance_start(&self) -> Result<(), VmmActionError> {
         if self.instance_info.state != InstanceState::NotStarted {
             return Err(VmmActionError::UnsupportedState {
@@ -213,6 +257,7 @@ impl VmmController {
                 Ok(VmmData::InstanceInformation(self.instance_info.clone()))
             }
             VmmAction::GetMachineConfig => Ok(VmmData::MachineConfiguration(self.machine_config)),
+            VmmAction::GetVmConfig => Ok(VmmData::VmConfiguration(self.vm_config())),
             VmmAction::InstanceStart => {
                 self.preflight_instance_start()?;
                 Err(VmmActionError::UnsupportedAction(action_name))
@@ -389,7 +434,102 @@ mod tests {
     }
 
     #[test]
+    fn handles_get_vm_config_before_configuration() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
+        let data = controller
+            .handle_action(VmmAction::GetVmConfig)
+            .expect("VM config should be returned");
+
+        let VmmData::VmConfiguration(config) = data else {
+            panic!("expected VM config");
+        };
+        assert_eq!(config.machine_config().vcpu_count(), DEFAULT_VCPU_COUNT);
+        assert_eq!(config.machine_config().mem_size_mib(), DEFAULT_MEM_SIZE_MIB);
+        assert_eq!(config.boot_source_config(), None);
+        assert!(config.drive_configs().is_empty());
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert!(controller.boot_source_config().is_none());
+        assert!(controller.drive_configs().is_empty());
+    }
+
+    #[test]
+    fn handles_get_vm_config_after_configuration() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 256)))
+            .expect("machine config should be stored");
+        controller
+            .handle_action(VmmAction::PutBootSource(
+                boot_source_input("/tmp/vmlinux")
+                    .with_initrd_path("/tmp/initrd.img")
+                    .with_boot_args("console=hvc0 reboot=k panic=1"),
+            ))
+            .expect("boot source config should be stored");
+        controller
+            .handle_action(VmmAction::PutDrive(drive_input(
+                "rootfs",
+                "/tmp/rootfs.ext4",
+                true,
+            )))
+            .expect("drive config should be stored");
+
+        let data = controller
+            .handle_action(VmmAction::GetVmConfig)
+            .expect("VM config should be returned");
+
+        let VmmData::VmConfiguration(config) = data else {
+            panic!("expected VM config");
+        };
+        assert_eq!(config.machine_config().vcpu_count(), 2);
+        assert_eq!(config.machine_config().mem_size_mib(), 256);
+        let boot_source = config
+            .boot_source_config()
+            .expect("boot source should be present");
+        assert_eq!(boot_source.kernel_image_path(), Path::new("/tmp/vmlinux"));
+        assert_eq!(
+            boot_source.initrd_path(),
+            Some(Path::new("/tmp/initrd.img"))
+        );
+        assert_eq!(
+            boot_source.boot_args(),
+            Some("console=hvc0 reboot=k panic=1")
+        );
+        assert_eq!(config.drive_configs().len(), 1);
+        assert_eq!(config.drive_configs()[0].drive_id(), "rootfs");
+        assert_eq!(
+            config.drive_configs()[0].path_on_host(),
+            Path::new("/tmp/rootfs.ext4")
+        );
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+    }
+
+    #[test]
+    fn handles_get_vm_config_after_running_state() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller
+            .commit_instance_start()
+            .expect("start commit should set running state");
+
+        let data = controller
+            .handle_action(VmmAction::GetVmConfig)
+            .expect("VM config should be returned after start");
+
+        let VmmData::VmConfiguration(config) = data else {
+            panic!("expected VM config");
+        };
+        assert_eq!(controller.instance_info().state, InstanceState::Running);
+        assert_eq!(config.machine_config().vcpu_count(), DEFAULT_VCPU_COUNT);
+        assert!(config.boot_source_config().is_some());
+        assert!(config.drive_configs().is_empty());
+    }
+
+    #[test]
     fn action_names_include_start_and_metrics() {
+        assert_eq!(VmmAction::GetVmConfig.name(), "GetVmConfig");
         assert_eq!(VmmAction::InstanceStart.name(), "InstanceStart");
         assert_eq!(VmmAction::FlushMetrics.name(), "FlushMetrics");
     }

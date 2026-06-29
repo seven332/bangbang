@@ -6,8 +6,8 @@ the current scaffold implements all listed API behavior.
 
 The current repository defines crate boundaries, endpoint names, a minimal
 HTTP-over-Unix-socket API server for `GET /`, `GET /version`,
-`GET /machine-config`, pre-boot `PUT /machine-config` configuration storage,
-pre-boot `PUT /boot-source` configuration storage, and pre-boot `PUT /drives/{drive_id}`
+`GET /vm/config`, `GET /machine-config`, pre-boot `PUT /machine-config`
+configuration storage, pre-boot `PUT /boot-source` configuration storage, and pre-boot `PUT /drives/{drive_id}`
 configuration storage, VMM-routed `PUT /actions` preflight and unsupported action handling, a backend-neutral VM trait, a minimal VMM action/data model with internal
 `InstanceStart` preflight and successful-start state transition helpers, backend-neutral guest
 physical address and aarch64 DRAM layout/access primitives, arm64 boot
@@ -69,9 +69,9 @@ manages one microVM. Future API work should keep the control plane outside the
 guest execution fast path.
 
 The intended public control plane is Firecracker-style HTTP over a Unix domain
-socket. The implemented `GET /`, `GET /version`, `GET /machine-config`,
-pre-boot `PUT /machine-config`, pre-boot `PUT /boot-source`, pre-boot
-`PUT /drives/{drive_id}`, and parsed `PUT /actions` requests
+socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
+`GET /machine-config`, pre-boot `PUT /machine-config`, pre-boot
+`PUT /boot-source`, pre-boot `PUT /drives/{drive_id}`, and parsed `PUT /actions` requests
 already map through a minimal internal VMM action/data boundary. Validation
 rejects malformed boot-source and actions requests before VMM state mutation.
 Successful action execution and VM state transitions remain deferred.
@@ -80,8 +80,8 @@ Successful action execution and VM state transitions remain deferred.
 
 The current `bangbang` executable parses only the first process-lifecycle
 arguments and starts the first API socket surface. It binds a Unix socket and
-serves `GET /`, `GET /version`, `GET /machine-config`, pre-boot
-`PUT /machine-config`, pre-boot `PUT /boot-source` configuration storage, and
+serves `GET /`, `GET /version`, `GET /vm/config`, `GET /machine-config`,
+pre-boot `PUT /machine-config`, pre-boot `PUT /boot-source` configuration storage, and
 pre-boot `PUT /drives/{drive_id}` configuration storage, plus VMM-routed
 `PUT /actions` preflight or unsupported faults, but does not load a configuration file or
 start a guest.
@@ -162,8 +162,8 @@ before changing this reference.
 
 ## Support Level Vocabulary
 
-The current scaffold implements `GET /`, `GET /version`, `GET /machine-config`,
-pre-boot `PUT /machine-config` configuration storage, and pre-boot
+The current scaffold implements `GET /`, `GET /version`, `GET /vm/config`,
+`GET /machine-config`, pre-boot `PUT /machine-config` configuration storage, and pre-boot
 `PUT /boot-source` and `PUT /drives/{drive_id}` configuration storage over HTTP
 on a Unix domain socket. The support levels below describe compatibility targets
 for future API work:
@@ -195,11 +195,11 @@ compatibility targets.
 | --- | --- | --- | --- |
 | `GET` | `/` | supported target; implemented | Describe the microVM instance. The current state remains `Not started` until startup behavior exists. |
 | `GET` | `/version` | supported target; implemented | Report the VMM version with a Firecracker-shaped body. |
-| `GET` | `/vm/config` | supported target | Return the full VM configuration once configuration models exist. |
+| `GET` | `/vm/config` | supported target; implemented | Returns the accumulated supported VM configuration subset. Unsupported sections are omitted until their models exist. |
 | `GET` | `/machine-config` | supported target; implemented | Returns the stored/default machine configuration. The current state remains `Not started` until startup behavior exists. |
 | `PUT` | `/machine-config` | supported target; implemented | Stores the first vCPU and memory configuration subset before boot; startup application is deferred. |
 | `PUT` | `/boot-source` | supported target; implemented | Stores guest kernel path, optional initrd path, and optional boot arguments before boot. Host-file validation, payload loading, and startup use are deferred. |
-| `PUT` | `/drives/{drive_id}` | supported target | Configure initial virtio-block devices before boot. |
+| `PUT` | `/drives/{drive_id}` | supported target; implemented | Stores initial virtio-block device configuration before boot; startup application is deferred. |
 | `PUT` | `/actions` | supported target; VMM-routed preflight and unsupported actions | Parses `InstanceStart` and `FlushMetrics` request bodies and routes them through the VMM action model. `InstanceStart` validates stored boot-source and state preflight before unsupported execution; `FlushMetrics` returns unsupported before any VMM state change. |
 | `PUT` | `/actions` with `SendCtrlAltDel` | intentionally unsupported; parser rejected | Firecracker gates this action on x86 keyboard behavior; the first bangbang target is Apple Silicon. |
 | `PUT` | `/logger`, `/metrics` | planned later | Tied to observability work in #17. |
@@ -261,6 +261,13 @@ above. Valid pre-boot `PUT /machine-config` requests replace the stored full
 machine configuration and return `204 No Content`; `GET /machine-config`
 returns the stored or default configuration. The stored values are not applied
 to guest memory, vCPU creation, or startup yet.
+
+`GET /vm/config` returns the accumulated supported VM configuration subset
+without side effects. It includes the stored/default `machine-config`, includes
+`boot-source` only after it is configured, and always includes a `drives` array
+for configured virtio-block drives. Unsupported Firecracker sections such as
+logger, metrics, MMDS, network, vsock, balloon, snapshots, and hotplug are
+omitted until their configuration models exist.
 
 The API and VMM state path implement the `PUT /boot-source` field policy above.
 Valid pre-boot requests replace the stored boot-source configuration and return
@@ -754,8 +761,8 @@ or should preserve Firecracker's architecture-helper truncation behavior.
 ## API State and Response Policy
 
 The current scaffold implements the first HTTP API behavior for `GET /`,
-`GET /version`, pre-boot `/machine-config` configuration storage, and pre-boot
-`PUT /boot-source` and `PUT /drives/{drive_id}` configuration storage, plus
+`GET /version`, `GET /vm/config`, pre-boot `/machine-config` configuration
+storage, and pre-boot `PUT /boot-source` and `PUT /drives/{drive_id}` configuration storage, plus
 VMM-routed `PUT /actions` preflight and unsupported action handling. The
 policy below is the compatibility target for future request parsing, VMM action
 mapping, state validation, and golden API tests.
@@ -765,7 +772,10 @@ as `GetVmmVersion` and returns VMM version data. The implemented `GET /` path
 flows through the same boundary as `GetVmInstanceInfo` and returns
 Firecracker-shaped instance information. Parsed `/machine-config` requests
 flow through `GetMachineConfig` and `PutMachineConfig` and read or replace
-stored machine configuration state. The implemented pre-boot drive path flows
+stored machine configuration state. `GET /vm/config` flows through
+`GetVmConfig` and returns the supported accumulated configuration subset:
+`machine-config`, `boot-source` when configured, and the `drives` array.
+Unsupported top-level sections are omitted until their models exist. The implemented pre-boot drive path flows
 through `PutDrive` and records validated configuration state. Parsed
 `/boot-source` requests flow through `PutBootSource` and replace stored
 boot-source configuration state. Parsed `/actions` requests flow through
@@ -797,11 +807,11 @@ The first API implementation should model the same broad stages as Firecracker:
 | --- | --- | --- | --- |
 | `GET /` | implemented; `200` JSON | implemented; `200` JSON | Response state should reflect the current microVM state. It currently remains `Not started` until startup behavior exists. |
 | `GET /version` | implemented; `200` JSON | implemented; `200` JSON | Body uses Firecracker's `firecracker_version` field shape. |
-| `GET /vm/config` | supported target; `200` JSON | supported target; `200` JSON | Returns the accumulated or active VM configuration once models exist. |
+| `GET /vm/config` | implemented; `200` JSON | implemented; `200` JSON | Returns the accumulated supported configuration subset. Startup still does not apply it to a guest. |
 | `GET /machine-config` | implemented; `200` JSON | supported target; `200` JSON | Returns the stored/default machine configuration. |
 | `PUT /machine-config` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Pre-boot-only configuration. The stored values are not applied to startup yet. |
 | `PUT /boot-source` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config only; host path opening/loading and startup use are deferred. Host path errors must avoid leaking sensitive path details when implemented. |
-| `PUT /drives/{drive_id}` | supported target; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config only; the internal block-device preparation and MMIO registration helpers are not invoked by the API path, and block attachment plus runtime hotplug remain deferred. |
+| `PUT /drives/{drive_id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config only; the internal block-device preparation and MMIO registration helpers are not invoked by the API path, and block attachment plus runtime hotplug remain deferred. |
 | `PUT /actions` with `InstanceStart` | VMM-routed; currently `400` preflight or unsupported execution `fault_message` | unsupported after start; `400` `fault_message` | Internal start preflight/commit exists; public startup execution remains deferred to later runtime action wiring. |
 | `PUT /actions` with `FlushMetrics` | VMM-routed; currently `400` unsupported `fault_message` | deferred until metrics support exists; future success should use `204` empty response | Firecracker treats this as runtime-only; tied to observability work. |
 | `PUT /actions` with `SendCtrlAltDel` | intentionally unsupported; parser returns `400` `fault_message` | intentionally unsupported; `400` `fault_message` | Firecracker rejects this on aarch64; bangbang's first target is Apple Silicon. |
