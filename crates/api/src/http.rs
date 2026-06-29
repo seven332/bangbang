@@ -11,12 +11,15 @@ const RATE_LIMITER_OPS_FIELD: &str = "ops";
 const TOKEN_BUCKET_SIZE_FIELD: &str = "size";
 const TOKEN_BUCKET_ONE_TIME_BURST_FIELD: &str = "one_time_burst";
 const TOKEN_BUCKET_REFILL_TIME_FIELD: &str = "refill_time";
+const MAX_MACHINE_CONFIG_VCPUS: u8 = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiRequest {
     GetInstanceInfo,
+    GetMachineConfig,
     GetVersion,
     PutDrive(Box<DriveConfigRequest>),
+    PutMachineConfig(Box<MachineConfigRequest>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +50,70 @@ impl fmt::Display for RequestError {
 }
 
 impl std::error::Error for RequestError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineConfigRequest {
+    vcpu_count: u8,
+    mem_size_mib: u64,
+    smt: bool,
+    cpu_template: Option<MachineConfigCpuTemplate>,
+    track_dirty_pages: bool,
+    huge_pages: MachineConfigHugePages,
+}
+
+impl MachineConfigRequest {
+    pub const fn vcpu_count(&self) -> u8 {
+        self.vcpu_count
+    }
+
+    pub const fn mem_size_mib(&self) -> u64 {
+        self.mem_size_mib
+    }
+
+    pub const fn smt(&self) -> bool {
+        self.smt
+    }
+
+    pub const fn cpu_template(&self) -> Option<MachineConfigCpuTemplate> {
+        self.cpu_template
+    }
+
+    pub const fn track_dirty_pages(&self) -> bool {
+        self.track_dirty_pages
+    }
+
+    pub const fn huge_pages(&self) -> MachineConfigHugePages {
+        self.huge_pages
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum MachineConfigCpuTemplate {
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+pub enum MachineConfigHugePages {
+    #[default]
+    None,
+    #[serde(rename = "2M")]
+    TwoM,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MachineConfigRequestBody {
+    vcpu_count: u8,
+    mem_size_mib: u64,
+    #[serde(default)]
+    smt: bool,
+    #[serde(default)]
+    cpu_template: Option<MachineConfigCpuTemplate>,
+    #[serde(default)]
+    track_dirty_pages: bool,
+    #[serde(default)]
+    huge_pages: MachineConfigHugePages,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriveConfigRequest {
@@ -264,9 +331,13 @@ pub fn parse_request(bytes: &[u8]) -> Result<ApiRequest, RequestError> {
     {
         return parse_drive_config_request(path_drive_id, body);
     }
+    if method == "PUT" && path == "/machine-config" {
+        return parse_machine_config_request(body);
+    }
 
     match (method, path) {
         ("GET", "/") => Ok(ApiRequest::GetInstanceInfo),
+        ("GET", "/machine-config") => Ok(ApiRequest::GetMachineConfig),
         ("GET", "/version") => Ok(ApiRequest::GetVersion),
         _ => Err(RequestError::InvalidPathMethod),
     }
@@ -315,6 +386,38 @@ fn parse_drive_config_request(
         rate_limiter_configured,
         socket: body.socket,
     })))
+}
+
+fn parse_machine_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
+    let body = serde_json::from_slice::<MachineConfigRequestBody>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+
+    validate_machine_config_request(&body)?;
+
+    Ok(ApiRequest::PutMachineConfig(Box::new(
+        MachineConfigRequest {
+            vcpu_count: body.vcpu_count,
+            mem_size_mib: body.mem_size_mib,
+            smt: body.smt,
+            cpu_template: body.cpu_template,
+            track_dirty_pages: body.track_dirty_pages,
+            huge_pages: body.huge_pages,
+        },
+    )))
+}
+
+fn validate_machine_config_request(body: &MachineConfigRequestBody) -> Result<(), RequestError> {
+    if body.vcpu_count == 0 || body.vcpu_count > MAX_MACHINE_CONFIG_VCPUS {
+        return Err(RequestError::MalformedRequest);
+    }
+    if body.mem_size_mib == 0 {
+        return Err(RequestError::MalformedRequest);
+    }
+    if body.smt || body.track_dirty_pages || body.huge_pages != MachineConfigHugePages::None {
+        return Err(RequestError::MalformedRequest);
+    }
+
+    Ok(())
 }
 
 fn validate_rate_limiter_config(value: &serde_json::Value) -> Result<(), RequestError> {
@@ -521,8 +624,10 @@ impl From<ApiRequest> for Endpoint {
     fn from(request: ApiRequest) -> Self {
         match request {
             ApiRequest::GetInstanceInfo => Self::DescribeInstance,
+            ApiRequest::GetMachineConfig => Self::MachineConfig,
             ApiRequest::GetVersion => Self::Version,
             ApiRequest::PutDrive(_) => Self::Drive,
+            ApiRequest::PutMachineConfig(_) => Self::MachineConfig,
         }
     }
 }
@@ -587,6 +692,169 @@ mod tests {
 
         assert_eq!(parse_request(request), Ok(ApiRequest::GetVersion));
         assert_eq!(request_total_len(request), Ok(Some(request.len())));
+    }
+
+    #[test]
+    fn parses_get_machine_config() {
+        let request = b"GET /machine-config HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+        assert_eq!(parse_request(request), Ok(ApiRequest::GetMachineConfig));
+        assert_eq!(request_total_len(request), Ok(Some(request.len())));
+    }
+
+    #[test]
+    fn rejects_get_machine_config_with_body() {
+        let request = request_with_body("GET", "/machine-config", "{}");
+
+        assert_eq!(parse_request(&request), Err(RequestError::GetRequestBody));
+    }
+
+    #[test]
+    fn parses_put_machine_config_with_minimal_body() {
+        let body = r#"{
+            "vcpu_count": 1,
+            "mem_size_mib": 128
+        }"#;
+        let request = request_with_body("PUT", "/machine-config", body);
+
+        let parsed = parse_request(&request).expect("machine-config request should parse");
+
+        let ApiRequest::PutMachineConfig(config) = parsed else {
+            panic!("expected machine-config request");
+        };
+        assert_eq!(config.vcpu_count(), 1);
+        assert_eq!(config.mem_size_mib(), 128);
+        assert!(!config.smt());
+        assert_eq!(config.cpu_template(), None);
+        assert!(!config.track_dirty_pages());
+        assert_eq!(config.huge_pages(), MachineConfigHugePages::None);
+        assert_eq!(request_total_len(&request), Ok(Some(request.len())));
+    }
+
+    #[test]
+    fn parses_put_machine_config_with_accepted_default_values() {
+        let body = r#"{
+            "vcpu_count": 32,
+            "mem_size_mib": 1024,
+            "smt": false,
+            "cpu_template": "None",
+            "track_dirty_pages": false,
+            "huge_pages": "None"
+        }"#;
+        let request = request_with_body("PUT", "/machine-config", body);
+
+        let parsed = parse_request(&request).expect("machine-config defaults should parse");
+
+        let ApiRequest::PutMachineConfig(config) = parsed else {
+            panic!("expected machine-config request");
+        };
+        assert_eq!(config.vcpu_count(), 32);
+        assert_eq!(config.mem_size_mib(), 1024);
+        assert_eq!(config.cpu_template(), Some(MachineConfigCpuTemplate::None));
+        assert_eq!(config.huge_pages(), MachineConfigHugePages::None);
+    }
+
+    #[test]
+    fn parses_put_machine_config_with_null_cpu_template() {
+        let body = r#"{
+            "vcpu_count": 2,
+            "mem_size_mib": 256,
+            "cpu_template": null
+        }"#;
+        let request = request_with_body("PUT", "/machine-config", body);
+
+        let parsed = parse_request(&request).expect("null CPU template should parse");
+
+        let ApiRequest::PutMachineConfig(config) = parsed else {
+            panic!("expected machine-config request");
+        };
+        assert_eq!(config.cpu_template(), None);
+    }
+
+    #[test]
+    fn rejects_put_machine_config_missing_required_fields() {
+        assert_eq!(
+            parse_request(&request_with_body(
+                "PUT",
+                "/machine-config",
+                r#"{"mem_size_mib":128}"#,
+            )),
+            Err(RequestError::MalformedRequest)
+        );
+        assert_eq!(
+            parse_request(&request_with_body(
+                "PUT",
+                "/machine-config",
+                r#"{"vcpu_count":1}"#,
+            )),
+            Err(RequestError::MalformedRequest)
+        );
+    }
+
+    #[test]
+    fn rejects_put_machine_config_unknown_field() {
+        let body = r#"{
+            "vcpu_count": 1,
+            "mem_size_mib": 128,
+            "unknown": true
+        }"#;
+        let request = request_with_body("PUT", "/machine-config", body);
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_put_machine_config_invalid_field_type() {
+        let body = r#"{
+            "vcpu_count": "1",
+            "mem_size_mib": 128
+        }"#;
+        let request = request_with_body("PUT", "/machine-config", body);
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_put_machine_config_invalid_numeric_bounds() {
+        for body in [
+            r#"{"vcpu_count":0,"mem_size_mib":128}"#,
+            r#"{"vcpu_count":33,"mem_size_mib":128}"#,
+            r#"{"vcpu_count":1,"mem_size_mib":0}"#,
+        ] {
+            assert_eq!(
+                parse_request(&request_with_body("PUT", "/machine-config", body)),
+                Err(RequestError::MalformedRequest)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_put_machine_config_unsupported_values() {
+        for body in [
+            r#"{"vcpu_count":1,"mem_size_mib":128,"smt":true}"#,
+            r#"{"vcpu_count":1,"mem_size_mib":128,"track_dirty_pages":true}"#,
+            r#"{"vcpu_count":1,"mem_size_mib":128,"cpu_template":"V1N1"}"#,
+            r#"{"vcpu_count":1,"mem_size_mib":128,"huge_pages":"2M"}"#,
+        ] {
+            assert_eq!(
+                parse_request(&request_with_body("PUT", "/machine-config", body)),
+                Err(RequestError::MalformedRequest)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_put_machine_config_null_for_non_nullable_default_fields() {
+        for body in [
+            r#"{"vcpu_count":1,"mem_size_mib":128,"smt":null}"#,
+            r#"{"vcpu_count":1,"mem_size_mib":128,"track_dirty_pages":null}"#,
+            r#"{"vcpu_count":1,"mem_size_mib":128,"huge_pages":null}"#,
+        ] {
+            assert_eq!(
+                parse_request(&request_with_body("PUT", "/machine-config", body)),
+                Err(RequestError::MalformedRequest)
+            );
+        }
     }
 
     #[test]
@@ -1078,6 +1346,10 @@ mod tests {
             Endpoint::DescribeInstance
         );
         assert_eq!(Endpoint::from(ApiRequest::GetVersion), Endpoint::Version);
+        assert_eq!(
+            Endpoint::from(ApiRequest::GetMachineConfig),
+            Endpoint::MachineConfig
+        );
         let request = parse_request(&request_with_body(
             "PUT",
             "/drives/rootfs",
@@ -1090,5 +1362,14 @@ mod tests {
         .expect("drive request should parse");
 
         assert_eq!(Endpoint::from(request), Endpoint::Drive);
+
+        let request = parse_request(&request_with_body(
+            "PUT",
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":128}"#,
+        ))
+        .expect("machine-config request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::MachineConfig);
     }
 }
