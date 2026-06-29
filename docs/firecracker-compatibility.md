@@ -46,7 +46,7 @@ with a runner-compatible shared MMIO dispatcher, controlled mapped guest-memory
 access, one-step runner-thread MMIO handling, a run-cancellation boundary, a
 virtual-timer-mask control boundary, a bounded internal boot-session run-loop
 pump, owned internal boot-session handle, process-level owned startup-session
-wiring with optional serial capture and boot run-loop supervision across bounded step windows, boot block queue interrupt signaling,
+wiring with optional serial capture and boot run-loop supervision across bounded step windows with retained internal worker status, boot block queue interrupt signaling,
 virtual timer PPI assertion, and an initial process startup argument model.
 There is no broader API request body model beyond the initial boot-source,
 drive configuration, machine-configuration, and actions bodies, public guest
@@ -77,7 +77,7 @@ socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
 already map through a minimal internal VMM action/data boundary. Validation
 rejects malformed boot-source and actions requests before VMM state mutation.
 Successful `InstanceStart` startup, the `Running` transition, and an internal boot run-loop worker across bounded step windows are implemented with an internal serial MMIO
-console capture path; public run-loop control and public serial
+console capture path and retained internal active, terminal-outcome, or error worker status; public run-loop control and public serial
 streaming remain deferred.
 
 ## Process Startup CLI
@@ -576,7 +576,7 @@ mismatch, or FDT write failure.
 The assembled bundle is used by owned HVF startup preparation. HVF owns the
 mapped guest memory while runtime metadata, the MMIO dispatcher, optional serial
 metadata, and block metadata stay available to the retained session. bangbang
-now starts an internal boot run-loop worker across bounded step windows after successful startup, but
+now starts an internal boot run-loop worker across bounded step windows after successful startup and retains internal active, terminal-outcome, or error worker status, but
 does not yet provide public run-loop control, signal backend
 interrupts outside the internal boot block notification path, or prove guest
 boot with a smoke test.
@@ -748,7 +748,7 @@ MMIO dispatcher, so a
 resulting MMIO exit is handled on the vCPU-owning thread without global state.
 The boot session can also expose a cloneable cancellation-only handle for an
 in-flight run step without exposing the full runner. Public `InstanceStart`
-now starts a process-owned internal boot run-loop worker across bounded step windows with an owned
+now starts a process-owned internal boot run-loop worker across bounded step windows with retained internal worker status and an owned
 HVF boot session and internal serial MMIO console after successful startup. A
 bounded internal
 boot-session run-loop pump now composes that one-step path with boot block
@@ -826,7 +826,7 @@ The first API implementation should model the same broad stages as Firecracker:
 | `PUT /machine-config` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Pre-boot-only configuration. Stored values are applied during startup preparation. |
 | `PUT /boot-source` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config; host paths are opened during startup preparation. Host path errors must avoid leaking sensitive path details. |
 | `PUT /drives/{drive_id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config; startup preparation opens backing files and registers initial block MMIO devices. Runtime hotplug remains deferred. |
-| `PUT /actions` with `InstanceStart` | process-routed; `204` after successful owned HVF startup with internal boot run-loop worker across bounded step windows or `400` preflight/preparation fault | unsupported after start; `400` `fault_message` | Commits `Running` only after the owned HVF boot-session worker with internal serial capture is retained. Public run-loop control and public serial streaming remain deferred. |
+| `PUT /actions` with `InstanceStart` | process-routed; `204` after successful owned HVF startup with internal boot run-loop worker across bounded step windows or `400` preflight/preparation fault | unsupported after start; `400` `fault_message` | Commits `Running` only after the owned HVF boot-session worker with internal serial capture is retained. The worker keeps internal active, terminal-outcome, or error status; public run-loop control and public serial streaming remain deferred. |
 | `PUT /actions` with `FlushMetrics` | VMM-routed; currently `400` unsupported `fault_message` | deferred until metrics support exists; future success should use `204` empty response | Firecracker treats this as runtime-only; tied to observability work. |
 | `PUT /actions` with `SendCtrlAltDel` | intentionally unsupported; parser returns `400` `fault_message` | intentionally unsupported; `400` `fault_message` | Firecracker rejects this on aarch64; bangbang's first target is Apple Silicon. |
 | Non-initial endpoints from the endpoint matrix | `400` `fault_message` until their capability exists | `400` `fault_message` until their capability exists | Covers planned later and deferred endpoints; a later capability PR may define more specific state behavior. |

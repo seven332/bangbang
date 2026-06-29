@@ -1,6 +1,8 @@
 use std::fmt;
 use std::num::NonZeroUsize;
-use std::sync::mpsc;
+#[cfg(test)]
+use std::sync::Condvar;
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
 
 use bangbang_hvf::{
@@ -201,7 +203,7 @@ impl BootRunLoopControl for HvfArm64BootRunLoopControl {
 pub(crate) trait BootRunLoopSession: Send + 'static {
     type Control: BootRunLoopControl;
     type Error: fmt::Display + Send + 'static;
-    type Outcome: fmt::Debug + Send + 'static;
+    type Outcome: Clone + fmt::Debug + Send + 'static;
 
     fn run_loop_control(&self) -> Self::Control;
 
@@ -236,11 +238,80 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BootRunLoopWorkerStatus<O> {
+    Running,
+    Exited(O),
+    Failed(String),
+}
+
+#[derive(Debug)]
+struct BootRunLoopWorkerStatusCell<O> {
+    status: Mutex<BootRunLoopWorkerStatus<O>>,
+    #[cfg(test)]
+    changed: Condvar,
+}
+
+impl<O> BootRunLoopWorkerStatusCell<O> {
+    fn new() -> Self {
+        Self {
+            status: Mutex::new(BootRunLoopWorkerStatus::Running),
+            #[cfg(test)]
+            changed: Condvar::new(),
+        }
+    }
+
+    fn snapshot(&self) -> BootRunLoopWorkerStatus<O>
+    where
+        O: Clone,
+    {
+        self.lock_status().clone()
+    }
+
+    fn record(&self, status: BootRunLoopWorkerStatus<O>) {
+        {
+            let mut current = self.lock_status();
+            *current = status;
+        }
+        #[cfg(test)]
+        self.changed.notify_all();
+    }
+
+    #[cfg(test)]
+    fn wait_for_terminal_status(&self) -> BootRunLoopWorkerStatus<O>
+    where
+        O: Clone,
+    {
+        let mut current = self.lock_status();
+        while matches!(&*current, BootRunLoopWorkerStatus::Running) {
+            current = match self.changed.wait(current) {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+        current.clone()
+    }
+
+    fn lock_status(&self) -> MutexGuard<'_, BootRunLoopWorkerStatus<O>> {
+        match self.status.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+impl<O> Default for BootRunLoopWorkerStatusCell<O> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub(crate) struct BootRunLoopSupervisor<S>
 where
     S: BootRunLoopSession,
 {
     control: S::Control,
+    status: Arc<BootRunLoopWorkerStatusCell<S::Outcome>>,
     session_release_sender: Option<mpsc::Sender<()>>,
     worker: Option<JoinHandle<Result<S::Outcome, S::Error>>>,
 }
@@ -252,6 +323,8 @@ where
     fn start(mut session: S, max_steps: NonZeroUsize) -> Result<Self, BackendError> {
         let control = session.run_loop_control();
         let stop_token = control.stop_token();
+        let status = Arc::new(BootRunLoopWorkerStatusCell::new());
+        let worker_status = Arc::clone(&status);
         let (session_release_sender, session_release_receiver) = mpsc::channel();
         let worker = thread::Builder::new()
             .name(HVF_BOOT_RUN_LOOP_THREAD_NAME.to_owned())
@@ -259,7 +332,14 @@ where
                 let result = loop {
                     match session.run_loop(&stop_token, max_steps) {
                         Ok(outcome) if S::should_continue_after_outcome(&outcome) => continue,
-                        result => break result,
+                        Ok(outcome) => {
+                            worker_status.record(BootRunLoopWorkerStatus::Exited(outcome.clone()));
+                            break Ok(outcome);
+                        }
+                        Err(err) => {
+                            worker_status.record(BootRunLoopWorkerStatus::Failed(err.to_string()));
+                            break Err(err);
+                        }
                     }
                 };
                 let _ = session_release_receiver.recv();
@@ -271,9 +351,19 @@ where
 
         Ok(Self {
             control,
+            status,
             session_release_sender: Some(session_release_sender),
             worker: Some(worker),
         })
+    }
+
+    fn status(&self) -> BootRunLoopWorkerStatus<S::Outcome> {
+        self.status.snapshot()
+    }
+
+    #[cfg(test)]
+    fn wait_for_terminal_status(&self) -> BootRunLoopWorkerStatus<S::Outcome> {
+        self.status.wait_for_terminal_status()
     }
 
     fn stop_and_join(&mut self) {
@@ -308,6 +398,7 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BootRunLoopSupervisor")
             .field("control", &self.control)
+            .field("status", &self.status())
             .field("worker_active", &self.worker.is_some())
             .finish()
     }
@@ -347,7 +438,7 @@ mod tests {
     use bangbang_runtime::{BackendError, InstanceState, VmmAction, VmmActionError};
 
     use super::{
-        BootRunLoopControl, BootRunLoopSession, BootRunLoopSupervisor,
+        BootRunLoopControl, BootRunLoopSession, BootRunLoopSupervisor, BootRunLoopWorkerStatus,
         DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT, DEFAULT_SERIAL_MMIO_BASE,
         DEFAULT_SERIAL_MMIO_REGION_ID, HvfInstanceStartExecutor, InstanceStartExecutor, ProcessVmm,
         default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
@@ -510,6 +601,7 @@ mod tests {
         max_steps_sender: mpsc::Sender<usize>,
         outcomes: Arc<Mutex<VecDeque<Result<FakeRunLoopOutcome, FakeRunLoopError>>>>,
         wait_for_stop: bool,
+        wait_for_stop_sequence: Arc<Mutex<VecDeque<bool>>>,
     }
 
     impl FakeRunLoopSession {
@@ -527,6 +619,7 @@ mod tests {
                     FakeRunLoopOutcome::Terminal,
                 )]))),
                 wait_for_stop: true,
+                wait_for_stop_sequence: Arc::default(),
             }
         }
 
@@ -544,6 +637,14 @@ mod tests {
 
         const fn with_wait_for_stop(mut self, wait_for_stop: bool) -> Self {
             self.wait_for_stop = wait_for_stop;
+            self
+        }
+
+        fn with_wait_for_stop_sequence(
+            mut self,
+            wait_for_stop: impl IntoIterator<Item = bool>,
+        ) -> Self {
+            self.wait_for_stop_sequence = Arc::new(Mutex::new(wait_for_stop.into_iter().collect()));
             self
         }
     }
@@ -570,7 +671,13 @@ mod tests {
         ) -> Result<Self::Outcome, Self::Error> {
             self.run_count.fetch_add(1, Ordering::SeqCst);
             let _ = self.max_steps_sender.send(max_steps.get());
-            if self.wait_for_stop {
+            let wait_for_stop = self
+                .wait_for_stop_sequence
+                .lock()
+                .expect("fake wait sequence should lock")
+                .pop_front()
+                .unwrap_or(self.wait_for_stop);
+            if wait_for_stop {
                 stop_token.wait_for_stop();
             }
             self.outcomes
@@ -683,6 +790,33 @@ mod tests {
     }
 
     #[test]
+    fn boot_run_loop_supervisor_reports_running_status_before_stop() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender);
+
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(5).expect("non-zero limit"))
+                .expect("supervisor should start");
+
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            5
+        );
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Running);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 0);
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn boot_run_loop_supervisor_retains_session_after_bounded_loop_returns() {
         let control = FakeRunLoopControl::default();
         let drop_count = Arc::new(AtomicU64::new(0));
@@ -701,6 +835,38 @@ mod tests {
                 .expect("worker should enter run loop"),
             3
         );
+        assert_eq!(drop_count.load(Ordering::SeqCst), 0);
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_records_terminal_outcome_before_release() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_wait_for_stop(false);
+
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(3).expect("non-zero limit"))
+                .expect("supervisor should start");
+
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            3
+        );
+        assert_eq!(
+            supervisor.wait_for_terminal_status(),
+            BootRunLoopWorkerStatus::Exited(FakeRunLoopOutcome::Terminal)
+        );
+        assert_eq!(control.request_stop_count(), 0);
         assert_eq!(drop_count.load(Ordering::SeqCst), 0);
 
         drop(supervisor);
@@ -746,6 +912,43 @@ mod tests {
     }
 
     #[test]
+    fn boot_run_loop_supervisor_keeps_status_running_across_step_limit() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_wait_for_stop(false)
+                .with_outcomes([
+                    Ok(FakeRunLoopOutcome::StepLimitReached),
+                    Ok(FakeRunLoopOutcome::Terminal),
+                ])
+                .with_wait_for_stop_sequence([false, true]);
+        let run_count = session.run_count();
+
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(17).expect("non-zero limit"))
+                .expect("supervisor should start");
+
+        for _ in 0..2 {
+            assert_eq!(
+                max_steps_receiver
+                    .recv()
+                    .expect("worker should enter run loop"),
+                17
+            );
+        }
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Running);
+        assert_eq!(run_count.load(Ordering::SeqCst), 2);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 0);
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn boot_run_loop_supervisor_stops_after_run_loop_error() {
         let control = FakeRunLoopControl::default();
         let drop_count = Arc::new(AtomicU64::new(0));
@@ -773,6 +976,39 @@ mod tests {
         drop(supervisor);
 
         assert_eq!(run_count.load(Ordering::SeqCst), 1);
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_records_error_status_before_release() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_wait_for_stop(false)
+                .with_outcomes([Err(FakeRunLoopError)]);
+
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(19).expect("non-zero limit"))
+                .expect("supervisor should start");
+
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            19
+        );
+        assert_eq!(
+            supervisor.wait_for_terminal_status(),
+            BootRunLoopWorkerStatus::Failed("fake run loop failed".to_string())
+        );
+        assert_eq!(control.request_stop_count(), 0);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 0);
+
+        drop(supervisor);
+
         assert_eq!(control.request_stop_count(), 1);
         assert_eq!(drop_count.load(Ordering::SeqCst), 1);
     }
