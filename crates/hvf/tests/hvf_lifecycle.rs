@@ -1,5 +1,7 @@
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 static HVF_LIFECYCLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static NEXT_HVF_TEST_FILE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
@@ -199,12 +201,172 @@ fn maps_guest_memory_and_unmaps_before_destroying_vm() {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn prepares_internal_hvf_arm64_boot_session() {
+    use bangbang_hvf::{HvfArm64BootSessionConfig, HvfBackend};
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::BlockMmioLayout;
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::mmio::MmioRegionId;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let image = arm64_image().expect("test arm64 image should build");
+    let kernel = TempFile::new("session-kernel", &image).expect("temp kernel should be created");
+    let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    controller
+        .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            kernel.path(),
+        )))
+        .expect("boot source config should be stored");
+    let mut backend = HvfBackend::new();
+    let config = HvfArm64BootSessionConfig::new(BlockMmioLayout::new(
+        GuestAddress::new(0x4000_0000),
+        MmioRegionId::new(1),
+    ));
+
+    let mut session = backend
+        .prepare_arm64_boot_session(&controller, config)
+        .expect("internal HVF arm64 boot session should prepare");
+
+    assert!(session.block_interrupt_lines().is_empty());
+    assert_eq!(
+        session.boot_registers().kernel_entry,
+        session
+            .runtime_resources()
+            .loaded_boot_source
+            .kernel
+            .entry_address
+    );
+    assert_eq!(
+        session.boot_registers().fdt_address,
+        session.runtime_resources().fdt.address
+    );
+    session
+        .shutdown()
+        .expect("internal HVF arm64 boot session should shut down");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn rejects_boot_session_on_existing_hvf_vm_without_destroying_it() {
+    use bangbang_hvf::{HvfArm64BootSessionConfig, HvfArm64BootSessionError, HvfBackend};
+    use bangbang_runtime::VmBackend;
+    use bangbang_runtime::block::BlockMmioLayout;
+    use bangbang_runtime::memory::GuestAddress;
+    use bangbang_runtime::mmio::MmioRegionId;
+
+    let _test_lock = HVF_LIFECYCLE_TEST_LOCK
+        .lock()
+        .expect("HVF lifecycle test lock should not be poisoned");
+    let controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
+    let mut backend = HvfBackend::new();
+    backend.create_vm().expect("existing VM should be created");
+
+    let err = backend
+        .prepare_arm64_boot_session(
+            &controller,
+            HvfArm64BootSessionConfig::new(BlockMmioLayout::new(
+                GuestAddress::new(0x4000_0000),
+                MmioRegionId::new(1),
+            )),
+        )
+        .expect_err("existing VM should be rejected");
+
+    assert!(matches!(
+        err,
+        HvfArm64BootSessionError::BackendAlreadyInitialized
+    ));
+    let _metadata = backend
+        .create_gic()
+        .expect("existing VM should remain available after rejected session");
+    backend
+        .destroy_vm()
+        .expect("existing VM should remain owned by caller");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn host_page_size() -> Result<u64, std::num::TryFromIntError> {
     // SAFETY: `sysconf(_SC_PAGESIZE)` has no pointer arguments and does not
     // require process-local invariants from Rust.
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
 
     u64::try_from(page_size)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct TempFile {
+    path: std::path::PathBuf,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl TempFile {
+    fn new(name: &str, bytes: &[u8]) -> std::io::Result<Self> {
+        use std::io::Write as _;
+
+        let id = NEXT_HVF_TEST_FILE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("bangbang-hvf-{name}-{}-{}", std::process::id(), id));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        file.write_all(bytes)?;
+
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn arm64_image() -> Result<Vec<u8>, &'static str> {
+    const ARM64_IMAGE_HEADER_SIZE: usize = 64;
+    const ARM64_IMAGE_TEXT_OFFSET_OFFSET: usize = 8;
+    const ARM64_IMAGE_SIZE_OFFSET: usize = 16;
+    const ARM64_IMAGE_MAGIC_OFFSET: usize = 56;
+    const ARM64_IMAGE_MAGIC: u32 = 0x644d_5241;
+
+    let mut bytes = vec![0xaa; ARM64_IMAGE_HEADER_SIZE];
+    write_u64_le(&mut bytes, ARM64_IMAGE_TEXT_OFFSET_OFFSET, 0)?;
+    write_u64_le(
+        &mut bytes,
+        ARM64_IMAGE_SIZE_OFFSET,
+        ARM64_IMAGE_HEADER_SIZE as u64,
+    )?;
+    write_u32_le(&mut bytes, ARM64_IMAGE_MAGIC_OFFSET, ARM64_IMAGE_MAGIC)?;
+    Ok(bytes)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn write_u64_le(bytes: &mut [u8], offset: usize, value: u64) -> Result<(), &'static str> {
+    let end = offset + std::mem::size_of::<u64>();
+    let destination = bytes
+        .get_mut(offset..end)
+        .ok_or("u64 write range should fit test image")?;
+    destination.copy_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn write_u32_le(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), &'static str> {
+    let end = offset + std::mem::size_of::<u32>();
+    let destination = bytes
+        .get_mut(offset..end)
+        .ok_or("u32 write range should fit test image")?;
+    destination.copy_from_slice(&value.to_le_bytes());
+    Ok(())
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]

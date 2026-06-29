@@ -39,7 +39,8 @@ notification dispatch helper with virtio-mmio queue interrupt-status updates
 for future device handlers, internal boot-resource assembly from stored VM
 configuration with optional serial and block MMIO registration, an internal
 backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
-boot-register setup, and an initial process startup argument model.
+boot-register setup, internal HVF single-vCPU arm64 boot-session preparation,
+and an initial process startup argument model.
 There is no broader API request body model beyond the initial boot-source,
 drive configuration, machine-configuration, and actions bodies, guest execution, continuous vCPU run loop,
 complete interrupt delivery, public startup or HVF runner-loop wiring for block
@@ -539,11 +540,13 @@ layout/allocation failure, boot-source loading failure, block-device preparation
 failure, serial or block MMIO registration failure, interrupt-line count
 mismatch, or FDT write failure.
 
-This is still an internal preparation step. The public API does not invoke it,
-`PUT /actions` still returns the documented unsupported fault, and bangbang does
-not yet create an HVF VM from the bundle, map the memory, configure vCPU
-registers through the public startup path, run a continuous vCPU loop, signal
-backend interrupts, or prove guest boot with a smoke test.
+This is still an internal preparation step. The assembled bundle can be split
+so HVF owns the mapped guest memory while runtime metadata, the MMIO dispatcher,
+optional serial metadata, and block metadata stay available to the internal
+session. The public API does not invoke it, `PUT /actions` still returns the
+documented unsupported fault, and bangbang does not yet configure vCPU registers
+through the public startup path, run a continuous vCPU loop, signal backend
+interrupts, or prove guest boot with a smoke test.
 
 The runtime crate also contains an internal MMIO region registry, operation
 model, and handler dispatch boundary for future real devices. It reuses
@@ -655,7 +658,9 @@ The HVF backend can map allocated guest memory regions into an existing
 Hypervisor.framework VM with read/write/execute guest RAM permissions. The
 backend-owned mapping owner consumes the `GuestMemory` allocation, unmaps mapped
 regions on explicit unmap, partial failure, drop, and VM destruction, and keeps
-cleanup local to the backend instance.
+cleanup local to the backend instance. The internal HVF boot-session preparation
+path maps the guest memory after runtime boot-resource assembly and releases the
+mapping with VM-owned state when the session shuts down or is dropped.
 
 On macOS 15.0 or newer, the HVF backend can create a GIC v3 device after VM
 creation and before vCPU creation. It dynamically resolves the macOS 15 GIC
@@ -669,12 +674,14 @@ against that supported range before setting explicit GIC SPI levels with
 runtime timer node, and MSI/ITS metadata is intentionally absent until a later
 device path needs it.
 
-This still is not bootable guest RAM. bangbang can now write an internal FDT
-payload, read the primary runner-owned vCPU `MPIDR_EL1` for later boot metadata,
-and configure a single primary HVF vCPU with the arm64 Linux boot register state:
-PC points at the loaded kernel entry, X0 points at the FDT guest address, X1-X3
-are zero, and CPSR/PSTATE is `0x3c5`. The runner path performs metadata reads
-and boot-register setup on the vCPU-owning thread, rejects duplicate setup,
+This still is not public guest startup. bangbang can now write an internal FDT
+payload, create an internal single-vCPU HVF arm64 boot session, read the primary
+runner-owned vCPU `MPIDR_EL1` for boot metadata, allocate deterministic block
+and optional serial SPI interrupt lines, map the assembled guest memory into
+HVF, and configure a single primary HVF vCPU with the arm64 Linux boot register
+state: PC points at the loaded kernel entry, X0 points at the FDT guest address,
+X1-X3 are zero, and CPSR/PSTATE is `0x3c5`. The runner path performs metadata
+reads and boot-register setup on the vCPU-owning thread, rejects duplicate setup,
 setup during shutdown, setup while a run is in flight, and setup after a run has
 started. If setup fails after partially writing registers, the runner rejects
 guest runs until setup is retried successfully. The runner also exposes explicit
