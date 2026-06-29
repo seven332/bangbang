@@ -18,6 +18,7 @@ pub enum ApiRequest {
     GetInstanceInfo,
     GetMachineConfig,
     GetVersion,
+    PutAction(Box<ActionRequest>),
     PutBootSource(Box<BootSourceRequest>),
     PutDrive(Box<DriveConfigRequest>),
     PutMachineConfig(Box<MachineConfigRequest>),
@@ -30,6 +31,7 @@ pub enum RequestError {
     MismatchedDriveId,
     MalformedRequest,
     PayloadTooLarge,
+    SendCtrlAltDelUnsupported,
 }
 
 impl RequestError {
@@ -40,6 +42,7 @@ impl RequestError {
             Self::MismatchedDriveId => "path drive_id must match body drive_id.",
             Self::MalformedRequest => "Malformed HTTP request.",
             Self::PayloadTooLarge => "HTTP request payload exceeds the configured limit.",
+            Self::SendCtrlAltDelUnsupported => "SendCtrlAltDel does not supported on aarch64.",
         }
     }
 }
@@ -51,6 +54,36 @@ impl fmt::Display for RequestError {
 }
 
 impl std::error::Error for RequestError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionRequest {
+    action_type: ActionType,
+}
+
+impl ActionRequest {
+    pub const fn action_type(&self) -> ActionType {
+        self.action_type
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionType {
+    FlushMetrics,
+    InstanceStart,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActionRequestBody {
+    action_type: ActionTypeBody,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+enum ActionTypeBody {
+    FlushMetrics,
+    InstanceStart,
+    SendCtrlAltDel,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootSourceRequest {
@@ -383,6 +416,9 @@ pub fn parse_request(bytes: &[u8]) -> Result<ApiRequest, RequestError> {
     {
         return parse_drive_config_request(path_drive_id, body);
     }
+    if method == "PUT" && path == "/actions" {
+        return parse_action_request(body);
+    }
     if method == "PUT" && path == "/boot-source" {
         return parse_boot_source_request(body);
     }
@@ -410,6 +446,21 @@ fn drive_path_id(path: &str) -> Option<&str> {
     }
 
     Some(rest)
+}
+
+fn parse_action_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
+    let body = serde_json::from_slice::<ActionRequestBody>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+
+    let action_type = match body.action_type {
+        ActionTypeBody::FlushMetrics => ActionType::FlushMetrics,
+        ActionTypeBody::InstanceStart => ActionType::InstanceStart,
+        ActionTypeBody::SendCtrlAltDel => return Err(RequestError::SendCtrlAltDelUnsupported),
+    };
+
+    Ok(ApiRequest::PutAction(Box::new(ActionRequest {
+        action_type,
+    })))
 }
 
 fn parse_boot_source_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
@@ -692,6 +743,7 @@ impl From<ApiRequest> for Endpoint {
             ApiRequest::GetInstanceInfo => Self::DescribeInstance,
             ApiRequest::GetMachineConfig => Self::MachineConfig,
             ApiRequest::GetVersion => Self::Version,
+            ApiRequest::PutAction(_) => Self::Actions,
             ApiRequest::PutBootSource(_) => Self::BootSource,
             ApiRequest::PutDrive(_) => Self::Drive,
             ApiRequest::PutMachineConfig(_) => Self::MachineConfig,
@@ -774,6 +826,111 @@ mod tests {
         let request = request_with_body("GET", "/machine-config", "{}");
 
         assert_eq!(parse_request(&request), Err(RequestError::GetRequestBody));
+    }
+
+    #[test]
+    fn parses_put_actions_instance_start() {
+        let body = r#"{"action_type":"InstanceStart"}"#;
+        let request = request_with_body("PUT", "/actions", body);
+
+        let parsed = parse_request(&request).expect("actions request should parse");
+
+        let ApiRequest::PutAction(action) = parsed else {
+            panic!("expected actions request");
+        };
+        assert_eq!(action.action_type(), ActionType::InstanceStart);
+        assert_eq!(request_total_len(&request), Ok(Some(request.len())));
+    }
+
+    #[test]
+    fn parses_put_actions_flush_metrics() {
+        let body = r#"{"action_type":"FlushMetrics"}"#;
+        let request = request_with_body("PUT", "/actions", body);
+
+        let parsed = parse_request(&request).expect("actions request should parse");
+
+        let ApiRequest::PutAction(action) = parsed else {
+            panic!("expected actions request");
+        };
+        assert_eq!(action.action_type(), ActionType::FlushMetrics);
+    }
+
+    #[test]
+    fn rejects_put_actions_send_ctrl_alt_del() {
+        let body = r#"{"action_type":"SendCtrlAltDel"}"#;
+        let request = request_with_body("PUT", "/actions", body);
+
+        let err = parse_request(&request).expect_err("SendCtrlAltDel should be unsupported");
+
+        assert_eq!(err, RequestError::SendCtrlAltDelUnsupported);
+        assert_eq!(
+            err.fault_message(),
+            "SendCtrlAltDel does not supported on aarch64."
+        );
+    }
+
+    #[test]
+    fn rejects_put_actions_missing_action_type() {
+        let request = request_with_body("PUT", "/actions", "{}");
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_put_actions_unknown_field() {
+        let body = r#"{"action_type":"InstanceStart","unknown":true}"#;
+        let request = request_with_body("PUT", "/actions", body);
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_put_actions_invalid_field_types() {
+        for body in [
+            r#"{"action_type":1}"#,
+            r#"{"action_type":null}"#,
+            r#"{"action_type":["InstanceStart"]}"#,
+        ] {
+            assert_eq!(
+                parse_request(&request_with_body("PUT", "/actions", body)),
+                Err(RequestError::MalformedRequest)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_put_actions_unknown_action_type() {
+        let body = r#"{"action_type":"Pause"}"#;
+        let request = request_with_body("PUT", "/actions", body);
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_put_actions_empty_body() {
+        let request = request_with_body("PUT", "/actions", "");
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_unsupported_actions_method_or_path() {
+        assert_eq!(
+            parse_request(b"GET /actions HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+            Err(RequestError::InvalidPathMethod)
+        );
+        assert_eq!(
+            parse_request(&request_with_body("GET", "/actions", "{}")),
+            Err(RequestError::GetRequestBody)
+        );
+        assert_eq!(
+            parse_request(&request_with_body(
+                "PUT",
+                "/actions/extra",
+                r#"{"action_type":"InstanceStart"}"#,
+            )),
+            Err(RequestError::InvalidPathMethod)
+        );
     }
 
     #[test]
@@ -1546,6 +1703,15 @@ mod tests {
             Endpoint::from(ApiRequest::GetMachineConfig),
             Endpoint::MachineConfig
         );
+        let request = parse_request(&request_with_body(
+            "PUT",
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        ))
+        .expect("actions request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::Actions);
+
         let request = parse_request(&request_with_body(
             "PUT",
             "/boot-source",
