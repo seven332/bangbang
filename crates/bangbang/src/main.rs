@@ -346,9 +346,9 @@ fn help_text() -> String {
             "pre-boot PUT /machine-config, pre-boot PUT /boot-source, and ",
             "pre-boot PUT /drives/{{drive_id}} ",
             "configuration storage over the API ",
-            "socket; PUT /actions starts a process-owned bounded HVF boot ",
-            "run-loop worker for InstanceStart, but unbounded public continuous ",
-            "VM execution is not implemented yet."
+            "socket; PUT /actions starts a process-owned HVF boot run-loop ",
+            "worker across bounded step windows for InstanceStart, but public ",
+            "run-loop control is not implemented yet."
         ),
         env!("CARGO_PKG_VERSION"),
         DEFAULT_API_SOCK_PATH,
@@ -518,8 +518,9 @@ mod tests {
         assert!(help.contains("pre-boot PUT /machine-config"));
         assert!(help.contains("pre-boot PUT /boot-source"));
         assert!(help.contains("pre-boot PUT /drives/{drive_id} configuration storage"));
-        assert!(help.contains("PUT /actions starts a process-owned bounded HVF boot"));
-        assert!(help.contains("unbounded public continuous VM execution is not implemented yet"));
+        assert!(help.contains("PUT /actions starts a process-owned HVF boot run-loop worker"));
+        assert!(help.contains("across bounded step windows for InstanceStart"));
+        assert!(help.contains("public run-loop control is not implemented yet"));
     }
 
     #[test]

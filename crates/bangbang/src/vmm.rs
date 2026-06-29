@@ -210,6 +210,8 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
         stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
         max_steps: NonZeroUsize,
     ) -> Result<Self::Outcome, Self::Error>;
+
+    fn should_continue_after_outcome(outcome: &Self::Outcome) -> bool;
 }
 
 impl BootRunLoopSession for OwnedHvfArm64BootSession {
@@ -227,6 +229,10 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
         max_steps: NonZeroUsize,
     ) -> Result<Self::Outcome, Self::Error> {
         OwnedHvfArm64BootSession::run_loop(self, stop_token, max_steps)
+    }
+
+    fn should_continue_after_outcome(outcome: &Self::Outcome) -> bool {
+        matches!(outcome, HvfArm64BootRunLoopOutcome::StepLimitReached { .. })
     }
 }
 
@@ -250,7 +256,12 @@ where
         let worker = thread::Builder::new()
             .name(HVF_BOOT_RUN_LOOP_THREAD_NAME.to_owned())
             .spawn(move || {
-                let result = session.run_loop(&stop_token, max_steps);
+                let result = loop {
+                    match session.run_loop(&stop_token, max_steps) {
+                        Ok(outcome) if S::should_continue_after_outcome(&outcome) => continue,
+                        result => break result,
+                    }
+                };
                 let _ = session_release_receiver.recv();
                 result
             })
@@ -322,6 +333,7 @@ fn default_hvf_boot_session_config(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::fmt;
     use std::fs::{File, remove_file};
     use std::num::NonZeroUsize;
@@ -417,7 +429,10 @@ mod tests {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
-    struct FakeRunLoopOutcome;
+    enum FakeRunLoopOutcome {
+        StepLimitReached,
+        Terminal,
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct FakeRunLoopError;
@@ -491,7 +506,9 @@ mod tests {
     struct FakeRunLoopSession {
         control: FakeRunLoopControl,
         drop_count: Arc<AtomicU64>,
+        run_count: Arc<AtomicU64>,
         max_steps_sender: mpsc::Sender<usize>,
+        outcomes: Arc<Mutex<VecDeque<Result<FakeRunLoopOutcome, FakeRunLoopError>>>>,
         wait_for_stop: bool,
     }
 
@@ -504,9 +521,25 @@ mod tests {
             Self {
                 control,
                 drop_count,
+                run_count: Arc::default(),
                 max_steps_sender,
+                outcomes: Arc::new(Mutex::new(VecDeque::from([Ok(
+                    FakeRunLoopOutcome::Terminal,
+                )]))),
                 wait_for_stop: true,
             }
+        }
+
+        fn run_count(&self) -> Arc<AtomicU64> {
+            Arc::clone(&self.run_count)
+        }
+
+        fn with_outcomes(
+            mut self,
+            outcomes: impl IntoIterator<Item = Result<FakeRunLoopOutcome, FakeRunLoopError>>,
+        ) -> Self {
+            self.outcomes = Arc::new(Mutex::new(outcomes.into_iter().collect()));
+            self
         }
 
         const fn with_wait_for_stop(mut self, wait_for_stop: bool) -> Self {
@@ -535,11 +568,20 @@ mod tests {
             stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
             max_steps: NonZeroUsize,
         ) -> Result<Self::Outcome, Self::Error> {
+            self.run_count.fetch_add(1, Ordering::SeqCst);
             let _ = self.max_steps_sender.send(max_steps.get());
             if self.wait_for_stop {
                 stop_token.wait_for_stop();
             }
-            Ok(FakeRunLoopOutcome)
+            self.outcomes
+                .lock()
+                .expect("fake outcomes should lock")
+                .pop_front()
+                .unwrap_or(Ok(FakeRunLoopOutcome::Terminal))
+        }
+
+        fn should_continue_after_outcome(outcome: &Self::Outcome) -> bool {
+            matches!(outcome, FakeRunLoopOutcome::StepLimitReached)
         }
     }
 
@@ -663,6 +705,74 @@ mod tests {
 
         drop(supervisor);
 
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_repeats_after_step_limit() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_wait_for_stop(false)
+                .with_outcomes([
+                    Ok(FakeRunLoopOutcome::StepLimitReached),
+                    Ok(FakeRunLoopOutcome::StepLimitReached),
+                    Ok(FakeRunLoopOutcome::Terminal),
+                ]);
+        let run_count = session.run_count();
+
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(11).expect("non-zero limit"))
+                .expect("supervisor should start");
+
+        for _ in 0..3 {
+            assert_eq!(
+                max_steps_receiver
+                    .recv()
+                    .expect("worker should enter run loop"),
+                11
+            );
+        }
+        assert_eq!(run_count.load(Ordering::SeqCst), 3);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 0);
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_stops_after_run_loop_error() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_wait_for_stop(false)
+                .with_outcomes([
+                    Err(FakeRunLoopError),
+                    Ok(FakeRunLoopOutcome::StepLimitReached),
+                ]);
+        let run_count = session.run_count();
+
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(13).expect("non-zero limit"))
+                .expect("supervisor should start");
+
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            13
+        );
+
+        drop(supervisor);
+
+        assert_eq!(run_count.load(Ordering::SeqCst), 1);
         assert_eq!(control.request_stop_count(), 1);
         assert_eq!(drop_count.load(Ordering::SeqCst), 1);
     }
