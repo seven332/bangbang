@@ -27,8 +27,8 @@ pub use runner::{HvfVcpuRunner, HvfVcpuRunnerError};
 pub use startup::{
     HvfArm64BootBlockNotificationDispatch, HvfArm64BootBlockNotificationDispatchError,
     HvfArm64BootBlockNotificationDispatches, HvfArm64BootInterruptLinePurpose,
-    HvfArm64BootSerialDeviceConfig, HvfArm64BootSession, HvfArm64BootSessionConfig,
-    HvfArm64BootSessionError, HvfArm64BootSessionShutdownError,
+    HvfArm64BootMmioDispatcherError, HvfArm64BootSerialDeviceConfig, HvfArm64BootSession,
+    HvfArm64BootSessionConfig, HvfArm64BootSessionError, HvfArm64BootSessionShutdownError,
 };
 pub use vcpu::{
     ARM64_LINUX_BOOT_CPSR, HvfArm64BootRegisters, HvfRegister, HvfSystemRegister, HvfVcpu,

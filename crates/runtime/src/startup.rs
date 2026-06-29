@@ -77,6 +77,7 @@ pub struct Arm64BootResources {
 #[derive(Debug)]
 pub struct Arm64BootResourceParts {
     pub memory: GuestMemory,
+    pub mmio_dispatcher: MmioDispatcher,
     pub runtime: Arm64BootRuntimeResources,
 }
 
@@ -86,7 +87,6 @@ pub struct Arm64BootRuntimeResources {
     pub layout: GuestMemoryLayout,
     pub loaded_boot_source: LoadedBootSource,
     pub fdt: Arm64FdtGuestMemoryWrite,
-    pub mmio_dispatcher: MmioDispatcher,
     pub serial_device: Option<Arm64BootSerialDevice>,
     pub block_devices: Vec<Arm64BootBlockDevice>,
 }
@@ -228,6 +228,7 @@ impl Arm64BootRuntimeResources {
     pub fn dispatch_block_queue_notifications(
         &mut self,
         memory: &mut GuestMemory,
+        mmio_dispatcher: &mut MmioDispatcher,
     ) -> Result<Arm64BootBlockNotificationDispatches, Arm64BootBlockNotificationDispatchError> {
         let mut devices = Vec::new();
         devices
@@ -238,10 +239,7 @@ impl Arm64BootRuntimeResources {
 
         for device in self.block_devices.iter().cloned() {
             let region_id = device.registration.region_id();
-            let outcome = match self
-                .mmio_dispatcher
-                .handler_mut::<VirtioBlockMmioHandler>(region_id)
-            {
+            let outcome = match mmio_dispatcher.handler_mut::<VirtioBlockMmioHandler>(region_id) {
                 Ok(handler) => match handler.dispatch_block_queue_notifications(memory) {
                     Ok(dispatch) => Arm64BootBlockNotificationOutcome::Dispatched(dispatch),
                     Err(source) => Arm64BootBlockNotificationOutcome::DispatchFailed(source),
@@ -475,12 +473,12 @@ impl Arm64BootResources {
     pub fn into_parts(self) -> Arm64BootResourceParts {
         Arm64BootResourceParts {
             memory: self.memory,
+            mmio_dispatcher: self.mmio_dispatcher,
             runtime: Arm64BootRuntimeResources {
                 machine_config: self.machine_config,
                 layout: self.layout,
                 loaded_boot_source: self.loaded_boot_source,
                 fdt: self.fdt,
-                mmio_dispatcher: self.mmio_dispatcher,
                 serial_device: self.serial_device,
                 block_devices: self.block_devices,
             },
@@ -839,16 +837,18 @@ mod tests {
 
     fn write_boot_block_mmio_u32(
         runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
         device_index: usize,
         register: VirtioMmioRegister,
         value: u32,
     ) {
-        try_write_boot_block_mmio_u32(runtime, device_index, register, value)
+        try_write_boot_block_mmio_u32(runtime, mmio_dispatcher, device_index, register, value)
             .expect("block MMIO write should dispatch");
     }
 
     fn try_write_boot_block_mmio_u32(
         runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
         device_index: usize,
         register: VirtioMmioRegister,
         value: u32,
@@ -858,18 +858,18 @@ mod tests {
             .address()
             .checked_add(register.offset())
             .expect("test MMIO address should not overflow");
-        let access = runtime
-            .mmio_dispatcher
+        let access = mmio_dispatcher
             .lookup(address, 4)
             .expect("block MMIO access should resolve");
         let data = MmioAccessBytes::new(&value.to_le_bytes()).expect("u32 bytes should be valid");
-        runtime.mmio_dispatcher.dispatch(
+        mmio_dispatcher.dispatch(
             MmioOperation::write(access, data).expect("u32 write operation should be valid"),
         )
     }
 
     fn read_boot_block_mmio_u32(
         runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
         device_index: usize,
         register: VirtioMmioRegister,
     ) -> u32 {
@@ -878,12 +878,10 @@ mod tests {
             .address()
             .checked_add(register.offset())
             .expect("test MMIO address should not overflow");
-        let access = runtime
-            .mmio_dispatcher
+        let access = mmio_dispatcher
             .lookup(address, 4)
             .expect("block MMIO access should resolve");
-        let outcome = runtime
-            .mmio_dispatcher
+        let outcome = mmio_dispatcher
             .dispatch(MmioOperation::read(access).expect("u32 read operation should be valid"))
             .expect("block MMIO read should dispatch");
         match outcome {
@@ -898,54 +896,69 @@ mod tests {
 
     fn configure_boot_block_queue(
         runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
         device_index: usize,
         device_ring: GuestAddress,
     ) {
         write_boot_block_mmio_u32(
             runtime,
+            mmio_dispatcher,
             device_index,
             VirtioMmioRegister::Status,
             VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
         );
         write_boot_block_mmio_u32(
             runtime,
+            mmio_dispatcher,
             device_index,
             VirtioMmioRegister::Status,
             VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
         );
         write_boot_block_mmio_u32(
             runtime,
+            mmio_dispatcher,
             device_index,
             VirtioMmioRegister::Status,
             QUEUE_CONFIG_STATUS,
         );
         write_boot_block_mmio_u32(
             runtime,
+            mmio_dispatcher,
             device_index,
             VirtioMmioRegister::QueueNum,
             u32::from(TEST_QUEUE_SIZE),
         );
         write_boot_block_mmio_u32(
             runtime,
+            mmio_dispatcher,
             device_index,
             VirtioMmioRegister::QueueDescLow,
             guest_address_low(TEST_DESCRIPTOR_TABLE),
         );
         write_boot_block_mmio_u32(
             runtime,
+            mmio_dispatcher,
             device_index,
             VirtioMmioRegister::QueueDriverLow,
             guest_address_low(TEST_AVAILABLE_RING),
         );
         write_boot_block_mmio_u32(
             runtime,
+            mmio_dispatcher,
             device_index,
             VirtioMmioRegister::QueueDeviceLow,
             guest_address_low(device_ring),
         );
-        write_boot_block_mmio_u32(runtime, device_index, VirtioMmioRegister::QueueReady, 1);
         write_boot_block_mmio_u32(
             runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::QueueReady,
+            1,
+        );
+        write_boot_block_mmio_u32(
+            runtime,
+            mmio_dispatcher,
             device_index,
             VirtioMmioRegister::Status,
             DRIVER_OK_STATUS,
@@ -954,9 +967,16 @@ mod tests {
 
     fn notify_boot_block_queue(
         runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
         device_index: usize,
     ) {
-        write_boot_block_mmio_u32(runtime, device_index, VirtioMmioRegister::QueueNotify, 0);
+        write_boot_block_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::QueueNotify,
+            0,
+        );
     }
 
     fn guest_address_low(address: GuestAddress) -> u32 {
@@ -1297,10 +1317,11 @@ mod tests {
                 .expect("boot resources should assemble");
         let parts = resources.into_parts();
         let mut memory = parts.memory;
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
         let mut runtime = parts.runtime;
 
         let dispatches = runtime
-            .dispatch_block_queue_notifications(&mut memory)
+            .dispatch_block_queue_notifications(&mut memory, &mut mmio_dispatcher)
             .expect("empty block dispatch result should allocate");
 
         assert!(dispatches.is_empty());
@@ -1319,11 +1340,12 @@ mod tests {
                 .expect("boot resources should assemble");
         let parts = resources.into_parts();
         let mut memory = parts.memory;
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
         let mut runtime = parts.runtime;
-        configure_boot_block_queue(&mut runtime, 0, TEST_USED_RING);
+        configure_boot_block_queue(&mut runtime, &mut mmio_dispatcher, 0, TEST_USED_RING);
 
         let dispatches = runtime
-            .dispatch_block_queue_notifications(&mut memory)
+            .dispatch_block_queue_notifications(&mut memory, &mut mmio_dispatcher)
             .expect("block dispatch result should allocate");
 
         assert_eq!(dispatches.len(), 1);
@@ -1339,7 +1361,12 @@ mod tests {
         assert!(dispatch.queue_dispatch().is_none());
         assert!(!device_dispatch.needs_queue_interrupt());
         assert_eq!(
-            read_boot_block_mmio_u32(&mut runtime, 0, VirtioMmioRegister::InterruptStatus),
+            read_boot_block_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                0,
+                VirtioMmioRegister::InterruptStatus
+            ),
             0
         );
     }
@@ -1356,13 +1383,14 @@ mod tests {
                 .expect("boot resources should assemble");
         let parts = resources.into_parts();
         let mut memory = parts.memory;
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
         let mut runtime = parts.runtime;
-        configure_boot_block_queue(&mut runtime, 0, TEST_USED_RING);
+        configure_boot_block_queue(&mut runtime, &mut mmio_dispatcher, 0, TEST_USED_RING);
         write_queued_read_request(&mut memory);
-        notify_boot_block_queue(&mut runtime, 0);
+        notify_boot_block_queue(&mut runtime, &mut mmio_dispatcher, 0);
 
         let dispatches = runtime
-            .dispatch_block_queue_notifications(&mut memory)
+            .dispatch_block_queue_notifications(&mut memory, &mut mmio_dispatcher)
             .expect("block dispatch result should allocate");
 
         assert_eq!(dispatches.len(), 1);
@@ -1387,7 +1415,12 @@ mod tests {
         assert!(queue.needs_queue_interrupt());
         assert!(device_dispatch.needs_queue_interrupt());
         assert_eq!(
-            read_boot_block_mmio_u32(&mut runtime, 0, VirtioMmioRegister::InterruptStatus),
+            read_boot_block_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                0,
+                VirtioMmioRegister::InterruptStatus
+            ),
             DeviceInterruptKind::Queue.status().bits()
         );
         assert_eq!(
@@ -1400,7 +1433,7 @@ mod tests {
         );
 
         let second_dispatches = runtime
-            .dispatch_block_queue_notifications(&mut memory)
+            .dispatch_block_queue_notifications(&mut memory, &mut mmio_dispatcher)
             .expect("second block dispatch result should allocate");
         let second = second_dispatches.as_slice()[0]
             .outcome()
@@ -1421,36 +1454,41 @@ mod tests {
                 .expect("boot resources should assemble");
         let parts = resources.into_parts();
         let mut memory = parts.memory;
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
         let mut runtime = parts.runtime;
         write_boot_block_mmio_u32(
             &mut runtime,
+            &mut mmio_dispatcher,
             0,
             VirtioMmioRegister::Status,
             VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
         );
         write_boot_block_mmio_u32(
             &mut runtime,
+            &mut mmio_dispatcher,
             0,
             VirtioMmioRegister::Status,
             VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
         );
         write_boot_block_mmio_u32(
             &mut runtime,
+            &mut mmio_dispatcher,
             0,
             VirtioMmioRegister::Status,
             QUEUE_CONFIG_STATUS,
         );
         try_write_boot_block_mmio_u32(
             &mut runtime,
+            &mut mmio_dispatcher,
             0,
             VirtioMmioRegister::Status,
             DRIVER_OK_STATUS,
         )
         .expect_err("unconfigured block queue activation should fail");
-        notify_boot_block_queue(&mut runtime, 0);
+        notify_boot_block_queue(&mut runtime, &mut mmio_dispatcher, 0);
 
         let dispatches = runtime
-            .dispatch_block_queue_notifications(&mut memory)
+            .dispatch_block_queue_notifications(&mut memory, &mut mmio_dispatcher)
             .expect("block dispatch result should allocate");
 
         let device_dispatch = &dispatches.as_slice()[0];
@@ -1476,13 +1514,14 @@ mod tests {
                 .expect("boot resources should assemble");
         let parts = resources.into_parts();
         let mut memory = parts.memory;
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
         let mut runtime = parts.runtime;
-        configure_boot_block_queue(&mut runtime, 0, TEST_USED_RING);
+        configure_boot_block_queue(&mut runtime, &mut mmio_dispatcher, 0, TEST_USED_RING);
         write_partially_invalid_queued_flush_request(&mut memory);
-        notify_boot_block_queue(&mut runtime, 0);
+        notify_boot_block_queue(&mut runtime, &mut mmio_dispatcher, 0);
 
         let dispatches = runtime
-            .dispatch_block_queue_notifications(&mut memory)
+            .dispatch_block_queue_notifications(&mut memory, &mut mmio_dispatcher)
             .expect("block dispatch result should allocate");
 
         assert!(dispatches.needs_queue_interrupt());
@@ -1500,7 +1539,12 @@ mod tests {
         assert_eq!(completed.successful_requests(), 1);
         assert!(completed.needs_queue_interrupt());
         assert_eq!(
-            read_boot_block_mmio_u32(&mut runtime, 0, VirtioMmioRegister::InterruptStatus),
+            read_boot_block_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                0,
+                VirtioMmioRegister::InterruptStatus
+            ),
             DeviceInterruptKind::Queue.status().bits()
         );
         assert_eq!(
@@ -1520,11 +1564,11 @@ mod tests {
                 .expect("boot resources should assemble");
         let parts = resources.into_parts();
         let mut memory = parts.memory;
+        let mut mmio_dispatcher = MmioDispatcher::new();
         let mut runtime = parts.runtime;
-        runtime.mmio_dispatcher = MmioDispatcher::new();
 
         let dispatches = runtime
-            .dispatch_block_queue_notifications(&mut memory)
+            .dispatch_block_queue_notifications(&mut memory, &mut mmio_dispatcher)
             .expect("block dispatch result should allocate");
 
         let error = dispatches.as_slice()[0]
@@ -1552,13 +1596,11 @@ mod tests {
         let mut memory = parts.memory;
         let mut runtime = parts.runtime;
         let region = runtime.block_devices[0].registration.region();
-        runtime.mmio_dispatcher = MmioDispatcher::new();
-        runtime
-            .mmio_dispatcher
+        let mut mmio_dispatcher = MmioDispatcher::new();
+        mmio_dispatcher
             .insert_region(region.id(), region.range().start(), region.range().size())
             .expect("replacement region should insert");
-        runtime
-            .mmio_dispatcher
+        mmio_dispatcher
             .register_handler(
                 region.id(),
                 SerialMmioDevice::new(SharedSerialOutputBuffer::default()),
@@ -1566,7 +1608,7 @@ mod tests {
             .expect("serial handler should register under block region id for test");
 
         let dispatches = runtime
-            .dispatch_block_queue_notifications(&mut memory)
+            .dispatch_block_queue_notifications(&mut memory, &mut mmio_dispatcher)
             .expect("block dispatch result should allocate");
 
         let error = dispatches.as_slice()[0]
@@ -1598,14 +1640,15 @@ mod tests {
         .expect("boot resources should assemble");
         let parts = resources.into_parts();
         let mut memory = parts.memory;
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
         let mut runtime = parts.runtime;
-        configure_boot_block_queue(&mut runtime, 0, TEST_USED_RING);
-        configure_boot_block_queue(&mut runtime, 1, TEST_USED_RING);
+        configure_boot_block_queue(&mut runtime, &mut mmio_dispatcher, 0, TEST_USED_RING);
+        configure_boot_block_queue(&mut runtime, &mut mmio_dispatcher, 1, TEST_USED_RING);
         write_queued_read_request(&mut memory);
-        notify_boot_block_queue(&mut runtime, 1);
+        notify_boot_block_queue(&mut runtime, &mut mmio_dispatcher, 1);
 
         let dispatches = runtime
-            .dispatch_block_queue_notifications(&mut memory)
+            .dispatch_block_queue_notifications(&mut memory, &mut mmio_dispatcher)
             .expect("block dispatch result should allocate");
 
         assert_eq!(dispatches.len(), 2);
@@ -1634,11 +1677,21 @@ mod tests {
             [0]
         );
         assert_eq!(
-            read_boot_block_mmio_u32(&mut runtime, 0, VirtioMmioRegister::InterruptStatus),
+            read_boot_block_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                0,
+                VirtioMmioRegister::InterruptStatus
+            ),
             0
         );
         assert_eq!(
-            read_boot_block_mmio_u32(&mut runtime, 1, VirtioMmioRegister::InterruptStatus),
+            read_boot_block_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                1,
+                VirtioMmioRegister::InterruptStatus
+            ),
             DeviceInterruptKind::Queue.status().bits()
         );
         assert_eq!(
