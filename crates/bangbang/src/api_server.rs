@@ -12,15 +12,18 @@ use std::time::{Duration, Instant};
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_api::http::{
     ApiRequest, DriveCacheType as ApiDriveCacheType, DriveConfigRequest,
-    DriveIoEngine as ApiDriveIoEngine, HttpResponse, RequestError, parse_request,
-    request_total_len,
+    DriveIoEngine as ApiDriveIoEngine, HttpResponse, MachineConfigRequest, RequestError,
+    parse_request, request_total_len,
 };
 use bangbang_runtime::block::{DriveCacheType, DriveConfigInput, DriveIoEngine};
+use bangbang_runtime::machine::{
+    MachineConfigCpuTemplate as RuntimeMachineConfigCpuTemplate,
+    MachineConfigHugePages as RuntimeMachineConfigHugePages, MachineConfigInput,
+};
 use bangbang_runtime::{VmmAction, VmmController, VmmData};
 
 const READ_CHUNK_SIZE: usize = 4096;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
-const MACHINE_CONFIG_UNSUPPORTED_MESSAGE: &str = "machine configuration API is not supported yet.";
 static NEXT_TEMP_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -390,9 +393,12 @@ fn handle_api_request(request: ApiRequest, vmm: &mut VmmController) -> HttpRespo
             handle_instance_info(vmm.handle_action(VmmAction::GetVmInstanceInfo))
         }
         ApiRequest::GetVersion => handle_vmm_version(vmm.handle_action(VmmAction::GetVmmVersion)),
-        ApiRequest::GetMachineConfig | ApiRequest::PutMachineConfig(_) => {
-            HttpResponse::fault(MACHINE_CONFIG_UNSUPPORTED_MESSAGE)
+        ApiRequest::GetMachineConfig => {
+            handle_machine_config(vmm.handle_action(VmmAction::GetMachineConfig))
         }
+        ApiRequest::PutMachineConfig(config) => handle_empty(vmm.handle_action(
+            VmmAction::PutMachineConfig(machine_config_input_from_request(config.as_ref())),
+        )),
         ApiRequest::PutDrive(config) => handle_empty(vmm.handle_action(VmmAction::PutDrive(
             drive_config_input_from_request(config.as_ref()),
         ))),
@@ -402,7 +408,7 @@ fn handle_api_request(request: ApiRequest, vmm: &mut VmmController) -> HttpRespo
 fn handle_vmm_version(result: Result<VmmData, bangbang_runtime::VmmActionError>) -> HttpResponse {
     match result {
         Ok(VmmData::VmmVersion(version)) => HttpResponse::version(&version),
-        Ok(VmmData::Empty | VmmData::InstanceInformation(_)) => {
+        Ok(VmmData::Empty | VmmData::InstanceInformation(_) | VmmData::MachineConfiguration(_)) => {
             HttpResponse::fault("version request returned unexpected VMM data.")
         }
         Err(err) => HttpResponse::fault(&err.to_string()),
@@ -415,8 +421,26 @@ fn handle_instance_info(result: Result<VmmData, bangbang_runtime::VmmActionError
             let state = info.state.to_string();
             HttpResponse::instance_info(&info.id, &state, &info.vmm_version, &info.app_name)
         }
-        Ok(VmmData::Empty | VmmData::VmmVersion(_)) => {
+        Ok(VmmData::Empty | VmmData::VmmVersion(_) | VmmData::MachineConfiguration(_)) => {
             HttpResponse::fault("instance info request returned unexpected VMM data.")
+        }
+        Err(err) => HttpResponse::fault(&err.to_string()),
+    }
+}
+
+fn handle_machine_config(
+    result: Result<VmmData, bangbang_runtime::VmmActionError>,
+) -> HttpResponse {
+    match result {
+        Ok(VmmData::MachineConfiguration(config)) => HttpResponse::machine_config(
+            config.vcpu_count(),
+            config.mem_size_mib(),
+            config.smt(),
+            config.track_dirty_pages(),
+            machine_config_huge_pages_name(config.huge_pages()),
+        ),
+        Ok(VmmData::Empty | VmmData::VmmVersion(_) | VmmData::InstanceInformation(_)) => {
+            HttpResponse::fault("machine config request returned unexpected VMM data.")
         }
         Err(err) => HttpResponse::fault(&err.to_string()),
     }
@@ -425,10 +449,39 @@ fn handle_instance_info(result: Result<VmmData, bangbang_runtime::VmmActionError
 fn handle_empty(result: Result<VmmData, bangbang_runtime::VmmActionError>) -> HttpResponse {
     match result {
         Ok(VmmData::Empty) => HttpResponse::no_content(),
-        Ok(VmmData::InstanceInformation(_) | VmmData::VmmVersion(_)) => {
-            HttpResponse::fault("no-content request returned unexpected VMM data.")
-        }
+        Ok(
+            VmmData::InstanceInformation(_)
+            | VmmData::VmmVersion(_)
+            | VmmData::MachineConfiguration(_),
+        ) => HttpResponse::fault("no-content request returned unexpected VMM data."),
         Err(err) => HttpResponse::fault(&err.to_string()),
+    }
+}
+
+fn machine_config_input_from_request(config: &MachineConfigRequest) -> MachineConfigInput {
+    let mut input = MachineConfigInput::new(config.vcpu_count(), config.mem_size_mib())
+        .with_smt(config.smt())
+        .with_track_dirty_pages(config.track_dirty_pages())
+        .with_huge_pages(match config.huge_pages() {
+            bangbang_api::http::MachineConfigHugePages::None => RuntimeMachineConfigHugePages::None,
+            bangbang_api::http::MachineConfigHugePages::TwoM => RuntimeMachineConfigHugePages::TwoM,
+        });
+
+    if let Some(cpu_template) = config.cpu_template() {
+        input = input.with_cpu_template(match cpu_template {
+            bangbang_api::http::MachineConfigCpuTemplate::None => {
+                RuntimeMachineConfigCpuTemplate::None
+            }
+        });
+    }
+
+    input
+}
+
+fn machine_config_huge_pages_name(huge_pages: RuntimeMachineConfigHugePages) -> &'static str {
+    match huge_pages {
+        RuntimeMachineConfigHugePages::None => "None",
+        RuntimeMachineConfigHugePages::TwoM => "2M",
     }
 }
 
@@ -642,7 +695,7 @@ mod tests {
     }
 
     #[test]
-    fn returns_fault_for_machine_config_until_storage_exists() {
+    fn dispatches_machine_config_requests_through_vmm_controller() {
         let mut vmm = test_controller();
 
         let get_response = handle_request_bytes(
@@ -650,17 +703,15 @@ mod tests {
             &mut vmm,
         );
 
-        assert_eq!(
-            get_response.status(),
-            bangbang_api::http::StatusCode::BadRequest
-        );
-        assert_eq!(
-            get_response.body(),
-            r#"{"fault_message":"machine configuration API is not supported yet."}"#
-        );
+        assert_eq!(get_response.status(), bangbang_api::http::StatusCode::Ok);
+        assert!(get_response.body().contains(r#""vcpu_count":1"#));
+        assert!(get_response.body().contains(r#""mem_size_mib":128"#));
+        assert!(get_response.body().contains(r#""smt":false"#));
+        assert!(get_response.body().contains(r#""track_dirty_pages":false"#));
+        assert!(get_response.body().contains(r#""huge_pages":"None""#));
         assert!(vmm.drive_configs().is_empty());
 
-        let body = r#"{"vcpu_count":1,"mem_size_mib":128}"#;
+        let body = r#"{"vcpu_count":2,"mem_size_mib":256}"#;
         let request = format!(
             "PUT /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
@@ -670,13 +721,53 @@ mod tests {
 
         assert_eq!(
             put_response.status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        assert_eq!(put_response.body(), "");
+        assert_eq!(vmm.machine_config().vcpu_count(), 2);
+        assert_eq!(vmm.machine_config().mem_size_mib(), 256);
+        assert!(vmm.drive_configs().is_empty());
+
+        let get_response = handle_request_bytes(
+            b"GET /machine-config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &mut vmm,
+        );
+
+        assert!(get_response.body().contains(r#""vcpu_count":2"#));
+        assert!(get_response.body().contains(r#""mem_size_mib":256"#));
+    }
+
+    #[test]
+    fn invalid_machine_config_request_does_not_mutate_vmm_state() {
+        let mut vmm = test_controller();
+        let body = r#"{"vcpu_count":2,"mem_size_mib":256}"#;
+        let request = format!(
+            "PUT /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let invalid_body = r#"{"vcpu_count":4,"mem_size_mib":512,"track_dirty_pages":true}"#;
+        let invalid_request = format!(
+            "PUT /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{invalid_body}",
+            invalid_body.len()
+        );
+
+        let response = handle_request_bytes(invalid_request.as_bytes(), &mut vmm);
+
+        assert_eq!(
+            response.status(),
             bangbang_api::http::StatusCode::BadRequest
         );
         assert_eq!(
-            put_response.body(),
-            r#"{"fault_message":"machine configuration API is not supported yet."}"#
+            response.body(),
+            r#"{"fault_message":"Malformed HTTP request."}"#
         );
-        assert!(vmm.drive_configs().is_empty());
+        assert_eq!(vmm.machine_config().vcpu_count(), 2);
+        assert_eq!(vmm.machine_config().mem_size_mib(), 256);
     }
 
     #[test]
@@ -794,11 +885,11 @@ mod tests {
     }
 
     #[test]
-    fn returns_machine_config_fault_over_unix_socket() {
+    fn configures_machine_config_over_unix_socket() {
         let path = unique_socket_path("machine-config");
         let server = ApiServer::bind(&path).expect("server should bind");
         let mut client = UnixStream::connect(&path).expect("client should connect");
-        let body = r#"{"vcpu_count":1,"mem_size_mib":128}"#;
+        let body = r#"{"vcpu_count":2,"mem_size_mib":256}"#;
         let request = format!(
             "PUT /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
@@ -817,11 +908,11 @@ mod tests {
             .read_to_string(&mut response)
             .expect("client should read response");
 
-        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        assert!(
-            response
-                .contains(r#"{"fault_message":"machine configuration API is not supported yet."}"#)
-        );
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(response.contains("Content-Length: 0\r\n"));
+        assert!(response.ends_with("\r\n\r\n"));
+        assert_eq!(vmm.machine_config().vcpu_count(), 2);
+        assert_eq!(vmm.machine_config().mem_size_mib(), 256);
         assert!(vmm.drive_configs().is_empty());
     }
 

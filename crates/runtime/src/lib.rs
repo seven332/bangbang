@@ -4,6 +4,7 @@ pub mod block;
 pub mod boot;
 pub mod fdt;
 pub mod interrupt;
+pub mod machine;
 pub mod memory;
 pub mod mmio;
 pub mod virtio_mmio;
@@ -57,6 +58,8 @@ impl InstanceInfo {
 pub enum VmmAction {
     GetVmmVersion,
     GetVmInstanceInfo,
+    GetMachineConfig,
+    PutMachineConfig(machine::MachineConfigInput),
     PutDrive(block::DriveConfigInput),
 }
 
@@ -65,6 +68,8 @@ impl VmmAction {
         match self {
             Self::GetVmmVersion => "GetVmmVersion",
             Self::GetVmInstanceInfo => "GetVmInstanceInfo",
+            Self::GetMachineConfig => "GetMachineConfig",
+            Self::PutMachineConfig(_) => "PutMachineConfig",
             Self::PutDrive(_) => "PutDrive",
         }
     }
@@ -75,6 +80,7 @@ pub enum VmmData {
     Empty,
     VmmVersion(String),
     InstanceInformation(InstanceInfo),
+    MachineConfiguration(machine::MachineConfig),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +91,7 @@ pub enum VmmActionError {
         state: InstanceState,
     },
     DriveConfig(block::DriveConfigError),
+    MachineConfig(machine::MachineConfigError),
 }
 
 impl fmt::Display for VmmActionError {
@@ -100,6 +107,7 @@ impl fmt::Display for VmmActionError {
                 )
             }
             Self::DriveConfig(err) => write!(f, "{err}"),
+            Self::MachineConfig(err) => write!(f, "{err}"),
         }
     }
 }
@@ -108,6 +116,7 @@ impl std::error::Error for VmmActionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::DriveConfig(err) => Some(err),
+            Self::MachineConfig(err) => Some(err),
             Self::UnsupportedAction(_) | Self::UnsupportedState { .. } => None,
         }
     }
@@ -116,6 +125,7 @@ impl std::error::Error for VmmActionError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmmController {
     instance_info: InstanceInfo,
+    machine_config: machine::MachineConfig,
     drive_configs: block::DriveConfigs,
 }
 
@@ -132,6 +142,7 @@ impl VmmController {
                 vmm_version,
                 app_name,
             ),
+            machine_config: machine::MachineConfig::default(),
             drive_configs: block::DriveConfigs::new(),
         }
     }
@@ -144,6 +155,10 @@ impl VmmController {
         self.drive_configs.as_slice()
     }
 
+    pub const fn machine_config(&self) -> machine::MachineConfig {
+        self.machine_config
+    }
+
     pub fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
         let action_name = action.name();
         match action {
@@ -152,6 +167,19 @@ impl VmmController {
             }
             VmmAction::GetVmInstanceInfo => {
                 Ok(VmmData::InstanceInformation(self.instance_info.clone()))
+            }
+            VmmAction::GetMachineConfig => Ok(VmmData::MachineConfiguration(self.machine_config)),
+            VmmAction::PutMachineConfig(config) => {
+                if self.instance_info.state != InstanceState::NotStarted {
+                    return Err(VmmActionError::UnsupportedState {
+                        action: action_name,
+                        state: self.instance_info.state,
+                    });
+                }
+
+                self.machine_config = config.validate().map_err(VmmActionError::MachineConfig)?;
+
+                Ok(VmmData::Empty)
             }
             VmmAction::PutDrive(config) => {
                 if self.instance_info.state != InstanceState::NotStarted {
@@ -203,6 +231,7 @@ mod tests {
     use super::{
         BackendError, InstanceState, VmmAction, VmmActionError, VmmController, VmmData,
         block::{DriveConfigError, DriveConfigInput},
+        machine::{DEFAULT_MEM_SIZE_MIB, DEFAULT_VCPU_COUNT, MachineConfigInput},
     };
 
     fn drive_input(id: &str, path: &str, is_root_device: bool) -> DriveConfigInput {
@@ -233,6 +262,11 @@ mod tests {
         assert_eq!(info.state, InstanceState::NotStarted);
         assert_eq!(info.vmm_version, "0.1.0");
         assert_eq!(info.app_name, "bangbang");
+        assert_eq!(controller.machine_config().vcpu_count(), DEFAULT_VCPU_COUNT);
+        assert_eq!(
+            controller.machine_config().mem_size_mib(),
+            DEFAULT_MEM_SIZE_MIB
+        );
         assert!(controller.drive_configs().is_empty());
     }
 
@@ -261,6 +295,91 @@ mod tests {
         assert_eq!(info.state, InstanceState::NotStarted);
         assert_eq!(info.vmm_version, "0.1.0");
         assert_eq!(info.app_name, "bangbang");
+    }
+
+    #[test]
+    fn handles_get_machine_config() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
+        let data = controller
+            .handle_action(VmmAction::GetMachineConfig)
+            .expect("machine config should be returned");
+
+        let VmmData::MachineConfiguration(config) = data else {
+            panic!("expected machine config");
+        };
+        assert_eq!(config.vcpu_count(), DEFAULT_VCPU_COUNT);
+        assert_eq!(config.mem_size_mib(), DEFAULT_MEM_SIZE_MIB);
+        assert!(!config.smt());
+        assert_eq!(config.cpu_template(), None);
+        assert!(!config.track_dirty_pages());
+    }
+
+    #[test]
+    fn handles_put_machine_config() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
+        assert_eq!(
+            controller.handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 256))),
+            Ok(VmmData::Empty)
+        );
+
+        assert_eq!(controller.machine_config().vcpu_count(), 2);
+        assert_eq!(controller.machine_config().mem_size_mib(), 256);
+    }
+
+    #[test]
+    fn put_machine_config_replaces_previous_config() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 256)))
+            .expect("initial machine config should be stored");
+
+        controller
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(4, 512)))
+            .expect("replacement machine config should be stored");
+
+        assert_eq!(controller.machine_config().vcpu_count(), 4);
+        assert_eq!(controller.machine_config().mem_size_mib(), 512);
+    }
+
+    #[test]
+    fn put_machine_config_rejects_invalid_input_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 256)))
+            .expect("initial machine config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(0, 512)))
+            .expect_err("invalid machine config should fail");
+
+        assert_eq!(err.to_string(), "machine vcpu_count must be in 1..=32");
+        assert_eq!(controller.machine_config().vcpu_count(), 2);
+        assert_eq!(controller.machine_config().mem_size_mib(), 256);
+    }
+
+    #[test]
+    fn put_machine_config_rejects_running_state_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 256)))
+            .expect("initial machine config should be stored");
+        controller.instance_info.state = InstanceState::Running;
+
+        let err = controller
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(4, 512)))
+            .expect_err("running machine config should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::UnsupportedState {
+                action: "PutMachineConfig",
+                state: InstanceState::Running,
+            }
+        );
+        assert_eq!(controller.machine_config().vcpu_count(), 2);
+        assert_eq!(controller.machine_config().mem_size_mib(), 256);
     }
 
     #[test]
@@ -409,6 +528,15 @@ mod tests {
         let err = VmmActionError::DriveConfig(DriveConfigError::EmptyPathOnHost);
 
         assert_eq!(err.to_string(), "drive path_on_host must not be empty");
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn displays_machine_config_error() {
+        let err =
+            VmmActionError::MachineConfig(super::machine::MachineConfigError::InvalidMemorySize);
+
+        assert_eq!(err.to_string(), "machine mem_size_mib must not be zero");
         assert!(err.source().is_some());
     }
 
