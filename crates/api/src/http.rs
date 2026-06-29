@@ -860,9 +860,12 @@ mod tests {
         let body = r#"{"action_type":"SendCtrlAltDel"}"#;
         let request = request_with_body("PUT", "/actions", body);
 
+        let err = parse_request(&request).expect_err("SendCtrlAltDel should be unsupported");
+
+        assert_eq!(err, RequestError::SendCtrlAltDelUnsupported);
         assert_eq!(
-            parse_request(&request),
-            Err(RequestError::SendCtrlAltDelUnsupported)
+            err.fault_message(),
+            "SendCtrlAltDel does not supported on aarch64."
         );
     }
 
