@@ -618,8 +618,9 @@ mod tests {
     };
     use crate::VmmAction;
     use crate::block::{
-        DriveConfigInput, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, VIRTIO_BLOCK_REQUEST_TYPE_IN,
-        VIRTIO_BLOCK_SECTOR_SIZE, VIRTIO_BLOCK_STATUS_OK,
+        DriveConfigInput, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
+        VIRTIO_BLOCK_REQUEST_TYPE_IN, VIRTIO_BLOCK_SECTOR_SIZE, VIRTIO_BLOCK_STATUS_OK,
+        VIRTIO_BLOCK_STATUS_SIZE,
     };
     use crate::boot::{BootPayloadKind, BootSourceConfigInput, BootSourceLoadError};
     use crate::fdt::{Arm64FdtError, Arm64FdtGic, Arm64FdtRegion, Arm64FdtTimerInterrupts};
@@ -1008,6 +1009,21 @@ mod tests {
         );
         write_descriptor(memory, 2, TestDescriptor::writable(STATUS_ADDR, 1, None));
         write_available_heads(memory, &[0]);
+    }
+
+    fn write_partially_invalid_queued_flush_request(memory: &mut crate::memory::GuestMemory) {
+        write_request_header(memory, HEADER_ADDR, VIRTIO_BLOCK_REQUEST_TYPE_FLUSH, 0);
+        write_descriptor(
+            memory,
+            0,
+            TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+        );
+        write_descriptor(
+            memory,
+            1,
+            TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+        );
+        write_available_heads(memory, &[0, TEST_QUEUE_SIZE]);
     }
 
     fn write_request_header(
@@ -1443,6 +1459,50 @@ mod tests {
         assert_eq!(error.drained_notifications(), [0]);
         assert!(error.completed_dispatch().is_none());
         assert!(!device_dispatch.needs_queue_interrupt());
+    }
+
+    #[test]
+    fn boot_runtime_block_notification_dispatch_preserves_partial_error_interrupt_intent() {
+        let kernel = temp_file("kernel-block-partial-error-dispatch", &arm64_image());
+        let block = temp_file("block-partial-error-dispatch", &[0x5a; 512]);
+        let mut controller = controller_with_kernel(kernel.path());
+        add_drive(&mut controller, "rootfs", block.path());
+        let resources =
+            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[line(32)]))
+                .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut runtime = parts.runtime;
+        configure_boot_block_queue(&mut runtime, 0, TEST_USED_RING);
+        write_partially_invalid_queued_flush_request(&mut memory);
+        notify_boot_block_queue(&mut runtime, 0);
+
+        let dispatches = runtime
+            .dispatch_block_queue_notifications(&mut memory)
+            .expect("block dispatch result should allocate");
+
+        assert!(dispatches.needs_queue_interrupt());
+        let device_dispatch = &dispatches.as_slice()[0];
+        assert!(device_dispatch.needs_queue_interrupt());
+        let error = device_dispatch
+            .outcome()
+            .dispatch_error()
+            .expect("partial queue failure should be preserved as a device error");
+        assert_eq!(error.drained_notifications(), [0]);
+        let completed = error
+            .completed_dispatch()
+            .expect("partial queue failure should preserve completed dispatch metadata");
+        assert_eq!(completed.processed_requests(), 1);
+        assert_eq!(completed.successful_requests(), 1);
+        assert!(completed.needs_queue_interrupt());
+        assert_eq!(
+            read_boot_block_mmio_u32(&mut runtime, 0, VirtioMmioRegister::InterruptStatus),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        assert_eq!(
+            read_guest_bytes(&memory, STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE as usize),
+            [VIRTIO_BLOCK_STATUS_OK]
+        );
     }
 
     #[test]
