@@ -2,6 +2,7 @@
 
 use std::collections::TryReserveError;
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 use crate::mmio::{
     MmioAccess, MmioAccessBytes, MmioAccessBytesError, MmioHandler, MmioHandlerError,
@@ -77,6 +78,59 @@ impl SerialOutput for SerialOutputBuffer {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct SharedSerialOutputBuffer {
+    buffer: Arc<Mutex<SerialOutputBuffer>>,
+}
+
+impl SharedSerialOutputBuffer {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            buffer: Arc::new(Mutex::new(SerialOutputBuffer::new(limit))),
+        }
+    }
+
+    pub fn bytes(&self) -> Result<Vec<u8>, SerialOutputError> {
+        let buffer = self
+            .buffer
+            .lock()
+            .map_err(|_| SerialOutputError::lock_poisoned())?;
+
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(buffer.bytes().len())
+            .map_err(SerialOutputError::from_try_reserve)?;
+        bytes.extend_from_slice(buffer.bytes());
+        Ok(bytes)
+    }
+
+    pub fn limit(&self) -> Result<usize, SerialOutputError> {
+        let buffer = self
+            .buffer
+            .lock()
+            .map_err(|_| SerialOutputError::lock_poisoned())?;
+
+        Ok(buffer.limit())
+    }
+}
+
+impl Default for SharedSerialOutputBuffer {
+    fn default() -> Self {
+        Self::new(SERIAL_OUTPUT_BUFFER_DEFAULT_LIMIT)
+    }
+}
+
+impl SerialOutput for SharedSerialOutputBuffer {
+    fn write_byte(&mut self, byte: u8) -> Result<(), SerialOutputError> {
+        let mut buffer = self
+            .buffer
+            .lock()
+            .map_err(|_| SerialOutputError::lock_poisoned())?;
+
+        buffer.write_byte(byte)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DiscardSerialOutput;
 
@@ -110,6 +164,10 @@ impl SerialOutputError {
         Self::new(format!(
             "serial output buffer reached its {limit}-byte limit"
         ))
+    }
+
+    fn lock_poisoned() -> Self {
+        Self::new("serial output buffer lock was poisoned")
     }
 }
 
@@ -436,7 +494,7 @@ mod tests {
         SERIAL_MODEM_CONTROL_REGISTER_OFFSET, SERIAL_MODEM_STATUS_REGISTER_OFFSET,
         SERIAL_OUTPUT_BUFFER_DEFAULT_LIMIT, SERIAL_SCRATCH_REGISTER_OFFSET,
         SERIAL_TRANSMIT_REGISTER_OFFSET, SerialMmioDevice, SerialMmioError, SerialOutput,
-        SerialOutputBuffer, SerialOutputError,
+        SerialOutputBuffer, SerialOutputError, SharedSerialOutputBuffer,
     };
     use crate::memory::GuestAddress;
     use crate::mmio::{
@@ -701,6 +759,27 @@ mod tests {
         let device = SerialMmioDevice::buffered();
 
         assert_eq!(device.output().limit(), SERIAL_OUTPUT_BUFFER_DEFAULT_LIMIT);
+    }
+
+    #[test]
+    fn shared_output_buffer_clones_share_bounded_output() {
+        let mut first = SharedSerialOutputBuffer::new(1);
+        let mut second = first.clone();
+
+        first
+            .write_byte(b'a')
+            .expect("first byte should fit shared buffer");
+        let err = second
+            .write_byte(b'b')
+            .expect_err("shared buffer should enforce one-byte limit");
+
+        assert_eq!(
+            err.message(),
+            "serial output buffer reached its 1-byte limit"
+        );
+        assert_eq!(first.bytes().expect("shared bytes should read"), b"a");
+        assert_eq!(second.bytes().expect("shared bytes should read"), b"a");
+        assert_eq!(first.limit().expect("shared limit should read"), 1);
     }
 
     #[derive(Debug)]

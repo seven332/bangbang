@@ -17,7 +17,7 @@ preparation and MMIO registration helpers, an internal virtio-block
 config-space capacity model, an internal virtio-block request parser, single-request
 executor, queue dispatcher, MMIO queue-state bridge, resettable activation
 state, notification/interrupt-status dispatch helper, an internal TX-only
-serial MMIO output device model, and a minimal
+serial MMIO output device model with shared bounded capture support, and a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
 create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding,
 registry resolution, vCPU exit classification, single resolved HVF MMIO
@@ -37,7 +37,7 @@ available-ring read model, used-ring write model, and internal virtio-block
 queue construction, drain, resettable active queue ownership, and active queue
 notification dispatch helper with virtio-mmio queue interrupt-status updates
 for future device handlers, internal boot-resource assembly from stored VM
-configuration, an internal
+configuration with optional serial and block MMIO registration, an internal
 backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, and an initial process startup argument model.
 There is no broader API request body model beyond the initial boot-source,
@@ -505,7 +505,9 @@ with `compatible = "ns16550a"`, `reg = [base, size]`,
 FDT configuration validates that the serial region is non-empty, does not
 overflow, does not overlap guest RAM, GIC distributor or redistributor ranges,
 or any virtio-mmio range, and that the serial interrupt line is an SPI INTID
-before encoding it.
+before encoding it. The internal boot-resource assembly path can register one
+optional serial MMIO handler and pass matching serial FDT metadata from the
+same placement and interrupt line.
 
 FDT writes first reject mismatches between the layout used to describe guest RAM
 and the allocated guest memory object. FDT bytes are then built before guest
@@ -523,16 +525,19 @@ controller configuration and caller-provided backend boot metadata. This path
 requires a configured boot source, applies `mem_size_mib` to the aarch64 DRAM
 layout, allocates guest memory, loads the arm64 Linux `Image` and optional
 initrd, prepares configured block devices, registers their virtio-mmio regions
-in a fresh internal `MmioDispatcher`, pairs those registrations with supplied
-SPI interrupt lines, and writes the arm64 FDT.
+in a fresh internal `MmioDispatcher`, optionally registers one TX-only serial
+MMIO handler in the same dispatcher, pairs block registrations with supplied
+SPI interrupt lines, and writes the arm64 FDT with matching serial and
+virtio-mmio metadata.
 
 The assembled bundle owns the guest memory, loaded boot metadata, FDT write
-metadata, MMIO dispatcher, and block/FDT device metadata needed by later HVF
-startup wiring. It fails with typed errors for missing boot source, memory size
+metadata, MMIO dispatcher, optional serial metadata/output sink, and block/FDT
+device metadata needed by later HVF startup wiring. It fails with typed errors
+for missing boot source, memory size
 overflow or a memory size above the arm64 architectural maximum,
 layout/allocation failure, boot-source loading failure, block-device preparation
-failure, MMIO registration failure, interrupt-line count mismatch, or FDT write
-failure.
+failure, serial or block MMIO registration failure, interrupt-line count
+mismatch, or FDT write failure.
 
 This is still an internal preparation step. The public API does not invoke it,
 `PUT /actions` still returns the documented unsupported fault, and bangbang does
@@ -566,13 +571,14 @@ errors for unsupported widths, invalid offsets, read-only writes, and output
 sink failures. Output is captured through an injected sink instead of global
 state, and the provided in-memory sink has an explicit byte limit, so
 independent device instances do not share guest console data or grow host
-memory without a caller-chosen bound. The internal arm64 FDT builder can
-describe a caller-provided serial MMIO descriptor as a Firecracker-shaped
-`uart@...` node, but this is still internal groundwork only: startup does not
-register the serial MMIO handler or pass serial FDT metadata yet, and the
-public `/serial` endpoint, kernel `earlycon` wiring, serial input/RX, rate
-limiting, metrics, host file output configuration, and boot-smoke use are still
-deferred.
+memory without a caller-chosen bound. A shared bounded sink lets the internal
+boot-resource assembly path register a serial handler while retaining an output
+handle for later startup wiring or tests. The internal arm64 FDT builder can
+describe the same serial MMIO descriptor as a Firecracker-shaped `uart@...`
+node, but this is still internal groundwork only: the public `/serial`
+endpoint, kernel `earlycon` wiring, runner-loop console capture, serial
+input/RX, rate limiting, metrics, host file output configuration, and
+boot-smoke use are still deferred.
 
 The runtime crate can decode checked MMIO operations into typed virtio-mmio
 generic-register or device-configuration accesses for the Firecracker `v1.16.0`
