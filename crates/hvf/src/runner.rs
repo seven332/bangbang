@@ -10,7 +10,7 @@ use bangbang_runtime::mmio::{MmioDispatchOutcome, MmioDispatcher};
 use crate::backend::HvfBackend;
 use crate::exit::{HvfResolvedMmioAccess, HvfVcpuExit, HvfVcpuExitResolveError};
 use crate::mmio::HvfMmioDispatchError;
-use crate::vcpu::{HvfArm64BootRegisters, HvfVcpuOwner};
+use crate::vcpu::{HvfArm64BootRegisters, HvfSystemRegister, HvfVcpuOwner};
 
 const RUNNER_SHUT_DOWN_MESSAGE: &str = "vCPU runner is shut down";
 const RUNNER_SHUTTING_DOWN_MESSAGE: &str = "vCPU runner shutdown is already in progress";
@@ -24,6 +24,7 @@ const BOOT_REGISTER_SETUP_FAILED_MESSAGE: &str =
 const BOOT_REGISTERS_ALREADY_CONFIGURED_MESSAGE: &str =
     "vCPU runner boot registers are already configured";
 const RUN_ALREADY_STARTED_MESSAGE: &str = "vCPU runner has already started a run";
+const METADATA_READ_IN_FLIGHT_MESSAGE: &str = "vCPU runner already has metadata read in flight";
 const RUNNER_STATE_POISONED_MESSAGE: &str = "vCPU runner state lock is poisoned";
 const MMIO_DISPATCHER_BUSY_MESSAGE: &str = "vCPU runner MMIO dispatcher lock is busy";
 const MMIO_DISPATCHER_POISONED_MESSAGE: &str = "vCPU runner MMIO dispatcher lock is poisoned";
@@ -120,6 +121,7 @@ struct RunnerHandleState {
     in_flight_runs: usize,
     mmio_dispatch_in_flight: bool,
     boot_register_setup_in_flight: bool,
+    metadata_read_in_flight: bool,
     boot_register_setup_failed: bool,
     boot_registers_configured: bool,
     run_started: bool,
@@ -141,6 +143,9 @@ enum RunnerCommand {
         access: HvfResolvedMmioAccess,
         dispatcher: SharedMmioDispatcher,
         response_sender: mpsc::Sender<Result<MmioDispatchOutcome, HvfVcpuRunnerError>>,
+    },
+    ReadMpidrEl1 {
+        response_sender: mpsc::Sender<Result<u64, HvfVcpuRunnerError>>,
     },
     Shutdown {
         response_sender: mpsc::Sender<Result<(), HvfVcpuRunnerError>>,
@@ -165,6 +170,11 @@ trait RunnerVcpu {
         access: HvfResolvedMmioAccess,
         dispatcher: &mut MmioDispatcher,
     ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError>;
+    fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
+        Err(BackendError::InvalidState(
+            "vCPU does not support MPIDR_EL1 reads",
+        ))
+    }
     fn destroy(&mut self) -> Result<(), BackendError>;
 }
 
@@ -204,6 +214,10 @@ impl RunnerVcpu for RealRunnerVcpu {
         self.owner
             .dispatch_mmio_access(access, dispatcher)
             .map_err(HvfVcpuRunnerError::MmioDispatch)
+    }
+
+    fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
+        self.owner.get_system_register(HvfSystemRegister::MPIDR_EL1)
     }
 
     fn destroy(&mut self) -> Result<(), BackendError> {
@@ -289,6 +303,16 @@ impl<'vm> HvfVcpuRunner<'vm> {
         self.cancel_vcpu()
     }
 
+    /// Read the primary vCPU MPIDR on the vCPU-owning runner thread.
+    pub fn mpidr_el1(&self) -> Result<u64, HvfVcpuRunnerError> {
+        let (response_sender, response_receiver) = mpsc::channel();
+        let _in_flight_read = self.start_mpidr_el1_read(response_sender)?;
+
+        response_receiver
+            .recv()
+            .map_err(|_| HvfVcpuRunnerError::ChannelClosed(RESPONSE_CHANNEL_CLOSED_MESSAGE))?
+    }
+
     pub fn shutdown(&self) -> Result<(), HvfVcpuRunnerError> {
         let (command_sender, should_cancel) = match self.prepare_shutdown() {
             Ok(prepared_shutdown) => prepared_shutdown,
@@ -334,6 +358,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 in_flight_runs: 0,
                 mmio_dispatch_in_flight: false,
                 boot_register_setup_in_flight: false,
+                metadata_read_in_flight: false,
                 boot_register_setup_failed: false,
                 boot_registers_configured: false,
                 run_started: false,
@@ -367,6 +392,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.boot_register_setup_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
                 BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.metadata_read_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                METADATA_READ_IN_FLIGHT_MESSAGE,
             ));
         }
         if state.run_started {
@@ -419,6 +449,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE,
             ));
         }
+        if state.metadata_read_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                METADATA_READ_IN_FLIGHT_MESSAGE,
+            ));
+        }
         if state.boot_register_setup_failed {
             return Err(HvfVcpuRunnerError::InvalidState(
                 BOOT_REGISTER_SETUP_FAILED_MESSAGE,
@@ -462,6 +497,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.boot_register_setup_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
                 BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.metadata_read_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                METADATA_READ_IN_FLIGHT_MESSAGE,
             ));
         }
         if state.boot_register_setup_failed {
@@ -513,6 +553,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
                 BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE,
             ));
         }
+        if state.metadata_read_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                METADATA_READ_IN_FLIGHT_MESSAGE,
+            ));
+        }
         if state.boot_register_setup_failed {
             return Err(HvfVcpuRunnerError::InvalidState(
                 BOOT_REGISTER_SETUP_FAILED_MESSAGE,
@@ -546,6 +591,53 @@ impl<'vm> HvfVcpuRunner<'vm> {
         Ok(InFlightMmioDispatch::new(&self.state))
     }
 
+    fn start_mpidr_el1_read(
+        &self,
+        response_sender: mpsc::Sender<Result<u64, HvfVcpuRunnerError>>,
+    ) -> Result<InFlightMetadataRead<'_>, HvfVcpuRunnerError> {
+        let mut state = self.lock_state()?;
+        if state.thread.is_none() {
+            return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
+        }
+        if state.shutting_down {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                RUNNER_SHUTTING_DOWN_MESSAGE,
+            ));
+        }
+        if state.in_flight_runs > 0 {
+            return Err(HvfVcpuRunnerError::InvalidState(RUN_IN_FLIGHT_MESSAGE));
+        }
+        if state.mmio_dispatch_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                MMIO_DISPATCH_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.boot_register_setup_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.metadata_read_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                METADATA_READ_IN_FLIGHT_MESSAGE,
+            ));
+        }
+
+        state.metadata_read_in_flight = true;
+        if self
+            .command_sender
+            .send(RunnerCommand::ReadMpidrEl1 { response_sender })
+            .is_err()
+        {
+            state.metadata_read_in_flight = false;
+            return Err(HvfVcpuRunnerError::ChannelClosed(
+                COMMAND_CHANNEL_CLOSED_MESSAGE,
+            ));
+        }
+
+        Ok(InFlightMetadataRead::new(&self.state))
+    }
+
     fn prepare_shutdown(&self) -> Result<(mpsc::Sender<RunnerCommand>, bool), HvfVcpuRunnerError> {
         let mut state = self.lock_state()?;
         if state.shutting_down {
@@ -555,6 +647,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         }
         if state.thread.is_none() {
             return Err(HvfVcpuRunnerError::InvalidState(RUNNER_SHUT_DOWN_MESSAGE));
+        }
+        if state.metadata_read_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                METADATA_READ_IN_FLIGHT_MESSAGE,
+            ));
         }
 
         state.shutting_down = true;
@@ -587,6 +684,11 @@ impl<'vm> HvfVcpuRunner<'vm> {
         if state.mmio_dispatch_in_flight {
             return Err(HvfVcpuRunnerError::InvalidState(
                 MMIO_DISPATCH_IN_FLIGHT_MESSAGE,
+            ));
+        }
+        if state.metadata_read_in_flight {
+            return Err(HvfVcpuRunnerError::InvalidState(
+                METADATA_READ_IN_FLIGHT_MESSAGE,
             ));
         }
         Ok(state)
@@ -741,6 +843,24 @@ fn real_cancel_vcpu() -> CancelVcpu {
     })
 }
 
+struct InFlightMetadataRead<'state> {
+    state: &'state Mutex<RunnerHandleState>,
+}
+
+impl<'state> InFlightMetadataRead<'state> {
+    fn new(state: &'state Mutex<RunnerHandleState>) -> Self {
+        Self { state }
+    }
+}
+
+impl Drop for InFlightMetadataRead<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.metadata_read_in_flight = false;
+        }
+    }
+}
+
 fn spawn_runner_thread<C, V>(create_vcpu: C) -> Result<StartedRunner, HvfVcpuRunnerError>
 where
     C: FnOnce() -> Result<V, BackendError> + Send + 'static,
@@ -832,6 +952,10 @@ fn run_runner_thread<C, V>(
                 response_sender,
             } => {
                 let result = dispatch_mmio_access_on_runner_thread(&mut vcpu, access, &dispatcher);
+                let _ = response_sender.send(result);
+            }
+            RunnerCommand::ReadMpidrEl1 { response_sender } => {
+                let result = vcpu.mpidr_el1().map_err(HvfVcpuRunnerError::Backend);
                 let _ = response_sender.send(result);
             }
             RunnerCommand::Shutdown { response_sender } => {
@@ -958,6 +1082,16 @@ mod tests {
     struct BlockingConfigureVcpu {
         entered_setup_sender: mpsc::Sender<()>,
         release_setup_receiver: mpsc::Receiver<Result<(), BackendError>>,
+    }
+
+    struct MpidrRecordingVcpu {
+        mpidr: u64,
+        fail_next_read: bool,
+    }
+
+    struct BlockingMpidrVcpu {
+        entered_read_sender: mpsc::Sender<()>,
+        release_read_receiver: mpsc::Receiver<Result<u64, BackendError>>,
     }
 
     struct MmioDispatchRecordingVcpu {
@@ -1171,6 +1305,82 @@ mod tests {
             _dispatcher: &mut MmioDispatcher,
         ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
             unsupported_mmio_dispatch()
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for MpidrRecordingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
+            if self.fail_next_read {
+                self.fail_next_read = false;
+                Err(BackendError::InvalidState("fake MPIDR read failed"))
+            } else {
+                Ok(self.mpidr)
+            }
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    impl RunnerVcpu for BlockingMpidrVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            Ok(HvfVcpuExit::Canceled)
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
+            self.entered_read_sender
+                .send(())
+                .map_err(|_| BackendError::InvalidState("fake MPIDR entry receiver closed"))?;
+            self.release_read_receiver
+                .recv()
+                .map_err(|_| BackendError::InvalidState("fake MPIDR release sender closed"))?
         }
 
         fn destroy(&mut self) -> Result<(), BackendError> {
@@ -1455,6 +1665,42 @@ mod tests {
             .expect("runner should be created")
     }
 
+    fn start_mpidr_recording_runner(mpidr: u64, fail_next_read: bool) -> HvfVcpuRunner<'static> {
+        let started = spawn_runner_thread(move || {
+            Ok(MpidrRecordingVcpu {
+                mpidr,
+                fail_next_read,
+            })
+        })
+        .expect("fake runner should start");
+
+        HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+            .expect("runner should be created")
+    }
+
+    fn start_blocking_mpidr_runner() -> (
+        HvfVcpuRunner<'static>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<Result<u64, BackendError>>,
+    ) {
+        let (entered_read_sender, entered_read_receiver) = mpsc::channel();
+        let (release_read_sender, release_read_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(BlockingMpidrVcpu {
+                entered_read_sender,
+                release_read_receiver,
+            })
+        })
+        .expect("fake runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            entered_read_receiver,
+            release_read_sender,
+        )
+    }
+
     fn start_fake_runner_with_cancel(
         cancel_vcpu: CancelVcpu,
         entered_run_sender: mpsc::Sender<()>,
@@ -1481,6 +1727,147 @@ mod tests {
             entered_run_receiver,
             destroyed_receiver,
         )
+    }
+
+    #[test]
+    fn reads_mpidr_on_runner_thread() {
+        let runner = start_mpidr_recording_runner(0x8000_0000, false);
+
+        assert_eq!(runner.mpidr_el1(), Ok(0x8000_0000));
+        assert_eq!(runner.mpidr_el1(), Ok(0x8000_0000));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn failed_mpidr_read_can_be_retried_without_stale_state() {
+        let runner = start_mpidr_recording_runner(0x8000_0001, true);
+
+        assert_eq!(
+            runner.mpidr_el1(),
+            Err(HvfVcpuRunnerError::Backend(BackendError::InvalidState(
+                "fake MPIDR read failed"
+            )))
+        );
+        assert_eq!(runner.mpidr_el1(), Ok(0x8000_0001));
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn commands_during_mpidr_read_are_rejected_without_queueing() {
+        let (runner, entered_read_receiver, release_read_sender) = start_blocking_mpidr_runner();
+
+        thread::scope(|scope| {
+            let read = scope.spawn(|| runner.mpidr_el1());
+            entered_read_receiver
+                .recv()
+                .expect("runner should enter fake MPIDR read");
+
+            assert_eq!(
+                runner.mpidr_el1(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::METADATA_READ_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.run_once(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::METADATA_READ_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.run_once_and_handle_mmio(shared_dispatcher()),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::METADATA_READ_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.dispatch_mmio_access(resolved_mmio_access(), shared_dispatcher()),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::METADATA_READ_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.configure_arm64_boot_registers(boot_registers()),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::METADATA_READ_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.cancel(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::METADATA_READ_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.shutdown(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::METADATA_READ_IN_FLIGHT_MESSAGE
+                ))
+            );
+
+            release_read_sender
+                .send(Ok(0x8000_0002))
+                .expect("MPIDR read release should be sent");
+            assert_eq!(
+                read.join().expect("MPIDR read thread should join"),
+                Ok(0x8000_0002)
+            );
+        });
+
+        assert_eq!(runner.run_once(), Ok(HvfVcpuExit::Canceled));
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn mpidr_read_after_shutdown_is_rejected() {
+        let runner = start_mpidr_recording_runner(0x8000_0000, false);
+
+        runner.shutdown().expect("runner should shut down");
+
+        assert_eq!(
+            runner.mpidr_el1(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUNNER_SHUT_DOWN_MESSAGE
+            ))
+        );
+    }
+
+    #[test]
+    fn mpidr_read_during_shutdown_is_rejected() {
+        let (runner, _, destroyed_receiver) = start_fake_runner();
+        let (command_sender, should_cancel) = runner
+            .prepare_shutdown()
+            .expect("first shutdown should be prepared");
+
+        assert!(!should_cancel);
+        assert_eq!(
+            runner.mpidr_el1(),
+            Err(HvfVcpuRunnerError::InvalidState(
+                super::RUNNER_SHUTTING_DOWN_MESSAGE
+            ))
+        );
+
+        let thread = runner
+            .take_thread()
+            .expect("runner state should be lockable");
+        let (response_sender, response_receiver) = mpsc::channel();
+        command_sender
+            .send(super::RunnerCommand::Shutdown { response_sender })
+            .expect("shutdown command should be sent");
+        assert_eq!(
+            response_receiver
+                .recv()
+                .expect("shutdown response should be sent"),
+            Ok(())
+        );
+        super::join_runner_thread(thread).expect("runner thread should join");
+        runner.finish_shutdown();
+        destroyed_receiver
+            .recv()
+            .expect("fake vCPU should be destroyed");
     }
 
     #[test]
@@ -1655,6 +2042,12 @@ mod tests {
 
             assert_eq!(
                 runner.configure_arm64_boot_registers(boot_registers()),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::RUN_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.mpidr_el1(),
                 Err(HvfVcpuRunnerError::InvalidState(
                     super::RUN_IN_FLIGHT_MESSAGE
                 ))
@@ -2457,6 +2850,12 @@ mod tests {
                     super::BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE
                 ))
             );
+            assert_eq!(
+                runner.mpidr_el1(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::BOOT_REGISTER_SETUP_IN_FLIGHT_MESSAGE
+                ))
+            );
 
             release_setup_sender
                 .send(Ok(()))
@@ -2504,6 +2903,12 @@ mod tests {
             );
             assert_eq!(
                 runner.cancel(),
+                Err(HvfVcpuRunnerError::InvalidState(
+                    super::MMIO_DISPATCH_IN_FLIGHT_MESSAGE
+                ))
+            );
+            assert_eq!(
+                runner.mpidr_el1(),
                 Err(HvfVcpuRunnerError::InvalidState(
                     super::MMIO_DISPATCH_IN_FLIGHT_MESSAGE
                 ))

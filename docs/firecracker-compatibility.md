@@ -670,19 +670,20 @@ runtime timer node, and MSI/ITS metadata is intentionally absent until a later
 device path needs it.
 
 This still is not bootable guest RAM. bangbang can now write an internal FDT
-payload and configure a single primary HVF vCPU with the arm64 Linux boot
-register state: PC points at the loaded kernel entry, X0 points at the FDT
-guest address, X1-X3 are zero, and CPSR/PSTATE is `0x3c5`. The runner path
-performs that setup on the vCPU-owning thread before the first run and rejects
-duplicate setup, setup during shutdown, setup while a run is in flight, and
-setup after a run has started. If setup fails after partially writing
-registers, the runner rejects guest runs until setup is retried successfully.
-The runner also exposes explicit single-exit MMIO commands that run on the
-vCPU-owning thread. One command dispatches an already resolved MMIO access
-after a run has started, and another command starts one vCPU run, resolves a
-resulting MMIO exit, and dispatches or completes it through a caller-provided
-shared dispatcher. These commands reject overlapping runs, boot-register setup,
-or MMIO dispatches. They do not yet form a continuous guest run loop.
+payload, read the primary runner-owned vCPU `MPIDR_EL1` for later boot metadata,
+and configure a single primary HVF vCPU with the arm64 Linux boot register state:
+PC points at the loaded kernel entry, X0 points at the FDT guest address, X1-X3
+are zero, and CPSR/PSTATE is `0x3c5`. The runner path performs metadata reads
+and boot-register setup on the vCPU-owning thread, rejects duplicate setup,
+setup during shutdown, setup while a run is in flight, and setup after a run has
+started. If setup fails after partially writing registers, the runner rejects
+guest runs until setup is retried successfully. The runner also exposes explicit
+single-exit MMIO commands that run on the vCPU-owning thread. One command
+dispatches an already resolved MMIO access after a run has started, and another
+command starts one vCPU run, resolves a resulting MMIO exit, and dispatches or
+completes it through a caller-provided shared dispatcher. These commands reject
+overlapping metadata reads, runs, boot-register setup, or MMIO dispatches. They
+do not yet form a continuous guest run loop.
 
 bangbang still does not wire `mem_size_mib` into public startup behavior,
 wire device interrupts into guest execution, emulate devices, start a guest, power on secondary vCPUs, or
