@@ -2,6 +2,8 @@
 
 use std::collections::TryReserveError;
 use std::fmt;
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use bangbang_runtime::block::BlockMmioLayout;
@@ -99,6 +101,100 @@ pub struct HvfArm64BootSession<'vm> {
     boot_registers: HvfArm64BootRegisters,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct HvfArm64BootRunLoopStopToken {
+    stop_requested: Arc<AtomicBool>,
+}
+
+impl HvfArm64BootRunLoopStopToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn request_stop(&self) {
+        self.stop_requested.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_stop_requested(&self) -> bool {
+        self.stop_requested.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HvfArm64BootRunLoopControl {
+    stop_token: HvfArm64BootRunLoopStopToken,
+    cancel_handle: HvfVcpuRunCancelHandle,
+}
+
+impl HvfArm64BootRunLoopControl {
+    fn new(cancel_handle: HvfVcpuRunCancelHandle) -> Self {
+        Self {
+            stop_token: HvfArm64BootRunLoopStopToken::new(),
+            cancel_handle,
+        }
+    }
+
+    pub fn stop_token(&self) -> HvfArm64BootRunLoopStopToken {
+        self.stop_token.clone()
+    }
+
+    pub fn request_stop(&self) -> Result<(), HvfVcpuRunnerError> {
+        self.stop_token.request_stop();
+        self.cancel_handle.cancel()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HvfArm64BootRunLoopOutcome {
+    StepLimitReached { steps: usize },
+    Stopped { steps: usize },
+    Canceled { steps: usize },
+    VtimerActivated { steps: usize },
+    Unknown { steps: usize, reason: u32 },
+}
+
+#[derive(Debug)]
+pub enum HvfArm64BootRunLoopError {
+    RunStep {
+        steps_completed: usize,
+        source: Box<HvfVcpuRunnerError>,
+    },
+    DispatchBlockNotifications {
+        steps_completed: usize,
+        source: Box<HvfArm64BootBlockNotificationDispatchError>,
+    },
+}
+
+impl fmt::Display for HvfArm64BootRunLoopError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RunStep {
+                steps_completed,
+                source,
+            } => write!(
+                f,
+                "failed to run HVF boot-session vCPU step after {steps_completed} completed steps: {source}"
+            ),
+            Self::DispatchBlockNotifications {
+                steps_completed,
+                source,
+            } => write!(
+                f,
+                "failed to dispatch HVF boot-session block notifications after {steps_completed} completed steps: {source}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HvfArm64BootRunLoopError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::RunStep { source, .. } => Some(source.as_ref()),
+            Self::DispatchBlockNotifications { source, .. } => Some(source.as_ref()),
+        }
+    }
+}
+
 impl HvfArm64BootSession<'_> {
     pub fn shutdown(&mut self) -> Result<(), HvfArm64BootSessionShutdownError> {
         let runner_result = self.runner.shutdown();
@@ -175,6 +271,26 @@ impl HvfArm64BootSession<'_> {
     /// shut down the boot session or make public `InstanceStart` succeed.
     pub fn run_cancel_handle(&self) -> HvfVcpuRunCancelHandle {
         self.runner.run_cancel_handle()
+    }
+
+    /// Return a control handle for the bounded internal boot-session run loop.
+    ///
+    /// Stop requests use the existing runner cancellation boundary. This remains
+    /// internal startup plumbing and does not make public `InstanceStart` succeed.
+    pub fn run_loop_control(&self) -> HvfArm64BootRunLoopControl {
+        HvfArm64BootRunLoopControl::new(self.run_cancel_handle())
+    }
+
+    /// Run bounded vCPU steps and dispatch boot block notifications between steps.
+    ///
+    /// The step limit keeps this scaffold deterministic until a later scheduler
+    /// owns the continuous guest loop and timer/device policy.
+    pub fn run_loop(
+        &mut self,
+        stop_token: &HvfArm64BootRunLoopStopToken,
+        max_steps: NonZeroUsize,
+    ) -> Result<HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopError> {
+        run_boot_session_loop(self, stop_token, max_steps)
     }
 
     pub fn dispatch_block_queue_notifications_and_signal_interrupts(
@@ -380,6 +496,82 @@ fn run_boot_session_vcpu_step(
     dispatcher: &Arc<Mutex<MmioDispatcher>>,
 ) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
     runner.run_once_and_handle_mmio(Arc::clone(dispatcher))
+}
+
+trait BootSessionRunLoopSession {
+    fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError>;
+
+    fn dispatch_run_loop_block_notifications(
+        &mut self,
+    ) -> Result<HvfArm64BootBlockNotificationDispatches, HvfArm64BootBlockNotificationDispatchError>;
+}
+
+impl BootSessionRunLoopSession for HvfArm64BootSession<'_> {
+    fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
+        self.run_once_and_handle_mmio()
+    }
+
+    fn dispatch_run_loop_block_notifications(
+        &mut self,
+    ) -> Result<HvfArm64BootBlockNotificationDispatches, HvfArm64BootBlockNotificationDispatchError>
+    {
+        self.dispatch_block_queue_notifications_and_signal_interrupts()
+    }
+}
+
+fn run_boot_session_loop(
+    session: &mut impl BootSessionRunLoopSession,
+    stop_token: &HvfArm64BootRunLoopStopToken,
+    max_steps: NonZeroUsize,
+) -> Result<HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopError> {
+    let max_steps = max_steps.get();
+    let mut steps = 0usize;
+
+    loop {
+        if stop_token.is_stop_requested() {
+            return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+        }
+
+        let outcome =
+            session
+                .run_loop_vcpu_step()
+                .map_err(|source| HvfArm64BootRunLoopError::RunStep {
+                    steps_completed: steps,
+                    source: Box::new(source),
+                })?;
+        steps += 1;
+
+        match outcome {
+            HvfVcpuRunStepOutcome::Canceled => {
+                if stop_token.is_stop_requested() {
+                    return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+                }
+                return Ok(HvfArm64BootRunLoopOutcome::Canceled { steps });
+            }
+            HvfVcpuRunStepOutcome::VtimerActivated => {
+                return Ok(HvfArm64BootRunLoopOutcome::VtimerActivated { steps });
+            }
+            HvfVcpuRunStepOutcome::Unknown { reason } => {
+                return Ok(HvfArm64BootRunLoopOutcome::Unknown { steps, reason });
+            }
+            HvfVcpuRunStepOutcome::Mmio { .. } => {
+                session
+                    .dispatch_run_loop_block_notifications()
+                    .map_err(
+                        |source| HvfArm64BootRunLoopError::DispatchBlockNotifications {
+                            steps_completed: steps,
+                            source: Box::new(source),
+                        },
+                    )?;
+                if stop_token.is_stop_requested() {
+                    return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+                }
+                if steps == max_steps {
+                    return Ok(HvfArm64BootRunLoopOutcome::StepLimitReached { steps });
+                }
+            }
+        }
+    }
 }
 
 fn lock_boot_mmio_dispatcher(
@@ -772,9 +964,11 @@ fn allocate_interrupt_lines(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::error::Error as _;
     use std::fs::{self, OpenOptions};
     use std::io::Write;
+    use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -812,11 +1006,13 @@ mod tests {
 
     use super::{
         HvfArm64BootBlockNotificationDispatchError, HvfArm64BootInterruptLinePurpose,
-        HvfArm64BootMmioDispatcherError, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
-        HvfArm64BootSessionError, allocate_interrupt_lines, collect_block_notification_dispatches,
-        lock_boot_mmio_dispatcher, run_boot_session_vcpu_step, signal_block_queue_interrupts,
+        HvfArm64BootMmioDispatcherError, HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopStopToken,
+        HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig, HvfArm64BootSessionError,
+        allocate_interrupt_lines, collect_block_notification_dispatches, lock_boot_mmio_dispatcher,
+        run_boot_session_loop, run_boot_session_vcpu_step, signal_block_queue_interrupts,
         validate_single_vcpu,
     };
+    use crate::exit::{HvfExceptionExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister};
     use crate::gic::{HvfGicInterruptRange, HvfGicMetadata, HvfGicRedistributor, HvfGicRegion};
     use crate::runner::{HvfVcpuRunStepOutcome, HvfVcpuRunnerError};
 
@@ -828,6 +1024,13 @@ mod tests {
     const ARM64_IMAGE_SIZE_OFFSET: usize = 16;
     const ARM64_IMAGE_MAGIC_OFFSET: usize = 56;
     const ARM64_IMAGE_MAGIC: u32 = 0x644d_5241;
+    const ESR_EC_DATA_ABORT_LOWER_EL: u64 = 0x24;
+    const ESR_EC_SHIFT: u64 = 26;
+    const ESR_ISS_ISV: u64 = 1 << 24;
+    const ESR_ISS_SAS_SHIFT: u64 = 22;
+    const ESR_ISS_SRT_SHIFT: u64 = 16;
+    const ESR_ISS_WNR: u64 = 1 << 6;
+    const ESR_ISS_SF: u64 = 1 << 15;
     const TEST_BLOCK_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_0000);
     const TEST_QUEUE_SIZE: u16 = 4;
     const TEST_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x8040_0000);
@@ -962,6 +1165,139 @@ mod tests {
             .lock()
             .expect("recorded dispatcher list should lock")
             .clone()
+    }
+
+    #[derive(Debug)]
+    struct RecordingBootSessionRunLoopSession {
+        run_results: VecDeque<Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError>>,
+        dispatch_results: VecDeque<
+            Result<
+                super::HvfArm64BootBlockNotificationDispatches,
+                HvfArm64BootBlockNotificationDispatchError,
+            >,
+        >,
+        events: Vec<&'static str>,
+        request_stop_on_run: Option<HvfArm64BootRunLoopStopToken>,
+        request_stop_on_dispatch: Option<HvfArm64BootRunLoopStopToken>,
+    }
+
+    impl RecordingBootSessionRunLoopSession {
+        fn new(run_results: impl IntoIterator<Item = HvfVcpuRunStepOutcome>) -> Self {
+            Self {
+                run_results: run_results.into_iter().map(Ok).collect(),
+                dispatch_results: VecDeque::new(),
+                events: Vec::new(),
+                request_stop_on_run: None,
+                request_stop_on_dispatch: None,
+            }
+        }
+
+        fn with_run_error(source: HvfVcpuRunnerError) -> Self {
+            Self {
+                run_results: VecDeque::from([Err(source)]),
+                dispatch_results: VecDeque::new(),
+                events: Vec::new(),
+                request_stop_on_run: None,
+                request_stop_on_dispatch: None,
+            }
+        }
+
+        fn push_dispatch_error(&mut self, source: HvfArm64BootBlockNotificationDispatchError) {
+            self.dispatch_results.push_back(Err(source));
+        }
+
+        fn request_stop_on_run(&mut self, stop_token: HvfArm64BootRunLoopStopToken) {
+            self.request_stop_on_run = Some(stop_token);
+        }
+
+        fn request_stop_on_dispatch(&mut self, stop_token: HvfArm64BootRunLoopStopToken) {
+            self.request_stop_on_dispatch = Some(stop_token);
+        }
+    }
+
+    impl super::BootSessionRunLoopSession for RecordingBootSessionRunLoopSession {
+        fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
+            self.events.push("run");
+            if let Some(stop_token) = self.request_stop_on_run.take() {
+                stop_token.request_stop();
+            }
+
+            self.run_results
+                .pop_front()
+                .expect("test run result should be queued")
+        }
+
+        fn dispatch_run_loop_block_notifications(
+            &mut self,
+        ) -> Result<
+            super::HvfArm64BootBlockNotificationDispatches,
+            HvfArm64BootBlockNotificationDispatchError,
+        > {
+            self.events.push("dispatch");
+            if let Some(stop_token) = self.request_stop_on_dispatch.take() {
+                stop_token.request_stop();
+            }
+
+            self.dispatch_results.pop_front().unwrap_or_else(|| {
+                Ok(super::HvfArm64BootBlockNotificationDispatches::new(
+                    Vec::new(),
+                ))
+            })
+        }
+    }
+
+    fn max_steps(steps: usize) -> NonZeroUsize {
+        NonZeroUsize::new(steps).expect("test step limit should be non-zero")
+    }
+
+    fn mmio_run_step_outcome() -> HvfVcpuRunStepOutcome {
+        let mut dispatcher = MmioDispatcher::new();
+        dispatcher
+            .insert_region(MmioRegionId::new(7), GuestAddress::new(0x1000), 0x100)
+            .expect("test MMIO region should insert");
+        let exit = HvfExceptionExit {
+            syndrome: data_abort_syndrome(
+                HvfMmioAccessSize::Byte,
+                HvfMmioDirection::Write,
+                HvfMmioRegister::new(0).expect("test MMIO register should exist"),
+            ),
+            virtual_address: 0x2000,
+            physical_address: 0x1040,
+        };
+        let resolved = exit
+            .decode_mmio_access()
+            .expect("test MMIO exit should decode")
+            .resolve(dispatcher.bus())
+            .expect("test MMIO access should resolve");
+
+        HvfVcpuRunStepOutcome::Mmio {
+            access: resolved,
+            outcome: MmioDispatchOutcome::Write,
+        }
+    }
+
+    fn data_abort_syndrome(
+        size: HvfMmioAccessSize,
+        direction: HvfMmioDirection,
+        register: HvfMmioRegister,
+    ) -> u64 {
+        let size_bits = match size {
+            HvfMmioAccessSize::Byte => 0,
+            HvfMmioAccessSize::Halfword => 1,
+            HvfMmioAccessSize::Word => 2,
+            HvfMmioAccessSize::Doubleword => 3,
+        };
+        let write_bit = match direction {
+            HvfMmioDirection::Read => 0,
+            HvfMmioDirection::Write => ESR_ISS_WNR,
+        };
+
+        (ESR_EC_DATA_ABORT_LOWER_EL << ESR_EC_SHIFT)
+            | ESR_ISS_ISV
+            | (size_bits << ESR_ISS_SAS_SHIFT)
+            | (u64::from(register.raw_value()) << ESR_ISS_SRT_SHIFT)
+            | write_bit
+            | ESR_ISS_SF
     }
 
     fn gic_with_spi_range(base: u32, count: u32) -> HvfGicMetadata {
@@ -1729,6 +2065,165 @@ mod tests {
         assert_eq!(recorded.len(), 1);
         let recorded_dispatcher = recorded.first().expect("one dispatcher should be recorded");
         assert!(Arc::ptr_eq(recorded_dispatcher, &dispatcher));
+    }
+
+    #[test]
+    fn boot_session_run_loop_stops_before_first_step() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        stop_token.request_stop();
+        let mut session = RecordingBootSessionRunLoopSession::new([mmio_run_step_outcome()]);
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("stopped loop should succeed");
+
+        assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Stopped { steps: 0 });
+        assert!(session.events.is_empty());
+    }
+
+    #[test]
+    fn boot_session_run_loop_control_types_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<super::HvfArm64BootRunLoopControl>();
+        assert_send_sync::<HvfArm64BootRunLoopStopToken>();
+    }
+
+    #[test]
+    fn boot_session_run_loop_dispatches_after_mmio_until_step_limit() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([
+            mmio_run_step_outcome(),
+            mmio_run_step_outcome(),
+        ]);
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(2))
+            .expect("step-limited loop should succeed");
+
+        assert_eq!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 2 }
+        );
+        assert_eq!(session.events, ["run", "dispatch", "run", "dispatch"]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_reports_stop_after_dispatch_before_step_limit() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([mmio_run_step_outcome()]);
+        session.request_stop_on_dispatch(stop_token.clone());
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("stop after dispatch should succeed");
+
+        assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Stopped { steps: 1 });
+        assert_eq!(session.events, ["run", "dispatch"]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_reports_stop_after_canceled_step_when_requested() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session =
+            RecordingBootSessionRunLoopSession::new([HvfVcpuRunStepOutcome::Canceled]);
+        session.request_stop_on_run(stop_token.clone());
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("stop after canceled step should succeed");
+
+        assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Stopped { steps: 1 });
+        assert_eq!(session.events, ["run"]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_reports_canceled_without_stop_request() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session =
+            RecordingBootSessionRunLoopSession::new([HvfVcpuRunStepOutcome::Canceled]);
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("canceled loop should succeed");
+
+        assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Canceled { steps: 1 });
+        assert_eq!(session.events, ["run"]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_preserves_runner_error() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let source = HvfVcpuRunnerError::InvalidState("fake run loop step failed");
+        let mut session = RecordingBootSessionRunLoopSession::with_run_error(source.clone());
+
+        let err = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect_err("runner error should stop loop");
+
+        match err {
+            super::HvfArm64BootRunLoopError::RunStep {
+                steps_completed,
+                source: actual,
+            } => {
+                assert_eq!(steps_completed, 0);
+                assert_eq!(*actual, source);
+            }
+            other => panic!("expected run-step error, got {other:?}"),
+        }
+        assert_eq!(session.events, ["run"]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_preserves_notification_error_after_mmio_step() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([mmio_run_step_outcome()]);
+        session.push_dispatch_error(HvfArm64BootBlockNotificationDispatchError::MmioDispatcher {
+            source: HvfArm64BootMmioDispatcherError::Busy,
+        });
+
+        let err = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect_err("notification error should stop loop");
+
+        match err {
+            super::HvfArm64BootRunLoopError::DispatchBlockNotifications {
+                steps_completed,
+                source,
+            } => {
+                assert_eq!(steps_completed, 1);
+                assert_eq!(
+                    source.to_string(),
+                    "failed to lock HVF boot-session MMIO dispatcher: HVF boot-session MMIO dispatcher lock is busy"
+                );
+            }
+            other => panic!("expected notification error, got {other:?}"),
+        }
+        assert_eq!(session.events, ["run", "dispatch"]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_returns_timer_and_unknown_as_terminal_outcomes() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut timer_session =
+            RecordingBootSessionRunLoopSession::new([HvfVcpuRunStepOutcome::VtimerActivated]);
+        let mut unknown_session =
+            RecordingBootSessionRunLoopSession::new([HvfVcpuRunStepOutcome::Unknown {
+                reason: 99,
+            }]);
+
+        let timer_outcome = run_boot_session_loop(&mut timer_session, &stop_token, max_steps(1))
+            .expect("virtual timer loop should succeed");
+        let unknown_outcome =
+            run_boot_session_loop(&mut unknown_session, &stop_token, max_steps(1))
+                .expect("unknown-exit loop should succeed");
+
+        assert_eq!(
+            timer_outcome,
+            HvfArm64BootRunLoopOutcome::VtimerActivated { steps: 1 }
+        );
+        assert_eq!(
+            unknown_outcome,
+            HvfArm64BootRunLoopOutcome::Unknown {
+                steps: 1,
+                reason: 99
+            }
+        );
+        assert_eq!(timer_session.events, ["run"]);
+        assert_eq!(unknown_session.events, ["run"]);
     }
 
     #[test]

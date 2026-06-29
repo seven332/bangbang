@@ -42,13 +42,13 @@ block notification dispatch with per-device metadata, an internal backend-neutra
 interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, internal HVF single-vCPU arm64 boot-session preparation
 with a runner-compatible shared MMIO dispatcher, controlled mapped guest-memory
-access, one-step runner-thread MMIO handling, a run-cancellation boundary, and
-boot block queue interrupt signaling, and an initial process startup argument
-model.
+access, one-step runner-thread MMIO handling, a run-cancellation boundary, a
+bounded internal boot-session run-loop pump, boot block queue interrupt
+signaling, and an initial process startup argument model.
 There is no broader API request body model beyond the initial boot-source,
 drive configuration, machine-configuration, and actions bodies, public guest
-execution, continuous vCPU run loop, complete interrupt delivery, public
-startup, HVF runner-loop notification scheduling or serial output,
+execution, unbounded or public continuous vCPU run loop, complete interrupt
+delivery, public startup, HVF runner-loop notification scheduling or serial output,
 serial/backend interrupt wiring beyond the internal boot block notification
 path, device-backed feature negotiation, indirect descriptor support,
 device-backed runner-loop MMIO scheduling, complete device emulation,
@@ -712,13 +712,18 @@ do not yet form a continuous guest run loop. The boot session can run one vCPU
 step through the runner with its per-session shared MMIO dispatcher, so a
 resulting MMIO exit is handled on the vCPU-owning thread without global state.
 The boot session can also expose a cloneable cancellation-only handle for an
-in-flight run step without exposing the full runner. The boot session can also
-dispatch pending boot block queue notifications against mapped guest memory and
-signal the corresponding block SPI line when the runtime dispatch summary
-reports queue-interrupt intent; per-device results preserve dispatch, lookup,
-and signal failures for later runner-loop policy. Boot notification dispatch
-locks the shared dispatcher only while draining runtime notifications and
-releases it before HVF GIC signaling.
+in-flight run step without exposing the full runner. A bounded internal
+boot-session run-loop pump now composes that one-step path with boot block
+notification dispatch between successful MMIO steps and stops explicitly on a
+step limit, stop-token request, canceled run exit, virtual timer activation,
+unknown run exit, or dispatch error. This is still internal startup plumbing,
+not public `InstanceStart` behavior or the future unbounded guest scheduler.
+The boot session can also dispatch pending boot block queue notifications
+against mapped guest memory and signal the corresponding block SPI line when
+the runtime dispatch summary reports queue-interrupt intent; per-device results
+preserve dispatch, lookup, and signal failures for later runner-loop policy.
+Boot notification dispatch locks the shared dispatcher only while draining
+runtime notifications and releases it before HVF GIC signaling.
 
 bangbang still does not wire `mem_size_mib` into public startup behavior,
 wire device interrupts into public guest execution, emulate devices, start a guest, power on secondary vCPUs, or
@@ -851,7 +856,9 @@ macOS design work instead of direct implementation:
   runtime dispatcher on the owning thread, runs once and handles a resulting
   MMIO exit through that dispatcher, supports one cancellable
   `hv_vcpu_run` step at a time, exposes a cancellation-only handle for that run
-  step, and shuts down by canceling and joining the runner thread.
+  step, and shuts down by canceling and joining the runner thread. The internal
+  boot session can compose those pieces into a bounded run-loop pump that
+  dispatches boot block notifications between successful MMIO steps.
 - HVF exit snapshots preserve Hypervisor.framework reasons such as canceled,
   exception, virtual timer activation, and unknown after a run wrapper marks
   exit data available. Candidate arm64 MMIO data-abort exceptions can be decoded
@@ -861,8 +868,9 @@ macOS design work instead of direct implementation:
   operation, dispatched through those handlers on the current thread or through
   an explicit runner-thread command, and completed back into guest GPRs for
   successful reads. The runner and boot session can perform that path for one
-  run step, but they do not yet provide a continuous loop or translate exits
-  into interrupt or runtime events.
+  run step, and the boot session can repeat it through a bounded internal loop
+  that terminates on explicit outcomes, but they do not yet provide an
+  unbounded public loop or translate exits into interrupt or runtime events.
 - Firecracker's full paused/resumed microVM loop is not implemented yet.
   bangbang's runner is only the HVF ownership and cancellation primitive set
   needed before guest memory, interrupt, timer, and device work can build the
