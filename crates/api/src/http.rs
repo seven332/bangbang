@@ -1049,6 +1049,14 @@ mod tests {
     }
 
     #[test]
+    fn parses_get_vm_config_with_zero_content_length() {
+        let request = b"GET /vm/config HTTP/1.1\r\nContent-Length:\t0 \r\n\r\n";
+
+        assert_eq!(parse_request(request), Ok(ApiRequest::GetVmConfig));
+        assert_eq!(request_total_len(request), Ok(Some(request.len())));
+    }
+
+    #[test]
     fn rejects_get_vm_config_with_body() {
         let request = request_with_body("GET", "/vm/config", "{}");
 
@@ -1953,6 +1961,38 @@ mod tests {
             })
         );
         assert_eq!(body.get("metrics"), None);
+    }
+
+    #[test]
+    fn response_body_omits_absent_optional_vm_config_fields() {
+        let response = HttpResponse::vm_config(&VmConfigResponse::new(
+            MachineConfigResponse::new(1, 128, false, false, "None"),
+            Some(BootSourceResponse::new("/tmp/vmlinux")),
+            vec![DriveConfigResponse::new(
+                "data",
+                "/tmp/data.ext4",
+                false,
+                false,
+                "Unsafe",
+                "Sync",
+            )],
+        ));
+        let body: serde_json::Value =
+            serde_json::from_str(response.body()).expect("body should be JSON");
+
+        assert_eq!(
+            body.get("boot-source"),
+            Some(&serde_json::json!({
+                "kernel_image_path": "/tmp/vmlinux",
+            }))
+        );
+        let drives = body
+            .get("drives")
+            .and_then(serde_json::Value::as_array)
+            .expect("drives should be an array");
+        let drive = drives.first().expect("one drive should be returned");
+        assert_eq!(drive.get("partuuid"), None);
+        assert_eq!(drive.get("rate_limiter"), None);
     }
 
     #[test]
