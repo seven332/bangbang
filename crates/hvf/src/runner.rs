@@ -1603,6 +1603,7 @@ mod tests {
         ))
     }
 
+    // Test-only wrapper used by panic-path tests to wait until run_runner_thread has unwound.
     fn start_panic_notifying_runner<C, V>(
         create_vcpu: C,
     ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<()>)
