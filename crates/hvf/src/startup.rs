@@ -101,6 +101,19 @@ pub struct HvfArm64BootSession<'vm> {
     boot_registers: HvfArm64BootRegisters,
 }
 
+#[derive(Debug)]
+pub struct OwnedHvfArm64BootSession {
+    runner: HvfVcpuRunner<'static>,
+    backend: HvfBackend,
+    mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
+    runtime_resources: Arm64BootRuntimeResources,
+    gic: HvfGicMetadata,
+    primary_mpidr: u64,
+    block_interrupt_lines: Vec<GuestInterruptLine>,
+    serial_interrupt_line: Option<GuestInterruptLine>,
+    boot_registers: HvfArm64BootRegisters,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct HvfArm64BootRunLoopStopToken {
     stop_requested: Arc<AtomicBool>,
@@ -337,6 +350,171 @@ impl HvfArm64BootSession<'_> {
 }
 
 impl Drop for HvfArm64BootSession<'_> {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+impl OwnedHvfArm64BootSession {
+    pub fn new(
+        controller: &VmmController,
+        config: HvfArm64BootSessionConfig,
+    ) -> Result<Self, HvfArm64BootSessionError> {
+        let mut backend = HvfBackend::new();
+        let prepared: PreparedHvfArm64BootSession<'static> =
+            match prepare_arm64_boot_session_parts(&mut backend, controller, config) {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    let _ = <HvfBackend as VmBackend>::destroy_vm(&mut backend);
+                    return Err(err);
+                }
+            };
+
+        Ok(Self {
+            runner: prepared.runner,
+            backend,
+            mmio_dispatcher: prepared.mmio_dispatcher,
+            runtime_resources: prepared.runtime_resources,
+            gic: prepared.gic,
+            primary_mpidr: prepared.primary_mpidr,
+            block_interrupt_lines: prepared.block_interrupt_lines,
+            serial_interrupt_line: prepared.serial_interrupt_line,
+            boot_registers: prepared.boot_registers,
+        })
+    }
+
+    pub fn shutdown(&mut self) -> Result<(), HvfArm64BootSessionShutdownError> {
+        let runner_result = self.runner.shutdown();
+        let destroy_result = <HvfBackend as VmBackend>::destroy_vm(&mut self.backend);
+
+        match (runner_result, destroy_result) {
+            (Err(source), _) => Err(HvfArm64BootSessionShutdownError::Runner { source }),
+            (Ok(()), Err(source)) => Err(HvfArm64BootSessionShutdownError::DestroyVm { source }),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    pub const fn gic_metadata(&self) -> HvfGicMetadata {
+        self.gic
+    }
+
+    pub const fn primary_mpidr(&self) -> u64 {
+        self.primary_mpidr
+    }
+
+    pub fn runtime_resources(&self) -> &Arm64BootRuntimeResources {
+        &self.runtime_resources
+    }
+
+    /// Return a cloned handle to the runner-compatible MMIO dispatcher.
+    ///
+    /// The dispatcher is local to this boot session. It is shared only so
+    /// vCPU-runner commands can dispatch MMIO on the runner thread. Keep cloned
+    /// handles scoped to runner commands so dispatcher-owned device resources
+    /// are released with the session.
+    pub fn mmio_dispatcher(&self) -> Arc<Mutex<MmioDispatcher>> {
+        Arc::clone(&self.mmio_dispatcher)
+    }
+
+    /// Borrow the guest memory mapped for this prepared boot session.
+    ///
+    /// This is internal startup plumbing for later runner-loop work; it does not
+    /// make public `InstanceStart` succeed.
+    pub fn guest_memory(&self) -> Result<&GuestMemory, HvfGuestMemoryMappingError> {
+        self.backend.mapped_guest_memory()
+    }
+
+    /// Mutably borrow the guest memory mapped for this prepared boot session.
+    ///
+    /// The HVF backend remains the mapping owner, so shutdown and drop still
+    /// unmap the memory through the backend.
+    pub fn guest_memory_mut(&mut self) -> Result<&mut GuestMemory, HvfGuestMemoryMappingError> {
+        self.backend.mapped_guest_memory_mut()
+    }
+
+    pub fn block_interrupt_lines(&self) -> &[GuestInterruptLine] {
+        &self.block_interrupt_lines
+    }
+
+    pub const fn serial_interrupt_line(&self) -> Option<GuestInterruptLine> {
+        self.serial_interrupt_line
+    }
+
+    pub const fn boot_registers(&self) -> HvfArm64BootRegisters {
+        self.boot_registers
+    }
+
+    pub fn run_once_and_handle_mmio(&self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
+        run_boot_session_vcpu_step(&self.runner, &self.mmio_dispatcher)
+    }
+
+    pub fn run_cancel_handle(&self) -> HvfVcpuRunCancelHandle {
+        self.runner.run_cancel_handle()
+    }
+
+    pub fn run_loop_control(&self) -> HvfArm64BootRunLoopControl {
+        HvfArm64BootRunLoopControl::new(self.run_cancel_handle())
+    }
+
+    pub fn run_loop(
+        &mut self,
+        stop_token: &HvfArm64BootRunLoopStopToken,
+        max_steps: NonZeroUsize,
+    ) -> Result<HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopError> {
+        run_boot_session_loop(self, stop_token, max_steps)
+    }
+
+    pub fn dispatch_block_queue_notifications_and_signal_interrupts(
+        &mut self,
+    ) -> Result<HvfArm64BootBlockNotificationDispatches, HvfArm64BootBlockNotificationDispatchError>
+    {
+        let dispatches = {
+            let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
+                HvfArm64BootBlockNotificationDispatchError::MapGuestMemory { source }
+            })?;
+            let mut mmio_dispatcher =
+                lock_boot_mmio_dispatcher(&self.mmio_dispatcher).map_err(|source| {
+                    HvfArm64BootBlockNotificationDispatchError::MmioDispatcher { source }
+                })?;
+
+            self.runtime_resources
+                .dispatch_block_queue_notifications(memory, &mut mmio_dispatcher)
+                .map_err(|source| {
+                    HvfArm64BootBlockNotificationDispatchError::DispatchNotifications { source }
+                })?
+        };
+
+        if !dispatches.needs_queue_interrupt() {
+            return collect_block_notification_dispatches(dispatches);
+        }
+
+        let signaler = HvfGicSpiSignaler::from_metadata(&self.gic).map_err(|source| {
+            HvfArm64BootBlockNotificationDispatchError::CreateSignalSink { source }
+        })?;
+
+        signal_block_queue_interrupts(dispatches, &signaler)
+    }
+}
+
+impl BootSessionRunLoopSession for OwnedHvfArm64BootSession {
+    fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
+        self.run_once_and_handle_mmio()
+    }
+
+    fn handle_run_loop_virtual_timer(&mut self) -> Result<(), HvfVcpuRunnerError> {
+        let intid = self.gic.timer_interrupts.el1_virtual_timer_intid;
+        self.runner.set_gic_ppi_pending(intid)
+    }
+
+    fn dispatch_run_loop_block_notifications(
+        &mut self,
+    ) -> Result<HvfArm64BootBlockNotificationDispatches, HvfArm64BootBlockNotificationDispatchError>
+    {
+        self.dispatch_block_queue_notifications_and_signal_interrupts()
+    }
+}
+
+impl Drop for OwnedHvfArm64BootSession {
     fn drop(&mut self) {
         let _ = self.shutdown();
     }

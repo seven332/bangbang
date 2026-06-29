@@ -32,7 +32,7 @@ pub use startup::{
     HvfArm64BootMmioDispatcherError, HvfArm64BootRunLoopControl, HvfArm64BootRunLoopError,
     HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig,
     HvfArm64BootSession, HvfArm64BootSessionConfig, HvfArm64BootSessionError,
-    HvfArm64BootSessionShutdownError,
+    HvfArm64BootSessionShutdownError, OwnedHvfArm64BootSession,
 };
 pub use vcpu::{
     ARM64_LINUX_BOOT_CPSR, HvfArm64BootRegisters, HvfRegister, HvfSystemRegister, HvfVcpu,

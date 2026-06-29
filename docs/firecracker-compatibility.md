@@ -45,8 +45,8 @@ boot-register setup, internal HVF single-vCPU arm64 boot-session preparation
 with a runner-compatible shared MMIO dispatcher, controlled mapped guest-memory
 access, one-step runner-thread MMIO handling, a run-cancellation boundary, a
 virtual-timer-mask control boundary, a bounded internal boot-session run-loop
-pump, boot block queue interrupt signaling, virtual timer PPI assertion, and an
-initial process startup argument model.
+pump, owned internal boot-session handle, boot block queue interrupt signaling,
+virtual timer PPI assertion, and an initial process startup argument model.
 There is no broader API request body model beyond the initial boot-source,
 drive configuration, machine-configuration, and actions bodies, public guest
 execution, unbounded or public continuous vCPU run loop, complete interrupt
@@ -695,7 +695,9 @@ backend-owned mapping owner consumes the `GuestMemory` allocation, unmaps mapped
 regions on explicit unmap, partial failure, drop, and VM destruction, and keeps
 cleanup local to the backend instance. The internal HVF boot-session preparation
 path maps the guest memory after runtime boot-resource assembly and releases the
-mapping with VM-owned state when the session shuts down or is dropped.
+mapping with VM-owned state when the session shuts down or is dropped. An owned
+internal boot-session handle can keep the prepared HVF backend/session resources
+as one storable value for future process startup wiring.
 
 On macOS 15.0 or newer, the HVF backend can create a GIC v3 device after VM
 creation and before vCPU creation. It dynamically resolves the macOS 15 GIC
@@ -745,7 +747,9 @@ notification dispatch between successful MMIO steps and virtual timer PPI
 assertion after virtual timer exits. It stops explicitly on a step limit,
 stop-token request, canceled run exit, unknown run exit, dispatch error, or
 timer handler error. This is still internal startup plumbing, not public
-`InstanceStart` behavior or the future unbounded guest scheduler.
+`InstanceStart` behavior or the future unbounded guest scheduler. An owned
+internal session handle preserves the same session operations while avoiding a
+self-referential backend/session owner in future process-level state.
 The boot session can also dispatch pending boot block queue notifications
 against mapped guest memory and signal the corresponding block SPI line when
 the runtime dispatch summary reports queue-interrupt intent; per-device results
