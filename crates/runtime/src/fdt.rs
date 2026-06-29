@@ -5,6 +5,7 @@ use std::fmt;
 use vm_fdt::{Error as VmFdtError, FdtWriter};
 
 use crate::boot::{BootCommandLineError, LoadedBootSource, LoadedInitrd};
+use crate::interrupt::GuestInterruptLine;
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryLayout,
     GuestMemoryRange, aarch64,
@@ -19,7 +20,11 @@ const CPU_SIZE_CELLS: u32 = 0;
 const CPU_REG_MASK: u64 = 0x7f_ffff;
 const MAX_ARM64_FDT_CPUS: usize = 32;
 const GIC_COMPATIBILITY: &str = "arm,gic-v3";
+const VIRTIO_MMIO_COMPATIBILITY: &str = "virtio,mmio";
+const VIRTIO_MMIO_NODE_PREFIX: &str = "virtio_mmio";
+const GIC_FDT_IRQ_TYPE_SPI: u32 = 0;
 const GIC_FDT_IRQ_TYPE_PPI: u32 = 1;
+const IRQ_TYPE_EDGE_RISING: u32 = 1;
 const IRQ_TYPE_LEVEL_HIGH: u32 = 4;
 const FIRST_PPI_INTID: u32 = 16;
 const FIRST_SPI_INTID: u32 = 32;
@@ -53,6 +58,7 @@ pub struct Arm64FdtConfig<'a> {
     pub vcpu_mpidrs: &'a [u64],
     pub gic: Arm64FdtGic,
     pub timer: Arm64FdtTimerInterrupts,
+    pub virtio_mmio_devices: &'a [Arm64FdtVirtioMmioDevice],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +95,12 @@ pub struct Arm64FdtTimerInterrupts {
     pub non_secure_physical: u32,
     pub virtual_timer: u32,
     pub hypervisor: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Arm64FdtVirtioMmioDevice {
+    pub region: Arm64FdtRegion,
+    pub interrupt_line: GuestInterruptLine,
 }
 
 impl Arm64FdtTimerInterrupts {
@@ -207,6 +219,31 @@ pub enum Arm64FdtError {
         intid: u32,
     },
     UnsupportedMsi,
+    InvalidVirtioMmioRegion {
+        index: usize,
+        region: Arm64FdtRegion,
+        source: GuestMemoryError,
+    },
+    VirtioMmioRegionOverlapsMemory {
+        index: usize,
+        region: Arm64FdtRegion,
+        memory_range: GuestMemoryRange,
+    },
+    VirtioMmioRegionOverlapsGic {
+        index: usize,
+        region: Arm64FdtRegion,
+        gic: &'static str,
+    },
+    VirtioMmioRegionsOverlap {
+        first_index: usize,
+        second_index: usize,
+        first_region: Arm64FdtRegion,
+        second_region: Arm64FdtRegion,
+    },
+    InvalidVirtioMmioInterrupt {
+        index: usize,
+        line: GuestInterruptLine,
+    },
     CreateFdt {
         source: VmFdtError,
     },
@@ -325,6 +362,43 @@ impl fmt::Display for Arm64FdtError {
                 "arm64 FDT {name} INTID must be in the PPI range [16, 32), got {intid}"
             ),
             Self::UnsupportedMsi => f.write_str("arm64 FDT MSI/ITS nodes are not supported yet"),
+            Self::InvalidVirtioMmioRegion {
+                index,
+                region,
+                source,
+            } => write!(
+                f,
+                "invalid arm64 FDT virtio-mmio device {index} region base=0x{:x}, size={}: {source}",
+                region.base, region.size
+            ),
+            Self::VirtioMmioRegionOverlapsMemory {
+                index,
+                region,
+                memory_range,
+            } => write!(
+                f,
+                "arm64 FDT virtio-mmio device {index} region base=0x{:x}, size={} overlaps guest memory range {memory_range}",
+                region.base, region.size
+            ),
+            Self::VirtioMmioRegionOverlapsGic { index, region, gic } => write!(
+                f,
+                "arm64 FDT virtio-mmio device {index} region base=0x{:x}, size={} overlaps GIC {gic} region",
+                region.base, region.size
+            ),
+            Self::VirtioMmioRegionsOverlap {
+                first_index,
+                second_index,
+                first_region,
+                second_region,
+            } => write!(
+                f,
+                "arm64 FDT virtio-mmio device {first_index} region base=0x{:x}, size={} overlaps device {second_index} region base=0x{:x}, size={}",
+                first_region.base, first_region.size, second_region.base, second_region.size
+            ),
+            Self::InvalidVirtioMmioInterrupt { index, line } => write!(
+                f,
+                "arm64 FDT virtio-mmio device {index} interrupt line {line} must be an SPI INTID at least {FIRST_SPI_INTID}"
+            ),
             Self::CreateFdt { source } => write!(f, "failed to create arm64 FDT: {source}"),
             Self::FdtTooLarge { size, max_size } => {
                 write!(
@@ -349,6 +423,7 @@ impl std::error::Error for Arm64FdtError {
             Self::InvalidLayout { source } => Some(source),
             Self::InvalidCommandLine { source } => Some(source),
             Self::InvalidInitrdRange { source } => Some(source),
+            Self::InvalidVirtioMmioRegion { source, .. } => Some(source),
             Self::CreateFdt { source } => Some(source),
             Self::GuestMemoryWrite { source } => Some(source),
             Self::MissingCpu
@@ -370,6 +445,10 @@ impl std::error::Error for Arm64FdtError {
             | Self::DuplicatePpi { .. }
             | Self::InvalidPpiIntid { .. }
             | Self::UnsupportedMsi
+            | Self::VirtioMmioRegionOverlapsMemory { .. }
+            | Self::VirtioMmioRegionOverlapsGic { .. }
+            | Self::VirtioMmioRegionsOverlap { .. }
+            | Self::InvalidVirtioMmioInterrupt { .. }
             | Self::FdtTooLarge { .. }
             | Self::GuestMemoryLayoutMismatch { .. } => None,
         }
@@ -385,6 +464,15 @@ impl From<VmFdtError> for Arm64FdtError {
 #[derive(Debug)]
 struct ValidatedArm64FdtConfig {
     memory_reg_cells: Vec<u64>,
+    virtio_mmio_devices: Vec<ValidatedArm64FdtVirtioMmioDevice>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ValidatedArm64FdtVirtioMmioDevice {
+    index: usize,
+    region: Arm64FdtRegion,
+    range: GuestMemoryRange,
+    interrupt_cell: u32,
 }
 
 pub fn build_arm64_fdt(config: &Arm64FdtConfig<'_>) -> Result<Vec<u8>, Arm64FdtError> {
@@ -403,6 +491,7 @@ pub fn build_arm64_fdt(config: &Arm64FdtConfig<'_>) -> Result<Vec<u8>, Arm64FdtE
     create_gic_node(&mut fdt, config.gic)?;
     create_timer_node(&mut fdt, config.timer)?;
     create_psci_node(&mut fdt)?;
+    create_virtio_mmio_nodes(&mut fdt, &validated.virtio_mmio_devices)?;
 
     fdt.end_node(root)?;
     let bytes = fdt.finish()?;
@@ -437,11 +526,16 @@ fn validate_config(config: &Arm64FdtConfig<'_>) -> Result<ValidatedArm64FdtConfi
     validate_gic(config.layout, config.gic)?;
     validate_timer(config.timer)?;
     validate_gic_timer_ppis(config.gic, config.timer)?;
+    let virtio_mmio_devices =
+        validate_virtio_mmio_devices(config.layout, config.gic, config.virtio_mmio_devices)?;
     if let Some(initrd) = config.boot.initrd {
         validate_initrd(config.layout, initrd)?;
     }
 
-    Ok(ValidatedArm64FdtConfig { memory_reg_cells })
+    Ok(ValidatedArm64FdtConfig {
+        memory_reg_cells,
+        virtio_mmio_devices,
+    })
 }
 
 fn validate_cpu_regs(mpidrs: &[u64]) -> Result<(), Arm64FdtError> {
@@ -606,6 +700,33 @@ fn create_psci_node(fdt: &mut FdtWriter) -> Result<(), Arm64FdtError> {
     fdt.property_string("compatible", "arm,psci-0.2")?;
     fdt.property_string("method", "hvc")?;
     fdt.end_node(psci)?;
+    Ok(())
+}
+
+fn create_virtio_mmio_nodes(
+    fdt: &mut FdtWriter,
+    devices: &[ValidatedArm64FdtVirtioMmioDevice],
+) -> Result<(), Arm64FdtError> {
+    for device in devices {
+        let node = fdt.begin_node(&format!(
+            "{VIRTIO_MMIO_NODE_PREFIX}@{:x}",
+            device.region.base
+        ))?;
+        fdt.property_null("dma-coherent")?;
+        fdt.property_string("compatible", VIRTIO_MMIO_COMPATIBILITY)?;
+        fdt.property_array_u64("reg", &[device.region.base, device.region.size])?;
+        fdt.property_array_u32(
+            "interrupts",
+            &[
+                GIC_FDT_IRQ_TYPE_SPI,
+                device.interrupt_cell,
+                IRQ_TYPE_EDGE_RISING,
+            ],
+        )?;
+        fdt.property_u32("interrupt-parent", GIC_PHANDLE)?;
+        fdt.end_node(node)?;
+    }
+
     Ok(())
 }
 
@@ -924,6 +1045,125 @@ fn validate_gic_region_does_not_overlap_memory(
     }
 
     Ok(())
+}
+
+fn validate_virtio_mmio_devices(
+    layout: &GuestMemoryLayout,
+    gic: Arm64FdtGic,
+    devices: &[Arm64FdtVirtioMmioDevice],
+) -> Result<Vec<ValidatedArm64FdtVirtioMmioDevice>, Arm64FdtError> {
+    let mut validated = Vec::with_capacity(devices.len());
+    for (index, device) in devices.iter().copied().enumerate() {
+        let range = validate_virtio_mmio_region(index, device.region)?;
+        validate_virtio_mmio_region_does_not_overlap_memory(layout, index, device.region, range)?;
+        validate_virtio_mmio_region_does_not_overlap_gic(index, device.region, range, gic)?;
+        validate_virtio_mmio_region_does_not_overlap_devices(
+            index,
+            device.region,
+            range,
+            &validated,
+        )?;
+        validated.push(ValidatedArm64FdtVirtioMmioDevice {
+            index,
+            region: device.region,
+            range,
+            interrupt_cell: virtio_mmio_interrupt_cell(index, device.interrupt_line)?,
+        });
+    }
+
+    validated.sort_by_key(|device| device.region.base);
+    Ok(validated)
+}
+
+fn validate_virtio_mmio_region(
+    index: usize,
+    region: Arm64FdtRegion,
+) -> Result<GuestMemoryRange, Arm64FdtError> {
+    GuestMemoryRange::new(GuestAddress::new(region.base), region.size).map_err(|source| {
+        Arm64FdtError::InvalidVirtioMmioRegion {
+            index,
+            region,
+            source,
+        }
+    })
+}
+
+fn validate_virtio_mmio_region_does_not_overlap_memory(
+    layout: &GuestMemoryLayout,
+    index: usize,
+    region: Arm64FdtRegion,
+    device_range: GuestMemoryRange,
+) -> Result<(), Arm64FdtError> {
+    for memory_range in layout.ranges().iter().copied() {
+        if device_range.overlaps(memory_range) {
+            return Err(Arm64FdtError::VirtioMmioRegionOverlapsMemory {
+                index,
+                region,
+                memory_range,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_virtio_mmio_region_does_not_overlap_gic(
+    index: usize,
+    region: Arm64FdtRegion,
+    device_range: GuestMemoryRange,
+    gic: Arm64FdtGic,
+) -> Result<(), Arm64FdtError> {
+    let gic_ranges = [
+        (
+            "distributor",
+            validate_gic_region("distributor", gic.distributor)?,
+        ),
+        (
+            "redistributor",
+            validate_gic_region("redistributor", gic.redistributor)?,
+        ),
+    ];
+
+    for (gic_name, gic_range) in gic_ranges {
+        if device_range.overlaps(gic_range) {
+            return Err(Arm64FdtError::VirtioMmioRegionOverlapsGic {
+                index,
+                region,
+                gic: gic_name,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_virtio_mmio_region_does_not_overlap_devices(
+    index: usize,
+    region: Arm64FdtRegion,
+    device_range: GuestMemoryRange,
+    previous_devices: &[ValidatedArm64FdtVirtioMmioDevice],
+) -> Result<(), Arm64FdtError> {
+    for previous_device in previous_devices {
+        if device_range.overlaps(previous_device.range) {
+            return Err(Arm64FdtError::VirtioMmioRegionsOverlap {
+                first_index: previous_device.index,
+                second_index: index,
+                first_region: previous_device.region,
+                second_region: region,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn virtio_mmio_interrupt_cell(
+    index: usize,
+    line: GuestInterruptLine,
+) -> Result<u32, Arm64FdtError> {
+    line.raw_value()
+        .checked_sub(FIRST_SPI_INTID)
+        .ok_or(Arm64FdtError::InvalidVirtioMmioInterrupt { index, line })
 }
 
 fn validate_timer(timer: Arm64FdtTimerInterrupts) -> Result<(), Arm64FdtError> {
@@ -1626,6 +1866,300 @@ mod tests {
     }
 
     #[test]
+    fn virtio_mmio_node_uses_firecracker_shape() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let devices = [virtio_mmio_device(0x4000_1000, 0x1000, 32)];
+        let config = test_config_with_virtio_mmio_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            &devices,
+        );
+
+        let bytes = build_arm64_fdt(&config).expect("FDT should be built");
+        let tree = DeviceTree::load(&bytes).expect("FDT should parse");
+        let virtio = required_node(&tree, "/virtio_mmio@40001000");
+
+        assert!(virtio.has_prop("dma-coherent"));
+        assert_eq!(virtio.prop_str("compatible").unwrap(), "virtio,mmio");
+        assert_eq!(prop_u64_cells(virtio, "reg"), vec![0x4000_1000, 0x1000]);
+        assert_eq!(prop_u32_cells(virtio, "interrupts"), vec![0, 0, 1]);
+        assert_eq!(virtio.prop_u32("interrupt-parent").unwrap(), GIC_PHANDLE);
+    }
+
+    #[test]
+    fn virtio_mmio_nodes_are_sorted_by_address() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let devices = [
+            virtio_mmio_device(0x4000_3000, 0x1000, 34),
+            virtio_mmio_device(0x4000_1000, 0x1000, 32),
+        ];
+        let config = test_config_with_virtio_mmio_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            &devices,
+        );
+
+        let bytes = build_arm64_fdt(&config).expect("FDT should be built");
+        let tree = DeviceTree::load(&bytes).expect("FDT should parse");
+        let root_children: Vec<&str> = tree
+            .root
+            .children
+            .iter()
+            .map(|child| child.name.as_str())
+            .collect();
+
+        assert_eq!(
+            root_children,
+            [
+                "cpus",
+                "memory@ram",
+                "chosen",
+                "intc",
+                "timer",
+                "psci",
+                "virtio_mmio@40001000",
+                "virtio_mmio@40003000",
+            ]
+        );
+        let first = required_node(&tree, "/virtio_mmio@40001000");
+        let second = required_node(&tree, "/virtio_mmio@40003000");
+        assert_eq!(prop_u32_cells(first, "interrupts"), vec![0, 0, 1]);
+        assert_eq!(prop_u32_cells(second, "interrupts"), vec![0, 2, 1]);
+    }
+
+    #[test]
+    fn rejects_invalid_virtio_mmio_region() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let devices = [virtio_mmio_device(0x4000_1000, 0, 32)];
+        let config = test_config_with_virtio_mmio_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            &devices,
+        );
+
+        let err = build_arm64_fdt(&config).expect_err("empty device region should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::InvalidVirtioMmioRegion {
+                index: 0,
+                region: devices[0].region,
+                source: GuestMemoryError::EmptyRange {
+                    start: GuestAddress::new(0x4000_1000),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_overflowing_virtio_mmio_region() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let devices = [virtio_mmio_device(u64::MAX, 1, 32)];
+        let config = test_config_with_virtio_mmio_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            &devices,
+        );
+
+        let err = build_arm64_fdt(&config).expect_err("overflowing device region should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::InvalidVirtioMmioRegion {
+                index: 0,
+                region: devices[0].region,
+                source: GuestMemoryError::AddressOverflow {
+                    start: GuestAddress::new(u64::MAX),
+                    size: 1,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_virtio_mmio_region_overlapping_guest_memory() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let devices = [virtio_mmio_device(aarch64::DRAM_MEM_START, 0x1000, 32)];
+        let config = test_config_with_virtio_mmio_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            &devices,
+        );
+
+        let err = build_arm64_fdt(&config).expect_err("RAM-overlapping device should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::VirtioMmioRegionOverlapsMemory {
+                index: 0,
+                region: devices[0].region,
+                memory_range: layout.ranges()[0],
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_virtio_mmio_region_overlapping_gic() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let devices = [virtio_mmio_device(0x3fff_0000, 0x1000, 32)];
+        let config = test_config_with_virtio_mmio_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            &devices,
+        );
+
+        let err = build_arm64_fdt(&config).expect_err("GIC-overlapping device should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::VirtioMmioRegionOverlapsGic {
+                index: 0,
+                region: devices[0].region,
+                gic: "distributor",
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_overlapping_virtio_mmio_regions() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let devices = [
+            virtio_mmio_device(0x4000_0000, 0x2000, 32),
+            virtio_mmio_device(0x4000_1000, 0x1000, 33),
+        ];
+        let config = test_config_with_virtio_mmio_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            &devices,
+        );
+
+        let err = build_arm64_fdt(&config).expect_err("overlapping devices should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::VirtioMmioRegionsOverlap {
+                first_index: 0,
+                second_index: 1,
+                first_region: devices[0].region,
+                second_region: devices[1].region,
+            }
+        );
+    }
+
+    #[test]
+    fn accepts_adjacent_virtio_mmio_regions() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let memory_adjacent_base = aarch64::DRAM_MEM_START - 0x1000;
+        let devices = [
+            virtio_mmio_device(0x4000_0000, 0x1000, 32),
+            virtio_mmio_device(0x4000_1000, 0x1000, 33),
+            virtio_mmio_device(memory_adjacent_base, 0x1000, 34),
+        ];
+        let config = test_config_with_virtio_mmio_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            &devices,
+        );
+
+        let bytes = build_arm64_fdt(&config).expect("adjacent device regions should be accepted");
+        let tree = DeviceTree::load(&bytes).expect("FDT should parse");
+        let gic_adjacent = required_node(&tree, "/virtio_mmio@40000000");
+        let device_adjacent = required_node(&tree, "/virtio_mmio@40001000");
+        let memory_adjacent =
+            required_node(&tree, &format!("/virtio_mmio@{memory_adjacent_base:x}"));
+
+        assert_eq!(
+            prop_u64_cells(gic_adjacent, "reg"),
+            vec![0x4000_0000, 0x1000]
+        );
+        assert_eq!(
+            prop_u64_cells(device_adjacent, "reg"),
+            vec![0x4000_1000, 0x1000]
+        );
+        assert_eq!(
+            prop_u64_cells(memory_adjacent, "reg"),
+            vec![memory_adjacent_base, 0x1000]
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_virtio_mmio_regions() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let devices = [
+            virtio_mmio_device(0x4000_0000, 0x1000, 32),
+            virtio_mmio_device(0x4000_0000, 0x1000, 33),
+        ];
+        let config = test_config_with_virtio_mmio_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            &devices,
+        );
+
+        let err = build_arm64_fdt(&config).expect_err("duplicate devices should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::VirtioMmioRegionsOverlap {
+                first_index: 0,
+                second_index: 1,
+                first_region: devices[0].region,
+                second_region: devices[1].region,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_non_spi_virtio_mmio_interrupt_line() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let devices = [virtio_mmio_device(0x4000_1000, 0x1000, 31)];
+        let config = test_config_with_virtio_mmio_devices(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+            &devices,
+        );
+
+        let err = build_arm64_fdt(&config).expect_err("non-SPI interrupt should fail");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::InvalidVirtioMmioInterrupt {
+                index: 0,
+                line: devices[0].interrupt_line,
+            }
+        );
+    }
+
+    #[test]
     fn writes_fdt_to_reserved_guest_memory_address() {
         let layout = test_layout(TEST_MEMORY_SIZE);
         let mut memory = GuestMemory::allocate(&layout).expect("guest memory should allocate");
@@ -2053,12 +2587,29 @@ mod tests {
         layout: &'a GuestMemoryLayout,
         boot: Arm64FdtBootInfo<'a>,
     ) -> Arm64FdtConfig<'a> {
+        test_config_with_virtio_mmio_devices(layout, boot, &[])
+    }
+
+    fn test_config_with_virtio_mmio_devices<'a>(
+        layout: &'a GuestMemoryLayout,
+        boot: Arm64FdtBootInfo<'a>,
+        virtio_mmio_devices: &'a [Arm64FdtVirtioMmioDevice],
+    ) -> Arm64FdtConfig<'a> {
         Arm64FdtConfig {
             layout,
             boot,
             vcpu_mpidrs: TEST_VCPU_MPIDRS,
             gic: test_gic(),
             timer: Arm64FdtTimerInterrupts::firecracker_default(),
+            virtio_mmio_devices,
+        }
+    }
+
+    fn virtio_mmio_device(base: u64, size: u64, line: u32) -> Arm64FdtVirtioMmioDevice {
+        Arm64FdtVirtioMmioDevice {
+            region: Arm64FdtRegion { base, size },
+            interrupt_line: GuestInterruptLine::new(line)
+                .expect("test interrupt line should be nonzero"),
         }
     }
 

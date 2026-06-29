@@ -21,7 +21,7 @@ create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding,
 registry resolution, vCPU exit classification, single resolved HVF MMIO
 exit dispatch/completion through runtime handlers, explicit runner-thread MMIO
 handling commands, narrow vCPU register wrappers, internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, HVF SPI interrupt-line allocation and signaling, minimal internal
-arm64 FDT generation and guest-memory writes, anonymous guest memory allocation
+arm64 FDT generation with virtio-mmio device-node descriptors and guest-memory writes, anonymous guest memory allocation
 for validated runtime layouts, HVF guest memory map/unmap ownership for
 allocated regions, an internal MMIO region ownership registry and operation/data
 model plus handler dispatch boundary, an internal virtio-mmio register/access
@@ -414,9 +414,9 @@ The config handler supports bounded read-only capacity reads through the
 existing virtio-mmio device-configuration path and rejects config writes.
 
 The runtime model is wired to successful pre-boot `PUT /drives/{drive_id}` VMM
-configuration storage. It still does not call block-device preparation or MMIO
-registration through the API, select a root block device for boot, describe
-block MMIO devices in the FDT, wire active block notification dispatch into
+configuration storage. It still does not call block-device preparation, MMIO
+registration, or FDT device description through the API or startup path, select
+a root block device for boot, wire active block notification dispatch into
 startup or HVF runner loops, signal backend interrupts for block devices,
 implement rate limiting, support vhost-user-block sockets, or use an async I/O
 engine.
@@ -425,9 +425,10 @@ engine.
 
 The runtime crate can build a minimal Firecracker-shaped arm64 FDT using the
 same `vm-fdt` writer crate that Firecracker uses. The generated tree currently
-contains root properties, CPU data, memory, chosen, timer, PSCI, and GIC nodes.
-It intentionally omits serial, RTC, virtio, PCI, vmgenid, vmclock, and other
-device nodes until the corresponding emulation paths exist.
+contains root properties, CPU data, memory, chosen, timer, PSCI, GIC nodes, and
+optional sorted virtio-mmio device nodes from caller-supplied descriptors. It
+intentionally omits serial, RTC, PCI, vmgenid, vmclock, and other device nodes
+until the corresponding emulation paths exist.
 
 The memory node excludes the first 2 MiB system area from the first DRAM range
 and preserves later DRAM ranges from the runtime layout, but direct FDT
@@ -447,6 +448,17 @@ guest-advertised memory or overlapping the reserved FDT window, and GIC MMIO
 regions that are invalid, overlap each other, or overlap guest RAM. It also
 rejects unexpected GIC compatibility strings and PPI collisions between the GIC
 maintenance interrupt and timer interrupts.
+
+Optional virtio-mmio nodes follow Firecracker's aarch64 FDT shape: node names
+are `virtio_mmio@{base:x}`, each node has `dma-coherent`,
+`compatible = "virtio,mmio"`, `reg = [base, size]`,
+`interrupts = [SPI, line - 32, edge-rising]`, and `interrupt-parent` pointing
+at the GIC phandle. Direct FDT configuration validates that each device range is
+non-empty, does not overflow, does not overlap guest RAM, GIC distributor or
+redistributor ranges, or another virtio-mmio range, and that each interrupt
+line is an actual SPI INTID before encoding Firecracker's legacy GSI-style FDT
+cell. Startup code does not yet compose block MMIO registrations and allocated
+interrupt lines into these descriptors.
 
 FDT writes first reject mismatches between the layout used to describe guest RAM
 and the allocated guest memory object. FDT bytes are then built before guest
