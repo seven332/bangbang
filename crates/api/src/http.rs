@@ -18,6 +18,7 @@ pub enum ApiRequest {
     GetInstanceInfo,
     GetMachineConfig,
     GetVersion,
+    PutBootSource(Box<BootSourceRequest>),
     PutDrive(Box<DriveConfigRequest>),
     PutMachineConfig(Box<MachineConfigRequest>),
 }
@@ -50,6 +51,35 @@ impl fmt::Display for RequestError {
 }
 
 impl std::error::Error for RequestError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootSourceRequest {
+    kernel_image_path: String,
+    initrd_path: Option<String>,
+    boot_args: Option<String>,
+}
+
+impl BootSourceRequest {
+    pub fn kernel_image_path(&self) -> &str {
+        &self.kernel_image_path
+    }
+
+    pub fn initrd_path(&self) -> Option<&str> {
+        self.initrd_path.as_deref()
+    }
+
+    pub fn boot_args(&self) -> Option<&str> {
+        self.boot_args.as_deref()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BootSourceRequestBody {
+    kernel_image_path: String,
+    initrd_path: Option<String>,
+    boot_args: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineConfigRequest {
@@ -353,6 +383,9 @@ pub fn parse_request(bytes: &[u8]) -> Result<ApiRequest, RequestError> {
     {
         return parse_drive_config_request(path_drive_id, body);
     }
+    if method == "PUT" && path == "/boot-source" {
+        return parse_boot_source_request(body);
+    }
     if method == "PUT" && path == "/machine-config" {
         return parse_machine_config_request(body);
     }
@@ -377,6 +410,17 @@ fn drive_path_id(path: &str) -> Option<&str> {
     }
 
     Some(rest)
+}
+
+fn parse_boot_source_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
+    let body = serde_json::from_slice::<BootSourceRequestBody>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+
+    Ok(ApiRequest::PutBootSource(Box::new(BootSourceRequest {
+        kernel_image_path: body.kernel_image_path,
+        initrd_path: body.initrd_path,
+        boot_args: body.boot_args,
+    })))
 }
 
 fn parse_drive_config_request(
@@ -648,6 +692,7 @@ impl From<ApiRequest> for Endpoint {
             ApiRequest::GetInstanceInfo => Self::DescribeInstance,
             ApiRequest::GetMachineConfig => Self::MachineConfig,
             ApiRequest::GetVersion => Self::Version,
+            ApiRequest::PutBootSource(_) => Self::BootSource,
             ApiRequest::PutDrive(_) => Self::Drive,
             ApiRequest::PutMachineConfig(_) => Self::MachineConfig,
         }
@@ -729,6 +774,115 @@ mod tests {
         let request = request_with_body("GET", "/machine-config", "{}");
 
         assert_eq!(parse_request(&request), Err(RequestError::GetRequestBody));
+    }
+
+    #[test]
+    fn parses_put_boot_source_with_minimal_body() {
+        let body = r#"{"kernel_image_path":"/tmp/vmlinux"}"#;
+        let request = request_with_body("PUT", "/boot-source", body);
+
+        let parsed = parse_request(&request).expect("boot-source request should parse");
+
+        let ApiRequest::PutBootSource(config) = parsed else {
+            panic!("expected boot-source request");
+        };
+        assert_eq!(config.kernel_image_path(), "/tmp/vmlinux");
+        assert_eq!(config.initrd_path(), None);
+        assert_eq!(config.boot_args(), None);
+        assert_eq!(request_total_len(&request), Ok(Some(request.len())));
+    }
+
+    #[test]
+    fn parses_put_boot_source_with_complete_body() {
+        let body = r#"{
+            "kernel_image_path": "/tmp/vmlinux",
+            "initrd_path": "/tmp/initrd.img",
+            "boot_args": "console=ttyS0 reboot=k panic=1"
+        }"#;
+        let request = request_with_body("PUT", "/boot-source", body);
+
+        let parsed = parse_request(&request).expect("complete boot-source request should parse");
+
+        let ApiRequest::PutBootSource(config) = parsed else {
+            panic!("expected boot-source request");
+        };
+        assert_eq!(config.kernel_image_path(), "/tmp/vmlinux");
+        assert_eq!(config.initrd_path(), Some("/tmp/initrd.img"));
+        assert_eq!(config.boot_args(), Some("console=ttyS0 reboot=k panic=1"));
+    }
+
+    #[test]
+    fn parses_put_boot_source_with_null_optional_fields() {
+        let body = r#"{
+            "kernel_image_path": "/tmp/vmlinux",
+            "initrd_path": null,
+            "boot_args": null
+        }"#;
+        let request = request_with_body("PUT", "/boot-source", body);
+
+        let parsed = parse_request(&request).expect("nullable boot-source fields should parse");
+
+        let ApiRequest::PutBootSource(config) = parsed else {
+            panic!("expected boot-source request");
+        };
+        assert_eq!(config.kernel_image_path(), "/tmp/vmlinux");
+        assert_eq!(config.initrd_path(), None);
+        assert_eq!(config.boot_args(), None);
+    }
+
+    #[test]
+    fn rejects_put_boot_source_missing_kernel_image_path() {
+        let request = request_with_body("PUT", "/boot-source", r#"{"boot_args":"console=ttyS0"}"#);
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_put_boot_source_unknown_field() {
+        let request = request_with_body(
+            "PUT",
+            "/boot-source",
+            r#"{"kernel_image_path":"/tmp/vmlinux","unknown":true}"#,
+        );
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_put_boot_source_invalid_field_types() {
+        for body in [
+            r#"{"kernel_image_path":1}"#,
+            r#"{"kernel_image_path":"/tmp/vmlinux","initrd_path":false}"#,
+            r#"{"kernel_image_path":"/tmp/vmlinux","boot_args":["console=ttyS0"]}"#,
+        ] {
+            assert_eq!(
+                parse_request(&request_with_body("PUT", "/boot-source", body)),
+                Err(RequestError::MalformedRequest)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_put_boot_source_empty_body() {
+        let request = request_with_body("PUT", "/boot-source", "");
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_unsupported_boot_source_method_or_path() {
+        assert_eq!(
+            parse_request(b"GET /boot-source HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+            Err(RequestError::InvalidPathMethod)
+        );
+        assert_eq!(
+            parse_request(&request_with_body(
+                "PUT",
+                "/boot-source/extra",
+                r#"{"kernel_image_path":"/tmp/vmlinux"}"#,
+            )),
+            Err(RequestError::InvalidPathMethod)
+        );
     }
 
     #[test]
@@ -1392,6 +1546,15 @@ mod tests {
             Endpoint::from(ApiRequest::GetMachineConfig),
             Endpoint::MachineConfig
         );
+        let request = parse_request(&request_with_body(
+            "PUT",
+            "/boot-source",
+            r#"{"kernel_image_path":"/tmp/vmlinux"}"#,
+        ))
+        .expect("boot-source request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::BootSource);
+
         let request = parse_request(&request_with_body(
             "PUT",
             "/drives/rootfs",
