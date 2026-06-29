@@ -268,6 +268,12 @@ fn prepares_internal_hvf_arm64_boot_session() {
     );
     let run_cancel_handle = session.run_cancel_handle();
     drop(run_cancel_handle);
+    let run_loop_control = session.run_loop_control();
+    let run_loop_stop_token = run_loop_control.stop_token();
+    run_loop_control
+        .request_stop()
+        .expect("internal HVF boot-session run-loop stop should request vCPU cancellation");
+    assert!(run_loop_stop_token.is_stop_requested());
     session
         .shutdown()
         .expect("internal HVF arm64 boot session should shut down");
