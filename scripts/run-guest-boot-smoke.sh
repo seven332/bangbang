@@ -91,7 +91,7 @@ if ! command -v codesign >/dev/null 2>&1; then
 fi
 
 kernel_path="$(scripts/fetch-firecracker-kernel.sh)"
-initrd_path="$(scripts/build-guest-boot-initrd.py)"
+initrd_path="$(scripts/build-guest-boot-initrd.py --check)"
 
 target_triple="aarch64-apple-darwin"
 

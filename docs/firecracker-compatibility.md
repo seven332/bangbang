@@ -560,11 +560,11 @@ reports feature support only for the implemented minimal calls, returns
 `MIGRATE_INFO_TYPE` as the PSCI value for a trusted OS that is MP-capable or
 not present, where migration is not required, and writes `NOT_SUPPORTED` to X0
 for other PSCI calls or HVC immediates.
-Early boot also traps the guest's `OSDLR_EL1` system-register access through
-the AArch64 SYS64 exception class (`0x18`), not through SMC/SMCCC. The HVF
-runner handles only that observed debug-register access with KVM-like RAZ/WI
-semantics: reads return zero, writes are ignored, and other trapped system
-registers still fail closed.
+Early boot also traps the guest's `OSDLR_EL1` and `OSLAR_EL1` OS lock
+system-register accesses through the AArch64 SYS64 exception class (`0x18`),
+not through SMC/SMCCC. The HVF runner handles only those observed
+debug-register accesses with KVM-like RAZ/WI semantics: reads return zero,
+writes are ignored, and other trapped system registers still fail closed.
 
 The memory node excludes the first 2 MiB system area from the first DRAM range
 and preserves later DRAM ranges from the runtime layout, but direct FDT

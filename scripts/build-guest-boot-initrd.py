@@ -12,6 +12,8 @@ from pathlib import Path
 
 BOOT_MARKER = b"BANGBANG_BOOT_OK\n"
 DEFAULT_RELATIVE_OUTPUT = Path("bangbang/guest-boot-smoke/initrd.cpio")
+CPIO_NEWC_HEADER_SIZE = 110
+CPIO_TRAILER = "TRAILER!!!"
 
 ELF_BASE_VADDR = 0x400000
 ELF_CODE_OFFSET = 0x100
@@ -22,6 +24,7 @@ ELF_PROGRAM_HEADER_SIZE = 0x38
 S_IFDIR = 0o040000
 S_IFCHR = 0o020000
 S_IFREG = 0o100000
+S_IFMT = 0o170000
 
 
 def movz_64(register: int, immediate: int, shift: int = 0) -> bytes:
@@ -199,6 +202,118 @@ def build_initrd() -> bytes:
     return pad512(archive)
 
 
+def align4_offset(offset: int) -> int:
+    return offset + ((-offset) % 4)
+
+
+def parse_newc_entries(data: bytes) -> list[dict[str, object]]:
+    entries: list[dict[str, object]] = []
+    offset = 0
+
+    while True:
+        if offset + CPIO_NEWC_HEADER_SIZE > len(data):
+            raise RuntimeError("guest initrd ended before newc trailer")
+
+        header = data[offset : offset + CPIO_NEWC_HEADER_SIZE]
+        if header[:6] != b"070701":
+            raise RuntimeError(f"guest initrd newc entry at offset {offset} has invalid magic")
+
+        field_names = (
+            "ino",
+            "mode",
+            "uid",
+            "gid",
+            "nlink",
+            "mtime",
+            "filesize",
+            "devmajor",
+            "devminor",
+            "rdevmajor",
+            "rdevminor",
+            "namesize",
+            "check",
+        )
+        fields = {
+            name: int(header[6 + (index * 8) : 14 + (index * 8)], 16)
+            for index, name in enumerate(field_names)
+        }
+        offset += CPIO_NEWC_HEADER_SIZE
+
+        namesize = int(fields["namesize"])
+        name_end = offset + namesize
+        if namesize == 0 or name_end > len(data):
+            raise RuntimeError("guest initrd newc entry has invalid name size")
+
+        raw_name = data[offset:name_end]
+        if raw_name[-1:] != b"\0":
+            raise RuntimeError("guest initrd newc entry name is not NUL-terminated")
+        name = raw_name[:-1].decode("utf-8")
+        offset = align4_offset(name_end)
+
+        filesize = int(fields["filesize"])
+        data_end = offset + filesize
+        if data_end > len(data):
+            raise RuntimeError(f"guest initrd newc entry {name} payload is truncated")
+        payload = data[offset:data_end]
+        offset = align4_offset(data_end)
+
+        entry = {
+            "name": name,
+            "payload": payload,
+            **fields,
+        }
+        entries.append(entry)
+
+        if name == CPIO_TRAILER:
+            if any(data[offset:]):
+                raise RuntimeError("guest initrd has non-zero bytes after newc trailer")
+            return entries
+
+
+def required_entry(entries: dict[str, dict[str, object]], name: str) -> dict[str, object]:
+    try:
+        return entries[name]
+    except KeyError as err:
+        raise RuntimeError(f"guest initrd is missing {name}") from err
+
+
+def file_type(mode: object) -> int:
+    return int(mode) & S_IFMT
+
+
+def validate_initrd(data: bytes) -> None:
+    if not data:
+        raise RuntimeError("guest initrd is empty")
+    if len(data) % 512 != 0:
+        raise RuntimeError("guest initrd is not padded to a 512-byte boundary")
+
+    parsed = parse_newc_entries(data)
+    entries = {str(entry["name"]): entry for entry in parsed}
+    names = [str(entry["name"]) for entry in parsed]
+    expected_names = ["dev", "dev/console", "init", CPIO_TRAILER]
+    if names != expected_names:
+        raise RuntimeError(f"guest initrd entries {names!r} do not match {expected_names!r}")
+
+    dev = required_entry(entries, "dev")
+    if file_type(dev["mode"]) != S_IFDIR:
+        raise RuntimeError("guest initrd dev entry is not a directory")
+
+    console = required_entry(entries, "dev/console")
+    if file_type(console["mode"]) != S_IFCHR:
+        raise RuntimeError("guest initrd dev/console entry is not a character device")
+    if int(console["rdevmajor"]) != 5 or int(console["rdevminor"]) != 1:
+        raise RuntimeError("guest initrd dev/console is not character device 5:1")
+
+    init = required_entry(entries, "init")
+    if file_type(init["mode"]) != S_IFREG:
+        raise RuntimeError("guest initrd init entry is not a regular file")
+    payload = bytes(init["payload"])
+    if not payload.startswith(b"\x7fELF"):
+        raise RuntimeError("guest initrd init payload is not an ELF file")
+    if BOOT_MARKER not in payload:
+        raise RuntimeError("guest initrd init payload does not contain the boot marker")
+
+
 def default_output_path() -> Path:
     script_path = Path(__file__).resolve()
     repo_root = script_path.parent.parent
@@ -257,6 +372,11 @@ def parse_args() -> argparse.Namespace:
         default=default_output_path(),
         help="Output initrd path. Defaults under BANGBANG_GUEST_ARTIFACTS_DIR or .tmp/guest-artifacts.",
     )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Validate the generated initrd structure after writing it.",
+    )
     return parser.parse_args()
 
 
@@ -264,7 +384,12 @@ def main() -> int:
     args = parse_args()
     try:
         output_path = args.output
-        write_output(output_path, build_initrd())
+        data = build_initrd()
+        if args.check:
+            validate_initrd(data)
+        write_output(output_path, data)
+        if args.check:
+            validate_initrd(output_path.read_bytes())
     except OSError as err:
         print(f"failed to build guest boot initrd: {err}", file=sys.stderr)
         return 1

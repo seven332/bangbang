@@ -212,6 +212,7 @@ pub struct HvfSys64Register {
 
 impl HvfSys64Register {
     pub const OSDLR_EL1: Self = Self::from_raw_fields(2, 0, 1, 3, 4);
+    pub const OSLAR_EL1: Self = Self::from_raw_fields(2, 0, 1, 0, 4);
 
     pub const fn new(op0: u8, op1: u8, crn: u8, crm: u8, op2: u8) -> Option<Self> {
         if op0 <= ESR_ISS_SYS64_OP0_MASK as u8
@@ -843,6 +844,18 @@ mod tests {
         assert_eq!(sys64.register(), HvfSys64Register::OSDLR_EL1);
         assert_eq!(sys64.target_register(), 31);
         assert_eq!(sys64.register().to_string(), "S2_0_C1_C3_4");
+    }
+
+    #[test]
+    fn decodes_observed_oslar_sys64_exception_exit() {
+        let exit = exception_exit(0x6228_07e0, 0);
+        let sys64 = exit.decode_sys64().expect("SYS64 exit should decode");
+
+        assert_eq!(sys64.exception_exit(), exit);
+        assert_eq!(sys64.direction(), HvfSys64Direction::Write);
+        assert_eq!(sys64.register(), HvfSys64Register::OSLAR_EL1);
+        assert_eq!(sys64.target_register(), 31);
+        assert_eq!(sys64.register().to_string(), "S2_0_C1_C0_4");
     }
 
     #[test]
