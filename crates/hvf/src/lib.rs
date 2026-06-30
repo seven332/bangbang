@@ -6,15 +6,17 @@ mod ffi;
 mod gic;
 mod memory;
 mod mmio;
+mod psci;
 mod runner;
 mod startup;
 mod vcpu;
 
 pub use backend::HvfBackend;
 pub use exit::{
-    HvfExceptionExit, HvfMmioAccess, HvfMmioAccessSize, HvfMmioDecodeError, HvfMmioDirection,
-    HvfMmioRegister, HvfMmioRegisterWidth, HvfMmioResolveError, HvfResolvedMmioAccess,
-    HvfResolvedVcpuExit, HvfVcpuExit, HvfVcpuExitResolveError,
+    HvfExceptionExit, HvfHvcDecodeError, HvfHvcExit, HvfMmioAccess, HvfMmioAccessSize,
+    HvfMmioDecodeError, HvfMmioDirection, HvfMmioRegister, HvfMmioRegisterWidth,
+    HvfMmioResolveError, HvfResolvedMmioAccess, HvfResolvedVcpuExit, HvfVcpuExit,
+    HvfVcpuExitResolveError,
 };
 pub use gic::{
     HvfGicError, HvfGicInterruptLineAllocator, HvfGicInterruptRange, HvfGicMetadata,

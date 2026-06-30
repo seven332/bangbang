@@ -761,6 +761,14 @@ fn run_boot_session_loop(
             HvfVcpuRunStepOutcome::Unknown { reason } => {
                 return Ok(HvfArm64BootRunLoopOutcome::Unknown { steps, reason });
             }
+            HvfVcpuRunStepOutcome::Hvc { .. } => {
+                if stop_token.is_stop_requested() {
+                    return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+                }
+                if steps == max_steps {
+                    return Ok(HvfArm64BootRunLoopOutcome::StepLimitReached { steps });
+                }
+            }
             HvfVcpuRunStepOutcome::Mmio { .. } => {
                 session
                     .dispatch_run_loop_block_notifications()
@@ -1219,7 +1227,9 @@ mod tests {
         run_boot_session_loop, run_boot_session_vcpu_step, signal_block_queue_interrupts,
         validate_single_vcpu,
     };
-    use crate::exit::{HvfExceptionExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister};
+    use crate::exit::{
+        HvfExceptionExit, HvfHvcExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
+    };
     use crate::gic::{HvfGicInterruptRange, HvfGicMetadata, HvfGicRedistributor, HvfGicRegion};
     use crate::runner::{HvfVcpuRunStepOutcome, HvfVcpuRunnerError};
 
@@ -1231,6 +1241,7 @@ mod tests {
     const ARM64_IMAGE_SIZE_OFFSET: usize = 16;
     const ARM64_IMAGE_MAGIC_OFFSET: usize = 56;
     const ARM64_IMAGE_MAGIC: u32 = 0x644d_5241;
+    const ESR_EC_HVC: u64 = 0x16;
     const ESR_EC_DATA_ABORT_LOWER_EL: u64 = 0x24;
     const ESR_EC_SHIFT: u64 = 26;
     const ESR_ISS_ISV: u64 = 1 << 24;
@@ -1253,6 +1264,8 @@ mod tests {
         | VIRTIO_DEVICE_STATUS_DRIVER
         | VIRTIO_DEVICE_STATUS_FEATURES_OK;
     const DRIVER_OK_STATUS: u32 = QUEUE_CONFIG_STATUS | VIRTIO_DEVICE_STATUS_DRIVER_OK;
+    const PSCI_VERSION: u64 = 0x8400_0000;
+    const PSCI_VERSION_0_2: u64 = 0x0000_0002;
 
     struct TempFile {
         path: PathBuf,
@@ -1504,6 +1517,28 @@ mod tests {
             access: resolved,
             outcome: MmioDispatchOutcome::Write,
         }
+    }
+
+    fn hvc_run_step_outcome() -> HvfVcpuRunStepOutcome {
+        HvfVcpuRunStepOutcome::Hvc {
+            exit: hvc_exit(0),
+            function_id: PSCI_VERSION,
+            return_value: PSCI_VERSION_0_2,
+        }
+    }
+
+    fn hvc_exit(immediate: u16) -> HvfHvcExit {
+        let exit = HvfExceptionExit {
+            syndrome: hvc_syndrome(immediate),
+            virtual_address: 0,
+            physical_address: 0,
+        };
+
+        exit.decode_hvc().expect("test HVC exit should decode")
+    }
+
+    fn hvc_syndrome(immediate: u16) -> u64 {
+        (ESR_EC_HVC << ESR_EC_SHIFT) | u64::from(immediate)
     }
 
     fn data_abort_syndrome(
@@ -2337,6 +2372,24 @@ mod tests {
     }
 
     #[test]
+    fn boot_session_run_loop_continues_after_hvc_until_step_limit() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([
+            hvc_run_step_outcome(),
+            hvc_run_step_outcome(),
+        ]);
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(2))
+            .expect("step-limited HVC loop should succeed");
+
+        assert_eq!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 2 }
+        );
+        assert_eq!(session.events, ["run", "run"]);
+    }
+
+    #[test]
     fn boot_session_run_loop_reports_stop_after_dispatch_before_step_limit() {
         let stop_token = HvfArm64BootRunLoopStopToken::new();
         let mut session = RecordingBootSessionRunLoopSession::new([mmio_run_step_outcome()]);
@@ -2347,6 +2400,19 @@ mod tests {
 
         assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Stopped { steps: 1 });
         assert_eq!(session.events, ["run", "dispatch"]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_reports_stop_after_hvc_when_requested() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([hvc_run_step_outcome()]);
+        session.request_stop_on_run(stop_token.clone());
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("stop after HVC should succeed");
+
+        assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Stopped { steps: 1 });
+        assert_eq!(session.events, ["run"]);
     }
 
     #[test]

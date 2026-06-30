@@ -8,10 +8,13 @@ use bangbang_runtime::BackendError;
 use bangbang_runtime::mmio::{MmioDispatchOutcome, MmioDispatcher};
 
 use crate::backend::HvfBackend;
-use crate::exit::{HvfResolvedMmioAccess, HvfVcpuExit, HvfVcpuExitResolveError};
+use crate::exit::{HvfHvcExit, HvfResolvedMmioAccess, HvfVcpuExit, HvfVcpuExitResolveError};
 use crate::gic::{HvfGicError, HvfGicPpiPendingWriter, validate_gic_ppi_pending_intid};
 use crate::mmio::HvfMmioDispatchError;
-use crate::vcpu::{HvfArm64BootRegisters, HvfSystemRegister, HvfVcpuOwner};
+use crate::psci::{
+    PsciCall, call_uses_arg0, handle_call as handle_psci_call, not_supported_result,
+};
+use crate::vcpu::{HvfArm64BootRegisters, HvfRegister, HvfSystemRegister, HvfVcpuOwner};
 
 const RUNNER_SHUT_DOWN_MESSAGE: &str = "vCPU runner is shut down";
 const RUNNER_SHUTTING_DOWN_MESSAGE: &str = "vCPU runner shutdown is already in progress";
@@ -55,6 +58,11 @@ pub enum HvfVcpuRunnerError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HvfVcpuRunStepOutcome {
     Canceled,
+    Hvc {
+        exit: HvfHvcExit,
+        function_id: u64,
+        return_value: u64,
+    },
     Mmio {
         access: HvfResolvedMmioAccess,
         outcome: MmioDispatchOutcome,
@@ -224,6 +232,16 @@ trait RunnerVcpu {
         access: HvfResolvedMmioAccess,
         dispatcher: &mut MmioDispatcher,
     ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError>;
+    fn read_register(&mut self, _register: HvfRegister) -> Result<u64, BackendError> {
+        Err(BackendError::InvalidState(
+            "vCPU does not support general register reads",
+        ))
+    }
+    fn write_register(&mut self, _register: HvfRegister, _value: u64) -> Result<(), BackendError> {
+        Err(BackendError::InvalidState(
+            "vCPU does not support general register writes",
+        ))
+    }
     fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
         Err(BackendError::InvalidState(
             "vCPU does not support MPIDR_EL1 reads",
@@ -291,6 +309,14 @@ impl RunnerVcpu for RealRunnerVcpu {
         self.owner
             .dispatch_mmio_access(access, dispatcher)
             .map_err(HvfVcpuRunnerError::MmioDispatch)
+    }
+
+    fn read_register(&mut self, register: HvfRegister) -> Result<u64, BackendError> {
+        self.owner.get_register(register)
+    }
+
+    fn write_register(&mut self, register: HvfRegister, value: u64) -> Result<(), BackendError> {
+        self.owner.set_register(register, value)
     }
 
     fn mpidr_el1(&mut self) -> Result<u64, BackendError> {
@@ -1436,6 +1462,10 @@ fn run_once_and_handle_mmio_on_runner_thread(
         HvfVcpuExit::VtimerActivated => Ok(HvfVcpuRunStepOutcome::VtimerActivated),
         HvfVcpuExit::Unknown { reason } => Ok(HvfVcpuRunStepOutcome::Unknown { reason }),
         HvfVcpuExit::Exception(exit) => {
+            if let Ok(hvc) = exit.decode_hvc() {
+                return handle_hvc_on_runner_thread(vcpu, hvc);
+            }
+
             let access = exit
                 .decode_mmio_access()
                 .map_err(|source| HvfVcpuExitResolveError::MmioDecode { exit, source })?;
@@ -1448,6 +1478,35 @@ fn run_once_and_handle_mmio_on_runner_thread(
             Ok(HvfVcpuRunStepOutcome::Mmio { access, outcome })
         }
     }
+}
+
+fn handle_hvc_on_runner_thread(
+    vcpu: &mut impl RunnerVcpu,
+    exit: HvfHvcExit,
+) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
+    let function_id = vcpu
+        .read_register(HvfRegister::X0)
+        .map_err(HvfVcpuRunnerError::Backend)?;
+    let arg0 = if exit.immediate() == 0 && call_uses_arg0(function_id) {
+        vcpu.read_register(HvfRegister::X1)
+            .map_err(HvfVcpuRunnerError::Backend)?
+    } else {
+        0
+    };
+    let result = if exit.immediate() == 0 {
+        handle_psci_call(PsciCall::new(function_id, arg0))
+    } else {
+        not_supported_result()
+    };
+    let return_value = result.return_value();
+    vcpu.write_register(HvfRegister::X0, return_value)
+        .map_err(HvfVcpuRunnerError::Backend)?;
+
+    Ok(HvfVcpuRunStepOutcome::Hvc {
+        exit,
+        function_id,
+        return_value,
+    })
 }
 
 fn dispatch_mmio_access_on_runner_thread(
@@ -1507,13 +1566,14 @@ mod tests {
         spawn_runner_thread,
     };
     use crate::exit::{
-        HvfExceptionExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
+        HvfExceptionExit, HvfHvcExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
         HvfResolvedMmioAccess, HvfResolvedVcpuExit, HvfVcpuExit, HvfVcpuExitResolveError,
     };
     use crate::gic::HvfGicError;
     use crate::mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
-    use crate::vcpu::HvfArm64BootRegisters;
+    use crate::vcpu::{HvfArm64BootRegisters, HvfRegister};
 
+    const ESR_EC_HVC: u64 = 0x16;
     const ESR_EC_DATA_ABORT_LOWER_EL: u64 = 0x24;
     const ESR_EC_SHIFT: u64 = 26;
     const ESR_ISS_ISV: u64 = 1 << 24;
@@ -1521,6 +1581,12 @@ mod tests {
     const ESR_ISS_SRT_SHIFT: u64 = 16;
     const ESR_ISS_WNR: u64 = 1 << 6;
     const ESR_ISS_SF: u64 = 1 << 15;
+    const PSCI_VERSION: u64 = 0x8400_0000;
+    const PSCI_CPU_ON: u64 = 0x8400_0003;
+    const PSCI_FEATURES: u64 = 0x8400_000a;
+    const PSCI_VERSION_0_2: u64 = 0x0000_0002;
+    const PSCI_RET_SUCCESS: u64 = 0;
+    const PSCI_RET_NOT_SUPPORTED: u64 = u64::MAX;
 
     struct FakeVcpu {
         entered_run_sender: mpsc::Sender<()>,
@@ -1595,6 +1661,13 @@ mod tests {
         run_once_result: Result<HvfVcpuExit, BackendError>,
         dispatched_sender: Option<mpsc::Sender<HvfResolvedMmioAccess>>,
         dispatch_result: Result<MmioDispatchOutcome, HvfVcpuRunnerError>,
+    }
+
+    struct PsciRunStepRecordingVcpu {
+        run_once_result: Result<HvfVcpuExit, BackendError>,
+        x0: u64,
+        x1: Result<u64, BackendError>,
+        register_write_sender: mpsc::Sender<(HvfRegister, u64)>,
     }
 
     fn unsupported_mmio_dispatch() -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
@@ -2270,6 +2343,58 @@ mod tests {
         }
     }
 
+    impl RunnerVcpu for PsciRunStepRecordingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            self.run_once_result.clone()
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn read_register(&mut self, register: HvfRegister) -> Result<u64, BackendError> {
+            match register {
+                HvfRegister::X0 => Ok(self.x0),
+                HvfRegister::X1 => self.x1.clone(),
+                _ => Err(BackendError::InvalidState("unexpected fake register read")),
+            }
+        }
+
+        fn write_register(
+            &mut self,
+            register: HvfRegister,
+            value: u64,
+        ) -> Result<(), BackendError> {
+            if register != HvfRegister::X0 {
+                return Err(BackendError::InvalidState("unexpected fake register write"));
+            }
+
+            self.x0 = value;
+            self.register_write_sender
+                .send((register, value))
+                .map_err(|_| BackendError::InvalidState("fake register write receiver closed"))
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
     fn boot_registers() -> HvfArm64BootRegisters {
         HvfArm64BootRegisters {
             kernel_entry: GuestAddress::new(0x8028_0000),
@@ -2290,6 +2415,22 @@ mod tests {
         })
     }
 
+    fn hvc_exception_exit(immediate: u16) -> HvfVcpuExit {
+        HvfVcpuExit::Exception(HvfExceptionExit {
+            syndrome: hvc_syndrome(immediate),
+            virtual_address: 0,
+            physical_address: 0,
+        })
+    }
+
+    fn hvc_exit(immediate: u16) -> HvfHvcExit {
+        let HvfVcpuExit::Exception(exit) = hvc_exception_exit(immediate) else {
+            panic!("test HVC helper should build an exception exit");
+        };
+
+        exit.decode_hvc().expect("test HVC exit should decode")
+    }
+
     fn resolved_mmio_access() -> HvfResolvedMmioAccess {
         let mut dispatcher = MmioDispatcher::new();
         dispatcher
@@ -2303,6 +2444,10 @@ mod tests {
             panic!("expected MMIO exit");
         };
         access
+    }
+
+    fn hvc_syndrome(immediate: u16) -> u64 {
+        (ESR_EC_HVC << ESR_EC_SHIFT) | u64::from(immediate)
     }
 
     fn data_abort_syndrome(
@@ -2434,6 +2579,43 @@ mod tests {
 
         HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
             .expect("runner should be created")
+    }
+
+    fn start_psci_run_step_recording_runner(
+        function_id: u64,
+        arg0: u64,
+    ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<(HvfRegister, u64)>) {
+        start_psci_run_step_recording_runner_with_x1(function_id, Ok(arg0))
+    }
+
+    fn start_psci_run_step_recording_runner_with_x1(
+        function_id: u64,
+        x1: Result<u64, BackendError>,
+    ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<(HvfRegister, u64)>) {
+        start_psci_run_step_recording_runner_with_exit(function_id, x1, 0)
+    }
+
+    fn start_psci_run_step_recording_runner_with_exit(
+        function_id: u64,
+        x1: Result<u64, BackendError>,
+        hvc_immediate: u16,
+    ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<(HvfRegister, u64)>) {
+        let (register_write_sender, register_write_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(PsciRunStepRecordingVcpu {
+                run_once_result: Ok(hvc_exception_exit(hvc_immediate)),
+                x0: function_id,
+                x1,
+                register_write_sender,
+            })
+        })
+        .expect("fake PSCI runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            register_write_receiver,
+        )
     }
 
     fn start_mpidr_recording_runner(mpidr: u64, fail_next_read: bool) -> HvfVcpuRunner<'static> {
@@ -3954,6 +4136,112 @@ mod tests {
 
             runner.shutdown().expect("runner should shut down");
         }
+    }
+
+    #[test]
+    fn run_once_and_handle_mmio_handles_psci_hvc_without_dispatcher_lock() {
+        let (runner, register_write_receiver) =
+            start_psci_run_step_recording_runner(PSCI_VERSION, 0);
+        let dispatcher = shared_dispatcher();
+        let dispatcher_guard = dispatcher
+            .lock()
+            .expect("dispatcher lock should not be poisoned");
+
+        assert_eq!(
+            runner.run_once_and_handle_mmio(Arc::clone(&dispatcher)),
+            Ok(HvfVcpuRunStepOutcome::Hvc {
+                exit: hvc_exit(0),
+                function_id: PSCI_VERSION,
+                return_value: PSCI_VERSION_0_2,
+            })
+        );
+        drop(dispatcher_guard);
+        assert_eq!(
+            register_write_receiver
+                .recv()
+                .expect("PSCI HVC should write X0"),
+            (HvfRegister::X0, PSCI_VERSION_0_2)
+        );
+        assert_eq!(
+            register_write_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn run_once_and_handle_mmio_reads_psci_features_argument() {
+        let (runner, register_write_receiver) =
+            start_psci_run_step_recording_runner(PSCI_FEATURES, PSCI_VERSION);
+
+        assert_eq!(
+            runner.run_once_and_handle_mmio(shared_dispatcher()),
+            Ok(HvfVcpuRunStepOutcome::Hvc {
+                exit: hvc_exit(0),
+                function_id: PSCI_FEATURES,
+                return_value: PSCI_RET_SUCCESS,
+            })
+        );
+        assert_eq!(
+            register_write_receiver
+                .recv()
+                .expect("PSCI_FEATURES should write X0"),
+            (HvfRegister::X0, PSCI_RET_SUCCESS)
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn run_once_and_handle_mmio_rejects_nonzero_hvc_immediate_without_reading_arg0() {
+        let (runner, register_write_receiver) = start_psci_run_step_recording_runner_with_exit(
+            PSCI_VERSION,
+            Err(BackendError::InvalidState("X1 should not be read")),
+            1,
+        );
+
+        assert_eq!(
+            runner.run_once_and_handle_mmio(shared_dispatcher()),
+            Ok(HvfVcpuRunStepOutcome::Hvc {
+                exit: hvc_exit(1),
+                function_id: PSCI_VERSION,
+                return_value: PSCI_RET_NOT_SUPPORTED,
+            })
+        );
+        assert_eq!(
+            register_write_receiver
+                .recv()
+                .expect("nonzero HVC immediate should still write X0"),
+            (HvfRegister::X0, PSCI_RET_NOT_SUPPORTED)
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn run_once_and_handle_mmio_returns_not_supported_for_unsupported_psci_hvc() {
+        let (runner, register_write_receiver) = start_psci_run_step_recording_runner_with_x1(
+            PSCI_CPU_ON,
+            Err(BackendError::InvalidState("X1 should not be read")),
+        );
+
+        assert_eq!(
+            runner.run_once_and_handle_mmio(shared_dispatcher()),
+            Ok(HvfVcpuRunStepOutcome::Hvc {
+                exit: hvc_exit(0),
+                function_id: PSCI_CPU_ON,
+                return_value: PSCI_RET_NOT_SUPPORTED,
+            })
+        );
+        assert_eq!(
+            register_write_receiver
+                .recv()
+                .expect("unsupported PSCI HVC should still write X0"),
+            (HvfRegister::X0, PSCI_RET_NOT_SUPPORTED)
+        );
+
+        runner.shutdown().expect("runner should shut down");
     }
 
     #[test]

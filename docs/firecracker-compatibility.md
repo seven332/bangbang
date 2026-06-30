@@ -59,7 +59,7 @@ and retained serial capture paths,
 device-backed feature negotiation, indirect descriptor support,
 device-backed runner-loop MMIO scheduling, complete device emulation,
 full Firecracker metrics counters, periodic metrics flushing, full logger integration,
-multi-vCPU setup, PSCI behavior, or successful actions beyond owned `InstanceStart`
+multi-vCPU setup, full PSCI behavior, or successful actions beyond owned `InstanceStart`
 startup with an internal boot run loop across bounded step windows and runtime
 `FlushMetrics` yet. Public drive configuration is
 recorded as pre-boot VM state and applied only during startup preparation; separate internal runtime helpers can
@@ -553,6 +553,13 @@ contains root properties, CPU data, memory, chosen, timer, PSCI, GIC nodes, and
 an optional serial device node plus optional sorted virtio-mmio device nodes
 from caller-supplied descriptors. It intentionally omits RTC, PCI, vmgenid,
 vmclock, and other device nodes until the corresponding emulation paths exist.
+Because the FDT advertises PSCI with `method = "hvc"`, the HVF backend decodes
+arm64 HVC exception exits and handles `HVC #0` as a minimal PSCI 0.2 responder
+for early single-vCPU boot probing. The responder returns `PSCI_VERSION`,
+reports feature support only for the implemented minimal calls, returns
+`MIGRATE_INFO_TYPE` as the PSCI value for a trusted OS that is MP-capable or
+not present, where migration is not required, and writes `NOT_SUPPORTED` to X0
+for other PSCI calls or HVC immediates.
 
 The memory node excludes the first 2 MiB system area from the first DRAM range
 and preserves later DRAM ranges from the runtime layout, but direct FDT
@@ -823,10 +830,12 @@ Boot notification dispatch locks the shared dispatcher only while draining
 runtime notifications and releases it before HVF GIC signaling.
 
 bangbang now wires `mem_size_mib` into startup preparation, but still does not
-wire device interrupts into public guest execution, emulate devices, provide public run-loop control, power on secondary vCPUs, or
-implement PSCI. Later API and startup work still needs to decide whether an
-oversized `mem_size_mib` request should be rejected before layout construction
-or should preserve Firecracker's architecture-helper truncation behavior.
+wire device interrupts into public guest execution, emulate devices, provide
+public run-loop control, power on secondary vCPUs, or implement full PSCI CPU
+and system power actions. Later API and startup work still needs to decide
+whether an oversized `mem_size_mib` request should be rejected before layout
+construction or should preserve Firecracker's architecture-helper truncation
+behavior.
 
 ## API State and Response Policy
 
