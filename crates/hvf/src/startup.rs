@@ -308,8 +308,8 @@ impl HvfArm64BootSession<'_> {
 
     /// Run the boot session's primary vCPU once with runner-thread MMIO handling.
     ///
-    /// This is runner-loop plumbing. It does not dispatch boot block
-    /// notifications or enter a continuous guest run loop.
+    /// This is runner-loop plumbing. It does not dispatch boot block or
+    /// virtio-net TX notifications or enter a continuous guest run loop.
     pub fn run_once_and_handle_mmio(&self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
         run_boot_session_vcpu_step(&self.runner, &self.mmio_dispatcher)
     }
@@ -330,7 +330,8 @@ impl HvfArm64BootSession<'_> {
         HvfArm64BootRunLoopControl::new(self.run_cancel_handle())
     }
 
-    /// Run bounded vCPU steps and dispatch boot block notifications between steps.
+    /// Run bounded vCPU steps and dispatch boot block and virtio-net TX
+    /// notifications between steps.
     ///
     /// The step limit keeps this scaffold deterministic until a later scheduler
     /// owns the continuous guest loop and timer/device policy.
@@ -346,7 +347,7 @@ impl HvfArm64BootSession<'_> {
     ///
     /// This keeps diagnostics at the same boundary as the internal boot loop:
     /// observers see the step that was returned by HVF before the loop performs
-    /// follow-up timer or block-notification handling.
+    /// follow-up timer or block/network-notification handling.
     pub fn run_loop_with_observer(
         &mut self,
         stop_token: &HvfArm64BootRunLoopStopToken,
