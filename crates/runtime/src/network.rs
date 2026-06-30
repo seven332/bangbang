@@ -27,6 +27,7 @@ pub const VIRTIO_RING_FEATURE_EVENT_IDX: u32 = 29;
 pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
 pub const VIRTIO_NET_TX_HEADER_SIZE: u32 = 12;
 pub const VIRTIO_NET_MAX_BUFFER_SIZE: u64 = 65_562;
+pub const VIRTIO_NET_RX_MIN_BUFFER_SIZE: u64 = 1_526;
 
 const VIRTIO_NET_RX_QUEUE_INDEX_U32: u32 = 0;
 const VIRTIO_NET_TX_QUEUE_INDEX_U32: u32 = 1;
@@ -573,6 +574,222 @@ impl std::error::Error for VirtioNetworkTxFrameParseError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioNetworkRxBufferSegment {
+    descriptor_index: u16,
+    address: GuestAddress,
+    len: u32,
+}
+
+impl VirtioNetworkRxBufferSegment {
+    const fn new(descriptor_index: u16, address: GuestAddress, len: u32) -> Self {
+        Self {
+            descriptor_index,
+            address,
+            len,
+        }
+    }
+
+    pub const fn descriptor_index(self) -> u16 {
+        self.descriptor_index
+    }
+
+    pub const fn address(self) -> GuestAddress {
+        self.address
+    }
+
+    pub const fn len(self) -> u32 {
+        self.len
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioNetworkRxBuffer {
+    descriptor_head: u16,
+    segments: Vec<VirtioNetworkRxBufferSegment>,
+    len: u64,
+}
+
+impl VirtioNetworkRxBuffer {
+    pub fn parse(
+        memory: &GuestMemory,
+        chain: &VirtqueueDescriptorChain,
+    ) -> Result<Self, VirtioNetworkRxBufferParseError> {
+        let descriptor_head = chain
+            .descriptors()
+            .first()
+            .ok_or(VirtioNetworkRxBufferParseError::DescriptorChainTooShort {
+                expected: 1,
+                actual: chain.len(),
+            })?
+            .index();
+        let mut segments = Vec::new();
+        segments.try_reserve_exact(chain.len()).map_err(|source| {
+            VirtioNetworkRxBufferParseError::BufferSegmentsAllocationFailed {
+                descriptor_count: chain.len(),
+                source,
+            }
+        })?;
+
+        let mut len = 0;
+        for descriptor in chain.descriptors() {
+            validate_rx_buffer_descriptor(descriptor)?;
+            let segment = VirtioNetworkRxBufferSegment::new(
+                descriptor.index(),
+                descriptor.address(),
+                descriptor.len(),
+            );
+            len = push_rx_buffer_segment(memory, &mut segments, len, segment)?;
+        }
+
+        if len < VIRTIO_NET_RX_MIN_BUFFER_SIZE {
+            return Err(VirtioNetworkRxBufferParseError::BufferTooSmall {
+                len,
+                min: VIRTIO_NET_RX_MIN_BUFFER_SIZE,
+            });
+        }
+
+        Ok(Self {
+            descriptor_head,
+            segments,
+            len,
+        })
+    }
+
+    pub const fn descriptor_head(&self) -> u16 {
+        self.descriptor_head
+    }
+
+    pub fn segments(&self) -> &[VirtioNetworkRxBufferSegment] {
+        &self.segments
+    }
+
+    pub const fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioNetworkRxBufferParseError {
+    DescriptorChainTooShort {
+        expected: usize,
+        actual: usize,
+    },
+    BufferDescriptorReadOnly {
+        index: u16,
+    },
+    BufferDescriptorEmpty {
+        index: u16,
+    },
+    BufferDescriptorRangeOverflow {
+        index: u16,
+        address: GuestAddress,
+        len: u32,
+    },
+    BufferDescriptorAccess {
+        index: u16,
+        address: GuestAddress,
+        len: u32,
+        source: GuestMemoryAccessError,
+    },
+    BufferLengthOverflow {
+        current: u64,
+        len: u32,
+    },
+    BufferTooSmall {
+        len: u64,
+        min: u64,
+    },
+    BufferSegmentsAllocationFailed {
+        descriptor_count: usize,
+        source: TryReserveError,
+    },
+}
+
+impl fmt::Display for VirtioNetworkRxBufferParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DescriptorChainTooShort { expected, actual } => {
+                write!(
+                    f,
+                    "virtio-net RX descriptor chain has {actual} descriptors; expected at least {expected}"
+                )
+            }
+            Self::BufferDescriptorReadOnly { index } => {
+                write!(f, "virtio-net RX buffer descriptor {index} is read-only")
+            }
+            Self::BufferDescriptorEmpty { index } => {
+                write!(f, "virtio-net RX buffer descriptor {index} is empty")
+            }
+            Self::BufferDescriptorRangeOverflow {
+                index,
+                address,
+                len,
+            } => {
+                write!(
+                    f,
+                    "virtio-net RX buffer descriptor {index} at {address} with length {len} overflows address space"
+                )
+            }
+            Self::BufferDescriptorAccess {
+                index,
+                address,
+                len,
+                source,
+            } => {
+                write!(
+                    f,
+                    "virtio-net RX buffer descriptor {index} at {address} with length {len} is not fully mapped: {source}"
+                )
+            }
+            Self::BufferLengthOverflow { current, len } => {
+                write!(
+                    f,
+                    "virtio-net RX buffer length overflows when adding descriptor length {len} to current length {current}"
+                )
+            }
+            Self::BufferTooSmall { len, min } => {
+                write!(
+                    f,
+                    "virtio-net RX buffer length {len} is smaller than required minimum {min}"
+                )
+            }
+            Self::BufferSegmentsAllocationFailed {
+                descriptor_count,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to reserve virtio-net RX buffer segment storage for {descriptor_count} descriptors: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioNetworkRxBufferParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BufferDescriptorAccess { source, .. } => Some(source),
+            Self::BufferSegmentsAllocationFailed { source, .. } => Some(source),
+            Self::DescriptorChainTooShort { .. }
+            | Self::BufferDescriptorReadOnly { .. }
+            | Self::BufferDescriptorEmpty { .. }
+            | Self::BufferDescriptorRangeOverflow { .. }
+            | Self::BufferLengthOverflow { .. }
+            | Self::BufferTooSmall { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VirtioNetworkDevice {
     active_rx_queue: Option<VirtioMmioQueueState>,
@@ -1045,6 +1262,65 @@ fn validate_tx_payload_segment_range(
     })
 }
 
+fn validate_rx_buffer_descriptor(
+    descriptor: &VirtqueueDescriptor,
+) -> Result<(), VirtioNetworkRxBufferParseError> {
+    if !descriptor.is_write_only() {
+        return Err(VirtioNetworkRxBufferParseError::BufferDescriptorReadOnly {
+            index: descriptor.index(),
+        });
+    }
+
+    if descriptor.is_empty() {
+        return Err(VirtioNetworkRxBufferParseError::BufferDescriptorEmpty {
+            index: descriptor.index(),
+        });
+    }
+
+    Ok(())
+}
+
+fn push_rx_buffer_segment(
+    memory: &GuestMemory,
+    segments: &mut Vec<VirtioNetworkRxBufferSegment>,
+    len: u64,
+    segment: VirtioNetworkRxBufferSegment,
+) -> Result<u64, VirtioNetworkRxBufferParseError> {
+    let next_len = len.checked_add(u64::from(segment.len())).ok_or(
+        VirtioNetworkRxBufferParseError::BufferLengthOverflow {
+            current: len,
+            len: segment.len(),
+        },
+    )?;
+
+    validate_rx_buffer_segment_range(memory, segment)?;
+    segments.push(segment);
+    Ok(next_len)
+}
+
+fn validate_rx_buffer_segment_range(
+    memory: &GuestMemory,
+    segment: VirtioNetworkRxBufferSegment,
+) -> Result<(), VirtioNetworkRxBufferParseError> {
+    let range =
+        GuestMemoryRange::new(segment.address(), u64::from(segment.len())).map_err(|_| {
+            VirtioNetworkRxBufferParseError::BufferDescriptorRangeOverflow {
+                index: segment.descriptor_index(),
+                address: segment.address(),
+                len: segment.len(),
+            }
+        })?;
+
+    memory.validate_mapped_range(range).map_err(|source| {
+        VirtioNetworkRxBufferParseError::BufferDescriptorAccess {
+            index: segment.descriptor_index(),
+            address: segment.address(),
+            len: segment.len(),
+            source,
+        }
+    })
+}
+
 fn active_network_queue_state(
     activation: VirtioMmioDeviceActivation<'_>,
     queue_index: u32,
@@ -1224,11 +1500,11 @@ mod tests {
         NetworkInterfaceConfigInput, NetworkInterfaceConfigs, VIRTIO_FEATURE_VERSION_1,
         VIRTIO_NET_CONFIG_MAC_SIZE, VIRTIO_NET_DEVICE_ID, VIRTIO_NET_F_MAC,
         VIRTIO_NET_MAX_BUFFER_SIZE, VIRTIO_NET_QUEUE_COUNT, VIRTIO_NET_QUEUE_SIZE,
-        VIRTIO_NET_QUEUE_SIZES, VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_HEADER_SIZE,
-        VIRTIO_NET_TX_QUEUE_INDEX, VIRTIO_RING_FEATURE_EVENT_IDX, VirtioNetworkConfigSpace,
-        VirtioNetworkDevice, VirtioNetworkDeviceActivationError,
-        VirtioNetworkDeviceNotificationError, VirtioNetworkMmioHandler, VirtioNetworkTxFrame,
-        VirtioNetworkTxFrameParseError,
+        VIRTIO_NET_QUEUE_SIZES, VIRTIO_NET_RX_MIN_BUFFER_SIZE, VIRTIO_NET_RX_QUEUE_INDEX,
+        VIRTIO_NET_TX_HEADER_SIZE, VIRTIO_NET_TX_QUEUE_INDEX, VIRTIO_RING_FEATURE_EVENT_IDX,
+        VirtioNetworkConfigSpace, VirtioNetworkDevice, VirtioNetworkDeviceActivationError,
+        VirtioNetworkDeviceNotificationError, VirtioNetworkMmioHandler, VirtioNetworkRxBuffer,
+        VirtioNetworkRxBufferParseError, VirtioNetworkTxFrame, VirtioNetworkTxFrameParseError,
     };
 
     const TEST_MMIO_BASE: GuestAddress = GuestAddress::new(0x1000);
@@ -1627,6 +1903,13 @@ mod tests {
         VirtioNetworkTxFrame::parse(memory, chain)
     }
 
+    fn parse_rx_buffer(
+        memory: &GuestMemory,
+        chain: &VirtqueueDescriptorChain,
+    ) -> Result<VirtioNetworkRxBuffer, VirtioNetworkRxBufferParseError> {
+        VirtioNetworkRxBuffer::parse(memory, chain)
+    }
+
     #[test]
     fn accepts_minimal_network_interface_config() {
         let config = validate(input()).expect("minimal network config should be valid");
@@ -1891,6 +2174,7 @@ mod tests {
         assert_eq!(VIRTIO_FEATURE_VERSION_1, 32);
         assert_eq!(VIRTIO_NET_TX_HEADER_SIZE, 12);
         assert_eq!(VIRTIO_NET_MAX_BUFFER_SIZE, 65_562);
+        assert_eq!(VIRTIO_NET_RX_MIN_BUFFER_SIZE, 1_526);
     }
 
     #[test]
@@ -2198,6 +2482,173 @@ mod tests {
             Err(VirtioNetworkTxFrameParseError::FrameTooLarge { len, max })
                 if len == VIRTIO_NET_MAX_BUFFER_SIZE + u64::from(VIRTIO_NET_TX_HEADER_SIZE)
                     && max == VIRTIO_NET_MAX_BUFFER_SIZE
+        ));
+    }
+
+    #[test]
+    fn virtio_network_rx_buffer_parser_accepts_single_descriptor_buffer() {
+        let mut memory = tx_frame_memory();
+        let len = u32::try_from(VIRTIO_NET_RX_MIN_BUFFER_SIZE)
+            .expect("RX minimum should fit in descriptor len");
+        let chain = tx_descriptor_chain(
+            &mut memory,
+            &[TestDescriptor::writable(TEST_TX_PAYLOAD, len, None)],
+        );
+
+        let buffer = parse_rx_buffer(&memory, &chain).expect("single RX buffer should parse");
+
+        assert_eq!(buffer.descriptor_head(), 0);
+        assert_eq!(buffer.len(), VIRTIO_NET_RX_MIN_BUFFER_SIZE);
+        assert!(!buffer.is_empty());
+        assert_eq!(buffer.segments().len(), 1);
+        let segment = buffer
+            .segments()
+            .first()
+            .expect("RX buffer segment should exist");
+        assert_eq!(segment.descriptor_index(), 0);
+        assert_eq!(segment.address(), TEST_TX_PAYLOAD);
+        assert_eq!(segment.len(), len);
+        assert!(!segment.is_empty());
+    }
+
+    #[test]
+    fn virtio_network_rx_buffer_parser_accepts_split_buffer() {
+        let mut memory = tx_frame_memory();
+        let chain = tx_descriptor_chain(
+            &mut memory,
+            &[
+                TestDescriptor::writable(TEST_TX_PAYLOAD, 1_000, Some(1)),
+                TestDescriptor::writable(TEST_TX_SECOND_PAYLOAD, 526, None),
+            ],
+        );
+
+        let buffer = parse_rx_buffer(&memory, &chain).expect("split RX buffer should parse");
+
+        assert_eq!(buffer.len(), VIRTIO_NET_RX_MIN_BUFFER_SIZE);
+        assert_eq!(buffer.segments().len(), 2);
+        let first = buffer
+            .segments()
+            .first()
+            .expect("first RX buffer segment should exist");
+        let second = buffer
+            .segments()
+            .get(1)
+            .expect("second RX buffer segment should exist");
+        assert_eq!(first.descriptor_index(), 0);
+        assert_eq!(first.address(), TEST_TX_PAYLOAD);
+        assert_eq!(first.len(), 1_000);
+        assert_eq!(second.descriptor_index(), 1);
+        assert_eq!(second.address(), TEST_TX_SECOND_PAYLOAD);
+        assert_eq!(second.len(), 526);
+    }
+
+    #[test]
+    fn virtio_network_rx_buffer_parser_rejects_read_only_descriptor() {
+        let mut memory = tx_frame_memory();
+        let chain = tx_descriptor_chain(
+            &mut memory,
+            &[TestDescriptor::readable(TEST_TX_PAYLOAD, 1_526, None)],
+        );
+
+        assert!(matches!(
+            parse_rx_buffer(&memory, &chain),
+            Err(VirtioNetworkRxBufferParseError::BufferDescriptorReadOnly { index: 0 })
+        ));
+    }
+
+    #[test]
+    fn virtio_network_rx_buffer_parser_rejects_empty_descriptor() {
+        let mut memory = tx_frame_memory();
+        let chain = tx_descriptor_chain(
+            &mut memory,
+            &[TestDescriptor::writable(TEST_TX_PAYLOAD, 0, None)],
+        );
+
+        assert!(matches!(
+            parse_rx_buffer(&memory, &chain),
+            Err(VirtioNetworkRxBufferParseError::BufferDescriptorEmpty { index: 0 })
+        ));
+    }
+
+    #[test]
+    fn virtio_network_rx_buffer_parser_rejects_unmapped_descriptor() {
+        let mut memory = tx_frame_memory();
+        let unmapped_buffer = GuestAddress::new(TEST_TX_MEMORY_SIZE + 0x1000);
+        let chain = tx_descriptor_chain(
+            &mut memory,
+            &[TestDescriptor::writable(unmapped_buffer, 1_526, None)],
+        );
+
+        let error = parse_rx_buffer(&memory, &chain).expect_err("unmapped RX buffer should fail");
+
+        match &error {
+            VirtioNetworkRxBufferParseError::BufferDescriptorAccess {
+                index,
+                address,
+                len,
+                ..
+            } => {
+                assert_eq!(*index, 0);
+                assert_eq!(*address, unmapped_buffer);
+                assert_eq!(*len, 1_526);
+            }
+            other => panic!("expected RX buffer access error, got {other:?}"),
+        }
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn virtio_network_rx_buffer_parser_rejects_descriptor_range_overflow() {
+        let mut memory = tx_frame_memory();
+        let overflowing_buffer = GuestAddress::new(u64::MAX - 1);
+        let chain = tx_descriptor_chain(
+            &mut memory,
+            &[TestDescriptor::writable(overflowing_buffer, 1_526, None)],
+        );
+
+        assert!(matches!(
+            parse_rx_buffer(&memory, &chain),
+            Err(VirtioNetworkRxBufferParseError::BufferDescriptorRangeOverflow {
+                index: 0,
+                address,
+                len: 1_526,
+            }) if address == overflowing_buffer
+        ));
+    }
+
+    #[test]
+    fn virtio_network_rx_buffer_parser_rejects_length_overflow_without_stale_segments() {
+        let memory = tx_frame_memory();
+        let segment = super::VirtioNetworkRxBufferSegment::new(0, TEST_TX_PAYLOAD, 1);
+        let mut segments = Vec::new();
+
+        let error = super::push_rx_buffer_segment(&memory, &mut segments, u64::MAX, segment)
+            .expect_err("overflowing RX buffer length should fail");
+
+        assert!(matches!(
+            error,
+            VirtioNetworkRxBufferParseError::BufferLengthOverflow {
+                current: u64::MAX,
+                len: 1,
+            }
+        ));
+        assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn virtio_network_rx_buffer_parser_rejects_small_buffer() {
+        let mut memory = tx_frame_memory();
+        let chain = tx_descriptor_chain(
+            &mut memory,
+            &[TestDescriptor::writable(TEST_TX_PAYLOAD, 1_525, None)],
+        );
+
+        assert!(matches!(
+            parse_rx_buffer(&memory, &chain),
+            Err(VirtioNetworkRxBufferParseError::BufferTooSmall {
+                len: 1_525,
+                min,
+            }) if min == VIRTIO_NET_RX_MIN_BUFFER_SIZE
         ));
     }
 
