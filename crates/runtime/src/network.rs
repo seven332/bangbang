@@ -965,12 +965,18 @@ impl PreparedNetworkDevices {
     pub fn from_configs(
         configs: &NetworkInterfaceConfigs,
     ) -> Result<Self, PreparedNetworkDeviceError> {
+        Self::from_config_slice(configs.as_slice())
+    }
+
+    pub(crate) fn from_config_slice(
+        configs: &[NetworkInterfaceConfig],
+    ) -> Result<Self, PreparedNetworkDeviceError> {
         let mut devices = Vec::new();
         devices
-            .try_reserve_exact(configs.as_slice().len())
+            .try_reserve_exact(configs.len())
             .map_err(|source| PreparedNetworkDeviceError::AllocateDevices { source })?;
 
-        for config in configs.as_slice() {
+        for config in configs {
             devices.push(PreparedNetworkDevice::from_config(config));
         }
 
@@ -998,6 +1004,14 @@ impl PreparedNetworkDevices {
         layout: NetworkMmioLayout,
     ) -> Result<NetworkMmioDevices, NetworkMmioRegistrationError> {
         NetworkMmioDevices::from_prepared(self, layout)
+    }
+
+    pub fn register_mmio_with_dispatcher(
+        self,
+        layout: NetworkMmioLayout,
+        dispatcher: MmioDispatcher,
+    ) -> Result<NetworkMmioDevices, NetworkMmioRegistrationError> {
+        NetworkMmioDevices::from_prepared_with_dispatcher(self, layout, dispatcher)
     }
 }
 
@@ -1165,6 +1179,14 @@ impl NetworkMmioDevices {
         prepared: PreparedNetworkDevices,
         layout: NetworkMmioLayout,
     ) -> Result<Self, NetworkMmioRegistrationError> {
+        Self::from_prepared_with_dispatcher(prepared, layout, MmioDispatcher::new())
+    }
+
+    pub fn from_prepared_with_dispatcher(
+        prepared: PreparedNetworkDevices,
+        layout: NetworkMmioLayout,
+        dispatcher: MmioDispatcher,
+    ) -> Result<Self, NetworkMmioRegistrationError> {
         layout.validate()?;
 
         let prepared_devices = prepared.into_vec();
@@ -1180,7 +1202,7 @@ impl NetworkMmioDevices {
             placements.push(layout.placement(index)?);
         }
 
-        let mut dispatcher = MmioDispatcher::new();
+        let mut dispatcher = dispatcher;
         for (prepared_device, placement) in prepared_devices.into_iter().zip(placements) {
             let (iface_id, host_dev_name, config_space, device) = prepared_device.into_parts();
             let handler = VirtioMmioRegisterHandler::with_device_config_and_activation(
@@ -2041,7 +2063,8 @@ mod tests {
 
     use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
     use crate::mmio::{
-        MmioAccess, MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioOperation, MmioRegionId,
+        MmioAccess, MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioDispatcher, MmioOperation,
+        MmioRegionId,
     };
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
@@ -2899,6 +2922,37 @@ mod tests {
         assert_eq!(devices.len(), 0);
         assert!(devices.registrations().is_empty());
         assert!(devices.dispatcher().regions().is_empty());
+    }
+
+    #[test]
+    fn network_mmio_devices_register_into_existing_dispatcher() {
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0"))
+            .expect("network config should be stored");
+        let prepared =
+            PreparedNetworkDevices::from_configs(&configs).expect("network device should prepare");
+        let mut dispatcher = MmioDispatcher::new();
+        let existing_region = dispatcher
+            .insert_region(MmioRegionId::new(1), GuestAddress::new(0x3000_0000), 0x1000)
+            .expect("existing MMIO region should insert");
+
+        let devices = prepared
+            .register_mmio_with_dispatcher(
+                NetworkMmioLayout::new(TEST_MMIO_BASE, MmioRegionId::new(10)),
+                dispatcher,
+            )
+            .expect("network MMIO device should register");
+
+        assert_eq!(devices.registrations().len(), 1);
+        assert_eq!(devices.dispatcher().regions().len(), 2);
+        assert!(devices.dispatcher().regions().contains(&existing_region));
+        assert!(
+            devices
+                .dispatcher()
+                .regions()
+                .contains(&devices.registrations()[0].region())
+        );
     }
 
     #[test]

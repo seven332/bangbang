@@ -13,6 +13,7 @@ use bangbang_hvf::{
 use bangbang_runtime::block::BlockMmioLayout;
 use bangbang_runtime::memory::GuestAddress;
 use bangbang_runtime::mmio::MmioRegionId;
+use bangbang_runtime::network::NetworkMmioLayout;
 use bangbang_runtime::serial::SharedSerialOutputBuffer;
 use bangbang_runtime::{BackendError, VmmAction, VmmActionError, VmmController, VmmData};
 
@@ -27,6 +28,8 @@ use bangbang_runtime::machine::MachineConfig;
 
 const DEFAULT_BLOCK_MMIO_BASE: GuestAddress = GuestAddress::new(0x5000_0000);
 const DEFAULT_BLOCK_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(1);
+const DEFAULT_NETWORK_MMIO_BASE: GuestAddress = GuestAddress::new(0x6000_0000);
+const DEFAULT_NETWORK_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(1000);
 const DEFAULT_SERIAL_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_0000);
 const DEFAULT_SERIAL_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(0);
 const DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT: usize = 1024;
@@ -411,10 +414,10 @@ fn default_hvf_boot_run_loop_step_limit() -> NonZeroUsize {
 fn default_hvf_boot_session_config(
     serial_output: SharedSerialOutputBuffer,
 ) -> HvfArm64BootSessionConfig {
-    HvfArm64BootSessionConfig::new(BlockMmioLayout::new(
-        DEFAULT_BLOCK_MMIO_BASE,
-        DEFAULT_BLOCK_MMIO_REGION_ID,
-    ))
+    HvfArm64BootSessionConfig::new(
+        BlockMmioLayout::new(DEFAULT_BLOCK_MMIO_BASE, DEFAULT_BLOCK_MMIO_REGION_ID),
+        NetworkMmioLayout::new(DEFAULT_NETWORK_MMIO_BASE, DEFAULT_NETWORK_MMIO_REGION_ID),
+    )
     .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
         DEFAULT_SERIAL_MMIO_REGION_ID,
         DEFAULT_SERIAL_MMIO_BASE,
@@ -434,13 +437,20 @@ mod tests {
 
     use bangbang_runtime::block::{DriveConfigInput, DriveConfigs, PreparedBlockDevices};
     use bangbang_runtime::boot::BootSourceConfigInput;
-    use bangbang_runtime::serial::{SerialOutput, SharedSerialOutputBuffer};
+    use bangbang_runtime::mmio::MmioRegion;
+    use bangbang_runtime::network::{
+        NetworkInterfaceConfigInput, NetworkInterfaceConfigs, PreparedNetworkDevices,
+    };
+    use bangbang_runtime::serial::{
+        SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialOutput, SharedSerialOutputBuffer,
+    };
     use bangbang_runtime::{BackendError, InstanceState, VmmAction, VmmActionError};
 
     use super::{
         BootRunLoopControl, BootRunLoopSession, BootRunLoopSupervisor, BootRunLoopWorkerStatus,
-        DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT, DEFAULT_SERIAL_MMIO_BASE,
-        DEFAULT_SERIAL_MMIO_REGION_ID, HvfInstanceStartExecutor, InstanceStartExecutor, ProcessVmm,
+        DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT, DEFAULT_NETWORK_MMIO_BASE,
+        DEFAULT_NETWORK_MMIO_REGION_ID, DEFAULT_SERIAL_MMIO_BASE, DEFAULT_SERIAL_MMIO_REGION_ID,
+        HvfInstanceStartExecutor, InstanceStartExecutor, ProcessVmm,
         default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
     };
 
@@ -725,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn default_hvf_boot_session_config_uses_serial_region_id_outside_block_regions() {
+    fn default_hvf_boot_session_config_uses_non_overlapping_device_layouts() {
         let root = TempFilePath::create("root");
         let data = TempFilePath::create("data");
         let mut drives = DriveConfigs::new();
@@ -735,22 +745,66 @@ mod tests {
         drives
             .insert(DriveConfigInput::new("data", "data", data.path(), false))
             .expect("data drive should configure");
+        let mut networks = NetworkInterfaceConfigs::new();
+        networks
+            .insert(NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0"))
+            .expect("first network should configure");
+        networks
+            .insert(NetworkInterfaceConfigInput::new("eth1", "eth1", "tap1"))
+            .expect("second network should configure");
 
         let config = default_hvf_boot_session_config(SharedSerialOutputBuffer::default());
         let serial_region_id = config
             .serial_device
             .expect("default HVF boot config should include serial MMIO")
             .region_id;
+        assert_eq!(
+            config.network_mmio_layout.base_address(),
+            DEFAULT_NETWORK_MMIO_BASE
+        );
+        assert_eq!(
+            config.network_mmio_layout.base_region_id(),
+            DEFAULT_NETWORK_MMIO_REGION_ID
+        );
         let block_devices = PreparedBlockDevices::from_configs(&drives)
             .expect("block devices should prepare")
             .register_mmio(config.block_mmio_layout)
             .expect("block MMIO should register");
+        let network_devices = PreparedNetworkDevices::from_configs(&networks)
+            .expect("network devices should prepare")
+            .register_mmio(config.network_mmio_layout)
+            .expect("network MMIO should register");
+        let serial_region = MmioRegion::new(
+            serial_region_id,
+            DEFAULT_SERIAL_MMIO_BASE,
+            SERIAL_MMIO_DEVICE_WINDOW_SIZE,
+        )
+        .expect("serial MMIO region should be valid");
 
         assert!(
             block_devices
                 .registrations()
                 .iter()
                 .all(|registration| registration.region_id() != serial_region_id)
+        );
+        assert!(
+            network_devices
+                .registrations()
+                .iter()
+                .all(|registration| registration.region_id() != serial_region_id)
+        );
+        assert!(block_devices.registrations().iter().all(|block| {
+            network_devices
+                .registrations()
+                .iter()
+                .all(|network| !block.region().range().overlaps(network.region().range()))
+                && !block.region().range().overlaps(serial_region.range())
+        }));
+        assert!(
+            network_devices
+                .registrations()
+                .iter()
+                .all(|network| !network.region().range().overlaps(serial_region.range()))
         );
     }
 

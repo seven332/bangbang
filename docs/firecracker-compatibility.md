@@ -14,7 +14,7 @@ physical address and aarch64 DRAM layout/access primitives, arm64 boot
 placement helpers, internal boot-source validation and arm64 kernel/initrd
 payload loading, an internal Firecracker-shaped drive configuration validation
 model, a Firecracker-shaped network interface configuration storage and
-validation model, internal virtio-net config-space, activation, TX frame parser, RX buffer parser, prepared device resources, MMIO registration helpers, and FDT-ready metadata helpers, a host-file backing access layer, internal configured block-device
+validation model, internal virtio-net config-space, activation, TX frame parser, RX buffer parser, prepared device resources, MMIO registration helpers, and startup FDT attachment for inert virtio-net devices, a host-file backing access layer, internal configured block-device
 preparation and MMIO registration helpers, an internal virtio-block
 config-space capacity model, an internal virtio-block request parser, single-request
 executor, queue dispatcher, MMIO queue-state bridge, resettable activation
@@ -39,8 +39,8 @@ available-ring read model, used-ring write model, and internal virtio-block
 queue construction, drain, resettable active queue ownership, and active queue
 notification dispatch helper with virtio-mmio queue interrupt-status updates
 for future device handlers, internal boot-resource assembly from stored VM
-configuration with optional serial and block MMIO registration plus boot-runtime
-block notification dispatch with per-device metadata, an internal backend-neutral
+configuration with optional serial plus block and inert network MMIO registration,
+boot-runtime block notification dispatch with per-device metadata, an internal backend-neutral
 interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, internal HVF single-vCPU arm64 boot-session preparation
 with a runner-compatible shared MMIO dispatcher, controlled mapped guest-memory
@@ -223,7 +223,7 @@ compatibility targets.
 | `PUT` | `/logger` | supported target; minimal subset implemented | Stores process logger configuration before boot, opens `log_path` with nonblocking output semantics when provided, accepts optional Firecracker-shaped level/show/module fields, and omits logger state from `GET /vm/config` because it is not guest configuration. Full internal log routing remains deferred. |
 | `PATCH` | `/machine-config` | deferred | Partial updates belong with later state and validation rules. |
 | `PUT` | `/cpu-config` | deferred | Needs HVF CPU feature design with VM and boot work in #8 and #10. |
-| `PUT` | `/network-interfaces/{iface_id}` | supported target; configuration storage implemented | Stores initial virtio-net configuration before boot without opening host networking resources. Internal virtio-net config, inactive device-resource preparation, MMIO handler registration, FDT-ready metadata derivation, TX frame parsing, and RX buffer parsing exist, but packet backend selection, packet queue execution, startup FDT attachment, and device attachment remain tied to #14. |
+| `PUT` | `/network-interfaces/{iface_id}` | supported target; configuration storage implemented | Stores initial virtio-net configuration before boot without opening host networking resources. Startup preparation attaches configured interfaces as inert virtio-mmio devices in the MMIO dispatcher and guest FDT, but packet backend selection, packet queue execution, packet movement, runtime updates, PATCH, and DELETE remain tied to #14. |
 | `PUT` | `/vsock` | deferred | Tied to virtio vsock work in #15. |
 | `GET`, `PUT`, `PATCH` | `/mmds` | deferred | Tied to MMDS work in #16. |
 | `PUT` | `/mmds/config` | deferred | Tied to MMDS work in #16. |
@@ -512,9 +512,8 @@ host device names, and MAC strings.
 
 The internal model rejects configured `mtu`, `rx_rate_limiter`, and
 `tx_rate_limiter` fields as unsupported. It does not open host networking
-resources, choose a macOS packet backend, or attach a virtio-net device yet.
-Stored network interface configs are returned from `GET /vm/config` in the
-`network-interfaces` array.
+resources or choose a macOS packet backend. Stored network interface configs are
+returned from `GET /vm/config` in the `network-interfaces` array.
 
 The runtime crate also has the first backend-neutral virtio-net config-space,
 activation, TX frame parser, RX buffer parser, prepared device resources, and
@@ -530,13 +529,13 @@ non-merged-RX minimum. Preparation can build ordered owned resources from stored
 configs, preserving `iface_id`, `host_dev_name`, guest-MAC config space, and an
 inactive `VirtioNetworkDevice` without opening host networking resources. The
 prepared resources can be consumed into deterministic virtio-mmio regions and
-handlers in a fresh internal `MmioDispatcher`, returning read-only registration
-metadata. Separate boot metadata helpers can pair those registrations with
-caller-provided interrupt lines and derive FDT-ready virtio-mmio descriptors
-while preserving interface order and host device names. These helpers do not
-register network MMIO regions during boot, write network nodes into the startup
-FDT, execute RX/TX queues, signal interrupts, advertise MTU, choose a host
-packet backend, write packets into guest RX buffers, or move packets.
+handlers in a fresh or existing internal `MmioDispatcher`, returning read-only
+registration metadata. Startup preparation can pair those registrations with
+caller-provided interrupt lines and write matching inert virtio-mmio descriptors
+into the guest FDT while preserving interface order and host device names. These
+helpers do not execute RX/TX queues, signal completed network queue interrupts,
+advertise MTU, choose a host packet backend, write packets into guest RX
+buffers, or move packets.
 
 The runtime crate can prepare owned internal block-device resources from a
 validated list of stored drive configs. Preparation opens each backing file,
@@ -653,15 +652,15 @@ The runtime crate can assemble internal arm64 boot resources from stored VMM
 controller configuration and caller-provided backend boot metadata. This path
 requires a configured boot source, applies `mem_size_mib` to the aarch64 DRAM
 layout, allocates guest memory, loads the arm64 Linux `Image` and optional
-initrd, prepares configured block devices, registers their virtio-mmio regions
-in a fresh internal `MmioDispatcher`, optionally registers one TX-only serial
-MMIO handler in the same dispatcher, pairs block registrations with supplied
-SPI interrupt lines, and writes the arm64 FDT with matching serial and
-virtio-mmio metadata.
+initrd, prepares configured block and network devices, registers their
+virtio-mmio regions in a fresh internal `MmioDispatcher`, optionally registers
+one TX-only serial MMIO handler in the same dispatcher, pairs block and network
+registrations with supplied SPI interrupt lines, and writes the arm64 FDT with
+matching serial and virtio-mmio metadata.
 
 The assembled bundle owns the guest memory, loaded boot metadata, FDT write
-metadata, MMIO dispatcher, optional serial metadata/output sink, and block/FDT
-device metadata needed by later HVF startup wiring. It fails with typed errors
+metadata, MMIO dispatcher, optional serial metadata/output sink, and block and
+network FDT device metadata needed by later HVF startup wiring. It fails with typed errors
 for missing boot source, memory size
 overflow or a memory size above the arm64 architectural maximum,
 layout/allocation failure, boot-source loading failure, block-device preparation
@@ -934,7 +933,7 @@ The first API implementation should model the same broad stages as Firecracker:
 | `PUT /machine-config` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Pre-boot-only configuration. Stored values are applied during startup preparation. |
 | `PUT /boot-source` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config; host paths are opened during startup preparation. Host path errors must avoid leaking sensitive path details. |
 | `PUT /drives/{drive_id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config; startup preparation opens backing files and registers initial block MMIO devices. Runtime hotplug remains deferred. |
-| `PUT /network-interfaces/{iface_id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config without opening host networking resources. Internal inactive device-resource preparation, MMIO handler registration, FDT-ready metadata derivation, TX frame parsing, and RX buffer parsing exist, while startup FDT attachment, packet backend, virtio-net packet queue execution, PATCH, and DELETE remain deferred. |
+| `PUT /network-interfaces/{iface_id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config without opening host networking resources. Startup preparation attaches configured interfaces as inert virtio-mmio devices in the MMIO dispatcher and guest FDT, while packet backend, virtio-net packet queue execution, packet movement, PATCH, and DELETE remain deferred. |
 | `PUT /metrics` | implemented; `204` empty response on successful output initialization | unsupported after start; `400` `fault_message` | Metrics output is process observability state, not guest configuration. Duplicate initialization fails. |
 | `PUT /logger` | implemented; `204` empty response on successful pre-boot configuration | unsupported after start; `400` `fault_message` | Logger output is process observability state, not guest configuration. Repeated pre-boot requests update provided fields; full log routing remains deferred. |
 | `PUT /actions` with `InstanceStart` | process-routed; `204` after successful owned HVF startup with internal boot run-loop worker across bounded step windows or `400` preflight/preparation fault | unsupported after start; `400` `fault_message` | Commits `Running` only after the owned HVF boot-session worker with internal serial capture is retained. The worker keeps internal active, terminal-outcome, or error status; public run-loop control and public serial streaming remain deferred. |
@@ -981,7 +980,7 @@ Their eventual support level should follow the endpoint matrix:
 - packet networking beyond pre-boot `network-interfaces` configuration storage
   and the internal virtio-net config-space, activation, TX frame parser, RX
   buffer parser, prepared device resources, MMIO registration helpers, and
-  FDT-ready metadata helpers
+  inert startup FDT attachment
 - vsock
 - snapshots
 - MMDS

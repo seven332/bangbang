@@ -20,6 +20,8 @@ const GUEST_BOOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 const SERIAL_MMIO_BASE: u64 = 0x4000_0000;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const BLOCK_MMIO_BASE: u64 = 0x5000_0000;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const NETWORK_MMIO_BASE: u64 = 0x6000_0000;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
@@ -34,6 +36,7 @@ fn boots_firecracker_kernel_to_guest_marker() {
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::memory::GuestAddress;
     use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
     use bangbang_runtime::serial::SharedSerialOutputBuffer;
     use bangbang_runtime::{VmmAction, VmmController};
 
@@ -52,10 +55,13 @@ fn boots_firecracker_kernel_to_guest_marker() {
         ))
         .expect("guest boot test boot source should configure");
     let serial_address = GuestAddress::new(SERIAL_MMIO_BASE);
-    let config = HvfArm64BootSessionConfig::new(BlockMmioLayout::new(
-        GuestAddress::new(BLOCK_MMIO_BASE),
-        MmioRegionId::new(1),
-    ))
+    let config = HvfArm64BootSessionConfig::new(
+        BlockMmioLayout::new(GuestAddress::new(BLOCK_MMIO_BASE), MmioRegionId::new(1)),
+        NetworkMmioLayout::new(
+            GuestAddress::new(NETWORK_MMIO_BASE),
+            MmioRegionId::new(1000),
+        ),
+    )
     .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
         MmioRegionId::new(0),
         serial_address,
