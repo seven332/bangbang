@@ -47,14 +47,14 @@ with a runner-compatible shared MMIO dispatcher, controlled mapped guest-memory
 access, one-step runner-thread MMIO handling, a run-cancellation boundary, a
 virtual-timer-mask control boundary, a bounded internal boot-session run-loop
 pump, owned internal boot-session handle, process-level owned startup-session
-wiring with optional serial capture and boot run-loop supervision across bounded step windows with retained internal worker status, boot block queue interrupt signaling,
+wiring with optional serial capture and boot run-loop supervision across bounded step windows with retained internal worker status, boot block and virtio-net TX queue interrupt signaling,
 virtual timer PPI assertion, per-controller metrics and logger output state, and an initial process startup argument model.
 There is no broader API request body model beyond the initial boot-source,
 drive configuration, machine-configuration, metrics, logger, and actions bodies, public guest
 execution beyond internal startup execution across bounded step windows, public run-loop control, complete interrupt
 delivery, including timer EOI/deactivation-driven unmasking,
-HVF runner-loop notification scheduling, public serial output streaming,
-serial/backend interrupt wiring beyond the internal boot block notification
+general HVF runner-loop notification scheduling, public serial output streaming,
+serial/backend interrupt wiring beyond the internal boot block and network TX notification
 and retained serial capture paths,
 device-backed feature negotiation, indirect descriptor support,
 device-backed runner-loop MMIO scheduling, complete device emulation,
@@ -668,16 +668,16 @@ network FDT device metadata needed by later HVF startup wiring. It fails with ty
 for missing boot source, memory size
 overflow or a memory size above the arm64 architectural maximum,
 layout/allocation failure, boot-source loading failure, block-device preparation
-failure, serial or block MMIO registration failure, interrupt-line count
+failure, serial, block, or network MMIO registration failure, interrupt-line count
 mismatch, or FDT write failure.
 
 The assembled bundle is used by owned HVF startup preparation. HVF owns the
 mapped guest memory while runtime metadata, the MMIO dispatcher, optional serial
-metadata, and block metadata stay available to the retained session. bangbang
+metadata, and block/network metadata stay available to the retained session. bangbang
 now starts an internal boot run-loop worker across bounded step windows after successful startup and retains internal active, terminal-outcome, or error worker status, but
 does not yet provide public run-loop control, signal backend
-interrupts outside the internal boot block notification path, or prove guest
-boot with an integration test.
+interrupts outside the internal boot block and network TX notification paths,
+or prove guest boot with an integration test.
 
 The runtime crate also contains an internal MMIO region registry, operation
 model, and handler dispatch boundary for future real devices. It reuses
@@ -748,10 +748,11 @@ explicitly reset. Activation failure marks the device as needing reset, but
 concrete device activation effects, device config layouts, config generation
 policy, and general runner-loop device-backed notification dispatch are still
 deferred. Activated queue metadata can now feed the internal virtio-block queue
-builder, and boot runtime resources can dispatch registered block-device queue
-notifications against caller-supplied guest memory. Internal HVF boot sessions
-can signal needed block SPI interrupts from those dispatch summaries, but HVF
-runner-loop calls remain deferred. The
+builder and the internal virtio-net TX queue dispatcher. Boot runtime resources
+can dispatch registered block-device and virtio-net TX queue notifications
+against caller-supplied guest memory. Internal HVF boot sessions can signal
+needed block and network SPI interrupts from those dispatch summaries, but
+general HVF runner-loop calls remain deferred. The
 virtqueue model can publish one used-ring completion element with validated
 layout, mapped-memory checks, wrapping, and release ordering, but batching,
 event-index notification suppression, and device-backed completion loops are
@@ -765,8 +766,8 @@ to an injected sink. The HVF crate can allocate deterministic guest interrupt
 lines from the validated GIC SPI range, signal validated SPI levels through
 `hv_gic_set_spi`, and set or clear validated GIC PPI pending bits through
 redistributor pending registers on the vCPU-owning thread. Internal HVF boot
-sessions use the SPI signal path for block queue interrupts after boot-runtime
-notification dispatch. This follows Firecracker's separation between
+sessions use the SPI signal path for block queue interrupts and virtio-net TX
+queue interrupts after boot-runtime notification dispatch. This follows Firecracker's separation between
 device-facing interrupt triggers and KVM-specific irqfd/GSI routing, but it is
 not yet device interrupt masking, timer EOI policy, runner-loop interrupt
 dispatch, or guest-visible device delivery.
@@ -791,8 +792,8 @@ Guest GPR 31 is rejected explicitly so it is not confused with HVF's PC
 register. The runner uses a non-blocking dispatcher lock after a run step
 returns an MMIO exception; it does not hold the dispatcher while `hv_vcpu_run`
 is blocked. There is still no continuous run-loop policy, public interrupt
-delivery, or real device emulation beyond the internal boot block notification
-signal step.
+delivery, or real device emulation beyond the internal boot block and
+virtio-net TX notification signal steps.
 
 The HVF backend can map allocated guest memory regions into an existing
 Hypervisor.framework VM with read/write/execute guest RAM permissions. The
@@ -851,18 +852,19 @@ in-flight run step without exposing the full runner. Public `InstanceStart`
 now starts a process-owned internal boot run-loop worker across bounded step windows with retained internal worker status and an owned
 HVF boot session and internal serial MMIO console after successful startup. A
 bounded internal
-boot-session run-loop pump now composes that one-step path with boot block
-notification dispatch between successful MMIO steps and virtual timer PPI
-assertion after virtual timer exits. It stops explicitly on a step limit,
+boot-session run-loop pump now composes that one-step path with boot block and
+virtio-net TX notification dispatch between successful MMIO steps and virtual
+timer PPI assertion after virtual timer exits. It stops explicitly on a step limit,
 stop-token request, canceled run exit, unknown run exit, dispatch error, or
 timer handler error. This remains internal runner-loop plumbing, not the future
 public guest scheduler. An owned internal session handle preserves the same
 session operations while avoiding a self-referential backend/session owner in
 process-level state.
-The boot session can also dispatch pending boot block queue notifications
-against mapped guest memory and signal the corresponding block SPI line when
-the runtime dispatch summary reports queue-interrupt intent; per-device results
-preserve dispatch, lookup, and signal failures for later runner-loop policy.
+The boot session can also dispatch pending boot block and virtio-net TX queue
+notifications against mapped guest memory and signal the corresponding block or
+network SPI line when the runtime dispatch summary reports queue-interrupt
+intent; per-device results preserve dispatch, lookup, and signal failures for
+later runner-loop policy.
 Boot notification dispatch locks the shared dispatcher only while draining
 runtime notifications and releases it before HVF GIC signaling.
 
@@ -1025,8 +1027,8 @@ macOS design work instead of direct implementation:
   `hv_vcpu_run` step at a time, exposes a cancellation-only handle for that run
   step, and shuts down by canceling and joining the runner thread. The internal
   boot session can compose those pieces into a bounded run-loop pump that
-  dispatches boot block notifications between successful MMIO steps and asserts
-  the EL1 virtual timer PPI after virtual timer exits.
+  dispatches boot block and virtio-net TX notifications between successful MMIO
+  steps and asserts the EL1 virtual timer PPI after virtual timer exits.
 - HVF exit snapshots preserve Hypervisor.framework reasons such as canceled,
   exception, virtual timer activation, and unknown after a run wrapper marks
   exit data available. Candidate arm64 MMIO data-abort exceptions can be decoded
@@ -1046,10 +1048,11 @@ macOS design work instead of direct implementation:
 - Device-facing interrupt triggers are backend-neutral runtime state today, and
   HVF interrupt-line support can allocate deterministic SPI lines from GIC
   metadata and set validated SPI levels through `hv_gic_set_spi`. Internal boot
-  sessions can now use that path for block queue interrupts, while device
-  interrupt masking, timer EOI/deactivation-driven unmasking, runner-loop
-  interrupt delivery beyond the current internal block/timer paths, and public
-  device wiring still need macOS-specific backend work.
+  sessions can now use that path for block queue interrupts and virtio-net TX
+  queue interrupts, while device interrupt masking, timer EOI/deactivation-driven
+  unmasking, runner-loop interrupt delivery beyond the current internal
+  block/network TX/timer paths, and public device wiring still need
+  macOS-specific backend work.
 - Linux seccomp, jailer, cgroups, and namespaces do not directly apply.
 - Linux TAP-based networking needs a macOS-specific design.
 - Snapshot and device behavior may differ when backed by HVF.

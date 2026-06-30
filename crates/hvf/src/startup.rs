@@ -17,8 +17,9 @@ use bangbang_runtime::network::NetworkMmioLayout;
 use bangbang_runtime::serial::SharedSerialOutputBuffer;
 use bangbang_runtime::startup::{
     Arm64BootBlockNotificationDispatch, Arm64BootBlockNotificationDispatchError,
-    Arm64BootBlockNotificationDispatches, Arm64BootResourceConfig, Arm64BootResourceError,
-    Arm64BootResources, Arm64BootRuntimeResources,
+    Arm64BootBlockNotificationDispatches, Arm64BootNetworkNotificationDispatch,
+    Arm64BootNetworkNotificationDispatchError, Arm64BootNetworkNotificationDispatches,
+    Arm64BootResourceConfig, Arm64BootResourceError, Arm64BootResources, Arm64BootRuntimeResources,
     Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig,
 };
 use bangbang_runtime::{BackendError, VmBackend, VmmController};
@@ -183,6 +184,10 @@ pub enum HvfArm64BootRunLoopError {
         steps_completed: usize,
         source: Box<HvfArm64BootBlockNotificationDispatchError>,
     },
+    DispatchNetworkNotifications {
+        steps_completed: usize,
+        source: Box<HvfArm64BootNetworkNotificationDispatchError>,
+    },
     HandleVirtualTimer {
         steps_completed: usize,
         source: Box<HvfVcpuRunnerError>,
@@ -206,6 +211,13 @@ impl fmt::Display for HvfArm64BootRunLoopError {
                 f,
                 "failed to dispatch HVF boot-session block notifications after {steps_completed} completed steps: {source}"
             ),
+            Self::DispatchNetworkNotifications {
+                steps_completed,
+                source,
+            } => write!(
+                f,
+                "failed to dispatch HVF boot-session network notifications after {steps_completed} completed steps: {source}"
+            ),
             Self::HandleVirtualTimer {
                 steps_completed,
                 source,
@@ -222,6 +234,7 @@ impl std::error::Error for HvfArm64BootRunLoopError {
         match self {
             Self::RunStep { source, .. } => Some(source.as_ref()),
             Self::DispatchBlockNotifications { source, .. } => Some(source.as_ref()),
+            Self::DispatchNetworkNotifications { source, .. } => Some(source.as_ref()),
             Self::HandleVirtualTimer { source, .. } => Some(source.as_ref()),
         }
     }
@@ -372,6 +385,39 @@ impl HvfArm64BootSession<'_> {
         })?;
 
         signal_block_queue_interrupts(dispatches, &signaler)
+    }
+
+    pub fn dispatch_network_queue_notifications_and_signal_interrupts(
+        &mut self,
+    ) -> Result<
+        HvfArm64BootNetworkNotificationDispatches,
+        HvfArm64BootNetworkNotificationDispatchError,
+    > {
+        let dispatches = {
+            let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
+                HvfArm64BootNetworkNotificationDispatchError::MapGuestMemory { source }
+            })?;
+            let mut mmio_dispatcher =
+                lock_boot_mmio_dispatcher(&self.mmio_dispatcher).map_err(|source| {
+                    HvfArm64BootNetworkNotificationDispatchError::MmioDispatcher { source }
+                })?;
+
+            self.runtime_resources
+                .dispatch_network_queue_notifications(memory, &mut mmio_dispatcher)
+                .map_err(|source| {
+                    HvfArm64BootNetworkNotificationDispatchError::DispatchNotifications { source }
+                })?
+        };
+
+        if !dispatches.needs_queue_interrupt() {
+            return collect_network_notification_dispatches(dispatches);
+        }
+
+        let signaler = HvfGicSpiSignaler::from_metadata(&self.gic).map_err(|source| {
+            HvfArm64BootNetworkNotificationDispatchError::CreateSignalSink { source }
+        })?;
+
+        signal_network_queue_interrupts(dispatches, &signaler)
     }
 }
 
@@ -534,6 +580,39 @@ impl OwnedHvfArm64BootSession {
 
         signal_block_queue_interrupts(dispatches, &signaler)
     }
+
+    pub fn dispatch_network_queue_notifications_and_signal_interrupts(
+        &mut self,
+    ) -> Result<
+        HvfArm64BootNetworkNotificationDispatches,
+        HvfArm64BootNetworkNotificationDispatchError,
+    > {
+        let dispatches = {
+            let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
+                HvfArm64BootNetworkNotificationDispatchError::MapGuestMemory { source }
+            })?;
+            let mut mmio_dispatcher =
+                lock_boot_mmio_dispatcher(&self.mmio_dispatcher).map_err(|source| {
+                    HvfArm64BootNetworkNotificationDispatchError::MmioDispatcher { source }
+                })?;
+
+            self.runtime_resources
+                .dispatch_network_queue_notifications(memory, &mut mmio_dispatcher)
+                .map_err(|source| {
+                    HvfArm64BootNetworkNotificationDispatchError::DispatchNotifications { source }
+                })?
+        };
+
+        if !dispatches.needs_queue_interrupt() {
+            return collect_network_notification_dispatches(dispatches);
+        }
+
+        let signaler = HvfGicSpiSignaler::from_metadata(&self.gic).map_err(|source| {
+            HvfArm64BootNetworkNotificationDispatchError::CreateSignalSink { source }
+        })?;
+
+        signal_network_queue_interrupts(dispatches, &signaler)
+    }
 }
 
 impl BootSessionRunLoopSession for OwnedHvfArm64BootSession {
@@ -551,6 +630,15 @@ impl BootSessionRunLoopSession for OwnedHvfArm64BootSession {
     ) -> Result<HvfArm64BootBlockNotificationDispatches, HvfArm64BootBlockNotificationDispatchError>
     {
         self.dispatch_block_queue_notifications_and_signal_interrupts()
+    }
+
+    fn dispatch_run_loop_network_notifications(
+        &mut self,
+    ) -> Result<
+        HvfArm64BootNetworkNotificationDispatches,
+        HvfArm64BootNetworkNotificationDispatchError,
+    > {
+        self.dispatch_network_queue_notifications_and_signal_interrupts()
     }
 }
 
@@ -620,6 +708,65 @@ impl HvfArm64BootBlockNotificationDispatch {
 }
 
 #[derive(Debug)]
+pub struct HvfArm64BootNetworkNotificationDispatches {
+    devices: Vec<HvfArm64BootNetworkNotificationDispatch>,
+}
+
+impl HvfArm64BootNetworkNotificationDispatches {
+    fn new(devices: Vec<HvfArm64BootNetworkNotificationDispatch>) -> Self {
+        Self { devices }
+    }
+
+    pub fn as_slice(&self) -> &[HvfArm64BootNetworkNotificationDispatch] {
+        &self.devices
+    }
+
+    pub fn len(&self) -> usize {
+        self.devices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.devices.is_empty()
+    }
+
+    pub fn has_signal_failure(&self) -> bool {
+        self.devices
+            .iter()
+            .any(|device| device.signal_error().is_some())
+    }
+}
+
+#[derive(Debug)]
+pub struct HvfArm64BootNetworkNotificationDispatch {
+    dispatch: Arm64BootNetworkNotificationDispatch,
+    signal_error: Option<DeviceInterruptTriggerError>,
+}
+
+impl HvfArm64BootNetworkNotificationDispatch {
+    fn new(
+        dispatch: Arm64BootNetworkNotificationDispatch,
+        signal_error: Option<DeviceInterruptTriggerError>,
+    ) -> Self {
+        Self {
+            dispatch,
+            signal_error,
+        }
+    }
+
+    pub const fn dispatch(&self) -> &Arm64BootNetworkNotificationDispatch {
+        &self.dispatch
+    }
+
+    pub const fn signal_error(&self) -> Option<&DeviceInterruptTriggerError> {
+        self.signal_error.as_ref()
+    }
+
+    pub fn queue_interrupt_signaled(&self) -> bool {
+        self.dispatch.needs_queue_interrupt() && self.signal_error.is_none()
+    }
+}
+
+#[derive(Debug)]
 pub enum HvfArm64BootBlockNotificationDispatchError {
     MapGuestMemory {
         source: HvfGuestMemoryMappingError,
@@ -636,6 +783,74 @@ pub enum HvfArm64BootBlockNotificationDispatchError {
     ResultAllocation {
         source: TryReserveError,
     },
+}
+
+#[derive(Debug)]
+pub enum HvfArm64BootNetworkNotificationDispatchError {
+    MapGuestMemory {
+        source: HvfGuestMemoryMappingError,
+    },
+    MmioDispatcher {
+        source: HvfArm64BootMmioDispatcherError,
+    },
+    DispatchNotifications {
+        source: Arm64BootNetworkNotificationDispatchError,
+    },
+    CreateSignalSink {
+        source: HvfGicSpiSignalError,
+    },
+    ResultAllocation {
+        source: TryReserveError,
+    },
+}
+
+impl fmt::Display for HvfArm64BootNetworkNotificationDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MapGuestMemory { source } => {
+                write!(
+                    f,
+                    "failed to borrow HVF boot-session guest memory for network notifications: {source}"
+                )
+            }
+            Self::MmioDispatcher { source } => {
+                write!(
+                    f,
+                    "failed to lock HVF boot-session MMIO dispatcher: {source}"
+                )
+            }
+            Self::DispatchNotifications { source } => {
+                write!(
+                    f,
+                    "failed to dispatch boot network queue notifications: {source}"
+                )
+            }
+            Self::CreateSignalSink { source } => {
+                write!(
+                    f,
+                    "failed to create HVF boot network interrupt signaler: {source}"
+                )
+            }
+            Self::ResultAllocation { source } => {
+                write!(
+                    f,
+                    "failed to allocate HVF boot network notification results: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for HvfArm64BootNetworkNotificationDispatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MapGuestMemory { source } => Some(source),
+            Self::MmioDispatcher { source } => Some(source),
+            Self::DispatchNotifications { source } => Some(source),
+            Self::CreateSignalSink { source } => Some(source),
+            Self::ResultAllocation { source } => Some(source),
+        }
+    }
 }
 
 impl fmt::Display for HvfArm64BootBlockNotificationDispatchError {
@@ -735,6 +950,13 @@ trait BootSessionRunLoopSession {
     fn dispatch_run_loop_block_notifications(
         &mut self,
     ) -> Result<HvfArm64BootBlockNotificationDispatches, HvfArm64BootBlockNotificationDispatchError>;
+
+    fn dispatch_run_loop_network_notifications(
+        &mut self,
+    ) -> Result<
+        HvfArm64BootNetworkNotificationDispatches,
+        HvfArm64BootNetworkNotificationDispatchError,
+    >;
 }
 
 impl BootSessionRunLoopSession for HvfArm64BootSession<'_> {
@@ -752,6 +974,15 @@ impl BootSessionRunLoopSession for HvfArm64BootSession<'_> {
     ) -> Result<HvfArm64BootBlockNotificationDispatches, HvfArm64BootBlockNotificationDispatchError>
     {
         self.dispatch_block_queue_notifications_and_signal_interrupts()
+    }
+
+    fn dispatch_run_loop_network_notifications(
+        &mut self,
+    ) -> Result<
+        HvfArm64BootNetworkNotificationDispatches,
+        HvfArm64BootNetworkNotificationDispatchError,
+    > {
+        self.dispatch_network_queue_notifications_and_signal_interrupts()
     }
 }
 
@@ -831,6 +1062,17 @@ fn run_boot_session_loop_with_observer(
                 if stop_token.is_stop_requested() {
                     return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
                 }
+                session
+                    .dispatch_run_loop_network_notifications()
+                    .map_err(
+                        |source| HvfArm64BootRunLoopError::DispatchNetworkNotifications {
+                            steps_completed: steps,
+                            source: Box::new(source),
+                        },
+                    )?;
+                if stop_token.is_stop_requested() {
+                    return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+                }
                 if steps == max_steps {
                     return Ok(HvfArm64BootRunLoopOutcome::StepLimitReached { steps });
                 }
@@ -891,6 +1133,53 @@ fn signal_block_queue_interrupts(
     }
 
     Ok(HvfArm64BootBlockNotificationDispatches::new(devices))
+}
+
+fn collect_network_notification_dispatches(
+    dispatches: Arm64BootNetworkNotificationDispatches,
+) -> Result<HvfArm64BootNetworkNotificationDispatches, HvfArm64BootNetworkNotificationDispatchError>
+{
+    let runtime_dispatches = dispatches.into_vec();
+    let mut devices = Vec::new();
+    devices
+        .try_reserve_exact(runtime_dispatches.len())
+        .map_err(
+            |source| HvfArm64BootNetworkNotificationDispatchError::ResultAllocation { source },
+        )?;
+
+    for dispatch in runtime_dispatches {
+        devices.push(HvfArm64BootNetworkNotificationDispatch::new(dispatch, None));
+    }
+
+    Ok(HvfArm64BootNetworkNotificationDispatches::new(devices))
+}
+
+fn signal_network_queue_interrupts(
+    dispatches: Arm64BootNetworkNotificationDispatches,
+    signaler: &dyn InterruptSink,
+) -> Result<HvfArm64BootNetworkNotificationDispatches, HvfArm64BootNetworkNotificationDispatchError>
+{
+    let runtime_dispatches = dispatches.into_vec();
+    let mut devices = Vec::new();
+    devices
+        .try_reserve_exact(runtime_dispatches.len())
+        .map_err(
+            |source| HvfArm64BootNetworkNotificationDispatchError::ResultAllocation { source },
+        )?;
+
+    for dispatch in runtime_dispatches {
+        let signal_error = if dispatch.needs_queue_interrupt() {
+            signal_queue_interrupt(dispatch.device().fdt_device.interrupt_line, signaler).err()
+        } else {
+            None
+        };
+        devices.push(HvfArm64BootNetworkNotificationDispatch::new(
+            dispatch,
+            signal_error,
+        ));
+    }
+
+    Ok(HvfArm64BootNetworkNotificationDispatches::new(devices))
 }
 
 fn signal_queue_interrupt(
@@ -1284,11 +1573,14 @@ mod tests {
         MmioAccess, MmioAccessBytes, MmioDispatchOutcome, MmioDispatcher, MmioHandler,
         MmioHandlerError, MmioOperation, MmioRegionId,
     };
-    use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::network::{
+        NetworkInterfaceConfigInput, NetworkMmioLayout, VIRTIO_NET_RX_QUEUE_INDEX,
+        VIRTIO_NET_TX_HEADER_SIZE, VIRTIO_NET_TX_QUEUE_INDEX,
+    };
     use bangbang_runtime::serial::SharedSerialOutputBuffer;
     use bangbang_runtime::startup::{
-        Arm64BootBlockNotificationDispatches, Arm64BootResourceConfig, Arm64BootResources,
-        Arm64BootRuntimeResources,
+        Arm64BootBlockNotificationDispatches, Arm64BootNetworkNotificationDispatches,
+        Arm64BootResourceConfig, Arm64BootResources, Arm64BootRuntimeResources,
     };
     use bangbang_runtime::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
@@ -1300,11 +1592,12 @@ mod tests {
 
     use super::{
         HvfArm64BootBlockNotificationDispatchError, HvfArm64BootInterruptLinePurpose,
-        HvfArm64BootMmioDispatcherError, HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopStopToken,
-        HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig, HvfArm64BootSessionError,
-        allocate_interrupt_lines, collect_block_notification_dispatches, lock_boot_mmio_dispatcher,
-        run_boot_session_loop, run_boot_session_vcpu_step, signal_block_queue_interrupts,
-        validate_single_vcpu,
+        HvfArm64BootMmioDispatcherError, HvfArm64BootNetworkNotificationDispatchError,
+        HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig,
+        HvfArm64BootSessionConfig, HvfArm64BootSessionError, allocate_interrupt_lines,
+        collect_block_notification_dispatches, collect_network_notification_dispatches,
+        lock_boot_mmio_dispatcher, run_boot_session_loop, run_boot_session_vcpu_step,
+        signal_block_queue_interrupts, signal_network_queue_interrupts, validate_single_vcpu,
     };
     use crate::exit::{
         HvfExceptionExit, HvfHvcExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
@@ -1339,6 +1632,14 @@ mod tests {
     const HEADER_ADDR: GuestAddress = GuestAddress::new(0x8043_0000);
     const DATA_ADDR: GuestAddress = GuestAddress::new(0x8044_0000);
     const STATUS_ADDR: GuestAddress = GuestAddress::new(0x8045_0000);
+    const TEST_NETWORK_RX_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x8050_0000);
+    const TEST_NETWORK_RX_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x8051_0000);
+    const TEST_NETWORK_RX_USED_RING: GuestAddress = GuestAddress::new(0x8052_0000);
+    const TEST_NETWORK_TX_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x8060_0000);
+    const TEST_NETWORK_TX_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x8061_0000);
+    const TEST_NETWORK_TX_USED_RING: GuestAddress = GuestAddress::new(0x8062_0000);
+    const TEST_NETWORK_TX_HEADER: GuestAddress = GuestAddress::new(0x8063_0000);
+    const TEST_NETWORK_TX_PAYLOAD: GuestAddress = GuestAddress::new(0x8064_0000);
     const TEST_AVAILABLE_RING_IDX_OFFSET: u64 = 2;
     const TEST_AVAILABLE_RING_RING_OFFSET: u64 = 4;
     const TEST_AVAILABLE_RING_ENTRY_SIZE: u64 = 2;
@@ -1423,6 +1724,23 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct WrongNetworkHandler;
+
+    impl MmioHandler for WrongNetworkHandler {
+        fn read(&mut self, _access: MmioAccess) -> Result<MmioAccessBytes, MmioHandlerError> {
+            Err(MmioHandlerError::new("wrong network handler read"))
+        }
+
+        fn write(
+            &mut self,
+            _access: MmioAccess,
+            _data: MmioAccessBytes,
+        ) -> Result<(), MmioHandlerError> {
+            Err(MmioHandlerError::new("wrong network handler write"))
+        }
+    }
+
     type RecordedRunStepDispatchers = Arc<Mutex<Vec<Arc<Mutex<MmioDispatcher>>>>>;
 
     #[derive(Debug)]
@@ -1479,10 +1797,17 @@ mod tests {
                 HvfArm64BootBlockNotificationDispatchError,
             >,
         >,
+        network_dispatch_results: VecDeque<
+            Result<
+                super::HvfArm64BootNetworkNotificationDispatches,
+                HvfArm64BootNetworkNotificationDispatchError,
+            >,
+        >,
         timer_results: VecDeque<Result<(), HvfVcpuRunnerError>>,
         events: Vec<&'static str>,
         request_stop_on_run: Option<HvfArm64BootRunLoopStopToken>,
         request_stop_on_dispatch: Option<HvfArm64BootRunLoopStopToken>,
+        request_stop_on_network_dispatch: Option<HvfArm64BootRunLoopStopToken>,
         request_stop_on_timer: Option<HvfArm64BootRunLoopStopToken>,
     }
 
@@ -1491,10 +1816,12 @@ mod tests {
             Self {
                 run_results: run_results.into_iter().map(Ok).collect(),
                 dispatch_results: VecDeque::new(),
+                network_dispatch_results: VecDeque::new(),
                 timer_results: VecDeque::new(),
                 events: Vec::new(),
                 request_stop_on_run: None,
                 request_stop_on_dispatch: None,
+                request_stop_on_network_dispatch: None,
                 request_stop_on_timer: None,
             }
         }
@@ -1503,16 +1830,25 @@ mod tests {
             Self {
                 run_results: VecDeque::from([Err(source)]),
                 dispatch_results: VecDeque::new(),
+                network_dispatch_results: VecDeque::new(),
                 timer_results: VecDeque::new(),
                 events: Vec::new(),
                 request_stop_on_run: None,
                 request_stop_on_dispatch: None,
+                request_stop_on_network_dispatch: None,
                 request_stop_on_timer: None,
             }
         }
 
         fn push_dispatch_error(&mut self, source: HvfArm64BootBlockNotificationDispatchError) {
             self.dispatch_results.push_back(Err(source));
+        }
+
+        fn push_network_dispatch_error(
+            &mut self,
+            source: HvfArm64BootNetworkNotificationDispatchError,
+        ) {
+            self.network_dispatch_results.push_back(Err(source));
         }
 
         fn push_timer_error(&mut self, source: HvfVcpuRunnerError) {
@@ -1525,6 +1861,10 @@ mod tests {
 
         fn request_stop_on_dispatch(&mut self, stop_token: HvfArm64BootRunLoopStopToken) {
             self.request_stop_on_dispatch = Some(stop_token);
+        }
+
+        fn request_stop_on_network_dispatch(&mut self, stop_token: HvfArm64BootRunLoopStopToken) {
+            self.request_stop_on_network_dispatch = Some(stop_token);
         }
 
         fn request_stop_on_timer(&mut self, stop_token: HvfArm64BootRunLoopStopToken) {
@@ -1569,6 +1909,26 @@ mod tests {
                     Vec::new(),
                 ))
             })
+        }
+
+        fn dispatch_run_loop_network_notifications(
+            &mut self,
+        ) -> Result<
+            super::HvfArm64BootNetworkNotificationDispatches,
+            HvfArm64BootNetworkNotificationDispatchError,
+        > {
+            self.events.push("network-dispatch");
+            if let Some(stop_token) = self.request_stop_on_network_dispatch.take() {
+                stop_token.request_stop();
+            }
+
+            self.network_dispatch_results
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Ok(super::HvfArm64BootNetworkNotificationDispatches::new(
+                        Vec::new(),
+                    ))
+                })
         }
     }
 
@@ -1794,19 +2154,38 @@ mod tests {
             .expect("drive config should be stored");
     }
 
+    fn add_network(
+        controller: &mut bangbang_runtime::VmmController,
+        iface_id: &str,
+        host_dev_name: &str,
+    ) {
+        controller
+            .handle_action(VmmAction::PutNetworkInterface(
+                NetworkInterfaceConfigInput::new(iface_id, iface_id, host_dev_name),
+            ))
+            .expect("network interface config should be stored");
+    }
+
     fn valid_boot_resource_config(lines: &[GuestInterruptLine]) -> Arm64BootResourceConfig<'_> {
+        valid_boot_resource_config_with_network_lines(lines, &[])
+    }
+
+    fn valid_boot_resource_config_with_network_lines<'a>(
+        block_lines: &'a [GuestInterruptLine],
+        network_lines: &'a [GuestInterruptLine],
+    ) -> Arm64BootResourceConfig<'a> {
         Arm64BootResourceConfig {
             vcpu_mpidrs: &[0],
             gic: valid_fdt_gic(),
             timer: Arm64FdtTimerInterrupts::firecracker_default(),
             serial_device: None,
             block_mmio_layout: BlockMmioLayout::new(TEST_BLOCK_MMIO_BASE, MmioRegionId::new(1)),
-            block_interrupt_lines: lines,
+            block_interrupt_lines: block_lines,
             network_mmio_layout: NetworkMmioLayout::new(
                 TEST_NETWORK_MMIO_BASE,
                 MmioRegionId::new(50),
             ),
-            network_interrupt_lines: &[],
+            network_interrupt_lines: network_lines,
         }
     }
 
@@ -1872,6 +2251,33 @@ mod tests {
         (parts.memory, parts.runtime, parts.mmio_dispatcher)
     }
 
+    fn boot_runtime_with_networks(
+        interfaces: &[(&str, &str)],
+    ) -> (GuestMemory, Arm64BootRuntimeResources, MmioDispatcher) {
+        let kernel = temp_file("kernel-with-networks", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+
+        for (iface_id, host_dev_name) in interfaces {
+            add_network(&mut controller, iface_id, host_dev_name);
+        }
+
+        let interrupt_lines: Vec<_> = (0..interfaces.len())
+            .map(|index| {
+                line(
+                    32 + u32::try_from(index).expect("test network device index should fit in u32"),
+                )
+            })
+            .collect();
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            valid_boot_resource_config_with_network_lines(&[], &interrupt_lines),
+        )
+        .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+
+        (parts.memory, parts.runtime, parts.mmio_dispatcher)
+    }
+
     fn dispatch_boot_block_notifications(
         memory: &mut GuestMemory,
         runtime: &mut Arm64BootRuntimeResources,
@@ -1880,6 +2286,16 @@ mod tests {
         runtime
             .dispatch_block_queue_notifications(memory, mmio_dispatcher)
             .expect("block notification dispatch result should allocate")
+    }
+
+    fn dispatch_boot_network_notifications(
+        memory: &mut GuestMemory,
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+    ) -> Arm64BootNetworkNotificationDispatches {
+        runtime
+            .dispatch_network_queue_notifications(memory, mmio_dispatcher)
+            .expect("network notification dispatch result should allocate")
     }
 
     fn write_boot_block_mmio_u32(
@@ -1922,6 +2338,57 @@ mod tests {
         let outcome = mmio_dispatcher
             .dispatch(MmioOperation::read(access).expect("u32 read should be valid"))
             .expect("block MMIO read should dispatch");
+
+        match outcome {
+            MmioDispatchOutcome::Read { data } => u32::from_le_bytes(
+                data.as_slice()
+                    .try_into()
+                    .expect("u32 read should return four bytes"),
+            ),
+            MmioDispatchOutcome::Write => panic!("read operation should not return write outcome"),
+        }
+    }
+
+    fn write_boot_network_mmio_u32(
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        device_index: usize,
+        register: VirtioMmioRegister,
+        value: u32,
+    ) {
+        let address = runtime.network_devices[device_index]
+            .registration
+            .address()
+            .checked_add(register.offset())
+            .expect("test MMIO address should not overflow");
+        let access = mmio_dispatcher
+            .lookup(address, 4)
+            .expect("network MMIO access should resolve");
+        let data = MmioAccessBytes::new(&value.to_le_bytes()).expect("u32 bytes should be valid");
+        let outcome = mmio_dispatcher
+            .dispatch(MmioOperation::write(access, data).expect("u32 write should be valid"))
+            .expect("network MMIO write should dispatch");
+
+        assert_eq!(outcome, MmioDispatchOutcome::Write);
+    }
+
+    fn read_boot_network_mmio_u32(
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        device_index: usize,
+        register: VirtioMmioRegister,
+    ) -> u32 {
+        let address = runtime.network_devices[device_index]
+            .registration
+            .address()
+            .checked_add(register.offset())
+            .expect("test MMIO address should not overflow");
+        let access = mmio_dispatcher
+            .lookup(address, 4)
+            .expect("network MMIO access should resolve");
+        let outcome = mmio_dispatcher
+            .dispatch(MmioOperation::read(access).expect("u32 read should be valid"))
+            .expect("network MMIO read should dispatch");
 
         match outcome {
             MmioDispatchOutcome::Read { data } => u32::from_le_bytes(
@@ -2016,6 +2483,137 @@ mod tests {
             VirtioMmioRegister::QueueNotify,
             0,
         );
+    }
+
+    fn configure_boot_network_queues(
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        device_index: usize,
+    ) {
+        write_boot_network_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+        );
+        write_boot_network_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+        );
+        write_boot_network_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::Status,
+            QUEUE_CONFIG_STATUS,
+        );
+        configure_boot_network_queue(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VIRTIO_NET_RX_QUEUE_INDEX,
+        );
+        configure_boot_network_queue(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VIRTIO_NET_TX_QUEUE_INDEX,
+        );
+        write_boot_network_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::Status,
+            DRIVER_OK_STATUS,
+        );
+    }
+
+    fn configure_boot_network_queue(
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        device_index: usize,
+        queue_index: usize,
+    ) {
+        let queue_index_u32 = u32::try_from(queue_index).expect("test queue index should fit");
+        let (descriptor_table, driver_ring, device_ring) = network_queue_addresses(queue_index_u32);
+        write_boot_network_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::QueueSel,
+            queue_index_u32,
+        );
+        write_boot_network_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::QueueNum,
+            u32::from(TEST_QUEUE_SIZE),
+        );
+        write_boot_network_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::QueueDescLow,
+            guest_address_low(descriptor_table),
+        );
+        write_boot_network_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::QueueDriverLow,
+            guest_address_low(driver_ring),
+        );
+        write_boot_network_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::QueueDeviceLow,
+            guest_address_low(device_ring),
+        );
+        write_boot_network_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::QueueReady,
+            1,
+        );
+    }
+
+    fn notify_boot_network_tx_queue(
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        device_index: usize,
+    ) {
+        write_boot_network_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::QueueNotify,
+            VIRTIO_NET_TX_QUEUE_INDEX
+                .try_into()
+                .expect("TX queue index should fit"),
+        );
+    }
+
+    fn network_queue_addresses(queue_index: u32) -> (GuestAddress, GuestAddress, GuestAddress) {
+        match queue_index {
+            0 => (
+                TEST_NETWORK_RX_DESCRIPTOR_TABLE,
+                TEST_NETWORK_RX_AVAILABLE_RING,
+                TEST_NETWORK_RX_USED_RING,
+            ),
+            1 => (
+                TEST_NETWORK_TX_DESCRIPTOR_TABLE,
+                TEST_NETWORK_TX_AVAILABLE_RING,
+                TEST_NETWORK_TX_USED_RING,
+            ),
+            other => panic!("unsupported test network queue index {other}"),
+        }
     }
 
     fn guest_address_low(address: GuestAddress) -> u32 {
@@ -2126,10 +2724,83 @@ mod tests {
             .expect("descriptor should write");
     }
 
+    fn write_network_tx_header(memory: &mut GuestMemory) {
+        let mut bytes = [0; VIRTIO_NET_TX_HEADER_SIZE as usize];
+        let (flags, tail) = bytes.split_at_mut(1);
+        let (gso_type, tail) = tail.split_at_mut(1);
+        let (header_len, tail) = tail.split_at_mut(2);
+        let (gso_size, tail) = tail.split_at_mut(2);
+        let (checksum_start, tail) = tail.split_at_mut(2);
+        let (checksum_offset, num_buffers) = tail.split_at_mut(2);
+
+        flags.copy_from_slice(&[0x1]);
+        gso_type.copy_from_slice(&[0x2]);
+        header_len.copy_from_slice(&0x0304_u16.to_le_bytes());
+        gso_size.copy_from_slice(&0x0506_u16.to_le_bytes());
+        checksum_start.copy_from_slice(&0x0708_u16.to_le_bytes());
+        checksum_offset.copy_from_slice(&0x090a_u16.to_le_bytes());
+        num_buffers.copy_from_slice(&0x0b0c_u16.to_le_bytes());
+
+        memory
+            .write_slice(&bytes, TEST_NETWORK_TX_HEADER)
+            .expect("virtio-net TX header should write");
+    }
+
+    fn write_network_tx_descriptor(
+        memory: &mut GuestMemory,
+        index: u16,
+        descriptor: TestDescriptor,
+    ) {
+        let mut bytes = [0; VIRTQUEUE_DESCRIPTOR_SIZE];
+        let (address_bytes, tail) = bytes.split_at_mut(8);
+        let (len_bytes, tail) = tail.split_at_mut(4);
+        let (flags_bytes, next_bytes) = tail.split_at_mut(2);
+        address_bytes.copy_from_slice(&descriptor.address.raw_value().to_le_bytes());
+        len_bytes.copy_from_slice(&descriptor.len.to_le_bytes());
+        flags_bytes.copy_from_slice(&descriptor.flags.to_le_bytes());
+        next_bytes.copy_from_slice(&descriptor.next.to_le_bytes());
+
+        let descriptor_address = TEST_NETWORK_TX_DESCRIPTOR_TABLE
+            .checked_add(
+                u64::from(index)
+                    * u64::try_from(VIRTQUEUE_DESCRIPTOR_SIZE).expect("descriptor size should fit"),
+            )
+            .expect("descriptor address should not overflow");
+        memory
+            .write_slice(&bytes, descriptor_address)
+            .expect("network TX descriptor should write");
+    }
+
+    fn write_network_tx_descriptors(memory: &mut GuestMemory, descriptors: &[TestDescriptor]) {
+        for (index, descriptor) in descriptors.iter().copied().enumerate() {
+            write_network_tx_descriptor(
+                memory,
+                u16::try_from(index).expect("test descriptor index should fit"),
+                descriptor,
+            );
+        }
+    }
+
     fn write_guest_u16(memory: &mut GuestMemory, address: GuestAddress, value: u16) {
         memory
             .write_slice(&value.to_le_bytes(), address)
             .expect("u16 field should write");
+    }
+
+    fn read_guest_u16(memory: &GuestMemory, address: GuestAddress) -> u16 {
+        let mut bytes = [0; 2];
+        memory
+            .read_slice(&mut bytes, address)
+            .expect("u16 field should read");
+        u16::from_le_bytes(bytes)
+    }
+
+    fn read_guest_u32(memory: &GuestMemory, address: GuestAddress) -> u32 {
+        let mut bytes = [0; 4];
+        memory
+            .read_slice(&mut bytes, address)
+            .expect("u32 field should read");
+        u32::from_le_bytes(bytes)
     }
 
     fn read_guest_bytes(memory: &GuestMemory, address: GuestAddress, len: usize) -> Vec<u8> {
@@ -2170,6 +2841,66 @@ mod tests {
             available_ring_idx_address(),
             u16::try_from(heads.len()).expect("test available length should fit in u16"),
         );
+    }
+
+    fn network_tx_available_ring_idx_address() -> GuestAddress {
+        TEST_NETWORK_TX_AVAILABLE_RING
+            .checked_add(TEST_AVAILABLE_RING_IDX_OFFSET)
+            .expect("network TX available idx address should not overflow")
+    }
+
+    fn network_tx_available_ring_entry_address(ring_index: u16) -> GuestAddress {
+        TEST_NETWORK_TX_AVAILABLE_RING
+            .checked_add(
+                TEST_AVAILABLE_RING_RING_OFFSET
+                    + u64::from(ring_index) * TEST_AVAILABLE_RING_ENTRY_SIZE,
+            )
+            .expect("network TX available entry address should not overflow")
+    }
+
+    fn write_network_tx_available_heads(memory: &mut GuestMemory, heads: &[u16]) {
+        for (ring_index, head) in heads.iter().copied().enumerate() {
+            write_guest_u16(
+                memory,
+                network_tx_available_ring_entry_address(
+                    u16::try_from(ring_index).expect("test ring index should fit in u16"),
+                ),
+                head,
+            );
+        }
+        write_guest_u16(
+            memory,
+            network_tx_available_ring_idx_address(),
+            u16::try_from(heads.len()).expect("test available length should fit in u16"),
+        );
+    }
+
+    fn network_tx_used_ring_idx_address() -> GuestAddress {
+        TEST_NETWORK_TX_USED_RING
+            .checked_add(2)
+            .expect("network TX used idx address should not overflow")
+    }
+
+    fn network_tx_used_ring_entry_address(index: usize) -> GuestAddress {
+        TEST_NETWORK_TX_USED_RING
+            .checked_add(4 + u64::try_from(index).expect("test index should fit") * 8)
+            .expect("network TX used entry address should not overflow")
+    }
+
+    fn read_network_tx_used_index(memory: &GuestMemory) -> u16 {
+        read_guest_u16(memory, network_tx_used_ring_idx_address())
+    }
+
+    fn read_network_tx_used_element(memory: &GuestMemory, index: usize) -> (u32, u32) {
+        let address = network_tx_used_ring_entry_address(index);
+        let descriptor_head = read_guest_u32(memory, address);
+        let len = read_guest_u32(
+            memory,
+            address
+                .checked_add(4)
+                .expect("network TX used-ring len address should not overflow"),
+        );
+        (descriptor_head, len)
     }
 
     #[test]
@@ -2405,6 +3136,237 @@ mod tests {
     }
 
     #[test]
+    fn network_notification_signal_dispatch_accepts_empty_devices() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_without_drives();
+        let dispatches =
+            dispatch_boot_network_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let result = collect_network_notification_dispatches(dispatches)
+            .expect("empty network dispatch result should collect");
+
+        assert!(result.is_empty());
+        assert_eq!(result.len(), 0);
+        assert!(!result.has_signal_failure());
+    }
+
+    #[test]
+    fn network_notification_signal_dispatch_skips_noop_device() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_networks(&[("eth0", "tap0")]);
+        configure_boot_network_queues(&mut runtime, &mut mmio_dispatcher, 0);
+        let dispatches =
+            dispatch_boot_network_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let (lines, sink) = RecordingSink::successful();
+
+        let result = signal_network_queue_interrupts(dispatches, sink.as_ref())
+            .expect("noop network dispatch should collect");
+
+        assert_eq!(result.len(), 1);
+        let device = &result.as_slice()[0];
+        assert_eq!(device.dispatch().device().registration.iface_id(), "eth0");
+        assert!(!device.dispatch().needs_queue_interrupt());
+        assert!(!device.queue_interrupt_signaled());
+        assert!(device.signal_error().is_none());
+        assert!(recorded_lines(&lines).is_empty());
+        assert_eq!(
+            read_boot_network_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                0,
+                VirtioMmioRegister::InterruptStatus
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn network_notification_signal_dispatch_signals_queued_tx_frame() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_networks(&[("eth0", "tap0")]);
+        configure_boot_network_queues(&mut runtime, &mut mmio_dispatcher, 0);
+        write_network_tx_header(&mut memory);
+        memory
+            .write_slice(&[0xde, 0xad, 0xbe, 0xef], TEST_NETWORK_TX_PAYLOAD)
+            .expect("network TX payload should write");
+        write_network_tx_descriptors(
+            &mut memory,
+            &[
+                TestDescriptor::readable(
+                    TEST_NETWORK_TX_HEADER,
+                    VIRTIO_NET_TX_HEADER_SIZE,
+                    Some(1),
+                ),
+                TestDescriptor::readable(TEST_NETWORK_TX_PAYLOAD, 4, None),
+            ],
+        );
+        write_network_tx_available_heads(&mut memory, &[0]);
+        notify_boot_network_tx_queue(&mut runtime, &mut mmio_dispatcher, 0);
+        let dispatches =
+            dispatch_boot_network_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let (lines, sink) = RecordingSink::successful();
+
+        let result = signal_network_queue_interrupts(dispatches, sink.as_ref())
+            .expect("queued network dispatch should collect");
+
+        assert_eq!(result.len(), 1);
+        let device = &result.as_slice()[0];
+        assert!(device.dispatch().needs_queue_interrupt());
+        assert!(device.queue_interrupt_signaled());
+        assert!(device.signal_error().is_none());
+        assert_eq!(recorded_lines(&lines), vec![32]);
+        let dispatch = device
+            .dispatch()
+            .outcome()
+            .dispatched()
+            .expect("network notification should dispatch");
+        let tx = dispatch
+            .tx_queue_dispatch()
+            .expect("TX queue dispatch should be present");
+        assert_eq!(tx.processed_frames(), 1);
+        assert_eq!(tx.successful_frames(), 1);
+        assert_eq!(tx.parse_failures(), 0);
+        assert_eq!(
+            read_boot_network_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                0,
+                VirtioMmioRegister::InterruptStatus
+            ),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        assert_eq!(read_network_tx_used_index(&memory), 1);
+        assert_eq!(read_network_tx_used_element(&memory, 0), (0, 0));
+    }
+
+    #[test]
+    fn network_notification_signal_dispatch_preserves_partial_error_interrupt_intent() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_networks(&[("eth0", "tap0")]);
+        configure_boot_network_queues(&mut runtime, &mut mmio_dispatcher, 0);
+        write_network_tx_header(&mut memory);
+        write_network_tx_descriptors(
+            &mut memory,
+            &[TestDescriptor::readable(
+                TEST_NETWORK_TX_HEADER,
+                VIRTIO_NET_TX_HEADER_SIZE + 4,
+                None,
+            )],
+        );
+        write_network_tx_available_heads(&mut memory, &[0, TEST_QUEUE_SIZE]);
+        notify_boot_network_tx_queue(&mut runtime, &mut mmio_dispatcher, 0);
+        let dispatches =
+            dispatch_boot_network_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let (lines, sink) = RecordingSink::successful();
+
+        let result = signal_network_queue_interrupts(dispatches, sink.as_ref())
+            .expect("partial network dispatch result should collect");
+
+        let device = &result.as_slice()[0];
+        assert!(device.dispatch().needs_queue_interrupt());
+        assert!(device.queue_interrupt_signaled());
+        let err = device
+            .dispatch()
+            .outcome()
+            .dispatch_error()
+            .expect("partial TX dispatch error should be preserved");
+        let completed = err
+            .completed_tx_dispatch()
+            .expect("completed TX metadata should be preserved");
+        assert_eq!(completed.processed_frames(), 1);
+        assert!(completed.needs_queue_interrupt());
+        assert_eq!(recorded_lines(&lines), vec![32]);
+        assert_eq!(read_network_tx_used_index(&memory), 1);
+        assert_eq!(read_network_tx_used_element(&memory, 0), (0, 0));
+    }
+
+    #[test]
+    fn network_notification_signal_dispatch_preserves_signal_failure_per_device() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_networks(&[("eth0", "tap0")]);
+        configure_boot_network_queues(&mut runtime, &mut mmio_dispatcher, 0);
+        write_network_tx_header(&mut memory);
+        write_network_tx_descriptors(
+            &mut memory,
+            &[TestDescriptor::readable(
+                TEST_NETWORK_TX_HEADER,
+                VIRTIO_NET_TX_HEADER_SIZE + 4,
+                None,
+            )],
+        );
+        write_network_tx_available_heads(&mut memory, &[0]);
+        notify_boot_network_tx_queue(&mut runtime, &mut mmio_dispatcher, 0);
+        let dispatches =
+            dispatch_boot_network_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let (lines, sink) = RecordingSink::failing("injected network signal failure");
+
+        let result = signal_network_queue_interrupts(dispatches, sink.as_ref())
+            .expect("network signal failure should stay per-device");
+
+        let device = &result.as_slice()[0];
+        assert!(result.has_signal_failure());
+        assert!(!device.queue_interrupt_signaled());
+        let err = device
+            .signal_error()
+            .expect("network signal failure should be preserved");
+        assert_eq!(
+            err.to_string(),
+            "failed to signal guest interrupt line 32 for queue interrupt: injected network signal failure"
+        );
+        assert_eq!(recorded_lines(&lines), vec![32]);
+        assert_eq!(
+            read_boot_network_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                0,
+                VirtioMmioRegister::InterruptStatus
+            ),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+    }
+
+    #[test]
+    fn network_notification_signal_dispatch_preserves_missing_handler_without_signal() {
+        let (mut memory, mut runtime, _) = boot_runtime_with_networks(&[("eth0", "tap0")]);
+        let mut mmio_dispatcher = MmioDispatcher::new();
+        let dispatches =
+            dispatch_boot_network_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let (lines, sink) = RecordingSink::successful();
+
+        let result = signal_network_queue_interrupts(dispatches, sink.as_ref())
+            .expect("missing network handler dispatch should collect");
+
+        let device = &result.as_slice()[0];
+        assert!(device.dispatch().outcome().handler_lookup_error().is_some());
+        assert!(!device.queue_interrupt_signaled());
+        assert!(device.signal_error().is_none());
+        assert!(recorded_lines(&lines).is_empty());
+    }
+
+    #[test]
+    fn network_notification_signal_dispatch_preserves_wrong_handler_without_signal() {
+        let (mut memory, mut runtime, _) = boot_runtime_with_networks(&[("eth0", "tap0")]);
+        let region = runtime.network_devices[0].registration.region();
+        let mut mmio_dispatcher = MmioDispatcher::new();
+        mmio_dispatcher
+            .insert_region(region.id(), region.range().start(), region.range().size())
+            .expect("replacement network region should insert");
+        mmio_dispatcher
+            .register_handler(region.id(), WrongNetworkHandler)
+            .expect("wrong network handler should register");
+        let dispatches =
+            dispatch_boot_network_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let (lines, sink) = RecordingSink::successful();
+
+        let result = signal_network_queue_interrupts(dispatches, sink.as_ref())
+            .expect("wrong network handler dispatch should collect");
+
+        let device = &result.as_slice()[0];
+        assert!(device.dispatch().outcome().handler_lookup_error().is_some());
+        assert!(!device.queue_interrupt_signaled());
+        assert!(device.signal_error().is_none());
+        assert!(recorded_lines(&lines).is_empty());
+    }
+
+    #[test]
     fn boot_session_run_step_delegates_with_session_dispatcher() {
         let dispatcher = Arc::new(Mutex::new(MmioDispatcher::new()));
         let (runner, recorded_dispatchers) =
@@ -2479,7 +3441,17 @@ mod tests {
             outcome,
             HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 2 }
         );
-        assert_eq!(session.events, ["run", "dispatch", "run", "dispatch"]);
+        assert_eq!(
+            session.events,
+            [
+                "run",
+                "dispatch",
+                "network-dispatch",
+                "run",
+                "dispatch",
+                "network-dispatch",
+            ]
+        );
     }
 
     #[test]
@@ -2552,7 +3524,15 @@ mod tests {
         );
         assert_eq!(
             session.events,
-            ["run", "run", "run", "timer", "run", "dispatch"]
+            [
+                "run",
+                "run",
+                "run",
+                "timer",
+                "run",
+                "dispatch",
+                "network-dispatch",
+            ]
         );
     }
 
@@ -2567,6 +3547,19 @@ mod tests {
 
         assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Stopped { steps: 1 });
         assert_eq!(session.events, ["run", "dispatch"]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_reports_stop_after_network_dispatch_before_step_limit() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([mmio_run_step_outcome()]);
+        session.request_stop_on_network_dispatch(stop_token.clone());
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("stop after network dispatch should succeed");
+
+        assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Stopped { steps: 1 });
+        assert_eq!(session.events, ["run", "dispatch", "network-dispatch"]);
     }
 
     #[test]
@@ -2656,6 +3649,35 @@ mod tests {
             other => panic!("expected notification error, got {other:?}"),
         }
         assert_eq!(session.events, ["run", "dispatch"]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_preserves_network_notification_error_after_mmio_step() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([mmio_run_step_outcome()]);
+        session.push_network_dispatch_error(
+            HvfArm64BootNetworkNotificationDispatchError::MmioDispatcher {
+                source: HvfArm64BootMmioDispatcherError::Busy,
+            },
+        );
+
+        let err = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect_err("network notification error should stop loop");
+
+        match err {
+            super::HvfArm64BootRunLoopError::DispatchNetworkNotifications {
+                steps_completed,
+                source,
+            } => {
+                assert_eq!(steps_completed, 1);
+                assert_eq!(
+                    source.to_string(),
+                    "failed to lock HVF boot-session MMIO dispatcher: HVF boot-session MMIO dispatcher lock is busy"
+                );
+            }
+            other => panic!("expected network notification error, got {other:?}"),
+        }
+        assert_eq!(session.events, ["run", "dispatch", "network-dispatch"]);
     }
 
     #[test]
@@ -2792,6 +3814,34 @@ mod tests {
         );
 
         let err = HvfArm64BootBlockNotificationDispatchError::MmioDispatcher {
+            source: HvfArm64BootMmioDispatcherError::Busy,
+        };
+        assert_eq!(
+            err.to_string(),
+            "failed to lock HVF boot-session MMIO dispatcher: HVF boot-session MMIO dispatcher lock is busy"
+        );
+        assert_eq!(
+            err.source().map(ToString::to_string),
+            Some("HVF boot-session MMIO dispatcher lock is busy".to_string())
+        );
+    }
+
+    #[test]
+    fn displays_network_notification_dispatch_errors() {
+        let err = HvfArm64BootNetworkNotificationDispatchError::MapGuestMemory {
+            source: crate::memory::HvfGuestMemoryMappingError::InvalidState("mapping missing"),
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "failed to borrow HVF boot-session guest memory for network notifications: invalid guest memory mapping state: mapping missing"
+        );
+        assert_eq!(
+            err.source().map(ToString::to_string),
+            Some("invalid guest memory mapping state: mapping missing".to_string())
+        );
+
+        let err = HvfArm64BootNetworkNotificationDispatchError::MmioDispatcher {
             source: HvfArm64BootMmioDispatcherError::Busy,
         };
         assert_eq!(
