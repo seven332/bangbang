@@ -3071,6 +3071,29 @@ mod tests {
     }
 
     #[test]
+    fn network_mmio_devices_reject_region_range_overflow_without_returning_bundle() {
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0"))
+            .expect("network config should be stored");
+        let prepared =
+            PreparedNetworkDevices::from_configs(&configs).expect("network device should prepare");
+
+        let err = prepared
+            .register_mmio(NetworkMmioLayout::new(
+                GuestAddress::new(u64::MAX),
+                MmioRegionId::new(60),
+            ))
+            .expect_err("overflowing network MMIO region range should fail");
+
+        assert!(matches!(
+            err,
+            NetworkMmioRegistrationError::InvalidRegion { .. },
+        ));
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
     fn network_mmio_devices_reject_region_id_overflow_without_returning_bundle() {
         let mut configs = NetworkInterfaceConfigs::new();
         configs
