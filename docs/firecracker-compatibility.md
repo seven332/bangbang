@@ -681,8 +681,9 @@ handle for later startup wiring or tests. The internal arm64 FDT builder can
 describe the same serial MMIO descriptor as a Firecracker-shaped `uart@...`
 node, but this is still internal groundwork only: the public `/serial`
 endpoint, kernel `earlycon` wiring, runner-loop console capture, serial
-input/RX, rate limiting, metrics, host file output configuration, and
-boot-smoke use are still deferred.
+input/RX, rate limiting, metrics, and host file output configuration are still
+deferred. The first internal guest boot smoke test uses this bounded capture
+path directly without adding public serial streaming.
 
 The runtime crate can decode checked MMIO operations into typed virtio-mmio
 generic-register or device-configuration accesses for the Firecracker `v1.16.0`
@@ -1031,7 +1032,10 @@ surface:
   `com.apple.security.hypervisor` entitlement before running it; the script
   fails when the host cannot run HVF tests unless CI explicitly uses
   `--allow-unsupported` after build/sign validation
-- boot smoke tests once a minimal guest boot exposes an observable success signal
+- guest boot smoke tests through `scripts/run-guest-boot-smoke.sh`, which
+  prepares the pinned Firecracker kernel plus generated tiny initrd, signs the
+  integration test, and checks an internal serial success marker on supported
+  macOS Apple Silicon hosts
 
 ## Security and Performance Scope
 

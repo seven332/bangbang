@@ -246,6 +246,24 @@ artifact. By default, it stores the kernel under
 prepares the kernel artifact; it does not start a guest or run the HVF boot
 smoke test.
 
+Run the minimal guest boot smoke test on macOS Apple Silicon hosts:
+
+```sh
+scripts/run-guest-boot-smoke.sh
+```
+
+The script reuses the pinned kernel artifact, generates a deterministic tiny
+initrd under `.tmp/guest-artifacts/bangbang/guest-boot-smoke/`, signs the
+`bangbang-hvf` integration test, and verifies that the guest emits
+`BANGBANG_BOOT_OK` on the internal serial console. The initrd contains its own
+`/init`, so a rootfs drive is not required for this smoke test. Hosted macOS CI
+may validate artifact preparation, compilation, and signing without executing
+HVF:
+
+```sh
+scripts/run-guest-boot-smoke.sh --allow-unsupported
+```
+
 Run the VMM process skeleton and API server:
 
 ```sh

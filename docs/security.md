@@ -69,6 +69,9 @@ is resource-specific:
   present and keeps a per-process logger sink.
 - `scripts/run-hvf-tests.sh` creates temporary files for signed HVF integration
   tests and removes them when the wrapper exits normally.
+- `scripts/run-guest-boot-smoke.sh` creates temporary files for the signed
+  guest boot smoke test and removes them when the wrapper exits normally. Its
+  generated guest initrd is cached under `.tmp/guest-artifacts` by default.
 
 Metrics and logger outputs are opened with append/create semantics and
 `O_NONBLOCK` to avoid blocking on FIFO-like paths during configuration. Block
@@ -86,11 +89,12 @@ Real Hypervisor.framework execution requires macOS support, Apple Silicon, and
 the `com.apple.security.hypervisor` entitlement on binaries that enter HVF.
 
 The unsigned Rust test path runs only non-HVF unit tests. Real HVF integration
-tests must run through `scripts/run-hvf-tests.sh`, which builds the HVF test
-binary, creates a temporary entitlement plist, ad-hoc signs a copy, and runs the
-signed copy with one test thread. CI may use `--allow-unsupported` only to
-compile and sign on runners that cannot execute HVF; local HVF verification
-should fail when HVF is unavailable.
+tests must run through signed wrappers, currently `scripts/run-hvf-tests.sh`
+and `scripts/run-guest-boot-smoke.sh`. These wrappers build the HVF test binary,
+create a temporary entitlement plist, ad-hoc sign a copy, and run the signed
+copy with one test thread. CI may use `--allow-unsupported` only to compile and
+sign on runners that cannot execute HVF; local HVF verification should fail
+when HVF is unavailable.
 
 ## Guest Data Exposure
 
