@@ -267,6 +267,7 @@ fn prepares_internal_hvf_arm64_boot_session() {
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::memory::GuestAddress;
     use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
 
     let _test_lock = HVF_LIFECYCLE_TEST_LOCK
         .lock()
@@ -280,10 +281,10 @@ fn prepares_internal_hvf_arm64_boot_session() {
         )))
         .expect("boot source config should be stored");
     let mut backend = HvfBackend::new();
-    let config = HvfArm64BootSessionConfig::new(BlockMmioLayout::new(
-        GuestAddress::new(0x4000_0000),
-        MmioRegionId::new(1),
-    ));
+    let config = HvfArm64BootSessionConfig::new(
+        BlockMmioLayout::new(GuestAddress::new(0x4000_0000), MmioRegionId::new(1)),
+        NetworkMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1000)),
+    );
 
     let mut session = backend
         .prepare_arm64_boot_session(&controller, config.clone())
@@ -361,6 +362,7 @@ fn prepares_owned_hvf_arm64_boot_session() {
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::memory::GuestAddress;
     use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
 
     let _test_lock = HVF_LIFECYCLE_TEST_LOCK
         .lock()
@@ -374,10 +376,10 @@ fn prepares_owned_hvf_arm64_boot_session() {
             kernel.path(),
         )))
         .expect("boot source config should be stored");
-    let config = HvfArm64BootSessionConfig::new(BlockMmioLayout::new(
-        GuestAddress::new(0x4000_0000),
-        MmioRegionId::new(1),
-    ));
+    let config = HvfArm64BootSessionConfig::new(
+        BlockMmioLayout::new(GuestAddress::new(0x4000_0000), MmioRegionId::new(1)),
+        NetworkMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1000)),
+    );
 
     let mut session = OwnedHvfArm64BootSession::new(&controller, config.clone())
         .expect("owned HVF arm64 boot session should prepare");
@@ -458,15 +460,16 @@ fn owned_hvf_arm64_boot_session_cleans_up_after_prepare_error() {
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::memory::GuestAddress;
     use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
     use bangbang_runtime::startup::Arm64BootResourceError;
 
     let _test_lock = HVF_LIFECYCLE_TEST_LOCK
         .lock()
         .expect("HVF lifecycle test lock should not be poisoned");
-    let config = HvfArm64BootSessionConfig::new(BlockMmioLayout::new(
-        GuestAddress::new(0x4000_0000),
-        MmioRegionId::new(1),
-    ));
+    let config = HvfArm64BootSessionConfig::new(
+        BlockMmioLayout::new(GuestAddress::new(0x4000_0000), MmioRegionId::new(1)),
+        NetworkMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1000)),
+    );
     let empty_controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
 
     let err = OwnedHvfArm64BootSession::new(&empty_controller, config.clone())
@@ -503,6 +506,7 @@ fn rejects_boot_session_on_existing_hvf_vm_without_destroying_it() {
     use bangbang_runtime::block::BlockMmioLayout;
     use bangbang_runtime::memory::GuestAddress;
     use bangbang_runtime::mmio::MmioRegionId;
+    use bangbang_runtime::network::NetworkMmioLayout;
 
     let _test_lock = HVF_LIFECYCLE_TEST_LOCK
         .lock()
@@ -514,10 +518,10 @@ fn rejects_boot_session_on_existing_hvf_vm_without_destroying_it() {
     let err = backend
         .prepare_arm64_boot_session(
             &controller,
-            HvfArm64BootSessionConfig::new(BlockMmioLayout::new(
-                GuestAddress::new(0x4000_0000),
-                MmioRegionId::new(1),
-            )),
+            HvfArm64BootSessionConfig::new(
+                BlockMmioLayout::new(GuestAddress::new(0x4000_0000), MmioRegionId::new(1)),
+                NetworkMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1000)),
+            ),
         )
         .expect_err("existing VM should be rejected");
 

@@ -24,7 +24,10 @@ use crate::mmio::{
     MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandlerLookupError, MmioRegion,
     MmioRegionId,
 };
-use crate::network::NetworkMmioDeviceRegistration;
+use crate::network::{
+    NetworkMmioDeviceRegistration, NetworkMmioLayout, NetworkMmioRegistrationError,
+    PreparedNetworkDeviceError, PreparedNetworkDevices,
+};
 use crate::serial::{SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialMmioDevice, SharedSerialOutputBuffer};
 
 const MIB: u64 = 1024 * 1024;
@@ -37,6 +40,8 @@ pub struct Arm64BootResourceConfig<'a> {
     pub serial_device: Option<Arm64BootSerialDeviceConfig>,
     pub block_mmio_layout: BlockMmioLayout,
     pub block_interrupt_lines: &'a [GuestInterruptLine],
+    pub network_mmio_layout: NetworkMmioLayout,
+    pub network_interrupt_lines: &'a [GuestInterruptLine],
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +78,7 @@ pub struct Arm64BootResources {
     pub mmio_dispatcher: MmioDispatcher,
     pub serial_device: Option<Arm64BootSerialDevice>,
     pub block_devices: Vec<Arm64BootBlockDevice>,
+    pub network_devices: Vec<Arm64BootNetworkDevice>,
 }
 
 #[derive(Debug)]
@@ -90,6 +96,7 @@ pub struct Arm64BootRuntimeResources {
     pub fdt: Arm64FdtGuestMemoryWrite,
     pub serial_device: Option<Arm64BootSerialDevice>,
     pub block_devices: Vec<Arm64BootBlockDevice>,
+    pub network_devices: Vec<Arm64BootNetworkDevice>,
 }
 
 #[derive(Debug)]
@@ -282,8 +289,14 @@ pub enum Arm64BootResourceError {
     PrepareBlockDevices {
         source: PreparedBlockDeviceError,
     },
+    PrepareNetworkDevices {
+        source: PreparedNetworkDeviceError,
+    },
     RegisterBlockMmio {
         source: Box<BlockMmioRegistrationError>,
+    },
+    RegisterNetworkMmio {
+        source: Box<NetworkMmioRegistrationError>,
     },
     RegisterSerialMmio {
         source: Box<Arm64BootSerialMmioRegistrationError>,
@@ -333,8 +346,14 @@ impl fmt::Display for Arm64BootResourceError {
             Self::PrepareBlockDevices { source } => {
                 write!(f, "failed to prepare block devices: {source}")
             }
+            Self::PrepareNetworkDevices { source } => {
+                write!(f, "failed to prepare network devices: {source}")
+            }
             Self::RegisterBlockMmio { source } => {
                 write!(f, "failed to register block MMIO devices: {source}")
+            }
+            Self::RegisterNetworkMmio { source } => {
+                write!(f, "failed to register network MMIO devices: {source}")
             }
             Self::RegisterSerialMmio { source } => {
                 write!(f, "failed to register serial MMIO device: {source}")
@@ -365,7 +384,9 @@ impl std::error::Error for Arm64BootResourceError {
             Self::GuestMemoryAllocation { source } => Some(source),
             Self::BootSourceLoad { source } => Some(source),
             Self::PrepareBlockDevices { source } => Some(source),
+            Self::PrepareNetworkDevices { source } => Some(source),
             Self::RegisterBlockMmio { source } => Some(source.as_ref()),
+            Self::RegisterNetworkMmio { source } => Some(source.as_ref()),
             Self::RegisterSerialMmio { source } => Some(source.as_ref()),
             Self::BlockDeviceMetadataAllocation { source } => Some(source),
             Self::NetworkDeviceMetadataAllocation { source } => Some(source),
@@ -432,6 +453,8 @@ impl Arm64BootResources {
             serial_device,
             block_mmio_layout,
             block_interrupt_lines,
+            network_mmio_layout,
+            network_interrupt_lines,
         } = config;
         let boot_source_config = controller
             .boot_source_config()
@@ -439,6 +462,10 @@ impl Arm64BootResources {
         validate_block_interrupt_line_count(
             controller.drive_configs().len(),
             block_interrupt_lines.len(),
+        )?;
+        validate_network_interrupt_line_count(
+            controller.network_interface_configs().len(),
+            network_interrupt_lines.len(),
         )?;
 
         let machine_config = controller.machine_config();
@@ -460,9 +487,24 @@ impl Arm64BootResources {
             .map_err(|source| Arm64BootResourceError::RegisterBlockMmio {
                 source: Box::new(source),
             })?;
-        let (mut mmio_dispatcher, registrations) = block_mmio.into_parts();
-        let (block_devices, fdt_devices) =
+        let (mmio_dispatcher, registrations) = block_mmio.into_parts();
+        let (block_devices, mut fdt_devices) =
             block_device_metadata(&registrations, block_interrupt_lines)?;
+        let prepared_networks =
+            PreparedNetworkDevices::from_config_slice(controller.network_interface_configs())
+                .map_err(|source| Arm64BootResourceError::PrepareNetworkDevices { source })?;
+        let network_mmio = prepared_networks
+            .register_mmio_with_dispatcher(network_mmio_layout, mmio_dispatcher)
+            .map_err(|source| Arm64BootResourceError::RegisterNetworkMmio {
+                source: Box::new(source),
+            })?;
+        let (mut mmio_dispatcher, network_registrations) = network_mmio.into_parts();
+        let (network_devices, network_fdt_devices) =
+            arm64_boot_network_device_metadata(&network_registrations, network_interrupt_lines)?;
+        fdt_devices
+            .try_reserve_exact(network_fdt_devices.len())
+            .map_err(|source| Arm64BootResourceError::NetworkDeviceMetadataAllocation { source })?;
+        fdt_devices.extend(network_fdt_devices);
         let serial_device = serial_device
             .map(|serial| register_serial_mmio(&mut mmio_dispatcher, serial))
             .transpose()?;
@@ -490,6 +532,7 @@ impl Arm64BootResources {
             mmio_dispatcher,
             serial_device,
             block_devices,
+            network_devices,
         })
     }
 
@@ -504,6 +547,7 @@ impl Arm64BootResources {
                 fdt: self.fdt,
                 serial_device: self.serial_device,
                 block_devices: self.block_devices,
+                network_devices: self.network_devices,
             },
         }
     }
@@ -846,6 +890,14 @@ mod tests {
             .expect("drive config should be stored");
     }
 
+    fn add_network(controller: &mut crate::VmmController, iface_id: &str, host_dev_name: &str) {
+        controller
+            .handle_action(VmmAction::PutNetworkInterface(
+                NetworkInterfaceConfigInput::new(iface_id, iface_id, host_dev_name),
+            ))
+            .expect("network config should be stored");
+    }
+
     fn network_registrations(
         interfaces: &[(&str, &str)],
         layout: NetworkMmioLayout,
@@ -880,6 +932,11 @@ mod tests {
                 MmioRegionId::new(1),
             ),
             block_interrupt_lines: lines,
+            network_mmio_layout: NetworkMmioLayout::new(
+                TEST_NETWORK_MMIO_BASE,
+                MmioRegionId::new(50),
+            ),
+            network_interrupt_lines: &[],
         }
     }
 
@@ -1268,6 +1325,7 @@ mod tests {
             aarch64::fdt_address(&resources.layout).expect("FDT address should be valid")
         );
         assert!(resources.block_devices.is_empty());
+        assert!(resources.network_devices.is_empty());
         assert!(resources.serial_device.is_none());
         assert!(resources.mmio_dispatcher.regions().is_empty());
         assert!(read_fdt(&resources).find("/uart@40002000").is_none());
@@ -1300,6 +1358,86 @@ mod tests {
             line(32)
         );
         assert_eq!(resources.mmio_dispatcher.regions().len(), 1);
+    }
+
+    #[test]
+    fn assembles_boot_resources_with_network_device_mmio_metadata() {
+        let kernel = temp_file("kernel-with-network", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        add_network(&mut controller, "eth0", "/bangbang/missing-tap0");
+        let network_lines = [line(33)];
+        let config = Arm64BootResourceConfig {
+            network_interrupt_lines: &network_lines,
+            ..valid_config(&[])
+        };
+
+        let resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("boot resources should assemble with network device");
+
+        assert!(resources.block_devices.is_empty());
+        assert_eq!(resources.network_devices.len(), 1);
+        assert_eq!(resources.network_devices[0].registration.iface_id(), "eth0");
+        assert_eq!(
+            resources.network_devices[0].registration.host_dev_name(),
+            "/bangbang/missing-tap0"
+        );
+        assert_eq!(
+            resources.network_devices[0].registration.address(),
+            TEST_NETWORK_MMIO_BASE
+        );
+        assert_eq!(
+            resources.network_devices[0].fdt_device.region.base,
+            TEST_NETWORK_MMIO_BASE.raw_value()
+        );
+        assert_eq!(
+            resources.network_devices[0].fdt_device.interrupt_line,
+            line(33)
+        );
+        assert_eq!(resources.mmio_dispatcher.regions().len(), 1);
+
+        let tree = read_fdt(&resources);
+        let network_node = tree
+            .find("/virtio_mmio@40004000")
+            .expect("network virtio-mmio node should be in assembled FDT");
+        assert_eq!(network_node.prop_str("compatible").unwrap(), "virtio,mmio");
+    }
+
+    #[test]
+    fn assembles_boot_resources_preserve_multiple_network_order() {
+        let kernel = temp_file("kernel-with-networks", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        add_network(&mut controller, "eth0", "tap0");
+        add_network(&mut controller, "eth1", "tap1");
+        let network_lines = [line(33), line(34)];
+        let config = Arm64BootResourceConfig {
+            network_interrupt_lines: &network_lines,
+            ..valid_config(&[])
+        };
+
+        let resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("boot resources should assemble with network devices");
+
+        assert_eq!(resources.network_devices.len(), 2);
+        assert_eq!(resources.network_devices[0].registration.iface_id(), "eth0");
+        assert_eq!(
+            resources.network_devices[0].fdt_device.interrupt_line,
+            line(33)
+        );
+        assert_eq!(resources.network_devices[1].registration.iface_id(), "eth1");
+        assert_eq!(
+            resources.network_devices[1].registration.address(),
+            TEST_NETWORK_MMIO_BASE
+                .checked_add(VIRTIO_MMIO_DEVICE_WINDOW_SIZE)
+                .expect("test network address should not overflow")
+        );
+        assert_eq!(
+            resources.network_devices[1].fdt_device.interrupt_line,
+            line(34)
+        );
+
+        let tree = read_fdt(&resources);
+        assert!(tree.find("/virtio_mmio@40004000").is_some());
+        assert!(tree.find("/virtio_mmio@40005000").is_some());
     }
 
     #[test]
@@ -1879,6 +2017,23 @@ mod tests {
         assert!(matches!(
             err,
             Arm64BootResourceError::BlockInterruptLineCount {
+                devices: 1,
+                lines: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn network_interrupt_line_count_mismatch_fails_before_boot_source_load() {
+        let mut controller = controller_with_kernel(&missing_path("network-line-mismatch-kernel"));
+        add_network(&mut controller, "eth0", "/bangbang/missing-tap0");
+
+        let err = Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
+            .expect_err("network line mismatch should fail");
+
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::NetworkInterruptLineCount {
                 devices: 1,
                 lines: 0
             }
