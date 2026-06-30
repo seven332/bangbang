@@ -126,14 +126,18 @@ scripts/fetch-firecracker-kernel.sh
 ```
 
 The default cache lives under `.tmp/guest-artifacts`. Set
-`BANGBANG_GUEST_ARTIFACTS_DIR` to use a different cache root.
+`BANGBANG_GUEST_ARTIFACTS_DIR` to use a different cache root. By default,
+`scripts/fetch-firecracker-kernel.sh` stores the pinned kernel at
+`.tmp/guest-artifacts/firecracker-ci/v1.15/aarch64/vmlinux-6.1.155`; when a
+custom cache root is configured, the same relative path is used under that
+root. The script verifies the pinned SHA-256 before reusing or installing the
+cached kernel.
 
-The pinned kernel is cached under the Firecracker artifact subtree below the
-cache root. The `guest_boot` runner also generates a deterministic tiny initrd
-under `.tmp/guest-artifacts/bangbang/guest-boot/` by default. That initrd
-contains its own `/init`, so a rootfs drive is not required for the minimal
-guest boot integration test. The test succeeds when the guest emits
-`BANGBANG_BOOT_OK` on the internal serial console.
+The `guest_boot` runner also generates a deterministic tiny initrd under
+`.tmp/guest-artifacts/bangbang/guest-boot/` by default. That initrd contains its
+own `/init`, so a rootfs drive is not required for the minimal guest boot
+integration test. The test succeeds when the guest emits `BANGBANG_BOOT_OK` on
+the internal serial console.
 
 ## PR Expectations
 
