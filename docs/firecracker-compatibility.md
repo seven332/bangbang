@@ -8,12 +8,12 @@ The current repository defines crate boundaries, endpoint names, a minimal
 HTTP-over-Unix-socket API server for `GET /`, `GET /version`,
 `GET /vm/config`, `GET /machine-config`, pre-boot `PUT /machine-config`
 configuration storage, pre-boot `PUT /boot-source` configuration storage, pre-boot `PUT /drives/{drive_id}`
-configuration storage, pre-boot `PUT /metrics` output configuration, pre-boot `PUT /logger` output configuration, process-owned `PUT /actions` startup with an internal boot run-loop worker across bounded step windows, runtime `FlushMetrics` with a minimal per-process metrics sink, a backend-neutral VM trait, a minimal VMM action/data model with internal
+configuration storage, pre-boot `PUT /network-interfaces/{iface_id}` configuration storage, pre-boot `PUT /metrics` output configuration, pre-boot `PUT /logger` output configuration, process-owned `PUT /actions` startup with an internal boot run-loop worker across bounded step windows, runtime `FlushMetrics` with a minimal per-process metrics sink, a backend-neutral VM trait, a minimal VMM action/data model with internal
 `InstanceStart` preflight, transactional startup executor, and successful-start state transition helpers, backend-neutral guest
 physical address and aarch64 DRAM layout/access primitives, arm64 boot
 placement helpers, internal boot-source validation and arm64 kernel/initrd
 payload loading, an internal Firecracker-shaped drive configuration validation
-model, an internal Firecracker-shaped network interface configuration
+model, a Firecracker-shaped network interface configuration storage and
 validation model, a host-file backing access layer, internal configured block-device
 preparation and MMIO registration helpers, an internal virtio-block
 config-space capacity model, an internal virtio-block request parser, single-request
@@ -223,7 +223,7 @@ compatibility targets.
 | `PUT` | `/logger` | supported target; minimal subset implemented | Stores process logger configuration before boot, opens `log_path` with nonblocking output semantics when provided, accepts optional Firecracker-shaped level/show/module fields, and omits logger state from `GET /vm/config` because it is not guest configuration. Full internal log routing remains deferred. |
 | `PATCH` | `/machine-config` | deferred | Partial updates belong with later state and validation rules. |
 | `PUT` | `/cpu-config` | deferred | Needs HVF CPU feature design with VM and boot work in #8 and #10. |
-| `PUT` | `/network-interfaces/{iface_id}` | deferred; internal model implemented | Public API behavior is tied to virtio network work in #14. The runtime has an internal Firecracker-shaped configuration validation model only. |
+| `PUT` | `/network-interfaces/{iface_id}` | supported target; configuration storage implemented | Stores initial virtio-net configuration before boot without opening host networking resources. Packet backend selection and device emulation remain tied to #14. |
 | `PUT` | `/vsock` | deferred | Tied to virtio vsock work in #15. |
 | `GET`, `PUT`, `PATCH` | `/mmds` | deferred | Tied to MMDS work in #16. |
 | `PUT` | `/mmds/config` | deferred | Tied to MMDS work in #16. |
@@ -269,12 +269,13 @@ exist.
 | `PUT /drives/{drive_id}` | `io_engine` | optional when `Sync`; rejected when `Async` | The internal model accepts omitted/default `Sync` and rejects `Async`; `Async` is tied to Linux io_uring and does not directly map to the first macOS target. |
 | `PUT /drives/{drive_id}` | `socket` | optional when absent or `null`; deferred when set | The internal model rejects configured sockets; vhost-user-block is outside the first tier. |
 | `PUT /drives/{drive_id}` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
-| `PUT /network-interfaces/{iface_id}` | path `iface_id` | required; internal model only | The internal model validates this as nonempty alphanumeric or `_`, matching Firecracker's `checked_id` rule. Public API parsing remains deferred. |
-| `PUT /network-interfaces/{iface_id}` | body `iface_id` | required; internal model only | The internal model requires this to match the path `iface_id`. |
-| `PUT /network-interfaces/{iface_id}` | `host_dev_name` | required; internal model only | The internal model rejects empty values without opening host networking resources. macOS packet backend selection remains deferred. |
-| `PUT /network-interfaces/{iface_id}` | `guest_mac` | optional; internal model only | The internal model accepts six colon-separated two-hex-digit octets and normalizes display to lowercase hex. Duplicate MAC validation requires future multi-interface state. |
+| `PUT /network-interfaces/{iface_id}` | path `iface_id` | required | The API parser captures this value, and the internal model validates it as nonempty alphanumeric or `_`, matching Firecracker's `checked_id` rule. |
+| `PUT /network-interfaces/{iface_id}` | body `iface_id` | required | The API parser rejects requests where this does not match the path `iface_id`. |
+| `PUT /network-interfaces/{iface_id}` | `host_dev_name` | required | The API/VMM path records this value only after rejecting empty values; it does not open, stat, or otherwise touch host networking resources. macOS packet backend selection remains deferred. |
+| `PUT /network-interfaces/{iface_id}` | `guest_mac` | optional | The internal model accepts six colon-separated two-hex-digit octets, normalizes display to lowercase hex, and rejects duplicate configured MAC addresses across different interface IDs. |
 | `PUT /network-interfaces/{iface_id}` | `mtu` | deferred when configured | The internal model rejects configured MTU values until virtio-net feature negotiation and backend behavior exist. |
 | `PUT /network-interfaces/{iface_id}` | `rx_rate_limiter`, `tx_rate_limiter` | deferred when configured | The internal model rejects configured network rate limiters until virtio-net rate limiting behavior exists. |
+| `PUT /network-interfaces/{iface_id}` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /metrics` | `metrics_path` | required | Host path to the metrics output file or FIFO. The runtime opens it as per-process observability state and redacts path details from API-facing open errors. |
 | `PUT /metrics` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /logger` | `log_path` | optional | Host path to the logger output file or FIFO. When present, the runtime opens it as per-process observability state and redacts path details from API-facing open errors. When omitted, the existing sink is left unchanged. |
@@ -297,11 +298,11 @@ during `InstanceStart` startup.
 `GET /vm/config` returns the accumulated supported VM configuration subset
 without side effects. It includes the stored/default `machine-config`, includes
 `boot-source` only after it is configured, and always includes a `drives` array
-for configured virtio-block drives. Unsupported Firecracker sections such as
-MMDS, network, vsock, balloon, snapshots, and hotplug are omitted until their
-configuration models exist. Metrics and logger output configuration are also
-omitted because they are process observability state rather than guest
-configuration.
+for configured virtio-block drives plus a `network-interfaces` array for stored
+network interface configs. Unsupported Firecracker sections such as MMDS, vsock,
+balloon, snapshots, and hotplug are omitted until their configuration models
+exist. Metrics and logger output configuration are also omitted because they are
+process observability state rather than guest configuration.
 
 The API and VMM state path implement the `PUT /boot-source` field policy above.
 Valid pre-boot requests replace the stored boot-source configuration and return
@@ -497,19 +498,23 @@ by public drive configuration yet.
 
 ## Internal Network Interface Configuration
 
-The runtime crate has an internal, Firecracker-shaped network interface
-configuration model for future virtio-net work. It validates path and body
-`iface_id` values as nonempty alphanumeric strings with `_`, requires the two
-IDs to match, requires a nonempty `host_dev_name`, and accepts optional
-`guest_mac` values only when they are six colon-separated two-hex-digit octets.
-Displayed validation errors avoid echoing invalid IDs, host device names, and
-MAC strings.
+The API and runtime crates implement pre-boot, Firecracker-shaped network
+interface configuration storage for future virtio-net work. The API parser
+accepts `PUT /network-interfaces/{iface_id}`, rejects path/body ID mismatches
+and unknown fields, and forwards the supported request shape through the VMM
+action boundary. The runtime validates path and body `iface_id` values as
+nonempty alphanumeric strings with `_`, requires the two IDs to match, requires
+a nonempty `host_dev_name`, accepts optional `guest_mac` values only when they
+are six colon-separated two-hex-digit octets, replaces existing entries with
+the same `iface_id`, and rejects duplicate configured guest MAC addresses across
+different interface IDs. Displayed validation errors avoid echoing invalid IDs,
+host device names, and MAC strings.
 
 The internal model rejects configured `mtu`, `rx_rate_limiter`, and
 `tx_rate_limiter` fields as unsupported. It does not open host networking
-resources, choose a macOS packet backend, validate duplicate MAC addresses
-across multiple devices, expose public API behavior, or add the configuration to
-`GET /vm/config` yet.
+resources, choose a macOS packet backend, or attach a virtio-net device yet.
+Stored network interface configs are returned from `GET /vm/config` in the
+`network-interfaces` array.
 
 The runtime crate can prepare owned internal block-device resources from a
 validated list of stored drive configs. Preparation opens each backing file,
@@ -862,9 +867,12 @@ Firecracker-shaped instance information. Parsed `/machine-config` requests
 flow through `GetMachineConfig` and `PutMachineConfig` and read or replace
 stored machine configuration state. `GET /vm/config` flows through
 `GetVmConfig` and returns the supported accumulated configuration subset:
-`machine-config`, `boot-source` when configured, and the `drives` array.
+`machine-config`, `boot-source` when configured, the `drives` array, and the
+`network-interfaces` array.
 Observability state such as metrics and logger configuration is omitted. Unsupported top-level sections are omitted until their models exist. The implemented pre-boot drive path flows
-through `PutDrive` and records validated configuration state. Parsed
+through `PutDrive` and records validated configuration state. The implemented
+pre-boot network-interface path flows through `PutNetworkInterface` and records
+validated configuration state without opening host networking resources. Parsed
 `/boot-source` requests flow through `PutBootSource` and replace stored
 boot-source configuration state. Parsed `/metrics` requests flow through
 `PutMetrics` and initialize per-process metrics output state that is not part of
@@ -904,6 +912,7 @@ The first API implementation should model the same broad stages as Firecracker:
 | `PUT /machine-config` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Pre-boot-only configuration. Stored values are applied during startup preparation. |
 | `PUT /boot-source` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config; host paths are opened during startup preparation. Host path errors must avoid leaking sensitive path details. |
 | `PUT /drives/{drive_id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config; startup preparation opens backing files and registers initial block MMIO devices. Runtime hotplug remains deferred. |
+| `PUT /network-interfaces/{iface_id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config without opening host networking resources. Packet backend, virtio-net device attachment, PATCH, and DELETE remain deferred. |
 | `PUT /metrics` | implemented; `204` empty response on successful output initialization | unsupported after start; `400` `fault_message` | Metrics output is process observability state, not guest configuration. Duplicate initialization fails. |
 | `PUT /logger` | implemented; `204` empty response on successful pre-boot configuration | unsupported after start; `400` `fault_message` | Logger output is process observability state, not guest configuration. Repeated pre-boot requests update provided fields; full log routing remains deferred. |
 | `PUT /actions` with `InstanceStart` | process-routed; `204` after successful owned HVF startup with internal boot run-loop worker across bounded step windows or `400` preflight/preparation fault | unsupported after start; `400` `fault_message` | Commits `Running` only after the owned HVF boot-session worker with internal serial capture is retained. The worker keeps internal active, terminal-outcome, or error status; public run-loop control and public serial streaming remain deferred. |
@@ -947,7 +956,7 @@ and tested.
 The following Firecracker features are outside the first compatibility tier.
 Their eventual support level should follow the endpoint matrix:
 
-- networking and `network-interfaces`
+- packet networking beyond pre-boot `network-interfaces` configuration storage
 - vsock
 - snapshots
 - MMDS

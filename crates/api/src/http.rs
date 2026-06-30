@@ -25,6 +25,7 @@ pub enum ApiRequest {
     PutLogger(Box<LoggerConfigRequest>),
     PutMachineConfig(Box<MachineConfigRequest>),
     PutMetrics(Box<MetricsConfigRequest>),
+    PutNetworkInterface(Box<NetworkInterfaceConfigRequest>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +33,7 @@ pub enum RequestError {
     GetRequestBody,
     InvalidPathMethod,
     MismatchedDriveId,
+    MismatchedInterfaceId,
     MalformedRequest,
     PayloadTooLarge,
     SendCtrlAltDelUnsupported,
@@ -43,6 +45,7 @@ impl RequestError {
             Self::GetRequestBody => "GET request cannot have a body.",
             Self::InvalidPathMethod => "Invalid request method and/or path.",
             Self::MismatchedDriveId => "path drive_id must match body drive_id.",
+            Self::MismatchedInterfaceId => "path iface_id must match body iface_id.",
             Self::MalformedRequest => "Malformed HTTP request.",
             Self::PayloadTooLarge => "HTTP request payload exceeds the configured limit.",
             Self::SendCtrlAltDelUnsupported => "SendCtrlAltDel does not supported on aarch64.",
@@ -328,6 +331,47 @@ impl DriveConfigRequest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkInterfaceConfigRequest {
+    path_iface_id: String,
+    body_iface_id: String,
+    host_dev_name: String,
+    guest_mac: Option<String>,
+    mtu_configured: bool,
+    rx_rate_limiter_configured: bool,
+    tx_rate_limiter_configured: bool,
+}
+
+impl NetworkInterfaceConfigRequest {
+    pub fn path_iface_id(&self) -> &str {
+        &self.path_iface_id
+    }
+
+    pub fn body_iface_id(&self) -> &str {
+        &self.body_iface_id
+    }
+
+    pub fn host_dev_name(&self) -> &str {
+        &self.host_dev_name
+    }
+
+    pub fn guest_mac(&self) -> Option<&str> {
+        self.guest_mac.as_deref()
+    }
+
+    pub const fn mtu_configured(&self) -> bool {
+        self.mtu_configured
+    }
+
+    pub const fn rx_rate_limiter_configured(&self) -> bool {
+        self.rx_rate_limiter_configured
+    }
+
+    pub const fn tx_rate_limiter_configured(&self) -> bool {
+        self.tx_rate_limiter_configured
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum DriveCacheType {
     Unsafe,
@@ -432,10 +476,33 @@ impl DriveConfigResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkInterfaceConfigResponse {
+    iface_id: String,
+    host_dev_name: String,
+    guest_mac: Option<String>,
+}
+
+impl NetworkInterfaceConfigResponse {
+    pub fn new(iface_id: impl Into<String>, host_dev_name: impl Into<String>) -> Self {
+        Self {
+            iface_id: iface_id.into(),
+            host_dev_name: host_dev_name.into(),
+            guest_mac: None,
+        }
+    }
+
+    pub fn with_guest_mac(mut self, guest_mac: impl Into<String>) -> Self {
+        self.guest_mac = Some(guest_mac.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmConfigResponse {
     machine_config: MachineConfigResponse,
     boot_source: Option<BootSourceResponse>,
     drives: Vec<DriveConfigResponse>,
+    network_interfaces: Vec<NetworkInterfaceConfigResponse>,
 }
 
 impl VmConfigResponse {
@@ -443,11 +510,13 @@ impl VmConfigResponse {
         machine_config: MachineConfigResponse,
         boot_source: Option<BootSourceResponse>,
         drives: Vec<DriveConfigResponse>,
+        network_interfaces: Vec<NetworkInterfaceConfigResponse>,
     ) -> Self {
         Self {
             machine_config,
             boot_source,
             drives,
+            network_interfaces,
         }
     }
 }
@@ -470,6 +539,21 @@ struct DriveConfigRequestBody {
     rate_limiter: Option<serde_json::Value>,
     #[serde(default)]
     socket: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkInterfaceConfigRequestBody {
+    iface_id: String,
+    host_dev_name: String,
+    #[serde(default)]
+    guest_mac: Option<String>,
+    #[serde(default)]
+    mtu: Option<u16>,
+    #[serde(default)]
+    rx_rate_limiter: Option<serde_json::Value>,
+    #[serde(default)]
+    tx_rate_limiter: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -571,6 +655,16 @@ impl HttpResponse {
         body.insert(
             "machine-config".to_string(),
             machine_config_response_value(&config.machine_config),
+        );
+        body.insert(
+            "network-interfaces".to_string(),
+            serde_json::Value::Array(
+                config
+                    .network_interfaces
+                    .iter()
+                    .map(network_interface_config_response_value)
+                    .collect(),
+            ),
         );
 
         Self {
@@ -690,6 +784,28 @@ fn drive_config_response_value(drive: &DriveConfigResponse) -> serde_json::Value
     serde_json::Value::Object(body)
 }
 
+fn network_interface_config_response_value(
+    network_interface: &NetworkInterfaceConfigResponse,
+) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    if let Some(guest_mac) = &network_interface.guest_mac {
+        body.insert(
+            "guest_mac".to_string(),
+            serde_json::Value::String(guest_mac.clone()),
+        );
+    }
+    body.insert(
+        "host_dev_name".to_string(),
+        serde_json::Value::String(network_interface.host_dev_name.clone()),
+    );
+    body.insert(
+        "iface_id".to_string(),
+        serde_json::Value::String(network_interface.iface_id.clone()),
+    );
+
+    serde_json::Value::Object(body)
+}
+
 pub fn parse_request(bytes: &[u8]) -> Result<ApiRequest, RequestError> {
     if bytes.len() > HTTP_MAX_PAYLOAD_SIZE {
         return Err(RequestError::PayloadTooLarge);
@@ -719,6 +835,11 @@ pub fn parse_request(bytes: &[u8]) -> Result<ApiRequest, RequestError> {
     {
         return parse_drive_config_request(path_drive_id, body);
     }
+    if method == "PUT"
+        && let Some(path_iface_id) = network_interface_path_id(path)
+    {
+        return parse_network_interface_config_request(path_iface_id, body);
+    }
     if method == "PUT" && path == "/actions" {
         return parse_action_request(body);
     }
@@ -746,6 +867,20 @@ pub fn parse_request(bytes: &[u8]) -> Result<ApiRequest, RequestError> {
 
 fn drive_path_id(path: &str) -> Option<&str> {
     let rest = path.strip_prefix("/drives/")?;
+    if rest.is_empty()
+        || rest.contains('/')
+        || !rest
+            .chars()
+            .all(|character| character == '_' || character.is_alphanumeric())
+    {
+        return None;
+    }
+
+    Some(rest)
+}
+
+fn network_interface_path_id(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/network-interfaces/")?;
     if rest.is_empty()
         || rest.contains('/')
         || !rest
@@ -826,6 +961,43 @@ fn parse_drive_config_request(
         rate_limiter_configured,
         socket: body.socket,
     })))
+}
+
+fn parse_network_interface_config_request(
+    path_iface_id: &str,
+    body: &[u8],
+) -> Result<ApiRequest, RequestError> {
+    let body = serde_json::from_slice::<NetworkInterfaceConfigRequestBody>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+    if path_iface_id != body.iface_id {
+        return Err(RequestError::MismatchedInterfaceId);
+    }
+    let rx_rate_limiter_configured = match &body.rx_rate_limiter {
+        Some(rate_limiter) => {
+            validate_rate_limiter_config(rate_limiter)?;
+            true
+        }
+        None => false,
+    };
+    let tx_rate_limiter_configured = match &body.tx_rate_limiter {
+        Some(rate_limiter) => {
+            validate_rate_limiter_config(rate_limiter)?;
+            true
+        }
+        None => false,
+    };
+
+    Ok(ApiRequest::PutNetworkInterface(Box::new(
+        NetworkInterfaceConfigRequest {
+            path_iface_id: path_iface_id.to_string(),
+            body_iface_id: body.iface_id,
+            host_dev_name: body.host_dev_name,
+            guest_mac: body.guest_mac,
+            mtu_configured: body.mtu.is_some(),
+            rx_rate_limiter_configured,
+            tx_rate_limiter_configured,
+        },
+    )))
 }
 
 fn parse_machine_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
@@ -1082,6 +1254,7 @@ impl From<ApiRequest> for Endpoint {
             ApiRequest::PutLogger(_) => Self::Logger,
             ApiRequest::PutMachineConfig(_) => Self::MachineConfig,
             ApiRequest::PutMetrics(_) => Self::Metrics,
+            ApiRequest::PutNetworkInterface(_) => Self::NetworkInterface,
         }
     }
 }
@@ -2052,6 +2225,227 @@ mod tests {
     }
 
     #[test]
+    fn parses_put_network_interface_with_minimal_body() {
+        let body = r#"{
+            "iface_id": "eth0",
+            "host_dev_name": "tap0"
+        }"#;
+        let request = request_with_body("PUT", "/network-interfaces/eth0", body);
+
+        let parsed = parse_request(&request).expect("network request should parse");
+
+        let ApiRequest::PutNetworkInterface(config) = parsed else {
+            panic!("expected network interface request");
+        };
+        assert_eq!(config.path_iface_id(), "eth0");
+        assert_eq!(config.body_iface_id(), "eth0");
+        assert_eq!(config.host_dev_name(), "tap0");
+        assert_eq!(config.guest_mac(), None);
+        assert!(!config.mtu_configured());
+        assert!(!config.rx_rate_limiter_configured());
+        assert!(!config.tx_rate_limiter_configured());
+    }
+
+    #[test]
+    fn parses_put_network_interface_with_complete_body() {
+        let body = r#"{
+            "iface_id": "eth0",
+            "host_dev_name": "tap0",
+            "guest_mac": "12:34:56:78:9a:bc",
+            "mtu": 1500,
+            "rx_rate_limiter": {
+                "bandwidth": {
+                    "size": 1024,
+                    "one_time_burst": 2048,
+                    "refill_time": 1000
+                }
+            },
+            "tx_rate_limiter": {
+                "ops": {
+                    "size": 100,
+                    "one_time_burst": null,
+                    "refill_time": 1000
+                }
+            }
+        }"#;
+        let request = request_with_body("PUT", "/network-interfaces/eth0", body);
+
+        let parsed = parse_request(&request).expect("network request should parse");
+
+        let ApiRequest::PutNetworkInterface(config) = parsed else {
+            panic!("expected network interface request");
+        };
+        assert_eq!(config.path_iface_id(), "eth0");
+        assert_eq!(config.body_iface_id(), "eth0");
+        assert_eq!(config.host_dev_name(), "tap0");
+        assert_eq!(config.guest_mac(), Some("12:34:56:78:9a:bc"));
+        assert!(config.mtu_configured());
+        assert!(config.rx_rate_limiter_configured());
+        assert!(config.tx_rate_limiter_configured());
+    }
+
+    #[test]
+    fn parses_put_network_interface_with_deferred_field_nulls() {
+        let body = r#"{
+            "iface_id": "eth0",
+            "host_dev_name": "tap0",
+            "guest_mac": null,
+            "mtu": null,
+            "rx_rate_limiter": null,
+            "tx_rate_limiter": null
+        }"#;
+        let request = request_with_body("PUT", "/network-interfaces/eth0", body);
+
+        let parsed = parse_request(&request).expect("network request should parse");
+
+        let ApiRequest::PutNetworkInterface(config) = parsed else {
+            panic!("expected network interface request");
+        };
+        assert_eq!(config.guest_mac(), None);
+        assert!(!config.mtu_configured());
+        assert!(!config.rx_rate_limiter_configured());
+        assert!(!config.tx_rate_limiter_configured());
+    }
+
+    #[test]
+    fn parses_put_network_interface_with_firecracker_id_character_set() {
+        let body = r#"{
+            "iface_id": "net_é1",
+            "host_dev_name": "tap0"
+        }"#;
+        let request = request_with_body("PUT", "/network-interfaces/net_é1", body);
+
+        let parsed = parse_request(&request).expect("network request should parse");
+
+        let ApiRequest::PutNetworkInterface(config) = parsed else {
+            panic!("expected network interface request");
+        };
+        assert_eq!(config.path_iface_id(), "net_é1");
+        assert_eq!(config.body_iface_id(), "net_é1");
+    }
+
+    #[test]
+    fn rejects_put_network_interface_mismatched_body_id() {
+        let body = r#"{
+            "iface_id": "eth1",
+            "host_dev_name": "tap0"
+        }"#;
+        let request = request_with_body("PUT", "/network-interfaces/eth0", body);
+
+        assert_eq!(
+            parse_request(&request),
+            Err(RequestError::MismatchedInterfaceId)
+        );
+    }
+
+    #[test]
+    fn rejects_put_network_interface_without_path_id() {
+        let body = r#"{
+            "iface_id": "eth0",
+            "host_dev_name": "tap0"
+        }"#;
+
+        assert_eq!(
+            parse_request(&request_with_body("PUT", "/network-interfaces", body)),
+            Err(RequestError::InvalidPathMethod)
+        );
+        assert_eq!(
+            parse_request(&request_with_body("PUT", "/network-interfaces/", body)),
+            Err(RequestError::InvalidPathMethod)
+        );
+    }
+
+    #[test]
+    fn rejects_put_network_interface_extra_path_segment() {
+        let body = r#"{
+            "iface_id": "eth0",
+            "host_dev_name": "tap0"
+        }"#;
+
+        assert_eq!(
+            parse_request(&request_with_body(
+                "PUT",
+                "/network-interfaces/eth0/extra",
+                body,
+            )),
+            Err(RequestError::InvalidPathMethod)
+        );
+    }
+
+    #[test]
+    fn rejects_put_network_interface_invalid_path_id() {
+        let body = r#"{
+            "iface_id": "eth0",
+            "host_dev_name": "tap0"
+        }"#;
+
+        assert_eq!(
+            parse_request(&request_with_body("PUT", "/network-interfaces/eth-0", body)),
+            Err(RequestError::InvalidPathMethod)
+        );
+        assert_eq!(
+            parse_request(&request_with_body(
+                "PUT",
+                "/network-interfaces/eth0?debug=true",
+                body,
+            )),
+            Err(RequestError::InvalidPathMethod)
+        );
+    }
+
+    #[test]
+    fn rejects_put_network_interface_with_empty_body() {
+        let request = b"PUT /network-interfaces/eth0 HTTP/1.1\r\nContent-Length: 0\r\n\r\n";
+
+        assert_eq!(parse_request(request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_put_network_interface_missing_required_field() {
+        let body = r#"{
+            "iface_id": "eth0"
+        }"#;
+        let request = request_with_body("PUT", "/network-interfaces/eth0", body);
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_put_network_interface_unknown_field() {
+        let body = r#"{
+            "iface_id": "eth0",
+            "host_dev_name": "tap0",
+            "unknown": true
+        }"#;
+        let request = request_with_body("PUT", "/network-interfaces/eth0", body);
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_put_network_interface_invalid_rate_limiter_bucket() {
+        let body = r#"{
+            "iface_id": "eth0",
+            "host_dev_name": "tap0",
+            "rx_rate_limiter": {
+                "ops": {
+                    "size": 100
+                }
+            }
+        }"#;
+        let request = request_with_body("PUT", "/network-interfaces/eth0", body);
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_get_network_interface_with_body() {
+        let request = request_with_body("GET", "/network-interfaces/eth0", "{}");
+
+        assert_eq!(parse_request(&request), Err(RequestError::GetRequestBody));
+    }
+
+    #[test]
     fn rejects_get_version_with_transfer_encoding_body() {
         let request = b"GET /version HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
 
@@ -2206,6 +2600,7 @@ mod tests {
             MachineConfigResponse::new(1, 128, false, false, "None"),
             None,
             Vec::new(),
+            Vec::new(),
         ));
         let body: serde_json::Value =
             serde_json::from_str(response.body()).expect("body should be JSON");
@@ -2222,6 +2617,7 @@ mod tests {
                     "track_dirty_pages": false,
                     "vcpu_count": 1,
                 },
+                "network-interfaces": [],
             })
         );
         assert_eq!(body.get("boot-source"), None);
@@ -2236,10 +2632,13 @@ mod tests {
         let drive =
             DriveConfigResponse::new("rootfs", "/tmp/rootfs.ext4", true, true, "Unsafe", "Sync")
                 .with_partuuid("0eaa91a0-01");
+        let network_interface =
+            NetworkInterfaceConfigResponse::new("eth0", "tap0").with_guest_mac("12:34:56:78:9a:bc");
         let response = HttpResponse::vm_config(&VmConfigResponse::new(
             MachineConfigResponse::new(2, 256, false, false, "None"),
             Some(boot_source),
             vec![drive],
+            vec![network_interface],
         ));
         let body: serde_json::Value =
             serde_json::from_str(response.body()).expect("body should be JSON");
@@ -2271,6 +2670,13 @@ mod tests {
                     "track_dirty_pages": false,
                     "vcpu_count": 2,
                 },
+                "network-interfaces": [
+                    {
+                        "guest_mac": "12:34:56:78:9a:bc",
+                        "host_dev_name": "tap0",
+                        "iface_id": "eth0",
+                    },
+                ],
             })
         );
         assert_eq!(body.get("metrics"), None);
@@ -2289,6 +2695,7 @@ mod tests {
                 "Unsafe",
                 "Sync",
             )],
+            vec![NetworkInterfaceConfigResponse::new("eth0", "tap0")],
         ));
         let body: serde_json::Value =
             serde_json::from_str(response.body()).expect("body should be JSON");
@@ -2306,6 +2713,15 @@ mod tests {
         let drive = drives.first().expect("one drive should be returned");
         assert_eq!(drive.get("partuuid"), None);
         assert_eq!(drive.get("rate_limiter"), None);
+        let network_interfaces = body
+            .get("network-interfaces")
+            .and_then(serde_json::Value::as_array)
+            .expect("network interfaces should be an array");
+        let network_interface = network_interfaces
+            .first()
+            .expect("one network interface should be returned");
+        assert_eq!(network_interface.get("guest_mac"), None);
+        assert_eq!(network_interface.get("rx_rate_limiter"), None);
     }
 
     #[test]
@@ -2413,5 +2829,17 @@ mod tests {
         .expect("metrics request should parse");
 
         assert_eq!(Endpoint::from(request), Endpoint::Metrics);
+
+        let request = parse_request(&request_with_body(
+            "PUT",
+            "/network-interfaces/eth0",
+            r#"{
+                "iface_id": "eth0",
+                "host_dev_name": "tap0"
+            }"#,
+        ))
+        .expect("network interface request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::NetworkInterface);
     }
 }

@@ -147,6 +147,48 @@ impl TryFrom<NetworkInterfaceConfigInput> for NetworkInterfaceConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkInterfaceConfigs {
+    configs: Vec<NetworkInterfaceConfig>,
+}
+
+impl NetworkInterfaceConfigs {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn as_slice(&self) -> &[NetworkInterfaceConfig] {
+        &self.configs
+    }
+
+    pub fn insert(
+        &mut self,
+        input: NetworkInterfaceConfigInput,
+    ) -> Result<(), NetworkInterfaceConfigError> {
+        let config = input.validate()?;
+
+        if let Some(guest_mac) = config.guest_mac()
+            && self.configs.iter().any(|existing| {
+                existing.iface_id() != config.iface_id() && existing.guest_mac() == Some(guest_mac)
+            })
+        {
+            return Err(NetworkInterfaceConfigError::GuestMacAddressInUse { guest_mac });
+        }
+
+        if let Some(index) = self
+            .configs
+            .iter()
+            .position(|existing| existing.iface_id() == config.iface_id())
+        {
+            self.configs.remove(index);
+        }
+
+        self.configs.push(config);
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuestMacAddress {
     bytes: [u8; MAC_ADDRESS_LEN],
@@ -244,6 +286,9 @@ pub enum NetworkInterfaceConfigError {
     InvalidGuestMacAddress {
         guest_mac: String,
     },
+    GuestMacAddressInUse {
+        guest_mac: GuestMacAddress,
+    },
     UnsupportedMtu,
     UnsupportedRxRateLimiter,
     UnsupportedTxRateLimiter,
@@ -266,6 +311,7 @@ impl fmt::Display for NetworkInterfaceConfigError {
             Self::InvalidGuestMacAddress { .. } => {
                 f.write_str("network guest_mac must be six colon-separated hex octets")
             }
+            Self::GuestMacAddressInUse { .. } => f.write_str("network guest_mac is already in use"),
             Self::UnsupportedMtu => f.write_str("network mtu is not supported"),
             Self::UnsupportedRxRateLimiter => {
                 f.write_str("network rx_rate_limiter is not supported")
@@ -306,7 +352,7 @@ mod tests {
 
     use super::{
         GuestMacAddress, InterfaceIdSource, NetworkInterfaceConfig, NetworkInterfaceConfigError,
-        NetworkInterfaceConfigInput,
+        NetworkInterfaceConfigInput, NetworkInterfaceConfigs,
     };
 
     fn input() -> NetworkInterfaceConfigInput {
@@ -508,5 +554,64 @@ mod tests {
 
         assert_eq!(err.to_string(), "network rx_rate_limiter is not supported");
         assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn network_interface_configs_store_multiple_interfaces() {
+        let mut configs = NetworkInterfaceConfigs::new();
+
+        configs
+            .insert(input().with_guest_mac("12:34:56:78:9a:bc"))
+            .expect("first interface should be stored");
+        configs
+            .insert(NetworkInterfaceConfigInput::new("eth1", "eth1", "tap1"))
+            .expect("second interface should be stored");
+
+        assert_eq!(configs.as_slice().len(), 2);
+        assert_eq!(configs.as_slice()[0].iface_id(), "eth0");
+        assert_eq!(configs.as_slice()[1].iface_id(), "eth1");
+    }
+
+    #[test]
+    fn network_interface_configs_replace_duplicate_id() {
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(input().with_guest_mac("12:34:56:78:9a:bc"))
+            .expect("initial interface should be stored");
+
+        configs
+            .insert(NetworkInterfaceConfigInput::new("eth0", "eth0", "tap1"))
+            .expect("duplicate interface id should replace existing config");
+
+        assert_eq!(configs.as_slice().len(), 1);
+        let config = &configs.as_slice()[0];
+        assert_eq!(config.iface_id(), "eth0");
+        assert_eq!(config.host_dev_name(), "tap1");
+        assert_eq!(config.guest_mac(), None);
+    }
+
+    #[test]
+    fn network_interface_configs_reject_duplicate_guest_mac_without_mutating() {
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(input().with_guest_mac("12:34:56:78:9a:bc"))
+            .expect("initial interface should be stored");
+
+        let err = configs
+            .insert(
+                NetworkInterfaceConfigInput::new("eth1", "eth1", "tap1")
+                    .with_guest_mac("12:34:56:78:9a:BC"),
+            )
+            .expect_err("duplicate guest MAC should fail");
+
+        assert_eq!(
+            err,
+            NetworkInterfaceConfigError::GuestMacAddressInUse {
+                guest_mac: GuestMacAddress::from_bytes([0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc]),
+            }
+        );
+        assert_eq!(err.to_string(), "network guest_mac is already in use");
+        assert_eq!(configs.as_slice().len(), 1);
+        assert_eq!(configs.as_slice()[0].iface_id(), "eth0");
     }
 }
