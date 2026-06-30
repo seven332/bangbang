@@ -4,6 +4,7 @@ pub mod block;
 pub mod boot;
 pub mod fdt;
 pub mod interrupt;
+pub mod logger;
 pub mod machine;
 pub mod memory;
 pub mod metrics;
@@ -66,6 +67,7 @@ pub enum VmmAction {
     InstanceStart,
     FlushMetrics,
     PutBootSource(boot::BootSourceConfigInput),
+    PutLogger(logger::LoggerConfigInput),
     PutMachineConfig(machine::MachineConfigInput),
     PutMetrics(metrics::MetricsConfigInput),
     PutDrive(block::DriveConfigInput),
@@ -81,6 +83,7 @@ impl VmmAction {
             Self::InstanceStart => "InstanceStart",
             Self::FlushMetrics => "FlushMetrics",
             Self::PutBootSource(_) => "PutBootSource",
+            Self::PutLogger(_) => "PutLogger",
             Self::PutMachineConfig(_) => "PutMachineConfig",
             Self::PutMetrics(_) => "PutMetrics",
             Self::PutDrive(_) => "PutDrive",
@@ -141,6 +144,7 @@ pub enum VmmActionError {
     InstanceStart(BackendError),
     BootSourceConfig(boot::BootSourceConfigError),
     DriveConfig(block::DriveConfigError),
+    LoggerConfig(logger::LoggerConfigError),
     MachineConfig(machine::MachineConfigError),
     MetricsConfig(metrics::MetricsConfigError),
     MetricsFlush(metrics::MetricsFlushError),
@@ -164,6 +168,7 @@ impl fmt::Display for VmmActionError {
             Self::InstanceStart(err) => write!(f, "failed to start microVM: {err}"),
             Self::BootSourceConfig(err) => write!(f, "{err}"),
             Self::DriveConfig(err) => write!(f, "{err}"),
+            Self::LoggerConfig(err) => write!(f, "{err}"),
             Self::MachineConfig(err) => write!(f, "{err}"),
             Self::MetricsConfig(err) => write!(f, "{err}"),
             Self::MetricsFlush(err) => write!(f, "{err}"),
@@ -177,6 +182,7 @@ impl std::error::Error for VmmActionError {
             Self::InstanceStart(err) => Some(err),
             Self::BootSourceConfig(err) => Some(err),
             Self::DriveConfig(err) => Some(err),
+            Self::LoggerConfig(err) => Some(err),
             Self::MachineConfig(err) => Some(err),
             Self::MetricsConfig(err) => Some(err),
             Self::MetricsFlush(err) => Some(err),
@@ -193,6 +199,7 @@ pub struct VmmController {
     machine_config: machine::MachineConfig,
     boot_source_config: Option<boot::BootSourceConfig>,
     drive_configs: block::DriveConfigs,
+    logger_state: logger::LoggerState,
     metrics_state: metrics::MetricsState,
 }
 
@@ -212,6 +219,7 @@ impl VmmController {
             machine_config: machine::MachineConfig::default(),
             boot_source_config: None,
             drive_configs: block::DriveConfigs::new(),
+            logger_state: logger::LoggerState::default(),
             metrics_state: metrics::MetricsState::default(),
         }
     }
@@ -313,6 +321,20 @@ impl VmmController {
 
                 Ok(VmmData::Empty)
             }
+            VmmAction::PutLogger(config) => {
+                if self.instance_info.state != InstanceState::NotStarted {
+                    return Err(VmmActionError::UnsupportedState {
+                        action: action_name,
+                        state: self.instance_info.state,
+                    });
+                }
+
+                self.logger_state
+                    .configure(config)
+                    .map_err(VmmActionError::LoggerConfig)?;
+
+                Ok(VmmData::Empty)
+            }
             VmmAction::PutMachineConfig(config) => {
                 if self.instance_info.state != InstanceState::NotStarted {
                     return Err(VmmActionError::UnsupportedState {
@@ -395,6 +417,7 @@ mod tests {
         boot::{
             BootCommandLineError, BootPayloadKind, BootSourceConfigError, BootSourceConfigInput,
         },
+        logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel},
         machine::{DEFAULT_MEM_SIZE_MIB, DEFAULT_VCPU_COUNT, MachineConfigInput},
         metrics::{MetricsConfigError, MetricsConfigInput},
     };
@@ -414,6 +437,17 @@ mod tests {
             .as_nanos();
         std::env::temp_dir().join(format!(
             "bangbang-runtime-metrics-test-{}-{nanos}-{name}",
+            std::process::id()
+        ))
+    }
+
+    fn unique_logger_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bangbang-runtime-logger-test-{}-{nanos}-{name}",
             std::process::id()
         ))
     }
@@ -591,10 +625,14 @@ mod tests {
     }
 
     #[test]
-    fn action_names_include_start_and_metrics() {
+    fn action_names_include_start_metrics_and_logger() {
         assert_eq!(VmmAction::GetVmConfig.name(), "GetVmConfig");
         assert_eq!(VmmAction::InstanceStart.name(), "InstanceStart");
         assert_eq!(VmmAction::FlushMetrics.name(), "FlushMetrics");
+        assert_eq!(
+            VmmAction::PutLogger(LoggerConfigInput::new()).name(),
+            "PutLogger"
+        );
     }
 
     #[test]
@@ -1082,6 +1120,169 @@ mod tests {
                 state: InstanceState::NotStarted,
             })
         );
+    }
+
+    #[test]
+    fn handles_put_logger_config_before_start() {
+        let path = unique_logger_path("configured");
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
+        assert_eq!(
+            controller.handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new()
+                    .with_log_path(&path)
+                    .with_level(LoggerLevel::Warn)
+                    .with_show_level(true)
+                    .with_show_log_origin(true)
+                    .with_module("api_server"),
+            )),
+            Ok(VmmData::Empty)
+        );
+
+        assert!(controller.logger_state.is_configured());
+        assert_eq!(controller.logger_state.level(), LoggerLevel::Warn);
+        assert!(controller.logger_state.show_level());
+        assert!(controller.logger_state.show_log_origin());
+        assert_eq!(controller.logger_state.module(), Some("api_server"));
+        assert!(path.exists());
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn put_logger_config_updates_without_requiring_log_path() {
+        let path = unique_logger_path("repeat");
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new()
+                    .with_log_path(&path)
+                    .with_level(LoggerLevel::Warn),
+            ))
+            .expect("initial logger config should be stored");
+
+        assert_eq!(
+            controller.handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new()
+                    .with_level(LoggerLevel::Debug)
+                    .with_show_level(true)
+                    .with_module("runtime"),
+            )),
+            Ok(VmmData::Empty)
+        );
+
+        assert!(controller.logger_state.is_configured());
+        assert!(path.exists());
+        assert_eq!(controller.logger_state.level(), LoggerLevel::Debug);
+        assert!(controller.logger_state.show_level());
+        assert!(!controller.logger_state.show_log_origin());
+        assert_eq!(controller.logger_state.module(), Some("runtime"));
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn put_logger_state_is_per_controller() {
+        let path = unique_logger_path("isolated");
+        let mut first = VmmController::new("demo-1", "0.1.0", "bangbang");
+        let mut second = VmmController::new("demo-2", "0.1.0", "bangbang");
+
+        first
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new()
+                    .with_log_path(&path)
+                    .with_level(LoggerLevel::Error),
+            ))
+            .expect("first logger config should be stored");
+        second
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new().with_level(LoggerLevel::Debug),
+            ))
+            .expect("second logger config should be stored");
+
+        assert!(first.logger_state.is_configured());
+        assert_eq!(first.logger_state.level(), LoggerLevel::Error);
+        assert!(!second.logger_state.is_configured());
+        assert_eq!(second.logger_state.level(), LoggerLevel::Debug);
+
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn put_logger_rejects_running_state_without_mutating() {
+        let path = unique_logger_path("running");
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller
+            .commit_instance_start()
+            .expect("start commit should set running state");
+
+        let err = controller
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new()
+                    .with_log_path(&path)
+                    .with_level(LoggerLevel::Debug),
+            ))
+            .expect_err("runtime logger config should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::UnsupportedState {
+                action: VmmAction::PutLogger(LoggerConfigInput::new()).name(),
+                state: InstanceState::Running,
+            }
+        );
+        assert!(!controller.logger_state.is_configured());
+        assert_eq!(controller.logger_state.level(), LoggerLevel::Info);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn put_logger_open_error_does_not_mutate_state() {
+        let missing_parent = unique_logger_path("parent").join("logger");
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new().with_level(LoggerLevel::Warn),
+            ))
+            .expect("level-only logger config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new()
+                    .with_log_path(&missing_parent)
+                    .with_level(LoggerLevel::Debug),
+            ))
+            .expect_err("missing parent should fail");
+
+        assert!(matches!(
+            err,
+            VmmActionError::LoggerConfig(LoggerConfigError::OpenFile(_))
+        ));
+        assert!(
+            !err.to_string()
+                .contains(missing_parent.to_string_lossy().as_ref())
+        );
+        assert_eq!(controller.logger_state.level(), LoggerLevel::Warn);
+        assert!(!controller.logger_state.is_configured());
+    }
+
+    #[test]
+    fn put_logger_rejects_empty_path_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
+        let err = controller
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new().with_log_path(PathBuf::new()),
+            ))
+            .expect_err("empty logger path should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::LoggerConfig(LoggerConfigError::EmptyPath)
+        );
+        assert!(!controller.logger_state.is_configured());
+        assert_eq!(controller.logger_state.level(), LoggerLevel::Info);
     }
 
     #[test]

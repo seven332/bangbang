@@ -13,11 +13,13 @@ use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_api::http::{
     ActionRequest, ActionType, ApiRequest, BootSourceRequest, BootSourceResponse,
     DriveCacheType as ApiDriveCacheType, DriveConfigRequest, DriveConfigResponse,
-    DriveIoEngine as ApiDriveIoEngine, HttpResponse, MachineConfigRequest, MachineConfigResponse,
+    DriveIoEngine as ApiDriveIoEngine, HttpResponse, LoggerConfigRequest,
+    LoggerLevel as ApiLoggerLevel, MachineConfigRequest, MachineConfigResponse,
     MetricsConfigRequest, RequestError, VmConfigResponse, parse_request, request_total_len,
 };
 use bangbang_runtime::block::{DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine};
 use bangbang_runtime::boot::{BootSourceConfig, BootSourceConfigInput};
+use bangbang_runtime::logger::{LoggerConfigInput, LoggerLevel};
 use bangbang_runtime::machine::{
     MachineConfig, MachineConfigCpuTemplate as RuntimeMachineConfigCpuTemplate,
     MachineConfigHugePages as RuntimeMachineConfigHugePages, MachineConfigInput,
@@ -408,6 +410,9 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PutBootSource(config) => handle_empty(vmm.handle_action(
             VmmAction::PutBootSource(boot_source_input_from_request(config.as_ref())),
         )),
+        ApiRequest::PutLogger(config) => handle_empty(vmm.handle_action(VmmAction::PutLogger(
+            logger_config_input_from_request(config.as_ref()),
+        ))),
         ApiRequest::PutMachineConfig(config) => handle_empty(vmm.handle_action(
             VmmAction::PutMachineConfig(machine_config_input_from_request(config.as_ref())),
         )),
@@ -596,6 +601,35 @@ fn machine_config_input_from_request(config: &MachineConfigRequest) -> MachineCo
 
 fn metrics_config_input_from_request(config: &MetricsConfigRequest) -> MetricsConfigInput {
     MetricsConfigInput::new(config.metrics_path())
+}
+
+fn logger_config_input_from_request(config: &LoggerConfigRequest) -> LoggerConfigInput {
+    let mut input = LoggerConfigInput::new();
+
+    if let Some(log_path) = config.log_path() {
+        input = input.with_log_path(log_path);
+    }
+    if let Some(level) = config.level() {
+        input = input.with_level(match level {
+            ApiLoggerLevel::Off => LoggerLevel::Off,
+            ApiLoggerLevel::Trace => LoggerLevel::Trace,
+            ApiLoggerLevel::Debug => LoggerLevel::Debug,
+            ApiLoggerLevel::Info => LoggerLevel::Info,
+            ApiLoggerLevel::Warn => LoggerLevel::Warn,
+            ApiLoggerLevel::Error => LoggerLevel::Error,
+        });
+    }
+    if let Some(show_level) = config.show_level() {
+        input = input.with_show_level(show_level);
+    }
+    if let Some(show_log_origin) = config.show_log_origin() {
+        input = input.with_show_log_origin(show_log_origin);
+    }
+    if let Some(module) = config.module() {
+        input = input.with_module(module);
+    }
+
+    input
 }
 
 fn machine_config_huge_pages_name(huge_pages: RuntimeMachineConfigHugePages) -> &'static str {
@@ -1269,6 +1303,76 @@ mod tests {
         assert!(!config_response.body().contains("metrics"));
 
         fs::remove_file(metrics_path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn configures_logger_without_adding_vm_config_section() {
+        let mut vmm = test_controller();
+        let logger_path = unique_socket_path("logger-output").with_extension("log");
+        let body = format!(
+            r#"{{
+                "log_path": "{}",
+                "level": "Warning",
+                "show_level": true,
+                "show_log_origin": true,
+                "module": "api_server"
+            }}"#,
+            logger_path.to_string_lossy()
+        );
+        let request = format!(
+            "PUT /logger HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        let response = handle_request_bytes(request.as_bytes(), &mut vmm);
+
+        assert_eq!(response.status(), bangbang_api::http::StatusCode::NoContent);
+        assert!(logger_path.exists());
+
+        let config_response = handle_request_bytes(
+            b"GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &mut vmm,
+        );
+        assert_eq!(config_response.status(), bangbang_api::http::StatusCode::Ok);
+        assert!(!config_response.body().contains("logger"));
+
+        fs::remove_file(logger_path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn rejects_logger_after_start_without_creating_output() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_request = format!(
+            "PUT /boot-source HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{boot_body}",
+            boot_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response =
+            put_action_over_socket(&mut vmm, "start-before-logger", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let logger_path = unique_socket_path("logger-after-start").with_extension("log");
+        let body = format!(r#"{{"log_path":"{}"}}"#, logger_path.to_string_lossy());
+        let request = format!(
+            "PUT /logger HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        let response = handle_request_bytes(request.as_bytes(), &mut vmm);
+
+        assert_eq!(
+            response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+        assert_eq!(
+            response.body(),
+            r#"{"fault_message":"The requested operation is not supported in Running state: PutLogger"}"#
+        );
+        assert!(!logger_path.exists());
     }
 
     #[test]
