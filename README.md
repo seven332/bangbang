@@ -6,6 +6,7 @@ This repository is currently a scaffold. It defines crate boundaries, an initial
 
 See [Firecracker Compatibility Scope](docs/firecracker-compatibility.md) for the intended compatibility target and current limitations.
 See [macOS Host Security Model](docs/security.md) for the current host trust boundary and security limitations.
+See [Testing Guide](docs/testing.md) for test layering, integration-test rules, and local verification commands.
 See [Pull Request Review Guidelines](docs/review-guidelines.md) for the project-specific review standard.
 
 ## Layout
@@ -209,6 +210,7 @@ integration, and CLI observability flags remain deferred.
 ## Build
 
 Requires the latest stable Rust toolchain.
+See [Testing Guide](docs/testing.md) for when to add unit tests, normal integration tests, or signed HVF integration tests.
 
 ```sh
 cargo check --workspace --all-targets --all-features --locked

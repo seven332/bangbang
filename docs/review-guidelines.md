@@ -120,6 +120,10 @@ overflow behavior when introduced.
 
 ## Test Expectations
 
+Use `docs/testing.md` as the contributor-facing testing guide. Reviewers should
+apply that document when deciding whether a change needs unit coverage, a new
+normal integration test, or a signed HVF integration test.
+
 Unit tests live next to the code they exercise under each crate's `src/` tree.
 Test public behavior where practical, and add narrower unit tests for parsing,
 error formatting, state transitions, FFI wrappers, and edge cases.
