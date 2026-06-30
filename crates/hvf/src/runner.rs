@@ -8,7 +8,10 @@ use bangbang_runtime::BackendError;
 use bangbang_runtime::mmio::{MmioDispatchOutcome, MmioDispatcher};
 
 use crate::backend::HvfBackend;
-use crate::exit::{HvfHvcExit, HvfResolvedMmioAccess, HvfVcpuExit, HvfVcpuExitResolveError};
+use crate::exit::{
+    HvfHvcExit, HvfResolvedMmioAccess, HvfSys64Direction, HvfSys64Exit, HvfSys64Register,
+    HvfVcpuExit, HvfVcpuExitResolveError,
+};
 use crate::gic::{HvfGicError, HvfGicPpiPendingWriter, validate_gic_ppi_pending_intid};
 use crate::mmio::HvfMmioDispatchError;
 use crate::psci::{
@@ -49,6 +52,7 @@ pub enum HvfVcpuRunnerError {
     Gic(HvfGicError),
     VcpuExitResolve(HvfVcpuExitResolveError),
     MmioDispatch(HvfMmioDispatchError),
+    UnsupportedSys64 { exit: HvfSys64Exit },
     InvalidState(&'static str),
     ThreadSpawn(String),
     ChannelClosed(&'static str),
@@ -62,6 +66,9 @@ pub enum HvfVcpuRunStepOutcome {
         exit: HvfHvcExit,
         function_id: u64,
         return_value: u64,
+    },
+    Sys64 {
+        exit: HvfSys64Exit,
     },
     Mmio {
         access: HvfResolvedMmioAccess,
@@ -80,6 +87,13 @@ impl fmt::Display for HvfVcpuRunnerError {
             Self::Gic(err) => write!(f, "{err}"),
             Self::VcpuExitResolve(err) => write!(f, "{err}"),
             Self::MmioDispatch(err) => write!(f, "{err}"),
+            Self::UnsupportedSys64 { exit } => write!(
+                f,
+                "unsupported HVF SYS64 {:?} access to {} using Rt {}",
+                exit.direction(),
+                exit.register(),
+                exit.target_register()
+            ),
             Self::InvalidState(message) => write!(f, "invalid vCPU runner state: {message}"),
             Self::ThreadSpawn(message) => {
                 write!(f, "failed to spawn vCPU runner thread: {message}")
@@ -98,6 +112,7 @@ impl std::error::Error for HvfVcpuRunnerError {
             Self::VcpuExitResolve(err) => Some(err),
             Self::MmioDispatch(err) => Some(err),
             Self::InvalidState(_)
+            | Self::UnsupportedSys64 { .. }
             | Self::ThreadSpawn(_)
             | Self::ChannelClosed(_)
             | Self::ThreadPanicked => None,
@@ -376,6 +391,7 @@ impl<'vm> HvfVcpuRunner<'vm> {
             Err(
                 HvfVcpuRunnerError::Gic(_)
                 | HvfVcpuRunnerError::InvalidState(_)
+                | HvfVcpuRunnerError::UnsupportedSys64 { .. }
                 | HvfVcpuRunnerError::VcpuExitResolve(_)
                 | HvfVcpuRunnerError::MmioDispatch(_)
                 | HvfVcpuRunnerError::ThreadSpawn(_)
@@ -1465,6 +1481,9 @@ fn run_once_and_handle_mmio_on_runner_thread(
             if let Ok(hvc) = exit.decode_hvc() {
                 return handle_hvc_on_runner_thread(vcpu, hvc);
             }
+            if let Ok(sys64) = exit.decode_sys64() {
+                return handle_sys64_on_runner_thread(vcpu, sys64);
+            }
 
             let access = exit
                 .decode_mmio_access()
@@ -1478,6 +1497,24 @@ fn run_once_and_handle_mmio_on_runner_thread(
             Ok(HvfVcpuRunStepOutcome::Mmio { access, outcome })
         }
     }
+}
+
+fn handle_sys64_on_runner_thread(
+    vcpu: &mut impl RunnerVcpu,
+    exit: HvfSys64Exit,
+) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
+    if exit.register() != HvfSys64Register::OSDLR_EL1 {
+        return Err(HvfVcpuRunnerError::UnsupportedSys64 { exit });
+    }
+
+    if exit.direction() == HvfSys64Direction::Read
+        && let Some(register) = HvfRegister::general_purpose(exit.target_register())
+    {
+        vcpu.write_register(register, 0)
+            .map_err(HvfVcpuRunnerError::Backend)?;
+    }
+
+    Ok(HvfVcpuRunStepOutcome::Sys64 { exit })
 }
 
 fn handle_hvc_on_runner_thread(
@@ -1567,16 +1604,25 @@ mod tests {
     };
     use crate::exit::{
         HvfExceptionExit, HvfHvcExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
-        HvfResolvedMmioAccess, HvfResolvedVcpuExit, HvfVcpuExit, HvfVcpuExitResolveError,
+        HvfResolvedMmioAccess, HvfResolvedVcpuExit, HvfSys64Direction, HvfSys64Exit,
+        HvfSys64Register, HvfVcpuExit, HvfVcpuExitResolveError,
     };
     use crate::gic::HvfGicError;
     use crate::mmio::{HvfMmioCompletionError, HvfMmioDispatchError};
     use crate::vcpu::{HvfArm64BootRegisters, HvfRegister};
 
     const ESR_EC_HVC: u64 = 0x16;
+    const ESR_EC_SYS64: u64 = 0x18;
     const ESR_EC_DATA_ABORT_LOWER_EL: u64 = 0x24;
     const ESR_EC_SHIFT: u64 = 26;
     const ESR_ISS_ISV: u64 = 1 << 24;
+    const ESR_ISS_SYS64_DIRECTION: u64 = 1;
+    const ESR_ISS_SYS64_CRM_SHIFT: u64 = 1;
+    const ESR_ISS_SYS64_RT_SHIFT: u64 = 5;
+    const ESR_ISS_SYS64_CRN_SHIFT: u64 = 10;
+    const ESR_ISS_SYS64_OP1_SHIFT: u64 = 14;
+    const ESR_ISS_SYS64_OP2_SHIFT: u64 = 17;
+    const ESR_ISS_SYS64_OP0_SHIFT: u64 = 20;
     const ESR_ISS_SAS_SHIFT: u64 = 22;
     const ESR_ISS_SRT_SHIFT: u64 = 16;
     const ESR_ISS_WNR: u64 = 1 << 6;
@@ -1667,6 +1713,11 @@ mod tests {
         run_once_result: Result<HvfVcpuExit, BackendError>,
         x0: u64,
         x1: Result<u64, BackendError>,
+        register_write_sender: mpsc::Sender<(HvfRegister, u64)>,
+    }
+
+    struct Sys64RunStepRecordingVcpu {
+        run_once_result: Result<HvfVcpuExit, BackendError>,
         register_write_sender: mpsc::Sender<(HvfRegister, u64)>,
     }
 
@@ -2395,6 +2446,49 @@ mod tests {
         }
     }
 
+    impl RunnerVcpu for Sys64RunStepRecordingVcpu {
+        fn raw_vcpu(&self) -> Result<crate::ffi::HvVcpu, BackendError> {
+            Ok(7)
+        }
+
+        fn configure_arm64_boot_registers(
+            &mut self,
+            _registers: HvfArm64BootRegisters,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn run_once(&mut self) -> Result<HvfVcpuExit, BackendError> {
+            self.run_once_result.clone()
+        }
+
+        fn dispatch_mmio_access(
+            &mut self,
+            _access: HvfResolvedMmioAccess,
+            _dispatcher: &mut MmioDispatcher,
+        ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
+            unsupported_mmio_dispatch()
+        }
+
+        fn read_register(&mut self, _register: HvfRegister) -> Result<u64, BackendError> {
+            Err(BackendError::InvalidState("SYS64 should not read a GPR"))
+        }
+
+        fn write_register(
+            &mut self,
+            register: HvfRegister,
+            value: u64,
+        ) -> Result<(), BackendError> {
+            self.register_write_sender
+                .send((register, value))
+                .map_err(|_| BackendError::InvalidState("fake register write receiver closed"))
+        }
+
+        fn destroy(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
     fn boot_registers() -> HvfArm64BootRegisters {
         HvfArm64BootRegisters {
             kernel_entry: GuestAddress::new(0x8028_0000),
@@ -2448,6 +2542,52 @@ mod tests {
 
     fn hvc_syndrome(immediate: u16) -> u64 {
         (ESR_EC_HVC << ESR_EC_SHIFT) | u64::from(immediate)
+    }
+
+    fn sys64_syndrome(
+        direction: HvfSys64Direction,
+        register: HvfSys64Register,
+        target_register: u8,
+    ) -> u64 {
+        let direction_bit = match direction {
+            HvfSys64Direction::Read => ESR_ISS_SYS64_DIRECTION,
+            HvfSys64Direction::Write => 0,
+        };
+
+        (ESR_EC_SYS64 << ESR_EC_SHIFT)
+            | direction_bit
+            | (u64::from(target_register) << ESR_ISS_SYS64_RT_SHIFT)
+            | (u64::from(register.op0()) << ESR_ISS_SYS64_OP0_SHIFT)
+            | (u64::from(register.op1()) << ESR_ISS_SYS64_OP1_SHIFT)
+            | (u64::from(register.crn()) << ESR_ISS_SYS64_CRN_SHIFT)
+            | (u64::from(register.crm()) << ESR_ISS_SYS64_CRM_SHIFT)
+            | (u64::from(register.op2()) << ESR_ISS_SYS64_OP2_SHIFT)
+    }
+
+    fn sys64_exception_exit(
+        direction: HvfSys64Direction,
+        register: HvfSys64Register,
+        target_register: u8,
+    ) -> HvfVcpuExit {
+        HvfVcpuExit::Exception(HvfExceptionExit {
+            syndrome: sys64_syndrome(direction, register, target_register),
+            virtual_address: 0,
+            physical_address: 0,
+        })
+    }
+
+    fn sys64_exit(
+        direction: HvfSys64Direction,
+        register: HvfSys64Register,
+        target_register: u8,
+    ) -> HvfSys64Exit {
+        let HvfVcpuExit::Exception(exit) =
+            sys64_exception_exit(direction, register, target_register)
+        else {
+            panic!("test SYS64 helper should build an exception exit");
+        };
+
+        exit.decode_sys64().expect("test SYS64 exit should decode")
     }
 
     fn data_abort_syndrome(
@@ -2610,6 +2750,27 @@ mod tests {
             })
         })
         .expect("fake PSCI runner should start");
+
+        (
+            HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
+                .expect("runner should be created"),
+            register_write_receiver,
+        )
+    }
+
+    fn start_sys64_run_step_recording_runner(
+        direction: HvfSys64Direction,
+        register: HvfSys64Register,
+        target_register: u8,
+    ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<(HvfRegister, u64)>) {
+        let (register_write_sender, register_write_receiver) = mpsc::channel();
+        let started = spawn_runner_thread(move || {
+            Ok(Sys64RunStepRecordingVcpu {
+                run_once_result: Ok(sys64_exception_exit(direction, register, target_register)),
+                register_write_sender,
+            })
+        })
+        .expect("fake SYS64 runner should start");
 
         (
             HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
@@ -4239,6 +4400,107 @@ mod tests {
                 .recv()
                 .expect("unsupported PSCI HVC should still write X0"),
             (HvfRegister::X0, PSCI_RET_NOT_SUPPORTED)
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn run_once_and_handle_mmio_ignores_osdlr_sys64_write_to_gpr_without_dispatcher_lock() {
+        let (runner, register_write_receiver) = start_sys64_run_step_recording_runner(
+            HvfSys64Direction::Write,
+            HvfSys64Register::OSDLR_EL1,
+            2,
+        );
+        let dispatcher = shared_dispatcher();
+        let dispatcher_guard = dispatcher
+            .lock()
+            .expect("dispatcher lock should not be poisoned");
+
+        assert_eq!(
+            runner.run_once_and_handle_mmio(Arc::clone(&dispatcher)),
+            Ok(HvfVcpuRunStepOutcome::Sys64 {
+                exit: sys64_exit(HvfSys64Direction::Write, HvfSys64Register::OSDLR_EL1, 2),
+            })
+        );
+        drop(dispatcher_guard);
+        assert_eq!(
+            register_write_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn run_once_and_handle_mmio_writes_zero_for_osdlr_sys64_read() {
+        let (runner, register_write_receiver) = start_sys64_run_step_recording_runner(
+            HvfSys64Direction::Read,
+            HvfSys64Register::OSDLR_EL1,
+            2,
+        );
+
+        assert_eq!(
+            runner.run_once_and_handle_mmio(shared_dispatcher()),
+            Ok(HvfVcpuRunStepOutcome::Sys64 {
+                exit: sys64_exit(HvfSys64Direction::Read, HvfSys64Register::OSDLR_EL1, 2),
+            })
+        );
+        assert_eq!(
+            register_write_receiver.try_recv(),
+            Ok((HvfRegister::general_purpose(2).expect("X2 should map"), 0))
+        );
+        assert_eq!(
+            register_write_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn run_once_and_handle_mmio_ignores_osdlr_sys64_read_to_xzr() {
+        let (runner, register_write_receiver) = start_sys64_run_step_recording_runner(
+            HvfSys64Direction::Read,
+            HvfSys64Register::OSDLR_EL1,
+            31,
+        );
+
+        assert_eq!(
+            runner.run_once_and_handle_mmio(shared_dispatcher()),
+            Ok(HvfVcpuRunStepOutcome::Sys64 {
+                exit: sys64_exit(HvfSys64Direction::Read, HvfSys64Register::OSDLR_EL1, 31,),
+            })
+        );
+        assert_eq!(
+            register_write_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn run_once_and_handle_mmio_rejects_unsupported_sys64_without_dispatcher_lock() {
+        let unsupported_register =
+            HvfSys64Register::new(3, 0, 0, 0, 0).expect("SYS64 register should be valid");
+        let (runner, register_write_receiver) =
+            start_sys64_run_step_recording_runner(HvfSys64Direction::Read, unsupported_register, 0);
+        let dispatcher = shared_dispatcher();
+        let dispatcher_guard = dispatcher
+            .lock()
+            .expect("dispatcher lock should not be poisoned");
+
+        assert_eq!(
+            runner.run_once_and_handle_mmio(Arc::clone(&dispatcher)),
+            Err(HvfVcpuRunnerError::UnsupportedSys64 {
+                exit: sys64_exit(HvfSys64Direction::Read, unsupported_register, 0),
+            })
+        );
+        drop(dispatcher_guard);
+        assert_eq!(
+            register_write_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
         );
 
         runner.shutdown().expect("runner should shut down");

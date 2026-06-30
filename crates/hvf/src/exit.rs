@@ -10,9 +10,23 @@ use bangbang_runtime::{
 const ESR_EC_SHIFT: u64 = 26;
 const ESR_EC_MASK: u64 = 0x3f;
 const ESR_EC_HVC: u8 = 0x16;
+const ESR_EC_SYS64: u8 = 0x18;
 const ESR_EC_DATA_ABORT_LOWER_EL: u8 = 0x24;
 const ESR_ISS_HVC_IMMEDIATE_MASK: u64 = 0xffff;
 const ESR_ISS_ISV: u64 = 1 << 24;
+const ESR_ISS_SYS64_DIRECTION: u64 = 1;
+const ESR_ISS_SYS64_CRM_SHIFT: u64 = 1;
+const ESR_ISS_SYS64_CRM_MASK: u64 = 0xf;
+const ESR_ISS_SYS64_RT_SHIFT: u64 = 5;
+const ESR_ISS_SYS64_RT_MASK: u64 = 0x1f;
+const ESR_ISS_SYS64_CRN_SHIFT: u64 = 10;
+const ESR_ISS_SYS64_CRN_MASK: u64 = 0xf;
+const ESR_ISS_SYS64_OP1_SHIFT: u64 = 14;
+const ESR_ISS_SYS64_OP1_MASK: u64 = 0x7;
+const ESR_ISS_SYS64_OP2_SHIFT: u64 = 17;
+const ESR_ISS_SYS64_OP2_MASK: u64 = 0x7;
+const ESR_ISS_SYS64_OP0_SHIFT: u64 = 20;
+const ESR_ISS_SYS64_OP0_MASK: u64 = 0x3;
 const ESR_ISS_SAS_SHIFT: u64 = 22;
 const ESR_ISS_SAS_MASK: u64 = 0x3;
 const ESR_ISS_SSE: u64 = 1 << 21;
@@ -40,6 +54,33 @@ impl HvfExceptionExit {
         Ok(HvfHvcExit {
             exit: self,
             immediate: (self.syndrome & ESR_ISS_HVC_IMMEDIATE_MASK) as u16,
+        })
+    }
+
+    pub fn decode_sys64(self) -> Result<HvfSys64Exit, HvfSys64DecodeError> {
+        let exception_class = exception_class(self.syndrome);
+        if exception_class != ESR_EC_SYS64 {
+            return Err(HvfSys64DecodeError::UnsupportedExceptionClass { exception_class });
+        }
+
+        let register = HvfSys64Register::from_raw_fields(
+            ((self.syndrome >> ESR_ISS_SYS64_OP0_SHIFT) & ESR_ISS_SYS64_OP0_MASK) as u8,
+            ((self.syndrome >> ESR_ISS_SYS64_OP1_SHIFT) & ESR_ISS_SYS64_OP1_MASK) as u8,
+            ((self.syndrome >> ESR_ISS_SYS64_CRN_SHIFT) & ESR_ISS_SYS64_CRN_MASK) as u8,
+            ((self.syndrome >> ESR_ISS_SYS64_CRM_SHIFT) & ESR_ISS_SYS64_CRM_MASK) as u8,
+            ((self.syndrome >> ESR_ISS_SYS64_OP2_SHIFT) & ESR_ISS_SYS64_OP2_MASK) as u8,
+        );
+
+        Ok(HvfSys64Exit {
+            exit: self,
+            direction: if self.syndrome & ESR_ISS_SYS64_DIRECTION == 0 {
+                HvfSys64Direction::Write
+            } else {
+                HvfSys64Direction::Read
+            },
+            register,
+            target_register: ((self.syndrome >> ESR_ISS_SYS64_RT_SHIFT) & ESR_ISS_SYS64_RT_MASK)
+                as u8,
         })
     }
 
@@ -127,6 +168,124 @@ impl fmt::Display for HvfHvcDecodeError {
 }
 
 impl std::error::Error for HvfHvcDecodeError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfSys64Exit {
+    exit: HvfExceptionExit,
+    direction: HvfSys64Direction,
+    register: HvfSys64Register,
+    target_register: u8,
+}
+
+impl HvfSys64Exit {
+    pub const fn exception_exit(self) -> HvfExceptionExit {
+        self.exit
+    }
+
+    pub const fn direction(self) -> HvfSys64Direction {
+        self.direction
+    }
+
+    pub const fn register(self) -> HvfSys64Register {
+        self.register
+    }
+
+    pub const fn target_register(self) -> u8 {
+        self.target_register
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfSys64Direction {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfSys64Register {
+    op0: u8,
+    op1: u8,
+    crn: u8,
+    crm: u8,
+    op2: u8,
+}
+
+impl HvfSys64Register {
+    pub const OSDLR_EL1: Self = Self::from_raw_fields(2, 0, 1, 3, 4);
+
+    pub const fn new(op0: u8, op1: u8, crn: u8, crm: u8, op2: u8) -> Option<Self> {
+        if op0 <= ESR_ISS_SYS64_OP0_MASK as u8
+            && op1 <= ESR_ISS_SYS64_OP1_MASK as u8
+            && crn <= ESR_ISS_SYS64_CRN_MASK as u8
+            && crm <= ESR_ISS_SYS64_CRM_MASK as u8
+            && op2 <= ESR_ISS_SYS64_OP2_MASK as u8
+        {
+            Some(Self::from_raw_fields(op0, op1, crn, crm, op2))
+        } else {
+            None
+        }
+    }
+
+    const fn from_raw_fields(op0: u8, op1: u8, crn: u8, crm: u8, op2: u8) -> Self {
+        Self {
+            op0,
+            op1,
+            crn,
+            crm,
+            op2,
+        }
+    }
+
+    pub const fn op0(self) -> u8 {
+        self.op0
+    }
+
+    pub const fn op1(self) -> u8 {
+        self.op1
+    }
+
+    pub const fn crn(self) -> u8 {
+        self.crn
+    }
+
+    pub const fn crm(self) -> u8 {
+        self.crm
+    }
+
+    pub const fn op2(self) -> u8 {
+        self.op2
+    }
+}
+
+impl fmt::Display for HvfSys64Register {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "S{}_{}_C{}_C{}_{}",
+            self.op0, self.op1, self.crn, self.crm, self.op2
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfSys64DecodeError {
+    UnsupportedExceptionClass { exception_class: u8 },
+}
+
+impl fmt::Display for HvfSys64DecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedExceptionClass { exception_class } => {
+                write!(
+                    f,
+                    "unsupported HVF exception class 0x{exception_class:x} for SYS64 decode"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for HvfSys64DecodeError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvfMmioAccess {
@@ -401,6 +560,9 @@ impl HvfVcpuExit {
                 if let Ok(hvc) = exit.decode_hvc() {
                     return Ok(HvfResolvedVcpuExit::Hvc(hvc));
                 }
+                if let Ok(sys64) = exit.decode_sys64() {
+                    return Ok(HvfResolvedVcpuExit::Sys64(sys64));
+                }
 
                 let access = exit
                     .decode_mmio_access()
@@ -436,6 +598,7 @@ impl HvfVcpuExit {
 pub enum HvfResolvedVcpuExit {
     Canceled,
     Hvc(HvfHvcExit),
+    Sys64(HvfSys64Exit),
     Mmio(HvfResolvedMmioAccess),
     VtimerActivated,
     Unknown { reason: u32 },
@@ -486,11 +649,14 @@ mod tests {
     use std::error::Error as _;
 
     use super::{
-        ESR_EC_DATA_ABORT_LOWER_EL, ESR_EC_HVC, ESR_EC_SHIFT, ESR_ISS_CM, ESR_ISS_ISV,
-        ESR_ISS_S1PTW, ESR_ISS_SAS_SHIFT, ESR_ISS_SF, ESR_ISS_SRT_SHIFT, ESR_ISS_SSE, ESR_ISS_WNR,
-        HvfExceptionExit, HvfHvcDecodeError, HvfMmioAccessSize, HvfMmioDecodeError,
-        HvfMmioDirection, HvfMmioRegister, HvfMmioRegisterWidth, HvfMmioResolveError,
-        HvfResolvedVcpuExit, HvfVcpuExit, HvfVcpuExitResolveError,
+        ESR_EC_DATA_ABORT_LOWER_EL, ESR_EC_HVC, ESR_EC_SHIFT, ESR_EC_SYS64, ESR_ISS_CM,
+        ESR_ISS_ISV, ESR_ISS_S1PTW, ESR_ISS_SAS_SHIFT, ESR_ISS_SF, ESR_ISS_SRT_SHIFT, ESR_ISS_SSE,
+        ESR_ISS_SYS64_CRM_SHIFT, ESR_ISS_SYS64_CRN_SHIFT, ESR_ISS_SYS64_DIRECTION,
+        ESR_ISS_SYS64_OP0_SHIFT, ESR_ISS_SYS64_OP1_SHIFT, ESR_ISS_SYS64_OP2_SHIFT,
+        ESR_ISS_SYS64_RT_SHIFT, ESR_ISS_WNR, HvfExceptionExit, HvfHvcDecodeError,
+        HvfMmioAccessSize, HvfMmioDecodeError, HvfMmioDirection, HvfMmioRegister,
+        HvfMmioRegisterWidth, HvfMmioResolveError, HvfResolvedVcpuExit, HvfSys64DecodeError,
+        HvfSys64Direction, HvfSys64Register, HvfVcpuExit, HvfVcpuExitResolveError,
     };
     use bangbang_runtime::{
         memory::{GuestAddress, GuestMemoryError, GuestMemoryRange},
@@ -518,6 +684,26 @@ mod tests {
 
     fn hvc_syndrome(immediate: u16) -> u64 {
         (u64::from(ESR_EC_HVC) << ESR_EC_SHIFT) | u64::from(immediate)
+    }
+
+    fn sys64_syndrome(
+        direction: HvfSys64Direction,
+        register: HvfSys64Register,
+        target_register: u8,
+    ) -> u64 {
+        let direction_bit = match direction {
+            HvfSys64Direction::Read => ESR_ISS_SYS64_DIRECTION,
+            HvfSys64Direction::Write => 0,
+        };
+
+        (u64::from(ESR_EC_SYS64) << ESR_EC_SHIFT)
+            | direction_bit
+            | (u64::from(target_register) << ESR_ISS_SYS64_RT_SHIFT)
+            | (u64::from(register.op0()) << ESR_ISS_SYS64_OP0_SHIFT)
+            | (u64::from(register.op1()) << ESR_ISS_SYS64_OP1_SHIFT)
+            | (u64::from(register.crn()) << ESR_ISS_SYS64_CRN_SHIFT)
+            | (u64::from(register.crm()) << ESR_ISS_SYS64_CRM_SHIFT)
+            | (u64::from(register.op2()) << ESR_ISS_SYS64_OP2_SHIFT)
     }
 
     fn data_abort_syndrome(
@@ -644,6 +830,66 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "unsupported HVF exception class 0x0 for HVC decode"
+        );
+    }
+
+    #[test]
+    fn decodes_observed_osdlr_sys64_exception_exit() {
+        let exit = exception_exit(0x6228_07e6, 0);
+        let sys64 = exit.decode_sys64().expect("SYS64 exit should decode");
+
+        assert_eq!(sys64.exception_exit(), exit);
+        assert_eq!(sys64.direction(), HvfSys64Direction::Write);
+        assert_eq!(sys64.register(), HvfSys64Register::OSDLR_EL1);
+        assert_eq!(sys64.target_register(), 31);
+        assert_eq!(sys64.register().to_string(), "S2_0_C1_C3_4");
+    }
+
+    #[test]
+    fn decodes_sys64_read_target_register() {
+        let register =
+            HvfSys64Register::new(2, 0, 1, 3, 4).expect("SYS64 register should be valid");
+        let exit = exception_exit(sys64_syndrome(HvfSys64Direction::Read, register, 2), 0);
+        let sys64 = exit.decode_sys64().expect("SYS64 exit should decode");
+
+        assert_eq!(sys64.direction(), HvfSys64Direction::Read);
+        assert_eq!(sys64.register(), register);
+        assert_eq!(sys64.target_register(), 2);
+    }
+
+    #[test]
+    fn validates_sys64_register_field_boundaries() {
+        let register =
+            HvfSys64Register::new(3, 7, 15, 15, 7).expect("max SYS64 fields should be valid");
+
+        assert_eq!(register.op0(), 3);
+        assert_eq!(register.op1(), 7);
+        assert_eq!(register.crn(), 15);
+        assert_eq!(register.crm(), 15);
+        assert_eq!(register.op2(), 7);
+        assert_eq!(HvfSys64Register::new(4, 0, 0, 0, 0), None);
+        assert_eq!(HvfSys64Register::new(0, 8, 0, 0, 0), None);
+        assert_eq!(HvfSys64Register::new(0, 0, 16, 0, 0), None);
+        assert_eq!(HvfSys64Register::new(0, 0, 0, 16, 0), None);
+        assert_eq!(HvfSys64Register::new(0, 0, 0, 0, 8), None);
+    }
+
+    #[test]
+    fn rejects_non_sys64_exception_for_sys64_decode() {
+        let exit = exception_exit(hvc_syndrome(0), 0);
+        let err = exit
+            .decode_sys64()
+            .expect_err("non-SYS64 exception should not decode as SYS64");
+
+        assert_eq!(
+            err,
+            HvfSys64DecodeError::UnsupportedExceptionClass {
+                exception_class: ESR_EC_HVC
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "unsupported HVF exception class 0x16 for SYS64 decode"
         );
     }
 
@@ -874,6 +1120,25 @@ mod tests {
         };
         assert_eq!(hvc.exception_exit(), exit);
         assert_eq!(hvc.immediate(), 0);
+    }
+
+    #[test]
+    fn resolves_sys64_vcpu_exit_without_bus_lookup() {
+        let bus = MmioBus::new();
+        let exit = exception_exit(
+            sys64_syndrome(HvfSys64Direction::Write, HvfSys64Register::OSDLR_EL1, 31),
+            0,
+        );
+        let resolved = HvfVcpuExit::Exception(exit)
+            .resolve_with_mmio_bus(&bus)
+            .expect("SYS64 exit should resolve without MMIO bus ownership");
+
+        let HvfResolvedVcpuExit::Sys64(sys64) = resolved else {
+            panic!("expected resolved SYS64 exit, got {resolved:?}");
+        };
+        assert_eq!(sys64.exception_exit(), exit);
+        assert_eq!(sys64.register(), HvfSys64Register::OSDLR_EL1);
+        assert_eq!(sys64.target_register(), 31);
     }
 
     #[test]
