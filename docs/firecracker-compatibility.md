@@ -72,6 +72,12 @@ bangbang should follow Firecracker's process model: one `bangbang` process
 manages one microVM. Future API work should keep the control plane outside the
 guest execution fast path.
 
+The macOS host security baseline is documented separately in
+[macOS Host Security Model](security.md). That document records the current
+socket, host-path, HVF entitlement, guest-data, and multi-process boundaries, and
+also records Linux Firecracker hardening features that are not implemented by the
+current macOS/HVF scaffold.
+
 The intended public control plane is Firecracker-style HTTP over a Unix domain
 socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
 `GET /machine-config`, pre-boot `PUT /machine-config`, pre-boot
