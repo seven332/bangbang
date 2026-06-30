@@ -1969,6 +1969,44 @@ mod tests {
     }
 
     #[test]
+    fn virtio_network_tx_frame_parser_accepts_header_remainder_and_split_payload() {
+        let mut memory = tx_frame_memory();
+        write_tx_header(&mut memory, TEST_TX_HEADER);
+        let chain = tx_descriptor_chain(
+            &mut memory,
+            &[
+                TestDescriptor::readable(TEST_TX_HEADER, VIRTIO_NET_TX_HEADER_SIZE + 3, Some(1)),
+                TestDescriptor::readable(TEST_TX_PAYLOAD, 4, None),
+            ],
+        );
+
+        let frame =
+            parse_tx_frame(&memory, &chain).expect("header remainder plus payload should parse");
+
+        assert_eq!(frame.payload_len(), 7);
+        assert_eq!(frame.payload_segments().len(), 2);
+        let first = frame
+            .payload_segments()
+            .first()
+            .expect("header remainder segment should exist");
+        let second = frame
+            .payload_segments()
+            .get(1)
+            .expect("following payload segment should exist");
+        assert_eq!(first.descriptor_index(), 0);
+        assert_eq!(
+            first.address(),
+            TEST_TX_HEADER
+                .checked_add(u64::from(VIRTIO_NET_TX_HEADER_SIZE))
+                .expect("header remainder address should not overflow")
+        );
+        assert_eq!(first.len(), 3);
+        assert_eq!(second.descriptor_index(), 1);
+        assert_eq!(second.address(), TEST_TX_PAYLOAD);
+        assert_eq!(second.len(), 4);
+    }
+
+    #[test]
     fn virtio_network_tx_frame_parser_rejects_write_only_header() {
         let mut memory = tx_frame_memory();
         let chain = tx_descriptor_chain(
