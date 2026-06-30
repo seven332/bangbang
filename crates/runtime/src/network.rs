@@ -421,11 +421,15 @@ mod tests {
     #[test]
     fn rejects_invalid_guest_mac_addresses_without_echoing_them() {
         for invalid in [
+            "",
+            ":",
             "12:34:56:78:9a",
             "12:34:56:78:9a:bc:de",
+            "12::56:78:9a:bc",
             "12:34:56:78:9a:b",
             "12:34:56:78:9a:bbb",
             "12:34:56:78:9a:xx",
+            "12:34:56:78:9a:bc ",
             "123456789abc",
         ] {
             let err = validate(input().with_guest_mac(invalid))
@@ -441,7 +445,9 @@ mod tests {
                 err.to_string(),
                 "network guest_mac must be six colon-separated hex octets"
             );
-            assert!(!err.to_string().contains(invalid));
+            if !invalid.is_empty() {
+                assert!(!err.to_string().contains(invalid));
+            }
         }
     }
 
