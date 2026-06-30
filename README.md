@@ -232,6 +232,20 @@ Hypervisor.framework is unavailable:
 scripts/run-hvf-tests.sh --allow-unsupported
 ```
 
+Prepare the pinned Firecracker arm64 Linux kernel artifact used by later guest
+boot smoke validation work:
+
+```sh
+scripts/fetch-firecracker-kernel.sh
+```
+
+The script verifies the pinned SHA-256 before reusing or installing the cached
+artifact. By default, it stores the kernel under
+`.tmp/guest-artifacts/firecracker-ci/v1.15/aarch64/vmlinux-6.1.155`. Set
+`BANGBANG_GUEST_ARTIFACTS_DIR` to use a different cache root. This command only
+prepares the kernel artifact; it does not start a guest or run the HVF boot
+smoke test.
+
 Run the VMM process skeleton and API server:
 
 ```sh
