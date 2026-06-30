@@ -6073,6 +6073,88 @@ mod tests {
     }
 
     #[test]
+    fn virtio_network_notifications_deliver_multiple_rx_packets() {
+        let mut memory = tx_frame_memory();
+        let mut handler = network_activation_handler();
+        let mut sink = RecordingTxPacketSink::default();
+        let mut source =
+            RecordingRxPacketSource::with_packets(vec![vec![0x11, 0x12], vec![0x21, 0x22, 0x23]]);
+
+        configure_network_handler_queues(&mut handler);
+        activate_network_handler(&mut handler);
+        write_rx_descriptors(
+            &mut memory,
+            &[
+                TestDescriptor::writable(
+                    TEST_RX_BUFFER,
+                    u32::try_from(VIRTIO_NET_RX_MIN_BUFFER_SIZE)
+                        .expect("RX minimum should fit u32"),
+                    None,
+                ),
+                TestDescriptor::writable(
+                    TEST_RX_SECOND_BUFFER,
+                    u32::try_from(VIRTIO_NET_RX_MIN_BUFFER_SIZE)
+                        .expect("RX minimum should fit u32"),
+                    None,
+                ),
+            ],
+        );
+        write_rx_available_heads(&mut memory, &[0, 1]);
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_RX_QUEUE_INDEX
+                    .try_into()
+                    .expect("RX queue index should fit"),
+            )
+            .expect("RX notification should write");
+
+        let notification = handler
+            .dispatch_network_queue_notifications_with_packet_io(
+                &mut memory,
+                &mut sink,
+                &mut source,
+            )
+            .expect("multiple RX packets should dispatch");
+
+        let dispatch = notification
+            .rx_queue_dispatch()
+            .expect("RX dispatch summary should be present");
+        assert_eq!(dispatch.processed_buffers(), 2);
+        assert_eq!(dispatch.delivered_packets(), 2);
+        assert_eq!(dispatch.deliveries().len(), 2);
+        assert_eq!(source.consume_calls, 2);
+        assert_eq!(source.remaining_packets(), 0);
+        assert_eq!(read_rx_used_index(&memory), 2);
+        assert_eq!(read_rx_used_element(&memory, 0), (0, rx_used_len(2)));
+        assert_eq!(read_rx_used_element(&memory, 1), (1, rx_used_len(3)));
+        assert_eq!(
+            read_guest_bytes(
+                &memory,
+                TEST_RX_BUFFER
+                    .checked_add(u64::from(VIRTIO_NET_TX_HEADER_SIZE))
+                    .expect("first RX payload address should not overflow"),
+                2,
+            ),
+            vec![0x11, 0x12]
+        );
+        assert_eq!(
+            read_guest_bytes(
+                &memory,
+                TEST_RX_SECOND_BUFFER
+                    .checked_add(u64::from(VIRTIO_NET_TX_HEADER_SIZE))
+                    .expect("second RX payload address should not overflow"),
+                3,
+            ),
+            vec![0x21, 0x22, 0x23]
+        );
+        assert_eq!(
+            read_interrupt_status(&handler),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+    }
+
+    #[test]
     fn virtio_network_notifications_empty_rx_source_keeps_available_buffer() {
         let mut memory = tx_frame_memory();
         let mut handler = network_activation_handler();
