@@ -6,7 +6,7 @@ const PSCI_FEATURES: u64 = 0x8400_000a;
 const PSCI_VERSION_0_2: u64 = 0x0000_0002;
 const PSCI_RET_SUCCESS: u64 = 0;
 const PSCI_RET_NOT_SUPPORTED: u64 = u64::MAX;
-const PSCI_MIGRATE_INFO_TYPE_NO_TRUSTED_OS_MIGRATION: u64 = 0;
+const PSCI_MIGRATE_INFO_TYPE_TRUSTED_OS_NOT_REQUIRED: u64 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PsciCall {
@@ -44,7 +44,7 @@ impl PsciCallResult {
 pub(crate) const fn handle_call(call: PsciCall) -> PsciCallResult {
     let return_value = match call.function_id {
         PSCI_VERSION => PSCI_VERSION_0_2,
-        PSCI_MIGRATE_INFO_TYPE => PSCI_MIGRATE_INFO_TYPE_NO_TRUSTED_OS_MIGRATION,
+        PSCI_MIGRATE_INFO_TYPE => PSCI_MIGRATE_INFO_TYPE_TRUSTED_OS_NOT_REQUIRED,
         PSCI_FEATURES => {
             if supports_function(call.arg0) {
                 PSCI_RET_SUCCESS
@@ -68,7 +68,7 @@ const fn supports_function(function_id: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        PSCI_FEATURES, PSCI_MIGRATE_INFO_TYPE, PSCI_MIGRATE_INFO_TYPE_NO_TRUSTED_OS_MIGRATION,
+        PSCI_FEATURES, PSCI_MIGRATE_INFO_TYPE, PSCI_MIGRATE_INFO_TYPE_TRUSTED_OS_NOT_REQUIRED,
         PSCI_RET_NOT_SUPPORTED, PSCI_RET_SUCCESS, PSCI_VERSION, PSCI_VERSION_0_2, PsciCall,
         call_uses_arg0, handle_call, not_supported_result,
     };
@@ -82,10 +82,10 @@ mod tests {
     }
 
     #[test]
-    fn returns_no_trusted_os_migration_for_migrate_info_type() {
+    fn returns_trusted_os_migration_not_required_for_migrate_info_type() {
         assert_eq!(
             handle_call(PsciCall::new(PSCI_MIGRATE_INFO_TYPE, 0)).return_value(),
-            PSCI_MIGRATE_INFO_TYPE_NO_TRUSTED_OS_MIGRATION
+            PSCI_MIGRATE_INFO_TYPE_TRUSTED_OS_NOT_REQUIRED
         );
     }
 
