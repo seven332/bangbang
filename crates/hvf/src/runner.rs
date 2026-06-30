@@ -4484,7 +4484,8 @@ mod tests {
 
     #[test]
     fn run_once_and_handle_mmio_rejects_unsupported_sys64_without_dispatcher_lock() {
-        let unsupported_register = HvfSys64Register::new(3, 0, 0, 0, 0);
+        let unsupported_register =
+            HvfSys64Register::new(3, 0, 0, 0, 0).expect("SYS64 register should be valid");
         let (runner, register_write_receiver) =
             start_sys64_run_step_recording_runner(HvfSys64Direction::Read, unsupported_register, 0);
         let dispatcher = shared_dispatcher();

@@ -63,7 +63,7 @@ impl HvfExceptionExit {
             return Err(HvfSys64DecodeError::UnsupportedExceptionClass { exception_class });
         }
 
-        let register = HvfSys64Register::new(
+        let register = HvfSys64Register::from_raw_fields(
             ((self.syndrome >> ESR_ISS_SYS64_OP0_SHIFT) & ESR_ISS_SYS64_OP0_MASK) as u8,
             ((self.syndrome >> ESR_ISS_SYS64_OP1_SHIFT) & ESR_ISS_SYS64_OP1_MASK) as u8,
             ((self.syndrome >> ESR_ISS_SYS64_CRN_SHIFT) & ESR_ISS_SYS64_CRN_MASK) as u8,
@@ -211,9 +211,22 @@ pub struct HvfSys64Register {
 }
 
 impl HvfSys64Register {
-    pub const OSDLR_EL1: Self = Self::new(2, 0, 1, 3, 4);
+    pub const OSDLR_EL1: Self = Self::from_raw_fields(2, 0, 1, 3, 4);
 
-    pub const fn new(op0: u8, op1: u8, crn: u8, crm: u8, op2: u8) -> Self {
+    pub const fn new(op0: u8, op1: u8, crn: u8, crm: u8, op2: u8) -> Option<Self> {
+        if op0 <= ESR_ISS_SYS64_OP0_MASK as u8
+            && op1 <= ESR_ISS_SYS64_OP1_MASK as u8
+            && crn <= ESR_ISS_SYS64_CRN_MASK as u8
+            && crm <= ESR_ISS_SYS64_CRM_MASK as u8
+            && op2 <= ESR_ISS_SYS64_OP2_MASK as u8
+        {
+            Some(Self::from_raw_fields(op0, op1, crn, crm, op2))
+        } else {
+            None
+        }
+    }
+
+    const fn from_raw_fields(op0: u8, op1: u8, crn: u8, crm: u8, op2: u8) -> Self {
         Self {
             op0,
             op1,
@@ -834,13 +847,31 @@ mod tests {
 
     #[test]
     fn decodes_sys64_read_target_register() {
-        let register = HvfSys64Register::new(2, 0, 1, 3, 4);
+        let register =
+            HvfSys64Register::new(2, 0, 1, 3, 4).expect("SYS64 register should be valid");
         let exit = exception_exit(sys64_syndrome(HvfSys64Direction::Read, register, 2), 0);
         let sys64 = exit.decode_sys64().expect("SYS64 exit should decode");
 
         assert_eq!(sys64.direction(), HvfSys64Direction::Read);
         assert_eq!(sys64.register(), register);
         assert_eq!(sys64.target_register(), 2);
+    }
+
+    #[test]
+    fn validates_sys64_register_field_boundaries() {
+        let register =
+            HvfSys64Register::new(3, 7, 15, 15, 7).expect("max SYS64 fields should be valid");
+
+        assert_eq!(register.op0(), 3);
+        assert_eq!(register.op1(), 7);
+        assert_eq!(register.crn(), 15);
+        assert_eq!(register.crm(), 15);
+        assert_eq!(register.op2(), 7);
+        assert_eq!(HvfSys64Register::new(4, 0, 0, 0, 0), None);
+        assert_eq!(HvfSys64Register::new(0, 8, 0, 0, 0), None);
+        assert_eq!(HvfSys64Register::new(0, 0, 16, 0, 0), None);
+        assert_eq!(HvfSys64Register::new(0, 0, 0, 16, 0), None);
+        assert_eq!(HvfSys64Register::new(0, 0, 0, 0, 8), None);
     }
 
     #[test]
