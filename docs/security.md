@@ -124,6 +124,7 @@ Use unique paths for:
 - metrics files or FIFOs
 - logger files or FIFOs
 - writable block backing files
+- future host network devices or sockets
 - temporary test files
 
 Each process owns its own VMM controller state and observability sinks. There is
@@ -139,7 +140,9 @@ The current scaffold does not implement:
 - a Firecracker-jailer replacement
 - privilege dropping
 - host resource brokering
-- network, vsock, MMDS, or snapshot containment
+- network, vsock, MMDS, or snapshot containment; the current internal network
+  interface model validates configuration strings only and does not open host
+  networking resources
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 
