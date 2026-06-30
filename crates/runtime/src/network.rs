@@ -190,6 +190,11 @@ impl FromStr for GuestMacAddress {
                     guest_mac: value.to_string(),
                 });
             }
+            if !part.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+                return Err(NetworkInterfaceConfigError::InvalidGuestMacAddress {
+                    guest_mac: value.to_string(),
+                });
+            }
             *byte = u8::from_str_radix(part, 16).map_err(|_| {
                 NetworkInterfaceConfigError::InvalidGuestMacAddress {
                     guest_mac: value.to_string(),
@@ -429,6 +434,7 @@ mod tests {
             "12:34:56:78:9a:b",
             "12:34:56:78:9a:bbb",
             "12:34:56:78:9a:xx",
+            "+1:34:56:78:9a:bc",
             "12:34:56:78:9a:bc ",
             "123456789abc",
         ] {
