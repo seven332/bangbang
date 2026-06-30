@@ -900,6 +900,118 @@ impl VirtioMmioDeviceActivationHandler for VirtioNetworkDevice {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedNetworkDevice {
+    iface_id: String,
+    host_dev_name: String,
+    config_space: VirtioNetworkConfigSpace,
+    device: VirtioNetworkDevice,
+}
+
+impl PreparedNetworkDevice {
+    fn from_config(config: &NetworkInterfaceConfig) -> Self {
+        Self {
+            iface_id: config.iface_id().to_string(),
+            host_dev_name: config.host_dev_name().to_string(),
+            config_space: VirtioNetworkConfigSpace::new(config.guest_mac()),
+            device: VirtioNetworkDevice::new(),
+        }
+    }
+
+    pub fn iface_id(&self) -> &str {
+        &self.iface_id
+    }
+
+    pub fn host_dev_name(&self) -> &str {
+        &self.host_dev_name
+    }
+
+    pub const fn config_space(&self) -> VirtioNetworkConfigSpace {
+        self.config_space
+    }
+
+    pub const fn device(&self) -> &VirtioNetworkDevice {
+        &self.device
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        String,
+        String,
+        VirtioNetworkConfigSpace,
+        VirtioNetworkDevice,
+    ) {
+        (
+            self.iface_id,
+            self.host_dev_name,
+            self.config_space,
+            self.device,
+        )
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PreparedNetworkDevices {
+    devices: Vec<PreparedNetworkDevice>,
+}
+
+impl PreparedNetworkDevices {
+    pub fn from_configs(
+        configs: &NetworkInterfaceConfigs,
+    ) -> Result<Self, PreparedNetworkDeviceError> {
+        let mut devices = Vec::new();
+        devices
+            .try_reserve_exact(configs.as_slice().len())
+            .map_err(|source| PreparedNetworkDeviceError::AllocateDevices { source })?;
+
+        for config in configs.as_slice() {
+            devices.push(PreparedNetworkDevice::from_config(config));
+        }
+
+        Ok(Self { devices })
+    }
+
+    pub fn as_slice(&self) -> &[PreparedNetworkDevice] {
+        &self.devices
+    }
+
+    pub fn len(&self) -> usize {
+        self.devices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.devices.is_empty()
+    }
+
+    pub fn into_vec(self) -> Vec<PreparedNetworkDevice> {
+        self.devices
+    }
+}
+
+#[derive(Debug)]
+pub enum PreparedNetworkDeviceError {
+    AllocateDevices { source: TryReserveError },
+}
+
+impl fmt::Display for PreparedNetworkDeviceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AllocateDevices { source } => {
+                write!(f, "failed to allocate prepared network devices: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PreparedNetworkDeviceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AllocateDevices { source } => Some(source),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtioNetworkDeviceNotificationDispatch {
     drained_notifications: Vec<usize>,
 }
@@ -1497,14 +1609,15 @@ mod tests {
 
     use super::{
         GuestMacAddress, InterfaceIdSource, NetworkInterfaceConfig, NetworkInterfaceConfigError,
-        NetworkInterfaceConfigInput, NetworkInterfaceConfigs, VIRTIO_FEATURE_VERSION_1,
-        VIRTIO_NET_CONFIG_MAC_SIZE, VIRTIO_NET_DEVICE_ID, VIRTIO_NET_F_MAC,
-        VIRTIO_NET_MAX_BUFFER_SIZE, VIRTIO_NET_QUEUE_COUNT, VIRTIO_NET_QUEUE_SIZE,
-        VIRTIO_NET_QUEUE_SIZES, VIRTIO_NET_RX_MIN_BUFFER_SIZE, VIRTIO_NET_RX_QUEUE_INDEX,
-        VIRTIO_NET_TX_HEADER_SIZE, VIRTIO_NET_TX_QUEUE_INDEX, VIRTIO_RING_FEATURE_EVENT_IDX,
-        VirtioNetworkConfigSpace, VirtioNetworkDevice, VirtioNetworkDeviceActivationError,
-        VirtioNetworkDeviceNotificationError, VirtioNetworkMmioHandler, VirtioNetworkRxBuffer,
-        VirtioNetworkRxBufferParseError, VirtioNetworkTxFrame, VirtioNetworkTxFrameParseError,
+        NetworkInterfaceConfigInput, NetworkInterfaceConfigs, PreparedNetworkDevices,
+        VIRTIO_FEATURE_VERSION_1, VIRTIO_NET_CONFIG_MAC_SIZE, VIRTIO_NET_DEVICE_ID,
+        VIRTIO_NET_F_MAC, VIRTIO_NET_MAX_BUFFER_SIZE, VIRTIO_NET_QUEUE_COUNT,
+        VIRTIO_NET_QUEUE_SIZE, VIRTIO_NET_QUEUE_SIZES, VIRTIO_NET_RX_MIN_BUFFER_SIZE,
+        VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_HEADER_SIZE, VIRTIO_NET_TX_QUEUE_INDEX,
+        VIRTIO_RING_FEATURE_EVENT_IDX, VirtioNetworkConfigSpace, VirtioNetworkDevice,
+        VirtioNetworkDeviceActivationError, VirtioNetworkDeviceNotificationError,
+        VirtioNetworkMmioHandler, VirtioNetworkRxBuffer, VirtioNetworkRxBufferParseError,
+        VirtioNetworkTxFrame, VirtioNetworkTxFrameParseError,
     };
 
     const TEST_MMIO_BASE: GuestAddress = GuestAddress::new(0x1000);
@@ -2158,6 +2271,127 @@ mod tests {
         assert_eq!(err.to_string(), "network guest_mac is already in use");
         assert_eq!(configs.as_slice().len(), 1);
         assert_eq!(configs.as_slice()[0].iface_id(), "eth0");
+    }
+
+    #[test]
+    fn prepared_network_devices_accept_empty_configs() {
+        let configs = NetworkInterfaceConfigs::new();
+        let devices =
+            PreparedNetworkDevices::from_configs(&configs).expect("empty configs should prepare");
+
+        assert!(devices.is_empty());
+        assert_eq!(devices.len(), 0);
+        assert!(devices.as_slice().is_empty());
+        assert!(devices.into_vec().is_empty());
+    }
+
+    #[test]
+    fn prepared_network_devices_prepare_interface_without_guest_mac() {
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(input())
+            .expect("network config should be stored");
+
+        let devices =
+            PreparedNetworkDevices::from_configs(&configs).expect("network device should prepare");
+        let device = devices
+            .as_slice()
+            .first()
+            .expect("prepared network device should exist");
+        let base_features = virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
+            | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX);
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(device.iface_id(), "eth0");
+        assert_eq!(device.host_dev_name(), "tap0");
+        assert_eq!(device.config_space().guest_mac(), None);
+        assert_eq!(device.config_space().available_features(), base_features);
+        assert!(!device.device().is_activated());
+    }
+
+    #[test]
+    fn prepared_network_devices_prepare_interface_with_guest_mac() {
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(input().with_guest_mac("12:34:56:78:9a:bc"))
+            .expect("network config should be stored");
+
+        let devices =
+            PreparedNetworkDevices::from_configs(&configs).expect("network device should prepare");
+        let device = devices
+            .as_slice()
+            .first()
+            .expect("prepared network device should exist");
+
+        assert_eq!(device.config_space().guest_mac(), Some(test_guest_mac()));
+        assert_eq!(
+            device.config_space().available_features(),
+            virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
+                | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX)
+                | virtio_feature_bit(VIRTIO_NET_F_MAC)
+        );
+        assert!(!device.device().is_activated());
+    }
+
+    #[test]
+    fn prepared_network_devices_preserve_interface_order() {
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0"))
+            .expect("first network config should be stored");
+        configs
+            .insert(NetworkInterfaceConfigInput::new("eth1", "eth1", "tap1"))
+            .expect("second network config should be stored");
+
+        let devices =
+            PreparedNetworkDevices::from_configs(&configs).expect("network devices should prepare");
+
+        assert_eq!(devices.as_slice()[0].iface_id(), "eth0");
+        assert_eq!(devices.as_slice()[0].host_dev_name(), "tap0");
+        assert_eq!(devices.as_slice()[1].iface_id(), "eth1");
+        assert_eq!(devices.as_slice()[1].host_dev_name(), "tap1");
+    }
+
+    #[test]
+    fn prepared_network_devices_do_not_touch_host_device_name() {
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(NetworkInterfaceConfigInput::new(
+                "eth0",
+                "eth0",
+                "/definitely/missing/bangbang-tap",
+            ))
+            .expect("network config should be stored");
+
+        let devices = PreparedNetworkDevices::from_configs(&configs)
+            .expect("network preparation should not open host devices");
+
+        assert_eq!(
+            devices.as_slice()[0].host_dev_name(),
+            "/definitely/missing/bangbang-tap"
+        );
+    }
+
+    #[test]
+    fn prepared_network_device_into_parts_consumes_owned_resource() {
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(input().with_guest_mac("12:34:56:78:9a:bc"))
+            .expect("network config should be stored");
+
+        let mut devices = PreparedNetworkDevices::from_configs(&configs)
+            .expect("network device should prepare")
+            .into_vec();
+        let device = devices
+            .pop()
+            .expect("prepared network device should be returned");
+        let (iface_id, host_dev_name, config_space, device) = device.into_parts();
+
+        assert!(devices.is_empty());
+        assert_eq!(iface_id, "eth0");
+        assert_eq!(host_dev_name, "tap0");
+        assert_eq!(config_space.guest_mac(), Some(test_guest_mac()));
+        assert!(!device.is_activated());
     }
 
     #[test]
