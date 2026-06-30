@@ -2885,11 +2885,25 @@ mod tests {
         register: HvfSys64Register,
         target_register: u8,
     ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<(HvfRegister, u64)>) {
+        start_sys64_run_step_recording_runner_with_pc(
+            direction,
+            register,
+            target_register,
+            0x8020_1000,
+        )
+    }
+
+    fn start_sys64_run_step_recording_runner_with_pc(
+        direction: HvfSys64Direction,
+        register: HvfSys64Register,
+        target_register: u8,
+        pc: u64,
+    ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<(HvfRegister, u64)>) {
         let (register_write_sender, register_write_receiver) = mpsc::channel();
         let started = spawn_runner_thread(move || {
             Ok(Sys64RunStepRecordingVcpu {
                 run_once_result: Ok(sys64_exception_exit(direction, register, target_register)),
-                pc: 0x8020_1000,
+                pc,
                 register_write_sender,
             })
         })
@@ -4588,6 +4602,29 @@ mod tests {
         assert_eq!(
             register_write_receiver.try_recv(),
             Ok((HvfRegister::PC, 0x8020_1004))
+        );
+        assert_eq!(
+            register_write_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn run_once_and_handle_mmio_rejects_pc_overflow_after_supported_sys64_write() {
+        let (runner, register_write_receiver) = start_sys64_run_step_recording_runner_with_pc(
+            HvfSys64Direction::Write,
+            HvfSys64Register::OSDLR_EL1,
+            31,
+            u64::MAX,
+        );
+
+        assert_eq!(
+            runner.run_once_and_handle_mmio(shared_dispatcher()),
+            Err(HvfVcpuRunnerError::InvalidState(
+                "arm64 PC overflow while advancing handled synchronous exit"
+            ))
         );
         assert_eq!(
             register_write_receiver.try_recv(),
