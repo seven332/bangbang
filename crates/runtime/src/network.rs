@@ -3,7 +3,23 @@
 use std::fmt;
 use std::str::FromStr;
 
+use crate::mmio::{MmioAccessBytes, MmioAccessBytesError, MmioHandlerError};
+use crate::virtio_mmio::{
+    VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError, VirtioMmioDeviceConfigHandler,
+};
+
 const MAC_ADDRESS_LEN: usize = 6;
+pub const VIRTIO_NET_DEVICE_ID: u32 = 1;
+pub const VIRTIO_NET_QUEUE_COUNT: usize = 2;
+pub const VIRTIO_NET_RX_QUEUE_INDEX: usize = 0;
+pub const VIRTIO_NET_TX_QUEUE_INDEX: usize = 1;
+pub const VIRTIO_NET_QUEUE_SIZE: u16 = 256;
+pub const VIRTIO_NET_QUEUE_SIZES: [u16; VIRTIO_NET_QUEUE_COUNT] =
+    [VIRTIO_NET_QUEUE_SIZE; VIRTIO_NET_QUEUE_COUNT];
+pub const VIRTIO_NET_CONFIG_MAC_SIZE: usize = MAC_ADDRESS_LEN;
+pub const VIRTIO_NET_F_MAC: u32 = 5;
+pub const VIRTIO_RING_FEATURE_EVENT_IDX: u32 = 29;
+pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkInterfaceConfigInput {
@@ -190,6 +206,65 @@ impl NetworkInterfaceConfigs {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioNetworkConfigSpace {
+    guest_mac: Option<GuestMacAddress>,
+}
+
+impl VirtioNetworkConfigSpace {
+    pub const fn new(guest_mac: Option<GuestMacAddress>) -> Self {
+        Self { guest_mac }
+    }
+
+    pub const fn guest_mac(self) -> Option<GuestMacAddress> {
+        self.guest_mac
+    }
+
+    pub const fn available_features(self) -> u64 {
+        let features = virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
+            | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX);
+        if self.guest_mac.is_some() {
+            features | virtio_feature_bit(VIRTIO_NET_F_MAC)
+        } else {
+            features
+        }
+    }
+
+    const fn mac_bytes(self) -> Option<[u8; VIRTIO_NET_CONFIG_MAC_SIZE]> {
+        match self.guest_mac {
+            Some(guest_mac) => Some(guest_mac.octets()),
+            None => None,
+        }
+    }
+}
+
+impl VirtioMmioDeviceConfigHandler for VirtioNetworkConfigSpace {
+    fn read_device_config(
+        &self,
+        access: VirtioMmioDeviceConfigAccess,
+    ) -> Result<MmioAccessBytes, VirtioMmioDeviceConfigError> {
+        let Some(mac) = self.mac_bytes() else {
+            return Err(VirtioMmioDeviceConfigError::UnsupportedRead {
+                offset: access.offset(),
+                len: access.len(),
+            });
+        };
+        let bytes = read_virtio_network_mac_bytes(&mac, access)?;
+        MmioAccessBytes::new(bytes).map_err(network_config_bytes_error)
+    }
+
+    fn write_device_config(
+        &mut self,
+        access: VirtioMmioDeviceConfigAccess,
+        _data: MmioAccessBytes,
+    ) -> Result<(), VirtioMmioDeviceConfigError> {
+        Err(VirtioMmioDeviceConfigError::UnsupportedWrite {
+            offset: access.offset(),
+            len: access.len(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuestMacAddress {
     bytes: [u8; MAC_ADDRESS_LEN],
 }
@@ -211,6 +286,40 @@ impl fmt::Display for GuestMacAddress {
             f,
             "{first:02x}:{second:02x}:{third:02x}:{fourth:02x}:{fifth:02x}:{sixth:02x}"
         )
+    }
+}
+
+const fn virtio_feature_bit(feature: u32) -> u64 {
+    1_u64 << feature
+}
+
+fn read_virtio_network_mac_bytes(
+    mac: &[u8; VIRTIO_NET_CONFIG_MAC_SIZE],
+    access: VirtioMmioDeviceConfigAccess,
+) -> Result<&[u8], VirtioMmioDeviceConfigError> {
+    let offset = usize::try_from(access.offset()).map_err(|_| {
+        VirtioMmioDeviceConfigError::UnsupportedRead {
+            offset: access.offset(),
+            len: access.len(),
+        }
+    })?;
+    let Some(end) = offset.checked_add(access.len()) else {
+        return Err(VirtioMmioDeviceConfigError::UnsupportedRead {
+            offset: access.offset(),
+            len: access.len(),
+        });
+    };
+
+    mac.get(offset..end)
+        .ok_or(VirtioMmioDeviceConfigError::UnsupportedRead {
+            offset: access.offset(),
+            len: access.len(),
+        })
+}
+
+fn network_config_bytes_error(source: MmioAccessBytesError) -> VirtioMmioDeviceConfigError {
+    VirtioMmioDeviceConfigError::Handler {
+        source: MmioHandlerError::new(format!("virtio-net config access bytes failed: {source}")),
     }
 }
 
@@ -350,10 +459,23 @@ fn validate_interface_id(
 mod tests {
     use std::str::FromStr;
 
+    use crate::memory::GuestAddress;
+    use crate::mmio::{MmioAccess, MmioAccessBytes, MmioBus, MmioRegionId};
+    use crate::virtio_mmio::{
+        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
+        VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioRegister,
+        VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
+    };
+
     use super::{
         GuestMacAddress, InterfaceIdSource, NetworkInterfaceConfig, NetworkInterfaceConfigError,
-        NetworkInterfaceConfigInput, NetworkInterfaceConfigs,
+        NetworkInterfaceConfigInput, NetworkInterfaceConfigs, VIRTIO_FEATURE_VERSION_1,
+        VIRTIO_NET_CONFIG_MAC_SIZE, VIRTIO_NET_DEVICE_ID, VIRTIO_NET_F_MAC, VIRTIO_NET_QUEUE_COUNT,
+        VIRTIO_NET_QUEUE_SIZE, VIRTIO_NET_QUEUE_SIZES, VIRTIO_NET_RX_QUEUE_INDEX,
+        VIRTIO_NET_TX_QUEUE_INDEX, VIRTIO_RING_FEATURE_EVENT_IDX, VirtioNetworkConfigSpace,
     };
+
+    const TEST_MMIO_BASE: GuestAddress = GuestAddress::new(0x1000);
 
     fn input() -> NetworkInterfaceConfigInput {
         NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0")
@@ -363,6 +485,74 @@ mod tests {
         input: NetworkInterfaceConfigInput,
     ) -> Result<NetworkInterfaceConfig, NetworkInterfaceConfigError> {
         input.validate()
+    }
+
+    fn test_guest_mac() -> GuestMacAddress {
+        GuestMacAddress::from_bytes([0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc])
+    }
+
+    fn virtio_feature_bit(feature: u32) -> u64 {
+        1_u64 << feature
+    }
+
+    fn mmio_access(offset: u64, len: usize) -> MmioAccess {
+        let mut bus = MmioBus::new();
+        bus.insert(
+            MmioRegionId::new(1),
+            TEST_MMIO_BASE,
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+        )
+        .expect("virtio-mmio test region should insert");
+        let address = TEST_MMIO_BASE
+            .checked_add(offset)
+            .expect("test offset should not overflow");
+        bus.lookup(
+            address,
+            u64::try_from(len).expect("test access len should fit"),
+        )
+        .expect("test access should resolve")
+    }
+
+    fn network_handler(
+        config: VirtioNetworkConfigSpace,
+    ) -> VirtioMmioRegisterHandler<VirtioNetworkConfigSpace> {
+        VirtioMmioRegisterHandler::with_device_config(
+            VIRTIO_NET_DEVICE_ID,
+            config.available_features(),
+            &VIRTIO_NET_QUEUE_SIZES,
+            config,
+        )
+        .expect("network register handler should build")
+    }
+
+    fn read_network_config(
+        config: VirtioNetworkConfigSpace,
+        offset: u64,
+        len: usize,
+    ) -> Result<MmioAccessBytes, VirtioMmioRegisterHandlerError> {
+        network_handler(config)
+            .read_access(mmio_access(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET + offset, len))
+    }
+
+    fn write_network_config_after_driver(
+        config: VirtioNetworkConfigSpace,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), VirtioMmioRegisterHandlerError> {
+        let mut handler = network_handler(config);
+        handler
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
+            .expect("ACKNOWLEDGE status should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            )
+            .expect("DRIVER status should write");
+        handler.write_access(
+            mmio_access(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET + offset, data.len()),
+            MmioAccessBytes::new(data).expect("test config write bytes should build"),
+        )
     }
 
     #[test]
@@ -613,5 +803,156 @@ mod tests {
         assert_eq!(err.to_string(), "network guest_mac is already in use");
         assert_eq!(configs.as_slice().len(), 1);
         assert_eq!(configs.as_slice()[0].iface_id(), "eth0");
+    }
+
+    #[test]
+    fn virtio_network_constants_match_firecracker_shape() {
+        assert_eq!(VIRTIO_NET_DEVICE_ID, 1);
+        assert_eq!(VIRTIO_NET_QUEUE_COUNT, 2);
+        assert_eq!(VIRTIO_NET_RX_QUEUE_INDEX, 0);
+        assert_eq!(VIRTIO_NET_TX_QUEUE_INDEX, 1);
+        assert_eq!(VIRTIO_NET_QUEUE_SIZE, 256);
+        assert_eq!(VIRTIO_NET_QUEUE_SIZES, [256, 256]);
+        assert_eq!(VIRTIO_NET_CONFIG_MAC_SIZE, 6);
+        assert_eq!(VIRTIO_NET_F_MAC, 5);
+        assert_eq!(VIRTIO_RING_FEATURE_EVENT_IDX, 29);
+        assert_eq!(VIRTIO_FEATURE_VERSION_1, 32);
+    }
+
+    #[test]
+    fn virtio_network_config_space_tracks_guest_mac_feature() {
+        let base_features = virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
+            | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX);
+        let without_mac = VirtioNetworkConfigSpace::new(None);
+        let with_mac = VirtioNetworkConfigSpace::new(Some(test_guest_mac()));
+
+        assert_eq!(without_mac.guest_mac(), None);
+        assert_eq!(without_mac.available_features(), base_features);
+        assert_eq!(with_mac.guest_mac(), Some(test_guest_mac()));
+        assert_eq!(
+            with_mac.available_features(),
+            base_features | virtio_feature_bit(VIRTIO_NET_F_MAC)
+        );
+    }
+
+    #[test]
+    fn virtio_network_config_space_reads_mac_bytes() {
+        let config = VirtioNetworkConfigSpace::new(Some(test_guest_mac()));
+
+        assert_eq!(
+            read_network_config(config, 0, 4)
+                .expect("low MAC config word should read")
+                .as_slice(),
+            &[0x12, 0x34, 0x56, 0x78]
+        );
+        assert_eq!(
+            read_network_config(config, 4, 2)
+                .expect("high MAC config halfword should read")
+                .as_slice(),
+            &[0x9a, 0xbc]
+        );
+        assert_eq!(
+            read_network_config(config, 1, 2)
+                .expect("partial MAC config read should succeed")
+                .as_slice(),
+            &[0x34, 0x56]
+        );
+        assert_eq!(
+            read_network_config(config, 5, 1)
+                .expect("last MAC byte should read")
+                .as_slice(),
+            &[0xbc]
+        );
+        assert_eq!(
+            read_network_config(config, 2, 4)
+                .expect("read ending at MAC boundary should succeed")
+                .as_slice(),
+            &[0x56, 0x78, 0x9a, 0xbc]
+        );
+    }
+
+    #[test]
+    fn virtio_network_config_space_rejects_unsupported_reads() {
+        let config = VirtioNetworkConfigSpace::new(Some(test_guest_mac()));
+
+        assert_eq!(
+            read_network_config(VirtioNetworkConfigSpace::new(None), 0, 1),
+            Err(VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead { offset: 0, len: 1 })
+        );
+        assert_eq!(
+            read_network_config(config, 6, 1),
+            Err(VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead { offset: 6, len: 1 })
+        );
+        assert_eq!(
+            read_network_config(config, 5, 2),
+            Err(VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead { offset: 5, len: 2 })
+        );
+    }
+
+    #[test]
+    fn virtio_network_config_space_rejects_writes_after_driver_status() {
+        assert_eq!(
+            write_network_config_after_driver(
+                VirtioNetworkConfigSpace::new(Some(test_guest_mac())),
+                0,
+                &[1, 2, 3, 4],
+            ),
+            Err(VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigWrite { offset: 0, len: 4 })
+        );
+    }
+
+    #[test]
+    fn virtio_network_config_space_runs_through_mmio_register_handler() {
+        let config = VirtioNetworkConfigSpace::new(Some(test_guest_mac()));
+        let mut handler = network_handler(config);
+
+        assert_eq!(handler.device_registers().device_id(), VIRTIO_NET_DEVICE_ID);
+        assert_eq!(
+            handler.device_registers().device_features(),
+            config.available_features()
+        );
+        assert_eq!(
+            handler.queue_registers().queue_count(),
+            VIRTIO_NET_QUEUE_COUNT
+        );
+        assert_eq!(
+            handler
+                .queue_registers()
+                .queue(
+                    VIRTIO_NET_RX_QUEUE_INDEX
+                        .try_into()
+                        .expect("RX index should fit")
+                )
+                .expect("RX queue should exist")
+                .max_size(),
+            VIRTIO_NET_QUEUE_SIZE
+        );
+        assert_eq!(
+            handler
+                .queue_registers()
+                .queue(
+                    VIRTIO_NET_TX_QUEUE_INDEX
+                        .try_into()
+                        .expect("TX index should fit")
+                )
+                .expect("TX queue should exist")
+                .max_size(),
+            VIRTIO_NET_QUEUE_SIZE
+        );
+
+        let read = handler
+            .read_access(mmio_access(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, 4))
+            .expect("network config read should delegate through handler");
+        assert_eq!(read.as_slice(), &test_guest_mac().octets()[..4]);
+
+        handler
+            .write_register(VirtioMmioRegister::QueueSel, 1)
+            .expect("TX queue should be selectable");
+        assert_eq!(
+            handler
+                .read_register(VirtioMmioRegister::QueueNumMax)
+                .expect("selected TX max queue size should read"),
+            u32::from(VIRTIO_NET_QUEUE_SIZE)
+        );
     }
 }
