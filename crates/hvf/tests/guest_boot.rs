@@ -8,7 +8,7 @@
 )]
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-static GUEST_BOOT_SMOKE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static GUEST_BOOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const BOOT_MARKER: &[u8] = b"BANGBANG_BOOT_OK";
@@ -37,20 +37,20 @@ fn boots_firecracker_kernel_to_guest_marker() {
     use bangbang_runtime::serial::SharedSerialOutputBuffer;
     use bangbang_runtime::{VmmAction, VmmController};
 
-    let _test_lock = GUEST_BOOT_SMOKE_TEST_LOCK
+    let _test_lock = GUEST_BOOT_TEST_LOCK
         .lock()
-        .expect("guest boot smoke test lock should not be poisoned");
+        .expect("guest boot integration test lock should not be poisoned");
     let kernel_path = env_path("BANGBANG_GUEST_KERNEL_PATH");
     let initrd_path = env_path("BANGBANG_GUEST_INITRD_PATH");
     let serial_output = SharedSerialOutputBuffer::default();
-    let mut controller = VmmController::new("guest-boot-smoke", "0.1.0", "bangbang");
+    let mut controller = VmmController::new("guest-boot", "0.1.0", "bangbang");
     controller
         .handle_action(VmmAction::PutBootSource(
             BootSourceConfigInput::new(kernel_path.clone())
                 .with_initrd_path(initrd_path.clone())
                 .with_boot_args(BOOT_ARGS),
         ))
-        .expect("guest boot smoke boot source should configure");
+        .expect("guest boot test boot source should configure");
     let serial_address = GuestAddress::new(SERIAL_MMIO_BASE);
     let config = HvfArm64BootSessionConfig::new(BlockMmioLayout::new(
         GuestAddress::new(BLOCK_MMIO_BASE),
@@ -62,16 +62,16 @@ fn boots_firecracker_kernel_to_guest_marker() {
         serial_output.clone(),
     ));
     let mut session = OwnedHvfArm64BootSession::new(&controller, config)
-        .expect("guest boot smoke session should prepare");
+        .expect("guest boot test session should prepare");
     let boot_diagnostics =
-        SmokeBootDiagnostics::from_session(&session, kernel_path, initrd_path, serial_address);
+        GuestBootDiagnostics::from_session(&session, kernel_path, initrd_path, serial_address);
     validate_pre_run_boot_metadata(&session, &boot_diagnostics);
     let run_loop_control = session.run_loop_control();
     let stop_token = run_loop_control.stop_token();
-    let watchdog = SmokeWatchdog::spawn(run_loop_control.clone());
+    let watchdog = GuestBootWatchdog::spawn(run_loop_control.clone());
     let one_step = NonZeroUsize::new(1).expect("one-step limit should be non-zero");
     let started_at = Instant::now();
-    let mut run_diagnostics = SmokeRunDiagnostics::default();
+    let mut run_diagnostics = GuestBootRunDiagnostics::default();
     let mut terminal_outcome = None;
 
     while started_at.elapsed() < GUEST_BOOT_TIMEOUT {
@@ -83,7 +83,7 @@ fn boots_firecracker_kernel_to_guest_marker() {
             .run_loop_with_observer(&stop_token, one_step, |step| {
                 run_diagnostics.record_step(step);
             })
-            .expect("guest boot smoke run-loop should not fail before marker");
+            .expect("guest boot test run-loop should not fail before marker");
         run_diagnostics.record_loop_outcome(&outcome);
 
         if serial_contains_marker(&serial_output) {
@@ -107,7 +107,7 @@ fn boots_firecracker_kernel_to_guest_marker() {
     let elapsed = started_at.elapsed();
     let serial_bytes = serial_output
         .bytes()
-        .expect("guest boot smoke serial output should read");
+        .expect("guest boot test serial output should read");
     run_diagnostics.finish(
         elapsed,
         marker_observed,
@@ -118,31 +118,31 @@ fn boots_firecracker_kernel_to_guest_marker() {
     );
     session
         .shutdown()
-        .expect("guest boot smoke session should shut down");
+        .expect("guest boot test session should shut down");
 
     assert!(
         !watchdog_timed_out,
-        "guest boot smoke watchdog canceled the vCPU run\n{}\nserial output:\n{}",
-        SmokeFailureReport::new(&boot_diagnostics, &run_diagnostics),
+        "guest boot test watchdog canceled the vCPU run\n{}\nserial output:\n{}",
+        GuestBootFailureReport::new(&boot_diagnostics, &run_diagnostics),
         String::from_utf8_lossy(&serial_bytes)
     );
     assert!(
         bytes_contain_marker(&serial_bytes),
-        "guest boot smoke did not observe marker {:?}\n{}\nserial output:\n{}",
+        "guest boot test did not observe marker {:?}\n{}\nserial output:\n{}",
         String::from_utf8_lossy(BOOT_MARKER),
-        SmokeFailureReport::new(&boot_diagnostics, &run_diagnostics),
+        GuestBootFailureReport::new(&boot_diagnostics, &run_diagnostics),
         String::from_utf8_lossy(&serial_bytes)
     );
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-struct SmokeWatchdog {
+struct GuestBootWatchdog {
     done_sender: Option<std::sync::mpsc::Sender<()>>,
     handle: Option<std::thread::JoinHandle<bool>>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl SmokeWatchdog {
+impl GuestBootWatchdog {
     fn spawn(control: bangbang_hvf::HvfArm64BootRunLoopControl) -> Self {
         let (done_sender, done_receiver) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
@@ -162,7 +162,7 @@ impl SmokeWatchdog {
 
     fn finish(mut self) -> bool {
         self.signal_done();
-        self.join().expect("guest boot smoke watchdog should join")
+        self.join().expect("guest boot test watchdog should join")
     }
 
     fn signal_done(&mut self) {
@@ -181,7 +181,7 @@ impl SmokeWatchdog {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl Drop for SmokeWatchdog {
+impl Drop for GuestBootWatchdog {
     fn drop(&mut self) {
         self.signal_done();
         let _ = self.join();
@@ -190,7 +190,7 @@ impl Drop for SmokeWatchdog {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Clone)]
-struct SmokeBootDiagnostics {
+struct GuestBootDiagnostics {
     kernel_path: std::path::PathBuf,
     initrd_path: std::path::PathBuf,
     boot_args: &'static str,
@@ -205,7 +205,7 @@ struct SmokeBootDiagnostics {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl SmokeBootDiagnostics {
+impl GuestBootDiagnostics {
     fn from_session(
         session: &bangbang_hvf::OwnedHvfArm64BootSession,
         kernel_path: std::path::PathBuf,
@@ -216,20 +216,20 @@ impl SmokeBootDiagnostics {
         let initrd = resources
             .loaded_boot_source
             .initrd
-            .expect("guest boot smoke initrd should be loaded");
+            .expect("guest boot test initrd should be loaded");
         let serial = resources
             .serial_device
             .as_ref()
-            .expect("guest boot smoke serial device should be registered");
+            .expect("guest boot test serial device should be registered");
         assert_eq!(
             serial.region.range().start(),
             expected_serial_address,
-            "guest boot smoke serial MMIO base should match test config"
+            "guest boot test serial MMIO base should match test config"
         );
         assert_eq!(
             Some(serial.fdt_device.interrupt_line),
             session.serial_interrupt_line(),
-            "guest boot smoke runtime and HVF serial interrupt metadata should match"
+            "guest boot test runtime and HVF serial interrupt metadata should match"
         );
 
         Self {
@@ -250,7 +250,7 @@ impl SmokeBootDiagnostics {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct SmokeRunDiagnostics {
+struct GuestBootRunDiagnostics {
     run_loop_calls: usize,
     raw_steps: usize,
     completed_steps: usize,
@@ -271,7 +271,7 @@ struct SmokeRunDiagnostics {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl SmokeRunDiagnostics {
+impl GuestBootRunDiagnostics {
     fn record_step(&mut self, step: &bangbang_hvf::HvfVcpuRunStepOutcome) {
         self.raw_steps += 1;
         self.last_step = Some(format!("{step:?}"));
@@ -353,20 +353,20 @@ impl SmokeRunDiagnostics {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
-struct SmokeFailureReport<'a> {
-    boot: &'a SmokeBootDiagnostics,
-    run: &'a SmokeRunDiagnostics,
+struct GuestBootFailureReport<'a> {
+    boot: &'a GuestBootDiagnostics,
+    run: &'a GuestBootRunDiagnostics,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl<'a> SmokeFailureReport<'a> {
-    const fn new(boot: &'a SmokeBootDiagnostics, run: &'a SmokeRunDiagnostics) -> Self {
+impl<'a> GuestBootFailureReport<'a> {
+    const fn new(boot: &'a GuestBootDiagnostics, run: &'a GuestBootRunDiagnostics) -> Self {
         Self { boot, run }
     }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl std::fmt::Display for SmokeFailureReport<'_> {
+impl std::fmt::Display for GuestBootFailureReport<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let elapsed = self
             .run
@@ -376,7 +376,7 @@ impl std::fmt::Display for SmokeFailureReport<'_> {
         let terminal = self.run.terminal_outcome.as_deref().unwrap_or("none");
         let last_step = self.run.last_step.as_deref().unwrap_or("none");
 
-        writeln!(f, "guest boot smoke diagnostics:")?;
+        writeln!(f, "guest boot diagnostics:")?;
         writeln!(f, "  classification: {}", self.run.timeout_classification())?;
         writeln!(f, "  elapsed: {elapsed}")?;
         writeln!(f, "  marker observed: {}", self.run.marker_observed)?;
@@ -432,7 +432,7 @@ impl std::fmt::Display for SmokeFailureReport<'_> {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn validate_pre_run_boot_metadata(
     session: &bangbang_hvf::OwnedHvfArm64BootSession,
-    diagnostics: &SmokeBootDiagnostics,
+    diagnostics: &GuestBootDiagnostics,
 ) {
     use device_tree::DeviceTree;
 
@@ -440,29 +440,29 @@ fn validate_pre_run_boot_metadata(
     assert_eq!(
         resources.loaded_boot_source.command_line.as_str(),
         BOOT_ARGS,
-        "guest boot smoke boot args should match diagnostics"
+        "guest boot test boot args should match diagnostics"
     );
     assert_eq!(
         resources
             .loaded_boot_source
             .initrd
-            .expect("guest boot smoke initrd should be loaded")
+            .expect("guest boot test initrd should be loaded")
             .address
             .raw_value(),
         diagnostics.initrd_address,
-        "guest boot smoke initrd address should match diagnostics"
+        "guest boot test initrd address should match diagnostics"
     );
 
     let mut fdt_bytes = vec![0; resources.fdt.size];
     session
         .guest_memory()
-        .expect("guest boot smoke memory should be mapped")
+        .expect("guest boot test memory should be mapped")
         .read_slice(&mut fdt_bytes, resources.fdt.address)
-        .expect("guest boot smoke FDT bytes should read");
-    let tree = DeviceTree::load(&fdt_bytes).expect("guest boot smoke FDT should parse");
+        .expect("guest boot test FDT bytes should read");
+    let tree = DeviceTree::load(&fdt_bytes).expect("guest boot test FDT should parse");
     let chosen = tree
         .find("/chosen")
-        .expect("guest boot smoke FDT should contain /chosen");
+        .expect("guest boot test FDT should contain /chosen");
     assert_eq!(chosen.prop_str("bootargs").unwrap(), BOOT_ARGS);
     assert_eq!(
         chosen.prop_u64("linux,initrd-start").unwrap(),
@@ -476,7 +476,7 @@ fn validate_pre_run_boot_metadata(
     let serial_node_path = format!("/uart@{:x}", diagnostics.serial_mmio_base);
     let serial = tree
         .find(&serial_node_path)
-        .expect("guest boot smoke FDT should contain serial node");
+        .expect("guest boot test FDT should contain serial node");
     assert_eq!(serial.prop_str("compatible").unwrap(), "ns16550a");
     assert_eq!(
         prop_u64_cells(serial, "reg"),
@@ -526,14 +526,14 @@ fn prop_u64_cells(node: &device_tree::Node, name: &str) -> Vec<u64> {
 fn env_path(name: &str) -> std::path::PathBuf {
     std::env::var_os(name)
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| panic!("{name} must be set by scripts/run-guest-boot-smoke.sh"))
+        .unwrap_or_else(|| panic!("{name} must be set by scripts/run-guest-boot-tests.sh"))
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn serial_contains_marker(output: &bangbang_runtime::serial::SharedSerialOutputBuffer) -> bool {
     output
         .bytes()
-        .expect("guest boot smoke serial output should read")
+        .expect("guest boot test serial output should read")
         .windows(BOOT_MARKER.len())
         .any(|window| window == BOOT_MARKER)
 }
@@ -548,13 +548,13 @@ fn bytes_contain_marker(bytes: &[u8]) -> bool {
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 mod tests {
     use super::{
-        SmokeBootDiagnostics, SmokeFailureReport, SmokeRunDiagnostics, bytes_contain_marker,
-        run_loop_completed_steps,
+        GuestBootDiagnostics, GuestBootFailureReport, GuestBootRunDiagnostics,
+        bytes_contain_marker, run_loop_completed_steps,
     };
 
     #[test]
-    fn smoke_run_diagnostics_classifies_outer_timeout_after_handled_steps() {
-        let mut diagnostics = SmokeRunDiagnostics::default();
+    fn guest_boot_run_diagnostics_classifies_outer_timeout_after_handled_steps() {
+        let mut diagnostics = GuestBootRunDiagnostics::default();
         let outcome = bangbang_hvf::HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 1 };
         diagnostics.record_step(&bangbang_hvf::HvfVcpuRunStepOutcome::VtimerActivated);
         diagnostics.record_loop_outcome(&outcome);
@@ -577,8 +577,8 @@ mod tests {
     }
 
     #[test]
-    fn smoke_run_diagnostics_classifies_watchdog_cancellation() {
-        let mut diagnostics = SmokeRunDiagnostics::default();
+    fn guest_boot_run_diagnostics_classifies_watchdog_cancellation() {
+        let mut diagnostics = GuestBootRunDiagnostics::default();
         let outcome = bangbang_hvf::HvfArm64BootRunLoopOutcome::Stopped { steps: 1 };
         diagnostics.record_step(&bangbang_hvf::HvfVcpuRunStepOutcome::Canceled);
         diagnostics.record_loop_outcome(&outcome);
@@ -602,8 +602,8 @@ mod tests {
     }
 
     #[test]
-    fn smoke_failure_report_includes_boot_and_run_context() {
-        let boot = SmokeBootDiagnostics {
+    fn guest_boot_failure_report_includes_boot_and_run_context() {
+        let boot = GuestBootDiagnostics {
             kernel_path: "/tmp/vmlinux".into(),
             initrd_path: "/tmp/initrd.cpio".into(),
             boot_args: super::BOOT_ARGS,
@@ -616,7 +616,7 @@ mod tests {
             serial_mmio_size: 4096,
             serial_interrupt_line: 32,
         };
-        let mut run = SmokeRunDiagnostics::default();
+        let mut run = GuestBootRunDiagnostics::default();
         run.finish(
             std::time::Duration::from_secs(30),
             false,
@@ -626,7 +626,7 @@ mod tests {
             None,
         );
 
-        let report = SmokeFailureReport::new(&boot, &run).to_string();
+        let report = GuestBootFailureReport::new(&boot, &run).to_string();
 
         assert!(report.contains("classification: outer-timeout-without-terminal-outcome"));
         assert!(report.contains("kernel path: /tmp/vmlinux"));

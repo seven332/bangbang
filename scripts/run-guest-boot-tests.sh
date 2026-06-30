@@ -3,10 +3,10 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/run-guest-boot-smoke.sh [--allow-unsupported] [-- TEST_ARGS...]
+Usage: scripts/run-guest-boot-tests.sh [--allow-unsupported] [-- TEST_ARGS...]
 
 Prepare the pinned Firecracker kernel and generated initrd, build and sign the
-bangbang-hvf guest boot smoke integration test, then run it when the host
+bangbang-hvf guest boot integration test, then run it when the host
 supports Hypervisor.framework VM execution.
 
 Options:
@@ -48,7 +48,7 @@ if [[ "${#test_args[@]}" -gt 0 ]]; then
   for test_arg in "${test_args[@]}"; do
     case "$test_arg" in
       --test-threads | --test-threads=*)
-        echo "scripts/run-guest-boot-smoke.sh controls --test-threads and always uses 1" >&2
+        echo "scripts/run-guest-boot-tests.sh controls --test-threads and always uses 1" >&2
         exit 2
         ;;
     esac
@@ -58,14 +58,14 @@ fi
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/bangbang-guest-boot-smoke.XXXXXX")"
+tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/bangbang-guest-boot.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
 
 finish_unsupported() {
   local message="$1"
 
   if [[ "$allow_unsupported" == true ]]; then
-    echo "$message; skipping signed guest boot smoke test"
+    echo "$message; skipping signed guest boot integration test"
     exit 0
   fi
 
@@ -77,16 +77,16 @@ host_os="$(uname -s)"
 host_arch="$(uname -m)"
 
 if [[ "$host_os" != "Darwin" ]]; then
-  finish_unsupported "guest boot smoke tests require macOS; found $host_os $host_arch"
+  finish_unsupported "guest boot integration tests require macOS; found $host_os $host_arch"
 fi
 
 if ! command -v python3 >/dev/null 2>&1; then
-  echo "python3 is required to prepare guest boot smoke artifacts" >&2
+  echo "python3 is required to prepare guest boot test artifacts" >&2
   exit 1
 fi
 
 if ! command -v codesign >/dev/null 2>&1; then
-  echo "codesign is required to sign guest boot smoke tests" >&2
+  echo "codesign is required to sign guest boot integration tests" >&2
   exit 1
 fi
 
@@ -110,7 +110,7 @@ EOF
 cargo_messages="$tmp_dir/cargo-test.json"
 cargo test \
   -p bangbang-hvf \
-  --test guest_boot_smoke \
+  --test guest_boot \
   --all-features \
   --locked \
   --target "$target_triple" \
@@ -132,7 +132,7 @@ with open(sys.argv[1], encoding="utf-8") as messages:
         if (
             message.get("reason") == "compiler-artifact"
             and executable is not None
-            and target.get("name") == "guest_boot_smoke"
+            and target.get("name") == "guest_boot"
             and "test" in target.get("kind", [])
         ):
             sys.stdout.write(executable)
@@ -147,7 +147,7 @@ while IFS= read -r -d "" test_bin; do
 done < "$test_bins_file"
 
 if [[ "${#test_bins[@]}" -eq 0 ]]; then
-  echo "failed to locate bangbang-hvf guest boot smoke test executable" >&2
+  echo "failed to locate bangbang-hvf guest boot integration test executable" >&2
   exit 1
 fi
 
@@ -161,7 +161,7 @@ for index in "${!test_bins[@]}"; do
 done
 
 if [[ "$host_arch" != "arm64" ]]; then
-  finish_unsupported "guest boot smoke tests require Apple Silicon; found $host_os $host_arch"
+  finish_unsupported "guest boot integration tests require Apple Silicon; found $host_os $host_arch"
 fi
 
 hv_support="$(sysctl -n kern.hv_support 2>/dev/null || sysctl -n kern.hv.supported 2>/dev/null || true)"
