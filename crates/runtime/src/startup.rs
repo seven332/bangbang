@@ -279,7 +279,7 @@ impl Arm64BootNetworkNotificationDispatch {
 
 #[derive(Debug)]
 pub enum Arm64BootNetworkNotificationOutcome {
-    Dispatched(VirtioNetworkDeviceNotificationDispatch),
+    Dispatched(Box<VirtioNetworkDeviceNotificationDispatch>),
     DispatchFailed(VirtioNetworkDeviceNotificationError),
     HandlerLookupFailed(MmioHandlerLookupError),
 }
@@ -288,16 +288,20 @@ impl Arm64BootNetworkNotificationOutcome {
     pub fn needs_queue_interrupt(&self) -> bool {
         match self {
             Self::Dispatched(dispatch) => dispatch.needs_queue_interrupt(),
-            Self::DispatchFailed(source) => source
-                .completed_tx_dispatch()
-                .is_some_and(crate::network::VirtioNetworkTxQueueDispatch::needs_queue_interrupt),
+            Self::DispatchFailed(source) => {
+                source.completed_tx_dispatch().is_some_and(
+                    crate::network::VirtioNetworkTxQueueDispatch::needs_queue_interrupt,
+                ) || source.completed_rx_dispatch().is_some_and(
+                    crate::network::VirtioNetworkRxQueueDispatch::needs_queue_interrupt,
+                )
+            }
             Self::HandlerLookupFailed(_) => false,
         }
     }
 
-    pub const fn dispatched(&self) -> Option<&VirtioNetworkDeviceNotificationDispatch> {
+    pub fn dispatched(&self) -> Option<&VirtioNetworkDeviceNotificationDispatch> {
         match self {
-            Self::Dispatched(dispatch) => Some(dispatch),
+            Self::Dispatched(dispatch) => Some(dispatch.as_ref()),
             Self::DispatchFailed(_) | Self::HandlerLookupFailed(_) => None,
         }
     }
@@ -407,7 +411,9 @@ impl Arm64BootRuntimeResources {
             let region_id = device.registration.region_id();
             let outcome = match mmio_dispatcher.handler_mut::<VirtioNetworkMmioHandler>(region_id) {
                 Ok(handler) => match handler.dispatch_network_queue_notifications(memory) {
-                    Ok(dispatch) => Arm64BootNetworkNotificationOutcome::Dispatched(dispatch),
+                    Ok(dispatch) => {
+                        Arm64BootNetworkNotificationOutcome::Dispatched(Box::new(dispatch))
+                    }
                     Err(source) => Arm64BootNetworkNotificationOutcome::DispatchFailed(source),
                 },
                 Err(source) => Arm64BootNetworkNotificationOutcome::HandlerLookupFailed(source),
