@@ -899,7 +899,8 @@ mod tests {
     };
     use crate::network::{
         NetworkInterfaceConfigInput, NetworkInterfaceConfigs, NetworkMmioDeviceRegistration,
-        NetworkMmioLayout, PreparedNetworkDevices,
+        NetworkMmioLayout, PreparedNetworkDevices, VIRTIO_NET_RX_QUEUE_INDEX,
+        VIRTIO_NET_TX_HEADER_SIZE, VIRTIO_NET_TX_QUEUE_INDEX,
     };
     use crate::serial::{
         SERIAL_MMIO_DEVICE_WINDOW_SIZE, SERIAL_TRANSMIT_REGISTER_OFFSET, SerialMmioDevice,
@@ -932,6 +933,9 @@ mod tests {
     const HEADER_ADDR: GuestAddress = GuestAddress::new(0x8043_0000);
     const DATA_ADDR: GuestAddress = GuestAddress::new(0x8044_0000);
     const STATUS_ADDR: GuestAddress = GuestAddress::new(0x8045_0000);
+    const TEST_RX_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x8046_0000);
+    const TEST_RX_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x8047_0000);
+    const TEST_RX_USED_RING: GuestAddress = GuestAddress::new(0x8048_0000);
     const TEST_AVAILABLE_RING_IDX_OFFSET: u64 = 2;
     const TEST_AVAILABLE_RING_RING_OFFSET: u64 = 4;
     const TEST_AVAILABLE_RING_ENTRY_SIZE: u64 = 2;
@@ -1200,6 +1204,65 @@ mod tests {
         }
     }
 
+    fn write_boot_network_mmio_u32(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        device_index: usize,
+        register: VirtioMmioRegister,
+        value: u32,
+    ) {
+        try_write_boot_network_mmio_u32(runtime, mmio_dispatcher, device_index, register, value)
+            .expect("network MMIO write should dispatch");
+    }
+
+    fn try_write_boot_network_mmio_u32(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        device_index: usize,
+        register: VirtioMmioRegister,
+        value: u32,
+    ) -> Result<MmioDispatchOutcome, crate::mmio::MmioDispatchError> {
+        let address = runtime.network_devices[device_index]
+            .registration
+            .address()
+            .checked_add(register.offset())
+            .expect("test MMIO address should not overflow");
+        let access = mmio_dispatcher
+            .lookup(address, 4)
+            .expect("network MMIO access should resolve");
+        let data = MmioAccessBytes::new(&value.to_le_bytes()).expect("u32 bytes should be valid");
+        mmio_dispatcher.dispatch(
+            MmioOperation::write(access, data).expect("u32 write operation should be valid"),
+        )
+    }
+
+    fn read_boot_network_mmio_u32(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        device_index: usize,
+        register: VirtioMmioRegister,
+    ) -> u32 {
+        let address = runtime.network_devices[device_index]
+            .registration
+            .address()
+            .checked_add(register.offset())
+            .expect("test MMIO address should not overflow");
+        let access = mmio_dispatcher
+            .lookup(address, 4)
+            .expect("network MMIO access should resolve");
+        let outcome = mmio_dispatcher
+            .dispatch(MmioOperation::read(access).expect("u32 read operation should be valid"))
+            .expect("network MMIO read should dispatch");
+        match outcome {
+            MmioDispatchOutcome::Read { data } => u32::from_le_bytes(
+                data.as_slice()
+                    .try_into()
+                    .expect("u32 read should return four bytes"),
+            ),
+            MmioDispatchOutcome::Write => panic!("read operation should not produce write outcome"),
+        }
+    }
+
     fn configure_boot_block_queue(
         runtime: &mut super::Arm64BootRuntimeResources,
         mmio_dispatcher: &mut MmioDispatcher,
@@ -1271,6 +1334,112 @@ mod tests {
         );
     }
 
+    fn configure_boot_network_queue(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        device_index: usize,
+        queue_index: usize,
+        descriptor_table: GuestAddress,
+        driver_ring: GuestAddress,
+        device_ring: GuestAddress,
+    ) {
+        write_boot_network_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::QueueSel,
+            u32::try_from(queue_index).expect("queue index should fit"),
+        );
+        write_boot_network_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::QueueNum,
+            u32::from(TEST_QUEUE_SIZE),
+        );
+        write_boot_network_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::QueueDescLow,
+            guest_address_low(descriptor_table),
+        );
+        write_boot_network_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::QueueDriverLow,
+            guest_address_low(driver_ring),
+        );
+        write_boot_network_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::QueueDeviceLow,
+            guest_address_low(device_ring),
+        );
+        write_boot_network_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::QueueReady,
+            1,
+        );
+    }
+
+    fn configure_boot_network_queues(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        device_index: usize,
+    ) {
+        write_boot_network_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+        );
+        write_boot_network_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+        );
+        write_boot_network_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::Status,
+            QUEUE_CONFIG_STATUS,
+        );
+        configure_boot_network_queue(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VIRTIO_NET_RX_QUEUE_INDEX,
+            TEST_RX_DESCRIPTOR_TABLE,
+            TEST_RX_AVAILABLE_RING,
+            TEST_RX_USED_RING,
+        );
+        configure_boot_network_queue(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VIRTIO_NET_TX_QUEUE_INDEX,
+            TEST_DESCRIPTOR_TABLE,
+            TEST_AVAILABLE_RING,
+            TEST_USED_RING,
+        );
+        write_boot_network_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::Status,
+            DRIVER_OK_STATUS,
+        );
+    }
+
     fn notify_boot_block_queue(
         runtime: &mut super::Arm64BootRuntimeResources,
         mmio_dispatcher: &mut MmioDispatcher,
@@ -1282,6 +1451,20 @@ mod tests {
             device_index,
             VirtioMmioRegister::QueueNotify,
             0,
+        );
+    }
+
+    fn notify_boot_network_tx_queue(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        device_index: usize,
+    ) {
+        write_boot_network_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::QueueNotify,
+            u32::try_from(VIRTIO_NET_TX_QUEUE_INDEX).expect("TX queue index should fit"),
         );
     }
 
@@ -1354,6 +1537,22 @@ mod tests {
             TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
         );
         write_available_heads(memory, &[0, TEST_QUEUE_SIZE]);
+    }
+
+    fn write_queued_tx_frame(memory: &mut crate::memory::GuestMemory) {
+        memory
+            .write_slice(&[0; VIRTIO_NET_TX_HEADER_SIZE as usize], HEADER_ADDR)
+            .expect("TX header should write");
+        memory
+            .write_slice(&[0x45, 0, 0, 0], DATA_ADDR)
+            .expect("TX payload should write");
+        write_descriptor(
+            memory,
+            0,
+            TestDescriptor::readable(HEADER_ADDR, VIRTIO_NET_TX_HEADER_SIZE, Some(1)),
+        );
+        write_descriptor(memory, 1, TestDescriptor::readable(DATA_ADDR, 4, None));
+        write_available_heads(memory, &[0]);
     }
 
     fn write_request_header(
@@ -1769,6 +1968,61 @@ mod tests {
         assert_eq!(dispatch.drained_notifications(), []);
         assert!(dispatch.tx_queue_dispatch().is_none());
         assert!(!device_dispatch.needs_queue_interrupt());
+    }
+
+    #[test]
+    fn boot_runtime_network_notification_dispatch_executes_tx_queue() {
+        let kernel = temp_file("kernel-network-tx-dispatch", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        add_network(&mut controller, "eth0", "tap0");
+        let config = Arm64BootResourceConfig {
+            network_interrupt_lines: &[line(33)],
+            ..valid_config(&[])
+        };
+        let resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
+        let mut runtime = parts.runtime;
+        configure_boot_network_queues(&mut runtime, &mut mmio_dispatcher, 0);
+        write_queued_tx_frame(&mut memory);
+        notify_boot_network_tx_queue(&mut runtime, &mut mmio_dispatcher, 0);
+
+        let dispatches = runtime
+            .dispatch_network_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("network dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 1);
+        assert!(dispatches.needs_queue_interrupt());
+        let device_dispatch = &dispatches.as_slice()[0];
+        assert_eq!(device_dispatch.device().registration.iface_id(), "eth0");
+        assert_eq!(device_dispatch.device().fdt_device.interrupt_line, line(33));
+        let dispatch = device_dispatch
+            .outcome()
+            .dispatched()
+            .expect("queued TX notification should dispatch");
+        assert_eq!(
+            dispatch.drained_notifications(),
+            [VIRTIO_NET_TX_QUEUE_INDEX]
+        );
+        let tx_dispatch = dispatch
+            .tx_queue_dispatch()
+            .expect("TX dispatch summary should be present");
+        assert_eq!(tx_dispatch.processed_frames(), 1);
+        assert_eq!(tx_dispatch.successful_frames(), 1);
+        assert_eq!(tx_dispatch.parse_failures(), 0);
+        assert_eq!(tx_dispatch.frames()[0].payload_len(), 4);
+        assert!(device_dispatch.needs_queue_interrupt());
+        assert_eq!(
+            read_boot_network_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                0,
+                VirtioMmioRegister::InterruptStatus
+            ),
+            DeviceInterruptKind::Queue.status().bits()
+        );
     }
 
     #[test]
