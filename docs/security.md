@@ -146,9 +146,9 @@ The current scaffold does not implement:
 - a Firecracker-jailer replacement
 - privilege dropping
 - host resource brokering
-- network, vsock, MMDS, or snapshot containment; the current internal network
-  interface model validates configuration strings only and does not open host
-  networking resources
+- network, vsock, MMDS, or snapshot containment; the current network interface
+  configuration path validates and stores configuration strings only and does
+  not open host networking resources
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 

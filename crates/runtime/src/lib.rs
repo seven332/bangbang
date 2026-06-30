@@ -72,6 +72,7 @@ pub enum VmmAction {
     PutMachineConfig(machine::MachineConfigInput),
     PutMetrics(metrics::MetricsConfigInput),
     PutDrive(block::DriveConfigInput),
+    PutNetworkInterface(network::NetworkInterfaceConfigInput),
 }
 
 impl VmmAction {
@@ -88,6 +89,7 @@ impl VmmAction {
             Self::PutMachineConfig(_) => "PutMachineConfig",
             Self::PutMetrics(_) => "PutMetrics",
             Self::PutDrive(_) => "PutDrive",
+            Self::PutNetworkInterface(_) => "PutNetworkInterface",
         }
     }
 }
@@ -106,6 +108,7 @@ pub struct VmConfiguration {
     machine_config: machine::MachineConfig,
     boot_source_config: Option<boot::BootSourceConfig>,
     drive_configs: Vec<block::DriveConfig>,
+    network_interface_configs: Vec<network::NetworkInterfaceConfig>,
 }
 
 impl VmConfiguration {
@@ -113,11 +116,13 @@ impl VmConfiguration {
         machine_config: machine::MachineConfig,
         boot_source_config: Option<boot::BootSourceConfig>,
         drive_configs: Vec<block::DriveConfig>,
+        network_interface_configs: Vec<network::NetworkInterfaceConfig>,
     ) -> Self {
         Self {
             machine_config,
             boot_source_config,
             drive_configs,
+            network_interface_configs,
         }
     }
 
@@ -131,6 +136,10 @@ impl VmConfiguration {
 
     pub fn drive_configs(&self) -> &[block::DriveConfig] {
         &self.drive_configs
+    }
+
+    pub fn network_interface_configs(&self) -> &[network::NetworkInterfaceConfig] {
+        &self.network_interface_configs
     }
 }
 
@@ -149,6 +158,7 @@ pub enum VmmActionError {
     MachineConfig(machine::MachineConfigError),
     MetricsConfig(metrics::MetricsConfigError),
     MetricsFlush(metrics::MetricsFlushError),
+    NetworkInterfaceConfig(network::NetworkInterfaceConfigError),
 }
 
 impl fmt::Display for VmmActionError {
@@ -173,6 +183,7 @@ impl fmt::Display for VmmActionError {
             Self::MachineConfig(err) => write!(f, "{err}"),
             Self::MetricsConfig(err) => write!(f, "{err}"),
             Self::MetricsFlush(err) => write!(f, "{err}"),
+            Self::NetworkInterfaceConfig(err) => write!(f, "{err}"),
         }
     }
 }
@@ -187,6 +198,7 @@ impl std::error::Error for VmmActionError {
             Self::MachineConfig(err) => Some(err),
             Self::MetricsConfig(err) => Some(err),
             Self::MetricsFlush(err) => Some(err),
+            Self::NetworkInterfaceConfig(err) => Some(err),
             Self::MissingBootSource
             | Self::UnsupportedAction(_)
             | Self::UnsupportedState { .. } => None,
@@ -200,6 +212,7 @@ pub struct VmmController {
     machine_config: machine::MachineConfig,
     boot_source_config: Option<boot::BootSourceConfig>,
     drive_configs: block::DriveConfigs,
+    network_interface_configs: network::NetworkInterfaceConfigs,
     logger_state: logger::LoggerState,
     metrics_state: metrics::MetricsState,
 }
@@ -220,6 +233,7 @@ impl VmmController {
             machine_config: machine::MachineConfig::default(),
             boot_source_config: None,
             drive_configs: block::DriveConfigs::new(),
+            network_interface_configs: network::NetworkInterfaceConfigs::new(),
             logger_state: logger::LoggerState::default(),
             metrics_state: metrics::MetricsState::default(),
         }
@@ -231,6 +245,10 @@ impl VmmController {
 
     pub fn drive_configs(&self) -> &[block::DriveConfig] {
         self.drive_configs.as_slice()
+    }
+
+    pub fn network_interface_configs(&self) -> &[network::NetworkInterfaceConfig] {
+        self.network_interface_configs.as_slice()
     }
 
     pub const fn machine_config(&self) -> machine::MachineConfig {
@@ -246,6 +264,7 @@ impl VmmController {
             self.machine_config,
             self.boot_source_config.clone(),
             self.drive_configs.as_slice().to_vec(),
+            self.network_interface_configs.as_slice().to_vec(),
         )
     }
 
@@ -376,6 +395,20 @@ impl VmmController {
 
                 Ok(VmmData::Empty)
             }
+            VmmAction::PutNetworkInterface(config) => {
+                if self.instance_info.state != InstanceState::NotStarted {
+                    return Err(VmmActionError::UnsupportedState {
+                        action: action_name,
+                        state: self.instance_info.state,
+                    });
+                }
+
+                self.network_interface_configs
+                    .insert(config)
+                    .map_err(VmmActionError::NetworkInterfaceConfig)?;
+
+                Ok(VmmData::Empty)
+            }
         }
     }
 }
@@ -421,10 +454,15 @@ mod tests {
         logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel},
         machine::{DEFAULT_MEM_SIZE_MIB, DEFAULT_VCPU_COUNT, MachineConfigInput},
         metrics::{MetricsConfigError, MetricsConfigInput},
+        network::{GuestMacAddress, NetworkInterfaceConfigError, NetworkInterfaceConfigInput},
     };
 
     fn drive_input(id: &str, path: &str, is_root_device: bool) -> DriveConfigInput {
         DriveConfigInput::new(id, id, path, is_root_device)
+    }
+
+    fn network_input(id: &str, host_dev_name: &str) -> NetworkInterfaceConfigInput {
+        NetworkInterfaceConfigInput::new(id, id, host_dev_name)
     }
 
     fn boot_source_input(kernel_image_path: &str) -> BootSourceConfigInput {
@@ -484,6 +522,7 @@ mod tests {
         );
         assert_eq!(controller.boot_source_config(), None);
         assert!(controller.drive_configs().is_empty());
+        assert!(controller.network_interface_configs().is_empty());
     }
 
     #[test]
@@ -546,9 +585,11 @@ mod tests {
         assert_eq!(config.machine_config().mem_size_mib(), DEFAULT_MEM_SIZE_MIB);
         assert_eq!(config.boot_source_config(), None);
         assert!(config.drive_configs().is_empty());
+        assert!(config.network_interface_configs().is_empty());
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
         assert!(controller.boot_source_config().is_none());
         assert!(controller.drive_configs().is_empty());
+        assert!(controller.network_interface_configs().is_empty());
     }
 
     #[test]
@@ -571,6 +612,11 @@ mod tests {
                 true,
             )))
             .expect("drive config should be stored");
+        controller
+            .handle_action(VmmAction::PutNetworkInterface(
+                network_input("eth0", "tap0").with_guest_mac("12:34:56:78:9a:bc"),
+            ))
+            .expect("network interface config should be stored");
 
         let data = controller
             .handle_action(VmmAction::GetVmConfig)
@@ -599,6 +645,18 @@ mod tests {
             config.drive_configs()[0].path_on_host(),
             Path::new("/tmp/rootfs.ext4")
         );
+        assert_eq!(config.network_interface_configs().len(), 1);
+        assert_eq!(config.network_interface_configs()[0].iface_id(), "eth0");
+        assert_eq!(
+            config.network_interface_configs()[0].host_dev_name(),
+            "tap0"
+        );
+        assert_eq!(
+            config.network_interface_configs()[0].guest_mac(),
+            Some(GuestMacAddress::from_bytes([
+                0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc,
+            ]))
+        );
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
     }
 
@@ -623,6 +681,7 @@ mod tests {
         assert_eq!(config.machine_config().vcpu_count(), DEFAULT_VCPU_COUNT);
         assert!(config.boot_source_config().is_some());
         assert!(config.drive_configs().is_empty());
+        assert!(config.network_interface_configs().is_empty());
     }
 
     #[test]
@@ -633,6 +692,10 @@ mod tests {
         assert_eq!(
             VmmAction::PutLogger(LoggerConfigInput::new()).name(),
             "PutLogger"
+        );
+        assert_eq!(
+            VmmAction::PutNetworkInterface(network_input("eth0", "tap0")).name(),
+            "PutNetworkInterface"
         );
     }
 
@@ -682,6 +745,7 @@ mod tests {
         assert_eq!(controller.machine_config().vcpu_count(), DEFAULT_VCPU_COUNT);
         assert!(controller.boot_source_config().is_none());
         assert!(controller.drive_configs().is_empty());
+        assert!(controller.network_interface_configs().is_empty());
     }
 
     #[test]
@@ -1633,6 +1697,120 @@ mod tests {
             }
         );
         assert!(controller.drive_configs().is_empty());
+    }
+
+    #[test]
+    fn handles_put_network_interface_config() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
+        assert_eq!(
+            controller.handle_action(VmmAction::PutNetworkInterface(
+                network_input("eth0", "tap0").with_guest_mac("12:34:56:78:9a:bc")
+            )),
+            Ok(VmmData::Empty)
+        );
+
+        assert_eq!(controller.network_interface_configs().len(), 1);
+        let config = &controller.network_interface_configs()[0];
+        assert_eq!(config.iface_id(), "eth0");
+        assert_eq!(config.host_dev_name(), "tap0");
+        assert_eq!(
+            config.guest_mac(),
+            Some(GuestMacAddress::from_bytes([
+                0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc,
+            ]))
+        );
+    }
+
+    #[test]
+    fn put_network_interface_config_replaces_duplicate_id() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutNetworkInterface(
+                network_input("eth0", "tap0").with_guest_mac("12:34:56:78:9a:bc"),
+            ))
+            .expect("initial network interface config should be stored");
+
+        controller
+            .handle_action(VmmAction::PutNetworkInterface(network_input(
+                "eth0", "tap1",
+            )))
+            .expect("duplicate interface id should replace existing config");
+
+        assert_eq!(controller.network_interface_configs().len(), 1);
+        let config = &controller.network_interface_configs()[0];
+        assert_eq!(config.iface_id(), "eth0");
+        assert_eq!(config.host_dev_name(), "tap1");
+        assert_eq!(config.guest_mac(), None);
+    }
+
+    #[test]
+    fn put_network_interface_config_rejects_duplicate_guest_mac_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutNetworkInterface(
+                network_input("eth0", "tap0").with_guest_mac("12:34:56:78:9a:bc"),
+            ))
+            .expect("initial network interface config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PutNetworkInterface(
+                network_input("eth1", "tap1").with_guest_mac("12:34:56:78:9a:BC"),
+            ))
+            .expect_err("duplicate guest MAC should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::NetworkInterfaceConfig(
+                NetworkInterfaceConfigError::GuestMacAddressInUse {
+                    guest_mac: GuestMacAddress::from_bytes([0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc,]),
+                }
+            )
+        );
+        assert_eq!(err.to_string(), "network guest_mac is already in use");
+        assert_eq!(controller.network_interface_configs().len(), 1);
+        assert_eq!(controller.network_interface_configs()[0].iface_id(), "eth0");
+    }
+
+    #[test]
+    fn put_network_interface_config_rejects_invalid_config_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
+        let err = controller
+            .handle_action(VmmAction::PutNetworkInterface(
+                NetworkInterfaceConfigInput::new("eth0", "eth0", ""),
+            ))
+            .expect_err("invalid network interface config should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::NetworkInterfaceConfig(
+                NetworkInterfaceConfigError::EmptyHostDeviceName
+            )
+        );
+        assert_eq!(err.to_string(), "network host_dev_name must not be empty");
+        assert!(controller.network_interface_configs().is_empty());
+    }
+
+    #[test]
+    fn put_network_interface_config_rejects_running_state() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller.instance_info.state = InstanceState::Running;
+
+        let err = controller
+            .handle_action(VmmAction::PutNetworkInterface(network_input(
+                "eth0", "tap0",
+            )))
+            .expect_err("running network interface config should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::UnsupportedState {
+                action: "PutNetworkInterface",
+                state: InstanceState::Running,
+            }
+        );
+        assert!(controller.network_interface_configs().is_empty());
     }
 
     #[test]

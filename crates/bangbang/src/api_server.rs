@@ -15,7 +15,8 @@ use bangbang_api::http::{
     DriveCacheType as ApiDriveCacheType, DriveConfigRequest, DriveConfigResponse,
     DriveIoEngine as ApiDriveIoEngine, HttpResponse, LoggerConfigRequest,
     LoggerLevel as ApiLoggerLevel, MachineConfigRequest, MachineConfigResponse,
-    MetricsConfigRequest, RequestError, VmConfigResponse, parse_request, request_total_len,
+    MetricsConfigRequest, NetworkInterfaceConfigRequest, NetworkInterfaceConfigResponse,
+    RequestError, VmConfigResponse, parse_request, request_total_len,
 };
 use bangbang_runtime::block::{DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine};
 use bangbang_runtime::boot::{BootSourceConfig, BootSourceConfigInput};
@@ -25,6 +26,7 @@ use bangbang_runtime::machine::{
     MachineConfigHugePages as RuntimeMachineConfigHugePages, MachineConfigInput,
 };
 use bangbang_runtime::metrics::MetricsConfigInput;
+use bangbang_runtime::network::{NetworkInterfaceConfig, NetworkInterfaceConfigInput};
 use bangbang_runtime::{VmConfiguration, VmmAction, VmmData};
 
 use crate::vmm::VmmRequestHandler;
@@ -422,6 +424,11 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PutDrive(config) => handle_empty(vmm.handle_action(VmmAction::PutDrive(
             drive_config_input_from_request(config.as_ref()),
         ))),
+        ApiRequest::PutNetworkInterface(config) => {
+            handle_empty(vmm.handle_action(VmmAction::PutNetworkInterface(
+                network_interface_config_input_from_request(config.as_ref()),
+            )))
+        }
     }
 }
 
@@ -534,6 +541,11 @@ fn vm_config_response_from_runtime(config: &VmConfiguration) -> VmConfigResponse
             .iter()
             .map(drive_config_response_from_runtime)
             .collect(),
+        config
+            .network_interface_configs()
+            .iter()
+            .map(network_interface_config_response_from_runtime)
+            .collect(),
     )
 }
 
@@ -570,6 +582,18 @@ fn drive_config_response_from_runtime(config: &DriveConfig) -> DriveConfigRespon
     );
     if let Some(partuuid) = config.partuuid() {
         response = response.with_partuuid(partuuid);
+    }
+
+    response
+}
+
+fn network_interface_config_response_from_runtime(
+    config: &NetworkInterfaceConfig,
+) -> NetworkInterfaceConfigResponse {
+    let mut response =
+        NetworkInterfaceConfigResponse::new(config.iface_id(), config.host_dev_name());
+    if let Some(guest_mac) = config.guest_mac() {
+        response = response.with_guest_mac(guest_mac.to_string());
     }
 
     response
@@ -670,6 +694,31 @@ fn drive_config_input_from_request(config: &DriveConfigRequest) -> DriveConfigIn
     }
     if let Some(socket) = config.socket() {
         input = input.with_socket(socket);
+    }
+
+    input
+}
+
+fn network_interface_config_input_from_request(
+    config: &NetworkInterfaceConfigRequest,
+) -> NetworkInterfaceConfigInput {
+    let mut input = NetworkInterfaceConfigInput::new(
+        config.path_iface_id(),
+        config.body_iface_id(),
+        config.host_dev_name(),
+    );
+
+    if let Some(guest_mac) = config.guest_mac() {
+        input = input.with_guest_mac(guest_mac);
+    }
+    if config.mtu_configured() {
+        input = input.with_mtu_configured();
+    }
+    if config.rx_rate_limiter_configured() {
+        input = input.with_rx_rate_limiter_configured();
+    }
+    if config.tx_rate_limiter_configured() {
+        input = input.with_tx_rate_limiter_configured();
     }
 
     input
@@ -979,6 +1028,11 @@ mod tests {
         );
         assert!(default_response.body().contains(r#""drives":[]"#));
         assert!(default_response.body().contains(r#""machine-config":"#));
+        assert!(
+            default_response
+                .body()
+                .contains(r#""network-interfaces":[]"#)
+        );
         assert!(default_response.body().contains(r#""vcpu_count":1"#));
         assert!(!default_response.body().contains(r#""boot-source":"#));
         assert_eq!(
@@ -1026,6 +1080,20 @@ mod tests {
             bangbang_api::http::StatusCode::NoContent
         );
 
+        let network_body = r#"{
+            "iface_id": "eth0",
+            "host_dev_name": "tap0",
+            "guest_mac": "12:34:56:78:9a:bc"
+        }"#;
+        let network_request = format!(
+            "PUT /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{network_body}",
+            network_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(network_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
         let response = handle_request_bytes(
             b"GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
             &mut vmm,
@@ -1060,6 +1128,14 @@ mod tests {
         assert!(response.body().contains(r#""is_root_device":true"#));
         assert!(response.body().contains(r#""is_read_only":true"#));
         assert!(response.body().contains(r#""partuuid":"0eaa91a0-01""#));
+        assert!(response.body().contains(r#""network-interfaces":["#));
+        assert!(response.body().contains(r#""iface_id":"eth0""#));
+        assert!(response.body().contains(r#""host_dev_name":"tap0""#));
+        assert!(
+            response
+                .body()
+                .contains(r#""guest_mac":"12:34:56:78:9a:bc""#)
+        );
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::NotStarted
@@ -1570,6 +1646,11 @@ mod tests {
                 .with_partuuid("0eaa91a0-01"),
         ))
         .expect("drive config should be stored");
+        vmm.handle_action(VmmAction::PutNetworkInterface(
+            NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0")
+                .with_guest_mac("12:34:56:78:9a:bc"),
+        ))
+        .expect("network interface config should be stored");
 
         client
             .write_all(b"GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n")
@@ -1598,6 +1679,10 @@ mod tests {
         assert!(response.contains(r#""is_root_device":true"#));
         assert!(response.contains(r#""is_read_only":true"#));
         assert!(response.contains(r#""partuuid":"0eaa91a0-01""#));
+        assert!(response.contains(r#""network-interfaces":["#));
+        assert!(response.contains(r#""iface_id":"eth0""#));
+        assert!(response.contains(r#""host_dev_name":"tap0""#));
+        assert!(response.contains(r#""guest_mac":"12:34:56:78:9a:bc""#));
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::NotStarted
@@ -1736,6 +1821,42 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
         assert!(response.contains(r#"{"fault_message":"drive path_on_host must not be empty"}"#));
         assert!(vmm.drive_configs().is_empty());
+    }
+
+    #[test]
+    fn returns_fault_for_unsupported_network_mtu_without_storing() {
+        let mut vmm = test_controller();
+        let body = r#"{
+            "iface_id": "eth0",
+            "host_dev_name": "tap0",
+            "mtu": 1500
+        }"#;
+        let request = format!(
+            "PUT /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        let response = handle_request_bytes(request.as_bytes(), &mut vmm);
+
+        assert_eq!(
+            response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+        assert_eq!(
+            response.body(),
+            r#"{"fault_message":"network mtu is not supported"}"#
+        );
+
+        let config_response = handle_request_bytes(
+            b"GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &mut vmm,
+        );
+        assert_eq!(config_response.status(), bangbang_api::http::StatusCode::Ok);
+        assert!(
+            config_response
+                .body()
+                .contains(r#""network-interfaces":[]"#)
+        );
     }
 
     #[test]
