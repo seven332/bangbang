@@ -1,14 +1,17 @@
 //! Backend-neutral network-interface configuration model.
 
+use std::collections::TryReserveError;
 use std::fmt;
 use std::str::FromStr;
 
+use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryRange};
 use crate::mmio::{MmioAccessBytes, MmioAccessBytesError, MmioHandlerError};
 use crate::virtio_mmio::{
     VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError, VirtioMmioDeviceActivationHandler,
     VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError, VirtioMmioDeviceConfigHandler,
     VirtioMmioQueueRegisterError, VirtioMmioQueueState, VirtioMmioRegisterHandler,
 };
+use crate::virtio_queue::{VirtqueueDescriptor, VirtqueueDescriptorChain};
 
 const MAC_ADDRESS_LEN: usize = 6;
 pub const VIRTIO_NET_DEVICE_ID: u32 = 1;
@@ -22,6 +25,8 @@ pub const VIRTIO_NET_CONFIG_MAC_SIZE: usize = MAC_ADDRESS_LEN;
 pub const VIRTIO_NET_F_MAC: u32 = 5;
 pub const VIRTIO_RING_FEATURE_EVENT_IDX: u32 = 29;
 pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
+pub const VIRTIO_NET_TX_HEADER_SIZE: u32 = 12;
+pub const VIRTIO_NET_MAX_BUFFER_SIZE: u64 = 65_562;
 
 const VIRTIO_NET_RX_QUEUE_INDEX_U32: u32 = 0;
 const VIRTIO_NET_TX_QUEUE_INDEX_U32: u32 = 1;
@@ -269,6 +274,302 @@ impl VirtioMmioDeviceConfigHandler for VirtioNetworkConfigSpace {
             offset: access.offset(),
             len: access.len(),
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioNetworkTxHeader {
+    flags: u8,
+    gso_type: u8,
+    header_len: u16,
+    gso_size: u16,
+    checksum_start: u16,
+    checksum_offset: u16,
+    num_buffers: u16,
+}
+
+impl VirtioNetworkTxHeader {
+    pub const fn flags(self) -> u8 {
+        self.flags
+    }
+
+    pub const fn gso_type(self) -> u8 {
+        self.gso_type
+    }
+
+    pub const fn header_len(self) -> u16 {
+        self.header_len
+    }
+
+    pub const fn gso_size(self) -> u16 {
+        self.gso_size
+    }
+
+    pub const fn checksum_start(self) -> u16 {
+        self.checksum_start
+    }
+
+    pub const fn checksum_offset(self) -> u16 {
+        self.checksum_offset
+    }
+
+    pub const fn num_buffers(self) -> u16 {
+        self.num_buffers
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioNetworkTxPayloadSegment {
+    descriptor_index: u16,
+    address: GuestAddress,
+    len: u32,
+}
+
+impl VirtioNetworkTxPayloadSegment {
+    const fn new(descriptor_index: u16, address: GuestAddress, len: u32) -> Self {
+        Self {
+            descriptor_index,
+            address,
+            len,
+        }
+    }
+
+    pub const fn descriptor_index(self) -> u16 {
+        self.descriptor_index
+    }
+
+    pub const fn address(self) -> GuestAddress {
+        self.address
+    }
+
+    pub const fn len(self) -> u32 {
+        self.len
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioNetworkTxFrame {
+    descriptor_head: u16,
+    header: VirtioNetworkTxHeader,
+    payload_segments: Vec<VirtioNetworkTxPayloadSegment>,
+    payload_len: u64,
+}
+
+impl VirtioNetworkTxFrame {
+    pub fn parse(
+        memory: &GuestMemory,
+        chain: &VirtqueueDescriptorChain,
+    ) -> Result<Self, VirtioNetworkTxFrameParseError> {
+        let header_descriptor = network_descriptor_at(chain, 0, 1)?;
+        validate_tx_header_descriptor(header_descriptor)?;
+        let header = read_virtio_network_tx_header(memory, header_descriptor)?;
+
+        let mut payload_segments = Vec::new();
+        payload_segments
+            .try_reserve_exact(chain.len())
+            .map_err(
+                |source| VirtioNetworkTxFrameParseError::PayloadSegmentsAllocationFailed {
+                    descriptor_count: chain.len(),
+                    source,
+                },
+            )?;
+
+        let mut payload_len = 0;
+        if let Some(segment) = header_descriptor_payload_segment(header_descriptor)? {
+            payload_len =
+                push_tx_payload_segment(memory, &mut payload_segments, payload_len, segment)?;
+        }
+
+        for descriptor in chain.descriptors().iter().skip(1) {
+            validate_tx_payload_descriptor(descriptor)?;
+            let segment = VirtioNetworkTxPayloadSegment::new(
+                descriptor.index(),
+                descriptor.address(),
+                descriptor.len(),
+            );
+            payload_len =
+                push_tx_payload_segment(memory, &mut payload_segments, payload_len, segment)?;
+        }
+
+        if payload_segments.is_empty() {
+            return Err(VirtioNetworkTxFrameParseError::MissingPayload {
+                descriptor_head: header_descriptor.index(),
+            });
+        }
+
+        Ok(Self {
+            descriptor_head: header_descriptor.index(),
+            header,
+            payload_segments,
+            payload_len,
+        })
+    }
+
+    pub const fn descriptor_head(&self) -> u16 {
+        self.descriptor_head
+    }
+
+    pub const fn header(&self) -> VirtioNetworkTxHeader {
+        self.header
+    }
+
+    pub fn payload_segments(&self) -> &[VirtioNetworkTxPayloadSegment] {
+        &self.payload_segments
+    }
+
+    pub const fn payload_len(&self) -> u64 {
+        self.payload_len
+    }
+
+    pub fn frame_len(&self) -> u64 {
+        u64::from(VIRTIO_NET_TX_HEADER_SIZE) + self.payload_len
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioNetworkTxFrameParseError {
+    DescriptorChainTooShort {
+        expected: usize,
+        actual: usize,
+    },
+    HeaderDescriptorWriteOnly {
+        index: u16,
+    },
+    HeaderDescriptorTooSmall {
+        index: u16,
+        len: u32,
+        min: u32,
+    },
+    InvalidHeaderLayout,
+    ReadHeader {
+        address: GuestAddress,
+        source: GuestMemoryAccessError,
+    },
+    MissingPayload {
+        descriptor_head: u16,
+    },
+    PayloadDescriptorWriteOnly {
+        index: u16,
+    },
+    PayloadDescriptorEmpty {
+        index: u16,
+    },
+    PayloadDescriptorRangeOverflow {
+        index: u16,
+        address: GuestAddress,
+        len: u32,
+    },
+    PayloadDescriptorAccess {
+        index: u16,
+        address: GuestAddress,
+        len: u32,
+        source: GuestMemoryAccessError,
+    },
+    FrameTooLarge {
+        len: u64,
+        max: u64,
+    },
+    PayloadSegmentsAllocationFailed {
+        descriptor_count: usize,
+        source: TryReserveError,
+    },
+}
+
+impl fmt::Display for VirtioNetworkTxFrameParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DescriptorChainTooShort { expected, actual } => {
+                write!(
+                    f,
+                    "virtio-net TX descriptor chain has {actual} descriptors; expected at least {expected}"
+                )
+            }
+            Self::HeaderDescriptorWriteOnly { index } => {
+                write!(f, "virtio-net TX header descriptor {index} is write-only")
+            }
+            Self::HeaderDescriptorTooSmall { index, len, min } => {
+                write!(
+                    f,
+                    "virtio-net TX header descriptor {index} has length {len}; expected at least {min}"
+                )
+            }
+            Self::InvalidHeaderLayout => f.write_str("virtio-net TX header layout is invalid"),
+            Self::ReadHeader { address, source } => {
+                write!(
+                    f,
+                    "failed to read virtio-net TX header at {address}: {source}"
+                )
+            }
+            Self::MissingPayload { descriptor_head } => {
+                write!(
+                    f,
+                    "virtio-net TX descriptor chain headed by {descriptor_head} has no packet payload"
+                )
+            }
+            Self::PayloadDescriptorWriteOnly { index } => {
+                write!(f, "virtio-net TX payload descriptor {index} is write-only")
+            }
+            Self::PayloadDescriptorEmpty { index } => {
+                write!(f, "virtio-net TX payload descriptor {index} is empty")
+            }
+            Self::PayloadDescriptorRangeOverflow {
+                index,
+                address,
+                len,
+            } => {
+                write!(
+                    f,
+                    "virtio-net TX payload descriptor {index} at {address} with length {len} overflows address space"
+                )
+            }
+            Self::PayloadDescriptorAccess {
+                index,
+                address,
+                len,
+                source,
+            } => {
+                write!(
+                    f,
+                    "virtio-net TX payload descriptor {index} at {address} with length {len} is not fully mapped: {source}"
+                )
+            }
+            Self::FrameTooLarge { len, max } => {
+                write!(f, "virtio-net TX frame length {len} exceeds maximum {max}")
+            }
+            Self::PayloadSegmentsAllocationFailed {
+                descriptor_count,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to reserve virtio-net TX payload segment storage for {descriptor_count} descriptors: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioNetworkTxFrameParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ReadHeader { source, .. } | Self::PayloadDescriptorAccess { source, .. } => {
+                Some(source)
+            }
+            Self::PayloadSegmentsAllocationFailed { source, .. } => Some(source),
+            Self::DescriptorChainTooShort { .. }
+            | Self::HeaderDescriptorWriteOnly { .. }
+            | Self::HeaderDescriptorTooSmall { .. }
+            | Self::InvalidHeaderLayout
+            | Self::MissingPayload { .. }
+            | Self::PayloadDescriptorWriteOnly { .. }
+            | Self::PayloadDescriptorEmpty { .. }
+            | Self::PayloadDescriptorRangeOverflow { .. }
+            | Self::FrameTooLarge { .. } => None,
+        }
     }
 }
 
@@ -569,6 +870,181 @@ fn network_config_bytes_error(source: MmioAccessBytesError) -> VirtioMmioDeviceC
     }
 }
 
+fn network_descriptor_at(
+    chain: &VirtqueueDescriptorChain,
+    index: usize,
+    expected: usize,
+) -> Result<&VirtqueueDescriptor, VirtioNetworkTxFrameParseError> {
+    chain
+        .descriptors()
+        .get(index)
+        .ok_or(VirtioNetworkTxFrameParseError::DescriptorChainTooShort {
+            expected,
+            actual: chain.len(),
+        })
+}
+
+fn validate_tx_header_descriptor(
+    descriptor: &VirtqueueDescriptor,
+) -> Result<(), VirtioNetworkTxFrameParseError> {
+    if descriptor.is_write_only() {
+        return Err(VirtioNetworkTxFrameParseError::HeaderDescriptorWriteOnly {
+            index: descriptor.index(),
+        });
+    }
+
+    if descriptor.len() < VIRTIO_NET_TX_HEADER_SIZE {
+        return Err(VirtioNetworkTxFrameParseError::HeaderDescriptorTooSmall {
+            index: descriptor.index(),
+            len: descriptor.len(),
+            min: VIRTIO_NET_TX_HEADER_SIZE,
+        });
+    }
+
+    Ok(())
+}
+
+fn read_virtio_network_tx_header(
+    memory: &GuestMemory,
+    descriptor: &VirtqueueDescriptor,
+) -> Result<VirtioNetworkTxHeader, VirtioNetworkTxFrameParseError> {
+    let mut bytes = [0; VIRTIO_NET_TX_HEADER_SIZE as usize];
+    memory
+        .read_slice(&mut bytes, descriptor.address())
+        .map_err(|source| VirtioNetworkTxFrameParseError::ReadHeader {
+            address: descriptor.address(),
+            source,
+        })?;
+
+    Ok(VirtioNetworkTxHeader {
+        flags: network_header_byte(&bytes, 0)?,
+        gso_type: network_header_byte(&bytes, 1)?,
+        header_len: u16::from_le_bytes(network_header_field(&bytes, 2)?),
+        gso_size: u16::from_le_bytes(network_header_field(&bytes, 4)?),
+        checksum_start: u16::from_le_bytes(network_header_field(&bytes, 6)?),
+        checksum_offset: u16::from_le_bytes(network_header_field(&bytes, 8)?),
+        num_buffers: u16::from_le_bytes(network_header_field(&bytes, 10)?),
+    })
+}
+
+fn network_header_byte(
+    bytes: &[u8; VIRTIO_NET_TX_HEADER_SIZE as usize],
+    offset: usize,
+) -> Result<u8, VirtioNetworkTxFrameParseError> {
+    bytes
+        .get(offset)
+        .copied()
+        .ok_or(VirtioNetworkTxFrameParseError::InvalidHeaderLayout)
+}
+
+fn network_header_field<const N: usize>(
+    bytes: &[u8; VIRTIO_NET_TX_HEADER_SIZE as usize],
+    offset: usize,
+) -> Result<[u8; N], VirtioNetworkTxFrameParseError> {
+    let Some(end) = offset.checked_add(N) else {
+        return Err(VirtioNetworkTxFrameParseError::InvalidHeaderLayout);
+    };
+    let Some(source) = bytes.get(offset..end) else {
+        return Err(VirtioNetworkTxFrameParseError::InvalidHeaderLayout);
+    };
+    let mut field = [0; N];
+    field.copy_from_slice(source);
+    Ok(field)
+}
+
+fn header_descriptor_payload_segment(
+    descriptor: &VirtqueueDescriptor,
+) -> Result<Option<VirtioNetworkTxPayloadSegment>, VirtioNetworkTxFrameParseError> {
+    let payload_len = descriptor
+        .len()
+        .checked_sub(VIRTIO_NET_TX_HEADER_SIZE)
+        .ok_or(VirtioNetworkTxFrameParseError::HeaderDescriptorTooSmall {
+            index: descriptor.index(),
+            len: descriptor.len(),
+            min: VIRTIO_NET_TX_HEADER_SIZE,
+        })?;
+    if payload_len == 0 {
+        return Ok(None);
+    }
+
+    let address = descriptor
+        .address()
+        .checked_add(u64::from(VIRTIO_NET_TX_HEADER_SIZE))
+        .ok_or(
+            VirtioNetworkTxFrameParseError::PayloadDescriptorRangeOverflow {
+                index: descriptor.index(),
+                address: descriptor.address(),
+                len: payload_len,
+            },
+        )?;
+    Ok(Some(VirtioNetworkTxPayloadSegment::new(
+        descriptor.index(),
+        address,
+        payload_len,
+    )))
+}
+
+fn validate_tx_payload_descriptor(
+    descriptor: &VirtqueueDescriptor,
+) -> Result<(), VirtioNetworkTxFrameParseError> {
+    if descriptor.is_write_only() {
+        return Err(VirtioNetworkTxFrameParseError::PayloadDescriptorWriteOnly {
+            index: descriptor.index(),
+        });
+    }
+
+    if descriptor.is_empty() {
+        return Err(VirtioNetworkTxFrameParseError::PayloadDescriptorEmpty {
+            index: descriptor.index(),
+        });
+    }
+
+    Ok(())
+}
+
+fn push_tx_payload_segment(
+    memory: &GuestMemory,
+    payload_segments: &mut Vec<VirtioNetworkTxPayloadSegment>,
+    payload_len: u64,
+    segment: VirtioNetworkTxPayloadSegment,
+) -> Result<u64, VirtioNetworkTxFrameParseError> {
+    let next_payload_len = payload_len + u64::from(segment.len());
+    let next_frame_len = u64::from(VIRTIO_NET_TX_HEADER_SIZE) + next_payload_len;
+    if next_frame_len > VIRTIO_NET_MAX_BUFFER_SIZE {
+        return Err(VirtioNetworkTxFrameParseError::FrameTooLarge {
+            len: next_frame_len,
+            max: VIRTIO_NET_MAX_BUFFER_SIZE,
+        });
+    }
+
+    validate_tx_payload_segment_range(memory, segment)?;
+    payload_segments.push(segment);
+    Ok(next_payload_len)
+}
+
+fn validate_tx_payload_segment_range(
+    memory: &GuestMemory,
+    segment: VirtioNetworkTxPayloadSegment,
+) -> Result<(), VirtioNetworkTxFrameParseError> {
+    let range =
+        GuestMemoryRange::new(segment.address(), u64::from(segment.len())).map_err(|_| {
+            VirtioNetworkTxFrameParseError::PayloadDescriptorRangeOverflow {
+                index: segment.descriptor_index(),
+                address: segment.address(),
+                len: segment.len(),
+            }
+        })?;
+
+    memory.validate_mapped_range(range).map_err(|source| {
+        VirtioNetworkTxFrameParseError::PayloadDescriptorAccess {
+            index: segment.descriptor_index(),
+            address: segment.address(),
+            len: segment.len(),
+            source,
+        }
+    })
+}
+
 fn active_network_queue_state(
     activation: VirtioMmioDeviceActivation<'_>,
     queue_index: u32,
@@ -727,7 +1203,7 @@ fn validate_interface_id(
 mod tests {
     use std::str::FromStr;
 
-    use crate::memory::GuestAddress;
+    use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
     use crate::mmio::{MmioAccess, MmioAccessBytes, MmioBus, MmioRegionId};
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
@@ -738,15 +1214,21 @@ mod tests {
         VirtioMmioDeviceRegisters, VirtioMmioQueueRegisterError, VirtioMmioQueueRegisters,
         VirtioMmioRegister, VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
     };
+    use crate::virtio_queue::{
+        VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
+        VirtqueueDescriptorChain, read_descriptor_chain,
+    };
 
     use super::{
         GuestMacAddress, InterfaceIdSource, NetworkInterfaceConfig, NetworkInterfaceConfigError,
         NetworkInterfaceConfigInput, NetworkInterfaceConfigs, VIRTIO_FEATURE_VERSION_1,
-        VIRTIO_NET_CONFIG_MAC_SIZE, VIRTIO_NET_DEVICE_ID, VIRTIO_NET_F_MAC, VIRTIO_NET_QUEUE_COUNT,
-        VIRTIO_NET_QUEUE_SIZE, VIRTIO_NET_QUEUE_SIZES, VIRTIO_NET_RX_QUEUE_INDEX,
+        VIRTIO_NET_CONFIG_MAC_SIZE, VIRTIO_NET_DEVICE_ID, VIRTIO_NET_F_MAC,
+        VIRTIO_NET_MAX_BUFFER_SIZE, VIRTIO_NET_QUEUE_COUNT, VIRTIO_NET_QUEUE_SIZE,
+        VIRTIO_NET_QUEUE_SIZES, VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_HEADER_SIZE,
         VIRTIO_NET_TX_QUEUE_INDEX, VIRTIO_RING_FEATURE_EVENT_IDX, VirtioNetworkConfigSpace,
         VirtioNetworkDevice, VirtioNetworkDeviceActivationError,
-        VirtioNetworkDeviceNotificationError, VirtioNetworkMmioHandler,
+        VirtioNetworkDeviceNotificationError, VirtioNetworkMmioHandler, VirtioNetworkTxFrame,
+        VirtioNetworkTxFrameParseError,
     };
 
     const TEST_MMIO_BASE: GuestAddress = GuestAddress::new(0x1000);
@@ -756,6 +1238,10 @@ mod tests {
     const TEST_TX_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x20_0000);
     const TEST_TX_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x21_0000);
     const TEST_TX_USED_RING: GuestAddress = GuestAddress::new(0x22_0000);
+    const TEST_TX_HEADER: GuestAddress = GuestAddress::new(0x23_0000);
+    const TEST_TX_PAYLOAD: GuestAddress = GuestAddress::new(0x24_0000);
+    const TEST_TX_SECOND_PAYLOAD: GuestAddress = GuestAddress::new(0x25_0000);
+    const TEST_TX_MEMORY_SIZE: u64 = 0x30_0000;
     const TEST_QUEUE_SIZE: u16 = 8;
     const TEST_RETRY_QUEUE_SIZE: u16 = 16;
     const QUEUE_CONFIG_STATUS: u32 = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
@@ -1030,6 +1516,117 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Copy)]
+    struct TestDescriptor {
+        address: GuestAddress,
+        len: u32,
+        flags: u16,
+        next: u16,
+    }
+
+    impl TestDescriptor {
+        const fn readable(address: GuestAddress, len: u32, next: Option<u16>) -> Self {
+            let (flags, next_index) = match next {
+                Some(index) => (VIRTQUEUE_DESC_F_NEXT, index),
+                None => (0, 0),
+            };
+            Self {
+                address,
+                len,
+                flags,
+                next: next_index,
+            }
+        }
+
+        const fn writable(address: GuestAddress, len: u32, next: Option<u16>) -> Self {
+            let (flags, next_index) = match next {
+                Some(index) => (VIRTQUEUE_DESC_F_WRITE | VIRTQUEUE_DESC_F_NEXT, index),
+                None => (VIRTQUEUE_DESC_F_WRITE, 0),
+            };
+            Self {
+                address,
+                len,
+                flags,
+                next: next_index,
+            }
+        }
+    }
+
+    fn tx_frame_memory() -> GuestMemory {
+        let layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(GuestAddress::new(0), TEST_TX_MEMORY_SIZE)
+                .expect("test range should be valid"),
+        ])
+        .expect("test memory layout should be valid");
+        GuestMemory::allocate(&layout).expect("test guest memory should allocate")
+    }
+
+    fn write_tx_header(memory: &mut GuestMemory, address: GuestAddress) {
+        let mut bytes = [0; VIRTIO_NET_TX_HEADER_SIZE as usize];
+        let (flags, tail) = bytes.split_at_mut(1);
+        let (gso_type, tail) = tail.split_at_mut(1);
+        let (header_len, tail) = tail.split_at_mut(2);
+        let (gso_size, tail) = tail.split_at_mut(2);
+        let (checksum_start, tail) = tail.split_at_mut(2);
+        let (checksum_offset, num_buffers) = tail.split_at_mut(2);
+
+        flags.copy_from_slice(&[0x1]);
+        gso_type.copy_from_slice(&[0x2]);
+        header_len.copy_from_slice(&0x0304_u16.to_le_bytes());
+        gso_size.copy_from_slice(&0x0506_u16.to_le_bytes());
+        checksum_start.copy_from_slice(&0x0708_u16.to_le_bytes());
+        checksum_offset.copy_from_slice(&0x090a_u16.to_le_bytes());
+        num_buffers.copy_from_slice(&0x0b0c_u16.to_le_bytes());
+
+        memory
+            .write_slice(&bytes, address)
+            .expect("virtio-net TX header should write");
+    }
+
+    fn write_tx_descriptor(memory: &mut GuestMemory, index: u16, descriptor: TestDescriptor) {
+        let mut bytes = [0; VIRTQUEUE_DESCRIPTOR_SIZE];
+        let (address_bytes, tail) = bytes.split_at_mut(8);
+        let (len_bytes, tail) = tail.split_at_mut(4);
+        let (flags_bytes, next_bytes) = tail.split_at_mut(2);
+        address_bytes.copy_from_slice(&descriptor.address.raw_value().to_le_bytes());
+        len_bytes.copy_from_slice(&descriptor.len.to_le_bytes());
+        flags_bytes.copy_from_slice(&descriptor.flags.to_le_bytes());
+        next_bytes.copy_from_slice(&descriptor.next.to_le_bytes());
+
+        let descriptor_address = TEST_TX_DESCRIPTOR_TABLE
+            .checked_add(
+                u64::from(index)
+                    * u64::try_from(VIRTQUEUE_DESCRIPTOR_SIZE).expect("descriptor size should fit"),
+            )
+            .expect("descriptor address should not overflow");
+        memory
+            .write_slice(&bytes, descriptor_address)
+            .expect("descriptor should write");
+    }
+
+    fn tx_descriptor_chain(
+        memory: &mut GuestMemory,
+        descriptors: &[TestDescriptor],
+    ) -> VirtqueueDescriptorChain {
+        for (index, descriptor) in descriptors.iter().copied().enumerate() {
+            write_tx_descriptor(
+                memory,
+                u16::try_from(index).expect("test descriptor index should fit"),
+                descriptor,
+            );
+        }
+
+        read_descriptor_chain(memory, TEST_TX_DESCRIPTOR_TABLE, TEST_QUEUE_SIZE, 0)
+            .expect("TX descriptor chain should read")
+    }
+
+    fn parse_tx_frame(
+        memory: &GuestMemory,
+        chain: &VirtqueueDescriptorChain,
+    ) -> Result<VirtioNetworkTxFrame, VirtioNetworkTxFrameParseError> {
+        VirtioNetworkTxFrame::parse(memory, chain)
+    }
+
     #[test]
     fn accepts_minimal_network_interface_config() {
         let config = validate(input()).expect("minimal network config should be valid");
@@ -1292,6 +1889,316 @@ mod tests {
         assert_eq!(VIRTIO_NET_F_MAC, 5);
         assert_eq!(VIRTIO_RING_FEATURE_EVENT_IDX, 29);
         assert_eq!(VIRTIO_FEATURE_VERSION_1, 32);
+        assert_eq!(VIRTIO_NET_TX_HEADER_SIZE, 12);
+        assert_eq!(VIRTIO_NET_MAX_BUFFER_SIZE, 65_562);
+    }
+
+    #[test]
+    fn virtio_network_tx_frame_parser_accepts_single_descriptor_frame() {
+        let mut memory = tx_frame_memory();
+        write_tx_header(&mut memory, TEST_TX_HEADER);
+        let chain = tx_descriptor_chain(
+            &mut memory,
+            &[TestDescriptor::readable(
+                TEST_TX_HEADER,
+                VIRTIO_NET_TX_HEADER_SIZE + 4,
+                None,
+            )],
+        );
+
+        let frame = parse_tx_frame(&memory, &chain).expect("single-descriptor frame should parse");
+
+        assert_eq!(frame.descriptor_head(), 0);
+        assert_eq!(frame.header().flags(), 0x1);
+        assert_eq!(frame.header().gso_type(), 0x2);
+        assert_eq!(frame.header().header_len(), 0x0304);
+        assert_eq!(frame.header().gso_size(), 0x0506);
+        assert_eq!(frame.header().checksum_start(), 0x0708);
+        assert_eq!(frame.header().checksum_offset(), 0x090a);
+        assert_eq!(frame.header().num_buffers(), 0x0b0c);
+        assert_eq!(frame.payload_len(), 4);
+        assert_eq!(frame.frame_len(), 16);
+
+        let segment = frame
+            .payload_segments()
+            .first()
+            .expect("payload segment should exist");
+        assert_eq!(frame.payload_segments().len(), 1);
+        assert_eq!(segment.descriptor_index(), 0);
+        assert_eq!(
+            segment.address(),
+            TEST_TX_HEADER
+                .checked_add(u64::from(VIRTIO_NET_TX_HEADER_SIZE))
+                .expect("payload address should not overflow")
+        );
+        assert_eq!(segment.len(), 4);
+    }
+
+    #[test]
+    fn virtio_network_tx_frame_parser_accepts_split_payload_descriptors() {
+        let mut memory = tx_frame_memory();
+        write_tx_header(&mut memory, TEST_TX_HEADER);
+        let chain = tx_descriptor_chain(
+            &mut memory,
+            &[
+                TestDescriptor::readable(TEST_TX_HEADER, VIRTIO_NET_TX_HEADER_SIZE, Some(1)),
+                TestDescriptor::readable(TEST_TX_PAYLOAD, 4, Some(2)),
+                TestDescriptor::readable(TEST_TX_SECOND_PAYLOAD, 5, None),
+            ],
+        );
+
+        let frame = parse_tx_frame(&memory, &chain).expect("split TX frame should parse");
+
+        assert_eq!(frame.payload_len(), 9);
+        assert_eq!(frame.frame_len(), 21);
+        assert_eq!(frame.payload_segments().len(), 2);
+        let first = frame
+            .payload_segments()
+            .first()
+            .expect("first payload segment should exist");
+        let second = frame
+            .payload_segments()
+            .get(1)
+            .expect("second payload segment should exist");
+        assert_eq!(first.descriptor_index(), 1);
+        assert_eq!(first.address(), TEST_TX_PAYLOAD);
+        assert_eq!(first.len(), 4);
+        assert_eq!(second.descriptor_index(), 2);
+        assert_eq!(second.address(), TEST_TX_SECOND_PAYLOAD);
+        assert_eq!(second.len(), 5);
+    }
+
+    #[test]
+    fn virtio_network_tx_frame_parser_accepts_header_remainder_and_split_payload() {
+        let mut memory = tx_frame_memory();
+        write_tx_header(&mut memory, TEST_TX_HEADER);
+        let chain = tx_descriptor_chain(
+            &mut memory,
+            &[
+                TestDescriptor::readable(TEST_TX_HEADER, VIRTIO_NET_TX_HEADER_SIZE + 3, Some(1)),
+                TestDescriptor::readable(TEST_TX_PAYLOAD, 4, None),
+            ],
+        );
+
+        let frame =
+            parse_tx_frame(&memory, &chain).expect("header remainder plus payload should parse");
+
+        assert_eq!(frame.payload_len(), 7);
+        assert_eq!(frame.payload_segments().len(), 2);
+        let first = frame
+            .payload_segments()
+            .first()
+            .expect("header remainder segment should exist");
+        let second = frame
+            .payload_segments()
+            .get(1)
+            .expect("following payload segment should exist");
+        assert_eq!(first.descriptor_index(), 0);
+        assert_eq!(
+            first.address(),
+            TEST_TX_HEADER
+                .checked_add(u64::from(VIRTIO_NET_TX_HEADER_SIZE))
+                .expect("header remainder address should not overflow")
+        );
+        assert_eq!(first.len(), 3);
+        assert_eq!(second.descriptor_index(), 1);
+        assert_eq!(second.address(), TEST_TX_PAYLOAD);
+        assert_eq!(second.len(), 4);
+    }
+
+    #[test]
+    fn virtio_network_tx_frame_parser_rejects_write_only_header() {
+        let mut memory = tx_frame_memory();
+        let chain = tx_descriptor_chain(
+            &mut memory,
+            &[TestDescriptor::writable(
+                TEST_TX_HEADER,
+                VIRTIO_NET_TX_HEADER_SIZE + 1,
+                None,
+            )],
+        );
+
+        assert!(matches!(
+            parse_tx_frame(&memory, &chain),
+            Err(VirtioNetworkTxFrameParseError::HeaderDescriptorWriteOnly { index: 0 })
+        ));
+    }
+
+    #[test]
+    fn virtio_network_tx_frame_parser_rejects_small_header() {
+        let mut memory = tx_frame_memory();
+        let chain = tx_descriptor_chain(
+            &mut memory,
+            &[TestDescriptor::readable(
+                TEST_TX_HEADER,
+                VIRTIO_NET_TX_HEADER_SIZE - 1,
+                None,
+            )],
+        );
+
+        assert!(matches!(
+            parse_tx_frame(&memory, &chain),
+            Err(VirtioNetworkTxFrameParseError::HeaderDescriptorTooSmall {
+                index: 0,
+                len: 11,
+                min: 12,
+            })
+        ));
+    }
+
+    #[test]
+    fn virtio_network_tx_frame_parser_rejects_unmapped_header() {
+        let mut memory = tx_frame_memory();
+        let unmapped_header = GuestAddress::new(TEST_TX_MEMORY_SIZE + 0x1000);
+        let chain = tx_descriptor_chain(
+            &mut memory,
+            &[TestDescriptor::readable(
+                unmapped_header,
+                VIRTIO_NET_TX_HEADER_SIZE + 1,
+                None,
+            )],
+        );
+
+        let error = parse_tx_frame(&memory, &chain).expect_err("unmapped header should fail");
+
+        match &error {
+            VirtioNetworkTxFrameParseError::ReadHeader { address, .. } => {
+                assert_eq!(*address, unmapped_header);
+            }
+            other => panic!("expected header read error, got {other:?}"),
+        }
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn virtio_network_tx_frame_parser_rejects_missing_payload() {
+        let mut memory = tx_frame_memory();
+        write_tx_header(&mut memory, TEST_TX_HEADER);
+        let chain = tx_descriptor_chain(
+            &mut memory,
+            &[TestDescriptor::readable(
+                TEST_TX_HEADER,
+                VIRTIO_NET_TX_HEADER_SIZE,
+                None,
+            )],
+        );
+
+        assert!(matches!(
+            parse_tx_frame(&memory, &chain),
+            Err(VirtioNetworkTxFrameParseError::MissingPayload { descriptor_head: 0 })
+        ));
+    }
+
+    #[test]
+    fn virtio_network_tx_frame_parser_rejects_write_only_payload() {
+        let mut memory = tx_frame_memory();
+        write_tx_header(&mut memory, TEST_TX_HEADER);
+        let chain = tx_descriptor_chain(
+            &mut memory,
+            &[
+                TestDescriptor::readable(TEST_TX_HEADER, VIRTIO_NET_TX_HEADER_SIZE, Some(1)),
+                TestDescriptor::writable(TEST_TX_PAYLOAD, 4, None),
+            ],
+        );
+
+        assert!(matches!(
+            parse_tx_frame(&memory, &chain),
+            Err(VirtioNetworkTxFrameParseError::PayloadDescriptorWriteOnly { index: 1 })
+        ));
+    }
+
+    #[test]
+    fn virtio_network_tx_frame_parser_rejects_empty_payload() {
+        let mut memory = tx_frame_memory();
+        write_tx_header(&mut memory, TEST_TX_HEADER);
+        let chain = tx_descriptor_chain(
+            &mut memory,
+            &[
+                TestDescriptor::readable(TEST_TX_HEADER, VIRTIO_NET_TX_HEADER_SIZE, Some(1)),
+                TestDescriptor::readable(TEST_TX_PAYLOAD, 0, None),
+            ],
+        );
+
+        assert!(matches!(
+            parse_tx_frame(&memory, &chain),
+            Err(VirtioNetworkTxFrameParseError::PayloadDescriptorEmpty { index: 1 })
+        ));
+    }
+
+    #[test]
+    fn virtio_network_tx_frame_parser_rejects_unmapped_payload() {
+        let mut memory = tx_frame_memory();
+        write_tx_header(&mut memory, TEST_TX_HEADER);
+        let unmapped_payload = GuestAddress::new(TEST_TX_MEMORY_SIZE + 0x1000);
+        let chain = tx_descriptor_chain(
+            &mut memory,
+            &[
+                TestDescriptor::readable(TEST_TX_HEADER, VIRTIO_NET_TX_HEADER_SIZE, Some(1)),
+                TestDescriptor::readable(unmapped_payload, 4, None),
+            ],
+        );
+
+        let error = parse_tx_frame(&memory, &chain).expect_err("unmapped payload should fail");
+
+        match &error {
+            VirtioNetworkTxFrameParseError::PayloadDescriptorAccess {
+                index,
+                address,
+                len,
+                ..
+            } => {
+                assert_eq!(*index, 1);
+                assert_eq!(*address, unmapped_payload);
+                assert_eq!(*len, 4);
+            }
+            other => panic!("expected payload access error, got {other:?}"),
+        }
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn virtio_network_tx_frame_parser_rejects_payload_range_overflow() {
+        let mut memory = tx_frame_memory();
+        write_tx_header(&mut memory, TEST_TX_HEADER);
+        let overflowing_payload = GuestAddress::new(u64::MAX - 1);
+        let chain = tx_descriptor_chain(
+            &mut memory,
+            &[
+                TestDescriptor::readable(TEST_TX_HEADER, VIRTIO_NET_TX_HEADER_SIZE, Some(1)),
+                TestDescriptor::readable(overflowing_payload, 4, None),
+            ],
+        );
+
+        assert!(matches!(
+            parse_tx_frame(&memory, &chain),
+            Err(VirtioNetworkTxFrameParseError::PayloadDescriptorRangeOverflow {
+                index: 1,
+                address,
+                len: 4,
+            }) if address == overflowing_payload
+        ));
+    }
+
+    #[test]
+    fn virtio_network_tx_frame_parser_rejects_oversized_frame_before_mapping_payload() {
+        let mut memory = tx_frame_memory();
+        write_tx_header(&mut memory, TEST_TX_HEADER);
+        let too_large_payload_len =
+            u32::try_from(VIRTIO_NET_MAX_BUFFER_SIZE).expect("max buffer should fit in u32");
+        let chain = tx_descriptor_chain(
+            &mut memory,
+            &[
+                TestDescriptor::readable(TEST_TX_HEADER, VIRTIO_NET_TX_HEADER_SIZE, Some(1)),
+                TestDescriptor::readable(TEST_TX_PAYLOAD, too_large_payload_len, None),
+            ],
+        );
+
+        assert!(matches!(
+            parse_tx_frame(&memory, &chain),
+            Err(VirtioNetworkTxFrameParseError::FrameTooLarge { len, max })
+                if len == VIRTIO_NET_MAX_BUFFER_SIZE + u64::from(VIRTIO_NET_TX_HEADER_SIZE)
+                    && max == VIRTIO_NET_MAX_BUFFER_SIZE
+        ));
     }
 
     #[test]
