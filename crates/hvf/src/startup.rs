@@ -317,6 +317,20 @@ impl HvfArm64BootSession<'_> {
         run_boot_session_loop(self, stop_token, max_steps)
     }
 
+    /// Run bounded vCPU steps and report each raw step outcome to `observe_step`.
+    ///
+    /// This keeps diagnostics at the same boundary as the internal boot loop:
+    /// observers see the step that was returned by HVF before the loop performs
+    /// follow-up timer or block-notification handling.
+    pub fn run_loop_with_observer(
+        &mut self,
+        stop_token: &HvfArm64BootRunLoopStopToken,
+        max_steps: NonZeroUsize,
+        observe_step: impl FnMut(&HvfVcpuRunStepOutcome),
+    ) -> Result<HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopError> {
+        run_boot_session_loop_with_observer(self, stop_token, max_steps, observe_step)
+    }
+
     pub fn dispatch_block_queue_notifications_and_signal_interrupts(
         &mut self,
     ) -> Result<HvfArm64BootBlockNotificationDispatches, HvfArm64BootBlockNotificationDispatchError>
@@ -462,6 +476,15 @@ impl OwnedHvfArm64BootSession {
         max_steps: NonZeroUsize,
     ) -> Result<HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopError> {
         run_boot_session_loop(self, stop_token, max_steps)
+    }
+
+    pub fn run_loop_with_observer(
+        &mut self,
+        stop_token: &HvfArm64BootRunLoopStopToken,
+        max_steps: NonZeroUsize,
+        observe_step: impl FnMut(&HvfVcpuRunStepOutcome),
+    ) -> Result<HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopError> {
+        run_boot_session_loop_with_observer(self, stop_token, max_steps, observe_step)
     }
 
     pub fn dispatch_block_queue_notifications_and_signal_interrupts(
@@ -720,6 +743,15 @@ fn run_boot_session_loop(
     stop_token: &HvfArm64BootRunLoopStopToken,
     max_steps: NonZeroUsize,
 ) -> Result<HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopError> {
+    run_boot_session_loop_with_observer(session, stop_token, max_steps, |_| {})
+}
+
+fn run_boot_session_loop_with_observer(
+    session: &mut impl BootSessionRunLoopSession,
+    stop_token: &HvfArm64BootRunLoopStopToken,
+    max_steps: NonZeroUsize,
+    mut observe_step: impl FnMut(&HvfVcpuRunStepOutcome),
+) -> Result<HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopError> {
     let max_steps = max_steps.get();
     let mut steps = 0usize;
 
@@ -735,6 +767,7 @@ fn run_boot_session_loop(
                     steps_completed: steps,
                     source: Box::new(source),
                 })?;
+        observe_step(&outcome);
         steps += 1;
 
         match outcome {
@@ -2431,6 +2464,44 @@ mod tests {
             HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 2 }
         );
         assert_eq!(session.events, ["run", "run"]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_observer_records_step_outcomes() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([
+            hvc_run_step_outcome(),
+            sys64_run_step_outcome(),
+            HvfVcpuRunStepOutcome::VtimerActivated,
+            mmio_run_step_outcome(),
+        ]);
+        let mut observed = Vec::new();
+
+        let outcome = super::run_boot_session_loop_with_observer(
+            &mut session,
+            &stop_token,
+            max_steps(4),
+            |step| observed.push(*step),
+        )
+        .expect("observed run loop should succeed");
+
+        assert_eq!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 4 }
+        );
+        assert_eq!(
+            observed,
+            [
+                hvc_run_step_outcome(),
+                sys64_run_step_outcome(),
+                HvfVcpuRunStepOutcome::VtimerActivated,
+                mmio_run_step_outcome(),
+            ]
+        );
+        assert_eq!(
+            session.events,
+            ["run", "run", "run", "timer", "run", "dispatch"]
+        );
     }
 
     #[test]

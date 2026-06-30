@@ -56,6 +56,9 @@ jobs:
       - name: Build and sign HVF smoke test
         run: scripts/run-hvf-tests.sh --allow-unsupported
 
+      - name: Build and sign guest boot smoke test
+        run: scripts/run-guest-boot-smoke.sh --allow-unsupported
+
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 

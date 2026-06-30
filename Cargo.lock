@@ -27,6 +27,7 @@ name = "bangbang-hvf"
 version = "0.1.0"
 dependencies = [
  "bangbang-runtime",
+ "device_tree",
  "libc",
 ]
 

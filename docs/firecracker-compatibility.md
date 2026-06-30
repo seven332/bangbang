@@ -560,11 +560,11 @@ reports feature support only for the implemented minimal calls, returns
 `MIGRATE_INFO_TYPE` as the PSCI value for a trusted OS that is MP-capable or
 not present, where migration is not required, and writes `NOT_SUPPORTED` to X0
 for other PSCI calls or HVC immediates.
-Early boot also traps the guest's `OSDLR_EL1` system-register access through
-the AArch64 SYS64 exception class (`0x18`), not through SMC/SMCCC. The HVF
-runner handles only that observed debug-register access with KVM-like RAZ/WI
-semantics: reads return zero, writes are ignored, and other trapped system
-registers still fail closed.
+Early boot also traps the guest's `OSDLR_EL1` and `OSLAR_EL1` OS lock
+system-register accesses through the AArch64 SYS64 exception class (`0x18`),
+not through SMC/SMCCC. The HVF runner handles only those observed
+debug-register accesses with KVM-like RAZ/WI semantics: reads return zero,
+writes are ignored, and other trapped system registers still fail closed.
 
 The memory node excludes the first 2 MiB system area from the first DRAM range
 and preserves later DRAM ranges from the runtime layout, but direct FDT
@@ -681,8 +681,9 @@ handle for later startup wiring or tests. The internal arm64 FDT builder can
 describe the same serial MMIO descriptor as a Firecracker-shaped `uart@...`
 node, but this is still internal groundwork only: the public `/serial`
 endpoint, kernel `earlycon` wiring, runner-loop console capture, serial
-input/RX, rate limiting, metrics, host file output configuration, and
-boot-smoke use are still deferred.
+input/RX, rate limiting, metrics, and host file output configuration are still
+deferred. The first internal guest boot smoke test uses this bounded capture
+path directly without adding public serial streaming.
 
 The runtime crate can decode checked MMIO operations into typed virtio-mmio
 generic-register or device-configuration accesses for the Firecracker `v1.16.0`
@@ -1031,7 +1032,10 @@ surface:
   `com.apple.security.hypervisor` entitlement before running it; the script
   fails when the host cannot run HVF tests unless CI explicitly uses
   `--allow-unsupported` after build/sign validation
-- boot smoke tests once a minimal guest boot exposes an observable success signal
+- guest boot smoke tests through `scripts/run-guest-boot-smoke.sh`, which
+  prepares the pinned Firecracker kernel plus generated tiny initrd, signs the
+  integration test, and checks an internal serial success marker on supported
+  macOS Apple Silicon hosts
 
 ## Security and Performance Scope
 

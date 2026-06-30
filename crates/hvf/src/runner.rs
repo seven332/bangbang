@@ -41,6 +41,7 @@ const MMIO_DISPATCHER_BUSY_MESSAGE: &str = "vCPU runner MMIO dispatcher lock is 
 const MMIO_DISPATCHER_POISONED_MESSAGE: &str = "vCPU runner MMIO dispatcher lock is poisoned";
 const COMMAND_CHANNEL_CLOSED_MESSAGE: &str = "vCPU runner command channel is closed";
 const RESPONSE_CHANNEL_CLOSED_MESSAGE: &str = "vCPU runner response channel is closed";
+const ARM64_INSTRUCTION_SIZE: u64 = 4;
 
 type CancelVcpu = Arc<dyn Fn(crate::ffi::HvVcpu) -> Result<(), BackendError> + Send + Sync>;
 type SharedMmioDispatcher = Arc<Mutex<MmioDispatcher>>;
@@ -1493,6 +1494,7 @@ fn run_once_and_handle_mmio_on_runner_thread(
                 .resolve(dispatcher.bus())
                 .map_err(|source| HvfVcpuExitResolveError::MmioResolve { source })?;
             let outcome = vcpu.dispatch_mmio_access(access, &mut dispatcher)?;
+            advance_arm64_pc(vcpu)?;
 
             Ok(HvfVcpuRunStepOutcome::Mmio { access, outcome })
         }
@@ -1503,7 +1505,7 @@ fn handle_sys64_on_runner_thread(
     vcpu: &mut impl RunnerVcpu,
     exit: HvfSys64Exit,
 ) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
-    if exit.register() != HvfSys64Register::OSDLR_EL1 {
+    if !is_supported_os_lock_sys64_register(exit.register()) {
         return Err(HvfVcpuRunnerError::UnsupportedSys64 { exit });
     }
 
@@ -1514,7 +1516,30 @@ fn handle_sys64_on_runner_thread(
             .map_err(HvfVcpuRunnerError::Backend)?;
     }
 
+    advance_arm64_pc(vcpu)?;
+
     Ok(HvfVcpuRunStepOutcome::Sys64 { exit })
+}
+
+const fn is_supported_os_lock_sys64_register(register: HvfSys64Register) -> bool {
+    matches!(
+        register,
+        HvfSys64Register::OSDLR_EL1 | HvfSys64Register::OSLAR_EL1
+    )
+}
+
+fn advance_arm64_pc(vcpu: &mut impl RunnerVcpu) -> Result<(), HvfVcpuRunnerError> {
+    let pc = vcpu
+        .read_register(HvfRegister::PC)
+        .map_err(HvfVcpuRunnerError::Backend)?;
+    let next_pc =
+        pc.checked_add(ARM64_INSTRUCTION_SIZE)
+            .ok_or(HvfVcpuRunnerError::InvalidState(
+                "arm64 PC overflow while advancing handled synchronous exit",
+            ))?;
+
+    vcpu.write_register(HvfRegister::PC, next_pc)
+        .map_err(HvfVcpuRunnerError::Backend)
 }
 
 fn handle_hvc_on_runner_thread(
@@ -1553,7 +1578,10 @@ fn dispatch_mmio_access_on_runner_thread(
 ) -> Result<MmioDispatchOutcome, HvfVcpuRunnerError> {
     let mut dispatcher = lock_shared_mmio_dispatcher(dispatcher)?;
 
-    vcpu.dispatch_mmio_access(access, &mut dispatcher)
+    let outcome = vcpu.dispatch_mmio_access(access, &mut dispatcher)?;
+    advance_arm64_pc(vcpu)?;
+
+    Ok(outcome)
 }
 
 fn lock_shared_mmio_dispatcher(
@@ -1696,17 +1724,21 @@ mod tests {
     struct MmioDispatchRecordingVcpu {
         dispatched_sender: mpsc::Sender<HvfResolvedMmioAccess>,
         result: Result<MmioDispatchOutcome, HvfVcpuRunnerError>,
+        pc: u64,
     }
 
     struct BlockingMmioDispatchVcpu {
         entered_dispatch_sender: mpsc::Sender<()>,
         release_dispatch_receiver: mpsc::Receiver<Result<MmioDispatchOutcome, HvfVcpuRunnerError>>,
+        pc: u64,
     }
 
     struct RunStepRecordingVcpu {
         run_once_result: Result<HvfVcpuExit, BackendError>,
         dispatched_sender: Option<mpsc::Sender<HvfResolvedMmioAccess>>,
         dispatch_result: Result<MmioDispatchOutcome, HvfVcpuRunnerError>,
+        pc: u64,
+        register_write_sender: mpsc::Sender<(HvfRegister, u64)>,
     }
 
     struct PsciRunStepRecordingVcpu {
@@ -1718,6 +1750,7 @@ mod tests {
 
     struct Sys64RunStepRecordingVcpu {
         run_once_result: Result<HvfVcpuExit, BackendError>,
+        pc: u64,
         register_write_sender: mpsc::Sender<(HvfRegister, u64)>,
     }
 
@@ -2314,6 +2347,31 @@ mod tests {
             self.result.clone()
         }
 
+        fn read_register(&mut self, register: HvfRegister) -> Result<u64, BackendError> {
+            if register == HvfRegister::PC {
+                Ok(self.pc)
+            } else {
+                Err(BackendError::InvalidState(
+                    "fake MMIO dispatch vCPU only supports PC reads",
+                ))
+            }
+        }
+
+        fn write_register(
+            &mut self,
+            register: HvfRegister,
+            value: u64,
+        ) -> Result<(), BackendError> {
+            if register == HvfRegister::PC {
+                self.pc = value;
+                Ok(())
+            } else {
+                Err(BackendError::InvalidState(
+                    "fake MMIO dispatch vCPU only supports PC writes",
+                ))
+            }
+        }
+
         fn destroy(&mut self) -> Result<(), BackendError> {
             Ok(())
         }
@@ -2346,6 +2404,31 @@ mod tests {
             self.release_dispatch_receiver.recv().map_err(|_| {
                 HvfVcpuRunnerError::InvalidState("fake MMIO dispatch release sender closed")
             })?
+        }
+
+        fn read_register(&mut self, register: HvfRegister) -> Result<u64, BackendError> {
+            if register == HvfRegister::PC {
+                Ok(self.pc)
+            } else {
+                Err(BackendError::InvalidState(
+                    "fake blocking MMIO dispatch vCPU only supports PC reads",
+                ))
+            }
+        }
+
+        fn write_register(
+            &mut self,
+            register: HvfRegister,
+            value: u64,
+        ) -> Result<(), BackendError> {
+            if register == HvfRegister::PC {
+                self.pc = value;
+                Ok(())
+            } else {
+                Err(BackendError::InvalidState(
+                    "fake blocking MMIO dispatch vCPU only supports PC writes",
+                ))
+            }
         }
 
         fn destroy(&mut self) -> Result<(), BackendError> {
@@ -2387,6 +2470,29 @@ mod tests {
                 .map_err(|_| HvfVcpuRunnerError::InvalidState("fake dispatcher mutation failed"))?;
 
             self.dispatch_result.clone()
+        }
+
+        fn read_register(&mut self, register: HvfRegister) -> Result<u64, BackendError> {
+            if register == HvfRegister::PC {
+                Ok(self.pc)
+            } else {
+                Err(BackendError::InvalidState(
+                    "fake run step vCPU only supports PC reads",
+                ))
+            }
+        }
+
+        fn write_register(
+            &mut self,
+            register: HvfRegister,
+            value: u64,
+        ) -> Result<(), BackendError> {
+            if register == HvfRegister::PC {
+                self.pc = value;
+            }
+            self.register_write_sender
+                .send((register, value))
+                .map_err(|_| BackendError::InvalidState("fake register write receiver closed"))
         }
 
         fn destroy(&mut self) -> Result<(), BackendError> {
@@ -2470,8 +2576,12 @@ mod tests {
             unsupported_mmio_dispatch()
         }
 
-        fn read_register(&mut self, _register: HvfRegister) -> Result<u64, BackendError> {
-            Err(BackendError::InvalidState("SYS64 should not read a GPR"))
+        fn read_register(&mut self, register: HvfRegister) -> Result<u64, BackendError> {
+            if register == HvfRegister::PC {
+                Ok(self.pc)
+            } else {
+                Err(BackendError::InvalidState("SYS64 should not read a GPR"))
+            }
         }
 
         fn write_register(
@@ -2479,6 +2589,9 @@ mod tests {
             register: HvfRegister,
             value: u64,
         ) -> Result<(), BackendError> {
+            if register == HvfRegister::PC {
+                self.pc = value;
+            }
             self.register_write_sender
                 .send((register, value))
                 .map_err(|_| BackendError::InvalidState("fake register write receiver closed"))
@@ -2670,6 +2783,7 @@ mod tests {
             Ok(MmioDispatchRecordingVcpu {
                 dispatched_sender,
                 result,
+                pc: 0x8020_2000,
             })
         })
         .expect("fake runner should start");
@@ -2687,13 +2801,17 @@ mod tests {
     ) -> (
         HvfVcpuRunner<'static>,
         mpsc::Receiver<HvfResolvedMmioAccess>,
+        mpsc::Receiver<(HvfRegister, u64)>,
     ) {
         let (dispatched_sender, dispatched_receiver) = mpsc::channel();
+        let (register_write_sender, register_write_receiver) = mpsc::channel();
         let started = spawn_runner_thread(move || {
             Ok(RunStepRecordingVcpu {
                 run_once_result,
                 dispatched_sender: Some(dispatched_sender),
                 dispatch_result,
+                pc: 0x8020_3000,
+                register_write_sender,
             })
         })
         .expect("fake runner should start");
@@ -2702,6 +2820,7 @@ mod tests {
             HvfVcpuRunner::from_started(started, Arc::new(|_| Ok(())))
                 .expect("runner should be created"),
             dispatched_receiver,
+            register_write_receiver,
         )
     }
 
@@ -2709,10 +2828,13 @@ mod tests {
         run_once_result: Result<HvfVcpuExit, BackendError>,
     ) -> HvfVcpuRunner<'static> {
         let started = spawn_runner_thread(move || {
+            let (register_write_sender, _register_write_receiver) = mpsc::channel();
             Ok(RunStepRecordingVcpu {
                 run_once_result,
                 dispatched_sender: None,
                 dispatch_result: Ok(MmioDispatchOutcome::Write),
+                pc: 0x8020_3000,
+                register_write_sender,
             })
         })
         .expect("fake runner should start");
@@ -2763,10 +2885,25 @@ mod tests {
         register: HvfSys64Register,
         target_register: u8,
     ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<(HvfRegister, u64)>) {
+        start_sys64_run_step_recording_runner_with_pc(
+            direction,
+            register,
+            target_register,
+            0x8020_1000,
+        )
+    }
+
+    fn start_sys64_run_step_recording_runner_with_pc(
+        direction: HvfSys64Direction,
+        register: HvfSys64Register,
+        target_register: u8,
+        pc: u64,
+    ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<(HvfRegister, u64)>) {
         let (register_write_sender, register_write_receiver) = mpsc::channel();
         let started = spawn_runner_thread(move || {
             Ok(Sys64RunStepRecordingVcpu {
                 run_once_result: Ok(sys64_exception_exit(direction, register, target_register)),
+                pc,
                 register_write_sender,
             })
         })
@@ -4236,10 +4373,11 @@ mod tests {
     #[test]
     fn run_once_and_handle_mmio_dispatches_mmio_exit_on_runner_thread() {
         let access = resolved_mmio_access();
-        let (runner, dispatched_receiver) = start_run_step_recording_runner(
-            Ok(mmio_exception_exit()),
-            Ok(MmioDispatchOutcome::Write),
-        );
+        let (runner, dispatched_receiver, register_write_receiver) =
+            start_run_step_recording_runner(
+                Ok(mmio_exception_exit()),
+                Ok(MmioDispatchOutcome::Write),
+            );
         let dispatcher = shared_dispatcher_with_region();
 
         assert_eq!(
@@ -4254,6 +4392,12 @@ mod tests {
                 .recv()
                 .expect("fake vCPU should receive dispatch"),
             access
+        );
+        assert_eq!(
+            register_write_receiver
+                .recv()
+                .expect("fake vCPU should advance PC"),
+            (HvfRegister::PC, 0x8020_3004)
         );
         let region_ids = dispatcher
             .lock()
@@ -4406,7 +4550,7 @@ mod tests {
     }
 
     #[test]
-    fn run_once_and_handle_mmio_ignores_osdlr_sys64_write_to_gpr_without_dispatcher_lock() {
+    fn run_once_and_handle_mmio_advances_pc_after_osdlr_sys64_write_without_dispatcher_lock() {
         let (runner, register_write_receiver) = start_sys64_run_step_recording_runner(
             HvfSys64Direction::Write,
             HvfSys64Register::OSDLR_EL1,
@@ -4424,6 +4568,64 @@ mod tests {
             })
         );
         drop(dispatcher_guard);
+        assert_eq!(
+            register_write_receiver.try_recv(),
+            Ok((HvfRegister::PC, 0x8020_1004))
+        );
+        assert_eq!(
+            register_write_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn run_once_and_handle_mmio_advances_pc_after_oslar_sys64_write_without_dispatcher_lock() {
+        let (runner, register_write_receiver) = start_sys64_run_step_recording_runner(
+            HvfSys64Direction::Write,
+            HvfSys64Register::OSLAR_EL1,
+            31,
+        );
+        let dispatcher = shared_dispatcher();
+        let dispatcher_guard = dispatcher
+            .lock()
+            .expect("dispatcher lock should not be poisoned");
+
+        assert_eq!(
+            runner.run_once_and_handle_mmio(Arc::clone(&dispatcher)),
+            Ok(HvfVcpuRunStepOutcome::Sys64 {
+                exit: sys64_exit(HvfSys64Direction::Write, HvfSys64Register::OSLAR_EL1, 31),
+            })
+        );
+        drop(dispatcher_guard);
+        assert_eq!(
+            register_write_receiver.try_recv(),
+            Ok((HvfRegister::PC, 0x8020_1004))
+        );
+        assert_eq!(
+            register_write_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn run_once_and_handle_mmio_rejects_pc_overflow_after_supported_sys64_write() {
+        let (runner, register_write_receiver) = start_sys64_run_step_recording_runner_with_pc(
+            HvfSys64Direction::Write,
+            HvfSys64Register::OSDLR_EL1,
+            31,
+            u64::MAX,
+        );
+
+        assert_eq!(
+            runner.run_once_and_handle_mmio(shared_dispatcher()),
+            Err(HvfVcpuRunnerError::InvalidState(
+                "arm64 PC overflow while advancing handled synchronous exit"
+            ))
+        );
         assert_eq!(
             register_write_receiver.try_recv(),
             Err(mpsc::TryRecvError::Empty)
@@ -4452,6 +4654,10 @@ mod tests {
         );
         assert_eq!(
             register_write_receiver.try_recv(),
+            Ok((HvfRegister::PC, 0x8020_1004))
+        );
+        assert_eq!(
+            register_write_receiver.try_recv(),
             Err(mpsc::TryRecvError::Empty)
         );
 
@@ -4471,6 +4677,10 @@ mod tests {
             Ok(HvfVcpuRunStepOutcome::Sys64 {
                 exit: sys64_exit(HvfSys64Direction::Read, HvfSys64Register::OSDLR_EL1, 31,),
             })
+        );
+        assert_eq!(
+            register_write_receiver.try_recv(),
+            Ok((HvfRegister::PC, 0x8020_1004))
         );
         assert_eq!(
             register_write_receiver.try_recv(),
@@ -4576,10 +4786,11 @@ mod tests {
                 register: HvfMmioRegister::new(31).expect("test register should decode"),
             },
         };
-        let (runner, dispatched_receiver) = start_run_step_recording_runner(
-            Ok(mmio_exception_exit()),
-            Err(HvfVcpuRunnerError::MmioDispatch(source.clone())),
-        );
+        let (runner, dispatched_receiver, register_write_receiver) =
+            start_run_step_recording_runner(
+                Ok(mmio_exception_exit()),
+                Err(HvfVcpuRunnerError::MmioDispatch(source.clone())),
+            );
         let dispatcher = shared_dispatcher_with_region();
 
         assert_eq!(
@@ -4591,6 +4802,10 @@ mod tests {
                 .recv()
                 .expect("fake vCPU should receive dispatch"),
             resolved_mmio_access()
+        );
+        assert_eq!(
+            register_write_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
         );
         assert_eq!(runner.run_once(), Ok(mmio_exception_exit()));
 
@@ -4978,6 +5193,7 @@ mod tests {
             Ok(BlockingMmioDispatchVcpu {
                 entered_dispatch_sender,
                 release_dispatch_receiver,
+                pc: 0x8020_4000,
             })
         })
         .expect("fake runner should start");
