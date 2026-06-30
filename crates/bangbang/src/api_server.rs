@@ -1791,6 +1791,54 @@ mod tests {
     }
 
     #[test]
+    fn configures_network_interface_over_unix_socket() {
+        let path = unique_socket_path("net-config");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+        let body = r#"{
+            "iface_id": "eth0",
+            "host_dev_name": "tap0",
+            "guest_mac": "12:34:56:78:9a:BC"
+        }"#;
+        let request = format!(
+            "PUT /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        client
+            .write_all(request.as_bytes())
+            .expect("client should write request");
+        let mut vmm = test_controller();
+        server
+            .serve_next(&mut vmm)
+            .expect("server should handle one request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("client should read response");
+
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(response.contains("Content-Length: 0\r\n"));
+        assert!(response.ends_with("\r\n\r\n"));
+
+        let data = vmm
+            .handle_action(VmmAction::GetVmConfig)
+            .expect("VM config should be returned");
+        let VmmData::VmConfiguration(config) = data else {
+            panic!("expected VM config");
+        };
+        assert_eq!(config.network_interface_configs().len(), 1);
+        let config = &config.network_interface_configs()[0];
+        assert_eq!(config.iface_id(), "eth0");
+        assert_eq!(config.host_dev_name(), "tap0");
+        assert_eq!(
+            config.guest_mac().map(|guest_mac| guest_mac.to_string()),
+            Some("12:34:56:78:9a:bc".to_string())
+        );
+    }
+
+    #[test]
     fn returns_fault_for_invalid_drive_config_without_storing() {
         let path = unique_socket_path("drive-invalid");
         let server = ApiServer::bind(&path).expect("server should bind");
