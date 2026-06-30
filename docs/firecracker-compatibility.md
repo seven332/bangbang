@@ -324,7 +324,7 @@ pre-boot-only per-process output sink. Duplicate initialization fails without
 replacing the original sink. `FlushMetrics` is runtime-only: it fails before
 startup, succeeds without writing when the sink is unconfigured, and writes one
 minimal JSON line when `/metrics` configured an output path. Public run-loop
-control, boot smoke output, public runner loop scheduling, full Firecracker
+control, guest boot output, public runner loop scheduling, full Firecracker
 metrics counters, periodic metrics flush, full logger integration, and CLI
 observability flags remain deferred.
 The API and VMM state path implement the `PUT /logger` field policy above as a
@@ -647,7 +647,7 @@ metadata, and block metadata stay available to the retained session. bangbang
 now starts an internal boot run-loop worker across bounded step windows after successful startup and retains internal active, terminal-outcome, or error worker status, but
 does not yet provide public run-loop control, signal backend
 interrupts outside the internal boot block notification path, or prove guest
-boot with a smoke test.
+boot with an integration test.
 
 The runtime crate also contains an internal MMIO region registry, operation
 model, and handler dispatch boundary for future real devices. It reuses
@@ -682,7 +682,7 @@ describe the same serial MMIO descriptor as a Firecracker-shaped `uart@...`
 node, but this is still internal groundwork only: the public `/serial`
 endpoint, kernel `earlycon` wiring, runner-loop console capture, serial
 input/RX, rate limiting, metrics, and host file output configuration are still
-deferred. The first internal guest boot smoke test uses this bounded capture
+deferred. The first internal guest boot integration test uses this bounded capture
 path directly without adding public serial streaming.
 
 The runtime crate can decode checked MMIO operations into typed virtio-mmio
@@ -1032,7 +1032,7 @@ surface:
   `com.apple.security.hypervisor` entitlement before running it; the script
   fails when the host cannot run HVF tests unless CI explicitly uses
   `--allow-unsupported` after build/sign validation
-- guest boot smoke tests through `scripts/run-guest-boot-smoke.sh`, which
+- guest boot integration tests through `scripts/run-guest-boot-tests.sh`, which
   prepares the pinned Firecracker kernel plus generated tiny initrd, signs the
   integration test, and checks an internal serial success marker on supported
   macOS Apple Silicon hosts

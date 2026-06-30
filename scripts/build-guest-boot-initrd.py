@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the deterministic initrd used by the guest boot smoke test."""
+"""Build the deterministic initrd used by the guest boot integration test."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 
 BOOT_MARKER = b"BANGBANG_BOOT_OK\n"
-DEFAULT_RELATIVE_OUTPUT = Path("bangbang/guest-boot-smoke/initrd.cpio")
+DEFAULT_RELATIVE_OUTPUT = Path("bangbang/guest-boot/initrd.cpio")
 CPIO_NEWC_HEADER_SIZE = 110
 CPIO_TRAILER = "TRAILER!!!"
 
@@ -364,7 +364,7 @@ def write_output(path: Path, data: bytes) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build the deterministic initrd used by bangbang guest boot smoke tests.",
+        description="Build the deterministic initrd used by bangbang guest boot integration tests.",
     )
     parser.add_argument(
         "--output",
