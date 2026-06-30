@@ -4661,6 +4661,50 @@ mod tests {
     }
 
     #[test]
+    fn virtio_network_notifications_empty_tx_queue_has_no_interrupt() {
+        let mut memory = tx_frame_memory();
+        let mut handler = network_activation_handler();
+
+        configure_network_handler_queues(&mut handler);
+        activate_network_handler(&mut handler);
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_TX_QUEUE_INDEX
+                    .try_into()
+                    .expect("TX queue index should fit"),
+            )
+            .expect("TX notification should write");
+
+        let notification = handler
+            .dispatch_network_queue_notifications(&mut memory)
+            .expect("empty TX queue notification should dispatch as no-op");
+
+        assert_eq!(
+            notification.drained_notifications(),
+            [VIRTIO_NET_TX_QUEUE_INDEX]
+        );
+        assert!(!notification.needs_queue_interrupt());
+        let dispatch = notification
+            .tx_queue_dispatch()
+            .expect("TX dispatch summary should be present");
+        assert_eq!(dispatch.processed_frames(), 0);
+        assert_eq!(dispatch.successful_frames(), 0);
+        assert_eq!(dispatch.parse_failures(), 0);
+        assert!(dispatch.frames().is_empty());
+        assert!(!dispatch.needs_queue_interrupt());
+        assert_eq!(read_interrupt_status(&handler), 0);
+        assert!(handler.pending_queue_notifications().is_empty());
+        let active_tx_queue = handler
+            .activation_handler()
+            .active_tx_dispatch_queue()
+            .expect("TX dispatch queue should remain active");
+        assert_eq!(active_tx_queue.available_ring().next_avail(), 0);
+        assert_eq!(active_tx_queue.used_ring().next_used(), 0);
+        assert_eq!(read_tx_used_index(&memory), 0);
+    }
+
+    #[test]
     fn virtio_network_notifications_record_tx_parse_failure_and_complete_used_ring() {
         let mut memory = tx_frame_memory();
         let mut handler = network_activation_handler();
