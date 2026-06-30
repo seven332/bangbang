@@ -526,7 +526,7 @@ fn prop_u64_cells(node: &device_tree::Node, name: &str) -> Vec<u64> {
 fn env_path(name: &str) -> std::path::PathBuf {
     std::env::var_os(name)
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| panic!("{name} must be set by scripts/run-guest-boot-tests.sh"))
+        .unwrap_or_else(|| panic!("{name} must be set by scripts/run-integration-tests.sh"))
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

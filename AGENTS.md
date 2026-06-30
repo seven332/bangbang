@@ -20,11 +20,10 @@ Unit tests live next to the code they exercise under each crate’s `src/` tree.
 - `cargo test -p bangbang-hvf --lib --all-features --locked`: run unsigned HVF unit tests.
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: run lint checks with warnings treated as errors.
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked`: build documentation without dependency docs.
-- `scripts/run-hvf-tests.sh`: sign and run HVF integration tests on macOS Apple Silicon; use `--allow-unsupported` only for CI runners that cannot execute HVF.
-- `scripts/run-guest-boot-tests.sh`: sign and run the minimal guest boot integration test on macOS Apple Silicon; use `--allow-unsupported` only for CI runners that cannot execute HVF.
+- `scripts/run-integration-tests.sh`: sign and run HVF-backed integration tests on macOS Apple Silicon; use `--allow-unsupported` only for CI runners that cannot execute HVF.
 - `cargo run -p bangbang`: run the current VMM process skeleton.
 
-Use these commands before opening or updating a pull request. For local or self-hosted HVF verification, run `scripts/run-hvf-tests.sh` and `scripts/run-guest-boot-tests.sh` without `--allow-unsupported` so unsupported hosts fail instead of being ignored.
+Use these commands before opening or updating a pull request. For local or self-hosted HVF verification, run `scripts/run-integration-tests.sh` without `--allow-unsupported` so unsupported hosts fail instead of being ignored.
 
 ## Coding Style & Naming Conventions
 
@@ -42,7 +41,7 @@ Unsafe code must stay isolated behind small FFI wrappers, with `SAFETY:` comment
 
 Use Rust’s built-in test framework with `#[test]`. Add focused unit tests for argument parsing, error formatting, and backend state transitions as those surfaces grow. Test names should describe behavior, such as `parse_help_arg` or `displays_hypervisor_error`.
 
-Real Hypervisor.framework integration tests must stay in `crates/hvf/tests/` and run through a signed wrapper, such as `scripts/run-hvf-tests.sh` or `scripts/run-guest-boot-tests.sh`, so the test binary is signed and unsupported hosts are handled explicitly. Do not run or add real HVF integration tests through the unsigned workspace test path.
+Real Hypervisor.framework integration tests must stay in `crates/hvf/tests/` and run through `scripts/run-integration-tests.sh` so the test binary is signed and unsupported hosts are handled explicitly. Do not run or add real HVF integration tests through the unsigned workspace test path.
 
 ## Commit & Pull Request Guidelines
 

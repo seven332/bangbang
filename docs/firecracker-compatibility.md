@@ -1027,15 +1027,13 @@ surface:
 
 - unit tests for parsing, configuration, and state transitions
 - golden tests for Firecracker-shaped API responses once the API exists
-- real HVF tests on macOS Apple Silicon through `scripts/run-hvf-tests.sh`,
-  which signs the `bangbang-hvf` integration test with the
-  `com.apple.security.hypervisor` entitlement before running it; the script
-  fails when the host cannot run HVF tests unless CI explicitly uses
-  `--allow-unsupported` after build/sign validation
-- guest boot integration tests through `scripts/run-guest-boot-tests.sh`, which
-  prepares the pinned Firecracker kernel plus generated tiny initrd, signs the
-  integration test, and checks an internal serial success marker on supported
-  macOS Apple Silicon hosts
+- real HVF-backed integration tests on macOS Apple Silicon through
+  `scripts/run-integration-tests.sh`, which signs the `bangbang-hvf`
+  integration tests with the `com.apple.security.hypervisor` entitlement before
+  running them; the script prepares the pinned Firecracker kernel plus
+  generated tiny initrd for guest boot tests and fails when the host cannot run
+  HVF tests unless CI explicitly uses `--allow-unsupported` after build/sign
+  validation
 
 ## Security and Performance Scope
 

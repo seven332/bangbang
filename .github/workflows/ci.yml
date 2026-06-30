@@ -53,11 +53,8 @@ jobs:
       - name: Run HVF unit tests
         run: cargo test -p bangbang-hvf --lib --all-features --locked
 
-      - name: Build and sign HVF integration tests
-        run: scripts/run-hvf-tests.sh --allow-unsupported
-
-      - name: Build and sign guest boot integration test
-        run: scripts/run-guest-boot-tests.sh --allow-unsupported
+      - name: Build and sign integration tests
+        run: scripts/run-integration-tests.sh --allow-unsupported
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
