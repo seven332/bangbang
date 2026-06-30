@@ -4406,11 +4406,11 @@ mod tests {
     }
 
     #[test]
-    fn run_once_and_handle_mmio_ignores_osdlr_sys64_write_without_dispatcher_lock() {
+    fn run_once_and_handle_mmio_ignores_osdlr_sys64_write_to_gpr_without_dispatcher_lock() {
         let (runner, register_write_receiver) = start_sys64_run_step_recording_runner(
             HvfSys64Direction::Write,
             HvfSys64Register::OSDLR_EL1,
-            31,
+            2,
         );
         let dispatcher = shared_dispatcher();
         let dispatcher_guard = dispatcher
@@ -4420,7 +4420,7 @@ mod tests {
         assert_eq!(
             runner.run_once_and_handle_mmio(Arc::clone(&dispatcher)),
             Ok(HvfVcpuRunStepOutcome::Sys64 {
-                exit: sys64_exit(HvfSys64Direction::Write, HvfSys64Register::OSDLR_EL1, 31,),
+                exit: sys64_exit(HvfSys64Direction::Write, HvfSys64Register::OSDLR_EL1, 2),
             })
         );
         drop(dispatcher_guard);
