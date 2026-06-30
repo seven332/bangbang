@@ -26,7 +26,8 @@ use crate::mmio::{
 };
 use crate::network::{
     NetworkMmioDeviceRegistration, NetworkMmioLayout, NetworkMmioRegistrationError,
-    PreparedNetworkDeviceError, PreparedNetworkDevices,
+    PreparedNetworkDeviceError, PreparedNetworkDevices, VirtioNetworkDeviceNotificationDispatch,
+    VirtioNetworkDeviceNotificationError, VirtioNetworkMmioHandler,
 };
 use crate::serial::{SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialMmioDevice, SharedSerialOutputBuffer};
 
@@ -219,6 +220,129 @@ impl std::error::Error for Arm64BootBlockNotificationDispatchError {
     }
 }
 
+#[derive(Debug)]
+pub struct Arm64BootNetworkNotificationDispatches {
+    devices: Vec<Arm64BootNetworkNotificationDispatch>,
+}
+
+impl Arm64BootNetworkNotificationDispatches {
+    fn new(devices: Vec<Arm64BootNetworkNotificationDispatch>) -> Self {
+        Self { devices }
+    }
+
+    pub fn as_slice(&self) -> &[Arm64BootNetworkNotificationDispatch] {
+        &self.devices
+    }
+
+    pub fn into_vec(self) -> Vec<Arm64BootNetworkNotificationDispatch> {
+        self.devices
+    }
+
+    pub fn len(&self) -> usize {
+        self.devices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.devices.is_empty()
+    }
+
+    pub fn needs_queue_interrupt(&self) -> bool {
+        self.devices
+            .iter()
+            .any(Arm64BootNetworkNotificationDispatch::needs_queue_interrupt)
+    }
+}
+
+#[derive(Debug)]
+pub struct Arm64BootNetworkNotificationDispatch {
+    device: Arm64BootNetworkDevice,
+    outcome: Arm64BootNetworkNotificationOutcome,
+}
+
+impl Arm64BootNetworkNotificationDispatch {
+    fn new(device: Arm64BootNetworkDevice, outcome: Arm64BootNetworkNotificationOutcome) -> Self {
+        Self { device, outcome }
+    }
+
+    pub const fn device(&self) -> &Arm64BootNetworkDevice {
+        &self.device
+    }
+
+    pub const fn outcome(&self) -> &Arm64BootNetworkNotificationOutcome {
+        &self.outcome
+    }
+
+    pub fn needs_queue_interrupt(&self) -> bool {
+        self.outcome.needs_queue_interrupt()
+    }
+}
+
+#[derive(Debug)]
+pub enum Arm64BootNetworkNotificationOutcome {
+    Dispatched(VirtioNetworkDeviceNotificationDispatch),
+    DispatchFailed(VirtioNetworkDeviceNotificationError),
+    HandlerLookupFailed(MmioHandlerLookupError),
+}
+
+impl Arm64BootNetworkNotificationOutcome {
+    pub fn needs_queue_interrupt(&self) -> bool {
+        match self {
+            Self::Dispatched(dispatch) => dispatch.needs_queue_interrupt(),
+            Self::DispatchFailed(source) => source
+                .completed_tx_dispatch()
+                .is_some_and(crate::network::VirtioNetworkTxQueueDispatch::needs_queue_interrupt),
+            Self::HandlerLookupFailed(_) => false,
+        }
+    }
+
+    pub const fn dispatched(&self) -> Option<&VirtioNetworkDeviceNotificationDispatch> {
+        match self {
+            Self::Dispatched(dispatch) => Some(dispatch),
+            Self::DispatchFailed(_) | Self::HandlerLookupFailed(_) => None,
+        }
+    }
+
+    pub const fn dispatch_error(&self) -> Option<&VirtioNetworkDeviceNotificationError> {
+        match self {
+            Self::DispatchFailed(source) => Some(source),
+            Self::Dispatched(_) | Self::HandlerLookupFailed(_) => None,
+        }
+    }
+
+    pub const fn handler_lookup_error(&self) -> Option<&MmioHandlerLookupError> {
+        match self {
+            Self::HandlerLookupFailed(source) => Some(source),
+            Self::Dispatched(_) | Self::DispatchFailed(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum Arm64BootNetworkNotificationDispatchError {
+    ResultAllocation { source: TryReserveError },
+}
+
+impl fmt::Display for Arm64BootNetworkNotificationDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ResultAllocation { source } => {
+                write!(
+                    f,
+                    "failed to allocate network notification results: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for Arm64BootNetworkNotificationDispatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ResultAllocation { source } => Some(source),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arm64BootBlockDevice {
     pub registration: BlockMmioDeviceRegistration,
@@ -264,6 +388,34 @@ impl Arm64BootRuntimeResources {
         }
 
         Ok(Arm64BootBlockNotificationDispatches::new(devices))
+    }
+
+    pub fn dispatch_network_queue_notifications(
+        &mut self,
+        memory: &mut GuestMemory,
+        mmio_dispatcher: &mut MmioDispatcher,
+    ) -> Result<Arm64BootNetworkNotificationDispatches, Arm64BootNetworkNotificationDispatchError>
+    {
+        let mut devices = Vec::new();
+        devices
+            .try_reserve_exact(self.network_devices.len())
+            .map_err(
+                |source| Arm64BootNetworkNotificationDispatchError::ResultAllocation { source },
+            )?;
+
+        for device in self.network_devices.iter().cloned() {
+            let region_id = device.registration.region_id();
+            let outcome = match mmio_dispatcher.handler_mut::<VirtioNetworkMmioHandler>(region_id) {
+                Ok(handler) => match handler.dispatch_network_queue_notifications(memory) {
+                    Ok(dispatch) => Arm64BootNetworkNotificationOutcome::Dispatched(dispatch),
+                    Err(source) => Arm64BootNetworkNotificationOutcome::DispatchFailed(source),
+                },
+                Err(source) => Arm64BootNetworkNotificationOutcome::HandlerLookupFailed(source),
+            };
+            devices.push(Arm64BootNetworkNotificationDispatch::new(device, outcome));
+        }
+
+        Ok(Arm64BootNetworkNotificationDispatches::new(devices))
     }
 }
 
@@ -1562,6 +1714,98 @@ mod tests {
         assert!(dispatches.is_empty());
         assert_eq!(dispatches.len(), 0);
         assert!(!dispatches.needs_queue_interrupt());
+    }
+
+    #[test]
+    fn boot_runtime_network_notification_dispatch_accepts_empty_network_devices() {
+        let kernel = temp_file("kernel-empty-network-dispatch", &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+        let resources =
+            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
+                .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
+        let mut runtime = parts.runtime;
+
+        let dispatches = runtime
+            .dispatch_network_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("empty network dispatch result should allocate");
+
+        assert!(dispatches.is_empty());
+        assert_eq!(dispatches.len(), 0);
+        assert!(!dispatches.needs_queue_interrupt());
+    }
+
+    #[test]
+    fn boot_runtime_network_notification_dispatch_without_pending_notification_is_noop() {
+        let kernel = temp_file("kernel-network-noop-dispatch", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        add_network(&mut controller, "eth0", "tap0");
+        let config = Arm64BootResourceConfig {
+            network_interrupt_lines: &[line(33)],
+            ..valid_config(&[])
+        };
+        let resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
+        let mut runtime = parts.runtime;
+
+        let dispatches = runtime
+            .dispatch_network_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("network dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 1);
+        assert!(!dispatches.needs_queue_interrupt());
+        let device_dispatch = &dispatches.as_slice()[0];
+        assert_eq!(device_dispatch.device().registration.iface_id(), "eth0");
+        assert_eq!(device_dispatch.device().fdt_device.interrupt_line, line(33));
+        let dispatch = device_dispatch
+            .outcome()
+            .dispatched()
+            .expect("no pending notification should dispatch as no-op");
+        assert_eq!(dispatch.drained_notifications(), []);
+        assert!(dispatch.tx_queue_dispatch().is_none());
+        assert!(!device_dispatch.needs_queue_interrupt());
+    }
+
+    #[test]
+    fn boot_runtime_network_notification_dispatch_reports_missing_handler() {
+        let kernel = temp_file("kernel-network-missing-handler-dispatch", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        add_network(&mut controller, "eth0", "tap0");
+        let config = Arm64BootResourceConfig {
+            network_interrupt_lines: &[line(33)],
+            ..valid_config(&[])
+        };
+        let resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut mmio_dispatcher = MmioDispatcher::new();
+        let mut runtime = parts.runtime;
+
+        let dispatches = runtime
+            .dispatch_network_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("network dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 1);
+        assert!(!dispatches.needs_queue_interrupt());
+        let error = dispatches.as_slice()[0]
+            .outcome()
+            .handler_lookup_error()
+            .expect("missing network handler should be reported");
+        match error {
+            crate::mmio::MmioHandlerLookupError::MissingHandler { region_id } => {
+                assert_eq!(
+                    *region_id,
+                    runtime.network_devices[0].registration.region_id()
+                );
+            }
+            other => panic!("expected missing network handler, got {other:?}"),
+        }
     }
 
     #[test]
