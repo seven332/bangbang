@@ -9,7 +9,9 @@ use bangbang_runtime::{
 
 const ESR_EC_SHIFT: u64 = 26;
 const ESR_EC_MASK: u64 = 0x3f;
+const ESR_EC_HVC: u8 = 0x16;
 const ESR_EC_DATA_ABORT_LOWER_EL: u8 = 0x24;
+const ESR_ISS_HVC_IMMEDIATE_MASK: u64 = 0xffff;
 const ESR_ISS_ISV: u64 = 1 << 24;
 const ESR_ISS_SAS_SHIFT: u64 = 22;
 const ESR_ISS_SAS_MASK: u64 = 0x3;
@@ -29,6 +31,18 @@ pub struct HvfExceptionExit {
 }
 
 impl HvfExceptionExit {
+    pub fn decode_hvc(self) -> Result<HvfHvcExit, HvfHvcDecodeError> {
+        let exception_class = exception_class(self.syndrome);
+        if exception_class != ESR_EC_HVC {
+            return Err(HvfHvcDecodeError::UnsupportedExceptionClass { exception_class });
+        }
+
+        Ok(HvfHvcExit {
+            exit: self,
+            immediate: (self.syndrome & ESR_ISS_HVC_IMMEDIATE_MASK) as u16,
+        })
+    }
+
     pub fn decode_mmio_access(self) -> Result<HvfMmioAccess, HvfMmioDecodeError> {
         let exception_class = exception_class(self.syndrome);
         if exception_class != ESR_EC_DATA_ABORT_LOWER_EL {
@@ -77,6 +91,42 @@ impl HvfExceptionExit {
         })
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfHvcExit {
+    exit: HvfExceptionExit,
+    immediate: u16,
+}
+
+impl HvfHvcExit {
+    pub const fn exception_exit(self) -> HvfExceptionExit {
+        self.exit
+    }
+
+    pub const fn immediate(self) -> u16 {
+        self.immediate
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HvfHvcDecodeError {
+    UnsupportedExceptionClass { exception_class: u8 },
+}
+
+impl fmt::Display for HvfHvcDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedExceptionClass { exception_class } => {
+                write!(
+                    f,
+                    "unsupported HVF exception class 0x{exception_class:x} for HVC decode"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for HvfHvcDecodeError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HvfMmioAccess {
@@ -348,6 +398,10 @@ impl HvfVcpuExit {
         match self {
             Self::Canceled => Ok(HvfResolvedVcpuExit::Canceled),
             Self::Exception(exit) => {
+                if let Ok(hvc) = exit.decode_hvc() {
+                    return Ok(HvfResolvedVcpuExit::Hvc(hvc));
+                }
+
                 let access = exit
                     .decode_mmio_access()
                     .map_err(|source| HvfVcpuExitResolveError::MmioDecode { exit, source })?;
@@ -381,6 +435,7 @@ impl HvfVcpuExit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HvfResolvedVcpuExit {
     Canceled,
+    Hvc(HvfHvcExit),
     Mmio(HvfResolvedMmioAccess),
     VtimerActivated,
     Unknown { reason: u32 },
@@ -431,11 +486,11 @@ mod tests {
     use std::error::Error as _;
 
     use super::{
-        ESR_EC_DATA_ABORT_LOWER_EL, ESR_EC_SHIFT, ESR_ISS_CM, ESR_ISS_ISV, ESR_ISS_S1PTW,
-        ESR_ISS_SAS_SHIFT, ESR_ISS_SF, ESR_ISS_SRT_SHIFT, ESR_ISS_SSE, ESR_ISS_WNR,
-        HvfExceptionExit, HvfMmioAccessSize, HvfMmioDecodeError, HvfMmioDirection, HvfMmioRegister,
-        HvfMmioRegisterWidth, HvfMmioResolveError, HvfResolvedVcpuExit, HvfVcpuExit,
-        HvfVcpuExitResolveError,
+        ESR_EC_DATA_ABORT_LOWER_EL, ESR_EC_HVC, ESR_EC_SHIFT, ESR_ISS_CM, ESR_ISS_ISV,
+        ESR_ISS_S1PTW, ESR_ISS_SAS_SHIFT, ESR_ISS_SF, ESR_ISS_SRT_SHIFT, ESR_ISS_SSE, ESR_ISS_WNR,
+        HvfExceptionExit, HvfHvcDecodeError, HvfMmioAccessSize, HvfMmioDecodeError,
+        HvfMmioDirection, HvfMmioRegister, HvfMmioRegisterWidth, HvfMmioResolveError,
+        HvfResolvedVcpuExit, HvfVcpuExit, HvfVcpuExitResolveError,
     };
     use bangbang_runtime::{
         memory::{GuestAddress, GuestMemoryError, GuestMemoryRange},
@@ -459,6 +514,10 @@ mod tests {
             virtual_address: 0x22,
             physical_address,
         }
+    }
+
+    fn hvc_syndrome(immediate: u16) -> u64 {
+        (u64::from(ESR_EC_HVC) << ESR_EC_SHIFT) | u64::from(immediate)
     }
 
     fn data_abort_syndrome(
@@ -560,6 +619,32 @@ mod tests {
         assert_eq!(access.register(), register);
         assert!(!access.sign_extend());
         assert_eq!(access.register_width(), HvfMmioRegisterWidth::Bits32);
+    }
+
+    #[test]
+    fn decodes_hvc_exception_exit() {
+        let exit = exception_exit(hvc_syndrome(0x1234), 0);
+        let hvc = exit.decode_hvc().expect("HVC exit should decode");
+
+        assert_eq!(hvc.exception_exit(), exit);
+        assert_eq!(hvc.immediate(), 0x1234);
+    }
+
+    #[test]
+    fn rejects_non_hvc_exception_for_hvc_decode() {
+        let exit = exception_exit(ESR_ISS_ISV, 0x1000);
+        let err = exit
+            .decode_hvc()
+            .expect_err("non-HVC exception should not decode as HVC");
+
+        assert_eq!(
+            err,
+            HvfHvcDecodeError::UnsupportedExceptionClass { exception_class: 0 }
+        );
+        assert_eq!(
+            err.to_string(),
+            "unsupported HVF exception class 0x0 for HVC decode"
+        );
     }
 
     #[test]
@@ -774,6 +859,21 @@ mod tests {
         assert_eq!(access.direction(), HvfMmioDirection::Write);
         assert_eq!(access.size(), HvfMmioAccessSize::Word);
         assert_eq!(access.register(), register);
+    }
+
+    #[test]
+    fn resolves_hvc_vcpu_exit_without_bus_lookup() {
+        let bus = MmioBus::new();
+        let exit = exception_exit(hvc_syndrome(0), 0);
+        let resolved = HvfVcpuExit::Exception(exit)
+            .resolve_with_mmio_bus(&bus)
+            .expect("HVC exit should resolve without MMIO bus ownership");
+
+        let HvfResolvedVcpuExit::Hvc(hvc) = resolved else {
+            panic!("expected resolved HVC exit, got {resolved:?}");
+        };
+        assert_eq!(hvc.exception_exit(), exit);
+        assert_eq!(hvc.immediate(), 0);
     }
 
     #[test]
