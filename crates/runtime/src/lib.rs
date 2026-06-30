@@ -9,6 +9,7 @@ pub mod machine;
 pub mod memory;
 pub mod metrics;
 pub mod mmio;
+pub mod network;
 pub mod serial;
 pub mod startup;
 pub mod virtio_mmio;
