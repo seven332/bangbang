@@ -25,8 +25,6 @@ const BLOCK_MMIO_BASE: u64 = 0x5000_0000;
 #[test]
 fn boots_firecracker_kernel_to_guest_marker() {
     use std::num::NonZeroUsize;
-    use std::sync::mpsc;
-    use std::thread;
     use std::time::Instant;
 
     use bangbang_hvf::{
@@ -70,16 +68,7 @@ fn boots_firecracker_kernel_to_guest_marker() {
     validate_pre_run_boot_metadata(&session, &boot_diagnostics);
     let run_loop_control = session.run_loop_control();
     let stop_token = run_loop_control.stop_token();
-    let watchdog_control = run_loop_control.clone();
-    let (done_sender, done_receiver) = mpsc::channel();
-    let watchdog = thread::spawn(move || {
-        if done_receiver.recv_timeout(GUEST_BOOT_TIMEOUT).is_err() {
-            let _ = watchdog_control.request_stop();
-            true
-        } else {
-            false
-        }
-    });
+    let watchdog = SmokeWatchdog::spawn(run_loop_control.clone());
     let one_step = NonZeroUsize::new(1).expect("one-step limit should be non-zero");
     let started_at = Instant::now();
     let mut run_diagnostics = SmokeRunDiagnostics::default();
@@ -114,10 +103,7 @@ fn boots_firecracker_kernel_to_guest_marker() {
         let _ = run_loop_control.request_stop();
         true
     };
-    let _ = done_sender.send(());
-    let watchdog_timed_out = watchdog
-        .join()
-        .expect("guest boot smoke watchdog should join");
+    let watchdog_timed_out = watchdog.finish();
     let elapsed = started_at.elapsed();
     let serial_bytes = serial_output
         .bytes()
@@ -147,6 +133,59 @@ fn boots_firecracker_kernel_to_guest_marker() {
         SmokeFailureReport::new(&boot_diagnostics, &run_diagnostics),
         String::from_utf8_lossy(&serial_bytes)
     );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct SmokeWatchdog {
+    done_sender: Option<std::sync::mpsc::Sender<()>>,
+    handle: Option<std::thread::JoinHandle<bool>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl SmokeWatchdog {
+    fn spawn(control: bangbang_hvf::HvfArm64BootRunLoopControl) -> Self {
+        let (done_sender, done_receiver) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            if done_receiver.recv_timeout(GUEST_BOOT_TIMEOUT).is_err() {
+                let _ = control.request_stop();
+                true
+            } else {
+                false
+            }
+        });
+
+        Self {
+            done_sender: Some(done_sender),
+            handle: Some(handle),
+        }
+    }
+
+    fn finish(mut self) -> bool {
+        self.signal_done();
+        self.join().expect("guest boot smoke watchdog should join")
+    }
+
+    fn signal_done(&mut self) {
+        if let Some(done_sender) = self.done_sender.take() {
+            let _ = done_sender.send(());
+        }
+    }
+
+    fn join(&mut self) -> std::thread::Result<bool> {
+        if let Some(handle) = self.handle.take() {
+            handle.join()
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for SmokeWatchdog {
+    fn drop(&mut self) {
+        self.signal_done();
+        let _ = self.join();
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
