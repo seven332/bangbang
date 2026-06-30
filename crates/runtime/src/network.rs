@@ -5,7 +5,9 @@ use std::str::FromStr;
 
 use crate::mmio::{MmioAccessBytes, MmioAccessBytesError, MmioHandlerError};
 use crate::virtio_mmio::{
+    VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError, VirtioMmioDeviceActivationHandler,
     VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError, VirtioMmioDeviceConfigHandler,
+    VirtioMmioQueueRegisterError, VirtioMmioQueueState, VirtioMmioRegisterHandler,
 };
 
 const MAC_ADDRESS_LEN: usize = 6;
@@ -20,6 +22,12 @@ pub const VIRTIO_NET_CONFIG_MAC_SIZE: usize = MAC_ADDRESS_LEN;
 pub const VIRTIO_NET_F_MAC: u32 = 5;
 pub const VIRTIO_RING_FEATURE_EVENT_IDX: u32 = 29;
 pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
+
+const VIRTIO_NET_RX_QUEUE_INDEX_U32: u32 = 0;
+const VIRTIO_NET_TX_QUEUE_INDEX_U32: u32 = 1;
+
+pub type VirtioNetworkMmioHandler =
+    VirtioMmioRegisterHandler<VirtioNetworkConfigSpace, VirtioNetworkDevice>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkInterfaceConfigInput {
@@ -264,6 +272,244 @@ impl VirtioMmioDeviceConfigHandler for VirtioNetworkConfigSpace {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VirtioNetworkDevice {
+    active_rx_queue: Option<VirtioMmioQueueState>,
+    active_tx_queue: Option<VirtioMmioQueueState>,
+}
+
+impl VirtioNetworkDevice {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_activated(&self) -> bool {
+        self.active_rx_queue.is_some() && self.active_tx_queue.is_some()
+    }
+
+    pub const fn active_rx_queue(&self) -> Option<VirtioMmioQueueState> {
+        self.active_rx_queue
+    }
+
+    pub const fn active_tx_queue(&self) -> Option<VirtioMmioQueueState> {
+        self.active_tx_queue
+    }
+
+    pub fn activate_network(
+        &mut self,
+        activation: VirtioMmioDeviceActivation<'_>,
+    ) -> Result<(), VirtioNetworkDeviceActivationError> {
+        if self.is_activated() {
+            return Err(VirtioNetworkDeviceActivationError::AlreadyActive);
+        }
+
+        let active_rx_queue =
+            active_network_queue_state(activation, VIRTIO_NET_RX_QUEUE_INDEX_U32)?;
+        let active_tx_queue =
+            active_network_queue_state(activation, VIRTIO_NET_TX_QUEUE_INDEX_U32)?;
+
+        self.active_rx_queue = Some(active_rx_queue);
+        self.active_tx_queue = Some(active_tx_queue);
+
+        Ok(())
+    }
+
+    pub fn reset(&mut self) {
+        self.active_rx_queue = None;
+        self.active_tx_queue = None;
+    }
+
+    fn dispatch_drained_queue_notifications(
+        &mut self,
+        drained_notifications: Vec<usize>,
+    ) -> Result<VirtioNetworkDeviceNotificationDispatch, VirtioNetworkDeviceNotificationError> {
+        if drained_notifications.is_empty() {
+            return Ok(VirtioNetworkDeviceNotificationDispatch::new(
+                drained_notifications,
+            ));
+        }
+
+        if !self.is_activated() {
+            return Err(VirtioNetworkDeviceNotificationError::Inactive {
+                drained_notifications,
+            });
+        }
+
+        if let Some(queue_index) = drained_notifications.iter().copied().find(|queue_index| {
+            *queue_index != VIRTIO_NET_RX_QUEUE_INDEX && *queue_index != VIRTIO_NET_TX_QUEUE_INDEX
+        }) {
+            return Err(VirtioNetworkDeviceNotificationError::UnsupportedQueue {
+                drained_notifications,
+                queue_index,
+            });
+        }
+
+        match drained_notifications.first().copied() {
+            Some(queue_index) => Err(
+                VirtioNetworkDeviceNotificationError::UnsupportedQueueExecution {
+                    drained_notifications,
+                    queue_index,
+                },
+            ),
+            None => Ok(VirtioNetworkDeviceNotificationDispatch::new(
+                drained_notifications,
+            )),
+        }
+    }
+}
+
+impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioNetworkDevice> {
+    pub fn dispatch_network_queue_notifications(
+        &mut self,
+    ) -> Result<VirtioNetworkDeviceNotificationDispatch, VirtioNetworkDeviceNotificationError> {
+        let drained_notifications = self.take_pending_queue_notifications();
+        self.activation_handler_mut()
+            .dispatch_drained_queue_notifications(drained_notifications)
+    }
+}
+
+impl VirtioMmioDeviceActivationHandler for VirtioNetworkDevice {
+    fn activate(
+        &mut self,
+        activation: VirtioMmioDeviceActivation<'_>,
+    ) -> Result<(), VirtioMmioDeviceActivationError> {
+        self.activate_network(activation).map_err(Into::into)
+    }
+
+    fn reset(&mut self) {
+        VirtioNetworkDevice::reset(self);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioNetworkDeviceNotificationDispatch {
+    drained_notifications: Vec<usize>,
+}
+
+impl VirtioNetworkDeviceNotificationDispatch {
+    const fn new(drained_notifications: Vec<usize>) -> Self {
+        Self {
+            drained_notifications,
+        }
+    }
+
+    pub fn drained_notifications(&self) -> &[usize] {
+        &self.drained_notifications
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioNetworkDeviceNotificationError {
+    Inactive {
+        drained_notifications: Vec<usize>,
+    },
+    UnsupportedQueue {
+        drained_notifications: Vec<usize>,
+        queue_index: usize,
+    },
+    UnsupportedQueueExecution {
+        drained_notifications: Vec<usize>,
+        queue_index: usize,
+    },
+}
+
+impl VirtioNetworkDeviceNotificationError {
+    pub fn drained_notifications(&self) -> &[usize] {
+        match self {
+            Self::Inactive {
+                drained_notifications,
+            }
+            | Self::UnsupportedQueue {
+                drained_notifications,
+                ..
+            }
+            | Self::UnsupportedQueueExecution {
+                drained_notifications,
+                ..
+            } => drained_notifications,
+        }
+    }
+}
+
+impl fmt::Display for VirtioNetworkDeviceNotificationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inactive { .. } => {
+                f.write_str("virtio-net queue notification cannot be dispatched before activation")
+            }
+            Self::UnsupportedQueue { queue_index, .. } => {
+                write!(
+                    f,
+                    "virtio-net queue notification for unsupported queue {queue_index}"
+                )
+            }
+            Self::UnsupportedQueueExecution { queue_index, .. } => {
+                write!(
+                    f,
+                    "virtio-net queue {queue_index} notification execution is not supported"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioNetworkDeviceNotificationError {}
+
+#[derive(Debug)]
+pub enum VirtioNetworkDeviceActivationError {
+    AlreadyActive,
+    QueueMetadata {
+        queue_index: u32,
+        source: VirtioMmioQueueRegisterError,
+    },
+    QueueNotReady {
+        queue_index: u32,
+    },
+    QueueSizeNotConfigured {
+        queue_index: u32,
+    },
+}
+
+impl fmt::Display for VirtioNetworkDeviceActivationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyActive => f.write_str("virtio-net device is already active"),
+            Self::QueueMetadata {
+                queue_index,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to read virtio-net queue {queue_index} activation metadata: {source}"
+                )
+            }
+            Self::QueueNotReady { queue_index } => {
+                write!(f, "virtio-net queue {queue_index} is not ready")
+            }
+            Self::QueueSizeNotConfigured { queue_index } => {
+                write!(f, "virtio-net queue {queue_index} size is not configured")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioNetworkDeviceActivationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::QueueMetadata { source, .. } => Some(source),
+            Self::AlreadyActive
+            | Self::QueueNotReady { .. }
+            | Self::QueueSizeNotConfigured { .. } => None,
+        }
+    }
+}
+
+impl From<VirtioNetworkDeviceActivationError> for VirtioMmioDeviceActivationError {
+    fn from(source: VirtioNetworkDeviceActivationError) -> Self {
+        MmioHandlerError::new(source.to_string()).into()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuestMacAddress {
     bytes: [u8; MAC_ADDRESS_LEN],
@@ -321,6 +567,28 @@ fn network_config_bytes_error(source: MmioAccessBytesError) -> VirtioMmioDeviceC
     VirtioMmioDeviceConfigError::Handler {
         source: MmioHandlerError::new(format!("virtio-net config access bytes failed: {source}")),
     }
+}
+
+fn active_network_queue_state(
+    activation: VirtioMmioDeviceActivation<'_>,
+    queue_index: u32,
+) -> Result<VirtioMmioQueueState, VirtioNetworkDeviceActivationError> {
+    let queue = *activation.queue(queue_index).map_err(|source| {
+        VirtioNetworkDeviceActivationError::QueueMetadata {
+            queue_index,
+            source,
+        }
+    })?;
+
+    if !queue.ready() {
+        return Err(VirtioNetworkDeviceActivationError::QueueNotReady { queue_index });
+    }
+
+    if queue.size() == 0 {
+        return Err(VirtioNetworkDeviceActivationError::QueueSizeNotConfigured { queue_index });
+    }
+
+    Ok(queue)
 }
 
 impl FromStr for GuestMacAddress {
@@ -463,8 +731,12 @@ mod tests {
     use crate::mmio::{MmioAccess, MmioAccessBytes, MmioBus, MmioRegionId};
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
-        VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioRegister,
-        VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
+        VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
+        VIRTIO_DEVICE_STATUS_INIT, VIRTIO_MMIO_DEVICE_CONFIG_OFFSET,
+        VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation,
+        VirtioMmioDeviceActivationError, VirtioMmioDeviceActivationHandler,
+        VirtioMmioDeviceRegisters, VirtioMmioQueueRegisterError, VirtioMmioQueueRegisters,
+        VirtioMmioRegister, VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
     };
 
     use super::{
@@ -473,9 +745,23 @@ mod tests {
         VIRTIO_NET_CONFIG_MAC_SIZE, VIRTIO_NET_DEVICE_ID, VIRTIO_NET_F_MAC, VIRTIO_NET_QUEUE_COUNT,
         VIRTIO_NET_QUEUE_SIZE, VIRTIO_NET_QUEUE_SIZES, VIRTIO_NET_RX_QUEUE_INDEX,
         VIRTIO_NET_TX_QUEUE_INDEX, VIRTIO_RING_FEATURE_EVENT_IDX, VirtioNetworkConfigSpace,
+        VirtioNetworkDevice, VirtioNetworkDeviceActivationError,
+        VirtioNetworkDeviceNotificationError, VirtioNetworkMmioHandler,
     };
 
     const TEST_MMIO_BASE: GuestAddress = GuestAddress::new(0x1000);
+    const TEST_RX_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x10_0000);
+    const TEST_RX_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x11_0000);
+    const TEST_RX_USED_RING: GuestAddress = GuestAddress::new(0x12_0000);
+    const TEST_TX_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x20_0000);
+    const TEST_TX_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x21_0000);
+    const TEST_TX_USED_RING: GuestAddress = GuestAddress::new(0x22_0000);
+    const TEST_QUEUE_SIZE: u16 = 8;
+    const TEST_RETRY_QUEUE_SIZE: u16 = 16;
+    const QUEUE_CONFIG_STATUS: u32 = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+        | VIRTIO_DEVICE_STATUS_DRIVER
+        | VIRTIO_DEVICE_STATUS_FEATURES_OK;
+    const DRIVER_OK_STATUS: u32 = QUEUE_CONFIG_STATUS | VIRTIO_DEVICE_STATUS_DRIVER_OK;
 
     fn input() -> NetworkInterfaceConfigInput {
         NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0")
@@ -525,6 +811,18 @@ mod tests {
         .expect("network register handler should build")
     }
 
+    fn network_activation_handler() -> VirtioNetworkMmioHandler {
+        let config = VirtioNetworkConfigSpace::new(Some(test_guest_mac()));
+        VirtioMmioRegisterHandler::with_device_config_and_activation(
+            VIRTIO_NET_DEVICE_ID,
+            config.available_features(),
+            &VIRTIO_NET_QUEUE_SIZES,
+            config,
+            VirtioNetworkDevice::new(),
+        )
+        .expect("network activation handler should build")
+    }
+
     fn read_network_config(
         config: VirtioNetworkConfigSpace,
         offset: u64,
@@ -553,6 +851,183 @@ mod tests {
             mmio_access(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET + offset, data.len()),
             MmioAccessBytes::new(data).expect("test config write bytes should build"),
         )
+    }
+
+    fn guest_address_low(address: GuestAddress) -> u32 {
+        u32::try_from(address.raw_value()).expect("test address should fit in queue low register")
+    }
+
+    fn network_device_registers() -> VirtioMmioDeviceRegisters {
+        let config = VirtioNetworkConfigSpace::new(Some(test_guest_mac()));
+        VirtioMmioDeviceRegisters::new(VIRTIO_NET_DEVICE_ID, config.available_features())
+    }
+
+    fn configured_network_queues(
+        rx_size: Option<u16>,
+        rx_ready: bool,
+        tx_size: Option<u16>,
+        tx_ready: bool,
+    ) -> VirtioMmioQueueRegisters {
+        let mut queues = VirtioMmioQueueRegisters::new(&VIRTIO_NET_QUEUE_SIZES)
+            .expect("network queue table should build");
+        configure_network_queue_registers(
+            &mut queues,
+            VIRTIO_NET_RX_QUEUE_INDEX
+                .try_into()
+                .expect("RX queue index should fit"),
+            rx_size,
+            rx_ready,
+        );
+        configure_network_queue_registers(
+            &mut queues,
+            VIRTIO_NET_TX_QUEUE_INDEX
+                .try_into()
+                .expect("TX queue index should fit"),
+            tx_size,
+            tx_ready,
+        );
+        queues
+    }
+
+    fn configure_network_queue_registers(
+        queues: &mut VirtioMmioQueueRegisters,
+        queue_index: u32,
+        queue_size: Option<u16>,
+        ready: bool,
+    ) {
+        let (descriptor_table, driver_ring, device_ring) = network_queue_addresses(queue_index);
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueSel,
+                queue_index,
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("queue should be selectable");
+        if let Some(queue_size) = queue_size {
+            queues
+                .write_register(
+                    VirtioMmioRegister::QueueNum,
+                    u32::from(queue_size),
+                    QUEUE_CONFIG_STATUS,
+                )
+                .expect("queue size should write");
+        }
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDescLow,
+                guest_address_low(descriptor_table),
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("queue descriptor table should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDriverLow,
+                guest_address_low(driver_ring),
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("queue driver ring should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDeviceLow,
+                guest_address_low(device_ring),
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("queue device ring should write");
+        if ready {
+            queues
+                .write_register(VirtioMmioRegister::QueueReady, 1, QUEUE_CONFIG_STATUS)
+                .expect("queue ready should write");
+        }
+    }
+
+    fn put_network_handler_in_queue_config_state(handler: &mut VirtioNetworkMmioHandler) {
+        handler
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
+            .expect("status should accept ACKNOWLEDGE");
+        handler
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            )
+            .expect("status should accept DRIVER");
+        handler
+            .write_register(VirtioMmioRegister::Status, QUEUE_CONFIG_STATUS)
+            .expect("status should accept FEATURES_OK");
+    }
+
+    fn configure_network_handler_queue(
+        handler: &mut VirtioNetworkMmioHandler,
+        queue_index: u32,
+        queue_size: u16,
+    ) {
+        let (descriptor_table, driver_ring, device_ring) = network_queue_addresses(queue_index);
+        handler
+            .write_register(VirtioMmioRegister::QueueSel, queue_index)
+            .expect("queue should be selectable");
+        handler
+            .write_register(VirtioMmioRegister::QueueNum, u32::from(queue_size))
+            .expect("queue size should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueDescLow,
+                guest_address_low(descriptor_table),
+            )
+            .expect("queue descriptor table should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueDriverLow,
+                guest_address_low(driver_ring),
+            )
+            .expect("queue driver ring should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueDeviceLow,
+                guest_address_low(device_ring),
+            )
+            .expect("queue device ring should write");
+        handler
+            .write_register(VirtioMmioRegister::QueueReady, 1)
+            .expect("queue ready should write");
+    }
+
+    fn configure_network_handler_queues(handler: &mut VirtioNetworkMmioHandler) {
+        put_network_handler_in_queue_config_state(handler);
+        configure_network_handler_queue(
+            handler,
+            VIRTIO_NET_RX_QUEUE_INDEX
+                .try_into()
+                .expect("RX queue index should fit"),
+            TEST_QUEUE_SIZE,
+        );
+        configure_network_handler_queue(
+            handler,
+            VIRTIO_NET_TX_QUEUE_INDEX
+                .try_into()
+                .expect("TX queue index should fit"),
+            TEST_QUEUE_SIZE,
+        );
+    }
+
+    fn activate_network_handler(handler: &mut VirtioNetworkMmioHandler) {
+        handler
+            .write_register(VirtioMmioRegister::Status, DRIVER_OK_STATUS)
+            .expect("DRIVER_OK should activate network device");
+    }
+
+    fn network_queue_addresses(queue_index: u32) -> (GuestAddress, GuestAddress, GuestAddress) {
+        match queue_index {
+            0 => (
+                TEST_RX_DESCRIPTOR_TABLE,
+                TEST_RX_AVAILABLE_RING,
+                TEST_RX_USED_RING,
+            ),
+            1 => (
+                TEST_TX_DESCRIPTOR_TABLE,
+                TEST_TX_AVAILABLE_RING,
+                TEST_TX_USED_RING,
+            ),
+            other => panic!("unsupported test queue index {other}"),
+        }
     }
 
     #[test]
@@ -954,5 +1429,338 @@ mod tests {
                 .expect("selected TX max queue size should read"),
             u32::from(VIRTIO_NET_QUEUE_SIZE)
         );
+    }
+
+    #[test]
+    fn virtio_network_device_activation_stores_rx_and_tx_queues() {
+        let mut device = VirtioNetworkDevice::new();
+        let registers = network_device_registers();
+        let queues = configured_network_queues(
+            Some(TEST_QUEUE_SIZE),
+            true,
+            Some(TEST_RETRY_QUEUE_SIZE),
+            true,
+        );
+
+        device
+            .activate_network(VirtioMmioDeviceActivation::new(&registers, &queues))
+            .expect("network device should activate");
+
+        assert!(device.is_activated());
+        assert_eq!(
+            device
+                .active_rx_queue()
+                .expect("RX queue should be active")
+                .size(),
+            TEST_QUEUE_SIZE
+        );
+        assert_eq!(
+            device
+                .active_tx_queue()
+                .expect("TX queue should be active")
+                .size(),
+            TEST_RETRY_QUEUE_SIZE
+        );
+    }
+
+    #[test]
+    fn virtio_network_device_activation_rejects_not_ready_queue_without_stale_state() {
+        let mut device = VirtioNetworkDevice::new();
+        let registers = network_device_registers();
+        let queues =
+            configured_network_queues(Some(TEST_QUEUE_SIZE), true, Some(TEST_QUEUE_SIZE), false);
+
+        let error = device
+            .activate_network(VirtioMmioDeviceActivation::new(&registers, &queues))
+            .expect_err("not-ready TX queue should not activate");
+
+        assert!(matches!(
+            error,
+            VirtioNetworkDeviceActivationError::QueueNotReady { queue_index: 1 }
+        ));
+        assert!(!device.is_activated());
+        assert!(device.active_rx_queue().is_none());
+        assert!(device.active_tx_queue().is_none());
+    }
+
+    #[test]
+    fn virtio_network_device_activation_rejects_zero_size_queue_without_stale_state() {
+        let mut device = VirtioNetworkDevice::new();
+        let registers = network_device_registers();
+        let queues = configured_network_queues(Some(TEST_QUEUE_SIZE), true, None, true);
+
+        let error = device
+            .activate_network(VirtioMmioDeviceActivation::new(&registers, &queues))
+            .expect_err("ready zero-size TX queue should not activate");
+
+        assert!(matches!(
+            error,
+            VirtioNetworkDeviceActivationError::QueueSizeNotConfigured { queue_index: 1 }
+        ));
+        assert!(!device.is_activated());
+        assert!(device.active_rx_queue().is_none());
+        assert!(device.active_tx_queue().is_none());
+    }
+
+    #[test]
+    fn virtio_network_device_activation_rejects_duplicate_without_replacing_queues() {
+        let mut device = VirtioNetworkDevice::new();
+        let registers = network_device_registers();
+        let first_queues =
+            configured_network_queues(Some(TEST_QUEUE_SIZE), true, Some(TEST_QUEUE_SIZE), true);
+        let second_queues = configured_network_queues(
+            Some(TEST_RETRY_QUEUE_SIZE),
+            true,
+            Some(TEST_RETRY_QUEUE_SIZE),
+            true,
+        );
+
+        device
+            .activate_network(VirtioMmioDeviceActivation::new(&registers, &first_queues))
+            .expect("first activation should succeed");
+
+        let error = device
+            .activate_network(VirtioMmioDeviceActivation::new(&registers, &second_queues))
+            .expect_err("duplicate activation should fail");
+
+        assert!(matches!(
+            error,
+            VirtioNetworkDeviceActivationError::AlreadyActive
+        ));
+        assert_eq!(
+            device
+                .active_rx_queue()
+                .expect("original RX queue should remain active")
+                .size(),
+            TEST_QUEUE_SIZE
+        );
+        assert_eq!(
+            device
+                .active_tx_queue()
+                .expect("original TX queue should remain active")
+                .size(),
+            TEST_QUEUE_SIZE
+        );
+    }
+
+    #[test]
+    fn virtio_network_device_activation_reset_clears_state_and_allows_retry() {
+        let mut device = VirtioNetworkDevice::new();
+        let registers = network_device_registers();
+        let first_queues =
+            configured_network_queues(Some(TEST_QUEUE_SIZE), true, Some(TEST_QUEUE_SIZE), true);
+        let second_queues = configured_network_queues(
+            Some(TEST_RETRY_QUEUE_SIZE),
+            true,
+            Some(TEST_RETRY_QUEUE_SIZE),
+            true,
+        );
+
+        device
+            .activate_network(VirtioMmioDeviceActivation::new(&registers, &first_queues))
+            .expect("first activation should succeed");
+
+        VirtioMmioDeviceActivationHandler::reset(&mut device);
+
+        assert!(!device.is_activated());
+        assert!(device.active_rx_queue().is_none());
+        assert!(device.active_tx_queue().is_none());
+
+        device
+            .activate_network(VirtioMmioDeviceActivation::new(&registers, &second_queues))
+            .expect("second activation should succeed after reset");
+
+        assert_eq!(
+            device
+                .active_rx_queue()
+                .expect("RX queue should be active after retry")
+                .size(),
+            TEST_RETRY_QUEUE_SIZE
+        );
+    }
+
+    #[test]
+    fn virtio_network_device_activation_trait_error_is_generic_handler_error() {
+        let mut device = VirtioNetworkDevice::new();
+        let registers = network_device_registers();
+        let queues =
+            configured_network_queues(Some(TEST_QUEUE_SIZE), false, Some(TEST_QUEUE_SIZE), true);
+
+        let error = VirtioMmioDeviceActivationHandler::activate(
+            &mut device,
+            VirtioMmioDeviceActivation::new(&registers, &queues),
+        )
+        .expect_err("trait activation should fail with generic handler error");
+
+        match &error {
+            VirtioMmioDeviceActivationError::Handler { source } => {
+                assert_eq!(source.to_string(), "virtio-net queue 0 is not ready");
+            }
+        }
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn virtio_network_device_activation_reports_queue_metadata_errors() {
+        let mut device = VirtioNetworkDevice::new();
+        let registers = network_device_registers();
+        let mut queues = VirtioMmioQueueRegisters::new(&[VIRTIO_NET_QUEUE_SIZE])
+            .expect("one queue table should build");
+        configure_network_queue_registers(
+            &mut queues,
+            VIRTIO_NET_RX_QUEUE_INDEX
+                .try_into()
+                .expect("RX queue index should fit"),
+            Some(TEST_QUEUE_SIZE),
+            true,
+        );
+
+        let error = device
+            .activate_network(VirtioMmioDeviceActivation::new(&registers, &queues))
+            .expect_err("missing TX queue should fail activation");
+
+        match &error {
+            VirtioNetworkDeviceActivationError::QueueMetadata {
+                queue_index,
+                source:
+                    VirtioMmioQueueRegisterError::InvalidQueueIndex {
+                        queue_index: source_queue_index,
+                        queue_count,
+                    },
+            } => {
+                assert_eq!(*queue_index, 1);
+                assert_eq!(*source_queue_index, 1);
+                assert_eq!(*queue_count, 1);
+            }
+            other => panic!("expected queue metadata error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn virtio_network_device_activation_runs_through_mmio_register_handler_and_reset() {
+        let mut handler = network_activation_handler();
+
+        configure_network_handler_queues(&mut handler);
+        activate_network_handler(&mut handler);
+
+        assert!(handler.is_device_activated());
+        assert!(handler.activation_handler().is_activated());
+        assert_eq!(
+            handler
+                .activation_handler()
+                .active_rx_queue()
+                .expect("RX queue should be active")
+                .device_ring(),
+            TEST_RX_USED_RING
+        );
+        assert_eq!(
+            handler
+                .activation_handler()
+                .active_tx_queue()
+                .expect("TX queue should be active")
+                .device_ring(),
+            TEST_TX_USED_RING
+        );
+
+        handler
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_INIT)
+            .expect("INIT status should reset network activation state");
+
+        assert!(!handler.is_device_activated());
+        assert!(!handler.activation_handler().is_activated());
+    }
+
+    #[test]
+    fn virtio_network_notifications_without_pending_work_are_noop() {
+        let mut device = VirtioNetworkDevice::new();
+
+        let dispatch = device
+            .dispatch_drained_queue_notifications(Vec::new())
+            .expect("empty notification drain should be a no-op");
+
+        assert_eq!(dispatch.drained_notifications(), &[]);
+    }
+
+    #[test]
+    fn virtio_network_notifications_reject_inactive_device_with_drained_metadata() {
+        let mut device = VirtioNetworkDevice::new();
+
+        let error = device
+            .dispatch_drained_queue_notifications(vec![VIRTIO_NET_RX_QUEUE_INDEX])
+            .expect_err("notification before activation should fail");
+
+        assert!(matches!(
+            error,
+            VirtioNetworkDeviceNotificationError::Inactive { .. }
+        ));
+        assert_eq!(error.drained_notifications(), &[VIRTIO_NET_RX_QUEUE_INDEX]);
+        assert_eq!(
+            error.to_string(),
+            "virtio-net queue notification cannot be dispatched before activation"
+        );
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
+    fn virtio_network_notifications_reject_unsupported_queue_execution_and_drain() {
+        let mut handler = network_activation_handler();
+
+        configure_network_handler_queues(&mut handler);
+        activate_network_handler(&mut handler);
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_RX_QUEUE_INDEX
+                    .try_into()
+                    .expect("RX queue index should fit"),
+            )
+            .expect("RX notification should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_TX_QUEUE_INDEX
+                    .try_into()
+                    .expect("TX queue index should fit"),
+            )
+            .expect("TX notification should write");
+
+        let error = handler
+            .dispatch_network_queue_notifications()
+            .expect_err("network packet execution is not supported yet");
+
+        match &error {
+            VirtioNetworkDeviceNotificationError::UnsupportedQueueExecution {
+                queue_index, ..
+            } => assert_eq!(*queue_index, VIRTIO_NET_RX_QUEUE_INDEX),
+            other => panic!("expected unsupported queue execution, got {other:?}"),
+        }
+        assert_eq!(
+            error.drained_notifications(),
+            &[VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_QUEUE_INDEX]
+        );
+        assert!(handler.pending_queue_notifications().is_empty());
+    }
+
+    #[test]
+    fn virtio_network_notifications_reject_unsupported_queue_index() {
+        let mut device = VirtioNetworkDevice::new();
+        let registers = network_device_registers();
+        let queues =
+            configured_network_queues(Some(TEST_QUEUE_SIZE), true, Some(TEST_QUEUE_SIZE), true);
+        device
+            .activate_network(VirtioMmioDeviceActivation::new(&registers, &queues))
+            .expect("network device should activate");
+
+        let error = device
+            .dispatch_drained_queue_notifications(vec![2])
+            .expect_err("unsupported queue index should fail");
+
+        match &error {
+            VirtioNetworkDeviceNotificationError::UnsupportedQueue { queue_index, .. } => {
+                assert_eq!(*queue_index, 2);
+            }
+            other => panic!("expected unsupported queue error, got {other:?}"),
+        }
+        assert_eq!(error.drained_notifications(), &[2]);
     }
 }
