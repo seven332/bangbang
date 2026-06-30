@@ -4,12 +4,18 @@ use std::collections::TryReserveError;
 use std::fmt;
 use std::str::FromStr;
 
-use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryRange};
-use crate::mmio::{MmioAccessBytes, MmioAccessBytesError, MmioHandlerError};
+use crate::memory::{
+    GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryRange,
+};
+use crate::mmio::{
+    MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
+    MmioHandlerError, MmioRegion, MmioRegionId,
+};
 use crate::virtio_mmio::{
-    VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError, VirtioMmioDeviceActivationHandler,
-    VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError, VirtioMmioDeviceConfigHandler,
-    VirtioMmioQueueRegisterError, VirtioMmioQueueState, VirtioMmioRegisterHandler,
+    VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
+    VirtioMmioDeviceActivationHandler, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
+    VirtioMmioDeviceConfigHandler, VirtioMmioQueueRegisterError, VirtioMmioQueueState,
+    VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
 };
 use crate::virtio_queue::{VirtqueueDescriptor, VirtqueueDescriptorChain};
 
@@ -986,6 +992,448 @@ impl PreparedNetworkDevices {
     pub fn into_vec(self) -> Vec<PreparedNetworkDevice> {
         self.devices
     }
+
+    pub fn register_mmio(
+        self,
+        layout: NetworkMmioLayout,
+    ) -> Result<NetworkMmioDevices, NetworkMmioRegistrationError> {
+        NetworkMmioDevices::from_prepared(self, layout)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkMmioLayout {
+    base_address: GuestAddress,
+    base_region_id: MmioRegionId,
+    address_stride: u64,
+    region_id_stride: u64,
+}
+
+impl NetworkMmioLayout {
+    pub const fn new(base_address: GuestAddress, base_region_id: MmioRegionId) -> Self {
+        Self {
+            base_address,
+            base_region_id,
+            address_stride: VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+            region_id_stride: 1,
+        }
+    }
+
+    pub const fn base_address(self) -> GuestAddress {
+        self.base_address
+    }
+
+    pub const fn base_region_id(self) -> MmioRegionId {
+        self.base_region_id
+    }
+
+    pub const fn address_stride(self) -> u64 {
+        self.address_stride
+    }
+
+    pub const fn region_id_stride(self) -> u64 {
+        self.region_id_stride
+    }
+
+    pub const fn with_address_stride(mut self, address_stride: u64) -> Self {
+        self.address_stride = address_stride;
+        self
+    }
+
+    pub const fn with_region_id_stride(mut self, region_id_stride: u64) -> Self {
+        self.region_id_stride = region_id_stride;
+        self
+    }
+
+    fn validate(self) -> Result<(), NetworkMmioRegistrationError> {
+        if self.address_stride < VIRTIO_MMIO_DEVICE_WINDOW_SIZE {
+            return Err(NetworkMmioRegistrationError::AddressStrideTooSmall {
+                stride: self.address_stride,
+                minimum: VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+            });
+        }
+
+        if self.region_id_stride == 0 {
+            return Err(NetworkMmioRegistrationError::DuplicateRegionIdStride {
+                region_id: self.base_region_id,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn placement(
+        self,
+        index: usize,
+    ) -> Result<NetworkMmioDevicePlacement, NetworkMmioRegistrationError> {
+        let device_index = u64::try_from(index)
+            .map_err(|_| NetworkMmioRegistrationError::DeviceIndexTooLarge { index })?;
+        let address_offset = device_index.checked_mul(self.address_stride).ok_or(
+            NetworkMmioRegistrationError::AddressOffsetOverflow {
+                device_index,
+                stride: self.address_stride,
+            },
+        )?;
+        let address = self.base_address.checked_add(address_offset).ok_or(
+            NetworkMmioRegistrationError::AddressOverflow {
+                base_address: self.base_address,
+                offset: address_offset,
+            },
+        )?;
+        let region_id_offset = device_index.checked_mul(self.region_id_stride).ok_or(
+            NetworkMmioRegistrationError::RegionIdOffsetOverflow {
+                device_index,
+                stride: self.region_id_stride,
+            },
+        )?;
+        let region_id = self
+            .base_region_id
+            .raw_value()
+            .checked_add(region_id_offset)
+            .map(MmioRegionId::new)
+            .ok_or(NetworkMmioRegistrationError::RegionIdOverflow {
+                base_region_id: self.base_region_id,
+                offset: region_id_offset,
+            })?;
+        let region = MmioRegion::new(region_id, address, VIRTIO_MMIO_DEVICE_WINDOW_SIZE).map_err(
+            |source| NetworkMmioRegistrationError::InvalidRegion {
+                region_id,
+                address,
+                source,
+            },
+        )?;
+
+        Ok(NetworkMmioDevicePlacement {
+            index,
+            address,
+            region_id,
+            region,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NetworkMmioDevicePlacement {
+    index: usize,
+    address: GuestAddress,
+    region_id: MmioRegionId,
+    region: MmioRegion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkMmioDeviceRegistration {
+    index: usize,
+    iface_id: String,
+    host_dev_name: String,
+    region: MmioRegion,
+}
+
+impl NetworkMmioDeviceRegistration {
+    pub const fn index(&self) -> usize {
+        self.index
+    }
+
+    pub fn iface_id(&self) -> &str {
+        &self.iface_id
+    }
+
+    pub fn host_dev_name(&self) -> &str {
+        &self.host_dev_name
+    }
+
+    pub const fn region(&self) -> MmioRegion {
+        self.region
+    }
+
+    pub const fn region_id(&self) -> MmioRegionId {
+        self.region.id()
+    }
+
+    pub const fn address(&self) -> GuestAddress {
+        self.region.range().start()
+    }
+}
+
+#[derive(Debug)]
+pub struct NetworkMmioDevices {
+    dispatcher: MmioDispatcher,
+    registrations: Vec<NetworkMmioDeviceRegistration>,
+}
+
+impl NetworkMmioDevices {
+    pub fn from_prepared(
+        prepared: PreparedNetworkDevices,
+        layout: NetworkMmioLayout,
+    ) -> Result<Self, NetworkMmioRegistrationError> {
+        layout.validate()?;
+
+        let prepared_devices = prepared.into_vec();
+        let mut registrations = Vec::new();
+        registrations
+            .try_reserve_exact(prepared_devices.len())
+            .map_err(|source| NetworkMmioRegistrationError::AllocateRegistrations { source })?;
+        let mut placements = Vec::new();
+        placements
+            .try_reserve_exact(prepared_devices.len())
+            .map_err(|source| NetworkMmioRegistrationError::AllocatePlacements { source })?;
+        for index in 0..prepared_devices.len() {
+            placements.push(layout.placement(index)?);
+        }
+
+        let mut dispatcher = MmioDispatcher::new();
+        for (prepared_device, placement) in prepared_devices.into_iter().zip(placements) {
+            let (iface_id, host_dev_name, config_space, device) = prepared_device.into_parts();
+            let handler = VirtioMmioRegisterHandler::with_device_config_and_activation(
+                VIRTIO_NET_DEVICE_ID,
+                config_space.available_features(),
+                &VIRTIO_NET_QUEUE_SIZES,
+                config_space,
+                device,
+            )
+            .map_err(|source| NetworkMmioRegistrationError::BuildHandler {
+                iface_id: iface_id.clone(),
+                region_id: placement.region_id,
+                source,
+            })?;
+            let region = dispatcher
+                .insert_region(
+                    placement.region_id,
+                    placement.address,
+                    VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+                )
+                .map_err(|source| NetworkMmioRegistrationError::InsertRegion {
+                    iface_id: iface_id.clone(),
+                    region_id: placement.region_id,
+                    address: placement.address,
+                    source,
+                })?;
+            dispatcher
+                .register_handler(placement.region_id, handler)
+                .map_err(|source| NetworkMmioRegistrationError::RegisterHandler {
+                    iface_id: iface_id.clone(),
+                    region_id: placement.region_id,
+                    source,
+                })?;
+            debug_assert_eq!(region, placement.region);
+            registrations.push(NetworkMmioDeviceRegistration {
+                index: placement.index,
+                iface_id,
+                host_dev_name,
+                region,
+            });
+        }
+
+        Ok(Self {
+            dispatcher,
+            registrations,
+        })
+    }
+
+    pub fn dispatcher(&self) -> &MmioDispatcher {
+        &self.dispatcher
+    }
+
+    pub fn dispatcher_mut(&mut self) -> &mut MmioDispatcher {
+        &mut self.dispatcher
+    }
+
+    pub fn registrations(&self) -> &[NetworkMmioDeviceRegistration] {
+        &self.registrations
+    }
+
+    pub fn len(&self) -> usize {
+        self.registrations.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.registrations.is_empty()
+    }
+
+    pub fn into_parts(self) -> (MmioDispatcher, Vec<NetworkMmioDeviceRegistration>) {
+        (self.dispatcher, self.registrations)
+    }
+}
+
+#[derive(Debug)]
+pub enum NetworkMmioRegistrationError {
+    AddressStrideTooSmall {
+        stride: u64,
+        minimum: u64,
+    },
+    DuplicateRegionIdStride {
+        region_id: MmioRegionId,
+    },
+    DeviceIndexTooLarge {
+        index: usize,
+    },
+    AddressOffsetOverflow {
+        device_index: u64,
+        stride: u64,
+    },
+    AddressOverflow {
+        base_address: GuestAddress,
+        offset: u64,
+    },
+    RegionIdOffsetOverflow {
+        device_index: u64,
+        stride: u64,
+    },
+    RegionIdOverflow {
+        base_region_id: MmioRegionId,
+        offset: u64,
+    },
+    AllocateRegistrations {
+        source: TryReserveError,
+    },
+    AllocatePlacements {
+        source: TryReserveError,
+    },
+    InvalidRegion {
+        region_id: MmioRegionId,
+        address: GuestAddress,
+        source: GuestMemoryError,
+    },
+    BuildHandler {
+        iface_id: String,
+        region_id: MmioRegionId,
+        source: VirtioMmioRegisterHandlerError,
+    },
+    InsertRegion {
+        iface_id: String,
+        region_id: MmioRegionId,
+        address: GuestAddress,
+        source: MmioBusError,
+    },
+    RegisterHandler {
+        iface_id: String,
+        region_id: MmioRegionId,
+        source: MmioDispatchError,
+    },
+}
+
+impl fmt::Display for NetworkMmioRegistrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AddressStrideTooSmall { stride, minimum } => {
+                write!(
+                    f,
+                    "network MMIO address stride {stride} is smaller than the required device window size {minimum}"
+                )
+            }
+            Self::DuplicateRegionIdStride { region_id } => {
+                write!(
+                    f,
+                    "network MMIO region id stride cannot be 0 because it would duplicate region id={region_id}"
+                )
+            }
+            Self::DeviceIndexTooLarge { index } => {
+                write!(f, "network MMIO device index {index} does not fit in u64")
+            }
+            Self::AddressOffsetOverflow {
+                device_index,
+                stride,
+            } => {
+                write!(
+                    f,
+                    "network MMIO address offset overflows for device index {device_index} with stride {stride}"
+                )
+            }
+            Self::AddressOverflow {
+                base_address,
+                offset,
+            } => {
+                write!(
+                    f,
+                    "network MMIO address overflows from base {base_address} with offset {offset}"
+                )
+            }
+            Self::RegionIdOffsetOverflow {
+                device_index,
+                stride,
+            } => {
+                write!(
+                    f,
+                    "network MMIO region id offset overflows for device index {device_index} with stride {stride}"
+                )
+            }
+            Self::RegionIdOverflow {
+                base_region_id,
+                offset,
+            } => {
+                write!(
+                    f,
+                    "network MMIO region id overflows from base id={base_region_id} with offset {offset}"
+                )
+            }
+            Self::AllocateRegistrations { source } => {
+                write!(f, "failed to allocate network MMIO registrations: {source}")
+            }
+            Self::AllocatePlacements { source } => {
+                write!(f, "failed to allocate network MMIO placements: {source}")
+            }
+            Self::InvalidRegion {
+                region_id,
+                address,
+                source,
+            } => {
+                write!(
+                    f,
+                    "invalid network MMIO region id={region_id} at {address}: {source}"
+                )
+            }
+            Self::BuildHandler {
+                iface_id,
+                region_id,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to build network MMIO handler for interface {iface_id} region id={region_id}: {source}"
+                )
+            }
+            Self::InsertRegion {
+                iface_id,
+                region_id,
+                address,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to insert network MMIO region for interface {iface_id} region id={region_id} at {address}: {source}"
+                )
+            }
+            Self::RegisterHandler {
+                iface_id,
+                region_id,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to register network MMIO handler for interface {iface_id} region id={region_id}: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for NetworkMmioRegistrationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AllocateRegistrations { source } => Some(source),
+            Self::AllocatePlacements { source } => Some(source),
+            Self::InvalidRegion { source, .. } => Some(source),
+            Self::BuildHandler { source, .. } => Some(source),
+            Self::InsertRegion { source, .. } => Some(source),
+            Self::RegisterHandler { source, .. } => Some(source),
+            Self::AddressStrideTooSmall { .. }
+            | Self::DuplicateRegionIdStride { .. }
+            | Self::DeviceIndexTooLarge { .. }
+            | Self::AddressOffsetOverflow { .. }
+            | Self::AddressOverflow { .. }
+            | Self::RegionIdOffsetOverflow { .. }
+            | Self::RegionIdOverflow { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1592,12 +2040,14 @@ mod tests {
     use std::str::FromStr;
 
     use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
-    use crate::mmio::{MmioAccess, MmioAccessBytes, MmioBus, MmioRegionId};
+    use crate::mmio::{
+        MmioAccess, MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioOperation, MmioRegionId,
+    };
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
         VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
         VIRTIO_DEVICE_STATUS_INIT, VIRTIO_MMIO_DEVICE_CONFIG_OFFSET,
-        VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation,
+        VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VIRTIO_MMIO_MAGIC_VALUE, VirtioMmioDeviceActivation,
         VirtioMmioDeviceActivationError, VirtioMmioDeviceActivationHandler,
         VirtioMmioDeviceRegisters, VirtioMmioQueueRegisterError, VirtioMmioQueueRegisters,
         VirtioMmioRegister, VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
@@ -1609,7 +2059,8 @@ mod tests {
 
     use super::{
         GuestMacAddress, InterfaceIdSource, NetworkInterfaceConfig, NetworkInterfaceConfigError,
-        NetworkInterfaceConfigInput, NetworkInterfaceConfigs, PreparedNetworkDevices,
+        NetworkInterfaceConfigInput, NetworkInterfaceConfigs, NetworkMmioDevices,
+        NetworkMmioLayout, NetworkMmioRegistrationError, PreparedNetworkDevices,
         VIRTIO_FEATURE_VERSION_1, VIRTIO_NET_CONFIG_MAC_SIZE, VIRTIO_NET_DEVICE_ID,
         VIRTIO_NET_F_MAC, VIRTIO_NET_MAX_BUFFER_SIZE, VIRTIO_NET_QUEUE_COUNT,
         VIRTIO_NET_QUEUE_SIZE, VIRTIO_NET_QUEUE_SIZES, VIRTIO_NET_RX_MIN_BUFFER_SIZE,
@@ -1725,6 +2176,43 @@ mod tests {
         handler.write_access(
             mmio_access(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET + offset, data.len()),
             MmioAccessBytes::new(data).expect("test config write bytes should build"),
+        )
+    }
+
+    fn dispatch_network_mmio_read(
+        devices: &mut NetworkMmioDevices,
+        device_index: usize,
+        offset: u64,
+        len: u64,
+    ) -> MmioAccessBytes {
+        let address = devices.registrations()[device_index]
+            .address()
+            .checked_add(offset)
+            .expect("test MMIO address should not overflow");
+        let access = devices
+            .dispatcher()
+            .lookup(address, len)
+            .expect("test MMIO access should resolve");
+        match devices
+            .dispatcher_mut()
+            .dispatch(MmioOperation::read(access).expect("test read operation should be valid"))
+            .expect("test MMIO read should dispatch")
+        {
+            MmioDispatchOutcome::Read { data } => data,
+            MmioDispatchOutcome::Write => panic!("read operation should not produce write outcome"),
+        }
+    }
+
+    fn dispatch_network_mmio_read_u32(
+        devices: &mut NetworkMmioDevices,
+        device_index: usize,
+        offset: u64,
+    ) -> u32 {
+        let data = dispatch_network_mmio_read(devices, device_index, offset, 4);
+        u32::from_le_bytes(
+            data.as_slice()
+                .try_into()
+                .expect("test MMIO read should return 4 bytes"),
         )
     }
 
@@ -2392,6 +2880,220 @@ mod tests {
         assert_eq!(host_dev_name, "tap0");
         assert_eq!(config_space.guest_mac(), Some(test_guest_mac()));
         assert!(!device.is_activated());
+    }
+
+    #[test]
+    fn network_mmio_devices_accept_empty_prepared_devices() {
+        let configs = NetworkInterfaceConfigs::new();
+        let prepared =
+            PreparedNetworkDevices::from_configs(&configs).expect("empty configs should prepare");
+
+        let devices = prepared
+            .register_mmio(NetworkMmioLayout::new(
+                TEST_MMIO_BASE,
+                MmioRegionId::new(10),
+            ))
+            .expect("empty prepared network devices should register");
+
+        assert!(devices.is_empty());
+        assert_eq!(devices.len(), 0);
+        assert!(devices.registrations().is_empty());
+        assert!(devices.dispatcher().regions().is_empty());
+    }
+
+    #[test]
+    fn network_mmio_devices_register_one_prepared_device() {
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(input().with_guest_mac("12:34:56:78:9a:bc"))
+            .expect("network config should be stored");
+        let prepared =
+            PreparedNetworkDevices::from_configs(&configs).expect("network device should prepare");
+
+        let mut devices = prepared
+            .register_mmio(NetworkMmioLayout::new(
+                TEST_MMIO_BASE,
+                MmioRegionId::new(10),
+            ))
+            .expect("network MMIO device should register");
+
+        assert_eq!(devices.len(), 1);
+        let registration = &devices.registrations()[0];
+        assert_eq!(registration.index(), 0);
+        assert_eq!(registration.iface_id(), "eth0");
+        assert_eq!(registration.host_dev_name(), "tap0");
+        assert_eq!(registration.region_id(), MmioRegionId::new(10));
+        assert_eq!(registration.address(), TEST_MMIO_BASE);
+        assert_eq!(
+            registration.region().range().size(),
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE
+        );
+        assert_eq!(devices.dispatcher().regions().len(), 1);
+        assert_eq!(devices.dispatcher().regions()[0], registration.region());
+        assert_eq!(
+            dispatch_network_mmio_read_u32(
+                &mut devices,
+                0,
+                VirtioMmioRegister::MagicValue.offset(),
+            ),
+            VIRTIO_MMIO_MAGIC_VALUE,
+        );
+        assert_eq!(
+            dispatch_network_mmio_read_u32(&mut devices, 0, VirtioMmioRegister::DeviceId.offset()),
+            VIRTIO_NET_DEVICE_ID,
+        );
+        assert_eq!(
+            dispatch_network_mmio_read(&mut devices, 0, VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, 4)
+                .as_slice(),
+            &[0x12, 0x34, 0x56, 0x78],
+        );
+    }
+
+    #[test]
+    fn network_mmio_devices_preserve_prepared_interface_order_and_layout() {
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0"))
+            .expect("first network config should be stored");
+        configs
+            .insert(NetworkInterfaceConfigInput::new("eth1", "eth1", "tap1"))
+            .expect("second network config should be stored");
+        let prepared =
+            PreparedNetworkDevices::from_configs(&configs).expect("network devices should prepare");
+
+        let devices = prepared
+            .register_mmio(
+                NetworkMmioLayout::new(TEST_MMIO_BASE, MmioRegionId::new(20))
+                    .with_address_stride(VIRTIO_MMIO_DEVICE_WINDOW_SIZE * 2)
+                    .with_region_id_stride(3),
+            )
+            .expect("network MMIO devices should register");
+
+        assert_eq!(devices.registrations()[0].iface_id(), "eth0");
+        assert_eq!(devices.registrations()[0].host_dev_name(), "tap0");
+        assert_eq!(devices.registrations()[0].index(), 0);
+        assert_eq!(
+            devices.registrations()[0].region_id(),
+            MmioRegionId::new(20)
+        );
+        assert_eq!(devices.registrations()[0].address(), TEST_MMIO_BASE);
+        assert_eq!(devices.registrations()[1].iface_id(), "eth1");
+        assert_eq!(devices.registrations()[1].host_dev_name(), "tap1");
+        assert_eq!(devices.registrations()[1].index(), 1);
+        assert_eq!(
+            devices.registrations()[1].region_id(),
+            MmioRegionId::new(23)
+        );
+        assert_eq!(
+            devices.registrations()[1].address(),
+            TEST_MMIO_BASE
+                .checked_add(VIRTIO_MMIO_DEVICE_WINDOW_SIZE * 2)
+                .expect("test address should not overflow"),
+        );
+    }
+
+    #[test]
+    fn network_mmio_devices_reject_overlapping_address_stride() {
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0"))
+            .expect("first network config should be stored");
+        configs
+            .insert(NetworkInterfaceConfigInput::new("eth1", "eth1", "tap1"))
+            .expect("second network config should be stored");
+        let prepared =
+            PreparedNetworkDevices::from_configs(&configs).expect("network devices should prepare");
+
+        let err = prepared
+            .register_mmio(
+                NetworkMmioLayout::new(TEST_MMIO_BASE, MmioRegionId::new(30))
+                    .with_address_stride(VIRTIO_MMIO_DEVICE_WINDOW_SIZE - 1),
+            )
+            .expect_err("overlapping network MMIO layout should fail");
+
+        assert!(matches!(
+            err,
+            NetworkMmioRegistrationError::AddressStrideTooSmall { .. },
+        ));
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn network_mmio_devices_reject_duplicate_region_id_stride() {
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0"))
+            .expect("first network config should be stored");
+        configs
+            .insert(NetworkInterfaceConfigInput::new("eth1", "eth1", "tap1"))
+            .expect("second network config should be stored");
+        let prepared =
+            PreparedNetworkDevices::from_configs(&configs).expect("network devices should prepare");
+
+        let err = prepared
+            .register_mmio(
+                NetworkMmioLayout::new(TEST_MMIO_BASE, MmioRegionId::new(40))
+                    .with_region_id_stride(0),
+            )
+            .expect_err("duplicate network MMIO region id layout should fail");
+
+        assert!(matches!(
+            err,
+            NetworkMmioRegistrationError::DuplicateRegionIdStride { .. },
+        ));
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn network_mmio_devices_reject_address_overflow_without_returning_bundle() {
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0"))
+            .expect("first network config should be stored");
+        configs
+            .insert(NetworkInterfaceConfigInput::new("eth1", "eth1", "tap1"))
+            .expect("second network config should be stored");
+        let prepared =
+            PreparedNetworkDevices::from_configs(&configs).expect("network devices should prepare");
+
+        let err = prepared
+            .register_mmio(
+                NetworkMmioLayout::new(TEST_MMIO_BASE, MmioRegionId::new(50))
+                    .with_address_stride(u64::MAX),
+            )
+            .expect_err("overflowing network MMIO layout should fail");
+
+        assert!(matches!(
+            err,
+            NetworkMmioRegistrationError::AddressOverflow { .. },
+        ));
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn network_mmio_devices_reject_region_id_overflow_without_returning_bundle() {
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0"))
+            .expect("first network config should be stored");
+        configs
+            .insert(NetworkInterfaceConfigInput::new("eth1", "eth1", "tap1"))
+            .expect("second network config should be stored");
+        let prepared =
+            PreparedNetworkDevices::from_configs(&configs).expect("network devices should prepare");
+
+        let err = prepared
+            .register_mmio(NetworkMmioLayout::new(
+                TEST_MMIO_BASE,
+                MmioRegionId::new(u64::MAX),
+            ))
+            .expect_err("overflowing network MMIO region id should fail");
+
+        assert!(matches!(
+            err,
+            NetworkMmioRegistrationError::RegionIdOverflow { .. },
+        ));
+        assert!(std::error::Error::source(&err).is_none());
     }
 
     #[test]
