@@ -5983,6 +5983,96 @@ mod tests {
     }
 
     #[test]
+    fn virtio_network_notifications_deliver_maximum_rx_packet() {
+        let mut memory = tx_frame_memory();
+        let mut handler = network_activation_handler();
+        let mut sink = RecordingTxPacketSink::default();
+        let packet_len =
+            usize::try_from(VIRTIO_NET_MAX_BUFFER_SIZE - u64::from(VIRTIO_NET_TX_HEADER_SIZE))
+                .expect("maximum RX payload should fit usize");
+        let mut source = RecordingRxPacketSource::with_packets(vec![vec![0xa5; packet_len]]);
+
+        configure_network_handler_queues(&mut handler);
+        activate_network_handler(&mut handler);
+        write_rx_descriptors(
+            &mut memory,
+            &[TestDescriptor::writable(
+                TEST_RX_BUFFER,
+                u32::try_from(VIRTIO_NET_MAX_BUFFER_SIZE).expect("RX maximum should fit u32"),
+                None,
+            )],
+        );
+        write_rx_available_heads(&mut memory, &[0]);
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_RX_QUEUE_INDEX
+                    .try_into()
+                    .expect("RX queue index should fit"),
+            )
+            .expect("RX notification should write");
+
+        let notification = handler
+            .dispatch_network_queue_notifications_with_packet_io(
+                &mut memory,
+                &mut sink,
+                &mut source,
+            )
+            .expect("maximum RX packet should dispatch");
+
+        let dispatch = notification
+            .rx_queue_dispatch()
+            .expect("RX dispatch summary should be present");
+        assert_eq!(dispatch.processed_buffers(), 1);
+        assert_eq!(dispatch.delivered_packets(), 1);
+        assert_eq!(
+            dispatch
+                .deliveries()
+                .first()
+                .expect("maximum RX delivery should be recorded")
+                .bytes_written_to_guest(),
+            u32::try_from(VIRTIO_NET_MAX_BUFFER_SIZE).expect("RX maximum should fit u32")
+        );
+        assert_eq!(
+            read_rx_used_element(&memory, 0),
+            (
+                0,
+                u32::try_from(VIRTIO_NET_MAX_BUFFER_SIZE).expect("RX maximum should fit u32"),
+            )
+        );
+        assert_eq!(
+            read_guest_bytes(&memory, TEST_RX_BUFFER, VIRTIO_NET_TX_HEADER_SIZE as usize),
+            vec![0; VIRTIO_NET_TX_HEADER_SIZE as usize]
+        );
+        assert_eq!(
+            read_guest_bytes(
+                &memory,
+                TEST_RX_BUFFER
+                    .checked_add(u64::from(VIRTIO_NET_TX_HEADER_SIZE))
+                    .expect("first payload address should not overflow"),
+                1,
+            ),
+            vec![0xa5]
+        );
+        assert_eq!(
+            read_guest_bytes(
+                &memory,
+                TEST_RX_BUFFER
+                    .checked_add(VIRTIO_NET_MAX_BUFFER_SIZE - 1)
+                    .expect("last payload address should not overflow"),
+                1,
+            ),
+            vec![0xa5]
+        );
+        assert_eq!(source.consume_calls, 1);
+        assert_eq!(source.remaining_packets(), 0);
+        assert_eq!(
+            read_interrupt_status(&handler),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+    }
+
+    #[test]
     fn virtio_network_notifications_empty_rx_source_keeps_available_buffer() {
         let mut memory = tx_frame_memory();
         let mut handler = network_activation_handler();
