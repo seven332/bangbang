@@ -24,6 +24,7 @@ use crate::mmio::{
     MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandlerLookupError, MmioRegion,
     MmioRegionId,
 };
+use crate::network::NetworkMmioDeviceRegistration;
 use crate::serial::{SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialMmioDevice, SharedSerialOutputBuffer};
 
 const MIB: u64 = 1024 * 1024;
@@ -217,6 +218,12 @@ pub struct Arm64BootBlockDevice {
     pub fdt_device: Arm64FdtVirtioMmioDevice,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Arm64BootNetworkDevice {
+    pub registration: NetworkMmioDeviceRegistration,
+    pub fdt_device: Arm64FdtVirtioMmioDevice,
+}
+
 #[derive(Debug, Clone)]
 pub struct Arm64BootSerialDevice {
     pub region: MmioRegion,
@@ -285,7 +292,14 @@ pub enum Arm64BootResourceError {
         devices: usize,
         lines: usize,
     },
+    NetworkInterruptLineCount {
+        devices: usize,
+        lines: usize,
+    },
     BlockDeviceMetadataAllocation {
+        source: TryReserveError,
+    },
+    NetworkDeviceMetadataAllocation {
         source: TryReserveError,
     },
     Fdt {
@@ -329,8 +343,15 @@ impl fmt::Display for Arm64BootResourceError {
                 f,
                 "block MMIO device count {devices} does not match interrupt line count {lines}"
             ),
+            Self::NetworkInterruptLineCount { devices, lines } => write!(
+                f,
+                "network MMIO device count {devices} does not match interrupt line count {lines}"
+            ),
             Self::BlockDeviceMetadataAllocation { source } => {
                 write!(f, "failed to allocate block device metadata: {source}")
+            }
+            Self::NetworkDeviceMetadataAllocation { source } => {
+                write!(f, "failed to allocate network device metadata: {source}")
             }
             Self::Fdt { source } => write!(f, "failed to write arm64 FDT: {source}"),
         }
@@ -347,11 +368,13 @@ impl std::error::Error for Arm64BootResourceError {
             Self::RegisterBlockMmio { source } => Some(source.as_ref()),
             Self::RegisterSerialMmio { source } => Some(source.as_ref()),
             Self::BlockDeviceMetadataAllocation { source } => Some(source),
+            Self::NetworkDeviceMetadataAllocation { source } => Some(source),
             Self::Fdt { source } => Some(source),
             Self::MissingBootSource
             | Self::MemorySizeOverflow { .. }
             | Self::MemorySizeExceedsArchitecturalMaximum { .. }
-            | Self::BlockInterruptLineCount { .. } => None,
+            | Self::BlockInterruptLineCount { .. }
+            | Self::NetworkInterruptLineCount { .. } => None,
         }
     }
 }
@@ -525,6 +548,17 @@ fn validate_block_interrupt_line_count(
     }
 }
 
+fn validate_network_interrupt_line_count(
+    devices: usize,
+    lines: usize,
+) -> Result<(), Arm64BootResourceError> {
+    if devices == lines {
+        Ok(())
+    } else {
+        Err(Arm64BootResourceError::NetworkInterruptLineCount { devices, lines })
+    }
+}
+
 fn block_device_metadata(
     registrations: &[BlockMmioDeviceRegistration],
     interrupt_lines: &[GuestInterruptLine],
@@ -557,6 +591,40 @@ fn block_device_metadata(
     }
 
     Ok((block_devices, fdt_devices))
+}
+
+pub fn arm64_boot_network_device_metadata(
+    registrations: &[NetworkMmioDeviceRegistration],
+    interrupt_lines: &[GuestInterruptLine],
+) -> Result<(Vec<Arm64BootNetworkDevice>, Vec<Arm64FdtVirtioMmioDevice>), Arm64BootResourceError> {
+    validate_network_interrupt_line_count(registrations.len(), interrupt_lines.len())?;
+
+    let mut network_devices = Vec::new();
+    network_devices
+        .try_reserve_exact(registrations.len())
+        .map_err(|source| Arm64BootResourceError::NetworkDeviceMetadataAllocation { source })?;
+    let mut fdt_devices = Vec::new();
+    fdt_devices
+        .try_reserve_exact(registrations.len())
+        .map_err(|source| Arm64BootResourceError::NetworkDeviceMetadataAllocation { source })?;
+
+    for (registration, interrupt_line) in registrations.iter().zip(interrupt_lines) {
+        let range = registration.region().range();
+        let fdt_device = Arm64FdtVirtioMmioDevice {
+            region: Arm64FdtRegion {
+                base: range.start().raw_value(),
+                size: range.size(),
+            },
+            interrupt_line: *interrupt_line,
+        };
+        network_devices.push(Arm64BootNetworkDevice {
+            registration: registration.clone(),
+            fdt_device,
+        });
+        fdt_devices.push(fdt_device);
+    }
+
+    Ok((network_devices, fdt_devices))
 }
 
 fn register_serial_mmio(
@@ -616,7 +684,7 @@ mod tests {
     use super::{
         Arm64BootResourceConfig, Arm64BootResourceError, Arm64BootResources,
         Arm64BootSerialDeviceConfig, Arm64BootSerialMmioRegistrationError, MIB,
-        block_device_metadata,
+        arm64_boot_network_device_metadata, block_device_metadata,
     };
     use crate::VmmAction;
     use crate::block::{
@@ -633,13 +701,18 @@ mod tests {
         MmioAccessBytes, MmioBusError, MmioDispatchOutcome, MmioDispatcher, MmioOperation,
         MmioRegionId,
     };
+    use crate::network::{
+        NetworkInterfaceConfigInput, NetworkInterfaceConfigs, NetworkMmioDeviceRegistration,
+        NetworkMmioLayout, PreparedNetworkDevices,
+    };
     use crate::serial::{
         SERIAL_MMIO_DEVICE_WINDOW_SIZE, SERIAL_TRANSMIT_REGISTER_OFFSET, SerialMmioDevice,
         SharedSerialOutputBuffer,
     };
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
-        VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK, VirtioMmioRegister,
+        VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
+        VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioRegister,
     };
     use crate::virtio_queue::{
         VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
@@ -654,6 +727,7 @@ mod tests {
     const ARM64_IMAGE_MAGIC_OFFSET: usize = 56;
     const ARM64_IMAGE_MAGIC: u32 = 0x644d_5241;
     const TEST_BLOCK_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_0000);
+    const TEST_NETWORK_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_4000);
     const TEST_SERIAL_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_2000);
     const TEST_QUEUE_SIZE: u16 = 4;
     const TEST_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x8040_0000);
@@ -770,6 +844,29 @@ mod tests {
                 is_root_device,
             )))
             .expect("drive config should be stored");
+    }
+
+    fn network_registrations(
+        interfaces: &[(&str, &str)],
+        layout: NetworkMmioLayout,
+    ) -> Vec<NetworkMmioDeviceRegistration> {
+        let mut configs = NetworkInterfaceConfigs::new();
+        for (iface_id, host_dev_name) in interfaces {
+            configs
+                .insert(NetworkInterfaceConfigInput::new(
+                    *iface_id,
+                    *iface_id,
+                    *host_dev_name,
+                ))
+                .expect("network config should be stored");
+        }
+        let prepared =
+            PreparedNetworkDevices::from_configs(&configs).expect("network devices should prepare");
+        let (_dispatcher, registrations) = prepared
+            .register_mmio(layout)
+            .expect("network MMIO devices should register")
+            .into_parts();
+        registrations
     }
 
     fn valid_config(lines: &[GuestInterruptLine]) -> Arm64BootResourceConfig<'_> {
@@ -1801,6 +1898,103 @@ mod tests {
                 lines: 1
             }
         ));
+    }
+
+    #[test]
+    fn network_metadata_accepts_empty_registrations() {
+        let (devices, fdt_devices) = arm64_boot_network_device_metadata(&[], &[])
+            .expect("empty network metadata should build");
+
+        assert!(devices.is_empty());
+        assert!(fdt_devices.is_empty());
+    }
+
+    #[test]
+    fn network_metadata_maps_one_registration_without_host_resource_access() {
+        let registrations = network_registrations(
+            &[("eth0", "/bangbang/missing-tap0")],
+            NetworkMmioLayout::new(TEST_NETWORK_MMIO_BASE, MmioRegionId::new(50)),
+        );
+        let lines = [line(34)];
+
+        let (devices, fdt_devices) = arm64_boot_network_device_metadata(&registrations, &lines)
+            .expect("network metadata should build");
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(fdt_devices.len(), 1);
+        assert_eq!(devices[0].registration.index(), 0);
+        assert_eq!(devices[0].registration.iface_id(), "eth0");
+        assert_eq!(
+            devices[0].registration.host_dev_name(),
+            "/bangbang/missing-tap0"
+        );
+        assert_eq!(devices[0].registration.region_id(), MmioRegionId::new(50));
+        assert_eq!(devices[0].registration.address(), TEST_NETWORK_MMIO_BASE);
+        assert_eq!(
+            devices[0].fdt_device.region.base,
+            TEST_NETWORK_MMIO_BASE.raw_value()
+        );
+        assert_eq!(
+            devices[0].fdt_device.region.size,
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE
+        );
+        assert_eq!(devices[0].fdt_device.interrupt_line, line(34));
+        assert_eq!(fdt_devices[0], devices[0].fdt_device);
+    }
+
+    #[test]
+    fn network_metadata_preserves_registration_order_and_interrupt_pairing() {
+        let stride = VIRTIO_MMIO_DEVICE_WINDOW_SIZE * 2;
+        let registrations = network_registrations(
+            &[("eth0", "tap0"), ("eth1", "tap1")],
+            NetworkMmioLayout::new(TEST_NETWORK_MMIO_BASE, MmioRegionId::new(60))
+                .with_address_stride(stride)
+                .with_region_id_stride(3),
+        );
+        let lines = [line(35), line(36)];
+
+        let (devices, fdt_devices) = arm64_boot_network_device_metadata(&registrations, &lines)
+            .expect("network metadata should build");
+
+        assert_eq!(devices.len(), 2);
+        assert_eq!(fdt_devices.len(), 2);
+        assert_eq!(devices[0].registration.iface_id(), "eth0");
+        assert_eq!(devices[0].registration.host_dev_name(), "tap0");
+        assert_eq!(devices[0].registration.region_id(), MmioRegionId::new(60));
+        assert_eq!(devices[0].registration.address(), TEST_NETWORK_MMIO_BASE);
+        assert_eq!(devices[0].fdt_device.interrupt_line, line(35));
+        assert_eq!(devices[1].registration.iface_id(), "eth1");
+        assert_eq!(devices[1].registration.host_dev_name(), "tap1");
+        assert_eq!(devices[1].registration.region_id(), MmioRegionId::new(63));
+        assert_eq!(
+            devices[1].registration.address(),
+            TEST_NETWORK_MMIO_BASE
+                .checked_add(stride)
+                .expect("test address should not overflow"),
+        );
+        assert_eq!(devices[1].fdt_device.interrupt_line, line(36));
+        assert_eq!(fdt_devices[0], devices[0].fdt_device);
+        assert_eq!(fdt_devices[1], devices[1].fdt_device);
+    }
+
+    #[test]
+    fn network_metadata_rejects_registration_line_mismatch() {
+        let registrations = network_registrations(
+            &[("eth0", "tap0")],
+            NetworkMmioLayout::new(TEST_NETWORK_MMIO_BASE, MmioRegionId::new(70)),
+        );
+
+        let err = arm64_boot_network_device_metadata(&registrations, &[])
+            .expect_err("line mismatch should fail");
+
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::NetworkInterruptLineCount {
+                devices: 1,
+                lines: 0
+            }
+        ));
+        assert!(std::error::Error::source(&err).is_none());
     }
 
     #[test]
