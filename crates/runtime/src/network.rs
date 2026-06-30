@@ -2617,6 +2617,25 @@ mod tests {
     }
 
     #[test]
+    fn virtio_network_rx_buffer_parser_rejects_length_overflow_without_stale_segments() {
+        let memory = tx_frame_memory();
+        let segment = super::VirtioNetworkRxBufferSegment::new(0, TEST_TX_PAYLOAD, 1);
+        let mut segments = Vec::new();
+
+        let error = super::push_rx_buffer_segment(&memory, &mut segments, u64::MAX, segment)
+            .expect_err("overflowing RX buffer length should fail");
+
+        assert!(matches!(
+            error,
+            VirtioNetworkRxBufferParseError::BufferLengthOverflow {
+                current: u64::MAX,
+                len: 1,
+            }
+        ));
+        assert!(segments.is_empty());
+    }
+
+    #[test]
     fn virtio_network_rx_buffer_parser_rejects_small_buffer() {
         let mut memory = tx_frame_memory();
         let chain = tx_descriptor_chain(
