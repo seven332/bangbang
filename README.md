@@ -216,20 +216,19 @@ cargo test --workspace --all-targets --all-features --locked --exclude bangbang-
 cargo test -p bangbang-hvf --lib --all-features --locked
 ```
 
-On macOS Apple Silicon hosts, `bangbang-hvf` contains real HVF lifecycle,
-GIC creation, guest memory mapping, and runner integration tests in
-`crates/hvf/tests/hvf_lifecycle.rs`. The tests are not ignored; run the signed
+On macOS Apple Silicon hosts, `bangbang-hvf` contains real HVF integration
+tests under `crates/hvf/tests/`. The tests are not ignored; run the signed
 test wrapper so host or entitlement failures fail the test run:
 
 ```sh
-scripts/run-hvf-tests.sh
+scripts/run-integration-tests.sh
 ```
 
-Hosted macOS CI may build and sign the HVF tests without executing them when
-Hypervisor.framework is unavailable:
+Hosted macOS CI may build and sign the integration tests without executing them
+when Hypervisor.framework is unavailable:
 
 ```sh
-scripts/run-hvf-tests.sh --allow-unsupported
+scripts/run-integration-tests.sh --allow-unsupported
 ```
 
 Prepare the pinned Firecracker arm64 Linux kernel artifact used by guest boot
@@ -246,22 +245,22 @@ artifact. By default, it stores the kernel under
 prepares the kernel artifact; it does not start a guest or run the guest boot
 integration test.
 
-Run the minimal guest boot integration test on macOS Apple Silicon hosts:
+Run only the minimal guest boot integration test on macOS Apple Silicon hosts:
 
 ```sh
-scripts/run-guest-boot-tests.sh
+scripts/run-integration-tests.sh --test guest_boot
 ```
 
-The script reuses the pinned kernel artifact, generates a deterministic tiny
-initrd under `.tmp/guest-artifacts/bangbang/guest-boot/`, signs the
-`bangbang-hvf` integration test, and verifies that the guest emits
+The integration-test runner reuses the pinned kernel artifact, generates a
+deterministic tiny initrd under `.tmp/guest-artifacts/bangbang/guest-boot/`,
+signs the `bangbang-hvf` integration test, and verifies that the guest emits
 `BANGBANG_BOOT_OK` on the internal serial console. The initrd contains its own
 `/init`, so a rootfs drive is not required for this integration test. Hosted
 macOS CI may validate artifact preparation, compilation, and signing without
 executing HVF:
 
 ```sh
-scripts/run-guest-boot-tests.sh --allow-unsupported
+scripts/run-integration-tests.sh --allow-unsupported --test guest_boot
 ```
 
 Run the VMM process skeleton and API server:
