@@ -97,6 +97,10 @@ should fail when HVF is unavailable.
 The guest is untrusted. vCPU execution, guest memory contents, virtqueue
 descriptor chains, MMIO accesses, block requests, and future device inputs must
 be validated before they affect host resources.
+Trapped system-register exits are guest-visible CPU behavior and must stay
+explicit. The current HVF runner emulates only the early-boot `OSDLR_EL1`
+RAZ/WI behavior needed by the pinned Firecracker kernel; unsupported trapped
+system registers fail closed instead of being treated as generic no-ops.
 
 The current serial device is an internal TX-only MMIO output path with bounded
 capture. Public serial output streaming is not implemented. Treat serial output

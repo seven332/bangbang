@@ -15,8 +15,8 @@ pub use backend::HvfBackend;
 pub use exit::{
     HvfExceptionExit, HvfHvcDecodeError, HvfHvcExit, HvfMmioAccess, HvfMmioAccessSize,
     HvfMmioDecodeError, HvfMmioDirection, HvfMmioRegister, HvfMmioRegisterWidth,
-    HvfMmioResolveError, HvfResolvedMmioAccess, HvfResolvedVcpuExit, HvfVcpuExit,
-    HvfVcpuExitResolveError,
+    HvfMmioResolveError, HvfResolvedMmioAccess, HvfResolvedVcpuExit, HvfSys64DecodeError,
+    HvfSys64Direction, HvfSys64Exit, HvfSys64Register, HvfVcpuExit, HvfVcpuExitResolveError,
 };
 pub use gic::{
     HvfGicError, HvfGicInterruptLineAllocator, HvfGicInterruptRange, HvfGicMetadata,

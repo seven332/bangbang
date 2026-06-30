@@ -761,7 +761,7 @@ fn run_boot_session_loop(
             HvfVcpuRunStepOutcome::Unknown { reason } => {
                 return Ok(HvfArm64BootRunLoopOutcome::Unknown { steps, reason });
             }
-            HvfVcpuRunStepOutcome::Hvc { .. } => {
+            HvfVcpuRunStepOutcome::Hvc { .. } | HvfVcpuRunStepOutcome::Sys64 { .. } => {
                 if stop_token.is_stop_requested() {
                     return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
                 }
@@ -1229,6 +1229,7 @@ mod tests {
     };
     use crate::exit::{
         HvfExceptionExit, HvfHvcExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
+        HvfSys64Exit,
     };
     use crate::gic::{HvfGicInterruptRange, HvfGicMetadata, HvfGicRedistributor, HvfGicRegion};
     use crate::runner::{HvfVcpuRunStepOutcome, HvfVcpuRunnerError};
@@ -1242,9 +1243,11 @@ mod tests {
     const ARM64_IMAGE_MAGIC_OFFSET: usize = 56;
     const ARM64_IMAGE_MAGIC: u32 = 0x644d_5241;
     const ESR_EC_HVC: u64 = 0x16;
+    const ESR_EC_SYS64: u64 = 0x18;
     const ESR_EC_DATA_ABORT_LOWER_EL: u64 = 0x24;
     const ESR_EC_SHIFT: u64 = 26;
     const ESR_ISS_ISV: u64 = 1 << 24;
+    const ESR_ISS_SYS64_DIRECTION: u64 = 1;
     const ESR_ISS_SAS_SHIFT: u64 = 22;
     const ESR_ISS_SRT_SHIFT: u64 = 16;
     const ESR_ISS_WNR: u64 = 1 << 6;
@@ -1525,6 +1528,29 @@ mod tests {
             function_id: PSCI_VERSION,
             return_value: PSCI_VERSION_0_2,
         }
+    }
+
+    fn sys64_run_step_outcome() -> HvfVcpuRunStepOutcome {
+        HvfVcpuRunStepOutcome::Sys64 { exit: sys64_exit() }
+    }
+
+    fn sys64_exit() -> HvfSys64Exit {
+        let exit = HvfExceptionExit {
+            syndrome: sys64_osdlr_syndrome(),
+            virtual_address: 0,
+            physical_address: 0,
+        };
+
+        exit.decode_sys64().expect("test SYS64 exit should decode")
+    }
+
+    fn sys64_osdlr_syndrome() -> u64 {
+        (ESR_EC_SYS64 << ESR_EC_SHIFT)
+            | ESR_ISS_SYS64_DIRECTION
+            | (2 << 20)
+            | (1 << 10)
+            | (3 << 1)
+            | (4 << 17)
     }
 
     fn hvc_exit(immediate: u16) -> HvfHvcExit {
@@ -2381,6 +2407,24 @@ mod tests {
 
         let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(2))
             .expect("step-limited HVC loop should succeed");
+
+        assert_eq!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 2 }
+        );
+        assert_eq!(session.events, ["run", "run"]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_continues_after_sys64_until_step_limit() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([
+            sys64_run_step_outcome(),
+            sys64_run_step_outcome(),
+        ]);
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(2))
+            .expect("step-limited SYS64 loop should succeed");
 
         assert_eq!(
             outcome,

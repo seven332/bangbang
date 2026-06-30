@@ -560,6 +560,11 @@ reports feature support only for the implemented minimal calls, returns
 `MIGRATE_INFO_TYPE` as the PSCI value for a trusted OS that is MP-capable or
 not present, where migration is not required, and writes `NOT_SUPPORTED` to X0
 for other PSCI calls or HVC immediates.
+Early boot also traps the guest's `OSDLR_EL1` system-register access through
+the AArch64 SYS64 exception class (`0x18`), not through SMC/SMCCC. The HVF
+runner handles only that observed debug-register access with KVM-like RAZ/WI
+semantics: reads return zero, writes are ignored, and other trapped system
+registers still fail closed.
 
 The memory node excludes the first 2 MiB system area from the first DRAM range
 and preserves later DRAM ranges from the runtime layout, but direct FDT
@@ -736,18 +741,19 @@ not yet device interrupt masking, timer EOI policy, runner-loop interrupt
 dispatch, or guest-visible device delivery.
 
 The HVF backend can decode candidate MMIO accesses from arm64 data-abort
-exception exits. The decoder converts supported ESR and IPA metadata into a
-checked access range, direction, width, register number, and read-extension
-metadata while the raw exit snapshot still preserves FAR. Unsupported exception
-classes, missing instruction-syndrome metadata, table-walk aborts,
-cache-maintenance aborts, and overflowing access ranges fail closed before
-runtime dispatch or later HVF completion can use them. Decoded accesses can also
-be resolved against the runtime MMIO registry to identify the owning region,
-offset, and preserved HVF access metadata. Whole vCPU exits can be classified
-into resolved MMIO, virtual-timer, canceled, or unknown events while preserving
-typed decode and bus-resolution errors. A single resolved HVF MMIO exit can be
-converted into a runtime read/write operation by reading the trapped guest GPR
-for writes, dispatched to a runtime handler, and completed back into the
+exception exits and decode trapped AArch64 SYS64 system-register exits. The
+MMIO decoder converts supported ESR and IPA metadata into a checked access
+range, direction, width, register number, and read-extension metadata while the
+raw exit snapshot still preserves FAR. Unsupported exception classes, missing
+instruction-syndrome metadata, table-walk aborts, cache-maintenance aborts, and
+overflowing access ranges fail closed before runtime dispatch or later HVF
+completion can use them. Decoded accesses can also be resolved against the
+runtime MMIO registry to identify the owning region, offset, and preserved HVF
+access metadata. Whole vCPU exits can be classified into resolved MMIO, SYS64,
+HVC, virtual-timer, canceled, or unknown events while preserving typed decode
+and bus-resolution errors. A single resolved HVF MMIO exit can be converted into
+a runtime read/write operation by reading the trapped guest GPR for writes,
+dispatched to a runtime handler, and completed back into the
 trapped guest GPR for successful reads with zero/sign extension and 32-bit or
 64-bit target width handling.
 Guest GPR 31 is rejected explicitly so it is not confused with HVF's PC
