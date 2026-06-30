@@ -4447,10 +4447,8 @@ mod tests {
             })
         );
         assert_eq!(
-            register_write_receiver
-                .recv()
-                .expect("OSDLR read should write zero to Rt"),
-            (HvfRegister::general_purpose(2).expect("X2 should map"), 0)
+            register_write_receiver.try_recv(),
+            Ok((HvfRegister::general_purpose(2).expect("X2 should map"), 0))
         );
         assert_eq!(
             register_write_receiver.try_recv(),
