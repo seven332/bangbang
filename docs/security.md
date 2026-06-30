@@ -97,8 +97,8 @@ HVF; local HVF verification should fail when HVF is unavailable.
 
 The guest is untrusted. vCPU execution, guest memory contents, virtqueue
 descriptor chains, MMIO accesses, block requests, virtio-net TX descriptor
-metadata, and future device inputs must be validated before they affect host
-resources.
+metadata and payload bytes, and future device inputs must be validated before
+they affect host resources.
 Trapped system-register exits are guest-visible CPU behavior and must stay
 explicit. The current HVF runner emulates only the early-boot `OSDLR_EL1` and
 `OSLAR_EL1` OS lock RAZ/WI behavior needed by the pinned Firecracker kernel;
@@ -149,8 +149,10 @@ The current scaffold does not implement:
 - host resource brokering
 - network, vsock, MMDS, or snapshot containment; the current network interface
   configuration path validates and stores configuration strings, and internal
-  virtio-net TX notification dispatch parses guest descriptor metadata, but
-  bangbang still does not open host networking resources
+  virtio-net TX notification dispatch can parse guest descriptor metadata and
+  pass validated TX frame payloads to an injected packet sink, but the default
+  path is a no-op sink and bangbang still does not open host networking
+  resources
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 

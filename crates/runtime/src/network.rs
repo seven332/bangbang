@@ -441,6 +441,52 @@ impl VirtioNetworkTxFrame {
     }
 }
 
+pub trait VirtioNetworkTxPacketSink {
+    fn transmit_frame(
+        &mut self,
+        memory: &GuestMemory,
+        frame: &VirtioNetworkTxFrame,
+    ) -> Result<(), VirtioNetworkTxPacketSinkError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioNetworkTxPacketSinkError {
+    message: String,
+}
+
+impl VirtioNetworkTxPacketSinkError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for VirtioNetworkTxPacketSinkError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for VirtioNetworkTxPacketSinkError {}
+
+#[derive(Debug, Default)]
+struct NoopVirtioNetworkTxPacketSink;
+
+impl VirtioNetworkTxPacketSink for NoopVirtioNetworkTxPacketSink {
+    fn transmit_frame(
+        &mut self,
+        _memory: &GuestMemory,
+        _frame: &VirtioNetworkTxFrame,
+    ) -> Result<(), VirtioNetworkTxPacketSinkError> {
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub enum VirtioNetworkTxFrameParseError {
     DescriptorChainTooShort {
@@ -860,10 +906,11 @@ impl VirtioNetworkDevice {
         self.active_tx_queue = None;
     }
 
-    fn dispatch_drained_queue_notifications(
+    fn dispatch_drained_queue_notifications_with_tx_sink(
         &mut self,
         memory: &mut GuestMemory,
         drained_notifications: Vec<usize>,
+        tx_sink: &mut impl VirtioNetworkTxPacketSink,
     ) -> Result<VirtioNetworkDeviceNotificationDispatch, VirtioNetworkDeviceNotificationError> {
         if drained_notifications.is_empty() {
             return Ok(VirtioNetworkDeviceNotificationDispatch::new(
@@ -906,7 +953,7 @@ impl VirtioNetworkDevice {
             });
         };
 
-        match queue.dispatch(memory) {
+        match queue.dispatch_with_sink(memory, tx_sink) {
             Ok(dispatch) => Ok(VirtioNetworkDeviceNotificationDispatch::new(
                 drained_notifications,
                 Some(dispatch),
@@ -966,6 +1013,15 @@ impl VirtioNetworkTxQueue {
         &mut self,
         memory: &mut GuestMemory,
     ) -> Result<VirtioNetworkTxQueueDispatch, VirtioNetworkTxQueueDispatchError> {
+        let mut sink = NoopVirtioNetworkTxPacketSink;
+        self.dispatch_with_sink(memory, &mut sink)
+    }
+
+    pub fn dispatch_with_sink(
+        &mut self,
+        memory: &mut GuestMemory,
+        tx_sink: &mut impl VirtioNetworkTxPacketSink,
+    ) -> Result<VirtioNetworkTxQueueDispatch, VirtioNetworkTxQueueDispatchError> {
         let mut dispatch =
             VirtioNetworkTxQueueDispatch::with_capacity(self.available.queue_size())?;
         while let Some(chain) = match self.available.pop_descriptor_chain(memory) {
@@ -985,10 +1041,7 @@ impl VirtioNetworkTxQueue {
                     });
                 }
             };
-            let outcome = match VirtioNetworkTxFrame::parse(memory, &chain) {
-                Ok(frame) => VirtioNetworkTxQueueDispatchOutcome::Ok(frame),
-                Err(source) => VirtioNetworkTxQueueDispatchOutcome::ParseError(source),
-            };
+            let frame = VirtioNetworkTxFrame::parse(memory, &chain);
             if let Err(source) = self.used.publish_used_element(memory, descriptor_head, 0) {
                 return Err(VirtioNetworkTxQueueDispatchError::UsedRing {
                     completed_dispatch: Box::new(dispatch),
@@ -997,6 +1050,13 @@ impl VirtioNetworkTxQueue {
                     source,
                 });
             }
+            let outcome = match frame {
+                Ok(frame) => {
+                    let sink_error = tx_sink.transmit_frame(memory, &frame).err();
+                    VirtioNetworkTxQueueDispatchOutcome::Ok { frame, sink_error }
+                }
+                Err(source) => VirtioNetworkTxQueueDispatchOutcome::ParseError(source),
+            };
             dispatch.record(outcome);
         }
 
@@ -1040,8 +1100,11 @@ pub struct VirtioNetworkTxQueueDispatch {
     processed_frames: usize,
     successful_frames: usize,
     parse_failures: usize,
+    sink_successful_frames: usize,
+    sink_failures: usize,
     frames: Vec<VirtioNetworkTxFrame>,
     first_parse_failure: Option<VirtioNetworkTxFrameParseError>,
+    first_sink_failure: Option<VirtioNetworkTxPacketSinkError>,
 }
 
 impl VirtioNetworkTxQueueDispatch {
@@ -1057,8 +1120,11 @@ impl VirtioNetworkTxQueueDispatch {
             processed_frames: 0,
             successful_frames: 0,
             parse_failures: 0,
+            sink_successful_frames: 0,
+            sink_failures: 0,
             frames,
             first_parse_failure: None,
+            first_sink_failure: None,
         })
     }
 
@@ -1074,8 +1140,20 @@ impl VirtioNetworkTxQueueDispatch {
         self.parse_failures
     }
 
+    pub const fn sink_successful_frames(&self) -> usize {
+        self.sink_successful_frames
+    }
+
+    pub const fn sink_failures(&self) -> usize {
+        self.sink_failures
+    }
+
     pub const fn first_parse_failure(&self) -> Option<&VirtioNetworkTxFrameParseError> {
         self.first_parse_failure.as_ref()
+    }
+
+    pub const fn first_sink_failure(&self) -> Option<&VirtioNetworkTxPacketSinkError> {
+        self.first_sink_failure.as_ref()
     }
 
     pub fn frames(&self) -> &[VirtioNetworkTxFrame] {
@@ -1089,8 +1167,19 @@ impl VirtioNetworkTxQueueDispatch {
     fn record(&mut self, outcome: VirtioNetworkTxQueueDispatchOutcome) {
         self.processed_frames += 1;
         match outcome {
-            VirtioNetworkTxQueueDispatchOutcome::Ok(frame) => {
+            VirtioNetworkTxQueueDispatchOutcome::Ok { frame, sink_error } => {
                 self.successful_frames += 1;
+                match sink_error {
+                    Some(source) => {
+                        self.sink_failures += 1;
+                        if self.first_sink_failure.is_none() {
+                            self.first_sink_failure = Some(source);
+                        }
+                    }
+                    None => {
+                        self.sink_successful_frames += 1;
+                    }
+                }
                 self.frames.push(frame);
             }
             VirtioNetworkTxQueueDispatchOutcome::ParseError(source) => {
@@ -1105,7 +1194,10 @@ impl VirtioNetworkTxQueueDispatch {
 
 #[derive(Debug)]
 enum VirtioNetworkTxQueueDispatchOutcome {
-    Ok(VirtioNetworkTxFrame),
+    Ok {
+        frame: VirtioNetworkTxFrame,
+        sink_error: Option<VirtioNetworkTxPacketSinkError>,
+    },
     ParseError(VirtioNetworkTxFrameParseError),
 }
 
@@ -1202,10 +1294,23 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioNetwor
         &mut self,
         memory: &mut GuestMemory,
     ) -> Result<VirtioNetworkDeviceNotificationDispatch, VirtioNetworkDeviceNotificationError> {
+        let mut sink = NoopVirtioNetworkTxPacketSink;
+        self.dispatch_network_queue_notifications_with_tx_sink(memory, &mut sink)
+    }
+
+    pub fn dispatch_network_queue_notifications_with_tx_sink(
+        &mut self,
+        memory: &mut GuestMemory,
+        tx_sink: &mut impl VirtioNetworkTxPacketSink,
+    ) -> Result<VirtioNetworkDeviceNotificationDispatch, VirtioNetworkDeviceNotificationError> {
         let drained_notifications = self.take_pending_queue_notifications();
         let dispatch = self
             .activation_handler_mut()
-            .dispatch_drained_queue_notifications(memory, drained_notifications);
+            .dispatch_drained_queue_notifications_with_tx_sink(
+                memory,
+                drained_notifications,
+                tx_sink,
+            );
         let needs_queue_interrupt = match &dispatch {
             Ok(dispatch) => dispatch.needs_queue_interrupt(),
             Err(error) => error
@@ -2478,7 +2583,8 @@ mod tests {
         VIRTIO_RING_FEATURE_EVENT_IDX, VirtioNetworkConfigSpace, VirtioNetworkDevice,
         VirtioNetworkDeviceActivationError, VirtioNetworkDeviceNotificationError,
         VirtioNetworkMmioHandler, VirtioNetworkRxBuffer, VirtioNetworkRxBufferParseError,
-        VirtioNetworkTxFrame, VirtioNetworkTxFrameParseError, VirtioNetworkTxQueueDispatchError,
+        VirtioNetworkTxFrame, VirtioNetworkTxFrameParseError, VirtioNetworkTxPacketSink,
+        VirtioNetworkTxPacketSinkError, VirtioNetworkTxQueueDispatchError,
     };
 
     const TEST_MMIO_BASE: GuestAddress = GuestAddress::new(0x1000);
@@ -2839,6 +2945,65 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct RecordingTxPacketSink {
+        calls: usize,
+        fail_on_call: Option<usize>,
+        frame_heads: Vec<u16>,
+        packets: Vec<Vec<u8>>,
+    }
+
+    impl RecordingTxPacketSink {
+        const fn failing_on(fail_on_call: usize) -> Self {
+            Self {
+                calls: 0,
+                fail_on_call: Some(fail_on_call),
+                frame_heads: Vec::new(),
+                packets: Vec::new(),
+            }
+        }
+    }
+
+    impl VirtioNetworkTxPacketSink for RecordingTxPacketSink {
+        fn transmit_frame(
+            &mut self,
+            memory: &GuestMemory,
+            frame: &VirtioNetworkTxFrame,
+        ) -> Result<(), VirtioNetworkTxPacketSinkError> {
+            self.calls += 1;
+            self.frame_heads.push(frame.descriptor_head());
+
+            if self.fail_on_call == Some(self.calls) {
+                return Err(VirtioNetworkTxPacketSinkError::new(format!(
+                    "test sink failure on call {}",
+                    self.calls
+                )));
+            }
+
+            let mut packet = Vec::new();
+            packet
+                .try_reserve_exact(
+                    usize::try_from(frame.payload_len())
+                        .expect("test payload length should fit usize"),
+                )
+                .expect("test packet allocation should succeed");
+            for segment in frame.payload_segments() {
+                let mut bytes = vec![
+                    0;
+                    usize::try_from(segment.len())
+                        .expect("test payload segment length should fit usize")
+                ];
+                memory
+                    .read_slice(&mut bytes, segment.address())
+                    .expect("test payload segment should read");
+                packet.extend_from_slice(&bytes);
+            }
+            self.packets.push(packet);
+
+            Ok(())
+        }
+    }
+
     fn tx_frame_memory() -> GuestMemory {
         let layout = GuestMemoryLayout::new(vec![
             GuestMemoryRange::new(GuestAddress::new(0), TEST_TX_MEMORY_SIZE)
@@ -2868,6 +3033,18 @@ mod tests {
         memory
             .write_slice(&bytes, address)
             .expect("virtio-net TX header should write");
+    }
+
+    fn tx_payload_address_after_header(header_address: GuestAddress) -> GuestAddress {
+        header_address
+            .checked_add(u64::from(VIRTIO_NET_TX_HEADER_SIZE))
+            .expect("test TX payload address should not overflow")
+    }
+
+    fn write_tx_payload(memory: &mut GuestMemory, address: GuestAddress, bytes: &[u8]) {
+        memory
+            .write_slice(bytes, address)
+            .expect("test TX payload should write");
     }
 
     fn write_tx_descriptor(memory: &mut GuestMemory, index: u16, descriptor: TestDescriptor) {
@@ -4522,23 +4699,30 @@ mod tests {
     fn virtio_network_notifications_without_pending_work_are_noop() {
         let mut memory = tx_frame_memory();
         let mut device = VirtioNetworkDevice::new();
+        let mut sink = RecordingTxPacketSink::default();
 
         let dispatch = device
-            .dispatch_drained_queue_notifications(&mut memory, Vec::new())
+            .dispatch_drained_queue_notifications_with_tx_sink(&mut memory, Vec::new(), &mut sink)
             .expect("empty notification drain should be a no-op");
 
         assert_eq!(dispatch.drained_notifications(), &[]);
         assert!(dispatch.tx_queue_dispatch().is_none());
         assert!(!dispatch.needs_queue_interrupt());
+        assert_eq!(sink.calls, 0);
     }
 
     #[test]
     fn virtio_network_notifications_reject_inactive_device_with_drained_metadata() {
         let mut memory = tx_frame_memory();
         let mut device = VirtioNetworkDevice::new();
+        let mut sink = RecordingTxPacketSink::default();
 
         let error = device
-            .dispatch_drained_queue_notifications(&mut memory, vec![VIRTIO_NET_RX_QUEUE_INDEX])
+            .dispatch_drained_queue_notifications_with_tx_sink(
+                &mut memory,
+                vec![VIRTIO_NET_RX_QUEUE_INDEX],
+                &mut sink,
+            )
             .expect_err("notification before activation should fail");
 
         assert!(matches!(
@@ -4552,6 +4736,7 @@ mod tests {
         );
         assert!(error.completed_tx_dispatch().is_none());
         assert!(std::error::Error::source(&error).is_none());
+        assert_eq!(sink.calls, 0);
     }
 
     #[test]
@@ -4637,7 +4822,10 @@ mod tests {
         assert_eq!(dispatch.processed_frames(), 1);
         assert_eq!(dispatch.successful_frames(), 1);
         assert_eq!(dispatch.parse_failures(), 0);
+        assert_eq!(dispatch.sink_successful_frames(), 1);
+        assert_eq!(dispatch.sink_failures(), 0);
         assert!(dispatch.first_parse_failure().is_none());
+        assert!(dispatch.first_sink_failure().is_none());
         assert!(dispatch.needs_queue_interrupt());
         let frame = dispatch
             .frames()
@@ -4661,9 +4849,59 @@ mod tests {
     }
 
     #[test]
+    fn virtio_network_notifications_deliver_tx_frame_to_sink() {
+        let mut memory = tx_frame_memory();
+        let mut handler = network_activation_handler();
+        let mut sink = RecordingTxPacketSink::default();
+
+        configure_network_handler_queues(&mut handler);
+        activate_network_handler(&mut handler);
+        write_tx_header(&mut memory, TEST_TX_HEADER);
+        write_tx_payload(&mut memory, TEST_TX_PAYLOAD, &[0xde, 0xad, 0xbe, 0xef]);
+        tx_descriptor_chain(
+            &mut memory,
+            &[
+                TestDescriptor::readable(TEST_TX_HEADER, VIRTIO_NET_TX_HEADER_SIZE, Some(1)),
+                TestDescriptor::readable(TEST_TX_PAYLOAD, 4, None),
+            ],
+        );
+        write_tx_available_heads(&mut memory, &[0]);
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_TX_QUEUE_INDEX
+                    .try_into()
+                    .expect("TX queue index should fit"),
+            )
+            .expect("TX notification should write");
+
+        let notification = handler
+            .dispatch_network_queue_notifications_with_tx_sink(&mut memory, &mut sink)
+            .expect("TX queue notification should dispatch through sink");
+
+        let dispatch = notification
+            .tx_queue_dispatch()
+            .expect("TX dispatch summary should be present");
+        assert_eq!(dispatch.processed_frames(), 1);
+        assert_eq!(dispatch.successful_frames(), 1);
+        assert_eq!(dispatch.sink_successful_frames(), 1);
+        assert_eq!(dispatch.sink_failures(), 0);
+        assert_eq!(sink.calls, 1);
+        assert_eq!(sink.frame_heads, [0]);
+        assert_eq!(sink.packets, [vec![0xde, 0xad, 0xbe, 0xef]]);
+        assert_eq!(read_tx_used_index(&memory), 1);
+        assert_eq!(read_tx_used_element(&memory, 0), (0, 0));
+        assert_eq!(
+            read_interrupt_status(&handler),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+    }
+
+    #[test]
     fn virtio_network_notifications_empty_tx_queue_has_no_interrupt() {
         let mut memory = tx_frame_memory();
         let mut handler = network_activation_handler();
+        let mut sink = RecordingTxPacketSink::default();
 
         configure_network_handler_queues(&mut handler);
         activate_network_handler(&mut handler);
@@ -4677,7 +4915,7 @@ mod tests {
             .expect("TX notification should write");
 
         let notification = handler
-            .dispatch_network_queue_notifications(&mut memory)
+            .dispatch_network_queue_notifications_with_tx_sink(&mut memory, &mut sink)
             .expect("empty TX queue notification should dispatch as no-op");
 
         assert_eq!(
@@ -4691,8 +4929,11 @@ mod tests {
         assert_eq!(dispatch.processed_frames(), 0);
         assert_eq!(dispatch.successful_frames(), 0);
         assert_eq!(dispatch.parse_failures(), 0);
+        assert_eq!(dispatch.sink_successful_frames(), 0);
+        assert_eq!(dispatch.sink_failures(), 0);
         assert!(dispatch.frames().is_empty());
         assert!(!dispatch.needs_queue_interrupt());
+        assert_eq!(sink.calls, 0);
         assert_eq!(read_interrupt_status(&handler), 0);
         assert!(handler.pending_queue_notifications().is_empty());
         let active_tx_queue = handler
@@ -4708,6 +4949,7 @@ mod tests {
     fn virtio_network_notifications_record_tx_parse_failure_and_complete_used_ring() {
         let mut memory = tx_frame_memory();
         let mut handler = network_activation_handler();
+        let mut sink = RecordingTxPacketSink::default();
 
         configure_network_handler_queues(&mut handler);
         activate_network_handler(&mut handler);
@@ -4730,7 +4972,7 @@ mod tests {
             .expect("TX notification should write");
 
         let notification = handler
-            .dispatch_network_queue_notifications(&mut memory)
+            .dispatch_network_queue_notifications_with_tx_sink(&mut memory, &mut sink)
             .expect("malformed TX frame should still complete descriptor head");
 
         assert_eq!(
@@ -4743,6 +4985,8 @@ mod tests {
         assert_eq!(dispatch.processed_frames(), 1);
         assert_eq!(dispatch.successful_frames(), 0);
         assert_eq!(dispatch.parse_failures(), 1);
+        assert_eq!(dispatch.sink_successful_frames(), 0);
+        assert_eq!(dispatch.sink_failures(), 0);
         assert!(matches!(
             dispatch.first_parse_failure(),
             Some(VirtioNetworkTxFrameParseError::HeaderDescriptorTooSmall {
@@ -4751,7 +4995,9 @@ mod tests {
                 min: 12,
             })
         ));
+        assert!(dispatch.first_sink_failure().is_none());
         assert!(dispatch.frames().is_empty());
+        assert_eq!(sink.calls, 0);
         assert!(notification.needs_queue_interrupt());
         assert_eq!(
             read_interrupt_status(&handler),
@@ -4759,6 +5005,84 @@ mod tests {
         );
         assert_eq!(read_tx_used_index(&memory), 1);
         assert_eq!(read_tx_used_element(&memory, 0), (0, 0));
+    }
+
+    #[test]
+    fn virtio_network_notifications_record_sink_failure_and_continue_dispatch() {
+        let mut memory = tx_frame_memory();
+        let mut handler = network_activation_handler();
+        let mut sink = RecordingTxPacketSink::failing_on(2);
+        let first_payload = tx_payload_address_after_header(TEST_TX_HEADER);
+        let second_payload = tx_payload_address_after_header(TEST_TX_PAYLOAD);
+        let third_payload = tx_payload_address_after_header(TEST_TX_SECOND_PAYLOAD);
+
+        configure_network_handler_queues(&mut handler);
+        activate_network_handler(&mut handler);
+        write_tx_header(&mut memory, TEST_TX_HEADER);
+        write_tx_payload(&mut memory, first_payload, &[0x10, 0x11]);
+        write_tx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(TEST_TX_HEADER, VIRTIO_NET_TX_HEADER_SIZE + 2, None),
+        );
+        write_tx_header(&mut memory, TEST_TX_PAYLOAD);
+        write_tx_payload(&mut memory, second_payload, &[0x20, 0x21, 0x22]);
+        write_tx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::readable(TEST_TX_PAYLOAD, VIRTIO_NET_TX_HEADER_SIZE + 3, None),
+        );
+        write_tx_header(&mut memory, TEST_TX_SECOND_PAYLOAD);
+        write_tx_payload(&mut memory, third_payload, &[0x30, 0x31, 0x32, 0x33]);
+        write_tx_descriptor(
+            &mut memory,
+            2,
+            TestDescriptor::readable(TEST_TX_SECOND_PAYLOAD, VIRTIO_NET_TX_HEADER_SIZE + 4, None),
+        );
+        write_tx_available_heads(&mut memory, &[0, 1, 2]);
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_TX_QUEUE_INDEX
+                    .try_into()
+                    .expect("TX queue index should fit"),
+            )
+            .expect("TX notification should write");
+
+        let notification = handler
+            .dispatch_network_queue_notifications_with_tx_sink(&mut memory, &mut sink)
+            .expect("sink failure should not fail queue dispatch");
+
+        let dispatch = notification
+            .tx_queue_dispatch()
+            .expect("TX dispatch summary should be present");
+        assert_eq!(dispatch.processed_frames(), 3);
+        assert_eq!(dispatch.successful_frames(), 3);
+        assert_eq!(dispatch.parse_failures(), 0);
+        assert_eq!(dispatch.sink_successful_frames(), 2);
+        assert_eq!(dispatch.sink_failures(), 1);
+        assert_eq!(
+            dispatch
+                .first_sink_failure()
+                .expect("first sink failure should be recorded")
+                .message(),
+            "test sink failure on call 2"
+        );
+        assert_eq!(sink.calls, 3);
+        assert_eq!(sink.frame_heads, [0, 1, 2]);
+        assert_eq!(
+            sink.packets,
+            [vec![0x10, 0x11], vec![0x30, 0x31, 0x32, 0x33]]
+        );
+        assert!(notification.needs_queue_interrupt());
+        assert_eq!(
+            read_interrupt_status(&handler),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        assert_eq!(read_tx_used_index(&memory), 3);
+        assert_eq!(read_tx_used_element(&memory, 0), (0, 0));
+        assert_eq!(read_tx_used_element(&memory, 1), (1, 0));
+        assert_eq!(read_tx_used_element(&memory, 2), (2, 0));
     }
 
     #[test]
@@ -4853,6 +5177,8 @@ mod tests {
             .expect("partial dispatch metadata should be preserved");
         assert_eq!(completed.processed_frames(), 1);
         assert_eq!(completed.successful_frames(), 1);
+        assert_eq!(completed.sink_successful_frames(), 1);
+        assert_eq!(completed.sink_failures(), 0);
         assert!(completed.needs_queue_interrupt());
         assert_eq!(
             read_interrupt_status(&handler),
@@ -4873,6 +5199,7 @@ mod tests {
     fn virtio_network_notifications_reject_unsupported_queue_index() {
         let mut memory = tx_frame_memory();
         let mut device = VirtioNetworkDevice::new();
+        let mut sink = RecordingTxPacketSink::default();
         let registers = network_device_registers();
         let queues =
             configured_network_queues(Some(TEST_QUEUE_SIZE), true, Some(TEST_QUEUE_SIZE), true);
@@ -4881,7 +5208,7 @@ mod tests {
             .expect("network device should activate");
 
         let error = device
-            .dispatch_drained_queue_notifications(&mut memory, vec![2])
+            .dispatch_drained_queue_notifications_with_tx_sink(&mut memory, vec![2], &mut sink)
             .expect_err("unsupported queue index should fail");
 
         match &error {
