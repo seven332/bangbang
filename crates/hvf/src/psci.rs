@@ -24,6 +24,12 @@ pub(crate) const fn call_uses_arg0(function_id: u64) -> bool {
     matches!(function_id, PSCI_FEATURES)
 }
 
+pub(crate) const fn not_supported_result() -> PsciCallResult {
+    PsciCallResult {
+        return_value: PSCI_RET_NOT_SUPPORTED,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PsciCallResult {
     return_value: u64,
@@ -64,7 +70,7 @@ mod tests {
     use super::{
         PSCI_FEATURES, PSCI_MIGRATE_INFO_TYPE, PSCI_MIGRATE_INFO_TYPE_NO_TRUSTED_OS_MIGRATION,
         PSCI_RET_NOT_SUPPORTED, PSCI_RET_SUCCESS, PSCI_VERSION, PSCI_VERSION_0_2, PsciCall,
-        call_uses_arg0, handle_call,
+        call_uses_arg0, handle_call, not_supported_result,
     };
 
     #[test]
@@ -99,6 +105,14 @@ mod tests {
         assert!(!call_uses_arg0(PSCI_VERSION));
         assert!(!call_uses_arg0(PSCI_MIGRATE_INFO_TYPE));
         assert!(!call_uses_arg0(0x8400_0003));
+    }
+
+    #[test]
+    fn builds_not_supported_result() {
+        assert_eq!(
+            not_supported_result().return_value(),
+            PSCI_RET_NOT_SUPPORTED
+        );
     }
 
     #[test]

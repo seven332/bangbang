@@ -11,7 +11,9 @@ use crate::backend::HvfBackend;
 use crate::exit::{HvfHvcExit, HvfResolvedMmioAccess, HvfVcpuExit, HvfVcpuExitResolveError};
 use crate::gic::{HvfGicError, HvfGicPpiPendingWriter, validate_gic_ppi_pending_intid};
 use crate::mmio::HvfMmioDispatchError;
-use crate::psci::{PsciCall, call_uses_arg0, handle_call as handle_psci_call};
+use crate::psci::{
+    PsciCall, call_uses_arg0, handle_call as handle_psci_call, not_supported_result,
+};
 use crate::vcpu::{HvfArm64BootRegisters, HvfRegister, HvfSystemRegister, HvfVcpuOwner};
 
 const RUNNER_SHUT_DOWN_MESSAGE: &str = "vCPU runner is shut down";
@@ -1485,13 +1487,17 @@ fn handle_hvc_on_runner_thread(
     let function_id = vcpu
         .read_register(HvfRegister::X0)
         .map_err(HvfVcpuRunnerError::Backend)?;
-    let arg0 = if call_uses_arg0(function_id) {
+    let arg0 = if exit.immediate() == 0 && call_uses_arg0(function_id) {
         vcpu.read_register(HvfRegister::X1)
             .map_err(HvfVcpuRunnerError::Backend)?
     } else {
         0
     };
-    let result = handle_psci_call(PsciCall::new(function_id, arg0));
+    let result = if exit.immediate() == 0 {
+        handle_psci_call(PsciCall::new(function_id, arg0))
+    } else {
+        not_supported_result()
+    };
     let return_value = result.return_value();
     vcpu.write_register(HvfRegister::X0, return_value)
         .map_err(HvfVcpuRunnerError::Backend)?;
@@ -2586,10 +2592,18 @@ mod tests {
         function_id: u64,
         x1: Result<u64, BackendError>,
     ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<(HvfRegister, u64)>) {
+        start_psci_run_step_recording_runner_with_exit(function_id, x1, 0)
+    }
+
+    fn start_psci_run_step_recording_runner_with_exit(
+        function_id: u64,
+        x1: Result<u64, BackendError>,
+        hvc_immediate: u16,
+    ) -> (HvfVcpuRunner<'static>, mpsc::Receiver<(HvfRegister, u64)>) {
         let (register_write_sender, register_write_receiver) = mpsc::channel();
         let started = spawn_runner_thread(move || {
             Ok(PsciRunStepRecordingVcpu {
-                run_once_result: Ok(hvc_exception_exit(0)),
+                run_once_result: Ok(hvc_exception_exit(hvc_immediate)),
                 x0: function_id,
                 x1,
                 register_write_sender,
@@ -4174,6 +4188,32 @@ mod tests {
                 .recv()
                 .expect("PSCI_FEATURES should write X0"),
             (HvfRegister::X0, PSCI_RET_SUCCESS)
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn run_once_and_handle_mmio_rejects_nonzero_hvc_immediate_without_reading_arg0() {
+        let (runner, register_write_receiver) = start_psci_run_step_recording_runner_with_exit(
+            PSCI_VERSION,
+            Err(BackendError::InvalidState("X1 should not be read")),
+            1,
+        );
+
+        assert_eq!(
+            runner.run_once_and_handle_mmio(shared_dispatcher()),
+            Ok(HvfVcpuRunStepOutcome::Hvc {
+                exit: hvc_exit(1),
+                function_id: PSCI_VERSION,
+                return_value: PSCI_RET_NOT_SUPPORTED,
+            })
+        );
+        assert_eq!(
+            register_write_receiver
+                .recv()
+                .expect("nonzero HVC immediate should still write X0"),
+            (HvfRegister::X0, PSCI_RET_NOT_SUPPORTED)
         );
 
         runner.shutdown().expect("runner should shut down");

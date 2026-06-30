@@ -554,11 +554,11 @@ an optional serial device node plus optional sorted virtio-mmio device nodes
 from caller-supplied descriptors. It intentionally omits RTC, PCI, vmgenid,
 vmclock, and other device nodes until the corresponding emulation paths exist.
 Because the FDT advertises PSCI with `method = "hvc"`, the HVF backend decodes
-arm64 HVC exception exits and handles a minimal PSCI 0.2 responder for early
-single-vCPU boot probing. The responder returns `PSCI_VERSION`, reports feature
-support only for the implemented minimal calls, returns `MIGRATE_INFO_TYPE` as
-no trusted-OS migration requirement, and writes `NOT_SUPPORTED` to X0 for other
-PSCI calls.
+arm64 HVC exception exits and handles `HVC #0` as a minimal PSCI 0.2 responder
+for early single-vCPU boot probing. The responder returns `PSCI_VERSION`,
+reports feature support only for the implemented minimal calls, returns
+`MIGRATE_INFO_TYPE` as no trusted-OS migration requirement, and writes
+`NOT_SUPPORTED` to X0 for other PSCI calls or HVC immediates.
 
 The memory node excludes the first 2 MiB system area from the first DRAM range
 and preserves later DRAM ranges from the runtime layout, but direct FDT
