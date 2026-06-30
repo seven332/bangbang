@@ -5196,6 +5196,70 @@ mod tests {
     }
 
     #[test]
+    fn virtio_network_notifications_preserve_sink_failure_in_partial_dispatch_error() {
+        let mut memory = tx_frame_memory();
+        let mut handler = network_activation_handler();
+        let mut sink = RecordingTxPacketSink::failing_on(1);
+
+        configure_network_handler_queues(&mut handler);
+        activate_network_handler(&mut handler);
+        write_tx_header(&mut memory, TEST_TX_HEADER);
+        tx_descriptor_chain(
+            &mut memory,
+            &[TestDescriptor::readable(
+                TEST_TX_HEADER,
+                VIRTIO_NET_TX_HEADER_SIZE + 4,
+                None,
+            )],
+        );
+        write_tx_available_heads(&mut memory, &[0, TEST_QUEUE_SIZE]);
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_TX_QUEUE_INDEX
+                    .try_into()
+                    .expect("TX queue index should fit"),
+            )
+            .expect("TX notification should write");
+
+        let error = handler
+            .dispatch_network_queue_notifications_with_tx_sink(&mut memory, &mut sink)
+            .expect_err("invalid second TX head should fail after sink failure");
+
+        match &error {
+            VirtioNetworkDeviceNotificationError::TxQueueDispatch {
+                source: VirtioNetworkTxQueueDispatchError::AvailableRing { .. },
+                ..
+            } => {}
+            other => panic!("expected TX available-ring dispatch error, got {other:?}"),
+        }
+        assert_eq!(error.drained_notifications(), [VIRTIO_NET_TX_QUEUE_INDEX]);
+        let completed = error
+            .completed_tx_dispatch()
+            .expect("partial dispatch metadata should be preserved");
+        assert_eq!(completed.processed_frames(), 1);
+        assert_eq!(completed.successful_frames(), 1);
+        assert_eq!(completed.sink_successful_frames(), 0);
+        assert_eq!(completed.sink_failures(), 1);
+        assert_eq!(
+            completed
+                .first_sink_failure()
+                .expect("first sink failure should be recorded")
+                .message(),
+            "test sink failure on call 1"
+        );
+        assert!(completed.needs_queue_interrupt());
+        assert_eq!(sink.calls, 1);
+        assert_eq!(
+            read_interrupt_status(&handler),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        assert!(handler.pending_queue_notifications().is_empty());
+        assert_eq!(read_tx_used_index(&memory), 1);
+        assert_eq!(read_tx_used_element(&memory, 0), (0, 0));
+    }
+
+    #[test]
     fn virtio_network_notifications_reject_unsupported_queue_index() {
         let mut memory = tx_frame_memory();
         let mut device = VirtioNetworkDevice::new();
