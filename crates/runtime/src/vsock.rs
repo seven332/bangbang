@@ -3,6 +3,7 @@
 use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::fs;
+use std::io::Read as _;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -195,6 +196,9 @@ impl std::error::Error for VsockConfigError {}
 #[derive(Debug)]
 pub struct VsockHostAcceptedConnection {
     stream: UnixStream,
+    connect_request_buf: [u8; VSOCK_HOST_CONNECT_REQUEST_MAX_LEN],
+    connect_request_len: usize,
+    connect_request: Option<VsockHostConnectRequest>,
 }
 
 impl VsockHostAcceptedConnection {
@@ -202,7 +206,12 @@ impl VsockHostAcceptedConnection {
         stream
             .set_nonblocking(true)
             .map_err(|err| VsockHostSocketAcceptError::SetNonblocking(err.kind()))?;
-        Ok(Self { stream })
+        Ok(Self {
+            stream,
+            connect_request_buf: [0; VSOCK_HOST_CONNECT_REQUEST_MAX_LEN],
+            connect_request_len: 0,
+            connect_request: None,
+        })
     }
 
     pub fn stream(&self) -> &UnixStream {
@@ -211,6 +220,44 @@ impl VsockHostAcceptedConnection {
 
     pub fn into_stream(self) -> UnixStream {
         self.stream
+    }
+
+    pub fn read_connect_request(
+        &mut self,
+    ) -> Result<Option<VsockHostConnectRequest>, VsockHostConnectHandshakeError> {
+        if let Some(request) = self.connect_request {
+            return Ok(Some(request));
+        }
+
+        loop {
+            let Some(next_byte) = self.connect_request_buf.get_mut(self.connect_request_len) else {
+                return Err(VsockHostConnectHandshakeError::TooLong {
+                    max: VSOCK_HOST_CONNECT_REQUEST_MAX_LEN,
+                });
+            };
+
+            match self.stream.read(std::slice::from_mut(next_byte)) {
+                Ok(0) => return Err(VsockHostConnectHandshakeError::Closed),
+                Ok(_) => {
+                    let byte = *next_byte;
+                    self.connect_request_len += 1;
+                    if byte == b'\n' {
+                        let bytes = self
+                            .connect_request_buf
+                            .get(..self.connect_request_len)
+                            .ok_or(VsockHostConnectHandshakeError::TooLong {
+                                max: VSOCK_HOST_CONNECT_REQUEST_MAX_LEN,
+                            })?;
+                        let request = VsockHostConnectRequest::parse(bytes)
+                            .map_err(|source| VsockHostConnectHandshakeError::Parse { source })?;
+                        self.connect_request = Some(request);
+                        return Ok(Some(request));
+                    }
+                }
+                Err(err) if is_transient_host_socket_read_error(err.kind()) => return Ok(None),
+                Err(err) => return Err(VsockHostConnectHandshakeError::Read(err.kind())),
+            }
+        }
     }
 }
 
@@ -352,6 +399,47 @@ fn is_transient_host_socket_accept_error(kind: std::io::ErrorKind) -> bool {
         std::io::ErrorKind::WouldBlock
             | std::io::ErrorKind::Interrupted
             | std::io::ErrorKind::ConnectionAborted
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VsockHostConnectHandshakeError {
+    Read(std::io::ErrorKind),
+    Closed,
+    TooLong {
+        max: usize,
+    },
+    Parse {
+        source: VsockHostConnectRequestError,
+    },
+}
+
+impl fmt::Display for VsockHostConnectHandshakeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(kind) => write!(f, "failed to read vsock host CONNECT request: {kind:?}"),
+            Self::Closed => f.write_str("vsock host connection closed before CONNECT request"),
+            Self::TooLong { max } => {
+                write!(f, "vsock host CONNECT request exceeds maximum length {max}")
+            }
+            Self::Parse { source } => write!(f, "invalid vsock host CONNECT request: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for VsockHostConnectHandshakeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Parse { source } => Some(source),
+            Self::Read(_) | Self::Closed | Self::TooLong { .. } => None,
+        }
+    }
+}
+
+fn is_transient_host_socket_read_error(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
     )
 }
 
@@ -2790,13 +2878,13 @@ mod tests {
         VirtioVsockMmioHandler, VirtioVsockPacketHeader, VirtioVsockPacketLengthError,
         VirtioVsockQueueBuildError, VirtioVsockTxPacket, VirtioVsockTxPacketParseError,
         VirtioVsockTxQueue, VirtioVsockTxQueueDispatchError, VsockConfigError, VsockConfigInput,
-        VsockHostConnectRequest, VsockHostConnectRequestError, VsockHostConnectionKey,
-        VsockHostConnectionTable, VsockHostConnectionTableError, VsockHostLocalPort,
-        VsockHostLocalPortAllocator, VsockHostLocalPortAllocatorError, VsockHostLocalPortError,
-        VsockHostSocketAcceptError, VsockHostSocketOwner, VsockHostSocketOwnerError,
-        VsockMmioDevice, VsockMmioLayout, VsockMmioRegistrationError,
-        is_transient_host_socket_accept_error, parse_vsock_host_connect_request,
-        virtio_vsock_mmio_handler,
+        VsockHostConnectHandshakeError, VsockHostConnectRequest, VsockHostConnectRequestError,
+        VsockHostConnectionKey, VsockHostConnectionTable, VsockHostConnectionTableError,
+        VsockHostLocalPort, VsockHostLocalPortAllocator, VsockHostLocalPortAllocatorError,
+        VsockHostLocalPortError, VsockHostSocketAcceptError, VsockHostSocketOwner,
+        VsockHostSocketOwnerError, VsockMmioDevice, VsockMmioLayout, VsockMmioRegistrationError,
+        is_transient_host_socket_accept_error, is_transient_host_socket_read_error,
+        parse_vsock_host_connect_request, virtio_vsock_mmio_handler,
     };
 
     static NEXT_TEST_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
@@ -2842,6 +2930,21 @@ mod tests {
             "bb-vsock-{short_name}-{now:x}-{}-{id:x}.sock",
             std::process::id()
         ))
+    }
+
+    fn accepted_host_connection(name: &str) -> (super::VsockHostAcceptedConnection, UnixStream) {
+        let path = unique_socket_path(name);
+        let owner = VsockHostSocketOwner::bind(&path).expect("host socket should bind");
+        let client = UnixStream::connect(&path).expect("client should connect");
+        let accepted = owner
+            .accept_host_connection()
+            .expect("pending connection should accept")
+            .expect("accepted connection should be present");
+
+        drop(owner);
+        assert!(!path.exists());
+
+        (accepted, client)
     }
 
     fn unique_missing_socket_path() -> String {
@@ -3578,6 +3681,185 @@ mod tests {
     #[test]
     fn host_connect_errors_have_no_sources() {
         assert!(VsockHostConnectRequestError::InvalidPort.source().is_none());
+    }
+
+    #[test]
+    fn host_connect_handshake_reads_complete_request() {
+        let (mut accepted, mut client) = accepted_host_connection("connect-ok");
+        client
+            .write_all(b"CONNECT 52\n")
+            .expect("client should write handshake");
+
+        let request = accepted
+            .read_connect_request()
+            .expect("handshake read should succeed")
+            .expect("handshake should be complete");
+
+        assert_eq!(request.guest_port(), 52);
+    }
+
+    #[test]
+    fn host_connect_handshake_caches_complete_request_without_consuming_payload() {
+        let (mut accepted, mut client) = accepted_host_connection("connect-cached");
+        client
+            .write_all(b"CONNECT 52\npayload")
+            .expect("client should write handshake and payload");
+
+        let request = accepted
+            .read_connect_request()
+            .expect("handshake read should succeed")
+            .expect("handshake should be complete");
+        assert_eq!(request.guest_port(), 52);
+
+        let repeated = accepted
+            .read_connect_request()
+            .expect("cached handshake should succeed")
+            .expect("cached handshake should be complete");
+        assert_eq!(repeated, request);
+
+        let mut payload = [0; 7];
+        accepted
+            .into_stream()
+            .read_exact(&mut payload)
+            .expect("payload should remain unread after handshake");
+        assert_eq!(&payload, b"payload");
+    }
+
+    #[test]
+    fn host_connect_handshake_empty_nonblocking_stream_returns_none() {
+        let (mut accepted, _client) = accepted_host_connection("connect-empty");
+
+        let request = accepted
+            .read_connect_request()
+            .expect("empty nonblocking read should not fail");
+
+        assert!(request.is_none());
+    }
+
+    #[test]
+    fn host_connect_handshake_preserves_partial_request_across_reads() {
+        let (mut accepted, mut client) = accepted_host_connection("connect-split");
+        client
+            .write_all(b"CONN")
+            .expect("client should write partial handshake");
+
+        let partial = accepted
+            .read_connect_request()
+            .expect("partial nonblocking read should not fail");
+        assert!(partial.is_none());
+
+        client
+            .write_all(b"ECT 4096\n")
+            .expect("client should finish handshake");
+        let request = accepted
+            .read_connect_request()
+            .expect("completed handshake read should succeed")
+            .expect("handshake should be complete");
+
+        assert_eq!(request.guest_port(), 4096);
+    }
+
+    #[test]
+    fn host_connect_handshake_rejects_overlong_request_without_unbounded_buffering() {
+        let (mut accepted, mut client) = accepted_host_connection("connect-long");
+        let overlong = [b'x'; VSOCK_HOST_CONNECT_REQUEST_MAX_LEN + 1];
+        client
+            .write_all(&overlong)
+            .expect("client should write overlong handshake");
+
+        let err = accepted
+            .read_connect_request()
+            .expect_err("overlong handshake should fail");
+
+        assert_eq!(
+            err,
+            VsockHostConnectHandshakeError::TooLong {
+                max: VSOCK_HOST_CONNECT_REQUEST_MAX_LEN,
+            }
+        );
+    }
+
+    #[test]
+    fn host_connect_handshake_propagates_parse_error_source() {
+        let (mut accepted, mut client) = accepted_host_connection("connect-bad");
+        client
+            .write_all(b"OPEN 52\n")
+            .expect("client should write invalid handshake");
+
+        let err = accepted
+            .read_connect_request()
+            .expect_err("invalid handshake should fail");
+
+        assert!(matches!(
+            err,
+            VsockHostConnectHandshakeError::Parse {
+                source: VsockHostConnectRequestError::InvalidCommand
+            }
+        ));
+        assert!(err.source().is_some());
+        assert_eq!(
+            err.to_string(),
+            "invalid vsock host CONNECT request: vsock host CONNECT request command is invalid"
+        );
+    }
+
+    #[test]
+    fn host_connect_handshake_reports_closed_stream_before_request() {
+        let (mut accepted, client) = accepted_host_connection("connect-eof");
+
+        drop(client);
+
+        let err = accepted
+            .read_connect_request()
+            .expect_err("closed stream before handshake should fail");
+
+        assert_eq!(err, VsockHostConnectHandshakeError::Closed);
+    }
+
+    #[test]
+    fn host_connect_handshake_errors_have_expected_sources_and_no_paths() {
+        let read = VsockHostConnectHandshakeError::Read(std::io::ErrorKind::PermissionDenied);
+        let closed = VsockHostConnectHandshakeError::Closed;
+        let too_long = VsockHostConnectHandshakeError::TooLong {
+            max: VSOCK_HOST_CONNECT_REQUEST_MAX_LEN,
+        };
+        let parse = VsockHostConnectHandshakeError::Parse {
+            source: VsockHostConnectRequestError::MissingPort,
+        };
+
+        assert!(read.source().is_none());
+        assert!(closed.source().is_none());
+        assert!(too_long.source().is_none());
+        assert!(parse.source().is_some());
+        assert_eq!(
+            read.to_string(),
+            "failed to read vsock host CONNECT request: PermissionDenied"
+        );
+        assert_eq!(
+            closed.to_string(),
+            "vsock host connection closed before CONNECT request"
+        );
+        assert_eq!(
+            too_long.to_string(),
+            "vsock host CONNECT request exceeds maximum length 32"
+        );
+        assert_eq!(
+            parse.to_string(),
+            "invalid vsock host CONNECT request: vsock host CONNECT request is missing port"
+        );
+    }
+
+    #[test]
+    fn host_connect_handshake_classifies_transient_read_errors() {
+        assert!(is_transient_host_socket_read_error(
+            std::io::ErrorKind::WouldBlock
+        ));
+        assert!(is_transient_host_socket_read_error(
+            std::io::ErrorKind::Interrupted
+        ));
+        assert!(!is_transient_host_socket_read_error(
+            std::io::ErrorKind::ConnectionReset
+        ));
     }
 
     #[test]
