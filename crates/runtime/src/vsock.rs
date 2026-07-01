@@ -11,7 +11,8 @@ use crate::mmio::{
 use crate::virtio_mmio::{
     VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
     VirtioMmioDeviceActivationHandler, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
-    VirtioMmioDeviceConfigHandler, VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
+    VirtioMmioDeviceConfigHandler, VirtioMmioQueueRegisterError, VirtioMmioQueueState,
+    VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
 };
 
 pub const MIN_GUEST_CID: u32 = 3;
@@ -28,7 +29,9 @@ pub const VIRTIO_RING_FEATURE_EVENT_IDX: u32 = 29;
 pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
 pub const VIRTIO_FEATURE_IN_ORDER: u32 = 35;
 
-const VIRTIO_VSOCK_QUEUE_INDEXES: [u32; VIRTIO_VSOCK_QUEUE_COUNT] = [0, 1, 2];
+const VIRTIO_VSOCK_RX_QUEUE_INDEX_U32: u32 = 0;
+const VIRTIO_VSOCK_TX_QUEUE_INDEX_U32: u32 = 1;
+const VIRTIO_VSOCK_EVENT_QUEUE_INDEX_U32: u32 = 2;
 
 pub type VirtioVsockMmioHandler =
     VirtioMmioRegisterHandler<VirtioVsockConfigSpace, VirtioVsockDevice>;
@@ -216,9 +219,97 @@ impl VirtioMmioDeviceConfigHandler for VirtioVsockConfigSpace {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioVsockRxQueue {
+    queue_state: VirtioMmioQueueState,
+}
+
+impl VirtioVsockRxQueue {
+    pub fn from_mmio_queue_state(
+        queue: VirtioMmioQueueState,
+    ) -> Result<Self, VirtioVsockQueueBuildError> {
+        validate_active_vsock_queue(queue)?;
+        Ok(Self { queue_state: queue })
+    }
+
+    pub const fn queue_state(self) -> VirtioMmioQueueState {
+        self.queue_state
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioVsockTxQueue {
+    queue_state: VirtioMmioQueueState,
+}
+
+impl VirtioVsockTxQueue {
+    pub fn from_mmio_queue_state(
+        queue: VirtioMmioQueueState,
+    ) -> Result<Self, VirtioVsockQueueBuildError> {
+        validate_active_vsock_queue(queue)?;
+        Ok(Self { queue_state: queue })
+    }
+
+    pub const fn queue_state(self) -> VirtioMmioQueueState {
+        self.queue_state
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioVsockEventQueue {
+    queue_state: VirtioMmioQueueState,
+}
+
+impl VirtioVsockEventQueue {
+    pub fn from_mmio_queue_state(
+        queue: VirtioMmioQueueState,
+    ) -> Result<Self, VirtioVsockQueueBuildError> {
+        validate_active_vsock_queue(queue)?;
+        Ok(Self { queue_state: queue })
+    }
+
+    pub const fn queue_state(self) -> VirtioMmioQueueState {
+        self.queue_state
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioVsockQueueBuildError {
+    QueueNotReady,
+    QueueSizeNotConfigured,
+}
+
+impl fmt::Display for VirtioVsockQueueBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::QueueNotReady => f.write_str("virtio-vsock queue is not ready"),
+            Self::QueueSizeNotConfigured => {
+                f.write_str("virtio-vsock queue size is not configured")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioVsockQueueBuildError {}
+
+fn validate_active_vsock_queue(
+    queue: VirtioMmioQueueState,
+) -> Result<(), VirtioVsockQueueBuildError> {
+    if !queue.ready() {
+        return Err(VirtioVsockQueueBuildError::QueueNotReady);
+    }
+    if queue.size() == 0 {
+        return Err(VirtioVsockQueueBuildError::QueueSizeNotConfigured);
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VirtioVsockDevice {
-    activated: bool,
+    active_rx_queue: Option<VirtioVsockRxQueue>,
+    active_tx_queue: Option<VirtioVsockTxQueue>,
+    active_event_queue: Option<VirtioVsockEventQueue>,
 }
 
 impl VirtioVsockDevice {
@@ -226,43 +317,195 @@ impl VirtioVsockDevice {
         Self::default()
     }
 
-    pub const fn is_activated(&self) -> bool {
-        self.activated
+    pub fn is_activated(&self) -> bool {
+        self.active_rx_queue.is_some()
+            && self.active_tx_queue.is_some()
+            && self.active_event_queue.is_some()
+    }
+
+    pub fn active_rx_queue(&self) -> Option<VirtioMmioQueueState> {
+        self.active_rx_queue.map(VirtioVsockRxQueue::queue_state)
+    }
+
+    pub const fn active_rx_dispatch_queue(&self) -> Option<&VirtioVsockRxQueue> {
+        self.active_rx_queue.as_ref()
+    }
+
+    pub fn active_tx_queue(&self) -> Option<VirtioMmioQueueState> {
+        self.active_tx_queue.map(VirtioVsockTxQueue::queue_state)
+    }
+
+    pub const fn active_tx_dispatch_queue(&self) -> Option<&VirtioVsockTxQueue> {
+        self.active_tx_queue.as_ref()
+    }
+
+    pub fn active_event_queue(&self) -> Option<VirtioMmioQueueState> {
+        self.active_event_queue
+            .map(VirtioVsockEventQueue::queue_state)
+    }
+
+    pub const fn active_event_dispatch_queue(&self) -> Option<&VirtioVsockEventQueue> {
+        self.active_event_queue.as_ref()
     }
 
     pub fn activate_vsock(
         &mut self,
         activation: VirtioMmioDeviceActivation<'_>,
-    ) -> Result<(), VirtioMmioDeviceActivationError> {
+    ) -> Result<(), VirtioVsockDeviceActivationError> {
+        if self.is_activated() {
+            return Err(VirtioVsockDeviceActivationError::AlreadyActive);
+        }
+
         if activation.queue_count() != VIRTIO_VSOCK_QUEUE_COUNT {
-            return Err(MmioHandlerError::new(format!(
-                "virtio-vsock expected {VIRTIO_VSOCK_QUEUE_COUNT} queues, got {}",
-                activation.queue_count()
-            ))
-            .into());
+            return Err(VirtioVsockDeviceActivationError::QueueCountMismatch {
+                expected: VIRTIO_VSOCK_QUEUE_COUNT,
+                got: activation.queue_count(),
+            });
         }
 
-        for queue_index in VIRTIO_VSOCK_QUEUE_INDEXES {
-            let queue = activation.queue(queue_index).map_err(|source| {
-                MmioHandlerError::new(format!(
-                    "failed to read virtio-vsock queue {queue_index}: {source}"
-                ))
+        let active_rx_queue = active_vsock_queue_state(activation, VIRTIO_VSOCK_RX_QUEUE_INDEX_U32)
+            .and_then(|queue| {
+                VirtioVsockRxQueue::from_mmio_queue_state(queue).map_err(|source| {
+                    VirtioVsockDeviceActivationError::RxQueueBuild {
+                        queue_index: VIRTIO_VSOCK_RX_QUEUE_INDEX_U32,
+                        source,
+                    }
+                })
             })?;
-            if !queue.ready() || queue.size() == 0 {
-                return Err(MmioHandlerError::new(format!(
-                    "virtio-vsock queue {queue_index} must be configured and ready before activation"
-                ))
-                .into());
-            }
-        }
+        let active_tx_queue = active_vsock_queue_state(activation, VIRTIO_VSOCK_TX_QUEUE_INDEX_U32)
+            .and_then(|queue| {
+                VirtioVsockTxQueue::from_mmio_queue_state(queue).map_err(|source| {
+                    VirtioVsockDeviceActivationError::TxQueueBuild {
+                        queue_index: VIRTIO_VSOCK_TX_QUEUE_INDEX_U32,
+                        source,
+                    }
+                })
+            })?;
+        let active_event_queue =
+            active_vsock_queue_state(activation, VIRTIO_VSOCK_EVENT_QUEUE_INDEX_U32).and_then(
+                |queue| {
+                    VirtioVsockEventQueue::from_mmio_queue_state(queue).map_err(|source| {
+                        VirtioVsockDeviceActivationError::EventQueueBuild {
+                            queue_index: VIRTIO_VSOCK_EVENT_QUEUE_INDEX_U32,
+                            source,
+                        }
+                    })
+                },
+            )?;
 
-        self.activated = true;
+        self.active_rx_queue = Some(active_rx_queue);
+        self.active_tx_queue = Some(active_tx_queue);
+        self.active_event_queue = Some(active_event_queue);
         Ok(())
     }
 
     pub fn reset(&mut self) {
-        self.activated = false;
+        self.active_rx_queue = None;
+        self.active_tx_queue = None;
+        self.active_event_queue = None;
     }
+}
+
+#[derive(Debug)]
+pub enum VirtioVsockDeviceActivationError {
+    AlreadyActive,
+    QueueCountMismatch {
+        expected: usize,
+        got: usize,
+    },
+    QueueMetadata {
+        queue_index: u32,
+        source: VirtioMmioQueueRegisterError,
+    },
+    RxQueueBuild {
+        queue_index: u32,
+        source: VirtioVsockQueueBuildError,
+    },
+    TxQueueBuild {
+        queue_index: u32,
+        source: VirtioVsockQueueBuildError,
+    },
+    EventQueueBuild {
+        queue_index: u32,
+        source: VirtioVsockQueueBuildError,
+    },
+}
+
+impl fmt::Display for VirtioVsockDeviceActivationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyActive => f.write_str("virtio-vsock device is already active"),
+            Self::QueueCountMismatch { expected, got } => {
+                write!(f, "virtio-vsock expected {expected} queues, got {got}")
+            }
+            Self::QueueMetadata {
+                queue_index,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to read virtio-vsock queue {queue_index} activation metadata: {source}"
+                )
+            }
+            Self::RxQueueBuild {
+                queue_index,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to activate virtio-vsock RX queue {queue_index}: {source}"
+                )
+            }
+            Self::TxQueueBuild {
+                queue_index,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to activate virtio-vsock TX queue {queue_index}: {source}"
+                )
+            }
+            Self::EventQueueBuild {
+                queue_index,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to activate virtio-vsock event queue {queue_index}: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioVsockDeviceActivationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::QueueMetadata { source, .. } => Some(source),
+            Self::RxQueueBuild { source, .. }
+            | Self::TxQueueBuild { source, .. }
+            | Self::EventQueueBuild { source, .. } => Some(source),
+            Self::AlreadyActive | Self::QueueCountMismatch { .. } => None,
+        }
+    }
+}
+
+impl From<VirtioVsockDeviceActivationError> for VirtioMmioDeviceActivationError {
+    fn from(source: VirtioVsockDeviceActivationError) -> Self {
+        MmioHandlerError::new(source.to_string()).into()
+    }
+}
+
+fn active_vsock_queue_state(
+    activation: VirtioMmioDeviceActivation<'_>,
+    queue_index: u32,
+) -> Result<VirtioMmioQueueState, VirtioVsockDeviceActivationError> {
+    activation.queue(queue_index).copied().map_err(|source| {
+        VirtioVsockDeviceActivationError::QueueMetadata {
+            queue_index,
+            source,
+        }
+    })
 }
 
 impl VirtioMmioDeviceActivationHandler for VirtioVsockDevice {
@@ -270,7 +513,7 @@ impl VirtioMmioDeviceActivationHandler for VirtioVsockDevice {
         &mut self,
         activation: VirtioMmioDeviceActivation<'_>,
     ) -> Result<(), VirtioMmioDeviceActivationError> {
-        self.activate_vsock(activation)
+        self.activate_vsock(activation).map_err(Into::into)
     }
 
     fn reset(&mut self) {
@@ -603,8 +846,10 @@ mod tests {
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
         VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
         VIRTIO_DEVICE_STATUS_INIT, VIRTIO_MMIO_DEVICE_CONFIG_OFFSET,
-        VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceRegisters,
-        VirtioMmioQueueRegisters, VirtioMmioRegister, VirtioMmioRegisterHandlerError,
+        VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation,
+        VirtioMmioDeviceActivationError, VirtioMmioDeviceActivationHandler,
+        VirtioMmioDeviceRegisters, VirtioMmioQueueRegisters, VirtioMmioRegister,
+        VirtioMmioRegisterHandlerError,
     };
 
     use super::{
@@ -612,9 +857,9 @@ mod tests {
         VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_VSOCK_CONFIG_GUEST_CID_SIZE, VIRTIO_VSOCK_DEVICE_ID,
         VIRTIO_VSOCK_EVENT_QUEUE_INDEX, VIRTIO_VSOCK_QUEUE_COUNT, VIRTIO_VSOCK_QUEUE_SIZE,
         VIRTIO_VSOCK_QUEUE_SIZES, VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_TX_QUEUE_INDEX,
-        VirtioVsockConfigSpace, VirtioVsockDevice, VirtioVsockMmioHandler, VsockConfigError,
-        VsockConfigInput, VsockMmioDevice, VsockMmioLayout, VsockMmioRegistrationError,
-        virtio_vsock_mmio_handler,
+        VirtioVsockConfigSpace, VirtioVsockDevice, VirtioVsockDeviceActivationError,
+        VirtioVsockMmioHandler, VirtioVsockQueueBuildError, VsockConfigError, VsockConfigInput,
+        VsockMmioDevice, VsockMmioLayout, VsockMmioRegistrationError, virtio_vsock_mmio_handler,
     };
 
     const TEST_MMIO_BASE: u64 = 0x1000_0000;
@@ -717,42 +962,112 @@ mod tests {
         u32::try_from(address.raw_value()).expect("test guest address should fit in low half")
     }
 
+    fn queue_base(queue_index: u32) -> u64 {
+        TEST_QUEUE_ADDRESS_BASE + u64::from(queue_index) * TEST_QUEUE_ADDRESS_STRIDE
+    }
+
     fn configure_vsock_queues(handler: &mut VirtioVsockMmioHandler) {
+        configure_vsock_queues_with_size(handler, VIRTIO_VSOCK_QUEUE_SIZE);
+    }
+
+    fn configure_vsock_queues_with_size(handler: &mut VirtioVsockMmioHandler, queue_size: u16) {
         for queue_index in 0..VIRTIO_VSOCK_QUEUE_COUNT {
             let queue_index_u32 = u32::try_from(queue_index).expect("queue index should fit");
-            let queue_base =
-                TEST_QUEUE_ADDRESS_BASE + u64::from(queue_index_u32) * TEST_QUEUE_ADDRESS_STRIDE;
+            let base = queue_base(queue_index_u32);
             handler
                 .write_register(VirtioMmioRegister::QueueSel, queue_index_u32)
                 .expect("queue select should write");
             handler
-                .write_register(
-                    VirtioMmioRegister::QueueNum,
-                    u32::from(VIRTIO_VSOCK_QUEUE_SIZE),
-                )
+                .write_register(VirtioMmioRegister::QueueNum, u32::from(queue_size))
                 .expect("queue size should write");
             handler
                 .write_register(
                     VirtioMmioRegister::QueueDescLow,
-                    guest_address_low(GuestAddress::new(queue_base)),
+                    guest_address_low(GuestAddress::new(base)),
                 )
                 .expect("queue descriptor table should write");
             handler
                 .write_register(
                     VirtioMmioRegister::QueueDriverLow,
-                    guest_address_low(GuestAddress::new(queue_base + 0x200)),
+                    guest_address_low(GuestAddress::new(base + 0x200)),
                 )
                 .expect("queue driver ring should write");
             handler
                 .write_register(
                     VirtioMmioRegister::QueueDeviceLow,
-                    guest_address_low(GuestAddress::new(queue_base + 0x400)),
+                    guest_address_low(GuestAddress::new(base + 0x400)),
                 )
                 .expect("queue device ring should write");
             handler
                 .write_register(VirtioMmioRegister::QueueReady, 1)
                 .expect("queue ready should write");
         }
+    }
+
+    fn configured_vsock_queue_registers(
+        queue_size: Option<u16>,
+        ready: bool,
+    ) -> VirtioMmioQueueRegisters {
+        configured_vsock_queue_registers_from_specs([(queue_size, ready); VIRTIO_VSOCK_QUEUE_COUNT])
+    }
+
+    fn configured_vsock_queue_registers_from_specs(
+        specs: [(Option<u16>, bool); VIRTIO_VSOCK_QUEUE_COUNT],
+    ) -> VirtioMmioQueueRegisters {
+        let mut queues = VirtioMmioQueueRegisters::new(&VIRTIO_VSOCK_QUEUE_SIZES)
+            .expect("queue table should build");
+        for (queue_index, (queue_size, ready)) in specs.into_iter().enumerate() {
+            let queue_index_u32 = u32::try_from(queue_index).expect("queue index should fit");
+            let base = queue_base(queue_index_u32);
+            queues
+                .write_register(
+                    VirtioMmioRegister::QueueSel,
+                    queue_index_u32,
+                    QUEUE_CONFIG_STATUS,
+                )
+                .expect("queue select should write");
+            if let Some(queue_size) = queue_size {
+                queues
+                    .write_register(
+                        VirtioMmioRegister::QueueNum,
+                        u32::from(queue_size),
+                        QUEUE_CONFIG_STATUS,
+                    )
+                    .expect("queue size should write");
+            }
+            queues
+                .write_register(
+                    VirtioMmioRegister::QueueDescLow,
+                    guest_address_low(GuestAddress::new(base)),
+                    QUEUE_CONFIG_STATUS,
+                )
+                .expect("queue descriptor table should write");
+            queues
+                .write_register(
+                    VirtioMmioRegister::QueueDriverLow,
+                    guest_address_low(GuestAddress::new(base + 0x200)),
+                    QUEUE_CONFIG_STATUS,
+                )
+                .expect("queue driver ring should write");
+            queues
+                .write_register(
+                    VirtioMmioRegister::QueueDeviceLow,
+                    guest_address_low(GuestAddress::new(base + 0x400)),
+                    QUEUE_CONFIG_STATUS,
+                )
+                .expect("queue device ring should write");
+            if ready {
+                queues
+                    .write_register(VirtioMmioRegister::QueueReady, 1, QUEUE_CONFIG_STATUS)
+                    .expect("queue ready should write");
+            }
+        }
+
+        queues
+    }
+
+    fn vsock_device_registers() -> VirtioMmioDeviceRegisters {
+        VirtioMmioDeviceRegisters::new(VIRTIO_VSOCK_DEVICE_ID, 0)
     }
 
     fn vsock_handler_for_config(config: VirtioVsockConfigSpace) -> VirtioVsockMmioHandler {
@@ -1211,6 +1526,258 @@ mod tests {
     }
 
     #[test]
+    fn virtio_vsock_device_activation_retains_active_queue_metadata() {
+        let registers = vsock_device_registers();
+        let queues = configured_vsock_queue_registers(Some(4), true);
+        let mut device = VirtioVsockDevice::new();
+
+        device
+            .activate_vsock(VirtioMmioDeviceActivation::new(&registers, &queues))
+            .expect("vsock device should activate");
+
+        assert!(device.is_activated());
+        let rx_queue = device
+            .active_rx_queue()
+            .expect("active RX queue should be present");
+        let tx_queue = device
+            .active_tx_queue()
+            .expect("active TX queue should be present");
+        let event_queue = device
+            .active_event_queue()
+            .expect("active event queue should be present");
+
+        assert_eq!(rx_queue.size(), 4);
+        assert_eq!(tx_queue.size(), 4);
+        assert_eq!(event_queue.size(), 4);
+        assert_eq!(
+            rx_queue.descriptor_table(),
+            GuestAddress::new(queue_base(0))
+        );
+        assert_eq!(
+            tx_queue.descriptor_table(),
+            GuestAddress::new(queue_base(1))
+        );
+        assert_eq!(
+            event_queue.descriptor_table(),
+            GuestAddress::new(queue_base(2))
+        );
+        assert_eq!(
+            device
+                .active_rx_dispatch_queue()
+                .expect("active RX dispatch queue should be present")
+                .queue_state(),
+            rx_queue
+        );
+        assert_eq!(
+            device
+                .active_tx_dispatch_queue()
+                .expect("active TX dispatch queue should be present")
+                .queue_state(),
+            tx_queue
+        );
+        assert_eq!(
+            device
+                .active_event_dispatch_queue()
+                .expect("active event dispatch queue should be present")
+                .queue_state(),
+            event_queue
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_device_rejects_duplicate_activation_without_replacing_queues() {
+        let registers = vsock_device_registers();
+        let first_queues = configured_vsock_queue_registers(Some(4), true);
+        let second_queues = configured_vsock_queue_registers(Some(8), true);
+        let mut device = VirtioVsockDevice::new();
+
+        device
+            .activate_vsock(VirtioMmioDeviceActivation::new(&registers, &first_queues))
+            .expect("first activation should succeed");
+
+        let error = device
+            .activate_vsock(VirtioMmioDeviceActivation::new(&registers, &second_queues))
+            .expect_err("duplicate activation should fail");
+
+        assert!(matches!(
+            &error,
+            VirtioVsockDeviceActivationError::AlreadyActive
+        ));
+        assert!(error.source().is_none());
+        assert_eq!(error.to_string(), "virtio-vsock device is already active");
+        assert_eq!(
+            device
+                .active_rx_queue()
+                .expect("original RX queue should remain active")
+                .size(),
+            4
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_device_activation_reset_clears_queues_and_allows_retry() {
+        let registers = vsock_device_registers();
+        let first_queues = configured_vsock_queue_registers(Some(4), true);
+        let second_queues = configured_vsock_queue_registers(Some(8), true);
+        let mut device = VirtioVsockDevice::new();
+
+        device
+            .activate_vsock(VirtioMmioDeviceActivation::new(&registers, &first_queues))
+            .expect("first activation should succeed");
+        assert!(device.is_activated());
+
+        VirtioMmioDeviceActivationHandler::reset(&mut device);
+
+        assert!(!device.is_activated());
+        assert!(device.active_rx_queue().is_none());
+        assert!(device.active_tx_queue().is_none());
+        assert!(device.active_event_queue().is_none());
+
+        device
+            .activate_vsock(VirtioMmioDeviceActivation::new(&registers, &second_queues))
+            .expect("second activation should succeed after reset");
+
+        assert_eq!(
+            device
+                .active_event_queue()
+                .expect("new event queue should be active")
+                .size(),
+            8
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_device_rejects_not_ready_queue_without_partial_activation() {
+        let registers = vsock_device_registers();
+        let queues = configured_vsock_queue_registers(Some(4), false);
+        let mut device = VirtioVsockDevice::new();
+
+        let error = device
+            .activate_vsock(VirtioMmioDeviceActivation::new(&registers, &queues))
+            .expect_err("not-ready queue should fail activation");
+
+        assert!(matches!(
+            &error,
+            VirtioVsockDeviceActivationError::RxQueueBuild {
+                queue_index: 0,
+                source: VirtioVsockQueueBuildError::QueueNotReady
+            }
+        ));
+        assert!(error.source().is_some());
+        assert_eq!(
+            error.to_string(),
+            "failed to activate virtio-vsock RX queue 0: virtio-vsock queue is not ready"
+        );
+        assert!(!device.is_activated());
+        assert!(device.active_rx_queue().is_none());
+        assert!(device.active_tx_queue().is_none());
+        assert!(device.active_event_queue().is_none());
+    }
+
+    #[test]
+    fn virtio_vsock_device_rejects_not_ready_tx_queue_without_partial_activation() {
+        let registers = vsock_device_registers();
+        let queues = configured_vsock_queue_registers_from_specs([
+            (Some(4), true),
+            (Some(4), false),
+            (Some(4), true),
+        ]);
+        let mut device = VirtioVsockDevice::new();
+
+        let error = device
+            .activate_vsock(VirtioMmioDeviceActivation::new(&registers, &queues))
+            .expect_err("not-ready TX queue should fail activation");
+
+        assert!(matches!(
+            &error,
+            VirtioVsockDeviceActivationError::TxQueueBuild {
+                queue_index: 1,
+                source: VirtioVsockQueueBuildError::QueueNotReady
+            }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "failed to activate virtio-vsock TX queue 1: virtio-vsock queue is not ready"
+        );
+        assert!(!device.is_activated());
+    }
+
+    #[test]
+    fn virtio_vsock_device_rejects_ready_queue_without_size() {
+        let registers = vsock_device_registers();
+        let queues = configured_vsock_queue_registers(None, true);
+        let mut device = VirtioVsockDevice::new();
+
+        let error = device
+            .activate_vsock(VirtioMmioDeviceActivation::new(&registers, &queues))
+            .expect_err("missing queue size should fail activation");
+
+        assert!(matches!(
+            &error,
+            VirtioVsockDeviceActivationError::RxQueueBuild {
+                queue_index: 0,
+                source: VirtioVsockQueueBuildError::QueueSizeNotConfigured
+            }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "failed to activate virtio-vsock RX queue 0: virtio-vsock queue size is not configured"
+        );
+        assert!(!device.is_activated());
+    }
+
+    #[test]
+    fn virtio_vsock_device_rejects_ready_event_queue_without_size() {
+        let registers = vsock_device_registers();
+        let queues = configured_vsock_queue_registers_from_specs([
+            (Some(4), true),
+            (Some(4), true),
+            (None, true),
+        ]);
+        let mut device = VirtioVsockDevice::new();
+
+        let error = device
+            .activate_vsock(VirtioMmioDeviceActivation::new(&registers, &queues))
+            .expect_err("missing event queue size should fail activation");
+
+        assert!(matches!(
+            &error,
+            VirtioVsockDeviceActivationError::EventQueueBuild {
+                queue_index: 2,
+                source: VirtioVsockQueueBuildError::QueueSizeNotConfigured
+            }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "failed to activate virtio-vsock event queue 2: virtio-vsock queue size is not configured"
+        );
+        assert!(!device.is_activated());
+    }
+
+    #[test]
+    fn virtio_vsock_device_activation_trait_error_is_generic_handler_error() {
+        let registers = vsock_device_registers();
+        let queues = configured_vsock_queue_registers(Some(4), false);
+        let mut device = VirtioVsockDevice::new();
+
+        let error = VirtioMmioDeviceActivationHandler::activate(
+            &mut device,
+            VirtioMmioDeviceActivation::new(&registers, &queues),
+        )
+        .expect_err("trait activation should fail with generic handler error");
+
+        match error {
+            VirtioMmioDeviceActivationError::Handler { source } => {
+                assert_eq!(
+                    source.to_string(),
+                    "failed to activate virtio-vsock RX queue 0: virtio-vsock queue is not ready"
+                );
+            }
+        }
+        assert!(!device.is_activated());
+    }
+
+    #[test]
     fn virtio_vsock_device_activates_and_resets_through_handler() {
         let mut handler = virtio_vsock_mmio_handler(3).expect("vsock handler should build");
 
@@ -1225,6 +1792,9 @@ mod tests {
 
         assert!(handler.is_device_activated());
         assert!(handler.activation_handler().is_activated());
+        assert!(handler.activation_handler().active_rx_queue().is_some());
+        assert!(handler.activation_handler().active_tx_queue().is_some());
+        assert!(handler.activation_handler().active_event_queue().is_some());
 
         handler
             .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_INIT)
@@ -1232,6 +1802,9 @@ mod tests {
 
         assert!(!handler.is_device_activated());
         assert!(!handler.activation_handler().is_activated());
+        assert!(handler.activation_handler().active_rx_queue().is_none());
+        assert!(handler.activation_handler().active_tx_queue().is_none());
+        assert!(handler.activation_handler().active_event_queue().is_none());
     }
 
     #[test]
@@ -1264,10 +1837,14 @@ mod tests {
             .activate_vsock(activation)
             .expect_err("unexpected queue count should fail activation");
 
-        assert_eq!(
-            err.to_string(),
-            "virtio-mmio device activation handler failed: virtio-vsock expected 3 queues, got 2"
-        );
+        assert_eq!(err.to_string(), "virtio-vsock expected 3 queues, got 2");
+        assert!(matches!(
+            err,
+            VirtioVsockDeviceActivationError::QueueCountMismatch {
+                expected: 3,
+                got: 2
+            }
+        ));
         assert!(!device.is_activated());
     }
 }
