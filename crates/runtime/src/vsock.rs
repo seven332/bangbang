@@ -3760,6 +3760,23 @@ mod tests {
     }
 
     #[test]
+    fn host_connect_handshake_accepts_exact_max_length_request() {
+        let (mut accepted, mut client) = accepted_host_connection("connect-max");
+        let exact_max = b"CONNECT 4294967295             \n";
+        assert_eq!(exact_max.len(), VSOCK_HOST_CONNECT_REQUEST_MAX_LEN);
+        client
+            .write_all(exact_max)
+            .expect("client should write exact maximum handshake");
+
+        let request = accepted
+            .read_connect_request()
+            .expect("maximum handshake read should succeed")
+            .expect("maximum handshake should be complete");
+
+        assert_eq!(request.guest_port(), u32::MAX);
+    }
+
+    #[test]
     fn host_connect_handshake_rejects_overlong_request_without_unbounded_buffering() {
         let (mut accepted, mut client) = accepted_host_connection("connect-long");
         let overlong = [b'x'; VSOCK_HOST_CONNECT_REQUEST_MAX_LEN + 1];
