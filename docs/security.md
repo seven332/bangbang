@@ -70,8 +70,8 @@ is resource-specific:
   descriptor packet parser. Startup-level dispatch can drain TX queue
   notifications, complete TX descriptor heads, and signal the allocated vsock
   queue interrupt line. The runtime can also parse host `CONNECT <PORT>`
-  requests and allocate Firecracker-shaped host local ports for future
-  host-initiated connections. Startup also binds a nonblocking host Unix
+  requests, allocate Firecracker-shaped host local ports, and track
+  host-initiated connection keys in an internal table. Startup also binds a nonblocking host Unix
   listener at `uds_path`, records the listener socket device and inode, and
   removes the path on normal shutdown only when it still refers to the socket
   created by this process. It does not accept host connections, connect to
@@ -191,8 +191,8 @@ The current scaffold does not implement:
   dispatch, startup FDT attachment, startup-level TX notification dispatch, and
   HVF queue interrupt signaling that expose only the configured guest CID
   through bounded config reads. The runtime can also parse host `CONNECT <PORT>`
-  requests and allocate Firecracker-shaped host local ports for future
-  host-initiated connections. Startup preparation creates a nonblocking host
+  requests, allocate Firecracker-shaped host local ports, and track
+  host-initiated connection keys in an internal table. Startup preparation creates a nonblocking host
   Unix listener at `uds_path` and cleans it up only while the path still matches
   the created socket inode. It does not implement host connection acceptance,
   guest-initiated `uds_path_<PORT>` connections, CID routing, RX buffer parsing,
