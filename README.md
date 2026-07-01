@@ -84,7 +84,7 @@ Record a pre-boot network interface:
 curl --unix-socket /tmp/bangbang.socket \
   -X PUT http://localhost/network-interfaces/eth0 \
   -H 'Content-Type: application/json' \
-  -d '{"iface_id":"eth0","host_dev_name":"tap0","guest_mac":"12:34:56:78:9a:bc"}'
+  -d '{"iface_id":"eth0","host_dev_name":"vmnet:shared","guest_mac":"12:34:56:78:9a:bc"}'
 ```
 
 Record a pre-boot vsock configuration:
