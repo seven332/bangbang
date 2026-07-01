@@ -1046,17 +1046,21 @@ mod tests {
     }
 
     #[test]
-    fn provider_returns_packet_io_for_matching_interface() {
-        let mut provider = VmnetVirtioNetworkPacketIoProvider::new(vec![provider_entry(
-            "eth0",
-            FakeVmnetPacketIoBackend::default(),
-        )])
+    fn provider_returns_packet_io_for_matching_interfaces() {
+        let mut provider = VmnetVirtioNetworkPacketIoProvider::new(vec![
+            provider_entry("eth0", FakeVmnetPacketIoBackend::default()),
+            provider_entry("eth1", FakeVmnetPacketIoBackend::default()),
+        ])
         .expect("provider should build");
-        let device = network_device("eth0");
+        let eth0_device = network_device("eth0");
+        let eth1_device = network_device("eth1");
 
         provider
-            .packet_io(&device)
-            .expect("matching provider entry should return packet I/O");
+            .packet_io(&eth0_device)
+            .expect("eth0 provider entry should return packet I/O");
+        provider
+            .packet_io(&eth1_device)
+            .expect("eth1 provider entry should return packet I/O");
     }
 
     #[test]
