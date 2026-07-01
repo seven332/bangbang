@@ -70,15 +70,14 @@ is resource-specific:
   descriptor packet parser. Startup-level dispatch can drain TX queue
   notifications, complete TX descriptor heads, and signal the allocated vsock
   queue interrupt line. The runtime can also parse host `CONNECT <PORT>`
-  requests, allocate Firecracker-shaped host local ports, track
-  host-initiated connection keys in an internal table, and accept one pending
-  host connection per call into an owned nonblocking stream, then read and
-  parse a bounded accepted-stream `CONNECT` handshake. Startup also binds a
-  nonblocking host Unix listener at `uds_path`, records the listener socket
-  device and inode, and removes the path on normal shutdown only when it still
-  refers to the socket created by this process. It does not allocate accepted
-  host local ports, connect to `uds_path_<PORT>`, route CIDs, or move vsock data
-  yet.
+  requests, allocate Firecracker-shaped host local ports, retain
+  host-initiated accepted streams in an internal table, accept one pending host
+  connection per call into an owned nonblocking stream, then read and parse a
+  bounded accepted-stream `CONNECT` handshake. Startup also binds a nonblocking
+  host Unix listener at `uds_path`, records the listener socket device and
+  inode, and removes the path on normal shutdown only when it still refers to
+  the socket created by this process. It does not send `OK` or `RST` responses,
+  connect to `uds_path_<PORT>`, route CIDs, or move vsock data yet.
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink.
 - `/logger` opens `log_path` during pre-boot configuration when that field is
@@ -194,15 +193,14 @@ The current scaffold does not implement:
   dispatch, startup FDT attachment, startup-level TX notification dispatch, and
   HVF queue interrupt signaling that expose only the configured guest CID
   through bounded config reads. The runtime can also parse host `CONNECT <PORT>`
-  requests, allocate Firecracker-shaped host local ports, track
-  host-initiated connection keys in an internal table, accept one pending host
+  requests, allocate Firecracker-shaped host local ports, retain
+  host-initiated accepted streams in an internal table, accept one pending host
   connection per call into an owned nonblocking stream, and read and parse a
   bounded accepted-stream `CONNECT` handshake. Startup preparation creates a
   nonblocking host Unix listener at `uds_path` and cleans it up only while the
-  path still matches the created socket inode. It does not allocate accepted
-  host local ports, send `OK` or `RST` responses, connect guest-initiated
-  `uds_path_<PORT>` sockets, route CIDs, parse RX buffers, dispatch event
-  queues, or move data
+  path still matches the created socket inode. It does not send `OK` or `RST`
+  responses, connect guest-initiated `uds_path_<PORT>` sockets, route CIDs,
+  parse RX buffers, dispatch event queues, or move data
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 
