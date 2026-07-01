@@ -25,6 +25,19 @@ pub const VIRTIO_VSOCK_QUEUE_SIZE: u16 = 256;
 pub const VIRTIO_VSOCK_QUEUE_SIZES: [u16; VIRTIO_VSOCK_QUEUE_COUNT] =
     [VIRTIO_VSOCK_QUEUE_SIZE; VIRTIO_VSOCK_QUEUE_COUNT];
 pub const VIRTIO_VSOCK_CONFIG_GUEST_CID_SIZE: usize = 8;
+pub const VIRTIO_VSOCK_PACKET_HEADER_SIZE: usize = 44;
+pub const VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE: u32 = 64 * 1024;
+pub const VIRTIO_VSOCK_HOST_CID: u64 = 2;
+pub const VIRTIO_VSOCK_PACKET_TYPE_STREAM: u16 = 1;
+pub const VIRTIO_VSOCK_OP_REQUEST: u16 = 1;
+pub const VIRTIO_VSOCK_OP_RESPONSE: u16 = 2;
+pub const VIRTIO_VSOCK_OP_RST: u16 = 3;
+pub const VIRTIO_VSOCK_OP_SHUTDOWN: u16 = 4;
+pub const VIRTIO_VSOCK_OP_RW: u16 = 5;
+pub const VIRTIO_VSOCK_OP_CREDIT_UPDATE: u16 = 6;
+pub const VIRTIO_VSOCK_OP_CREDIT_REQUEST: u16 = 7;
+pub const VIRTIO_VSOCK_FLAGS_SHUTDOWN_RCV: u32 = 1;
+pub const VIRTIO_VSOCK_FLAGS_SHUTDOWN_SEND: u32 = 2;
 pub const VIRTIO_RING_FEATURE_EVENT_IDX: u32 = 29;
 pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
 pub const VIRTIO_FEATURE_IN_ORDER: u32 = 35;
@@ -160,6 +173,346 @@ impl fmt::Display for VsockConfigError {
 }
 
 impl std::error::Error for VsockConfigError {}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VirtioVsockPacketHeader {
+    src_cid: u64,
+    dst_cid: u64,
+    src_port: u32,
+    dst_port: u32,
+    payload_len: u32,
+    packet_type: u16,
+    operation: u16,
+    flags: u32,
+    buffer_allocation: u32,
+    forwarded_count: u32,
+}
+
+impl VirtioVsockPacketHeader {
+    pub const fn new() -> Self {
+        Self {
+            src_cid: 0,
+            dst_cid: 0,
+            src_port: 0,
+            dst_port: 0,
+            payload_len: 0,
+            packet_type: 0,
+            operation: 0,
+            flags: 0,
+            buffer_allocation: 0,
+            forwarded_count: 0,
+        }
+    }
+
+    pub const fn src_cid(self) -> u64 {
+        self.src_cid
+    }
+
+    pub const fn dst_cid(self) -> u64 {
+        self.dst_cid
+    }
+
+    pub const fn src_port(self) -> u32 {
+        self.src_port
+    }
+
+    pub const fn dst_port(self) -> u32 {
+        self.dst_port
+    }
+
+    pub const fn payload_len(self) -> u32 {
+        self.payload_len
+    }
+
+    pub const fn packet_type(self) -> u16 {
+        self.packet_type
+    }
+
+    pub const fn operation(self) -> u16 {
+        self.operation
+    }
+
+    pub const fn flags(self) -> u32 {
+        self.flags
+    }
+
+    pub const fn buffer_allocation(self) -> u32 {
+        self.buffer_allocation
+    }
+
+    pub const fn forwarded_count(self) -> u32 {
+        self.forwarded_count
+    }
+
+    pub const fn with_src_cid(mut self, src_cid: u64) -> Self {
+        self.src_cid = src_cid;
+        self
+    }
+
+    pub const fn with_dst_cid(mut self, dst_cid: u64) -> Self {
+        self.dst_cid = dst_cid;
+        self
+    }
+
+    pub const fn with_src_port(mut self, src_port: u32) -> Self {
+        self.src_port = src_port;
+        self
+    }
+
+    pub const fn with_dst_port(mut self, dst_port: u32) -> Self {
+        self.dst_port = dst_port;
+        self
+    }
+
+    pub const fn with_payload_len(mut self, payload_len: u32) -> Self {
+        self.payload_len = payload_len;
+        self
+    }
+
+    pub const fn with_packet_type(mut self, packet_type: u16) -> Self {
+        self.packet_type = packet_type;
+        self
+    }
+
+    pub const fn with_operation(mut self, operation: u16) -> Self {
+        self.operation = operation;
+        self
+    }
+
+    pub const fn with_flags(mut self, flags: u32) -> Self {
+        self.flags = flags;
+        self
+    }
+
+    pub const fn with_buffer_allocation(mut self, buffer_allocation: u32) -> Self {
+        self.buffer_allocation = buffer_allocation;
+        self
+    }
+
+    pub const fn with_forwarded_count(mut self, forwarded_count: u32) -> Self {
+        self.forwarded_count = forwarded_count;
+        self
+    }
+
+    pub fn validate_payload_len(self) -> Result<(), VirtioVsockPacketLengthError> {
+        if self.payload_len > VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE {
+            return Err(VirtioVsockPacketLengthError {
+                payload_len: self.payload_len,
+                max_payload_len: VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE,
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn to_bytes(self) -> [u8; VIRTIO_VSOCK_PACKET_HEADER_SIZE] {
+        let [
+            src_cid_0,
+            src_cid_1,
+            src_cid_2,
+            src_cid_3,
+            src_cid_4,
+            src_cid_5,
+            src_cid_6,
+            src_cid_7,
+        ] = self.src_cid.to_le_bytes();
+        let [
+            dst_cid_0,
+            dst_cid_1,
+            dst_cid_2,
+            dst_cid_3,
+            dst_cid_4,
+            dst_cid_5,
+            dst_cid_6,
+            dst_cid_7,
+        ] = self.dst_cid.to_le_bytes();
+        let [src_port_0, src_port_1, src_port_2, src_port_3] = self.src_port.to_le_bytes();
+        let [dst_port_0, dst_port_1, dst_port_2, dst_port_3] = self.dst_port.to_le_bytes();
+        let [payload_len_0, payload_len_1, payload_len_2, payload_len_3] =
+            self.payload_len.to_le_bytes();
+        let [packet_type_0, packet_type_1] = self.packet_type.to_le_bytes();
+        let [operation_0, operation_1] = self.operation.to_le_bytes();
+        let [flags_0, flags_1, flags_2, flags_3] = self.flags.to_le_bytes();
+        let [
+            buffer_allocation_0,
+            buffer_allocation_1,
+            buffer_allocation_2,
+            buffer_allocation_3,
+        ] = self.buffer_allocation.to_le_bytes();
+        let [
+            forwarded_count_0,
+            forwarded_count_1,
+            forwarded_count_2,
+            forwarded_count_3,
+        ] = self.forwarded_count.to_le_bytes();
+
+        [
+            src_cid_0,
+            src_cid_1,
+            src_cid_2,
+            src_cid_3,
+            src_cid_4,
+            src_cid_5,
+            src_cid_6,
+            src_cid_7,
+            dst_cid_0,
+            dst_cid_1,
+            dst_cid_2,
+            dst_cid_3,
+            dst_cid_4,
+            dst_cid_5,
+            dst_cid_6,
+            dst_cid_7,
+            src_port_0,
+            src_port_1,
+            src_port_2,
+            src_port_3,
+            dst_port_0,
+            dst_port_1,
+            dst_port_2,
+            dst_port_3,
+            payload_len_0,
+            payload_len_1,
+            payload_len_2,
+            payload_len_3,
+            packet_type_0,
+            packet_type_1,
+            operation_0,
+            operation_1,
+            flags_0,
+            flags_1,
+            flags_2,
+            flags_3,
+            buffer_allocation_0,
+            buffer_allocation_1,
+            buffer_allocation_2,
+            buffer_allocation_3,
+            forwarded_count_0,
+            forwarded_count_1,
+            forwarded_count_2,
+            forwarded_count_3,
+        ]
+    }
+
+    pub fn try_from_bytes(
+        bytes: [u8; VIRTIO_VSOCK_PACKET_HEADER_SIZE],
+    ) -> Result<Self, VirtioVsockPacketLengthError> {
+        let header = Self::decode_bytes(bytes);
+        header.validate_payload_len()?;
+        Ok(header)
+    }
+
+    const fn decode_bytes(bytes: [u8; VIRTIO_VSOCK_PACKET_HEADER_SIZE]) -> Self {
+        let [
+            src_cid_0,
+            src_cid_1,
+            src_cid_2,
+            src_cid_3,
+            src_cid_4,
+            src_cid_5,
+            src_cid_6,
+            src_cid_7,
+            dst_cid_0,
+            dst_cid_1,
+            dst_cid_2,
+            dst_cid_3,
+            dst_cid_4,
+            dst_cid_5,
+            dst_cid_6,
+            dst_cid_7,
+            src_port_0,
+            src_port_1,
+            src_port_2,
+            src_port_3,
+            dst_port_0,
+            dst_port_1,
+            dst_port_2,
+            dst_port_3,
+            payload_len_0,
+            payload_len_1,
+            payload_len_2,
+            payload_len_3,
+            packet_type_0,
+            packet_type_1,
+            operation_0,
+            operation_1,
+            flags_0,
+            flags_1,
+            flags_2,
+            flags_3,
+            buffer_allocation_0,
+            buffer_allocation_1,
+            buffer_allocation_2,
+            buffer_allocation_3,
+            forwarded_count_0,
+            forwarded_count_1,
+            forwarded_count_2,
+            forwarded_count_3,
+        ] = bytes;
+
+        Self {
+            src_cid: u64::from_le_bytes([
+                src_cid_0, src_cid_1, src_cid_2, src_cid_3, src_cid_4, src_cid_5, src_cid_6,
+                src_cid_7,
+            ]),
+            dst_cid: u64::from_le_bytes([
+                dst_cid_0, dst_cid_1, dst_cid_2, dst_cid_3, dst_cid_4, dst_cid_5, dst_cid_6,
+                dst_cid_7,
+            ]),
+            src_port: u32::from_le_bytes([src_port_0, src_port_1, src_port_2, src_port_3]),
+            dst_port: u32::from_le_bytes([dst_port_0, dst_port_1, dst_port_2, dst_port_3]),
+            payload_len: u32::from_le_bytes([
+                payload_len_0,
+                payload_len_1,
+                payload_len_2,
+                payload_len_3,
+            ]),
+            packet_type: u16::from_le_bytes([packet_type_0, packet_type_1]),
+            operation: u16::from_le_bytes([operation_0, operation_1]),
+            flags: u32::from_le_bytes([flags_0, flags_1, flags_2, flags_3]),
+            buffer_allocation: u32::from_le_bytes([
+                buffer_allocation_0,
+                buffer_allocation_1,
+                buffer_allocation_2,
+                buffer_allocation_3,
+            ]),
+            forwarded_count: u32::from_le_bytes([
+                forwarded_count_0,
+                forwarded_count_1,
+                forwarded_count_2,
+                forwarded_count_3,
+            ]),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioVsockPacketLengthError {
+    payload_len: u32,
+    max_payload_len: u32,
+}
+
+impl VirtioVsockPacketLengthError {
+    pub const fn payload_len(self) -> u32 {
+        self.payload_len
+    }
+
+    pub const fn max_payload_len(self) -> u32 {
+        self.max_payload_len
+    }
+}
+
+impl fmt::Display for VirtioVsockPacketLengthError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "virtio-vsock packet payload length {} exceeds maximum {}",
+            self.payload_len, self.max_payload_len
+        )
+    }
+}
+
+impl std::error::Error for VirtioVsockPacketLengthError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtioVsockConfigSpace {
@@ -855,11 +1208,18 @@ mod tests {
     use super::{
         MIN_GUEST_CID, PreparedVsockDevice, VIRTIO_FEATURE_IN_ORDER, VIRTIO_FEATURE_VERSION_1,
         VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_VSOCK_CONFIG_GUEST_CID_SIZE, VIRTIO_VSOCK_DEVICE_ID,
-        VIRTIO_VSOCK_EVENT_QUEUE_INDEX, VIRTIO_VSOCK_QUEUE_COUNT, VIRTIO_VSOCK_QUEUE_SIZE,
-        VIRTIO_VSOCK_QUEUE_SIZES, VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_TX_QUEUE_INDEX,
-        VirtioVsockConfigSpace, VirtioVsockDevice, VirtioVsockDeviceActivationError,
-        VirtioVsockMmioHandler, VirtioVsockQueueBuildError, VsockConfigError, VsockConfigInput,
-        VsockMmioDevice, VsockMmioLayout, VsockMmioRegistrationError, virtio_vsock_mmio_handler,
+        VIRTIO_VSOCK_EVENT_QUEUE_INDEX, VIRTIO_VSOCK_FLAGS_SHUTDOWN_RCV,
+        VIRTIO_VSOCK_FLAGS_SHUTDOWN_SEND, VIRTIO_VSOCK_HOST_CID,
+        VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE, VIRTIO_VSOCK_OP_CREDIT_REQUEST,
+        VIRTIO_VSOCK_OP_CREDIT_UPDATE, VIRTIO_VSOCK_OP_REQUEST, VIRTIO_VSOCK_OP_RESPONSE,
+        VIRTIO_VSOCK_OP_RST, VIRTIO_VSOCK_OP_RW, VIRTIO_VSOCK_OP_SHUTDOWN,
+        VIRTIO_VSOCK_PACKET_HEADER_SIZE, VIRTIO_VSOCK_PACKET_TYPE_STREAM, VIRTIO_VSOCK_QUEUE_COUNT,
+        VIRTIO_VSOCK_QUEUE_SIZE, VIRTIO_VSOCK_QUEUE_SIZES, VIRTIO_VSOCK_RX_QUEUE_INDEX,
+        VIRTIO_VSOCK_TX_QUEUE_INDEX, VirtioVsockConfigSpace, VirtioVsockDevice,
+        VirtioVsockDeviceActivationError, VirtioVsockMmioHandler, VirtioVsockPacketHeader,
+        VirtioVsockPacketLengthError, VirtioVsockQueueBuildError, VsockConfigError,
+        VsockConfigInput, VsockMmioDevice, VsockMmioLayout, VsockMmioRegistrationError,
+        virtio_vsock_mmio_handler,
     };
 
     const TEST_MMIO_BASE: u64 = 0x1000_0000;
@@ -1084,6 +1444,20 @@ mod tests {
             VirtioVsockDevice::new(),
         )
         .expect("vsock handler should build")
+    }
+
+    fn test_vsock_packet_header() -> VirtioVsockPacketHeader {
+        VirtioVsockPacketHeader::new()
+            .with_src_cid(0x0102_0304_0506_0708)
+            .with_dst_cid(0x1112_1314_1516_1718)
+            .with_src_port(0x2122_2324)
+            .with_dst_port(0x3132_3334)
+            .with_payload_len(0x1000)
+            .with_packet_type(VIRTIO_VSOCK_PACKET_TYPE_STREAM)
+            .with_operation(VIRTIO_VSOCK_OP_RW)
+            .with_flags(VIRTIO_VSOCK_FLAGS_SHUTDOWN_RCV | VIRTIO_VSOCK_FLAGS_SHUTDOWN_SEND)
+            .with_buffer_allocation(0x4142_4344)
+            .with_forwarded_count(0x5152_5354)
     }
 
     #[test]
@@ -1400,6 +1774,108 @@ mod tests {
         assert_eq!(VIRTIO_VSOCK_QUEUE_SIZE, 256);
         assert_eq!(VIRTIO_VSOCK_QUEUE_SIZES, [256, 256, 256]);
         assert_eq!(VIRTIO_VSOCK_CONFIG_GUEST_CID_SIZE, 8);
+    }
+
+    #[test]
+    fn virtio_vsock_packet_constants_match_firecracker_shape() {
+        assert_eq!(VIRTIO_VSOCK_PACKET_HEADER_SIZE, 44);
+        assert_eq!(VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE, 64 * 1024);
+        assert_eq!(VIRTIO_VSOCK_HOST_CID, 2);
+        assert_eq!(VIRTIO_VSOCK_PACKET_TYPE_STREAM, 1);
+        assert_eq!(VIRTIO_VSOCK_OP_REQUEST, 1);
+        assert_eq!(VIRTIO_VSOCK_OP_RESPONSE, 2);
+        assert_eq!(VIRTIO_VSOCK_OP_RST, 3);
+        assert_eq!(VIRTIO_VSOCK_OP_SHUTDOWN, 4);
+        assert_eq!(VIRTIO_VSOCK_OP_RW, 5);
+        assert_eq!(VIRTIO_VSOCK_OP_CREDIT_UPDATE, 6);
+        assert_eq!(VIRTIO_VSOCK_OP_CREDIT_REQUEST, 7);
+        assert_eq!(VIRTIO_VSOCK_FLAGS_SHUTDOWN_RCV, 1);
+        assert_eq!(VIRTIO_VSOCK_FLAGS_SHUTDOWN_SEND, 2);
+    }
+
+    #[test]
+    fn virtio_vsock_packet_header_serializes_little_endian_layout() {
+        let header = test_vsock_packet_header();
+
+        assert_eq!(
+            header.to_bytes(),
+            [
+                0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13,
+                0x12, 0x11, 0x24, 0x23, 0x22, 0x21, 0x34, 0x33, 0x32, 0x31, 0x00, 0x10, 0x00, 0x00,
+                0x01, 0x00, 0x05, 0x00, 0x03, 0x00, 0x00, 0x00, 0x44, 0x43, 0x42, 0x41, 0x54, 0x53,
+                0x52, 0x51,
+            ]
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_packet_header_parses_little_endian_layout() {
+        let header = VirtioVsockPacketHeader::try_from_bytes([
+            0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13,
+            0x12, 0x11, 0x24, 0x23, 0x22, 0x21, 0x34, 0x33, 0x32, 0x31, 0x00, 0x10, 0x00, 0x00,
+            0x01, 0x00, 0x05, 0x00, 0x03, 0x00, 0x00, 0x00, 0x44, 0x43, 0x42, 0x41, 0x54, 0x53,
+            0x52, 0x51,
+        ])
+        .expect("valid header bytes should parse");
+
+        assert_eq!(header, test_vsock_packet_header());
+        assert_eq!(header.src_cid(), 0x0102_0304_0506_0708);
+        assert_eq!(header.dst_cid(), 0x1112_1314_1516_1718);
+        assert_eq!(header.src_port(), 0x2122_2324);
+        assert_eq!(header.dst_port(), 0x3132_3334);
+        assert_eq!(header.payload_len(), 0x1000);
+        assert_eq!(header.packet_type(), VIRTIO_VSOCK_PACKET_TYPE_STREAM);
+        assert_eq!(header.operation(), VIRTIO_VSOCK_OP_RW);
+        assert_eq!(
+            header.flags(),
+            VIRTIO_VSOCK_FLAGS_SHUTDOWN_RCV | VIRTIO_VSOCK_FLAGS_SHUTDOWN_SEND
+        );
+        assert_eq!(header.buffer_allocation(), 0x4142_4344);
+        assert_eq!(header.forwarded_count(), 0x5152_5354);
+    }
+
+    #[test]
+    fn virtio_vsock_packet_header_accepts_zero_and_max_payload_len() {
+        VirtioVsockPacketHeader::new()
+            .with_payload_len(0)
+            .validate_payload_len()
+            .expect("zero payload length should be accepted");
+        VirtioVsockPacketHeader::new()
+            .with_payload_len(VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE)
+            .validate_payload_len()
+            .expect("maximum payload length should be accepted");
+    }
+
+    #[test]
+    fn virtio_vsock_packet_header_rejects_payload_len_over_maximum() {
+        let err = VirtioVsockPacketHeader::new()
+            .with_payload_len(VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE + 1)
+            .validate_payload_len()
+            .expect_err("payload length above maximum should fail");
+
+        assert_eq!(
+            err,
+            VirtioVsockPacketLengthError {
+                payload_len: VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE + 1,
+                max_payload_len: VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE,
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "virtio-vsock packet payload length 65537 exceeds maximum 65536"
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_packet_header_rejects_payload_len_over_maximum_from_bytes() {
+        let err = VirtioVsockPacketHeader::try_from_bytes([
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ])
+        .expect_err("oversized payload length should fail");
+
+        assert_eq!(err.payload_len(), VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE + 1);
+        assert_eq!(err.max_payload_len(), VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE);
     }
 
     #[test]
