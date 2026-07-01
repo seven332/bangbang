@@ -152,9 +152,10 @@ The current scaffold does not implement:
   virtio-net notification dispatch can parse guest TX descriptor metadata and
   pass validated TX frame payloads to injected packet I/O selected per configured
   interface, and can copy injected RX packet bytes into validated guest RX
-  buffers through the same boundary. The process-owned HVF boot loop can use
-  that injected boundary, but the default provider is a no-op TX sink plus an
-  empty RX source and bangbang still does not open host networking resources
+  buffers through the same boundary. The process crate has an internal vmnet
+  lifecycle boundary for future macOS host networking, but it is not connected to
+  process startup. The default provider is a no-op TX sink plus an empty RX
+  source and bangbang still does not open host networking resources
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 
