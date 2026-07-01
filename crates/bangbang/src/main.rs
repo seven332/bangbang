@@ -6,6 +6,7 @@ use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 
 mod api_server;
+#[doc(hidden)]
 pub mod host_network;
 mod vmm;
 

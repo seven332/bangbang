@@ -1,3 +1,5 @@
+//! vmnet lifecycle boundary types for future macOS host networking.
+
 use std::fmt;
 
 pub const VMNET_HOST_MODE_VALUE: u32 = 1000;
