@@ -8038,6 +8038,58 @@ mod tests {
     }
 
     #[test]
+    fn virtio_vsock_notifications_reject_mixed_event_queue_without_rx_dispatch() {
+        let mut memory = vsock_tx_memory();
+        let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
+
+        activate_vsock_handler(&mut handler);
+        let (accepted, _client, request) =
+            accepted_host_connection_with_request("notify-event-rx", 4005);
+        let key = handler
+            .activation_handler_mut()
+            .insert_accepted_host_connection(accepted, request)
+            .expect("host connection should insert");
+        write_vsock_rx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_BUFFER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_rx_available_heads(&mut memory, &[0]);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_EVENT_QUEUE_INDEX);
+
+        let error = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect_err("mixed event notification should be unsupported before RX dispatch");
+
+        assert!(matches!(
+            error,
+            super::VirtioVsockDeviceNotificationError::UnsupportedQueue {
+                queue_index: VIRTIO_VSOCK_EVENT_QUEUE_INDEX,
+                ..
+            }
+        ));
+        assert_eq!(
+            error.drained_notifications(),
+            &[VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_EVENT_QUEUE_INDEX]
+        );
+        assert!(
+            handler
+                .activation_handler()
+                .has_pending_host_request_packet(key)
+        );
+        assert!(error.completed_tx_dispatch().is_none());
+        assert!(error.completed_rx_dispatch().is_none());
+        assert_eq!(read_interrupt_status(&handler), 0);
+        assert_eq!(read_vsock_rx_used_index(&memory), 0);
+        assert!(handler.pending_queue_notifications().is_empty());
+    }
+
+    #[test]
     fn virtio_vsock_notifications_dispatch_mixed_rx_noop_and_tx_queue() {
         let mut memory = vsock_tx_memory();
         let mut handler = virtio_vsock_mmio_handler(3).expect("vsock handler should build");
