@@ -855,7 +855,7 @@ impl VsockHostConnectionTable {
             .take_pending_request_packet_header(key, guest_cid)
     }
 
-    pub fn first_pending_request_packet_key(&self) -> Option<VsockHostConnectionKey> {
+    fn first_pending_request_packet_key(&self) -> Option<VsockHostConnectionKey> {
         self.connections
             .iter()
             .filter_map(|(key, connection)| connection.has_pending_request_packet().then_some(*key))
@@ -2952,7 +2952,8 @@ impl VirtioVsockDevice {
             .accept_host_connection()
     }
 
-    pub fn insert_accepted_host_connection(
+    #[cfg(test)]
+    fn insert_accepted_host_connection(
         &mut self,
         accepted: VsockHostAcceptedConnection,
         request: VsockHostConnectRequest,
@@ -2961,7 +2962,8 @@ impl VirtioVsockDevice {
             .insert_accepted_host_connection(accepted, request)
     }
 
-    pub fn has_pending_host_request_packet(&self, key: VsockHostConnectionKey) -> bool {
+    #[cfg(test)]
+    fn has_pending_host_request_packet(&self, key: VsockHostConnectionKey) -> bool {
         self.host_connections.has_pending_request_packet(key)
     }
 
