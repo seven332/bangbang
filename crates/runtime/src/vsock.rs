@@ -455,7 +455,7 @@ impl fmt::Display for VsockHostLocalPortError {
 
 impl std::error::Error for VsockHostLocalPortError {}
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct VsockHostLocalPortAllocator {
     capacity: u32,
     next_offset: u32,
