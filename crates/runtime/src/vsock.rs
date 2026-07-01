@@ -3712,6 +3712,22 @@ mod tests {
     }
 
     #[test]
+    fn vsock_host_connection_table_accepts_peer_port_boundaries() {
+        let mut table = VsockHostConnectionTable::with_local_port_capacity(2);
+
+        let zero = table
+            .insert_host_connection(0)
+            .expect("zero peer port should insert like Firecracker");
+        let max = table
+            .insert_host_connection(u32::MAX)
+            .expect("u32 max peer port should insert");
+
+        assert_eq!(zero.peer_port(), 0);
+        assert_eq!(max.peer_port(), u32::MAX);
+        assert_ne!(zero.local_port(), max.local_port());
+    }
+
+    #[test]
     fn vsock_host_connection_table_missing_remove_does_not_free_active_local_port() {
         let mut table = VsockHostConnectionTable::with_local_port_capacity(1);
         let active = table
