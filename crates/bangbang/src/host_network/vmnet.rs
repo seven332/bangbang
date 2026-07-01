@@ -1,6 +1,8 @@
 //! vmnet lifecycle boundary types for future macOS host networking.
 
+use std::ffi::{CString, c_char, c_void};
 use std::fmt;
+use std::ptr::{self, NonNull};
 
 pub const VMNET_HOST_MODE_VALUE: u32 = 1000;
 pub const VMNET_SHARED_MODE_VALUE: u32 = 1001;
@@ -196,6 +198,9 @@ impl VmnetInterfaceConfig {
         if interface_name.is_empty() {
             return Err(VmnetInterfaceConfigError::EmptyBridgedInterfaceName);
         }
+        if interface_name.as_bytes().contains(&0) {
+            return Err(VmnetInterfaceConfigError::InteriorNulInBridgedInterfaceName);
+        }
 
         Ok(Self {
             mode: VmnetMode::Bridged,
@@ -215,6 +220,7 @@ impl VmnetInterfaceConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmnetInterfaceConfigError {
     EmptyBridgedInterfaceName,
+    InteriorNulInBridgedInterfaceName,
 }
 
 impl fmt::Display for VmnetInterfaceConfigError {
@@ -223,11 +229,172 @@ impl fmt::Display for VmnetInterfaceConfigError {
             Self::EmptyBridgedInterfaceName => {
                 f.write_str("vmnet bridged interface name must not be empty")
             }
+            Self::InteriorNulInBridgedInterfaceName => {
+                f.write_str("vmnet bridged interface name must not contain NUL bytes")
+            }
         }
     }
 }
 
 impl std::error::Error for VmnetInterfaceConfigError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmnetInterfaceDescriptorError {
+    CreateDictionaryFailed,
+    InteriorNulInBridgedInterfaceName,
+    MissingVmnetKey(&'static str),
+}
+
+impl fmt::Display for VmnetInterfaceDescriptorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CreateDictionaryFailed => {
+                f.write_str("failed to create vmnet interface descriptor")
+            }
+            Self::InteriorNulInBridgedInterfaceName => {
+                f.write_str("vmnet bridged interface name must not contain NUL bytes")
+            }
+            Self::MissingVmnetKey(key) => write!(f, "vmnet key symbol {key} is null"),
+        }
+    }
+}
+
+impl std::error::Error for VmnetInterfaceDescriptorError {}
+
+#[derive(Debug)]
+pub struct VmnetInterfaceDescriptor {
+    dictionary: OwnedXpcObject,
+}
+
+impl VmnetInterfaceDescriptor {
+    pub fn new(config: &VmnetInterfaceConfig) -> Result<Self, VmnetInterfaceDescriptorError> {
+        let dictionary = OwnedXpcObject::dictionary()
+            .ok_or(VmnetInterfaceDescriptorError::CreateDictionaryFailed)?;
+        let operation_mode_key = vmnet_operation_mode_key()?;
+
+        // SAFETY: `dictionary` owns a live XPC dictionary, `operation_mode_key`
+        // is a non-null vmnet SDK key, and primitive uint64 insertion does not
+        // borrow data after the call returns.
+        unsafe {
+            xpc::xpc_dictionary_set_uint64(
+                dictionary.as_ptr(),
+                operation_mode_key,
+                u64::from(config.mode().raw_value()),
+            );
+        }
+
+        if let Some(interface_name) = config.bridged_interface_name() {
+            let interface_name = CString::new(interface_name)
+                .map_err(|_| VmnetInterfaceDescriptorError::InteriorNulInBridgedInterfaceName)?;
+            let shared_interface_name_key = vmnet_shared_interface_name_key()?;
+
+            // SAFETY: `dictionary` owns a live XPC dictionary,
+            // `shared_interface_name_key` is a non-null vmnet SDK key, and the
+            // bridged interface name is a valid C string for the duration of the call.
+            unsafe {
+                xpc::xpc_dictionary_set_string(
+                    dictionary.as_ptr(),
+                    shared_interface_name_key,
+                    interface_name.as_ptr(),
+                );
+            }
+        }
+
+        Ok(Self { dictionary })
+    }
+
+    pub fn as_raw_xpc_object(&self) -> *mut c_void {
+        self.dictionary.as_ptr()
+    }
+}
+
+#[derive(Debug)]
+struct OwnedXpcObject {
+    object: NonNull<c_void>,
+}
+
+impl OwnedXpcObject {
+    fn dictionary() -> Option<Self> {
+        // SAFETY: `xpc_dictionary_create` permits null key and value arrays
+        // when `count` is zero, creating an empty retained dictionary object.
+        let object = unsafe { xpc::xpc_dictionary_create(ptr::null(), ptr::null(), 0) };
+
+        NonNull::new(object).map(|object| Self { object })
+    }
+
+    fn as_ptr(&self) -> xpc::XpcObject {
+        self.object.as_ptr()
+    }
+}
+
+impl Drop for OwnedXpcObject {
+    fn drop(&mut self) {
+        // SAFETY: `object` came from an XPC create function and this owner is
+        // non-clone, so this is the single matching release.
+        unsafe {
+            xpc::xpc_release(self.object.as_ptr());
+        }
+    }
+}
+
+fn vmnet_operation_mode_key() -> Result<*const c_char, VmnetInterfaceDescriptorError> {
+    // SAFETY: The symbol is provided by vmnet.framework when this macOS-gated
+    // module is linked. The null check below prevents passing a null key to XPC.
+    let key = unsafe { xpc::VMNET_OPERATION_MODE_KEY };
+    if key.is_null() {
+        Err(VmnetInterfaceDescriptorError::MissingVmnetKey(
+            "vmnet_operation_mode_key",
+        ))
+    } else {
+        Ok(key)
+    }
+}
+
+fn vmnet_shared_interface_name_key() -> Result<*const c_char, VmnetInterfaceDescriptorError> {
+    // SAFETY: The symbol is provided by vmnet.framework when this macOS-gated
+    // module is linked. The null check below prevents passing a null key to XPC.
+    let key = unsafe { xpc::VMNET_SHARED_INTERFACE_NAME_KEY };
+    if key.is_null() {
+        Err(VmnetInterfaceDescriptorError::MissingVmnetKey(
+            "vmnet_shared_interface_name_key",
+        ))
+    } else {
+        Ok(key)
+    }
+}
+
+mod xpc {
+    use std::ffi::{c_char, c_void};
+
+    pub type XpcObject = *mut c_void;
+
+    unsafe extern "C" {
+        pub fn xpc_dictionary_create(
+            keys: *const *const c_char,
+            values: *const XpcObject,
+            count: usize,
+        ) -> XpcObject;
+        pub fn xpc_dictionary_set_uint64(xdict: XpcObject, key: *const c_char, value: u64);
+        pub fn xpc_dictionary_set_string(
+            xdict: XpcObject,
+            key: *const c_char,
+            string: *const c_char,
+        );
+        #[cfg(test)]
+        pub fn xpc_dictionary_get_uint64(xdict: XpcObject, key: *const c_char) -> u64;
+        #[cfg(test)]
+        pub fn xpc_dictionary_get_string(xdict: XpcObject, key: *const c_char) -> *const c_char;
+        pub fn xpc_release(object: XpcObject);
+    }
+
+    #[link(name = "vmnet", kind = "framework")]
+    unsafe extern "C" {
+        #[link_name = "vmnet_operation_mode_key"]
+        pub static VMNET_OPERATION_MODE_KEY: *const c_char;
+        #[link_name = "vmnet_shared_interface_name_key"]
+        pub static VMNET_SHARED_INTERFACE_NAME_KEY: *const c_char;
+    }
+}
 
 pub trait VmnetInterfaceLifecycle: fmt::Debug + Send + 'static {
     type Interface: fmt::Debug + Send + 'static;
@@ -289,12 +456,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CStr;
     use std::sync::{Arc, Mutex};
 
     use super::{
         OwnedVmnetInterface, VMNET_BRIDGED_MODE_VALUE, VMNET_HOST_MODE_VALUE,
         VMNET_SHARED_MODE_VALUE, VmnetError, VmnetInterfaceConfig, VmnetInterfaceConfigError,
-        VmnetInterfaceLifecycle, VmnetMode, VmnetOperation, VmnetStatus,
+        VmnetInterfaceDescriptor, VmnetInterfaceLifecycle, VmnetMode, VmnetOperation, VmnetStatus,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,6 +540,37 @@ mod tests {
         }
     }
 
+    fn descriptor_mode(descriptor: &VmnetInterfaceDescriptor) -> u64 {
+        let key = super::vmnet_operation_mode_key().expect("vmnet mode key should be available");
+
+        // SAFETY: The descriptor owns a live XPC dictionary, and the key comes
+        // from the vmnet SDK symbol wrapper.
+        unsafe { super::xpc::xpc_dictionary_get_uint64(descriptor.dictionary.as_ptr(), key) }
+    }
+
+    fn descriptor_bridged_interface_name(descriptor: &VmnetInterfaceDescriptor) -> Option<String> {
+        let key = super::vmnet_shared_interface_name_key()
+            .expect("vmnet shared interface name key should be available");
+
+        // SAFETY: The descriptor owns a live XPC dictionary, and the key comes
+        // from the vmnet SDK symbol wrapper. XPC owns the returned C string.
+        let value =
+            unsafe { super::xpc::xpc_dictionary_get_string(descriptor.dictionary.as_ptr(), key) };
+
+        if value.is_null() {
+            None
+        } else {
+            // SAFETY: XPC returns either null or a valid null-terminated C string
+            // for the lifetime of the dictionary.
+            Some(
+                unsafe { CStr::from_ptr(value) }
+                    .to_str()
+                    .expect("bridged interface name should be valid UTF-8")
+                    .to_string(),
+            )
+        }
+    }
+
     #[test]
     fn vmnet_modes_match_sdk_values() {
         assert_eq!(VmnetMode::Host.raw_value(), VMNET_HOST_MODE_VALUE);
@@ -432,6 +631,63 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "vmnet bridged interface name must not be empty"
+        );
+    }
+
+    #[test]
+    fn bridged_config_rejects_interior_nul_interface_name() {
+        let error = VmnetInterfaceConfig::bridged("en\0")
+            .expect_err("interior NUL bridged interface should be rejected");
+
+        assert_eq!(
+            error,
+            VmnetInterfaceConfigError::InteriorNulInBridgedInterfaceName
+        );
+        assert_eq!(
+            error.to_string(),
+            "vmnet bridged interface name must not contain NUL bytes"
+        );
+    }
+
+    #[test]
+    fn vmnet_interface_descriptor_models_host_mode() {
+        let config = VmnetInterfaceConfig::host();
+        let descriptor =
+            VmnetInterfaceDescriptor::new(&config).expect("host descriptor should be created");
+
+        assert_eq!(
+            descriptor_mode(&descriptor),
+            u64::from(VMNET_HOST_MODE_VALUE)
+        );
+        assert_eq!(descriptor_bridged_interface_name(&descriptor), None);
+    }
+
+    #[test]
+    fn vmnet_interface_descriptor_models_shared_mode() {
+        let config = VmnetInterfaceConfig::shared();
+        let descriptor =
+            VmnetInterfaceDescriptor::new(&config).expect("shared descriptor should be created");
+
+        assert_eq!(
+            descriptor_mode(&descriptor),
+            u64::from(VMNET_SHARED_MODE_VALUE)
+        );
+        assert_eq!(descriptor_bridged_interface_name(&descriptor), None);
+    }
+
+    #[test]
+    fn vmnet_interface_descriptor_models_bridged_mode() {
+        let config = VmnetInterfaceConfig::bridged("en0").expect("bridged config should validate");
+        let descriptor =
+            VmnetInterfaceDescriptor::new(&config).expect("bridged descriptor should be created");
+
+        assert_eq!(
+            descriptor_mode(&descriptor),
+            u64::from(VMNET_BRIDGED_MODE_VALUE)
+        );
+        assert_eq!(
+            descriptor_bridged_interface_name(&descriptor),
+            Some("en0".to_string())
         );
     }
 
