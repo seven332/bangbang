@@ -216,7 +216,7 @@ impl VsockHostAcceptedConnection {
 
 #[derive(Debug)]
 pub(crate) struct VsockHostSocketOwner {
-    _listener: UnixListener,
+    listener: UnixListener,
     path: PathBuf,
     dev: u64,
     ino: u64,
@@ -242,7 +242,7 @@ impl VsockHostSocketOwner {
         })?;
 
         let owner = Self {
-            _listener: listener,
+            listener,
             path: path.to_path_buf(),
             dev: metadata.dev(),
             ino: metadata.ino(),
@@ -257,7 +257,7 @@ impl VsockHostSocketOwner {
     pub(crate) fn accept_host_connection(
         &self,
     ) -> Result<Option<VsockHostAcceptedConnection>, VsockHostSocketAcceptError> {
-        match self._listener.accept() {
+        match self.listener.accept() {
             Ok((stream, _addr)) => VsockHostAcceptedConnection::from_stream(stream).map(Some),
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
             Err(err) => Err(VsockHostSocketAcceptError::Accept(err.kind())),
@@ -271,7 +271,7 @@ impl VsockHostSocketOwner {
 
     #[cfg(test)]
     fn listener(&self) -> &UnixListener {
-        &self._listener
+        &self.listener
     }
 
     fn owns_current_path(&self) -> bool {
