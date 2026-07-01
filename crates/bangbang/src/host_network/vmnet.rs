@@ -1289,8 +1289,11 @@ mod tests {
     use std::ptr::{self, NonNull};
     use std::sync::{Arc, Mutex};
 
+    use bangbang_runtime::network::VirtioNetworkRxPacketSource;
     use block2::Block;
     use dispatch2::DispatchQueue;
+
+    use crate::host_network::virtio_vmnet::VmnetVirtioNetworkPacketIo;
 
     use super::{
         OwnedVmnetInterface, StartedVmnetInterface, StartedVmnetPacketIoBackend,
@@ -2058,6 +2061,38 @@ mod tests {
                 format!("start:{}", u64::from(VMNET_SHARED_MODE_VALUE)),
                 "read:9".to_string(),
                 "write:9:3".to_string(),
+                "stop:9".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn started_packet_io_backend_builds_virtio_packet_io_adapter() {
+        let backend = RecordingVmnetBackend::new().with_read_result(Ok(Some(5)));
+        let event_log = backend.events();
+        let config = VmnetInterfaceConfig::shared();
+
+        {
+            let (backend, interface) = StartedVmnetPacketIoBackend::start(backend, &config)
+                .expect("started packet I/O backend should be created");
+            let mut packet_io =
+                VmnetVirtioNetworkPacketIo::with_rx_buffer_len(backend, interface, 2048)
+                    .expect("virtio vmnet packet I/O should build");
+            let packet = packet_io
+                .rx_source()
+                .peek_packet()
+                .expect("adapter RX should delegate")
+                .expect("adapter RX packet should be present");
+
+            assert_eq!(packet.bytes().len(), 5);
+        }
+
+        assert_eq!(
+            recorded_events(&event_log),
+            [
+                "descriptor:shared".to_string(),
+                format!("start:{}", u64::from(VMNET_SHARED_MODE_VALUE)),
+                "read:9".to_string(),
                 "stop:9".to_string(),
             ]
         );
