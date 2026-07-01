@@ -152,10 +152,11 @@ The current scaffold does not implement:
   virtio-net notification dispatch can parse guest TX descriptor metadata and
   pass validated TX frame payloads to injected packet I/O selected per configured
   interface, and can copy injected RX packet bytes into validated guest RX
-  buffers through the same boundary. On macOS, the process crate has an internal
-  vmnet descriptor and lifecycle boundary for future host networking, but it is
-  not connected to process startup. The default provider is a no-op TX sink plus
-  an empty RX source and bangbang still does not open host networking resources
+  buffers through the same boundary. On macOS, the process crate has internal
+  vmnet descriptor, lifecycle, and packet descriptor boundaries for future host
+  networking, but it is not connected to process startup and does not call
+  `vmnet_read` or `vmnet_write`. The default provider is a no-op TX sink plus an
+  empty RX source and bangbang still does not open host networking resources
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 
