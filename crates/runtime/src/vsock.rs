@@ -535,11 +535,12 @@ mod tests {
     fn virtio_vsock_config_space_reports_firecracker_feature_bits() {
         let config = VirtioVsockConfigSpace::new(3);
         let features = config.available_features();
+        let expected_features = (1_u64 << VIRTIO_FEATURE_VERSION_1)
+            | (1_u64 << VIRTIO_FEATURE_IN_ORDER)
+            | (1_u64 << VIRTIO_RING_FEATURE_EVENT_IDX);
 
         assert_eq!(config.guest_cid(), 3);
-        assert_ne!(features & (1_u64 << VIRTIO_FEATURE_VERSION_1), 0);
-        assert_ne!(features & (1_u64 << VIRTIO_FEATURE_IN_ORDER), 0);
-        assert_ne!(features & (1_u64 << VIRTIO_RING_FEATURE_EVENT_IDX), 0);
+        assert_eq!(features, expected_features);
     }
 
     #[test]
