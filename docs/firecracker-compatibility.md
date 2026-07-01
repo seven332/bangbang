@@ -232,7 +232,7 @@ compatibility targets.
 | `PUT` | `/logger` | supported target; minimal subset implemented | Stores process logger configuration before boot, opens `log_path` with nonblocking output semantics when provided, accepts optional Firecracker-shaped level/show/module fields, and omits logger state from `GET /vm/config` because it is not guest configuration. Full internal log routing remains deferred. |
 | `PATCH` | `/machine-config` | deferred | Partial updates belong with later state and validation rules. |
 | `PUT` | `/cpu-config` | deferred | Needs HVF CPU feature design with VM and boot work in #8 and #10. |
-| `PUT` | `/network-interfaces/{iface_id}` | supported target; configuration storage implemented | Stores initial virtio-net configuration before boot without opening host networking resources. Startup preparation attaches configured interfaces as virtio-mmio devices in the MMIO dispatcher and guest FDT. `InstanceStart` selects vmnet packet I/O only for `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>` host device names; unsupported names fail startup before `Running` is committed. Internal network notification dispatch can route each configured interface through selected packet I/O, parse TX descriptors through a packet sink boundary, and copy injected RX packets into guest buffers through a packet source boundary. Public packet movement, runtime updates, PATCH, and DELETE remain tied to #14. |
+| `PUT` | `/network-interfaces/{iface_id}` | supported target; configuration storage implemented | Stores up to 16 initial virtio-net configurations before boot without opening host networking resources. Startup preparation attaches configured interfaces as virtio-mmio devices in the MMIO dispatcher and guest FDT. `InstanceStart` revalidates the interface count before opening vmnet resources, then selects vmnet packet I/O only for `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>` host device names; unsupported names fail startup before `Running` is committed. Internal network notification dispatch can route each configured interface through selected packet I/O, parse TX descriptors through a packet sink boundary, and copy injected RX packets into guest buffers through a packet source boundary. Public packet movement, runtime updates, PATCH, and DELETE remain tied to #14. |
 | `PUT` | `/vsock` | supported target; configuration storage implemented | Stores one initial virtio-vsock configuration before boot without opening, binding, connecting, unlinking, or creating host Unix socket resources. Virtio-vsock device emulation, host socket backend behavior, guest CID routing, runtime updates, PATCH, and DELETE remain tied to #15. |
 | `GET`, `PUT`, `PATCH` | `/mmds` | deferred | Tied to MMDS work in #16. |
 | `PUT` | `/mmds/config` | deferred | Tied to MMDS work in #16. |
@@ -280,7 +280,7 @@ exist.
 | `PUT /drives/{drive_id}` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /network-interfaces/{iface_id}` | path `iface_id` | required | The API parser captures this value, and the internal model validates it as nonempty alphanumeric or `_`, matching Firecracker's `checked_id` rule. |
 | `PUT /network-interfaces/{iface_id}` | body `iface_id` | required | The API parser rejects requests where this does not match the path `iface_id`. |
-| `PUT /network-interfaces/{iface_id}` | `host_dev_name` | required | The API/VMM path records this value only after rejecting empty values; it does not open, stat, or otherwise touch host networking resources during configuration. `InstanceStart` later accepts only `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>` for vmnet packet I/O startup. |
+| `PUT /network-interfaces/{iface_id}` | `host_dev_name` | required | The API/VMM path records this value only after rejecting empty values and enforcing the current 16-interface bangbang limit; it does not open, stat, or otherwise touch host networking resources during configuration. `InstanceStart` later accepts only `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>` for vmnet packet I/O startup. |
 | `PUT /network-interfaces/{iface_id}` | `guest_mac` | optional | The internal model accepts six colon-separated two-hex-digit octets, normalizes display to lowercase hex, and rejects duplicate configured MAC addresses across different interface IDs. |
 | `PUT /network-interfaces/{iface_id}` | `mtu` | deferred when configured | The internal model rejects configured MTU values until virtio-net feature negotiation and backend behavior exist. |
 | `PUT /network-interfaces/{iface_id}` | `rx_rate_limiter`, `tx_rate_limiter` | deferred when configured | The internal model rejects configured network rate limiters until virtio-net rate limiting behavior exists. |
@@ -532,14 +532,17 @@ different interface IDs. Displayed validation errors avoid echoing invalid IDs,
 host device names, and MAC strings.
 
 The internal model rejects configured `mtu`, `rx_rate_limiter`, and
-`tx_rate_limiter` fields as unsupported. Configuration storage does not open
-host networking resources. Stored network interface configs are returned from
-`GET /vm/config` in the `network-interfaces` array. During `InstanceStart`, the
-process crate maps `host_dev_name` values `vmnet:host`, `vmnet:shared`, and
-`vmnet:bridged:<interface>` to vmnet host, shared, and bridged configurations
-and builds cleanup-owning packet I/O for each configured interface. Other
-nonempty names are still accepted before boot but fail startup before `Running`
-is committed.
+`tx_rate_limiter` fields as unsupported. bangbang currently limits stored
+network interfaces to 16. Firecracker `v1.16.0` does not publish a separate
+network-interface count limit; this is a macOS/HVF host-resource boundary for
+the current scaffold. Configuration storage does not open host networking
+resources. Stored network interface configs are returned from `GET /vm/config`
+in the `network-interfaces` array. During `InstanceStart`, the process crate
+revalidates the count before opening vmnet resources, maps `host_dev_name`
+values `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>` to vmnet
+host, shared, and bridged configurations, and builds cleanup-owning packet I/O
+for each configured interface. Other nonempty names are still accepted before
+boot but fail startup before `Running` is committed.
 
 ## Internal Vsock Configuration
 
@@ -602,11 +605,11 @@ adapter that copies TX guest-memory payload segments into vmnet writes and
 caches one vmnet RX packet until consumed, and a prebuilt adapter provider keyed
 by configured interface ID. It also defines an internal `host_dev_name` mapping
 for `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>`. Startup with
-configured network interfaces now opens vmnet resources through those supported
-forms and retains stop-on-drop cleanup. Startup without network interfaces still
-uses a no-op TX sink and an empty RX source. These helpers do not advertise MTU,
-support rate limiters, prove host connectivity, or provide public runtime packet
-movement.
+configured network interfaces revalidates the 16-interface limit before opening
+vmnet resources through those supported forms and retains stop-on-drop cleanup.
+Startup without network interfaces still uses a no-op TX sink and an empty RX
+source. These helpers do not advertise MTU, support rate limiters, prove host
+connectivity, or provide public runtime packet movement.
 
 The runtime crate can prepare owned internal block-device resources from a
 validated list of stored drive configs. Preparation opens each backing file,
@@ -1009,7 +1012,7 @@ The first API implementation should model the same broad stages as Firecracker:
 | `PUT /machine-config` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Pre-boot-only configuration. Stored values are applied during startup preparation. |
 | `PUT /boot-source` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config; host paths are opened during startup preparation. Host path errors must avoid leaking sensitive path details. |
 | `PUT /drives/{drive_id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config; startup preparation opens backing files and registers initial block MMIO devices. Runtime hotplug remains deferred. |
-| `PUT /network-interfaces/{iface_id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config without opening host networking resources. Startup preparation attaches configured interfaces as virtio-mmio devices in the MMIO dispatcher and guest FDT. `InstanceStart` opens vmnet packet I/O for `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>` host device names and fails before `Running` for unsupported names. Internal network notification dispatch can route each interface through selected packet I/O, complete TX descriptor heads through a packet sink boundary, and write injected RX packets into guest buffers through a packet source boundary. Public packet movement, PATCH, and DELETE remain deferred. |
+| `PUT /network-interfaces/{iface_id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records up to 16 validated pre-boot configs without opening host networking resources. Startup preparation attaches configured interfaces as virtio-mmio devices in the MMIO dispatcher and guest FDT. `InstanceStart` revalidates the count before opening vmnet packet I/O for `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>` host device names and fails before `Running` for unsupported names. Internal network notification dispatch can route each interface through selected packet I/O, complete TX descriptor heads through a packet sink boundary, and write injected RX packets into guest buffers through a packet source boundary. Public packet movement, PATCH, and DELETE remain deferred. |
 | `PUT /vsock` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config without opening or creating host Unix socket resources. Virtio-vsock device emulation, host socket backend behavior, CID routing, data movement, PATCH, and DELETE remain deferred. |
 | `PUT /metrics` | implemented; `204` empty response on successful output initialization | unsupported after start; `400` `fault_message` | Metrics output is process observability state, not guest configuration. Duplicate initialization fails. |
 | `PUT /logger` | implemented; `204` empty response on successful pre-boot configuration | unsupported after start; `400` `fault_message` | Logger output is process observability state, not guest configuration. Repeated pre-boot requests update provided fields; full log routing remains deferred. |

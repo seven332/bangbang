@@ -487,7 +487,10 @@ mod tests {
         logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel},
         machine::{DEFAULT_MEM_SIZE_MIB, DEFAULT_VCPU_COUNT, MachineConfigInput},
         metrics::{MetricsConfigError, MetricsConfigInput},
-        network::{GuestMacAddress, NetworkInterfaceConfigError, NetworkInterfaceConfigInput},
+        network::{
+            GuestMacAddress, MAX_NETWORK_INTERFACE_COUNT, NetworkInterfaceConfigError,
+            NetworkInterfaceConfigInput,
+        },
         vsock::{MIN_GUEST_CID, VsockConfigError, VsockConfigInput},
     };
 
@@ -1827,6 +1830,43 @@ mod tests {
         assert_eq!(err.to_string(), "network guest_mac is already in use");
         assert_eq!(controller.network_interface_configs().len(), 1);
         assert_eq!(controller.network_interface_configs()[0].iface_id(), "eth0");
+    }
+
+    #[test]
+    fn put_network_interface_config_rejects_one_over_limit_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
+        for index in 0..MAX_NETWORK_INTERFACE_COUNT {
+            let iface_id = format!("eth{index}");
+            let host_dev_name = format!("tap{index}");
+            controller
+                .handle_action(VmmAction::PutNetworkInterface(
+                    NetworkInterfaceConfigInput::new(iface_id.clone(), iface_id, host_dev_name),
+                ))
+                .expect("network interface within limit should insert");
+        }
+
+        let iface_id = format!("eth{MAX_NETWORK_INTERFACE_COUNT}");
+        let host_dev_name = format!("tap{MAX_NETWORK_INTERFACE_COUNT}");
+        let err = controller
+            .handle_action(VmmAction::PutNetworkInterface(
+                NetworkInterfaceConfigInput::new(iface_id.clone(), iface_id, host_dev_name),
+            ))
+            .expect_err("one-over network interface should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::NetworkInterfaceConfig(
+                NetworkInterfaceConfigError::TooManyNetworkInterfaces {
+                    count: MAX_NETWORK_INTERFACE_COUNT + 1,
+                    max: MAX_NETWORK_INTERFACE_COUNT,
+                }
+            )
+        );
+        assert_eq!(
+            controller.network_interface_configs().len(),
+            MAX_NETWORK_INTERFACE_COUNT
+        );
     }
 
     #[test]

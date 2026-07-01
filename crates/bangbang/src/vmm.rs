@@ -14,9 +14,9 @@ use bangbang_runtime::block::BlockMmioLayout;
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
 use bangbang_runtime::mmio::MmioRegionId;
 use bangbang_runtime::network::{
-    NetworkInterfaceConfig, NetworkMmioLayout, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
-    VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame, VirtioNetworkTxPacketSink,
-    VirtioNetworkTxPacketSinkError,
+    NetworkInterfaceConfig, NetworkInterfaceConfigError, NetworkMmioLayout, VirtioNetworkRxPacket,
+    VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame,
+    VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError, validate_network_interface_count,
 };
 use bangbang_runtime::serial::SharedSerialOutputBuffer;
 use bangbang_runtime::startup::{
@@ -266,6 +266,10 @@ impl ProcessNetworkPacketIoProvider {
     fn from_network_configs(
         configs: &[NetworkInterfaceConfig],
     ) -> Result<Self, ProcessNetworkPacketIoProviderBuildError> {
+        validate_network_interface_count(configs.len()).map_err(|source| {
+            ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { source }
+        })?;
+
         if configs.is_empty() {
             return Ok(Self::Noop(NoopProcessNetworkPacketIoProvider::default()));
         }
@@ -289,6 +293,9 @@ impl Arm64BootNetworkPacketIoProvider for ProcessNetworkPacketIoProvider {
 
 #[derive(Debug)]
 enum ProcessNetworkPacketIoProviderBuildError {
+    NetworkInterfaceCount {
+        source: NetworkInterfaceConfigError,
+    },
     HostDeviceName {
         iface_id: String,
         source: VmnetHostDeviceNameConfigError,
@@ -309,6 +316,9 @@ enum ProcessNetworkPacketIoProviderBuildError {
 impl fmt::Display for ProcessNetworkPacketIoProviderBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NetworkInterfaceCount { source } => {
+                write!(f, "unsupported network interface count: {source}")
+            }
             Self::HostDeviceName { iface_id, source } => {
                 write!(
                     f,
@@ -337,6 +347,7 @@ impl fmt::Display for ProcessNetworkPacketIoProviderBuildError {
 impl std::error::Error for ProcessNetworkPacketIoProviderBuildError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::NetworkInterfaceCount { source } => Some(source),
             Self::HostDeviceName { source, .. } => Some(source),
             Self::Start { source, .. } => Some(source),
             Self::PacketIoBuild { source, .. } => Some(source),
@@ -373,6 +384,10 @@ where
     F: ProcessVmnetPacketIoBackendFactory,
     F::Backend: VmnetPacketIoBackend<Interface = <F::Backend as VmnetInterfaceBackend>::Interface>,
 {
+    validate_network_interface_count(configs.len()).map_err(|source| {
+        ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { source }
+    })?;
+
     let mut entries = Vec::new();
 
     for config in configs {
@@ -766,8 +781,9 @@ mod tests {
     use bangbang_runtime::interrupt::GuestInterruptLine;
     use bangbang_runtime::mmio::MmioRegion;
     use bangbang_runtime::network::{
-        NetworkInterfaceConfig, NetworkInterfaceConfigInput, NetworkInterfaceConfigs,
-        NetworkMmioLayout, PreparedNetworkDevices,
+        MAX_NETWORK_INTERFACE_COUNT, NetworkInterfaceConfig, NetworkInterfaceConfigError,
+        NetworkInterfaceConfigInput, NetworkInterfaceConfigs, NetworkMmioLayout,
+        PreparedNetworkDevices,
     };
     use bangbang_runtime::serial::{
         SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialOutput, SharedSerialOutputBuffer,
@@ -1245,6 +1261,17 @@ mod tests {
         network_configs.as_slice().to_vec()
     }
 
+    fn validated_network_configs(count: usize) -> Vec<NetworkInterfaceConfig> {
+        (0..count)
+            .map(|index| {
+                let iface_id = format!("eth{index}");
+                NetworkInterfaceConfigInput::new(iface_id.clone(), iface_id, "vmnet:shared")
+                    .validate()
+                    .expect("individual network config should validate")
+            })
+            .collect()
+    }
+
     fn test_boot_network_device() -> Arm64BootNetworkDevice {
         let mut configs = NetworkInterfaceConfigs::new();
         configs
@@ -1485,6 +1512,34 @@ mod tests {
     }
 
     #[test]
+    fn process_vmnet_packet_io_provider_rejects_over_limit_before_backend() {
+        let configs = validated_network_configs(MAX_NETWORK_INTERFACE_COUNT + 1);
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        let event_log = factory.events();
+        let error = process_vmnet_packet_io_provider_from_configs(&configs, &mut factory)
+            .expect_err("over-limit network configs should fail provider construction");
+
+        match error {
+            ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { source } => {
+                assert_eq!(
+                    source,
+                    NetworkInterfaceConfigError::TooManyNetworkInterfaces {
+                        count: MAX_NETWORK_INTERFACE_COUNT + 1,
+                        max: MAX_NETWORK_INTERFACE_COUNT,
+                    }
+                );
+            }
+            ProcessNetworkPacketIoProviderBuildError::HostDeviceName { .. }
+            | ProcessNetworkPacketIoProviderBuildError::Start { .. }
+            | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
+            | ProcessNetworkPacketIoProviderBuildError::ProviderBuild { .. } => {
+                panic!("over-limit configs should fail before vmnet backend start");
+            }
+        }
+        assert!(recorded_events(&event_log).is_empty());
+    }
+
+    #[test]
     fn process_vmnet_packet_io_provider_rejects_unsupported_host_dev_name_before_backend() {
         let configs = network_configs([("eth0", "tap0")]);
         let mut factory = RecordingVmnetPacketIoBackendFactory::default();
@@ -1496,7 +1551,8 @@ mod tests {
             ProcessNetworkPacketIoProviderBuildError::HostDeviceName { iface_id, .. } => {
                 assert_eq!(iface_id, "eth0");
             }
-            ProcessNetworkPacketIoProviderBuildError::Start { .. }
+            ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { .. }
+            | ProcessNetworkPacketIoProviderBuildError::Start { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::ProviderBuild { .. } => {
                 panic!("unsupported host_dev_name should fail before vmnet backend start");
@@ -1517,7 +1573,8 @@ mod tests {
             ProcessNetworkPacketIoProviderBuildError::HostDeviceName { iface_id, .. } => {
                 assert_eq!(iface_id, "eth1");
             }
-            ProcessNetworkPacketIoProviderBuildError::Start { .. }
+            ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { .. }
+            | ProcessNetworkPacketIoProviderBuildError::Start { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::ProviderBuild { .. } => {
                 panic!("unsupported host_dev_name should be reported as config failure");
