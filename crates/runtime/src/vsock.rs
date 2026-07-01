@@ -4313,6 +4313,33 @@ mod tests {
     }
 
     #[test]
+    fn vsock_host_connection_table_reused_key_gets_fresh_request_packet_header() {
+        let mut table = VsockHostConnectionTable::with_local_port_capacity(1);
+        let (first, mut first_client) =
+            insert_accepted_host_connection_for_test(&mut table, "table-request-reused-a", 4000);
+
+        assert!(
+            table
+                .take_pending_request_packet_header(first, 42)
+                .is_some()
+        );
+        assert!(table.remove(first));
+        assert_stream_closed(
+            &mut first_client,
+            "removed connection should drop retained stream",
+        );
+
+        let (second, _second_client) =
+            insert_accepted_host_connection_for_test(&mut table, "table-request-reused-b", 4000);
+
+        assert_eq!(second, first);
+        let header = table
+            .take_pending_request_packet_header(second, 42)
+            .expect("reused key should have a fresh request packet header");
+        assert_host_connection_request_header(header, 42, second.local_port(), 4000);
+    }
+
+    #[test]
     fn vsock_host_connection_table_allows_same_peer_port_with_distinct_local_ports() {
         let mut table = VsockHostConnectionTable::new();
 
