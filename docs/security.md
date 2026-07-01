@@ -67,7 +67,9 @@ is resource-specific:
   can attach a guest-visible virtio-vsock device whose internal MMIO handler
   retains active RX, TX, and event queue metadata after `DRIVER_OK`, and the
   runtime has an internal Firecracker-shaped packet header model plus TX
-  descriptor packet parser. The current implementation does not open, bind,
+  descriptor packet parser. Startup-level dispatch can drain TX queue
+  notifications, complete TX descriptor heads, and signal the allocated vsock
+  queue interrupt line. The current implementation does not open, bind,
   connect, unlink, or create that socket path.
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink.
@@ -181,13 +183,13 @@ The current scaffold does not implement:
   registration helper, config-space, packet header model, TX descriptor packet
   parser, TX available-ring drain helper with used-ring descriptor completion,
   MMIO handler skeleton with active queue metadata retention and TX notification
-  dispatch, and startup FDT attachment that preserve the configured socket path
-  and expose only the configured guest CID through bounded config reads.
+  dispatch, startup FDT attachment, startup-level TX notification dispatch, and
+  HVF queue interrupt signaling that preserve the configured socket path and
+  expose only the configured guest CID through bounded config reads.
   Preparation, MMIO
   registration, and startup attachment do not open, bind, connect, unlink, or
   create `uds_path`, and do not implement host Unix socket backend behavior,
-  CID routing, startup run-loop notification dispatch, interrupt-line signaling,
-  RX buffer parsing, or data movement
+  CID routing, RX buffer parsing, event queue dispatch, or data movement
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 
