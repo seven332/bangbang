@@ -1456,6 +1456,35 @@ mod tests {
     }
 
     #[test]
+    fn process_vmnet_packet_io_provider_maps_all_supported_host_dev_name_forms() {
+        let configs = network_configs([
+            ("eth0", "vmnet:host"),
+            ("eth1", "vmnet:shared"),
+            ("eth2", "vmnet:bridged:en0"),
+        ]);
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        let event_log = factory.events();
+        let provider = process_vmnet_packet_io_provider_from_configs(&configs, &mut factory)
+            .expect("all supported vmnet host device names should build provider");
+
+        let events = recorded_events(&event_log);
+        assert!(events.iter().any(|event| event == "descriptor:eth0:host"));
+        assert!(events.iter().any(|event| event == "descriptor:eth1:shared"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event == "descriptor:eth2:bridged")
+        );
+        drop(provider);
+
+        let events = recorded_events(&event_log);
+        for iface_id in ["eth0", "eth1", "eth2"] {
+            let expected = format!("stop:{iface_id}");
+            assert!(events.iter().any(|event| event == &expected));
+        }
+    }
+
+    #[test]
     fn process_vmnet_packet_io_provider_rejects_unsupported_host_dev_name_before_backend() {
         let configs = network_configs([("eth0", "tap0")]);
         let mut factory = RecordingVmnetPacketIoBackendFactory::default();
