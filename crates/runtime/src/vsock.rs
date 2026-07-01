@@ -1066,6 +1066,11 @@ mod tests {
         queues
     }
 
+    fn vsock_queue_registers_with_count(queue_count: usize) -> VirtioMmioQueueRegisters {
+        let queue_sizes = vec![VIRTIO_VSOCK_QUEUE_SIZE; queue_count];
+        VirtioMmioQueueRegisters::new(&queue_sizes).expect("queue table should build")
+    }
+
     fn vsock_device_registers() -> VirtioMmioDeviceRegisters {
         VirtioMmioDeviceRegisters::new(VIRTIO_VSOCK_DEVICE_ID, 0)
     }
@@ -1826,25 +1831,29 @@ mod tests {
 
     #[test]
     fn virtio_vsock_device_rejects_unexpected_queue_count() {
-        let registers = VirtioMmioDeviceRegisters::new(VIRTIO_VSOCK_DEVICE_ID, 0);
-        let queues =
-            VirtioMmioQueueRegisters::new(&[VIRTIO_VSOCK_QUEUE_SIZE, VIRTIO_VSOCK_QUEUE_SIZE])
-                .expect("short queue table should build");
-        let activation = VirtioMmioDeviceActivation::new(&registers, &queues);
-        let mut device = VirtioVsockDevice::new();
+        let registers = vsock_device_registers();
 
-        let err = device
-            .activate_vsock(activation)
-            .expect_err("unexpected queue count should fail activation");
+        for queue_count in [2, 4] {
+            let queues = vsock_queue_registers_with_count(queue_count);
+            let activation = VirtioMmioDeviceActivation::new(&registers, &queues);
+            let mut device = VirtioVsockDevice::new();
 
-        assert_eq!(err.to_string(), "virtio-vsock expected 3 queues, got 2");
-        assert!(matches!(
-            err,
-            VirtioVsockDeviceActivationError::QueueCountMismatch {
-                expected: 3,
-                got: 2
-            }
-        ));
-        assert!(!device.is_activated());
+            let err = device
+                .activate_vsock(activation)
+                .expect_err("unexpected queue count should fail activation");
+
+            assert_eq!(
+                err.to_string(),
+                format!("virtio-vsock expected 3 queues, got {queue_count}")
+            );
+            assert!(matches!(
+                err,
+                VirtioVsockDeviceActivationError::QueueCountMismatch {
+                    expected: 3,
+                    got
+                } if got == queue_count
+            ));
+            assert!(!device.is_activated());
+        }
     }
 }
