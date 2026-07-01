@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
 use crate::interrupt::DeviceInterruptKind;
@@ -193,6 +193,28 @@ impl fmt::Display for VsockConfigError {
 impl std::error::Error for VsockConfigError {}
 
 #[derive(Debug)]
+pub struct VsockHostAcceptedConnection {
+    stream: UnixStream,
+}
+
+impl VsockHostAcceptedConnection {
+    fn from_stream(stream: UnixStream) -> Result<Self, VsockHostSocketAcceptError> {
+        stream
+            .set_nonblocking(true)
+            .map_err(|err| VsockHostSocketAcceptError::SetNonblocking(err.kind()))?;
+        Ok(Self { stream })
+    }
+
+    pub fn stream(&self) -> &UnixStream {
+        &self.stream
+    }
+
+    pub fn into_stream(self) -> UnixStream {
+        self.stream
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct VsockHostSocketOwner {
     _listener: UnixListener,
     path: PathBuf,
@@ -229,6 +251,16 @@ impl VsockHostSocketOwner {
             Ok(owner)
         } else {
             Err(VsockHostSocketOwnerError::SocketPathChanged)
+        }
+    }
+
+    pub(crate) fn accept_host_connection(
+        &self,
+    ) -> Result<Option<VsockHostAcceptedConnection>, VsockHostSocketAcceptError> {
+        match self._listener.accept() {
+            Ok((stream, _addr)) => VsockHostAcceptedConnection::from_stream(stream).map(Some),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(err) => Err(VsockHostSocketAcceptError::Accept(err.kind())),
         }
     }
 
@@ -287,6 +319,32 @@ impl fmt::Display for VsockHostSocketOwnerError {
 }
 
 impl std::error::Error for VsockHostSocketOwnerError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VsockHostSocketAcceptError {
+    HostSocketNotAttached,
+    Accept(std::io::ErrorKind),
+    SetNonblocking(std::io::ErrorKind),
+}
+
+impl fmt::Display for VsockHostSocketAcceptError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HostSocketNotAttached => f.write_str("vsock host socket is not attached"),
+            Self::Accept(kind) => {
+                write!(f, "failed to accept vsock host connection: {kind:?}")
+            }
+            Self::SetNonblocking(kind) => {
+                write!(
+                    f,
+                    "failed to set accepted vsock host connection nonblocking: {kind:?}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VsockHostSocketAcceptError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VsockHostConnectRequest {
@@ -1899,7 +1957,7 @@ pub struct VirtioVsockDevice {
     active_rx_queue: Option<VirtioVsockRxQueue>,
     active_tx_queue: Option<VirtioVsockTxQueue>,
     active_event_queue: Option<VirtioVsockEventQueue>,
-    _host_socket_owner: Option<VsockHostSocketOwner>,
+    host_socket_owner: Option<VsockHostSocketOwner>,
 }
 
 impl VirtioVsockDevice {
@@ -1909,7 +1967,7 @@ impl VirtioVsockDevice {
 
     pub(crate) fn with_host_socket_owner(host_socket_owner: VsockHostSocketOwner) -> Self {
         Self {
-            _host_socket_owner: Some(host_socket_owner),
+            host_socket_owner: Some(host_socket_owner),
             ..Self::default()
         }
     }
@@ -1945,6 +2003,15 @@ impl VirtioVsockDevice {
 
     pub const fn active_event_dispatch_queue(&self) -> Option<&VirtioVsockEventQueue> {
         self.active_event_queue.as_ref()
+    }
+
+    pub fn accept_host_connection(
+        &self,
+    ) -> Result<Option<VsockHostAcceptedConnection>, VsockHostSocketAcceptError> {
+        self.host_socket_owner
+            .as_ref()
+            .ok_or(VsockHostSocketAcceptError::HostSocketNotAttached)?
+            .accept_host_connection()
     }
 
     pub fn activate_vsock(
@@ -2667,7 +2734,8 @@ fn has_control_character(value: &str) -> bool {
 mod tests {
     use std::error::Error as _;
     use std::fs;
-    use std::os::unix::net::UnixListener;
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::Path;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2712,8 +2780,9 @@ mod tests {
         VsockHostConnectRequest, VsockHostConnectRequestError, VsockHostConnectionKey,
         VsockHostConnectionTable, VsockHostConnectionTableError, VsockHostLocalPort,
         VsockHostLocalPortAllocator, VsockHostLocalPortAllocatorError, VsockHostLocalPortError,
-        VsockHostSocketOwner, VsockHostSocketOwnerError, VsockMmioDevice, VsockMmioLayout,
-        VsockMmioRegistrationError, parse_vsock_host_connect_request, virtio_vsock_mmio_handler,
+        VsockHostSocketAcceptError, VsockHostSocketOwner, VsockHostSocketOwnerError,
+        VsockMmioDevice, VsockMmioLayout, VsockMmioRegistrationError,
+        parse_vsock_host_connect_request, virtio_vsock_mmio_handler,
     };
 
     static NEXT_TEST_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
@@ -3875,6 +3944,94 @@ mod tests {
     }
 
     #[test]
+    fn host_socket_owner_accept_without_pending_connection_returns_none() {
+        let path = unique_socket_path("accept-none");
+        let owner = VsockHostSocketOwner::bind(&path).expect("host socket should bind");
+
+        let accepted = owner
+            .accept_host_connection()
+            .expect("idle accept should not fail");
+
+        assert!(accepted.is_none());
+    }
+
+    #[test]
+    fn host_socket_owner_accepts_pending_connection_as_nonblocking_stream() {
+        let path = unique_socket_path("accept-one");
+        let owner = VsockHostSocketOwner::bind(&path).expect("host socket should bind");
+        let _client = UnixStream::connect(&path).expect("client should connect");
+
+        let accepted = owner
+            .accept_host_connection()
+            .expect("pending connection should accept")
+            .expect("accepted connection should be present");
+
+        let mut buffer = [0; 1];
+        let mut accepted_stream = accepted.stream();
+        let err = accepted_stream
+            .read(&mut buffer)
+            .expect_err("idle accepted stream should not block");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            owner
+                .accept_host_connection()
+                .expect("second idle accept should not fail")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn host_socket_owner_drop_keeps_accepted_connection_usable() {
+        let path = unique_socket_path("accept-drop");
+        let owner = VsockHostSocketOwner::bind(&path).expect("host socket should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+        let accepted = owner
+            .accept_host_connection()
+            .expect("pending connection should accept")
+            .expect("accepted connection should be present");
+
+        drop(owner);
+
+        assert!(!path.exists());
+        let mut accepted_stream = accepted.into_stream();
+        accepted_stream
+            .set_nonblocking(false)
+            .expect("test stream should switch to blocking mode");
+        client
+            .write_all(b"x")
+            .expect("client should write to accepted stream");
+        let mut buffer = [0; 1];
+        accepted_stream
+            .read_exact(&mut buffer)
+            .expect("accepted stream should remain usable after listener drop");
+        assert_eq!(buffer, [b'x']);
+    }
+
+    #[test]
+    fn host_socket_accept_errors_have_no_sources_or_paths() {
+        let not_attached = VsockHostSocketAcceptError::HostSocketNotAttached;
+        let accept = VsockHostSocketAcceptError::Accept(std::io::ErrorKind::PermissionDenied);
+        let nonblocking =
+            VsockHostSocketAcceptError::SetNonblocking(std::io::ErrorKind::PermissionDenied);
+
+        assert!(not_attached.source().is_none());
+        assert!(accept.source().is_none());
+        assert!(nonblocking.source().is_none());
+        assert_eq!(
+            not_attached.to_string(),
+            "vsock host socket is not attached"
+        );
+        assert_eq!(
+            accept.to_string(),
+            "failed to accept vsock host connection: PermissionDenied"
+        );
+        assert_eq!(
+            nonblocking.to_string(),
+            "failed to set accepted vsock host connection nonblocking: PermissionDenied"
+        );
+    }
+
+    #[test]
     fn host_socket_owner_rejects_existing_file_without_unlinking() {
         let path = unique_socket_path("existing-file");
         fs::write(&path, "existing file").expect("fixture file should be written");
@@ -3978,6 +4135,38 @@ mod tests {
         drop(prepared);
 
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn prepared_vsock_device_accepts_host_connection_through_device() {
+        let path = unique_socket_path("prepared-accept");
+        let config = valid_vsock_config(9, path.to_string_lossy());
+
+        let prepared = PreparedVsockDevice::from_config_with_host_socket(&config)
+            .expect("prepared vsock should bind host socket");
+        let _client = UnixStream::connect(&path).expect("client should connect");
+
+        let accepted = prepared
+            .device()
+            .accept_host_connection()
+            .expect("pending connection should accept")
+            .expect("accepted connection should be present");
+
+        let mut buffer = [0; 1];
+        let mut accepted_stream = accepted.stream();
+        let err = accepted_stream
+            .read(&mut buffer)
+            .expect_err("idle accepted stream should not block");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn virtio_vsock_device_accept_without_host_socket_fails() {
+        let err = VirtioVsockDevice::new()
+            .accept_host_connection()
+            .expect_err("missing host socket owner should fail");
+
+        assert_eq!(err, VsockHostSocketAcceptError::HostSocketNotAttached);
     }
 
     #[test]
