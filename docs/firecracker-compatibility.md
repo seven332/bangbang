@@ -587,13 +587,14 @@ lifecycle, start owner, packet descriptor, and concrete system start/stop
 backend boundaries with vmnet mode, status, operation error, XPC descriptor
 configuration, retained dispatch queue ownership, completion-status mapping,
 backend start/stop ownership, packet `iovec` layout, single-packet system
-`vmnet_read`/`vmnet_write` wrappers, count validation, and owned cleanup models
-for a later host backend. These boundaries are not connected to the default
-process provider. The default process provider uses a no-op TX sink and an
-empty RX source, so current boot sessions still do not open host networking
-resources or provide user-visible packet ingress or egress. These helpers do
-not advertise MTU, choose a live host packet backend, or connect packets to the
-host network.
+`vmnet_read`/`vmnet_write` wrappers, count validation, owned cleanup models,
+and an internal virtio-net packet I/O adapter that copies TX guest-memory
+payload segments into vmnet writes and caches one vmnet RX packet until
+consumed. These boundaries are not connected to the default process provider.
+The default process provider uses a no-op TX sink and an empty RX source, so
+current boot sessions still do not open host networking resources or provide
+user-visible packet ingress or egress. These helpers do not advertise MTU,
+choose a live host packet backend, or connect packets to the host network.
 
 The runtime crate can prepare owned internal block-device resources from a
 validated list of stored drive configs. Preparation opens each backing file,
