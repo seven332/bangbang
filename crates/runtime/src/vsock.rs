@@ -259,7 +259,7 @@ impl VsockHostSocketOwner {
     ) -> Result<Option<VsockHostAcceptedConnection>, VsockHostSocketAcceptError> {
         match self.listener.accept() {
             Ok((stream, _addr)) => VsockHostAcceptedConnection::from_stream(stream).map(Some),
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(err) if is_transient_host_socket_accept_error(err.kind()) => Ok(None),
             Err(err) => Err(VsockHostSocketAcceptError::Accept(err.kind())),
         }
     }
@@ -345,6 +345,15 @@ impl fmt::Display for VsockHostSocketAcceptError {
 }
 
 impl std::error::Error for VsockHostSocketAcceptError {}
+
+fn is_transient_host_socket_accept_error(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::ConnectionAborted
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VsockHostConnectRequest {
@@ -2005,6 +2014,10 @@ impl VirtioVsockDevice {
         self.active_event_queue.as_ref()
     }
 
+    /// Accepts one pending host connection from the owned listener.
+    ///
+    /// Returns `Ok(None)` when this call did not produce an accepted stream,
+    /// including transient listener errors that are safe to retry.
     pub fn accept_host_connection(
         &self,
     ) -> Result<Option<VsockHostAcceptedConnection>, VsockHostSocketAcceptError> {
@@ -2782,7 +2795,8 @@ mod tests {
         VsockHostLocalPortAllocator, VsockHostLocalPortAllocatorError, VsockHostLocalPortError,
         VsockHostSocketAcceptError, VsockHostSocketOwner, VsockHostSocketOwnerError,
         VsockMmioDevice, VsockMmioLayout, VsockMmioRegistrationError,
-        parse_vsock_host_connect_request, virtio_vsock_mmio_handler,
+        is_transient_host_socket_accept_error, parse_vsock_host_connect_request,
+        virtio_vsock_mmio_handler,
     };
 
     static NEXT_TEST_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
@@ -4029,6 +4043,22 @@ mod tests {
             nonblocking.to_string(),
             "failed to set accepted vsock host connection nonblocking: PermissionDenied"
         );
+    }
+
+    #[test]
+    fn host_socket_accept_classifies_transient_errors() {
+        assert!(is_transient_host_socket_accept_error(
+            std::io::ErrorKind::WouldBlock
+        ));
+        assert!(is_transient_host_socket_accept_error(
+            std::io::ErrorKind::Interrupted
+        ));
+        assert!(is_transient_host_socket_accept_error(
+            std::io::ErrorKind::ConnectionAborted
+        ));
+        assert!(!is_transient_host_socket_accept_error(
+            std::io::ErrorKind::PermissionDenied
+        ));
     }
 
     #[test]
