@@ -50,7 +50,8 @@ virtual-timer-mask control boundary, a bounded internal boot-session run-loop
 pump, owned internal boot-session handle, process-level owned startup-session
 wiring with optional serial capture and boot run-loop supervision across bounded
 step windows with retained internal worker status, process-owned no-op
-virtio-net packet-I/O provider injection, boot block and virtio-net queue
+virtio-net packet-I/O provider injection, an internal vmnet virtio-net packet
+I/O provider keyed by configured interface ID, boot block and virtio-net queue
 interrupt signaling,
 virtual timer PPI assertion, per-controller metrics and logger output state, and an initial process startup argument model.
 There is no broader API request body model beyond the initial boot-source,
@@ -588,9 +589,10 @@ backend boundaries with vmnet mode, status, operation error, XPC descriptor
 configuration, retained dispatch queue ownership, completion-status mapping,
 backend start/stop ownership, packet `iovec` layout, single-packet system
 `vmnet_read`/`vmnet_write` wrappers, count validation, owned cleanup models,
-and an internal virtio-net packet I/O adapter that copies TX guest-memory
-payload segments into vmnet writes and caches one vmnet RX packet until
-consumed. These boundaries are not connected to the default process provider.
+an internal virtio-net packet I/O adapter that copies TX guest-memory payload
+segments into vmnet writes and caches one vmnet RX packet until consumed, and a
+prebuilt adapter provider keyed by configured interface ID. These boundaries
+are not connected to the default process provider.
 The default process provider uses a no-op TX sink and an empty RX source, so
 current boot sessions still do not open host networking resources or provide
 user-visible packet ingress or egress. These helpers do not advertise MTU,
