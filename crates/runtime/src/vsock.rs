@@ -2637,6 +2637,41 @@ mod tests {
     }
 
     #[test]
+    fn virtio_vsock_tx_packet_parser_accepts_max_payload_len_packet() {
+        let mut memory = vsock_tx_memory();
+        let header =
+            test_vsock_packet_header().with_payload_len(VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE);
+        let payload_address = vsock_payload_address_after_header(TEST_VSOCK_HEADER);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_HEADER, header);
+        let chain = vsock_tx_descriptor_chain(
+            &mut memory,
+            &[TestDescriptor::readable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32 + VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE,
+                None,
+            )],
+        );
+
+        let packet =
+            parse_vsock_tx_packet(&memory, &chain).expect("max-payload packet should parse");
+
+        assert_eq!(packet.header(), header);
+        assert_eq!(packet.payload_len(), VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE);
+        assert_eq!(
+            packet.packet_len(),
+            VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64 + u64::from(VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE)
+        );
+        assert_eq!(packet.payload_segments().len(), 1);
+        let segment = packet
+            .payload_segments()
+            .first()
+            .expect("payload segment should be present");
+        assert_eq!(segment.descriptor_index(), 0);
+        assert_eq!(segment.address(), payload_address);
+        assert_eq!(segment.len(), VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE);
+    }
+
+    #[test]
     fn virtio_vsock_tx_packet_parser_accepts_zero_payload_header_only() {
         let mut memory = vsock_tx_memory();
         let header = test_vsock_packet_header().with_payload_len(0);
