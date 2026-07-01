@@ -63,6 +63,7 @@ pub const VSOCK_HOST_LOCAL_PORT_CAPACITY: u32 =
 const VIRTIO_VSOCK_RX_QUEUE_INDEX_U32: u32 = 0;
 const VIRTIO_VSOCK_TX_QUEUE_INDEX_U32: u32 = 1;
 const VIRTIO_VSOCK_EVENT_QUEUE_INDEX_U32: u32 = 2;
+const VIRTIO_VSOCK_PACKET_HEADER_SIZE_U32: u32 = VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32;
 const VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64: u64 = VIRTIO_VSOCK_PACKET_HEADER_SIZE as u64;
 const VSOCK_HOST_CONNECT_COMMAND: &str = "connect";
 
@@ -725,7 +726,6 @@ impl VsockHostConnection {
         self.accepted.stream()
     }
 
-    #[cfg(test)]
     const fn has_pending_request_packet(&self) -> bool {
         self.request_packet_pending
     }
@@ -837,6 +837,12 @@ impl VsockHostConnectionTable {
 
     pub fn get(&self, key: VsockHostConnectionKey) -> Option<&VsockHostConnection> {
         self.connections.get(&key)
+    }
+
+    pub fn has_pending_request_packet(&self, key: VsockHostConnectionKey) -> bool {
+        self.connections
+            .get(&key)
+            .is_some_and(VsockHostConnection::has_pending_request_packet)
     }
 
     pub fn take_pending_request_packet_header(
@@ -1791,8 +1797,499 @@ impl VirtioMmioDeviceConfigHandler for VirtioVsockConfigSpace {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VirtioVsockRxBufferSegment {
+    descriptor_index: u16,
+    address: GuestAddress,
+    len: u32,
+}
+
+impl VirtioVsockRxBufferSegment {
+    const fn new(descriptor_index: u16, address: GuestAddress, len: u32) -> Self {
+        Self {
+            descriptor_index,
+            address,
+            len,
+        }
+    }
+
+    const fn descriptor_index(self) -> u16 {
+        self.descriptor_index
+    }
+
+    const fn address(self) -> GuestAddress {
+        self.address
+    }
+
+    const fn len(self) -> u32 {
+        self.len
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VirtioVsockRxBuffer {
+    len: u64,
+    segments: Vec<VirtioVsockRxBufferSegment>,
+}
+
+impl VirtioVsockRxBuffer {
+    fn parse(
+        memory: &GuestMemory,
+        chain: &VirtqueueDescriptorChain,
+    ) -> Result<Self, VirtioVsockRxBufferParseError> {
+        let mut len = 0;
+        let mut segments = Vec::new();
+        segments.try_reserve_exact(chain.len()).map_err(|source| {
+            VirtioVsockRxBufferParseError::BufferSegmentsAllocationFailed {
+                descriptor_count: chain.len(),
+                source,
+            }
+        })?;
+
+        for descriptor in chain.descriptors().iter().copied() {
+            validate_vsock_rx_buffer_descriptor(&descriptor)?;
+            len = push_vsock_rx_buffer_segment(
+                memory,
+                &mut segments,
+                len,
+                VirtioVsockRxBufferSegment::new(
+                    descriptor.index(),
+                    descriptor.address(),
+                    descriptor.len(),
+                ),
+            )?;
+        }
+
+        Ok(Self { len, segments })
+    }
+
+    const fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn segments(&self) -> &[VirtioVsockRxBufferSegment] {
+        &self.segments
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioVsockRxBufferParseError {
+    BufferSegmentsAllocationFailed {
+        descriptor_count: usize,
+        source: std::collections::TryReserveError,
+    },
+    BufferDescriptorReadOnly {
+        index: u16,
+    },
+    BufferDescriptorEmpty {
+        index: u16,
+    },
+    BufferLengthOverflow {
+        current: u64,
+        len: u32,
+    },
+    BufferDescriptorRangeOverflow {
+        index: u16,
+        address: GuestAddress,
+        len: u32,
+    },
+    BufferDescriptorAccess {
+        index: u16,
+        address: GuestAddress,
+        len: u32,
+        source: GuestMemoryAccessError,
+    },
+}
+
+impl fmt::Display for VirtioVsockRxBufferParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BufferSegmentsAllocationFailed {
+                descriptor_count,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to reserve virtio-vsock RX buffer segments for {descriptor_count} descriptors: {source}"
+                )
+            }
+            Self::BufferDescriptorReadOnly { index } => {
+                write!(
+                    f,
+                    "virtio-vsock RX buffer descriptor {index} is not writable"
+                )
+            }
+            Self::BufferDescriptorEmpty { index } => {
+                write!(f, "virtio-vsock RX buffer descriptor {index} is empty")
+            }
+            Self::BufferLengthOverflow { current, len } => {
+                write!(
+                    f,
+                    "virtio-vsock RX buffer length overflows when adding descriptor length {len} to {current}"
+                )
+            }
+            Self::BufferDescriptorRangeOverflow {
+                index,
+                address,
+                len,
+            } => {
+                write!(
+                    f,
+                    "virtio-vsock RX buffer descriptor {index} at {address} with length {len} overflows address space"
+                )
+            }
+            Self::BufferDescriptorAccess {
+                index,
+                address,
+                len,
+                source,
+            } => {
+                write!(
+                    f,
+                    "virtio-vsock RX buffer descriptor {index} at {address} with length {len} is not fully mapped: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioVsockRxBufferParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BufferSegmentsAllocationFailed { source, .. } => Some(source),
+            Self::BufferDescriptorAccess { source, .. } => Some(source),
+            Self::BufferDescriptorReadOnly { .. }
+            | Self::BufferDescriptorEmpty { .. }
+            | Self::BufferLengthOverflow { .. }
+            | Self::BufferDescriptorRangeOverflow { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioVsockRxBufferTooSmall {
+    descriptor_head: u16,
+    len: u64,
+    required_len: u64,
+}
+
+impl VirtioVsockRxBufferTooSmall {
+    pub const fn descriptor_head(self) -> u16 {
+        self.descriptor_head
+    }
+
+    pub const fn buffer_len(self) -> u64 {
+        self.len
+    }
+
+    pub const fn required_len(self) -> u64 {
+        self.required_len
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioVsockRxRequestDelivery {
+    descriptor_head: u16,
+    bytes_written_to_guest: u32,
+}
+
+impl VirtioVsockRxRequestDelivery {
+    pub const fn descriptor_head(self) -> u16 {
+        self.descriptor_head
+    }
+
+    pub const fn bytes_written_to_guest(self) -> u32 {
+        self.bytes_written_to_guest
+    }
+}
+
+#[derive(Debug)]
+pub struct VirtioVsockRxQueueDispatch {
+    processed_buffers: usize,
+    delivered_requests: usize,
+    buffer_parse_failures: usize,
+    buffer_too_small_failures: usize,
+    deliveries: Vec<VirtioVsockRxRequestDelivery>,
+    first_buffer_parse_failure: Option<VirtioVsockRxBufferParseError>,
+    first_buffer_too_small: Option<VirtioVsockRxBufferTooSmall>,
+}
+
+impl VirtioVsockRxQueueDispatch {
+    const fn new() -> Self {
+        Self {
+            processed_buffers: 0,
+            delivered_requests: 0,
+            buffer_parse_failures: 0,
+            buffer_too_small_failures: 0,
+            deliveries: Vec::new(),
+            first_buffer_parse_failure: None,
+            first_buffer_too_small: None,
+        }
+    }
+
+    fn with_delivery_capacity(
+        delivery_capacity: usize,
+    ) -> Result<Self, VirtioVsockRxQueueDispatchError> {
+        let mut deliveries = Vec::new();
+        deliveries
+            .try_reserve_exact(delivery_capacity)
+            .map_err(
+                |source| VirtioVsockRxQueueDispatchError::RequestMetadataAllocation { source },
+            )?;
+
+        Ok(Self {
+            processed_buffers: 0,
+            delivered_requests: 0,
+            buffer_parse_failures: 0,
+            buffer_too_small_failures: 0,
+            deliveries,
+            first_buffer_parse_failure: None,
+            first_buffer_too_small: None,
+        })
+    }
+
+    pub const fn processed_buffers(&self) -> usize {
+        self.processed_buffers
+    }
+
+    pub const fn delivered_requests(&self) -> usize {
+        self.delivered_requests
+    }
+
+    pub const fn buffer_parse_failures(&self) -> usize {
+        self.buffer_parse_failures
+    }
+
+    pub const fn buffer_too_small_failures(&self) -> usize {
+        self.buffer_too_small_failures
+    }
+
+    pub fn deliveries(&self) -> &[VirtioVsockRxRequestDelivery] {
+        &self.deliveries
+    }
+
+    pub const fn first_buffer_parse_failure(&self) -> Option<&VirtioVsockRxBufferParseError> {
+        self.first_buffer_parse_failure.as_ref()
+    }
+
+    pub const fn first_buffer_too_small(&self) -> Option<VirtioVsockRxBufferTooSmall> {
+        self.first_buffer_too_small
+    }
+
+    pub const fn needs_queue_interrupt(&self) -> bool {
+        self.processed_buffers != 0
+    }
+
+    fn record(&mut self, outcome: VirtioVsockRxQueueDispatchOutcome) {
+        self.processed_buffers += 1;
+        match outcome {
+            VirtioVsockRxQueueDispatchOutcome::Delivered(delivery) => {
+                self.delivered_requests += 1;
+                self.deliveries.push(delivery);
+            }
+            VirtioVsockRxQueueDispatchOutcome::BufferParseError(source) => {
+                self.buffer_parse_failures += 1;
+                if self.first_buffer_parse_failure.is_none() {
+                    self.first_buffer_parse_failure = Some(source);
+                }
+            }
+            VirtioVsockRxQueueDispatchOutcome::BufferTooSmall(failure) => {
+                self.buffer_too_small_failures += 1;
+                if self.first_buffer_too_small.is_none() {
+                    self.first_buffer_too_small = Some(failure);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum VirtioVsockRxQueueDispatchOutcome {
+    Delivered(VirtioVsockRxRequestDelivery),
+    BufferParseError(VirtioVsockRxBufferParseError),
+    BufferTooSmall(VirtioVsockRxBufferTooSmall),
+}
+
+#[derive(Debug)]
+pub enum VirtioVsockRxHeaderWriteError {
+    SegmentOffsetTooLarge {
+        descriptor_index: u16,
+        offset: usize,
+    },
+    SegmentAddressOverflow {
+        descriptor_index: u16,
+        address: GuestAddress,
+        offset: u64,
+    },
+    SegmentWrite {
+        descriptor_index: u16,
+        address: GuestAddress,
+        len: usize,
+        source: GuestMemoryAccessError,
+    },
+    IncompleteHeader {
+        remaining_bytes: usize,
+    },
+}
+
+impl fmt::Display for VirtioVsockRxHeaderWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SegmentOffsetTooLarge {
+                descriptor_index,
+                offset,
+            } => {
+                write!(
+                    f,
+                    "virtio-vsock RX buffer descriptor {descriptor_index} offset {offset} is too large"
+                )
+            }
+            Self::SegmentAddressOverflow {
+                descriptor_index,
+                address,
+                offset,
+            } => {
+                write!(
+                    f,
+                    "virtio-vsock RX buffer descriptor {descriptor_index} at {address} overflows when adding offset {offset}"
+                )
+            }
+            Self::SegmentWrite {
+                descriptor_index,
+                address,
+                len,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to write {len} bytes into virtio-vsock RX buffer descriptor {descriptor_index} at {address}: {source}"
+                )
+            }
+            Self::IncompleteHeader { remaining_bytes } => {
+                write!(
+                    f,
+                    "virtio-vsock RX header write finished with {remaining_bytes} header bytes remaining"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioVsockRxHeaderWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SegmentWrite { source, .. } => Some(source),
+            Self::SegmentOffsetTooLarge { .. }
+            | Self::SegmentAddressOverflow { .. }
+            | Self::IncompleteHeader { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioVsockRxQueueDispatchError {
+    RequestMetadataAllocation {
+        source: std::collections::TryReserveError,
+    },
+    AvailableRing {
+        completed_dispatch: Box<VirtioVsockRxQueueDispatch>,
+        source: VirtqueueAvailableRingError,
+    },
+    EmptyDescriptorChain {
+        completed_dispatch: Box<VirtioVsockRxQueueDispatch>,
+    },
+    UsedRing {
+        completed_dispatch: Box<VirtioVsockRxQueueDispatch>,
+        descriptor_head: u16,
+        bytes_written_to_guest: u32,
+        source: VirtqueueUsedRingError,
+    },
+    BufferWrite {
+        completed_dispatch: Box<VirtioVsockRxQueueDispatch>,
+        descriptor_head: u16,
+        source: VirtioVsockRxHeaderWriteError,
+    },
+}
+
+impl VirtioVsockRxQueueDispatchError {
+    pub const fn completed_dispatch(&self) -> Option<&VirtioVsockRxQueueDispatch> {
+        match self {
+            Self::AvailableRing {
+                completed_dispatch, ..
+            }
+            | Self::EmptyDescriptorChain {
+                completed_dispatch, ..
+            }
+            | Self::UsedRing {
+                completed_dispatch, ..
+            }
+            | Self::BufferWrite {
+                completed_dispatch, ..
+            } => Some(completed_dispatch),
+            Self::RequestMetadataAllocation { .. } => None,
+        }
+    }
+}
+
+impl fmt::Display for VirtioVsockRxQueueDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RequestMetadataAllocation { source } => {
+                write!(
+                    f,
+                    "failed to reserve virtio-vsock RX request metadata: {source}"
+                )
+            }
+            Self::AvailableRing { source, .. } => {
+                write!(
+                    f,
+                    "failed to pop virtio-vsock RX available descriptor chain: {source}"
+                )
+            }
+            Self::EmptyDescriptorChain { .. } => {
+                f.write_str("virtio-vsock RX queue produced an empty descriptor chain")
+            }
+            Self::UsedRing {
+                descriptor_head,
+                bytes_written_to_guest,
+                source,
+                ..
+            } => {
+                write!(
+                    f,
+                    "failed to publish virtio-vsock RX used descriptor head {descriptor_head} with length {bytes_written_to_guest}: {source}"
+                )
+            }
+            Self::BufferWrite {
+                descriptor_head,
+                source,
+                ..
+            } => {
+                write!(
+                    f,
+                    "failed to write virtio-vsock RX request into descriptor head {descriptor_head}: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioVsockRxQueueDispatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::RequestMetadataAllocation { source } => Some(source),
+            Self::AvailableRing { source, .. } => Some(source),
+            Self::UsedRing { source, .. } => Some(source),
+            Self::BufferWrite { source, .. } => Some(source),
+            Self::EmptyDescriptorChain { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtioVsockRxQueue {
     queue_state: VirtioMmioQueueState,
+    available: VirtqueueAvailableRing,
+    used: VirtqueueUsedRing,
 }
 
 impl VirtioVsockRxQueue {
@@ -1800,12 +2297,254 @@ impl VirtioVsockRxQueue {
         queue: VirtioMmioQueueState,
     ) -> Result<Self, VirtioVsockQueueBuildError> {
         validate_active_vsock_queue(queue)?;
-        Ok(Self { queue_state: queue })
+        let available = VirtqueueAvailableRing::new(
+            queue.descriptor_table(),
+            queue.driver_ring(),
+            queue.size(),
+        )
+        .map_err(|source| VirtioVsockQueueBuildError::AvailableRing { source })?;
+        let used = VirtqueueUsedRing::new(queue.device_ring(), queue.size())
+            .map_err(|source| VirtioVsockQueueBuildError::UsedRing { source })?;
+
+        Ok(Self {
+            queue_state: queue,
+            available,
+            used,
+        })
     }
 
-    pub const fn queue_state(self) -> VirtioMmioQueueState {
+    pub const fn queue_state(&self) -> VirtioMmioQueueState {
         self.queue_state
     }
+
+    pub const fn available_ring(&self) -> &VirtqueueAvailableRing {
+        &self.available
+    }
+
+    pub const fn used_ring(&self) -> &VirtqueueUsedRing {
+        &self.used
+    }
+
+    pub fn dispatch_host_request(
+        &mut self,
+        memory: &mut GuestMemory,
+        connections: &mut VsockHostConnectionTable,
+        key: VsockHostConnectionKey,
+        guest_cid: u32,
+    ) -> Result<VirtioVsockRxQueueDispatch, VirtioVsockRxQueueDispatchError> {
+        if !connections.has_pending_request_packet(key) {
+            return Ok(VirtioVsockRxQueueDispatch::new());
+        }
+
+        let mut dispatch = VirtioVsockRxQueueDispatch::with_delivery_capacity(1)?;
+        let Some(chain) = (match self.available.pop_descriptor_chain(memory) {
+            Ok(chain) => chain,
+            Err(source) => {
+                return Err(VirtioVsockRxQueueDispatchError::AvailableRing {
+                    completed_dispatch: Box::new(dispatch),
+                    source,
+                });
+            }
+        }) else {
+            return Ok(dispatch);
+        };
+
+        let descriptor_head = match descriptor_chain_head(&chain) {
+            Some(descriptor_head) => descriptor_head,
+            None => {
+                return Err(VirtioVsockRxQueueDispatchError::EmptyDescriptorChain {
+                    completed_dispatch: Box::new(dispatch),
+                });
+            }
+        };
+
+        match VirtioVsockRxBuffer::parse(memory, &chain) {
+            Ok(buffer) => {
+                if VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64 > buffer.len() {
+                    if let Err(source) = self.used.publish_used_element(memory, descriptor_head, 0)
+                    {
+                        return Err(VirtioVsockRxQueueDispatchError::UsedRing {
+                            completed_dispatch: Box::new(dispatch),
+                            descriptor_head,
+                            bytes_written_to_guest: 0,
+                            source,
+                        });
+                    }
+                    dispatch.record(VirtioVsockRxQueueDispatchOutcome::BufferTooSmall(
+                        VirtioVsockRxBufferTooSmall {
+                            descriptor_head,
+                            len: buffer.len(),
+                            required_len: VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64,
+                        },
+                    ));
+                    return Ok(dispatch);
+                }
+
+                let header = host_connection_request_packet_header(key, guest_cid);
+                if let Err(source) = write_vsock_rx_request_header(memory, &buffer, header) {
+                    return Err(VirtioVsockRxQueueDispatchError::BufferWrite {
+                        completed_dispatch: Box::new(dispatch),
+                        descriptor_head,
+                        source,
+                    });
+                }
+                let bytes_written_to_guest = VIRTIO_VSOCK_PACKET_HEADER_SIZE_U32;
+                if let Err(source) =
+                    self.used
+                        .publish_used_element(memory, descriptor_head, bytes_written_to_guest)
+                {
+                    return Err(VirtioVsockRxQueueDispatchError::UsedRing {
+                        completed_dispatch: Box::new(dispatch),
+                        descriptor_head,
+                        bytes_written_to_guest,
+                        source,
+                    });
+                }
+                let consumed = connections.take_pending_request_packet_header(key, guest_cid);
+                debug_assert_eq!(consumed, Some(header));
+                dispatch.record(VirtioVsockRxQueueDispatchOutcome::Delivered(
+                    VirtioVsockRxRequestDelivery {
+                        descriptor_head,
+                        bytes_written_to_guest,
+                    },
+                ));
+            }
+            Err(source) => {
+                if let Err(used_source) = self.used.publish_used_element(memory, descriptor_head, 0)
+                {
+                    return Err(VirtioVsockRxQueueDispatchError::UsedRing {
+                        completed_dispatch: Box::new(dispatch),
+                        descriptor_head,
+                        bytes_written_to_guest: 0,
+                        source: used_source,
+                    });
+                }
+                dispatch.record(VirtioVsockRxQueueDispatchOutcome::BufferParseError(source));
+            }
+        }
+
+        Ok(dispatch)
+    }
+}
+
+fn validate_vsock_rx_buffer_descriptor(
+    descriptor: &VirtqueueDescriptor,
+) -> Result<(), VirtioVsockRxBufferParseError> {
+    if !descriptor.is_write_only() {
+        return Err(VirtioVsockRxBufferParseError::BufferDescriptorReadOnly {
+            index: descriptor.index(),
+        });
+    }
+
+    if descriptor.is_empty() {
+        return Err(VirtioVsockRxBufferParseError::BufferDescriptorEmpty {
+            index: descriptor.index(),
+        });
+    }
+
+    Ok(())
+}
+
+fn push_vsock_rx_buffer_segment(
+    memory: &GuestMemory,
+    segments: &mut Vec<VirtioVsockRxBufferSegment>,
+    len: u64,
+    segment: VirtioVsockRxBufferSegment,
+) -> Result<u64, VirtioVsockRxBufferParseError> {
+    let next_len = len.checked_add(u64::from(segment.len())).ok_or(
+        VirtioVsockRxBufferParseError::BufferLengthOverflow {
+            current: len,
+            len: segment.len(),
+        },
+    )?;
+
+    validate_vsock_rx_buffer_segment_range(memory, segment)?;
+    segments.push(segment);
+    Ok(next_len)
+}
+
+fn validate_vsock_rx_buffer_segment_range(
+    memory: &GuestMemory,
+    segment: VirtioVsockRxBufferSegment,
+) -> Result<(), VirtioVsockRxBufferParseError> {
+    let range =
+        GuestMemoryRange::new(segment.address(), u64::from(segment.len())).map_err(|_| {
+            VirtioVsockRxBufferParseError::BufferDescriptorRangeOverflow {
+                index: segment.descriptor_index(),
+                address: segment.address(),
+                len: segment.len(),
+            }
+        })?;
+
+    memory.validate_mapped_range(range).map_err(|source| {
+        VirtioVsockRxBufferParseError::BufferDescriptorAccess {
+            index: segment.descriptor_index(),
+            address: segment.address(),
+            len: segment.len(),
+            source,
+        }
+    })
+}
+
+fn write_vsock_rx_request_header(
+    memory: &mut GuestMemory,
+    buffer: &VirtioVsockRxBuffer,
+    header: VirtioVsockPacketHeader,
+) -> Result<(), VirtioVsockRxHeaderWriteError> {
+    let header = header.to_bytes();
+    let mut header_remaining = header.as_slice();
+
+    for segment in buffer.segments() {
+        if header_remaining.is_empty() {
+            return Ok(());
+        }
+
+        let write_len = header_remaining.len().min(segment.len() as usize);
+        let (bytes, remaining) = header_remaining.split_at(write_len);
+        write_vsock_rx_segment_bytes(memory, *segment, 0, bytes)?;
+        header_remaining = remaining;
+    }
+
+    if header_remaining.is_empty() {
+        Ok(())
+    } else {
+        Err(VirtioVsockRxHeaderWriteError::IncompleteHeader {
+            remaining_bytes: header_remaining.len(),
+        })
+    }
+}
+
+fn write_vsock_rx_segment_bytes(
+    memory: &mut GuestMemory,
+    segment: VirtioVsockRxBufferSegment,
+    offset: usize,
+    bytes: &[u8],
+) -> Result<(), VirtioVsockRxHeaderWriteError> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+
+    let offset = u64::try_from(offset).map_err(|_| {
+        VirtioVsockRxHeaderWriteError::SegmentOffsetTooLarge {
+            descriptor_index: segment.descriptor_index(),
+            offset,
+        }
+    })?;
+    let address = segment.address().checked_add(offset).ok_or(
+        VirtioVsockRxHeaderWriteError::SegmentAddressOverflow {
+            descriptor_index: segment.descriptor_index(),
+            address: segment.address(),
+            offset,
+        },
+    )?;
+    memory.write_slice(bytes, address).map_err(|source| {
+        VirtioVsockRxHeaderWriteError::SegmentWrite {
+            descriptor_index: segment.descriptor_index(),
+            address,
+            len: bytes.len(),
+            source,
+        }
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2148,7 +2887,9 @@ impl VirtioVsockDevice {
     }
 
     pub fn active_rx_queue(&self) -> Option<VirtioMmioQueueState> {
-        self.active_rx_queue.map(VirtioVsockRxQueue::queue_state)
+        self.active_rx_queue
+            .as_ref()
+            .map(VirtioVsockRxQueue::queue_state)
     }
 
     pub const fn active_rx_dispatch_queue(&self) -> Option<&VirtioVsockRxQueue> {
@@ -2949,7 +3690,8 @@ mod tests {
         VSOCK_HOST_LOCAL_PORT_CAPACITY, VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE,
         VirtioVsockConfigSpace, VirtioVsockDevice, VirtioVsockDeviceActivationError,
         VirtioVsockMmioHandler, VirtioVsockPacketHeader, VirtioVsockPacketLengthError,
-        VirtioVsockQueueBuildError, VirtioVsockTxPacket, VirtioVsockTxPacketParseError,
+        VirtioVsockQueueBuildError, VirtioVsockRxBufferParseError, VirtioVsockRxQueue,
+        VirtioVsockRxQueueDispatchError, VirtioVsockTxPacket, VirtioVsockTxPacketParseError,
         VirtioVsockTxQueue, VirtioVsockTxQueueDispatchError, VsockConfigError, VsockConfigInput,
         VsockHostConnectHandshakeError, VsockHostConnectRequest, VsockHostConnectRequestError,
         VsockHostConnectionKey, VsockHostConnectionTable, VsockHostConnectionTableError,
@@ -2974,6 +3716,13 @@ mod tests {
     const TEST_VSOCK_TX_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x2200);
     const TEST_VSOCK_TX_USED_RING: GuestAddress = GuestAddress::new(0x2400);
     const TEST_VSOCK_TX_UNMAPPED_USED_RING: GuestAddress = GuestAddress::new(0x30_000);
+    const TEST_VSOCK_RX_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x8000);
+    const TEST_VSOCK_RX_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x8200);
+    const TEST_VSOCK_RX_USED_RING: GuestAddress = GuestAddress::new(0x8400);
+    const TEST_VSOCK_RX_UNMAPPED_USED_RING: GuestAddress = GuestAddress::new(0x30_000);
+    const TEST_VSOCK_RX_BUFFER: GuestAddress = GuestAddress::new(0x9000);
+    const TEST_VSOCK_RX_SECOND_BUFFER: GuestAddress = GuestAddress::new(0xa000);
+    const TEST_VSOCK_RX_UNMAPPED_BUFFER: GuestAddress = GuestAddress::new(0x30_000);
     const TEST_VSOCK_HEADER: GuestAddress = GuestAddress::new(0x4000);
     const TEST_VSOCK_SECOND_HEADER: GuestAddress = GuestAddress::new(0x5000);
     const TEST_VSOCK_PAYLOAD: GuestAddress = GuestAddress::new(0x6000);
@@ -3577,6 +4326,148 @@ mod tests {
             .queue(queue_index)
             .expect("TX queue state should be configured");
         VirtioVsockTxQueue::from_mmio_queue_state(queue_state).expect("TX queue should build")
+    }
+
+    fn write_vsock_rx_descriptor(memory: &mut GuestMemory, index: u16, descriptor: TestDescriptor) {
+        let mut bytes = [0; VIRTQUEUE_DESCRIPTOR_SIZE];
+        let (address_bytes, tail) = bytes.split_at_mut(8);
+        let (len_bytes, tail) = tail.split_at_mut(4);
+        let (flags_bytes, next_bytes) = tail.split_at_mut(2);
+        address_bytes.copy_from_slice(&descriptor.address.raw_value().to_le_bytes());
+        len_bytes.copy_from_slice(&descriptor.len.to_le_bytes());
+        flags_bytes.copy_from_slice(&descriptor.flags.to_le_bytes());
+        next_bytes.copy_from_slice(&descriptor.next.to_le_bytes());
+
+        let descriptor_address = TEST_VSOCK_RX_DESCRIPTOR_TABLE
+            .checked_add(
+                u64::from(index)
+                    * u64::try_from(VIRTQUEUE_DESCRIPTOR_SIZE).expect("descriptor size should fit"),
+            )
+            .expect("descriptor address should not overflow");
+        memory
+            .write_slice(&bytes, descriptor_address)
+            .expect("vsock RX descriptor should write");
+    }
+
+    fn write_vsock_rx_available_index(memory: &mut GuestMemory, index: u16) {
+        let index_address = TEST_VSOCK_RX_AVAILABLE_RING
+            .checked_add(2)
+            .expect("available index address should not overflow");
+        memory
+            .write_slice(&index.to_le_bytes(), index_address)
+            .expect("vsock RX available index should write");
+    }
+
+    fn write_vsock_rx_available_entry(memory: &mut GuestMemory, slot: usize, head: u16) {
+        let slot_offset = u64::try_from(slot).expect("available slot should fit") * 2;
+        let entry_address = TEST_VSOCK_RX_AVAILABLE_RING
+            .checked_add(4 + slot_offset)
+            .expect("available entry address should not overflow");
+        memory
+            .write_slice(&head.to_le_bytes(), entry_address)
+            .expect("vsock RX available entry should write");
+    }
+
+    fn write_vsock_rx_available_heads(memory: &mut GuestMemory, heads: &[u16]) {
+        for (slot, head) in heads.iter().copied().enumerate() {
+            write_vsock_rx_available_entry(memory, slot, head);
+        }
+        write_vsock_rx_available_index(
+            memory,
+            u16::try_from(heads.len()).expect("available head count should fit"),
+        );
+    }
+
+    fn vsock_rx_used_ring_idx_address() -> GuestAddress {
+        TEST_VSOCK_RX_USED_RING
+            .checked_add(2)
+            .expect("vsock RX used ring idx address should not overflow")
+    }
+
+    fn vsock_rx_used_ring_entry_address(index: usize) -> GuestAddress {
+        TEST_VSOCK_RX_USED_RING
+            .checked_add(4 + u64::try_from(index).expect("used ring index should fit") * 8)
+            .expect("vsock RX used ring entry address should not overflow")
+    }
+
+    fn read_vsock_rx_used_index(memory: &GuestMemory) -> u16 {
+        read_guest_u16(memory, vsock_rx_used_ring_idx_address())
+    }
+
+    fn read_vsock_rx_used_element(memory: &GuestMemory, index: usize) -> (u32, u32) {
+        let address = vsock_rx_used_ring_entry_address(index);
+        let descriptor_head = read_guest_u32(memory, address);
+        let len = read_guest_u32(
+            memory,
+            address
+                .checked_add(4)
+                .expect("vsock RX used ring len address should not overflow"),
+        );
+        (descriptor_head, len)
+    }
+
+    fn read_vsock_packet_header(
+        memory: &GuestMemory,
+        address: GuestAddress,
+    ) -> VirtioVsockPacketHeader {
+        let mut bytes = [0; VIRTIO_VSOCK_PACKET_HEADER_SIZE];
+        memory
+            .read_slice(&mut bytes, address)
+            .expect("vsock packet header should read");
+        VirtioVsockPacketHeader::try_from_bytes(bytes).expect("vsock packet header should parse")
+    }
+
+    fn vsock_rx_queue() -> VirtioVsockRxQueue {
+        vsock_rx_queue_with_used_ring(TEST_VSOCK_RX_USED_RING)
+    }
+
+    fn vsock_rx_queue_with_used_ring(device_ring: GuestAddress) -> VirtioVsockRxQueue {
+        let mut queues = VirtioMmioQueueRegisters::new(&VIRTIO_VSOCK_QUEUE_SIZES)
+            .expect("queue table should build");
+        let queue_index =
+            u32::try_from(VIRTIO_VSOCK_RX_QUEUE_INDEX).expect("RX queue index should fit");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueSel,
+                queue_index,
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("RX queue select should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueNum,
+                u32::from(TEST_VSOCK_QUEUE_SIZE),
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("RX queue size should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDescLow,
+                guest_address_low(TEST_VSOCK_RX_DESCRIPTOR_TABLE),
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("RX descriptor table should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDriverLow,
+                guest_address_low(TEST_VSOCK_RX_AVAILABLE_RING),
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("RX available ring should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDeviceLow,
+                guest_address_low(device_ring),
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("RX used ring should write");
+        queues
+            .write_register(VirtioMmioRegister::QueueReady, 1, QUEUE_CONFIG_STATUS)
+            .expect("RX queue ready should write");
+        let queue_state = *queues
+            .queue(queue_index)
+            .expect("RX queue state should be configured");
+        VirtioVsockRxQueue::from_mmio_queue_state(queue_state).expect("RX queue should build")
     }
 
     #[test]
@@ -5177,6 +6068,400 @@ mod tests {
 
         assert_eq!(err.payload_len(), VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE + 1);
         assert_eq!(err.max_payload_len(), VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE);
+    }
+
+    #[test]
+    fn virtio_vsock_rx_queue_dispatches_host_request_packet() {
+        let mut memory = vsock_tx_memory();
+        let mut queue = vsock_rx_queue();
+        let mut table = VsockHostConnectionTable::new();
+        let (key, _client) =
+            insert_accepted_host_connection_for_test(&mut table, "rx-request", 4000);
+        write_vsock_rx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_BUFFER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_rx_available_heads(&mut memory, &[0]);
+
+        let dispatch = queue
+            .dispatch_host_request(&mut memory, &mut table, key, 42)
+            .expect("pending host request should dispatch");
+
+        assert_eq!(dispatch.processed_buffers(), 1);
+        assert_eq!(dispatch.delivered_requests(), 1);
+        assert_eq!(dispatch.buffer_parse_failures(), 0);
+        assert_eq!(dispatch.buffer_too_small_failures(), 0);
+        assert!(dispatch.first_buffer_parse_failure().is_none());
+        assert!(dispatch.first_buffer_too_small().is_none());
+        assert!(dispatch.needs_queue_interrupt());
+        assert_eq!(dispatch.deliveries().len(), 1);
+        assert_eq!(dispatch.deliveries()[0].descriptor_head(), 0);
+        assert_eq!(
+            dispatch.deliveries()[0].bytes_written_to_guest(),
+            VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32
+        );
+        assert_eq!(queue.available_ring().next_avail(), 1);
+        assert_eq!(queue.used_ring().next_used(), 1);
+        assert_eq!(read_vsock_rx_used_index(&memory), 1);
+        assert_eq!(
+            read_vsock_rx_used_element(&memory, 0),
+            (0, VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32)
+        );
+        assert_host_connection_request_header(
+            read_vsock_packet_header(&memory, TEST_VSOCK_RX_BUFFER),
+            42,
+            key.local_port(),
+            4000,
+        );
+        assert!(!table.has_pending_request_packet(key));
+
+        let second_dispatch = queue
+            .dispatch_host_request(&mut memory, &mut table, key, 42)
+            .expect("consumed host request should be a no-op");
+        assert_eq!(second_dispatch.processed_buffers(), 0);
+        assert!(!second_dispatch.needs_queue_interrupt());
+        assert_eq!(queue.available_ring().next_avail(), 1);
+        assert_eq!(queue.used_ring().next_used(), 1);
+    }
+
+    #[test]
+    fn virtio_vsock_rx_queue_dispatch_without_pending_request_is_noop() {
+        let mut memory = vsock_tx_memory();
+        let mut queue = vsock_rx_queue();
+        let mut table = VsockHostConnectionTable::new();
+        let key = VsockHostConnectionKey::new(
+            VsockHostLocalPort::try_from_raw(VSOCK_HOST_LOCAL_PORT_BASE)
+                .expect("test local port should be valid"),
+            4000,
+        );
+        write_vsock_rx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_BUFFER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_rx_available_heads(&mut memory, &[0]);
+
+        let dispatch = queue
+            .dispatch_host_request(&mut memory, &mut table, key, 42)
+            .expect("missing host request should be a no-op");
+
+        assert_eq!(dispatch.processed_buffers(), 0);
+        assert_eq!(dispatch.delivered_requests(), 0);
+        assert!(!dispatch.needs_queue_interrupt());
+        assert_eq!(queue.available_ring().next_avail(), 0);
+        assert_eq!(queue.used_ring().next_used(), 0);
+        assert_eq!(read_vsock_rx_used_index(&memory), 0);
+    }
+
+    #[test]
+    fn virtio_vsock_rx_queue_dispatch_without_available_descriptor_keeps_request_pending() {
+        let mut memory = vsock_tx_memory();
+        let mut queue = vsock_rx_queue();
+        let mut table = VsockHostConnectionTable::new();
+        let (key, _client) =
+            insert_accepted_host_connection_for_test(&mut table, "rx-no-descriptor", 4001);
+
+        let dispatch = queue
+            .dispatch_host_request(&mut memory, &mut table, key, 42)
+            .expect("empty RX queue should dispatch as no work");
+
+        assert_eq!(dispatch.processed_buffers(), 0);
+        assert_eq!(dispatch.delivered_requests(), 0);
+        assert!(!dispatch.needs_queue_interrupt());
+        assert!(table.has_pending_request_packet(key));
+        assert_eq!(queue.available_ring().next_avail(), 0);
+        assert_eq!(queue.used_ring().next_used(), 0);
+        assert_eq!(read_vsock_rx_used_index(&memory), 0);
+    }
+
+    #[test]
+    fn virtio_vsock_rx_queue_dispatch_rejects_read_only_buffer_without_consuming_request() {
+        let mut memory = vsock_tx_memory();
+        let mut queue = vsock_rx_queue();
+        let mut table = VsockHostConnectionTable::new();
+        let (key, _client) =
+            insert_accepted_host_connection_for_test(&mut table, "rx-read-only", 4002);
+        write_vsock_rx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(
+                TEST_VSOCK_RX_BUFFER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_rx_available_heads(&mut memory, &[0]);
+
+        let dispatch = queue
+            .dispatch_host_request(&mut memory, &mut table, key, 42)
+            .expect("read-only RX descriptor should be recorded");
+
+        assert_eq!(dispatch.processed_buffers(), 1);
+        assert_eq!(dispatch.delivered_requests(), 0);
+        assert_eq!(dispatch.buffer_parse_failures(), 1);
+        assert!(matches!(
+            dispatch.first_buffer_parse_failure(),
+            Some(VirtioVsockRxBufferParseError::BufferDescriptorReadOnly { index: 0 })
+        ));
+        assert!(dispatch.needs_queue_interrupt());
+        assert!(table.has_pending_request_packet(key));
+        assert_eq!(queue.available_ring().next_avail(), 1);
+        assert_eq!(queue.used_ring().next_used(), 1);
+        assert_eq!(read_vsock_rx_used_index(&memory), 1);
+        assert_eq!(read_vsock_rx_used_element(&memory, 0), (0, 0));
+    }
+
+    #[test]
+    fn virtio_vsock_rx_queue_dispatch_rejects_empty_buffer_without_consuming_request() {
+        let mut memory = vsock_tx_memory();
+        let mut queue = vsock_rx_queue();
+        let mut table = VsockHostConnectionTable::new();
+        let (key, _client) = insert_accepted_host_connection_for_test(&mut table, "rx-empty", 4003);
+        write_vsock_rx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::writable(TEST_VSOCK_RX_BUFFER, 0, None),
+        );
+        write_vsock_rx_available_heads(&mut memory, &[0]);
+
+        let dispatch = queue
+            .dispatch_host_request(&mut memory, &mut table, key, 42)
+            .expect("empty RX descriptor should be recorded");
+
+        assert_eq!(dispatch.processed_buffers(), 1);
+        assert_eq!(dispatch.delivered_requests(), 0);
+        assert_eq!(dispatch.buffer_parse_failures(), 1);
+        assert!(matches!(
+            dispatch.first_buffer_parse_failure(),
+            Some(VirtioVsockRxBufferParseError::BufferDescriptorEmpty { index: 0 })
+        ));
+        assert!(dispatch.needs_queue_interrupt());
+        assert!(table.has_pending_request_packet(key));
+        assert_eq!(queue.available_ring().next_avail(), 1);
+        assert_eq!(queue.used_ring().next_used(), 1);
+        assert_eq!(read_vsock_rx_used_index(&memory), 1);
+        assert_eq!(read_vsock_rx_used_element(&memory, 0), (0, 0));
+    }
+
+    #[test]
+    fn virtio_vsock_rx_queue_dispatch_rejects_small_buffer_without_consuming_request() {
+        let mut memory = vsock_tx_memory();
+        let mut queue = vsock_rx_queue();
+        let mut table = VsockHostConnectionTable::new();
+        let (key, _client) = insert_accepted_host_connection_for_test(&mut table, "rx-small", 4004);
+        write_vsock_rx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_BUFFER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32 - 1,
+                None,
+            ),
+        );
+        write_vsock_rx_available_heads(&mut memory, &[0]);
+
+        let dispatch = queue
+            .dispatch_host_request(&mut memory, &mut table, key, 42)
+            .expect("small RX buffer should be recorded");
+
+        assert_eq!(dispatch.processed_buffers(), 1);
+        assert_eq!(dispatch.delivered_requests(), 0);
+        assert_eq!(dispatch.buffer_parse_failures(), 0);
+        assert_eq!(dispatch.buffer_too_small_failures(), 1);
+        let too_small = dispatch
+            .first_buffer_too_small()
+            .expect("too-small metadata should exist");
+        assert_eq!(too_small.descriptor_head(), 0);
+        assert_eq!(
+            too_small.buffer_len(),
+            VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64 - 1
+        );
+        assert_eq!(
+            too_small.required_len(),
+            VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64
+        );
+        assert!(dispatch.needs_queue_interrupt());
+        assert!(table.has_pending_request_packet(key));
+        assert_eq!(queue.available_ring().next_avail(), 1);
+        assert_eq!(queue.used_ring().next_used(), 1);
+        assert_eq!(read_vsock_rx_used_index(&memory), 1);
+        assert_eq!(read_vsock_rx_used_element(&memory, 0), (0, 0));
+    }
+
+    #[test]
+    fn virtio_vsock_rx_queue_dispatch_rejects_unmapped_buffer_without_consuming_request() {
+        let mut memory = vsock_tx_memory();
+        let mut queue = vsock_rx_queue();
+        let mut table = VsockHostConnectionTable::new();
+        let (key, _client) =
+            insert_accepted_host_connection_for_test(&mut table, "rx-unmapped", 4005);
+        write_vsock_rx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_UNMAPPED_BUFFER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_rx_available_heads(&mut memory, &[0]);
+
+        let dispatch = queue
+            .dispatch_host_request(&mut memory, &mut table, key, 42)
+            .expect("unmapped RX buffer should be recorded");
+
+        assert_eq!(dispatch.processed_buffers(), 1);
+        assert_eq!(dispatch.delivered_requests(), 0);
+        assert_eq!(dispatch.buffer_parse_failures(), 1);
+        assert!(matches!(
+            dispatch.first_buffer_parse_failure(),
+            Some(VirtioVsockRxBufferParseError::BufferDescriptorAccess { index: 0, .. })
+        ));
+        assert!(dispatch.needs_queue_interrupt());
+        assert!(table.has_pending_request_packet(key));
+        assert_eq!(queue.available_ring().next_avail(), 1);
+        assert_eq!(queue.used_ring().next_used(), 1);
+        assert_eq!(read_vsock_rx_used_index(&memory), 1);
+        assert_eq!(read_vsock_rx_used_element(&memory, 0), (0, 0));
+    }
+
+    #[test]
+    fn virtio_vsock_rx_queue_dispatch_preserves_request_on_available_ring_failure() {
+        let mut memory = vsock_tx_memory();
+        let mut queue = vsock_rx_queue();
+        let mut table = VsockHostConnectionTable::new();
+        let (key, _client) =
+            insert_accepted_host_connection_for_test(&mut table, "rx-available", 4006);
+        write_vsock_rx_available_heads(&mut memory, &[TEST_VSOCK_QUEUE_SIZE]);
+
+        let error = queue
+            .dispatch_host_request(&mut memory, &mut table, key, 42)
+            .expect_err("invalid RX available head should fail");
+
+        assert!(matches!(
+            error,
+            VirtioVsockRxQueueDispatchError::AvailableRing { .. }
+        ));
+        let completed = error
+            .completed_dispatch()
+            .expect("completed dispatch metadata should be preserved");
+        assert_eq!(completed.processed_buffers(), 0);
+        assert_eq!(completed.delivered_requests(), 0);
+        assert_eq!(completed.buffer_parse_failures(), 0);
+        assert_eq!(completed.buffer_too_small_failures(), 0);
+        assert!(!completed.needs_queue_interrupt());
+        assert!(table.has_pending_request_packet(key));
+        assert_eq!(queue.available_ring().next_avail(), 0);
+        assert_eq!(queue.used_ring().next_used(), 0);
+        assert_eq!(read_vsock_rx_used_index(&memory), 0);
+    }
+
+    #[test]
+    fn virtio_vsock_rx_queue_dispatch_writes_split_host_request_header() {
+        let mut memory = vsock_tx_memory();
+        let mut queue = vsock_rx_queue();
+        let mut table = VsockHostConnectionTable::new();
+        let (key, _client) = insert_accepted_host_connection_for_test(&mut table, "rx-split", 4006);
+        write_vsock_rx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::writable(TEST_VSOCK_RX_BUFFER, 8, Some(1)),
+        );
+        write_vsock_rx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_SECOND_BUFFER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32 - 8,
+                None,
+            ),
+        );
+        write_vsock_rx_available_heads(&mut memory, &[0]);
+
+        let dispatch = queue
+            .dispatch_host_request(&mut memory, &mut table, key, 42)
+            .expect("split RX buffer should dispatch");
+
+        assert_eq!(dispatch.processed_buffers(), 1);
+        assert_eq!(dispatch.delivered_requests(), 1);
+        assert!(dispatch.needs_queue_interrupt());
+        assert_eq!(read_vsock_rx_used_index(&memory), 1);
+        assert_eq!(
+            read_vsock_rx_used_element(&memory, 0),
+            (0, VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32)
+        );
+        let mut header_bytes = read_guest_bytes(&memory, TEST_VSOCK_RX_BUFFER, 8);
+        header_bytes.extend(read_guest_bytes(
+            &memory,
+            TEST_VSOCK_RX_SECOND_BUFFER,
+            VIRTIO_VSOCK_PACKET_HEADER_SIZE - 8,
+        ));
+        let header = VirtioVsockPacketHeader::try_from_bytes(
+            header_bytes
+                .try_into()
+                .expect("split header bytes should be complete"),
+        )
+        .expect("split header should parse");
+        assert_host_connection_request_header(header, 42, key.local_port(), 4006);
+        assert!(!table.has_pending_request_packet(key));
+    }
+
+    #[test]
+    fn virtio_vsock_rx_queue_dispatch_preserves_request_on_used_ring_failure() {
+        let mut memory = vsock_tx_memory();
+        let mut queue = vsock_rx_queue_with_used_ring(TEST_VSOCK_RX_UNMAPPED_USED_RING);
+        let mut table = VsockHostConnectionTable::new();
+        let (key, _client) =
+            insert_accepted_host_connection_for_test(&mut table, "rx-used-ring", 4007);
+        write_vsock_rx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_BUFFER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_rx_available_heads(&mut memory, &[0]);
+
+        let error = queue
+            .dispatch_host_request(&mut memory, &mut table, key, 42)
+            .expect_err("unmapped RX used ring should fail");
+
+        assert!(matches!(
+            error,
+            VirtioVsockRxQueueDispatchError::UsedRing {
+                descriptor_head: 0,
+                bytes_written_to_guest,
+                ..
+            } if bytes_written_to_guest == VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32
+        ));
+        let completed = error
+            .completed_dispatch()
+            .expect("completed dispatch metadata should be preserved");
+        assert_eq!(completed.processed_buffers(), 0);
+        assert_eq!(completed.delivered_requests(), 0);
+        assert_eq!(completed.buffer_parse_failures(), 0);
+        assert_eq!(completed.buffer_too_small_failures(), 0);
+        assert!(!completed.needs_queue_interrupt());
+        assert!(table.has_pending_request_packet(key));
+        assert_eq!(queue.available_ring().next_avail(), 1);
+        assert_eq!(queue.used_ring().next_used(), 0);
+        assert_host_connection_request_header(
+            read_vsock_packet_header(&memory, TEST_VSOCK_RX_BUFFER),
+            42,
+            key.local_port(),
+            4007,
+        );
     }
 
     #[test]
