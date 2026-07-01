@@ -1597,6 +1597,33 @@ mod tests {
     }
 
     #[test]
+    fn system_vmnet_backend_maps_successful_null_start_handle_to_failure() {
+        let api = RecordingVmnetSystemApi::new().with_null_start_handle();
+        let event_log = api.events();
+        let config = VmnetInterfaceConfig::shared();
+        let backend = super::SystemVmnetInterfaceBackendWithApi::with_api(api);
+        let error = StartedVmnetInterface::start(backend, &config)
+            .expect_err("null vmnet start handle should fail even with success completion");
+
+        match error {
+            VmnetInterfaceStartError::Start { source } => {
+                assert_eq!(source.operation(), VmnetOperation::StartInterface);
+                assert_eq!(source.status(), VmnetStatus::Failure);
+            }
+            VmnetInterfaceStartError::Descriptor { .. } => {
+                panic!("null start handle should not be reported as a descriptor error");
+            }
+        }
+        assert_eq!(
+            recorded_events(&event_log),
+            [format!(
+                "system-start:{}",
+                u64::from(VMNET_SHARED_MODE_VALUE)
+            )]
+        );
+    }
+
+    #[test]
     fn system_vmnet_backend_failed_stop_schedule_keeps_interface_for_retry() {
         let api =
             RecordingVmnetSystemApi::new().with_stop_schedule_status(VmnetStatus::SetupIncomplete);
