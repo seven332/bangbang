@@ -490,9 +490,14 @@ impl Arm64BootVsockNotificationOutcome {
     pub fn needs_queue_interrupt(&self) -> bool {
         match self {
             Self::Dispatched(dispatch) => dispatch.needs_queue_interrupt(),
-            Self::DispatchFailed(source) => source
-                .completed_tx_dispatch()
-                .is_some_and(crate::vsock::VirtioVsockTxQueueDispatch::needs_queue_interrupt),
+            Self::DispatchFailed(source) => {
+                source
+                    .completed_tx_dispatch()
+                    .is_some_and(crate::vsock::VirtioVsockTxQueueDispatch::needs_queue_interrupt)
+                    || source.completed_rx_dispatch().is_some_and(
+                        crate::vsock::VirtioVsockRxQueueDispatch::needs_queue_interrupt,
+                    )
+            }
             Self::HandlerLookupFailed(_) => false,
         }
     }
@@ -3176,9 +3181,9 @@ mod tests {
     }
 
     #[test]
-    fn boot_runtime_vsock_notification_dispatch_reports_unsupported_queue() {
-        let kernel = temp_file("kernel-vsock-unsupported-dispatch", &arm64_image());
-        let socket_path = missing_path("vsock-unsupported.sock");
+    fn boot_runtime_vsock_notification_dispatch_reports_rx_noop() {
+        let kernel = temp_file("kernel-vsock-rx-noop-dispatch", &arm64_image());
+        let socket_path = missing_path("vsock-rx-noop.sock");
         let mut controller = controller_with_kernel(kernel.path());
         add_vsock(&mut controller, 44, &socket_path);
         let config = Arm64BootResourceConfig {
@@ -3204,18 +3209,79 @@ mod tests {
 
         assert_eq!(dispatches.len(), 1);
         assert!(!dispatches.needs_queue_interrupt());
+        let dispatch = dispatches.as_slice()[0]
+            .outcome()
+            .dispatched()
+            .expect("RX queue notification should dispatch as no-op");
+        assert_eq!(
+            dispatch.drained_notifications(),
+            [VIRTIO_VSOCK_RX_QUEUE_INDEX]
+        );
+        let rx = dispatch
+            .rx_queue_dispatch()
+            .expect("RX dispatch summary should be present");
+        assert_eq!(rx.processed_buffers(), 0);
+        assert_eq!(rx.delivered_requests(), 0);
+        assert!(!rx.needs_queue_interrupt());
+        assert!(dispatch.tx_queue_dispatch().is_none());
+        assert_eq!(
+            read_boot_vsock_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                VirtioMmioRegister::InterruptStatus
+            ),
+            0
+        );
+        assert!(socket_path.exists());
+        drop(mmio_dispatcher);
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn boot_runtime_vsock_notification_dispatch_reports_unsupported_queue() {
+        let kernel = temp_file("kernel-vsock-unsupported-dispatch", &arm64_image());
+        let socket_path = missing_path("vsock-unsupported.sock");
+        let mut controller = controller_with_kernel(kernel.path());
+        add_vsock(&mut controller, 44, &socket_path);
+        let config = Arm64BootResourceConfig {
+            vsock_interrupt_line: Some(line(35)),
+            ..valid_config(&[])
+        };
+        let resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
+        let mut runtime = parts.runtime;
+        configure_boot_vsock_queues(&mut runtime, &mut mmio_dispatcher);
+        notify_boot_vsock_queue(
+            &mut runtime,
+            &mut mmio_dispatcher,
+            VIRTIO_VSOCK_EVENT_QUEUE_INDEX,
+        );
+
+        let dispatches = runtime
+            .dispatch_vsock_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("vsock dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 1);
+        assert!(!dispatches.needs_queue_interrupt());
         let error = dispatches.as_slice()[0]
             .outcome()
             .dispatch_error()
             .expect("unsupported queue should be preserved as a device error");
-        assert_eq!(error.drained_notifications(), [VIRTIO_VSOCK_RX_QUEUE_INDEX]);
+        assert_eq!(
+            error.drained_notifications(),
+            [VIRTIO_VSOCK_EVENT_QUEUE_INDEX]
+        );
         assert!(matches!(
             error,
             crate::vsock::VirtioVsockDeviceNotificationError::UnsupportedQueue {
-                queue_index: VIRTIO_VSOCK_RX_QUEUE_INDEX,
+                queue_index: VIRTIO_VSOCK_EVENT_QUEUE_INDEX,
                 ..
             }
         ));
+        assert!(error.completed_rx_dispatch().is_none());
         assert!(error.completed_tx_dispatch().is_none());
         assert_eq!(
             read_boot_vsock_mmio_u32(

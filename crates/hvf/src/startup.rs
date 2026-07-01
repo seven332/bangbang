@@ -4607,13 +4607,56 @@ mod tests {
     }
 
     #[test]
-    fn vsock_notification_signal_dispatch_preserves_unsupported_queue_without_signal() {
+    fn vsock_notification_signal_dispatch_skips_rx_noop_device() {
         let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_with_vsock();
         configure_boot_vsock_queues(&mut runtime, &mut mmio_dispatcher);
         notify_boot_vsock_queue(
             &mut runtime,
             &mut mmio_dispatcher,
             VIRTIO_VSOCK_RX_QUEUE_INDEX,
+        );
+        let dispatches =
+            dispatch_boot_vsock_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let (lines, sink) = RecordingSink::successful();
+
+        let result = signal_vsock_queue_interrupts(dispatches, sink.as_ref())
+            .expect("unsupported vsock dispatch should collect");
+
+        let device = &result.as_slice()[0];
+        assert!(!device.dispatch().needs_queue_interrupt());
+        assert!(!device.queue_interrupt_signaled());
+        assert!(device.signal_error().is_none());
+        assert!(recorded_lines(&lines).is_empty());
+        let dispatch = device
+            .dispatch()
+            .outcome()
+            .dispatched()
+            .expect("RX noop should dispatch");
+        let rx = dispatch
+            .rx_queue_dispatch()
+            .expect("RX dispatch summary should be present");
+        assert_eq!(rx.processed_buffers(), 0);
+        assert_eq!(rx.delivered_requests(), 0);
+        assert!(!rx.needs_queue_interrupt());
+        assert!(dispatch.tx_queue_dispatch().is_none());
+        assert_eq!(
+            read_boot_vsock_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                VirtioMmioRegister::InterruptStatus
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn vsock_notification_signal_dispatch_preserves_unsupported_queue_without_signal() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_with_vsock();
+        configure_boot_vsock_queues(&mut runtime, &mut mmio_dispatcher);
+        notify_boot_vsock_queue(
+            &mut runtime,
+            &mut mmio_dispatcher,
+            VIRTIO_VSOCK_EVENT_QUEUE_INDEX,
         );
         let dispatches =
             dispatch_boot_vsock_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
@@ -4635,11 +4678,14 @@ mod tests {
         assert!(matches!(
             err,
             bangbang_runtime::vsock::VirtioVsockDeviceNotificationError::UnsupportedQueue {
-                queue_index: VIRTIO_VSOCK_RX_QUEUE_INDEX,
+                queue_index: VIRTIO_VSOCK_EVENT_QUEUE_INDEX,
                 ..
             }
         ));
-        assert_eq!(err.drained_notifications(), [VIRTIO_VSOCK_RX_QUEUE_INDEX]);
+        assert_eq!(
+            err.drained_notifications(),
+            [VIRTIO_VSOCK_EVENT_QUEUE_INDEX]
+        );
         assert_eq!(
             read_boot_vsock_mmio_u32(
                 &mut runtime,

@@ -67,15 +67,16 @@ is resource-specific:
   can attach a guest-visible virtio-vsock device whose internal MMIO handler
   retains active RX, TX, and event queue metadata after `DRIVER_OK`, and the
   runtime has an internal Firecracker-shaped packet header model plus TX
-  descriptor packet parser. Startup-level dispatch can drain TX queue
-  notifications, complete TX descriptor heads, and signal the allocated vsock
-  queue interrupt line. The runtime can also parse host `CONNECT <PORT>`
-  requests, allocate Firecracker-shaped host local ports, retain
-  host-initiated accepted streams in an internal table, expose one-shot
-  guest-facing `VSOCK_OP_REQUEST` packet headers for retained host connections,
-  write those request headers into validated writable guest RX descriptors,
-  accept one pending host connection per call into an owned nonblocking stream,
-  then read and parse a bounded accepted-stream `CONNECT` handshake. Startup
+  descriptor packet parser. Startup-level dispatch can drain RX and TX queue
+  notifications, complete descriptor heads, and signal the allocated vsock
+  queue interrupt line when completed descriptors require it. The runtime can
+  also parse host `CONNECT <PORT>` requests, allocate Firecracker-shaped host
+  local ports, retain host-initiated accepted streams in an internal table,
+  expose one-shot guest-facing `VSOCK_OP_REQUEST` packet headers for retained
+  host connections, dispatch those request headers through RX queue
+  notifications into validated writable guest RX descriptors, accept one
+  pending host connection per call into an owned nonblocking stream, then read
+  and parse a bounded accepted-stream `CONNECT` handshake. Startup
   also binds a nonblocking host Unix listener at `uds_path`, records the
   listener socket device and inode, and removes the path on normal shutdown only
   when it still refers to the socket created by this process. It does not send
@@ -193,16 +194,17 @@ The current scaffold does not implement:
   The runtime crate has an internal virtio-vsock prepared resource, MMIO
   registration helper, config-space, packet header model, TX descriptor packet
   parser, TX available-ring drain helper with used-ring descriptor completion,
-  MMIO handler skeleton with active queue metadata retention and TX notification
-  dispatch, startup FDT attachment, startup-level TX notification dispatch, and
-  HVF queue interrupt signaling that expose only the configured guest CID
-  through bounded config reads. The runtime can also parse host `CONNECT <PORT>`
-  requests, allocate Firecracker-shaped host local ports, retain
-  host-initiated accepted streams in an internal table, expose one-shot
+  MMIO handler skeleton with active queue metadata retention and RX/TX
+  notification dispatch, startup FDT attachment, startup-level RX/TX
+  notification dispatch, and HVF queue interrupt signaling that expose only the
+  configured guest CID through bounded config reads. The runtime can also parse
+  host `CONNECT <PORT>` requests, allocate Firecracker-shaped host local ports,
+  retain host-initiated accepted streams in an internal table, expose one-shot
   guest-facing `VSOCK_OP_REQUEST` packet headers for retained host connections,
-  write those request headers into validated writable guest RX descriptors,
-  accept one pending host connection per call into an owned nonblocking stream,
-  and read and parse a bounded accepted-stream `CONNECT` handshake. Startup
+  dispatch those request headers through RX queue notifications into validated
+  writable guest RX descriptors, accept one pending host connection per call
+  into an owned nonblocking stream, and read and parse a bounded
+  accepted-stream `CONNECT` handshake. Startup
   preparation creates a nonblocking host Unix listener at `uds_path` and cleans
   it up only while the path still matches the created socket inode. It does not
   send `OK` or `RST` responses, connect guest-initiated `uds_path_<PORT>`
