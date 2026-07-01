@@ -855,6 +855,13 @@ impl VsockHostConnectionTable {
             .take_pending_request_packet_header(key, guest_cid)
     }
 
+    fn first_pending_request_packet_key(&self) -> Option<VsockHostConnectionKey> {
+        self.connections
+            .iter()
+            .filter_map(|(key, connection)| connection.has_pending_request_packet().then_some(*key))
+            .min()
+    }
+
     pub fn contains(&self, key: VsockHostConnectionKey) -> bool {
         self.connections.contains_key(&key)
     }
@@ -2860,12 +2867,14 @@ fn validate_active_vsock_queue(
     Ok(())
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct VirtioVsockDevice {
+    guest_cid: u32,
     active_rx_queue: Option<VirtioVsockRxQueue>,
     active_tx_queue: Option<VirtioVsockTxQueue>,
     active_event_queue: Option<VirtioVsockEventQueue>,
     host_socket_owner: Option<VsockHostSocketOwner>,
+    host_connections: VsockHostConnectionTable,
 }
 
 impl VirtioVsockDevice {
@@ -2873,10 +2882,25 @@ impl VirtioVsockDevice {
         Self::default()
     }
 
-    pub(crate) fn with_host_socket_owner(host_socket_owner: VsockHostSocketOwner) -> Self {
+    fn with_guest_cid(guest_cid: u32) -> Self {
         Self {
+            guest_cid,
+            active_rx_queue: None,
+            active_tx_queue: None,
+            active_event_queue: None,
+            host_socket_owner: None,
+            host_connections: VsockHostConnectionTable::new(),
+        }
+    }
+
+    pub(crate) fn with_host_socket_owner(
+        guest_cid: u32,
+        host_socket_owner: VsockHostSocketOwner,
+    ) -> Self {
+        Self {
+            guest_cid,
             host_socket_owner: Some(host_socket_owner),
-            ..Self::default()
+            ..Self::with_guest_cid(guest_cid)
         }
     }
 
@@ -2926,6 +2950,21 @@ impl VirtioVsockDevice {
             .as_ref()
             .ok_or(VsockHostSocketAcceptError::HostSocketNotAttached)?
             .accept_host_connection()
+    }
+
+    #[cfg(test)]
+    fn insert_accepted_host_connection(
+        &mut self,
+        accepted: VsockHostAcceptedConnection,
+        request: VsockHostConnectRequest,
+    ) -> Result<VsockHostConnectionKey, VsockHostConnectionTableError> {
+        self.host_connections
+            .insert_accepted_host_connection(accepted, request)
+    }
+
+    #[cfg(test)]
+    fn has_pending_host_request_packet(&self, key: VsockHostConnectionKey) -> bool {
+        self.host_connections.has_pending_request_packet(key)
     }
 
     pub fn activate_vsock(
@@ -2983,6 +3022,7 @@ impl VirtioVsockDevice {
         self.active_rx_queue = None;
         self.active_tx_queue = None;
         self.active_event_queue = None;
+        self.host_connections = VsockHostConnectionTable::new();
     }
 
     fn dispatch_drained_queue_notifications(
@@ -2994,6 +3034,7 @@ impl VirtioVsockDevice {
             return Ok(VirtioVsockDeviceNotificationDispatch::new(
                 drained_notifications,
                 None,
+                None,
             ));
         }
 
@@ -3003,21 +3044,53 @@ impl VirtioVsockDevice {
             });
         }
 
-        if let Some(queue_index) = drained_notifications
-            .iter()
-            .copied()
-            .find(|queue_index| *queue_index != VIRTIO_VSOCK_TX_QUEUE_INDEX)
-        {
+        if let Some(queue_index) = drained_notifications.iter().copied().find(|queue_index| {
+            *queue_index != VIRTIO_VSOCK_RX_QUEUE_INDEX
+                && *queue_index != VIRTIO_VSOCK_TX_QUEUE_INDEX
+        }) {
             return Err(VirtioVsockDeviceNotificationError::UnsupportedQueue {
                 drained_notifications,
                 queue_index,
             });
         }
 
+        let dispatch_rx = drained_notifications
+            .iter()
+            .copied()
+            .any(|queue_index| queue_index == VIRTIO_VSOCK_RX_QUEUE_INDEX);
         let dispatch_tx = drained_notifications
             .iter()
             .copied()
             .any(|queue_index| queue_index == VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let rx_queue_dispatch = if dispatch_rx {
+            let Some(queue) = self.active_rx_queue.as_mut() else {
+                return Err(VirtioVsockDeviceNotificationError::Inactive {
+                    drained_notifications,
+                });
+            };
+
+            match self.host_connections.first_pending_request_packet_key() {
+                Some(key) => match queue.dispatch_host_request(
+                    memory,
+                    &mut self.host_connections,
+                    key,
+                    self.guest_cid,
+                ) {
+                    Ok(dispatch) => Some(dispatch),
+                    Err(source) => {
+                        return Err(VirtioVsockDeviceNotificationError::RxQueueDispatch {
+                            drained_notifications,
+                            completed_tx_dispatch: None,
+                            source,
+                        });
+                    }
+                },
+                None => Some(VirtioVsockRxQueueDispatch::new()),
+            }
+        } else {
+            None
+        };
 
         let tx_queue_dispatch = if dispatch_tx {
             let Some(queue) = self.active_tx_queue.as_mut() else {
@@ -3031,6 +3104,7 @@ impl VirtioVsockDevice {
                 Err(source) => {
                     return Err(VirtioVsockDeviceNotificationError::TxQueueDispatch {
                         drained_notifications,
+                        completed_rx_dispatch: rx_queue_dispatch.map(Box::new),
                         source,
                     });
                 }
@@ -3041,8 +3115,15 @@ impl VirtioVsockDevice {
 
         Ok(VirtioVsockDeviceNotificationDispatch::new(
             drained_notifications,
+            rx_queue_dispatch,
             tx_queue_dispatch,
         ))
+    }
+}
+
+impl Default for VirtioVsockDevice {
+    fn default() -> Self {
+        Self::with_guest_cid(MIN_GUEST_CID)
     }
 }
 
@@ -3139,16 +3220,19 @@ impl From<VirtioVsockDeviceActivationError> for VirtioMmioDeviceActivationError 
 #[derive(Debug)]
 pub struct VirtioVsockDeviceNotificationDispatch {
     drained_notifications: Vec<usize>,
+    rx_queue_dispatch: Option<VirtioVsockRxQueueDispatch>,
     tx_queue_dispatch: Option<VirtioVsockTxQueueDispatch>,
 }
 
 impl VirtioVsockDeviceNotificationDispatch {
     const fn new(
         drained_notifications: Vec<usize>,
+        rx_queue_dispatch: Option<VirtioVsockRxQueueDispatch>,
         tx_queue_dispatch: Option<VirtioVsockTxQueueDispatch>,
     ) -> Self {
         Self {
             drained_notifications,
+            rx_queue_dispatch,
             tx_queue_dispatch,
         }
     }
@@ -3161,10 +3245,18 @@ impl VirtioVsockDeviceNotificationDispatch {
         self.tx_queue_dispatch.as_ref()
     }
 
+    pub const fn rx_queue_dispatch(&self) -> Option<&VirtioVsockRxQueueDispatch> {
+        self.rx_queue_dispatch.as_ref()
+    }
+
     pub fn needs_queue_interrupt(&self) -> bool {
         self.tx_queue_dispatch
             .as_ref()
             .is_some_and(VirtioVsockTxQueueDispatch::needs_queue_interrupt)
+            || self
+                .rx_queue_dispatch
+                .as_ref()
+                .is_some_and(VirtioVsockRxQueueDispatch::needs_queue_interrupt)
     }
 }
 
@@ -3179,7 +3271,13 @@ pub enum VirtioVsockDeviceNotificationError {
     },
     TxQueueDispatch {
         drained_notifications: Vec<usize>,
+        completed_rx_dispatch: Option<Box<VirtioVsockRxQueueDispatch>>,
         source: VirtioVsockTxQueueDispatchError,
+    },
+    RxQueueDispatch {
+        drained_notifications: Vec<usize>,
+        completed_tx_dispatch: Option<Box<VirtioVsockTxQueueDispatch>>,
+        source: VirtioVsockRxQueueDispatchError,
     },
 }
 
@@ -3196,6 +3294,10 @@ impl VirtioVsockDeviceNotificationError {
             | Self::TxQueueDispatch {
                 drained_notifications,
                 ..
+            }
+            | Self::RxQueueDispatch {
+                drained_notifications,
+                ..
             } => drained_notifications,
         }
     }
@@ -3203,6 +3305,27 @@ impl VirtioVsockDeviceNotificationError {
     pub const fn completed_tx_dispatch(&self) -> Option<&VirtioVsockTxQueueDispatch> {
         match self {
             Self::TxQueueDispatch { source, .. } => source.completed_dispatch(),
+            Self::RxQueueDispatch {
+                completed_tx_dispatch,
+                ..
+            } => match completed_tx_dispatch {
+                Some(dispatch) => Some(dispatch),
+                None => None,
+            },
+            Self::Inactive { .. } | Self::UnsupportedQueue { .. } => None,
+        }
+    }
+
+    pub const fn completed_rx_dispatch(&self) -> Option<&VirtioVsockRxQueueDispatch> {
+        match self {
+            Self::RxQueueDispatch { source, .. } => source.completed_dispatch(),
+            Self::TxQueueDispatch {
+                completed_rx_dispatch,
+                ..
+            } => match completed_rx_dispatch {
+                Some(dispatch) => Some(dispatch),
+                None => None,
+            },
             Self::Inactive { .. } | Self::UnsupportedQueue { .. } => None,
         }
     }
@@ -3223,6 +3346,9 @@ impl fmt::Display for VirtioVsockDeviceNotificationError {
             Self::TxQueueDispatch { source, .. } => {
                 write!(f, "failed to dispatch virtio-vsock TX queue: {source}")
             }
+            Self::RxQueueDispatch { source, .. } => {
+                write!(f, "failed to dispatch virtio-vsock RX queue: {source}")
+            }
         }
     }
 }
@@ -3231,6 +3357,7 @@ impl std::error::Error for VirtioVsockDeviceNotificationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::TxQueueDispatch { source, .. } => Some(source),
+            Self::RxQueueDispatch { source, .. } => Some(source),
             Self::Inactive { .. } | Self::UnsupportedQueue { .. } => None,
         }
     }
@@ -3247,9 +3374,14 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioVsockD
             .dispatch_drained_queue_notifications(memory, drained_notifications);
         let needs_queue_interrupt = match &dispatch {
             Ok(dispatch) => dispatch.needs_queue_interrupt(),
-            Err(error) => error
-                .completed_tx_dispatch()
-                .is_some_and(VirtioVsockTxQueueDispatch::needs_queue_interrupt),
+            Err(error) => {
+                error
+                    .completed_tx_dispatch()
+                    .is_some_and(VirtioVsockTxQueueDispatch::needs_queue_interrupt)
+                    || error
+                        .completed_rx_dispatch()
+                        .is_some_and(VirtioVsockRxQueueDispatch::needs_queue_interrupt)
+            }
         };
         if needs_queue_interrupt {
             self.mark_interrupt_pending(DeviceInterruptKind::Queue);
@@ -3294,7 +3426,10 @@ pub struct PreparedVsockDevice {
 
 impl PreparedVsockDevice {
     pub fn from_config(config: &VsockConfig) -> Self {
-        Self::from_config_with_device(config, VirtioVsockDevice::new())
+        Self::from_config_with_device(
+            config,
+            VirtioVsockDevice::with_guest_cid(config.guest_cid()),
+        )
     }
 
     pub fn from_config_with_host_socket(
@@ -3309,7 +3444,7 @@ impl PreparedVsockDevice {
 
         Ok(Self::from_config_with_device(
             config,
-            VirtioVsockDevice::with_host_socket_owner(owner),
+            VirtioVsockDevice::with_host_socket_owner(config.guest_cid(), owner),
         ))
     }
 
@@ -3626,7 +3761,7 @@ pub fn virtio_vsock_mmio_handler(
         config.available_features(),
         &VIRTIO_VSOCK_QUEUE_SIZES,
         config,
-        VirtioVsockDevice::new(),
+        VirtioVsockDevice::with_guest_cid(guest_cid),
     )
 }
 
@@ -3716,9 +3851,9 @@ mod tests {
     const TEST_VSOCK_TX_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x2200);
     const TEST_VSOCK_TX_USED_RING: GuestAddress = GuestAddress::new(0x2400);
     const TEST_VSOCK_TX_UNMAPPED_USED_RING: GuestAddress = GuestAddress::new(0x30_000);
-    const TEST_VSOCK_RX_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x8000);
-    const TEST_VSOCK_RX_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x8200);
-    const TEST_VSOCK_RX_USED_RING: GuestAddress = GuestAddress::new(0x8400);
+    const TEST_VSOCK_RX_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x1000);
+    const TEST_VSOCK_RX_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x1200);
+    const TEST_VSOCK_RX_USED_RING: GuestAddress = GuestAddress::new(0x1400);
     const TEST_VSOCK_RX_UNMAPPED_USED_RING: GuestAddress = GuestAddress::new(0x30_000);
     const TEST_VSOCK_RX_BUFFER: GuestAddress = GuestAddress::new(0x9000);
     const TEST_VSOCK_RX_SECOND_BUFFER: GuestAddress = GuestAddress::new(0xa000);
@@ -3980,6 +4115,27 @@ mod tests {
         ready: bool,
     ) -> VirtioMmioQueueRegisters {
         configured_vsock_queue_registers_from_specs([(queue_size, ready); VIRTIO_VSOCK_QUEUE_COUNT])
+    }
+
+    fn configured_vsock_queue_registers_with_rx_device_ring(
+        device_ring: GuestAddress,
+    ) -> VirtioMmioQueueRegisters {
+        let mut queues = configured_vsock_queue_registers(Some(VIRTIO_VSOCK_QUEUE_SIZE), true);
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueSel,
+                u32::try_from(VIRTIO_VSOCK_RX_QUEUE_INDEX).expect("RX queue index should fit"),
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("RX queue select should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDeviceLow,
+                guest_address_low(device_ring),
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("RX device ring should write");
+        queues
     }
 
     fn configured_vsock_queue_registers_from_specs(
@@ -5160,6 +5316,31 @@ mod tests {
         );
         assert!(table.take_pending_request_packet_header(key, 42).is_none());
         assert!(table.contains(key));
+    }
+
+    #[test]
+    fn vsock_host_connection_table_selects_smallest_pending_request_key() {
+        let mut table = VsockHostConnectionTable::new();
+        let (first_key, _first_client) =
+            insert_accepted_host_connection_for_test(&mut table, "table-pending-first", 4000);
+        let (second_key, _second_client) =
+            insert_accepted_host_connection_for_test(&mut table, "table-pending-second", 3000);
+
+        assert_eq!(table.first_pending_request_packet_key(), Some(first_key));
+
+        let first_header = table
+            .take_pending_request_packet_header(first_key, 42)
+            .expect("first pending request should exist");
+
+        assert_host_connection_request_header(first_header, 42, first_key.local_port(), 4000);
+        assert_eq!(table.first_pending_request_packet_key(), Some(second_key));
+
+        let second_header = table
+            .take_pending_request_packet_header(second_key, 42)
+            .expect("second pending request should exist");
+
+        assert_host_connection_request_header(second_header, 42, second_key.local_port(), 3000);
+        assert_eq!(table.first_pending_request_packet_key(), None);
     }
 
     #[test]
@@ -7366,6 +7547,23 @@ mod tests {
     }
 
     #[test]
+    fn virtio_vsock_device_reset_drops_retained_host_connections() {
+        let mut device = VirtioVsockDevice::new();
+        let (accepted, mut client, request) =
+            accepted_host_connection_with_request("device-reset-connection", 4000);
+        let key = device
+            .insert_accepted_host_connection(accepted, request)
+            .expect("host connection should insert");
+
+        assert!(device.has_pending_host_request_packet(key));
+
+        VirtioMmioDeviceActivationHandler::reset(&mut device);
+
+        assert!(!device.has_pending_host_request_packet(key));
+        assert_stream_closed(&mut client, "reset should close retained host stream");
+    }
+
+    #[test]
     fn virtio_vsock_device_rejects_not_ready_queue_without_partial_activation() {
         let registers = vsock_device_registers();
         let queues = configured_vsock_queue_registers(Some(4), false);
@@ -7536,6 +7734,7 @@ mod tests {
             .expect("empty notification drain should be a no-op");
 
         assert_eq!(dispatch.drained_notifications(), &[]);
+        assert!(dispatch.rx_queue_dispatch().is_none());
         assert!(dispatch.tx_queue_dispatch().is_none());
         assert!(!dispatch.needs_queue_interrupt());
     }
@@ -7562,45 +7761,247 @@ mod tests {
             "virtio-vsock queue notification cannot be dispatched before activation"
         );
         assert!(error.completed_tx_dispatch().is_none());
+        assert!(error.completed_rx_dispatch().is_none());
         assert!(error.source().is_none());
     }
 
     #[test]
-    fn virtio_vsock_notifications_reject_rx_queue_without_dispatch() {
+    fn virtio_vsock_notifications_dispatch_rx_queue_without_pending_request_as_noop() {
         let mut memory = vsock_tx_memory();
         let mut handler = virtio_vsock_mmio_handler(3).expect("vsock handler should build");
 
         activate_vsock_handler(&mut handler);
         notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
 
-        let error = handler
+        let notification = handler
             .dispatch_vsock_queue_notifications(&mut memory)
-            .expect_err("RX notification should be unsupported");
+            .expect("RX notification without pending request should be a no-op");
+
+        assert_eq!(
+            notification.drained_notifications(),
+            &[VIRTIO_VSOCK_RX_QUEUE_INDEX]
+        );
+        assert!(!notification.needs_queue_interrupt());
+        assert!(notification.tx_queue_dispatch().is_none());
+        let rx = notification
+            .rx_queue_dispatch()
+            .expect("RX dispatch summary should be present");
+        assert_eq!(rx.processed_buffers(), 0);
+        assert_eq!(rx.delivered_requests(), 0);
+        assert!(!rx.needs_queue_interrupt());
+        assert_eq!(read_interrupt_status(&handler), 0);
+        assert!(handler.pending_queue_notifications().is_empty());
+        let active_rx_queue = handler
+            .activation_handler()
+            .active_rx_dispatch_queue()
+            .expect("RX dispatch queue should remain active");
+        assert_eq!(active_rx_queue.available_ring().next_avail(), 0);
+        assert_eq!(active_rx_queue.used_ring().next_used(), 0);
+        assert_eq!(read_vsock_rx_used_index(&memory), 0);
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_dispatch_rx_host_request_and_mark_interrupt() {
+        let mut memory = vsock_tx_memory();
+        let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
+
+        activate_vsock_handler(&mut handler);
+        let (accepted, _client, request) =
+            accepted_host_connection_with_request("notify-rx-request", 4000);
+        let key = handler
+            .activation_handler_mut()
+            .insert_accepted_host_connection(accepted, request)
+            .expect("host connection should insert");
+        write_vsock_rx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_BUFFER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_rx_available_heads(&mut memory, &[0]);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("RX host request notification should dispatch");
+
+        assert_eq!(
+            notification.drained_notifications(),
+            &[VIRTIO_VSOCK_RX_QUEUE_INDEX]
+        );
+        assert!(notification.needs_queue_interrupt());
+        assert!(notification.tx_queue_dispatch().is_none());
+        let rx = notification
+            .rx_queue_dispatch()
+            .expect("RX dispatch summary should be present");
+        assert_eq!(rx.processed_buffers(), 1);
+        assert_eq!(rx.delivered_requests(), 1);
+        assert_eq!(rx.buffer_parse_failures(), 0);
+        assert!(rx.needs_queue_interrupt());
+        assert_eq!(rx.deliveries()[0].descriptor_head(), 0);
+        assert_eq!(
+            rx.deliveries()[0].bytes_written_to_guest(),
+            VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32
+        );
+        assert!(
+            !handler
+                .activation_handler()
+                .has_pending_host_request_packet(key)
+        );
+        assert_eq!(
+            read_interrupt_status(&handler),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        assert!(handler.pending_queue_notifications().is_empty());
+        assert_eq!(read_vsock_rx_used_index(&memory), 1);
+        assert_eq!(
+            read_vsock_rx_used_element(&memory, 0),
+            (0, VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32)
+        );
+        assert_host_connection_request_header(
+            read_vsock_packet_header(&memory, TEST_VSOCK_RX_BUFFER),
+            42,
+            key.local_port(),
+            4000,
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_keep_pending_rx_request_without_available_buffer() {
+        let mut memory = vsock_tx_memory();
+        let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
+
+        activate_vsock_handler(&mut handler);
+        let (accepted, _client, request) =
+            accepted_host_connection_with_request("notify-rx-empty", 4001);
+        let key = handler
+            .activation_handler_mut()
+            .insert_accepted_host_connection(accepted, request)
+            .expect("host connection should insert");
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("RX notification without available buffer should be a no-op");
+
+        assert!(!notification.needs_queue_interrupt());
+        let rx = notification
+            .rx_queue_dispatch()
+            .expect("RX dispatch summary should be present");
+        assert_eq!(rx.processed_buffers(), 0);
+        assert_eq!(rx.delivered_requests(), 0);
+        assert!(
+            handler
+                .activation_handler()
+                .has_pending_host_request_packet(key)
+        );
+        assert_eq!(read_interrupt_status(&handler), 0);
+        assert_eq!(read_vsock_rx_used_index(&memory), 0);
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_reject_malformed_rx_buffer_without_consuming_request() {
+        let mut memory = vsock_tx_memory();
+        let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
+
+        activate_vsock_handler(&mut handler);
+        let (accepted, _client, request) =
+            accepted_host_connection_with_request("notify-rx-bad", 4002);
+        let key = handler
+            .activation_handler_mut()
+            .insert_accepted_host_connection(accepted, request)
+            .expect("host connection should insert");
+        write_vsock_rx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(
+                TEST_VSOCK_RX_BUFFER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_rx_available_heads(&mut memory, &[0]);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("malformed RX buffer should be completed");
+
+        assert!(notification.needs_queue_interrupt());
+        let rx = notification
+            .rx_queue_dispatch()
+            .expect("RX dispatch summary should be present");
+        assert_eq!(rx.processed_buffers(), 1);
+        assert_eq!(rx.delivered_requests(), 0);
+        assert_eq!(rx.buffer_parse_failures(), 1);
+        assert!(matches!(
+            rx.first_buffer_parse_failure(),
+            Some(VirtioVsockRxBufferParseError::BufferDescriptorReadOnly { index: 0 })
+        ));
+        assert!(
+            handler
+                .activation_handler()
+                .has_pending_host_request_packet(key)
+        );
+        assert_eq!(
+            read_interrupt_status(&handler),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        assert_eq!(read_vsock_rx_used_index(&memory), 1);
+        assert_eq!(read_vsock_rx_used_element(&memory, 0), (0, 0));
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_preserve_pending_request_on_rx_used_ring_error() {
+        let registers = vsock_device_registers();
+        let queues =
+            configured_vsock_queue_registers_with_rx_device_ring(TEST_VSOCK_RX_UNMAPPED_USED_RING);
+        let mut memory = vsock_tx_memory();
+        let mut device = VirtioVsockDevice::with_guest_cid(42);
+
+        device
+            .activate_vsock(VirtioMmioDeviceActivation::new(&registers, &queues))
+            .expect("vsock device should activate");
+        let (accepted, _client, request) =
+            accepted_host_connection_with_request("notify-rx-used", 4003);
+        let key = device
+            .insert_accepted_host_connection(accepted, request)
+            .expect("host connection should insert");
+        write_vsock_rx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_BUFFER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_rx_available_heads(&mut memory, &[0]);
+
+        let error = device
+            .dispatch_drained_queue_notifications(&mut memory, vec![VIRTIO_VSOCK_RX_QUEUE_INDEX])
+            .expect_err("unmapped RX used ring should fail notification dispatch");
 
         assert!(matches!(
             error,
-            super::VirtioVsockDeviceNotificationError::UnsupportedQueue {
-                queue_index: VIRTIO_VSOCK_RX_QUEUE_INDEX,
-                ..
-            }
+            super::VirtioVsockDeviceNotificationError::RxQueueDispatch { .. }
         ));
         assert_eq!(
             error.drained_notifications(),
             &[VIRTIO_VSOCK_RX_QUEUE_INDEX]
         );
-        assert_eq!(
-            error.to_string(),
-            "virtio-vsock queue notification for unsupported queue 0"
-        );
+        let completed = error
+            .completed_rx_dispatch()
+            .expect("completed RX metadata should be preserved");
+        assert_eq!(completed.processed_buffers(), 0);
+        assert_eq!(completed.delivered_requests(), 0);
+        assert!(!completed.needs_queue_interrupt());
         assert!(error.completed_tx_dispatch().is_none());
-        assert_eq!(read_interrupt_status(&handler), 0);
-        assert!(handler.pending_queue_notifications().is_empty());
-        let active_tx_queue = handler
-            .activation_handler()
-            .active_tx_dispatch_queue()
-            .expect("TX dispatch queue should remain active");
-        assert_eq!(active_tx_queue.available_ring().next_avail(), 0);
-        assert_eq!(active_tx_queue.used_ring().next_used(), 0);
+        assert!(device.has_pending_host_request_packet(key));
+        assert_eq!(read_vsock_rx_used_index(&memory), 0);
     }
 
     #[test]
@@ -7631,12 +8032,65 @@ mod tests {
             "virtio-vsock queue notification for unsupported queue 2"
         );
         assert!(error.completed_tx_dispatch().is_none());
+        assert!(error.completed_rx_dispatch().is_none());
         assert_eq!(read_interrupt_status(&handler), 0);
         assert!(handler.pending_queue_notifications().is_empty());
     }
 
     #[test]
-    fn virtio_vsock_notifications_reject_mixed_unsupported_queue_without_tx_dispatch() {
+    fn virtio_vsock_notifications_reject_mixed_event_queue_without_rx_dispatch() {
+        let mut memory = vsock_tx_memory();
+        let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
+
+        activate_vsock_handler(&mut handler);
+        let (accepted, _client, request) =
+            accepted_host_connection_with_request("notify-event-rx", 4005);
+        let key = handler
+            .activation_handler_mut()
+            .insert_accepted_host_connection(accepted, request)
+            .expect("host connection should insert");
+        write_vsock_rx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_BUFFER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_rx_available_heads(&mut memory, &[0]);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_EVENT_QUEUE_INDEX);
+
+        let error = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect_err("mixed event notification should be unsupported before RX dispatch");
+
+        assert!(matches!(
+            error,
+            super::VirtioVsockDeviceNotificationError::UnsupportedQueue {
+                queue_index: VIRTIO_VSOCK_EVENT_QUEUE_INDEX,
+                ..
+            }
+        ));
+        assert_eq!(
+            error.drained_notifications(),
+            &[VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_EVENT_QUEUE_INDEX]
+        );
+        assert!(
+            handler
+                .activation_handler()
+                .has_pending_host_request_packet(key)
+        );
+        assert!(error.completed_tx_dispatch().is_none());
+        assert!(error.completed_rx_dispatch().is_none());
+        assert_eq!(read_interrupt_status(&handler), 0);
+        assert_eq!(read_vsock_rx_used_index(&memory), 0);
+        assert!(handler.pending_queue_notifications().is_empty());
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_dispatch_mixed_rx_noop_and_tx_queue() {
         let mut memory = vsock_tx_memory();
         let mut handler = virtio_vsock_mmio_handler(3).expect("vsock handler should build");
         let header = test_vsock_packet_header().with_payload_len(0);
@@ -7656,31 +8110,38 @@ mod tests {
         notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
         notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
 
-        let error = handler
+        let notification = handler
             .dispatch_vsock_queue_notifications(&mut memory)
-            .expect_err("mixed unsupported notification should reject before TX dispatch");
+            .expect("mixed RX/TX notification should dispatch");
 
-        assert!(matches!(
-            error,
-            super::VirtioVsockDeviceNotificationError::UnsupportedQueue {
-                queue_index: VIRTIO_VSOCK_RX_QUEUE_INDEX,
-                ..
-            }
-        ));
         assert_eq!(
-            error.drained_notifications(),
+            notification.drained_notifications(),
             &[VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_TX_QUEUE_INDEX]
         );
-        assert!(error.completed_tx_dispatch().is_none());
-        assert_eq!(read_interrupt_status(&handler), 0);
+        assert!(notification.needs_queue_interrupt());
+        let rx = notification
+            .rx_queue_dispatch()
+            .expect("RX dispatch summary should be present");
+        assert_eq!(rx.processed_buffers(), 0);
+        assert!(!rx.needs_queue_interrupt());
+        let tx = notification
+            .tx_queue_dispatch()
+            .expect("TX dispatch summary should be present");
+        assert_eq!(tx.processed_packets(), 1);
+        assert_eq!(tx.successful_packets(), 1);
+        assert!(tx.needs_queue_interrupt());
+        assert_eq!(
+            read_interrupt_status(&handler),
+            DeviceInterruptKind::Queue.status().bits()
+        );
         assert!(handler.pending_queue_notifications().is_empty());
         let active_tx_queue = handler
             .activation_handler()
             .active_tx_dispatch_queue()
             .expect("TX dispatch queue should remain active");
-        assert_eq!(active_tx_queue.available_ring().next_avail(), 0);
-        assert_eq!(active_tx_queue.used_ring().next_used(), 0);
-        assert_eq!(read_vsock_tx_used_index(&memory), 0);
+        assert_eq!(active_tx_queue.available_ring().next_avail(), 1);
+        assert_eq!(active_tx_queue.used_ring().next_used(), 1);
+        assert_eq!(read_vsock_tx_used_index(&memory), 1);
     }
 
     #[test]
@@ -7868,6 +8329,80 @@ mod tests {
         assert_eq!(active_tx_queue.used_ring().next_used(), 1);
         assert_eq!(read_vsock_tx_used_index(&memory), 1);
         assert_eq!(read_vsock_tx_used_element(&memory, 0), (0, 0));
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_preserve_completed_rx_when_mixed_tx_fails() {
+        let mut memory = vsock_tx_memory();
+        let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
+        let header = test_vsock_packet_header().with_payload_len(0);
+
+        activate_vsock_handler(&mut handler);
+        let (accepted, _client, request) =
+            accepted_host_connection_with_request("notify-mixed-error", 4004);
+        let key = handler
+            .activation_handler_mut()
+            .insert_accepted_host_connection(accepted, request)
+            .expect("host connection should insert");
+        write_vsock_rx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_BUFFER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_rx_available_heads(&mut memory, &[0]);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_HEADER, header);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_tx_available_heads(&mut memory, &[0, VIRTIO_VSOCK_QUEUE_SIZE]);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let error = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect_err("invalid second TX head should fail after RX dispatch");
+
+        assert!(matches!(
+            error,
+            super::VirtioVsockDeviceNotificationError::TxQueueDispatch { .. }
+        ));
+        assert_eq!(
+            error.drained_notifications(),
+            &[VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_TX_QUEUE_INDEX]
+        );
+        let rx = error
+            .completed_rx_dispatch()
+            .expect("completed RX dispatch should be preserved");
+        assert_eq!(rx.processed_buffers(), 1);
+        assert_eq!(rx.delivered_requests(), 1);
+        assert!(rx.needs_queue_interrupt());
+        let tx = error
+            .completed_tx_dispatch()
+            .expect("completed TX dispatch should be preserved");
+        assert_eq!(tx.processed_packets(), 1);
+        assert_eq!(tx.successful_packets(), 1);
+        assert!(tx.needs_queue_interrupt());
+        assert!(
+            !handler
+                .activation_handler()
+                .has_pending_host_request_packet(key)
+        );
+        assert_eq!(
+            read_interrupt_status(&handler),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        assert_eq!(read_vsock_rx_used_index(&memory), 1);
+        assert_eq!(read_vsock_tx_used_index(&memory), 1);
     }
 
     #[test]
