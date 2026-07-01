@@ -1523,7 +1523,8 @@ impl VirtioVsockDevice {
         }
     }
 
-    pub fn has_host_socket_owner(&self) -> bool {
+    #[cfg(test)]
+    fn has_host_socket_owner(&self) -> bool {
         self.host_socket_owner.is_some()
     }
 
@@ -2358,8 +2359,13 @@ mod tests {
 
     fn unique_socket_path(name: &str) -> PathBuf {
         let id = NEXT_TEST_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "bangbang-vsock-{name}-{}-{id}.sock",
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after Unix epoch")
+            .as_nanos();
+        let short_name: String = name.chars().take(12).collect();
+        PathBuf::from("/tmp").join(format!(
+            "bb-vsock-{short_name}-{now:x}-{}-{id:x}.sock",
             std::process::id()
         ))
     }
