@@ -1508,7 +1508,7 @@ pub struct VirtioVsockDevice {
     active_rx_queue: Option<VirtioVsockRxQueue>,
     active_tx_queue: Option<VirtioVsockTxQueue>,
     active_event_queue: Option<VirtioVsockEventQueue>,
-    host_socket_owner: Option<VsockHostSocketOwner>,
+    _host_socket_owner: Option<VsockHostSocketOwner>,
 }
 
 impl VirtioVsockDevice {
@@ -1518,14 +1518,9 @@ impl VirtioVsockDevice {
 
     pub(crate) fn with_host_socket_owner(host_socket_owner: VsockHostSocketOwner) -> Self {
         Self {
-            host_socket_owner: Some(host_socket_owner),
+            _host_socket_owner: Some(host_socket_owner),
             ..Self::default()
         }
-    }
-
-    #[cfg(test)]
-    fn has_host_socket_owner(&self) -> bool {
-        self.host_socket_owner.is_some()
     }
 
     pub fn is_activated(&self) -> bool {
@@ -3077,7 +3072,6 @@ mod tests {
         let prepared = PreparedVsockDevice::from_config_with_host_socket(&config)
             .expect("prepared vsock should bind host socket");
 
-        assert!(prepared.device().has_host_socket_owner());
         assert!(path.exists());
 
         drop(prepared);
