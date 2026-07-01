@@ -63,6 +63,9 @@ is resource-specific:
   Files are opened later during `InstanceStart`.
 - `/drives/{drive_id}` stores block backing paths during configuration. Backing
   files are opened later during `InstanceStart`.
+- `/vsock` stores the configured Unix socket path during configuration only.
+  The current implementation does not open, bind, connect, unlink, or create
+  that socket path.
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink.
 - `/logger` opens `log_path` during pre-boot configuration when that field is
@@ -131,6 +134,7 @@ Use unique paths for:
 - metrics files or FIFOs
 - logger files or FIFOs
 - writable block backing files
+- configured vsock socket paths when future vsock backends start creating them
 - future host network devices or sockets
 - temporary test files
 
@@ -147,7 +151,7 @@ The current scaffold does not implement:
 - a Firecracker-jailer replacement
 - privilege dropping
 - host resource brokering
-- network, vsock, MMDS, or snapshot containment; the current network interface
+- network, MMDS, snapshot, or full vsock containment; the current network interface
   configuration path validates and stores configuration strings, and internal
   virtio-net notification dispatch can parse guest TX descriptor metadata and
   pass validated TX frame payloads to injected packet I/O selected per configured
@@ -158,7 +162,9 @@ The current scaffold does not implement:
   not include a concrete system vmnet backend or call `vmnet_start_interface`,
   `vmnet_stop_interface`, `vmnet_read`, or `vmnet_write`. The default provider
   is a no-op TX sink plus an empty RX source and bangbang still does not open
-  host networking resources
+  host networking resources. The current vsock API path validates and stores
+  `guest_cid` plus `uds_path` before boot, but it does not implement a
+  virtio-vsock device or host Unix socket backend
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 

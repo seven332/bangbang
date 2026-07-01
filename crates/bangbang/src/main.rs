@@ -347,8 +347,9 @@ fn help_text() -> String {
             "Current scope:\n",
             "  Serves GET /, GET /version, GET /vm/config, GET /machine-config, ",
             "pre-boot PUT /machine-config, pre-boot PUT /boot-source, ",
-            "pre-boot PUT /drives/{{drive_id}}, pre-boot PUT /metrics, and ",
-            "pre-boot PUT /logger configuration storage over the API ",
+            "pre-boot PUT /drives/{{drive_id}}, pre-boot ",
+            "PUT /network-interfaces/{{iface_id}}, pre-boot PUT /vsock, ",
+            "pre-boot PUT /metrics, and pre-boot PUT /logger configuration storage over the API ",
             "socket; PUT /actions starts a process-owned HVF boot run-loop ",
             "worker across bounded step windows for InstanceStart, but public ",
             "run-loop control is not implemented yet."
