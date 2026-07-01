@@ -377,6 +377,7 @@ pub enum VmnetPacketIoError {
     Vmnet {
         source: VmnetError,
     },
+    InterfaceStopped,
     UnexpectedPacketCount {
         operation: VmnetOperation,
         expected: VmnetPacketCountExpectation,
@@ -400,6 +401,7 @@ impl fmt::Display for VmnetPacketIoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Vmnet { source } => write!(f, "{source}"),
+            Self::InterfaceStopped => f.write_str("vmnet interface is not started"),
             Self::UnexpectedPacketCount {
                 operation,
                 expected,
@@ -423,7 +425,9 @@ impl std::error::Error for VmnetPacketIoError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Vmnet { source } => Some(source),
-            Self::UnexpectedPacketCount { .. } | Self::ReadPacketSizeExceedsBuffer { .. } => None,
+            Self::InterfaceStopped
+            | Self::UnexpectedPacketCount { .. }
+            | Self::ReadPacketSizeExceedsBuffer { .. } => None,
         }
     }
 }
@@ -1152,6 +1156,72 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StartedVmnetPacketIoInterface;
+
+#[derive(Debug)]
+pub struct StartedVmnetPacketIoBackend<B>
+where
+    B: VmnetInterfaceBackend
+        + VmnetPacketIoBackend<Interface = <B as VmnetInterfaceBackend>::Interface>,
+{
+    started: StartedVmnetInterface<B>,
+}
+
+impl<B> StartedVmnetPacketIoBackend<B>
+where
+    B: VmnetInterfaceBackend
+        + VmnetPacketIoBackend<Interface = <B as VmnetInterfaceBackend>::Interface>,
+{
+    pub fn start(
+        backend: B,
+        config: &VmnetInterfaceConfig,
+    ) -> Result<(Self, StartedVmnetPacketIoInterface), VmnetInterfaceStartError> {
+        Ok((
+            Self {
+                started: StartedVmnetInterface::start(backend, config)?,
+            },
+            StartedVmnetPacketIoInterface,
+        ))
+    }
+
+    pub const fn is_started(&self) -> bool {
+        self.started.is_started()
+    }
+}
+
+impl<B> VmnetPacketIoBackend for StartedVmnetPacketIoBackend<B>
+where
+    B: VmnetInterfaceBackend
+        + VmnetPacketIoBackend<Interface = <B as VmnetInterfaceBackend>::Interface>,
+{
+    type Interface = StartedVmnetPacketIoInterface;
+
+    fn read_packet(
+        &mut self,
+        _interface: &mut Self::Interface,
+        packet: &mut VmnetReadPacket<'_>,
+    ) -> Result<Option<usize>, VmnetPacketIoError> {
+        let Some(interface) = self.started.interface.as_mut() else {
+            return Err(VmnetPacketIoError::InterfaceStopped);
+        };
+
+        self.started.backend.read_packet(interface, packet)
+    }
+
+    fn write_packet(
+        &mut self,
+        _interface: &mut Self::Interface,
+        packet: &mut VmnetWritePacket<'_>,
+    ) -> Result<(), VmnetPacketIoError> {
+        let Some(interface) = self.started.interface.as_mut() else {
+            return Err(VmnetPacketIoError::InterfaceStopped);
+        };
+
+        self.started.backend.write_packet(interface, packet)
+    }
+}
+
 pub trait VmnetInterfaceLifecycle: fmt::Debug + Send + 'static {
     type Interface: fmt::Debug + Send + 'static;
 
@@ -1219,17 +1289,21 @@ mod tests {
     use std::ptr::{self, NonNull};
     use std::sync::{Arc, Mutex};
 
+    use bangbang_runtime::network::VirtioNetworkRxPacketSource;
     use block2::Block;
     use dispatch2::DispatchQueue;
 
+    use crate::host_network::virtio_vmnet::VmnetVirtioNetworkPacketIo;
+
     use super::{
-        OwnedVmnetInterface, StartedVmnetInterface, VMNET_BRIDGED_MODE_VALUE,
-        VMNET_HOST_MODE_VALUE, VMNET_SHARED_MODE_VALUE, VmnetError, VmnetHostDeviceNameConfigError,
-        VmnetInterfaceBackend, VmnetInterfaceConfig, VmnetInterfaceConfigError,
-        VmnetInterfaceDescriptor, VmnetInterfaceDescriptorError, VmnetInterfaceLifecycle,
-        VmnetInterfaceStartError, VmnetMode, VmnetOperation, VmnetPacketCountExpectation,
-        VmnetPacketDescriptor, VmnetPacketDescriptorError, VmnetPacketIoBackend,
-        VmnetPacketIoError, VmnetReadPacket, VmnetStatus, VmnetSystemApi, VmnetWritePacket,
+        OwnedVmnetInterface, StartedVmnetInterface, StartedVmnetPacketIoBackend,
+        VMNET_BRIDGED_MODE_VALUE, VMNET_HOST_MODE_VALUE, VMNET_SHARED_MODE_VALUE, VmnetError,
+        VmnetHostDeviceNameConfigError, VmnetInterfaceBackend, VmnetInterfaceConfig,
+        VmnetInterfaceConfigError, VmnetInterfaceDescriptor, VmnetInterfaceDescriptorError,
+        VmnetInterfaceLifecycle, VmnetInterfaceStartError, VmnetMode, VmnetOperation,
+        VmnetPacketCountExpectation, VmnetPacketDescriptor, VmnetPacketDescriptorError,
+        VmnetPacketIoBackend, VmnetPacketIoError, VmnetReadPacket, VmnetStatus, VmnetSystemApi,
+        VmnetWritePacket,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1299,6 +1373,8 @@ mod tests {
         descriptor_error: Option<VmnetInterfaceDescriptorError>,
         start_status: Option<VmnetStatus>,
         stop_statuses: VecDeque<VmnetStatus>,
+        read_result: Result<Option<usize>, VmnetPacketIoError>,
+        write_result: Result<(), VmnetPacketIoError>,
     }
 
     impl RecordingVmnetBackend {
@@ -1308,6 +1384,8 @@ mod tests {
                 descriptor_error: None,
                 start_status: None,
                 stop_statuses: VecDeque::new(),
+                read_result: Ok(None),
+                write_result: Ok(()),
             }
         }
 
@@ -1323,6 +1401,16 @@ mod tests {
 
         fn with_stop_status(mut self, status: VmnetStatus) -> Self {
             self.stop_statuses.push_back(status);
+            self
+        }
+
+        fn with_read_result(mut self, result: Result<Option<usize>, VmnetPacketIoError>) -> Self {
+            self.read_result = result;
+            self
+        }
+
+        fn with_write_result(mut self, result: Result<(), VmnetPacketIoError>) -> Self {
+            self.write_result = result;
             self
         }
 
@@ -1368,6 +1456,35 @@ mod tests {
             }
 
             Ok(())
+        }
+    }
+
+    impl VmnetPacketIoBackend for RecordingVmnetBackend {
+        type Interface = RecordedVmnetInterface;
+
+        fn read_packet(
+            &mut self,
+            interface: &mut Self::Interface,
+            _packet: &mut VmnetReadPacket<'_>,
+        ) -> Result<Option<usize>, VmnetPacketIoError> {
+            push_event(&self.events, format!("read:{}", interface.id));
+            self.read_result.clone()
+        }
+
+        fn write_packet(
+            &mut self,
+            interface: &mut Self::Interface,
+            packet: &mut VmnetWritePacket<'_>,
+        ) -> Result<(), VmnetPacketIoError> {
+            push_event(
+                &self.events,
+                format!(
+                    "write:{}:{}",
+                    interface.id,
+                    packet.as_raw_descriptor().packet_size()
+                ),
+            );
+            self.write_result.clone()
         }
     }
 
@@ -1889,6 +2006,168 @@ mod tests {
     }
 
     #[test]
+    fn started_packet_io_backend_starts_and_stops_on_drop() {
+        let backend = RecordingVmnetBackend::new();
+        let event_log = backend.events();
+        let config = VmnetInterfaceConfig::host();
+
+        {
+            let (backend, _interface) = StartedVmnetPacketIoBackend::start(backend, &config)
+                .expect("started packet I/O backend should be created");
+            assert!(backend.is_started());
+        }
+
+        assert_eq!(
+            recorded_events(&event_log),
+            [
+                "descriptor:host".to_string(),
+                format!("start:{}", u64::from(VMNET_HOST_MODE_VALUE)),
+                "stop:9".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn started_packet_io_backend_delegates_read_and_write() {
+        let backend = RecordingVmnetBackend::new().with_read_result(Ok(Some(7)));
+        let event_log = backend.events();
+        let config = VmnetInterfaceConfig::shared();
+
+        {
+            let (mut backend, mut interface) = StartedVmnetPacketIoBackend::start(backend, &config)
+                .expect("started packet I/O backend should be created");
+            let mut read_buffer = [0_u8; 2048];
+            let mut read_packet =
+                VmnetReadPacket::new(&mut read_buffer).expect("read packet should build");
+            let write_bytes = [0xaa, 0xbb, 0xcc];
+            let mut write_packet =
+                VmnetWritePacket::new(&write_bytes).expect("write packet should build");
+
+            assert_eq!(
+                backend
+                    .read_packet(&mut interface, &mut read_packet)
+                    .expect("read should delegate"),
+                Some(7)
+            );
+            backend
+                .write_packet(&mut interface, &mut write_packet)
+                .expect("write should delegate");
+        }
+
+        assert_eq!(
+            recorded_events(&event_log),
+            [
+                "descriptor:shared".to_string(),
+                format!("start:{}", u64::from(VMNET_SHARED_MODE_VALUE)),
+                "read:9".to_string(),
+                "write:9:3".to_string(),
+                "stop:9".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn started_packet_io_backend_builds_virtio_packet_io_adapter() {
+        let backend = RecordingVmnetBackend::new().with_read_result(Ok(Some(5)));
+        let event_log = backend.events();
+        let config = VmnetInterfaceConfig::shared();
+
+        {
+            let (backend, interface) = StartedVmnetPacketIoBackend::start(backend, &config)
+                .expect("started packet I/O backend should be created");
+            let mut packet_io =
+                VmnetVirtioNetworkPacketIo::with_rx_buffer_len(backend, interface, 2048)
+                    .expect("virtio vmnet packet I/O should build");
+            let packet = packet_io
+                .rx_source()
+                .peek_packet()
+                .expect("adapter RX should delegate")
+                .expect("adapter RX packet should be present");
+
+            assert_eq!(packet.bytes().len(), 5);
+        }
+
+        assert_eq!(
+            recorded_events(&event_log),
+            [
+                "descriptor:shared".to_string(),
+                format!("start:{}", u64::from(VMNET_SHARED_MODE_VALUE)),
+                "read:9".to_string(),
+                "stop:9".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn started_packet_io_backend_preserves_write_failure() {
+        let backend = RecordingVmnetBackend::new().with_write_result(Err(
+            VmnetPacketIoError::UnexpectedPacketCount {
+                operation: VmnetOperation::WritePackets,
+                expected: VmnetPacketCountExpectation::One,
+                actual: 0,
+            },
+        ));
+        let event_log = backend.events();
+        let config = VmnetInterfaceConfig::host();
+
+        {
+            let (mut backend, mut interface) = StartedVmnetPacketIoBackend::start(backend, &config)
+                .expect("started packet I/O backend should be created");
+            let write_bytes = [0xaa];
+            let mut write_packet =
+                VmnetWritePacket::new(&write_bytes).expect("write packet should build");
+            let error = backend
+                .write_packet(&mut interface, &mut write_packet)
+                .expect_err("write failure should be preserved");
+
+            assert_eq!(
+                error,
+                VmnetPacketIoError::UnexpectedPacketCount {
+                    operation: VmnetOperation::WritePackets,
+                    expected: VmnetPacketCountExpectation::One,
+                    actual: 0,
+                }
+            );
+        }
+
+        assert_eq!(
+            recorded_events(&event_log),
+            [
+                "descriptor:host".to_string(),
+                format!("start:{}", u64::from(VMNET_HOST_MODE_VALUE)),
+                "write:9:1".to_string(),
+                "stop:9".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn started_packet_io_backend_start_failure_does_not_create_owner() {
+        let backend = RecordingVmnetBackend::new().with_start_status(VmnetStatus::NotAuthorized);
+        let event_log = backend.events();
+        let config = VmnetInterfaceConfig::host();
+        let error = StartedVmnetPacketIoBackend::start(backend, &config)
+            .expect_err("start failure should prevent packet I/O ownership");
+
+        match error {
+            VmnetInterfaceStartError::Start { source } => {
+                assert_eq!(source.operation(), VmnetOperation::StartInterface);
+                assert_eq!(source.status(), VmnetStatus::NotAuthorized);
+            }
+            VmnetInterfaceStartError::Descriptor { .. } => {
+                panic!("start failure should not return a descriptor error");
+            }
+        }
+        assert_eq!(
+            recorded_events(&event_log),
+            [
+                "descriptor:host".to_string(),
+                format!("start:{}", u64::from(VMNET_HOST_MODE_VALUE)),
+            ]
+        );
+    }
+
+    #[test]
     fn system_vmnet_backend_starts_and_stops_interface() {
         let api = RecordingVmnetSystemApi::new();
         let event_log = api.events();
@@ -2134,6 +2413,9 @@ mod tests {
                 assert_eq!(source.operation(), VmnetOperation::ReadPackets);
                 assert_eq!(source.status(), VmnetStatus::BufferExhausted);
             }
+            VmnetPacketIoError::InterfaceStopped => {
+                panic!("vmnet read status failure should not become a stopped interface error");
+            }
             VmnetPacketIoError::UnexpectedPacketCount { .. } => {
                 panic!("vmnet read status failure should not become a count error");
             }
@@ -2229,6 +2511,9 @@ mod tests {
             VmnetPacketIoError::Vmnet { source } => {
                 assert_eq!(source.operation(), VmnetOperation::WritePackets);
                 assert_eq!(source.status(), VmnetStatus::PacketTooBig);
+            }
+            VmnetPacketIoError::InterfaceStopped => {
+                panic!("vmnet write status failure should not become a stopped interface error");
             }
             VmnetPacketIoError::UnexpectedPacketCount { .. } => {
                 panic!("vmnet write status failure should not become a count error");

@@ -158,13 +158,14 @@ The current scaffold does not implement:
   interface, and can copy injected RX packet bytes into validated guest RX
   buffers through the same boundary. On macOS, the process crate has internal
   vmnet descriptor, lifecycle, start owner, concrete system start/stop backend,
-  packet descriptor, single-packet system read/write backend boundaries, and an
-  internal virtio-net adapter that can move packets between vmnet and the
-  runtime packet traits for future host networking, plus an internal provider
-  that can select prebuilt adapters by configured interface ID and an internal
-  `host_dev_name` mapping for `vmnet:host`, `vmnet:shared`, and
-  `vmnet:bridged:<interface>`, but these boundaries are not connected to
-  process startup and bangbang startup does not call
+  packet descriptor, single-packet system read/write backend boundaries, a
+  cleanup-owning packet backend for retaining stop-on-drop ownership while
+  delegating packet I/O, and an internal virtio-net adapter that can move
+  packets between vmnet and the runtime packet traits for future host
+  networking, plus an internal provider that can select prebuilt adapters by
+  configured interface ID and an internal `host_dev_name` mapping for
+  `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>`, but these
+  boundaries are not connected to process startup and bangbang startup does not call
   `vmnet_start_interface`, `vmnet_stop_interface`, `vmnet_read`, or
   `vmnet_write`. The default provider is a no-op TX sink plus an empty RX source
   and bangbang still does not open host networking resources. The current vsock
