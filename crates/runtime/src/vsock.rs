@@ -4294,6 +4294,41 @@ mod tests {
     }
 
     #[test]
+    fn virtio_vsock_notifications_dispatch_empty_tx_queue_without_interrupt() {
+        let mut memory = vsock_tx_memory();
+        let mut handler = virtio_vsock_mmio_handler(3).expect("vsock handler should build");
+
+        activate_vsock_handler(&mut handler);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("empty TX queue notification should dispatch");
+
+        assert_eq!(
+            notification.drained_notifications(),
+            &[VIRTIO_VSOCK_TX_QUEUE_INDEX]
+        );
+        assert!(!notification.needs_queue_interrupt());
+        let dispatch = notification
+            .tx_queue_dispatch()
+            .expect("TX dispatch summary should be present");
+        assert_eq!(dispatch.processed_packets(), 0);
+        assert_eq!(dispatch.successful_packets(), 0);
+        assert_eq!(dispatch.parse_failures(), 0);
+        assert!(!dispatch.needs_queue_interrupt());
+        assert_eq!(read_interrupt_status(&handler), 0);
+        assert!(handler.pending_queue_notifications().is_empty());
+        let active_tx_queue = handler
+            .activation_handler()
+            .active_tx_dispatch_queue()
+            .expect("TX dispatch queue should remain active");
+        assert_eq!(active_tx_queue.available_ring().next_avail(), 0);
+        assert_eq!(active_tx_queue.used_ring().next_used(), 0);
+        assert_eq!(read_vsock_tx_used_index(&memory), 0);
+    }
+
+    #[test]
     fn virtio_vsock_notifications_complete_malformed_tx_packet_and_mark_interrupt() {
         let mut memory = vsock_tx_memory();
         let mut handler = virtio_vsock_mmio_handler(3).expect("vsock handler should build");
