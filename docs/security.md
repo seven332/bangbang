@@ -171,11 +171,12 @@ The current scaffold does not implement:
   sink plus empty RX source, and still lacks a macOS sandbox, host resource
   broker, connectivity policy, and live vmnet integration proof. The current
   vsock API path validates and stores `guest_cid` plus `uds_path` before boot.
-  The runtime crate has an internal virtio-vsock config-space and inert MMIO
-  handler skeleton that exposes only the configured guest CID through bounded
-  config reads. It does not open, bind, connect, unlink, or create `uds_path`,
-  does not attach a guest-visible startup device, and does not implement host
-  Unix socket backend behavior, CID routing, or data movement
+  The runtime crate has an internal virtio-vsock prepared resource, config-space,
+  and inert MMIO handler skeleton that preserve the configured socket path and
+  expose only the configured guest CID through bounded config reads. Preparation
+  does not open, bind, connect, unlink, or create `uds_path`, does not attach a
+  guest-visible startup device, and does not implement host Unix socket backend
+  behavior, CID routing, or data movement
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 
