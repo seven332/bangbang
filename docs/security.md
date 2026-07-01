@@ -160,8 +160,9 @@ The current scaffold does not implement:
   vmnet descriptor, lifecycle, start owner, concrete system start/stop backend,
   packet descriptor, single-packet system read/write backend boundaries, and an
   internal virtio-net adapter that can move packets between vmnet and the
-  runtime packet traits for future host networking, but these boundaries are not
-  connected to process startup and bangbang startup does not call
+  runtime packet traits for future host networking, plus an internal provider
+  that can select prebuilt adapters by configured interface ID, but these
+  boundaries are not connected to process startup and bangbang startup does not call
   `vmnet_start_interface`, `vmnet_stop_interface`, `vmnet_read`, or
   `vmnet_write`. The default provider is a no-op TX sink plus an empty RX source
   and bangbang still does not open host networking resources. The current vsock

@@ -10,6 +10,10 @@ use bangbang_runtime::network::{
     VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame, VirtioNetworkTxPacketSink,
     VirtioNetworkTxPacketSinkError,
 };
+use bangbang_runtime::startup::{
+    Arm64BootNetworkDevice, Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError,
+    Arm64BootNetworkPacketIoProvider,
+};
 
 use crate::host_network::vmnet::{
     VmnetPacketDescriptorError, VmnetPacketIoBackend, VmnetPacketIoError, VmnetReadPacket,
@@ -93,6 +97,105 @@ where
 
     pub fn rx_source(&mut self) -> &mut VmnetVirtioNetworkRxPacketSource<B> {
         &mut self.rx_source
+    }
+}
+
+#[derive(Debug)]
+pub struct VmnetVirtioNetworkPacketIoProviderEntry<B>
+where
+    B: VmnetPacketIoBackend,
+{
+    iface_id: String,
+    packet_io: VmnetVirtioNetworkPacketIo<B>,
+}
+
+impl<B> VmnetVirtioNetworkPacketIoProviderEntry<B>
+where
+    B: VmnetPacketIoBackend,
+{
+    pub fn new(iface_id: impl Into<String>, packet_io: VmnetVirtioNetworkPacketIo<B>) -> Self {
+        Self {
+            iface_id: iface_id.into(),
+            packet_io,
+        }
+    }
+
+    pub fn iface_id(&self) -> &str {
+        &self.iface_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VmnetVirtioNetworkPacketIoProviderBuildError {
+    DuplicateInterfaceId { iface_id: String },
+}
+
+impl fmt::Display for VmnetVirtioNetworkPacketIoProviderBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateInterfaceId { iface_id } => {
+                write!(f, "duplicate vmnet packet I/O interface id {iface_id}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VmnetVirtioNetworkPacketIoProviderBuildError {}
+
+#[derive(Debug)]
+pub struct VmnetVirtioNetworkPacketIoProvider<B>
+where
+    B: VmnetPacketIoBackend,
+{
+    entries: Vec<VmnetVirtioNetworkPacketIoProviderEntry<B>>,
+}
+
+impl<B> VmnetVirtioNetworkPacketIoProvider<B>
+where
+    B: VmnetPacketIoBackend,
+{
+    pub fn new(
+        entries: Vec<VmnetVirtioNetworkPacketIoProviderEntry<B>>,
+    ) -> Result<Self, VmnetVirtioNetworkPacketIoProviderBuildError> {
+        for (index, entry) in entries.iter().enumerate() {
+            if entries
+                .iter()
+                .skip(index + 1)
+                .any(|candidate| candidate.iface_id == entry.iface_id)
+            {
+                return Err(
+                    VmnetVirtioNetworkPacketIoProviderBuildError::DuplicateInterfaceId {
+                        iface_id: entry.iface_id.clone(),
+                    },
+                );
+            }
+        }
+
+        Ok(Self { entries })
+    }
+}
+
+impl<B> Arm64BootNetworkPacketIoProvider for VmnetVirtioNetworkPacketIoProvider<B>
+where
+    B: VmnetPacketIoBackend,
+{
+    fn packet_io(
+        &mut self,
+        device: &Arm64BootNetworkDevice,
+    ) -> Result<Arm64BootNetworkPacketIo<'_>, Arm64BootNetworkPacketIoError> {
+        let iface_id = device.registration.iface_id();
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.iface_id == iface_id)
+        else {
+            return Err(Arm64BootNetworkPacketIoError::new(format!(
+                "missing vmnet packet I/O for interface {iface_id}"
+            )));
+        };
+
+        let VmnetVirtioNetworkPacketIo { tx_sink, rx_source } = &mut entry.packet_io;
+        Ok(Arm64BootNetworkPacketIo::new(tx_sink, rx_source))
     }
 }
 
@@ -400,20 +503,27 @@ mod tests {
     use std::ptr;
     use std::sync::Arc;
 
+    use bangbang_runtime::fdt::{Arm64FdtRegion, Arm64FdtVirtioMmioDevice};
+    use bangbang_runtime::interrupt::GuestInterruptLine;
     use bangbang_runtime::memory::{
         GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
     };
+    use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::network::{
-        VIRTIO_NET_TX_HEADER_SIZE, VirtioNetworkRxPacketSource, VirtioNetworkTxFrame,
-        VirtioNetworkTxPacketSink,
+        NetworkInterfaceConfigInput, NetworkInterfaceConfigs, NetworkMmioLayout,
+        PreparedNetworkDevices, VIRTIO_NET_TX_HEADER_SIZE, VirtioNetworkRxPacketSource,
+        VirtioNetworkTxFrame, VirtioNetworkTxPacketSink,
     };
+    use bangbang_runtime::startup::{Arm64BootNetworkDevice, Arm64BootNetworkPacketIoProvider};
     use bangbang_runtime::virtio_queue::{
         VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESCRIPTOR_SIZE, read_descriptor_chain,
     };
 
     use super::{
         VmnetPacketIoBackend, VmnetPacketIoError, VmnetReadPacket, VmnetVirtioNetworkPacketIo,
-        VmnetVirtioNetworkPacketIoBuildError, VmnetWritePacket,
+        VmnetVirtioNetworkPacketIoBuildError, VmnetVirtioNetworkPacketIoProvider,
+        VmnetVirtioNetworkPacketIoProviderBuildError, VmnetVirtioNetworkPacketIoProviderEntry,
+        VmnetWritePacket,
     };
     use crate::host_network::vmnet::{VmnetOperation, VmnetPacketCountExpectation};
 
@@ -608,6 +718,44 @@ mod tests {
     ) -> VmnetVirtioNetworkPacketIo<FakeVmnetPacketIoBackend> {
         VmnetVirtioNetworkPacketIo::with_rx_buffer_len(backend, fake_interface(), 2048)
             .expect("packet I/O should build")
+    }
+
+    fn provider_entry(
+        iface_id: &str,
+        backend: FakeVmnetPacketIoBackend,
+    ) -> VmnetVirtioNetworkPacketIoProviderEntry<FakeVmnetPacketIoBackend> {
+        VmnetVirtioNetworkPacketIoProviderEntry::new(iface_id, packet_io(backend))
+    }
+
+    fn network_device(iface_id: &str) -> Arm64BootNetworkDevice {
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(NetworkInterfaceConfigInput::new(iface_id, iface_id, "tap0"))
+            .expect("network config should insert");
+        let prepared =
+            PreparedNetworkDevices::from_configs(&configs).expect("network device should prepare");
+        let (_dispatcher, mut registrations) = prepared
+            .register_mmio(NetworkMmioLayout::new(
+                GuestAddress::new(0x6000_0000),
+                MmioRegionId::new(1000),
+            ))
+            .expect("network MMIO should register")
+            .into_parts();
+        let registration = registrations
+            .pop()
+            .expect("one network registration should be present");
+
+        Arm64BootNetworkDevice {
+            registration,
+            fdt_device: Arm64FdtVirtioMmioDevice {
+                region: Arm64FdtRegion {
+                    base: 0x6000_0000,
+                    size: 0x1000,
+                },
+                interrupt_line: GuestInterruptLine::new(33)
+                    .expect("test interrupt line should be valid"),
+            },
+        }
     }
 
     fn unexpected_count_error(operation: VmnetOperation) -> VmnetPacketIoError {
@@ -895,5 +1043,139 @@ mod tests {
         fn assert_send<T: Send>() {}
 
         assert_send::<VmnetVirtioNetworkPacketIo<FakeVmnetPacketIoBackend>>();
+    }
+
+    #[test]
+    fn provider_returns_packet_io_for_matching_interface() {
+        let mut provider = VmnetVirtioNetworkPacketIoProvider::new(vec![provider_entry(
+            "eth0",
+            FakeVmnetPacketIoBackend::default(),
+        )])
+        .expect("provider should build");
+        let device = network_device("eth0");
+
+        provider
+            .packet_io(&device)
+            .expect("matching provider entry should return packet I/O");
+    }
+
+    #[test]
+    fn provider_rejects_duplicate_interface_ids() {
+        let error = VmnetVirtioNetworkPacketIoProvider::new(vec![
+            provider_entry("eth0", FakeVmnetPacketIoBackend::default()),
+            provider_entry("eth0", FakeVmnetPacketIoBackend::default()),
+        ])
+        .expect_err("duplicate interface ids should fail");
+
+        assert!(matches!(
+            error,
+            VmnetVirtioNetworkPacketIoProviderBuildError::DuplicateInterfaceId { ref iface_id }
+                if iface_id == "eth0"
+        ));
+    }
+
+    #[test]
+    fn provider_reports_missing_interface_id() {
+        let mut provider = VmnetVirtioNetworkPacketIoProvider::new(vec![provider_entry(
+            "eth0",
+            FakeVmnetPacketIoBackend::default(),
+        )])
+        .expect("provider should build");
+        let device = network_device("eth1");
+
+        let error = provider
+            .packet_io(&device)
+            .expect_err("missing provider entry should fail");
+
+        assert_eq!(
+            error.message(),
+            "missing vmnet packet I/O for interface eth1"
+        );
+    }
+
+    #[test]
+    fn provider_keeps_per_interface_packet_state_independent() {
+        let mut provider = VmnetVirtioNetworkPacketIoProvider::new(vec![
+            provider_entry(
+                "eth0",
+                FakeVmnetPacketIoBackend::default().with_read_result(Ok(Some(vec![0x10]))),
+            ),
+            provider_entry(
+                "eth1",
+                FakeVmnetPacketIoBackend::default().with_read_result(Ok(Some(vec![0x20]))),
+            ),
+        ])
+        .expect("provider should build");
+        let mut memory = tx_memory();
+        let eth0_frame = tx_frame(&mut memory, &[(&[0xa0], PAYLOAD_ADDRESS)]);
+        let eth1_frame = tx_frame(&mut memory, &[(&[0xb0], SECOND_PAYLOAD_ADDRESS)]);
+
+        {
+            let eth0 = provider
+                .entries
+                .iter_mut()
+                .find(|entry| entry.iface_id() == "eth0")
+                .expect("eth0 entry should exist");
+            eth0.packet_io
+                .tx_sink()
+                .transmit_frame(&memory, &eth0_frame)
+                .expect("eth0 TX should succeed");
+            let packet = eth0
+                .packet_io
+                .rx_source()
+                .peek_packet()
+                .expect("eth0 RX should succeed")
+                .expect("eth0 packet should exist");
+            assert_eq!(packet.bytes(), &[0x10]);
+        }
+
+        {
+            let eth1 = provider
+                .entries
+                .iter_mut()
+                .find(|entry| entry.iface_id() == "eth1")
+                .expect("eth1 entry should exist");
+            eth1.packet_io
+                .tx_sink()
+                .transmit_frame(&memory, &eth1_frame)
+                .expect("eth1 TX should succeed");
+            let packet = eth1
+                .packet_io
+                .rx_source()
+                .peek_packet()
+                .expect("eth1 RX should succeed")
+                .expect("eth1 packet should exist");
+            assert_eq!(packet.bytes(), &[0x20]);
+        }
+
+        {
+            let eth0 = provider
+                .entries
+                .iter_mut()
+                .find(|entry| entry.iface_id() == "eth0")
+                .expect("eth0 entry should exist");
+            let eth0_state = eth0
+                .packet_io
+                .tx_sink()
+                .shared
+                .lock()
+                .expect("eth0 state lock should succeed");
+            assert_eq!(eth0_state.backend.written_packets, [vec![0xa0]]);
+        }
+
+        {
+            let eth1 = provider
+                .entries
+                .iter_mut()
+                .find(|entry| entry.iface_id() == "eth1")
+                .expect("eth1 entry should exist");
+            let eth1_state = eth1
+                .packet_io
+                .tx_sink()
+                .shared
+                .lock()
+                .expect("eth1 state lock should succeed");
+            assert_eq!(eth1_state.backend.written_packets, [vec![0xb0]]);
+        }
     }
 }
