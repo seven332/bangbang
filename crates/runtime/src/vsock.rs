@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque, hash_map::Entry};
 use std::fmt;
 use std::fs;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -713,6 +713,7 @@ impl VsockHostConnectionKey {
 pub struct VsockHostConnection {
     accepted: VsockHostAcceptedConnection,
     request_packet_pending: bool,
+    host_ack_sent: bool,
 }
 
 impl VsockHostConnection {
@@ -720,6 +721,7 @@ impl VsockHostConnection {
         Self {
             accepted,
             request_packet_pending: true,
+            host_ack_sent: false,
         }
     }
 
@@ -729,6 +731,34 @@ impl VsockHostConnection {
 
     const fn has_pending_request_packet(&self) -> bool {
         self.request_packet_pending
+    }
+
+    #[cfg(test)]
+    const fn host_ack_sent(&self) -> bool {
+        self.host_ack_sent
+    }
+
+    fn acknowledge_guest_response(
+        &mut self,
+        key: VsockHostConnectionKey,
+    ) -> Result<(), VsockHostConnectionAcknowledgeError> {
+        if self.host_ack_sent {
+            return Err(VsockHostConnectionAcknowledgeError::AlreadyAcknowledged);
+        }
+
+        let message = format!("OK {}\n", key.local_port().raw());
+        let mut stream = self.accepted.stream();
+        match stream.write(message.as_bytes()) {
+            Ok(written) if written == message.len() => {
+                self.host_ack_sent = true;
+                Ok(())
+            }
+            Ok(written) => Err(VsockHostConnectionAcknowledgeError::ShortWrite {
+                expected: message.len(),
+                written,
+            }),
+            Err(err) => Err(VsockHostConnectionAcknowledgeError::Write(err.kind())),
+        }
     }
 
     fn take_pending_request_packet_header(
@@ -744,6 +774,32 @@ impl VsockHostConnection {
         Some(host_connection_request_packet_header(key, guest_cid))
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VsockHostConnectionAcknowledgeError {
+    AlreadyAcknowledged,
+    ShortWrite { expected: usize, written: usize },
+    Write(std::io::ErrorKind),
+}
+
+impl fmt::Display for VsockHostConnectionAcknowledgeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyAcknowledged => {
+                f.write_str("vsock host connection was already acknowledged")
+            }
+            Self::ShortWrite { expected, written } => write!(
+                f,
+                "short write while acknowledging vsock host connection: wrote {written} of {expected} bytes"
+            ),
+            Self::Write(kind) => {
+                write!(f, "failed to acknowledge vsock host connection: {kind:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VsockHostConnectionAcknowledgeError {}
 
 fn host_connection_request_packet_header(
     key: VsockHostConnectionKey,
@@ -856,6 +912,69 @@ impl VsockHostConnectionTable {
             .take_pending_request_packet_header(key, guest_cid)
     }
 
+    fn acknowledge_guest_response_packet(
+        &mut self,
+        packet: &VirtioVsockTxPacket,
+        guest_cid: u32,
+    ) -> Option<VsockHostGuestResponseOutcome> {
+        let header = packet.header();
+        if header.operation() != VIRTIO_VSOCK_OP_RESPONSE {
+            return None;
+        }
+
+        if header.packet_type() != VIRTIO_VSOCK_PACKET_TYPE_STREAM {
+            return Some(VsockHostGuestResponseOutcome::Ignored {
+                reason: VsockHostGuestResponseIgnoreReason::UnsupportedPacketType,
+            });
+        }
+        if header.payload_len() != 0 {
+            return Some(VsockHostGuestResponseOutcome::Ignored {
+                reason: VsockHostGuestResponseIgnoreReason::PayloadPresent,
+            });
+        }
+        if header.src_cid() != u64::from(guest_cid) {
+            return Some(VsockHostGuestResponseOutcome::Ignored {
+                reason: VsockHostGuestResponseIgnoreReason::WrongSourceCid,
+            });
+        }
+        if header.dst_cid() != VIRTIO_VSOCK_HOST_CID {
+            return Some(VsockHostGuestResponseOutcome::Ignored {
+                reason: VsockHostGuestResponseIgnoreReason::WrongDestinationCid,
+            });
+        }
+
+        let Ok(local_port) = VsockHostLocalPort::try_from_raw(header.dst_port()) else {
+            return Some(VsockHostGuestResponseOutcome::Ignored {
+                reason: VsockHostGuestResponseIgnoreReason::InvalidLocalPort,
+            });
+        };
+        let key = VsockHostConnectionKey::new(local_port, header.src_port());
+        let Some(connection) = self.connections.get_mut(&key) else {
+            return Some(VsockHostGuestResponseOutcome::Ignored {
+                reason: VsockHostGuestResponseIgnoreReason::MissingConnection,
+            });
+        };
+        if connection.has_pending_request_packet() {
+            return Some(VsockHostGuestResponseOutcome::Ignored {
+                reason: VsockHostGuestResponseIgnoreReason::RequestStillPending,
+            });
+        }
+
+        match connection.acknowledge_guest_response(key) {
+            Ok(()) => Some(VsockHostGuestResponseOutcome::Acknowledged { key }),
+            Err(VsockHostConnectionAcknowledgeError::AlreadyAcknowledged) => {
+                Some(VsockHostGuestResponseOutcome::Ignored {
+                    reason: VsockHostGuestResponseIgnoreReason::AlreadyAcknowledged,
+                })
+            }
+            Err(source) => {
+                let removed = self.remove(key);
+                debug_assert!(removed);
+                Some(VsockHostGuestResponseOutcome::Dropped { key, source })
+            }
+        }
+    }
+
     fn first_pending_request_packet_key(&self) -> Option<VsockHostConnectionKey> {
         self.connections
             .iter()
@@ -880,6 +999,32 @@ impl Default for VsockHostConnectionTable {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VsockHostGuestResponseOutcome {
+    Acknowledged {
+        key: VsockHostConnectionKey,
+    },
+    Ignored {
+        reason: VsockHostGuestResponseIgnoreReason,
+    },
+    Dropped {
+        key: VsockHostConnectionKey,
+        source: VsockHostConnectionAcknowledgeError,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VsockHostGuestResponseIgnoreReason {
+    UnsupportedPacketType,
+    PayloadPresent,
+    WrongSourceCid,
+    WrongDestinationCid,
+    InvalidLocalPort,
+    MissingConnection,
+    RequestStillPending,
+    AlreadyAcknowledged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3100,6 +3245,24 @@ impl VirtioVsockDevice {
         dispatch
     }
 
+    fn dispatch_guest_response_packets(
+        &mut self,
+        tx_dispatch: &VirtioVsockTxQueueDispatch,
+    ) -> VirtioVsockGuestResponseDispatch {
+        let mut dispatch = VirtioVsockGuestResponseDispatch::new();
+
+        for packet in tx_dispatch.packets() {
+            if let Some(outcome) = self
+                .host_connections
+                .acknowledge_guest_response_packet(packet, self.guest_cid)
+            {
+                dispatch.record(outcome);
+            }
+        }
+
+        dispatch
+    }
+
     fn dispatch_drained_queue_notifications(
         &mut self,
         memory: &mut GuestMemory,
@@ -3110,6 +3273,7 @@ impl VirtioVsockDevice {
                 return Ok(VirtioVsockDeviceNotificationDispatch::new(
                     drained_notifications,
                     VirtioVsockHostRequestDispatch::new(),
+                    VirtioVsockGuestResponseDispatch::new(),
                     None,
                     None,
                 ));
@@ -3148,6 +3312,7 @@ impl VirtioVsockDevice {
             return Ok(VirtioVsockDeviceNotificationDispatch::new(
                 drained_notifications,
                 host_request_dispatch,
+                VirtioVsockGuestResponseDispatch::new(),
                 None,
                 None,
             ));
@@ -3182,7 +3347,7 @@ impl VirtioVsockDevice {
             None
         };
 
-        let tx_queue_dispatch = if dispatch_tx {
+        let (tx_queue_dispatch, guest_response_dispatch) = if dispatch_tx {
             let Some(queue) = self.active_tx_queue.as_mut() else {
                 return Err(VirtioVsockDeviceNotificationError::Inactive {
                     drained_notifications,
@@ -3190,7 +3355,10 @@ impl VirtioVsockDevice {
             };
 
             match queue.dispatch(memory) {
-                Ok(dispatch) => Some(dispatch),
+                Ok(dispatch) => {
+                    let guest_response_dispatch = self.dispatch_guest_response_packets(&dispatch);
+                    (Some(dispatch), guest_response_dispatch)
+                }
                 Err(source) => {
                     return Err(VirtioVsockDeviceNotificationError::TxQueueDispatch {
                         drained_notifications,
@@ -3200,12 +3368,13 @@ impl VirtioVsockDevice {
                 }
             }
         } else {
-            None
+            (None, VirtioVsockGuestResponseDispatch::new())
         };
 
         Ok(VirtioVsockDeviceNotificationDispatch::new(
             drained_notifications,
             host_request_dispatch,
+            guest_response_dispatch,
             rx_queue_dispatch,
             tx_queue_dispatch,
         ))
@@ -3312,6 +3481,7 @@ impl From<VirtioVsockDeviceActivationError> for VirtioMmioDeviceActivationError 
 pub struct VirtioVsockDeviceNotificationDispatch {
     drained_notifications: Vec<usize>,
     host_request_dispatch: VirtioVsockHostRequestDispatch,
+    guest_response_dispatch: VirtioVsockGuestResponseDispatch,
     rx_queue_dispatch: Option<VirtioVsockRxQueueDispatch>,
     tx_queue_dispatch: Option<VirtioVsockTxQueueDispatch>,
 }
@@ -3320,12 +3490,14 @@ impl VirtioVsockDeviceNotificationDispatch {
     const fn new(
         drained_notifications: Vec<usize>,
         host_request_dispatch: VirtioVsockHostRequestDispatch,
+        guest_response_dispatch: VirtioVsockGuestResponseDispatch,
         rx_queue_dispatch: Option<VirtioVsockRxQueueDispatch>,
         tx_queue_dispatch: Option<VirtioVsockTxQueueDispatch>,
     ) -> Self {
         Self {
             drained_notifications,
             host_request_dispatch,
+            guest_response_dispatch,
             rx_queue_dispatch,
             tx_queue_dispatch,
         }
@@ -3337,6 +3509,10 @@ impl VirtioVsockDeviceNotificationDispatch {
 
     pub const fn host_request_dispatch(&self) -> &VirtioVsockHostRequestDispatch {
         &self.host_request_dispatch
+    }
+
+    pub const fn guest_response_dispatch(&self) -> &VirtioVsockGuestResponseDispatch {
+        &self.guest_response_dispatch
     }
 
     pub const fn tx_queue_dispatch(&self) -> Option<&VirtioVsockTxQueueDispatch> {
@@ -3355,6 +3531,56 @@ impl VirtioVsockDeviceNotificationDispatch {
                 .rx_queue_dispatch
                 .as_ref()
                 .is_some_and(VirtioVsockRxQueueDispatch::needs_queue_interrupt)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioVsockGuestResponseDispatch {
+    response_packets: usize,
+    acknowledged_responses: usize,
+    ignored_responses: usize,
+    dropped_connections: usize,
+}
+
+impl VirtioVsockGuestResponseDispatch {
+    const fn new() -> Self {
+        Self {
+            response_packets: 0,
+            acknowledged_responses: 0,
+            ignored_responses: 0,
+            dropped_connections: 0,
+        }
+    }
+
+    pub const fn response_packets(&self) -> usize {
+        self.response_packets
+    }
+
+    pub const fn acknowledged_responses(&self) -> usize {
+        self.acknowledged_responses
+    }
+
+    pub const fn ignored_responses(&self) -> usize {
+        self.ignored_responses
+    }
+
+    pub const fn dropped_connections(&self) -> usize {
+        self.dropped_connections
+    }
+
+    fn record(&mut self, outcome: VsockHostGuestResponseOutcome) {
+        self.response_packets += 1;
+        match outcome {
+            VsockHostGuestResponseOutcome::Acknowledged { .. } => {
+                self.acknowledged_responses += 1;
+            }
+            VsockHostGuestResponseOutcome::Ignored { .. } => {
+                self.ignored_responses += 1;
+            }
+            VsockHostGuestResponseOutcome::Dropped { .. } => {
+                self.dropped_connections += 1;
+            }
+        }
     }
 }
 
@@ -3957,16 +4183,16 @@ mod tests {
         VSOCK_HOST_CONNECT_REQUEST_MAX_LEN, VSOCK_HOST_LOCAL_PORT_BASE,
         VSOCK_HOST_LOCAL_PORT_CAPACITY, VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE,
         VirtioVsockConfigSpace, VirtioVsockDevice, VirtioVsockDeviceActivationError,
-        VirtioVsockHostRequestDispatch, VirtioVsockMmioHandler, VirtioVsockPacketHeader,
-        VirtioVsockPacketLengthError, VirtioVsockQueueBuildError, VirtioVsockRxBufferParseError,
-        VirtioVsockRxQueue, VirtioVsockRxQueueDispatchError, VirtioVsockTxPacket,
-        VirtioVsockTxPacketParseError, VirtioVsockTxQueue, VirtioVsockTxQueueDispatchError,
-        VsockConfigError, VsockConfigInput, VsockHostConnectHandshakeError,
-        VsockHostConnectRequest, VsockHostConnectRequestError, VsockHostConnectionKey,
-        VsockHostConnectionTable, VsockHostConnectionTableError, VsockHostLocalPort,
-        VsockHostLocalPortAllocator, VsockHostLocalPortAllocatorError, VsockHostLocalPortError,
-        VsockHostSocketAcceptError, VsockHostSocketOwner, VsockHostSocketOwnerError,
-        VsockMmioDevice, VsockMmioLayout, VsockMmioRegistrationError,
+        VirtioVsockGuestResponseDispatch, VirtioVsockHostRequestDispatch, VirtioVsockMmioHandler,
+        VirtioVsockPacketHeader, VirtioVsockPacketLengthError, VirtioVsockQueueBuildError,
+        VirtioVsockRxBufferParseError, VirtioVsockRxQueue, VirtioVsockRxQueueDispatchError,
+        VirtioVsockTxPacket, VirtioVsockTxPacketParseError, VirtioVsockTxQueue,
+        VirtioVsockTxQueueDispatchError, VsockConfigError, VsockConfigInput,
+        VsockHostConnectHandshakeError, VsockHostConnectRequest, VsockHostConnectRequestError,
+        VsockHostConnectionKey, VsockHostConnectionTable, VsockHostConnectionTableError,
+        VsockHostLocalPort, VsockHostLocalPortAllocator, VsockHostLocalPortAllocatorError,
+        VsockHostLocalPortError, VsockHostSocketAcceptError, VsockHostSocketOwner,
+        VsockHostSocketOwnerError, VsockMmioDevice, VsockMmioLayout, VsockMmioRegistrationError,
         is_transient_host_socket_accept_error, is_transient_host_socket_read_error,
         parse_vsock_host_connect_request, virtio_vsock_mmio_handler,
     };
@@ -4070,6 +4296,13 @@ mod tests {
         assert_eq!(dispatch.pending_connections(), 0);
     }
 
+    fn assert_empty_guest_response_dispatch(dispatch: &VirtioVsockGuestResponseDispatch) {
+        assert_eq!(dispatch.response_packets(), 0);
+        assert_eq!(dispatch.acknowledged_responses(), 0);
+        assert_eq!(dispatch.ignored_responses(), 0);
+        assert_eq!(dispatch.dropped_connections(), 0);
+    }
+
     fn host_connect_request(peer_port: u32) -> VsockHostConnectRequest {
         let request = format!("CONNECT {peer_port}\n");
         VsockHostConnectRequest::parse(request.as_bytes())
@@ -4129,6 +4362,63 @@ mod tests {
             VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE
         );
         assert_eq!(header.forwarded_count(), 0);
+    }
+
+    fn guest_response_tx_packet(
+        guest_cid: u32,
+        local_port: VsockHostLocalPort,
+        peer_port: u32,
+    ) -> VirtioVsockTxPacket {
+        guest_response_tx_packet_with_header(
+            VirtioVsockPacketHeader::new()
+                .with_src_cid(u64::from(guest_cid))
+                .with_dst_cid(VIRTIO_VSOCK_HOST_CID)
+                .with_src_port(peer_port)
+                .with_dst_port(local_port.raw())
+                .with_packet_type(VIRTIO_VSOCK_PACKET_TYPE_STREAM)
+                .with_operation(VIRTIO_VSOCK_OP_RESPONSE),
+        )
+    }
+
+    fn guest_response_tx_packet_with_header(
+        header: VirtioVsockPacketHeader,
+    ) -> VirtioVsockTxPacket {
+        VirtioVsockTxPacket {
+            descriptor_head: 0,
+            header,
+            payload_segments: Vec::new(),
+        }
+    }
+
+    fn assert_host_ok_message(stream: &mut UnixStream, local_port: VsockHostLocalPort) {
+        let expected = format!("OK {}\n", local_port.raw());
+        let mut buffer = vec![0; expected.len()];
+        stream
+            .read_exact(&mut buffer)
+            .expect("host stream should receive OK message");
+
+        assert_eq!(buffer, expected.as_bytes());
+    }
+
+    fn assert_no_host_message(stream: &mut UnixStream) {
+        stream
+            .set_nonblocking(true)
+            .expect("test stream should switch to nonblocking mode");
+        let mut buffer = [0; 1];
+        let err = stream
+            .read(&mut buffer)
+            .expect_err("host stream should not have readable bytes");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    fn assert_guest_response_ignored(
+        outcome: Option<super::VsockHostGuestResponseOutcome>,
+        reason: super::VsockHostGuestResponseIgnoreReason,
+    ) {
+        assert_eq!(
+            outcome,
+            Some(super::VsockHostGuestResponseOutcome::Ignored { reason })
+        );
     }
 
     fn unique_missing_socket_path() -> String {
@@ -5482,6 +5772,219 @@ mod tests {
         );
         assert!(table.take_pending_request_packet_header(key, 42).is_none());
         assert!(table.contains(key));
+    }
+
+    #[test]
+    fn vsock_host_connection_table_acknowledges_guest_response() {
+        let mut table = VsockHostConnectionTable::new();
+        let (key, mut client) =
+            insert_accepted_host_connection_for_test(&mut table, "table-response", 4000);
+        let request = table
+            .take_pending_request_packet_header(key, 42)
+            .expect("pending request should be delivered before response");
+        assert_host_connection_request_header(request, 42, key.local_port(), 4000);
+
+        let outcome = table.acknowledge_guest_response_packet(
+            &guest_response_tx_packet(42, key.local_port(), 4000),
+            42,
+        );
+
+        assert_eq!(
+            outcome,
+            Some(super::VsockHostGuestResponseOutcome::Acknowledged { key })
+        );
+        assert!(
+            table
+                .get(key)
+                .expect("acknowledged connection should stay retained")
+                .host_ack_sent()
+        );
+        assert_host_ok_message(&mut client, key.local_port());
+    }
+
+    #[test]
+    fn vsock_host_connection_table_ignores_guest_response_before_request_delivery() {
+        let mut table = VsockHostConnectionTable::new();
+        let (key, mut client) =
+            insert_accepted_host_connection_for_test(&mut table, "table-pending-response", 4000);
+
+        let outcome = table.acknowledge_guest_response_packet(
+            &guest_response_tx_packet(42, key.local_port(), 4000),
+            42,
+        );
+
+        assert_guest_response_ignored(
+            outcome,
+            super::VsockHostGuestResponseIgnoreReason::RequestStillPending,
+        );
+        assert!(
+            !table
+                .get(key)
+                .expect("ignored response should keep connection")
+                .host_ack_sent()
+        );
+        assert_no_host_message(&mut client);
+    }
+
+    #[test]
+    fn vsock_host_connection_table_ignores_duplicate_guest_response() {
+        let mut table = VsockHostConnectionTable::new();
+        let (key, mut client) =
+            insert_accepted_host_connection_for_test(&mut table, "table-duplicate-response", 4000);
+        let _request = table
+            .take_pending_request_packet_header(key, 42)
+            .expect("pending request should be delivered before response");
+        let packet = guest_response_tx_packet(42, key.local_port(), 4000);
+
+        assert_eq!(
+            table.acknowledge_guest_response_packet(&packet, 42),
+            Some(super::VsockHostGuestResponseOutcome::Acknowledged { key })
+        );
+        assert_host_ok_message(&mut client, key.local_port());
+        assert_guest_response_ignored(
+            table.acknowledge_guest_response_packet(&packet, 42),
+            super::VsockHostGuestResponseIgnoreReason::AlreadyAcknowledged,
+        );
+        assert_no_host_message(&mut client);
+        assert!(table.contains(key));
+    }
+
+    #[test]
+    fn vsock_host_connection_table_acknowledges_only_matching_guest_response() {
+        let mut table = VsockHostConnectionTable::new();
+        let (first_key, mut first_client) =
+            insert_accepted_host_connection_for_test(&mut table, "table-first-response", 4000);
+        let (second_key, mut second_client) =
+            insert_accepted_host_connection_for_test(&mut table, "table-second-response", 5000);
+        let _first_request = table
+            .take_pending_request_packet_header(first_key, 42)
+            .expect("first pending request should be delivered before response");
+        let _second_request = table
+            .take_pending_request_packet_header(second_key, 42)
+            .expect("second pending request should be delivered before response");
+
+        let outcome = table.acknowledge_guest_response_packet(
+            &guest_response_tx_packet(42, second_key.local_port(), 5000),
+            42,
+        );
+
+        assert_eq!(
+            outcome,
+            Some(super::VsockHostGuestResponseOutcome::Acknowledged { key: second_key })
+        );
+        assert!(
+            !table
+                .get(first_key)
+                .expect("unmatched connection should stay retained")
+                .host_ack_sent()
+        );
+        assert!(
+            table
+                .get(second_key)
+                .expect("matched connection should stay retained")
+                .host_ack_sent()
+        );
+        assert_no_host_message(&mut first_client);
+        assert_host_ok_message(&mut second_client, second_key.local_port());
+    }
+
+    #[test]
+    fn vsock_host_connection_table_ignores_unroutable_guest_responses() {
+        let mut table = VsockHostConnectionTable::new();
+        let (key, mut client) =
+            insert_accepted_host_connection_for_test(&mut table, "table-ignore-response", 4000);
+        let _request = table
+            .take_pending_request_packet_header(key, 42)
+            .expect("pending request should be delivered before response");
+        let valid_header = guest_response_tx_packet(42, key.local_port(), 4000).header();
+
+        assert_guest_response_ignored(
+            table.acknowledge_guest_response_packet(
+                &guest_response_tx_packet_with_header(valid_header.with_packet_type(0)),
+                42,
+            ),
+            super::VsockHostGuestResponseIgnoreReason::UnsupportedPacketType,
+        );
+        assert_guest_response_ignored(
+            table.acknowledge_guest_response_packet(
+                &guest_response_tx_packet_with_header(valid_header.with_payload_len(1)),
+                42,
+            ),
+            super::VsockHostGuestResponseIgnoreReason::PayloadPresent,
+        );
+        assert_guest_response_ignored(
+            table.acknowledge_guest_response_packet(
+                &guest_response_tx_packet_with_header(valid_header.with_src_cid(43)),
+                42,
+            ),
+            super::VsockHostGuestResponseIgnoreReason::WrongSourceCid,
+        );
+        assert_guest_response_ignored(
+            table.acknowledge_guest_response_packet(
+                &guest_response_tx_packet_with_header(valid_header.with_dst_cid(3)),
+                42,
+            ),
+            super::VsockHostGuestResponseIgnoreReason::WrongDestinationCid,
+        );
+        assert_guest_response_ignored(
+            table.acknowledge_guest_response_packet(
+                &guest_response_tx_packet_with_header(valid_header.with_dst_port(1)),
+                42,
+            ),
+            super::VsockHostGuestResponseIgnoreReason::InvalidLocalPort,
+        );
+        assert_guest_response_ignored(
+            table.acknowledge_guest_response_packet(
+                &guest_response_tx_packet(42, key.local_port(), 4001),
+                42,
+            ),
+            super::VsockHostGuestResponseIgnoreReason::MissingConnection,
+        );
+
+        assert!(
+            !table
+                .get(key)
+                .expect("ignored responses should keep connection")
+                .host_ack_sent()
+        );
+        assert_no_host_message(&mut client);
+    }
+
+    #[test]
+    fn vsock_host_connection_table_drops_connection_when_guest_response_ack_fails() {
+        let mut table = VsockHostConnectionTable::with_local_port_capacity(1);
+        let (key, client) =
+            insert_accepted_host_connection_for_test(&mut table, "table-response-fail", 4000);
+        let _request = table
+            .take_pending_request_packet_header(key, 42)
+            .expect("pending request should be delivered before response");
+        drop(client);
+
+        let outcome = table.acknowledge_guest_response_packet(
+            &guest_response_tx_packet(42, key.local_port(), 4000),
+            42,
+        );
+
+        assert!(matches!(
+            outcome,
+            Some(super::VsockHostGuestResponseOutcome::Dropped {
+                key: dropped_key,
+                ..
+            }) if dropped_key == key
+        ));
+        assert!(!table.contains(key));
+        let (accepted, mut next_client, request) =
+            accepted_host_connection_with_request("table-response-reuse", 4001);
+        let next_key = table
+            .insert_accepted_host_connection(accepted, request)
+            .expect("local port should be reusable after failed response ack");
+        assert_eq!(next_key.local_port(), key.local_port());
+
+        drop(table);
+        assert_stream_closed(
+            &mut next_client,
+            "dropped table should drop reused connection stream",
+        );
     }
 
     #[test]
@@ -8060,6 +8563,7 @@ mod tests {
 
         assert_eq!(dispatch.drained_notifications(), &[]);
         assert_empty_host_request_dispatch(dispatch.host_request_dispatch());
+        assert_empty_guest_response_dispatch(dispatch.guest_response_dispatch());
         assert!(dispatch.rx_queue_dispatch().is_none());
         assert!(dispatch.tx_queue_dispatch().is_none());
         assert!(!dispatch.needs_queue_interrupt());
@@ -8108,6 +8612,7 @@ mod tests {
             &[VIRTIO_VSOCK_RX_QUEUE_INDEX]
         );
         assert_empty_host_request_dispatch(notification.host_request_dispatch());
+        assert_empty_guest_response_dispatch(notification.guest_response_dispatch());
         assert!(!notification.needs_queue_interrupt());
         assert!(notification.tx_queue_dispatch().is_none());
         let rx = notification
@@ -8585,6 +9090,7 @@ mod tests {
         assert_eq!(dispatch.successful_packets(), 1);
         assert_eq!(dispatch.parse_failures(), 0);
         assert!(dispatch.needs_queue_interrupt());
+        assert_empty_guest_response_dispatch(notification.guest_response_dispatch());
         assert_eq!(dispatch.packets()[0].descriptor_head(), 0);
         assert_eq!(
             read_interrupt_status(&handler),
@@ -8599,6 +9105,102 @@ mod tests {
         assert_eq!(active_tx_queue.used_ring().next_used(), 1);
         assert_eq!(read_vsock_tx_used_index(&memory), 1);
         assert_eq!(read_vsock_tx_used_element(&memory, 0), (0, 0));
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_acknowledge_guest_response_to_host_stream() {
+        let mut memory = vsock_tx_memory();
+        let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
+
+        activate_vsock_handler(&mut handler);
+        let (accepted, mut client, request) =
+            accepted_host_connection_with_request("notify-response-ok", 4000);
+        let key = handler
+            .activation_handler_mut()
+            .insert_accepted_host_connection(accepted, request)
+            .expect("host connection should insert");
+        write_vsock_rx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_BUFFER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_rx_available_heads(&mut memory, &[0]);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+        let rx_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("RX host request should dispatch");
+        assert_eq!(
+            rx_notification
+                .rx_queue_dispatch()
+                .expect("RX dispatch summary should be present")
+                .delivered_requests(),
+            1
+        );
+
+        let response_header = VirtioVsockPacketHeader::new()
+            .with_src_cid(42)
+            .with_dst_cid(VIRTIO_VSOCK_HOST_CID)
+            .with_src_port(4000)
+            .with_dst_port(key.local_port().raw())
+            .with_packet_type(VIRTIO_VSOCK_PACKET_TYPE_STREAM)
+            .with_operation(VIRTIO_VSOCK_OP_RESPONSE);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_HEADER, response_header);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_tx_available_heads(&mut memory, &[0]);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let tx_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("TX guest response should dispatch");
+
+        assert_eq!(
+            tx_notification.drained_notifications(),
+            &[VIRTIO_VSOCK_TX_QUEUE_INDEX]
+        );
+        assert!(tx_notification.needs_queue_interrupt());
+        assert_empty_host_request_dispatch(tx_notification.host_request_dispatch());
+        assert_eq!(
+            tx_notification.guest_response_dispatch().response_packets(),
+            1
+        );
+        assert_eq!(
+            tx_notification
+                .guest_response_dispatch()
+                .acknowledged_responses(),
+            1
+        );
+        assert_eq!(
+            tx_notification
+                .guest_response_dispatch()
+                .ignored_responses(),
+            0
+        );
+        assert_eq!(
+            tx_notification
+                .guest_response_dispatch()
+                .dropped_connections(),
+            0
+        );
+        let tx = tx_notification
+            .tx_queue_dispatch()
+            .expect("TX dispatch summary should be present");
+        assert_eq!(tx.processed_packets(), 1);
+        assert_eq!(tx.successful_packets(), 1);
+        assert_eq!(read_vsock_tx_used_index(&memory), 1);
+        assert_eq!(read_vsock_tx_used_element(&memory, 0), (0, 0));
+        assert_host_ok_message(&mut client, key.local_port());
     }
 
     #[test]

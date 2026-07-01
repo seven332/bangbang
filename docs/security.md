@@ -77,13 +77,16 @@ is resource-specific:
   guest RX descriptors, accept one pending host connection per dispatch pass
   into an owned nonblocking stream, retain bounded accepted streams across
   partial handshakes and retained connection records, drop invalid
-  accepted-stream handshakes without exposing host paths, and retry RX delivery
-  when pending host requests exist. Startup
+  accepted-stream handshakes without exposing host paths, retry RX delivery
+  when pending host requests exist, and acknowledge guest `VSOCK_OP_RESPONSE`
+  packets for delivered host requests by writing `OK <local_port>\n` to the
+  retained host stream. Short or failed acknowledgement writes drop the retained
+  connection and release its host local port. Startup
   also binds a nonblocking host Unix listener at `uds_path`, records the
   listener socket device and inode, and removes the path on normal shutdown only
   when it still refers to the socket created by this process. It does not send
-  `OK` or `RST` responses, connect to `uds_path_<PORT>`, route CIDs, or move
-  vsock data yet.
+  `RST` responses, connect to `uds_path_<PORT>`, route CIDs, or move vsock data
+  yet.
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink.
 - `/logger` opens `log_path` during pre-boot configuration when that field is
@@ -207,12 +210,15 @@ The current scaffold does not implement:
   accept one pending host connection per dispatch pass into an owned
   nonblocking stream, retain bounded accepted streams across partial handshakes
   and retained connection records, drop invalid accepted-stream handshakes
-  without exposing host paths, and retry RX delivery when pending host requests
-  exist. Startup
+  without exposing host paths, retry RX delivery when pending host requests
+  exist, and acknowledge guest `VSOCK_OP_RESPONSE` packets for delivered host
+  requests by writing `OK <local_port>\n` to the retained host stream. Short or
+  failed acknowledgement writes drop the retained connection and release its
+  host local port. Startup
   preparation creates a nonblocking host Unix listener at `uds_path` and cleans
   it up only while the path still matches the created socket inode. It does not
-  send `OK` or `RST` responses, connect guest-initiated `uds_path_<PORT>`
-  sockets, route CIDs, dispatch event queues, or move data
+  send `RST` responses, connect guest-initiated `uds_path_<PORT>` sockets, route
+  CIDs, dispatch event queues, or move data
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 
