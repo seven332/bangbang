@@ -352,8 +352,8 @@ pre-boot-only guest configuration section. Valid requests replace the stored
 vsock config and return `204 No Content`; invalid requests fail without
 mutating previous vsock state. The current response reports `guest_cid` and
 `uds_path` while omitting the accepted deprecated `vsock_id`, matching
-Firecracker's effective config output. It does not create a virtio-vsock device,
-open host socket resources, route CIDs, or move data.
+Firecracker's effective config output. It does not attach a guest-visible
+virtio-vsock device, open host socket resources, route CIDs, or move data.
 `SendCtrlAltDel` is rejected at parse time for the first aarch64 target.
 
 Future implementation PRs should derive unit or golden tests from these tables.

@@ -184,9 +184,10 @@ impl VirtioMmioDeviceConfigHandler for VirtioVsockConfigSpace {
         &self,
         access: VirtioMmioDeviceConfigAccess,
     ) -> Result<MmioAccessBytes, VirtioMmioDeviceConfigError> {
-        let [b0, b1, b2, b3, b4, b5, b6, b7] = self.guest_cid_bytes();
+        let bytes = self.guest_cid_bytes();
+        let [b0, b1, b2, b3, b4, b5, b6, b7] = bytes;
         match (access.offset(), access.len()) {
-            (0, 8) => MmioAccessBytes::new(&self.guest_cid_bytes()),
+            (0, 8) => MmioAccessBytes::new(&bytes),
             (0, 4) => MmioAccessBytes::new(&[b0, b1, b2, b3]),
             (4, 4) => MmioAccessBytes::new(&[b4, b5, b6, b7]),
             _ => {
@@ -579,6 +580,24 @@ mod tests {
         assert!(matches!(
             err,
             VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead { offset: 2, len: 4 }
+        ));
+
+        let err = handler
+            .read_access(device_config_access(8, 1))
+            .expect_err("past-end config read should fail");
+
+        assert!(matches!(
+            err,
+            VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead { offset: 8, len: 1 }
+        ));
+
+        let err = handler
+            .read_access(device_config_access(4, 8))
+            .expect_err("straddling config read should fail");
+
+        assert!(matches!(
+            err,
+            VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead { offset: 4, len: 8 }
         ));
     }
 
