@@ -65,9 +65,10 @@ is resource-specific:
   files are opened later during `InstanceStart`.
 - `/vsock` stores the configured Unix socket path during configuration. Startup
   can attach a guest-visible virtio-vsock device whose internal MMIO handler
-  retains active RX, TX, and event queue metadata after `DRIVER_OK`, but the
-  current implementation does not open, bind, connect, unlink, or create that
-  socket path.
+  retains active RX, TX, and event queue metadata after `DRIVER_OK`, and the
+  runtime has an internal Firecracker-shaped packet header model. The current
+  implementation does not open, bind, connect, unlink, or create that socket
+  path.
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink.
 - `/logger` opens `log_path` during pre-boot configuration when that field is
@@ -102,8 +103,9 @@ HVF; local HVF verification should fail when HVF is unavailable.
 
 The guest is untrusted. vCPU execution, guest memory contents, virtqueue
 descriptor chains, MMIO accesses, block requests, virtio-net TX descriptor
-metadata and payload bytes, virtio-net RX buffer descriptors, and future device
-inputs must be validated before they affect host resources.
+metadata and payload bytes, virtio-net RX buffer descriptors, virtio-vsock
+packet headers, and future device inputs must be validated before they affect
+host resources.
 Trapped system-register exits are guest-visible CPU behavior and must stay
 explicit. The current HVF runner emulates only the early-boot `OSDLR_EL1` and
 `OSLAR_EL1` OS lock RAZ/WI behavior needed by the pinned Firecracker kernel;
@@ -174,13 +176,13 @@ The current scaffold does not implement:
   broker, connectivity policy, and live vmnet integration proof. The current
   vsock API path validates and stores `guest_cid` plus `uds_path` before boot.
   The runtime crate has an internal virtio-vsock prepared resource, MMIO
-  registration helper, config-space, MMIO handler skeleton with active queue
-  metadata retention, and startup FDT attachment that preserve the configured
-  socket path and expose only the configured guest CID through bounded config
-  reads. Preparation, MMIO registration, and startup attachment do not open,
-  bind, connect, unlink, or create `uds_path`, and do not implement host Unix
-  socket backend behavior, CID routing, queue notification dispatch, or data
-  movement
+  registration helper, config-space, packet header model, MMIO handler skeleton
+  with active queue metadata retention, and startup FDT attachment that
+  preserve the configured socket path and expose only the configured guest CID
+  through bounded config reads. Preparation, MMIO registration, and startup
+  attachment do not open, bind, connect, unlink, or create `uds_path`, and do
+  not implement host Unix socket backend behavior, CID routing, queue
+  notification dispatch, descriptor parsing, or data movement
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 

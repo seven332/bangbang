@@ -8,7 +8,7 @@ The current repository defines crate boundaries, endpoint names, a minimal
 HTTP-over-Unix-socket API server for `GET /`, `GET /version`,
 `GET /vm/config`, `GET /machine-config`, pre-boot `PUT /machine-config`
 configuration storage, pre-boot `PUT /boot-source` configuration storage, pre-boot `PUT /drives/{drive_id}`
-configuration storage, pre-boot `PUT /network-interfaces/{iface_id}` configuration storage, pre-boot `PUT /vsock` configuration storage plus an internal virtio-vsock config-space, prepared device resource, MMIO registration helper, MMIO handler skeleton with active queue metadata retention, and startup FDT attachment, pre-boot `PUT /metrics` output configuration, pre-boot `PUT /logger` output configuration, process-owned `PUT /actions` startup with an internal boot run-loop worker across bounded step windows, runtime `FlushMetrics` with a minimal per-process metrics sink, a macOS-gated internal vmnet descriptor, lifecycle, start owner, concrete system start/stop backend, and packet descriptor boundary model for future host networking, a backend-neutral VM trait, a minimal VMM action/data model with internal
+configuration storage, pre-boot `PUT /network-interfaces/{iface_id}` configuration storage, pre-boot `PUT /vsock` configuration storage plus an internal virtio-vsock config-space, packet header model, prepared device resource, MMIO registration helper, MMIO handler skeleton with active queue metadata retention, and startup FDT attachment, pre-boot `PUT /metrics` output configuration, pre-boot `PUT /logger` output configuration, process-owned `PUT /actions` startup with an internal boot run-loop worker across bounded step windows, runtime `FlushMetrics` with a minimal per-process metrics sink, a macOS-gated internal vmnet descriptor, lifecycle, start owner, concrete system start/stop backend, and packet descriptor boundary model for future host networking, a backend-neutral VM trait, a minimal VMM action/data model with internal
 `InstanceStart` preflight, transactional startup executor, and successful-start state transition helpers, backend-neutral guest
 physical address and aarch64 DRAM layout/access primitives, arm64 boot
 placement helpers, internal boot-source validation and arm64 kernel/initrd
@@ -233,7 +233,7 @@ compatibility targets.
 | `PATCH` | `/machine-config` | deferred | Partial updates belong with later state and validation rules. |
 | `PUT` | `/cpu-config` | deferred | Needs HVF CPU feature design with VM and boot work in #8 and #10. |
 | `PUT` | `/network-interfaces/{iface_id}` | supported target; configuration storage implemented | Stores up to 16 initial virtio-net configurations before boot without opening host networking resources. Startup preparation attaches configured interfaces as virtio-mmio devices in the MMIO dispatcher and guest FDT. `InstanceStart` revalidates the interface count before opening vmnet resources, then selects vmnet packet I/O only for `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>` host device names; unsupported names fail startup before `Running` is committed. Internal network notification dispatch can route each configured interface through selected packet I/O, parse TX descriptors through a packet sink boundary, and copy injected RX packets into guest buffers through a packet source boundary. Public packet movement, runtime updates, PATCH, and DELETE remain tied to #14. |
-| `PUT` | `/vsock` | supported target; startup attachment implemented | Stores one initial virtio-vsock configuration before boot without opening, binding, connecting, unlinking, or creating host Unix socket resources. Startup preparation attaches the configured device as one virtio-mmio FDT node backed by the internal MMIO handler, which retains active RX, TX, and event queue metadata after `DRIVER_OK`. Queue notification dispatch, host socket backend behavior, guest CID routing, runtime updates, PATCH, and DELETE remain tied to #15. |
+| `PUT` | `/vsock` | supported target; startup attachment implemented | Stores one initial virtio-vsock configuration before boot without opening, binding, connecting, unlinking, or creating host Unix socket resources. Startup preparation attaches the configured device as one virtio-mmio FDT node backed by the internal MMIO handler, which retains active RX, TX, and event queue metadata after `DRIVER_OK`. The runtime has a Firecracker-shaped packet header model for later queue parsing. Queue notification dispatch, host socket backend behavior, guest CID routing, runtime updates, PATCH, and DELETE remain tied to #15. |
 | `GET`, `PUT`, `PATCH` | `/mmds` | deferred | Tied to MMDS work in #16. |
 | `PUT` | `/mmds/config` | deferred | Tied to MMDS work in #16. |
 | `PUT` | `/snapshot/create`, `/snapshot/load` | deferred | Tied to snapshot and restore work in #19. |
@@ -353,8 +353,11 @@ vsock config and return `204 No Content`; invalid requests fail without
 mutating previous vsock state. The current response reports `guest_cid` and
 `uds_path` while omitting the accepted deprecated `vsock_id`, matching
 Firecracker's effective config output. Startup preparation attaches the
-configured virtio-vsock device as guest-visible FDT/MMIO metadata, but it still
-does not open host socket resources, route CIDs, or move data.
+configured virtio-vsock device as guest-visible FDT/MMIO metadata. The runtime
+also models Firecracker's 44-byte little-endian virtio-vsock packet header and
+rejects header byte parsing when payload length exceeds the 64 KiB maximum
+packet buffer length, but it still does not parse descriptor chains, open host
+socket resources, route CIDs, or move data.
 `SendCtrlAltDel` is rejected at parse time for the first aarch64 target.
 
 Future implementation PRs should derive unit or golden tests from these tables.
@@ -561,19 +564,23 @@ and is returned from `GET /vm/config` as `vsock` with `guest_cid` and
 does not open, bind, connect, unlink, or create the configured `uds_path`.
 
 The runtime crate has an internal virtio-vsock prepared resource, MMIO
-registration helper, config-space, MMIO handler skeleton with active queue
-metadata retention, and startup FDT attachment. It uses the
+registration helper, config-space, 44-byte little-endian packet header model,
+MMIO handler skeleton with active queue metadata retention, and startup FDT
+attachment. It uses the
 virtio device id `19`, three 256-entry RX, TX, and event queues, Firecracker's
 `VERSION_1`, `IN_ORDER`, and `EVENT_IDX` feature bits, and a guest-CID config
 field that supports Firecracker-shaped 8-byte and 4-byte-half reads. Config
-writes are rejected. The prepared resource preserves the validated guest CID,
-socket path, config-space, and inactive device state, and the registration
-helper can consume it into a caller-provided internal MMIO dispatcher without
-touching host socket resources. Arm64 startup resource assembly can expose one
+writes are rejected. The packet header model preserves Firecracker's header
+field order and rejects header byte parsing when payload length exceeds
+Firecracker's 64 KiB maximum packet buffer length without reading descriptor
+chains yet. The prepared resource preserves the validated guest CID, socket
+path, config-space, and inactive device state, and the registration helper can
+consume it into a caller-provided internal MMIO dispatcher without touching
+host socket resources. Arm64 startup resource assembly can expose one
 configured vsock device in the guest FDT. After `DRIVER_OK`, the internal
 device retains active RX, TX, and event queue metadata for later notification
-dispatch work. Packet formats, host Unix socket backend behavior, CID routing,
-queue notification dispatch, and data movement remain deferred.
+dispatch work. Host Unix socket backend behavior, CID routing, queue
+notification dispatch, descriptor parsing, and data movement remain deferred.
 
 The runtime crate also has the first backend-neutral virtio-net config-space,
 activation, TX frame parser, RX buffer parser, prepared device resources, and
@@ -1079,7 +1086,7 @@ Their eventual support level should follow the endpoint matrix:
 - virtio-vsock host Unix socket backend behavior, CID routing, and data movement
   beyond pre-boot `/vsock` configuration storage, startup FDT attachment, and
   the internal prepared resource/MMIO registration/config-space/MMIO handler
-  skeleton with active queue metadata retention
+  skeleton with active queue metadata retention plus packet header model
 - snapshots
 - MMDS
 - balloon devices and balloon statistics
