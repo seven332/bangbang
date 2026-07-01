@@ -105,8 +105,9 @@ The guest is untrusted. vCPU execution, guest memory contents, virtqueue
 descriptor chains, MMIO accesses, block requests, virtio-net TX descriptor
 metadata and payload bytes, virtio-net RX buffer descriptors, virtio-vsock
 packet headers, virtio-vsock TX available-ring heads, virtio-vsock TX payload
-descriptor ranges, virtio-vsock TX used-ring completion writes, and future
-device inputs must be validated before they affect host resources.
+descriptor ranges, virtio-vsock TX used-ring completion writes, virtio-vsock
+queue notifications, and future device inputs must be validated before they
+affect host resources.
 Trapped system-register exits are guest-visible CPU behavior and must stay
 explicit. The current HVF runner emulates only the early-boot `OSDLR_EL1` and
 `OSLAR_EL1` OS lock RAZ/WI behavior needed by the pinned Firecracker kernel;
@@ -179,13 +180,14 @@ The current scaffold does not implement:
   The runtime crate has an internal virtio-vsock prepared resource, MMIO
   registration helper, config-space, packet header model, TX descriptor packet
   parser, TX available-ring drain helper with used-ring descriptor completion,
-  MMIO handler skeleton with active queue metadata retention, and startup FDT
-  attachment that preserve the configured socket path and expose only the
-  configured guest CID through bounded config reads. Preparation, MMIO
+  MMIO handler skeleton with active queue metadata retention and TX notification
+  dispatch, and startup FDT attachment that preserve the configured socket path
+  and expose only the configured guest CID through bounded config reads.
+  Preparation, MMIO
   registration, and startup attachment do not open, bind, connect, unlink, or
   create `uds_path`, and do not implement host Unix socket backend behavior,
-  CID routing, MMIO notification-handler wiring, interrupts, RX buffer parsing,
-  or data movement
+  CID routing, startup run-loop notification dispatch, interrupt-line signaling,
+  RX buffer parsing, or data movement
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 
