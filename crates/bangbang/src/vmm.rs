@@ -11,10 +11,18 @@ use bangbang_hvf::{
     HvfVcpuRunnerError, OwnedHvfArm64BootSession,
 };
 use bangbang_runtime::block::BlockMmioLayout;
-use bangbang_runtime::memory::GuestAddress;
+use bangbang_runtime::memory::{GuestAddress, GuestMemory};
 use bangbang_runtime::mmio::MmioRegionId;
-use bangbang_runtime::network::NetworkMmioLayout;
+use bangbang_runtime::network::{
+    NetworkMmioLayout, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
+    VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame, VirtioNetworkTxPacketSink,
+    VirtioNetworkTxPacketSinkError,
+};
 use bangbang_runtime::serial::SharedSerialOutputBuffer;
+use bangbang_runtime::startup::{
+    Arm64BootNetworkDevice, Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError,
+    Arm64BootNetworkPacketIoProvider,
+};
 use bangbang_runtime::{BackendError, VmmAction, VmmActionError, VmmController, VmmData};
 
 #[cfg(test)]
@@ -175,11 +183,130 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
     fn start(&mut self, controller: &VmmController) -> Result<Self::Session, BackendError> {
         let session = OwnedHvfArm64BootSession::new(controller, self.boot_session_config())
             .map_err(|err| BackendError::Hypervisor(err.to_string()))?;
+        let session =
+            ProcessHvfBootSession::new(session, NoopProcessNetworkPacketIoProvider::default());
         HvfBootRunLoopSupervisor::start(session, default_hvf_boot_run_loop_step_limit())
     }
 }
 
-pub(crate) type HvfBootRunLoopSupervisor = BootRunLoopSupervisor<OwnedHvfArm64BootSession>;
+pub(crate) type HvfBootRunLoopSupervisor = BootRunLoopSupervisor<
+    ProcessHvfBootSession<OwnedHvfArm64BootSession, NoopProcessNetworkPacketIoProvider>,
+>;
+
+pub(crate) struct ProcessHvfBootSession<S, P> {
+    session: S,
+    packet_io: P,
+}
+
+impl<S, P> ProcessHvfBootSession<S, P> {
+    const fn new(session: S, packet_io: P) -> Self {
+        Self { session, packet_io }
+    }
+}
+
+impl<S, P> fmt::Debug for ProcessHvfBootSession<S, P>
+where
+    S: fmt::Debug,
+    P: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProcessHvfBootSession")
+            .field("session", &self.session)
+            .field("packet_io", &self.packet_io)
+            .finish()
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct NoopProcessNetworkPacketIoProvider {
+    tx_sink: NoopProcessNetworkTxPacketSink,
+    rx_source: EmptyProcessNetworkRxPacketSource,
+}
+
+impl Arm64BootNetworkPacketIoProvider for NoopProcessNetworkPacketIoProvider {
+    fn packet_io(
+        &mut self,
+        _device: &Arm64BootNetworkDevice,
+    ) -> Result<Arm64BootNetworkPacketIo<'_>, Arm64BootNetworkPacketIoError> {
+        Ok(Arm64BootNetworkPacketIo::new(
+            &mut self.tx_sink,
+            &mut self.rx_source,
+        ))
+    }
+}
+
+#[derive(Debug, Default)]
+struct NoopProcessNetworkTxPacketSink;
+
+impl VirtioNetworkTxPacketSink for NoopProcessNetworkTxPacketSink {
+    fn transmit_frame(
+        &mut self,
+        _memory: &GuestMemory,
+        _frame: &VirtioNetworkTxFrame,
+    ) -> Result<(), VirtioNetworkTxPacketSinkError> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct EmptyProcessNetworkRxPacketSource;
+
+impl VirtioNetworkRxPacketSource for EmptyProcessNetworkRxPacketSource {
+    fn peek_packet(
+        &mut self,
+    ) -> Result<Option<VirtioNetworkRxPacket<'_>>, VirtioNetworkRxPacketSourceError> {
+        Ok(None)
+    }
+
+    fn consume_packet(&mut self) {}
+}
+
+pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
+    type Control: BootRunLoopControl;
+    type Error: fmt::Display + Send + 'static;
+    type Outcome: Clone + fmt::Debug + Send + 'static;
+
+    fn run_loop_control(&self) -> Self::Control;
+
+    fn run_loop_with_network_packet_io<P>(
+        &mut self,
+        stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
+        max_steps: NonZeroUsize,
+        packet_io: &mut P,
+    ) -> Result<Self::Outcome, Self::Error>
+    where
+        P: Arm64BootNetworkPacketIoProvider;
+
+    fn should_continue_after_outcome(outcome: &Self::Outcome) -> bool;
+}
+
+impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
+    type Control = HvfArm64BootRunLoopControl;
+    type Error = HvfArm64BootRunLoopError;
+    type Outcome = HvfArm64BootRunLoopOutcome;
+
+    fn run_loop_control(&self) -> Self::Control {
+        OwnedHvfArm64BootSession::run_loop_control(self)
+    }
+
+    fn run_loop_with_network_packet_io<P>(
+        &mut self,
+        stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
+        max_steps: NonZeroUsize,
+        packet_io: &mut P,
+    ) -> Result<Self::Outcome, Self::Error>
+    where
+        P: Arm64BootNetworkPacketIoProvider,
+    {
+        OwnedHvfArm64BootSession::run_loop_with_network_packet_io(
+            self, stop_token, max_steps, packet_io,
+        )
+    }
+
+    fn should_continue_after_outcome(outcome: &Self::Outcome) -> bool {
+        matches!(outcome, HvfArm64BootRunLoopOutcome::StepLimitReached { .. })
+    }
+}
 
 pub(crate) trait BootRunLoopControl: Clone + fmt::Debug + Send + Sync + 'static {
     type Error: fmt::Display + Send + 'static;
@@ -238,6 +365,33 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
 
     fn should_continue_after_outcome(outcome: &Self::Outcome) -> bool {
         matches!(outcome, HvfArm64BootRunLoopOutcome::StepLimitReached { .. })
+    }
+}
+
+impl<S, P> BootRunLoopSession for ProcessHvfBootSession<S, P>
+where
+    S: NetworkPacketIoRunLoopSession,
+    P: Arm64BootNetworkPacketIoProvider + Send + 'static,
+{
+    type Control = S::Control;
+    type Error = S::Error;
+    type Outcome = S::Outcome;
+
+    fn run_loop_control(&self) -> Self::Control {
+        self.session.run_loop_control()
+    }
+
+    fn run_loop(
+        &mut self,
+        stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
+        max_steps: NonZeroUsize,
+    ) -> Result<Self::Outcome, Self::Error> {
+        self.session
+            .run_loop_with_network_packet_io(stop_token, max_steps, &mut self.packet_io)
+    }
+
+    fn should_continue_after_outcome(outcome: &Self::Outcome) -> bool {
+        S::should_continue_after_outcome(outcome)
     }
 }
 
@@ -437,12 +591,19 @@ mod tests {
 
     use bangbang_runtime::block::{DriveConfigInput, DriveConfigs, PreparedBlockDevices};
     use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::fdt::{Arm64FdtRegion, Arm64FdtVirtioMmioDevice};
+    use bangbang_runtime::interrupt::GuestInterruptLine;
     use bangbang_runtime::mmio::MmioRegion;
     use bangbang_runtime::network::{
-        NetworkInterfaceConfigInput, NetworkInterfaceConfigs, PreparedNetworkDevices,
+        NetworkInterfaceConfigInput, NetworkInterfaceConfigs, NetworkMmioLayout,
+        PreparedNetworkDevices,
     };
     use bangbang_runtime::serial::{
         SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialOutput, SharedSerialOutputBuffer,
+    };
+    use bangbang_runtime::startup::{
+        Arm64BootNetworkDevice, Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError,
+        Arm64BootNetworkPacketIoProvider,
     };
     use bangbang_runtime::{BackendError, InstanceState, VmmAction, VmmActionError};
 
@@ -450,8 +611,9 @@ mod tests {
         BootRunLoopControl, BootRunLoopSession, BootRunLoopSupervisor, BootRunLoopWorkerStatus,
         DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT, DEFAULT_NETWORK_MMIO_BASE,
         DEFAULT_NETWORK_MMIO_REGION_ID, DEFAULT_SERIAL_MMIO_BASE, DEFAULT_SERIAL_MMIO_REGION_ID,
-        HvfInstanceStartExecutor, InstanceStartExecutor, ProcessVmm,
-        default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
+        EmptyProcessNetworkRxPacketSource, HvfInstanceStartExecutor, InstanceStartExecutor,
+        NetworkPacketIoRunLoopSession, NoopProcessNetworkTxPacketSink, ProcessHvfBootSession,
+        ProcessVmm, default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
     };
 
     static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -702,6 +864,109 @@ mod tests {
         }
     }
 
+    struct FakeNetworkPacketIoRunLoopSession {
+        control: FakeRunLoopControl,
+        max_steps_sender: mpsc::Sender<usize>,
+    }
+
+    impl FakeNetworkPacketIoRunLoopSession {
+        const fn new(control: FakeRunLoopControl, max_steps_sender: mpsc::Sender<usize>) -> Self {
+            Self {
+                control,
+                max_steps_sender,
+            }
+        }
+    }
+
+    impl NetworkPacketIoRunLoopSession for FakeNetworkPacketIoRunLoopSession {
+        type Control = FakeRunLoopControl;
+        type Error = FakeRunLoopError;
+        type Outcome = FakeRunLoopOutcome;
+
+        fn run_loop_control(&self) -> Self::Control {
+            self.control.clone()
+        }
+
+        fn run_loop_with_network_packet_io<P>(
+            &mut self,
+            _stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
+            max_steps: NonZeroUsize,
+            packet_io: &mut P,
+        ) -> Result<Self::Outcome, Self::Error>
+        where
+            P: Arm64BootNetworkPacketIoProvider,
+        {
+            let _ = self.max_steps_sender.send(max_steps.get());
+            packet_io
+                .packet_io(&test_boot_network_device())
+                .map_err(|_| FakeRunLoopError)?;
+            Ok(FakeRunLoopOutcome::Terminal)
+        }
+
+        fn should_continue_after_outcome(outcome: &Self::Outcome) -> bool {
+            matches!(outcome, FakeRunLoopOutcome::StepLimitReached)
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingProcessNetworkPacketIoProvider {
+        requested_ifaces: Arc<Mutex<Vec<String>>>,
+        tx_sink: NoopProcessNetworkTxPacketSink,
+        rx_source: EmptyProcessNetworkRxPacketSource,
+    }
+
+    impl RecordingProcessNetworkPacketIoProvider {
+        fn requested_ifaces(&self) -> Arc<Mutex<Vec<String>>> {
+            Arc::clone(&self.requested_ifaces)
+        }
+    }
+
+    impl Arm64BootNetworkPacketIoProvider for RecordingProcessNetworkPacketIoProvider {
+        fn packet_io(
+            &mut self,
+            device: &Arm64BootNetworkDevice,
+        ) -> Result<Arm64BootNetworkPacketIo<'_>, Arm64BootNetworkPacketIoError> {
+            self.requested_ifaces
+                .lock()
+                .expect("requested ifaces should lock")
+                .push(device.registration.iface_id().to_string());
+            Ok(Arm64BootNetworkPacketIo::new(
+                &mut self.tx_sink,
+                &mut self.rx_source,
+            ))
+        }
+    }
+
+    fn test_boot_network_device() -> Arm64BootNetworkDevice {
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0"))
+            .expect("test network config should insert");
+        let prepared = PreparedNetworkDevices::from_configs(&configs)
+            .expect("test network device should prepare");
+        let devices = prepared
+            .register_mmio(NetworkMmioLayout::new(
+                DEFAULT_NETWORK_MMIO_BASE,
+                DEFAULT_NETWORK_MMIO_REGION_ID,
+            ))
+            .expect("test network MMIO should register");
+        let (_dispatcher, mut registrations) = devices.into_parts();
+        let registration = registrations.remove(0);
+        let region = registration.region();
+
+        Arm64BootNetworkDevice {
+            registration,
+            fdt_device: Arm64FdtVirtioMmioDevice {
+                region: Arm64FdtRegion {
+                    base: region.range().start().raw_value(),
+                    size: region.range().size(),
+                },
+                interrupt_line: GuestInterruptLine::new(32)
+                    .expect("test interrupt line should be valid"),
+            },
+        }
+    }
+
     fn configured_vmm(starter: FakeStarter) -> ProcessVmm<FakeStarter> {
         let mut vmm = ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", starter);
         vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
@@ -805,6 +1070,38 @@ mod tests {
                 .registrations()
                 .iter()
                 .all(|network| !network.region().range().overlaps(serial_region.range()))
+        );
+    }
+
+    #[test]
+    fn process_hvf_boot_session_routes_run_loop_through_packet_io() {
+        let control = FakeRunLoopControl::default();
+        let stop_token = control.stop_token();
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let fake_session = FakeNetworkPacketIoRunLoopSession::new(control, max_steps_sender);
+        let provider = RecordingProcessNetworkPacketIoProvider::default();
+        let requested_ifaces = provider.requested_ifaces();
+        let mut session = ProcessHvfBootSession::new(fake_session, provider);
+
+        let result = session
+            .run_loop(
+                &stop_token,
+                NonZeroUsize::new(17).expect("test step limit should be nonzero"),
+            )
+            .expect("process HVF boot session should run");
+
+        assert_eq!(result, FakeRunLoopOutcome::Terminal);
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("fake session should receive step limit"),
+            17
+        );
+        assert_eq!(
+            *requested_ifaces
+                .lock()
+                .expect("requested ifaces should lock"),
+            ["eth0".to_string()]
         );
     }
 

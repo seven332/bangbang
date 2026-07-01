@@ -48,7 +48,10 @@ with a runner-compatible shared MMIO dispatcher, controlled mapped guest-memory
 access, one-step runner-thread MMIO handling, a run-cancellation boundary, a
 virtual-timer-mask control boundary, a bounded internal boot-session run-loop
 pump, owned internal boot-session handle, process-level owned startup-session
-wiring with optional serial capture and boot run-loop supervision across bounded step windows with retained internal worker status, boot block and virtio-net queue interrupt signaling,
+wiring with optional serial capture and boot run-loop supervision across bounded
+step windows with retained internal worker status, process-owned no-op
+virtio-net packet-I/O provider injection, boot block and virtio-net queue
+interrupt signaling,
 virtual timer PPI assertion, per-controller metrics and logger output state, and an initial process startup argument model.
 There is no broader API request body model beyond the initial boot-source,
 drive configuration, machine-configuration, metrics, logger, and actions bodies, public guest
@@ -537,9 +540,9 @@ into the guest FDT while preserving interface order and host device names.
 Internal network notification dispatch can drain pending TX and RX queue
 notifications and can choose injected packet I/O per configured interface at the
 boot-runtime boundary. The HVF boot-session wrapper can invoke that injected
-path while preserving the existing default no-op behavior. TX dispatch walks the
-TX available ring, parses descriptor chains into `VirtioNetworkTxFrame`
-metadata, publishes used-ring
+path, and process-owned startup wires the internal boot loop through a default
+no-op provider. TX dispatch walks the TX available ring, parses descriptor
+chains into `VirtioNetworkTxFrame` metadata, publishes used-ring
 completions with length 0, delivers parsed frames to an injected internal packet
 sink, preserves parse, sink, and partial-dispatch errors, and marks queue
 interrupt status when descriptor heads complete. RX dispatch uses an injected
@@ -547,10 +550,10 @@ internal packet source, copies a zeroed 12-byte virtio-net header plus packet
 payload into validated guest-writable RX buffers, publishes used-ring
 completions with the written length, preserves malformed-buffer and
 partial-dispatch metadata, and marks queue interrupt status when RX buffers
-complete. The default dispatch path uses a no-op TX sink and an empty RX source,
-so current boot sessions still do not open host networking resources or provide
-user-visible packet ingress or egress. These helpers do not advertise MTU,
-choose a host packet backend, or connect packets to the host network.
+complete. The default process provider uses a no-op TX sink and an empty RX
+source, so current boot sessions still do not open host networking resources or
+provide user-visible packet ingress or egress. These helpers do not advertise
+MTU, choose a host packet backend, or connect packets to the host network.
 
 The runtime crate can prepare owned internal block-device resources from a
 validated list of stored drive configs. Preparation opens each backing file,
