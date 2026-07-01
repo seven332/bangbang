@@ -481,7 +481,7 @@ impl Arm64BootVsockNotificationDispatch {
 
 #[derive(Debug)]
 pub enum Arm64BootVsockNotificationOutcome {
-    Dispatched(VirtioVsockDeviceNotificationDispatch),
+    Dispatched(Box<VirtioVsockDeviceNotificationDispatch>),
     DispatchFailed(VirtioVsockDeviceNotificationError),
     HandlerLookupFailed(MmioHandlerLookupError),
 }
@@ -502,9 +502,9 @@ impl Arm64BootVsockNotificationOutcome {
         }
     }
 
-    pub const fn dispatched(&self) -> Option<&VirtioVsockDeviceNotificationDispatch> {
+    pub fn dispatched(&self) -> Option<&VirtioVsockDeviceNotificationDispatch> {
         match self {
-            Self::Dispatched(dispatch) => Some(dispatch),
+            Self::Dispatched(dispatch) => Some(dispatch.as_ref()),
             Self::DispatchFailed(_) | Self::HandlerLookupFailed(_) => None,
         }
     }
@@ -703,7 +703,9 @@ impl Arm64BootRuntimeResources {
             let region_id = device.registration.region_id();
             let outcome = match mmio_dispatcher.handler_mut::<VirtioVsockMmioHandler>(region_id) {
                 Ok(handler) => match handler.dispatch_vsock_queue_notifications(memory) {
-                    Ok(dispatch) => Arm64BootVsockNotificationOutcome::Dispatched(dispatch),
+                    Ok(dispatch) => {
+                        Arm64BootVsockNotificationOutcome::Dispatched(Box::new(dispatch))
+                    }
                     Err(source) => Arm64BootVsockNotificationOutcome::DispatchFailed(source),
                 },
                 Err(source) => Arm64BootVsockNotificationOutcome::HandlerLookupFailed(source),
@@ -1276,7 +1278,7 @@ fn register_serial_mmio(
 mod tests {
     use std::collections::VecDeque;
     use std::fs::{self, OpenOptions};
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1326,10 +1328,10 @@ mod tests {
     };
     use crate::vsock::{
         VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE, VIRTIO_VSOCK_EVENT_QUEUE_INDEX, VIRTIO_VSOCK_HOST_CID,
-        VIRTIO_VSOCK_OP_REQUEST, VIRTIO_VSOCK_PACKET_HEADER_SIZE, VIRTIO_VSOCK_PACKET_TYPE_STREAM,
-        VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_TX_QUEUE_INDEX, VSOCK_HOST_LOCAL_PORT_BASE,
-        VirtioVsockMmioHandler, VirtioVsockPacketHeader, VsockConfigInput,
-        VsockHostSocketOwnerError, VsockMmioLayout,
+        VIRTIO_VSOCK_OP_REQUEST, VIRTIO_VSOCK_OP_RESPONSE, VIRTIO_VSOCK_PACKET_HEADER_SIZE,
+        VIRTIO_VSOCK_PACKET_TYPE_STREAM, VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_TX_QUEUE_INDEX,
+        VSOCK_HOST_LOCAL_PORT_BASE, VirtioVsockMmioHandler, VirtioVsockPacketHeader,
+        VsockConfigInput, VsockHostSocketOwnerError, VsockMmioLayout,
     };
 
     static NEXT_TEST_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -2138,6 +2140,24 @@ mod tests {
             TEST_VSOCK_TX_USED_RING
                 .checked_add(2)
                 .expect("vsock TX used idx address should not overflow"),
+        )
+    }
+
+    fn read_boot_vsock_tx_used_element(
+        memory: &crate::memory::GuestMemory,
+        ring_index: u16,
+    ) -> (u32, u32) {
+        let element = TEST_VSOCK_TX_USED_RING
+            .checked_add(4 + u64::from(ring_index) * 8)
+            .expect("vsock TX used element address should not overflow");
+        (
+            read_guest_u32(memory, element),
+            read_guest_u32(
+                memory,
+                element
+                    .checked_add(4)
+                    .expect("vsock TX used len address should not overflow"),
+            ),
         )
     }
 
@@ -3394,6 +3414,62 @@ mod tests {
             header.buffer_allocation(),
             VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE
         );
+
+        let response_header = VirtioVsockPacketHeader::new()
+            .with_src_cid(44)
+            .with_dst_cid(VIRTIO_VSOCK_HOST_CID)
+            .with_src_port(4000)
+            .with_dst_port(VSOCK_HOST_LOCAL_PORT_BASE)
+            .with_packet_type(VIRTIO_VSOCK_PACKET_TYPE_STREAM)
+            .with_operation(VIRTIO_VSOCK_OP_RESPONSE);
+        write_boot_vsock_tx_packet_header(&mut memory, response_header);
+        write_boot_vsock_tx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_boot_vsock_tx_available_heads(&mut memory, &[0]);
+        notify_boot_vsock_queue(
+            &mut runtime,
+            &mut mmio_dispatcher,
+            VIRTIO_VSOCK_TX_QUEUE_INDEX,
+        );
+
+        let third = runtime
+            .dispatch_vsock_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("guest RESPONSE dispatch should allocate");
+
+        assert_eq!(third.len(), 1);
+        assert!(third.needs_queue_interrupt());
+        let dispatch = third.as_slice()[0]
+            .outcome()
+            .dispatched()
+            .expect("guest RESPONSE should dispatch");
+        assert_eq!(
+            dispatch.drained_notifications(),
+            [VIRTIO_VSOCK_TX_QUEUE_INDEX]
+        );
+        assert_eq!(dispatch.guest_response_dispatch().response_packets(), 1);
+        assert_eq!(
+            dispatch.guest_response_dispatch().acknowledged_responses(),
+            1
+        );
+        let tx = dispatch
+            .tx_queue_dispatch()
+            .expect("guest RESPONSE should produce TX dispatch");
+        assert_eq!(tx.processed_packets(), 1);
+        assert_eq!(tx.successful_packets(), 1);
+        assert_eq!(read_boot_vsock_tx_used_index(&memory), 1);
+        assert_eq!(read_boot_vsock_tx_used_element(&memory, 0), (0, 0));
+        let mut ok = [0; "OK 1073741824\n".len()];
+        client
+            .read_exact(&mut ok)
+            .expect("host stream should receive OK");
+        assert_eq!(&ok, b"OK 1073741824\n");
         assert_eq!(
             read_boot_vsock_mmio_u32(
                 &mut runtime,
