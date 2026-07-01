@@ -3003,6 +3003,15 @@ mod tests {
         (key, client)
     }
 
+    fn assert_stream_closed(stream: &mut UnixStream, context: &str) {
+        stream
+            .set_nonblocking(true)
+            .expect("test stream should switch to nonblocking mode");
+        let mut closed = [0; 1];
+
+        assert_eq!(stream.read(&mut closed).expect(context), 0, "{context}");
+    }
+
     fn unique_missing_socket_path() -> String {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4236,13 +4245,7 @@ mod tests {
             ))
         ));
 
-        let mut closed = [0; 1];
-        assert_eq!(
-            client
-                .read(&mut closed)
-                .expect("failed insertion should drop supplied stream"),
-            0
-        );
+        assert_stream_closed(&mut client, "failed insertion should drop supplied stream");
     }
 
     #[test]
@@ -4263,18 +4266,13 @@ mod tests {
         assert!(table.is_empty());
         assert!(table.get(first).is_none());
 
-        let mut closed = [0; 1];
-        assert_eq!(
-            first_client
-                .read(&mut closed)
-                .expect("removed connection should drop retained stream"),
-            0
+        assert_stream_closed(
+            &mut first_client,
+            "removed connection should drop retained stream",
         );
-        assert_eq!(
-            exhausted_client
-                .read(&mut closed)
-                .expect("exhausted insertion should drop supplied stream"),
-            0
+        assert_stream_closed(
+            &mut exhausted_client,
+            "exhausted insertion should drop supplied stream",
         );
 
         let (second, _second_client) =
@@ -4293,13 +4291,7 @@ mod tests {
             client
         };
 
-        let mut closed = [0; 1];
-        assert_eq!(
-            client
-                .read(&mut closed)
-                .expect("dropped table should drop retained stream"),
-            0
-        );
+        assert_stream_closed(&mut client, "dropped table should drop retained stream");
     }
 
     #[test]
@@ -4322,12 +4314,9 @@ mod tests {
         );
         assert!(table.is_empty());
 
-        let mut closed = [0; 1];
-        assert_eq!(
-            client
-                .read(&mut closed)
-                .expect("exhausted insertion should drop supplied stream"),
-            0
+        assert_stream_closed(
+            &mut client,
+            "exhausted insertion should drop supplied stream",
         );
     }
 
@@ -4354,12 +4343,9 @@ mod tests {
         assert!(table.contains(key));
         assert_eq!(table.len(), 1);
 
-        let mut closed = [0; 1];
-        assert_eq!(
-            duplicate_client
-                .read(&mut closed)
-                .expect("duplicate insertion should drop supplied stream"),
-            0
+        assert_stream_closed(
+            &mut duplicate_client,
+            "duplicate insertion should drop supplied stream",
         );
     }
 
@@ -4386,18 +4372,13 @@ mod tests {
         ));
         assert!(table.remove(key));
 
-        let mut closed = [0; 1];
-        assert_eq!(
-            duplicate_client
-                .read(&mut closed)
-                .expect("duplicate insertion should drop supplied stream"),
-            0
+        assert_stream_closed(
+            &mut duplicate_client,
+            "duplicate insertion should drop supplied stream",
         );
-        assert_eq!(
-            exhausted_client
-                .read(&mut closed)
-                .expect("exhausted insertion should drop supplied stream"),
-            0
+        assert_stream_closed(
+            &mut exhausted_client,
+            "exhausted insertion should drop supplied stream",
         );
 
         let (reused, _reused_client) =
