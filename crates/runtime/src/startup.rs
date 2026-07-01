@@ -3318,7 +3318,7 @@ mod tests {
     }
 
     #[test]
-    fn boot_runtime_vsock_notification_dispatch_delivers_late_host_connect() {
+    fn boot_runtime_vsock_acknowledges_guest_response_after_late_host_connect() {
         let kernel = temp_file("kernel-vsock-late-connect", &arm64_image());
         let socket_path = missing_path("vsock-late-connect.sock");
         let mut controller = controller_with_kernel(kernel.path());
