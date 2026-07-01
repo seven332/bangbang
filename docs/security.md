@@ -69,11 +69,13 @@ is resource-specific:
   runtime has an internal Firecracker-shaped packet header model plus TX
   descriptor packet parser. Startup-level dispatch can drain TX queue
   notifications, complete TX descriptor heads, and signal the allocated vsock
-  queue interrupt line. Startup also binds a nonblocking host Unix listener at
-  `uds_path`, records the listener socket device and inode, and removes the path
-  on normal shutdown only when it still refers to the socket created by this
-  process. It does not accept host connections, connect to `uds_path_<PORT>`,
-  route CIDs, or move vsock data yet.
+  queue interrupt line. The runtime can also parse host `CONNECT <PORT>`
+  requests and allocate Firecracker-shaped host local ports for future
+  host-initiated connections. Startup also binds a nonblocking host Unix
+  listener at `uds_path`, records the listener socket device and inode, and
+  removes the path on normal shutdown only when it still refers to the socket
+  created by this process. It does not accept host connections, connect to
+  `uds_path_<PORT>`, route CIDs, or move vsock data yet.
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink.
 - `/logger` opens `log_path` during pre-boot configuration when that field is
@@ -188,7 +190,9 @@ The current scaffold does not implement:
   MMIO handler skeleton with active queue metadata retention and TX notification
   dispatch, startup FDT attachment, startup-level TX notification dispatch, and
   HVF queue interrupt signaling that expose only the configured guest CID
-  through bounded config reads. Startup preparation creates a nonblocking host
+  through bounded config reads. The runtime can also parse host `CONNECT <PORT>`
+  requests and allocate Firecracker-shaped host local ports for future
+  host-initiated connections. Startup preparation creates a nonblocking host
   Unix listener at `uds_path` and cleans it up only while the path still matches
   the created socket inode. It does not implement host connection acceptance,
   guest-initiated `uds_path_<PORT>` connections, CID routing, RX buffer parsing,

@@ -1,5 +1,6 @@
 //! Backend-neutral vsock configuration model.
 
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -52,6 +53,10 @@ pub const VIRTIO_RING_FEATURE_EVENT_IDX: u32 = 29;
 pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
 pub const VIRTIO_FEATURE_IN_ORDER: u32 = 35;
 pub const VSOCK_HOST_CONNECT_REQUEST_MAX_LEN: usize = 32;
+pub const VSOCK_HOST_LOCAL_PORT_BASE: u32 = 1_u32 << 30;
+pub const VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE: u32 = 1_u32 << 31;
+pub const VSOCK_HOST_LOCAL_PORT_CAPACITY: u32 =
+    VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE - VSOCK_HOST_LOCAL_PORT_BASE;
 
 const VIRTIO_VSOCK_RX_QUEUE_INDEX_U32: u32 = 0;
 const VIRTIO_VSOCK_TX_QUEUE_INDEX_U32: u32 = 1;
@@ -382,6 +387,146 @@ pub fn parse_vsock_host_connect_request(
 
     Ok(VsockHostConnectRequest { guest_port: port })
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct VsockHostLocalPort {
+    raw: u32,
+}
+
+impl VsockHostLocalPort {
+    const fn from_offset(offset: u32) -> Self {
+        Self {
+            raw: VSOCK_HOST_LOCAL_PORT_BASE + offset,
+        }
+    }
+
+    pub fn try_from_raw(raw: u32) -> Result<Self, VsockHostLocalPortError> {
+        Self::try_from(raw)
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.raw
+    }
+
+    const fn offset(self) -> u32 {
+        self.raw - VSOCK_HOST_LOCAL_PORT_BASE
+    }
+}
+
+impl TryFrom<u32> for VsockHostLocalPort {
+    type Error = VsockHostLocalPortError;
+
+    fn try_from(raw: u32) -> Result<Self, Self::Error> {
+        if !(VSOCK_HOST_LOCAL_PORT_BASE..VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE).contains(&raw) {
+            return Err(VsockHostLocalPortError::InvalidRawPort {
+                raw,
+                min: VSOCK_HOST_LOCAL_PORT_BASE,
+                max_exclusive: VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE,
+            });
+        }
+
+        Ok(Self { raw })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VsockHostLocalPortError {
+    InvalidRawPort {
+        raw: u32,
+        min: u32,
+        max_exclusive: u32,
+    },
+}
+
+impl fmt::Display for VsockHostLocalPortError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRawPort {
+                raw,
+                min,
+                max_exclusive,
+            } => write!(
+                f,
+                "vsock host local port {raw} is outside range [{min}, {max_exclusive})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VsockHostLocalPortError {}
+
+#[derive(Debug)]
+pub struct VsockHostLocalPortAllocator {
+    capacity: u32,
+    next_offset: u32,
+    allocated_offsets: HashSet<u32>,
+    freed_offsets: BTreeSet<u32>,
+}
+
+impl VsockHostLocalPortAllocator {
+    pub fn new() -> Self {
+        Self::with_capacity(VSOCK_HOST_LOCAL_PORT_CAPACITY)
+    }
+
+    fn with_capacity(capacity: u32) -> Self {
+        let capacity = capacity.min(VSOCK_HOST_LOCAL_PORT_CAPACITY);
+        Self {
+            capacity,
+            next_offset: 0,
+            allocated_offsets: HashSet::new(),
+            freed_offsets: BTreeSet::new(),
+        }
+    }
+
+    pub fn allocate(&mut self) -> Result<VsockHostLocalPort, VsockHostLocalPortAllocatorError> {
+        if self.next_offset < self.capacity {
+            let offset = self.next_offset;
+            self.next_offset += 1;
+            self.allocated_offsets.insert(offset);
+            return Ok(VsockHostLocalPort::from_offset(offset));
+        }
+
+        let Some(offset) = self.freed_offsets.pop_first() else {
+            return Err(VsockHostLocalPortAllocatorError::Exhausted);
+        };
+        self.allocated_offsets.insert(offset);
+        Ok(VsockHostLocalPort::from_offset(offset))
+    }
+
+    pub fn free(&mut self, port: VsockHostLocalPort) -> bool {
+        let offset = port.offset();
+        if offset >= self.capacity {
+            return false;
+        }
+        if self.allocated_offsets.remove(&offset) {
+            self.freed_offsets.insert(offset);
+            return true;
+        }
+
+        false
+    }
+}
+
+impl Default for VsockHostLocalPortAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VsockHostLocalPortAllocatorError {
+    Exhausted,
+}
+
+impl fmt::Display for VsockHostLocalPortAllocatorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Exhausted => f.write_str("vsock host local port allocation exhausted"),
+        }
+    }
+}
+
+impl std::error::Error for VsockHostLocalPortAllocatorError {}
 
 fn socket_path_exists_without_following_links(
     path: &Path,
@@ -2414,11 +2559,14 @@ mod tests {
         VIRTIO_VSOCK_PACKET_HEADER_SIZE, VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64,
         VIRTIO_VSOCK_PACKET_TYPE_STREAM, VIRTIO_VSOCK_QUEUE_COUNT, VIRTIO_VSOCK_QUEUE_SIZE,
         VIRTIO_VSOCK_QUEUE_SIZES, VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_TX_QUEUE_INDEX,
-        VSOCK_HOST_CONNECT_REQUEST_MAX_LEN, VirtioVsockConfigSpace, VirtioVsockDevice,
-        VirtioVsockDeviceActivationError, VirtioVsockMmioHandler, VirtioVsockPacketHeader,
-        VirtioVsockPacketLengthError, VirtioVsockQueueBuildError, VirtioVsockTxPacket,
-        VirtioVsockTxPacketParseError, VirtioVsockTxQueue, VirtioVsockTxQueueDispatchError,
-        VsockConfigError, VsockConfigInput, VsockHostConnectRequest, VsockHostConnectRequestError,
+        VSOCK_HOST_CONNECT_REQUEST_MAX_LEN, VSOCK_HOST_LOCAL_PORT_BASE,
+        VSOCK_HOST_LOCAL_PORT_CAPACITY, VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE,
+        VirtioVsockConfigSpace, VirtioVsockDevice, VirtioVsockDeviceActivationError,
+        VirtioVsockMmioHandler, VirtioVsockPacketHeader, VirtioVsockPacketLengthError,
+        VirtioVsockQueueBuildError, VirtioVsockTxPacket, VirtioVsockTxPacketParseError,
+        VirtioVsockTxQueue, VirtioVsockTxQueueDispatchError, VsockConfigError, VsockConfigInput,
+        VsockHostConnectRequest, VsockHostConnectRequestError, VsockHostLocalPort,
+        VsockHostLocalPortAllocator, VsockHostLocalPortAllocatorError, VsockHostLocalPortError,
         VsockHostSocketOwner, VsockHostSocketOwnerError, VsockMmioDevice, VsockMmioLayout,
         VsockMmioRegistrationError, parse_vsock_host_connect_request, virtio_vsock_mmio_handler,
     };
@@ -3202,6 +3350,185 @@ mod tests {
     #[test]
     fn host_connect_errors_have_no_sources() {
         assert!(VsockHostConnectRequestError::InvalidPort.source().is_none());
+    }
+
+    #[test]
+    fn host_local_port_accepts_firecracker_range_boundaries() {
+        let first = VsockHostLocalPort::try_from_raw(VSOCK_HOST_LOCAL_PORT_BASE)
+            .expect("port should parse");
+        let last = VsockHostLocalPort::try_from_raw(VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE - 1)
+            .expect("port should parse");
+
+        assert_eq!(first.raw(), VSOCK_HOST_LOCAL_PORT_BASE);
+        assert_eq!(last.raw(), VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE - 1);
+        assert_eq!(VSOCK_HOST_LOCAL_PORT_CAPACITY, 1_u32 << 30);
+    }
+
+    #[test]
+    fn host_local_port_rejects_raw_values_outside_firecracker_range() {
+        for raw in [
+            0,
+            VSOCK_HOST_LOCAL_PORT_BASE - 1,
+            VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE,
+            u32::MAX,
+        ] {
+            let err = VsockHostLocalPort::try_from_raw(raw)
+                .expect_err("raw host local port outside Firecracker range should fail");
+
+            assert_eq!(
+                err,
+                VsockHostLocalPortError::InvalidRawPort {
+                    raw,
+                    min: VSOCK_HOST_LOCAL_PORT_BASE,
+                    max_exclusive: VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn host_local_port_allocator_allocates_first_and_sequential_ports() {
+        let mut allocator = VsockHostLocalPortAllocator::new();
+
+        let first = allocator.allocate().expect("first port should allocate");
+        let second = allocator.allocate().expect("second port should allocate");
+        let third = allocator.allocate().expect("third port should allocate");
+
+        assert_eq!(first.raw(), VSOCK_HOST_LOCAL_PORT_BASE);
+        assert_eq!(second.raw(), VSOCK_HOST_LOCAL_PORT_BASE + 1);
+        assert_eq!(third.raw(), VSOCK_HOST_LOCAL_PORT_BASE + 2);
+    }
+
+    #[test]
+    fn host_local_port_allocator_ports_have_firecracker_shape() {
+        let mut allocator = VsockHostLocalPortAllocator::with_capacity(3);
+
+        for _ in 0..3 {
+            let port = allocator.allocate().expect("port should allocate").raw();
+
+            assert_ne!(port & VSOCK_HOST_LOCAL_PORT_BASE, 0);
+            assert_eq!(port & VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE, 0);
+        }
+    }
+
+    #[test]
+    fn host_local_port_allocator_reports_exhaustion_without_scanning() {
+        let mut allocator = VsockHostLocalPortAllocator::with_capacity(0);
+
+        let err = allocator
+            .allocate()
+            .expect_err("zero-capacity allocator should be exhausted");
+
+        assert_eq!(err, VsockHostLocalPortAllocatorError::Exhausted);
+        assert_eq!(
+            err.to_string(),
+            "vsock host local port allocation exhausted"
+        );
+    }
+
+    #[test]
+    fn host_local_port_allocator_reuses_freed_ports_after_range_exhaustion() {
+        let mut allocator = VsockHostLocalPortAllocator::with_capacity(3);
+        let first = allocator.allocate().expect("first port should allocate");
+        let second = allocator.allocate().expect("second port should allocate");
+        let third = allocator.allocate().expect("third port should allocate");
+
+        assert!(matches!(
+            allocator.allocate(),
+            Err(VsockHostLocalPortAllocatorError::Exhausted)
+        ));
+
+        assert!(allocator.free(second));
+        let reused_second = allocator
+            .allocate()
+            .expect("freed port should allocate after exhaustion");
+        assert_eq!(reused_second, second);
+
+        assert!(allocator.free(first));
+        let reused_first = allocator
+            .allocate()
+            .expect("freed port should allocate after exhaustion");
+        assert_eq!(reused_first, first);
+
+        assert!(allocator.free(third));
+        let reused_third = allocator
+            .allocate()
+            .expect("freed port should allocate after exhaustion");
+        assert_eq!(reused_third, third);
+    }
+
+    #[test]
+    fn host_local_port_allocator_ignores_unknown_and_duplicate_free() {
+        let mut allocator = VsockHostLocalPortAllocator::with_capacity(2);
+        let first = allocator.allocate().expect("first port should allocate");
+        let second = allocator.allocate().expect("second port should allocate");
+
+        assert!(allocator.free(first));
+        assert!(!allocator.free(first));
+        assert!(
+            !allocator.free(
+                VsockHostLocalPort::try_from_raw(VSOCK_HOST_LOCAL_PORT_BASE + 7)
+                    .expect("test port should be in Firecracker range")
+            )
+        );
+        assert_eq!(
+            allocator
+                .allocate()
+                .expect("freed port should allocate after exhaustion"),
+            first
+        );
+        assert!(allocator.free(second));
+    }
+
+    #[test]
+    fn host_local_port_allocator_ignores_never_allocated_ports_within_capacity() {
+        let mut allocator = VsockHostLocalPortAllocator::with_capacity(3);
+        let first = allocator.allocate().expect("first port should allocate");
+        let second = allocator.allocate().expect("second port should allocate");
+        let third = VsockHostLocalPort::try_from_raw(VSOCK_HOST_LOCAL_PORT_BASE + 2)
+            .expect("test port should be in Firecracker range");
+
+        assert!(!allocator.free(third));
+        assert_eq!(
+            allocator.allocate().expect("third port should allocate"),
+            third
+        );
+        assert!(matches!(
+            allocator.allocate(),
+            Err(VsockHostLocalPortAllocatorError::Exhausted)
+        ));
+        assert!(allocator.free(first));
+        assert!(allocator.free(second));
+        assert!(allocator.free(third));
+    }
+
+    #[test]
+    fn host_local_port_allocator_ignores_ports_outside_allocator_capacity() {
+        let mut allocator = VsockHostLocalPortAllocator::with_capacity(1);
+        let first = allocator.allocate().expect("first port should allocate");
+        let outside_capacity = VsockHostLocalPort::try_from_raw(VSOCK_HOST_LOCAL_PORT_BASE + 1)
+            .expect("test port should be in Firecracker range");
+
+        assert!(!allocator.free(outside_capacity));
+        assert!(allocator.free(first));
+    }
+
+    #[test]
+    fn host_local_port_errors_have_no_sources() {
+        assert!(
+            VsockHostLocalPortError::InvalidRawPort {
+                raw: 0,
+                min: VSOCK_HOST_LOCAL_PORT_BASE,
+                max_exclusive: VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE,
+            }
+            .source()
+            .is_none()
+        );
+        assert!(
+            VsockHostLocalPortAllocatorError::Exhausted
+                .source()
+                .is_none()
+        );
     }
 
     #[test]
