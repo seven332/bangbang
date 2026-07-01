@@ -920,6 +920,10 @@ fn vsock_tx_payload_segments(
     chain: &VirtqueueDescriptorChain,
     payload_len: u32,
 ) -> Result<Vec<VirtioVsockTxPayloadSegment>, VirtioVsockTxPacketParseError> {
+    if payload_len == 0 {
+        return Ok(Vec::new());
+    }
+
     let mut segments = Vec::new();
     segments.try_reserve_exact(chain.len()).map_err(|source| {
         VirtioVsockTxPacketParseError::PayloadSegmentsAllocationFailed {
