@@ -593,12 +593,13 @@ backend boundaries with vmnet mode, status, operation error, XPC descriptor
 configuration, retained dispatch queue ownership, completion-status mapping,
 backend start/stop ownership, packet `iovec` layout, single-packet system
 `vmnet_read`/`vmnet_write` wrappers, count validation, owned cleanup models,
-an internal virtio-net packet I/O adapter that copies TX guest-memory payload
-segments into vmnet writes and caches one vmnet RX packet until consumed, and a
-prebuilt adapter provider keyed by configured interface ID. It also defines an
-internal `host_dev_name` mapping for `vmnet:host`, `vmnet:shared`, and
-`vmnet:bridged:<interface>`. These boundaries are not connected to the default
-process provider.
+an internal cleanup-owning packet backend that can delegate read/write while
+retaining vmnet stop-on-drop ownership, an internal virtio-net packet I/O
+adapter that copies TX guest-memory payload segments into vmnet writes and
+caches one vmnet RX packet until consumed, and a prebuilt adapter provider keyed
+by configured interface ID. It also defines an internal `host_dev_name` mapping
+for `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>`. These
+boundaries are not connected to the default process provider.
 The default process provider uses a no-op TX sink and an empty RX source, so
 current boot sessions still do not open host networking resources or provide
 user-visible packet ingress or egress. These helpers do not advertise MTU,
