@@ -528,6 +528,150 @@ impl fmt::Display for VsockHostLocalPortAllocatorError {
 
 impl std::error::Error for VsockHostLocalPortAllocatorError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct VsockHostConnectionKey {
+    local_port: VsockHostLocalPort,
+    peer_port: u32,
+}
+
+impl VsockHostConnectionKey {
+    pub const fn new(local_port: VsockHostLocalPort, peer_port: u32) -> Self {
+        Self {
+            local_port,
+            peer_port,
+        }
+    }
+
+    pub const fn local_port(self) -> VsockHostLocalPort {
+        self.local_port
+    }
+
+    pub const fn peer_port(self) -> u32 {
+        self.peer_port
+    }
+}
+
+#[derive(Debug)]
+pub struct VsockHostConnectionTable {
+    local_ports: VsockHostLocalPortAllocator,
+    connections: HashSet<VsockHostConnectionKey>,
+}
+
+impl VsockHostConnectionTable {
+    pub fn new() -> Self {
+        Self::with_local_port_allocator(VsockHostLocalPortAllocator::new())
+    }
+
+    fn with_local_port_allocator(local_ports: VsockHostLocalPortAllocator) -> Self {
+        Self {
+            local_ports,
+            connections: HashSet::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_local_port_capacity(capacity: u32) -> Self {
+        Self::with_local_port_allocator(VsockHostLocalPortAllocator::with_capacity(capacity))
+    }
+
+    pub fn insert_host_connection(
+        &mut self,
+        peer_port: u32,
+    ) -> Result<VsockHostConnectionKey, VsockHostConnectionTableError> {
+        let local_port = self
+            .local_ports
+            .allocate()
+            .map_err(VsockHostConnectionTableError::LocalPort)?;
+        let key = VsockHostConnectionKey::new(local_port, peer_port);
+
+        if let Err(error) = self.insert_allocated_key(key) {
+            let freed = self.local_ports.free(local_port);
+            debug_assert!(freed);
+            return Err(error);
+        }
+
+        Ok(key)
+    }
+
+    fn insert_allocated_key(
+        &mut self,
+        key: VsockHostConnectionKey,
+    ) -> Result<(), VsockHostConnectionTableError> {
+        if self.connections.insert(key) {
+            Ok(())
+        } else {
+            Err(VsockHostConnectionTableError::DuplicateKey { key })
+        }
+    }
+
+    #[cfg(test)]
+    fn insert_allocated_key_for_test(
+        &mut self,
+        key: VsockHostConnectionKey,
+    ) -> Result<(), VsockHostConnectionTableError> {
+        self.insert_allocated_key(key)
+    }
+
+    pub fn remove(&mut self, key: VsockHostConnectionKey) -> bool {
+        if !self.connections.remove(&key) {
+            return false;
+        }
+
+        let freed = self.local_ports.free(key.local_port());
+        debug_assert!(freed);
+        true
+    }
+
+    pub fn contains(&self, key: VsockHostConnectionKey) -> bool {
+        self.connections.contains(&key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.connections.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.connections.is_empty()
+    }
+}
+
+impl Default for VsockHostConnectionTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VsockHostConnectionTableError {
+    LocalPort(VsockHostLocalPortAllocatorError),
+    DuplicateKey { key: VsockHostConnectionKey },
+}
+
+impl fmt::Display for VsockHostConnectionTableError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LocalPort(source) => {
+                write!(f, "failed to allocate vsock host local port: {source}")
+            }
+            Self::DuplicateKey { key } => write!(
+                f,
+                "vsock host connection already exists for local port {} and peer port {}",
+                key.local_port().raw(),
+                key.peer_port()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VsockHostConnectionTableError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::LocalPort(source) => Some(source),
+            Self::DuplicateKey { .. } => None,
+        }
+    }
+}
+
 fn socket_path_exists_without_following_links(
     path: &Path,
 ) -> Result<bool, VsockHostSocketOwnerError> {
@@ -2565,7 +2709,8 @@ mod tests {
         VirtioVsockMmioHandler, VirtioVsockPacketHeader, VirtioVsockPacketLengthError,
         VirtioVsockQueueBuildError, VirtioVsockTxPacket, VirtioVsockTxPacketParseError,
         VirtioVsockTxQueue, VirtioVsockTxQueueDispatchError, VsockConfigError, VsockConfigInput,
-        VsockHostConnectRequest, VsockHostConnectRequestError, VsockHostLocalPort,
+        VsockHostConnectRequest, VsockHostConnectRequestError, VsockHostConnectionKey,
+        VsockHostConnectionTable, VsockHostConnectionTableError, VsockHostLocalPort,
         VsockHostLocalPortAllocator, VsockHostLocalPortAllocatorError, VsockHostLocalPortError,
         VsockHostSocketOwner, VsockHostSocketOwnerError, VsockMmioDevice, VsockMmioLayout,
         VsockMmioRegistrationError, parse_vsock_host_connect_request, virtio_vsock_mmio_handler,
@@ -3526,6 +3671,169 @@ mod tests {
         );
         assert!(
             VsockHostLocalPortAllocatorError::Exhausted
+                .source()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn vsock_host_connection_table_inserts_first_connection_with_firecracker_local_port() {
+        let mut table = VsockHostConnectionTable::new();
+
+        let key = table
+            .insert_host_connection(1024)
+            .expect("host connection should insert");
+
+        assert_eq!(key.local_port().raw(), VSOCK_HOST_LOCAL_PORT_BASE);
+        assert_eq!(key.peer_port(), 1024);
+        assert!(table.contains(key));
+        assert_eq!(table.len(), 1);
+        assert!(!table.is_empty());
+    }
+
+    #[test]
+    fn vsock_host_connection_table_allows_same_peer_port_with_distinct_local_ports() {
+        let mut table = VsockHostConnectionTable::new();
+
+        let first = table
+            .insert_host_connection(2048)
+            .expect("first host connection should insert");
+        let second = table
+            .insert_host_connection(2048)
+            .expect("second host connection should insert");
+
+        assert_ne!(first, second);
+        assert_eq!(first.peer_port(), second.peer_port());
+        assert_eq!(first.local_port().raw(), VSOCK_HOST_LOCAL_PORT_BASE);
+        assert_eq!(second.local_port().raw(), VSOCK_HOST_LOCAL_PORT_BASE + 1);
+        assert!(table.contains(first));
+        assert!(table.contains(second));
+        assert_eq!(table.len(), 2);
+    }
+
+    #[test]
+    fn vsock_host_connection_table_missing_remove_does_not_free_active_local_port() {
+        let mut table = VsockHostConnectionTable::with_local_port_capacity(1);
+        let active = table
+            .insert_host_connection(3000)
+            .expect("host connection should insert");
+        let missing = VsockHostConnectionKey::new(active.local_port(), 3001);
+
+        assert!(!table.remove(missing));
+        assert!(table.contains(active));
+        assert_eq!(table.len(), 1);
+        assert!(matches!(
+            table.insert_host_connection(3002),
+            Err(VsockHostConnectionTableError::LocalPort(
+                VsockHostLocalPortAllocatorError::Exhausted
+            ))
+        ));
+    }
+
+    #[test]
+    fn vsock_host_connection_table_remove_releases_local_port_for_reuse() {
+        let mut table = VsockHostConnectionTable::with_local_port_capacity(1);
+        let first = table
+            .insert_host_connection(4000)
+            .expect("host connection should insert");
+
+        assert!(matches!(
+            table.insert_host_connection(4001),
+            Err(VsockHostConnectionTableError::LocalPort(
+                VsockHostLocalPortAllocatorError::Exhausted
+            ))
+        ));
+        assert!(table.remove(first));
+        assert!(table.is_empty());
+
+        let second = table
+            .insert_host_connection(4002)
+            .expect("released local port should be reused");
+
+        assert_eq!(second.local_port(), first.local_port());
+        assert_eq!(second.peer_port(), 4002);
+    }
+
+    #[test]
+    fn vsock_host_connection_table_propagates_local_port_exhaustion() {
+        let mut table = VsockHostConnectionTable::with_local_port_capacity(0);
+
+        let err = table
+            .insert_host_connection(5000)
+            .expect_err("zero-capacity table should be exhausted");
+
+        assert_eq!(
+            err,
+            VsockHostConnectionTableError::LocalPort(VsockHostLocalPortAllocatorError::Exhausted)
+        );
+        assert_eq!(
+            err.to_string(),
+            "failed to allocate vsock host local port: vsock host local port allocation exhausted"
+        );
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn vsock_host_connection_table_rejects_duplicate_allocated_key() {
+        let mut table = VsockHostConnectionTable::new();
+        let key = table
+            .insert_host_connection(6000)
+            .expect("host connection should insert");
+
+        let err = table
+            .insert_allocated_key_for_test(key)
+            .expect_err("duplicate key should fail");
+
+        assert_eq!(err, VsockHostConnectionTableError::DuplicateKey { key });
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "vsock host connection already exists for local port {} and peer port 6000",
+                VSOCK_HOST_LOCAL_PORT_BASE
+            )
+        );
+        assert!(table.contains(key));
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn vsock_host_connection_table_duplicate_key_does_not_release_active_local_port() {
+        let mut table = VsockHostConnectionTable::with_local_port_capacity(1);
+        let key = table
+            .insert_host_connection(6500)
+            .expect("host connection should insert");
+
+        assert!(matches!(
+            table.insert_allocated_key_for_test(key),
+            Err(VsockHostConnectionTableError::DuplicateKey { .. })
+        ));
+        assert!(matches!(
+            table.insert_host_connection(6501),
+            Err(VsockHostConnectionTableError::LocalPort(
+                VsockHostLocalPortAllocatorError::Exhausted
+            ))
+        ));
+        assert!(table.remove(key));
+
+        let reused = table
+            .insert_host_connection(6502)
+            .expect("local port should be reusable after real removal");
+        assert_eq!(reused.local_port(), key.local_port());
+    }
+
+    #[test]
+    fn vsock_host_connection_table_errors_report_sources() {
+        let local_port_err =
+            VsockHostConnectionTableError::LocalPort(VsockHostLocalPortAllocatorError::Exhausted);
+        let key = VsockHostConnectionKey::new(
+            VsockHostLocalPort::try_from_raw(VSOCK_HOST_LOCAL_PORT_BASE)
+                .expect("test local port should parse"),
+            7000,
+        );
+
+        assert!(local_port_err.source().is_some());
+        assert!(
+            VsockHostConnectionTableError::DuplicateKey { key }
                 .source()
                 .is_none()
         );
