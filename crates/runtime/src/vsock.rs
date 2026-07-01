@@ -274,6 +274,50 @@ impl VirtioMmioDeviceActivationHandler for VirtioVsockDevice {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedVsockDevice {
+    guest_cid: u32,
+    uds_path: PathBuf,
+    config_space: VirtioVsockConfigSpace,
+    device: VirtioVsockDevice,
+}
+
+impl PreparedVsockDevice {
+    pub fn from_config(config: &VsockConfig) -> Self {
+        Self {
+            guest_cid: config.guest_cid(),
+            uds_path: config.uds_path().to_path_buf(),
+            config_space: VirtioVsockConfigSpace::new(u64::from(config.guest_cid())),
+            device: VirtioVsockDevice::new(),
+        }
+    }
+
+    pub const fn guest_cid(&self) -> u32 {
+        self.guest_cid
+    }
+
+    pub fn uds_path(&self) -> &Path {
+        &self.uds_path
+    }
+
+    pub const fn config_space(&self) -> VirtioVsockConfigSpace {
+        self.config_space
+    }
+
+    pub const fn device(&self) -> &VirtioVsockDevice {
+        &self.device
+    }
+
+    pub fn into_parts(self) -> (u32, PathBuf, VirtioVsockConfigSpace, VirtioVsockDevice) {
+        (
+            self.guest_cid,
+            self.uds_path,
+            self.config_space,
+            self.device,
+        )
+    }
+}
+
 pub fn virtio_vsock_mmio_handler(
     guest_cid: u32,
 ) -> Result<VirtioVsockMmioHandler, VirtioMmioRegisterHandlerError> {
@@ -317,7 +361,7 @@ mod tests {
     };
 
     use super::{
-        MIN_GUEST_CID, VIRTIO_FEATURE_IN_ORDER, VIRTIO_FEATURE_VERSION_1,
+        MIN_GUEST_CID, PreparedVsockDevice, VIRTIO_FEATURE_IN_ORDER, VIRTIO_FEATURE_VERSION_1,
         VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_VSOCK_CONFIG_GUEST_CID_SIZE, VIRTIO_VSOCK_DEVICE_ID,
         VIRTIO_VSOCK_EVENT_QUEUE_INDEX, VIRTIO_VSOCK_QUEUE_COUNT, VIRTIO_VSOCK_QUEUE_SIZE,
         VIRTIO_VSOCK_QUEUE_SIZES, VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_TX_QUEUE_INDEX,
@@ -335,6 +379,10 @@ mod tests {
 
     fn validate(input: VsockConfigInput) -> Result<super::VsockConfig, VsockConfigError> {
         input.validate()
+    }
+
+    fn valid_vsock_config(guest_cid: u32, uds_path: impl Into<String>) -> super::VsockConfig {
+        validate(VsockConfigInput::new(guest_cid, uds_path)).expect("valid config")
     }
 
     fn virtio_mmio_access(offset: u64, len: u64) -> MmioAccess {
@@ -518,6 +566,51 @@ mod tests {
     #[test]
     fn errors_have_no_sources() {
         assert!(VsockConfigError::EmptySocketPath.source().is_none());
+    }
+
+    #[test]
+    fn prepared_vsock_device_preserves_config_and_inactive_device() {
+        let config = valid_vsock_config(u32::MAX, "./relative-vsock.sock");
+        let prepared = PreparedVsockDevice::from_config(&config);
+
+        assert_eq!(prepared.guest_cid(), u32::MAX);
+        assert_eq!(prepared.uds_path(), Path::new("./relative-vsock.sock"));
+        assert_eq!(prepared.config_space().guest_cid(), u64::from(u32::MAX));
+        assert!(!prepared.device().is_activated());
+    }
+
+    #[test]
+    fn prepared_vsock_device_into_parts_consumes_owned_resource() {
+        let config = valid_vsock_config(7, "relative-vsock.sock");
+        let prepared = PreparedVsockDevice::from_config(&config);
+
+        let (guest_cid, uds_path, config_space, device) = prepared.into_parts();
+
+        assert_eq!(guest_cid, 7);
+        assert_eq!(uds_path.as_path(), Path::new("relative-vsock.sock"));
+        assert_eq!(config_space.guest_cid(), 7);
+        assert!(!device.is_activated());
+    }
+
+    #[test]
+    fn prepared_vsock_device_does_not_touch_missing_socket_path() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after Unix epoch")
+            .as_nanos();
+        let socket_path = format!(
+            "bangbang-vsock-missing-parent-{}-{unique}/v.sock",
+            std::process::id(),
+        );
+        let path = Path::new(&socket_path);
+        let config = valid_vsock_config(8, socket_path.clone());
+
+        assert!(!path.exists());
+
+        let prepared = PreparedVsockDevice::from_config(&config);
+
+        assert_eq!(prepared.uds_path(), path);
+        assert!(!path.exists());
     }
 
     #[test]
