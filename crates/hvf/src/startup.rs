@@ -562,6 +562,16 @@ impl OwnedHvfArm64BootSession {
         run_boot_session_loop(self, stop_token, max_steps)
     }
 
+    pub fn run_loop_with_network_packet_io(
+        &mut self,
+        stop_token: &HvfArm64BootRunLoopStopToken,
+        max_steps: NonZeroUsize,
+        packet_io: &mut impl Arm64BootNetworkPacketIoProvider,
+    ) -> Result<HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopError> {
+        let mut session = NetworkPacketIoBootSessionRunLoopSession::new(self, packet_io);
+        run_boot_session_loop(&mut session, stop_token, max_steps)
+    }
+
     pub fn run_loop_with_observer(
         &mut self,
         stop_token: &HvfArm64BootRunLoopStopToken,
@@ -679,6 +689,60 @@ impl BootSessionRunLoopSession for OwnedHvfArm64BootSession {
         HvfArm64BootNetworkNotificationDispatchError,
     > {
         self.dispatch_network_queue_notifications_and_signal_interrupts()
+    }
+}
+
+struct NetworkPacketIoBootSessionRunLoopSession<'session, 'packet_io, P>
+where
+    P: Arm64BootNetworkPacketIoProvider,
+{
+    session: &'session mut OwnedHvfArm64BootSession,
+    packet_io: &'packet_io mut P,
+}
+
+impl<'session, 'packet_io, P> NetworkPacketIoBootSessionRunLoopSession<'session, 'packet_io, P>
+where
+    P: Arm64BootNetworkPacketIoProvider,
+{
+    const fn new(
+        session: &'session mut OwnedHvfArm64BootSession,
+        packet_io: &'packet_io mut P,
+    ) -> Self {
+        Self { session, packet_io }
+    }
+}
+
+impl<P> BootSessionRunLoopSession for NetworkPacketIoBootSessionRunLoopSession<'_, '_, P>
+where
+    P: Arm64BootNetworkPacketIoProvider,
+{
+    fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
+        self.session.run_once_and_handle_mmio()
+    }
+
+    fn handle_run_loop_virtual_timer(&mut self) -> Result<(), HvfVcpuRunnerError> {
+        let intid = self.session.gic.timer_interrupts.el1_virtual_timer_intid;
+        self.session.runner.set_gic_ppi_pending(intid)
+    }
+
+    fn dispatch_run_loop_block_notifications(
+        &mut self,
+    ) -> Result<HvfArm64BootBlockNotificationDispatches, HvfArm64BootBlockNotificationDispatchError>
+    {
+        self.session
+            .dispatch_block_queue_notifications_and_signal_interrupts()
+    }
+
+    fn dispatch_run_loop_network_notifications(
+        &mut self,
+    ) -> Result<
+        HvfArm64BootNetworkNotificationDispatches,
+        HvfArm64BootNetworkNotificationDispatchError,
+    > {
+        self.session
+            .dispatch_network_queue_notifications_with_packet_io_and_signal_interrupts(
+                self.packet_io,
+            )
     }
 }
 
