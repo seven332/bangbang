@@ -7,6 +7,7 @@ use std::process::ExitCode;
 
 mod api_server;
 #[doc(hidden)]
+#[cfg(target_os = "macos")]
 pub mod host_network;
 mod vmm;
 
