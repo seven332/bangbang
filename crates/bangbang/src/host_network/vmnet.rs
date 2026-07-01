@@ -746,10 +746,14 @@ where
             .api
             .start_interface(descriptor, &self.queue, &completion)
         else {
-            return Err(VmnetError::new(
-                VmnetOperation::StartInterface,
-                VmnetStatus::Failure,
-            ));
+            let status = receiver.try_recv().unwrap_or(VmnetStatus::Failure);
+            let status = if status == VmnetStatus::Success {
+                VmnetStatus::Failure
+            } else {
+                status
+            };
+
+            return Err(VmnetError::new(VmnetOperation::StartInterface, status));
         };
         let status = wait_for_vmnet_completion(receiver, VmnetOperation::StartInterface)?;
         if status == VmnetStatus::Success {
@@ -1568,7 +1572,9 @@ mod tests {
 
     #[test]
     fn system_vmnet_backend_rejects_null_start_handle() {
-        let api = RecordingVmnetSystemApi::new().with_null_start_handle();
+        let api = RecordingVmnetSystemApi::new()
+            .with_null_start_handle()
+            .with_start_completion(VmnetStatus::NotAuthorized);
         let event_log = api.events();
         let config = VmnetInterfaceConfig::host();
         let backend = super::SystemVmnetInterfaceBackendWithApi::with_api(api);
@@ -1578,7 +1584,7 @@ mod tests {
         match error {
             VmnetInterfaceStartError::Start { source } => {
                 assert_eq!(source.operation(), VmnetOperation::StartInterface);
-                assert_eq!(source.status(), VmnetStatus::Failure);
+                assert_eq!(source.status(), VmnetStatus::NotAuthorized);
             }
             VmnetInterfaceStartError::Descriptor { .. } => {
                 panic!("null start handle should not be reported as a descriptor error");
