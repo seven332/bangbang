@@ -3834,6 +3834,21 @@ mod tests {
     }
 
     #[test]
+    fn host_connect_handshake_reports_closed_stream_after_partial_request() {
+        let (mut accepted, mut client) = accepted_host_connection("connect-partial-eof");
+        client
+            .write_all(b"CONN")
+            .expect("client should write partial handshake");
+        drop(client);
+
+        let err = accepted
+            .read_connect_request()
+            .expect_err("closed stream after partial handshake should fail");
+
+        assert_eq!(err, VsockHostConnectHandshakeError::Closed);
+    }
+
+    #[test]
     fn host_connect_handshake_errors_have_expected_sources_and_no_paths() {
         let read = VsockHostConnectHandshakeError::Read(std::io::ErrorKind::PermissionDenied);
         let closed = VsockHostConnectHandshakeError::Closed;
