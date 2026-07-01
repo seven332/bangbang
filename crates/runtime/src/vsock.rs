@@ -570,12 +570,12 @@ mod tests {
 
     #[test]
     fn prepared_vsock_device_preserves_config_and_inactive_device() {
-        let config = valid_vsock_config(42, "./relative-vsock.sock");
+        let config = valid_vsock_config(u32::MAX, "./relative-vsock.sock");
         let prepared = PreparedVsockDevice::from_config(&config);
 
-        assert_eq!(prepared.guest_cid(), 42);
+        assert_eq!(prepared.guest_cid(), u32::MAX);
         assert_eq!(prepared.uds_path(), Path::new("./relative-vsock.sock"));
-        assert_eq!(prepared.config_space().guest_cid(), 42);
+        assert_eq!(prepared.config_space().guest_cid(), u64::from(u32::MAX));
         assert!(!prepared.device().is_activated());
     }
 
@@ -598,19 +598,18 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time should be after Unix epoch")
             .as_nanos();
-        let path = std::env::temp_dir()
-            .join(format!(
-                "bangbang-vsock-missing-parent-{}-{unique}",
-                std::process::id(),
-            ))
-            .join("v.sock");
-        let config = valid_vsock_config(8, path.to_string_lossy().into_owned());
+        let socket_path = format!(
+            "bangbang-vsock-missing-parent-{}-{unique}/v.sock",
+            std::process::id(),
+        );
+        let path = Path::new(&socket_path);
+        let config = valid_vsock_config(8, socket_path.clone());
 
         assert!(!path.exists());
 
         let prepared = PreparedVsockDevice::from_config(&config);
 
-        assert_eq!(prepared.uds_path(), path.as_path());
+        assert_eq!(prepared.uds_path(), path);
         assert!(!path.exists());
     }
 
