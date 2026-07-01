@@ -709,16 +709,51 @@ impl VsockHostConnectionKey {
 #[derive(Debug)]
 pub struct VsockHostConnection {
     accepted: VsockHostAcceptedConnection,
+    request_packet_pending: bool,
 }
 
 impl VsockHostConnection {
     fn from_accepted(accepted: VsockHostAcceptedConnection) -> Self {
-        Self { accepted }
+        Self {
+            accepted,
+            request_packet_pending: true,
+        }
     }
 
     pub fn stream(&self) -> &UnixStream {
         self.accepted.stream()
     }
+
+    #[cfg(test)]
+    const fn has_pending_request_packet(&self) -> bool {
+        self.request_packet_pending
+    }
+
+    fn take_pending_request_packet_header(
+        &mut self,
+        key: VsockHostConnectionKey,
+        guest_cid: u32,
+    ) -> Option<VirtioVsockPacketHeader> {
+        if !self.request_packet_pending {
+            return None;
+        }
+        self.request_packet_pending = false;
+
+        Some(host_connection_request_packet_header(key, guest_cid))
+    }
+}
+
+fn host_connection_request_packet_header(
+    key: VsockHostConnectionKey,
+    guest_cid: u32,
+) -> VirtioVsockPacketHeader {
+    VirtioVsockPacketHeader::new()
+        .with_src_cid(VIRTIO_VSOCK_HOST_CID)
+        .with_dst_cid(u64::from(guest_cid))
+        .with_src_port(key.local_port().raw())
+        .with_dst_port(key.peer_port())
+        .with_packet_type(VIRTIO_VSOCK_PACKET_TYPE_STREAM)
+        .with_operation(VIRTIO_VSOCK_OP_REQUEST)
 }
 
 #[derive(Debug)]
@@ -800,6 +835,16 @@ impl VsockHostConnectionTable {
 
     pub fn get(&self, key: VsockHostConnectionKey) -> Option<&VsockHostConnection> {
         self.connections.get(&key)
+    }
+
+    pub fn take_pending_request_packet_header(
+        &mut self,
+        key: VsockHostConnectionKey,
+        guest_cid: u32,
+    ) -> Option<VirtioVsockPacketHeader> {
+        self.connections
+            .get_mut(&key)?
+            .take_pending_request_packet_header(key, guest_cid)
     }
 
     pub fn contains(&self, key: VsockHostConnectionKey) -> bool {
@@ -3012,6 +3057,24 @@ mod tests {
         assert_eq!(stream.read(&mut closed).expect(context), 0, "{context}");
     }
 
+    fn assert_host_connection_request_header(
+        header: VirtioVsockPacketHeader,
+        guest_cid: u32,
+        local_port: VsockHostLocalPort,
+        peer_port: u32,
+    ) {
+        assert_eq!(header.src_cid(), VIRTIO_VSOCK_HOST_CID);
+        assert_eq!(header.dst_cid(), u64::from(guest_cid));
+        assert_eq!(header.src_port(), local_port.raw());
+        assert_eq!(header.dst_port(), peer_port);
+        assert_eq!(header.payload_len(), 0);
+        assert_eq!(header.packet_type(), VIRTIO_VSOCK_PACKET_TYPE_STREAM);
+        assert_eq!(header.operation(), VIRTIO_VSOCK_OP_REQUEST);
+        assert_eq!(header.flags(), 0);
+        assert_eq!(header.buffer_allocation(), 0);
+        assert_eq!(header.forwarded_count(), 0);
+    }
+
     fn unique_missing_socket_path() -> String {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4173,6 +4236,74 @@ mod tests {
             .expect("retained stream should receive payload");
 
         assert_eq!(&payload, b"payload");
+    }
+
+    #[test]
+    fn vsock_host_connection_table_takes_pending_request_packet_header() {
+        let mut table = VsockHostConnectionTable::new();
+        let (key, _client) =
+            insert_accepted_host_connection_for_test(&mut table, "table-request", 1024);
+
+        assert!(
+            table
+                .get(key)
+                .expect("retained connection should exist")
+                .has_pending_request_packet()
+        );
+        let header = table
+            .take_pending_request_packet_header(key, 42)
+            .expect("pending request packet header should exist");
+
+        assert_host_connection_request_header(header, 42, key.local_port(), 1024);
+        assert!(
+            !table
+                .get(key)
+                .expect("retained connection should still exist")
+                .has_pending_request_packet()
+        );
+        assert!(table.take_pending_request_packet_header(key, 42).is_none());
+        assert!(table.contains(key));
+    }
+
+    #[test]
+    fn vsock_host_connection_table_request_packet_header_accepts_boundaries() {
+        let mut table = VsockHostConnectionTable::new();
+        let (key, _client) = insert_accepted_host_connection_for_test(
+            &mut table,
+            "table-request-boundary",
+            u32::MAX,
+        );
+
+        let header = table
+            .take_pending_request_packet_header(key, u32::MAX)
+            .expect("boundary request packet header should exist");
+
+        assert_host_connection_request_header(header, u32::MAX, key.local_port(), u32::MAX);
+    }
+
+    #[test]
+    fn vsock_host_connection_table_missing_request_packet_header_is_noop() {
+        let mut table = VsockHostConnectionTable::new();
+        let (key, _client) =
+            insert_accepted_host_connection_for_test(&mut table, "table-request-missing", 3000);
+        let missing = VsockHostConnectionKey::new(key.local_port(), 3001);
+
+        assert!(
+            table
+                .take_pending_request_packet_header(missing, 42)
+                .is_none()
+        );
+        assert!(
+            table
+                .get(key)
+                .expect("retained connection should still exist")
+                .has_pending_request_packet()
+        );
+
+        let header = table
+            .take_pending_request_packet_header(key, 42)
+            .expect("active connection request packet header should still exist");
+        assert_host_connection_request_header(header, 42, key.local_port(), 3000);
     }
 
     #[test]
