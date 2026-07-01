@@ -312,7 +312,8 @@ mod tests {
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
         VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
         VIRTIO_DEVICE_STATUS_INIT, VIRTIO_MMIO_DEVICE_CONFIG_OFFSET,
-        VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioRegister, VirtioMmioRegisterHandlerError,
+        VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceRegisters,
+        VirtioMmioQueueRegisters, VirtioMmioRegister, VirtioMmioRegisterHandlerError,
     };
 
     use super::{
@@ -698,5 +699,25 @@ mod tests {
         ));
         assert!(!handler.is_device_activated());
         assert!(!handler.activation_handler().is_activated());
+    }
+
+    #[test]
+    fn virtio_vsock_device_rejects_unexpected_queue_count() {
+        let registers = VirtioMmioDeviceRegisters::new(VIRTIO_VSOCK_DEVICE_ID, 0);
+        let queues =
+            VirtioMmioQueueRegisters::new(&[VIRTIO_VSOCK_QUEUE_SIZE, VIRTIO_VSOCK_QUEUE_SIZE])
+                .expect("short queue table should build");
+        let activation = VirtioMmioDeviceActivation::new(&registers, &queues);
+        let mut device = VirtioVsockDevice::new();
+
+        let err = device
+            .activate_vsock(activation)
+            .expect_err("unexpected queue count should fail activation");
+
+        assert_eq!(
+            err.to_string(),
+            "virtio-mmio device activation handler failed: virtio-vsock expected 3 queues, got 2"
+        );
+        assert!(!device.is_activated());
     }
 }
