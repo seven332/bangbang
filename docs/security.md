@@ -63,9 +63,10 @@ is resource-specific:
   Files are opened later during `InstanceStart`.
 - `/drives/{drive_id}` stores block backing paths during configuration. Backing
   files are opened later during `InstanceStart`.
-- `/vsock` stores the configured Unix socket path during configuration only.
-  The current implementation does not open, bind, connect, unlink, or create
-  that socket path.
+- `/vsock` stores the configured Unix socket path during configuration. Startup
+  can attach an inert guest-visible virtio-vsock device, but the current
+  implementation does not open, bind, connect, unlink, or create that socket
+  path.
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink.
 - `/logger` opens `log_path` during pre-boot configuration when that field is
@@ -172,11 +173,11 @@ The current scaffold does not implement:
   broker, connectivity policy, and live vmnet integration proof. The current
   vsock API path validates and stores `guest_cid` plus `uds_path` before boot.
   The runtime crate has an internal virtio-vsock prepared resource, MMIO
-  registration helper, config-space, and inert MMIO handler skeleton that
-  preserve the configured socket path and expose only the configured guest CID
-  through bounded config reads. Preparation and MMIO registration do not open,
-  bind, connect, unlink, or create `uds_path`, do not attach a guest-visible
-  startup device, and do not implement host Unix socket backend behavior, CID
+  registration helper, config-space, inert MMIO handler skeleton, and startup
+  FDT attachment that preserve the configured socket path and expose only the
+  configured guest CID through bounded config reads. Preparation, MMIO
+  registration, and startup attachment do not open, bind, connect, unlink, or
+  create `uds_path`, and do not implement host Unix socket backend behavior, CID
   routing, or data movement
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy

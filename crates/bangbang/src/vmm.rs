@@ -23,6 +23,7 @@ use bangbang_runtime::startup::{
     Arm64BootNetworkDevice, Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError,
     Arm64BootNetworkPacketIoProvider,
 };
+use bangbang_runtime::vsock::VsockMmioLayout;
 use bangbang_runtime::{BackendError, VmmAction, VmmActionError, VmmController, VmmData};
 
 use crate::host_network::virtio_vmnet::{
@@ -48,6 +49,8 @@ const DEFAULT_BLOCK_MMIO_BASE: GuestAddress = GuestAddress::new(0x5000_0000);
 const DEFAULT_BLOCK_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(1);
 const DEFAULT_NETWORK_MMIO_BASE: GuestAddress = GuestAddress::new(0x6000_0000);
 const DEFAULT_NETWORK_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(1000);
+const DEFAULT_VSOCK_MMIO_BASE: GuestAddress = GuestAddress::new(0x7000_0000);
+const DEFAULT_VSOCK_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(2000);
 const DEFAULT_SERIAL_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_0000);
 const DEFAULT_SERIAL_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(0);
 const DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT: usize = 1024;
@@ -757,6 +760,7 @@ fn default_hvf_boot_session_config(
     HvfArm64BootSessionConfig::new(
         BlockMmioLayout::new(DEFAULT_BLOCK_MMIO_BASE, DEFAULT_BLOCK_MMIO_REGION_ID),
         NetworkMmioLayout::new(DEFAULT_NETWORK_MMIO_BASE, DEFAULT_NETWORK_MMIO_REGION_ID),
+        VsockMmioLayout::new(DEFAULT_VSOCK_MMIO_BASE, DEFAULT_VSOCK_MMIO_REGION_ID),
     )
     .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
         DEFAULT_SERIAL_MMIO_REGION_ID,
@@ -792,6 +796,7 @@ mod tests {
         Arm64BootNetworkDevice, Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError,
         Arm64BootNetworkPacketIoProvider,
     };
+    use bangbang_runtime::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE;
     use bangbang_runtime::{BackendError, InstanceState, VmmAction, VmmActionError};
 
     use crate::host_network::vmnet::{
@@ -804,11 +809,12 @@ mod tests {
         BootRunLoopControl, BootRunLoopSession, BootRunLoopSupervisor, BootRunLoopWorkerStatus,
         DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT, DEFAULT_NETWORK_MMIO_BASE,
         DEFAULT_NETWORK_MMIO_REGION_ID, DEFAULT_SERIAL_MMIO_BASE, DEFAULT_SERIAL_MMIO_REGION_ID,
-        EmptyProcessNetworkRxPacketSource, HvfInstanceStartExecutor, InstanceStartExecutor,
-        NetworkPacketIoRunLoopSession, NoopProcessNetworkTxPacketSink, ProcessHvfBootSession,
-        ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError, ProcessVmm,
-        ProcessVmnetPacketIoBackendFactory, default_hvf_boot_run_loop_step_limit,
-        default_hvf_boot_session_config, process_vmnet_packet_io_provider_from_configs,
+        DEFAULT_VSOCK_MMIO_BASE, DEFAULT_VSOCK_MMIO_REGION_ID, EmptyProcessNetworkRxPacketSource,
+        HvfInstanceStartExecutor, InstanceStartExecutor, NetworkPacketIoRunLoopSession,
+        NoopProcessNetworkTxPacketSink, ProcessHvfBootSession, ProcessNetworkPacketIoProvider,
+        ProcessNetworkPacketIoProviderBuildError, ProcessVmm, ProcessVmnetPacketIoBackendFactory,
+        default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
+        process_vmnet_packet_io_provider_from_configs,
     };
 
     static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -1366,6 +1372,11 @@ mod tests {
             config.network_mmio_layout.base_region_id(),
             DEFAULT_NETWORK_MMIO_REGION_ID
         );
+        assert_eq!(config.vsock_mmio_layout.address(), DEFAULT_VSOCK_MMIO_BASE);
+        assert_eq!(
+            config.vsock_mmio_layout.region_id(),
+            DEFAULT_VSOCK_MMIO_REGION_ID
+        );
         let block_devices = PreparedBlockDevices::from_configs(&drives)
             .expect("block devices should prepare")
             .register_mmio(config.block_mmio_layout)
@@ -1374,6 +1385,12 @@ mod tests {
             .expect("network devices should prepare")
             .register_mmio(config.network_mmio_layout)
             .expect("network MMIO should register");
+        let vsock_region = MmioRegion::new(
+            config.vsock_mmio_layout.region_id(),
+            config.vsock_mmio_layout.address(),
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+        )
+        .expect("vsock MMIO region should be valid");
         let serial_region = MmioRegion::new(
             serial_region_id,
             DEFAULT_SERIAL_MMIO_BASE,
@@ -1385,27 +1402,30 @@ mod tests {
             block_devices
                 .registrations()
                 .iter()
-                .all(|registration| registration.region_id() != serial_region_id)
+                .all(|registration| registration.region_id() != serial_region_id
+                    && registration.region_id() != vsock_region.id())
         );
         assert!(
             network_devices
                 .registrations()
                 .iter()
-                .all(|registration| registration.region_id() != serial_region_id)
+                .all(|registration| registration.region_id() != serial_region_id
+                    && registration.region_id() != vsock_region.id())
         );
+        assert_ne!(vsock_region.id(), serial_region_id);
         assert!(block_devices.registrations().iter().all(|block| {
             network_devices
                 .registrations()
                 .iter()
                 .all(|network| !block.region().range().overlaps(network.region().range()))
                 && !block.region().range().overlaps(serial_region.range())
+                && !block.region().range().overlaps(vsock_region.range())
         }));
-        assert!(
-            network_devices
-                .registrations()
-                .iter()
-                .all(|network| !network.region().range().overlaps(serial_region.range()))
-        );
+        assert!(network_devices.registrations().iter().all(|network| {
+            !network.region().range().overlaps(serial_region.range())
+                && !network.region().range().overlaps(vsock_region.range())
+        }));
+        assert!(!vsock_region.range().overlaps(serial_region.range()));
     }
 
     #[test]

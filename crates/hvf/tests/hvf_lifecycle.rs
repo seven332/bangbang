@@ -268,6 +268,7 @@ fn prepares_internal_hvf_arm64_boot_session() {
     use bangbang_runtime::memory::GuestAddress;
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::vsock::VsockMmioLayout;
 
     let _test_lock = HVF_LIFECYCLE_TEST_LOCK
         .lock()
@@ -284,6 +285,7 @@ fn prepares_internal_hvf_arm64_boot_session() {
     let config = HvfArm64BootSessionConfig::new(
         BlockMmioLayout::new(GuestAddress::new(0x4000_0000), MmioRegionId::new(1)),
         NetworkMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1000)),
+        VsockMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(2000)),
     );
 
     let mut session = backend
@@ -363,6 +365,7 @@ fn prepares_owned_hvf_arm64_boot_session() {
     use bangbang_runtime::memory::GuestAddress;
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::vsock::VsockMmioLayout;
 
     let _test_lock = HVF_LIFECYCLE_TEST_LOCK
         .lock()
@@ -379,6 +382,7 @@ fn prepares_owned_hvf_arm64_boot_session() {
     let config = HvfArm64BootSessionConfig::new(
         BlockMmioLayout::new(GuestAddress::new(0x4000_0000), MmioRegionId::new(1)),
         NetworkMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1000)),
+        VsockMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(2000)),
     );
 
     let mut session = OwnedHvfArm64BootSession::new(&controller, config.clone())
@@ -462,6 +466,7 @@ fn owned_hvf_arm64_boot_session_cleans_up_after_prepare_error() {
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::network::NetworkMmioLayout;
     use bangbang_runtime::startup::Arm64BootResourceError;
+    use bangbang_runtime::vsock::VsockMmioLayout;
 
     let _test_lock = HVF_LIFECYCLE_TEST_LOCK
         .lock()
@@ -469,6 +474,7 @@ fn owned_hvf_arm64_boot_session_cleans_up_after_prepare_error() {
     let config = HvfArm64BootSessionConfig::new(
         BlockMmioLayout::new(GuestAddress::new(0x4000_0000), MmioRegionId::new(1)),
         NetworkMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1000)),
+        VsockMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(2000)),
     );
     let empty_controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
 
@@ -507,6 +513,7 @@ fn rejects_boot_session_on_existing_hvf_vm_without_destroying_it() {
     use bangbang_runtime::memory::GuestAddress;
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::vsock::VsockMmioLayout;
 
     let _test_lock = HVF_LIFECYCLE_TEST_LOCK
         .lock()
@@ -521,6 +528,7 @@ fn rejects_boot_session_on_existing_hvf_vm_without_destroying_it() {
             HvfArm64BootSessionConfig::new(
                 BlockMmioLayout::new(GuestAddress::new(0x4000_0000), MmioRegionId::new(1)),
                 NetworkMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1000)),
+                VsockMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(2000)),
             ),
         )
         .expect_err("existing VM should be rejected");

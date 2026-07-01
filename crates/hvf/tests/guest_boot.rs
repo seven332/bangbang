@@ -22,6 +22,8 @@ const SERIAL_MMIO_BASE: u64 = 0x4000_0000;
 const BLOCK_MMIO_BASE: u64 = 0x5000_0000;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const NETWORK_MMIO_BASE: u64 = 0x6000_0000;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const VSOCK_MMIO_BASE: u64 = 0x7000_0000;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
@@ -38,6 +40,7 @@ fn boots_firecracker_kernel_to_guest_marker() {
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::network::NetworkMmioLayout;
     use bangbang_runtime::serial::SharedSerialOutputBuffer;
+    use bangbang_runtime::vsock::VsockMmioLayout;
     use bangbang_runtime::{VmmAction, VmmController};
 
     let _test_lock = GUEST_BOOT_TEST_LOCK
@@ -61,6 +64,7 @@ fn boots_firecracker_kernel_to_guest_marker() {
             GuestAddress::new(NETWORK_MMIO_BASE),
             MmioRegionId::new(1000),
         ),
+        VsockMmioLayout::new(GuestAddress::new(VSOCK_MMIO_BASE), MmioRegionId::new(2000)),
     )
     .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
         MmioRegionId::new(0),

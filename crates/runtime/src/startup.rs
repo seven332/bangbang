@@ -31,6 +31,9 @@ use crate::network::{
     VirtioNetworkTxPacketSink,
 };
 use crate::serial::{SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialMmioDevice, SharedSerialOutputBuffer};
+use crate::vsock::{
+    PreparedVsockDevice, VsockMmioDeviceRegistration, VsockMmioLayout, VsockMmioRegistrationError,
+};
 
 const MIB: u64 = 1024 * 1024;
 
@@ -44,6 +47,8 @@ pub struct Arm64BootResourceConfig<'a> {
     pub block_interrupt_lines: &'a [GuestInterruptLine],
     pub network_mmio_layout: NetworkMmioLayout,
     pub network_interrupt_lines: &'a [GuestInterruptLine],
+    pub vsock_mmio_layout: VsockMmioLayout,
+    pub vsock_interrupt_line: Option<GuestInterruptLine>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +86,7 @@ pub struct Arm64BootResources {
     pub serial_device: Option<Arm64BootSerialDevice>,
     pub block_devices: Vec<Arm64BootBlockDevice>,
     pub network_devices: Vec<Arm64BootNetworkDevice>,
+    pub vsock_device: Option<Arm64BootVsockDevice>,
 }
 
 #[derive(Debug)]
@@ -99,6 +105,7 @@ pub struct Arm64BootRuntimeResources {
     pub serial_device: Option<Arm64BootSerialDevice>,
     pub block_devices: Vec<Arm64BootBlockDevice>,
     pub network_devices: Vec<Arm64BootNetworkDevice>,
+    pub vsock_device: Option<Arm64BootVsockDevice>,
 }
 
 #[derive(Debug)]
@@ -425,6 +432,12 @@ pub struct Arm64BootNetworkDevice {
     pub fdt_device: Arm64FdtVirtioMmioDevice,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Arm64BootVsockDevice {
+    pub registration: VsockMmioDeviceRegistration,
+    pub fdt_device: Arm64FdtVirtioMmioDevice,
+}
+
 #[derive(Debug, Clone)]
 pub struct Arm64BootSerialDevice {
     pub region: MmioRegion,
@@ -580,6 +593,9 @@ pub enum Arm64BootResourceError {
     RegisterNetworkMmio {
         source: Box<NetworkMmioRegistrationError>,
     },
+    RegisterVsockMmio {
+        source: Box<VsockMmioRegistrationError>,
+    },
     RegisterSerialMmio {
         source: Box<Arm64BootSerialMmioRegistrationError>,
     },
@@ -591,10 +607,17 @@ pub enum Arm64BootResourceError {
         devices: usize,
         lines: usize,
     },
+    VsockInterruptLineCount {
+        devices: usize,
+        lines: usize,
+    },
     BlockDeviceMetadataAllocation {
         source: TryReserveError,
     },
     NetworkDeviceMetadataAllocation {
+        source: TryReserveError,
+    },
+    VsockDeviceMetadataAllocation {
         source: TryReserveError,
     },
     Fdt {
@@ -637,6 +660,9 @@ impl fmt::Display for Arm64BootResourceError {
             Self::RegisterNetworkMmio { source } => {
                 write!(f, "failed to register network MMIO devices: {source}")
             }
+            Self::RegisterVsockMmio { source } => {
+                write!(f, "failed to register vsock MMIO device: {source}")
+            }
             Self::RegisterSerialMmio { source } => {
                 write!(f, "failed to register serial MMIO device: {source}")
             }
@@ -648,11 +674,18 @@ impl fmt::Display for Arm64BootResourceError {
                 f,
                 "network MMIO device count {devices} does not match interrupt line count {lines}"
             ),
+            Self::VsockInterruptLineCount { devices, lines } => write!(
+                f,
+                "vsock MMIO device count {devices} does not match interrupt line count {lines}"
+            ),
             Self::BlockDeviceMetadataAllocation { source } => {
                 write!(f, "failed to allocate block device metadata: {source}")
             }
             Self::NetworkDeviceMetadataAllocation { source } => {
                 write!(f, "failed to allocate network device metadata: {source}")
+            }
+            Self::VsockDeviceMetadataAllocation { source } => {
+                write!(f, "failed to allocate vsock device metadata: {source}")
             }
             Self::Fdt { source } => write!(f, "failed to write arm64 FDT: {source}"),
         }
@@ -669,15 +702,18 @@ impl std::error::Error for Arm64BootResourceError {
             Self::PrepareNetworkDevices { source } => Some(source),
             Self::RegisterBlockMmio { source } => Some(source.as_ref()),
             Self::RegisterNetworkMmio { source } => Some(source.as_ref()),
+            Self::RegisterVsockMmio { source } => Some(source.as_ref()),
             Self::RegisterSerialMmio { source } => Some(source.as_ref()),
             Self::BlockDeviceMetadataAllocation { source } => Some(source),
             Self::NetworkDeviceMetadataAllocation { source } => Some(source),
+            Self::VsockDeviceMetadataAllocation { source } => Some(source),
             Self::Fdt { source } => Some(source),
             Self::MissingBootSource
             | Self::MemorySizeOverflow { .. }
             | Self::MemorySizeExceedsArchitecturalMaximum { .. }
             | Self::BlockInterruptLineCount { .. }
-            | Self::NetworkInterruptLineCount { .. } => None,
+            | Self::NetworkInterruptLineCount { .. }
+            | Self::VsockInterruptLineCount { .. } => None,
         }
     }
 }
@@ -737,6 +773,8 @@ impl Arm64BootResources {
             block_interrupt_lines,
             network_mmio_layout,
             network_interrupt_lines,
+            vsock_mmio_layout,
+            vsock_interrupt_line,
         } = config;
         let boot_source_config = controller
             .boot_source_config()
@@ -748,6 +786,10 @@ impl Arm64BootResources {
         validate_network_interrupt_line_count(
             controller.network_interface_configs().len(),
             network_interrupt_lines.len(),
+        )?;
+        validate_vsock_interrupt_line_count(
+            controller.vsock_config().is_some(),
+            vsock_interrupt_line.is_some(),
         )?;
 
         let machine_config = controller.machine_config();
@@ -787,6 +829,32 @@ impl Arm64BootResources {
             .try_reserve_exact(network_fdt_devices.len())
             .map_err(|source| Arm64BootResourceError::NetworkDeviceMetadataAllocation { source })?;
         fdt_devices.extend(network_fdt_devices);
+        let vsock_device = match (controller.vsock_config(), vsock_interrupt_line) {
+            (Some(config), Some(interrupt_line)) => {
+                let prepared_vsock = PreparedVsockDevice::from_config(config);
+                let vsock_mmio = prepared_vsock
+                    .register_mmio_with_dispatcher(vsock_mmio_layout, mmio_dispatcher)
+                    .map_err(|source| Arm64BootResourceError::RegisterVsockMmio {
+                        source: Box::new(source),
+                    })?;
+                let (dispatcher, registration) = vsock_mmio.into_parts();
+                mmio_dispatcher = dispatcher;
+                let (device, fdt_device) =
+                    arm64_boot_vsock_device_metadata(registration, interrupt_line);
+                fdt_devices.try_reserve_exact(1).map_err(|source| {
+                    Arm64BootResourceError::VsockDeviceMetadataAllocation { source }
+                })?;
+                fdt_devices.push(fdt_device);
+                Some(device)
+            }
+            (None, None) => None,
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(vsock_interrupt_line_count_error(
+                    controller.vsock_config().is_some(),
+                    vsock_interrupt_line.is_some(),
+                ));
+            }
+        };
         let serial_device = serial_device
             .map(|serial| register_serial_mmio(&mut mmio_dispatcher, serial))
             .transpose()?;
@@ -815,6 +883,7 @@ impl Arm64BootResources {
             serial_device,
             block_devices,
             network_devices,
+            vsock_device,
         })
     }
 
@@ -830,6 +899,7 @@ impl Arm64BootResources {
                 serial_device: self.serial_device,
                 block_devices: self.block_devices,
                 network_devices: self.network_devices,
+                vsock_device: self.vsock_device,
             },
         }
     }
@@ -882,6 +952,27 @@ fn validate_network_interrupt_line_count(
         Ok(())
     } else {
         Err(Arm64BootResourceError::NetworkInterruptLineCount { devices, lines })
+    }
+}
+
+fn validate_vsock_interrupt_line_count(
+    configured: bool,
+    line_present: bool,
+) -> Result<(), Arm64BootResourceError> {
+    if configured == line_present {
+        Ok(())
+    } else {
+        Err(vsock_interrupt_line_count_error(configured, line_present))
+    }
+}
+
+fn vsock_interrupt_line_count_error(
+    configured: bool,
+    line_present: bool,
+) -> Arm64BootResourceError {
+    Arm64BootResourceError::VsockInterruptLineCount {
+        devices: usize::from(configured),
+        lines: usize::from(line_present),
     }
 }
 
@@ -951,6 +1042,28 @@ pub fn arm64_boot_network_device_metadata(
     }
 
     Ok((network_devices, fdt_devices))
+}
+
+fn arm64_boot_vsock_device_metadata(
+    registration: VsockMmioDeviceRegistration,
+    interrupt_line: GuestInterruptLine,
+) -> (Arm64BootVsockDevice, Arm64FdtVirtioMmioDevice) {
+    let range = registration.region().range();
+    let fdt_device = Arm64FdtVirtioMmioDevice {
+        region: Arm64FdtRegion {
+            base: range.start().raw_value(),
+            size: range.size(),
+        },
+        interrupt_line,
+    };
+
+    (
+        Arm64BootVsockDevice {
+            registration,
+            fdt_device,
+        },
+        fdt_device,
+    )
 }
 
 fn register_serial_mmio(
@@ -1049,6 +1162,7 @@ mod tests {
     use crate::virtio_queue::{
         VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
     };
+    use crate::vsock::{VirtioVsockMmioHandler, VsockConfigInput, VsockMmioLayout};
 
     static NEXT_TEST_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -1060,6 +1174,7 @@ mod tests {
     const ARM64_IMAGE_MAGIC: u32 = 0x644d_5241;
     const TEST_BLOCK_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_0000);
     const TEST_NETWORK_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_4000);
+    const TEST_VSOCK_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_6000);
     const TEST_SERIAL_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_2000);
     const TEST_QUEUE_SIZE: u16 = 4;
     const TEST_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x8040_0000);
@@ -1191,6 +1306,15 @@ mod tests {
             .expect("network config should be stored");
     }
 
+    fn add_vsock(controller: &mut crate::VmmController, guest_cid: u32, uds_path: &Path) {
+        controller
+            .handle_action(VmmAction::PutVsock(VsockConfigInput::new(
+                guest_cid,
+                uds_path.to_string_lossy().into_owned(),
+            )))
+            .expect("vsock config should be stored");
+    }
+
     fn network_registrations(
         interfaces: &[(&str, &str)],
         layout: NetworkMmioLayout,
@@ -1230,6 +1354,8 @@ mod tests {
                 MmioRegionId::new(50),
             ),
             network_interrupt_lines: &[],
+            vsock_mmio_layout: VsockMmioLayout::new(TEST_VSOCK_MMIO_BASE, MmioRegionId::new(90)),
+            vsock_interrupt_line: None,
         }
     }
 
@@ -2095,9 +2221,11 @@ mod tests {
         );
         assert!(resources.block_devices.is_empty());
         assert!(resources.network_devices.is_empty());
+        assert!(resources.vsock_device.is_none());
         assert!(resources.serial_device.is_none());
         assert!(resources.mmio_dispatcher.regions().is_empty());
         assert!(read_fdt(&resources).find("/uart@40002000").is_none());
+        assert!(read_fdt(&resources).find("/virtio_mmio@40006000").is_none());
     }
 
     #[test]
@@ -2169,6 +2297,125 @@ mod tests {
             .find("/virtio_mmio@40004000")
             .expect("network virtio-mmio node should be in assembled FDT");
         assert_eq!(network_node.prop_str("compatible").unwrap(), "virtio,mmio");
+    }
+
+    #[test]
+    fn assembles_boot_resources_with_vsock_mmio_metadata() {
+        let kernel = temp_file("kernel-with-vsock", &arm64_image());
+        let socket_path = missing_path("vsock-startup.sock");
+        let mut controller = controller_with_kernel(kernel.path());
+        add_vsock(&mut controller, 42, &socket_path);
+        let config = Arm64BootResourceConfig {
+            vsock_interrupt_line: Some(line(35)),
+            ..valid_config(&[])
+        };
+
+        assert!(!socket_path.exists());
+
+        let mut resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("boot resources should assemble with vsock device");
+
+        assert!(resources.block_devices.is_empty());
+        assert!(resources.network_devices.is_empty());
+        let vsock = resources
+            .vsock_device
+            .as_ref()
+            .expect("vsock metadata should be returned");
+        assert_eq!(vsock.registration.guest_cid(), 42);
+        assert_eq!(vsock.registration.uds_path(), socket_path.as_path());
+        assert_eq!(vsock.registration.region_id(), MmioRegionId::new(90));
+        assert_eq!(vsock.registration.address(), TEST_VSOCK_MMIO_BASE);
+        assert_eq!(
+            vsock.registration.region().range().size(),
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE
+        );
+        assert_eq!(
+            vsock.fdt_device.region.base,
+            TEST_VSOCK_MMIO_BASE.raw_value()
+        );
+        assert_eq!(vsock.fdt_device.region.size, VIRTIO_MMIO_DEVICE_WINDOW_SIZE);
+        assert_eq!(vsock.fdt_device.interrupt_line, line(35));
+        assert_eq!(resources.mmio_dispatcher.regions().len(), 1);
+        resources
+            .mmio_dispatcher
+            .handler_mut::<VirtioVsockMmioHandler>(vsock.registration.region_id())
+            .expect("vsock MMIO handler should be registered");
+        assert!(!socket_path.exists());
+
+        let tree = read_fdt(&resources);
+        let vsock_node = tree
+            .find("/virtio_mmio@40006000")
+            .expect("vsock virtio-mmio node should be in assembled FDT");
+        assert_eq!(vsock_node.prop_str("compatible").unwrap(), "virtio,mmio");
+    }
+
+    #[test]
+    fn configured_vsock_without_interrupt_line_fails_before_socket_access() {
+        let kernel = temp_file("kernel-vsock-missing-line", &arm64_image());
+        let socket_path = missing_path("vsock-missing-line.sock");
+        let mut controller = controller_with_kernel(kernel.path());
+        add_vsock(&mut controller, 43, &socket_path);
+
+        let err = Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
+            .expect_err("configured vsock without interrupt line should fail");
+
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::VsockInterruptLineCount {
+                devices: 1,
+                lines: 0
+            }
+        ));
+        assert!(std::error::Error::source(&err).is_none());
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn extra_vsock_interrupt_line_without_config_fails() {
+        let kernel = temp_file("kernel-vsock-extra-line", &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+        let config = Arm64BootResourceConfig {
+            vsock_interrupt_line: Some(line(35)),
+            ..valid_config(&[])
+        };
+
+        let err = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect_err("extra vsock interrupt line should fail");
+
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::VsockInterruptLineCount {
+                devices: 0,
+                lines: 1
+            }
+        ));
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn vsock_region_overlapping_block_mmio_fails_during_registration_without_path_leak() {
+        let kernel = temp_file("kernel-vsock-overlap-block", &arm64_image());
+        let block = temp_file("block-vsock-overlap", &[0x5a; 512]);
+        let socket_path = missing_path("vsock-overlap-secret.sock");
+        let mut controller = controller_with_kernel(kernel.path());
+        add_drive(&mut controller, "rootfs", block.path());
+        add_vsock(&mut controller, 44, &socket_path);
+        let block_interrupt_lines = [line(32)];
+        let config = Arm64BootResourceConfig {
+            vsock_mmio_layout: VsockMmioLayout::new(TEST_BLOCK_MMIO_BASE, MmioRegionId::new(90)),
+            vsock_interrupt_line: Some(line(35)),
+            ..valid_config(&block_interrupt_lines)
+        };
+
+        let err = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect_err("overlapping vsock MMIO should fail");
+
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::RegisterVsockMmio { .. }
+        ));
+        assert!(!err.to_string().contains("vsock-overlap-secret"));
+        assert!(!socket_path.exists());
     }
 
     #[test]
@@ -2297,6 +2544,7 @@ mod tests {
         );
         assert_eq!(parts.runtime.fdt, fdt);
         assert_eq!(parts.runtime.block_devices.len(), 1);
+        assert!(parts.runtime.vsock_device.is_none());
         assert_eq!(
             parts.runtime.block_devices[0].registration,
             block_registration
