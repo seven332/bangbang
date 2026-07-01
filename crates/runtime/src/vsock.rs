@@ -3,11 +3,15 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::mmio::{MmioAccessBytes, MmioAccessBytesError, MmioHandlerError};
+use crate::memory::{GuestAddress, GuestMemoryError};
+use crate::mmio::{
+    MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
+    MmioHandlerError, MmioRegion, MmioRegionId,
+};
 use crate::virtio_mmio::{
-    VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError, VirtioMmioDeviceActivationHandler,
-    VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError, VirtioMmioDeviceConfigHandler,
-    VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
+    VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
+    VirtioMmioDeviceActivationHandler, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
+    VirtioMmioDeviceConfigHandler, VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
 };
 
 pub const MIN_GUEST_CID: u32 = 3;
@@ -316,6 +320,246 @@ impl PreparedVsockDevice {
             self.device,
         )
     }
+
+    pub fn register_mmio(
+        self,
+        layout: VsockMmioLayout,
+    ) -> Result<VsockMmioDevice, VsockMmioRegistrationError> {
+        VsockMmioDevice::from_prepared(self, layout)
+    }
+
+    pub fn register_mmio_with_dispatcher(
+        self,
+        layout: VsockMmioLayout,
+        dispatcher: MmioDispatcher,
+    ) -> Result<VsockMmioDevice, VsockMmioRegistrationError> {
+        VsockMmioDevice::from_prepared_with_dispatcher(self, layout, dispatcher)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VsockMmioLayout {
+    address: GuestAddress,
+    region_id: MmioRegionId,
+}
+
+impl VsockMmioLayout {
+    pub const fn new(address: GuestAddress, region_id: MmioRegionId) -> Self {
+        Self { address, region_id }
+    }
+
+    pub const fn address(self) -> GuestAddress {
+        self.address
+    }
+
+    pub const fn region_id(self) -> MmioRegionId {
+        self.region_id
+    }
+
+    fn region(self) -> Result<MmioRegion, VsockMmioRegistrationError> {
+        MmioRegion::new(self.region_id, self.address, VIRTIO_MMIO_DEVICE_WINDOW_SIZE).map_err(
+            |source| VsockMmioRegistrationError::InvalidRegion {
+                region_id: self.region_id,
+                address: self.address,
+                source,
+            },
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VsockMmioDeviceRegistration {
+    guest_cid: u32,
+    uds_path: PathBuf,
+    region: MmioRegion,
+}
+
+impl VsockMmioDeviceRegistration {
+    pub const fn guest_cid(&self) -> u32 {
+        self.guest_cid
+    }
+
+    pub fn uds_path(&self) -> &Path {
+        &self.uds_path
+    }
+
+    pub const fn region(&self) -> MmioRegion {
+        self.region
+    }
+
+    pub const fn region_id(&self) -> MmioRegionId {
+        self.region.id()
+    }
+
+    pub const fn address(&self) -> GuestAddress {
+        self.region.range().start()
+    }
+}
+
+#[derive(Debug)]
+pub struct VsockMmioDevice {
+    dispatcher: MmioDispatcher,
+    registration: VsockMmioDeviceRegistration,
+}
+
+impl VsockMmioDevice {
+    pub fn from_prepared(
+        prepared: PreparedVsockDevice,
+        layout: VsockMmioLayout,
+    ) -> Result<Self, VsockMmioRegistrationError> {
+        Self::from_prepared_with_dispatcher(prepared, layout, MmioDispatcher::new())
+    }
+
+    pub fn from_prepared_with_dispatcher(
+        prepared: PreparedVsockDevice,
+        layout: VsockMmioLayout,
+        dispatcher: MmioDispatcher,
+    ) -> Result<Self, VsockMmioRegistrationError> {
+        let region = layout.region()?;
+        let (guest_cid, uds_path, config_space, device) = prepared.into_parts();
+        let handler = VirtioMmioRegisterHandler::with_device_config_and_activation(
+            VIRTIO_VSOCK_DEVICE_ID,
+            config_space.available_features(),
+            &VIRTIO_VSOCK_QUEUE_SIZES,
+            config_space,
+            device,
+        )
+        .map_err(|source| VsockMmioRegistrationError::BuildHandler {
+            guest_cid,
+            region_id: layout.region_id(),
+            source,
+        })?;
+        let mut dispatcher = dispatcher;
+        let inserted_region = dispatcher
+            .insert_region(
+                layout.region_id(),
+                layout.address(),
+                VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+            )
+            .map_err(|source| VsockMmioRegistrationError::InsertRegion {
+                guest_cid,
+                region_id: layout.region_id(),
+                address: layout.address(),
+                source,
+            })?;
+        dispatcher
+            .register_handler(layout.region_id(), handler)
+            .map_err(|source| VsockMmioRegistrationError::RegisterHandler {
+                guest_cid,
+                region_id: layout.region_id(),
+                source,
+            })?;
+        debug_assert_eq!(inserted_region, region);
+
+        Ok(Self {
+            dispatcher,
+            registration: VsockMmioDeviceRegistration {
+                guest_cid,
+                uds_path,
+                region,
+            },
+        })
+    }
+
+    pub fn dispatcher(&self) -> &MmioDispatcher {
+        &self.dispatcher
+    }
+
+    pub fn dispatcher_mut(&mut self) -> &mut MmioDispatcher {
+        &mut self.dispatcher
+    }
+
+    pub const fn registration(&self) -> &VsockMmioDeviceRegistration {
+        &self.registration
+    }
+
+    pub fn into_parts(self) -> (MmioDispatcher, VsockMmioDeviceRegistration) {
+        (self.dispatcher, self.registration)
+    }
+}
+
+#[derive(Debug)]
+pub enum VsockMmioRegistrationError {
+    InvalidRegion {
+        region_id: MmioRegionId,
+        address: GuestAddress,
+        source: GuestMemoryError,
+    },
+    BuildHandler {
+        guest_cid: u32,
+        region_id: MmioRegionId,
+        source: VirtioMmioRegisterHandlerError,
+    },
+    InsertRegion {
+        guest_cid: u32,
+        region_id: MmioRegionId,
+        address: GuestAddress,
+        source: MmioBusError,
+    },
+    RegisterHandler {
+        guest_cid: u32,
+        region_id: MmioRegionId,
+        source: MmioDispatchError,
+    },
+}
+
+impl fmt::Display for VsockMmioRegistrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRegion {
+                region_id,
+                address,
+                source,
+            } => {
+                write!(
+                    f,
+                    "invalid vsock MMIO region id={region_id} at {address}: {source}"
+                )
+            }
+            Self::BuildHandler {
+                guest_cid,
+                region_id,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to build vsock MMIO handler for guest CID {guest_cid} region id={region_id}: {source}"
+                )
+            }
+            Self::InsertRegion {
+                guest_cid,
+                region_id,
+                address,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to insert vsock MMIO region for guest CID {guest_cid} region id={region_id} at {address}: {source}"
+                )
+            }
+            Self::RegisterHandler {
+                guest_cid,
+                region_id,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to register vsock MMIO handler for guest CID {guest_cid} region id={region_id}: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VsockMmioRegistrationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidRegion { source, .. } => Some(source),
+            Self::BuildHandler { source, .. } => Some(source),
+            Self::InsertRegion { source, .. } => Some(source),
+            Self::RegisterHandler { source, .. } => Some(source),
+        }
+    }
 }
 
 pub fn virtio_vsock_mmio_handler(
@@ -351,7 +595,10 @@ mod tests {
     use std::path::Path;
 
     use crate::memory::GuestAddress;
-    use crate::mmio::{MmioAccess, MmioAccessBytes, MmioBus, MmioRegionId};
+    use crate::mmio::{
+        MmioAccess, MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioDispatcher, MmioOperation,
+        MmioRegionId,
+    };
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
         VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
@@ -366,7 +613,8 @@ mod tests {
         VIRTIO_VSOCK_EVENT_QUEUE_INDEX, VIRTIO_VSOCK_QUEUE_COUNT, VIRTIO_VSOCK_QUEUE_SIZE,
         VIRTIO_VSOCK_QUEUE_SIZES, VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_TX_QUEUE_INDEX,
         VirtioVsockConfigSpace, VirtioVsockDevice, VirtioVsockMmioHandler, VsockConfigError,
-        VsockConfigInput, virtio_vsock_mmio_handler,
+        VsockConfigInput, VsockMmioDevice, VsockMmioLayout, VsockMmioRegistrationError,
+        virtio_vsock_mmio_handler,
     };
 
     const TEST_MMIO_BASE: u64 = 0x1000_0000;
@@ -383,6 +631,47 @@ mod tests {
 
     fn valid_vsock_config(guest_cid: u32, uds_path: impl Into<String>) -> super::VsockConfig {
         validate(VsockConfigInput::new(guest_cid, uds_path)).expect("valid config")
+    }
+
+    fn prepared_vsock_device(guest_cid: u32, uds_path: impl Into<String>) -> PreparedVsockDevice {
+        PreparedVsockDevice::from_config(&valid_vsock_config(guest_cid, uds_path))
+    }
+
+    fn unique_missing_socket_path() -> String {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after Unix epoch")
+            .as_nanos();
+        format!(
+            "bangbang-vsock-missing-parent-{}-{unique}/v.sock",
+            std::process::id(),
+        )
+    }
+
+    fn vsock_mmio_layout() -> VsockMmioLayout {
+        VsockMmioLayout::new(GuestAddress::new(TEST_MMIO_BASE), MmioRegionId::new(2))
+    }
+
+    fn read_registered_config(device: &mut VsockMmioDevice, offset: u64, len: u64) -> Vec<u8> {
+        let address = device
+            .registration()
+            .address()
+            .checked_add(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET + offset)
+            .expect("test config address should not overflow");
+        let access = device
+            .dispatcher()
+            .lookup(address, len)
+            .expect("registered config access should resolve");
+        let operation = MmioOperation::read(access).expect("registered config read should build");
+        let outcome = device
+            .dispatcher_mut()
+            .dispatch(operation)
+            .expect("registered config read should dispatch");
+        let MmioDispatchOutcome::Read { data } = outcome else {
+            panic!("read operation should return read outcome");
+        };
+
+        data.as_slice().to_vec()
     }
 
     fn virtio_mmio_access(offset: u64, len: u64) -> MmioAccess {
@@ -594,14 +883,7 @@ mod tests {
 
     #[test]
     fn prepared_vsock_device_does_not_touch_missing_socket_path() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time should be after Unix epoch")
-            .as_nanos();
-        let socket_path = format!(
-            "bangbang-vsock-missing-parent-{}-{unique}/v.sock",
-            std::process::id(),
-        );
+        let socket_path = unique_missing_socket_path();
         let path = Path::new(&socket_path);
         let config = valid_vsock_config(8, socket_path.clone());
 
@@ -610,6 +892,181 @@ mod tests {
         let prepared = PreparedVsockDevice::from_config(&config);
 
         assert_eq!(prepared.uds_path(), path);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn prepared_vsock_device_registers_mmio_in_fresh_dispatcher() {
+        let mut device = prepared_vsock_device(42, "./v.sock")
+            .register_mmio(vsock_mmio_layout())
+            .expect("vsock device should register");
+        let registration = device.registration();
+
+        assert_eq!(registration.guest_cid(), 42);
+        assert_eq!(registration.uds_path(), Path::new("./v.sock"));
+        assert_eq!(registration.region_id(), MmioRegionId::new(2));
+        assert_eq!(registration.address(), GuestAddress::new(TEST_MMIO_BASE));
+        assert_eq!(
+            registration.region().range().size(),
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE
+        );
+        assert_eq!(device.dispatcher().regions(), &[registration.region()]);
+
+        let region_id = registration.region_id();
+        let handler = device
+            .dispatcher_mut()
+            .handler_mut::<VirtioVsockMmioHandler>(region_id)
+            .expect("registered vsock handler should be present");
+        assert!(!handler.is_device_activated());
+        assert!(!handler.activation_handler().is_activated());
+    }
+
+    #[test]
+    fn prepared_vsock_device_registers_mmio_in_existing_dispatcher() {
+        let mut dispatcher = MmioDispatcher::new();
+        let existing_region = dispatcher
+            .insert_region(
+                MmioRegionId::new(1),
+                GuestAddress::new(TEST_MMIO_BASE - VIRTIO_MMIO_DEVICE_WINDOW_SIZE),
+                VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+            )
+            .expect("existing region should insert");
+        let device = prepared_vsock_device(9, "./v.sock")
+            .register_mmio_with_dispatcher(vsock_mmio_layout(), dispatcher)
+            .expect("vsock device should register with existing dispatcher");
+
+        assert_eq!(device.dispatcher().regions().len(), 2);
+        assert!(device.dispatcher().regions().contains(&existing_region));
+        assert!(
+            device
+                .dispatcher()
+                .regions()
+                .contains(&device.registration().region())
+        );
+    }
+
+    #[test]
+    fn registered_vsock_mmio_dispatch_reads_guest_cid_config() {
+        let mut device = prepared_vsock_device(0x1122_3344, "./v.sock")
+            .register_mmio(vsock_mmio_layout())
+            .expect("vsock device should register");
+
+        assert_eq!(
+            read_registered_config(&mut device, 0, 8),
+            u64::from(0x1122_3344_u32).to_le_bytes().to_vec()
+        );
+        assert_eq!(
+            read_registered_config(&mut device, 0, 4),
+            0x1122_3344_u32.to_le_bytes().to_vec()
+        );
+        assert_eq!(
+            read_registered_config(&mut device, 4, 4),
+            0_u32.to_le_bytes().to_vec()
+        );
+    }
+
+    #[test]
+    fn registered_vsock_mmio_into_parts_consumes_owned_resource() {
+        let device = prepared_vsock_device(11, "relative-vsock.sock")
+            .register_mmio(vsock_mmio_layout())
+            .expect("vsock device should register");
+
+        let (dispatcher, registration) = device.into_parts();
+
+        assert_eq!(dispatcher.regions(), &[registration.region()]);
+        assert_eq!(registration.guest_cid(), 11);
+        assert_eq!(registration.uds_path(), Path::new("relative-vsock.sock"));
+    }
+
+    #[test]
+    fn prepared_vsock_device_rejects_overlapping_mmio_registration_without_path_leak() {
+        let mut dispatcher = MmioDispatcher::new();
+        dispatcher
+            .insert_region(
+                MmioRegionId::new(1),
+                GuestAddress::new(TEST_MMIO_BASE),
+                VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+            )
+            .expect("existing region should insert");
+
+        let layout = VsockMmioLayout::new(
+            GuestAddress::new(TEST_MMIO_BASE + 0x100),
+            MmioRegionId::new(3),
+        );
+        let err = prepared_vsock_device(12, "secret-vsock-path.sock")
+            .register_mmio_with_dispatcher(layout, dispatcher)
+            .expect_err("overlapping region should fail");
+
+        assert!(matches!(
+            err,
+            VsockMmioRegistrationError::InsertRegion {
+                guest_cid: 12,
+                region_id,
+                ..
+            } if region_id == MmioRegionId::new(3)
+        ));
+        assert!(err.source().is_some());
+        assert!(!err.to_string().contains("secret-vsock-path"));
+    }
+
+    #[test]
+    fn prepared_vsock_device_rejects_invalid_mmio_layout_without_path_leak() {
+        let layout = VsockMmioLayout::new(GuestAddress::new(u64::MAX), MmioRegionId::new(4));
+        let err = prepared_vsock_device(13, "secret-vsock-path.sock")
+            .register_mmio(layout)
+            .expect_err("overflowing region should fail");
+
+        assert!(matches!(
+            err,
+            VsockMmioRegistrationError::InvalidRegion {
+                region_id,
+                address,
+                ..
+            } if region_id == MmioRegionId::new(4) && address == GuestAddress::new(u64::MAX)
+        ));
+        assert!(err.source().is_some());
+        assert!(!err.to_string().contains("secret-vsock-path"));
+    }
+
+    #[test]
+    fn prepared_vsock_device_rejects_duplicate_mmio_handler_without_path_leak() {
+        let layout = vsock_mmio_layout();
+        let mut dispatcher = MmioDispatcher::new();
+        dispatcher
+            .register_handler(
+                layout.region_id(),
+                virtio_vsock_mmio_handler(3).expect("existing handler should build"),
+            )
+            .expect("existing handler should register");
+
+        let err = prepared_vsock_device(14, "secret-vsock-path.sock")
+            .register_mmio_with_dispatcher(layout, dispatcher)
+            .expect_err("duplicate handler should fail");
+
+        assert!(matches!(
+            err,
+            VsockMmioRegistrationError::RegisterHandler {
+                guest_cid: 14,
+                region_id,
+                ..
+            } if region_id == layout.region_id()
+        ));
+        assert!(err.source().is_some());
+        assert!(!err.to_string().contains("secret-vsock-path"));
+    }
+
+    #[test]
+    fn prepared_vsock_device_mmio_registration_does_not_touch_missing_socket_path() {
+        let socket_path = unique_missing_socket_path();
+        let path = Path::new(&socket_path);
+
+        assert!(!path.exists());
+
+        let device = prepared_vsock_device(13, socket_path.clone())
+            .register_mmio(vsock_mmio_layout())
+            .expect("vsock device should register");
+
+        assert_eq!(device.registration().uds_path(), path);
         assert!(!path.exists());
     }
 
