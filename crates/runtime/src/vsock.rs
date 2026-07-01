@@ -3,7 +3,9 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::memory::{GuestAddress, GuestMemoryError};
+use crate::memory::{
+    GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryRange,
+};
 use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
     MmioHandlerError, MmioRegion, MmioRegionId,
@@ -14,6 +16,7 @@ use crate::virtio_mmio::{
     VirtioMmioDeviceConfigHandler, VirtioMmioQueueRegisterError, VirtioMmioQueueState,
     VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
 };
+use crate::virtio_queue::{VirtqueueDescriptor, VirtqueueDescriptorChain};
 
 pub const MIN_GUEST_CID: u32 = 3;
 pub const VIRTIO_VSOCK_DEVICE_ID: u32 = 19;
@@ -45,6 +48,7 @@ pub const VIRTIO_FEATURE_IN_ORDER: u32 = 35;
 const VIRTIO_VSOCK_RX_QUEUE_INDEX_U32: u32 = 0;
 const VIRTIO_VSOCK_TX_QUEUE_INDEX_U32: u32 = 1;
 const VIRTIO_VSOCK_EVENT_QUEUE_INDEX_U32: u32 = 2;
+const VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64: u64 = VIRTIO_VSOCK_PACKET_HEADER_SIZE as u64;
 
 pub type VirtioVsockMmioHandler =
     VirtioMmioRegisterHandler<VirtioVsockConfigSpace, VirtioVsockDevice>;
@@ -513,6 +517,458 @@ impl fmt::Display for VirtioVsockPacketLengthError {
 }
 
 impl std::error::Error for VirtioVsockPacketLengthError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioVsockTxPayloadSegment {
+    descriptor_index: u16,
+    address: GuestAddress,
+    len: u32,
+}
+
+impl VirtioVsockTxPayloadSegment {
+    const fn new(descriptor_index: u16, address: GuestAddress, len: u32) -> Self {
+        Self {
+            descriptor_index,
+            address,
+            len,
+        }
+    }
+
+    pub const fn descriptor_index(self) -> u16 {
+        self.descriptor_index
+    }
+
+    pub const fn address(self) -> GuestAddress {
+        self.address
+    }
+
+    pub const fn len(self) -> u32 {
+        self.len
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioVsockTxPacket {
+    descriptor_head: u16,
+    header: VirtioVsockPacketHeader,
+    payload_segments: Vec<VirtioVsockTxPayloadSegment>,
+}
+
+impl VirtioVsockTxPacket {
+    pub fn parse(
+        memory: &GuestMemory,
+        chain: &VirtqueueDescriptorChain,
+    ) -> Result<Self, VirtioVsockTxPacketParseError> {
+        let (descriptor_head, total_readable_len) =
+            validate_vsock_tx_descriptor_chain(memory, chain)?;
+        validate_vsock_tx_header_available(descriptor_head, total_readable_len)?;
+
+        let header_bytes = read_vsock_tx_header_bytes(memory, chain, descriptor_head)?;
+        let header = VirtioVsockPacketHeader::try_from_bytes(header_bytes)
+            .map_err(|source| VirtioVsockTxPacketParseError::InvalidHeaderLength { source })?;
+        validate_vsock_tx_payload_len(descriptor_head, total_readable_len, header.payload_len())?;
+
+        let payload_segments = vsock_tx_payload_segments(chain, header.payload_len())?;
+
+        Ok(Self {
+            descriptor_head,
+            header,
+            payload_segments,
+        })
+    }
+
+    pub const fn descriptor_head(&self) -> u16 {
+        self.descriptor_head
+    }
+
+    pub const fn header(&self) -> VirtioVsockPacketHeader {
+        self.header
+    }
+
+    pub fn payload_segments(&self) -> &[VirtioVsockTxPayloadSegment] {
+        &self.payload_segments
+    }
+
+    pub const fn payload_len(&self) -> u32 {
+        self.header.payload_len()
+    }
+
+    pub fn packet_len(&self) -> u64 {
+        VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64 + u64::from(self.payload_len())
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioVsockTxPacketParseError {
+    DescriptorChainTooShort {
+        expected: usize,
+        actual: usize,
+    },
+    DescriptorWriteOnly {
+        index: u16,
+    },
+    DescriptorRangeOverflow {
+        index: u16,
+        address: GuestAddress,
+        len: u32,
+    },
+    DescriptorAccess {
+        index: u16,
+        address: GuestAddress,
+        len: u32,
+        source: GuestMemoryAccessError,
+    },
+    ReadableLengthOverflow {
+        descriptor_head: u16,
+    },
+    HeaderTooShort {
+        descriptor_head: u16,
+        actual: u64,
+        min: u64,
+    },
+    ReadHeader {
+        index: u16,
+        address: GuestAddress,
+        len: usize,
+        source: GuestMemoryAccessError,
+    },
+    InvalidHeaderLength {
+        source: VirtioVsockPacketLengthError,
+    },
+    PayloadTooShort {
+        descriptor_head: u16,
+        required: u32,
+        available: u64,
+    },
+    PayloadSegmentLengthOverflow {
+        index: u16,
+        available: u64,
+    },
+    PayloadSegmentsAllocationFailed {
+        descriptor_count: usize,
+        source: std::collections::TryReserveError,
+    },
+}
+
+impl fmt::Display for VirtioVsockTxPacketParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DescriptorChainTooShort { expected, actual } => {
+                write!(
+                    f,
+                    "virtio-vsock TX descriptor chain has {actual} descriptors; expected at least {expected}"
+                )
+            }
+            Self::DescriptorWriteOnly { index } => {
+                write!(f, "virtio-vsock TX descriptor {index} is write-only")
+            }
+            Self::DescriptorRangeOverflow {
+                index,
+                address,
+                len,
+            } => {
+                write!(
+                    f,
+                    "virtio-vsock TX descriptor {index} at {address} with length {len} overflows address space"
+                )
+            }
+            Self::DescriptorAccess {
+                index,
+                address,
+                len,
+                source,
+            } => {
+                write!(
+                    f,
+                    "virtio-vsock TX descriptor {index} at {address} with length {len} is not fully mapped: {source}"
+                )
+            }
+            Self::ReadableLengthOverflow { descriptor_head } => {
+                write!(
+                    f,
+                    "virtio-vsock TX descriptor chain headed by {descriptor_head} overflows readable length"
+                )
+            }
+            Self::HeaderTooShort {
+                descriptor_head,
+                actual,
+                min,
+            } => {
+                write!(
+                    f,
+                    "virtio-vsock TX descriptor chain headed by {descriptor_head} has {actual} readable bytes; expected at least {min} for the packet header"
+                )
+            }
+            Self::ReadHeader {
+                index,
+                address,
+                len,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to read {len} virtio-vsock TX header bytes from descriptor {index} at {address}: {source}"
+                )
+            }
+            Self::InvalidHeaderLength { source } => {
+                write!(f, "invalid virtio-vsock TX packet header length: {source}")
+            }
+            Self::PayloadTooShort {
+                descriptor_head,
+                required,
+                available,
+            } => {
+                write!(
+                    f,
+                    "virtio-vsock TX descriptor chain headed by {descriptor_head} advertises {required} payload bytes but only {available} are readable after the header"
+                )
+            }
+            Self::PayloadSegmentLengthOverflow { index, available } => {
+                write!(
+                    f,
+                    "virtio-vsock TX payload segment in descriptor {index} has {available} readable bytes, which cannot fit in a segment length"
+                )
+            }
+            Self::PayloadSegmentsAllocationFailed {
+                descriptor_count,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to reserve virtio-vsock TX payload segment storage for {descriptor_count} descriptors: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioVsockTxPacketParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DescriptorAccess { source, .. } => Some(source),
+            Self::ReadHeader { source, .. } => Some(source),
+            Self::InvalidHeaderLength { source } => Some(source),
+            Self::PayloadSegmentsAllocationFailed { source, .. } => Some(source),
+            Self::DescriptorChainTooShort { .. }
+            | Self::DescriptorWriteOnly { .. }
+            | Self::DescriptorRangeOverflow { .. }
+            | Self::ReadableLengthOverflow { .. }
+            | Self::HeaderTooShort { .. }
+            | Self::PayloadTooShort { .. }
+            | Self::PayloadSegmentLengthOverflow { .. } => None,
+        }
+    }
+}
+
+fn validate_vsock_tx_descriptor_chain(
+    memory: &GuestMemory,
+    chain: &VirtqueueDescriptorChain,
+) -> Result<(u16, u64), VirtioVsockTxPacketParseError> {
+    let descriptor_head = chain
+        .descriptors()
+        .first()
+        .copied()
+        .ok_or(VirtioVsockTxPacketParseError::DescriptorChainTooShort {
+            expected: 1,
+            actual: 0,
+        })?
+        .index();
+
+    let mut total_readable_len = 0_u64;
+    for descriptor in chain.descriptors().iter().copied() {
+        validate_vsock_tx_descriptor(memory, descriptor)?;
+        total_readable_len = total_readable_len
+            .checked_add(u64::from(descriptor.len()))
+            .ok_or(VirtioVsockTxPacketParseError::ReadableLengthOverflow { descriptor_head })?;
+    }
+
+    Ok((descriptor_head, total_readable_len))
+}
+
+fn validate_vsock_tx_descriptor(
+    memory: &GuestMemory,
+    descriptor: VirtqueueDescriptor,
+) -> Result<(), VirtioVsockTxPacketParseError> {
+    if descriptor.is_write_only() {
+        return Err(VirtioVsockTxPacketParseError::DescriptorWriteOnly {
+            index: descriptor.index(),
+        });
+    }
+
+    if descriptor.is_empty() {
+        return Ok(());
+    }
+
+    let range =
+        GuestMemoryRange::new(descriptor.address(), u64::from(descriptor.len())).map_err(|_| {
+            VirtioVsockTxPacketParseError::DescriptorRangeOverflow {
+                index: descriptor.index(),
+                address: descriptor.address(),
+                len: descriptor.len(),
+            }
+        })?;
+    memory.validate_mapped_range(range).map_err(|source| {
+        VirtioVsockTxPacketParseError::DescriptorAccess {
+            index: descriptor.index(),
+            address: descriptor.address(),
+            len: descriptor.len(),
+            source,
+        }
+    })
+}
+
+fn validate_vsock_tx_header_available(
+    descriptor_head: u16,
+    total_readable_len: u64,
+) -> Result<(), VirtioVsockTxPacketParseError> {
+    if total_readable_len < VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64 {
+        return Err(VirtioVsockTxPacketParseError::HeaderTooShort {
+            descriptor_head,
+            actual: total_readable_len,
+            min: VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64,
+        });
+    }
+
+    Ok(())
+}
+
+fn read_vsock_tx_header_bytes(
+    memory: &GuestMemory,
+    chain: &VirtqueueDescriptorChain,
+    descriptor_head: u16,
+) -> Result<[u8; VIRTIO_VSOCK_PACKET_HEADER_SIZE], VirtioVsockTxPacketParseError> {
+    let mut header = [0; VIRTIO_VSOCK_PACKET_HEADER_SIZE];
+    let unread_header_len = fill_vsock_tx_header_bytes(memory, chain, &mut header)?;
+    if unread_header_len != 0 {
+        let actual = VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64
+            - u64::try_from(unread_header_len).map_err(|_| {
+                VirtioVsockTxPacketParseError::HeaderTooShort {
+                    descriptor_head,
+                    actual: 0,
+                    min: VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64,
+                }
+            })?;
+        return Err(VirtioVsockTxPacketParseError::HeaderTooShort {
+            descriptor_head,
+            actual,
+            min: VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64,
+        });
+    }
+
+    Ok(header)
+}
+
+fn fill_vsock_tx_header_bytes(
+    memory: &GuestMemory,
+    chain: &VirtqueueDescriptorChain,
+    header: &mut [u8; VIRTIO_VSOCK_PACKET_HEADER_SIZE],
+) -> Result<usize, VirtioVsockTxPacketParseError> {
+    let mut remaining_header = header.as_mut_slice();
+    for descriptor in chain.descriptors().iter().copied() {
+        if remaining_header.is_empty() {
+            return Ok(0);
+        }
+
+        let descriptor_len = usize::try_from(descriptor.len()).map_err(|_| {
+            VirtioVsockTxPacketParseError::PayloadSegmentLengthOverflow {
+                index: descriptor.index(),
+                available: u64::from(descriptor.len()),
+            }
+        })?;
+        let read_len = remaining_header.len().min(descriptor_len);
+        if read_len == 0 {
+            continue;
+        }
+
+        let (destination, next_remaining) = remaining_header.split_at_mut(read_len);
+        memory
+            .read_slice(destination, descriptor.address())
+            .map_err(|source| VirtioVsockTxPacketParseError::ReadHeader {
+                index: descriptor.index(),
+                address: descriptor.address(),
+                len: read_len,
+                source,
+            })?;
+        remaining_header = next_remaining;
+    }
+
+    Ok(remaining_header.len())
+}
+
+fn validate_vsock_tx_payload_len(
+    descriptor_head: u16,
+    total_readable_len: u64,
+    payload_len: u32,
+) -> Result<(), VirtioVsockTxPacketParseError> {
+    let available = total_readable_len - VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64;
+    if u64::from(payload_len) > available {
+        return Err(VirtioVsockTxPacketParseError::PayloadTooShort {
+            descriptor_head,
+            required: payload_len,
+            available,
+        });
+    }
+
+    Ok(())
+}
+
+fn vsock_tx_payload_segments(
+    chain: &VirtqueueDescriptorChain,
+    payload_len: u32,
+) -> Result<Vec<VirtioVsockTxPayloadSegment>, VirtioVsockTxPacketParseError> {
+    let mut segments = Vec::new();
+    segments.try_reserve_exact(chain.len()).map_err(|source| {
+        VirtioVsockTxPacketParseError::PayloadSegmentsAllocationFailed {
+            descriptor_count: chain.len(),
+            source,
+        }
+    })?;
+
+    let mut header_remaining = VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64;
+    let mut payload_remaining = payload_len;
+    for descriptor in chain.descriptors().iter().copied() {
+        if payload_remaining == 0 {
+            break;
+        }
+
+        let descriptor_len = u64::from(descriptor.len());
+        if header_remaining >= descriptor_len {
+            header_remaining -= descriptor_len;
+            continue;
+        }
+
+        let payload_offset = header_remaining;
+        header_remaining = 0;
+        let available = descriptor_len - payload_offset;
+        let available = u32::try_from(available).map_err(|_| {
+            VirtioVsockTxPacketParseError::PayloadSegmentLengthOverflow {
+                index: descriptor.index(),
+                available,
+            }
+        })?;
+        let segment_len = payload_remaining.min(available);
+        let segment_address = descriptor.address().checked_add(payload_offset).ok_or(
+            VirtioVsockTxPacketParseError::DescriptorRangeOverflow {
+                index: descriptor.index(),
+                address: descriptor.address(),
+                len: descriptor.len(),
+            },
+        )?;
+
+        segments.push(VirtioVsockTxPayloadSegment::new(
+            descriptor.index(),
+            segment_address,
+            segment_len,
+        ));
+        payload_remaining -= segment_len;
+    }
+
+    Ok(segments)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtioVsockConfigSpace {
@@ -1190,7 +1646,7 @@ mod tests {
     use std::error::Error as _;
     use std::path::Path;
 
-    use crate::memory::GuestAddress;
+    use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
     use crate::mmio::{
         MmioAccess, MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioDispatcher, MmioOperation,
         MmioRegionId,
@@ -1204,6 +1660,10 @@ mod tests {
         VirtioMmioDeviceRegisters, VirtioMmioQueueRegisters, VirtioMmioRegister,
         VirtioMmioRegisterHandlerError,
     };
+    use crate::virtio_queue::{
+        VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
+        VirtqueueDescriptorChain, read_descriptor_chain,
+    };
 
     use super::{
         MIN_GUEST_CID, PreparedVsockDevice, VIRTIO_FEATURE_IN_ORDER, VIRTIO_FEATURE_VERSION_1,
@@ -1213,13 +1673,14 @@ mod tests {
         VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE, VIRTIO_VSOCK_OP_CREDIT_REQUEST,
         VIRTIO_VSOCK_OP_CREDIT_UPDATE, VIRTIO_VSOCK_OP_REQUEST, VIRTIO_VSOCK_OP_RESPONSE,
         VIRTIO_VSOCK_OP_RST, VIRTIO_VSOCK_OP_RW, VIRTIO_VSOCK_OP_SHUTDOWN,
-        VIRTIO_VSOCK_PACKET_HEADER_SIZE, VIRTIO_VSOCK_PACKET_TYPE_STREAM, VIRTIO_VSOCK_QUEUE_COUNT,
-        VIRTIO_VSOCK_QUEUE_SIZE, VIRTIO_VSOCK_QUEUE_SIZES, VIRTIO_VSOCK_RX_QUEUE_INDEX,
-        VIRTIO_VSOCK_TX_QUEUE_INDEX, VirtioVsockConfigSpace, VirtioVsockDevice,
-        VirtioVsockDeviceActivationError, VirtioVsockMmioHandler, VirtioVsockPacketHeader,
-        VirtioVsockPacketLengthError, VirtioVsockQueueBuildError, VsockConfigError,
-        VsockConfigInput, VsockMmioDevice, VsockMmioLayout, VsockMmioRegistrationError,
-        virtio_vsock_mmio_handler,
+        VIRTIO_VSOCK_PACKET_HEADER_SIZE, VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64,
+        VIRTIO_VSOCK_PACKET_TYPE_STREAM, VIRTIO_VSOCK_QUEUE_COUNT, VIRTIO_VSOCK_QUEUE_SIZE,
+        VIRTIO_VSOCK_QUEUE_SIZES, VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_TX_QUEUE_INDEX,
+        VirtioVsockConfigSpace, VirtioVsockDevice, VirtioVsockDeviceActivationError,
+        VirtioVsockMmioHandler, VirtioVsockPacketHeader, VirtioVsockPacketLengthError,
+        VirtioVsockQueueBuildError, VirtioVsockTxPacket, VirtioVsockTxPacketParseError,
+        VsockConfigError, VsockConfigInput, VsockMmioDevice, VsockMmioLayout,
+        VsockMmioRegistrationError, virtio_vsock_mmio_handler,
     };
 
     const TEST_MMIO_BASE: u64 = 0x1000_0000;
@@ -1229,6 +1690,13 @@ mod tests {
     const DRIVER_OK_STATUS: u32 = QUEUE_CONFIG_STATUS | VIRTIO_DEVICE_STATUS_DRIVER_OK;
     const TEST_QUEUE_ADDRESS_BASE: u64 = 0x1000;
     const TEST_QUEUE_ADDRESS_STRIDE: u64 = 0x1000;
+    const TEST_VSOCK_TX_MEMORY_SIZE: u64 = 0x20_000;
+    const TEST_VSOCK_TX_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x1000);
+    const TEST_VSOCK_HEADER: GuestAddress = GuestAddress::new(0x4000);
+    const TEST_VSOCK_SECOND_HEADER: GuestAddress = GuestAddress::new(0x5000);
+    const TEST_VSOCK_PAYLOAD: GuestAddress = GuestAddress::new(0x6000);
+    const TEST_VSOCK_SECOND_PAYLOAD: GuestAddress = GuestAddress::new(0x7000);
+    const TEST_VSOCK_QUEUE_SIZE: u16 = 8;
 
     fn validate(input: VsockConfigInput) -> Result<super::VsockConfig, VsockConfigError> {
         input.validate()
@@ -1458,6 +1926,137 @@ mod tests {
             .with_flags(VIRTIO_VSOCK_FLAGS_SHUTDOWN_RCV | VIRTIO_VSOCK_FLAGS_SHUTDOWN_SEND)
             .with_buffer_allocation(0x4142_4344)
             .with_forwarded_count(0x5152_5354)
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestDescriptor {
+        address: GuestAddress,
+        len: u32,
+        flags: u16,
+        next: u16,
+    }
+
+    impl TestDescriptor {
+        const fn readable(address: GuestAddress, len: u32, next: Option<u16>) -> Self {
+            Self {
+                address,
+                len,
+                flags: descriptor_flags(next),
+                next: descriptor_next(next),
+            }
+        }
+
+        const fn writable(address: GuestAddress, len: u32, next: Option<u16>) -> Self {
+            Self {
+                address,
+                len,
+                flags: descriptor_flags(next) | VIRTQUEUE_DESC_F_WRITE,
+                next: descriptor_next(next),
+            }
+        }
+    }
+
+    const fn descriptor_flags(next: Option<u16>) -> u16 {
+        if next.is_some() {
+            VIRTQUEUE_DESC_F_NEXT
+        } else {
+            0
+        }
+    }
+
+    const fn descriptor_next(next: Option<u16>) -> u16 {
+        match next {
+            Some(next) => next,
+            None => 0,
+        }
+    }
+
+    fn vsock_tx_memory() -> GuestMemory {
+        let layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(GuestAddress::new(0), TEST_VSOCK_TX_MEMORY_SIZE)
+                .expect("test range should be valid"),
+        ])
+        .expect("test memory layout should be valid");
+        GuestMemory::allocate(&layout).expect("test guest memory should allocate")
+    }
+
+    fn write_vsock_tx_descriptor(memory: &mut GuestMemory, index: u16, descriptor: TestDescriptor) {
+        let mut bytes = [0; VIRTQUEUE_DESCRIPTOR_SIZE];
+        let (address_bytes, tail) = bytes.split_at_mut(8);
+        let (len_bytes, tail) = tail.split_at_mut(4);
+        let (flags_bytes, next_bytes) = tail.split_at_mut(2);
+        address_bytes.copy_from_slice(&descriptor.address.raw_value().to_le_bytes());
+        len_bytes.copy_from_slice(&descriptor.len.to_le_bytes());
+        flags_bytes.copy_from_slice(&descriptor.flags.to_le_bytes());
+        next_bytes.copy_from_slice(&descriptor.next.to_le_bytes());
+
+        let descriptor_address = TEST_VSOCK_TX_DESCRIPTOR_TABLE
+            .checked_add(
+                u64::from(index)
+                    * u64::try_from(VIRTQUEUE_DESCRIPTOR_SIZE).expect("descriptor size should fit"),
+            )
+            .expect("descriptor address should not overflow");
+        memory
+            .write_slice(&bytes, descriptor_address)
+            .expect("vsock TX descriptor should write");
+    }
+
+    fn vsock_tx_descriptor_chain(
+        memory: &mut GuestMemory,
+        descriptors: &[TestDescriptor],
+    ) -> VirtqueueDescriptorChain {
+        for (index, descriptor) in descriptors.iter().copied().enumerate() {
+            write_vsock_tx_descriptor(
+                memory,
+                u16::try_from(index).expect("test descriptor index should fit"),
+                descriptor,
+            );
+        }
+
+        read_descriptor_chain(
+            memory,
+            TEST_VSOCK_TX_DESCRIPTOR_TABLE,
+            TEST_VSOCK_QUEUE_SIZE,
+            0,
+        )
+        .expect("vsock TX descriptor chain should read")
+    }
+
+    fn write_vsock_packet_header(
+        memory: &mut GuestMemory,
+        address: GuestAddress,
+        header: VirtioVsockPacketHeader,
+    ) {
+        memory
+            .write_slice(&header.to_bytes(), address)
+            .expect("vsock packet header should write");
+    }
+
+    fn write_guest_bytes(memory: &mut GuestMemory, address: GuestAddress, bytes: &[u8]) {
+        memory
+            .write_slice(bytes, address)
+            .expect("test guest bytes should write");
+    }
+
+    fn read_guest_bytes(memory: &GuestMemory, address: GuestAddress, len: usize) -> Vec<u8> {
+        let mut bytes = vec![0; len];
+        memory
+            .read_slice(&mut bytes, address)
+            .expect("test guest bytes should read");
+        bytes
+    }
+
+    fn vsock_payload_address_after_header(header_address: GuestAddress) -> GuestAddress {
+        header_address
+            .checked_add(VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64)
+            .expect("test vsock payload address should not overflow")
+    }
+
+    fn parse_vsock_tx_packet(
+        memory: &GuestMemory,
+        chain: &VirtqueueDescriptorChain,
+    ) -> Result<VirtioVsockTxPacket, VirtioVsockTxPacketParseError> {
+        VirtioVsockTxPacket::parse(memory, chain)
     }
 
     #[test]
@@ -1876,6 +2475,363 @@ mod tests {
 
         assert_eq!(err.payload_len(), VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE + 1);
         assert_eq!(err.max_payload_len(), VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE);
+    }
+
+    #[test]
+    fn virtio_vsock_tx_packet_parser_accepts_single_descriptor_packet() {
+        let mut memory = vsock_tx_memory();
+        let header = test_vsock_packet_header().with_payload_len(4);
+        let payload_address = vsock_payload_address_after_header(TEST_VSOCK_HEADER);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_HEADER, header);
+        write_guest_bytes(&mut memory, payload_address, &[0xde, 0xad, 0xbe, 0xef]);
+        let chain = vsock_tx_descriptor_chain(
+            &mut memory,
+            &[TestDescriptor::readable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32 + 4,
+                None,
+            )],
+        );
+
+        let packet =
+            parse_vsock_tx_packet(&memory, &chain).expect("single-descriptor packet should parse");
+
+        assert_eq!(packet.descriptor_head(), 0);
+        assert_eq!(packet.header(), header);
+        assert_eq!(packet.payload_len(), 4);
+        assert_eq!(packet.packet_len(), VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64 + 4);
+        assert_eq!(packet.payload_segments().len(), 1);
+        let segment = packet
+            .payload_segments()
+            .first()
+            .expect("payload segment should be present");
+        assert_eq!(segment.descriptor_index(), 0);
+        assert_eq!(segment.address(), payload_address);
+        assert_eq!(segment.len(), 4);
+        assert!(!segment.is_empty());
+        assert_eq!(
+            read_guest_bytes(
+                &memory,
+                segment.address(),
+                usize::try_from(segment.len()).expect("segment length should fit")
+            ),
+            [0xde, 0xad, 0xbe, 0xef]
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_tx_packet_parser_accepts_split_header_packet() {
+        let mut memory = vsock_tx_memory();
+        let header = test_vsock_packet_header().with_payload_len(3);
+        let header_bytes = header.to_bytes();
+        let (first_header, second_header_and_payload) = header_bytes.split_at(16);
+        let payload_address = TEST_VSOCK_SECOND_HEADER
+            .checked_add(
+                u64::try_from(second_header_and_payload.len())
+                    .expect("second header length should fit"),
+            )
+            .expect("payload address should not overflow");
+        write_guest_bytes(&mut memory, TEST_VSOCK_HEADER, first_header);
+        write_guest_bytes(
+            &mut memory,
+            TEST_VSOCK_SECOND_HEADER,
+            second_header_and_payload,
+        );
+        write_guest_bytes(&mut memory, payload_address, &[0xaa, 0xbb, 0xcc]);
+        let chain = vsock_tx_descriptor_chain(
+            &mut memory,
+            &[
+                TestDescriptor::readable(TEST_VSOCK_HEADER, 16, Some(1)),
+                TestDescriptor::readable(
+                    TEST_VSOCK_SECOND_HEADER,
+                    u32::try_from(second_header_and_payload.len() + 3)
+                        .expect("descriptor length should fit"),
+                    None,
+                ),
+            ],
+        );
+
+        let packet =
+            parse_vsock_tx_packet(&memory, &chain).expect("split-header packet should parse");
+
+        assert_eq!(packet.header(), header);
+        assert_eq!(packet.payload_len(), 3);
+        assert_eq!(packet.payload_segments().len(), 1);
+        let segment = packet
+            .payload_segments()
+            .first()
+            .expect("payload segment should be present");
+        assert_eq!(segment.descriptor_index(), 1);
+        assert_eq!(segment.address(), payload_address);
+        assert_eq!(segment.len(), 3);
+        assert_eq!(
+            read_guest_bytes(
+                &memory,
+                segment.address(),
+                usize::try_from(segment.len()).expect("segment length should fit")
+            ),
+            [0xaa, 0xbb, 0xcc]
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_tx_packet_parser_accepts_split_payload_packet() {
+        let mut memory = vsock_tx_memory();
+        let header = test_vsock_packet_header().with_payload_len(5);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_HEADER, header);
+        write_guest_bytes(&mut memory, TEST_VSOCK_PAYLOAD, &[0x10, 0x11]);
+        write_guest_bytes(
+            &mut memory,
+            TEST_VSOCK_SECOND_PAYLOAD,
+            &[0x12, 0x13, 0x14, 0xff],
+        );
+        let chain = vsock_tx_descriptor_chain(
+            &mut memory,
+            &[
+                TestDescriptor::readable(
+                    TEST_VSOCK_HEADER,
+                    VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                    Some(1),
+                ),
+                TestDescriptor::readable(TEST_VSOCK_PAYLOAD, 2, Some(2)),
+                TestDescriptor::readable(TEST_VSOCK_SECOND_PAYLOAD, 4, None),
+            ],
+        );
+
+        let packet =
+            parse_vsock_tx_packet(&memory, &chain).expect("split-payload packet should parse");
+
+        assert_eq!(packet.header(), header);
+        assert_eq!(packet.payload_len(), 5);
+        assert_eq!(packet.payload_segments().len(), 2);
+        let first = packet
+            .payload_segments()
+            .first()
+            .expect("first payload segment should be present");
+        assert_eq!(first.descriptor_index(), 1);
+        assert_eq!(first.address(), TEST_VSOCK_PAYLOAD);
+        assert_eq!(first.len(), 2);
+        assert_eq!(
+            read_guest_bytes(
+                &memory,
+                first.address(),
+                usize::try_from(first.len()).expect("segment length should fit")
+            ),
+            [0x10, 0x11]
+        );
+        let second = packet
+            .payload_segments()
+            .get(1)
+            .expect("second payload segment should be present");
+        assert_eq!(second.descriptor_index(), 2);
+        assert_eq!(second.address(), TEST_VSOCK_SECOND_PAYLOAD);
+        assert_eq!(second.len(), 3);
+        assert_eq!(
+            read_guest_bytes(
+                &memory,
+                second.address(),
+                usize::try_from(second.len()).expect("segment length should fit")
+            ),
+            [0x12, 0x13, 0x14]
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_tx_packet_parser_accepts_zero_payload_header_only() {
+        let mut memory = vsock_tx_memory();
+        let header = test_vsock_packet_header().with_payload_len(0);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_HEADER, header);
+        let chain = vsock_tx_descriptor_chain(
+            &mut memory,
+            &[TestDescriptor::readable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            )],
+        );
+
+        let packet =
+            parse_vsock_tx_packet(&memory, &chain).expect("zero-payload packet should parse");
+
+        assert_eq!(packet.header(), header);
+        assert_eq!(packet.payload_len(), 0);
+        assert_eq!(packet.packet_len(), VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64);
+        assert!(packet.payload_segments().is_empty());
+    }
+
+    #[test]
+    fn virtio_vsock_tx_packet_parser_rejects_write_only_descriptor() {
+        let mut memory = vsock_tx_memory();
+        let header = test_vsock_packet_header().with_payload_len(0);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_HEADER, header);
+        let chain = vsock_tx_descriptor_chain(
+            &mut memory,
+            &[TestDescriptor::writable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            )],
+        );
+
+        let err =
+            parse_vsock_tx_packet(&memory, &chain).expect_err("write-only descriptor should fail");
+
+        assert!(matches!(
+            err,
+            VirtioVsockTxPacketParseError::DescriptorWriteOnly { index: 0 }
+        ));
+        assert_eq!(
+            err.to_string(),
+            "virtio-vsock TX descriptor 0 is write-only"
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_tx_packet_parser_rejects_chain_shorter_than_header() {
+        let mut memory = vsock_tx_memory();
+        let chain = vsock_tx_descriptor_chain(
+            &mut memory,
+            &[TestDescriptor::readable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32 - 1,
+                None,
+            )],
+        );
+
+        let err = parse_vsock_tx_packet(&memory, &chain).expect_err("short header should fail");
+
+        assert!(matches!(
+            err,
+            VirtioVsockTxPacketParseError::HeaderTooShort {
+                descriptor_head: 0,
+                actual: 43,
+                min: VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64,
+            }
+        ));
+    }
+
+    #[test]
+    fn virtio_vsock_tx_packet_parser_rejects_header_payload_len_over_maximum() {
+        let mut memory = vsock_tx_memory();
+        let header =
+            test_vsock_packet_header().with_payload_len(VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE + 1);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_HEADER, header);
+        let chain = vsock_tx_descriptor_chain(
+            &mut memory,
+            &[TestDescriptor::readable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            )],
+        );
+
+        let err =
+            parse_vsock_tx_packet(&memory, &chain).expect_err("oversized payload should fail");
+
+        let VirtioVsockTxPacketParseError::InvalidHeaderLength { source } = err else {
+            panic!("expected invalid header length, got {err:?}");
+        };
+        assert_eq!(
+            source.payload_len(),
+            VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE + 1
+        );
+        assert_eq!(
+            source.max_payload_len(),
+            VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_tx_packet_parser_rejects_payload_len_beyond_descriptor_bytes() {
+        let mut memory = vsock_tx_memory();
+        let header = test_vsock_packet_header().with_payload_len(8);
+        let payload_address = vsock_payload_address_after_header(TEST_VSOCK_HEADER);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_HEADER, header);
+        write_guest_bytes(&mut memory, payload_address, &[0xde, 0xad, 0xbe, 0xef]);
+        let chain = vsock_tx_descriptor_chain(
+            &mut memory,
+            &[TestDescriptor::readable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32 + 4,
+                None,
+            )],
+        );
+
+        let err = parse_vsock_tx_packet(&memory, &chain).expect_err("short payload should fail");
+
+        assert!(matches!(
+            err,
+            VirtioVsockTxPacketParseError::PayloadTooShort {
+                descriptor_head: 0,
+                required: 8,
+                available: 4,
+            }
+        ));
+    }
+
+    #[test]
+    fn virtio_vsock_tx_packet_parser_rejects_unmapped_header_descriptor() {
+        let mut memory = vsock_tx_memory();
+        let unmapped = GuestAddress::new(TEST_VSOCK_TX_MEMORY_SIZE + 0x1000);
+        let chain = vsock_tx_descriptor_chain(
+            &mut memory,
+            &[TestDescriptor::readable(
+                unmapped,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            )],
+        );
+
+        let err = parse_vsock_tx_packet(&memory, &chain).expect_err("unmapped header should fail");
+
+        match err {
+            VirtioVsockTxPacketParseError::DescriptorAccess {
+                index,
+                address,
+                len,
+                ..
+            } => {
+                assert_eq!(index, 0);
+                assert_eq!(address, unmapped);
+                assert_eq!(len, VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32);
+            }
+            other => panic!("expected descriptor access error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn virtio_vsock_tx_packet_parser_rejects_unmapped_payload_descriptor() {
+        let mut memory = vsock_tx_memory();
+        let header = test_vsock_packet_header().with_payload_len(4);
+        let unmapped = GuestAddress::new(TEST_VSOCK_TX_MEMORY_SIZE + 0x1000);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_HEADER, header);
+        let chain = vsock_tx_descriptor_chain(
+            &mut memory,
+            &[
+                TestDescriptor::readable(
+                    TEST_VSOCK_HEADER,
+                    VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                    Some(1),
+                ),
+                TestDescriptor::readable(unmapped, 4, None),
+            ],
+        );
+
+        let err = parse_vsock_tx_packet(&memory, &chain).expect_err("unmapped payload should fail");
+
+        match err {
+            VirtioVsockTxPacketParseError::DescriptorAccess {
+                index,
+                address,
+                len,
+                ..
+            } => {
+                assert_eq!(index, 1);
+                assert_eq!(address, unmapped);
+                assert_eq!(len, 4);
+            }
+            other => panic!("expected descriptor access error, got {other:?}"),
+        }
     }
 
     #[test]
