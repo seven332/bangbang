@@ -233,7 +233,7 @@ compatibility targets.
 | `PATCH` | `/machine-config` | deferred | Partial updates belong with later state and validation rules. |
 | `PUT` | `/cpu-config` | deferred | Needs HVF CPU feature design with VM and boot work in #8 and #10. |
 | `PUT` | `/network-interfaces/{iface_id}` | supported target; configuration storage implemented | Stores up to 16 initial virtio-net configurations before boot without opening host networking resources. Startup preparation attaches configured interfaces as virtio-mmio devices in the MMIO dispatcher and guest FDT. `InstanceStart` revalidates the interface count before opening vmnet resources, then selects vmnet packet I/O only for `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>` host device names; unsupported names fail startup before `Running` is committed. Internal network notification dispatch can route each configured interface through selected packet I/O, parse TX descriptors through a packet sink boundary, and copy injected RX packets into guest buffers through a packet source boundary. Public packet movement, runtime updates, PATCH, and DELETE remain tied to #14. |
-| `PUT` | `/vsock` | supported target; startup listener attachment and TX notification dispatch implemented | Stores one initial virtio-vsock configuration before boot without opening host resources during the API request. Startup preparation binds a nonblocking host Unix listener at `uds_path`, keeps ownership in the internal vsock device resource, and removes the path on shutdown only when it still refers to the created socket. Startup also attaches the configured device as one virtio-mmio FDT node backed by the internal MMIO handler, which retains active RX, TX, and event queue metadata after `DRIVER_OK`. The runtime has a Firecracker-shaped packet header model, internal TX descriptor packet parser, and TX available-ring drain helper that publishes zero-length TX used-ring completions. The handler and startup notification path can drain TX queue notifications, complete queued TX descriptors, mark the virtio queue interrupt status pending, and signal the allocated vsock interrupt line from the HVF boot loop. Host `CONNECT <PORT>` parsing, guest-initiated `uds_path_<PORT>` connections, RX buffers, guest CID routing, data movement, runtime updates, PATCH, and DELETE remain tied to #15. |
+| `PUT` | `/vsock` | supported target; startup listener attachment, host `CONNECT` parsing, and TX notification dispatch implemented | Stores one initial virtio-vsock configuration before boot without opening host resources during the API request. Startup preparation binds a nonblocking host Unix listener at `uds_path`, keeps ownership in the internal vsock device resource, and removes the path on shutdown only when it still refers to the created socket. Startup also attaches the configured device as one virtio-mmio FDT node backed by the internal MMIO handler, which retains active RX, TX, and event queue metadata after `DRIVER_OK`. The runtime has a Firecracker-shaped packet header model, internal TX descriptor packet parser, TX available-ring drain helper that publishes zero-length TX used-ring completions, and a host `CONNECT <PORT>` request parser. The handler and startup notification path can drain TX queue notifications, complete queued TX descriptors, mark the virtio queue interrupt status pending, and signal the allocated vsock interrupt line from the HVF boot loop. Host socket accept and connection lifecycle, guest-initiated `uds_path_<PORT>` connections, RX buffers, guest CID routing, data movement, runtime updates, PATCH, and DELETE remain tied to #15. |
 | `GET`, `PUT`, `PATCH` | `/mmds` | deferred | Tied to MMDS work in #16. |
 | `PUT` | `/mmds/config` | deferred | Tied to MMDS work in #16. |
 | `PUT` | `/snapshot/create`, `/snapshot/load` | deferred | Tied to snapshot and restore work in #19. |
@@ -362,9 +362,10 @@ than readable descriptor bytes after the header. The handler can dispatch TX
 queue notifications into descriptor completions, and startup can dispatch those
 notifications through the boot loop while signaling the allocated vsock
 interrupt line. Startup can also bind and own a nonblocking host listener at
-`uds_path`. Host `CONNECT <PORT>` parsing, guest-initiated `uds_path_<PORT>`
-connections, RX buffers, CID routing, event queue dispatch, and data movement
-remain deferred.
+`uds_path`. The runtime also parses Firecracker-shaped host `CONNECT <PORT>`
+requests. Host socket accept, connection lifecycle, guest-initiated
+`uds_path_<PORT>` connections, RX buffers, CID routing, event queue dispatch,
+and data movement remain deferred.
 `SendCtrlAltDel` is rejected at parse time for the first aarch64 target.
 
 Future implementation PRs should derive unit or golden tests from these tables.
@@ -597,9 +598,10 @@ summaries. The prepared resource preserves the validated guest CID, socket path,
 config-space, and inactive device state. Arm64 startup resource assembly can
 bind and own the nonblocking host listener at `uds_path`, retain that owner in
 the internal vsock device resource, and expose one configured vsock device in
-the guest FDT. Host `CONNECT <PORT>` parsing, guest-initiated
-`uds_path_<PORT>` connections, CID routing, RX buffer parsing, event queue
-dispatch, and data movement remain deferred.
+the guest FDT. The runtime can parse Firecracker-shaped host `CONNECT <PORT>`
+requests into a guest port. Host socket accept, connection lifecycle,
+guest-initiated `uds_path_<PORT>` connections, CID routing, RX buffer parsing,
+event queue dispatch, and data movement remain deferred.
 
 The runtime crate also has the first backend-neutral virtio-net config-space,
 activation, TX frame parser, RX buffer parser, prepared device resources, and
@@ -1053,7 +1055,7 @@ The first API implementation should model the same broad stages as Firecracker:
 | `PUT /boot-source` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config; host paths are opened during startup preparation. Host path errors must avoid leaking sensitive path details. |
 | `PUT /drives/{drive_id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config; startup preparation opens backing files and registers initial block MMIO devices. Runtime hotplug remains deferred. |
 | `PUT /network-interfaces/{iface_id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records up to 16 validated pre-boot configs without opening host networking resources. Startup preparation attaches configured interfaces as virtio-mmio devices in the MMIO dispatcher and guest FDT. `InstanceStart` revalidates the count before opening vmnet packet I/O for `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>` host device names and fails before `Running` for unsupported names. Internal network notification dispatch can route each interface through selected packet I/O, complete TX descriptor heads through a packet sink boundary, and write injected RX packets into guest buffers through a packet source boundary. Public packet movement, PATCH, and DELETE remain deferred. |
-| `PUT /vsock` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config without opening host Unix socket resources during the request. Startup preparation binds the configured `uds_path` as a nonblocking host Unix listener and attaches one configured virtio-vsock device as guest-visible FDT/MMIO metadata backed by the internal MMIO handler, which retains active RX, TX, and event queue metadata after `DRIVER_OK`. The runtime has an internal TX descriptor packet parser, TX available-ring drain helper, used-ring TX descriptor completion, handler-level and startup-level TX notification dispatch, and HVF boot-loop vsock queue interrupt signaling, but host connection handling, CID routing, RX buffers, event queue dispatch, data movement, PATCH, and DELETE remain deferred. |
+| `PUT /vsock` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config without opening host Unix socket resources during the request. Startup preparation binds the configured `uds_path` as a nonblocking host Unix listener and attaches one configured virtio-vsock device as guest-visible FDT/MMIO metadata backed by the internal MMIO handler, which retains active RX, TX, and event queue metadata after `DRIVER_OK`. The runtime has an internal TX descriptor packet parser, TX available-ring drain helper, used-ring TX descriptor completion, host `CONNECT <PORT>` request parser, handler-level and startup-level TX notification dispatch, and HVF boot-loop vsock queue interrupt signaling, but host socket accept, connection lifecycle, CID routing, RX buffers, event queue dispatch, data movement, PATCH, and DELETE remain deferred. |
 | `PUT /metrics` | implemented; `204` empty response on successful output initialization | unsupported after start; `400` `fault_message` | Metrics output is process observability state, not guest configuration. Duplicate initialization fails. |
 | `PUT /logger` | implemented; `204` empty response on successful pre-boot configuration | unsupported after start; `400` `fault_message` | Logger output is process observability state, not guest configuration. Repeated pre-boot requests update provided fields; full log routing remains deferred. |
 | `PUT /actions` with `InstanceStart` | process-routed; `204` after successful owned HVF startup with internal boot run-loop worker across bounded step windows or `400` preflight/preparation fault | unsupported after start; `400` `fault_message` | Commits `Running` only after the owned HVF boot-session worker with internal serial capture is retained. The worker keeps internal active, terminal-outcome, or error status; public run-loop control and public serial streaming remain deferred. |
@@ -1102,11 +1104,11 @@ Their eventual support level should follow the endpoint matrix:
   parser, prepared device resources, MMIO registration, startup FDT metadata,
   TX/RX notification dispatch metadata helpers, and startup-time vmnet packet
   I/O selection for supported `host_dev_name` forms
-- virtio-vsock host connection protocol, guest-initiated socket connections,
-  CID routing, RX/event queue dispatch, and data movement
+- virtio-vsock host socket accept and connection lifecycle, guest-initiated
+  socket connections, CID routing, RX/event queue dispatch, and data movement
   beyond pre-boot `/vsock` configuration storage, startup FDT attachment,
-  startup host listener ownership, and the internal prepared
-  resource/MMIO registration/config-space/MMIO handler
+  startup host listener ownership, host `CONNECT <PORT>` request parsing, and
+  the internal prepared resource/MMIO registration/config-space/MMIO handler
   skeleton with active queue metadata retention plus packet header model, TX
   descriptor packet parser, and TX available-ring drain helper with used-ring
   descriptor completion, handler-level and startup-level TX notification
