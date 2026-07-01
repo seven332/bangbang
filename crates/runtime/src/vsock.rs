@@ -39,6 +39,7 @@ pub const VIRTIO_VSOCK_QUEUE_SIZES: [u16; VIRTIO_VSOCK_QUEUE_COUNT] =
 pub const VIRTIO_VSOCK_CONFIG_GUEST_CID_SIZE: usize = 8;
 pub const VIRTIO_VSOCK_PACKET_HEADER_SIZE: usize = 44;
 pub const VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE: u32 = 64 * 1024;
+pub const VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE: u32 = 64 * 1024;
 pub const VIRTIO_VSOCK_HOST_CID: u64 = 2;
 pub const VIRTIO_VSOCK_PACKET_TYPE_STREAM: u16 = 1;
 pub const VIRTIO_VSOCK_OP_REQUEST: u16 = 1;
@@ -754,6 +755,7 @@ fn host_connection_request_packet_header(
         .with_dst_port(key.peer_port())
         .with_packet_type(VIRTIO_VSOCK_PACKET_TYPE_STREAM)
         .with_operation(VIRTIO_VSOCK_OP_REQUEST)
+        .with_buffer_allocation(VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE)
 }
 
 #[derive(Debug)]
@@ -2933,7 +2935,8 @@ mod tests {
 
     use super::{
         MIN_GUEST_CID, PreparedVsockDevice, VIRTIO_FEATURE_IN_ORDER, VIRTIO_FEATURE_VERSION_1,
-        VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_VSOCK_CONFIG_GUEST_CID_SIZE, VIRTIO_VSOCK_DEVICE_ID,
+        VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_VSOCK_CONFIG_GUEST_CID_SIZE,
+        VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE, VIRTIO_VSOCK_DEVICE_ID,
         VIRTIO_VSOCK_EVENT_QUEUE_INDEX, VIRTIO_VSOCK_FLAGS_SHUTDOWN_RCV,
         VIRTIO_VSOCK_FLAGS_SHUTDOWN_SEND, VIRTIO_VSOCK_HOST_CID,
         VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE, VIRTIO_VSOCK_OP_CREDIT_REQUEST,
@@ -3071,7 +3074,10 @@ mod tests {
         assert_eq!(header.packet_type(), VIRTIO_VSOCK_PACKET_TYPE_STREAM);
         assert_eq!(header.operation(), VIRTIO_VSOCK_OP_REQUEST);
         assert_eq!(header.flags(), 0);
-        assert_eq!(header.buffer_allocation(), 0);
+        assert_eq!(
+            header.buffer_allocation(),
+            VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE
+        );
         assert_eq!(header.forwarded_count(), 0);
     }
 
@@ -5047,6 +5053,7 @@ mod tests {
     fn virtio_vsock_packet_constants_match_firecracker_shape() {
         assert_eq!(VIRTIO_VSOCK_PACKET_HEADER_SIZE, 44);
         assert_eq!(VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE, 64 * 1024);
+        assert_eq!(VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE, 64 * 1024);
         assert_eq!(VIRTIO_VSOCK_HOST_CID, 2);
         assert_eq!(VIRTIO_VSOCK_PACKET_TYPE_STREAM, 1);
         assert_eq!(VIRTIO_VSOCK_OP_REQUEST, 1);
