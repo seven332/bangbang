@@ -6,6 +6,9 @@ use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 
 mod api_server;
+#[doc(hidden)]
+#[cfg(target_os = "macos")]
+pub mod host_network;
 mod vmm;
 
 use api_server::{ApiServer, ApiServerError};
