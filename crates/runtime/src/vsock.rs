@@ -39,6 +39,7 @@ pub const VIRTIO_VSOCK_QUEUE_SIZES: [u16; VIRTIO_VSOCK_QUEUE_COUNT] =
 pub const VIRTIO_VSOCK_CONFIG_GUEST_CID_SIZE: usize = 8;
 pub const VIRTIO_VSOCK_PACKET_HEADER_SIZE: usize = 44;
 pub const VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE: u32 = 64 * 1024;
+pub const VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE: u32 = 64 * 1024;
 pub const VIRTIO_VSOCK_HOST_CID: u64 = 2;
 pub const VIRTIO_VSOCK_PACKET_TYPE_STREAM: u16 = 1;
 pub const VIRTIO_VSOCK_OP_REQUEST: u16 = 1;
@@ -709,16 +710,52 @@ impl VsockHostConnectionKey {
 #[derive(Debug)]
 pub struct VsockHostConnection {
     accepted: VsockHostAcceptedConnection,
+    request_packet_pending: bool,
 }
 
 impl VsockHostConnection {
     fn from_accepted(accepted: VsockHostAcceptedConnection) -> Self {
-        Self { accepted }
+        Self {
+            accepted,
+            request_packet_pending: true,
+        }
     }
 
     pub fn stream(&self) -> &UnixStream {
         self.accepted.stream()
     }
+
+    #[cfg(test)]
+    const fn has_pending_request_packet(&self) -> bool {
+        self.request_packet_pending
+    }
+
+    fn take_pending_request_packet_header(
+        &mut self,
+        key: VsockHostConnectionKey,
+        guest_cid: u32,
+    ) -> Option<VirtioVsockPacketHeader> {
+        if !self.request_packet_pending {
+            return None;
+        }
+        self.request_packet_pending = false;
+
+        Some(host_connection_request_packet_header(key, guest_cid))
+    }
+}
+
+fn host_connection_request_packet_header(
+    key: VsockHostConnectionKey,
+    guest_cid: u32,
+) -> VirtioVsockPacketHeader {
+    VirtioVsockPacketHeader::new()
+        .with_src_cid(VIRTIO_VSOCK_HOST_CID)
+        .with_dst_cid(u64::from(guest_cid))
+        .with_src_port(key.local_port().raw())
+        .with_dst_port(key.peer_port())
+        .with_packet_type(VIRTIO_VSOCK_PACKET_TYPE_STREAM)
+        .with_operation(VIRTIO_VSOCK_OP_REQUEST)
+        .with_buffer_allocation(VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE)
 }
 
 #[derive(Debug)]
@@ -800,6 +837,16 @@ impl VsockHostConnectionTable {
 
     pub fn get(&self, key: VsockHostConnectionKey) -> Option<&VsockHostConnection> {
         self.connections.get(&key)
+    }
+
+    pub fn take_pending_request_packet_header(
+        &mut self,
+        key: VsockHostConnectionKey,
+        guest_cid: u32,
+    ) -> Option<VirtioVsockPacketHeader> {
+        self.connections
+            .get_mut(&key)?
+            .take_pending_request_packet_header(key, guest_cid)
     }
 
     pub fn contains(&self, key: VsockHostConnectionKey) -> bool {
@@ -2888,7 +2935,8 @@ mod tests {
 
     use super::{
         MIN_GUEST_CID, PreparedVsockDevice, VIRTIO_FEATURE_IN_ORDER, VIRTIO_FEATURE_VERSION_1,
-        VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_VSOCK_CONFIG_GUEST_CID_SIZE, VIRTIO_VSOCK_DEVICE_ID,
+        VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_VSOCK_CONFIG_GUEST_CID_SIZE,
+        VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE, VIRTIO_VSOCK_DEVICE_ID,
         VIRTIO_VSOCK_EVENT_QUEUE_INDEX, VIRTIO_VSOCK_FLAGS_SHUTDOWN_RCV,
         VIRTIO_VSOCK_FLAGS_SHUTDOWN_SEND, VIRTIO_VSOCK_HOST_CID,
         VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE, VIRTIO_VSOCK_OP_CREDIT_REQUEST,
@@ -3010,6 +3058,27 @@ mod tests {
         let mut closed = [0; 1];
 
         assert_eq!(stream.read(&mut closed).expect(context), 0, "{context}");
+    }
+
+    fn assert_host_connection_request_header(
+        header: VirtioVsockPacketHeader,
+        guest_cid: u32,
+        local_port: VsockHostLocalPort,
+        peer_port: u32,
+    ) {
+        assert_eq!(header.src_cid(), VIRTIO_VSOCK_HOST_CID);
+        assert_eq!(header.dst_cid(), u64::from(guest_cid));
+        assert_eq!(header.src_port(), local_port.raw());
+        assert_eq!(header.dst_port(), peer_port);
+        assert_eq!(header.payload_len(), 0);
+        assert_eq!(header.packet_type(), VIRTIO_VSOCK_PACKET_TYPE_STREAM);
+        assert_eq!(header.operation(), VIRTIO_VSOCK_OP_REQUEST);
+        assert_eq!(header.flags(), 0);
+        assert_eq!(
+            header.buffer_allocation(),
+            VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE
+        );
+        assert_eq!(header.forwarded_count(), 0);
     }
 
     fn unique_missing_socket_path() -> String {
@@ -4176,6 +4245,101 @@ mod tests {
     }
 
     #[test]
+    fn vsock_host_connection_table_takes_pending_request_packet_header() {
+        let mut table = VsockHostConnectionTable::new();
+        let (key, _client) =
+            insert_accepted_host_connection_for_test(&mut table, "table-request", 1024);
+
+        assert!(
+            table
+                .get(key)
+                .expect("retained connection should exist")
+                .has_pending_request_packet()
+        );
+        let header = table
+            .take_pending_request_packet_header(key, 42)
+            .expect("pending request packet header should exist");
+
+        assert_host_connection_request_header(header, 42, key.local_port(), 1024);
+        assert!(
+            !table
+                .get(key)
+                .expect("retained connection should still exist")
+                .has_pending_request_packet()
+        );
+        assert!(table.take_pending_request_packet_header(key, 42).is_none());
+        assert!(table.contains(key));
+    }
+
+    #[test]
+    fn vsock_host_connection_table_request_packet_header_accepts_boundaries() {
+        let mut table = VsockHostConnectionTable::new();
+        let (key, _client) = insert_accepted_host_connection_for_test(
+            &mut table,
+            "table-request-boundary",
+            u32::MAX,
+        );
+
+        let header = table
+            .take_pending_request_packet_header(key, u32::MAX)
+            .expect("boundary request packet header should exist");
+
+        assert_host_connection_request_header(header, u32::MAX, key.local_port(), u32::MAX);
+    }
+
+    #[test]
+    fn vsock_host_connection_table_missing_request_packet_header_is_noop() {
+        let mut table = VsockHostConnectionTable::new();
+        let (key, _client) =
+            insert_accepted_host_connection_for_test(&mut table, "table-request-missing", 3000);
+        let missing = VsockHostConnectionKey::new(key.local_port(), 3001);
+
+        assert!(
+            table
+                .take_pending_request_packet_header(missing, 42)
+                .is_none()
+        );
+        assert!(
+            table
+                .get(key)
+                .expect("retained connection should still exist")
+                .has_pending_request_packet()
+        );
+
+        let header = table
+            .take_pending_request_packet_header(key, 42)
+            .expect("active connection request packet header should still exist");
+        assert_host_connection_request_header(header, 42, key.local_port(), 3000);
+    }
+
+    #[test]
+    fn vsock_host_connection_table_reused_key_gets_fresh_request_packet_header() {
+        let mut table = VsockHostConnectionTable::with_local_port_capacity(1);
+        let (first, mut first_client) =
+            insert_accepted_host_connection_for_test(&mut table, "table-request-reused-a", 4000);
+
+        assert!(
+            table
+                .take_pending_request_packet_header(first, 42)
+                .is_some()
+        );
+        assert!(table.remove(first));
+        assert_stream_closed(
+            &mut first_client,
+            "removed connection should drop retained stream",
+        );
+
+        let (second, _second_client) =
+            insert_accepted_host_connection_for_test(&mut table, "table-request-reused-b", 4000);
+
+        assert_eq!(second, first);
+        let header = table
+            .take_pending_request_packet_header(second, 42)
+            .expect("reused key should have a fresh request packet header");
+        assert_host_connection_request_header(header, 42, second.local_port(), 4000);
+    }
+
+    #[test]
     fn vsock_host_connection_table_allows_same_peer_port_with_distinct_local_ports() {
         let mut table = VsockHostConnectionTable::new();
 
@@ -4916,6 +5080,7 @@ mod tests {
     fn virtio_vsock_packet_constants_match_firecracker_shape() {
         assert_eq!(VIRTIO_VSOCK_PACKET_HEADER_SIZE, 44);
         assert_eq!(VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE, 64 * 1024);
+        assert_eq!(VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE, 64 * 1024);
         assert_eq!(VIRTIO_VSOCK_HOST_CID, 2);
         assert_eq!(VIRTIO_VSOCK_PACKET_TYPE_STREAM, 1);
         assert_eq!(VIRTIO_VSOCK_OP_REQUEST, 1);
