@@ -2355,6 +2355,33 @@ mod tests {
     }
 
     #[test]
+    fn boot_runtime_network_packet_io_dispatch_accepts_empty_network_devices() {
+        let kernel = temp_file("kernel-empty-network-packet-io-dispatch", &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+        let resources =
+            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
+                .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
+        let mut runtime = parts.runtime;
+        let mut provider = RecordingNetworkPacketIoProvider::default();
+
+        let dispatches = runtime
+            .dispatch_network_queue_notifications_with_packet_io(
+                &mut memory,
+                &mut mmio_dispatcher,
+                &mut provider,
+            )
+            .expect("empty network dispatch result should allocate");
+
+        assert!(dispatches.is_empty());
+        assert_eq!(dispatches.len(), 0);
+        assert!(!dispatches.needs_queue_interrupt());
+        assert!(provider.requested_ifaces.is_empty());
+    }
+
+    #[test]
     fn boot_runtime_network_notification_dispatch_without_pending_notification_is_noop() {
         let kernel = temp_file("kernel-network-noop-dispatch", &arm64_image());
         let mut controller = controller_with_kernel(kernel.path());
