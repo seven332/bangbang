@@ -38,6 +38,7 @@ pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
 pub const VIRTIO_NET_TX_HEADER_SIZE: u32 = 12;
 pub const VIRTIO_NET_MAX_BUFFER_SIZE: u64 = 65_562;
 pub const VIRTIO_NET_RX_MIN_BUFFER_SIZE: u64 = 1_526;
+pub const MAX_NETWORK_INTERFACE_COUNT: usize = 16;
 
 const VIRTIO_NET_RX_QUEUE_INDEX_U32: u32 = 0;
 const VIRTIO_NET_TX_QUEUE_INDEX_U32: u32 = 1;
@@ -206,6 +207,10 @@ impl NetworkInterfaceConfigs {
         input: NetworkInterfaceConfigInput,
     ) -> Result<(), NetworkInterfaceConfigError> {
         let config = input.validate()?;
+        let existing_index = self
+            .configs
+            .iter()
+            .position(|existing| existing.iface_id() == config.iface_id());
 
         if let Some(guest_mac) = config.guest_mac()
             && self.configs.iter().any(|existing| {
@@ -215,11 +220,11 @@ impl NetworkInterfaceConfigs {
             return Err(NetworkInterfaceConfigError::GuestMacAddressInUse { guest_mac });
         }
 
-        if let Some(index) = self
-            .configs
-            .iter()
-            .position(|existing| existing.iface_id() == config.iface_id())
-        {
+        if existing_index.is_none() {
+            validate_network_interface_count(self.configs.len().saturating_add(1))?;
+        }
+
+        if let Some(index) = existing_index {
             self.configs.remove(index);
         }
 
@@ -3391,6 +3396,10 @@ pub enum NetworkInterfaceConfigError {
     GuestMacAddressInUse {
         guest_mac: GuestMacAddress,
     },
+    TooManyNetworkInterfaces {
+        count: usize,
+        max: usize,
+    },
     UnsupportedMtu,
     UnsupportedRxRateLimiter,
     UnsupportedTxRateLimiter,
@@ -3414,6 +3423,9 @@ impl fmt::Display for NetworkInterfaceConfigError {
                 f.write_str("network guest_mac must be six colon-separated hex octets")
             }
             Self::GuestMacAddressInUse { .. } => f.write_str("network guest_mac is already in use"),
+            Self::TooManyNetworkInterfaces { max, .. } => {
+                write!(f, "network interface count exceeds maximum {max}")
+            }
             Self::UnsupportedMtu => f.write_str("network mtu is not supported"),
             Self::UnsupportedRxRateLimiter => {
                 f.write_str("network rx_rate_limiter is not supported")
@@ -3426,6 +3438,17 @@ impl fmt::Display for NetworkInterfaceConfigError {
 }
 
 impl std::error::Error for NetworkInterfaceConfigError {}
+
+pub fn validate_network_interface_count(count: usize) -> Result<(), NetworkInterfaceConfigError> {
+    if count > MAX_NETWORK_INTERFACE_COUNT {
+        return Err(NetworkInterfaceConfigError::TooManyNetworkInterfaces {
+            count,
+            max: MAX_NETWORK_INTERFACE_COUNT,
+        });
+    }
+
+    Ok(())
+}
 
 fn validate_interface_id(
     source: InterfaceIdSource,
@@ -3473,11 +3496,11 @@ mod tests {
     };
 
     use super::{
-        GuestMacAddress, InterfaceIdSource, NetworkInterfaceConfig, NetworkInterfaceConfigError,
-        NetworkInterfaceConfigInput, NetworkInterfaceConfigs, NetworkMmioDevices,
-        NetworkMmioLayout, NetworkMmioRegistrationError, PreparedNetworkDevices,
-        VIRTIO_FEATURE_VERSION_1, VIRTIO_NET_CONFIG_MAC_SIZE, VIRTIO_NET_DEVICE_ID,
-        VIRTIO_NET_F_MAC, VIRTIO_NET_MAX_BUFFER_SIZE, VIRTIO_NET_QUEUE_COUNT,
+        GuestMacAddress, InterfaceIdSource, MAX_NETWORK_INTERFACE_COUNT, NetworkInterfaceConfig,
+        NetworkInterfaceConfigError, NetworkInterfaceConfigInput, NetworkInterfaceConfigs,
+        NetworkMmioDevices, NetworkMmioLayout, NetworkMmioRegistrationError,
+        PreparedNetworkDevices, VIRTIO_FEATURE_VERSION_1, VIRTIO_NET_CONFIG_MAC_SIZE,
+        VIRTIO_NET_DEVICE_ID, VIRTIO_NET_F_MAC, VIRTIO_NET_MAX_BUFFER_SIZE, VIRTIO_NET_QUEUE_COUNT,
         VIRTIO_NET_QUEUE_SIZE, VIRTIO_NET_QUEUE_SIZES, VIRTIO_NET_RX_MIN_BUFFER_SIZE,
         VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_HEADER_SIZE, VIRTIO_NET_TX_QUEUE_INDEX,
         VIRTIO_RING_FEATURE_EVENT_IDX, VirtioNetworkConfigSpace, VirtioNetworkDevice,
@@ -3511,6 +3534,12 @@ mod tests {
 
     fn input() -> NetworkInterfaceConfigInput {
         NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0")
+    }
+
+    fn numbered_input(index: usize) -> NetworkInterfaceConfigInput {
+        let iface_id = format!("eth{index}");
+        let host_dev_name = format!("tap{index}");
+        NetworkInterfaceConfigInput::new(iface_id.clone(), iface_id, host_dev_name)
     }
 
     fn validate(
@@ -4500,6 +4529,80 @@ mod tests {
         assert_eq!(err.to_string(), "network guest_mac is already in use");
         assert_eq!(configs.as_slice().len(), 1);
         assert_eq!(configs.as_slice()[0].iface_id(), "eth0");
+    }
+
+    #[test]
+    fn network_interface_configs_accept_exact_interface_count_limit() {
+        let mut configs = NetworkInterfaceConfigs::new();
+
+        for index in 0..MAX_NETWORK_INTERFACE_COUNT {
+            configs
+                .insert(numbered_input(index))
+                .expect("interface within limit should insert");
+        }
+
+        assert_eq!(configs.as_slice().len(), MAX_NETWORK_INTERFACE_COUNT);
+    }
+
+    #[test]
+    fn network_interface_configs_reject_one_over_limit_without_mutating() {
+        let mut configs = NetworkInterfaceConfigs::new();
+
+        for index in 0..MAX_NETWORK_INTERFACE_COUNT {
+            configs
+                .insert(numbered_input(index))
+                .expect("interface within limit should insert");
+        }
+
+        let err = configs
+            .insert(numbered_input(MAX_NETWORK_INTERFACE_COUNT))
+            .expect_err("one-over interface should fail");
+
+        assert_eq!(
+            err,
+            NetworkInterfaceConfigError::TooManyNetworkInterfaces {
+                count: MAX_NETWORK_INTERFACE_COUNT + 1,
+                max: MAX_NETWORK_INTERFACE_COUNT,
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("network interface count exceeds maximum {MAX_NETWORK_INTERFACE_COUNT}")
+        );
+        assert_eq!(configs.as_slice().len(), MAX_NETWORK_INTERFACE_COUNT);
+        assert_eq!(
+            configs.as_slice()[MAX_NETWORK_INTERFACE_COUNT - 1].iface_id(),
+            format!("eth{}", MAX_NETWORK_INTERFACE_COUNT - 1)
+        );
+    }
+
+    #[test]
+    fn network_interface_configs_replace_existing_interface_at_limit() {
+        let mut configs = NetworkInterfaceConfigs::new();
+
+        for index in 0..MAX_NETWORK_INTERFACE_COUNT {
+            configs
+                .insert(numbered_input(index))
+                .expect("interface within limit should insert");
+        }
+
+        configs
+            .insert(NetworkInterfaceConfigInput::new(
+                "eth0",
+                "eth0",
+                "replacement",
+            ))
+            .expect("replacement at limit should insert");
+
+        assert_eq!(configs.as_slice().len(), MAX_NETWORK_INTERFACE_COUNT);
+        assert_eq!(
+            configs.as_slice()[MAX_NETWORK_INTERFACE_COUNT - 1].iface_id(),
+            "eth0"
+        );
+        assert_eq!(
+            configs.as_slice()[MAX_NETWORK_INTERFACE_COUNT - 1].host_dev_name(),
+            "replacement"
+        );
     }
 
     #[test]

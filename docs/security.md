@@ -164,11 +164,13 @@ The current scaffold does not implement:
   packets between vmnet and the runtime packet traits for future host
   networking, plus an internal provider that can select prebuilt adapters by
   configured interface ID and an internal `host_dev_name` mapping for
-  `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>`. Startup opens
-  vmnet resources only when configured interfaces use those supported names,
-  keeps no-network startup on a no-op TX sink plus empty RX source, and still
-  lacks a macOS sandbox, host resource broker, connectivity policy, and live
-  vmnet integration proof. The current vsock API path validates and stores
+  `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>`. The current
+  model stores at most 16 configured network interfaces. Startup revalidates
+  that limit before opening vmnet resources, opens them only when configured
+  interfaces use the supported names, keeps no-network startup on a no-op TX
+  sink plus empty RX source, and still lacks a macOS sandbox, host resource
+  broker, connectivity policy, and live vmnet integration proof. The current
+  vsock API path validates and stores
   `guest_cid` plus `uds_path` before boot, but it does not implement a
   virtio-vsock device or host Unix socket backend
 - complete production logging or metrics policy

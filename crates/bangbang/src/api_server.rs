@@ -27,6 +27,8 @@ use bangbang_runtime::machine::{
     MachineConfigHugePages as RuntimeMachineConfigHugePages, MachineConfigInput,
 };
 use bangbang_runtime::metrics::MetricsConfigInput;
+#[cfg(test)]
+use bangbang_runtime::network::MAX_NETWORK_INTERFACE_COUNT;
 use bangbang_runtime::network::{NetworkInterfaceConfig, NetworkInterfaceConfigInput};
 use bangbang_runtime::vsock::{VsockConfig, VsockConfigInput};
 use bangbang_runtime::{VmConfiguration, VmmAction, VmmData};
@@ -2005,6 +2007,61 @@ mod tests {
         assert_eq!(
             config.guest_mac().map(|guest_mac| guest_mac.to_string()),
             Some("12:34:56:78:9a:bc".to_string())
+        );
+    }
+
+    #[test]
+    fn returns_fault_for_network_interface_count_over_limit_without_storing() {
+        let mut vmm = test_controller();
+
+        for index in 0..MAX_NETWORK_INTERFACE_COUNT {
+            let body = format!(r#"{{"iface_id":"eth{index}","host_dev_name":"tap{index}"}}"#);
+            let request = format!(
+                "PUT /network-interfaces/eth{index} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let response = handle_request_bytes(request.as_bytes(), &mut vmm);
+
+            assert_eq!(response.status(), bangbang_api::http::StatusCode::NoContent);
+        }
+
+        let path = unique_socket_path("net-limit");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+        let body = format!(
+            r#"{{"iface_id":"eth{MAX_NETWORK_INTERFACE_COUNT}","host_dev_name":"tap{MAX_NETWORK_INTERFACE_COUNT}"}}"#
+        );
+        let request = format!(
+            "PUT /network-interfaces/eth{MAX_NETWORK_INTERFACE_COUNT} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        client
+            .write_all(request.as_bytes())
+            .expect("client should write request");
+        server
+            .serve_next(&mut vmm)
+            .expect("server should handle one request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("client should read response");
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(
+            response.contains(r#"{"fault_message":"network interface count exceeds maximum 16"}"#)
+        );
+
+        let data = vmm
+            .handle_action(VmmAction::GetVmConfig)
+            .expect("VM config should be returned");
+        let VmmData::VmConfiguration(config) = data else {
+            panic!("expected VM config");
+        };
+        assert_eq!(
+            config.network_interface_configs().len(),
+            MAX_NETWORK_INTERFACE_COUNT
         );
     }
 
