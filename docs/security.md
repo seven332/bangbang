@@ -150,10 +150,11 @@ The current scaffold does not implement:
 - network, vsock, MMDS, or snapshot containment; the current network interface
   configuration path validates and stores configuration strings, and internal
   virtio-net notification dispatch can parse guest TX descriptor metadata and
-  pass validated TX frame payloads to an injected packet sink, and can copy
-  injected RX packet bytes into validated guest RX buffers through an injected
-  packet source, but the default path is a no-op TX sink plus an empty RX source
-  and bangbang still does not open host networking resources
+  pass validated TX frame payloads to injected packet I/O selected per configured
+  interface, and can copy injected RX packet bytes into validated guest RX
+  buffers through the same boundary, but the default path is a no-op TX sink
+  plus an empty RX source and bangbang still does not open host networking
+  resources
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 

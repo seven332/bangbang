@@ -223,7 +223,7 @@ compatibility targets.
 | `PUT` | `/logger` | supported target; minimal subset implemented | Stores process logger configuration before boot, opens `log_path` with nonblocking output semantics when provided, accepts optional Firecracker-shaped level/show/module fields, and omits logger state from `GET /vm/config` because it is not guest configuration. Full internal log routing remains deferred. |
 | `PATCH` | `/machine-config` | deferred | Partial updates belong with later state and validation rules. |
 | `PUT` | `/cpu-config` | deferred | Needs HVF CPU feature design with VM and boot work in #8 and #10. |
-| `PUT` | `/network-interfaces/{iface_id}` | supported target; configuration storage implemented | Stores initial virtio-net configuration before boot without opening host networking resources. Startup preparation attaches configured interfaces as virtio-mmio devices in the MMIO dispatcher and guest FDT, and internal network notification dispatch can parse TX descriptors through an injected packet sink boundary and copy injected RX packets into guest buffers through an injected packet source boundary. Host packet backend selection, public packet movement, runtime updates, PATCH, and DELETE remain tied to #14. |
+| `PUT` | `/network-interfaces/{iface_id}` | supported target; configuration storage implemented | Stores initial virtio-net configuration before boot without opening host networking resources. Startup preparation attaches configured interfaces as virtio-mmio devices in the MMIO dispatcher and guest FDT, and internal network notification dispatch can route each configured interface through injected packet I/O, parse TX descriptors through a packet sink boundary, and copy injected RX packets into guest buffers through a packet source boundary. Host packet backend selection, public packet movement, runtime updates, PATCH, and DELETE remain tied to #14. |
 | `PUT` | `/vsock` | deferred | Tied to virtio vsock work in #15. |
 | `GET`, `PUT`, `PATCH` | `/mmds` | deferred | Tied to MMDS work in #16. |
 | `PUT` | `/mmds/config` | deferred | Tied to MMDS work in #16. |
@@ -534,19 +534,20 @@ registration metadata. Startup preparation can pair those registrations with
 caller-provided interrupt lines and write matching inert virtio-mmio descriptors
 into the guest FDT while preserving interface order and host device names.
 Internal network notification dispatch can drain pending TX and RX queue
-notifications. TX dispatch walks the TX available ring, parses descriptor chains
-into `VirtioNetworkTxFrame` metadata, publishes used-ring completions with
-length 0, delivers parsed frames to an injected internal packet sink, preserves
-parse, sink, and partial-dispatch errors, and marks queue interrupt status when
-descriptor heads complete. RX dispatch uses an injected internal packet source,
-copies a zeroed 12-byte virtio-net header plus packet payload into validated
-guest-writable RX buffers, publishes used-ring completions with the written
-length, preserves malformed-buffer and partial-dispatch metadata, and marks
-queue interrupt status when RX buffers complete. The default dispatch path uses
-a no-op TX sink and an empty RX source, so current boot sessions still do not
-open host networking resources or provide user-visible packet ingress or egress.
-These helpers do not advertise MTU, choose a host packet backend, or connect
-packets to the host network.
+notifications and can choose injected packet I/O per configured interface at the
+boot-runtime boundary. TX dispatch walks the TX available ring, parses
+descriptor chains into `VirtioNetworkTxFrame` metadata, publishes used-ring
+completions with length 0, delivers parsed frames to an injected internal packet
+sink, preserves parse, sink, and partial-dispatch errors, and marks queue
+interrupt status when descriptor heads complete. RX dispatch uses an injected
+internal packet source, copies a zeroed 12-byte virtio-net header plus packet
+payload into validated guest-writable RX buffers, publishes used-ring
+completions with the written length, preserves malformed-buffer and
+partial-dispatch metadata, and marks queue interrupt status when RX buffers
+complete. The default dispatch path uses a no-op TX sink and an empty RX source,
+so current boot sessions still do not open host networking resources or provide
+user-visible packet ingress or egress. These helpers do not advertise MTU,
+choose a host packet backend, or connect packets to the host network.
 
 The runtime crate can prepare owned internal block-device resources from a
 validated list of stored drive configs. Preparation opens each backing file,
@@ -946,7 +947,7 @@ The first API implementation should model the same broad stages as Firecracker:
 | `PUT /machine-config` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Pre-boot-only configuration. Stored values are applied during startup preparation. |
 | `PUT /boot-source` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config; host paths are opened during startup preparation. Host path errors must avoid leaking sensitive path details. |
 | `PUT /drives/{drive_id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config; startup preparation opens backing files and registers initial block MMIO devices. Runtime hotplug remains deferred. |
-| `PUT /network-interfaces/{iface_id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config without opening host networking resources. Startup preparation attaches configured interfaces as virtio-mmio devices in the MMIO dispatcher and guest FDT, while internal network notification dispatch can parse and complete TX descriptor heads through an injected packet sink boundary and write injected RX packets into guest buffers through an injected packet source boundary. Host packet backend, public packet movement, PATCH, and DELETE remain deferred. |
+| `PUT /network-interfaces/{iface_id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config without opening host networking resources. Startup preparation attaches configured interfaces as virtio-mmio devices in the MMIO dispatcher and guest FDT, while internal network notification dispatch can route each interface through injected packet I/O, complete TX descriptor heads through a packet sink boundary, and write injected RX packets into guest buffers through a packet source boundary. Host packet backend, public packet movement, PATCH, and DELETE remain deferred. |
 | `PUT /metrics` | implemented; `204` empty response on successful output initialization | unsupported after start; `400` `fault_message` | Metrics output is process observability state, not guest configuration. Duplicate initialization fails. |
 | `PUT /logger` | implemented; `204` empty response on successful pre-boot configuration | unsupported after start; `400` `fault_message` | Logger output is process observability state, not guest configuration. Repeated pre-boot requests update provided fields; full log routing remains deferred. |
 | `PUT /actions` with `InstanceStart` | process-routed; `204` after successful owned HVF startup with internal boot run-loop worker across bounded step windows or `400` preflight/preparation fault | unsupported after start; `400` `fault_message` | Commits `Running` only after the owned HVF boot-session worker with internal serial capture is retained. The worker keeps internal active, terminal-outcome, or error status; public run-loop control and public serial streaming remain deferred. |

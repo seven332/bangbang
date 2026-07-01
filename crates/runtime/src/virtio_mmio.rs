@@ -964,6 +964,13 @@ impl VirtioMmioQueueNotificationRegisters {
             .collect()
     }
 
+    pub fn has_pending_queue_notifications(&self) -> bool {
+        self.pending_notifications
+            .iter()
+            .copied()
+            .any(|is_pending| is_pending)
+    }
+
     pub fn take_pending_queue_notifications(&mut self) -> Vec<usize> {
         let pending_notifications = self.pending_queue_notifications();
         self.reset();
@@ -1579,6 +1586,10 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
 
     pub fn pending_queue_notifications(&self) -> Vec<usize> {
         self.queue_notifications.pending_queue_notifications()
+    }
+
+    pub fn has_pending_queue_notifications(&self) -> bool {
+        self.queue_notifications.has_pending_queue_notifications()
     }
 
     pub fn take_pending_queue_notifications(&mut self) -> Vec<usize> {
@@ -3990,6 +4001,7 @@ mod tests {
         let notifications =
             VirtioMmioQueueNotificationRegisters::new(2).expect("notifications should build");
         assert_eq!(notifications.queue_count(), 2);
+        assert!(!notifications.has_pending_queue_notifications());
         assert!(notifications.pending_queue_notifications().is_empty());
         assert_eq!(notifications.is_queue_notification_pending(0), Ok(false));
         assert_eq!(notifications.is_queue_notification_pending(1), Ok(false));
@@ -4017,8 +4029,10 @@ mod tests {
         assert_eq!(notifications.is_queue_notification_pending(0), Ok(true));
         assert_eq!(notifications.is_queue_notification_pending(1), Ok(false));
         assert_eq!(notifications.is_queue_notification_pending(2), Ok(true));
+        assert!(notifications.has_pending_queue_notifications());
         assert_eq!(notifications.pending_queue_notifications(), vec![0, 2]);
         assert_eq!(notifications.take_pending_queue_notifications(), vec![0, 2]);
+        assert!(!notifications.has_pending_queue_notifications());
         assert!(notifications.pending_queue_notifications().is_empty());
     }
 
@@ -4262,15 +4276,18 @@ mod tests {
         advance_handler_to_driver_ok(&mut handler).expect("handler should reach DRIVER_OK");
 
         assert_eq!(handler.is_queue_notification_pending(1), Ok(false));
+        assert!(!handler.has_pending_queue_notifications());
         assert!(handler.pending_queue_notifications().is_empty());
 
         write_register_u32(&mut handler, VirtioMmioRegister::QueueNotify.offset(), 1)
             .expect("queue notify should write");
 
         assert_eq!(handler.is_queue_notification_pending(1), Ok(true));
+        assert!(handler.has_pending_queue_notifications());
         assert_eq!(handler.pending_queue_notifications(), vec![1]);
         assert_eq!(handler.take_pending_queue_notifications(), vec![1]);
         assert_eq!(handler.is_queue_notification_pending(1), Ok(false));
+        assert!(!handler.has_pending_queue_notifications());
         assert!(handler.take_pending_queue_notifications().is_empty());
     }
 

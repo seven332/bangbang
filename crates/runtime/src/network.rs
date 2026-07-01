@@ -992,7 +992,7 @@ impl VirtioNetworkDevice {
         &mut self,
         memory: &mut GuestMemory,
         drained_notifications: Vec<usize>,
-        tx_sink: &mut impl VirtioNetworkTxPacketSink,
+        tx_sink: &mut (impl VirtioNetworkTxPacketSink + ?Sized),
     ) -> Result<VirtioNetworkDeviceNotificationDispatch, VirtioNetworkDeviceNotificationError> {
         let mut rx_source = EmptyVirtioNetworkRxPacketSource;
         self.dispatch_drained_queue_notifications_with_packet_io(
@@ -1007,8 +1007,8 @@ impl VirtioNetworkDevice {
         &mut self,
         memory: &mut GuestMemory,
         drained_notifications: Vec<usize>,
-        tx_sink: &mut impl VirtioNetworkTxPacketSink,
-        rx_source: &mut impl VirtioNetworkRxPacketSource,
+        tx_sink: &mut (impl VirtioNetworkTxPacketSink + ?Sized),
+        rx_source: &mut (impl VirtioNetworkRxPacketSource + ?Sized),
     ) -> Result<VirtioNetworkDeviceNotificationDispatch, VirtioNetworkDeviceNotificationError> {
         if drained_notifications.is_empty() {
             return Ok(VirtioNetworkDeviceNotificationDispatch::new(
@@ -1146,7 +1146,7 @@ impl VirtioNetworkRxQueue {
     pub fn dispatch_with_source(
         &mut self,
         memory: &mut GuestMemory,
-        rx_source: &mut impl VirtioNetworkRxPacketSource,
+        rx_source: &mut (impl VirtioNetworkRxPacketSource + ?Sized),
     ) -> Result<VirtioNetworkRxQueueDispatch, VirtioNetworkRxQueueDispatchError> {
         let mut dispatch =
             VirtioNetworkRxQueueDispatch::with_capacity(self.available.queue_size())?;
@@ -1840,7 +1840,7 @@ impl VirtioNetworkTxQueue {
     pub fn dispatch_with_sink(
         &mut self,
         memory: &mut GuestMemory,
-        tx_sink: &mut impl VirtioNetworkTxPacketSink,
+        tx_sink: &mut (impl VirtioNetworkTxPacketSink + ?Sized),
     ) -> Result<VirtioNetworkTxQueueDispatch, VirtioNetworkTxQueueDispatchError> {
         let mut dispatch =
             VirtioNetworkTxQueueDispatch::with_capacity(self.available.queue_size())?;
@@ -2121,7 +2121,7 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioNetwor
     pub fn dispatch_network_queue_notifications_with_tx_sink(
         &mut self,
         memory: &mut GuestMemory,
-        tx_sink: &mut impl VirtioNetworkTxPacketSink,
+        tx_sink: &mut (impl VirtioNetworkTxPacketSink + ?Sized),
     ) -> Result<VirtioNetworkDeviceNotificationDispatch, VirtioNetworkDeviceNotificationError> {
         let drained_notifications = self.take_pending_queue_notifications();
         let dispatch = self
@@ -2152,8 +2152,8 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioNetwor
     pub fn dispatch_network_queue_notifications_with_packet_io(
         &mut self,
         memory: &mut GuestMemory,
-        tx_sink: &mut impl VirtioNetworkTxPacketSink,
-        rx_source: &mut impl VirtioNetworkRxPacketSource,
+        tx_sink: &mut (impl VirtioNetworkTxPacketSink + ?Sized),
+        rx_source: &mut (impl VirtioNetworkRxPacketSource + ?Sized),
     ) -> Result<VirtioNetworkDeviceNotificationDispatch, VirtioNetworkDeviceNotificationError> {
         let drained_notifications = self.take_pending_queue_notifications();
         let dispatch = self
