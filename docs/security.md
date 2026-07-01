@@ -73,10 +73,12 @@ is resource-specific:
   also parse host `CONNECT <PORT>` requests, allocate Firecracker-shaped host
   local ports, retain host-initiated accepted streams in an internal table,
   expose one-shot guest-facing `VSOCK_OP_REQUEST` packet headers for retained
-  host connections, dispatch those request headers through RX queue
-  notifications into validated writable guest RX descriptors, accept one
-  pending host connection per call into an owned nonblocking stream, then read
-  and parse a bounded accepted-stream `CONNECT` handshake. Startup
+  host connections, dispatch those request headers into validated writable
+  guest RX descriptors, accept one pending host connection per dispatch pass
+  into an owned nonblocking stream, retain bounded accepted streams across
+  partial handshakes and retained connection records, drop invalid
+  accepted-stream handshakes without exposing host paths, and retry RX delivery
+  when pending host requests exist. Startup
   also binds a nonblocking host Unix listener at `uds_path`, records the
   listener socket device and inode, and removes the path on normal shutdown only
   when it still refers to the socket created by this process. It does not send
@@ -201,10 +203,12 @@ The current scaffold does not implement:
   host `CONNECT <PORT>` requests, allocate Firecracker-shaped host local ports,
   retain host-initiated accepted streams in an internal table, expose one-shot
   guest-facing `VSOCK_OP_REQUEST` packet headers for retained host connections,
-  dispatch those request headers through RX queue notifications into validated
-  writable guest RX descriptors, accept one pending host connection per call
-  into an owned nonblocking stream, and read and parse a bounded
-  accepted-stream `CONNECT` handshake. Startup
+  dispatch those request headers into validated writable guest RX descriptors,
+  accept one pending host connection per dispatch pass into an owned
+  nonblocking stream, retain bounded accepted streams across partial handshakes
+  and retained connection records, drop invalid accepted-stream handshakes
+  without exposing host paths, and retry RX delivery when pending host requests
+  exist. Startup
   preparation creates a nonblocking host Unix listener at `uds_path` and cleans
   it up only while the path still matches the created socket inode. It does not
   send `OK` or `RST` responses, connect guest-initiated `uds_path_<PORT>`
