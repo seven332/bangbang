@@ -72,11 +72,13 @@ is resource-specific:
   queue interrupt line. The runtime can also parse host `CONNECT <PORT>`
   requests, allocate Firecracker-shaped host local ports, track
   host-initiated connection keys in an internal table, and accept one pending
-  host connection per call into an owned nonblocking stream. Startup also binds a nonblocking host Unix
-  listener at `uds_path`, records the listener socket device and inode, and
-  removes the path on normal shutdown only when it still refers to the socket
-  created by this process. It does not read accepted-stream `CONNECT`
-  handshakes, connect to `uds_path_<PORT>`, route CIDs, or move vsock data yet.
+  host connection per call into an owned nonblocking stream, then read and
+  parse a bounded accepted-stream `CONNECT` handshake. Startup also binds a
+  nonblocking host Unix listener at `uds_path`, records the listener socket
+  device and inode, and removes the path on normal shutdown only when it still
+  refers to the socket created by this process. It does not allocate accepted
+  host local ports, connect to `uds_path_<PORT>`, route CIDs, or move vsock data
+  yet.
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink.
 - `/logger` opens `log_path` during pre-boot configuration when that field is
@@ -193,12 +195,14 @@ The current scaffold does not implement:
   HVF queue interrupt signaling that expose only the configured guest CID
   through bounded config reads. The runtime can also parse host `CONNECT <PORT>`
   requests, allocate Firecracker-shaped host local ports, track
-  host-initiated connection keys in an internal table, and accept one pending
-  host connection per call into an owned nonblocking stream. Startup preparation creates a nonblocking host
-  Unix listener at `uds_path` and cleans it up only while the path still matches
-  the created socket inode. It does not read accepted-stream `CONNECT` handshakes,
-  guest-initiated `uds_path_<PORT>` connections, CID routing, RX buffer parsing,
-  event queue dispatch, or data movement
+  host-initiated connection keys in an internal table, accept one pending host
+  connection per call into an owned nonblocking stream, and read and parse a
+  bounded accepted-stream `CONNECT` handshake. Startup preparation creates a
+  nonblocking host Unix listener at `uds_path` and cleans it up only while the
+  path still matches the created socket inode. It does not allocate accepted
+  host local ports, send `OK` or `RST` responses, connect guest-initiated
+  `uds_path_<PORT>` sockets, route CIDs, parse RX buffers, dispatch event
+  queues, or move data
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 
