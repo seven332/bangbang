@@ -40,8 +40,9 @@ queue construction, drain, resettable active queue ownership, and active queue
 notification dispatch helper with virtio-mmio queue interrupt-status updates
 for future device handlers, internal boot-resource assembly from stored VM
 configuration with optional serial plus block and network MMIO registration,
-boot-runtime block and network notification dispatch with per-device metadata, an internal backend-neutral
-interrupt line/status/trigger model, single-vCPU arm64 HVF
+boot-runtime block and network notification dispatch with per-device metadata,
+including an HVF wrapper path for injected virtio-net packet I/O, an internal
+backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
 boot-register setup, internal HVF single-vCPU arm64 boot-session preparation
 with a runner-compatible shared MMIO dispatcher, controlled mapped guest-memory
 access, one-step runner-thread MMIO handling, a run-cancellation boundary, a
@@ -535,8 +536,10 @@ caller-provided interrupt lines and write matching inert virtio-mmio descriptors
 into the guest FDT while preserving interface order and host device names.
 Internal network notification dispatch can drain pending TX and RX queue
 notifications and can choose injected packet I/O per configured interface at the
-boot-runtime boundary. TX dispatch walks the TX available ring, parses
-descriptor chains into `VirtioNetworkTxFrame` metadata, publishes used-ring
+boot-runtime boundary. The HVF boot-session wrapper can invoke that injected
+path while preserving the existing default no-op behavior. TX dispatch walks the
+TX available ring, parses descriptor chains into `VirtioNetworkTxFrame`
+metadata, publishes used-ring
 completions with length 0, delivers parsed frames to an injected internal packet
 sink, preserves parse, sink, and partial-dispatch errors, and marks queue
 interrupt status when descriptor heads complete. RX dispatch uses an injected

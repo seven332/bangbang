@@ -19,7 +19,8 @@ use bangbang_runtime::startup::{
     Arm64BootBlockNotificationDispatch, Arm64BootBlockNotificationDispatchError,
     Arm64BootBlockNotificationDispatches, Arm64BootNetworkNotificationDispatch,
     Arm64BootNetworkNotificationDispatchError, Arm64BootNetworkNotificationDispatches,
-    Arm64BootResourceConfig, Arm64BootResourceError, Arm64BootResources, Arm64BootRuntimeResources,
+    Arm64BootNetworkPacketIoProvider, Arm64BootResourceConfig, Arm64BootResourceError,
+    Arm64BootResources, Arm64BootRuntimeResources,
     Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig,
 };
 use bangbang_runtime::{BackendError, VmBackend, VmmController};
@@ -403,22 +404,41 @@ impl HvfArm64BootSession<'_> {
                     HvfArm64BootNetworkNotificationDispatchError::MmioDispatcher { source }
                 })?;
 
-            self.runtime_resources
-                .dispatch_network_queue_notifications(memory, &mut mmio_dispatcher)
-                .map_err(|source| {
-                    HvfArm64BootNetworkNotificationDispatchError::DispatchNotifications { source }
-                })?
+            dispatch_network_runtime_notifications(
+                memory,
+                &mut self.runtime_resources,
+                &mut mmio_dispatcher,
+            )?
         };
 
-        if !dispatches.needs_queue_interrupt() {
-            return collect_network_notification_dispatches(dispatches);
-        }
+        collect_or_signal_network_queue_interrupts(dispatches, &self.gic)
+    }
 
-        let signaler = HvfGicSpiSignaler::from_metadata(&self.gic).map_err(|source| {
-            HvfArm64BootNetworkNotificationDispatchError::CreateSignalSink { source }
-        })?;
+    pub fn dispatch_network_queue_notifications_with_packet_io_and_signal_interrupts(
+        &mut self,
+        packet_io: &mut impl Arm64BootNetworkPacketIoProvider,
+    ) -> Result<
+        HvfArm64BootNetworkNotificationDispatches,
+        HvfArm64BootNetworkNotificationDispatchError,
+    > {
+        let dispatches = {
+            let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
+                HvfArm64BootNetworkNotificationDispatchError::MapGuestMemory { source }
+            })?;
+            let mut mmio_dispatcher =
+                lock_boot_mmio_dispatcher(&self.mmio_dispatcher).map_err(|source| {
+                    HvfArm64BootNetworkNotificationDispatchError::MmioDispatcher { source }
+                })?;
 
-        signal_network_queue_interrupts(dispatches, &signaler)
+            dispatch_network_runtime_notifications_with_packet_io(
+                memory,
+                &mut self.runtime_resources,
+                &mut mmio_dispatcher,
+                packet_io,
+            )?
+        };
+
+        collect_or_signal_network_queue_interrupts(dispatches, &self.gic)
     }
 }
 
@@ -597,22 +617,41 @@ impl OwnedHvfArm64BootSession {
                     HvfArm64BootNetworkNotificationDispatchError::MmioDispatcher { source }
                 })?;
 
-            self.runtime_resources
-                .dispatch_network_queue_notifications(memory, &mut mmio_dispatcher)
-                .map_err(|source| {
-                    HvfArm64BootNetworkNotificationDispatchError::DispatchNotifications { source }
-                })?
+            dispatch_network_runtime_notifications(
+                memory,
+                &mut self.runtime_resources,
+                &mut mmio_dispatcher,
+            )?
         };
 
-        if !dispatches.needs_queue_interrupt() {
-            return collect_network_notification_dispatches(dispatches);
-        }
+        collect_or_signal_network_queue_interrupts(dispatches, &self.gic)
+    }
 
-        let signaler = HvfGicSpiSignaler::from_metadata(&self.gic).map_err(|source| {
-            HvfArm64BootNetworkNotificationDispatchError::CreateSignalSink { source }
-        })?;
+    pub fn dispatch_network_queue_notifications_with_packet_io_and_signal_interrupts(
+        &mut self,
+        packet_io: &mut impl Arm64BootNetworkPacketIoProvider,
+    ) -> Result<
+        HvfArm64BootNetworkNotificationDispatches,
+        HvfArm64BootNetworkNotificationDispatchError,
+    > {
+        let dispatches = {
+            let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
+                HvfArm64BootNetworkNotificationDispatchError::MapGuestMemory { source }
+            })?;
+            let mut mmio_dispatcher =
+                lock_boot_mmio_dispatcher(&self.mmio_dispatcher).map_err(|source| {
+                    HvfArm64BootNetworkNotificationDispatchError::MmioDispatcher { source }
+                })?;
 
-        signal_network_queue_interrupts(dispatches, &signaler)
+            dispatch_network_runtime_notifications_with_packet_io(
+                memory,
+                &mut self.runtime_resources,
+                &mut mmio_dispatcher,
+                packet_io,
+            )?
+        };
+
+        collect_or_signal_network_queue_interrupts(dispatches, &self.gic)
     }
 }
 
@@ -1155,6 +1194,47 @@ fn collect_network_notification_dispatches(
     Ok(HvfArm64BootNetworkNotificationDispatches::new(devices))
 }
 
+fn dispatch_network_runtime_notifications(
+    memory: &mut GuestMemory,
+    runtime_resources: &mut Arm64BootRuntimeResources,
+    mmio_dispatcher: &mut MmioDispatcher,
+) -> Result<Arm64BootNetworkNotificationDispatches, HvfArm64BootNetworkNotificationDispatchError> {
+    runtime_resources
+        .dispatch_network_queue_notifications(memory, mmio_dispatcher)
+        .map_err(
+            |source| HvfArm64BootNetworkNotificationDispatchError::DispatchNotifications { source },
+        )
+}
+
+fn dispatch_network_runtime_notifications_with_packet_io(
+    memory: &mut GuestMemory,
+    runtime_resources: &mut Arm64BootRuntimeResources,
+    mmio_dispatcher: &mut MmioDispatcher,
+    packet_io: &mut impl Arm64BootNetworkPacketIoProvider,
+) -> Result<Arm64BootNetworkNotificationDispatches, HvfArm64BootNetworkNotificationDispatchError> {
+    runtime_resources
+        .dispatch_network_queue_notifications_with_packet_io(memory, mmio_dispatcher, packet_io)
+        .map_err(
+            |source| HvfArm64BootNetworkNotificationDispatchError::DispatchNotifications { source },
+        )
+}
+
+fn collect_or_signal_network_queue_interrupts(
+    dispatches: Arm64BootNetworkNotificationDispatches,
+    gic: &HvfGicMetadata,
+) -> Result<HvfArm64BootNetworkNotificationDispatches, HvfArm64BootNetworkNotificationDispatchError>
+{
+    if !dispatches.needs_queue_interrupt() {
+        return collect_network_notification_dispatches(dispatches);
+    }
+
+    let signaler = HvfGicSpiSignaler::from_metadata(gic).map_err(|source| {
+        HvfArm64BootNetworkNotificationDispatchError::CreateSignalSink { source }
+    })?;
+
+    signal_network_queue_interrupts(dispatches, &signaler)
+}
+
 fn signal_network_queue_interrupts(
     dispatches: Arm64BootNetworkNotificationDispatches,
     signaler: &dyn InterruptSink,
@@ -1576,12 +1656,16 @@ mod tests {
     };
     use bangbang_runtime::network::{
         NetworkInterfaceConfigInput, NetworkMmioLayout, VIRTIO_NET_RX_QUEUE_INDEX,
-        VIRTIO_NET_TX_HEADER_SIZE, VIRTIO_NET_TX_QUEUE_INDEX,
+        VIRTIO_NET_TX_HEADER_SIZE, VIRTIO_NET_TX_QUEUE_INDEX, VirtioNetworkRxPacket,
+        VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame,
+        VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
     };
     use bangbang_runtime::serial::SharedSerialOutputBuffer;
     use bangbang_runtime::startup::{
         Arm64BootBlockNotificationDispatches, Arm64BootNetworkNotificationDispatches,
-        Arm64BootResourceConfig, Arm64BootResources, Arm64BootRuntimeResources,
+        Arm64BootNetworkNotificationOutcome, Arm64BootNetworkPacketIo,
+        Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider, Arm64BootResourceConfig,
+        Arm64BootResources, Arm64BootRuntimeResources,
     };
     use bangbang_runtime::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
@@ -1597,8 +1681,9 @@ mod tests {
         HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig,
         HvfArm64BootSessionConfig, HvfArm64BootSessionError, allocate_interrupt_lines,
         collect_block_notification_dispatches, collect_network_notification_dispatches,
-        lock_boot_mmio_dispatcher, run_boot_session_loop, run_boot_session_vcpu_step,
-        signal_block_queue_interrupts, signal_network_queue_interrupts, validate_single_vcpu,
+        dispatch_network_runtime_notifications_with_packet_io, lock_boot_mmio_dispatcher,
+        run_boot_session_loop, run_boot_session_vcpu_step, signal_block_queue_interrupts,
+        signal_network_queue_interrupts, validate_single_vcpu,
     };
     use crate::exit::{
         HvfExceptionExit, HvfHvcExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
@@ -1705,6 +1790,107 @@ mod tests {
                 .expect("recording sink lock should not be poisoned")
                 .push(line);
             self.result.clone()
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingTxPacketSink {
+        packets: Vec<Vec<u8>>,
+    }
+
+    impl VirtioNetworkTxPacketSink for RecordingTxPacketSink {
+        fn transmit_frame(
+            &mut self,
+            memory: &GuestMemory,
+            frame: &VirtioNetworkTxFrame,
+        ) -> Result<(), VirtioNetworkTxPacketSinkError> {
+            let payload_len = usize::try_from(frame.payload_len())
+                .expect("test TX payload length should fit in usize");
+            let mut packet = Vec::new();
+            packet
+                .try_reserve_exact(payload_len)
+                .expect("test packet allocation should succeed");
+            for segment in frame.payload_segments() {
+                let len =
+                    usize::try_from(segment.len()).expect("test TX segment should fit in usize");
+                let mut bytes = vec![0; len];
+                memory
+                    .read_slice(&mut bytes, segment.address())
+                    .expect("test TX segment should read");
+                packet.extend(bytes);
+            }
+            self.packets.push(packet);
+
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct EmptyRxPacketSource {
+        peek_calls: usize,
+    }
+
+    impl VirtioNetworkRxPacketSource for EmptyRxPacketSource {
+        fn peek_packet(
+            &mut self,
+        ) -> Result<Option<VirtioNetworkRxPacket<'_>>, VirtioNetworkRxPacketSourceError> {
+            self.peek_calls += 1;
+            Ok(None)
+        }
+
+        fn consume_packet(&mut self) {}
+    }
+
+    #[derive(Debug)]
+    struct RecordingNetworkPacketIoProvider {
+        iface_id: String,
+        tx_sink: RecordingTxPacketSink,
+        rx_source: EmptyRxPacketSource,
+        requested_ifaces: Vec<String>,
+        fail: bool,
+    }
+
+    impl RecordingNetworkPacketIoProvider {
+        fn for_iface(iface_id: &str) -> Self {
+            Self {
+                iface_id: iface_id.to_string(),
+                tx_sink: RecordingTxPacketSink::default(),
+                rx_source: EmptyRxPacketSource::default(),
+                requested_ifaces: Vec::new(),
+                fail: false,
+            }
+        }
+
+        fn failing_for(iface_id: &str) -> Self {
+            Self {
+                fail: true,
+                ..Self::for_iface(iface_id)
+            }
+        }
+    }
+
+    impl Arm64BootNetworkPacketIoProvider for RecordingNetworkPacketIoProvider {
+        fn packet_io(
+            &mut self,
+            device: &bangbang_runtime::startup::Arm64BootNetworkDevice,
+        ) -> Result<Arm64BootNetworkPacketIo<'_>, Arm64BootNetworkPacketIoError> {
+            let iface_id = device.registration.iface_id();
+            self.requested_ifaces.push(iface_id.to_string());
+            if iface_id != self.iface_id {
+                return Err(Arm64BootNetworkPacketIoError::new(format!(
+                    "missing test packet I/O for interface {iface_id}"
+                )));
+            }
+            if self.fail {
+                return Err(Arm64BootNetworkPacketIoError::new(format!(
+                    "test packet I/O unavailable for interface {iface_id}"
+                )));
+            }
+
+            Ok(Arm64BootNetworkPacketIo::new(
+                &mut self.tx_sink,
+                &mut self.rx_source,
+            ))
         }
     }
 
@@ -2297,6 +2483,21 @@ mod tests {
         runtime
             .dispatch_network_queue_notifications(memory, mmio_dispatcher)
             .expect("network notification dispatch result should allocate")
+    }
+
+    fn dispatch_boot_network_notifications_with_packet_io(
+        memory: &mut GuestMemory,
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        provider: &mut impl Arm64BootNetworkPacketIoProvider,
+    ) -> Arm64BootNetworkNotificationDispatches {
+        dispatch_network_runtime_notifications_with_packet_io(
+            memory,
+            runtime,
+            mmio_dispatcher,
+            provider,
+        )
+        .expect("network packet I/O notification dispatch result should allocate")
     }
 
     fn write_boot_block_mmio_u32(
@@ -3150,6 +3351,25 @@ mod tests {
     }
 
     #[test]
+    fn network_notification_packet_io_dispatch_accepts_empty_devices() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_without_drives();
+        let mut provider = RecordingNetworkPacketIoProvider::for_iface("eth0");
+        let dispatches = dispatch_boot_network_notifications_with_packet_io(
+            &mut memory,
+            &mut runtime,
+            &mut mmio_dispatcher,
+            &mut provider,
+        );
+        let result = collect_network_notification_dispatches(dispatches)
+            .expect("empty network dispatch result should collect");
+
+        assert!(result.is_empty());
+        assert_eq!(result.len(), 0);
+        assert!(!result.has_signal_failure());
+        assert!(provider.requested_ifaces.is_empty());
+    }
+
+    #[test]
     fn network_notification_signal_dispatch_skips_noop_device() {
         let (mut memory, mut runtime, mut mmio_dispatcher) =
             boot_runtime_with_networks(&[("eth0", "tap0")]);
@@ -3177,6 +3397,33 @@ mod tests {
             ),
             0
         );
+    }
+
+    #[test]
+    fn network_notification_packet_io_dispatch_skips_provider_without_pending() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_networks(&[("eth0", "tap0")]);
+        configure_boot_network_queues(&mut runtime, &mut mmio_dispatcher, 0);
+        let mut provider = RecordingNetworkPacketIoProvider::for_iface("eth0");
+        let dispatches = dispatch_boot_network_notifications_with_packet_io(
+            &mut memory,
+            &mut runtime,
+            &mut mmio_dispatcher,
+            &mut provider,
+        );
+        let (lines, sink) = RecordingSink::successful();
+
+        let result = signal_network_queue_interrupts(dispatches, sink.as_ref())
+            .expect("noop network packet I/O dispatch should collect");
+
+        assert_eq!(result.len(), 1);
+        let device = &result.as_slice()[0];
+        assert_eq!(device.dispatch().device().registration.iface_id(), "eth0");
+        assert!(!device.dispatch().needs_queue_interrupt());
+        assert!(!device.queue_interrupt_signaled());
+        assert!(device.signal_error().is_none());
+        assert!(recorded_lines(&lines).is_empty());
+        assert!(provider.requested_ifaces.is_empty());
     }
 
     #[test]
@@ -3236,6 +3483,130 @@ mod tests {
         );
         assert_eq!(read_network_tx_used_index(&memory), 1);
         assert_eq!(read_network_tx_used_element(&memory, 0), (0, 0));
+    }
+
+    #[test]
+    fn network_notification_packet_io_dispatch_routes_tx_frame_and_signals() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_networks(&[("eth0", "tap0")]);
+        configure_boot_network_queues(&mut runtime, &mut mmio_dispatcher, 0);
+        write_network_tx_header(&mut memory);
+        memory
+            .write_slice(&[0xde, 0xad, 0xbe, 0xef], TEST_NETWORK_TX_PAYLOAD)
+            .expect("network TX payload should write");
+        write_network_tx_descriptors(
+            &mut memory,
+            &[
+                TestDescriptor::readable(
+                    TEST_NETWORK_TX_HEADER,
+                    VIRTIO_NET_TX_HEADER_SIZE,
+                    Some(1),
+                ),
+                TestDescriptor::readable(TEST_NETWORK_TX_PAYLOAD, 4, None),
+            ],
+        );
+        write_network_tx_available_heads(&mut memory, &[0]);
+        notify_boot_network_tx_queue(&mut runtime, &mut mmio_dispatcher, 0);
+        let mut provider = RecordingNetworkPacketIoProvider::for_iface("eth0");
+        let dispatches = dispatch_boot_network_notifications_with_packet_io(
+            &mut memory,
+            &mut runtime,
+            &mut mmio_dispatcher,
+            &mut provider,
+        );
+        let (lines, sink) = RecordingSink::successful();
+
+        let result = signal_network_queue_interrupts(dispatches, sink.as_ref())
+            .expect("queued network packet I/O dispatch should collect");
+
+        assert_eq!(provider.requested_ifaces, ["eth0".to_string()]);
+        assert_eq!(provider.tx_sink.packets, [vec![0xde, 0xad, 0xbe, 0xef]]);
+        assert_eq!(provider.rx_source.peek_calls, 0);
+        assert_eq!(result.len(), 1);
+        let device = &result.as_slice()[0];
+        assert!(device.dispatch().needs_queue_interrupt());
+        assert!(device.queue_interrupt_signaled());
+        assert!(device.signal_error().is_none());
+        assert_eq!(recorded_lines(&lines), vec![32]);
+        let dispatch = device
+            .dispatch()
+            .outcome()
+            .dispatched()
+            .expect("network notification should dispatch");
+        let tx = dispatch
+            .tx_queue_dispatch()
+            .expect("TX queue dispatch should be present");
+        assert_eq!(tx.processed_frames(), 1);
+        assert_eq!(tx.sink_successful_frames(), 1);
+        assert_eq!(read_network_tx_used_index(&memory), 1);
+        assert_eq!(read_network_tx_used_element(&memory, 0), (0, 0));
+    }
+
+    #[test]
+    fn network_notification_packet_io_dispatch_preserves_pending_on_provider_failure() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_networks(&[("eth0", "tap0")]);
+        configure_boot_network_queues(&mut runtime, &mut mmio_dispatcher, 0);
+        write_network_tx_header(&mut memory);
+        memory
+            .write_slice(&[0xde, 0xad, 0xbe, 0xef], TEST_NETWORK_TX_PAYLOAD)
+            .expect("network TX payload should write");
+        write_network_tx_descriptors(
+            &mut memory,
+            &[
+                TestDescriptor::readable(
+                    TEST_NETWORK_TX_HEADER,
+                    VIRTIO_NET_TX_HEADER_SIZE,
+                    Some(1),
+                ),
+                TestDescriptor::readable(TEST_NETWORK_TX_PAYLOAD, 4, None),
+            ],
+        );
+        write_network_tx_available_heads(&mut memory, &[0]);
+        notify_boot_network_tx_queue(&mut runtime, &mut mmio_dispatcher, 0);
+        let mut provider = RecordingNetworkPacketIoProvider::failing_for("eth0");
+        let failed = dispatch_boot_network_notifications_with_packet_io(
+            &mut memory,
+            &mut runtime,
+            &mut mmio_dispatcher,
+            &mut provider,
+        );
+
+        assert_eq!(provider.requested_ifaces, ["eth0".to_string()]);
+        assert!(!failed.needs_queue_interrupt());
+        match failed.as_slice()[0].outcome() {
+            Arm64BootNetworkNotificationOutcome::PacketIoProviderFailed(source) => {
+                assert_eq!(
+                    source.message(),
+                    "test packet I/O unavailable for interface eth0"
+                );
+            }
+            other => panic!("expected packet I/O provider failure, got {other:?}"),
+        }
+        let (lines, sink) = RecordingSink::successful();
+        let result = signal_network_queue_interrupts(failed, sink.as_ref())
+            .expect("failed network packet I/O dispatch should collect");
+        assert!(!result.has_signal_failure());
+        assert!(recorded_lines(&lines).is_empty());
+
+        let retried =
+            dispatch_boot_network_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        assert!(retried.needs_queue_interrupt());
+        let dispatch = retried.as_slice()[0]
+            .outcome()
+            .dispatched()
+            .expect("retry should dispatch preserved notification");
+        assert_eq!(
+            dispatch.drained_notifications(),
+            [VIRTIO_NET_TX_QUEUE_INDEX]
+        );
+        assert_eq!(
+            dispatch
+                .tx_queue_dispatch()
+                .expect("TX queue dispatch should be present")
+                .processed_frames(),
+            1
+        );
     }
 
     #[test]
@@ -3335,6 +3706,31 @@ mod tests {
         let result = signal_network_queue_interrupts(dispatches, sink.as_ref())
             .expect("missing network handler dispatch should collect");
 
+        let device = &result.as_slice()[0];
+        assert!(device.dispatch().outcome().handler_lookup_error().is_some());
+        assert!(!device.queue_interrupt_signaled());
+        assert!(device.signal_error().is_none());
+        assert!(recorded_lines(&lines).is_empty());
+    }
+
+    #[test]
+    fn network_notification_packet_io_dispatch_skips_provider_when_handler_missing() {
+        let (mut memory, mut runtime, _) = boot_runtime_with_networks(&[("eth0", "tap0")]);
+        let mut mmio_dispatcher = MmioDispatcher::new();
+        let mut provider = RecordingNetworkPacketIoProvider::for_iface("eth0");
+        let dispatches = dispatch_boot_network_notifications_with_packet_io(
+            &mut memory,
+            &mut runtime,
+            &mut mmio_dispatcher,
+            &mut provider,
+        );
+        let (lines, sink) = RecordingSink::successful();
+
+        let result = signal_network_queue_interrupts(dispatches, sink.as_ref())
+            .expect("missing network handler packet I/O dispatch should collect");
+
+        assert!(provider.requested_ifaces.is_empty());
+        assert_eq!(result.len(), 1);
         let device = &result.as_slice()[0];
         assert!(device.dispatch().outcome().handler_lookup_error().is_some());
         assert!(!device.queue_interrupt_signaled());
