@@ -498,6 +498,26 @@ mod tests {
     }
 
     #[test]
+    fn drop_retries_cleanup_after_failed_explicit_stop() {
+        let lifecycle =
+            RecordingVmnetLifecycle::new().with_stop_status(VmnetStatus::SetupIncomplete);
+        let event_log = lifecycle.events();
+        let config = VmnetInterfaceConfig::host();
+
+        {
+            let mut interface = OwnedVmnetInterface::start(lifecycle, &config)
+                .expect("owned vmnet interface should start");
+
+            let _ = interface.stop();
+        }
+
+        assert_eq!(
+            recorded_events(&event_log),
+            ["start:host", "stop:7", "stop:7"]
+        );
+    }
+
+    #[test]
     fn vmnet_write_operation_displays_name() {
         let error = VmnetError::new(VmnetOperation::WritePackets, VmnetStatus::PacketTooBig);
 
