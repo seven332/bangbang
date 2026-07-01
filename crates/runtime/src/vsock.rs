@@ -6335,6 +6335,37 @@ mod tests {
     }
 
     #[test]
+    fn virtio_vsock_rx_queue_dispatch_preserves_request_on_available_ring_failure() {
+        let mut memory = vsock_tx_memory();
+        let mut queue = vsock_rx_queue();
+        let mut table = VsockHostConnectionTable::new();
+        let (key, _client) =
+            insert_accepted_host_connection_for_test(&mut table, "rx-available", 4006);
+        write_vsock_rx_available_heads(&mut memory, &[TEST_VSOCK_QUEUE_SIZE]);
+
+        let error = queue
+            .dispatch_host_request(&mut memory, &mut table, key, 42)
+            .expect_err("invalid RX available head should fail");
+
+        assert!(matches!(
+            error,
+            VirtioVsockRxQueueDispatchError::AvailableRing { .. }
+        ));
+        let completed = error
+            .completed_dispatch()
+            .expect("completed dispatch metadata should be preserved");
+        assert_eq!(completed.processed_buffers(), 0);
+        assert_eq!(completed.delivered_requests(), 0);
+        assert_eq!(completed.buffer_parse_failures(), 0);
+        assert_eq!(completed.buffer_too_small_failures(), 0);
+        assert!(!completed.needs_queue_interrupt());
+        assert!(table.has_pending_request_packet(key));
+        assert_eq!(queue.available_ring().next_avail(), 0);
+        assert_eq!(queue.used_ring().next_used(), 0);
+        assert_eq!(read_vsock_rx_used_index(&memory), 0);
+    }
+
+    #[test]
     fn virtio_vsock_rx_queue_dispatch_writes_split_host_request_header() {
         let mut memory = vsock_tx_memory();
         let mut queue = vsock_rx_queue();
