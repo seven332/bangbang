@@ -69,8 +69,11 @@ is resource-specific:
   runtime has an internal Firecracker-shaped packet header model plus TX
   descriptor packet parser. Startup-level dispatch can drain TX queue
   notifications, complete TX descriptor heads, and signal the allocated vsock
-  queue interrupt line. The current implementation does not open, bind,
-  connect, unlink, or create that socket path.
+  queue interrupt line. Startup also binds a nonblocking host Unix listener at
+  `uds_path`, records the listener socket device and inode, and removes the path
+  on normal shutdown only when it still refers to the socket created by this
+  process. It does not accept host connections, connect to `uds_path_<PORT>`,
+  route CIDs, or move vsock data yet.
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink.
 - `/logger` opens `log_path` during pre-boot configuration when that field is
@@ -142,7 +145,7 @@ Use unique paths for:
 - metrics files or FIFOs
 - logger files or FIFOs
 - writable block backing files
-- configured vsock socket paths when future vsock backends start creating them
+- configured vsock socket paths
 - future host network devices or sockets
 - temporary test files
 
@@ -184,12 +187,12 @@ The current scaffold does not implement:
   parser, TX available-ring drain helper with used-ring descriptor completion,
   MMIO handler skeleton with active queue metadata retention and TX notification
   dispatch, startup FDT attachment, startup-level TX notification dispatch, and
-  HVF queue interrupt signaling that preserve the configured socket path and
-  expose only the configured guest CID through bounded config reads.
-  Preparation, MMIO
-  registration, and startup attachment do not open, bind, connect, unlink, or
-  create `uds_path`, and do not implement host Unix socket backend behavior,
-  CID routing, RX buffer parsing, event queue dispatch, or data movement
+  HVF queue interrupt signaling that expose only the configured guest CID
+  through bounded config reads. Startup preparation creates a nonblocking host
+  Unix listener at `uds_path` and cleans it up only while the path still matches
+  the created socket inode. It does not implement host connection acceptance,
+  guest-initiated `uds_path_<PORT>` connections, CID routing, RX buffer parsing,
+  event queue dispatch, or data movement
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 

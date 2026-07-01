@@ -1,6 +1,9 @@
 //! Backend-neutral vsock configuration model.
 
 use std::fmt;
+use std::fs;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 
 use crate::interrupt::DeviceInterruptKind;
@@ -181,6 +184,139 @@ impl fmt::Display for VsockConfigError {
 }
 
 impl std::error::Error for VsockConfigError {}
+
+#[derive(Debug)]
+pub(crate) struct VsockHostSocketOwner {
+    _listener: UnixListener,
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl VsockHostSocketOwner {
+    fn bind(path: impl AsRef<Path>) -> Result<Self, VsockHostSocketOwnerError> {
+        let path = path.as_ref();
+        if socket_path_exists_without_following_links(path)? {
+            return Err(VsockHostSocketOwnerError::SocketPathExists);
+        }
+
+        let listener = UnixListener::bind(path).map_err(|err| match err.kind() {
+            std::io::ErrorKind::AddrInUse | std::io::ErrorKind::AlreadyExists => {
+                VsockHostSocketOwnerError::SocketPathExists
+            }
+            kind => VsockHostSocketOwnerError::Bind(kind),
+        })?;
+        let metadata = socket_path_metadata(path)?;
+        listener.set_nonblocking(true).map_err(|err| {
+            remove_socket_path_if_owned(path, metadata.dev(), metadata.ino());
+            VsockHostSocketOwnerError::SetNonblocking(err.kind())
+        })?;
+
+        let owner = Self {
+            _listener: listener,
+            path: path.to_path_buf(),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        };
+        if owner.owns_current_path() {
+            Ok(owner)
+        } else {
+            Err(VsockHostSocketOwnerError::SocketPathChanged)
+        }
+    }
+
+    #[cfg(test)]
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[cfg(test)]
+    fn listener(&self) -> &UnixListener {
+        &self._listener
+    }
+
+    fn owns_current_path(&self) -> bool {
+        socket_path_is_owned(&self.path, self.dev, self.ino).unwrap_or(false)
+    }
+}
+
+impl Drop for VsockHostSocketOwner {
+    fn drop(&mut self) {
+        if self.owns_current_path() {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VsockHostSocketOwnerError {
+    SocketPathCheck(std::io::ErrorKind),
+    SocketPathExists,
+    Bind(std::io::ErrorKind),
+    SocketMetadata(std::io::ErrorKind),
+    SocketPathIsNotSocket,
+    SetNonblocking(std::io::ErrorKind),
+    SocketPathChanged,
+}
+
+impl fmt::Display for VsockHostSocketOwnerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SocketPathCheck(kind) => {
+                write!(f, "failed to check vsock host socket path: {kind:?}")
+            }
+            Self::SocketPathExists => f.write_str("vsock host socket path already exists"),
+            Self::Bind(kind) => write!(f, "failed to bind vsock host socket: {kind:?}"),
+            Self::SocketMetadata(kind) => {
+                write!(f, "failed to inspect vsock host socket: {kind:?}")
+            }
+            Self::SocketPathIsNotSocket => f.write_str("bound vsock host path is not a socket"),
+            Self::SetNonblocking(kind) => {
+                write!(f, "failed to set vsock host socket nonblocking: {kind:?}")
+            }
+            Self::SocketPathChanged => f.write_str("vsock host socket path changed during bind"),
+        }
+    }
+}
+
+impl std::error::Error for VsockHostSocketOwnerError {}
+
+fn socket_path_exists_without_following_links(
+    path: &Path,
+) -> Result<bool, VsockHostSocketOwnerError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(VsockHostSocketOwnerError::SocketPathCheck(err.kind())),
+    }
+}
+
+fn socket_path_metadata(path: &Path) -> Result<fs::Metadata, VsockHostSocketOwnerError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|err| VsockHostSocketOwnerError::SocketMetadata(err.kind()))?;
+
+    if !metadata.file_type().is_socket() {
+        return Err(VsockHostSocketOwnerError::SocketPathIsNotSocket);
+    }
+
+    Ok(metadata)
+}
+
+fn socket_path_is_owned(
+    path: &Path,
+    dev: u64,
+    ino: u64,
+) -> Result<bool, VsockHostSocketOwnerError> {
+    let metadata = socket_path_metadata(path)?;
+
+    Ok(metadata.dev() == dev && metadata.ino() == ino)
+}
+
+fn remove_socket_path_if_owned(path: &Path, dev: u64, ino: u64) {
+    if socket_path_is_owned(path, dev, ino).unwrap_or(false) {
+        let _ = fs::remove_file(path);
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VirtioVsockPacketHeader {
@@ -1367,16 +1503,24 @@ fn validate_active_vsock_queue(
     Ok(())
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct VirtioVsockDevice {
     active_rx_queue: Option<VirtioVsockRxQueue>,
     active_tx_queue: Option<VirtioVsockTxQueue>,
     active_event_queue: Option<VirtioVsockEventQueue>,
+    _host_socket_owner: Option<VsockHostSocketOwner>,
 }
 
 impl VirtioVsockDevice {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn with_host_socket_owner(host_socket_owner: VsockHostSocketOwner) -> Self {
+        Self {
+            _host_socket_owner: Some(host_socket_owner),
+            ..Self::default()
+        }
     }
 
     pub fn is_activated(&self) -> bool {
@@ -1768,7 +1912,7 @@ impl VirtioMmioDeviceActivationHandler for VirtioVsockDevice {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct PreparedVsockDevice {
     guest_cid: u32,
     uds_path: PathBuf,
@@ -1778,11 +1922,31 @@ pub struct PreparedVsockDevice {
 
 impl PreparedVsockDevice {
     pub fn from_config(config: &VsockConfig) -> Self {
+        Self::from_config_with_device(config, VirtioVsockDevice::new())
+    }
+
+    pub fn from_config_with_host_socket(
+        config: &VsockConfig,
+    ) -> Result<Self, PreparedVsockDeviceError> {
+        let owner = VsockHostSocketOwner::bind(config.uds_path()).map_err(|source| {
+            PreparedVsockDeviceError::HostSocket {
+                guest_cid: config.guest_cid(),
+                source,
+            }
+        })?;
+
+        Ok(Self::from_config_with_device(
+            config,
+            VirtioVsockDevice::with_host_socket_owner(owner),
+        ))
+    }
+
+    fn from_config_with_device(config: &VsockConfig, device: VirtioVsockDevice) -> Self {
         Self {
             guest_cid: config.guest_cid(),
             uds_path: config.uds_path().to_path_buf(),
             config_space: VirtioVsockConfigSpace::new(u64::from(config.guest_cid())),
-            device: VirtioVsockDevice::new(),
+            device,
         }
     }
 
@@ -1824,6 +1988,35 @@ impl PreparedVsockDevice {
         dispatcher: MmioDispatcher,
     ) -> Result<VsockMmioDevice, VsockMmioRegistrationError> {
         VsockMmioDevice::from_prepared_with_dispatcher(self, layout, dispatcher)
+    }
+}
+
+#[derive(Debug)]
+pub enum PreparedVsockDeviceError {
+    HostSocket {
+        guest_cid: u32,
+        source: VsockHostSocketOwnerError,
+    },
+}
+
+impl fmt::Display for PreparedVsockDeviceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HostSocket { guest_cid, source } => {
+                write!(
+                    f,
+                    "failed to prepare vsock host socket for guest CID {guest_cid}: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for PreparedVsockDeviceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::HostSocket { source, .. } => Some(source),
+        }
     }
 }
 
@@ -2082,7 +2275,11 @@ fn has_control_character(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
+    use std::fs;
+    use std::os::unix::net::UnixListener;
     use std::path::Path;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::interrupt::DeviceInterruptKind;
     use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
@@ -2119,8 +2316,11 @@ mod tests {
         VirtioVsockMmioHandler, VirtioVsockPacketHeader, VirtioVsockPacketLengthError,
         VirtioVsockQueueBuildError, VirtioVsockTxPacket, VirtioVsockTxPacketParseError,
         VirtioVsockTxQueue, VirtioVsockTxQueueDispatchError, VsockConfigError, VsockConfigInput,
-        VsockMmioDevice, VsockMmioLayout, VsockMmioRegistrationError, virtio_vsock_mmio_handler,
+        VsockHostSocketOwner, VsockHostSocketOwnerError, VsockMmioDevice, VsockMmioLayout,
+        VsockMmioRegistrationError, virtio_vsock_mmio_handler,
     };
+
+    static NEXT_TEST_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
     const TEST_MMIO_BASE: u64 = 0x1000_0000;
     const QUEUE_CONFIG_STATUS: u32 = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
@@ -2150,6 +2350,19 @@ mod tests {
 
     fn prepared_vsock_device(guest_cid: u32, uds_path: impl Into<String>) -> PreparedVsockDevice {
         PreparedVsockDevice::from_config(&valid_vsock_config(guest_cid, uds_path))
+    }
+
+    fn unique_socket_path(name: &str) -> PathBuf {
+        let id = NEXT_TEST_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after Unix epoch")
+            .as_nanos();
+        let short_name: String = name.chars().take(12).collect();
+        PathBuf::from("/tmp").join(format!(
+            "bb-vsock-{short_name}-{now:x}-{}-{id:x}.sock",
+            std::process::id()
+        ))
     }
 
     fn unique_missing_socket_path() -> String {
@@ -2739,6 +2952,153 @@ mod tests {
     #[test]
     fn errors_have_no_sources() {
         assert!(VsockConfigError::EmptySocketPath.source().is_none());
+    }
+
+    #[test]
+    fn host_socket_owner_binds_nonblocking_listener_and_cleans_up() {
+        let path = unique_socket_path("owner");
+
+        let owner = VsockHostSocketOwner::bind(&path).expect("host socket should bind");
+
+        assert_eq!(owner.path(), path.as_path());
+        assert!(path.exists());
+        let err = owner
+            .listener()
+            .accept()
+            .expect_err("idle nonblocking listener should not block");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+
+        drop(owner);
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn host_socket_owner_rejects_existing_file_without_unlinking() {
+        let path = unique_socket_path("existing-file");
+        fs::write(&path, "existing file").expect("fixture file should be written");
+
+        let err =
+            VsockHostSocketOwner::bind(&path).expect_err("existing file path should be rejected");
+
+        assert_eq!(err, VsockHostSocketOwnerError::SocketPathExists);
+        assert_eq!(
+            fs::read_to_string(&path).expect("existing file should remain"),
+            "existing file"
+        );
+
+        fs::remove_file(path).expect("fixture file should clean up");
+    }
+
+    #[test]
+    fn host_socket_owner_rejects_existing_socket_without_unlinking() {
+        let path = unique_socket_path("existing-socket");
+        let listener = UnixListener::bind(&path).expect("fixture socket should bind");
+
+        let err =
+            VsockHostSocketOwner::bind(&path).expect_err("existing socket path should be rejected");
+
+        assert_eq!(err, VsockHostSocketOwnerError::SocketPathExists);
+        assert!(path.exists());
+
+        drop(listener);
+        fs::remove_file(path).expect("fixture socket should clean up");
+    }
+
+    #[test]
+    fn host_socket_owner_rejects_broken_symlink_without_unlinking() {
+        let path = unique_socket_path("existing-symlink");
+        let target = unique_socket_path("missing-symlink-target");
+        std::os::unix::fs::symlink(&target, &path).expect("fixture symlink should be created");
+
+        let err = VsockHostSocketOwner::bind(&path)
+            .expect_err("existing symlink path should be rejected");
+
+        assert_eq!(err, VsockHostSocketOwnerError::SocketPathExists);
+        assert!(
+            fs::symlink_metadata(&path)
+                .expect("symlink should remain")
+                .file_type()
+                .is_symlink()
+        );
+
+        fs::remove_file(path).expect("fixture symlink should clean up");
+    }
+
+    #[test]
+    fn host_socket_owner_drop_keeps_replaced_path() {
+        let path = unique_socket_path("replaced");
+        let owner = VsockHostSocketOwner::bind(&path).expect("host socket should bind");
+
+        fs::remove_file(&path).expect("owned socket path should be removable");
+        fs::write(&path, "replacement").expect("replacement file should be written");
+
+        drop(owner);
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("replacement file should remain"),
+            "replacement"
+        );
+
+        fs::remove_file(path).expect("replacement file should clean up");
+    }
+
+    #[test]
+    fn host_socket_owner_allows_multiple_distinct_paths() {
+        let first_path = unique_socket_path("multi-first");
+        let second_path = unique_socket_path("multi-second");
+
+        let first = VsockHostSocketOwner::bind(&first_path).expect("first socket should bind");
+        let second = VsockHostSocketOwner::bind(&second_path).expect("second socket should bind");
+
+        assert!(first_path.exists());
+        assert!(second_path.exists());
+
+        drop(first);
+
+        assert!(!first_path.exists());
+        assert!(second_path.exists());
+
+        drop(second);
+
+        assert!(!second_path.exists());
+    }
+
+    #[test]
+    fn prepared_vsock_device_with_host_socket_owns_and_cleans_socket() {
+        let path = unique_socket_path("prepared-owner");
+        let config = valid_vsock_config(9, path.to_string_lossy());
+
+        let prepared = PreparedVsockDevice::from_config_with_host_socket(&config)
+            .expect("prepared vsock should bind host socket");
+
+        assert!(path.exists());
+
+        drop(prepared);
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn prepared_vsock_device_host_socket_error_does_not_leak_path() {
+        let path = unique_socket_path("secret-prepared-owner");
+        fs::write(&path, "existing file").expect("fixture file should be written");
+        let config = valid_vsock_config(10, path.to_string_lossy());
+
+        let err = PreparedVsockDevice::from_config_with_host_socket(&config)
+            .expect_err("existing host socket path should fail");
+
+        assert!(matches!(
+            err,
+            super::PreparedVsockDeviceError::HostSocket {
+                guest_cid: 10,
+                source: VsockHostSocketOwnerError::SocketPathExists
+            }
+        ));
+        assert!(err.source().is_some());
+        assert!(!err.to_string().contains("secret-prepared-owner"));
+
+        fs::remove_file(path).expect("fixture file should clean up");
     }
 
     #[test]
