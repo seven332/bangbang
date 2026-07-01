@@ -358,9 +358,9 @@ also models Firecracker's 44-byte little-endian virtio-vsock packet header and
 can parse guest-readable TX descriptor chains into validated packet metadata and
 payload segments. Header byte parsing rejects payload lengths above the 64 KiB
 maximum packet buffer length, and TX parsing rejects payload lengths larger
-than readable descriptor bytes. The implementation still does not dispatch
-vsock queue notifications, parse RX buffers, open host socket resources, route
-CIDs, or move data.
+than readable descriptor bytes after the header. The implementation still does
+not dispatch vsock queue notifications, parse RX buffers, open host socket
+resources, route CIDs, or move data.
 `SendCtrlAltDel` is rejected at parse time for the first aarch64 target.
 
 Future implementation PRs should derive unit or golden tests from these tables.
