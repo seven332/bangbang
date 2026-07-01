@@ -32,9 +32,9 @@ use crate::network::{
 };
 use crate::serial::{SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialMmioDevice, SharedSerialOutputBuffer};
 use crate::vsock::{
-    PreparedVsockDevice, VirtioVsockDeviceNotificationDispatch, VirtioVsockDeviceNotificationError,
-    VirtioVsockMmioHandler, VsockMmioDeviceRegistration, VsockMmioLayout,
-    VsockMmioRegistrationError,
+    PreparedVsockDevice, PreparedVsockDeviceError, VirtioVsockDeviceNotificationDispatch,
+    VirtioVsockDeviceNotificationError, VirtioVsockMmioHandler, VsockMmioDeviceRegistration,
+    VsockMmioLayout, VsockMmioRegistrationError,
 };
 
 const MIB: u64 = 1024 * 1024;
@@ -735,6 +735,9 @@ pub enum Arm64BootResourceError {
     PrepareNetworkDevices {
         source: PreparedNetworkDeviceError,
     },
+    PrepareVsockDevice {
+        source: PreparedVsockDeviceError,
+    },
     RegisterBlockMmio {
         source: Box<BlockMmioRegistrationError>,
     },
@@ -802,6 +805,9 @@ impl fmt::Display for Arm64BootResourceError {
             Self::PrepareNetworkDevices { source } => {
                 write!(f, "failed to prepare network devices: {source}")
             }
+            Self::PrepareVsockDevice { source } => {
+                write!(f, "failed to prepare vsock device: {source}")
+            }
             Self::RegisterBlockMmio { source } => {
                 write!(f, "failed to register block MMIO devices: {source}")
             }
@@ -848,6 +854,7 @@ impl std::error::Error for Arm64BootResourceError {
             Self::BootSourceLoad { source } => Some(source),
             Self::PrepareBlockDevices { source } => Some(source),
             Self::PrepareNetworkDevices { source } => Some(source),
+            Self::PrepareVsockDevice { source } => Some(source),
             Self::RegisterBlockMmio { source } => Some(source.as_ref()),
             Self::RegisterNetworkMmio { source } => Some(source.as_ref()),
             Self::RegisterVsockMmio { source } => Some(source.as_ref()),
@@ -979,7 +986,8 @@ impl Arm64BootResources {
         fdt_devices.extend(network_fdt_devices);
         let vsock_device = match (controller.vsock_config(), vsock_interrupt_line) {
             (Some(config), Some(interrupt_line)) => {
-                let prepared_vsock = PreparedVsockDevice::from_config(config);
+                let prepared_vsock = PreparedVsockDevice::from_config_with_host_socket(config)
+                    .map_err(|source| Arm64BootResourceError::PrepareVsockDevice { source })?;
                 let vsock_mmio = prepared_vsock
                     .register_mmio_with_dispatcher(vsock_mmio_layout, mmio_dispatcher)
                     .map_err(|source| Arm64BootResourceError::RegisterVsockMmio {
@@ -1313,7 +1321,7 @@ mod tests {
     use crate::vsock::{
         VIRTIO_VSOCK_EVENT_QUEUE_INDEX, VIRTIO_VSOCK_PACKET_HEADER_SIZE,
         VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_TX_QUEUE_INDEX, VirtioVsockMmioHandler,
-        VirtioVsockPacketHeader, VsockConfigInput, VsockMmioLayout,
+        VirtioVsockPacketHeader, VsockConfigInput, VsockHostSocketOwnerError, VsockMmioLayout,
     };
 
     static NEXT_TEST_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -2702,13 +2710,17 @@ mod tests {
             .mmio_dispatcher
             .handler_mut::<VirtioVsockMmioHandler>(vsock.registration.region_id())
             .expect("vsock MMIO handler should be registered");
-        assert!(!socket_path.exists());
+        assert!(socket_path.exists());
 
         let tree = read_fdt(&resources);
         let vsock_node = tree
             .find("/virtio_mmio@40006000")
             .expect("vsock virtio-mmio node should be in assembled FDT");
         assert_eq!(vsock_node.prop_str("compatible").unwrap(), "virtio,mmio");
+
+        drop(resources);
+
+        assert!(!socket_path.exists());
     }
 
     #[test]
@@ -2730,6 +2742,39 @@ mod tests {
         ));
         assert!(std::error::Error::source(&err).is_none());
         assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn configured_vsock_existing_socket_path_fails_without_unlinking() {
+        let kernel = temp_file("kernel-vsock-existing-socket-path", &arm64_image());
+        let socket_path = missing_path("vsock-existing-secret.sock");
+        fs::write(&socket_path, "existing file").expect("fixture file should be written");
+        let mut controller = controller_with_kernel(kernel.path());
+        add_vsock(&mut controller, 44, &socket_path);
+        let config = Arm64BootResourceConfig {
+            vsock_interrupt_line: Some(line(35)),
+            ..valid_config(&[])
+        };
+
+        let err = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect_err("existing vsock socket path should fail startup");
+
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::PrepareVsockDevice {
+                source: crate::vsock::PreparedVsockDeviceError::HostSocket {
+                    guest_cid: 44,
+                    source: VsockHostSocketOwnerError::SocketPathExists
+                }
+            }
+        ));
+        assert!(!err.to_string().contains("vsock-existing-secret"));
+        assert_eq!(
+            fs::read_to_string(&socket_path).expect("existing file should remain"),
+            "existing file"
+        );
+
+        fs::remove_file(socket_path).expect("fixture file should clean up");
     }
 
     #[test]
@@ -3053,6 +3098,8 @@ mod tests {
             ),
             0
         );
+        assert!(socket_path.exists());
+        drop(mmio_dispatcher);
         assert!(!socket_path.exists());
     }
 
@@ -3123,6 +3170,8 @@ mod tests {
             ),
             DeviceInterruptKind::Queue.status().bits()
         );
+        assert!(socket_path.exists());
+        drop(mmio_dispatcher);
         assert!(!socket_path.exists());
     }
 
@@ -3176,6 +3225,8 @@ mod tests {
             ),
             0
         );
+        assert!(socket_path.exists());
+        drop(mmio_dispatcher);
         assert!(!socket_path.exists());
     }
 
@@ -3240,6 +3291,8 @@ mod tests {
             ),
             DeviceInterruptKind::Queue.status().bits()
         );
+        assert!(socket_path.exists());
+        drop(mmio_dispatcher);
         assert!(!socket_path.exists());
     }
 
@@ -3257,6 +3310,8 @@ mod tests {
             .expect("boot resources should assemble");
         let parts = resources.into_parts();
         let mut memory = parts.memory;
+        let original_mmio_dispatcher = parts.mmio_dispatcher;
+        drop(original_mmio_dispatcher);
         let mut mmio_dispatcher = MmioDispatcher::new();
         let mut runtime = parts.runtime;
 
@@ -3293,6 +3348,8 @@ mod tests {
             .expect("boot resources should assemble");
         let parts = resources.into_parts();
         let mut memory = parts.memory;
+        let original_mmio_dispatcher = parts.mmio_dispatcher;
+        drop(original_mmio_dispatcher);
         let mut runtime = parts.runtime;
         let region = runtime
             .vsock_device
