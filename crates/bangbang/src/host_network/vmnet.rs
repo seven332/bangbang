@@ -2,6 +2,7 @@
 
 use std::ffi::{CString, c_char, c_void};
 use std::fmt;
+use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
 
 pub const VMNET_HOST_MODE_VALUE: u32 = 1000;
@@ -261,6 +262,23 @@ impl fmt::Display for VmnetInterfaceDescriptorError {
 
 impl std::error::Error for VmnetInterfaceDescriptorError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmnetPacketDescriptorError {
+    EmptyPacketBuffer,
+}
+
+impl fmt::Display for VmnetPacketDescriptorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyPacketBuffer => {
+                f.write_str("vmnet packet descriptor buffer must not be empty")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VmnetPacketDescriptorError {}
+
 #[derive(Debug)]
 pub struct VmnetInterfaceDescriptor {
     dictionary: OwnedXpcObject,
@@ -305,6 +323,121 @@ impl VmnetInterfaceDescriptor {
 
     pub fn as_raw_xpc_object(&self) -> *mut c_void {
         self.dictionary.as_ptr()
+    }
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct VmnetPacketDescriptor {
+    vm_pkt_size: usize,
+    vm_pkt_iov: *mut libc::iovec,
+    vm_pkt_iovcnt: u32,
+    vm_flags: u32,
+}
+
+impl VmnetPacketDescriptor {
+    pub const fn packet_size(&self) -> usize {
+        self.vm_pkt_size
+    }
+
+    pub const fn iov_count(&self) -> u32 {
+        self.vm_pkt_iovcnt
+    }
+
+    pub const fn flags(&self) -> u32 {
+        self.vm_flags
+    }
+
+    pub const fn iov_ptr(&self) -> *mut libc::iovec {
+        self.vm_pkt_iov
+    }
+}
+
+#[derive(Debug)]
+pub struct VmnetWritePacket<'a> {
+    descriptor: VmnetPacketDescriptor,
+    iov: Box<libc::iovec>,
+    _packet: PhantomData<&'a [u8]>,
+}
+
+impl<'a> VmnetWritePacket<'a> {
+    pub fn new(packet: &'a [u8]) -> Result<Self, VmnetPacketDescriptorError> {
+        if packet.is_empty() {
+            return Err(VmnetPacketDescriptorError::EmptyPacketBuffer);
+        }
+
+        let mut iov = Box::new(libc::iovec {
+            iov_base: packet.as_ptr().cast::<c_void>().cast_mut(),
+            iov_len: packet.len(),
+        });
+        let descriptor = VmnetPacketDescriptor {
+            vm_pkt_size: packet.len(),
+            vm_pkt_iov: ptr::from_mut(iov.as_mut()),
+            vm_pkt_iovcnt: 1,
+            vm_flags: 0,
+        };
+
+        Ok(Self {
+            descriptor,
+            iov,
+            _packet: PhantomData,
+        })
+    }
+
+    pub const fn as_raw_descriptor(&self) -> &VmnetPacketDescriptor {
+        &self.descriptor
+    }
+
+    pub fn as_mut_raw_descriptor(&mut self) -> &mut VmnetPacketDescriptor {
+        &mut self.descriptor
+    }
+
+    pub fn iov(&self) -> &libc::iovec {
+        &self.iov
+    }
+}
+
+#[derive(Debug)]
+pub struct VmnetReadPacket<'a> {
+    descriptor: VmnetPacketDescriptor,
+    iov: Box<libc::iovec>,
+    _buffer: PhantomData<&'a mut [u8]>,
+}
+
+impl<'a> VmnetReadPacket<'a> {
+    pub fn new(buffer: &'a mut [u8]) -> Result<Self, VmnetPacketDescriptorError> {
+        if buffer.is_empty() {
+            return Err(VmnetPacketDescriptorError::EmptyPacketBuffer);
+        }
+
+        let mut iov = Box::new(libc::iovec {
+            iov_base: buffer.as_mut_ptr().cast::<c_void>(),
+            iov_len: buffer.len(),
+        });
+        let descriptor = VmnetPacketDescriptor {
+            vm_pkt_size: buffer.len(),
+            vm_pkt_iov: ptr::from_mut(iov.as_mut()),
+            vm_pkt_iovcnt: 1,
+            vm_flags: 0,
+        };
+
+        Ok(Self {
+            descriptor,
+            iov,
+            _buffer: PhantomData,
+        })
+    }
+
+    pub const fn as_raw_descriptor(&self) -> &VmnetPacketDescriptor {
+        &self.descriptor
+    }
+
+    pub fn as_mut_raw_descriptor(&mut self) -> &mut VmnetPacketDescriptor {
+        &mut self.descriptor
+    }
+
+    pub fn iov(&self) -> &libc::iovec {
+        &self.iov
     }
 }
 
@@ -457,12 +590,15 @@ where
 #[cfg(test)]
 mod tests {
     use std::ffi::CStr;
+    use std::mem::{align_of, offset_of, size_of};
     use std::sync::{Arc, Mutex};
 
     use super::{
         OwnedVmnetInterface, VMNET_BRIDGED_MODE_VALUE, VMNET_HOST_MODE_VALUE,
         VMNET_SHARED_MODE_VALUE, VmnetError, VmnetInterfaceConfig, VmnetInterfaceConfigError,
-        VmnetInterfaceDescriptor, VmnetInterfaceLifecycle, VmnetMode, VmnetOperation, VmnetStatus,
+        VmnetInterfaceDescriptor, VmnetInterfaceLifecycle, VmnetMode, VmnetOperation,
+        VmnetPacketDescriptor, VmnetPacketDescriptorError, VmnetReadPacket, VmnetStatus,
+        VmnetWritePacket,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -571,6 +707,14 @@ mod tests {
         }
     }
 
+    fn descriptor_iov(descriptor: &VmnetPacketDescriptor) -> &libc::iovec {
+        assert!(!descriptor.iov_ptr().is_null());
+
+        // SAFETY: Tests only call this after descriptor construction, which
+        // stores a pointer to a boxed iovec owned by the packet wrapper.
+        unsafe { &*descriptor.iov_ptr() }
+    }
+
     #[test]
     fn vmnet_modes_match_sdk_values() {
         assert_eq!(VmnetMode::Host.raw_value(), VMNET_HOST_MODE_VALUE);
@@ -594,6 +738,124 @@ mod tests {
             VmnetStatus::Unknown(9000).to_string(),
             "vmnet_return_t=9000"
         );
+    }
+
+    #[test]
+    fn vmnet_packet_descriptor_matches_sdk_layout() {
+        assert_eq!(offset_of!(VmnetPacketDescriptor, vm_pkt_size), 0);
+        assert_eq!(
+            offset_of!(VmnetPacketDescriptor, vm_pkt_iov),
+            size_of::<usize>()
+        );
+        assert_eq!(
+            offset_of!(VmnetPacketDescriptor, vm_pkt_iovcnt),
+            size_of::<usize>() + size_of::<*mut libc::iovec>()
+        );
+        assert_eq!(
+            offset_of!(VmnetPacketDescriptor, vm_flags),
+            size_of::<usize>() + size_of::<*mut libc::iovec>() + size_of::<u32>()
+        );
+        assert_eq!(align_of::<VmnetPacketDescriptor>(), align_of::<usize>());
+        assert_eq!(
+            size_of::<VmnetPacketDescriptor>(),
+            size_of::<usize>() + size_of::<*mut libc::iovec>() + (2 * size_of::<u32>())
+        );
+    }
+
+    #[test]
+    fn write_packet_descriptor_borrows_packet_buffer() {
+        let packet = [0x12, 0x34, 0x56];
+        let packet_ptr = packet.as_ptr().cast::<std::ffi::c_void>().cast_mut();
+        let descriptor = VmnetWritePacket::new(&packet)
+            .expect("non-empty write packet descriptor should be created");
+        let raw_descriptor = descriptor.as_raw_descriptor();
+        let iov = descriptor_iov(raw_descriptor);
+
+        assert_eq!(raw_descriptor.packet_size(), packet.len());
+        assert_eq!(raw_descriptor.iov_count(), 1);
+        assert_eq!(raw_descriptor.flags(), 0);
+        assert_eq!(
+            raw_descriptor.iov_ptr(),
+            descriptor.iov() as *const _ as *mut _
+        );
+        assert_eq!(iov.iov_base, packet_ptr);
+        assert_eq!(iov.iov_len, packet.len());
+    }
+
+    #[test]
+    fn read_packet_descriptor_borrows_read_buffer() {
+        let mut buffer = [0_u8; 2048];
+        let buffer_ptr = buffer.as_mut_ptr().cast::<std::ffi::c_void>();
+        let buffer_len = buffer.len();
+        let descriptor = VmnetReadPacket::new(&mut buffer)
+            .expect("non-empty read packet descriptor should be created");
+        let raw_descriptor = descriptor.as_raw_descriptor();
+        let iov = descriptor_iov(raw_descriptor);
+
+        assert_eq!(raw_descriptor.packet_size(), buffer_len);
+        assert_eq!(raw_descriptor.iov_count(), 1);
+        assert_eq!(raw_descriptor.flags(), 0);
+        assert_eq!(
+            raw_descriptor.iov_ptr(),
+            descriptor.iov() as *const _ as *mut _
+        );
+        assert_eq!(iov.iov_base, buffer_ptr);
+        assert_eq!(iov.iov_len, buffer_len);
+    }
+
+    #[test]
+    fn packet_descriptors_reject_empty_buffers() {
+        let write_error = VmnetWritePacket::new(&[])
+            .expect_err("empty write packet descriptor should be rejected");
+        let mut buffer = [];
+        let read_error = VmnetReadPacket::new(&mut buffer)
+            .expect_err("empty read packet descriptor should be rejected");
+
+        assert_eq!(write_error, VmnetPacketDescriptorError::EmptyPacketBuffer);
+        assert_eq!(read_error, VmnetPacketDescriptorError::EmptyPacketBuffer);
+        assert_eq!(
+            write_error.to_string(),
+            "vmnet packet descriptor buffer must not be empty"
+        );
+    }
+
+    #[test]
+    fn write_packet_descriptor_iovec_pointer_survives_wrapper_move() {
+        let packet = [0x7f, 0x45, 0x4c, 0x46];
+        let packet_ptr = packet.as_ptr().cast::<std::ffi::c_void>().cast_mut();
+        let descriptor = VmnetWritePacket::new(&packet)
+            .expect("non-empty write packet descriptor should be created");
+        let original_iov_ptr = descriptor.as_raw_descriptor().iov_ptr();
+
+        let moved_descriptor = descriptor;
+        let moved_iov = descriptor_iov(moved_descriptor.as_raw_descriptor());
+
+        assert_eq!(
+            moved_descriptor.as_raw_descriptor().iov_ptr(),
+            original_iov_ptr
+        );
+        assert_eq!(moved_iov.iov_base, packet_ptr);
+        assert_eq!(moved_iov.iov_len, packet.len());
+    }
+
+    #[test]
+    fn read_packet_descriptor_iovec_pointer_survives_wrapper_move() {
+        let mut buffer = [0_u8; 64];
+        let buffer_ptr = buffer.as_mut_ptr().cast::<std::ffi::c_void>();
+        let buffer_len = buffer.len();
+        let descriptor = VmnetReadPacket::new(&mut buffer)
+            .expect("non-empty read packet descriptor should be created");
+        let original_iov_ptr = descriptor.as_raw_descriptor().iov_ptr();
+
+        let moved_descriptor = descriptor;
+        let moved_iov = descriptor_iov(moved_descriptor.as_raw_descriptor());
+
+        assert_eq!(
+            moved_descriptor.as_raw_descriptor().iov_ptr(),
+            original_iov_ptr
+        );
+        assert_eq!(moved_iov.iov_base, buffer_ptr);
+        assert_eq!(moved_iov.iov_len, buffer_len);
     }
 
     #[test]

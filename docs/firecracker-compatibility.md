@@ -8,7 +8,7 @@ The current repository defines crate boundaries, endpoint names, a minimal
 HTTP-over-Unix-socket API server for `GET /`, `GET /version`,
 `GET /vm/config`, `GET /machine-config`, pre-boot `PUT /machine-config`
 configuration storage, pre-boot `PUT /boot-source` configuration storage, pre-boot `PUT /drives/{drive_id}`
-configuration storage, pre-boot `PUT /network-interfaces/{iface_id}` configuration storage, pre-boot `PUT /metrics` output configuration, pre-boot `PUT /logger` output configuration, process-owned `PUT /actions` startup with an internal boot run-loop worker across bounded step windows, runtime `FlushMetrics` with a minimal per-process metrics sink, a macOS-gated internal vmnet descriptor and lifecycle boundary model for future host networking, a backend-neutral VM trait, a minimal VMM action/data model with internal
+configuration storage, pre-boot `PUT /network-interfaces/{iface_id}` configuration storage, pre-boot `PUT /metrics` output configuration, pre-boot `PUT /logger` output configuration, process-owned `PUT /actions` startup with an internal boot run-loop worker across bounded step windows, runtime `FlushMetrics` with a minimal per-process metrics sink, a macOS-gated internal vmnet descriptor, lifecycle, and packet descriptor boundary model for future host networking, a backend-neutral VM trait, a minimal VMM action/data model with internal
 `InstanceStart` preflight, transactional startup executor, and successful-start state transition helpers, backend-neutral guest
 physical address and aarch64 DRAM layout/access primitives, arm64 boot
 placement helpers, internal boot-source validation and arm64 kernel/initrd
@@ -550,14 +550,15 @@ internal packet source, copies a zeroed 12-byte virtio-net header plus packet
 payload into validated guest-writable RX buffers, publishes used-ring
 completions with the written length, preserves malformed-buffer and
 partial-dispatch metadata, and marks queue interrupt status when RX buffers
-complete. On macOS, the process crate also defines an internal vmnet descriptor
-and lifecycle boundary with vmnet mode, status, operation error, XPC descriptor
-configuration, and owned cleanup models for a later host backend. This boundary
-is not connected to the default process provider. The default process provider
-uses a no-op TX sink and an empty RX source, so current boot sessions still do
-not open host networking resources or provide user-visible packet ingress or
-egress. These helpers do not advertise MTU, start a vmnet interface, choose a
-live host packet backend, or connect packets to the host network.
+complete. On macOS, the process crate also defines internal vmnet descriptor,
+lifecycle, and packet descriptor boundaries with vmnet mode, status, operation
+error, XPC descriptor configuration, packet `iovec` layout, and owned cleanup
+models for a later host backend. These boundaries are not connected to the
+default process provider. The default process provider uses a no-op TX sink and
+an empty RX source, so current boot sessions still do not open host networking
+resources or provide user-visible packet ingress or egress. These helpers do
+not advertise MTU, start a vmnet interface, call `vmnet_read` or `vmnet_write`,
+choose a live host packet backend, or connect packets to the host network.
 
 The runtime crate can prepare owned internal block-device resources from a
 validated list of stored drive configs. Preparation opens each backing file,
