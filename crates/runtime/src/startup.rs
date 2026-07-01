@@ -1277,6 +1277,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::fs::{self, OpenOptions};
     use std::io::Write;
+    use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1324,9 +1325,11 @@ mod tests {
         VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
     };
     use crate::vsock::{
-        VIRTIO_VSOCK_EVENT_QUEUE_INDEX, VIRTIO_VSOCK_PACKET_HEADER_SIZE,
-        VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_TX_QUEUE_INDEX, VirtioVsockMmioHandler,
-        VirtioVsockPacketHeader, VsockConfigInput, VsockHostSocketOwnerError, VsockMmioLayout,
+        VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE, VIRTIO_VSOCK_EVENT_QUEUE_INDEX, VIRTIO_VSOCK_HOST_CID,
+        VIRTIO_VSOCK_OP_REQUEST, VIRTIO_VSOCK_PACKET_HEADER_SIZE, VIRTIO_VSOCK_PACKET_TYPE_STREAM,
+        VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_TX_QUEUE_INDEX, VSOCK_HOST_LOCAL_PORT_BASE,
+        VirtioVsockMmioHandler, VirtioVsockPacketHeader, VsockConfigInput,
+        VsockHostSocketOwnerError, VsockMmioLayout,
     };
 
     static NEXT_TEST_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -2117,6 +2120,18 @@ mod tests {
         write_available_heads_at(memory, TEST_VSOCK_TX_AVAILABLE_RING, heads);
     }
 
+    fn write_boot_vsock_rx_descriptor(
+        memory: &mut crate::memory::GuestMemory,
+        index: u16,
+        descriptor: TestDescriptor,
+    ) {
+        write_descriptor_at(memory, TEST_VSOCK_RX_DESCRIPTOR_TABLE, index, descriptor);
+    }
+
+    fn write_boot_vsock_rx_available_heads(memory: &mut crate::memory::GuestMemory, heads: &[u16]) {
+        write_available_heads_at(memory, TEST_VSOCK_RX_AVAILABLE_RING, heads);
+    }
+
     fn read_boot_vsock_tx_used_index(memory: &crate::memory::GuestMemory) -> u16 {
         read_guest_u16(
             memory,
@@ -2124,6 +2139,43 @@ mod tests {
                 .checked_add(2)
                 .expect("vsock TX used idx address should not overflow"),
         )
+    }
+
+    fn read_boot_vsock_rx_used_index(memory: &crate::memory::GuestMemory) -> u16 {
+        read_guest_u16(
+            memory,
+            TEST_VSOCK_RX_USED_RING
+                .checked_add(2)
+                .expect("vsock RX used idx address should not overflow"),
+        )
+    }
+
+    fn read_boot_vsock_rx_used_element(
+        memory: &crate::memory::GuestMemory,
+        ring_index: u16,
+    ) -> (u32, u32) {
+        let element = TEST_VSOCK_RX_USED_RING
+            .checked_add(4 + u64::from(ring_index) * 8)
+            .expect("vsock RX used element address should not overflow");
+        (
+            read_guest_u32(memory, element),
+            read_guest_u32(
+                memory,
+                element
+                    .checked_add(4)
+                    .expect("vsock RX used len address should not overflow"),
+            ),
+        )
+    }
+
+    fn read_boot_vsock_packet_header(
+        memory: &crate::memory::GuestMemory,
+        address: GuestAddress,
+    ) -> VirtioVsockPacketHeader {
+        let bytes = read_guest_bytes(memory, address, VIRTIO_VSOCK_PACKET_HEADER_SIZE)
+            .try_into()
+            .expect("vsock packet header length should match");
+        VirtioVsockPacketHeader::try_from_bytes(bytes).expect("vsock packet header should parse")
     }
 
     fn guest_address_low(address: GuestAddress) -> u32 {
@@ -2469,6 +2521,14 @@ mod tests {
             .read_slice(&mut bytes, address)
             .expect("guest u16 should read");
         u16::from_le_bytes(bytes)
+    }
+
+    fn read_guest_u32(memory: &crate::memory::GuestMemory, address: GuestAddress) -> u32 {
+        let mut bytes = [0; 4];
+        memory
+            .read_slice(&mut bytes, address)
+            .expect("guest u32 should read");
+        u32::from_le_bytes(bytes)
     }
 
     fn available_ring_idx_address_at(available_ring: GuestAddress) -> GuestAddress {
@@ -3231,6 +3291,116 @@ mod tests {
                 VirtioMmioRegister::InterruptStatus
             ),
             0
+        );
+        assert!(socket_path.exists());
+        drop(mmio_dispatcher);
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn boot_runtime_vsock_notification_dispatch_delivers_late_host_connect() {
+        let kernel = temp_file("kernel-vsock-late-connect", &arm64_image());
+        let socket_path = missing_path("vsock-late-connect.sock");
+        let mut controller = controller_with_kernel(kernel.path());
+        add_vsock(&mut controller, 44, &socket_path);
+        let config = Arm64BootResourceConfig {
+            vsock_interrupt_line: Some(line(35)),
+            ..valid_config(&[])
+        };
+        let resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
+        let mut runtime = parts.runtime;
+        configure_boot_vsock_queues(&mut runtime, &mut mmio_dispatcher);
+        write_boot_vsock_rx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::writable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_boot_vsock_rx_available_heads(&mut memory, &[0]);
+        notify_boot_vsock_queue(
+            &mut runtime,
+            &mut mmio_dispatcher,
+            VIRTIO_VSOCK_RX_QUEUE_INDEX,
+        );
+
+        let first = runtime
+            .dispatch_vsock_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("vsock dispatch result should allocate");
+
+        let first_dispatch = first.as_slice()[0]
+            .outcome()
+            .dispatched()
+            .expect("first RX dispatch should be a no-op");
+        assert_eq!(
+            first_dispatch.drained_notifications(),
+            [VIRTIO_VSOCK_RX_QUEUE_INDEX]
+        );
+        assert_eq!(
+            first_dispatch
+                .host_request_dispatch()
+                .accepted_connections(),
+            0
+        );
+        assert_eq!(read_boot_vsock_rx_used_index(&memory), 0);
+
+        let mut client = UnixStream::connect(&socket_path).expect("host client should connect");
+        client
+            .write_all(b"CONNECT 4000\n")
+            .expect("host CONNECT should write");
+
+        let second = runtime
+            .dispatch_vsock_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("late host CONNECT dispatch should allocate");
+
+        assert_eq!(second.len(), 1);
+        assert!(second.needs_queue_interrupt());
+        let device_dispatch = &second.as_slice()[0];
+        assert!(device_dispatch.needs_queue_interrupt());
+        let dispatch = device_dispatch
+            .outcome()
+            .dispatched()
+            .expect("late host CONNECT should dispatch");
+        assert_eq!(dispatch.drained_notifications(), []);
+        assert_eq!(dispatch.host_request_dispatch().accepted_connections(), 1);
+        assert_eq!(dispatch.host_request_dispatch().completed_requests(), 1);
+        assert_eq!(dispatch.host_request_dispatch().dropped_connections(), 0);
+        assert_eq!(dispatch.host_request_dispatch().pending_connections(), 0);
+        let rx = dispatch
+            .rx_queue_dispatch()
+            .expect("late host CONNECT should produce RX dispatch");
+        assert_eq!(rx.processed_buffers(), 1);
+        assert_eq!(rx.delivered_requests(), 1);
+        assert!(rx.needs_queue_interrupt());
+        assert_eq!(read_boot_vsock_rx_used_index(&memory), 1);
+        assert_eq!(
+            read_boot_vsock_rx_used_element(&memory, 0),
+            (0, VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32)
+        );
+        let header = read_boot_vsock_packet_header(&memory, TEST_VSOCK_HEADER);
+        assert_eq!(header.src_cid(), VIRTIO_VSOCK_HOST_CID);
+        assert_eq!(header.dst_cid(), 44);
+        assert_eq!(header.src_port(), VSOCK_HOST_LOCAL_PORT_BASE);
+        assert_eq!(header.dst_port(), 4000);
+        assert_eq!(header.operation(), VIRTIO_VSOCK_OP_REQUEST);
+        assert_eq!(header.packet_type(), VIRTIO_VSOCK_PACKET_TYPE_STREAM);
+        assert_eq!(
+            header.buffer_allocation(),
+            VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE
+        );
+        assert_eq!(
+            read_boot_vsock_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                VirtioMmioRegister::InterruptStatus
+            ),
+            DeviceInterruptKind::Queue.status().bits()
         );
         assert!(socket_path.exists());
         drop(mmio_dispatcher);

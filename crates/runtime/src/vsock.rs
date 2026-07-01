@@ -1,6 +1,6 @@
 //! Backend-neutral vsock configuration model.
 
-use std::collections::{BTreeSet, HashMap, HashSet, hash_map::Entry};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque, hash_map::Entry};
 use std::fmt;
 use std::fs;
 use std::io::Read as _;
@@ -55,6 +55,7 @@ pub const VIRTIO_RING_FEATURE_EVENT_IDX: u32 = 29;
 pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
 pub const VIRTIO_FEATURE_IN_ORDER: u32 = 35;
 pub const VSOCK_HOST_CONNECT_REQUEST_MAX_LEN: usize = 32;
+pub const VSOCK_HOST_CONNECTION_LIMIT: usize = VIRTIO_VSOCK_QUEUE_SIZE as usize;
 pub const VSOCK_HOST_LOCAL_PORT_BASE: u32 = 1_u32 << 30;
 pub const VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE: u32 = 1_u32 << 31;
 pub const VSOCK_HOST_LOCAL_PORT_CAPACITY: u32 =
@@ -2874,6 +2875,8 @@ pub struct VirtioVsockDevice {
     active_tx_queue: Option<VirtioVsockTxQueue>,
     active_event_queue: Option<VirtioVsockEventQueue>,
     host_socket_owner: Option<VsockHostSocketOwner>,
+    pending_host_connections: VecDeque<VsockHostAcceptedConnection>,
+    host_connection_limit: usize,
     host_connections: VsockHostConnectionTable,
 }
 
@@ -2889,6 +2892,8 @@ impl VirtioVsockDevice {
             active_tx_queue: None,
             active_event_queue: None,
             host_socket_owner: None,
+            pending_host_connections: VecDeque::new(),
+            host_connection_limit: VSOCK_HOST_CONNECTION_LIMIT,
             host_connections: VsockHostConnectionTable::new(),
         }
     }
@@ -2967,6 +2972,16 @@ impl VirtioVsockDevice {
         self.host_connections.has_pending_request_packet(key)
     }
 
+    #[cfg(test)]
+    fn pending_host_connection_count(&self) -> usize {
+        self.pending_host_connections.len()
+    }
+
+    #[cfg(test)]
+    fn set_host_connection_limit(&mut self, limit: usize) {
+        self.host_connection_limit = limit;
+    }
+
     pub fn activate_vsock(
         &mut self,
         activation: VirtioMmioDeviceActivation<'_>,
@@ -3022,7 +3037,67 @@ impl VirtioVsockDevice {
         self.active_rx_queue = None;
         self.active_tx_queue = None;
         self.active_event_queue = None;
+        self.pending_host_connections.clear();
         self.host_connections = VsockHostConnectionTable::new();
+    }
+
+    fn poll_host_request_connections(&mut self) -> VirtioVsockHostRequestDispatch {
+        let mut dispatch = VirtioVsockHostRequestDispatch::new();
+
+        let retained_connections = self
+            .host_connections
+            .len()
+            .saturating_add(self.pending_host_connections.len());
+        if retained_connections < self.host_connection_limit
+            && let Some(host_socket_owner) = self.host_socket_owner.as_ref()
+        {
+            match host_socket_owner.accept_host_connection() {
+                Ok(Some(accepted)) => {
+                    self.pending_host_connections.push_back(accepted);
+                    dispatch.accepted_connections += 1;
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    dispatch.dropped_connections += 1;
+                }
+            }
+        }
+
+        let pending_to_poll = self.pending_host_connections.len();
+        for _ in 0..pending_to_poll {
+            let Some(mut accepted) = self.pending_host_connections.pop_front() else {
+                break;
+            };
+
+            match accepted.read_connect_request() {
+                Ok(Some(request)) => {
+                    if self.host_connections.len() >= self.host_connection_limit {
+                        dispatch.dropped_connections += 1;
+                        continue;
+                    }
+                    match self
+                        .host_connections
+                        .insert_accepted_host_connection(accepted, request)
+                    {
+                        Ok(_) => {
+                            dispatch.completed_requests += 1;
+                        }
+                        Err(_) => {
+                            dispatch.dropped_connections += 1;
+                        }
+                    }
+                }
+                Ok(None) => {
+                    self.pending_host_connections.push_back(accepted);
+                }
+                Err(_) => {
+                    dispatch.dropped_connections += 1;
+                }
+            }
+        }
+
+        dispatch.pending_connections = self.pending_host_connections.len();
+        dispatch
     }
 
     fn dispatch_drained_queue_notifications(
@@ -3030,15 +3105,15 @@ impl VirtioVsockDevice {
         memory: &mut GuestMemory,
         drained_notifications: Vec<usize>,
     ) -> Result<VirtioVsockDeviceNotificationDispatch, VirtioVsockDeviceNotificationError> {
-        if drained_notifications.is_empty() {
-            return Ok(VirtioVsockDeviceNotificationDispatch::new(
-                drained_notifications,
-                None,
-                None,
-            ));
-        }
-
         if !self.is_activated() {
+            if drained_notifications.is_empty() {
+                return Ok(VirtioVsockDeviceNotificationDispatch::new(
+                    drained_notifications,
+                    VirtioVsockHostRequestDispatch::new(),
+                    None,
+                    None,
+                ));
+            }
             return Err(VirtioVsockDeviceNotificationError::Inactive {
                 drained_notifications,
             });
@@ -3054,14 +3129,29 @@ impl VirtioVsockDevice {
             });
         }
 
+        let host_request_dispatch = self.poll_host_request_connections();
+
         let dispatch_rx = drained_notifications
             .iter()
             .copied()
-            .any(|queue_index| queue_index == VIRTIO_VSOCK_RX_QUEUE_INDEX);
+            .any(|queue_index| queue_index == VIRTIO_VSOCK_RX_QUEUE_INDEX)
+            || self
+                .host_connections
+                .first_pending_request_packet_key()
+                .is_some();
         let dispatch_tx = drained_notifications
             .iter()
             .copied()
             .any(|queue_index| queue_index == VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        if !dispatch_rx && !dispatch_tx {
+            return Ok(VirtioVsockDeviceNotificationDispatch::new(
+                drained_notifications,
+                host_request_dispatch,
+                None,
+                None,
+            ));
+        }
 
         let rx_queue_dispatch = if dispatch_rx {
             let Some(queue) = self.active_rx_queue.as_mut() else {
@@ -3115,6 +3205,7 @@ impl VirtioVsockDevice {
 
         Ok(VirtioVsockDeviceNotificationDispatch::new(
             drained_notifications,
+            host_request_dispatch,
             rx_queue_dispatch,
             tx_queue_dispatch,
         ))
@@ -3220,6 +3311,7 @@ impl From<VirtioVsockDeviceActivationError> for VirtioMmioDeviceActivationError 
 #[derive(Debug)]
 pub struct VirtioVsockDeviceNotificationDispatch {
     drained_notifications: Vec<usize>,
+    host_request_dispatch: VirtioVsockHostRequestDispatch,
     rx_queue_dispatch: Option<VirtioVsockRxQueueDispatch>,
     tx_queue_dispatch: Option<VirtioVsockTxQueueDispatch>,
 }
@@ -3227,11 +3319,13 @@ pub struct VirtioVsockDeviceNotificationDispatch {
 impl VirtioVsockDeviceNotificationDispatch {
     const fn new(
         drained_notifications: Vec<usize>,
+        host_request_dispatch: VirtioVsockHostRequestDispatch,
         rx_queue_dispatch: Option<VirtioVsockRxQueueDispatch>,
         tx_queue_dispatch: Option<VirtioVsockTxQueueDispatch>,
     ) -> Self {
         Self {
             drained_notifications,
+            host_request_dispatch,
             rx_queue_dispatch,
             tx_queue_dispatch,
         }
@@ -3239,6 +3333,10 @@ impl VirtioVsockDeviceNotificationDispatch {
 
     pub fn drained_notifications(&self) -> &[usize] {
         &self.drained_notifications
+    }
+
+    pub const fn host_request_dispatch(&self) -> &VirtioVsockHostRequestDispatch {
+        &self.host_request_dispatch
     }
 
     pub const fn tx_queue_dispatch(&self) -> Option<&VirtioVsockTxQueueDispatch> {
@@ -3257,6 +3355,41 @@ impl VirtioVsockDeviceNotificationDispatch {
                 .rx_queue_dispatch
                 .as_ref()
                 .is_some_and(VirtioVsockRxQueueDispatch::needs_queue_interrupt)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioVsockHostRequestDispatch {
+    accepted_connections: usize,
+    completed_requests: usize,
+    dropped_connections: usize,
+    pending_connections: usize,
+}
+
+impl VirtioVsockHostRequestDispatch {
+    const fn new() -> Self {
+        Self {
+            accepted_connections: 0,
+            completed_requests: 0,
+            dropped_connections: 0,
+            pending_connections: 0,
+        }
+    }
+
+    pub const fn accepted_connections(&self) -> usize {
+        self.accepted_connections
+    }
+
+    pub const fn completed_requests(&self) -> usize {
+        self.completed_requests
+    }
+
+    pub const fn dropped_connections(&self) -> usize {
+        self.dropped_connections
+    }
+
+    pub const fn pending_connections(&self) -> usize {
+        self.pending_connections
     }
 }
 
@@ -3802,7 +3935,7 @@ mod tests {
         VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation,
         VirtioMmioDeviceActivationError, VirtioMmioDeviceActivationHandler,
         VirtioMmioDeviceRegisters, VirtioMmioQueueRegisters, VirtioMmioRegister,
-        VirtioMmioRegisterHandlerError,
+        VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
     };
     use crate::virtio_queue::{
         VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
@@ -3824,15 +3957,16 @@ mod tests {
         VSOCK_HOST_CONNECT_REQUEST_MAX_LEN, VSOCK_HOST_LOCAL_PORT_BASE,
         VSOCK_HOST_LOCAL_PORT_CAPACITY, VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE,
         VirtioVsockConfigSpace, VirtioVsockDevice, VirtioVsockDeviceActivationError,
-        VirtioVsockMmioHandler, VirtioVsockPacketHeader, VirtioVsockPacketLengthError,
-        VirtioVsockQueueBuildError, VirtioVsockRxBufferParseError, VirtioVsockRxQueue,
-        VirtioVsockRxQueueDispatchError, VirtioVsockTxPacket, VirtioVsockTxPacketParseError,
-        VirtioVsockTxQueue, VirtioVsockTxQueueDispatchError, VsockConfigError, VsockConfigInput,
-        VsockHostConnectHandshakeError, VsockHostConnectRequest, VsockHostConnectRequestError,
-        VsockHostConnectionKey, VsockHostConnectionTable, VsockHostConnectionTableError,
-        VsockHostLocalPort, VsockHostLocalPortAllocator, VsockHostLocalPortAllocatorError,
-        VsockHostLocalPortError, VsockHostSocketAcceptError, VsockHostSocketOwner,
-        VsockHostSocketOwnerError, VsockMmioDevice, VsockMmioLayout, VsockMmioRegistrationError,
+        VirtioVsockHostRequestDispatch, VirtioVsockMmioHandler, VirtioVsockPacketHeader,
+        VirtioVsockPacketLengthError, VirtioVsockQueueBuildError, VirtioVsockRxBufferParseError,
+        VirtioVsockRxQueue, VirtioVsockRxQueueDispatchError, VirtioVsockTxPacket,
+        VirtioVsockTxPacketParseError, VirtioVsockTxQueue, VirtioVsockTxQueueDispatchError,
+        VsockConfigError, VsockConfigInput, VsockHostConnectHandshakeError,
+        VsockHostConnectRequest, VsockHostConnectRequestError, VsockHostConnectionKey,
+        VsockHostConnectionTable, VsockHostConnectionTableError, VsockHostLocalPort,
+        VsockHostLocalPortAllocator, VsockHostLocalPortAllocatorError, VsockHostLocalPortError,
+        VsockHostSocketAcceptError, VsockHostSocketOwner, VsockHostSocketOwnerError,
+        VsockMmioDevice, VsockMmioLayout, VsockMmioRegistrationError,
         is_transient_host_socket_accept_error, is_transient_host_socket_read_error,
         parse_vsock_host_connect_request, virtio_vsock_mmio_handler,
     };
@@ -3902,6 +4036,38 @@ mod tests {
         assert!(!path.exists());
 
         (accepted, client)
+    }
+
+    fn host_socket_device(guest_cid: u32, name: &str) -> (VirtioVsockDevice, PathBuf) {
+        let path = unique_socket_path(name);
+        let owner = VsockHostSocketOwner::bind(&path).expect("host socket should bind");
+        (
+            VirtioVsockDevice::with_host_socket_owner(guest_cid, owner),
+            path,
+        )
+    }
+
+    fn virtio_vsock_mmio_handler_with_host_socket(
+        guest_cid: u32,
+        path: &Path,
+    ) -> VirtioVsockMmioHandler {
+        let config = VirtioVsockConfigSpace::new(u64::from(guest_cid));
+        let owner = VsockHostSocketOwner::bind(path).expect("host socket should bind");
+        VirtioMmioRegisterHandler::with_device_config_and_activation(
+            VIRTIO_VSOCK_DEVICE_ID,
+            config.available_features(),
+            &VIRTIO_VSOCK_QUEUE_SIZES,
+            config,
+            VirtioVsockDevice::with_host_socket_owner(guest_cid, owner),
+        )
+        .expect("vsock handler with host socket should build")
+    }
+
+    fn assert_empty_host_request_dispatch(dispatch: &VirtioVsockHostRequestDispatch) {
+        assert_eq!(dispatch.accepted_connections(), 0);
+        assert_eq!(dispatch.completed_requests(), 0);
+        assert_eq!(dispatch.dropped_connections(), 0);
+        assert_eq!(dispatch.pending_connections(), 0);
     }
 
     fn host_connect_request(peer_port: u32) -> VsockHostConnectRequest {
@@ -5902,6 +6068,165 @@ mod tests {
     }
 
     #[test]
+    fn virtio_vsock_host_request_poll_without_host_socket_is_noop() {
+        let mut device = VirtioVsockDevice::with_guest_cid(42);
+
+        let dispatch = device.poll_host_request_connections();
+
+        assert_empty_host_request_dispatch(&dispatch);
+        assert_eq!(device.pending_host_connection_count(), 0);
+        assert!(device.host_connections.is_empty());
+    }
+
+    #[test]
+    fn virtio_vsock_host_request_poll_retains_partial_connect_handshake() {
+        let (mut device, path) = host_socket_device(42, "poll-partial");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+
+        client
+            .write_all(b"CONN")
+            .expect("partial CONNECT should write");
+        let first = device.poll_host_request_connections();
+
+        assert_eq!(first.accepted_connections(), 1);
+        assert_eq!(first.completed_requests(), 0);
+        assert_eq!(first.dropped_connections(), 0);
+        assert_eq!(first.pending_connections(), 1);
+        assert_eq!(device.pending_host_connection_count(), 1);
+        assert!(device.host_connections.is_empty());
+
+        client
+            .write_all(b"ECT 4000\n")
+            .expect("remaining CONNECT should write");
+        let second = device.poll_host_request_connections();
+
+        assert_eq!(second.accepted_connections(), 0);
+        assert_eq!(second.completed_requests(), 1);
+        assert_eq!(second.dropped_connections(), 0);
+        assert_eq!(second.pending_connections(), 0);
+        assert_eq!(device.pending_host_connection_count(), 0);
+        let key = device
+            .host_connections
+            .first_pending_request_packet_key()
+            .expect("completed host request should be pending");
+        assert_eq!(key.peer_port(), 4000);
+    }
+
+    #[test]
+    fn virtio_vsock_host_request_poll_drops_malformed_connect_handshake() {
+        let (mut device, path) = host_socket_device(42, "poll-bad");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+
+        client
+            .write_all(b"BAD 4000\n")
+            .expect("malformed CONNECT should write");
+        let dispatch = device.poll_host_request_connections();
+
+        assert_eq!(dispatch.accepted_connections(), 1);
+        assert_eq!(dispatch.completed_requests(), 0);
+        assert_eq!(dispatch.dropped_connections(), 1);
+        assert_eq!(dispatch.pending_connections(), 0);
+        assert_eq!(device.pending_host_connection_count(), 0);
+        assert!(device.host_connections.is_empty());
+        assert_stream_closed(&mut client, "malformed host stream should be dropped");
+    }
+
+    #[test]
+    fn virtio_vsock_host_request_poll_respects_pending_handshake_limit() {
+        let (mut device, path) = host_socket_device(42, "poll-limit");
+        device.set_host_connection_limit(1);
+        let mut first_client = UnixStream::connect(&path).expect("first client should connect");
+        let _second_client = UnixStream::connect(&path).expect("second client should connect");
+
+        let first = device.poll_host_request_connections();
+
+        assert_eq!(first.accepted_connections(), 1);
+        assert_eq!(first.pending_connections(), 1);
+
+        let capped = device.poll_host_request_connections();
+
+        assert_eq!(capped.accepted_connections(), 0);
+        assert_eq!(capped.completed_requests(), 0);
+        assert_eq!(capped.dropped_connections(), 0);
+        assert_eq!(capped.pending_connections(), 1);
+
+        first_client
+            .write_all(b"CONNECT 4000\n")
+            .expect("first CONNECT should write");
+        let completed = device.poll_host_request_connections();
+
+        assert_eq!(completed.accepted_connections(), 0);
+        assert_eq!(completed.completed_requests(), 1);
+        assert_eq!(completed.pending_connections(), 0);
+        let key = device
+            .host_connections
+            .first_pending_request_packet_key()
+            .expect("completed host request should be pending");
+        assert!(device.host_connections.remove(key));
+
+        let next = device.poll_host_request_connections();
+
+        assert_eq!(next.accepted_connections(), 1);
+        assert_eq!(next.completed_requests(), 0);
+        assert_eq!(next.pending_connections(), 1);
+    }
+
+    #[test]
+    fn virtio_vsock_host_request_poll_drops_completed_handshake_when_connection_limit_is_full() {
+        let (mut device, path) = host_socket_device(42, "poll-full");
+        device.set_host_connection_limit(1);
+        let mut pending_client = UnixStream::connect(&path).expect("pending client should connect");
+
+        let pending = device.poll_host_request_connections();
+
+        assert_eq!(pending.accepted_connections(), 1);
+        assert_eq!(pending.completed_requests(), 0);
+        assert_eq!(pending.pending_connections(), 1);
+
+        let (active, _active_client, active_request) =
+            accepted_host_connection_with_request("poll-full-active", 5000);
+        device
+            .insert_accepted_host_connection(active, active_request)
+            .expect("test active host connection should insert");
+
+        pending_client
+            .write_all(b"CONNECT 4000\n")
+            .expect("pending CONNECT should write");
+        let dropped = device.poll_host_request_connections();
+
+        assert_eq!(dropped.accepted_connections(), 0);
+        assert_eq!(dropped.completed_requests(), 0);
+        assert_eq!(dropped.dropped_connections(), 1);
+        assert_eq!(dropped.pending_connections(), 0);
+        assert_eq!(device.pending_host_connection_count(), 0);
+        assert_eq!(device.host_connections.len(), 1);
+        assert_stream_closed(
+            &mut pending_client,
+            "completed pending stream should close when connection limit is full",
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_device_reset_drops_pending_host_handshakes() {
+        let (mut device, path) = host_socket_device(42, "poll-reset");
+        let _client = UnixStream::connect(&path).expect("client should connect");
+
+        let dispatch = device.poll_host_request_connections();
+
+        assert_eq!(dispatch.accepted_connections(), 1);
+        assert_eq!(dispatch.pending_connections(), 1);
+        assert_eq!(device.pending_host_connection_count(), 1);
+
+        device.reset();
+
+        assert_eq!(device.pending_host_connection_count(), 0);
+        assert!(device.host_connections.is_empty());
+        assert!(path.exists());
+        drop(device);
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn prepared_vsock_device_host_socket_error_does_not_leak_path() {
         let path = unique_socket_path("secret-prepared-owner");
         fs::write(&path, "existing file").expect("fixture file should be written");
@@ -7734,6 +8059,7 @@ mod tests {
             .expect("empty notification drain should be a no-op");
 
         assert_eq!(dispatch.drained_notifications(), &[]);
+        assert_empty_host_request_dispatch(dispatch.host_request_dispatch());
         assert!(dispatch.rx_queue_dispatch().is_none());
         assert!(dispatch.tx_queue_dispatch().is_none());
         assert!(!dispatch.needs_queue_interrupt());
@@ -7781,6 +8107,7 @@ mod tests {
             notification.drained_notifications(),
             &[VIRTIO_VSOCK_RX_QUEUE_INDEX]
         );
+        assert_empty_host_request_dispatch(notification.host_request_dispatch());
         assert!(!notification.needs_queue_interrupt());
         assert!(notification.tx_queue_dispatch().is_none());
         let rx = notification
@@ -7798,6 +8125,82 @@ mod tests {
         assert_eq!(active_rx_queue.available_ring().next_avail(), 0);
         assert_eq!(active_rx_queue.used_ring().next_used(), 0);
         assert_eq!(read_vsock_rx_used_index(&memory), 0);
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_dispatch_late_host_connect_without_second_rx_notify() {
+        let mut memory = vsock_tx_memory();
+        let path = unique_socket_path("notify-late");
+        let mut handler = virtio_vsock_mmio_handler_with_host_socket(42, &path);
+
+        activate_vsock_handler(&mut handler);
+        write_vsock_rx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_BUFFER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_rx_available_heads(&mut memory, &[0]);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+
+        let first = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("RX notification without host request should be a no-op");
+
+        assert_eq!(
+            first.drained_notifications(),
+            &[VIRTIO_VSOCK_RX_QUEUE_INDEX]
+        );
+        assert_empty_host_request_dispatch(first.host_request_dispatch());
+        let first_rx = first
+            .rx_queue_dispatch()
+            .expect("RX dispatch summary should be present");
+        assert_eq!(first_rx.processed_buffers(), 0);
+        assert_eq!(first_rx.delivered_requests(), 0);
+        assert_eq!(read_vsock_rx_used_index(&memory), 0);
+        assert!(handler.pending_queue_notifications().is_empty());
+
+        let mut client = UnixStream::connect(&path).expect("host client should connect");
+        client
+            .write_all(b"CONNECT 4000\n")
+            .expect("host CONNECT should write");
+
+        let second = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("late host CONNECT should dispatch into available RX buffer");
+
+        assert_eq!(second.drained_notifications(), &[]);
+        assert_eq!(second.host_request_dispatch().accepted_connections(), 1);
+        assert_eq!(second.host_request_dispatch().completed_requests(), 1);
+        assert_eq!(second.host_request_dispatch().dropped_connections(), 0);
+        assert_eq!(second.host_request_dispatch().pending_connections(), 0);
+        assert!(second.needs_queue_interrupt());
+        assert!(second.tx_queue_dispatch().is_none());
+        let second_rx = second
+            .rx_queue_dispatch()
+            .expect("late host CONNECT should produce RX dispatch");
+        assert_eq!(second_rx.processed_buffers(), 1);
+        assert_eq!(second_rx.delivered_requests(), 1);
+        assert!(second_rx.needs_queue_interrupt());
+        assert_eq!(
+            read_interrupt_status(&handler),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        assert_eq!(read_vsock_rx_used_index(&memory), 1);
+        assert_eq!(
+            read_vsock_rx_used_element(&memory, 0),
+            (0, VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32)
+        );
+        assert_host_connection_request_header(
+            read_vsock_packet_header(&memory, TEST_VSOCK_RX_BUFFER),
+            42,
+            VsockHostLocalPort::try_from_raw(VSOCK_HOST_LOCAL_PORT_BASE)
+                .expect("first host local port should be valid"),
+            4000,
+        );
     }
 
     #[test]
