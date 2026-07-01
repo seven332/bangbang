@@ -51,11 +51,13 @@ pub const VIRTIO_VSOCK_FLAGS_SHUTDOWN_SEND: u32 = 2;
 pub const VIRTIO_RING_FEATURE_EVENT_IDX: u32 = 29;
 pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
 pub const VIRTIO_FEATURE_IN_ORDER: u32 = 35;
+pub const VSOCK_HOST_CONNECT_REQUEST_MAX_LEN: usize = 32;
 
 const VIRTIO_VSOCK_RX_QUEUE_INDEX_U32: u32 = 0;
 const VIRTIO_VSOCK_TX_QUEUE_INDEX_U32: u32 = 1;
 const VIRTIO_VSOCK_EVENT_QUEUE_INDEX_U32: u32 = 2;
 const VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64: u64 = VIRTIO_VSOCK_PACKET_HEADER_SIZE as u64;
+const VSOCK_HOST_CONNECT_COMMAND: &str = "connect";
 
 pub type VirtioVsockMmioHandler =
     VirtioMmioRegisterHandler<VirtioVsockConfigSpace, VirtioVsockDevice>;
@@ -280,6 +282,106 @@ impl fmt::Display for VsockHostSocketOwnerError {
 }
 
 impl std::error::Error for VsockHostSocketOwnerError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VsockHostConnectRequest {
+    guest_port: u32,
+}
+
+impl VsockHostConnectRequest {
+    pub fn parse(bytes: &[u8]) -> Result<Self, VsockHostConnectRequestError> {
+        parse_vsock_host_connect_request(bytes)
+    }
+
+    pub const fn guest_port(self) -> u32 {
+        self.guest_port
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VsockHostConnectRequestError {
+    Empty,
+    TooLong { len: usize, max: usize },
+    MissingNewline,
+    TrailingData,
+    InvalidUtf8,
+    MissingCommand,
+    InvalidCommand,
+    MissingPort,
+    InvalidPort,
+    ExtraTokens,
+}
+
+impl fmt::Display for VsockHostConnectRequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("vsock host CONNECT request must not be empty"),
+            Self::TooLong { len, max } => {
+                write!(
+                    f,
+                    "vsock host CONNECT request length {len} exceeds maximum {max}"
+                )
+            }
+            Self::MissingNewline => f.write_str("vsock host CONNECT request must end with newline"),
+            Self::TrailingData => f.write_str("vsock host CONNECT request has data after newline"),
+            Self::InvalidUtf8 => f.write_str("vsock host CONNECT request is not valid UTF-8"),
+            Self::MissingCommand => f.write_str("vsock host CONNECT request is missing command"),
+            Self::InvalidCommand => f.write_str("vsock host CONNECT request command is invalid"),
+            Self::MissingPort => f.write_str("vsock host CONNECT request is missing port"),
+            Self::InvalidPort => f.write_str("vsock host CONNECT request port is invalid"),
+            Self::ExtraTokens => f.write_str("vsock host CONNECT request has extra tokens"),
+        }
+    }
+}
+
+impl std::error::Error for VsockHostConnectRequestError {}
+
+pub fn parse_vsock_host_connect_request(
+    bytes: &[u8],
+) -> Result<VsockHostConnectRequest, VsockHostConnectRequestError> {
+    if bytes.is_empty() {
+        return Err(VsockHostConnectRequestError::Empty);
+    }
+    if bytes.len() > VSOCK_HOST_CONNECT_REQUEST_MAX_LEN {
+        return Err(VsockHostConnectRequestError::TooLong {
+            len: bytes.len(),
+            max: VSOCK_HOST_CONNECT_REQUEST_MAX_LEN,
+        });
+    }
+    if bytes.last() != Some(&b'\n') {
+        if bytes.contains(&b'\n') {
+            return Err(VsockHostConnectRequestError::TrailingData);
+        }
+        return Err(VsockHostConnectRequestError::MissingNewline);
+    }
+
+    let request =
+        std::str::from_utf8(bytes).map_err(|_| VsockHostConnectRequestError::InvalidUtf8)?;
+    let mut words = request.split_whitespace();
+
+    let command = words
+        .next()
+        .ok_or(VsockHostConnectRequestError::MissingCommand)?;
+    if !command.eq_ignore_ascii_case(VSOCK_HOST_CONNECT_COMMAND) {
+        return Err(VsockHostConnectRequestError::InvalidCommand);
+    }
+
+    let port = words
+        .next()
+        .ok_or(VsockHostConnectRequestError::MissingPort)?;
+    if !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(VsockHostConnectRequestError::InvalidPort);
+    }
+    let port = port
+        .parse::<u32>()
+        .map_err(|_| VsockHostConnectRequestError::InvalidPort)?;
+
+    if words.next().is_some() {
+        return Err(VsockHostConnectRequestError::ExtraTokens);
+    }
+
+    Ok(VsockHostConnectRequest { guest_port: port })
+}
 
 fn socket_path_exists_without_following_links(
     path: &Path,
@@ -2312,12 +2414,13 @@ mod tests {
         VIRTIO_VSOCK_PACKET_HEADER_SIZE, VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64,
         VIRTIO_VSOCK_PACKET_TYPE_STREAM, VIRTIO_VSOCK_QUEUE_COUNT, VIRTIO_VSOCK_QUEUE_SIZE,
         VIRTIO_VSOCK_QUEUE_SIZES, VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_TX_QUEUE_INDEX,
-        VirtioVsockConfigSpace, VirtioVsockDevice, VirtioVsockDeviceActivationError,
-        VirtioVsockMmioHandler, VirtioVsockPacketHeader, VirtioVsockPacketLengthError,
-        VirtioVsockQueueBuildError, VirtioVsockTxPacket, VirtioVsockTxPacketParseError,
-        VirtioVsockTxQueue, VirtioVsockTxQueueDispatchError, VsockConfigError, VsockConfigInput,
+        VSOCK_HOST_CONNECT_REQUEST_MAX_LEN, VirtioVsockConfigSpace, VirtioVsockDevice,
+        VirtioVsockDeviceActivationError, VirtioVsockMmioHandler, VirtioVsockPacketHeader,
+        VirtioVsockPacketLengthError, VirtioVsockQueueBuildError, VirtioVsockTxPacket,
+        VirtioVsockTxPacketParseError, VirtioVsockTxQueue, VirtioVsockTxQueueDispatchError,
+        VsockConfigError, VsockConfigInput, VsockHostConnectRequest, VsockHostConnectRequestError,
         VsockHostSocketOwner, VsockHostSocketOwnerError, VsockMmioDevice, VsockMmioLayout,
-        VsockMmioRegistrationError, virtio_vsock_mmio_handler,
+        VsockMmioRegistrationError, parse_vsock_host_connect_request, virtio_vsock_mmio_handler,
     };
 
     static NEXT_TEST_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
@@ -2952,6 +3055,153 @@ mod tests {
     #[test]
     fn errors_have_no_sources() {
         assert!(VsockConfigError::EmptySocketPath.source().is_none());
+    }
+
+    #[test]
+    fn parses_host_connect_request() {
+        let request = parse_vsock_host_connect_request(b"CONNECT 1024\n")
+            .expect("host CONNECT request should parse");
+
+        assert_eq!(request.guest_port(), 1024);
+    }
+
+    #[test]
+    fn host_connect_request_parse_method_delegates_to_parser() {
+        let request = VsockHostConnectRequest::parse(b"CONNECT 2048\n")
+            .expect("host CONNECT request should parse");
+
+        assert_eq!(request.guest_port(), 2048);
+    }
+
+    #[test]
+    fn parses_host_connect_request_case_insensitive_command() {
+        let request = parse_vsock_host_connect_request(b"cOnNeCt 52\n")
+            .expect("host CONNECT request should parse");
+
+        assert_eq!(request.guest_port(), 52);
+    }
+
+    #[test]
+    fn parses_host_connect_request_with_whitespace() {
+        let request = parse_vsock_host_connect_request(b"  CONNECT\t52  \n")
+            .expect("host CONNECT request should parse");
+
+        assert_eq!(request.guest_port(), 52);
+    }
+
+    #[test]
+    fn parses_host_connect_request_port_boundaries() {
+        let zero = parse_vsock_host_connect_request(b"CONNECT 0\n")
+            .expect("zero port should parse like Firecracker");
+        let max = parse_vsock_host_connect_request(b"CONNECT 4294967295\n")
+            .expect("u32 max port should parse");
+
+        assert_eq!(zero.guest_port(), 0);
+        assert_eq!(max.guest_port(), u32::MAX);
+    }
+
+    #[test]
+    fn rejects_empty_host_connect_request() {
+        let err = parse_vsock_host_connect_request(b"")
+            .expect_err("empty host CONNECT request should fail");
+
+        assert_eq!(err, VsockHostConnectRequestError::Empty);
+        assert_eq!(
+            err.to_string(),
+            "vsock host CONNECT request must not be empty"
+        );
+    }
+
+    #[test]
+    fn rejects_overlong_host_connect_request_without_echoing_it() {
+        let input = [b'x'; VSOCK_HOST_CONNECT_REQUEST_MAX_LEN + 1];
+        let err = parse_vsock_host_connect_request(&input)
+            .expect_err("overlong host CONNECT request should fail");
+
+        assert_eq!(
+            err,
+            VsockHostConnectRequestError::TooLong {
+                len: VSOCK_HOST_CONNECT_REQUEST_MAX_LEN + 1,
+                max: VSOCK_HOST_CONNECT_REQUEST_MAX_LEN,
+            }
+        );
+        assert!(!err.to_string().contains("xxx"));
+    }
+
+    #[test]
+    fn rejects_host_connect_request_missing_newline() {
+        let err = parse_vsock_host_connect_request(b"CONNECT 42")
+            .expect_err("host CONNECT request without newline should fail");
+
+        assert_eq!(err, VsockHostConnectRequestError::MissingNewline);
+    }
+
+    #[test]
+    fn rejects_host_connect_request_trailing_data_after_newline() {
+        let err = parse_vsock_host_connect_request(b"CONNECT 42\npayload")
+            .expect_err("host CONNECT request with trailing data should fail");
+
+        assert_eq!(err, VsockHostConnectRequestError::TrailingData);
+    }
+
+    #[test]
+    fn rejects_host_connect_request_invalid_utf8() {
+        let err = parse_vsock_host_connect_request(b"CONNECT \xff\n")
+            .expect_err("non UTF-8 host CONNECT request should fail");
+
+        assert_eq!(err, VsockHostConnectRequestError::InvalidUtf8);
+    }
+
+    #[test]
+    fn rejects_host_connect_request_missing_command() {
+        let err = parse_vsock_host_connect_request(b"\n")
+            .expect_err("host CONNECT request without command should fail");
+
+        assert_eq!(err, VsockHostConnectRequestError::MissingCommand);
+    }
+
+    #[test]
+    fn rejects_host_connect_request_invalid_command() {
+        let err = parse_vsock_host_connect_request(b"OPEN 42\n")
+            .expect_err("host CONNECT request with wrong command should fail");
+
+        assert_eq!(err, VsockHostConnectRequestError::InvalidCommand);
+    }
+
+    #[test]
+    fn rejects_host_connect_request_missing_port() {
+        let err = parse_vsock_host_connect_request(b"CONNECT\n")
+            .expect_err("host CONNECT request without port should fail");
+
+        assert_eq!(err, VsockHostConnectRequestError::MissingPort);
+    }
+
+    #[test]
+    fn rejects_host_connect_request_invalid_port() {
+        for input in [
+            &b"CONNECT port\n"[..],
+            &b"CONNECT -1\n"[..],
+            &b"CONNECT +1\n"[..],
+            &b"CONNECT 4294967296\n"[..],
+        ] {
+            let err = parse_vsock_host_connect_request(input)
+                .expect_err("host CONNECT request with invalid port should fail");
+
+            assert_eq!(err, VsockHostConnectRequestError::InvalidPort);
+        }
+    }
+
+    #[test]
+    fn rejects_host_connect_request_extra_tokens() {
+        let err = parse_vsock_host_connect_request(b"CONNECT 42 extra\n")
+            .expect_err("host CONNECT request with extra tokens should fail");
+
+        assert_eq!(err, VsockHostConnectRequestError::ExtraTokens);
+    }
+
+    #[test]
+    fn host_connect_errors_have_no_sources() {
+        assert!(VsockHostConnectRequestError::InvalidPort.source().is_none());
     }
 
     #[test]
