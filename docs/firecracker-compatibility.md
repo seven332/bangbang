@@ -8,7 +8,7 @@ The current repository defines crate boundaries, endpoint names, a minimal
 HTTP-over-Unix-socket API server for `GET /`, `GET /version`,
 `GET /vm/config`, `GET /machine-config`, pre-boot `PUT /machine-config`
 configuration storage, pre-boot `PUT /boot-source` configuration storage, pre-boot `PUT /drives/{drive_id}`
-configuration storage, pre-boot `PUT /network-interfaces/{iface_id}` configuration storage, pre-boot `PUT /metrics` output configuration, pre-boot `PUT /logger` output configuration, process-owned `PUT /actions` startup with an internal boot run-loop worker across bounded step windows, runtime `FlushMetrics` with a minimal per-process metrics sink, a macOS-gated internal vmnet descriptor, lifecycle, start owner, and packet descriptor boundary model for future host networking, a backend-neutral VM trait, a minimal VMM action/data model with internal
+configuration storage, pre-boot `PUT /network-interfaces/{iface_id}` configuration storage, pre-boot `PUT /vsock` configuration storage, pre-boot `PUT /metrics` output configuration, pre-boot `PUT /logger` output configuration, process-owned `PUT /actions` startup with an internal boot run-loop worker across bounded step windows, runtime `FlushMetrics` with a minimal per-process metrics sink, a macOS-gated internal vmnet descriptor, lifecycle, start owner, and packet descriptor boundary model for future host networking, a backend-neutral VM trait, a minimal VMM action/data model with internal
 `InstanceStart` preflight, transactional startup executor, and successful-start state transition helpers, backend-neutral guest
 physical address and aarch64 DRAM layout/access primitives, arm64 boot
 placement helpers, internal boot-source validation and arm64 kernel/initrd
@@ -54,7 +54,7 @@ virtio-net packet-I/O provider injection, boot block and virtio-net queue
 interrupt signaling,
 virtual timer PPI assertion, per-controller metrics and logger output state, and an initial process startup argument model.
 There is no broader API request body model beyond the initial boot-source,
-drive configuration, machine-configuration, metrics, logger, and actions bodies, public guest
+drive configuration, network-interface configuration, vsock configuration, machine-configuration, metrics, logger, and actions bodies, public guest
 execution beyond internal startup execution across bounded step windows, public run-loop control, complete interrupt
 delivery, including timer EOI/deactivation-driven unmasking,
 general HVF runner-loop notification scheduling, public serial output streaming,
@@ -87,6 +87,7 @@ The intended public control plane is Firecracker-style HTTP over a Unix domain
 socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
 `GET /machine-config`, pre-boot `PUT /machine-config`, pre-boot
 `PUT /boot-source`, pre-boot `PUT /drives/{drive_id}`, pre-boot
+`PUT /network-interfaces/{iface_id}`, pre-boot `PUT /vsock`, pre-boot
 `PUT /metrics`, pre-boot `PUT /logger`, and parsed `PUT /actions` requests
 already map through a minimal internal VMM action/data boundary. Validation
 rejects malformed boot-source and actions requests before VMM state mutation.
@@ -100,7 +101,8 @@ The current `bangbang` executable parses only the first process-lifecycle
 arguments and starts the first API socket surface. It binds a Unix socket and
 serves `GET /`, `GET /version`, `GET /vm/config`, `GET /machine-config`,
 pre-boot `PUT /machine-config`, pre-boot `PUT /boot-source` configuration storage, and
-pre-boot `PUT /drives/{drive_id}` configuration storage, pre-boot `PUT /metrics`
+pre-boot `PUT /drives/{drive_id}` configuration storage, pre-boot
+`PUT /network-interfaces/{iface_id}` configuration storage, pre-boot `PUT /vsock` configuration storage, pre-boot `PUT /metrics`
 output configuration, pre-boot `PUT /logger` output configuration, plus process-routed `PUT /actions` startup and metrics
 flush with an internal boot run-loop worker across bounded step windows or
 state/configuration faults, but does not load a configuration file or provide
@@ -184,7 +186,8 @@ before changing this reference.
 
 The current scaffold implements `GET /`, `GET /version`, `GET /vm/config`,
 `GET /machine-config`, pre-boot `PUT /machine-config` configuration storage, pre-boot
-`PUT /boot-source`, `PUT /drives/{drive_id}`, `PUT /metrics`, and `PUT /logger` configuration
+`PUT /boot-source`, `PUT /drives/{drive_id}`,
+`PUT /network-interfaces/{iface_id}`, `PUT /vsock`, `PUT /metrics`, and `PUT /logger` configuration
 storage over HTTP on a Unix domain socket, plus runtime `FlushMetrics` after
 successful startup. The support levels below describe compatibility targets for
 future API work:
@@ -228,7 +231,7 @@ compatibility targets.
 | `PATCH` | `/machine-config` | deferred | Partial updates belong with later state and validation rules. |
 | `PUT` | `/cpu-config` | deferred | Needs HVF CPU feature design with VM and boot work in #8 and #10. |
 | `PUT` | `/network-interfaces/{iface_id}` | supported target; configuration storage implemented | Stores initial virtio-net configuration before boot without opening host networking resources. Startup preparation attaches configured interfaces as virtio-mmio devices in the MMIO dispatcher and guest FDT, and internal network notification dispatch can route each configured interface through injected packet I/O, parse TX descriptors through a packet sink boundary, and copy injected RX packets into guest buffers through a packet source boundary. Host packet backend selection, public packet movement, runtime updates, PATCH, and DELETE remain tied to #14. |
-| `PUT` | `/vsock` | deferred | Tied to virtio vsock work in #15. |
+| `PUT` | `/vsock` | supported target; configuration storage implemented | Stores one initial virtio-vsock configuration before boot without opening, binding, connecting, unlinking, or creating host Unix socket resources. Virtio-vsock device emulation, host socket backend behavior, guest CID routing, runtime updates, PATCH, and DELETE remain tied to #15. |
 | `GET`, `PUT`, `PATCH` | `/mmds` | deferred | Tied to MMDS work in #16. |
 | `PUT` | `/mmds/config` | deferred | Tied to MMDS work in #16. |
 | `PUT` | `/snapshot/create`, `/snapshot/load` | deferred | Tied to snapshot and restore work in #19. |
@@ -280,6 +283,10 @@ exist.
 | `PUT /network-interfaces/{iface_id}` | `mtu` | deferred when configured | The internal model rejects configured MTU values until virtio-net feature negotiation and backend behavior exist. |
 | `PUT /network-interfaces/{iface_id}` | `rx_rate_limiter`, `tx_rate_limiter` | deferred when configured | The internal model rejects configured network rate limiters until virtio-net rate limiting behavior exists. |
 | `PUT /network-interfaces/{iface_id}` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
+| `PUT /vsock` | `vsock_id` | optional and deprecated | Firecracker `v1.16.0` accepts this field but treats it as deprecated. The internal model accepts it when present and rejects empty or control-character values. `GET /vm/config` omits this deprecated field. |
+| `PUT /vsock` | `guest_cid` | required | Firecracker's published schema requires a 32-bit guest CID with minimum value `3`; smaller values are rejected before state mutation. |
+| `PUT /vsock` | `uds_path` | required | Host Unix socket path to use for the future backend. The current API/VMM path records this value only after rejecting empty paths and control characters. Relative paths remain accepted to match Firecracker's documented `./v.sock` examples. No file or socket is opened, bound, connected, unlinked, or created by this configuration path. |
+| `PUT /vsock` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /metrics` | `metrics_path` | required | Host path to the metrics output file or FIFO. The runtime opens it as per-process observability state and redacts path details from API-facing open errors. |
 | `PUT /metrics` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /logger` | `log_path` | optional | Host path to the logger output file or FIFO. When present, the runtime opens it as per-process observability state and redacts path details from API-facing open errors. When omitted, the existing sink is left unchanged. |
@@ -303,9 +310,10 @@ during `InstanceStart` startup.
 without side effects. It includes the stored/default `machine-config`, includes
 `boot-source` only after it is configured, and always includes a `drives` array
 for configured virtio-block drives plus a `network-interfaces` array for stored
-network interface configs. Unsupported Firecracker sections such as MMDS, vsock,
-balloon, snapshots, and hotplug are omitted until their configuration models
-exist. Metrics and logger output configuration are also omitted because they are
+network interface configs. It includes `vsock` only after `PUT /vsock` stores a
+valid configuration. Unsupported Firecracker sections such as MMDS, balloon,
+snapshots, and hotplug are omitted until their configuration models exist.
+Metrics and logger output configuration are also omitted because they are
 process observability state rather than guest configuration.
 
 The API and VMM state path implement the `PUT /boot-source` field policy above.
@@ -337,6 +345,13 @@ pre-boot-only per-process observability configuration. Repeated pre-boot
 requests update only the fields they provide. Runtime requests fail without
 opening a new output path. The configured logger sink is not wired into the
 process logging backend yet.
+The API and VMM state path implement the `PUT /vsock` field policy above as a
+pre-boot-only guest configuration section. Valid requests replace the stored
+vsock config and return `204 No Content`; invalid requests fail without
+mutating previous vsock state. The current response reports `guest_cid` and
+`uds_path` while omitting the accepted deprecated `vsock_id`, matching
+Firecracker's effective config output. It does not create a virtio-vsock device,
+open host socket resources, route CIDs, or move data.
 `SendCtrlAltDel` is rejected at parse time for the first aarch64 target.
 
 Future implementation PRs should derive unit or golden tests from these tables.
@@ -518,6 +533,23 @@ The internal model rejects configured `mtu`, `rx_rate_limiter`, and
 `tx_rate_limiter` fields as unsupported. It does not open host networking
 resources or choose a macOS packet backend. Stored network interface configs are
 returned from `GET /vm/config` in the `network-interfaces` array.
+
+## Internal Vsock Configuration
+
+The API and runtime crates implement pre-boot, Firecracker-shaped vsock
+configuration storage for future virtio-vsock work. The API parser accepts
+`PUT /vsock`, rejects unknown fields, and forwards the supported request shape
+through the VMM action boundary. The runtime requires `guest_cid >= 3`, accepts
+the deprecated optional `vsock_id` when it is nonempty and contains no control
+characters, and requires a nonempty `uds_path` with no control characters.
+Displayed validation errors avoid echoing configured socket paths.
+
+Stored vsock configuration replaces any previous pre-boot vsock configuration
+and is returned from `GET /vm/config` as `vsock` with `guest_cid` and
+`uds_path`; the deprecated input-only `vsock_id` is omitted. The current model
+does not open, bind, connect, unlink, or create the configured `uds_path`;
+virtio-vsock device emulation, host Unix socket backend behavior, CID routing,
+and data movement remain deferred.
 
 The runtime crate also has the first backend-neutral virtio-net config-space,
 activation, TX frame parser, RX buffer parser, prepared device resources, and
@@ -902,7 +934,8 @@ behavior.
 The current scaffold implements the first HTTP API behavior for `GET /`,
 `GET /version`, `GET /vm/config`, pre-boot `/machine-config` configuration
 storage, pre-boot `PUT /boot-source`, `PUT /drives/{drive_id}`, and
-`PUT /metrics` and `PUT /logger` configuration storage, plus
+`PUT /network-interfaces/{iface_id}`, `PUT /vsock`, and `PUT /metrics` and
+`PUT /logger` configuration storage, plus
 process-routed `PUT /actions` startup with a bounded internal boot run-loop
 worker and runtime metrics flush handling. The
 policy below is the compatibility target for future request parsing, VMM action
@@ -916,11 +949,13 @@ flow through `GetMachineConfig` and `PutMachineConfig` and read or replace
 stored machine configuration state. `GET /vm/config` flows through
 `GetVmConfig` and returns the supported accumulated configuration subset:
 `machine-config`, `boot-source` when configured, the `drives` array, and the
-`network-interfaces` array.
+`network-interfaces` array, plus `vsock` when configured.
 Observability state such as metrics and logger configuration is omitted. Unsupported top-level sections are omitted until their models exist. The implemented pre-boot drive path flows
 through `PutDrive` and records validated configuration state. The implemented
 pre-boot network-interface path flows through `PutNetworkInterface` and records
 validated configuration state without opening host networking resources. Parsed
+`/vsock` requests flow through `PutVsock` and replace validated vsock
+configuration state without opening host Unix socket resources. Parsed
 `/boot-source` requests flow through `PutBootSource` and replace stored
 boot-source configuration state. Parsed `/metrics` requests flow through
 `PutMetrics` and initialize per-process metrics output state that is not part of
@@ -961,6 +996,7 @@ The first API implementation should model the same broad stages as Firecracker:
 | `PUT /boot-source` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config; host paths are opened during startup preparation. Host path errors must avoid leaking sensitive path details. |
 | `PUT /drives/{drive_id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config; startup preparation opens backing files and registers initial block MMIO devices. Runtime hotplug remains deferred. |
 | `PUT /network-interfaces/{iface_id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config without opening host networking resources. Startup preparation attaches configured interfaces as virtio-mmio devices in the MMIO dispatcher and guest FDT, while internal network notification dispatch can route each interface through injected packet I/O, complete TX descriptor heads through a packet sink boundary, and write injected RX packets into guest buffers through a packet source boundary. Host packet backend, public packet movement, PATCH, and DELETE remain deferred. |
+| `PUT /vsock` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config without opening or creating host Unix socket resources. Virtio-vsock device emulation, host socket backend behavior, CID routing, data movement, PATCH, and DELETE remain deferred. |
 | `PUT /metrics` | implemented; `204` empty response on successful output initialization | unsupported after start; `400` `fault_message` | Metrics output is process observability state, not guest configuration. Duplicate initialization fails. |
 | `PUT /logger` | implemented; `204` empty response on successful pre-boot configuration | unsupported after start; `400` `fault_message` | Logger output is process observability state, not guest configuration. Repeated pre-boot requests update provided fields; full log routing remains deferred. |
 | `PUT /actions` with `InstanceStart` | process-routed; `204` after successful owned HVF startup with internal boot run-loop worker across bounded step windows or `400` preflight/preparation fault | unsupported after start; `400` `fault_message` | Commits `Running` only after the owned HVF boot-session worker with internal serial capture is retained. The worker keeps internal active, terminal-outcome, or error status; public run-loop control and public serial streaming remain deferred. |
@@ -1009,7 +1045,8 @@ Their eventual support level should follow the endpoint matrix:
   buffer parser, prepared device resources, MMIO registration, startup FDT
   metadata, TX/RX notification dispatch metadata helpers, injected no-op TX
   packet sink boundary, and injected empty RX packet source boundary
-- vsock
+- virtio-vsock device emulation, host Unix socket backend behavior, CID routing,
+  and data movement beyond pre-boot `/vsock` configuration storage
 - snapshots
 - MMDS
 - balloon devices and balloon statistics

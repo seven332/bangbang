@@ -16,7 +16,8 @@ use bangbang_api::http::{
     DriveIoEngine as ApiDriveIoEngine, HttpResponse, LoggerConfigRequest,
     LoggerLevel as ApiLoggerLevel, MachineConfigRequest, MachineConfigResponse,
     MetricsConfigRequest, NetworkInterfaceConfigRequest, NetworkInterfaceConfigResponse,
-    RequestError, VmConfigResponse, parse_request, request_total_len,
+    RequestError, VmConfigResponse, VsockConfigRequest, VsockConfigResponse, parse_request,
+    request_total_len,
 };
 use bangbang_runtime::block::{DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine};
 use bangbang_runtime::boot::{BootSourceConfig, BootSourceConfigInput};
@@ -27,6 +28,7 @@ use bangbang_runtime::machine::{
 };
 use bangbang_runtime::metrics::MetricsConfigInput;
 use bangbang_runtime::network::{NetworkInterfaceConfig, NetworkInterfaceConfigInput};
+use bangbang_runtime::vsock::{VsockConfig, VsockConfigInput};
 use bangbang_runtime::{VmConfiguration, VmmAction, VmmData};
 
 use crate::vmm::VmmRequestHandler;
@@ -429,6 +431,9 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
                 network_interface_config_input_from_request(config.as_ref()),
             )))
         }
+        ApiRequest::PutVsock(config) => handle_empty(vmm.handle_action(VmmAction::PutVsock(
+            vsock_config_input_from_request(config.as_ref()),
+        ))),
     }
 }
 
@@ -546,6 +551,9 @@ fn vm_config_response_from_runtime(config: &VmConfiguration) -> VmConfigResponse
             .iter()
             .map(network_interface_config_response_from_runtime)
             .collect(),
+        config
+            .vsock_config()
+            .map(vsock_config_response_from_runtime),
     )
 }
 
@@ -597,6 +605,10 @@ fn network_interface_config_response_from_runtime(
     }
 
     response
+}
+
+fn vsock_config_response_from_runtime(config: &VsockConfig) -> VsockConfigResponse {
+    VsockConfigResponse::new(config.guest_cid(), path_text(config.uds_path()))
 }
 
 fn path_text(path: &Path) -> String {
@@ -719,6 +731,15 @@ fn network_interface_config_input_from_request(
     }
     if config.tx_rate_limiter_configured() {
         input = input.with_tx_rate_limiter_configured();
+    }
+
+    input
+}
+
+fn vsock_config_input_from_request(config: &VsockConfigRequest) -> VsockConfigInput {
+    let mut input = VsockConfigInput::new(config.guest_cid(), config.uds_path());
+    if let Some(vsock_id) = config.vsock_id() {
+        input = input.with_vsock_id(vsock_id);
     }
 
     input
@@ -1035,6 +1056,7 @@ mod tests {
         );
         assert!(default_response.body().contains(r#""vcpu_count":1"#));
         assert!(!default_response.body().contains(r#""boot-source":"#));
+        assert!(!default_response.body().contains(r#""vsock":"#));
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::NotStarted
@@ -1094,6 +1116,20 @@ mod tests {
             bangbang_api::http::StatusCode::NoContent
         );
 
+        let vsock_body = r#"{
+            "vsock_id": "vsock0",
+            "guest_cid": 3,
+            "uds_path": "./v.sock"
+        }"#;
+        let vsock_request = format!(
+            "PUT /vsock HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{vsock_body}",
+            vsock_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(vsock_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
         let response = handle_request_bytes(
             b"GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
             &mut vmm,
@@ -1136,6 +1172,10 @@ mod tests {
                 .body()
                 .contains(r#""guest_mac":"12:34:56:78:9a:bc""#)
         );
+        assert!(response.body().contains(r#""vsock":"#));
+        assert!(response.body().contains(r#""guest_cid":3"#));
+        assert!(response.body().contains(r#""uds_path":"./v.sock""#));
+        assert!(!response.body().contains("vsock_id"));
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::NotStarted
@@ -1271,6 +1311,128 @@ mod tests {
         );
         assert_eq!(config.initrd_path(), None);
         assert_eq!(config.boot_args(), None);
+    }
+
+    #[test]
+    fn configures_vsock_over_unix_socket() {
+        let mut vmm = test_controller();
+        let path = unique_socket_path("vsock");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+        let body = r#"{
+            "guest_cid": 3,
+            "uds_path": "./v.sock"
+        }"#;
+        let request = format!(
+            "PUT /vsock HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        client
+            .write_all(request.as_bytes())
+            .expect("client should write request");
+        server
+            .serve_next(&mut vmm)
+            .expect("server should handle one request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("client should read response");
+
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(response.contains("Content-Length: 0\r\n"));
+        let config_response = handle_request_bytes(
+            b"GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &mut vmm,
+        );
+        assert_eq!(config_response.status(), bangbang_api::http::StatusCode::Ok);
+        assert!(config_response.body().contains(r#""vsock":"#));
+        assert!(config_response.body().contains(r#""guest_cid":3"#));
+        assert!(config_response.body().contains(r#""uds_path":"./v.sock""#));
+    }
+
+    #[test]
+    fn returns_fault_for_invalid_vsock_without_mutating() {
+        let mut vmm = test_controller();
+        let original_body = r#"{"guest_cid":3,"uds_path":"./original.sock"}"#;
+        let original_request = format!(
+            "PUT /vsock HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{original_body}",
+            original_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(original_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let invalid_body = r#"{"guest_cid":2,"uds_path":"/tmp/private-v.sock"}"#;
+        let invalid_request = format!(
+            "PUT /vsock HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{invalid_body}",
+            invalid_body.len()
+        );
+
+        let response = handle_request_bytes(invalid_request.as_bytes(), &mut vmm);
+
+        assert_eq!(
+            response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+        assert_eq!(
+            response.body(),
+            r#"{"fault_message":"vsock guest_cid 2 is below minimum 3"}"#
+        );
+        assert!(!response.body().contains("/tmp/private-v.sock"));
+
+        let config_response = handle_request_bytes(
+            b"GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &mut vmm,
+        );
+        assert!(config_response.body().contains(r#""guest_cid":3"#));
+        assert!(
+            config_response
+                .body()
+                .contains(r#""uds_path":"./original.sock""#)
+        );
+        assert!(!config_response.body().contains("/tmp/private-v.sock"));
+    }
+
+    #[test]
+    fn rejects_vsock_after_start_without_creating_socket_path() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_request = format!(
+            "PUT /boot-source HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{boot_body}",
+            boot_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response =
+            put_action_over_socket(&mut vmm, "start-before-vsock", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let uds_path = unique_socket_path("vsock-after-start");
+        let body = format!(
+            r#"{{"guest_cid":3,"uds_path":"{}"}}"#,
+            uds_path.to_string_lossy()
+        );
+        let request = format!(
+            "PUT /vsock HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        let response = handle_request_bytes(request.as_bytes(), &mut vmm);
+
+        assert_eq!(
+            response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+        assert_eq!(
+            response.body(),
+            r#"{"fault_message":"The requested operation is not supported in Running state: PutVsock"}"#
+        );
+        assert!(!uds_path.exists());
     }
 
     #[test]
@@ -1651,6 +1813,10 @@ mod tests {
                 .with_guest_mac("12:34:56:78:9a:bc"),
         ))
         .expect("network interface config should be stored");
+        vmm.handle_action(VmmAction::PutVsock(
+            VsockConfigInput::new(3, "./v.sock").with_vsock_id("vsock0"),
+        ))
+        .expect("vsock config should be stored");
 
         client
             .write_all(b"GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n")
@@ -1683,6 +1849,10 @@ mod tests {
         assert!(response.contains(r#""iface_id":"eth0""#));
         assert!(response.contains(r#""host_dev_name":"tap0""#));
         assert!(response.contains(r#""guest_mac":"12:34:56:78:9a:bc""#));
+        assert!(response.contains(r#""vsock":"#));
+        assert!(response.contains(r#""guest_cid":3"#));
+        assert!(response.contains(r#""uds_path":"./v.sock""#));
+        assert!(!response.contains("vsock_id"));
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::NotStarted

@@ -14,6 +14,7 @@ pub mod serial;
 pub mod startup;
 pub mod virtio_mmio;
 pub mod virtio_queue;
+pub mod vsock;
 
 use std::fmt;
 
@@ -73,6 +74,7 @@ pub enum VmmAction {
     PutMetrics(metrics::MetricsConfigInput),
     PutDrive(block::DriveConfigInput),
     PutNetworkInterface(network::NetworkInterfaceConfigInput),
+    PutVsock(vsock::VsockConfigInput),
 }
 
 impl VmmAction {
@@ -90,6 +92,7 @@ impl VmmAction {
             Self::PutMetrics(_) => "PutMetrics",
             Self::PutDrive(_) => "PutDrive",
             Self::PutNetworkInterface(_) => "PutNetworkInterface",
+            Self::PutVsock(_) => "PutVsock",
         }
     }
 }
@@ -109,6 +112,7 @@ pub struct VmConfiguration {
     boot_source_config: Option<boot::BootSourceConfig>,
     drive_configs: Vec<block::DriveConfig>,
     network_interface_configs: Vec<network::NetworkInterfaceConfig>,
+    vsock_config: Option<vsock::VsockConfig>,
 }
 
 impl VmConfiguration {
@@ -117,12 +121,14 @@ impl VmConfiguration {
         boot_source_config: Option<boot::BootSourceConfig>,
         drive_configs: Vec<block::DriveConfig>,
         network_interface_configs: Vec<network::NetworkInterfaceConfig>,
+        vsock_config: Option<vsock::VsockConfig>,
     ) -> Self {
         Self {
             machine_config,
             boot_source_config,
             drive_configs,
             network_interface_configs,
+            vsock_config,
         }
     }
 
@@ -140,6 +146,10 @@ impl VmConfiguration {
 
     pub fn network_interface_configs(&self) -> &[network::NetworkInterfaceConfig] {
         &self.network_interface_configs
+    }
+
+    pub fn vsock_config(&self) -> Option<&vsock::VsockConfig> {
+        self.vsock_config.as_ref()
     }
 }
 
@@ -159,6 +169,7 @@ pub enum VmmActionError {
     MetricsConfig(metrics::MetricsConfigError),
     MetricsFlush(metrics::MetricsFlushError),
     NetworkInterfaceConfig(network::NetworkInterfaceConfigError),
+    VsockConfig(vsock::VsockConfigError),
 }
 
 impl fmt::Display for VmmActionError {
@@ -184,6 +195,7 @@ impl fmt::Display for VmmActionError {
             Self::MetricsConfig(err) => write!(f, "{err}"),
             Self::MetricsFlush(err) => write!(f, "{err}"),
             Self::NetworkInterfaceConfig(err) => write!(f, "{err}"),
+            Self::VsockConfig(err) => write!(f, "{err}"),
         }
     }
 }
@@ -199,6 +211,7 @@ impl std::error::Error for VmmActionError {
             Self::MetricsConfig(err) => Some(err),
             Self::MetricsFlush(err) => Some(err),
             Self::NetworkInterfaceConfig(err) => Some(err),
+            Self::VsockConfig(err) => Some(err),
             Self::MissingBootSource
             | Self::UnsupportedAction(_)
             | Self::UnsupportedState { .. } => None,
@@ -213,6 +226,7 @@ pub struct VmmController {
     boot_source_config: Option<boot::BootSourceConfig>,
     drive_configs: block::DriveConfigs,
     network_interface_configs: network::NetworkInterfaceConfigs,
+    vsock_config: Option<vsock::VsockConfig>,
     logger_state: logger::LoggerState,
     metrics_state: metrics::MetricsState,
 }
@@ -234,6 +248,7 @@ impl VmmController {
             boot_source_config: None,
             drive_configs: block::DriveConfigs::new(),
             network_interface_configs: network::NetworkInterfaceConfigs::new(),
+            vsock_config: None,
             logger_state: logger::LoggerState::default(),
             metrics_state: metrics::MetricsState::default(),
         }
@@ -251,6 +266,10 @@ impl VmmController {
         self.network_interface_configs.as_slice()
     }
 
+    pub fn vsock_config(&self) -> Option<&vsock::VsockConfig> {
+        self.vsock_config.as_ref()
+    }
+
     pub const fn machine_config(&self) -> machine::MachineConfig {
         self.machine_config
     }
@@ -265,6 +284,7 @@ impl VmmController {
             self.boot_source_config.clone(),
             self.drive_configs.as_slice().to_vec(),
             self.network_interface_configs.as_slice().to_vec(),
+            self.vsock_config.clone(),
         )
     }
 
@@ -409,6 +429,19 @@ impl VmmController {
 
                 Ok(VmmData::Empty)
             }
+            VmmAction::PutVsock(config) => {
+                if self.instance_info.state != InstanceState::NotStarted {
+                    return Err(VmmActionError::UnsupportedState {
+                        action: action_name,
+                        state: self.instance_info.state,
+                    });
+                }
+
+                let config = config.validate().map_err(VmmActionError::VsockConfig)?;
+                self.vsock_config = Some(config);
+
+                Ok(VmmData::Empty)
+            }
         }
     }
 }
@@ -455,6 +488,7 @@ mod tests {
         machine::{DEFAULT_MEM_SIZE_MIB, DEFAULT_VCPU_COUNT, MachineConfigInput},
         metrics::{MetricsConfigError, MetricsConfigInput},
         network::{GuestMacAddress, NetworkInterfaceConfigError, NetworkInterfaceConfigInput},
+        vsock::{MIN_GUEST_CID, VsockConfigError, VsockConfigInput},
     };
 
     fn drive_input(id: &str, path: &str, is_root_device: bool) -> DriveConfigInput {
@@ -463,6 +497,10 @@ mod tests {
 
     fn network_input(id: &str, host_dev_name: &str) -> NetworkInterfaceConfigInput {
         NetworkInterfaceConfigInput::new(id, id, host_dev_name)
+    }
+
+    fn vsock_input(guest_cid: u32, uds_path: &str) -> VsockConfigInput {
+        VsockConfigInput::new(guest_cid, uds_path)
     }
 
     fn boot_source_input(kernel_image_path: &str) -> BootSourceConfigInput {
@@ -523,6 +561,7 @@ mod tests {
         assert_eq!(controller.boot_source_config(), None);
         assert!(controller.drive_configs().is_empty());
         assert!(controller.network_interface_configs().is_empty());
+        assert_eq!(controller.vsock_config(), None);
     }
 
     #[test]
@@ -586,10 +625,12 @@ mod tests {
         assert_eq!(config.boot_source_config(), None);
         assert!(config.drive_configs().is_empty());
         assert!(config.network_interface_configs().is_empty());
+        assert_eq!(config.vsock_config(), None);
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
         assert!(controller.boot_source_config().is_none());
         assert!(controller.drive_configs().is_empty());
         assert!(controller.network_interface_configs().is_empty());
+        assert!(controller.vsock_config().is_none());
     }
 
     #[test]
@@ -617,6 +658,11 @@ mod tests {
                 network_input("eth0", "tap0").with_guest_mac("12:34:56:78:9a:bc"),
             ))
             .expect("network interface config should be stored");
+        controller
+            .handle_action(VmmAction::PutVsock(
+                vsock_input(3, "./v.sock").with_vsock_id("vsock0"),
+            ))
+            .expect("vsock config should be stored");
 
         let data = controller
             .handle_action(VmmAction::GetVmConfig)
@@ -657,6 +703,12 @@ mod tests {
                 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc,
             ]))
         );
+        let vsock = config
+            .vsock_config()
+            .expect("vsock config should be present");
+        assert_eq!(vsock.vsock_id(), Some("vsock0"));
+        assert_eq!(vsock.guest_cid(), 3);
+        assert_eq!(vsock.uds_path(), Path::new("./v.sock"));
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
     }
 
@@ -682,6 +734,7 @@ mod tests {
         assert!(config.boot_source_config().is_some());
         assert!(config.drive_configs().is_empty());
         assert!(config.network_interface_configs().is_empty());
+        assert_eq!(config.vsock_config(), None);
     }
 
     #[test]
@@ -696,6 +749,10 @@ mod tests {
         assert_eq!(
             VmmAction::PutNetworkInterface(network_input("eth0", "tap0")).name(),
             "PutNetworkInterface"
+        );
+        assert_eq!(
+            VmmAction::PutVsock(vsock_input(3, "./v.sock")).name(),
+            "PutVsock"
         );
     }
 
@@ -1814,6 +1871,99 @@ mod tests {
     }
 
     #[test]
+    fn handles_put_vsock_config() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
+        assert_eq!(
+            controller.handle_action(VmmAction::PutVsock(
+                vsock_input(MIN_GUEST_CID, "./v.sock").with_vsock_id("vsock0"),
+            )),
+            Ok(VmmData::Empty)
+        );
+
+        let config = controller
+            .vsock_config()
+            .expect("vsock config should be stored");
+        assert_eq!(config.vsock_id(), Some("vsock0"));
+        assert_eq!(config.guest_cid(), MIN_GUEST_CID);
+        assert_eq!(config.uds_path(), Path::new("./v.sock"));
+    }
+
+    #[test]
+    fn put_vsock_config_replaces_existing_config() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutVsock(vsock_input(3, "/tmp/first.sock")))
+            .expect("initial vsock config should be stored");
+
+        controller
+            .handle_action(VmmAction::PutVsock(vsock_input(42, "/tmp/replaced.sock")))
+            .expect("replacement vsock config should be stored");
+
+        let config = controller
+            .vsock_config()
+            .expect("replacement config should be stored");
+        assert_eq!(config.vsock_id(), None);
+        assert_eq!(config.guest_cid(), 42);
+        assert_eq!(config.uds_path(), Path::new("/tmp/replaced.sock"));
+    }
+
+    #[test]
+    fn put_vsock_config_rejects_invalid_config_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutVsock(vsock_input(3, "/tmp/original.sock")))
+            .expect("initial vsock config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PutVsock(vsock_input(2, "/tmp/replacement.sock")))
+            .expect_err("invalid guest cid should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::VsockConfig(VsockConfigError::GuestCidTooSmall {
+                guest_cid: 2,
+                min: MIN_GUEST_CID,
+            })
+        );
+        assert_eq!(err.to_string(), "vsock guest_cid 2 is below minimum 3");
+        let config = controller
+            .vsock_config()
+            .expect("original config should remain stored");
+        assert_eq!(config.guest_cid(), 3);
+        assert_eq!(config.uds_path(), Path::new("/tmp/original.sock"));
+    }
+
+    #[test]
+    fn put_vsock_config_rejects_running_state_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutVsock(vsock_input(3, "/tmp/original.sock")))
+            .expect("initial vsock config should be stored");
+        controller.instance_info.state = InstanceState::Running;
+
+        let err = controller
+            .handle_action(VmmAction::PutVsock(vsock_input(
+                42,
+                "/tmp/replacement.sock",
+            )))
+            .expect_err("running vsock config should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::UnsupportedState {
+                action: "PutVsock",
+                state: InstanceState::Running,
+            }
+        );
+        let config = controller
+            .vsock_config()
+            .expect("original config should remain stored");
+        assert_eq!(config.guest_cid(), 3);
+        assert_eq!(config.uds_path(), Path::new("/tmp/original.sock"));
+    }
+
+    #[test]
     fn displays_unsupported_action_error() {
         let err = VmmActionError::UnsupportedAction(VmmAction::GetVmInstanceInfo.name());
 
@@ -1852,6 +2002,14 @@ mod tests {
         let err = VmmActionError::DriveConfig(DriveConfigError::EmptyPathOnHost);
 
         assert_eq!(err.to_string(), "drive path_on_host must not be empty");
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn displays_vsock_config_error() {
+        let err = VmmActionError::VsockConfig(VsockConfigError::EmptySocketPath);
+
+        assert_eq!(err.to_string(), "vsock uds_path must not be empty");
         assert!(err.source().is_some());
     }
 

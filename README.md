@@ -87,6 +87,15 @@ curl --unix-socket /tmp/bangbang.socket \
   -d '{"iface_id":"eth0","host_dev_name":"tap0","guest_mac":"12:34:56:78:9a:bc"}'
 ```
 
+Record a pre-boot vsock configuration:
+
+```sh
+curl --unix-socket /tmp/bangbang.socket \
+  -X PUT http://localhost/vsock \
+  -H 'Content-Type: application/json' \
+  -d '{"guest_cid":3,"uds_path":"./v.sock"}'
+```
+
 Submit an `InstanceStart` action:
 
 ```sh

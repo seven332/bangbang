@@ -26,6 +26,7 @@ pub enum ApiRequest {
     PutMachineConfig(Box<MachineConfigRequest>),
     PutMetrics(Box<MetricsConfigRequest>),
     PutNetworkInterface(Box<NetworkInterfaceConfigRequest>),
+    PutVsock(Box<VsockConfigRequest>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,6 +373,27 @@ impl NetworkInterfaceConfigRequest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VsockConfigRequest {
+    vsock_id: Option<String>,
+    guest_cid: u32,
+    uds_path: String,
+}
+
+impl VsockConfigRequest {
+    pub fn vsock_id(&self) -> Option<&str> {
+        self.vsock_id.as_deref()
+    }
+
+    pub const fn guest_cid(&self) -> u32 {
+        self.guest_cid
+    }
+
+    pub fn uds_path(&self) -> &str {
+        &self.uds_path
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum DriveCacheType {
     Unsafe,
@@ -503,6 +525,7 @@ pub struct VmConfigResponse {
     boot_source: Option<BootSourceResponse>,
     drives: Vec<DriveConfigResponse>,
     network_interfaces: Vec<NetworkInterfaceConfigResponse>,
+    vsock: Option<VsockConfigResponse>,
 }
 
 impl VmConfigResponse {
@@ -511,12 +534,29 @@ impl VmConfigResponse {
         boot_source: Option<BootSourceResponse>,
         drives: Vec<DriveConfigResponse>,
         network_interfaces: Vec<NetworkInterfaceConfigResponse>,
+        vsock: Option<VsockConfigResponse>,
     ) -> Self {
         Self {
             machine_config,
             boot_source,
             drives,
             network_interfaces,
+            vsock,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VsockConfigResponse {
+    guest_cid: u32,
+    uds_path: String,
+}
+
+impl VsockConfigResponse {
+    pub fn new(guest_cid: u32, uds_path: impl Into<String>) -> Self {
+        Self {
+            guest_cid,
+            uds_path: uds_path.into(),
         }
     }
 }
@@ -554,6 +594,15 @@ struct NetworkInterfaceConfigRequestBody {
     rx_rate_limiter: Option<serde_json::Value>,
     #[serde(default)]
     tx_rate_limiter: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VsockConfigRequestBody {
+    #[serde(default)]
+    vsock_id: Option<String>,
+    guest_cid: u32,
+    uds_path: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -666,6 +715,9 @@ impl HttpResponse {
                     .collect(),
             ),
         );
+        if let Some(vsock) = &config.vsock {
+            body.insert("vsock".to_string(), vsock_config_response_value(vsock));
+        }
 
         Self {
             status: StatusCode::Ok,
@@ -806,6 +858,19 @@ fn network_interface_config_response_value(
     serde_json::Value::Object(body)
 }
 
+fn vsock_config_response_value(vsock: &VsockConfigResponse) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "guest_cid".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(vsock.guest_cid)),
+    );
+    body.insert(
+        "uds_path".to_string(),
+        serde_json::Value::String(vsock.uds_path.clone()),
+    );
+    serde_json::Value::Object(body)
+}
+
 pub fn parse_request(bytes: &[u8]) -> Result<ApiRequest, RequestError> {
     if bytes.len() > HTTP_MAX_PAYLOAD_SIZE {
         return Err(RequestError::PayloadTooLarge);
@@ -854,6 +919,9 @@ pub fn parse_request(bytes: &[u8]) -> Result<ApiRequest, RequestError> {
     }
     if method == "PUT" && path == "/metrics" {
         return parse_metrics_config_request(body);
+    }
+    if method == "PUT" && path == "/vsock" {
+        return parse_vsock_config_request(body);
     }
 
     match (method, path) {
@@ -1024,6 +1092,17 @@ fn parse_metrics_config_request(body: &[u8]) -> Result<ApiRequest, RequestError>
 
     Ok(ApiRequest::PutMetrics(Box::new(MetricsConfigRequest {
         metrics_path: body.metrics_path,
+    })))
+}
+
+fn parse_vsock_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
+    let body = serde_json::from_slice::<VsockConfigRequestBody>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+
+    Ok(ApiRequest::PutVsock(Box::new(VsockConfigRequest {
+        vsock_id: body.vsock_id,
+        guest_cid: body.guest_cid,
+        uds_path: body.uds_path,
     })))
 }
 
@@ -1255,6 +1334,7 @@ impl From<ApiRequest> for Endpoint {
             ApiRequest::PutMachineConfig(_) => Self::MachineConfig,
             ApiRequest::PutMetrics(_) => Self::Metrics,
             ApiRequest::PutNetworkInterface(_) => Self::NetworkInterface,
+            ApiRequest::PutVsock(_) => Self::Vsock,
         }
     }
 }
@@ -1907,6 +1987,127 @@ mod tests {
         );
         assert_eq!(
             parse_request(&request_with_body("PUT", "/metrics/extra", "{}")),
+            Err(RequestError::InvalidPathMethod)
+        );
+    }
+
+    #[test]
+    fn parses_put_vsock_with_minimal_body() {
+        let body = r#"{
+            "guest_cid": 3,
+            "uds_path": "./v.sock"
+        }"#;
+        let request = request_with_body("PUT", "/vsock", body);
+
+        let parsed = parse_request(&request).expect("vsock request should parse");
+
+        let ApiRequest::PutVsock(config) = parsed else {
+            panic!("expected vsock request");
+        };
+        assert_eq!(config.vsock_id(), None);
+        assert_eq!(config.guest_cid(), 3);
+        assert_eq!(config.uds_path(), "./v.sock");
+        assert_eq!(request_total_len(&request), Ok(Some(request.len())));
+    }
+
+    #[test]
+    fn parses_put_vsock_with_deprecated_vsock_id() {
+        let body = r#"{
+            "vsock_id": "vsock0",
+            "guest_cid": 42,
+            "uds_path": "/tmp/v.sock"
+        }"#;
+        let request = request_with_body("PUT", "/vsock", body);
+
+        let parsed = parse_request(&request).expect("vsock request should parse");
+
+        let ApiRequest::PutVsock(config) = parsed else {
+            panic!("expected vsock request");
+        };
+        assert_eq!(config.vsock_id(), Some("vsock0"));
+        assert_eq!(config.guest_cid(), 42);
+        assert_eq!(config.uds_path(), "/tmp/v.sock");
+    }
+
+    #[test]
+    fn parses_put_vsock_with_null_vsock_id() {
+        let body = r#"{
+            "vsock_id": null,
+            "guest_cid": 3,
+            "uds_path": "./v.sock"
+        }"#;
+        let request = request_with_body("PUT", "/vsock", body);
+
+        let parsed = parse_request(&request).expect("vsock request should parse");
+
+        let ApiRequest::PutVsock(config) = parsed else {
+            panic!("expected vsock request");
+        };
+        assert_eq!(config.vsock_id(), None);
+    }
+
+    #[test]
+    fn rejects_put_vsock_missing_required_fields() {
+        assert_eq!(
+            parse_request(&request_with_body(
+                "PUT",
+                "/vsock",
+                r#"{"uds_path":"./v.sock"}"#,
+            )),
+            Err(RequestError::MalformedRequest)
+        );
+        assert_eq!(
+            parse_request(&request_with_body("PUT", "/vsock", r#"{"guest_cid":3}"#)),
+            Err(RequestError::MalformedRequest)
+        );
+    }
+
+    #[test]
+    fn rejects_put_vsock_unknown_field() {
+        let body = r#"{
+            "guest_cid": 3,
+            "uds_path": "./v.sock",
+            "unknown": true
+        }"#;
+        let request = request_with_body("PUT", "/vsock", body);
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_put_vsock_invalid_field_type() {
+        for body in [
+            r#"{"guest_cid":"3","uds_path":"./v.sock"}"#,
+            r#"{"guest_cid":3,"uds_path":null}"#,
+            r#"{"guest_cid":3,"uds_path":["./v.sock"]}"#,
+            r#"{"vsock_id":1,"guest_cid":3,"uds_path":"./v.sock"}"#,
+        ] {
+            assert_eq!(
+                parse_request(&request_with_body("PUT", "/vsock", body)),
+                Err(RequestError::MalformedRequest)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_put_vsock_empty_body() {
+        let request = request_with_body("PUT", "/vsock", "");
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_unsupported_vsock_method_or_path() {
+        assert_eq!(
+            parse_request(b"GET /vsock HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+            Err(RequestError::InvalidPathMethod)
+        );
+        assert_eq!(
+            parse_request(&request_with_body(
+                "PUT",
+                "/vsock/extra",
+                r#"{"guest_cid":3,"uds_path":"./v.sock"}"#,
+            )),
             Err(RequestError::InvalidPathMethod)
         );
     }
@@ -2601,6 +2802,7 @@ mod tests {
             None,
             Vec::new(),
             Vec::new(),
+            None,
         ));
         let body: serde_json::Value =
             serde_json::from_str(response.body()).expect("body should be JSON");
@@ -2622,6 +2824,7 @@ mod tests {
         );
         assert_eq!(body.get("boot-source"), None);
         assert_eq!(body.get("logger"), None);
+        assert_eq!(body.get("vsock"), None);
     }
 
     #[test]
@@ -2634,11 +2837,13 @@ mod tests {
                 .with_partuuid("0eaa91a0-01");
         let network_interface =
             NetworkInterfaceConfigResponse::new("eth0", "tap0").with_guest_mac("12:34:56:78:9a:bc");
+        let vsock = VsockConfigResponse::new(3, "./v.sock");
         let response = HttpResponse::vm_config(&VmConfigResponse::new(
             MachineConfigResponse::new(2, 256, false, false, "None"),
             Some(boot_source),
             vec![drive],
             vec![network_interface],
+            Some(vsock),
         ));
         let body: serde_json::Value =
             serde_json::from_str(response.body()).expect("body should be JSON");
@@ -2677,6 +2882,10 @@ mod tests {
                         "iface_id": "eth0",
                     },
                 ],
+                "vsock": {
+                    "guest_cid": 3,
+                    "uds_path": "./v.sock",
+                },
             })
         );
         assert_eq!(body.get("metrics"), None);
@@ -2696,6 +2905,7 @@ mod tests {
                 "Sync",
             )],
             vec![NetworkInterfaceConfigResponse::new("eth0", "tap0")],
+            Some(VsockConfigResponse::new(3, "./v.sock")),
         ));
         let body: serde_json::Value =
             serde_json::from_str(response.body()).expect("body should be JSON");
@@ -2722,6 +2932,17 @@ mod tests {
             .expect("one network interface should be returned");
         assert_eq!(network_interface.get("guest_mac"), None);
         assert_eq!(network_interface.get("rx_rate_limiter"), None);
+        assert_eq!(
+            body.get("vsock"),
+            Some(&serde_json::json!({
+                "guest_cid": 3,
+                "uds_path": "./v.sock",
+            }))
+        );
+        assert_eq!(
+            body.get("vsock").and_then(|vsock| vsock.get("vsock_id")),
+            None
+        );
     }
 
     #[test]
@@ -2841,5 +3062,14 @@ mod tests {
         .expect("network interface request should parse");
 
         assert_eq!(Endpoint::from(request), Endpoint::NetworkInterface);
+
+        let request = parse_request(&request_with_body(
+            "PUT",
+            "/vsock",
+            r#"{"guest_cid":3,"uds_path":"./v.sock"}"#,
+        ))
+        .expect("vsock request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::Vsock);
     }
 }
