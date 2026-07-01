@@ -73,13 +73,14 @@ is resource-specific:
   requests, allocate Firecracker-shaped host local ports, retain
   host-initiated accepted streams in an internal table, expose one-shot
   guest-facing `VSOCK_OP_REQUEST` packet headers for retained host connections,
+  write those request headers into validated writable guest RX descriptors,
   accept one pending host connection per call into an owned nonblocking stream,
   then read and parse a bounded accepted-stream `CONNECT` handshake. Startup
   also binds a nonblocking host Unix listener at `uds_path`, records the
   listener socket device and inode, and removes the path on normal shutdown only
-  when it still refers to the socket created by this process. It does not write
-  modeled host request packets into RX queues, send `OK` or `RST` responses,
-  connect to `uds_path_<PORT>`, route CIDs, or move vsock data yet.
+  when it still refers to the socket created by this process. It does not send
+  `OK` or `RST` responses, connect to `uds_path_<PORT>`, route CIDs, or move
+  vsock data yet.
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink.
 - `/logger` opens `log_path` during pre-boot configuration when that field is
@@ -117,8 +118,9 @@ descriptor chains, MMIO accesses, block requests, virtio-net TX descriptor
 metadata and payload bytes, virtio-net RX buffer descriptors, virtio-vsock
 packet headers, virtio-vsock TX available-ring heads, virtio-vsock TX payload
 descriptor ranges, virtio-vsock TX used-ring completion writes, virtio-vsock
-queue notifications, and future device inputs must be validated before they
-affect host resources.
+RX available-ring heads, virtio-vsock RX buffer descriptor ranges,
+virtio-vsock RX used-ring completion writes, virtio-vsock queue notifications,
+and future device inputs must be validated before they affect host resources.
 Trapped system-register exits are guest-visible CPU behavior and must stay
 explicit. The current HVF runner emulates only the early-boot `OSDLR_EL1` and
 `OSLAR_EL1` OS lock RAZ/WI behavior needed by the pinned Firecracker kernel;
@@ -198,13 +200,13 @@ The current scaffold does not implement:
   requests, allocate Firecracker-shaped host local ports, retain
   host-initiated accepted streams in an internal table, expose one-shot
   guest-facing `VSOCK_OP_REQUEST` packet headers for retained host connections,
+  write those request headers into validated writable guest RX descriptors,
   accept one pending host connection per call into an owned nonblocking stream,
   and read and parse a bounded accepted-stream `CONNECT` handshake. Startup
   preparation creates a nonblocking host Unix listener at `uds_path` and cleans
   it up only while the path still matches the created socket inode. It does not
-  write modeled host request packets into RX queues, send `OK` or `RST`
-  responses, connect guest-initiated `uds_path_<PORT>` sockets, route CIDs,
-  parse RX buffers, dispatch event queues, or move data
+  send `OK` or `RST` responses, connect guest-initiated `uds_path_<PORT>`
+  sockets, route CIDs, dispatch event queues, or move data
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 
