@@ -3481,6 +3481,28 @@ mod tests {
     }
 
     #[test]
+    fn host_local_port_allocator_ignores_never_allocated_ports_within_capacity() {
+        let mut allocator = VsockHostLocalPortAllocator::with_capacity(3);
+        let first = allocator.allocate().expect("first port should allocate");
+        let second = allocator.allocate().expect("second port should allocate");
+        let third = VsockHostLocalPort::try_from_raw(VSOCK_HOST_LOCAL_PORT_BASE + 2)
+            .expect("test port should be in Firecracker range");
+
+        assert!(!allocator.free(third));
+        assert_eq!(
+            allocator.allocate().expect("third port should allocate"),
+            third
+        );
+        assert!(matches!(
+            allocator.allocate(),
+            Err(VsockHostLocalPortAllocatorError::Exhausted)
+        ));
+        assert!(allocator.free(first));
+        assert!(allocator.free(second));
+        assert!(allocator.free(third));
+    }
+
+    #[test]
     fn host_local_port_allocator_ignores_ports_outside_allocator_capacity() {
         let mut allocator = VsockHostLocalPortAllocator::with_capacity(1);
         let first = allocator.allocate().expect("first port should allocate");
