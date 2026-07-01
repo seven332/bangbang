@@ -3,6 +3,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::interrupt::DeviceInterruptKind;
 use crate::memory::{
     GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryRange,
 };
@@ -1467,6 +1468,66 @@ impl VirtioVsockDevice {
         self.active_tx_queue = None;
         self.active_event_queue = None;
     }
+
+    fn dispatch_drained_queue_notifications(
+        &mut self,
+        memory: &mut GuestMemory,
+        drained_notifications: Vec<usize>,
+    ) -> Result<VirtioVsockDeviceNotificationDispatch, VirtioVsockDeviceNotificationError> {
+        if drained_notifications.is_empty() {
+            return Ok(VirtioVsockDeviceNotificationDispatch::new(
+                drained_notifications,
+                None,
+            ));
+        }
+
+        if !self.is_activated() {
+            return Err(VirtioVsockDeviceNotificationError::Inactive {
+                drained_notifications,
+            });
+        }
+
+        if let Some(queue_index) = drained_notifications
+            .iter()
+            .copied()
+            .find(|queue_index| *queue_index != VIRTIO_VSOCK_TX_QUEUE_INDEX)
+        {
+            return Err(VirtioVsockDeviceNotificationError::UnsupportedQueue {
+                drained_notifications,
+                queue_index,
+            });
+        }
+
+        let dispatch_tx = drained_notifications
+            .iter()
+            .copied()
+            .any(|queue_index| queue_index == VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let tx_queue_dispatch = if dispatch_tx {
+            let Some(queue) = self.active_tx_queue.as_mut() else {
+                return Err(VirtioVsockDeviceNotificationError::Inactive {
+                    drained_notifications,
+                });
+            };
+
+            match queue.dispatch(memory) {
+                Ok(dispatch) => Some(dispatch),
+                Err(source) => {
+                    return Err(VirtioVsockDeviceNotificationError::TxQueueDispatch {
+                        drained_notifications,
+                        source,
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
+        Ok(VirtioVsockDeviceNotificationDispatch::new(
+            drained_notifications,
+            tx_queue_dispatch,
+        ))
+    }
 }
 
 #[derive(Debug)]
@@ -1556,6 +1617,129 @@ impl std::error::Error for VirtioVsockDeviceActivationError {
 impl From<VirtioVsockDeviceActivationError> for VirtioMmioDeviceActivationError {
     fn from(source: VirtioVsockDeviceActivationError) -> Self {
         MmioHandlerError::new(source.to_string()).into()
+    }
+}
+
+#[derive(Debug)]
+pub struct VirtioVsockDeviceNotificationDispatch {
+    drained_notifications: Vec<usize>,
+    tx_queue_dispatch: Option<VirtioVsockTxQueueDispatch>,
+}
+
+impl VirtioVsockDeviceNotificationDispatch {
+    const fn new(
+        drained_notifications: Vec<usize>,
+        tx_queue_dispatch: Option<VirtioVsockTxQueueDispatch>,
+    ) -> Self {
+        Self {
+            drained_notifications,
+            tx_queue_dispatch,
+        }
+    }
+
+    pub fn drained_notifications(&self) -> &[usize] {
+        &self.drained_notifications
+    }
+
+    pub const fn tx_queue_dispatch(&self) -> Option<&VirtioVsockTxQueueDispatch> {
+        self.tx_queue_dispatch.as_ref()
+    }
+
+    pub fn needs_queue_interrupt(&self) -> bool {
+        self.tx_queue_dispatch
+            .as_ref()
+            .is_some_and(VirtioVsockTxQueueDispatch::needs_queue_interrupt)
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioVsockDeviceNotificationError {
+    Inactive {
+        drained_notifications: Vec<usize>,
+    },
+    UnsupportedQueue {
+        drained_notifications: Vec<usize>,
+        queue_index: usize,
+    },
+    TxQueueDispatch {
+        drained_notifications: Vec<usize>,
+        source: VirtioVsockTxQueueDispatchError,
+    },
+}
+
+impl VirtioVsockDeviceNotificationError {
+    pub fn drained_notifications(&self) -> &[usize] {
+        match self {
+            Self::Inactive {
+                drained_notifications,
+            }
+            | Self::UnsupportedQueue {
+                drained_notifications,
+                ..
+            }
+            | Self::TxQueueDispatch {
+                drained_notifications,
+                ..
+            } => drained_notifications,
+        }
+    }
+
+    pub const fn completed_tx_dispatch(&self) -> Option<&VirtioVsockTxQueueDispatch> {
+        match self {
+            Self::TxQueueDispatch { source, .. } => source.completed_dispatch(),
+            Self::Inactive { .. } | Self::UnsupportedQueue { .. } => None,
+        }
+    }
+}
+
+impl fmt::Display for VirtioVsockDeviceNotificationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inactive { .. } => f.write_str(
+                "virtio-vsock queue notification cannot be dispatched before activation",
+            ),
+            Self::UnsupportedQueue { queue_index, .. } => {
+                write!(
+                    f,
+                    "virtio-vsock queue notification for unsupported queue {queue_index}"
+                )
+            }
+            Self::TxQueueDispatch { source, .. } => {
+                write!(f, "failed to dispatch virtio-vsock TX queue: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioVsockDeviceNotificationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::TxQueueDispatch { source, .. } => Some(source),
+            Self::Inactive { .. } | Self::UnsupportedQueue { .. } => None,
+        }
+    }
+}
+
+impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioVsockDevice> {
+    pub fn dispatch_vsock_queue_notifications(
+        &mut self,
+        memory: &mut GuestMemory,
+    ) -> Result<VirtioVsockDeviceNotificationDispatch, VirtioVsockDeviceNotificationError> {
+        let drained_notifications = self.take_pending_queue_notifications();
+        let dispatch = self
+            .activation_handler_mut()
+            .dispatch_drained_queue_notifications(memory, drained_notifications);
+        let needs_queue_interrupt = match &dispatch {
+            Ok(dispatch) => dispatch.needs_queue_interrupt(),
+            Err(error) => error
+                .completed_tx_dispatch()
+                .is_some_and(VirtioVsockTxQueueDispatch::needs_queue_interrupt),
+        };
+        if needs_queue_interrupt {
+            self.mark_interrupt_pending(DeviceInterruptKind::Queue);
+        }
+
+        dispatch
     }
 }
 
@@ -1900,6 +2084,7 @@ mod tests {
     use std::error::Error as _;
     use std::path::Path;
 
+    use crate::interrupt::DeviceInterruptKind;
     use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
     use crate::mmio::{
         MmioAccess, MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioDispatcher, MmioOperation,
@@ -2028,6 +2213,12 @@ mod tests {
             .to_vec()
     }
 
+    fn read_interrupt_status(handler: &VirtioVsockMmioHandler) -> u32 {
+        handler
+            .read_register(VirtioMmioRegister::InterruptStatus)
+            .expect("interrupt status should read")
+    }
+
     fn advance_handler_to_features_ok(handler: &mut VirtioVsockMmioHandler) {
         handler
             .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
@@ -2087,6 +2278,23 @@ mod tests {
                 .write_register(VirtioMmioRegister::QueueReady, 1)
                 .expect("queue ready should write");
         }
+    }
+
+    fn activate_vsock_handler(handler: &mut VirtioVsockMmioHandler) {
+        advance_handler_to_features_ok(handler);
+        configure_vsock_queues(handler);
+        handler
+            .write_register(VirtioMmioRegister::Status, DRIVER_OK_STATUS)
+            .expect("DRIVER_OK should activate vsock device");
+    }
+
+    fn notify_vsock_queue(handler: &mut VirtioVsockMmioHandler, queue_index: usize) {
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                u32::try_from(queue_index).expect("queue index should fit"),
+            )
+            .expect("queue notification should write");
     }
 
     fn configured_vsock_queue_registers(
@@ -3920,6 +4128,350 @@ mod tests {
         assert!(handler.activation_handler().active_rx_queue().is_none());
         assert!(handler.activation_handler().active_tx_queue().is_none());
         assert!(handler.activation_handler().active_event_queue().is_none());
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_without_pending_work_are_noop() {
+        let mut memory = vsock_tx_memory();
+        let mut device = VirtioVsockDevice::new();
+
+        let dispatch = device
+            .dispatch_drained_queue_notifications(&mut memory, Vec::new())
+            .expect("empty notification drain should be a no-op");
+
+        assert_eq!(dispatch.drained_notifications(), &[]);
+        assert!(dispatch.tx_queue_dispatch().is_none());
+        assert!(!dispatch.needs_queue_interrupt());
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_reject_inactive_device_with_drained_metadata() {
+        let mut memory = vsock_tx_memory();
+        let mut device = VirtioVsockDevice::new();
+
+        let error = device
+            .dispatch_drained_queue_notifications(&mut memory, vec![VIRTIO_VSOCK_TX_QUEUE_INDEX])
+            .expect_err("notification before activation should fail");
+
+        assert!(matches!(
+            error,
+            super::VirtioVsockDeviceNotificationError::Inactive { .. }
+        ));
+        assert_eq!(
+            error.drained_notifications(),
+            &[VIRTIO_VSOCK_TX_QUEUE_INDEX]
+        );
+        assert_eq!(
+            error.to_string(),
+            "virtio-vsock queue notification cannot be dispatched before activation"
+        );
+        assert!(error.completed_tx_dispatch().is_none());
+        assert!(error.source().is_none());
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_reject_rx_queue_without_dispatch() {
+        let mut memory = vsock_tx_memory();
+        let mut handler = virtio_vsock_mmio_handler(3).expect("vsock handler should build");
+
+        activate_vsock_handler(&mut handler);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+
+        let error = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect_err("RX notification should be unsupported");
+
+        assert!(matches!(
+            error,
+            super::VirtioVsockDeviceNotificationError::UnsupportedQueue {
+                queue_index: VIRTIO_VSOCK_RX_QUEUE_INDEX,
+                ..
+            }
+        ));
+        assert_eq!(
+            error.drained_notifications(),
+            &[VIRTIO_VSOCK_RX_QUEUE_INDEX]
+        );
+        assert_eq!(
+            error.to_string(),
+            "virtio-vsock queue notification for unsupported queue 0"
+        );
+        assert!(error.completed_tx_dispatch().is_none());
+        assert_eq!(read_interrupt_status(&handler), 0);
+        assert!(handler.pending_queue_notifications().is_empty());
+        let active_tx_queue = handler
+            .activation_handler()
+            .active_tx_dispatch_queue()
+            .expect("TX dispatch queue should remain active");
+        assert_eq!(active_tx_queue.available_ring().next_avail(), 0);
+        assert_eq!(active_tx_queue.used_ring().next_used(), 0);
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_reject_event_queue_without_dispatch() {
+        let mut memory = vsock_tx_memory();
+        let mut handler = virtio_vsock_mmio_handler(3).expect("vsock handler should build");
+
+        activate_vsock_handler(&mut handler);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_EVENT_QUEUE_INDEX);
+
+        let error = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect_err("event notification should be unsupported");
+
+        assert!(matches!(
+            error,
+            super::VirtioVsockDeviceNotificationError::UnsupportedQueue {
+                queue_index: VIRTIO_VSOCK_EVENT_QUEUE_INDEX,
+                ..
+            }
+        ));
+        assert_eq!(
+            error.drained_notifications(),
+            &[VIRTIO_VSOCK_EVENT_QUEUE_INDEX]
+        );
+        assert_eq!(
+            error.to_string(),
+            "virtio-vsock queue notification for unsupported queue 2"
+        );
+        assert!(error.completed_tx_dispatch().is_none());
+        assert_eq!(read_interrupt_status(&handler), 0);
+        assert!(handler.pending_queue_notifications().is_empty());
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_reject_mixed_unsupported_queue_without_tx_dispatch() {
+        let mut memory = vsock_tx_memory();
+        let mut handler = virtio_vsock_mmio_handler(3).expect("vsock handler should build");
+        let header = test_vsock_packet_header().with_payload_len(0);
+
+        activate_vsock_handler(&mut handler);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_HEADER, header);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_tx_available_heads(&mut memory, &[0]);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+
+        let error = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect_err("mixed unsupported notification should reject before TX dispatch");
+
+        assert!(matches!(
+            error,
+            super::VirtioVsockDeviceNotificationError::UnsupportedQueue {
+                queue_index: VIRTIO_VSOCK_RX_QUEUE_INDEX,
+                ..
+            }
+        ));
+        assert_eq!(
+            error.drained_notifications(),
+            &[VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_TX_QUEUE_INDEX]
+        );
+        assert!(error.completed_tx_dispatch().is_none());
+        assert_eq!(read_interrupt_status(&handler), 0);
+        assert!(handler.pending_queue_notifications().is_empty());
+        let active_tx_queue = handler
+            .activation_handler()
+            .active_tx_dispatch_queue()
+            .expect("TX dispatch queue should remain active");
+        assert_eq!(active_tx_queue.available_ring().next_avail(), 0);
+        assert_eq!(active_tx_queue.used_ring().next_used(), 0);
+        assert_eq!(read_vsock_tx_used_index(&memory), 0);
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_dispatch_tx_queue_and_mark_interrupt() {
+        let mut memory = vsock_tx_memory();
+        let mut handler = virtio_vsock_mmio_handler(3).expect("vsock handler should build");
+        let header = test_vsock_packet_header().with_payload_len(4);
+        let payload_address = vsock_payload_address_after_header(TEST_VSOCK_HEADER);
+
+        activate_vsock_handler(&mut handler);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_HEADER, header);
+        write_guest_bytes(&mut memory, payload_address, &[0xa0, 0xa1, 0xa2, 0xa3]);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32 + 4,
+                None,
+            ),
+        );
+        write_vsock_tx_available_heads(&mut memory, &[0]);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("TX queue notification should dispatch");
+
+        assert_eq!(
+            notification.drained_notifications(),
+            &[VIRTIO_VSOCK_TX_QUEUE_INDEX]
+        );
+        assert!(notification.needs_queue_interrupt());
+        let dispatch = notification
+            .tx_queue_dispatch()
+            .expect("TX dispatch summary should be present");
+        assert_eq!(dispatch.processed_packets(), 1);
+        assert_eq!(dispatch.successful_packets(), 1);
+        assert_eq!(dispatch.parse_failures(), 0);
+        assert!(dispatch.needs_queue_interrupt());
+        assert_eq!(dispatch.packets()[0].descriptor_head(), 0);
+        assert_eq!(
+            read_interrupt_status(&handler),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        assert!(handler.pending_queue_notifications().is_empty());
+        let active_tx_queue = handler
+            .activation_handler()
+            .active_tx_dispatch_queue()
+            .expect("TX dispatch queue should remain active");
+        assert_eq!(active_tx_queue.available_ring().next_avail(), 1);
+        assert_eq!(active_tx_queue.used_ring().next_used(), 1);
+        assert_eq!(read_vsock_tx_used_index(&memory), 1);
+        assert_eq!(read_vsock_tx_used_element(&memory, 0), (0, 0));
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_dispatch_empty_tx_queue_without_interrupt() {
+        let mut memory = vsock_tx_memory();
+        let mut handler = virtio_vsock_mmio_handler(3).expect("vsock handler should build");
+
+        activate_vsock_handler(&mut handler);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("empty TX queue notification should dispatch");
+
+        assert_eq!(
+            notification.drained_notifications(),
+            &[VIRTIO_VSOCK_TX_QUEUE_INDEX]
+        );
+        assert!(!notification.needs_queue_interrupt());
+        let dispatch = notification
+            .tx_queue_dispatch()
+            .expect("TX dispatch summary should be present");
+        assert_eq!(dispatch.processed_packets(), 0);
+        assert_eq!(dispatch.successful_packets(), 0);
+        assert_eq!(dispatch.parse_failures(), 0);
+        assert!(!dispatch.needs_queue_interrupt());
+        assert_eq!(read_interrupt_status(&handler), 0);
+        assert!(handler.pending_queue_notifications().is_empty());
+        let active_tx_queue = handler
+            .activation_handler()
+            .active_tx_dispatch_queue()
+            .expect("TX dispatch queue should remain active");
+        assert_eq!(active_tx_queue.available_ring().next_avail(), 0);
+        assert_eq!(active_tx_queue.used_ring().next_used(), 0);
+        assert_eq!(read_vsock_tx_used_index(&memory), 0);
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_complete_malformed_tx_packet_and_mark_interrupt() {
+        let mut memory = vsock_tx_memory();
+        let mut handler = virtio_vsock_mmio_handler(3).expect("vsock handler should build");
+
+        activate_vsock_handler(&mut handler);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32 - 1,
+                None,
+            ),
+        );
+        write_vsock_tx_available_heads(&mut memory, &[0]);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("malformed TX packet notification should dispatch");
+
+        assert!(notification.needs_queue_interrupt());
+        let dispatch = notification
+            .tx_queue_dispatch()
+            .expect("TX dispatch summary should be present");
+        assert_eq!(dispatch.processed_packets(), 1);
+        assert_eq!(dispatch.successful_packets(), 0);
+        assert_eq!(dispatch.parse_failures(), 1);
+        assert!(matches!(
+            dispatch.first_parse_failure(),
+            Some(VirtioVsockTxPacketParseError::HeaderTooShort {
+                descriptor_head: 0,
+                actual: 43,
+                min: VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64,
+            })
+        ));
+        assert_eq!(
+            read_interrupt_status(&handler),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        assert_eq!(read_vsock_tx_used_index(&memory), 1);
+        assert_eq!(read_vsock_tx_used_element(&memory, 0), (0, 0));
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_preserve_partial_tx_error_and_mark_interrupt() {
+        let mut memory = vsock_tx_memory();
+        let mut handler = virtio_vsock_mmio_handler(3).expect("vsock handler should build");
+        let header = test_vsock_packet_header().with_payload_len(0);
+
+        activate_vsock_handler(&mut handler);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_HEADER, header);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_tx_available_heads(&mut memory, &[0, VIRTIO_VSOCK_QUEUE_SIZE]);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let error = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect_err("invalid second TX head should fail after partial dispatch");
+
+        assert!(matches!(
+            error,
+            super::VirtioVsockDeviceNotificationError::TxQueueDispatch { .. }
+        ));
+        assert_eq!(
+            error.drained_notifications(),
+            &[VIRTIO_VSOCK_TX_QUEUE_INDEX]
+        );
+        let completed = error
+            .completed_tx_dispatch()
+            .expect("partial TX dispatch metadata should be preserved");
+        assert_eq!(completed.processed_packets(), 1);
+        assert_eq!(completed.successful_packets(), 1);
+        assert!(completed.needs_queue_interrupt());
+        assert_eq!(
+            read_interrupt_status(&handler),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        assert!(handler.pending_queue_notifications().is_empty());
+        let active_tx_queue = handler
+            .activation_handler()
+            .active_tx_dispatch_queue()
+            .expect("TX dispatch queue should remain active");
+        assert_eq!(active_tx_queue.available_ring().next_avail(), 1);
+        assert_eq!(active_tx_queue.used_ring().next_used(), 1);
+        assert_eq!(read_vsock_tx_used_index(&memory), 1);
+        assert_eq!(read_vsock_tx_used_element(&memory, 0), (0, 0));
     }
 
     #[test]
