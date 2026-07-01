@@ -532,8 +532,12 @@ host device names, and MAC strings.
 
 The internal model rejects configured `mtu`, `rx_rate_limiter`, and
 `tx_rate_limiter` fields as unsupported. It does not open host networking
-resources or choose a macOS packet backend. Stored network interface configs are
-returned from `GET /vm/config` in the `network-interfaces` array.
+resources. Stored network interface configs are returned from `GET /vm/config`
+in the `network-interfaces` array. For future macOS vmnet startup, the process
+crate has an internal mapping boundary that interprets `host_dev_name` values
+`vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>` as vmnet host,
+shared, and bridged configurations. That mapping is not applied by the public
+API storage path yet, so other nonempty names are still accepted before boot.
 
 ## Internal Vsock Configuration
 
@@ -591,12 +595,15 @@ backend start/stop ownership, packet `iovec` layout, single-packet system
 `vmnet_read`/`vmnet_write` wrappers, count validation, owned cleanup models,
 an internal virtio-net packet I/O adapter that copies TX guest-memory payload
 segments into vmnet writes and caches one vmnet RX packet until consumed, and a
-prebuilt adapter provider keyed by configured interface ID. These boundaries
-are not connected to the default process provider.
+prebuilt adapter provider keyed by configured interface ID. It also defines an
+internal `host_dev_name` mapping for `vmnet:host`, `vmnet:shared`, and
+`vmnet:bridged:<interface>`. These boundaries are not connected to the default
+process provider.
 The default process provider uses a no-op TX sink and an empty RX source, so
 current boot sessions still do not open host networking resources or provide
 user-visible packet ingress or egress. These helpers do not advertise MTU,
-choose a live host packet backend, or connect packets to the host network.
+choose a live host packet backend during startup, or connect packets to the host
+network.
 
 The runtime crate can prepare owned internal block-device resources from a
 validated list of stored drive configs. Preparation opens each backing file,

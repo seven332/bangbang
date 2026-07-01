@@ -25,6 +25,10 @@ pub const VMNET_TOO_MANY_PACKETS_VALUE: u32 = 1008;
 pub const VMNET_SHARING_SERVICE_BUSY_VALUE: u32 = 1009;
 pub const VMNET_NOT_AUTHORIZED_VALUE: u32 = 1010;
 
+pub const VMNET_HOST_DEVICE_NAME_HOST: &str = "vmnet:host";
+pub const VMNET_HOST_DEVICE_NAME_SHARED: &str = "vmnet:shared";
+pub const VMNET_HOST_DEVICE_NAME_BRIDGED_PREFIX: &str = "vmnet:bridged:";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmnetMode {
     Host,
@@ -198,6 +202,18 @@ impl VmnetInterfaceConfig {
         }
     }
 
+    pub fn from_host_dev_name(host_dev_name: &str) -> Result<Self, VmnetHostDeviceNameConfigError> {
+        match host_dev_name {
+            VMNET_HOST_DEVICE_NAME_HOST => Ok(Self::host()),
+            VMNET_HOST_DEVICE_NAME_SHARED => Ok(Self::shared()),
+            name => match name.strip_prefix(VMNET_HOST_DEVICE_NAME_BRIDGED_PREFIX) {
+                Some(interface_name) => Self::bridged(interface_name)
+                    .map_err(|source| VmnetHostDeviceNameConfigError::BridgedInterface { source }),
+                None => Err(VmnetHostDeviceNameConfigError::UnsupportedHostDeviceName),
+            },
+        }
+    }
+
     pub fn bridged(interface_name: impl Into<String>) -> Result<Self, VmnetInterfaceConfigError> {
         let interface_name = interface_name.into();
         if interface_name.is_empty() {
@@ -219,6 +235,34 @@ impl VmnetInterfaceConfig {
 
     pub fn bridged_interface_name(&self) -> Option<&str> {
         self.bridged_interface_name.as_deref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VmnetHostDeviceNameConfigError {
+    UnsupportedHostDeviceName,
+    BridgedInterface { source: VmnetInterfaceConfigError },
+}
+
+impl fmt::Display for VmnetHostDeviceNameConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedHostDeviceName => f.write_str(
+                "unsupported vmnet host_dev_name; expected vmnet:host, vmnet:shared, or vmnet:bridged:<interface>",
+            ),
+            Self::BridgedInterface { source } => {
+                write!(f, "invalid vmnet bridged host_dev_name: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VmnetHostDeviceNameConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::UnsupportedHostDeviceName => None,
+            Self::BridgedInterface { source } => Some(source),
+        }
     }
 }
 
@@ -1180,12 +1224,12 @@ mod tests {
 
     use super::{
         OwnedVmnetInterface, StartedVmnetInterface, VMNET_BRIDGED_MODE_VALUE,
-        VMNET_HOST_MODE_VALUE, VMNET_SHARED_MODE_VALUE, VmnetError, VmnetInterfaceBackend,
-        VmnetInterfaceConfig, VmnetInterfaceConfigError, VmnetInterfaceDescriptor,
-        VmnetInterfaceDescriptorError, VmnetInterfaceLifecycle, VmnetInterfaceStartError,
-        VmnetMode, VmnetOperation, VmnetPacketCountExpectation, VmnetPacketDescriptor,
-        VmnetPacketDescriptorError, VmnetPacketIoBackend, VmnetPacketIoError, VmnetReadPacket,
-        VmnetStatus, VmnetSystemApi, VmnetWritePacket,
+        VMNET_HOST_MODE_VALUE, VMNET_SHARED_MODE_VALUE, VmnetError, VmnetHostDeviceNameConfigError,
+        VmnetInterfaceBackend, VmnetInterfaceConfig, VmnetInterfaceConfigError,
+        VmnetInterfaceDescriptor, VmnetInterfaceDescriptorError, VmnetInterfaceLifecycle,
+        VmnetInterfaceStartError, VmnetMode, VmnetOperation, VmnetPacketCountExpectation,
+        VmnetPacketDescriptor, VmnetPacketDescriptorError, VmnetPacketIoBackend,
+        VmnetPacketIoError, VmnetReadPacket, VmnetStatus, VmnetSystemApi, VmnetWritePacket,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2246,6 +2290,89 @@ mod tests {
         assert_eq!(shared.bridged_interface_name(), None);
         assert_eq!(bridged.mode(), VmnetMode::Bridged);
         assert_eq!(bridged.bridged_interface_name(), Some("en0"));
+    }
+
+    #[test]
+    fn vmnet_host_dev_name_maps_host_mode() {
+        let config = VmnetInterfaceConfig::from_host_dev_name("vmnet:host")
+            .expect("host host_dev_name should map");
+
+        assert_eq!(config.mode(), VmnetMode::Host);
+        assert_eq!(config.bridged_interface_name(), None);
+    }
+
+    #[test]
+    fn vmnet_host_dev_name_maps_shared_mode() {
+        let config = VmnetInterfaceConfig::from_host_dev_name("vmnet:shared")
+            .expect("shared host_dev_name should map");
+
+        assert_eq!(config.mode(), VmnetMode::Shared);
+        assert_eq!(config.bridged_interface_name(), None);
+    }
+
+    #[test]
+    fn vmnet_host_dev_name_maps_bridged_mode() {
+        let config = VmnetInterfaceConfig::from_host_dev_name("vmnet:bridged:en0")
+            .expect("bridged host_dev_name should map");
+
+        assert_eq!(config.mode(), VmnetMode::Bridged);
+        assert_eq!(config.bridged_interface_name(), Some("en0"));
+    }
+
+    #[test]
+    fn vmnet_host_dev_name_rejects_unsupported_bare_name() {
+        let error = VmnetInterfaceConfig::from_host_dev_name("tap0")
+            .expect_err("bare host_dev_name should be rejected by vmnet mapping");
+
+        assert_eq!(
+            error,
+            VmnetHostDeviceNameConfigError::UnsupportedHostDeviceName
+        );
+        assert!(error.source().is_none());
+        assert_eq!(
+            error.to_string(),
+            "unsupported vmnet host_dev_name; expected vmnet:host, vmnet:shared, or vmnet:bridged:<interface>"
+        );
+    }
+
+    #[test]
+    fn vmnet_host_dev_name_rejects_empty_bridged_interface() {
+        let error = VmnetInterfaceConfig::from_host_dev_name("vmnet:bridged:")
+            .expect_err("empty bridged interface should be rejected");
+
+        assert_eq!(
+            error,
+            VmnetHostDeviceNameConfigError::BridgedInterface {
+                source: VmnetInterfaceConfigError::EmptyBridgedInterfaceName
+            }
+        );
+        assert_eq!(
+            error
+                .source()
+                .expect("bridged error should expose source")
+                .to_string(),
+            "vmnet bridged interface name must not be empty"
+        );
+    }
+
+    #[test]
+    fn vmnet_host_dev_name_rejects_interior_nul_bridged_interface() {
+        let error = VmnetInterfaceConfig::from_host_dev_name("vmnet:bridged:en\0")
+            .expect_err("interior NUL bridged interface should be rejected");
+
+        assert_eq!(
+            error,
+            VmnetHostDeviceNameConfigError::BridgedInterface {
+                source: VmnetInterfaceConfigError::InteriorNulInBridgedInterfaceName
+            }
+        );
+        assert_eq!(
+            error
+                .source()
+                .expect("bridged error should expose source")
+                .to_string(),
+            "vmnet bridged interface name must not contain NUL bytes"
+        );
     }
 
     #[test]
