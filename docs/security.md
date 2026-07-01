@@ -157,12 +157,13 @@ The current scaffold does not implement:
   pass validated TX frame payloads to injected packet I/O selected per configured
   interface, and can copy injected RX packet bytes into validated guest RX
   buffers through the same boundary. On macOS, the process crate has internal
-  vmnet descriptor, lifecycle, start owner, and packet descriptor boundaries for
-  future host networking, but it is not connected to process startup and does
-  not include a concrete system vmnet backend or call `vmnet_start_interface`,
-  `vmnet_stop_interface`, `vmnet_read`, or `vmnet_write`. The default provider
-  is a no-op TX sink plus an empty RX source and bangbang still does not open
-  host networking resources. The current vsock API path validates and stores
+  vmnet descriptor, lifecycle, start owner, concrete system start/stop backend,
+  and packet descriptor boundaries for future host networking, but that backend
+  is not connected to process startup and bangbang startup does not call
+  `vmnet_start_interface`, `vmnet_stop_interface`, `vmnet_read`, or
+  `vmnet_write`. The default provider is a no-op TX sink plus an empty RX source
+  and bangbang still does not open host networking resources. The current vsock
+  API path validates and stores
   `guest_cid` plus `uds_path` before boot, but it does not implement a
   virtio-vsock device or host Unix socket backend
 - complete production logging or metrics policy

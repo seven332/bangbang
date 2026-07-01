@@ -4,6 +4,10 @@ use std::ffi::{CString, c_char, c_void};
 use std::fmt;
 use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
+use std::sync::mpsc;
+
+use block2::{Block, RcBlock};
+use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
 
 pub const VMNET_HOST_MODE_VALUE: u32 = 1000;
 pub const VMNET_SHARED_MODE_VALUE: u32 = 1001;
@@ -559,6 +563,27 @@ mod xpc {
     }
 }
 
+mod vmnet_sys {
+    use std::ffi::c_void;
+
+    use block2::Block;
+    use dispatch2::DispatchQueue;
+
+    #[link(name = "vmnet", kind = "framework")]
+    unsafe extern "C" {
+        pub fn vmnet_start_interface(
+            interface_desc: *mut c_void,
+            queue: &DispatchQueue,
+            handler: &Block<dyn Fn(u32, *mut c_void)>,
+        ) -> *mut c_void;
+        pub fn vmnet_stop_interface(
+            interface: *mut c_void,
+            queue: &DispatchQueue,
+            handler: &Block<dyn Fn(u32)>,
+        ) -> u32;
+    }
+}
+
 pub trait VmnetInterfaceBackend: fmt::Debug + Send + 'static {
     type Interface: fmt::Debug + Send + 'static;
 
@@ -575,6 +600,204 @@ pub trait VmnetInterfaceBackend: fmt::Debug + Send + 'static {
     ) -> Result<Self::Interface, VmnetError>;
 
     fn stop_interface(&mut self, interface: &mut Self::Interface) -> Result<(), VmnetError>;
+}
+
+trait VmnetSystemApi: fmt::Debug + Send + 'static {
+    fn start_interface(
+        &mut self,
+        descriptor: &VmnetInterfaceDescriptor,
+        queue: &DispatchQueue,
+        completion: &Block<dyn Fn(u32, *mut c_void)>,
+    ) -> Option<NonNull<c_void>>;
+
+    fn stop_interface(
+        &mut self,
+        interface: NonNull<c_void>,
+        queue: &DispatchQueue,
+        completion: &Block<dyn Fn(u32)>,
+    ) -> VmnetStatus;
+}
+
+#[derive(Debug, Default)]
+struct SystemVmnetApi;
+
+impl VmnetSystemApi for SystemVmnetApi {
+    fn start_interface(
+        &mut self,
+        descriptor: &VmnetInterfaceDescriptor,
+        queue: &DispatchQueue,
+        completion: &Block<dyn Fn(u32, *mut c_void)>,
+    ) -> Option<NonNull<c_void>> {
+        // SAFETY: `descriptor` owns a live XPC dictionary, `queue` is a live
+        // dispatch queue, and `completion` is a valid Objective-C block. The
+        // vmnet async completion API owns any later callback use by copying the
+        // block before returning.
+        let interface = unsafe {
+            vmnet_sys::vmnet_start_interface(descriptor.as_raw_xpc_object(), queue, completion)
+        };
+
+        NonNull::new(interface)
+    }
+
+    fn stop_interface(
+        &mut self,
+        interface: NonNull<c_void>,
+        queue: &DispatchQueue,
+        completion: &Block<dyn Fn(u32)>,
+    ) -> VmnetStatus {
+        // SAFETY: `interface` is an opaque handle returned by
+        // `vmnet_start_interface`, `queue` is a live dispatch queue, and
+        // `completion` is a valid Objective-C block. The vmnet async completion
+        // API owns any later callback use by copying the block before returning.
+        let status =
+            unsafe { vmnet_sys::vmnet_stop_interface(interface.as_ptr(), queue, completion) };
+
+        VmnetStatus::from_raw(status)
+    }
+}
+
+#[derive(Debug)]
+pub struct SystemVmnetInterface {
+    interface: NonNull<c_void>,
+}
+
+// SAFETY: `interface` is an opaque vmnet.framework handle. Moving the owner
+// between threads does not dereference it, and lifecycle operations still go
+// through vmnet.framework with an explicit dispatch queue.
+unsafe impl Send for SystemVmnetInterface {}
+
+impl SystemVmnetInterface {
+    const fn new(interface: NonNull<c_void>) -> Self {
+        Self { interface }
+    }
+
+    pub const fn as_raw_interface(&self) -> NonNull<c_void> {
+        self.interface
+    }
+}
+
+#[derive(Debug)]
+pub struct SystemVmnetInterfaceBackend {
+    inner: SystemVmnetInterfaceBackendWithApi<SystemVmnetApi>,
+}
+
+impl Default for SystemVmnetInterfaceBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SystemVmnetInterfaceBackend {
+    pub fn new() -> Self {
+        Self {
+            inner: SystemVmnetInterfaceBackendWithApi::with_api(SystemVmnetApi),
+        }
+    }
+}
+
+impl VmnetInterfaceBackend for SystemVmnetInterfaceBackend {
+    type Interface = SystemVmnetInterface;
+
+    fn start_interface(
+        &mut self,
+        descriptor: &VmnetInterfaceDescriptor,
+    ) -> Result<Self::Interface, VmnetError> {
+        self.inner.start_interface(descriptor)
+    }
+
+    fn stop_interface(&mut self, interface: &mut Self::Interface) -> Result<(), VmnetError> {
+        self.inner.stop_interface(interface)
+    }
+}
+
+#[derive(Debug)]
+struct SystemVmnetInterfaceBackendWithApi<A> {
+    api: A,
+    queue: DispatchRetained<DispatchQueue>,
+}
+
+impl<A> SystemVmnetInterfaceBackendWithApi<A> {
+    fn with_api(api: A) -> Self {
+        Self {
+            api,
+            queue: DispatchQueue::new(
+                "com.github.seven332.bangbang.vmnet",
+                DispatchQueueAttr::SERIAL,
+            ),
+        }
+    }
+}
+
+impl<A> VmnetInterfaceBackend for SystemVmnetInterfaceBackendWithApi<A>
+where
+    A: VmnetSystemApi,
+{
+    type Interface = SystemVmnetInterface;
+
+    fn start_interface(
+        &mut self,
+        descriptor: &VmnetInterfaceDescriptor,
+    ) -> Result<Self::Interface, VmnetError> {
+        let (sender, receiver) = mpsc::channel();
+        let completion = RcBlock::new(move |status: u32, _interface_param: *mut c_void| {
+            let _ = sender.send(VmnetStatus::from_raw(status));
+        });
+        let Some(interface) = self
+            .api
+            .start_interface(descriptor, &self.queue, &completion)
+        else {
+            let status = receiver.try_recv().unwrap_or(VmnetStatus::Failure);
+            let status = if status == VmnetStatus::Success {
+                VmnetStatus::Failure
+            } else {
+                status
+            };
+
+            return Err(VmnetError::new(VmnetOperation::StartInterface, status));
+        };
+        let status = wait_for_vmnet_completion(receiver, VmnetOperation::StartInterface)?;
+        if status == VmnetStatus::Success {
+            return Ok(SystemVmnetInterface::new(interface));
+        }
+
+        let mut interface = SystemVmnetInterface::new(interface);
+        match self.stop_interface(&mut interface) {
+            Ok(()) | Err(_) => {}
+        }
+        Err(VmnetError::new(VmnetOperation::StartInterface, status))
+    }
+
+    fn stop_interface(&mut self, interface: &mut Self::Interface) -> Result<(), VmnetError> {
+        let (sender, receiver) = mpsc::channel();
+        let completion = RcBlock::new(move |status: u32| {
+            let _ = sender.send(VmnetStatus::from_raw(status));
+        });
+        let schedule_status =
+            self.api
+                .stop_interface(interface.as_raw_interface(), &self.queue, &completion);
+        if schedule_status != VmnetStatus::Success {
+            return Err(VmnetError::new(
+                VmnetOperation::StopInterface,
+                schedule_status,
+            ));
+        }
+
+        let status = wait_for_vmnet_completion(receiver, VmnetOperation::StopInterface)?;
+        if status == VmnetStatus::Success {
+            Ok(())
+        } else {
+            Err(VmnetError::new(VmnetOperation::StopInterface, status))
+        }
+    }
+}
+
+fn wait_for_vmnet_completion(
+    receiver: mpsc::Receiver<VmnetStatus>,
+    operation: VmnetOperation,
+) -> Result<VmnetStatus, VmnetError> {
+    receiver
+        .recv()
+        .map_err(|_| VmnetError::new(operation, VmnetStatus::Failure))
 }
 
 #[derive(Debug)]
@@ -694,9 +917,13 @@ where
 mod tests {
     use std::collections::VecDeque;
     use std::error::Error;
-    use std::ffi::CStr;
+    use std::ffi::{CStr, c_void};
     use std::mem::{align_of, offset_of, size_of};
+    use std::ptr::{self, NonNull};
     use std::sync::{Arc, Mutex};
+
+    use block2::Block;
+    use dispatch2::DispatchQueue;
 
     use super::{
         OwnedVmnetInterface, StartedVmnetInterface, VMNET_BRIDGED_MODE_VALUE,
@@ -704,7 +931,7 @@ mod tests {
         VmnetInterfaceConfig, VmnetInterfaceConfigError, VmnetInterfaceDescriptor,
         VmnetInterfaceDescriptorError, VmnetInterfaceLifecycle, VmnetInterfaceStartError,
         VmnetMode, VmnetOperation, VmnetPacketDescriptor, VmnetPacketDescriptorError,
-        VmnetReadPacket, VmnetStatus, VmnetWritePacket,
+        VmnetReadPacket, VmnetStatus, VmnetSystemApi, VmnetWritePacket,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -846,6 +1073,93 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct RecordingVmnetSystemApi {
+        events: Arc<Mutex<Vec<String>>>,
+        start_handle: Option<usize>,
+        start_completion: VmnetStatus,
+        stop_schedule_statuses: VecDeque<VmnetStatus>,
+        stop_completion_statuses: VecDeque<VmnetStatus>,
+    }
+
+    impl RecordingVmnetSystemApi {
+        fn new() -> Self {
+            Self {
+                events: Arc::new(Mutex::new(Vec::new())),
+                start_handle: Some(0x10),
+                start_completion: VmnetStatus::Success,
+                stop_schedule_statuses: VecDeque::new(),
+                stop_completion_statuses: VecDeque::new(),
+            }
+        }
+
+        fn with_null_start_handle(mut self) -> Self {
+            self.start_handle = None;
+            self
+        }
+
+        fn with_start_completion(mut self, status: VmnetStatus) -> Self {
+            self.start_completion = status;
+            self
+        }
+
+        fn with_stop_schedule_status(mut self, status: VmnetStatus) -> Self {
+            self.stop_schedule_statuses.push_back(status);
+            self
+        }
+
+        fn with_stop_completion_status(mut self, status: VmnetStatus) -> Self {
+            self.stop_completion_statuses.push_back(status);
+            self
+        }
+
+        fn events(&self) -> Arc<Mutex<Vec<String>>> {
+            Arc::clone(&self.events)
+        }
+    }
+
+    impl VmnetSystemApi for RecordingVmnetSystemApi {
+        fn start_interface(
+            &mut self,
+            descriptor: &VmnetInterfaceDescriptor,
+            _queue: &DispatchQueue,
+            completion: &Block<dyn Fn(u32, *mut c_void)>,
+        ) -> Option<NonNull<c_void>> {
+            push_event(
+                &self.events,
+                format!("system-start:{}", descriptor_mode(descriptor)),
+            );
+            completion.call((self.start_completion.raw_value(), ptr::null_mut()));
+
+            self.start_handle.map(fake_interface)
+        }
+
+        fn stop_interface(
+            &mut self,
+            interface: NonNull<c_void>,
+            _queue: &DispatchQueue,
+            completion: &Block<dyn Fn(u32)>,
+        ) -> VmnetStatus {
+            push_event(
+                &self.events,
+                format!("system-stop:{:x}", interface.as_ptr() as usize),
+            );
+            let schedule_status = self
+                .stop_schedule_statuses
+                .pop_front()
+                .unwrap_or(VmnetStatus::Success);
+            if schedule_status == VmnetStatus::Success {
+                let completion_status = self
+                    .stop_completion_statuses
+                    .pop_front()
+                    .unwrap_or(VmnetStatus::Success);
+                completion.call((completion_status.raw_value(),));
+            }
+
+            schedule_status
+        }
+    }
+
     fn push_event(events: &Arc<Mutex<Vec<String>>>, event: String) {
         match events.lock() {
             Ok(mut guard) => guard.push(event),
@@ -858,6 +1172,10 @@ mod tests {
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         }
+    }
+
+    fn fake_interface(handle: usize) -> NonNull<c_void> {
+        NonNull::new(handle as *mut c_void).expect("fake vmnet interface handle must be non-null")
     }
 
     fn descriptor_mode(descriptor: &VmnetInterfaceDescriptor) -> u64 {
@@ -1194,6 +1512,196 @@ mod tests {
                 format!("start:{}", u64::from(VMNET_SHARED_MODE_VALUE)),
                 "stop:9".to_string(),
                 "stop:9".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn system_vmnet_backend_starts_and_stops_interface() {
+        let api = RecordingVmnetSystemApi::new();
+        let event_log = api.events();
+        let config = VmnetInterfaceConfig::shared();
+        let backend = super::SystemVmnetInterfaceBackendWithApi::with_api(api);
+        let mut interface = StartedVmnetInterface::start(backend, &config)
+            .expect("system vmnet interface should start");
+
+        assert!(interface.is_started());
+        interface
+            .stop()
+            .expect("system vmnet interface should stop");
+        assert!(!interface.is_started());
+        interface
+            .stop()
+            .expect("second system stop should be a no-op");
+
+        assert_eq!(
+            recorded_events(&event_log),
+            [
+                format!("system-start:{}", u64::from(VMNET_SHARED_MODE_VALUE)),
+                "system-stop:10".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn system_vmnet_backend_cleans_up_after_start_completion_failure() {
+        let api = RecordingVmnetSystemApi::new().with_start_completion(VmnetStatus::InvalidAccess);
+        let event_log = api.events();
+        let config = VmnetInterfaceConfig::host();
+        let backend = super::SystemVmnetInterfaceBackendWithApi::with_api(api);
+        let error = StartedVmnetInterface::start(backend, &config)
+            .expect_err("system start completion failure should prevent ownership");
+
+        match error {
+            VmnetInterfaceStartError::Start { source } => {
+                assert_eq!(source.operation(), VmnetOperation::StartInterface);
+                assert_eq!(source.status(), VmnetStatus::InvalidAccess);
+            }
+            VmnetInterfaceStartError::Descriptor { .. } => {
+                panic!("system start failure should not be reported as a descriptor error");
+            }
+        }
+        assert_eq!(
+            recorded_events(&event_log),
+            [
+                format!("system-start:{}", u64::from(VMNET_HOST_MODE_VALUE)),
+                "system-stop:10".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn system_vmnet_backend_rejects_null_start_handle() {
+        let api = RecordingVmnetSystemApi::new()
+            .with_null_start_handle()
+            .with_start_completion(VmnetStatus::NotAuthorized);
+        let event_log = api.events();
+        let config = VmnetInterfaceConfig::host();
+        let backend = super::SystemVmnetInterfaceBackendWithApi::with_api(api);
+        let error = StartedVmnetInterface::start(backend, &config)
+            .expect_err("null vmnet start handle should prevent ownership");
+
+        match error {
+            VmnetInterfaceStartError::Start { source } => {
+                assert_eq!(source.operation(), VmnetOperation::StartInterface);
+                assert_eq!(source.status(), VmnetStatus::NotAuthorized);
+            }
+            VmnetInterfaceStartError::Descriptor { .. } => {
+                panic!("null start handle should not be reported as a descriptor error");
+            }
+        }
+        assert_eq!(
+            recorded_events(&event_log),
+            [format!("system-start:{}", u64::from(VMNET_HOST_MODE_VALUE))]
+        );
+    }
+
+    #[test]
+    fn system_vmnet_backend_maps_successful_null_start_handle_to_failure() {
+        let api = RecordingVmnetSystemApi::new().with_null_start_handle();
+        let event_log = api.events();
+        let config = VmnetInterfaceConfig::shared();
+        let backend = super::SystemVmnetInterfaceBackendWithApi::with_api(api);
+        let error = StartedVmnetInterface::start(backend, &config)
+            .expect_err("null vmnet start handle should fail even with success completion");
+
+        match error {
+            VmnetInterfaceStartError::Start { source } => {
+                assert_eq!(source.operation(), VmnetOperation::StartInterface);
+                assert_eq!(source.status(), VmnetStatus::Failure);
+            }
+            VmnetInterfaceStartError::Descriptor { .. } => {
+                panic!("null start handle should not be reported as a descriptor error");
+            }
+        }
+        assert_eq!(
+            recorded_events(&event_log),
+            [format!(
+                "system-start:{}",
+                u64::from(VMNET_SHARED_MODE_VALUE)
+            )]
+        );
+    }
+
+    #[test]
+    fn system_vmnet_backend_failed_stop_schedule_keeps_interface_for_retry() {
+        let api =
+            RecordingVmnetSystemApi::new().with_stop_schedule_status(VmnetStatus::SetupIncomplete);
+        let event_log = api.events();
+        let config = VmnetInterfaceConfig::host();
+        let backend = super::SystemVmnetInterfaceBackendWithApi::with_api(api);
+        let mut interface = StartedVmnetInterface::start(backend, &config)
+            .expect("system vmnet interface should start");
+        let error = interface
+            .stop()
+            .expect_err("failed system stop schedule should return an error");
+
+        assert_eq!(error.operation(), VmnetOperation::StopInterface);
+        assert_eq!(error.status(), VmnetStatus::SetupIncomplete);
+        assert!(interface.is_started());
+
+        interface
+            .stop()
+            .expect("second system stop should retry and succeed");
+        assert!(!interface.is_started());
+        assert_eq!(
+            recorded_events(&event_log),
+            [
+                format!("system-start:{}", u64::from(VMNET_HOST_MODE_VALUE)),
+                "system-stop:10".to_string(),
+                "system-stop:10".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn system_vmnet_backend_failed_stop_completion_keeps_interface_for_retry() {
+        let api = RecordingVmnetSystemApi::new()
+            .with_stop_completion_status(VmnetStatus::SharingServiceBusy);
+        let event_log = api.events();
+        let config = VmnetInterfaceConfig::shared();
+        let backend = super::SystemVmnetInterfaceBackendWithApi::with_api(api);
+        let mut interface = StartedVmnetInterface::start(backend, &config)
+            .expect("system vmnet interface should start");
+        let error = interface
+            .stop()
+            .expect_err("failed system stop completion should return an error");
+
+        assert_eq!(error.operation(), VmnetOperation::StopInterface);
+        assert_eq!(error.status(), VmnetStatus::SharingServiceBusy);
+        assert!(interface.is_started());
+
+        interface
+            .stop()
+            .expect("second system stop should retry and succeed");
+        assert!(!interface.is_started());
+        assert_eq!(
+            recorded_events(&event_log),
+            [
+                format!("system-start:{}", u64::from(VMNET_SHARED_MODE_VALUE)),
+                "system-stop:10".to_string(),
+                "system-stop:10".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn system_vmnet_backend_drop_stops_started_interface() {
+        let api = RecordingVmnetSystemApi::new();
+        let event_log = api.events();
+        let config = VmnetInterfaceConfig::shared();
+
+        {
+            let backend = super::SystemVmnetInterfaceBackendWithApi::with_api(api);
+            let _interface = StartedVmnetInterface::start(backend, &config)
+                .expect("system vmnet interface should start");
+        }
+
+        assert_eq!(
+            recorded_events(&event_log),
+            [
+                format!("system-start:{}", u64::from(VMNET_SHARED_MODE_VALUE)),
+                "system-stop:10".to_string(),
             ]
         );
     }
