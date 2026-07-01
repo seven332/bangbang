@@ -16,7 +16,10 @@ use crate::virtio_mmio::{
     VirtioMmioDeviceConfigHandler, VirtioMmioQueueRegisterError, VirtioMmioQueueState,
     VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
 };
-use crate::virtio_queue::{VirtqueueDescriptor, VirtqueueDescriptorChain};
+use crate::virtio_queue::{
+    VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
+    VirtqueueDescriptorChain,
+};
 
 pub const MIN_GUEST_CID: u32 = 3;
 pub const VIRTIO_VSOCK_DEVICE_ID: u32 = 19;
@@ -1050,9 +1053,10 @@ impl VirtioVsockRxQueue {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtioVsockTxQueue {
     queue_state: VirtioMmioQueueState,
+    available: VirtqueueAvailableRing,
 }
 
 impl VirtioVsockTxQueue {
@@ -1060,11 +1064,190 @@ impl VirtioVsockTxQueue {
         queue: VirtioMmioQueueState,
     ) -> Result<Self, VirtioVsockQueueBuildError> {
         validate_active_vsock_queue(queue)?;
-        Ok(Self { queue_state: queue })
+        let available = VirtqueueAvailableRing::new(
+            queue.descriptor_table(),
+            queue.driver_ring(),
+            queue.size(),
+        )
+        .map_err(|source| VirtioVsockQueueBuildError::AvailableRing { source })?;
+
+        Ok(Self {
+            queue_state: queue,
+            available,
+        })
     }
 
-    pub const fn queue_state(self) -> VirtioMmioQueueState {
+    pub const fn queue_state(&self) -> VirtioMmioQueueState {
         self.queue_state
+    }
+
+    pub const fn available_ring(&self) -> &VirtqueueAvailableRing {
+        &self.available
+    }
+
+    pub fn dispatch(
+        &mut self,
+        memory: &GuestMemory,
+    ) -> Result<VirtioVsockTxQueueDispatch, VirtioVsockTxQueueDispatchError> {
+        let mut dispatch = VirtioVsockTxQueueDispatch::with_capacity(self.available.queue_size())?;
+        while let Some(chain) = match self.available.pop_descriptor_chain(memory) {
+            Ok(chain) => chain,
+            Err(source) => {
+                return Err(VirtioVsockTxQueueDispatchError::AvailableRing {
+                    completed_dispatch: Box::new(dispatch),
+                    source,
+                });
+            }
+        } {
+            if chain.is_empty() {
+                return Err(VirtioVsockTxQueueDispatchError::EmptyDescriptorChain {
+                    completed_dispatch: Box::new(dispatch),
+                });
+            }
+
+            match VirtioVsockTxPacket::parse(memory, &chain) {
+                Ok(packet) => dispatch.record(VirtioVsockTxQueueDispatchOutcome::Ok(packet)),
+                Err(source) => {
+                    dispatch.record(VirtioVsockTxQueueDispatchOutcome::ParseError(source));
+                }
+            }
+        }
+
+        Ok(dispatch)
+    }
+}
+
+#[derive(Debug)]
+pub struct VirtioVsockTxQueueDispatch {
+    processed_packets: usize,
+    successful_packets: usize,
+    parse_failures: usize,
+    packets: Vec<VirtioVsockTxPacket>,
+    first_parse_failure: Option<VirtioVsockTxPacketParseError>,
+}
+
+impl VirtioVsockTxQueueDispatch {
+    fn with_capacity(queue_size: u16) -> Result<Self, VirtioVsockTxQueueDispatchError> {
+        let mut packets = Vec::new();
+        packets
+            .try_reserve_exact(usize::from(queue_size))
+            .map_err(
+                |source| VirtioVsockTxQueueDispatchError::PacketMetadataAllocation { source },
+            )?;
+
+        Ok(Self {
+            processed_packets: 0,
+            successful_packets: 0,
+            parse_failures: 0,
+            packets,
+            first_parse_failure: None,
+        })
+    }
+
+    pub const fn processed_packets(&self) -> usize {
+        self.processed_packets
+    }
+
+    pub const fn successful_packets(&self) -> usize {
+        self.successful_packets
+    }
+
+    pub const fn parse_failures(&self) -> usize {
+        self.parse_failures
+    }
+
+    pub fn packets(&self) -> &[VirtioVsockTxPacket] {
+        &self.packets
+    }
+
+    pub const fn first_parse_failure(&self) -> Option<&VirtioVsockTxPacketParseError> {
+        self.first_parse_failure.as_ref()
+    }
+
+    pub const fn needs_queue_interrupt(&self) -> bool {
+        false
+    }
+
+    fn record(&mut self, outcome: VirtioVsockTxQueueDispatchOutcome) {
+        self.processed_packets += 1;
+        match outcome {
+            VirtioVsockTxQueueDispatchOutcome::Ok(packet) => {
+                self.successful_packets += 1;
+                self.packets.push(packet);
+            }
+            VirtioVsockTxQueueDispatchOutcome::ParseError(source) => {
+                self.parse_failures += 1;
+                if self.first_parse_failure.is_none() {
+                    self.first_parse_failure = Some(source);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum VirtioVsockTxQueueDispatchOutcome {
+    Ok(VirtioVsockTxPacket),
+    ParseError(VirtioVsockTxPacketParseError),
+}
+
+#[derive(Debug)]
+pub enum VirtioVsockTxQueueDispatchError {
+    PacketMetadataAllocation {
+        source: std::collections::TryReserveError,
+    },
+    AvailableRing {
+        completed_dispatch: Box<VirtioVsockTxQueueDispatch>,
+        source: VirtqueueAvailableRingError,
+    },
+    EmptyDescriptorChain {
+        completed_dispatch: Box<VirtioVsockTxQueueDispatch>,
+    },
+}
+
+impl VirtioVsockTxQueueDispatchError {
+    pub const fn completed_dispatch(&self) -> Option<&VirtioVsockTxQueueDispatch> {
+        match self {
+            Self::AvailableRing {
+                completed_dispatch, ..
+            }
+            | Self::EmptyDescriptorChain {
+                completed_dispatch, ..
+            } => Some(completed_dispatch),
+            Self::PacketMetadataAllocation { .. } => None,
+        }
+    }
+}
+
+impl fmt::Display for VirtioVsockTxQueueDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PacketMetadataAllocation { source } => {
+                write!(
+                    f,
+                    "failed to reserve virtio-vsock TX packet metadata: {source}"
+                )
+            }
+            Self::AvailableRing { source, .. } => {
+                write!(
+                    f,
+                    "failed to pop virtio-vsock TX available descriptor chain: {source}"
+                )
+            }
+            Self::EmptyDescriptorChain { .. } => {
+                f.write_str("virtio-vsock TX queue produced an empty descriptor chain")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioVsockTxQueueDispatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::PacketMetadataAllocation { source } => Some(source),
+            Self::AvailableRing { source, .. } => Some(source),
+            Self::EmptyDescriptorChain { .. } => None,
+        }
     }
 }
 
@@ -1086,10 +1269,11 @@ impl VirtioVsockEventQueue {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum VirtioVsockQueueBuildError {
     QueueNotReady,
     QueueSizeNotConfigured,
+    AvailableRing { source: VirtqueueAvailableRingError },
 }
 
 impl fmt::Display for VirtioVsockQueueBuildError {
@@ -1099,11 +1283,21 @@ impl fmt::Display for VirtioVsockQueueBuildError {
             Self::QueueSizeNotConfigured => {
                 f.write_str("virtio-vsock queue size is not configured")
             }
+            Self::AvailableRing { source } => {
+                write!(f, "failed to build virtio-vsock available ring: {source}")
+            }
         }
     }
 }
 
-impl std::error::Error for VirtioVsockQueueBuildError {}
+impl std::error::Error for VirtioVsockQueueBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AvailableRing { source } => Some(source),
+            Self::QueueNotReady | Self::QueueSizeNotConfigured => None,
+        }
+    }
+}
 
 fn validate_active_vsock_queue(
     queue: VirtioMmioQueueState,
@@ -1145,7 +1339,9 @@ impl VirtioVsockDevice {
     }
 
     pub fn active_tx_queue(&self) -> Option<VirtioMmioQueueState> {
-        self.active_tx_queue.map(VirtioVsockTxQueue::queue_state)
+        self.active_tx_queue
+            .as_ref()
+            .map(VirtioVsockTxQueue::queue_state)
     }
 
     pub const fn active_tx_dispatch_queue(&self) -> Option<&VirtioVsockTxQueue> {
@@ -1683,8 +1879,8 @@ mod tests {
         VirtioVsockConfigSpace, VirtioVsockDevice, VirtioVsockDeviceActivationError,
         VirtioVsockMmioHandler, VirtioVsockPacketHeader, VirtioVsockPacketLengthError,
         VirtioVsockQueueBuildError, VirtioVsockTxPacket, VirtioVsockTxPacketParseError,
-        VsockConfigError, VsockConfigInput, VsockMmioDevice, VsockMmioLayout,
-        VsockMmioRegistrationError, virtio_vsock_mmio_handler,
+        VirtioVsockTxQueue, VirtioVsockTxQueueDispatchError, VsockConfigError, VsockConfigInput,
+        VsockMmioDevice, VsockMmioLayout, VsockMmioRegistrationError, virtio_vsock_mmio_handler,
     };
 
     const TEST_MMIO_BASE: u64 = 0x1000_0000;
@@ -1695,7 +1891,8 @@ mod tests {
     const TEST_QUEUE_ADDRESS_BASE: u64 = 0x1000;
     const TEST_QUEUE_ADDRESS_STRIDE: u64 = 0x1000;
     const TEST_VSOCK_TX_MEMORY_SIZE: u64 = 0x20_000;
-    const TEST_VSOCK_TX_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x1000);
+    const TEST_VSOCK_TX_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x2000);
+    const TEST_VSOCK_TX_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x2200);
     const TEST_VSOCK_HEADER: GuestAddress = GuestAddress::new(0x4000);
     const TEST_VSOCK_SECOND_HEADER: GuestAddress = GuestAddress::new(0x5000);
     const TEST_VSOCK_PAYLOAD: GuestAddress = GuestAddress::new(0x6000);
@@ -2005,6 +2202,35 @@ mod tests {
             .expect("vsock TX descriptor should write");
     }
 
+    fn write_vsock_tx_available_index(memory: &mut GuestMemory, index: u16) {
+        let index_address = TEST_VSOCK_TX_AVAILABLE_RING
+            .checked_add(2)
+            .expect("available index address should not overflow");
+        memory
+            .write_slice(&index.to_le_bytes(), index_address)
+            .expect("vsock TX available index should write");
+    }
+
+    fn write_vsock_tx_available_entry(memory: &mut GuestMemory, slot: usize, head: u16) {
+        let slot_offset = u64::try_from(slot).expect("available slot should fit") * 2;
+        let entry_address = TEST_VSOCK_TX_AVAILABLE_RING
+            .checked_add(4 + slot_offset)
+            .expect("available entry address should not overflow");
+        memory
+            .write_slice(&head.to_le_bytes(), entry_address)
+            .expect("vsock TX available entry should write");
+    }
+
+    fn write_vsock_tx_available_heads(memory: &mut GuestMemory, heads: &[u16]) {
+        for (slot, head) in heads.iter().copied().enumerate() {
+            write_vsock_tx_available_entry(memory, slot, head);
+        }
+        write_vsock_tx_available_index(
+            memory,
+            u16::try_from(heads.len()).expect("available head count should fit"),
+        );
+    }
+
     fn vsock_tx_descriptor_chain(
         memory: &mut GuestMemory,
         descriptors: &[TestDescriptor],
@@ -2061,6 +2287,16 @@ mod tests {
         chain: &VirtqueueDescriptorChain,
     ) -> Result<VirtioVsockTxPacket, VirtioVsockTxPacketParseError> {
         VirtioVsockTxPacket::parse(memory, chain)
+    }
+
+    fn vsock_tx_queue() -> VirtioVsockTxQueue {
+        let queues = configured_vsock_queue_registers(Some(TEST_VSOCK_QUEUE_SIZE), true);
+        let queue_index =
+            u32::try_from(VIRTIO_VSOCK_TX_QUEUE_INDEX).expect("TX queue index should fit");
+        let queue_state = *queues
+            .queue(queue_index)
+            .expect("TX queue state should be configured");
+        VirtioVsockTxQueue::from_mmio_queue_state(queue_state).expect("TX queue should build")
     }
 
     #[test]
@@ -2871,6 +3107,205 @@ mod tests {
             }
             other => panic!("expected descriptor access error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn virtio_vsock_tx_queue_dispatch_empty_available_ring_is_noop() {
+        let memory = vsock_tx_memory();
+        let mut queue = vsock_tx_queue();
+
+        let dispatch = queue
+            .dispatch(&memory)
+            .expect("empty TX queue should dispatch");
+
+        assert_eq!(dispatch.processed_packets(), 0);
+        assert_eq!(dispatch.successful_packets(), 0);
+        assert_eq!(dispatch.parse_failures(), 0);
+        assert!(dispatch.packets().is_empty());
+        assert!(dispatch.first_parse_failure().is_none());
+        assert!(!dispatch.needs_queue_interrupt());
+        assert_eq!(queue.available_ring().next_avail(), 0);
+    }
+
+    #[test]
+    fn virtio_vsock_tx_queue_dispatch_parses_single_packet() {
+        let mut memory = vsock_tx_memory();
+        let mut queue = vsock_tx_queue();
+        let header = test_vsock_packet_header().with_payload_len(4);
+        let payload_address = vsock_payload_address_after_header(TEST_VSOCK_HEADER);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_HEADER, header);
+        write_guest_bytes(&mut memory, payload_address, &[0xa0, 0xa1, 0xa2, 0xa3]);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32 + 4,
+                None,
+            ),
+        );
+        write_vsock_tx_available_heads(&mut memory, &[0]);
+
+        let dispatch = queue
+            .dispatch(&memory)
+            .expect("single TX packet should dispatch");
+
+        assert_eq!(dispatch.processed_packets(), 1);
+        assert_eq!(dispatch.successful_packets(), 1);
+        assert_eq!(dispatch.parse_failures(), 0);
+        assert!(dispatch.first_parse_failure().is_none());
+        assert!(!dispatch.needs_queue_interrupt());
+        let packet = dispatch
+            .packets()
+            .first()
+            .expect("parsed packet should be recorded");
+        assert_eq!(packet.descriptor_head(), 0);
+        assert_eq!(packet.header(), header);
+        assert_eq!(packet.payload_len(), 4);
+        assert_eq!(packet.payload_segments().len(), 1);
+        assert_eq!(
+            packet
+                .payload_segments()
+                .first()
+                .expect("payload segment should exist")
+                .address(),
+            payload_address
+        );
+        assert_eq!(queue.available_ring().next_avail(), 1);
+    }
+
+    #[test]
+    fn virtio_vsock_tx_queue_dispatch_preserves_next_avail_across_calls() {
+        let mut memory = vsock_tx_memory();
+        let mut queue = vsock_tx_queue();
+        let first_header = test_vsock_packet_header().with_payload_len(1);
+        let second_header = test_vsock_packet_header().with_payload_len(2);
+        let third_header = test_vsock_packet_header().with_payload_len(3);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_HEADER, first_header);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_SECOND_HEADER, second_header);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_PAYLOAD, third_header);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32 + 1,
+                None,
+            ),
+        );
+        write_vsock_tx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::readable(
+                TEST_VSOCK_SECOND_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32 + 2,
+                None,
+            ),
+        );
+        write_vsock_tx_available_heads(&mut memory, &[0, 1]);
+
+        let first_dispatch = queue
+            .dispatch(&memory)
+            .expect("first TX dispatch should drain two packets");
+
+        assert_eq!(first_dispatch.processed_packets(), 2);
+        assert_eq!(first_dispatch.successful_packets(), 2);
+        assert_eq!(queue.available_ring().next_avail(), 2);
+        assert_eq!(first_dispatch.packets()[0].descriptor_head(), 0);
+        assert_eq!(first_dispatch.packets()[1].descriptor_head(), 1);
+
+        write_vsock_tx_descriptor(
+            &mut memory,
+            2,
+            TestDescriptor::readable(
+                TEST_VSOCK_PAYLOAD,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32 + 3,
+                None,
+            ),
+        );
+        write_vsock_tx_available_entry(&mut memory, 2, 2);
+        write_vsock_tx_available_index(&mut memory, 3);
+
+        let second_dispatch = queue
+            .dispatch(&memory)
+            .expect("second TX dispatch should drain only the new packet");
+
+        assert_eq!(second_dispatch.processed_packets(), 1);
+        assert_eq!(second_dispatch.successful_packets(), 1);
+        assert_eq!(second_dispatch.packets()[0].descriptor_head(), 2);
+        assert_eq!(queue.available_ring().next_avail(), 3);
+    }
+
+    #[test]
+    fn virtio_vsock_tx_queue_dispatch_records_parse_failure() {
+        let mut memory = vsock_tx_memory();
+        let mut queue = vsock_tx_queue();
+        write_vsock_tx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32 - 1,
+                None,
+            ),
+        );
+        write_vsock_tx_available_heads(&mut memory, &[0]);
+
+        let dispatch = queue
+            .dispatch(&memory)
+            .expect("malformed TX packet should be recorded");
+
+        assert_eq!(dispatch.processed_packets(), 1);
+        assert_eq!(dispatch.successful_packets(), 0);
+        assert_eq!(dispatch.parse_failures(), 1);
+        assert!(dispatch.packets().is_empty());
+        assert!(matches!(
+            dispatch.first_parse_failure(),
+            Some(VirtioVsockTxPacketParseError::HeaderTooShort {
+                descriptor_head: 0,
+                actual: 43,
+                min: VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64,
+            })
+        ));
+        assert!(!dispatch.needs_queue_interrupt());
+        assert_eq!(queue.available_ring().next_avail(), 1);
+    }
+
+    #[test]
+    fn virtio_vsock_tx_queue_dispatch_preserves_partial_available_ring_failure() {
+        let mut memory = vsock_tx_memory();
+        let mut queue = vsock_tx_queue();
+        let header = test_vsock_packet_header().with_payload_len(0);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_HEADER, header);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_tx_available_heads(&mut memory, &[0, TEST_VSOCK_QUEUE_SIZE]);
+
+        let error = queue
+            .dispatch(&memory)
+            .expect_err("invalid second TX head should fail after partial dispatch");
+
+        assert!(matches!(
+            error,
+            VirtioVsockTxQueueDispatchError::AvailableRing { .. }
+        ));
+        let completed = error
+            .completed_dispatch()
+            .expect("partial dispatch metadata should be preserved");
+        assert_eq!(completed.processed_packets(), 1);
+        assert_eq!(completed.successful_packets(), 1);
+        assert_eq!(completed.parse_failures(), 0);
+        assert_eq!(completed.packets().len(), 1);
+        assert_eq!(completed.packets()[0].descriptor_head(), 0);
+        assert!(!completed.needs_queue_interrupt());
+        assert_eq!(queue.available_ring().next_avail(), 1);
     }
 
     #[test]

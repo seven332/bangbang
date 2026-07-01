@@ -104,8 +104,9 @@ HVF; local HVF verification should fail when HVF is unavailable.
 The guest is untrusted. vCPU execution, guest memory contents, virtqueue
 descriptor chains, MMIO accesses, block requests, virtio-net TX descriptor
 metadata and payload bytes, virtio-net RX buffer descriptors, virtio-vsock
-packet headers, virtio-vsock TX payload descriptor ranges, and future device
-inputs must be validated before they affect host resources.
+packet headers, virtio-vsock TX available-ring heads, virtio-vsock TX payload
+descriptor ranges, and future device inputs must be validated before they
+affect host resources.
 Trapped system-register exits are guest-visible CPU behavior and must stay
 explicit. The current HVF runner emulates only the early-boot `OSDLR_EL1` and
 `OSLAR_EL1` OS lock RAZ/WI behavior needed by the pinned Firecracker kernel;
@@ -177,12 +178,14 @@ The current scaffold does not implement:
   vsock API path validates and stores `guest_cid` plus `uds_path` before boot.
   The runtime crate has an internal virtio-vsock prepared resource, MMIO
   registration helper, config-space, packet header model, TX descriptor packet
-  parser, MMIO handler skeleton with active queue metadata retention, and
-  startup FDT attachment that preserve the configured socket path and expose
-  only the configured guest CID through bounded config reads. Preparation, MMIO
+  parser, TX available-ring drain helper, MMIO handler skeleton with active
+  queue metadata retention, and startup FDT attachment that preserve the
+  configured socket path and expose only the configured guest CID through
+  bounded config reads. Preparation, MMIO
   registration, and startup attachment do not open, bind, connect, unlink, or
   create `uds_path`, and do not implement host Unix socket backend behavior,
-  CID routing, queue notification dispatch, RX buffer parsing, or data movement
+  CID routing, MMIO notification-handler wiring, used-ring completion,
+  interrupts, RX buffer parsing, or data movement
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 
