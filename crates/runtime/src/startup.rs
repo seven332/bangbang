@@ -32,7 +32,9 @@ use crate::network::{
 };
 use crate::serial::{SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialMmioDevice, SharedSerialOutputBuffer};
 use crate::vsock::{
-    PreparedVsockDevice, VsockMmioDeviceRegistration, VsockMmioLayout, VsockMmioRegistrationError,
+    PreparedVsockDevice, VirtioVsockDeviceNotificationDispatch, VirtioVsockDeviceNotificationError,
+    VirtioVsockMmioHandler, VsockMmioDeviceRegistration, VsockMmioLayout,
+    VsockMmioRegistrationError,
 };
 
 const MIB: u64 = 1024 * 1024;
@@ -420,6 +422,126 @@ impl std::error::Error for Arm64BootNetworkNotificationDispatchError {
     }
 }
 
+#[derive(Debug)]
+pub struct Arm64BootVsockNotificationDispatches {
+    devices: Vec<Arm64BootVsockNotificationDispatch>,
+}
+
+impl Arm64BootVsockNotificationDispatches {
+    fn new(devices: Vec<Arm64BootVsockNotificationDispatch>) -> Self {
+        Self { devices }
+    }
+
+    pub fn as_slice(&self) -> &[Arm64BootVsockNotificationDispatch] {
+        &self.devices
+    }
+
+    pub fn into_vec(self) -> Vec<Arm64BootVsockNotificationDispatch> {
+        self.devices
+    }
+
+    pub fn len(&self) -> usize {
+        self.devices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.devices.is_empty()
+    }
+
+    pub fn needs_queue_interrupt(&self) -> bool {
+        self.devices
+            .iter()
+            .any(Arm64BootVsockNotificationDispatch::needs_queue_interrupt)
+    }
+}
+
+#[derive(Debug)]
+pub struct Arm64BootVsockNotificationDispatch {
+    device: Arm64BootVsockDevice,
+    outcome: Arm64BootVsockNotificationOutcome,
+}
+
+impl Arm64BootVsockNotificationDispatch {
+    fn new(device: Arm64BootVsockDevice, outcome: Arm64BootVsockNotificationOutcome) -> Self {
+        Self { device, outcome }
+    }
+
+    pub const fn device(&self) -> &Arm64BootVsockDevice {
+        &self.device
+    }
+
+    pub const fn outcome(&self) -> &Arm64BootVsockNotificationOutcome {
+        &self.outcome
+    }
+
+    pub fn needs_queue_interrupt(&self) -> bool {
+        self.outcome.needs_queue_interrupt()
+    }
+}
+
+#[derive(Debug)]
+pub enum Arm64BootVsockNotificationOutcome {
+    Dispatched(VirtioVsockDeviceNotificationDispatch),
+    DispatchFailed(VirtioVsockDeviceNotificationError),
+    HandlerLookupFailed(MmioHandlerLookupError),
+}
+
+impl Arm64BootVsockNotificationOutcome {
+    pub fn needs_queue_interrupt(&self) -> bool {
+        match self {
+            Self::Dispatched(dispatch) => dispatch.needs_queue_interrupt(),
+            Self::DispatchFailed(source) => source
+                .completed_tx_dispatch()
+                .is_some_and(crate::vsock::VirtioVsockTxQueueDispatch::needs_queue_interrupt),
+            Self::HandlerLookupFailed(_) => false,
+        }
+    }
+
+    pub const fn dispatched(&self) -> Option<&VirtioVsockDeviceNotificationDispatch> {
+        match self {
+            Self::Dispatched(dispatch) => Some(dispatch),
+            Self::DispatchFailed(_) | Self::HandlerLookupFailed(_) => None,
+        }
+    }
+
+    pub const fn dispatch_error(&self) -> Option<&VirtioVsockDeviceNotificationError> {
+        match self {
+            Self::DispatchFailed(source) => Some(source),
+            Self::Dispatched(_) | Self::HandlerLookupFailed(_) => None,
+        }
+    }
+
+    pub const fn handler_lookup_error(&self) -> Option<&MmioHandlerLookupError> {
+        match self {
+            Self::HandlerLookupFailed(source) => Some(source),
+            Self::Dispatched(_) | Self::DispatchFailed(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum Arm64BootVsockNotificationDispatchError {
+    ResultAllocation { source: TryReserveError },
+}
+
+impl fmt::Display for Arm64BootVsockNotificationDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ResultAllocation { source } => {
+                write!(f, "failed to allocate vsock notification results: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Arm64BootVsockNotificationDispatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ResultAllocation { source } => Some(source),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arm64BootBlockDevice {
     pub registration: BlockMmioDeviceRegistration,
@@ -559,6 +681,32 @@ impl Arm64BootRuntimeResources {
         }
 
         Ok(Arm64BootNetworkNotificationDispatches::new(devices))
+    }
+
+    pub fn dispatch_vsock_queue_notifications(
+        &mut self,
+        memory: &mut GuestMemory,
+        mmio_dispatcher: &mut MmioDispatcher,
+    ) -> Result<Arm64BootVsockNotificationDispatches, Arm64BootVsockNotificationDispatchError> {
+        let mut devices = Vec::new();
+        let device_count = if self.vsock_device.is_some() { 1 } else { 0 };
+        devices.try_reserve_exact(device_count).map_err(|source| {
+            Arm64BootVsockNotificationDispatchError::ResultAllocation { source }
+        })?;
+
+        if let Some(device) = self.vsock_device.clone() {
+            let region_id = device.registration.region_id();
+            let outcome = match mmio_dispatcher.handler_mut::<VirtioVsockMmioHandler>(region_id) {
+                Ok(handler) => match handler.dispatch_vsock_queue_notifications(memory) {
+                    Ok(dispatch) => Arm64BootVsockNotificationOutcome::Dispatched(dispatch),
+                    Err(source) => Arm64BootVsockNotificationOutcome::DispatchFailed(source),
+                },
+                Err(source) => Arm64BootVsockNotificationOutcome::HandlerLookupFailed(source),
+            };
+            devices.push(Arm64BootVsockNotificationDispatch::new(device, outcome));
+        }
+
+        Ok(Arm64BootVsockNotificationDispatches::new(devices))
     }
 }
 
@@ -1162,7 +1310,11 @@ mod tests {
     use crate::virtio_queue::{
         VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
     };
-    use crate::vsock::{VirtioVsockMmioHandler, VsockConfigInput, VsockMmioLayout};
+    use crate::vsock::{
+        VIRTIO_VSOCK_EVENT_QUEUE_INDEX, VIRTIO_VSOCK_PACKET_HEADER_SIZE,
+        VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_TX_QUEUE_INDEX, VirtioVsockMmioHandler,
+        VirtioVsockPacketHeader, VsockConfigInput, VsockMmioLayout,
+    };
 
     static NEXT_TEST_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -1187,6 +1339,16 @@ mod tests {
     const TEST_RX_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x8047_0000);
     const TEST_RX_USED_RING: GuestAddress = GuestAddress::new(0x8048_0000);
     const TEST_RX_BUFFER: GuestAddress = GuestAddress::new(0x8049_0000);
+    const TEST_VSOCK_RX_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x8050_0000);
+    const TEST_VSOCK_RX_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x8051_0000);
+    const TEST_VSOCK_RX_USED_RING: GuestAddress = GuestAddress::new(0x8052_0000);
+    const TEST_VSOCK_TX_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x8053_0000);
+    const TEST_VSOCK_TX_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x8054_0000);
+    const TEST_VSOCK_TX_USED_RING: GuestAddress = GuestAddress::new(0x8055_0000);
+    const TEST_VSOCK_EVENT_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x8056_0000);
+    const TEST_VSOCK_EVENT_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x8057_0000);
+    const TEST_VSOCK_EVENT_USED_RING: GuestAddress = GuestAddress::new(0x8058_0000);
+    const TEST_VSOCK_HEADER: GuestAddress = GuestAddress::new(0x8059_0000);
     const TEST_NETWORK_QUEUE_DEVICE_STRIDE: u64 = 0x0010_0000;
     const TEST_AVAILABLE_RING_IDX_OFFSET: u64 = 2;
     const TEST_AVAILABLE_RING_RING_OFFSET: u64 = 4;
@@ -1526,6 +1688,60 @@ mod tests {
         }
     }
 
+    fn write_boot_vsock_mmio_u32(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        register: VirtioMmioRegister,
+        value: u32,
+    ) {
+        let address = runtime
+            .vsock_device
+            .as_ref()
+            .expect("vsock device should be configured")
+            .registration
+            .address()
+            .checked_add(register.offset())
+            .expect("test MMIO address should not overflow");
+        let access = mmio_dispatcher
+            .lookup(address, 4)
+            .expect("vsock MMIO access should resolve");
+        let data = MmioAccessBytes::new(&value.to_le_bytes()).expect("u32 bytes should be valid");
+        mmio_dispatcher
+            .dispatch(
+                MmioOperation::write(access, data).expect("u32 write operation should be valid"),
+            )
+            .expect("vsock MMIO write should dispatch");
+    }
+
+    fn read_boot_vsock_mmio_u32(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        register: VirtioMmioRegister,
+    ) -> u32 {
+        let address = runtime
+            .vsock_device
+            .as_ref()
+            .expect("vsock device should be configured")
+            .registration
+            .address()
+            .checked_add(register.offset())
+            .expect("test MMIO address should not overflow");
+        let access = mmio_dispatcher
+            .lookup(address, 4)
+            .expect("vsock MMIO access should resolve");
+        let outcome = mmio_dispatcher
+            .dispatch(MmioOperation::read(access).expect("u32 read operation should be valid"))
+            .expect("vsock MMIO read should dispatch");
+        match outcome {
+            MmioDispatchOutcome::Read { data } => u32::from_le_bytes(
+                data.as_slice()
+                    .try_into()
+                    .expect("u32 read should return four bytes"),
+            ),
+            MmioDispatchOutcome::Write => panic!("read operation should not produce write outcome"),
+        }
+    }
+
     fn configure_boot_block_queue(
         runtime: &mut super::Arm64BootRuntimeResources,
         mmio_dispatcher: &mut MmioDispatcher,
@@ -1757,6 +1973,144 @@ mod tests {
             VirtioMmioRegister::QueueNotify,
             u32::try_from(VIRTIO_NET_RX_QUEUE_INDEX).expect("RX queue index should fit"),
         );
+    }
+
+    fn configure_boot_vsock_queue(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        queue_index: usize,
+        descriptor_table: GuestAddress,
+        driver_ring: GuestAddress,
+        device_ring: GuestAddress,
+    ) {
+        write_boot_vsock_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueSel,
+            u32::try_from(queue_index).expect("queue index should fit"),
+        );
+        write_boot_vsock_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueNum,
+            u32::from(TEST_QUEUE_SIZE),
+        );
+        write_boot_vsock_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueDescLow,
+            guest_address_low(descriptor_table),
+        );
+        write_boot_vsock_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueDriverLow,
+            guest_address_low(driver_ring),
+        );
+        write_boot_vsock_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueDeviceLow,
+            guest_address_low(device_ring),
+        );
+        write_boot_vsock_mmio_u32(runtime, mmio_dispatcher, VirtioMmioRegister::QueueReady, 1);
+    }
+
+    fn configure_boot_vsock_queues(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+    ) {
+        write_boot_vsock_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+        );
+        write_boot_vsock_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+        );
+        write_boot_vsock_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            QUEUE_CONFIG_STATUS,
+        );
+        configure_boot_vsock_queue(
+            runtime,
+            mmio_dispatcher,
+            VIRTIO_VSOCK_RX_QUEUE_INDEX,
+            TEST_VSOCK_RX_DESCRIPTOR_TABLE,
+            TEST_VSOCK_RX_AVAILABLE_RING,
+            TEST_VSOCK_RX_USED_RING,
+        );
+        configure_boot_vsock_queue(
+            runtime,
+            mmio_dispatcher,
+            VIRTIO_VSOCK_TX_QUEUE_INDEX,
+            TEST_VSOCK_TX_DESCRIPTOR_TABLE,
+            TEST_VSOCK_TX_AVAILABLE_RING,
+            TEST_VSOCK_TX_USED_RING,
+        );
+        configure_boot_vsock_queue(
+            runtime,
+            mmio_dispatcher,
+            VIRTIO_VSOCK_EVENT_QUEUE_INDEX,
+            TEST_VSOCK_EVENT_DESCRIPTOR_TABLE,
+            TEST_VSOCK_EVENT_AVAILABLE_RING,
+            TEST_VSOCK_EVENT_USED_RING,
+        );
+        write_boot_vsock_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            DRIVER_OK_STATUS,
+        );
+    }
+
+    fn notify_boot_vsock_queue(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        queue_index: usize,
+    ) {
+        write_boot_vsock_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueNotify,
+            u32::try_from(queue_index).expect("queue index should fit"),
+        );
+    }
+
+    fn write_boot_vsock_tx_packet_header(
+        memory: &mut crate::memory::GuestMemory,
+        header: VirtioVsockPacketHeader,
+    ) {
+        memory
+            .write_slice(&header.to_bytes(), TEST_VSOCK_HEADER)
+            .expect("vsock packet header should write");
+    }
+
+    fn write_boot_vsock_tx_descriptor(
+        memory: &mut crate::memory::GuestMemory,
+        index: u16,
+        descriptor: TestDescriptor,
+    ) {
+        write_descriptor_at(memory, TEST_VSOCK_TX_DESCRIPTOR_TABLE, index, descriptor);
+    }
+
+    fn write_boot_vsock_tx_available_heads(memory: &mut crate::memory::GuestMemory, heads: &[u16]) {
+        write_available_heads_at(memory, TEST_VSOCK_TX_AVAILABLE_RING, heads);
+    }
+
+    fn read_boot_vsock_tx_used_index(memory: &crate::memory::GuestMemory) -> u16 {
+        read_guest_u16(
+            memory,
+            TEST_VSOCK_TX_USED_RING
+                .checked_add(2)
+                .expect("vsock TX used idx address should not overflow"),
+        )
     }
 
     fn guest_address_low(address: GuestAddress) -> u32 {
@@ -2094,6 +2448,14 @@ mod tests {
             .read_slice(&mut bytes, address)
             .expect("guest bytes should read");
         bytes
+    }
+
+    fn read_guest_u16(memory: &crate::memory::GuestMemory, address: GuestAddress) -> u16 {
+        let mut bytes = [0; 2];
+        memory
+            .read_slice(&mut bytes, address)
+            .expect("guest u16 should read");
+        u16::from_le_bytes(bytes)
     }
 
     fn available_ring_idx_address_at(available_ring: GuestAddress) -> GuestAddress {
@@ -2627,6 +2989,344 @@ mod tests {
         assert_eq!(dispatches.len(), 0);
         assert!(!dispatches.needs_queue_interrupt());
         assert!(provider.requested_ifaces.is_empty());
+    }
+
+    #[test]
+    fn boot_runtime_vsock_notification_dispatch_accepts_empty_vsock_device() {
+        let kernel = temp_file("kernel-empty-vsock-dispatch", &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+        let resources =
+            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
+                .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
+        let mut runtime = parts.runtime;
+
+        let dispatches = runtime
+            .dispatch_vsock_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("empty vsock dispatch result should allocate");
+
+        assert!(dispatches.is_empty());
+        assert_eq!(dispatches.len(), 0);
+        assert!(!dispatches.needs_queue_interrupt());
+    }
+
+    #[test]
+    fn boot_runtime_vsock_notification_dispatch_without_pending_notification_is_noop() {
+        let kernel = temp_file("kernel-vsock-noop-dispatch", &arm64_image());
+        let socket_path = missing_path("vsock-noop.sock");
+        let mut controller = controller_with_kernel(kernel.path());
+        add_vsock(&mut controller, 42, &socket_path);
+        let config = Arm64BootResourceConfig {
+            vsock_interrupt_line: Some(line(35)),
+            ..valid_config(&[])
+        };
+        let resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
+        let mut runtime = parts.runtime;
+
+        let dispatches = runtime
+            .dispatch_vsock_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("vsock dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 1);
+        assert!(!dispatches.needs_queue_interrupt());
+        let device_dispatch = &dispatches.as_slice()[0];
+        assert_eq!(device_dispatch.device().registration.guest_cid(), 42);
+        assert_eq!(device_dispatch.device().fdt_device.interrupt_line, line(35));
+        let dispatch = device_dispatch
+            .outcome()
+            .dispatched()
+            .expect("no pending notification should dispatch as no-op");
+        assert_eq!(dispatch.drained_notifications(), []);
+        assert!(dispatch.tx_queue_dispatch().is_none());
+        assert!(!device_dispatch.needs_queue_interrupt());
+        assert_eq!(
+            read_boot_vsock_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                VirtioMmioRegister::InterruptStatus
+            ),
+            0
+        );
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn boot_runtime_vsock_notification_dispatch_executes_tx_queue() {
+        let kernel = temp_file("kernel-vsock-tx-dispatch", &arm64_image());
+        let socket_path = missing_path("vsock-tx.sock");
+        let mut controller = controller_with_kernel(kernel.path());
+        add_vsock(&mut controller, 43, &socket_path);
+        let config = Arm64BootResourceConfig {
+            vsock_interrupt_line: Some(line(35)),
+            ..valid_config(&[])
+        };
+        let resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
+        let mut runtime = parts.runtime;
+        configure_boot_vsock_queues(&mut runtime, &mut mmio_dispatcher);
+        write_boot_vsock_tx_packet_header(&mut memory, VirtioVsockPacketHeader::new());
+        write_boot_vsock_tx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_boot_vsock_tx_available_heads(&mut memory, &[0]);
+        notify_boot_vsock_queue(
+            &mut runtime,
+            &mut mmio_dispatcher,
+            VIRTIO_VSOCK_TX_QUEUE_INDEX,
+        );
+
+        let dispatches = runtime
+            .dispatch_vsock_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("vsock dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 1);
+        assert!(dispatches.needs_queue_interrupt());
+        let device_dispatch = &dispatches.as_slice()[0];
+        assert_eq!(device_dispatch.device().registration.guest_cid(), 43);
+        assert_eq!(device_dispatch.device().fdt_device.interrupt_line, line(35));
+        let dispatch = device_dispatch
+            .outcome()
+            .dispatched()
+            .expect("queued TX notification should dispatch");
+        assert_eq!(
+            dispatch.drained_notifications(),
+            [VIRTIO_VSOCK_TX_QUEUE_INDEX]
+        );
+        let tx_dispatch = dispatch
+            .tx_queue_dispatch()
+            .expect("TX dispatch summary should be present");
+        assert_eq!(tx_dispatch.processed_packets(), 1);
+        assert_eq!(tx_dispatch.successful_packets(), 1);
+        assert_eq!(tx_dispatch.parse_failures(), 0);
+        assert!(device_dispatch.needs_queue_interrupt());
+        assert_eq!(read_boot_vsock_tx_used_index(&memory), 1);
+        assert_eq!(
+            read_boot_vsock_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                VirtioMmioRegister::InterruptStatus
+            ),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn boot_runtime_vsock_notification_dispatch_reports_unsupported_queue() {
+        let kernel = temp_file("kernel-vsock-unsupported-dispatch", &arm64_image());
+        let socket_path = missing_path("vsock-unsupported.sock");
+        let mut controller = controller_with_kernel(kernel.path());
+        add_vsock(&mut controller, 44, &socket_path);
+        let config = Arm64BootResourceConfig {
+            vsock_interrupt_line: Some(line(35)),
+            ..valid_config(&[])
+        };
+        let resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
+        let mut runtime = parts.runtime;
+        configure_boot_vsock_queues(&mut runtime, &mut mmio_dispatcher);
+        notify_boot_vsock_queue(
+            &mut runtime,
+            &mut mmio_dispatcher,
+            VIRTIO_VSOCK_RX_QUEUE_INDEX,
+        );
+
+        let dispatches = runtime
+            .dispatch_vsock_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("vsock dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 1);
+        assert!(!dispatches.needs_queue_interrupt());
+        let error = dispatches.as_slice()[0]
+            .outcome()
+            .dispatch_error()
+            .expect("unsupported queue should be preserved as a device error");
+        assert_eq!(error.drained_notifications(), [VIRTIO_VSOCK_RX_QUEUE_INDEX]);
+        assert!(matches!(
+            error,
+            crate::vsock::VirtioVsockDeviceNotificationError::UnsupportedQueue {
+                queue_index: VIRTIO_VSOCK_RX_QUEUE_INDEX,
+                ..
+            }
+        ));
+        assert!(error.completed_tx_dispatch().is_none());
+        assert_eq!(
+            read_boot_vsock_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                VirtioMmioRegister::InterruptStatus
+            ),
+            0
+        );
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn boot_runtime_vsock_notification_dispatch_preserves_partial_error_interrupt_intent() {
+        let kernel = temp_file("kernel-vsock-partial-error-dispatch", &arm64_image());
+        let socket_path = missing_path("vsock-partial-error.sock");
+        let mut controller = controller_with_kernel(kernel.path());
+        add_vsock(&mut controller, 45, &socket_path);
+        let config = Arm64BootResourceConfig {
+            vsock_interrupt_line: Some(line(35)),
+            ..valid_config(&[])
+        };
+        let resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
+        let mut runtime = parts.runtime;
+        configure_boot_vsock_queues(&mut runtime, &mut mmio_dispatcher);
+        write_boot_vsock_tx_packet_header(&mut memory, VirtioVsockPacketHeader::new());
+        write_boot_vsock_tx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_boot_vsock_tx_available_heads(&mut memory, &[0, TEST_QUEUE_SIZE]);
+        notify_boot_vsock_queue(
+            &mut runtime,
+            &mut mmio_dispatcher,
+            VIRTIO_VSOCK_TX_QUEUE_INDEX,
+        );
+
+        let dispatches = runtime
+            .dispatch_vsock_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("vsock dispatch result should allocate");
+
+        assert!(dispatches.needs_queue_interrupt());
+        let device_dispatch = &dispatches.as_slice()[0];
+        assert!(device_dispatch.needs_queue_interrupt());
+        let error = device_dispatch
+            .outcome()
+            .dispatch_error()
+            .expect("partial TX failure should be preserved as a device error");
+        assert_eq!(error.drained_notifications(), [VIRTIO_VSOCK_TX_QUEUE_INDEX]);
+        let completed = error
+            .completed_tx_dispatch()
+            .expect("partial TX failure should preserve completed dispatch metadata");
+        assert_eq!(completed.processed_packets(), 1);
+        assert_eq!(completed.successful_packets(), 1);
+        assert!(completed.needs_queue_interrupt());
+        assert_eq!(read_boot_vsock_tx_used_index(&memory), 1);
+        assert_eq!(
+            read_boot_vsock_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                VirtioMmioRegister::InterruptStatus
+            ),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn boot_runtime_vsock_notification_dispatch_reports_missing_handler() {
+        let kernel = temp_file("kernel-vsock-missing-handler", &arm64_image());
+        let socket_path = missing_path("vsock-missing-handler.sock");
+        let mut controller = controller_with_kernel(kernel.path());
+        add_vsock(&mut controller, 46, &socket_path);
+        let config = Arm64BootResourceConfig {
+            vsock_interrupt_line: Some(line(35)),
+            ..valid_config(&[])
+        };
+        let resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut mmio_dispatcher = MmioDispatcher::new();
+        let mut runtime = parts.runtime;
+
+        let dispatches = runtime
+            .dispatch_vsock_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("vsock dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 1);
+        assert!(!dispatches.needs_queue_interrupt());
+        let error = dispatches.as_slice()[0]
+            .outcome()
+            .handler_lookup_error()
+            .expect("missing vsock handler should be reported");
+        assert!(matches!(
+            error,
+            crate::mmio::MmioHandlerLookupError::MissingHandler {
+                region_id
+            } if *region_id == MmioRegionId::new(90)
+        ));
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn boot_runtime_vsock_notification_dispatch_reports_wrong_handler_type() {
+        let kernel = temp_file("kernel-vsock-wrong-handler", &arm64_image());
+        let socket_path = missing_path("vsock-wrong-handler.sock");
+        let mut controller = controller_with_kernel(kernel.path());
+        add_vsock(&mut controller, 47, &socket_path);
+        let config = Arm64BootResourceConfig {
+            vsock_interrupt_line: Some(line(35)),
+            ..valid_config(&[])
+        };
+        let resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut runtime = parts.runtime;
+        let region = runtime
+            .vsock_device
+            .as_ref()
+            .expect("vsock device should exist")
+            .registration
+            .region();
+        let mut mmio_dispatcher = MmioDispatcher::new();
+        mmio_dispatcher
+            .insert_region(region.id(), region.range().start(), region.range().size())
+            .expect("replacement region should insert");
+        mmio_dispatcher
+            .register_handler(
+                region.id(),
+                SerialMmioDevice::new(SharedSerialOutputBuffer::default()),
+            )
+            .expect("serial handler should register under vsock region id for test");
+
+        let dispatches = runtime
+            .dispatch_vsock_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("vsock dispatch result should allocate");
+
+        let error = dispatches.as_slice()[0]
+            .outcome()
+            .handler_lookup_error()
+            .expect("wrong vsock handler type should be reported");
+        assert!(matches!(
+            error,
+            crate::mmio::MmioHandlerLookupError::UnexpectedHandlerType {
+                region_id,
+                ..
+            } if *region_id == MmioRegionId::new(90)
+        ));
+        assert!(!socket_path.exists());
     }
 
     #[test]
