@@ -1402,14 +1402,17 @@ mod tests {
             block_devices
                 .registrations()
                 .iter()
-                .all(|registration| registration.region_id() != serial_region_id)
+                .all(|registration| registration.region_id() != serial_region_id
+                    && registration.region_id() != vsock_region.id())
         );
         assert!(
             network_devices
                 .registrations()
                 .iter()
-                .all(|registration| registration.region_id() != serial_region_id)
+                .all(|registration| registration.region_id() != serial_region_id
+                    && registration.region_id() != vsock_region.id())
         );
+        assert_ne!(vsock_region.id(), serial_region_id);
         assert!(block_devices.registrations().iter().all(|block| {
             network_devices
                 .registrations()
