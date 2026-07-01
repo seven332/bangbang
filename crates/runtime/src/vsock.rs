@@ -1010,6 +1010,52 @@ mod tests {
     }
 
     #[test]
+    fn prepared_vsock_device_rejects_invalid_mmio_layout_without_path_leak() {
+        let layout = VsockMmioLayout::new(GuestAddress::new(u64::MAX), MmioRegionId::new(4));
+        let err = prepared_vsock_device(13, "secret-vsock-path.sock")
+            .register_mmio(layout)
+            .expect_err("overflowing region should fail");
+
+        assert!(matches!(
+            err,
+            VsockMmioRegistrationError::InvalidRegion {
+                region_id,
+                address,
+                ..
+            } if region_id == MmioRegionId::new(4) && address == GuestAddress::new(u64::MAX)
+        ));
+        assert!(err.source().is_some());
+        assert!(!err.to_string().contains("secret-vsock-path"));
+    }
+
+    #[test]
+    fn prepared_vsock_device_rejects_duplicate_mmio_handler_without_path_leak() {
+        let layout = vsock_mmio_layout();
+        let mut dispatcher = MmioDispatcher::new();
+        dispatcher
+            .register_handler(
+                layout.region_id(),
+                virtio_vsock_mmio_handler(3).expect("existing handler should build"),
+            )
+            .expect("existing handler should register");
+
+        let err = prepared_vsock_device(14, "secret-vsock-path.sock")
+            .register_mmio_with_dispatcher(layout, dispatcher)
+            .expect_err("duplicate handler should fail");
+
+        assert!(matches!(
+            err,
+            VsockMmioRegistrationError::RegisterHandler {
+                guest_cid: 14,
+                region_id,
+                ..
+            } if region_id == layout.region_id()
+        ));
+        assert!(err.source().is_some());
+        assert!(!err.to_string().contains("secret-vsock-path"));
+    }
+
+    #[test]
     fn prepared_vsock_device_mmio_registration_does_not_touch_missing_socket_path() {
         let socket_path = unique_missing_socket_path();
         let path = Path::new(&socket_path);
