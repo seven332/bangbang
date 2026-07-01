@@ -359,9 +359,12 @@ can parse guest-readable TX descriptor chains into validated packet metadata and
 payload segments. Header byte parsing rejects payload lengths above the 64 KiB
 maximum packet buffer length, and TX parsing rejects payload lengths larger
 than readable descriptor bytes after the header. The handler can dispatch TX
-queue notifications into descriptor completions, but startup run-loop
-notification dispatch, RX buffers, host socket resources, CID routing, and data
-movement remain deferred.
+queue notifications into descriptor completions, and startup can dispatch those
+notifications through the boot loop while signaling the allocated vsock
+interrupt line. Startup can also bind and own a nonblocking host listener at
+`uds_path`. Host `CONNECT <PORT>` parsing, guest-initiated `uds_path_<PORT>`
+connections, RX buffers, CID routing, event queue dispatch, and data movement
+remain deferred.
 `SendCtrlAltDel` is rejected at parse time for the first aarch64 target.
 
 Future implementation PRs should derive unit or golden tests from these tables.
@@ -590,14 +593,13 @@ TX dispatch metadata on errors, and mark the virtio queue interrupt status when
 completed descriptors require guest notification. Boot runtime resources can
 dispatch the registered vsock MMIO handler's TX notifications, and internal HVF
 boot sessions can signal the allocated vsock SPI line from those dispatch
-summaries. The
-prepared resource preserves the validated guest CID, socket path, config-space,
-and inactive device state, and the registration helper can consume it into a
-caller-provided internal MMIO dispatcher without touching host socket
-resources. Arm64 startup resource assembly can expose one
-configured vsock device in the guest FDT. Host Unix socket backend behavior,
-CID routing, RX buffer parsing, event queue dispatch, and data movement remain
-deferred.
+summaries. The prepared resource preserves the validated guest CID, socket path,
+config-space, and inactive device state. Arm64 startup resource assembly can
+bind and own the nonblocking host listener at `uds_path`, retain that owner in
+the internal vsock device resource, and expose one configured vsock device in
+the guest FDT. Host `CONNECT <PORT>` parsing, guest-initiated
+`uds_path_<PORT>` connections, CID routing, RX buffer parsing, event queue
+dispatch, and data movement remain deferred.
 
 The runtime crate also has the first backend-neutral virtio-net config-space,
 activation, TX frame parser, RX buffer parser, prepared device resources, and
@@ -1100,10 +1102,11 @@ Their eventual support level should follow the endpoint matrix:
   parser, prepared device resources, MMIO registration, startup FDT metadata,
   TX/RX notification dispatch metadata helpers, and startup-time vmnet packet
   I/O selection for supported `host_dev_name` forms
-- virtio-vsock host Unix socket backend behavior, CID routing, RX/event queue
-  dispatch, and data movement
-  beyond pre-boot `/vsock` configuration storage, startup FDT attachment, and
-  the internal prepared resource/MMIO registration/config-space/MMIO handler
+- virtio-vsock host connection protocol, guest-initiated socket connections,
+  CID routing, RX/event queue dispatch, and data movement
+  beyond pre-boot `/vsock` configuration storage, startup FDT attachment,
+  startup host listener ownership, and the internal prepared
+  resource/MMIO registration/config-space/MMIO handler
   skeleton with active queue metadata retention plus packet header model, TX
   descriptor packet parser, and TX available-ring drain helper with used-ring
   descriptor completion, handler-level and startup-level TX notification
