@@ -14,7 +14,7 @@ use bangbang_runtime::block::BlockMmioLayout;
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
 use bangbang_runtime::mmio::MmioRegionId;
 use bangbang_runtime::network::{
-    NetworkMmioLayout, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
+    NetworkInterfaceConfig, NetworkMmioLayout, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
     VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame, VirtioNetworkTxPacketSink,
     VirtioNetworkTxPacketSinkError,
 };
@@ -24,6 +24,16 @@ use bangbang_runtime::startup::{
     Arm64BootNetworkPacketIoProvider,
 };
 use bangbang_runtime::{BackendError, VmmAction, VmmActionError, VmmController, VmmData};
+
+use crate::host_network::virtio_vmnet::{
+    VmnetVirtioNetworkPacketIo, VmnetVirtioNetworkPacketIoBuildError,
+    VmnetVirtioNetworkPacketIoProvider, VmnetVirtioNetworkPacketIoProviderBuildError,
+    VmnetVirtioNetworkPacketIoProviderEntry,
+};
+use crate::host_network::vmnet::{
+    StartedVmnetPacketIoBackend, SystemVmnetInterfaceBackend, VmnetHostDeviceNameConfigError,
+    VmnetInterfaceBackend, VmnetInterfaceConfig, VmnetInterfaceStartError, VmnetPacketIoBackend,
+};
 
 #[cfg(test)]
 use bangbang_runtime::InstanceInfo;
@@ -181,16 +191,23 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
     type Session = HvfBootRunLoopSupervisor;
 
     fn start(&mut self, controller: &VmmController) -> Result<Self::Session, BackendError> {
+        let packet_io = ProcessNetworkPacketIoProvider::from_network_configs(
+            controller.network_interface_configs(),
+        )
+        .map_err(|err| {
+            BackendError::Hypervisor(format!(
+                "failed to build network packet I/O provider: {err}"
+            ))
+        })?;
         let session = OwnedHvfArm64BootSession::new(controller, self.boot_session_config())
             .map_err(|err| BackendError::Hypervisor(err.to_string()))?;
-        let session =
-            ProcessHvfBootSession::new(session, NoopProcessNetworkPacketIoProvider::default());
+        let session = ProcessHvfBootSession::new(session, packet_io);
         HvfBootRunLoopSupervisor::start(session, default_hvf_boot_run_loop_step_limit())
     }
 }
 
 pub(crate) type HvfBootRunLoopSupervisor = BootRunLoopSupervisor<
-    ProcessHvfBootSession<OwnedHvfArm64BootSession, NoopProcessNetworkPacketIoProvider>,
+    ProcessHvfBootSession<OwnedHvfArm64BootSession, ProcessNetworkPacketIoProvider>,
 >;
 
 pub(crate) struct ProcessHvfBootSession<S, P> {
@@ -233,6 +250,160 @@ impl Arm64BootNetworkPacketIoProvider for NoopProcessNetworkPacketIoProvider {
             &mut self.rx_source,
         ))
     }
+}
+
+type SystemStartedVmnetPacketIoBackend = StartedVmnetPacketIoBackend<SystemVmnetInterfaceBackend>;
+type SystemProcessVmnetPacketIoProvider =
+    VmnetVirtioNetworkPacketIoProvider<SystemStartedVmnetPacketIoBackend>;
+
+#[derive(Debug)]
+pub(crate) enum ProcessNetworkPacketIoProvider {
+    Noop(NoopProcessNetworkPacketIoProvider),
+    Vmnet(SystemProcessVmnetPacketIoProvider),
+}
+
+impl ProcessNetworkPacketIoProvider {
+    fn from_network_configs(
+        configs: &[NetworkInterfaceConfig],
+    ) -> Result<Self, ProcessNetworkPacketIoProviderBuildError> {
+        if configs.is_empty() {
+            return Ok(Self::Noop(NoopProcessNetworkPacketIoProvider::default()));
+        }
+
+        let mut factory = SystemProcessVmnetPacketIoBackendFactory;
+        process_vmnet_packet_io_provider_from_configs(configs, &mut factory).map(Self::Vmnet)
+    }
+}
+
+impl Arm64BootNetworkPacketIoProvider for ProcessNetworkPacketIoProvider {
+    fn packet_io(
+        &mut self,
+        device: &Arm64BootNetworkDevice,
+    ) -> Result<Arm64BootNetworkPacketIo<'_>, Arm64BootNetworkPacketIoError> {
+        match self {
+            Self::Noop(provider) => provider.packet_io(device),
+            Self::Vmnet(provider) => provider.packet_io(device),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ProcessNetworkPacketIoProviderBuildError {
+    HostDeviceName {
+        iface_id: String,
+        source: VmnetHostDeviceNameConfigError,
+    },
+    Start {
+        iface_id: String,
+        source: VmnetInterfaceStartError,
+    },
+    PacketIoBuild {
+        iface_id: String,
+        source: VmnetVirtioNetworkPacketIoBuildError,
+    },
+    ProviderBuild {
+        source: VmnetVirtioNetworkPacketIoProviderBuildError,
+    },
+}
+
+impl fmt::Display for ProcessNetworkPacketIoProviderBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HostDeviceName { iface_id, source } => {
+                write!(
+                    f,
+                    "network interface {iface_id} has unsupported vmnet host device config: {source}"
+                )
+            }
+            Self::Start { iface_id, source } => {
+                write!(
+                    f,
+                    "failed to start vmnet packet I/O for interface {iface_id}: {source}"
+                )
+            }
+            Self::PacketIoBuild { iface_id, source } => {
+                write!(
+                    f,
+                    "failed to build vmnet packet I/O for interface {iface_id}: {source}"
+                )
+            }
+            Self::ProviderBuild { source } => {
+                write!(f, "failed to build vmnet packet I/O provider: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProcessNetworkPacketIoProviderBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::HostDeviceName { source, .. } => Some(source),
+            Self::Start { source, .. } => Some(source),
+            Self::PacketIoBuild { source, .. } => Some(source),
+            Self::ProviderBuild { source } => Some(source),
+        }
+    }
+}
+
+trait ProcessVmnetPacketIoBackendFactory {
+    type Backend: VmnetInterfaceBackend;
+
+    fn new_backend(&mut self, iface_id: &str) -> Self::Backend;
+}
+
+#[derive(Debug, Default)]
+struct SystemProcessVmnetPacketIoBackendFactory;
+
+impl ProcessVmnetPacketIoBackendFactory for SystemProcessVmnetPacketIoBackendFactory {
+    type Backend = SystemVmnetInterfaceBackend;
+
+    fn new_backend(&mut self, _iface_id: &str) -> Self::Backend {
+        SystemVmnetInterfaceBackend::new()
+    }
+}
+
+fn process_vmnet_packet_io_provider_from_configs<F>(
+    configs: &[NetworkInterfaceConfig],
+    factory: &mut F,
+) -> Result<
+    VmnetVirtioNetworkPacketIoProvider<StartedVmnetPacketIoBackend<F::Backend>>,
+    ProcessNetworkPacketIoProviderBuildError,
+>
+where
+    F: ProcessVmnetPacketIoBackendFactory,
+    F::Backend: VmnetPacketIoBackend<Interface = <F::Backend as VmnetInterfaceBackend>::Interface>,
+{
+    let mut entries = Vec::new();
+
+    for config in configs {
+        let iface_id = config.iface_id();
+        let vmnet_config = VmnetInterfaceConfig::from_host_dev_name(config.host_dev_name())
+            .map_err(
+                |source| ProcessNetworkPacketIoProviderBuildError::HostDeviceName {
+                    iface_id: iface_id.to_string(),
+                    source,
+                },
+            )?;
+        let backend = factory.new_backend(iface_id);
+        let (backend, interface) = StartedVmnetPacketIoBackend::start(backend, &vmnet_config)
+            .map_err(|source| ProcessNetworkPacketIoProviderBuildError::Start {
+                iface_id: iface_id.to_string(),
+                source,
+            })?;
+        let packet_io = VmnetVirtioNetworkPacketIo::new(backend, interface).map_err(|source| {
+            ProcessNetworkPacketIoProviderBuildError::PacketIoBuild {
+                iface_id: iface_id.to_string(),
+                source,
+            }
+        })?;
+
+        entries.push(VmnetVirtioNetworkPacketIoProviderEntry::new(
+            iface_id, packet_io,
+        ));
+    }
+
+    VmnetVirtioNetworkPacketIoProvider::new(entries)
+        .map_err(|source| ProcessNetworkPacketIoProviderBuildError::ProviderBuild { source })
 }
 
 #[derive(Debug, Default)]
@@ -595,8 +766,8 @@ mod tests {
     use bangbang_runtime::interrupt::GuestInterruptLine;
     use bangbang_runtime::mmio::MmioRegion;
     use bangbang_runtime::network::{
-        NetworkInterfaceConfigInput, NetworkInterfaceConfigs, NetworkMmioLayout,
-        PreparedNetworkDevices,
+        NetworkInterfaceConfig, NetworkInterfaceConfigInput, NetworkInterfaceConfigs,
+        NetworkMmioLayout, PreparedNetworkDevices,
     };
     use bangbang_runtime::serial::{
         SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialOutput, SharedSerialOutputBuffer,
@@ -607,13 +778,21 @@ mod tests {
     };
     use bangbang_runtime::{BackendError, InstanceState, VmmAction, VmmActionError};
 
+    use crate::host_network::vmnet::{
+        VmnetError, VmnetInterfaceBackend, VmnetInterfaceConfig, VmnetInterfaceDescriptor,
+        VmnetInterfaceDescriptorError, VmnetOperation, VmnetPacketIoBackend, VmnetPacketIoError,
+        VmnetReadPacket, VmnetStatus, VmnetWritePacket,
+    };
+
     use super::{
         BootRunLoopControl, BootRunLoopSession, BootRunLoopSupervisor, BootRunLoopWorkerStatus,
         DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT, DEFAULT_NETWORK_MMIO_BASE,
         DEFAULT_NETWORK_MMIO_REGION_ID, DEFAULT_SERIAL_MMIO_BASE, DEFAULT_SERIAL_MMIO_REGION_ID,
         EmptyProcessNetworkRxPacketSource, HvfInstanceStartExecutor, InstanceStartExecutor,
         NetworkPacketIoRunLoopSession, NoopProcessNetworkTxPacketSink, ProcessHvfBootSession,
-        ProcessVmm, default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
+        ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError, ProcessVmm,
+        ProcessVmnetPacketIoBackendFactory, default_hvf_boot_run_loop_step_limit,
+        default_hvf_boot_session_config, process_vmnet_packet_io_provider_from_configs,
     };
 
     static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -937,6 +1116,135 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordingVmnetInterface {
+        iface_id: String,
+    }
+
+    #[derive(Debug)]
+    struct RecordingVmnetPacketIoBackend {
+        iface_id: String,
+        events: Arc<Mutex<Vec<String>>>,
+        start_status: Option<VmnetStatus>,
+    }
+
+    impl VmnetInterfaceBackend for RecordingVmnetPacketIoBackend {
+        type Interface = RecordingVmnetInterface;
+
+        fn build_interface_descriptor(
+            &mut self,
+            config: &VmnetInterfaceConfig,
+        ) -> Result<VmnetInterfaceDescriptor, VmnetInterfaceDescriptorError> {
+            push_recorded_event(
+                &self.events,
+                format!("descriptor:{}:{}", self.iface_id, config.mode()),
+            );
+            VmnetInterfaceDescriptor::new(config)
+        }
+
+        fn start_interface(
+            &mut self,
+            _descriptor: &VmnetInterfaceDescriptor,
+        ) -> Result<Self::Interface, VmnetError> {
+            push_recorded_event(&self.events, format!("start:{}", self.iface_id));
+            if let Some(status) = self.start_status {
+                return Err(VmnetError::new(VmnetOperation::StartInterface, status));
+            }
+
+            Ok(RecordingVmnetInterface {
+                iface_id: self.iface_id.clone(),
+            })
+        }
+
+        fn stop_interface(&mut self, interface: &mut Self::Interface) -> Result<(), VmnetError> {
+            push_recorded_event(&self.events, format!("stop:{}", interface.iface_id));
+            Ok(())
+        }
+    }
+
+    impl VmnetPacketIoBackend for RecordingVmnetPacketIoBackend {
+        type Interface = RecordingVmnetInterface;
+
+        fn read_packet(
+            &mut self,
+            interface: &mut Self::Interface,
+            _packet: &mut VmnetReadPacket<'_>,
+        ) -> Result<Option<usize>, VmnetPacketIoError> {
+            push_recorded_event(&self.events, format!("read:{}", interface.iface_id));
+            Ok(None)
+        }
+
+        fn write_packet(
+            &mut self,
+            interface: &mut Self::Interface,
+            _packet: &mut VmnetWritePacket<'_>,
+        ) -> Result<(), VmnetPacketIoError> {
+            push_recorded_event(&self.events, format!("write:{}", interface.iface_id));
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingVmnetPacketIoBackendFactory {
+        events: Arc<Mutex<Vec<String>>>,
+        start_statuses: VecDeque<Option<VmnetStatus>>,
+    }
+
+    impl RecordingVmnetPacketIoBackendFactory {
+        fn events(&self) -> Arc<Mutex<Vec<String>>> {
+            Arc::clone(&self.events)
+        }
+
+        fn with_next_start_status(mut self, status: Option<VmnetStatus>) -> Self {
+            self.start_statuses.push_back(status);
+            self
+        }
+    }
+
+    impl ProcessVmnetPacketIoBackendFactory for RecordingVmnetPacketIoBackendFactory {
+        type Backend = RecordingVmnetPacketIoBackend;
+
+        fn new_backend(&mut self, iface_id: &str) -> Self::Backend {
+            push_recorded_event(&self.events, format!("backend:{iface_id}"));
+            RecordingVmnetPacketIoBackend {
+                iface_id: iface_id.to_string(),
+                events: Arc::clone(&self.events),
+                start_status: self.start_statuses.pop_front().unwrap_or(None),
+            }
+        }
+    }
+
+    fn push_recorded_event(events: &Arc<Mutex<Vec<String>>>, event: String) {
+        events
+            .lock()
+            .expect("recorded event log should lock")
+            .push(event);
+    }
+
+    fn recorded_events(events: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        events
+            .lock()
+            .expect("recorded event log should lock")
+            .clone()
+    }
+
+    fn network_configs(
+        configs: impl IntoIterator<Item = (&'static str, &'static str)>,
+    ) -> Vec<NetworkInterfaceConfig> {
+        let mut network_configs = NetworkInterfaceConfigs::new();
+        for (iface_id, host_dev_name) in configs {
+            network_configs
+                .insert(NetworkInterfaceConfigInput::new(
+                    iface_id,
+                    iface_id,
+                    host_dev_name,
+                ))
+                .expect("network config should insert");
+        }
+
+        network_configs.as_slice().to_vec()
+    }
+
     fn test_boot_network_device() -> Arm64BootNetworkDevice {
         let mut configs = NetworkInterfaceConfigs::new();
         configs
@@ -1102,6 +1410,161 @@ mod tests {
                 .lock()
                 .expect("requested ifaces should lock"),
             ["eth0".to_string()]
+        );
+    }
+
+    #[test]
+    fn process_network_packet_io_provider_empty_configs_use_noop() {
+        let mut provider = ProcessNetworkPacketIoProvider::from_network_configs(&[])
+            .expect("empty network configs should build a no-op provider");
+
+        match &provider {
+            ProcessNetworkPacketIoProvider::Noop(_) => {}
+            ProcessNetworkPacketIoProvider::Vmnet(_) => {
+                panic!("empty network configs should not build a vmnet provider");
+            }
+        }
+        provider
+            .packet_io(&test_boot_network_device())
+            .expect("no-op provider should return packet I/O for any device");
+    }
+
+    #[test]
+    fn process_vmnet_packet_io_provider_starts_supported_configs() {
+        let configs = network_configs([("eth0", "vmnet:shared")]);
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        let event_log = factory.events();
+
+        {
+            let mut provider =
+                process_vmnet_packet_io_provider_from_configs(&configs, &mut factory)
+                    .expect("supported vmnet configs should build provider");
+            provider
+                .packet_io(&test_boot_network_device())
+                .expect("provider should select packet I/O by iface id");
+        }
+
+        assert_eq!(
+            recorded_events(&event_log),
+            [
+                "backend:eth0".to_string(),
+                "descriptor:eth0:shared".to_string(),
+                "start:eth0".to_string(),
+                "stop:eth0".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn process_vmnet_packet_io_provider_rejects_unsupported_host_dev_name_before_backend() {
+        let configs = network_configs([("eth0", "tap0")]);
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        let event_log = factory.events();
+        let error = process_vmnet_packet_io_provider_from_configs(&configs, &mut factory)
+            .expect_err("unsupported host_dev_name should fail provider construction");
+
+        match error {
+            ProcessNetworkPacketIoProviderBuildError::HostDeviceName { iface_id, .. } => {
+                assert_eq!(iface_id, "eth0");
+            }
+            ProcessNetworkPacketIoProviderBuildError::Start { .. }
+            | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
+            | ProcessNetworkPacketIoProviderBuildError::ProviderBuild { .. } => {
+                panic!("unsupported host_dev_name should fail before vmnet backend start");
+            }
+        }
+        assert!(recorded_events(&event_log).is_empty());
+    }
+
+    #[test]
+    fn process_vmnet_packet_io_provider_cleans_started_entries_after_later_failure() {
+        let configs = network_configs([("eth0", "vmnet:shared"), ("eth1", "tap1")]);
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default();
+        let event_log = factory.events();
+        let error = process_vmnet_packet_io_provider_from_configs(&configs, &mut factory)
+            .expect_err("later unsupported config should fail provider construction");
+
+        match error {
+            ProcessNetworkPacketIoProviderBuildError::HostDeviceName { iface_id, .. } => {
+                assert_eq!(iface_id, "eth1");
+            }
+            ProcessNetworkPacketIoProviderBuildError::Start { .. }
+            | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
+            | ProcessNetworkPacketIoProviderBuildError::ProviderBuild { .. } => {
+                panic!("unsupported host_dev_name should be reported as config failure");
+            }
+        }
+        assert_eq!(
+            recorded_events(&event_log),
+            [
+                "backend:eth0".to_string(),
+                "descriptor:eth0:shared".to_string(),
+                "start:eth0".to_string(),
+                "stop:eth0".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn process_vmnet_packet_io_provider_start_failure_preserves_not_started_state() {
+        let mut controller = bangbang_runtime::VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+                "/tmp/vmlinux",
+            )))
+            .expect("boot source should configure");
+        controller
+            .handle_action(VmmAction::PutNetworkInterface(
+                NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared"),
+            ))
+            .expect("network config should insert");
+        let mut factory = RecordingVmnetPacketIoBackendFactory::default()
+            .with_next_start_status(Some(VmnetStatus::NotAuthorized));
+        let event_log = factory.events();
+        let error = controller
+            .start_instance_with(|controller| {
+                process_vmnet_packet_io_provider_from_configs(
+                    controller.network_interface_configs(),
+                    &mut factory,
+                )
+                .map(|_provider| ())
+                .map_err(|err| {
+                    BackendError::Hypervisor(format!(
+                        "failed to build network packet I/O provider: {err}"
+                    ))
+                })
+            })
+            .expect_err("vmnet start failure should fail InstanceStart");
+
+        match error {
+            VmmActionError::InstanceStart(BackendError::Hypervisor(message)) => {
+                assert!(message.contains("failed to start vmnet packet I/O for interface eth0"));
+            }
+            VmmActionError::InstanceStart(
+                BackendError::Unsupported(_) | BackendError::InvalidState(_),
+            )
+            | VmmActionError::UnsupportedAction(_)
+            | VmmActionError::UnsupportedState { .. }
+            | VmmActionError::MissingBootSource
+            | VmmActionError::BootSourceConfig(_)
+            | VmmActionError::DriveConfig(_)
+            | VmmActionError::LoggerConfig(_)
+            | VmmActionError::MachineConfig(_)
+            | VmmActionError::MetricsConfig(_)
+            | VmmActionError::MetricsFlush(_)
+            | VmmActionError::NetworkInterfaceConfig(_)
+            | VmmActionError::VsockConfig(_) => {
+                panic!("vmnet start failure should propagate as hypervisor startup error");
+            }
+        }
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert_eq!(
+            recorded_events(&event_log),
+            [
+                "backend:eth0".to_string(),
+                "descriptor:eth0:shared".to_string(),
+                "start:eth0".to_string(),
+            ]
         );
     }
 
