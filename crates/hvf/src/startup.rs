@@ -23,6 +23,7 @@ use bangbang_runtime::startup::{
     Arm64BootResources, Arm64BootRuntimeResources,
     Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig,
 };
+use bangbang_runtime::vsock::VsockMmioLayout;
 use bangbang_runtime::{BackendError, VmBackend, VmmController};
 
 use crate::backend::HvfBackend;
@@ -42,6 +43,7 @@ const SINGLE_VCPU_COUNT: u8 = 1;
 pub struct HvfArm64BootSessionConfig {
     pub block_mmio_layout: BlockMmioLayout,
     pub network_mmio_layout: NetworkMmioLayout,
+    pub vsock_mmio_layout: VsockMmioLayout,
     pub serial_device: Option<HvfArm64BootSerialDeviceConfig>,
 }
 
@@ -49,10 +51,12 @@ impl HvfArm64BootSessionConfig {
     pub const fn new(
         block_mmio_layout: BlockMmioLayout,
         network_mmio_layout: NetworkMmioLayout,
+        vsock_mmio_layout: VsockMmioLayout,
     ) -> Self {
         Self {
             block_mmio_layout,
             network_mmio_layout,
+            vsock_mmio_layout,
             serial_device: None,
         }
     }
@@ -106,6 +110,7 @@ pub struct HvfArm64BootSession<'vm> {
     primary_mpidr: u64,
     block_interrupt_lines: Vec<GuestInterruptLine>,
     network_interrupt_lines: Vec<GuestInterruptLine>,
+    vsock_interrupt_line: Option<GuestInterruptLine>,
     serial_interrupt_line: Option<GuestInterruptLine>,
     boot_registers: HvfArm64BootRegisters,
 }
@@ -120,6 +125,7 @@ pub struct OwnedHvfArm64BootSession {
     primary_mpidr: u64,
     block_interrupt_lines: Vec<GuestInterruptLine>,
     network_interrupt_lines: Vec<GuestInterruptLine>,
+    vsock_interrupt_line: Option<GuestInterruptLine>,
     serial_interrupt_line: Option<GuestInterruptLine>,
     boot_registers: HvfArm64BootRegisters,
 }
@@ -299,6 +305,10 @@ impl HvfArm64BootSession<'_> {
         &self.network_interrupt_lines
     }
 
+    pub const fn vsock_interrupt_line(&self) -> Option<GuestInterruptLine> {
+        self.vsock_interrupt_line
+    }
+
     pub const fn serial_interrupt_line(&self) -> Option<GuestInterruptLine> {
         self.serial_interrupt_line
     }
@@ -472,6 +482,7 @@ impl OwnedHvfArm64BootSession {
             primary_mpidr: prepared.primary_mpidr,
             block_interrupt_lines: prepared.block_interrupt_lines,
             network_interrupt_lines: prepared.network_interrupt_lines,
+            vsock_interrupt_line: prepared.vsock_interrupt_line,
             serial_interrupt_line: prepared.serial_interrupt_line,
             boot_registers: prepared.boot_registers,
         })
@@ -532,6 +543,10 @@ impl OwnedHvfArm64BootSession {
 
     pub fn network_interrupt_lines(&self) -> &[GuestInterruptLine] {
         &self.network_interrupt_lines
+    }
+
+    pub const fn vsock_interrupt_line(&self) -> Option<GuestInterruptLine> {
+        self.vsock_interrupt_line
     }
 
     pub const fn serial_interrupt_line(&self) -> Option<GuestInterruptLine> {
@@ -1456,6 +1471,7 @@ impl std::error::Error for HvfArm64BootSessionError {
 pub enum HvfArm64BootInterruptLinePurpose {
     BlockDevice,
     NetworkDevice,
+    VsockDevice,
     SerialDevice,
 }
 
@@ -1464,6 +1480,7 @@ impl fmt::Display for HvfArm64BootInterruptLinePurpose {
         match self {
             Self::BlockDevice => f.write_str("block device"),
             Self::NetworkDevice => f.write_str("network device"),
+            Self::VsockDevice => f.write_str("vsock device"),
             Self::SerialDevice => f.write_str("serial device"),
         }
     }
@@ -1506,6 +1523,7 @@ struct PreparedHvfArm64BootSession<'vm> {
     primary_mpidr: u64,
     block_interrupt_lines: Vec<GuestInterruptLine>,
     network_interrupt_lines: Vec<GuestInterruptLine>,
+    vsock_interrupt_line: Option<GuestInterruptLine>,
     serial_interrupt_line: Option<GuestInterruptLine>,
     boot_registers: HvfArm64BootRegisters,
 }
@@ -1514,6 +1532,7 @@ struct PreparedHvfArm64BootSession<'vm> {
 struct HvfArm64BootInterruptLines {
     block: Vec<GuestInterruptLine>,
     network: Vec<GuestInterruptLine>,
+    vsock: Option<GuestInterruptLine>,
     serial: Option<GuestInterruptLine>,
 }
 
@@ -1544,6 +1563,7 @@ impl HvfBackend {
             primary_mpidr: prepared.primary_mpidr,
             block_interrupt_lines: prepared.block_interrupt_lines,
             network_interrupt_lines: prepared.network_interrupt_lines,
+            vsock_interrupt_line: prepared.vsock_interrupt_line,
             serial_interrupt_line: prepared.serial_interrupt_line,
             boot_registers: prepared.boot_registers,
         })
@@ -1569,6 +1589,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
         &gic,
         controller.drive_configs().len(),
         controller.network_interface_configs().len(),
+        controller.vsock_config().is_some(),
         config.serial_device.is_some(),
     )?;
 
@@ -1593,6 +1614,8 @@ fn prepare_arm64_boot_session_parts<'vm>(
             block_interrupt_lines: &interrupt_lines.block,
             network_mmio_layout: config.network_mmio_layout,
             network_interrupt_lines: &interrupt_lines.network,
+            vsock_mmio_layout: config.vsock_mmio_layout,
+            vsock_interrupt_line: interrupt_lines.vsock,
         },
     )
     .map_err(|source| HvfArm64BootSessionError::AssembleResources { source })?;
@@ -1617,6 +1640,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
         primary_mpidr,
         block_interrupt_lines: interrupt_lines.block,
         network_interrupt_lines: interrupt_lines.network,
+        vsock_interrupt_line: interrupt_lines.vsock,
         serial_interrupt_line: interrupt_lines.serial,
         boot_registers,
     })
@@ -1635,6 +1659,7 @@ fn allocate_interrupt_lines(
     gic: &HvfGicMetadata,
     block_device_count: usize,
     network_device_count: usize,
+    vsock_configured: bool,
     serial_configured: bool,
 ) -> Result<HvfArm64BootInterruptLines, HvfArm64BootSessionError> {
     let mut allocator = HvfGicInterruptLineAllocator::from_metadata(gic).map_err(|source| {
@@ -1671,6 +1696,17 @@ fn allocate_interrupt_lines(
         })?);
     }
 
+    let vsock = if vsock_configured {
+        Some(allocator.allocate().map_err(|source| {
+            HvfArm64BootSessionError::AllocateInterruptLine {
+                purpose: HvfArm64BootInterruptLinePurpose::VsockDevice,
+                source,
+            }
+        })?)
+    } else {
+        None
+    };
+
     let serial = if serial_configured {
         Some(allocator.allocate().map_err(|source| {
             HvfArm64BootSessionError::AllocateInterruptLine {
@@ -1685,6 +1721,7 @@ fn allocate_interrupt_lines(
     Ok(HvfArm64BootInterruptLines {
         block,
         network,
+        vsock,
         serial,
     })
 }
@@ -1738,6 +1775,7 @@ mod tests {
     use bangbang_runtime::virtio_queue::{
         VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
     };
+    use bangbang_runtime::vsock::VsockMmioLayout;
 
     use super::{
         HvfArm64BootBlockNotificationDispatchError, HvfArm64BootInterruptLinePurpose,
@@ -2437,6 +2475,11 @@ mod tests {
                 MmioRegionId::new(50),
             ),
             network_interrupt_lines: network_lines,
+            vsock_mmio_layout: VsockMmioLayout::new(
+                GuestAddress::new(0x4000_6000),
+                MmioRegionId::new(90),
+            ),
+            vsock_interrupt_line: None,
         }
     }
 
@@ -4328,6 +4371,7 @@ mod tests {
         let config = HvfArm64BootSessionConfig::new(
             BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
             network_layout,
+            VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
         )
         .with_serial_device(serial);
 
@@ -4354,27 +4398,43 @@ mod tests {
 
     #[test]
     fn interrupt_lines_allocate_blocks_before_network_before_serial() {
-        let lines = allocate_interrupt_lines(&gic_with_spi_range(32, 5), 2, 2, true)
+        let lines = allocate_interrupt_lines(&gic_with_spi_range(32, 6), 2, 2, true, true)
             .expect("interrupt lines should allocate");
 
         assert_eq!(line_values(&lines.block), vec![32, 33]);
         assert_eq!(line_values(&lines.network), vec![34, 35]);
-        assert_eq!(lines.serial.map(|line| line.raw_value()), Some(36));
+        assert_eq!(lines.vsock.map(|line| line.raw_value()), Some(36));
+        assert_eq!(lines.serial.map(|line| line.raw_value()), Some(37));
     }
 
     #[test]
     fn interrupt_lines_allocate_none_for_absent_serial() {
-        let lines = allocate_interrupt_lines(&gic_with_spi_range(40, 3), 2, 1, false)
+        let lines = allocate_interrupt_lines(&gic_with_spi_range(40, 3), 2, 1, false, false)
             .expect("interrupt lines should allocate");
 
         assert_eq!(line_values(&lines.block), vec![40, 41]);
         assert_eq!(line_values(&lines.network), vec![42]);
+        assert_eq!(lines.vsock, None);
         assert_eq!(lines.serial, None);
     }
 
     #[test]
+    fn interrupt_lines_report_vsock_exhaustion_with_purpose() {
+        let err = allocate_interrupt_lines(&gic_with_spi_range(32, 2), 1, 1, true, false)
+            .expect_err("vsock allocation should exhaust range");
+
+        assert!(matches!(
+            err,
+            HvfArm64BootSessionError::AllocateInterruptLine {
+                purpose: HvfArm64BootInterruptLinePurpose::VsockDevice,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn interrupt_lines_report_serial_exhaustion_with_purpose() {
-        let err = allocate_interrupt_lines(&gic_with_spi_range(32, 2), 1, 1, true)
+        let err = allocate_interrupt_lines(&gic_with_spi_range(32, 3), 1, 1, true, true)
             .expect_err("serial allocation should exhaust range");
 
         assert!(matches!(
@@ -4388,7 +4448,7 @@ mod tests {
 
     #[test]
     fn interrupt_lines_report_network_exhaustion_with_purpose() {
-        let err = allocate_interrupt_lines(&gic_with_spi_range(32, 1), 1, 1, false)
+        let err = allocate_interrupt_lines(&gic_with_spi_range(32, 1), 1, 1, false, false)
             .expect_err("network allocation should exhaust range");
 
         assert!(matches!(
@@ -4402,7 +4462,7 @@ mod tests {
 
     #[test]
     fn interrupt_lines_reject_invalid_gic_range() {
-        let err = allocate_interrupt_lines(&gic_with_spi_range(31, 1), 0, 0, false)
+        let err = allocate_interrupt_lines(&gic_with_spi_range(31, 1), 0, 0, false, false)
             .expect_err("invalid SPI range should fail");
 
         assert!(matches!(
