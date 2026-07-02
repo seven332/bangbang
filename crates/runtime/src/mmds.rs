@@ -581,6 +581,23 @@ mod tests {
     }
 
     #[test]
+    fn query_data_uses_json_pointer_escaping() {
+        let mut state = MmdsState::default();
+        state
+            .put_data(MmdsContentInput::new(serde_json::json!({
+                "with/slash": {
+                    "tilde~key": "escaped",
+                },
+            })))
+            .expect("test MMDS value should initialize");
+
+        assert_eq!(
+            state.query_data("/with~1slash/tilde~0key", MmdsOutputFormat::Json),
+            Ok(r#""escaped""#.to_string())
+        );
+    }
+
+    #[test]
     fn query_data_rejects_missing_path() {
         let state = initialized_query_state();
 
