@@ -88,11 +88,17 @@ is resource-specific:
   successful streams in a bounded guest-initiated connection table, and deliver
   guest-visible `VSOCK_OP_RESPONSE` headers. Connect, duplicate, or retention
   failures deliver guest-visible `VSOCK_OP_RST` headers and retain no stream.
+  Established guest-initiated connections can forward bounded guest
+  `VSOCK_OP_RW` payload bytes to the retained host stream. Would-block, short,
+  zero-byte, or failed host writes for non-empty payloads drop the retained
+  stream and queue a guest-visible `VSOCK_OP_RST` instead of buffering
+  unbounded data.
   Startup also binds a nonblocking host Unix listener at `uds_path`,
   records the listener socket device and inode, and removes the path on normal
   shutdown only when it still refers to the socket created by this process. It
   does not route CIDs beyond current host/guest checks, dispatch event queues,
-  or move vsock data yet.
+  provide host-to-guest data movement, retry buffered RW writes, or implement
+  full credit accounting yet.
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink.
 - `/logger` opens `log_path` during pre-boot configuration when that field is
@@ -226,11 +232,15 @@ The current scaffold does not implement:
   `uds_path_<PORT>` sockets, retain successful streams in a bounded
   guest-initiated connection table, and deliver guest-visible
   `VSOCK_OP_RESPONSE` headers; connect or retention failures deliver
-  guest-visible `VSOCK_OP_RST` headers and retain no stream. Startup
+  guest-visible `VSOCK_OP_RST` headers and retain no stream. Established
+  guest-initiated connections can forward bounded guest `VSOCK_OP_RW` payload
+  bytes to retained host streams, and failed or incomplete writes drop the
+  retained stream before queuing a guest-visible reset. Startup
   preparation creates a nonblocking host Unix
   listener at `uds_path` and cleans it up only while the path still matches the
   created socket inode. It still does not route CIDs beyond current host/guest
-  checks, dispatch event queues, or move data
+  checks, dispatch event queues, provide host-to-guest data movement, retry
+  buffered RW writes, or implement full credit accounting
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 
