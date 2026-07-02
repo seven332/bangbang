@@ -81,12 +81,14 @@ is resource-specific:
   when pending host requests exist, and acknowledge guest `VSOCK_OP_RESPONSE`
   packets for delivered host requests by writing `OK <local_port>\n` to the
   retained host stream. Short or failed acknowledgement writes drop the retained
-  connection and release its host local port. Startup
-  also binds a nonblocking host Unix listener at `uds_path`, records the
-  listener socket device and inode, and removes the path on normal shutdown only
-  when it still refers to the socket created by this process. It does not send
-  `RST` responses, connect to `uds_path_<PORT>`, route CIDs, or move vsock data
-  yet.
+  connection and release its host local port. Unsupported or orphan
+  host-destined guest TX packets can queue bounded guest-visible
+  `VSOCK_OP_RST` headers without opening host paths. Startup also binds a
+  nonblocking host Unix listener at `uds_path`, records the listener socket
+  device and inode, and removes the path on normal shutdown only when it still
+  refers to the socket created by this process. It does not connect to
+  `uds_path_<PORT>`, route CIDs beyond current host/guest checks, dispatch event
+  queues, or move vsock data yet.
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink.
 - `/logger` opens `log_path` during pre-boot configuration when that field is
@@ -214,11 +216,12 @@ The current scaffold does not implement:
   exist, and acknowledge guest `VSOCK_OP_RESPONSE` packets for delivered host
   requests by writing `OK <local_port>\n` to the retained host stream. Short or
   failed acknowledgement writes drop the retained connection and release its
-  host local port. Startup
-  preparation creates a nonblocking host Unix listener at `uds_path` and cleans
-  it up only while the path still matches the created socket inode. It does not
-  send `RST` responses, connect guest-initiated `uds_path_<PORT>` sockets, route
-  CIDs, dispatch event queues, or move data
+  host local port. Unsupported or orphan host-destined guest TX packets can
+  queue bounded guest-visible `VSOCK_OP_RST` headers without opening host paths.
+  Startup preparation creates a nonblocking host Unix listener at `uds_path` and
+  cleans it up only while the path still matches the created socket inode. It
+  does not connect guest-initiated `uds_path_<PORT>` sockets, route CIDs beyond
+  current host/guest checks, dispatch event queues, or move data
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 
