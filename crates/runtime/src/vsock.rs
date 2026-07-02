@@ -6257,6 +6257,8 @@ fn has_control_character(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::VSOCK_HOST_RW_PENDING_PACKET_LIMIT;
+
     use std::error::Error as _;
     use std::fs;
     use std::io;
@@ -12871,6 +12873,100 @@ mod tests {
         assert_stream_closed(
             &mut client,
             "dropping handler should close queued host-initiated RW stream",
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_keep_host_rw_backlog_bounded_without_rx_buffer() {
+        let (mut memory, mut handler, mut accepted) =
+            established_guest_connection_for_test("host-rw-bounded-backlog", 52, 4000);
+        let payloads: [&[u8]; VSOCK_HOST_RW_PENDING_PACKET_LIMIT + 1] = [
+            b"bounded-host-rw-0",
+            b"bounded-host-rw-1",
+            b"bounded-host-rw-2",
+            b"bounded-host-rw-3",
+            b"bounded-host-rw-4",
+        ];
+        let rx_buffers = [
+            TEST_VSOCK_RX_SECOND_BUFFER,
+            TEST_VSOCK_PAYLOAD,
+            TEST_VSOCK_SECOND_PAYLOAD,
+            TEST_VSOCK_THIRD_HEADER,
+            TEST_VSOCK_FOURTH_HEADER,
+        ];
+
+        for payload in payloads
+            .iter()
+            .copied()
+            .take(VSOCK_HOST_RW_PENDING_PACKET_LIMIT)
+        {
+            accepted
+                .write_all(payload)
+                .expect("host payload should write into bounded backlog");
+            let notification = handler
+                .dispatch_vsock_queue_notifications(&mut memory)
+                .expect("host payload should queue while RX buffers are unavailable");
+            let rx = notification
+                .rx_queue_dispatch()
+                .expect("queued host RW should attempt RX dispatch");
+            assert_eq!(rx.processed_buffers(), 0);
+            assert_eq!(rx.delivered_host_rw_packets(), 0);
+        }
+
+        accepted
+            .write_all(payloads[VSOCK_HOST_RW_PENDING_PACKET_LIMIT])
+            .expect("extra host payload should stay readable after backlog fills");
+        let full_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("full backlog should avoid polling another host RW payload");
+        let full_rx = full_notification
+            .rx_queue_dispatch()
+            .expect("full backlog should still attempt RX dispatch");
+        assert_eq!(full_rx.processed_buffers(), 0);
+        assert_eq!(full_rx.delivered_host_rw_packets(), 0);
+        assert_eq!(read_vsock_rx_used_index(&memory), 1);
+
+        for (index, (payload, rx_buffer)) in payloads.iter().copied().zip(rx_buffers).enumerate() {
+            let descriptor_index =
+                u16::try_from(index + 1).expect("test descriptor index should fit");
+            write_vsock_rx_descriptor(
+                &mut memory,
+                descriptor_index,
+                TestDescriptor::writable(rx_buffer, vsock_packet_len_with_payload(payload), None),
+            );
+            append_vsock_rx_available_head(
+                &mut memory,
+                index + 1,
+                descriptor_index,
+                descriptor_index + 1,
+            );
+            notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+
+            let notification = handler
+                .dispatch_vsock_queue_notifications(&mut memory)
+                .expect("queued host RW should deliver in backlog order");
+            let rx = notification
+                .rx_queue_dispatch()
+                .expect("queued host RW should produce RX dispatch");
+            assert_eq!(rx.processed_buffers(), 1);
+            assert_eq!(rx.delivered_host_rw_packets(), 1);
+            assert_eq!(rx.delivered_host_rw_bytes(), payload.len());
+            assert_host_rw_payload_in_guest(&memory, rx_buffer, 42, 52, 4000, payload);
+            assert_eq!(
+                read_vsock_rx_used_element(&memory, index + 1),
+                (
+                    u32::from(descriptor_index),
+                    vsock_packet_len_with_payload(payload)
+                )
+            );
+        }
+
+        assert_eq!(read_vsock_rx_used_index(&memory), 6);
+
+        drop(handler);
+        assert_stream_closed(
+            &mut accepted,
+            "dropping handler should close bounded backlog host RW stream",
         );
     }
 

@@ -94,7 +94,7 @@ is resource-specific:
   zero-byte, or failed host writes for non-empty payloads drop the retained
   stream and queue a guest-visible `VSOCK_OP_RST` instead of buffering
   unbounded data. Established host-initiated and guest-initiated connections
-  can also retain a bounded per-connection backlog of host
+  can also retain a bounded four-packet per-connection backlog of host
   `VSOCK_OP_RW` payloads and deliver one queued payload at a time
   into validated guest RX buffers. Guest `VSOCK_OP_RST` packets drop matching
   retained host-initiated or guest-initiated streams without queuing guest-visible
@@ -246,8 +246,8 @@ The current scaffold does not implement:
   bytes to retained host streams, and failed or incomplete writes drop the
   retained stream before queuing a guest-visible reset. Established
   host-initiated and guest-initiated connections can retain a bounded
-  per-connection backlog of host `VSOCK_OP_RW` payloads and deliver one queued
-  payload at a time into validated guest RX buffers,
+  four-packet per-connection backlog of host `VSOCK_OP_RW` payloads and deliver
+  one queued payload at a time into validated guest RX buffers,
   guest `VSOCK_OP_RST` packets drop matching retained host-initiated or
   guest-initiated streams without queuing guest-visible RX output, and
   full guest `VSOCK_OP_SHUTDOWN` packets drop matching retained streams before
