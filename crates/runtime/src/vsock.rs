@@ -3,7 +3,10 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque, hash_map::Entry};
 use std::fmt;
 use std::fs;
-use std::io::{Read as _, Write as _};
+use std::io::{self, Read as _, Write as _};
+use std::mem;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -66,6 +69,7 @@ const VIRTIO_VSOCK_TX_QUEUE_INDEX_U32: u32 = 1;
 const VIRTIO_VSOCK_EVENT_QUEUE_INDEX_U32: u32 = 2;
 const VIRTIO_VSOCK_PACKET_HEADER_SIZE_U32: u32 = VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32;
 const VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64: u64 = VIRTIO_VSOCK_PACKET_HEADER_SIZE as u64;
+const NONBLOCKING_CONNECT_INTERRUPTED_RETRY_LIMIT: usize = 4;
 const VSOCK_HOST_CONNECT_COMMAND: &str = "connect";
 
 pub type VirtioVsockMmioHandler =
@@ -835,6 +839,209 @@ fn guest_connection_socket_path(host_socket_path: &Path, host_port: u32) -> Path
     PathBuf::from(path)
 }
 
+fn nonblocking_unix_stream_connect(path: &Path) -> io::Result<UnixStream> {
+    let address = unix_socket_address(path)?;
+    let socket = nonblocking_unix_stream_socket()?;
+    let mut interrupted_attempts = 0;
+
+    loop {
+        // SAFETY: `socket` is a live AF_UNIX stream fd. `address.address` is a
+        // properly initialized `sockaddr_un`, and `address.len` covers only the
+        // initialized pathname bytes plus the trailing NUL.
+        let result = unsafe {
+            libc::connect(
+                socket.as_raw_fd(),
+                (&raw const address.address).cast::<libc::sockaddr>(),
+                address.len,
+            )
+        };
+
+        if result == 0 {
+            return Ok(UnixStream::from(socket));
+        }
+
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted
+            && interrupted_attempts < NONBLOCKING_CONNECT_INTERRUPTED_RETRY_LIMIT
+        {
+            interrupted_attempts += 1;
+            continue;
+        }
+        if err.raw_os_error() != Some(libc::EINPROGRESS) {
+            return Err(err);
+        }
+        break;
+    }
+
+    finish_nonblocking_unix_stream_connect(&socket)?;
+    Ok(UnixStream::from(socket))
+}
+
+#[derive(Debug)]
+struct UnixSocketAddress {
+    address: libc::sockaddr_un,
+    len: libc::socklen_t,
+}
+
+fn unix_socket_address(path: &Path) -> io::Result<UnixSocketAddress> {
+    let bytes = path.as_os_str().as_bytes();
+
+    // SAFETY: `sockaddr_un` is a plain C address struct. Zero initialization
+    // produces a valid baseline with an empty `sun_path`.
+    let mut address = unsafe { mem::zeroed::<libc::sockaddr_un>() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+
+    if bytes.contains(&0) || bytes.len() >= address.sun_path.len() {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+
+    for (target, byte) in address.sun_path.iter_mut().zip(bytes.iter().copied()) {
+        *target = byte as libc::c_char;
+    }
+
+    let len = libc::socklen_t::try_from(sockaddr_un_path_offset() + bytes.len() + 1)
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_vendor = "apple",
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    ))]
+    {
+        address.sun_len =
+            u8::try_from(len).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    }
+
+    Ok(UnixSocketAddress { address, len })
+}
+
+const fn sockaddr_un_path_offset() -> usize {
+    sockaddr_un_len_prefix_size() + mem::size_of::<libc::sa_family_t>()
+}
+
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_vendor = "apple",
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos"
+))]
+const fn sockaddr_un_len_prefix_size() -> usize {
+    mem::size_of::<u8>()
+}
+
+#[cfg(not(any(
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_vendor = "apple",
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos"
+)))]
+const fn sockaddr_un_len_prefix_size() -> usize {
+    0
+}
+
+fn nonblocking_unix_stream_socket() -> io::Result<OwnedFd> {
+    // SAFETY: `socket` has no Rust aliasing requirements. On success, the raw
+    // fd is immediately wrapped in `OwnedFd` so it is closed on every error path.
+    let raw_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if raw_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: `raw_fd` was just returned by `socket` and has not been wrapped
+    // or transferred elsewhere.
+    let socket = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    set_nonblocking_fd(&socket)?;
+    Ok(socket)
+}
+
+fn set_nonblocking_fd(fd: &OwnedFd) -> io::Result<()> {
+    // SAFETY: `fd` is a live file descriptor and `F_GETFL` does not require an
+    // additional pointer argument.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: `fd` is live and `flags | O_NONBLOCK` preserves existing status
+    // flags while enabling nonblocking I/O.
+    let result = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
+fn finish_nonblocking_unix_stream_connect(socket: &OwnedFd) -> io::Result<()> {
+    let mut poll_fd = libc::pollfd {
+        fd: socket.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    let mut interrupted_attempts = 0;
+    let result = loop {
+        // SAFETY: `poll_fd` points to one initialized descriptor entry. A zero
+        // timeout only observes immediately completed nonblocking connects.
+        let result = unsafe { libc::poll(&mut poll_fd, 1, 0) };
+        if result >= 0 {
+            break result;
+        }
+
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted
+            || interrupted_attempts >= NONBLOCKING_CONNECT_INTERRUPTED_RETRY_LIMIT
+        {
+            return Err(err);
+        }
+        interrupted_attempts += 1;
+    };
+    if result == 0 {
+        return Err(io::Error::from(io::ErrorKind::WouldBlock));
+    }
+
+    let mut socket_error: libc::c_int = 0;
+    let mut socket_error_len = libc::socklen_t::try_from(mem::size_of_val(&socket_error))
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: `socket_error` and `socket_error_len` are valid output pointers
+    // for the `SO_ERROR` integer on a live socket fd.
+    let result = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            (&raw mut socket_error).cast::<libc::c_void>(),
+            &raw mut socket_error_len,
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if socket_error != 0 {
+        return Err(io::Error::from_raw_os_error(socket_error));
+    }
+
+    Ok(())
+}
+
 fn guest_reset_packet_header_for_tx_packet(
     packet: &VirtioVsockTxPacket,
     guest_cid: u32,
@@ -1138,7 +1345,6 @@ enum VsockGuestConnectionRequestIgnoreReason {
 enum VsockGuestConnectionRequestError {
     MissingHostSocketPath,
     Connect(std::io::ErrorKind),
-    SetNonblocking(std::io::ErrorKind),
     Table(VsockGuestConnectionTableError),
 }
 
@@ -3760,7 +3966,7 @@ impl VirtioVsockDevice {
             });
         };
         let path = guest_connection_socket_path(host_socket_path, key.host_port());
-        let stream = match UnixStream::connect(path) {
+        let stream = match nonblocking_unix_stream_connect(&path) {
             Ok(stream) => stream,
             Err(err) => {
                 return Some(VsockGuestConnectionRequestOutcome::Dropped {
@@ -3769,12 +3975,6 @@ impl VirtioVsockDevice {
                 });
             }
         };
-        if let Err(err) = stream.set_nonblocking(true) {
-            return Some(VsockGuestConnectionRequestOutcome::Dropped {
-                key,
-                source: VsockGuestConnectionRequestError::SetNonblocking(err.kind()),
-            });
-        }
 
         match self
             .guest_connections
@@ -4841,6 +5041,7 @@ fn has_control_character(value: &str) -> bool {
 mod tests {
     use std::error::Error as _;
     use std::fs;
+    use std::io;
     use std::io::{Read as _, Write as _};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::Path;
@@ -5150,6 +5351,21 @@ mod tests {
 
     fn guest_connection_listener(base: &Path, port: u32) -> TestUnixListener {
         TestUnixListener::bind(super::guest_connection_socket_path(base, port))
+    }
+
+    #[test]
+    fn nonblocking_unix_stream_connect_rejects_too_long_path() {
+        let max_path_len = super::unix_socket_address(Path::new("x"))
+            .expect("single-byte path should fit")
+            .address
+            .sun_path
+            .len();
+        let path = PathBuf::from("x".repeat(max_path_len));
+
+        let err = super::nonblocking_unix_stream_connect(&path)
+            .expect_err("path at sun_path capacity should be rejected");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     fn guest_request_tx_packet(

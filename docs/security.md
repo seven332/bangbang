@@ -83,12 +83,12 @@ is resource-specific:
   retained host stream. Short or failed acknowledgement writes drop the retained
   connection and release its host local port. Unsupported or orphan
   host-destined guest TX packets can queue bounded guest-visible
-  `VSOCK_OP_RST` headers. Supported guest `VSOCK_OP_REQUEST` packets connect to
-  Firecracker-shaped `uds_path_<PORT>` sockets, set successful streams
-  nonblocking, retain them in a bounded guest-initiated connection table, and
-  deliver guest-visible `VSOCK_OP_RESPONSE` headers. Connect, duplicate, or
-  retention failures deliver guest-visible `VSOCK_OP_RST` headers and retain no
-  stream. Startup also binds a nonblocking host Unix listener at `uds_path`,
+  `VSOCK_OP_RST` headers. Supported guest `VSOCK_OP_REQUEST` packets attempt
+  nonblocking connects to Firecracker-shaped `uds_path_<PORT>` sockets, retain
+  successful streams in a bounded guest-initiated connection table, and deliver
+  guest-visible `VSOCK_OP_RESPONSE` headers. Connect, duplicate, or retention
+  failures deliver guest-visible `VSOCK_OP_RST` headers and retain no stream.
+  Startup also binds a nonblocking host Unix listener at `uds_path`,
   records the listener socket device and inode, and removes the path on normal
   shutdown only when it still refers to the socket created by this process. It
   does not route CIDs beyond current host/guest checks, dispatch event queues,
@@ -222,11 +222,12 @@ The current scaffold does not implement:
   failed acknowledgement writes drop the retained connection and release its
   host local port. Unsupported or orphan host-destined guest TX packets can
   queue bounded guest-visible `VSOCK_OP_RST` headers. Supported guest
-  `VSOCK_OP_REQUEST` packets connect to Firecracker-shaped `uds_path_<PORT>`
-  sockets, retain successful nonblocking streams in a bounded guest-initiated
-  connection table, and deliver guest-visible `VSOCK_OP_RESPONSE` headers;
-  connect or retention failures deliver guest-visible `VSOCK_OP_RST` headers
-  and retain no stream. Startup preparation creates a nonblocking host Unix
+  `VSOCK_OP_REQUEST` packets attempt nonblocking connects to Firecracker-shaped
+  `uds_path_<PORT>` sockets, retain successful streams in a bounded
+  guest-initiated connection table, and deliver guest-visible
+  `VSOCK_OP_RESPONSE` headers; connect or retention failures deliver
+  guest-visible `VSOCK_OP_RST` headers and retain no stream. Startup
+  preparation creates a nonblocking host Unix
   listener at `uds_path` and cleans it up only while the path still matches the
   created socket inode. It still does not route CIDs beyond current host/guest
   checks, dispatch event queues, or move data
