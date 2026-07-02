@@ -3172,7 +3172,7 @@ mod tests {
             .outcome()
             .dispatched()
             .expect("no pending notification should dispatch as no-op");
-        assert_eq!(dispatch.drained_notifications(), []);
+        assert!(dispatch.drained_notifications().is_empty());
         assert!(dispatch.tx_queue_dispatch().is_none());
         assert!(!device_dispatch.needs_queue_interrupt());
         assert_eq!(
@@ -3387,7 +3387,7 @@ mod tests {
             .outcome()
             .dispatched()
             .expect("late host CONNECT should dispatch");
-        assert_eq!(dispatch.drained_notifications(), []);
+        assert!(dispatch.drained_notifications().is_empty());
         assert_eq!(dispatch.host_request_dispatch().accepted_connections(), 1);
         assert_eq!(dispatch.host_request_dispatch().completed_requests(), 1);
         assert_eq!(dispatch.host_request_dispatch().dropped_connections(), 0);
@@ -3722,7 +3722,7 @@ mod tests {
             .outcome()
             .dispatched()
             .expect("no pending notification should dispatch as no-op");
-        assert_eq!(dispatch.drained_notifications(), []);
+        assert!(dispatch.drained_notifications().is_empty());
         assert!(dispatch.tx_queue_dispatch().is_none());
         assert!(!device_dispatch.needs_queue_interrupt());
     }
@@ -3758,7 +3758,7 @@ mod tests {
             .outcome()
             .dispatched()
             .expect("no pending notification should dispatch as no-op");
-        assert_eq!(dispatch.drained_notifications(), []);
+        assert!(dispatch.drained_notifications().is_empty());
         assert!(!dispatches.needs_queue_interrupt());
     }
 
@@ -4134,7 +4134,7 @@ mod tests {
             .outcome()
             .dispatched()
             .expect("no pending notification should still dispatch as no-op");
-        assert_eq!(dispatch.drained_notifications(), []);
+        assert!(dispatch.drained_notifications().is_empty());
         assert!(dispatch.queue_dispatch().is_none());
         assert!(!device_dispatch.needs_queue_interrupt());
         assert_eq!(
@@ -4216,7 +4216,7 @@ mod tests {
             .outcome()
             .dispatched()
             .expect("cleared notification should dispatch as no-op");
-        assert_eq!(second.drained_notifications(), []);
+        assert!(second.drained_notifications().is_empty());
         assert!(second.queue_dispatch().is_none());
     }
 
@@ -4434,13 +4434,13 @@ mod tests {
         assert_eq!(first.device().registration.drive_id(), "rootfs");
         assert_eq!(first.device().fdt_device.interrupt_line, line(32));
         assert!(!first.needs_queue_interrupt());
-        assert_eq!(
+        assert!(
             first
                 .outcome()
                 .dispatched()
                 .expect("first device should dispatch as no-op")
-                .drained_notifications(),
-            []
+                .drained_notifications()
+                .is_empty()
         );
         assert_eq!(second.device().registration.drive_id(), "data");
         assert_eq!(second.device().fdt_device.interrupt_line, line(33));

@@ -5797,7 +5797,7 @@ mod tests {
             .dispatch_block_queue_notifications(&mut memory)
             .expect("no pending notification should not fail");
 
-        assert_eq!(dispatch.drained_notifications(), []);
+        assert!(dispatch.drained_notifications().is_empty());
         assert!(dispatch.queue_dispatch().is_none());
         assert!(!dispatch.needs_queue_interrupt());
         assert_eq!(read_interrupt_status(&handler), 0);
@@ -6054,7 +6054,7 @@ mod tests {
             .dispatch_block_queue_notifications(&mut memory)
             .expect("reset handler should have no notification to dispatch");
 
-        assert_eq!(dispatch.drained_notifications(), []);
+        assert!(dispatch.drained_notifications().is_empty());
         assert!(dispatch.queue_dispatch().is_none());
         assert_eq!(read_interrupt_status(&handler), 0);
         assert!(!handler.activation_handler().is_activated());

@@ -176,6 +176,14 @@ configuration, and are intentionally omitted from `GET /vm/config`. Future full
 logging and metrics support must avoid leaking host paths or unexpected guest
 data in error messages.
 
+MMDS control-plane contents are process-local in-memory JSON state configured
+through the unauthenticated local API socket. Treat metadata as sensitive host
+control-plane data: any process that can use the API socket can read, replace,
+or patch it. The current implementation bounds the serialized MMDS data store
+to `51200` bytes and does not expose the contents to the guest yet. Future
+guest-visible MMDS work must validate device, packet, token, and response
+format inputs before making this data reachable from guest code.
+
 ## Multi-Process Operation
 
 Multiple bangbang processes can run on one host, but they must not share mutable
@@ -204,7 +212,7 @@ The current scaffold does not implement:
 - a Firecracker-jailer replacement
 - privilege dropping
 - host resource brokering
-- network, MMDS storage or guest access, snapshot, or full vsock containment; the current network interface
+- network, MMDS guest access, snapshot, or full vsock containment; the current network interface
   configuration path validates and stores configuration strings, and internal
   virtio-net notification dispatch can parse guest TX descriptor metadata and
   pass validated TX frame payloads to injected packet I/O selected per configured

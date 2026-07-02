@@ -12133,7 +12133,7 @@ mod tests {
             .dispatch_drained_queue_notifications(&mut memory, Vec::new())
             .expect("empty notification drain should be a no-op");
 
-        assert_eq!(dispatch.drained_notifications(), &[]);
+        assert!(dispatch.drained_notifications().is_empty());
         assert_eq!(dispatch.event_notifications(), 0);
         assert_empty_host_request_dispatch(dispatch.host_request_dispatch());
         assert_empty_guest_response_dispatch(dispatch.guest_response_dispatch());
@@ -12251,7 +12251,7 @@ mod tests {
             .dispatch_vsock_queue_notifications(&mut memory)
             .expect("late host CONNECT should dispatch into available RX buffer");
 
-        assert_eq!(second.drained_notifications(), &[]);
+        assert!(second.drained_notifications().is_empty());
         assert_eq!(second.host_request_dispatch().accepted_connections(), 1);
         assert_eq!(second.host_request_dispatch().completed_requests(), 1);
         assert_eq!(second.host_request_dispatch().dropped_connections(), 0);

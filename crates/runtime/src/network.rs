@@ -5872,7 +5872,7 @@ mod tests {
             .dispatch_drained_queue_notifications_with_tx_sink(&mut memory, Vec::new(), &mut sink)
             .expect("empty notification drain should be a no-op");
 
-        assert_eq!(dispatch.drained_notifications(), &[]);
+        assert!(dispatch.drained_notifications().is_empty());
         assert!(dispatch.rx_queue_dispatch().is_none());
         assert!(dispatch.tx_queue_dispatch().is_none());
         assert!(!dispatch.needs_queue_interrupt());
@@ -6448,7 +6448,7 @@ mod tests {
             .expect("too-small metadata should be present");
         assert_eq!(failure.descriptor_head(), 0);
         assert_eq!(failure.len(), VIRTIO_NET_RX_MIN_BUFFER_SIZE);
-        assert_eq!(failure.required_len(), rx_used_len(2_000).into());
+        assert_eq!(failure.required_len(), u64::from(rx_used_len(2_000)));
         assert_eq!(source.consume_calls, 0);
         assert_eq!(source.remaining_packets(), 1);
         assert_eq!(read_rx_used_index(&memory), 1);
@@ -7056,7 +7056,7 @@ mod tests {
             .dispatch_network_queue_notifications(&mut memory)
             .expect("second dispatch without notification should be a no-op");
 
-        assert_eq!(second.drained_notifications(), []);
+        assert!(second.drained_notifications().is_empty());
         assert!(second.tx_queue_dispatch().is_none());
         assert!(!second.needs_queue_interrupt());
         assert_eq!(read_interrupt_status(&handler), 0);
