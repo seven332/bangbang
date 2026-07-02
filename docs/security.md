@@ -97,15 +97,17 @@ is resource-specific:
   can also deliver one bounded pending host `VSOCK_OP_RW` payload at a time
   into validated guest RX buffers. Guest `VSOCK_OP_RST` packets drop matching
   retained host-initiated or guest-initiated streams without queuing guest-visible
-  RX output. Host-stream EOF or read failures drop the retained stream and
-  queue a guest-visible `VSOCK_OP_RST`.
+  RX output. Full guest `VSOCK_OP_SHUTDOWN` packets drop matching retained
+  streams, release the host local port when applicable, and queue a
+  guest-visible `VSOCK_OP_RST`. Host-stream EOF or read failures drop the
+  retained stream and queue a guest-visible `VSOCK_OP_RST`.
   Startup also binds a nonblocking host Unix listener at `uds_path`,
   records the listener socket device and inode, and removes the path on normal
   shutdown only when it still refers to the socket created by this process. It
   does not route CIDs beyond current host/guest checks, dispatch real event
   payloads, provide host-to-guest data movement beyond one bounded pending
-  packet per established stream, retry buffered RW writes, or implement full
-  credit accounting yet.
+  packet per established stream, track graceful half-close state, retry
+  buffered RW writes, or implement full credit accounting yet.
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink.
 - `/logger` opens `log_path` during pre-boot configuration when that field is
@@ -247,14 +249,15 @@ The current scaffold does not implement:
   pending host `VSOCK_OP_RW` payload at a time into validated guest RX buffers,
   guest `VSOCK_OP_RST` packets drop matching retained host-initiated or
   guest-initiated streams without queuing guest-visible RX output, and
-  host-stream EOF or read failures drop the retained stream before queuing
-  a guest-visible reset. Startup preparation creates a nonblocking host Unix
+  full guest `VSOCK_OP_SHUTDOWN` packets drop matching retained streams before
+  queuing a guest-visible reset. Host-stream EOF or read failures drop the
+  retained stream before queuing a guest-visible reset. Startup preparation creates a nonblocking host Unix
   listener at `uds_path` and cleans it up only while the path still matches the
   created socket inode. It can accept event queue notifications as no-op
   dispatch metadata, but it still does not route CIDs beyond current host/guest
   checks, dispatch real event payloads, provide host-to-guest data movement
-  beyond one bounded pending packet per established stream, implement graceful
-  shutdown, retry buffered RW writes, or implement full credit accounting
+  beyond one bounded pending packet per established stream, track graceful
+  half-close state, retry buffered RW writes, or implement full credit accounting
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 

@@ -1164,16 +1164,21 @@ fn guest_reset_packet_header_for_tx_packet(
         return None;
     }
 
-    Some(
-        VirtioVsockPacketHeader::new()
-            .with_src_cid(VIRTIO_VSOCK_HOST_CID)
-            .with_dst_cid(u64::from(guest_cid))
-            .with_src_port(header.dst_port())
-            .with_dst_port(header.src_port())
-            .with_packet_type(VIRTIO_VSOCK_PACKET_TYPE_STREAM)
-            .with_operation(VIRTIO_VSOCK_OP_RST)
-            .with_buffer_allocation(VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE),
-    )
+    Some(guest_reset_packet_header_for_tx_header(header, guest_cid))
+}
+
+fn guest_reset_packet_header_for_tx_header(
+    header: VirtioVsockPacketHeader,
+    guest_cid: u32,
+) -> VirtioVsockPacketHeader {
+    VirtioVsockPacketHeader::new()
+        .with_src_cid(VIRTIO_VSOCK_HOST_CID)
+        .with_dst_cid(u64::from(guest_cid))
+        .with_src_port(header.dst_port())
+        .with_dst_port(header.src_port())
+        .with_packet_type(VIRTIO_VSOCK_PACKET_TYPE_STREAM)
+        .with_operation(VIRTIO_VSOCK_OP_RST)
+        .with_buffer_allocation(VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE)
 }
 
 #[derive(Debug)]
@@ -1529,6 +1534,27 @@ enum VsockGuestRstIgnoreReason {
     WrongSourceCid,
     WrongDestinationCid,
     PayloadPresent,
+    MissingConnection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VsockGuestShutdownOutcome {
+    Closed {
+        host_connection_closed: bool,
+        guest_connection_closed: bool,
+        reset_queued: bool,
+    },
+    Ignored {
+        reason: VsockGuestShutdownIgnoreReason,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VsockGuestShutdownIgnoreReason {
+    WrongSourceCid,
+    WrongDestinationCid,
+    PayloadPresent,
+    MissingFullShutdownFlags,
     MissingConnection,
 }
 
@@ -4775,6 +4801,20 @@ impl VirtioVsockDevice {
         }
     }
 
+    fn remove_guest_stream_connections(&mut self, header: VirtioVsockPacketHeader) -> (bool, bool) {
+        let host_connection_closed =
+            VsockHostLocalPort::try_from_raw(header.dst_port()).is_ok_and(|local_port| {
+                self.host_connections
+                    .remove(VsockHostConnectionKey::new(local_port, header.src_port()))
+            });
+        let guest_connection_closed = self.guest_connections.remove(VsockGuestConnectionKey::new(
+            header.dst_port(),
+            header.src_port(),
+        ));
+
+        (host_connection_closed, guest_connection_closed)
+    }
+
     fn reset_guest_connection_packet(
         &mut self,
         packet: &VirtioVsockTxPacket,
@@ -4802,16 +4842,8 @@ impl VirtioVsockDevice {
             });
         }
 
-        let host_connection_closed =
-            VsockHostLocalPort::try_from_raw(header.dst_port()).is_ok_and(|local_port| {
-                self.host_connections
-                    .remove(VsockHostConnectionKey::new(local_port, header.src_port()))
-            });
-        let guest_connection_closed = self.guest_connections.remove(VsockGuestConnectionKey::new(
-            header.dst_port(),
-            header.src_port(),
-        ));
-
+        let (host_connection_closed, guest_connection_closed) =
+            self.remove_guest_stream_connections(header);
         if host_connection_closed || guest_connection_closed {
             Some(VsockGuestRstOutcome::Closed {
                 host_connection_closed,
@@ -4820,6 +4852,58 @@ impl VirtioVsockDevice {
         } else {
             Some(VsockGuestRstOutcome::Ignored {
                 reason: VsockGuestRstIgnoreReason::MissingConnection,
+            })
+        }
+    }
+
+    fn shutdown_guest_connection_packet(
+        &mut self,
+        packet: &VirtioVsockTxPacket,
+    ) -> Option<VsockGuestShutdownOutcome> {
+        let header = packet.header();
+        if header.operation() != VIRTIO_VSOCK_OP_SHUTDOWN {
+            return None;
+        }
+        if header.src_cid() != u64::from(self.guest_cid) {
+            return Some(VsockGuestShutdownOutcome::Ignored {
+                reason: VsockGuestShutdownIgnoreReason::WrongSourceCid,
+            });
+        }
+        if header.dst_cid() != VIRTIO_VSOCK_HOST_CID {
+            return Some(VsockGuestShutdownOutcome::Ignored {
+                reason: VsockGuestShutdownIgnoreReason::WrongDestinationCid,
+            });
+        }
+        if header.packet_type() != VIRTIO_VSOCK_PACKET_TYPE_STREAM {
+            return None;
+        }
+        if header.payload_len() != 0 {
+            return Some(VsockGuestShutdownOutcome::Ignored {
+                reason: VsockGuestShutdownIgnoreReason::PayloadPresent,
+            });
+        }
+        let required_shutdown_flags =
+            VIRTIO_VSOCK_FLAGS_SHUTDOWN_RCV | VIRTIO_VSOCK_FLAGS_SHUTDOWN_SEND;
+        if header.flags() & required_shutdown_flags != required_shutdown_flags {
+            return Some(VsockGuestShutdownOutcome::Ignored {
+                reason: VsockGuestShutdownIgnoreReason::MissingFullShutdownFlags,
+            });
+        }
+
+        let (host_connection_closed, guest_connection_closed) =
+            self.remove_guest_stream_connections(header);
+        if host_connection_closed || guest_connection_closed {
+            let reset_queued = self.queue_guest_reset_packet(
+                guest_reset_packet_header_for_tx_header(header, self.guest_cid),
+            );
+            Some(VsockGuestShutdownOutcome::Closed {
+                host_connection_closed,
+                guest_connection_closed,
+                reset_queued,
+            })
+        } else {
+            Some(VsockGuestShutdownOutcome::Ignored {
+                reason: VsockGuestShutdownIgnoreReason::MissingConnection,
             })
         }
     }
@@ -4833,6 +4917,7 @@ impl VirtioVsockDevice {
         let mut request_dispatch = VirtioVsockGuestRequestDispatch::new();
         let mut rw_dispatch = VirtioVsockGuestRwDispatch::new();
         let mut guest_rst_dispatch = VirtioVsockGuestRstDispatch::new();
+        let mut guest_shutdown_dispatch = VirtioVsockGuestShutdownDispatch::new();
         let mut reset_dispatch = VirtioVsockGuestResetDispatch::new();
 
         for packet in tx_dispatch.packets() {
@@ -4877,6 +4962,11 @@ impl VirtioVsockDevice {
                 continue;
             }
 
+            if let Some(outcome) = self.shutdown_guest_connection_packet(packet) {
+                guest_shutdown_dispatch.record(outcome);
+                continue;
+            }
+
             if let Some(header) = guest_reset_packet_header_for_tx_packet(packet, self.guest_cid) {
                 let queued = self.queue_guest_reset_packet(header);
                 reset_dispatch.record(queued);
@@ -4888,6 +4978,7 @@ impl VirtioVsockDevice {
             request_dispatch,
             rw_dispatch,
             guest_rst_dispatch,
+            guest_shutdown_dispatch,
             reset_dispatch,
         )
     }
@@ -5120,6 +5211,7 @@ struct VirtioVsockGuestTxControlDispatch {
     request_dispatch: VirtioVsockGuestRequestDispatch,
     rw_dispatch: VirtioVsockGuestRwDispatch,
     guest_rst_dispatch: VirtioVsockGuestRstDispatch,
+    guest_shutdown_dispatch: VirtioVsockGuestShutdownDispatch,
     reset_dispatch: VirtioVsockGuestResetDispatch,
 }
 
@@ -5130,6 +5222,7 @@ impl VirtioVsockGuestTxControlDispatch {
             VirtioVsockGuestRequestDispatch::new(),
             VirtioVsockGuestRwDispatch::new(),
             VirtioVsockGuestRstDispatch::new(),
+            VirtioVsockGuestShutdownDispatch::new(),
             VirtioVsockGuestResetDispatch::new(),
         )
     }
@@ -5139,6 +5232,7 @@ impl VirtioVsockGuestTxControlDispatch {
         request_dispatch: VirtioVsockGuestRequestDispatch,
         rw_dispatch: VirtioVsockGuestRwDispatch,
         guest_rst_dispatch: VirtioVsockGuestRstDispatch,
+        guest_shutdown_dispatch: VirtioVsockGuestShutdownDispatch,
         reset_dispatch: VirtioVsockGuestResetDispatch,
     ) -> Self {
         Self {
@@ -5146,6 +5240,7 @@ impl VirtioVsockGuestTxControlDispatch {
             request_dispatch,
             rw_dispatch,
             guest_rst_dispatch,
+            guest_shutdown_dispatch,
             reset_dispatch,
         }
     }
@@ -5160,6 +5255,7 @@ pub struct VirtioVsockDeviceNotificationDispatch {
     guest_request_dispatch: VirtioVsockGuestRequestDispatch,
     guest_rw_dispatch: VirtioVsockGuestRwDispatch,
     guest_rst_dispatch: VirtioVsockGuestRstDispatch,
+    guest_shutdown_dispatch: VirtioVsockGuestShutdownDispatch,
     guest_reset_dispatch: VirtioVsockGuestResetDispatch,
     rx_queue_dispatch: Option<VirtioVsockRxQueueDispatch>,
     tx_queue_dispatch: Option<VirtioVsockTxQueueDispatch>,
@@ -5185,6 +5281,7 @@ impl VirtioVsockDeviceNotificationDispatch {
             guest_request_dispatch: guest_tx_control_dispatch.request_dispatch,
             guest_rw_dispatch: guest_tx_control_dispatch.rw_dispatch,
             guest_rst_dispatch: guest_tx_control_dispatch.guest_rst_dispatch,
+            guest_shutdown_dispatch: guest_tx_control_dispatch.guest_shutdown_dispatch,
             guest_reset_dispatch: guest_tx_control_dispatch.reset_dispatch,
             rx_queue_dispatch,
             tx_queue_dispatch,
@@ -5217,6 +5314,10 @@ impl VirtioVsockDeviceNotificationDispatch {
 
     pub const fn guest_rst_dispatch(&self) -> &VirtioVsockGuestRstDispatch {
         &self.guest_rst_dispatch
+    }
+
+    pub const fn guest_shutdown_dispatch(&self) -> &VirtioVsockGuestShutdownDispatch {
+        &self.guest_shutdown_dispatch
     }
 
     pub const fn guest_reset_dispatch(&self) -> &VirtioVsockGuestResetDispatch {
@@ -5450,6 +5551,76 @@ impl VirtioVsockGuestRstDispatch {
                 self.closed_guest_connections += usize::from(guest_connection_closed);
             }
             VsockGuestRstOutcome::Ignored { reason } => {
+                let _ = reason;
+                self.ignored_packets += 1;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioVsockGuestShutdownDispatch {
+    shutdown_packets: usize,
+    closed_host_connections: usize,
+    closed_guest_connections: usize,
+    queued_resets: usize,
+    dropped_resets: usize,
+    ignored_packets: usize,
+}
+
+impl VirtioVsockGuestShutdownDispatch {
+    const fn new() -> Self {
+        Self {
+            shutdown_packets: 0,
+            closed_host_connections: 0,
+            closed_guest_connections: 0,
+            queued_resets: 0,
+            dropped_resets: 0,
+            ignored_packets: 0,
+        }
+    }
+
+    pub const fn shutdown_packets(&self) -> usize {
+        self.shutdown_packets
+    }
+
+    pub const fn closed_host_connections(&self) -> usize {
+        self.closed_host_connections
+    }
+
+    pub const fn closed_guest_connections(&self) -> usize {
+        self.closed_guest_connections
+    }
+
+    pub const fn queued_resets(&self) -> usize {
+        self.queued_resets
+    }
+
+    pub const fn dropped_resets(&self) -> usize {
+        self.dropped_resets
+    }
+
+    pub const fn ignored_packets(&self) -> usize {
+        self.ignored_packets
+    }
+
+    fn record(&mut self, outcome: VsockGuestShutdownOutcome) {
+        self.shutdown_packets += 1;
+        match outcome {
+            VsockGuestShutdownOutcome::Closed {
+                host_connection_closed,
+                guest_connection_closed,
+                reset_queued,
+            } => {
+                self.closed_host_connections += usize::from(host_connection_closed);
+                self.closed_guest_connections += usize::from(guest_connection_closed);
+                if reset_queued {
+                    self.queued_resets += 1;
+                } else {
+                    self.dropped_resets += 1;
+                }
+            }
+            VsockGuestShutdownOutcome::Ignored { reason } => {
                 let _ = reason;
                 self.ignored_packets += 1;
             }
@@ -6098,11 +6269,11 @@ mod tests {
         VirtioVsockConfigSpace, VirtioVsockDevice, VirtioVsockDeviceActivationError,
         VirtioVsockGuestRequestDispatch, VirtioVsockGuestResetDispatch,
         VirtioVsockGuestResponseDispatch, VirtioVsockGuestRstDispatch, VirtioVsockGuestRwDispatch,
-        VirtioVsockHostRequestDispatch, VirtioVsockMmioHandler, VirtioVsockPacketHeader,
-        VirtioVsockPacketLengthError, VirtioVsockQueueBuildError, VirtioVsockRxBufferParseError,
-        VirtioVsockRxPacketKind, VirtioVsockRxQueue, VirtioVsockRxQueueDispatchError,
-        VirtioVsockTxPacket, VirtioVsockTxPacketParseError, VirtioVsockTxQueue,
-        VirtioVsockTxQueueDispatchError, VsockConfigError, VsockConfigInput,
+        VirtioVsockGuestShutdownDispatch, VirtioVsockHostRequestDispatch, VirtioVsockMmioHandler,
+        VirtioVsockPacketHeader, VirtioVsockPacketLengthError, VirtioVsockQueueBuildError,
+        VirtioVsockRxBufferParseError, VirtioVsockRxPacketKind, VirtioVsockRxQueue,
+        VirtioVsockRxQueueDispatchError, VirtioVsockTxPacket, VirtioVsockTxPacketParseError,
+        VirtioVsockTxQueue, VirtioVsockTxQueueDispatchError, VsockConfigError, VsockConfigInput,
         VsockGuestConnectionKey, VsockHostConnectHandshakeError, VsockHostConnectRequest,
         VsockHostConnectRequestError, VsockHostConnectionKey, VsockHostConnectionTable,
         VsockHostConnectionTableError, VsockHostLocalPort, VsockHostLocalPortAllocator,
@@ -6139,6 +6310,7 @@ mod tests {
     const TEST_VSOCK_PAYLOAD: GuestAddress = GuestAddress::new(0x6000);
     const TEST_VSOCK_SECOND_PAYLOAD: GuestAddress = GuestAddress::new(0x7000);
     const TEST_VSOCK_THIRD_HEADER: GuestAddress = GuestAddress::new(0x8000);
+    const TEST_VSOCK_FOURTH_HEADER: GuestAddress = GuestAddress::new(0xb000);
     const TEST_VSOCK_QUEUE_SIZE: u16 = 8;
 
     fn validate(input: VsockConfigInput) -> Result<super::VsockConfig, VsockConfigError> {
@@ -6239,6 +6411,15 @@ mod tests {
         assert_eq!(dispatch.rst_packets(), 0);
         assert_eq!(dispatch.closed_host_connections(), 0);
         assert_eq!(dispatch.closed_guest_connections(), 0);
+        assert_eq!(dispatch.ignored_packets(), 0);
+    }
+
+    fn assert_empty_guest_shutdown_dispatch(dispatch: &VirtioVsockGuestShutdownDispatch) {
+        assert_eq!(dispatch.shutdown_packets(), 0);
+        assert_eq!(dispatch.closed_host_connections(), 0);
+        assert_eq!(dispatch.closed_guest_connections(), 0);
+        assert_eq!(dispatch.queued_resets(), 0);
+        assert_eq!(dispatch.dropped_resets(), 0);
         assert_eq!(dispatch.ignored_packets(), 0);
     }
 
@@ -6473,6 +6654,19 @@ mod tests {
         guest_tx_packet_with_header(header)
     }
 
+    fn guest_shutdown_tx_packet(
+        guest_cid: u32,
+        host_port: u32,
+        guest_port: u32,
+    ) -> VirtioVsockTxPacket {
+        guest_tx_packet_with_header(
+            guest_request_tx_packet(guest_cid, host_port, guest_port)
+                .header()
+                .with_operation(VIRTIO_VSOCK_OP_SHUTDOWN)
+                .with_flags(VIRTIO_VSOCK_FLAGS_SHUTDOWN_RCV | VIRTIO_VSOCK_FLAGS_SHUTDOWN_SEND),
+        )
+    }
+
     fn guest_tx_packet_with_header(header: VirtioVsockPacketHeader) -> VirtioVsockTxPacket {
         VirtioVsockTxPacket {
             descriptor_head: 0,
@@ -6523,6 +6717,7 @@ mod tests {
         assert_eq!(notification.guest_request_dispatch().retained_requests(), 1);
         assert_empty_guest_rw_dispatch(notification.guest_rw_dispatch());
         assert_empty_guest_rst_dispatch(notification.guest_rst_dispatch());
+        assert_empty_guest_shutdown_dispatch(notification.guest_shutdown_dispatch());
         assert_empty_guest_reset_dispatch(notification.guest_reset_dispatch());
         let rx = notification
             .rx_queue_dispatch()
@@ -6597,6 +6792,7 @@ mod tests {
             1
         );
         assert_empty_guest_rst_dispatch(tx_notification.guest_rst_dispatch());
+        assert_empty_guest_shutdown_dispatch(tx_notification.guest_shutdown_dispatch());
         assert_host_ok_message(&mut client, key.local_port());
 
         (memory, handler, client, key)
@@ -13365,6 +13561,472 @@ mod tests {
     }
 
     #[test]
+    fn virtio_vsock_notifications_shutdown_host_connection_and_queue_reset() {
+        let mut memory = vsock_tx_memory();
+        let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
+        let (accepted, mut client, request) =
+            accepted_host_connection_with_request("guest-shutdown-host", 4000);
+
+        activate_vsock_handler(&mut handler);
+        handler.activation_handler_mut().host_connections =
+            VsockHostConnectionTable::with_local_port_capacity(1);
+        let key = handler
+            .activation_handler_mut()
+            .insert_accepted_host_connection(accepted, request)
+            .expect("host connection should insert");
+        write_vsock_rx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_BUFFER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_rx_available_heads(&mut memory, &[0]);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+        let rx_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("host request should deliver");
+        assert_eq!(
+            rx_notification
+                .rx_queue_dispatch()
+                .expect("RX dispatch summary should be present")
+                .delivered_requests(),
+            1
+        );
+
+        let response = guest_response_tx_packet(42, key.local_port(), 4000).header();
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_HEADER, response);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_tx_available_heads(&mut memory, &[0]);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+        let response_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("guest response should acknowledge host connection");
+        assert_eq!(
+            response_notification
+                .guest_response_dispatch()
+                .acknowledged_responses(),
+            1
+        );
+        assert_host_ok_message(&mut client, key.local_port());
+
+        let shutdown = guest_shutdown_tx_packet(42, key.local_port().raw(), 4000).header();
+
+        write_vsock_rx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_SECOND_BUFFER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        append_vsock_rx_available_head(&mut memory, 1, 1, 2);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_SECOND_HEADER, shutdown);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::readable(
+                TEST_VSOCK_SECOND_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        append_vsock_tx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("guest SHUTDOWN should close host connection and queue RST");
+
+        assert_empty_guest_response_dispatch(notification.guest_response_dispatch());
+        assert_empty_guest_request_dispatch(notification.guest_request_dispatch());
+        assert_empty_guest_rw_dispatch(notification.guest_rw_dispatch());
+        assert_empty_guest_rst_dispatch(notification.guest_rst_dispatch());
+        assert_eq!(notification.guest_shutdown_dispatch().shutdown_packets(), 1);
+        assert_eq!(
+            notification
+                .guest_shutdown_dispatch()
+                .closed_host_connections(),
+            1
+        );
+        assert_eq!(
+            notification
+                .guest_shutdown_dispatch()
+                .closed_guest_connections(),
+            0
+        );
+        assert_eq!(notification.guest_shutdown_dispatch().queued_resets(), 1);
+        assert_eq!(notification.guest_shutdown_dispatch().dropped_resets(), 0);
+        assert_eq!(notification.guest_shutdown_dispatch().ignored_packets(), 0);
+        assert_empty_guest_reset_dispatch(notification.guest_reset_dispatch());
+        let rx = notification
+            .rx_queue_dispatch()
+            .expect("queued guest RST should dispatch to available RX buffer");
+        assert_eq!(rx.delivered_reset_packets(), 1);
+        assert_guest_reset_packet_header(
+            read_vsock_packet_header(&memory, TEST_VSOCK_RX_SECOND_BUFFER),
+            42,
+            key.local_port().raw(),
+            4000,
+        );
+        assert!(!handler.activation_handler().has_host_connection(key));
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_reset_packet_count(),
+            0
+        );
+        assert_eq!(read_vsock_rx_used_index(&memory), 2);
+        assert_eq!(
+            read_vsock_rx_used_element(&memory, 1),
+            (1, VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32)
+        );
+        assert_eq!(read_vsock_tx_used_index(&memory), 2);
+        assert_stream_closed(&mut client, "guest SHUTDOWN should close host stream");
+
+        let (accepted, _next_client, request) =
+            accepted_host_connection_with_request("guest-shutdown-reuse", 4001);
+        let reused = handler
+            .activation_handler_mut()
+            .insert_accepted_host_connection(accepted, request)
+            .expect("freed host local port should be reusable");
+        assert_eq!(reused.local_port(), key.local_port());
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_shutdown_guest_connection_and_queue_reset() {
+        let (mut memory, mut handler, mut accepted) =
+            established_guest_connection_for_test("guest-shutdown-guest", 52, 4000);
+        let key = VsockGuestConnectionKey::new(52, 4000);
+        let shutdown = guest_shutdown_tx_packet(42, 52, 4000).header();
+
+        write_vsock_rx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_SECOND_BUFFER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        append_vsock_rx_available_head(&mut memory, 1, 1, 2);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_SECOND_HEADER, shutdown);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::readable(
+                TEST_VSOCK_SECOND_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        append_vsock_tx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("guest SHUTDOWN should close guest connection and queue RST");
+
+        assert_empty_guest_response_dispatch(notification.guest_response_dispatch());
+        assert_empty_guest_request_dispatch(notification.guest_request_dispatch());
+        assert_empty_guest_rw_dispatch(notification.guest_rw_dispatch());
+        assert_empty_guest_rst_dispatch(notification.guest_rst_dispatch());
+        assert_eq!(notification.guest_shutdown_dispatch().shutdown_packets(), 1);
+        assert_eq!(
+            notification
+                .guest_shutdown_dispatch()
+                .closed_host_connections(),
+            0
+        );
+        assert_eq!(
+            notification
+                .guest_shutdown_dispatch()
+                .closed_guest_connections(),
+            1
+        );
+        assert_eq!(notification.guest_shutdown_dispatch().queued_resets(), 1);
+        assert_eq!(notification.guest_shutdown_dispatch().dropped_resets(), 0);
+        assert_eq!(notification.guest_shutdown_dispatch().ignored_packets(), 0);
+        assert_empty_guest_reset_dispatch(notification.guest_reset_dispatch());
+        let rx = notification
+            .rx_queue_dispatch()
+            .expect("queued guest RST should dispatch to available RX buffer");
+        assert_eq!(rx.delivered_reset_packets(), 1);
+        assert_guest_reset_packet_header(
+            read_vsock_packet_header(&memory, TEST_VSOCK_RX_SECOND_BUFFER),
+            42,
+            52,
+            4000,
+        );
+        assert!(!handler.activation_handler().has_guest_connection(key));
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_reset_packet_count(),
+            0
+        );
+        assert_eq!(read_vsock_rx_used_index(&memory), 2);
+        assert_eq!(
+            read_vsock_rx_used_element(&memory, 1),
+            (1, VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32)
+        );
+        assert_eq!(read_vsock_tx_used_index(&memory), 2);
+        assert_stream_closed(&mut accepted, "guest SHUTDOWN should close guest stream");
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_shutdown_connection_when_reset_queue_is_full() {
+        let (mut memory, mut handler, mut accepted) =
+            established_guest_connection_for_test("guest-shutdown-full-reset-queue", 52, 4000);
+        let key = VsockGuestConnectionKey::new(52, 4000);
+        let pending_reset = super::guest_reset_packet_header_for_tx_packet(
+            &guest_request_tx_packet(42, 53, 5000),
+            42,
+        )
+        .expect("guest request should produce reset header");
+        let shutdown = guest_shutdown_tx_packet(42, 52, 4000).header();
+
+        for _ in 0..VIRTIO_VSOCK_QUEUE_SIZE {
+            assert!(
+                handler
+                    .activation_handler_mut()
+                    .queue_guest_reset_packet(pending_reset)
+            );
+        }
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_SECOND_HEADER, shutdown);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::readable(
+                TEST_VSOCK_SECOND_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        append_vsock_tx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("guest SHUTDOWN should close connection even when reset queue is full");
+
+        assert_empty_guest_response_dispatch(notification.guest_response_dispatch());
+        assert_empty_guest_request_dispatch(notification.guest_request_dispatch());
+        assert_empty_guest_rw_dispatch(notification.guest_rw_dispatch());
+        assert_empty_guest_rst_dispatch(notification.guest_rst_dispatch());
+        assert_eq!(notification.guest_shutdown_dispatch().shutdown_packets(), 1);
+        assert_eq!(
+            notification
+                .guest_shutdown_dispatch()
+                .closed_guest_connections(),
+            1
+        );
+        assert_eq!(notification.guest_shutdown_dispatch().queued_resets(), 0);
+        assert_eq!(notification.guest_shutdown_dispatch().dropped_resets(), 1);
+        assert_eq!(notification.guest_shutdown_dispatch().ignored_packets(), 0);
+        assert_empty_guest_reset_dispatch(notification.guest_reset_dispatch());
+        let rx = notification
+            .rx_queue_dispatch()
+            .expect("pending reset queue should attempt RX retry");
+        assert_eq!(rx.processed_buffers(), 0);
+        assert_eq!(rx.delivered_reset_packets(), 0);
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_reset_packet_count(),
+            usize::from(VIRTIO_VSOCK_QUEUE_SIZE)
+        );
+        assert!(!handler.activation_handler().has_guest_connection(key));
+        assert_eq!(read_vsock_tx_used_index(&memory), 2);
+        assert_stream_closed(&mut accepted, "guest SHUTDOWN should close guest stream");
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_ignore_partial_shutdown_without_closing_connection() {
+        let (mut memory, mut handler, mut accepted) =
+            established_guest_connection_for_test("guest-partial-shutdown", 52, 4000);
+        let key = VsockGuestConnectionKey::new(52, 4000);
+        let receive_only_shutdown = guest_shutdown_tx_packet(42, 52, 4000)
+            .header()
+            .with_flags(VIRTIO_VSOCK_FLAGS_SHUTDOWN_RCV);
+
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_SECOND_HEADER, receive_only_shutdown);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::readable(
+                TEST_VSOCK_SECOND_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        append_vsock_tx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("partial guest SHUTDOWN should be ignored");
+
+        assert_empty_guest_response_dispatch(notification.guest_response_dispatch());
+        assert_empty_guest_request_dispatch(notification.guest_request_dispatch());
+        assert_empty_guest_rw_dispatch(notification.guest_rw_dispatch());
+        assert_empty_guest_rst_dispatch(notification.guest_rst_dispatch());
+        assert_eq!(notification.guest_shutdown_dispatch().shutdown_packets(), 1);
+        assert_eq!(notification.guest_shutdown_dispatch().ignored_packets(), 1);
+        assert_eq!(
+            notification
+                .guest_shutdown_dispatch()
+                .closed_guest_connections(),
+            0
+        );
+        assert_eq!(notification.guest_shutdown_dispatch().queued_resets(), 0);
+        assert_eq!(notification.guest_shutdown_dispatch().dropped_resets(), 0);
+        assert_empty_guest_reset_dispatch(notification.guest_reset_dispatch());
+        assert!(notification.rx_queue_dispatch().is_none());
+        assert!(handler.activation_handler().has_guest_connection(key));
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_reset_packet_count(),
+            0
+        );
+        assert_eq!(read_vsock_tx_used_index(&memory), 2);
+        accepted
+            .write_all(b"still-open")
+            .expect("partial guest SHUTDOWN should keep guest stream open");
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_ignore_invalid_guest_shutdown_without_rx_output() {
+        let mut memory = vsock_tx_memory();
+        let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
+        let wrong_destination = guest_shutdown_tx_packet(42, 52, 4000)
+            .header()
+            .with_dst_cid(VIRTIO_VSOCK_HOST_CID + 1);
+        let wrong_source = guest_shutdown_tx_packet(43, 52, 4000).header();
+        let payload_shutdown = guest_shutdown_tx_packet(42, 52, 4000)
+            .header()
+            .with_payload_len(1);
+        let receive_only_shutdown = guest_shutdown_tx_packet(42, 52, 4000)
+            .header()
+            .with_flags(VIRTIO_VSOCK_FLAGS_SHUTDOWN_RCV);
+        let send_only_shutdown = guest_shutdown_tx_packet(42, 52, 4000)
+            .header()
+            .with_flags(VIRTIO_VSOCK_FLAGS_SHUTDOWN_SEND);
+        let unmatched = guest_shutdown_tx_packet(42, 52, 4000).header();
+
+        activate_vsock_handler(&mut handler);
+        write_vsock_rx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_BUFFER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_rx_available_heads(&mut memory, &[0]);
+        for (index, address, header, len) in [
+            (
+                0,
+                TEST_VSOCK_HEADER,
+                wrong_destination,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+            ),
+            (
+                1,
+                TEST_VSOCK_SECOND_HEADER,
+                wrong_source,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+            ),
+            (
+                2,
+                TEST_VSOCK_PAYLOAD,
+                payload_shutdown,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32 + 1,
+            ),
+            (
+                3,
+                TEST_VSOCK_SECOND_PAYLOAD,
+                receive_only_shutdown,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+            ),
+            (
+                4,
+                TEST_VSOCK_THIRD_HEADER,
+                send_only_shutdown,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+            ),
+            (
+                5,
+                TEST_VSOCK_FOURTH_HEADER,
+                unmatched,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+            ),
+        ] {
+            write_vsock_packet_header(&mut memory, address, header);
+            write_vsock_tx_descriptor(
+                &mut memory,
+                index,
+                TestDescriptor::readable(address, len, None),
+            );
+        }
+        write_guest_bytes(
+            &mut memory,
+            vsock_payload_address_after_header(TEST_VSOCK_PAYLOAD),
+            &[0xa5],
+        );
+        write_vsock_tx_available_heads(&mut memory, &[0, 1, 2, 3, 4, 5]);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("invalid guest SHUTDOWN packets should still complete TX");
+
+        assert_empty_guest_response_dispatch(notification.guest_response_dispatch());
+        assert_empty_guest_request_dispatch(notification.guest_request_dispatch());
+        assert_empty_guest_rw_dispatch(notification.guest_rw_dispatch());
+        assert_empty_guest_rst_dispatch(notification.guest_rst_dispatch());
+        assert_eq!(notification.guest_shutdown_dispatch().shutdown_packets(), 6);
+        assert_eq!(notification.guest_shutdown_dispatch().ignored_packets(), 6);
+        assert_eq!(
+            notification
+                .guest_shutdown_dispatch()
+                .closed_host_connections(),
+            0
+        );
+        assert_eq!(
+            notification
+                .guest_shutdown_dispatch()
+                .closed_guest_connections(),
+            0
+        );
+        assert_eq!(notification.guest_shutdown_dispatch().queued_resets(), 0);
+        assert_eq!(notification.guest_shutdown_dispatch().dropped_resets(), 0);
+        assert_empty_guest_reset_dispatch(notification.guest_reset_dispatch());
+        assert!(notification.rx_queue_dispatch().is_none());
+        assert_eq!(read_vsock_rx_used_index(&memory), 0);
+        assert_eq!(read_vsock_tx_used_index(&memory), 6);
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_reset_packet_count(),
+            0
+        );
+    }
+
+    #[test]
     fn virtio_vsock_notifications_queue_resets_for_unsupported_type_and_orphan_response() {
         let mut memory = vsock_tx_memory();
         let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
@@ -13374,6 +14036,9 @@ mod tests {
         let unsupported_rst_type = guest_request_tx_packet(42, 54, 4003)
             .header()
             .with_operation(VIRTIO_VSOCK_OP_RST)
+            .with_packet_type(0);
+        let unsupported_shutdown_type = guest_shutdown_tx_packet(42, 55, 4004)
+            .header()
             .with_packet_type(0);
         let payload_request = guest_request_tx_packet(42, 53, 4001)
             .header()
@@ -13432,7 +14097,21 @@ mod tests {
                 None,
             ),
         );
-        write_vsock_tx_available_heads(&mut memory, &[0, 1, 2, 3]);
+        write_vsock_packet_header(
+            &mut memory,
+            TEST_VSOCK_FOURTH_HEADER,
+            unsupported_shutdown_type,
+        );
+        write_vsock_tx_descriptor(
+            &mut memory,
+            4,
+            TestDescriptor::readable(
+                TEST_VSOCK_FOURTH_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_tx_available_heads(&mut memory, &[0, 1, 2, 3, 4]);
         notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
 
         let notification = handler
@@ -13449,14 +14128,15 @@ mod tests {
         assert_eq!(notification.guest_request_dispatch().ignored_requests(), 2);
         assert_eq!(notification.guest_request_dispatch().dropped_requests(), 0);
         assert_empty_guest_rst_dispatch(notification.guest_rst_dispatch());
-        assert_eq!(notification.guest_reset_dispatch().reset_candidates(), 4);
-        assert_eq!(notification.guest_reset_dispatch().queued_resets(), 4);
+        assert_empty_guest_shutdown_dispatch(notification.guest_shutdown_dispatch());
+        assert_eq!(notification.guest_reset_dispatch().reset_candidates(), 5);
+        assert_eq!(notification.guest_reset_dispatch().queued_resets(), 5);
         assert_eq!(notification.guest_reset_dispatch().dropped_resets(), 0);
         assert_eq!(
             handler
                 .activation_handler()
                 .pending_guest_reset_packet_count(),
-            4
+            5
         );
         let rx = notification
             .rx_queue_dispatch()
@@ -13464,7 +14144,7 @@ mod tests {
         assert_eq!(rx.processed_buffers(), 0);
         assert_eq!(rx.delivered_reset_packets(), 0);
         assert_eq!(read_vsock_rx_used_index(&memory), 0);
-        assert_eq!(read_vsock_tx_used_index(&memory), 4);
+        assert_eq!(read_vsock_tx_used_index(&memory), 5);
     }
 
     #[test]
