@@ -5447,15 +5447,17 @@ impl VirtioVsockDevice {
 
         let host_key = VsockHostLocalPort::try_from_raw(header.dst_port())
             .map(|local_port| VsockHostConnectionKey::new(local_port, header.src_port()));
-        if let Ok(key) = host_key
-            && self.host_connections.contains(key)
-        {
-            let result = if operation == VIRTIO_VSOCK_OP_CREDIT_REQUEST {
-                self.host_connections
-                    .queue_pending_credit_update_packet(key)
-            } else {
-                self.host_connections.consume_credit_update_packet(key)
-            };
+        let host_result = host_key.ok().and_then(|key| {
+            self.host_connections.contains(key).then(|| {
+                if operation == VIRTIO_VSOCK_OP_CREDIT_REQUEST {
+                    self.host_connections
+                        .queue_pending_credit_update_packet(key)
+                } else {
+                    self.host_connections.consume_credit_update_packet(key)
+                }
+            })
+        });
+        if let Some(result @ Ok(())) = host_result {
             return Some(Self::guest_credit_outcome(operation, result));
         }
 
@@ -5469,6 +5471,9 @@ impl VirtioVsockDevice {
         };
         if guest_result != Err(VsockGuestCreditError::MissingConnection) {
             return Some(Self::guest_credit_outcome(operation, guest_result));
+        }
+        if let Some(result) = host_result {
+            return Some(Self::guest_credit_outcome(operation, result));
         }
 
         let reason = if host_key.is_ok() {
@@ -13118,6 +13123,83 @@ mod tests {
         assert_stream_closed(
             &mut accepted,
             "dropping handler should close retained guest stream",
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_match_guest_credit_when_host_tuple_is_not_established() {
+        let guest_host_port = VSOCK_HOST_LOCAL_PORT_BASE;
+        let guest_port = 4000;
+        let (mut memory, mut handler, mut accepted) = established_guest_connection_for_test(
+            "credit-guest-host-tuple-collision",
+            guest_host_port,
+            guest_port,
+        );
+        let guest_key = VsockGuestConnectionKey::new(guest_host_port, guest_port);
+        let (host_accepted, mut host_client, host_request) =
+            accepted_host_connection_with_request("credit-host-tuple-collision", guest_port);
+        let host_key = handler
+            .activation_handler_mut()
+            .insert_accepted_host_connection(host_accepted, host_request)
+            .expect("pending host connection should insert with colliding tuple");
+        let packet = guest_credit_tx_packet(
+            42,
+            guest_host_port,
+            guest_port,
+            VIRTIO_VSOCK_OP_CREDIT_REQUEST,
+        )
+        .header();
+
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_SECOND_HEADER, packet);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::readable(
+                TEST_VSOCK_SECOND_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        append_vsock_tx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("guest credit request should not be captured by pending host tuple");
+
+        assert_eq!(host_key.local_port().raw(), guest_host_port);
+        assert_eq!(host_key.peer_port(), guest_port);
+        assert_eq!(notification.guest_credit_dispatch().credit_packets(), 1);
+        assert_eq!(notification.guest_credit_dispatch().request_packets(), 1);
+        assert_eq!(notification.guest_credit_dispatch().queued_updates(), 1);
+        assert_eq!(notification.guest_credit_dispatch().ignored_packets(), 0);
+        assert_empty_guest_reset_dispatch(notification.guest_reset_dispatch());
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_reset_packet_count(),
+            0
+        );
+        assert!(
+            handler
+                .activation_handler()
+                .has_pending_host_request_packet(host_key)
+        );
+        assert!(
+            handler
+                .activation_handler()
+                .has_pending_guest_credit_update_packet(guest_key)
+        );
+        assert_no_host_message(&mut host_client);
+
+        drop(handler);
+        assert_stream_closed(
+            &mut accepted,
+            "dropping handler should close retained guest stream",
+        );
+        assert_stream_closed(
+            &mut host_client,
+            "dropping handler should close retained host stream",
         );
     }
 
