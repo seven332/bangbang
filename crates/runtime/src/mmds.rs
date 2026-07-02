@@ -17,10 +17,14 @@ pub const MMDS_TOKEN_MAX_ACTIVE_TOKENS: usize = 1_024;
 
 const MMDS_TOKEN_BYTES: usize = 32;
 const MMDS_GUEST_ALLOW_METHODS: &str = "GET, PUT";
+const MMDS_GUEST_INVALID_TOKEN: &str = "MMDS token not valid.";
+const MMDS_GUEST_MISSING_TOKEN: &str = "No MMDS token provided. Use `X-metadata-token` or `X-aws-ec2-metadata-token` header to specify the session token.";
 const MMDS_GUEST_TOKEN_PATH: &str = "/latest/api/token";
+const MMDS_GUEST_X_AWS_EC2_METADATA_TOKEN: &str = "X-aws-ec2-metadata-token";
 const MMDS_GUEST_X_AWS_EC2_METADATA_TOKEN_TTL_SECONDS: &str =
     "X-aws-ec2-metadata-token-ttl-seconds";
 const MMDS_GUEST_X_FORWARDED_FOR: &str = "X-Forwarded-For";
+const MMDS_GUEST_X_METADATA_TOKEN: &str = "X-metadata-token";
 const MMDS_GUEST_X_METADATA_TOKEN_TTL_SECONDS: &str = "X-metadata-token-ttl-seconds";
 const MMDS_MILLISECONDS_PER_SECOND: u64 = 1_000;
 const MMDS_TOKEN_GENERATION_ATTEMPTS: usize = 8;
@@ -225,6 +229,7 @@ impl MmdsGuestRequest {
         let uri = guest_request_uri_path(uri)?;
         let mut content_length = None;
         let mut output_format = MmdsOutputFormat::Imds;
+        let mut token = MmdsGuestToken::Missing;
         let mut token_ttl = MmdsGuestTokenTtl::Missing;
         let mut forwarded_for = false;
 
@@ -239,6 +244,18 @@ impl MmdsGuestRequest {
                 return Err(MmdsGuestRequestParseError::UnsupportedTransferEncoding);
             } else if method == MmdsGuestRequestMethod::Get && name.eq_ignore_ascii_case("Accept") {
                 output_format = parse_guest_accept_header(value)?;
+            } else if method == MmdsGuestRequestMethod::Get {
+                if let Some(header) = MmdsGuestTokenHeader::parse_name(name) {
+                    token = match token {
+                        MmdsGuestToken::Missing => MmdsGuestToken::Header {
+                            token_header: header,
+                            token_value: value.to_string(),
+                        },
+                        MmdsGuestToken::Header { .. } | MmdsGuestToken::Duplicate => {
+                            MmdsGuestToken::Duplicate
+                        }
+                    };
+                }
             } else if method == MmdsGuestRequestMethod::Put {
                 if name.eq_ignore_ascii_case(MMDS_GUEST_X_FORWARDED_FOR) {
                     forwarded_for = true;
@@ -265,6 +282,7 @@ impl MmdsGuestRequest {
             MmdsGuestRequestMethod::Get => Ok(Self::Get(MmdsGuestGetRequest {
                 uri: uri.to_string(),
                 output_format,
+                token,
             })),
             MmdsGuestRequestMethod::Put => {
                 if forwarded_for {
@@ -284,6 +302,7 @@ impl MmdsGuestRequest {
 pub struct MmdsGuestGetRequest {
     uri: String,
     output_format: MmdsOutputFormat,
+    token: MmdsGuestToken,
 }
 
 impl MmdsGuestGetRequest {
@@ -293,6 +312,10 @@ impl MmdsGuestGetRequest {
 
     pub const fn output_format(&self) -> MmdsOutputFormat {
         self.output_format
+    }
+
+    pub fn token(&self) -> &MmdsGuestToken {
+        &self.token
     }
 }
 
@@ -320,6 +343,42 @@ pub enum MmdsGuestTokenTtl {
         ttl_value: String,
     },
     Duplicate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MmdsGuestToken {
+    Missing,
+    Header {
+        token_header: MmdsGuestTokenHeader,
+        token_value: String,
+    },
+    Duplicate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmdsGuestTokenHeader {
+    Metadata,
+    AwsEc2Metadata,
+}
+
+impl MmdsGuestTokenHeader {
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Metadata => MMDS_GUEST_X_METADATA_TOKEN,
+            Self::AwsEc2Metadata => MMDS_GUEST_X_AWS_EC2_METADATA_TOKEN,
+        }
+    }
+
+    fn parse_name(name: &str) -> Option<Self> {
+        if name.eq_ignore_ascii_case(MMDS_GUEST_X_METADATA_TOKEN) {
+            return Some(Self::Metadata);
+        }
+        if name.eq_ignore_ascii_case(MMDS_GUEST_X_AWS_EC2_METADATA_TOKEN) {
+            return Some(Self::AwsEc2Metadata);
+        }
+
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -377,6 +436,8 @@ pub enum MmdsGuestRequestParseError {
     UnsupportedTransferEncoding,
     UnsupportedBody,
     UnsupportedAccept,
+    MissingToken,
+    InvalidToken,
     MissingTokenTtl,
     InvalidTokenTtl,
     DuplicateTokenTtl,
@@ -409,6 +470,8 @@ impl fmt::Display for MmdsGuestRequestParseError {
             Self::UnsupportedAccept => {
                 f.write_str("MMDS guest HTTP request Accept header is not supported.")
             }
+            Self::MissingToken => f.write_str(MMDS_GUEST_MISSING_TOKEN),
+            Self::InvalidToken => f.write_str(MMDS_GUEST_INVALID_TOKEN),
             Self::MissingTokenTtl => f.write_str(
                 "Token time to live value not found. Use `X-metadata-token-ttl-seconds` or `X-aws-ec2-metadata-token-ttl-seconds` header to specify the token's lifetime.",
             ),
@@ -431,6 +494,7 @@ impl std::error::Error for MmdsGuestRequestParseError {}
 pub enum MmdsGuestStatus {
     Ok,
     BadRequest,
+    Unauthorized,
     NotFound,
     MethodNotAllowed,
     NotImplemented,
@@ -441,6 +505,7 @@ impl MmdsGuestStatus {
         match self {
             Self::Ok => 200,
             Self::BadRequest => 400,
+            Self::Unauthorized => 401,
             Self::NotFound => 404,
             Self::MethodNotAllowed => 405,
             Self::NotImplemented => 501,
@@ -451,6 +516,7 @@ impl MmdsGuestStatus {
         match self {
             Self::Ok => "OK",
             Self::BadRequest => "Bad Request",
+            Self::Unauthorized => "Unauthorized",
             Self::NotFound => "Not Found",
             Self::MethodNotAllowed => "Method Not Allowed",
             Self::NotImplemented => "Not Implemented",
@@ -827,9 +893,7 @@ impl MmdsState {
 
     pub fn guest_http_response(&mut self, request_bytes: &[u8]) -> MmdsGuestResponse {
         match MmdsGuestRequest::parse_http(request_bytes) {
-            Ok(MmdsGuestRequest::Get(request)) => {
-                self.guest_get_response(request.uri(), request.output_format())
-            }
+            Ok(MmdsGuestRequest::Get(request)) => self.guest_get_http_response(&request),
             Ok(MmdsGuestRequest::TokenPut(request)) => self.guest_token_put_response(&request),
             Err(err) => guest_request_parse_error_response(err),
         }
@@ -891,6 +955,33 @@ impl MmdsState {
             MmdsOutputFormat::Json => MmdsGuestContentType::ApplicationJson,
             MmdsOutputFormat::Imds => MmdsGuestContentType::PlainText,
         }
+    }
+
+    fn guest_mmds_version(&self) -> MmdsVersion {
+        self.config
+            .as_ref()
+            .map_or(MmdsVersion::V1, MmdsConfig::version)
+    }
+
+    fn guest_get_http_response(&self, request: &MmdsGuestGetRequest) -> MmdsGuestResponse {
+        if self.guest_mmds_version() == MmdsVersion::V2 {
+            match request.token() {
+                MmdsGuestToken::Missing => {
+                    return guest_request_parse_error_response(
+                        MmdsGuestRequestParseError::MissingToken,
+                    );
+                }
+                MmdsGuestToken::Header { token_value, .. }
+                    if self.is_guest_token_valid(token_value) => {}
+                MmdsGuestToken::Header { .. } | MmdsGuestToken::Duplicate => {
+                    return guest_request_parse_error_response(
+                        MmdsGuestRequestParseError::InvalidToken,
+                    );
+                }
+            }
+        }
+
+        self.guest_get_response(request.uri(), request.output_format())
     }
 
     fn guest_token_put_response(
@@ -1153,6 +1244,9 @@ fn guest_request_parse_error_response(err: MmdsGuestRequestParseError) -> MmdsGu
         | MmdsGuestRequestParseError::InvalidTokenTtl
         | MmdsGuestRequestParseError::DuplicateTokenTtl
         | MmdsGuestRequestParseError::UnsupportedForwardedFor => MmdsGuestStatus::BadRequest,
+        MmdsGuestRequestParseError::MissingToken | MmdsGuestRequestParseError::InvalidToken => {
+            MmdsGuestStatus::Unauthorized
+        }
     };
 
     let response = MmdsGuestResponse::new(status, MmdsGuestContentType::PlainText, err.to_string());
@@ -1257,6 +1351,24 @@ mod tests {
         });
     }
 
+    fn enable_mmds_v1(state: &mut MmdsState) {
+        state.config = Some(MmdsConfig {
+            network_interfaces: vec!["eth0".to_string()],
+            version: MmdsVersion::V1,
+            ipv4_address: None,
+            imds_compat: false,
+        });
+    }
+
+    fn enable_mmds_v2(state: &mut MmdsState) {
+        state.config = Some(MmdsConfig {
+            network_interfaces: vec!["eth0".to_string()],
+            version: MmdsVersion::V2,
+            ipv4_address: None,
+            imds_compat: false,
+        });
+    }
+
     fn assert_json_value(output: &str, expected: Value) {
         let value = serde_json::from_str::<Value>(output).expect("query output should be JSON");
         assert_eq!(value, expected);
@@ -1296,6 +1408,39 @@ mod tests {
 
         assert_eq!(request.uri(), expected_uri);
         assert_eq!(request.output_format(), expected_output_format);
+        assert_eq!(request.token(), &MmdsGuestToken::Missing);
+    }
+
+    fn assert_guest_token_get_request(
+        bytes: &[u8],
+        expected_uri: &str,
+        expected_token_header: MmdsGuestTokenHeader,
+        expected_token_value: &str,
+    ) {
+        let request =
+            MmdsGuestRequest::parse_http(bytes).expect("test MMDS guest HTTP request should parse");
+        let MmdsGuestRequest::Get(request) = request else {
+            panic!("test MMDS guest HTTP request should be GET");
+        };
+
+        assert_eq!(request.uri(), expected_uri);
+        assert_eq!(
+            request.token(),
+            &MmdsGuestToken::Header {
+                token_header: expected_token_header,
+                token_value: expected_token_value.to_string(),
+            }
+        );
+    }
+
+    fn assert_guest_token_get_duplicate(bytes: &[u8]) {
+        let request =
+            MmdsGuestRequest::parse_http(bytes).expect("test MMDS guest HTTP request should parse");
+        let MmdsGuestRequest::Get(request) = request else {
+            panic!("test MMDS guest HTTP request should be GET");
+        };
+
+        assert_eq!(request.token(), &MmdsGuestToken::Duplicate);
     }
 
     fn assert_guest_token_put_request(
@@ -1703,6 +1848,7 @@ mod tests {
     fn guest_status_codes_match_http_values() {
         assert_eq!(MmdsGuestStatus::Ok.as_u16(), 200);
         assert_eq!(MmdsGuestStatus::BadRequest.as_u16(), 400);
+        assert_eq!(MmdsGuestStatus::Unauthorized.as_u16(), 401);
         assert_eq!(MmdsGuestStatus::NotFound.as_u16(), 404);
         assert_eq!(MmdsGuestStatus::MethodNotAllowed.as_u16(), 405);
         assert_eq!(MmdsGuestStatus::NotImplemented.as_u16(), 501);
@@ -1712,6 +1858,10 @@ mod tests {
     fn guest_status_reason_phrases_match_http_values() {
         assert_eq!(MmdsGuestStatus::Ok.reason_phrase(), "OK");
         assert_eq!(MmdsGuestStatus::BadRequest.reason_phrase(), "Bad Request");
+        assert_eq!(
+            MmdsGuestStatus::Unauthorized.reason_phrase(),
+            "Unauthorized"
+        );
         assert_eq!(MmdsGuestStatus::NotFound.reason_phrase(), "Not Found");
         assert_eq!(
             MmdsGuestStatus::NotImplemented.reason_phrase(),
@@ -1921,6 +2071,38 @@ mod tests {
     }
 
     #[test]
+    fn mmds_guest_request_parses_get_token_headers() {
+        assert_guest_token_get_request(
+            b"GET /meta-data/hostname HTTP/1.1\r\nX-metadata-token: token-1\r\n\r\n",
+            "/meta-data/hostname",
+            MmdsGuestTokenHeader::Metadata,
+            "token-1",
+        );
+        assert_guest_token_get_request(
+            b"GET /meta-data/hostname HTTP/1.1\r\nX-aws-ec2-metadata-token: token-2\r\n\r\n",
+            "/meta-data/hostname",
+            MmdsGuestTokenHeader::AwsEc2Metadata,
+            "token-2",
+        );
+        assert_guest_token_get_request(
+            b"GET http://169.254.169.254/meta-data/hostname HTTP/1.1\r\nx-MeTaDaTa-ToKeN: token-3\r\n\r\n",
+            "/meta-data/hostname",
+            MmdsGuestTokenHeader::Metadata,
+            "token-3",
+        );
+    }
+
+    #[test]
+    fn mmds_guest_request_records_duplicate_get_token_headers() {
+        assert_guest_token_get_duplicate(
+            b"GET /meta-data/hostname HTTP/1.1\r\nX-metadata-token: token-1\r\nX-aws-ec2-metadata-token: token-1\r\n\r\n",
+        );
+        assert_guest_token_get_duplicate(
+            b"GET /meta-data/hostname HTTP/1.1\r\nX-metadata-token: token-1\r\nX-metadata-token: token-2\r\n\r\n",
+        );
+    }
+
+    #[test]
     fn mmds_guest_request_rejects_forwarded_for_token_put_header() {
         assert_eq!(
             MmdsGuestRequest::parse_http(
@@ -2121,7 +2303,7 @@ mod tests {
     }
 
     #[test]
-    fn mmds_guest_http_response_get_does_not_enforce_tokens_yet() {
+    fn mmds_guest_http_response_default_get_does_not_enforce_tokens() {
         let mut state = initialized_query_state();
         let response = state.guest_http_response(
             b"GET /meta-data/hostname HTTP/1.1\r\nAccept: application/json\r\n\r\n",
@@ -2129,6 +2311,142 @@ mod tests {
 
         assert_eq!(response.status(), MmdsGuestStatus::Ok);
         assert_eq!(response.body(), r#""demo.local""#);
+    }
+
+    #[test]
+    fn mmds_guest_http_response_v1_get_does_not_enforce_tokens() {
+        for request in [
+            b"GET /meta-data/hostname HTTP/1.1\r\nAccept: application/json\r\n\r\n".as_slice(),
+            b"GET /meta-data/hostname HTTP/1.1\r\nAccept: application/json\r\nX-metadata-token: unknown\r\n\r\n",
+            b"GET /meta-data/hostname HTTP/1.1\r\nAccept: application/json\r\nX-metadata-token: unknown\r\nX-aws-ec2-metadata-token: duplicate\r\n\r\n",
+        ] {
+            let mut state = initialized_query_state();
+            enable_mmds_v1(&mut state);
+
+            assert_guest_response(
+                state.guest_http_response(request),
+                MmdsGuestStatus::Ok,
+                MmdsGuestContentType::ApplicationJson,
+                r#""demo.local""#,
+            );
+        }
+    }
+
+    #[test]
+    fn mmds_guest_http_response_v2_requires_token() {
+        let mut state = initialized_query_state();
+        enable_mmds_v2(&mut state);
+
+        assert_guest_response(
+            state.guest_http_response(
+                b"GET /meta-data/hostname HTTP/1.1\r\nAccept: application/json\r\n\r\n",
+            ),
+            MmdsGuestStatus::Unauthorized,
+            MmdsGuestContentType::PlainText,
+            MMDS_GUEST_MISSING_TOKEN,
+        );
+    }
+
+    #[test]
+    fn mmds_guest_http_response_v2_rejects_invalid_tokens() {
+        for request in [
+            b"GET /meta-data/hostname HTTP/1.1\r\nX-metadata-token: unknown\r\n\r\n".as_slice(),
+            b"GET /meta-data/hostname HTTP/1.1\r\nX-aws-ec2-metadata-token: \r\n\r\n",
+            b"GET /meta-data/hostname HTTP/1.1\r\nX-metadata-token: unknown\r\nX-aws-ec2-metadata-token: unknown\r\n\r\n",
+        ] {
+            let mut state = initialized_query_state();
+            enable_mmds_v2(&mut state);
+
+            assert_guest_response(
+                state.guest_http_response(request),
+                MmdsGuestStatus::Unauthorized,
+                MmdsGuestContentType::PlainText,
+                MMDS_GUEST_INVALID_TOKEN,
+            );
+        }
+    }
+
+    #[test]
+    fn mmds_guest_http_response_v2_rejects_expired_token() {
+        let mut state = initialized_query_state();
+        enable_mmds_v2(&mut state);
+        state.token_authority = MmdsTokenAuthority::with_manual_clock(1, 1_000);
+        let token = state
+            .generate_guest_token(1)
+            .expect("test token generation should succeed");
+        state.token_authority.set_now_millis(2_000);
+        let request =
+            format!("GET /meta-data/hostname HTTP/1.1\r\nX-metadata-token: {token}\r\n\r\n");
+
+        assert_guest_response(
+            state.guest_http_response(request.as_bytes()),
+            MmdsGuestStatus::Unauthorized,
+            MmdsGuestContentType::PlainText,
+            MMDS_GUEST_INVALID_TOKEN,
+        );
+    }
+
+    #[test]
+    fn mmds_guest_http_response_v2_accepts_valid_tokens() {
+        let mut state = initialized_query_state();
+        enable_mmds_v2(&mut state);
+        state.token_authority = MmdsTokenAuthority::with_manual_clock(1, 1_000);
+        let token = state
+            .generate_guest_token(1)
+            .expect("test token generation should succeed");
+        let request = format!(
+            "GET /meta-data/hostname HTTP/1.1\r\nAccept: application/json\r\nX-aws-ec2-metadata-token: {token}\r\n\r\n"
+        );
+
+        assert_guest_response(
+            state.guest_http_response(request.as_bytes()),
+            MmdsGuestStatus::Ok,
+            MmdsGuestContentType::ApplicationJson,
+            r#""demo.local""#,
+        );
+    }
+
+    #[test]
+    fn mmds_guest_http_response_v2_token_errors_do_not_mutate_state() {
+        let requests = [
+            b"GET /meta-data/hostname HTTP/1.1\r\n\r\n".as_slice(),
+            b"GET /meta-data/hostname HTTP/1.1\r\nX-metadata-token: unknown\r\n\r\n",
+            b"GET /meta-data/hostname HTTP/1.1\r\nX-metadata-token: unknown\r\nX-aws-ec2-metadata-token: duplicate\r\n\r\n",
+        ];
+
+        for request in requests {
+            let mut state = initialized_query_state();
+            enable_mmds_v2(&mut state);
+            state.token_authority = MmdsTokenAuthority::with_manual_clock(1, 1_000);
+            let token = state
+                .generate_guest_token(1)
+                .expect("test token generation should succeed");
+            let original = state.get_data().expect("data store should be initialized");
+
+            assert_eq!(
+                state.guest_http_response(request).status(),
+                MmdsGuestStatus::Unauthorized
+            );
+            assert_eq!(state.get_data(), Ok(original));
+            assert!(state.is_guest_token_valid(&token));
+        }
+    }
+
+    #[test]
+    fn mmds_guest_http_response_bytes_serialize_missing_v2_token() {
+        let mut state = initialized_query_state();
+        enable_mmds_v2(&mut state);
+        let expected = format!(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+            MMDS_GUEST_MISSING_TOKEN.len(),
+            MMDS_GUEST_MISSING_TOKEN
+        )
+        .into_bytes();
+
+        assert_eq!(
+            state.guest_http_response_bytes(b"GET /meta-data/hostname HTTP/1.1\r\n\r\n"),
+            expected
+        );
     }
 
     #[test]
@@ -2316,6 +2634,14 @@ mod tests {
         assert_eq!(
             MmdsGuestRequestParseError::UnsupportedAccept.to_string(),
             "MMDS guest HTTP request Accept header is not supported."
+        );
+        assert_eq!(
+            MmdsGuestRequestParseError::MissingToken.to_string(),
+            MMDS_GUEST_MISSING_TOKEN
+        );
+        assert_eq!(
+            MmdsGuestRequestParseError::InvalidToken.to_string(),
+            MMDS_GUEST_INVALID_TOKEN
         );
         assert_eq!(
             MmdsGuestRequestParseError::MissingTokenTtl.to_string(),

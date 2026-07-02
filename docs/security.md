@@ -188,10 +188,12 @@ responses without echoing malformed request bytes, and serialize process-local
 HTTP response bytes for future guest delivery. It also has a process-local
 opaque token authority with a default `1024`-entry active-token store and can
 model process-local guest `PUT /latest/api/token` exchanges that return
-generated tokens. These parsed requests, formatted responses, and generated
-tokens remain process-local and are not exposed to the guest through networking
-yet. Future guest-visible MMDS work must validate device, packet, token, and
-TCP/session inputs before making this data reachable from guest code.
+generated tokens. When MMDS v2 is configured, process-local guest GET handling
+requires a valid generated token before returning metadata. These parsed
+requests, formatted responses, and generated tokens remain process-local and
+are not exposed to the guest through networking yet. Future guest-visible MMDS
+work must validate device, packet, token, and TCP/session inputs before making
+this data reachable from guest code.
 
 ## Multi-Process Operation
 
