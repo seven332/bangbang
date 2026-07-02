@@ -362,13 +362,6 @@ pub enum MmdsGuestTokenHeader {
 }
 
 impl MmdsGuestTokenHeader {
-    pub const fn name(&self) -> &'static str {
-        match self {
-            Self::Metadata => MMDS_GUEST_X_METADATA_TOKEN,
-            Self::AwsEc2Metadata => MMDS_GUEST_X_AWS_EC2_METADATA_TOKEN,
-        }
-    }
-
     fn parse_name(name: &str) -> Option<Self> {
         if name.eq_ignore_ascii_case(MMDS_GUEST_X_METADATA_TOKEN) {
             return Some(Self::Metadata);
