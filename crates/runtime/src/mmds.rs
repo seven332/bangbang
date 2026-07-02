@@ -1,4 +1,4 @@
-//! Backend-neutral MMDS control-plane input model.
+//! Backend-neutral MMDS control-plane input and metadata query model.
 
 use std::fmt;
 use std::net::Ipv4Addr;
@@ -207,7 +207,7 @@ impl fmt::Display for MmdsDataStoreError {
             ),
             Self::Serialization => f.write_str("The MMDS data store could not be serialized."),
             Self::UnsupportedValueType => {
-                f.write_str("Cannot retrieve MMDS value. The value has an unsupported type.")
+                f.write_str("Cannot retrieve value. The value has an unsupported type.")
             }
         }
     }
@@ -600,6 +600,18 @@ mod tests {
                 Err(MmdsDataStoreError::UnsupportedValueType)
             );
         }
+    }
+
+    #[test]
+    fn query_data_error_messages_match_firecracker_shape() {
+        assert_eq!(
+            MmdsDataStoreError::NotFound.to_string(),
+            "The MMDS resource does not exist."
+        );
+        assert_eq!(
+            MmdsDataStoreError::UnsupportedValueType.to_string(),
+            "Cannot retrieve value. The value has an unsupported type."
+        );
     }
 
     #[test]
