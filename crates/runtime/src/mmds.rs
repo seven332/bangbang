@@ -585,6 +585,9 @@ fn guest_request_uri_path(uri: &str) -> Result<&str, MmdsGuestRequestParseError>
         let Some(path_start) = rest.find('/') else {
             return Err(MmdsGuestRequestParseError::InvalidUri);
         };
+        if path_start == 0 {
+            return Err(MmdsGuestRequestParseError::InvalidUri);
+        }
         let path = rest
             .get(path_start..)
             .ok_or(MmdsGuestRequestParseError::InvalidUri)?;
@@ -1177,6 +1180,7 @@ mod tests {
     fn mmds_guest_request_rejects_invalid_uri() {
         for request in [
             b"GET http://169.254.169.254 HTTP/1.1\r\n\r\n".as_slice(),
+            b"GET http:///meta-data/hostname HTTP/1.1\r\n\r\n",
             b"GET http:// HTTP/1.1\r\n\r\n",
             b"GET * HTTP/1.1\r\n\r\n",
         ] {
