@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::net::Ipv4Addr;
+use std::str;
 
 use serde_json::{Map, Value};
 
@@ -176,6 +177,115 @@ pub enum MmdsOutputFormat {
     Json,
     Imds,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MmdsGuestRequest {
+    uri: String,
+    output_format: MmdsOutputFormat,
+}
+
+impl MmdsGuestRequest {
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    pub const fn output_format(&self) -> MmdsOutputFormat {
+        self.output_format
+    }
+
+    pub fn parse_http(bytes: &[u8]) -> Result<Self, MmdsGuestRequestParseError> {
+        let request = str::from_utf8(bytes).map_err(|_| MmdsGuestRequestParseError::InvalidUtf8)?;
+        let (head, body) = request
+            .split_once("\r\n\r\n")
+            .ok_or(MmdsGuestRequestParseError::MalformedRequest)?;
+        let mut lines = head.split("\r\n");
+        let request_line = lines
+            .next()
+            .ok_or(MmdsGuestRequestParseError::MalformedRequest)?;
+        let (method, uri, version) = parse_guest_request_line(request_line)?;
+        if method != "GET" {
+            return Err(MmdsGuestRequestParseError::UnsupportedMethod);
+        }
+        if version != "HTTP/1.0" && version != "HTTP/1.1" {
+            return Err(MmdsGuestRequestParseError::UnsupportedHttpVersion);
+        }
+
+        let uri = guest_request_uri_path(uri)?;
+        let mut content_length = None;
+        let mut output_format = MmdsOutputFormat::Imds;
+
+        for line in lines {
+            let (name, value) = parse_guest_request_header(line)?;
+            if name.eq_ignore_ascii_case("Content-Length") {
+                if content_length.is_some() {
+                    return Err(MmdsGuestRequestParseError::DuplicateContentLength);
+                }
+                content_length = Some(parse_guest_content_length(value)?);
+            } else if name.eq_ignore_ascii_case("Transfer-Encoding") {
+                return Err(MmdsGuestRequestParseError::UnsupportedTransferEncoding);
+            } else if name.eq_ignore_ascii_case("Accept") {
+                output_format = parse_guest_accept_header(value)?;
+            }
+        }
+
+        let content_length = content_length.unwrap_or(0);
+        if content_length != 0 || !body.is_empty() {
+            return Err(MmdsGuestRequestParseError::UnsupportedBody);
+        }
+
+        Ok(Self {
+            uri: uri.to_string(),
+            output_format,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmdsGuestRequestParseError {
+    InvalidUtf8,
+    MalformedRequest,
+    UnsupportedMethod,
+    UnsupportedHttpVersion,
+    InvalidUri,
+    MalformedHeader,
+    DuplicateContentLength,
+    InvalidContentLength,
+    UnsupportedTransferEncoding,
+    UnsupportedBody,
+    UnsupportedAccept,
+}
+
+impl fmt::Display for MmdsGuestRequestParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidUtf8 => f.write_str("MMDS guest HTTP request is not valid UTF-8."),
+            Self::MalformedRequest => f.write_str("MMDS guest HTTP request is malformed."),
+            Self::UnsupportedMethod => {
+                f.write_str("MMDS guest HTTP request method is not supported.")
+            }
+            Self::UnsupportedHttpVersion => {
+                f.write_str("MMDS guest HTTP request version is not supported.")
+            }
+            Self::InvalidUri => f.write_str("Invalid URI."),
+            Self::MalformedHeader => f.write_str("MMDS guest HTTP request header is malformed."),
+            Self::DuplicateContentLength => {
+                f.write_str("MMDS guest HTTP request has duplicate Content-Length headers.")
+            }
+            Self::InvalidContentLength => {
+                f.write_str("MMDS guest HTTP request Content-Length is invalid.")
+            }
+            Self::UnsupportedTransferEncoding => {
+                f.write_str("MMDS guest HTTP request Transfer-Encoding is not supported.")
+            }
+            Self::UnsupportedBody => f.write_str("MMDS guest HTTP request body is not supported."),
+            Self::UnsupportedAccept => {
+                f.write_str("MMDS guest HTTP request Accept header is not supported.")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MmdsGuestRequestParseError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MmdsGuestStatus {
@@ -444,6 +554,121 @@ fn mmds_pointer_path(path: &str) -> &str {
     path.strip_suffix('/').unwrap_or(path)
 }
 
+fn parse_guest_request_line(
+    request_line: &str,
+) -> Result<(&str, &str, &str), MmdsGuestRequestParseError> {
+    let mut parts = request_line.split_ascii_whitespace();
+    let method = parts
+        .next()
+        .ok_or(MmdsGuestRequestParseError::MalformedRequest)?;
+    let uri = parts
+        .next()
+        .ok_or(MmdsGuestRequestParseError::MalformedRequest)?;
+    let version = parts
+        .next()
+        .ok_or(MmdsGuestRequestParseError::MalformedRequest)?;
+    if parts.next().is_some() {
+        return Err(MmdsGuestRequestParseError::MalformedRequest);
+    }
+
+    Ok((method, uri, version))
+}
+
+fn guest_request_uri_path(uri: &str) -> Result<&str, MmdsGuestRequestParseError> {
+    if uri.is_empty() {
+        return Err(MmdsGuestRequestParseError::InvalidUri);
+    }
+    if uri.starts_with('/') {
+        return Ok(uri);
+    }
+    if let Some(rest) = uri.strip_prefix("http://") {
+        let Some(path_start) = rest.find('/') else {
+            return Err(MmdsGuestRequestParseError::InvalidUri);
+        };
+        let path = rest
+            .get(path_start..)
+            .ok_or(MmdsGuestRequestParseError::InvalidUri)?;
+        if path.is_empty() {
+            return Err(MmdsGuestRequestParseError::InvalidUri);
+        }
+        return Ok(path);
+    }
+
+    Err(MmdsGuestRequestParseError::InvalidUri)
+}
+
+fn parse_guest_request_header(line: &str) -> Result<(&str, &str), MmdsGuestRequestParseError> {
+    let (name, value) = line
+        .split_once(':')
+        .ok_or(MmdsGuestRequestParseError::MalformedHeader)?;
+    if !is_http_token(name) {
+        return Err(MmdsGuestRequestParseError::MalformedHeader);
+    }
+
+    Ok((name, trim_http_optional_whitespace(value)))
+}
+
+fn is_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+                    | b'0'..=b'9'
+                    | b'A'..=b'Z'
+                    | b'a'..=b'z'
+            )
+        })
+}
+
+fn parse_guest_content_length(value: &str) -> Result<usize, MmdsGuestRequestParseError> {
+    if value.is_empty() {
+        return Err(MmdsGuestRequestParseError::InvalidContentLength);
+    }
+
+    let mut parsed = 0usize;
+    for byte in value.bytes() {
+        if !byte.is_ascii_digit() {
+            return Err(MmdsGuestRequestParseError::InvalidContentLength);
+        }
+
+        parsed = parsed
+            .checked_mul(10)
+            .and_then(|parsed| parsed.checked_add(usize::from(byte - b'0')))
+            .ok_or(MmdsGuestRequestParseError::InvalidContentLength)?;
+    }
+
+    Ok(parsed)
+}
+
+fn parse_guest_accept_header(value: &str) -> Result<MmdsOutputFormat, MmdsGuestRequestParseError> {
+    if value.is_empty() || value == "*/*" || value.eq_ignore_ascii_case("text/plain") {
+        return Ok(MmdsOutputFormat::Imds);
+    }
+    if value.eq_ignore_ascii_case("application/json") {
+        return Ok(MmdsOutputFormat::Json);
+    }
+
+    Err(MmdsGuestRequestParseError::UnsupportedAccept)
+}
+
+fn trim_http_optional_whitespace(value: &str) -> &str {
+    value.trim_matches(|character| matches!(character, ' ' | '\t'))
+}
+
 fn sanitize_guest_uri(uri: &str) -> String {
     let mut sanitized = String::with_capacity(uri.len());
     let mut last_was_slash = false;
@@ -589,6 +814,18 @@ mod tests {
         assert_eq!(response.status(), status);
         assert_eq!(response.content_type(), content_type);
         assert_eq!(response.body(), body);
+    }
+
+    fn assert_guest_request(
+        bytes: &[u8],
+        expected_uri: &str,
+        expected_output_format: MmdsOutputFormat,
+    ) {
+        let request =
+            MmdsGuestRequest::parse_http(bytes).expect("test MMDS guest HTTP request should parse");
+
+        assert_eq!(request.uri(), expected_uri);
+        assert_eq!(request.output_format(), expected_output_format);
     }
 
     fn serialized_len(value: &Value) -> usize {
@@ -851,6 +1088,210 @@ mod tests {
             "application/json"
         );
         assert_eq!(MmdsGuestContentType::PlainText.as_str(), "text/plain");
+    }
+
+    #[test]
+    fn mmds_guest_request_parses_get_without_accept_as_imds() {
+        assert_guest_request(
+            b"GET /latest/meta-data/hostname HTTP/1.1\r\nHost: 169.254.169.254\r\n\r\n",
+            "/latest/meta-data/hostname",
+            MmdsOutputFormat::Imds,
+        );
+    }
+
+    #[test]
+    fn mmds_guest_request_parses_absolute_form_uri_path() {
+        assert_guest_request(
+            b"GET http://169.254.169.254/latest/meta-data/hostname HTTP/1.0\r\n\r\n",
+            "/latest/meta-data/hostname",
+            MmdsOutputFormat::Imds,
+        );
+    }
+
+    #[test]
+    fn mmds_guest_request_parses_application_json_accept() {
+        assert_guest_request(
+            b"GET /meta-data/hostname HTTP/1.1\r\nAccept: application/json\r\n\r\n",
+            "/meta-data/hostname",
+            MmdsOutputFormat::Json,
+        );
+    }
+
+    #[test]
+    fn mmds_guest_request_parses_imds_accept_variants() {
+        for request in [
+            b"GET /meta-data/hostname HTTP/1.1\r\nAccept:\r\n\r\n".as_slice(),
+            b"GET /meta-data/hostname HTTP/1.1\r\nAccept: */*\r\n\r\n",
+            b"GET /meta-data/hostname HTTP/1.1\r\nAccept:\ttext/plain \r\n\r\n",
+        ] {
+            assert_guest_request(request, "/meta-data/hostname", MmdsOutputFormat::Imds);
+        }
+    }
+
+    #[test]
+    fn mmds_guest_request_accepts_zero_content_length() {
+        assert_guest_request(
+            b"GET /meta-data/hostname HTTP/1.1\r\nContent-Length:\t0 \r\n\r\n",
+            "/meta-data/hostname",
+            MmdsOutputFormat::Imds,
+        );
+    }
+
+    #[test]
+    fn mmds_guest_request_rejects_invalid_utf8() {
+        let request = b"GET /meta-data/host\xffname HTTP/1.1\r\n\r\n";
+
+        assert_eq!(
+            MmdsGuestRequest::parse_http(request),
+            Err(MmdsGuestRequestParseError::InvalidUtf8)
+        );
+    }
+
+    #[test]
+    fn mmds_guest_request_rejects_malformed_request_line() {
+        for request in [
+            b"GET /meta-data/hostname HTTP/1.1 extra\r\n\r\n".as_slice(),
+            b"GET /meta-data/hostname\r\n\r\n",
+            b"\r\n\r\n",
+        ] {
+            assert_eq!(
+                MmdsGuestRequest::parse_http(request),
+                Err(MmdsGuestRequestParseError::MalformedRequest)
+            );
+        }
+    }
+
+    #[test]
+    fn mmds_guest_request_rejects_unsupported_method_and_version() {
+        assert_eq!(
+            MmdsGuestRequest::parse_http(b"POST /meta-data/hostname HTTP/1.1\r\n\r\n"),
+            Err(MmdsGuestRequestParseError::UnsupportedMethod)
+        );
+        assert_eq!(
+            MmdsGuestRequest::parse_http(b"GET /meta-data/hostname HTTP/2\r\n\r\n"),
+            Err(MmdsGuestRequestParseError::UnsupportedHttpVersion)
+        );
+    }
+
+    #[test]
+    fn mmds_guest_request_rejects_invalid_uri() {
+        for request in [
+            b"GET http://169.254.169.254 HTTP/1.1\r\n\r\n".as_slice(),
+            b"GET http:// HTTP/1.1\r\n\r\n",
+            b"GET * HTTP/1.1\r\n\r\n",
+        ] {
+            assert_eq!(
+                MmdsGuestRequest::parse_http(request),
+                Err(MmdsGuestRequestParseError::InvalidUri)
+            );
+        }
+    }
+
+    #[test]
+    fn mmds_guest_request_rejects_malformed_headers() {
+        for request in [
+            b"GET /meta-data/hostname HTTP/1.1\r\nAccept application/json\r\n\r\n".as_slice(),
+            b"GET /meta-data/hostname HTTP/1.1\r\nBad Header: value\r\n\r\n",
+            b"GET /meta-data/hostname HTTP/1.1\r\n: value\r\n\r\n",
+            b"GET /meta-data/hostname HTTP/1.1\r\nBad\x7fHeader: value\r\n\r\n",
+        ] {
+            assert_eq!(
+                MmdsGuestRequest::parse_http(request),
+                Err(MmdsGuestRequestParseError::MalformedHeader)
+            );
+        }
+    }
+
+    #[test]
+    fn mmds_guest_request_rejects_body_framing() {
+        assert_eq!(
+            MmdsGuestRequest::parse_http(
+                b"GET /meta-data/hostname HTTP/1.1\r\nContent-Length: 0\r\n\r\nbody"
+            ),
+            Err(MmdsGuestRequestParseError::UnsupportedBody)
+        );
+        assert_eq!(
+            MmdsGuestRequest::parse_http(
+                b"GET /meta-data/hostname HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody"
+            ),
+            Err(MmdsGuestRequestParseError::UnsupportedBody)
+        );
+        assert_eq!(
+            MmdsGuestRequest::parse_http(
+                b"GET /meta-data/hostname HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+            ),
+            Err(MmdsGuestRequestParseError::DuplicateContentLength)
+        );
+        assert_eq!(
+            MmdsGuestRequest::parse_http(
+                b"GET /meta-data/hostname HTTP/1.1\r\nContent-Length: +0\r\n\r\n"
+            ),
+            Err(MmdsGuestRequestParseError::InvalidContentLength)
+        );
+        assert_eq!(
+            MmdsGuestRequest::parse_http(
+                b"GET /meta-data/hostname HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+            ),
+            Err(MmdsGuestRequestParseError::UnsupportedTransferEncoding)
+        );
+    }
+
+    #[test]
+    fn mmds_guest_request_rejects_unsupported_accept_header() {
+        assert_eq!(
+            MmdsGuestRequest::parse_http(
+                b"GET /meta-data/hostname HTTP/1.1\r\nAccept: application/xml\r\n\r\n"
+            ),
+            Err(MmdsGuestRequestParseError::UnsupportedAccept)
+        );
+    }
+
+    #[test]
+    fn mmds_guest_request_parse_errors_display_deterministic_messages() {
+        assert_eq!(
+            MmdsGuestRequestParseError::InvalidUtf8.to_string(),
+            "MMDS guest HTTP request is not valid UTF-8."
+        );
+        assert_eq!(
+            MmdsGuestRequestParseError::MalformedRequest.to_string(),
+            "MMDS guest HTTP request is malformed."
+        );
+        assert_eq!(
+            MmdsGuestRequestParseError::UnsupportedMethod.to_string(),
+            "MMDS guest HTTP request method is not supported."
+        );
+        assert_eq!(
+            MmdsGuestRequestParseError::UnsupportedHttpVersion.to_string(),
+            "MMDS guest HTTP request version is not supported."
+        );
+        assert_eq!(
+            MmdsGuestRequestParseError::InvalidUri.to_string(),
+            "Invalid URI."
+        );
+        assert_eq!(
+            MmdsGuestRequestParseError::MalformedHeader.to_string(),
+            "MMDS guest HTTP request header is malformed."
+        );
+        assert_eq!(
+            MmdsGuestRequestParseError::DuplicateContentLength.to_string(),
+            "MMDS guest HTTP request has duplicate Content-Length headers."
+        );
+        assert_eq!(
+            MmdsGuestRequestParseError::InvalidContentLength.to_string(),
+            "MMDS guest HTTP request Content-Length is invalid."
+        );
+        assert_eq!(
+            MmdsGuestRequestParseError::UnsupportedTransferEncoding.to_string(),
+            "MMDS guest HTTP request Transfer-Encoding is not supported."
+        );
+        assert_eq!(
+            MmdsGuestRequestParseError::UnsupportedBody.to_string(),
+            "MMDS guest HTTP request body is not supported."
+        );
+        assert_eq!(
+            MmdsGuestRequestParseError::UnsupportedAccept.to_string(),
+            "MMDS guest HTTP request Accept header is not supported."
+        );
     }
 
     #[test]
