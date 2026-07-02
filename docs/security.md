@@ -83,15 +83,16 @@ is resource-specific:
   retained host stream. Short or failed acknowledgement writes drop the retained
   connection and release its host local port. Unsupported or orphan
   host-destined guest TX packets can queue bounded guest-visible
-  `VSOCK_OP_RST` headers without opening host paths. Supported guest
-  `VSOCK_OP_REQUEST` packets are retained as bounded metadata-only connection
-  attempts for later host socket connection work, without opening
-  `uds_path_<PORT>` sockets in the current implementation. Startup also binds a
-  nonblocking host Unix listener at `uds_path`, records the listener socket
-  device and inode, and removes the path on normal shutdown only when it still
-  refers to the socket created by this process. It does not connect to
-  `uds_path_<PORT>`, route CIDs beyond current host/guest checks, dispatch event
-  queues, or move vsock data yet.
+  `VSOCK_OP_RST` headers. Supported guest `VSOCK_OP_REQUEST` packets connect to
+  Firecracker-shaped `uds_path_<PORT>` sockets, set successful streams
+  nonblocking, retain them in a bounded guest-initiated connection table, and
+  deliver guest-visible `VSOCK_OP_RESPONSE` headers. Connect, duplicate, or
+  retention failures deliver guest-visible `VSOCK_OP_RST` headers and retain no
+  stream. Startup also binds a nonblocking host Unix listener at `uds_path`,
+  records the listener socket device and inode, and removes the path on normal
+  shutdown only when it still refers to the socket created by this process. It
+  does not route CIDs beyond current host/guest checks, dispatch event queues,
+  or move vsock data yet.
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink.
 - `/logger` opens `log_path` during pre-boot configuration when that field is
@@ -220,13 +221,15 @@ The current scaffold does not implement:
   requests by writing `OK <local_port>\n` to the retained host stream. Short or
   failed acknowledgement writes drop the retained connection and release its
   host local port. Unsupported or orphan host-destined guest TX packets can
-  queue bounded guest-visible `VSOCK_OP_RST` headers without opening host paths.
-  Supported guest `VSOCK_OP_REQUEST` packets are retained as bounded
-  metadata-only connection attempts, and this retention opens no host paths.
-  Startup preparation creates a nonblocking host Unix listener at `uds_path` and
-  cleans it up only while the path still matches the created socket inode. It
-  does not connect guest-initiated `uds_path_<PORT>` sockets, route CIDs beyond
-  current host/guest checks, dispatch event queues, or move data
+  queue bounded guest-visible `VSOCK_OP_RST` headers. Supported guest
+  `VSOCK_OP_REQUEST` packets connect to Firecracker-shaped `uds_path_<PORT>`
+  sockets, retain successful nonblocking streams in a bounded guest-initiated
+  connection table, and deliver guest-visible `VSOCK_OP_RESPONSE` headers;
+  connect or retention failures deliver guest-visible `VSOCK_OP_RST` headers
+  and retain no stream. Startup preparation creates a nonblocking host Unix
+  listener at `uds_path` and cleans it up only while the path still matches the
+  created socket inode. It still does not route CIDs beyond current host/guest
+  checks, dispatch event queues, or move data
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 
