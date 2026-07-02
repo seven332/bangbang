@@ -173,6 +173,7 @@ impl std::error::Error for MmdsConfigError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MmdsDataStoreError {
+    InvalidObject,
     NotInitialized,
     DataStoreLimitExceeded {
         limit_bytes: usize,
@@ -184,6 +185,9 @@ pub enum MmdsDataStoreError {
 impl fmt::Display for MmdsDataStoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidObject => {
+                f.write_str("The MMDS data store request body must be a JSON object.")
+            }
             Self::NotInitialized => f.write_str("The MMDS data store is not initialized."),
             Self::DataStoreLimitExceeded {
                 limit_bytes,
@@ -247,6 +251,7 @@ impl MmdsState {
 
     pub fn put_data(&mut self, input: MmdsContentInput) -> Result<(), MmdsDataStoreError> {
         let value = input.into_value();
+        validate_object(&value)?;
         self.ensure_within_limit(&value)?;
         self.value = Some(value);
         Ok(())
@@ -257,6 +262,7 @@ impl MmdsState {
             .value
             .as_ref()
             .ok_or(MmdsDataStoreError::NotInitialized)?;
+        validate_object(input.value())?;
         let mut patched = value.clone();
         json_merge_patch(&mut patched, input.value());
         self.ensure_within_limit(&patched)?;
@@ -276,6 +282,14 @@ impl MmdsState {
         }
 
         Ok(())
+    }
+}
+
+fn validate_object(value: &Value) -> Result<(), MmdsDataStoreError> {
+    if value.is_object() {
+        Ok(())
+    } else {
+        Err(MmdsDataStoreError::InvalidObject)
     }
 }
 

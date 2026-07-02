@@ -1021,6 +1021,48 @@ mod tests {
     }
 
     #[test]
+    fn put_mmds_rejects_non_object_value_without_initializing_store() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
+        assert_eq!(
+            controller.handle_action(VmmAction::PutMmds(MmdsContentInput::new(
+                serde_json::json!("not-an-object"),
+            ))),
+            Err(VmmActionError::MmdsDataStore(
+                MmdsDataStoreError::InvalidObject
+            ))
+        );
+        assert_eq!(
+            controller.handle_action(VmmAction::GetMmds),
+            Err(VmmActionError::MmdsDataStore(
+                MmdsDataStoreError::NotInitialized
+            ))
+        );
+    }
+
+    #[test]
+    fn patch_mmds_rejects_non_object_value_without_mutating_store() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        let original = serde_json::json!({"latest": {"meta-data": {}}});
+        controller
+            .handle_action(VmmAction::PutMmds(MmdsContentInput::new(original.clone())))
+            .expect("initial MMDS put should succeed");
+
+        assert_eq!(
+            controller.handle_action(VmmAction::PatchMmds(MmdsContentInput::new(
+                serde_json::json!("not-an-object"),
+            ))),
+            Err(VmmActionError::MmdsDataStore(
+                MmdsDataStoreError::InvalidObject
+            ))
+        );
+        assert_eq!(
+            controller.handle_action(VmmAction::GetMmds),
+            Ok(VmmData::MmdsValue(original))
+        );
+    }
+
+    #[test]
     fn oversized_put_mmds_does_not_mutate_existing_data_store() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         let original = serde_json::json!({"latest": {"meta-data": {}}});
