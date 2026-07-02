@@ -177,6 +177,69 @@ pub enum MmdsOutputFormat {
     Imds,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmdsGuestStatus {
+    Ok,
+    BadRequest,
+    NotFound,
+    NotImplemented,
+}
+
+impl MmdsGuestStatus {
+    pub const fn as_u16(&self) -> u16 {
+        match self {
+            Self::Ok => 200,
+            Self::BadRequest => 400,
+            Self::NotFound => 404,
+            Self::NotImplemented => 501,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmdsGuestContentType {
+    ApplicationJson,
+    PlainText,
+}
+
+impl MmdsGuestContentType {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::ApplicationJson => "application/json",
+            Self::PlainText => "text/plain",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MmdsGuestResponse {
+    status: MmdsGuestStatus,
+    content_type: MmdsGuestContentType,
+    body: String,
+}
+
+impl MmdsGuestResponse {
+    fn new(status: MmdsGuestStatus, content_type: MmdsGuestContentType, body: String) -> Self {
+        Self {
+            status,
+            content_type,
+            body,
+        }
+    }
+
+    pub const fn status(&self) -> MmdsGuestStatus {
+        self.status
+    }
+
+    pub const fn content_type(&self) -> MmdsGuestContentType {
+        self.content_type
+    }
+
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MmdsDataStoreError {
     InvalidObject,
@@ -285,6 +348,30 @@ impl MmdsState {
         }
     }
 
+    pub fn guest_get_response(
+        &self,
+        uri: &str,
+        output_format: MmdsOutputFormat,
+    ) -> MmdsGuestResponse {
+        if uri.is_empty() {
+            return MmdsGuestResponse::new(
+                MmdsGuestStatus::BadRequest,
+                MmdsGuestContentType::PlainText,
+                "Invalid URI.".to_string(),
+            );
+        }
+
+        let query_path = sanitize_guest_uri(uri);
+        match self.query_data(&query_path, output_format) {
+            Ok(body) => MmdsGuestResponse::new(
+                MmdsGuestStatus::Ok,
+                self.guest_success_content_type(output_format),
+                body,
+            ),
+            Err(err) => guest_error_response(uri, err),
+        }
+    }
+
     pub fn put_data(&mut self, input: MmdsContentInput) -> Result<(), MmdsDataStoreError> {
         let value = input.into_value();
         validate_object(&value)?;
@@ -319,10 +406,58 @@ impl MmdsState {
 
         Ok(())
     }
+
+    fn guest_success_content_type(&self, output_format: MmdsOutputFormat) -> MmdsGuestContentType {
+        if self.config.as_ref().is_some_and(MmdsConfig::imds_compat) {
+            return MmdsGuestContentType::PlainText;
+        }
+
+        match output_format {
+            MmdsOutputFormat::Json => MmdsGuestContentType::ApplicationJson,
+            MmdsOutputFormat::Imds => MmdsGuestContentType::PlainText,
+        }
+    }
 }
 
 fn mmds_pointer_path(path: &str) -> &str {
     path.strip_suffix('/').unwrap_or(path)
+}
+
+fn sanitize_guest_uri(uri: &str) -> String {
+    let mut sanitized = String::with_capacity(uri.len());
+    let mut last_was_slash = false;
+
+    for character in uri.chars() {
+        if character == '/' {
+            if !last_was_slash {
+                sanitized.push(character);
+            }
+            last_was_slash = true;
+        } else {
+            sanitized.push(character);
+            last_was_slash = false;
+        }
+    }
+
+    sanitized
+}
+
+fn guest_error_response(uri: &str, err: MmdsDataStoreError) -> MmdsGuestResponse {
+    let (status, body) = match err {
+        MmdsDataStoreError::NotFound => (
+            MmdsGuestStatus::NotFound,
+            format!("Resource not found: {uri}."),
+        ),
+        MmdsDataStoreError::UnsupportedValueType => {
+            (MmdsGuestStatus::NotImplemented, err.to_string())
+        }
+        MmdsDataStoreError::InvalidObject
+        | MmdsDataStoreError::NotInitialized
+        | MmdsDataStoreError::DataStoreLimitExceeded { .. }
+        | MmdsDataStoreError::Serialization => (MmdsGuestStatus::BadRequest, err.to_string()),
+    };
+
+    MmdsGuestResponse::new(status, MmdsGuestContentType::PlainText, body)
 }
 
 fn format_imds(value: &Value) -> Result<String, MmdsDataStoreError> {
@@ -422,6 +557,17 @@ mod tests {
     fn assert_json_value(output: &str, expected: Value) {
         let value = serde_json::from_str::<Value>(output).expect("query output should be JSON");
         assert_eq!(value, expected);
+    }
+
+    fn assert_guest_response(
+        response: MmdsGuestResponse,
+        status: MmdsGuestStatus,
+        content_type: MmdsGuestContentType,
+        body: &str,
+    ) {
+        assert_eq!(response.status(), status);
+        assert_eq!(response.content_type(), content_type);
+        assert_eq!(response.body(), body);
     }
 
     fn serialized_len(value: &Value) -> usize {
@@ -654,6 +800,148 @@ mod tests {
         assert_eq!(
             state.query_data("/meta-data", MmdsOutputFormat::Imds),
             Ok("ami-id\nhostname".to_string())
+        );
+        assert_eq!(state.get_data(), Ok(original));
+    }
+
+    #[test]
+    fn guest_status_codes_match_http_values() {
+        assert_eq!(MmdsGuestStatus::Ok.as_u16(), 200);
+        assert_eq!(MmdsGuestStatus::BadRequest.as_u16(), 400);
+        assert_eq!(MmdsGuestStatus::NotFound.as_u16(), 404);
+        assert_eq!(MmdsGuestStatus::NotImplemented.as_u16(), 501);
+    }
+
+    #[test]
+    fn guest_content_type_names_match_http_values() {
+        assert_eq!(
+            MmdsGuestContentType::ApplicationJson.as_str(),
+            "application/json"
+        );
+        assert_eq!(MmdsGuestContentType::PlainText.as_str(), "text/plain");
+    }
+
+    #[test]
+    fn guest_get_response_returns_json_body() {
+        let state = initialized_query_state();
+        let response = state.guest_get_response("/", MmdsOutputFormat::Json);
+
+        assert_eq!(response.status(), MmdsGuestStatus::Ok);
+        assert_eq!(
+            response.content_type(),
+            MmdsGuestContentType::ApplicationJson
+        );
+        assert_json_value(response.body(), query_value());
+    }
+
+    #[test]
+    fn guest_get_response_returns_imds_body() {
+        let state = initialized_query_state();
+
+        assert_guest_response(
+            state.guest_get_response("/", MmdsOutputFormat::Imds),
+            MmdsGuestStatus::Ok,
+            MmdsGuestContentType::PlainText,
+            "age\nmember\nmeta-data/\nnothing\nphones\nuser-data",
+        );
+    }
+
+    #[test]
+    fn guest_get_response_imds_compat_forces_plain_text_response() {
+        let mut state = initialized_query_state();
+        enable_imds_compat(&mut state);
+
+        assert_guest_response(
+            state.guest_get_response("/meta-data", MmdsOutputFormat::Json),
+            MmdsGuestStatus::Ok,
+            MmdsGuestContentType::PlainText,
+            "ami-id\nhostname",
+        );
+    }
+
+    #[test]
+    fn guest_get_response_rejects_empty_uri() {
+        let state = initialized_query_state();
+
+        assert_guest_response(
+            state.guest_get_response("", MmdsOutputFormat::Json),
+            MmdsGuestStatus::BadRequest,
+            MmdsGuestContentType::PlainText,
+            "Invalid URI.",
+        );
+    }
+
+    #[test]
+    fn guest_get_response_uses_original_uri_in_missing_path_body() {
+        let state = initialized_query_state();
+
+        assert_guest_response(
+            state.guest_get_response("//meta-data//missing", MmdsOutputFormat::Json),
+            MmdsGuestStatus::NotFound,
+            MmdsGuestContentType::PlainText,
+            "Resource not found: //meta-data//missing.",
+        );
+    }
+
+    #[test]
+    fn guest_get_response_maps_unsupported_imds_value_type() {
+        let state = initialized_query_state();
+
+        assert_guest_response(
+            state.guest_get_response("/age", MmdsOutputFormat::Imds),
+            MmdsGuestStatus::NotImplemented,
+            MmdsGuestContentType::PlainText,
+            "Cannot retrieve value. The value has an unsupported type.",
+        );
+    }
+
+    #[test]
+    fn guest_get_response_sanitizes_repeated_slashes_for_lookup() {
+        let state = initialized_query_state();
+
+        assert_guest_response(
+            state.guest_get_response("//meta-data//hostname", MmdsOutputFormat::Imds),
+            MmdsGuestStatus::Ok,
+            MmdsGuestContentType::PlainText,
+            "demo.local",
+        );
+    }
+
+    #[test]
+    fn guest_get_response_sanitizes_slash_only_uri_to_root() {
+        let state = initialized_query_state();
+        let response = state.guest_get_response("////", MmdsOutputFormat::Json);
+
+        assert_eq!(response.status(), MmdsGuestStatus::Ok);
+        assert_eq!(
+            response.content_type(),
+            MmdsGuestContentType::ApplicationJson
+        );
+        assert_json_value(response.body(), query_value());
+    }
+
+    #[test]
+    fn guest_get_response_maps_uninitialized_store() {
+        let state = MmdsState::default();
+
+        assert_guest_response(
+            state.guest_get_response("/", MmdsOutputFormat::Json),
+            MmdsGuestStatus::BadRequest,
+            MmdsGuestContentType::PlainText,
+            "The MMDS data store is not initialized.",
+        );
+    }
+
+    #[test]
+    fn guest_get_response_does_not_mutate_data_store() {
+        let state = initialized_query_state();
+        let original = state.get_data().expect("data store should be initialized");
+
+        assert_guest_response(
+            state.guest_get_response("/meta-data", MmdsOutputFormat::Imds),
+            MmdsGuestStatus::Ok,
+            MmdsGuestContentType::PlainText,
+            "ami-id\nhostname",
         );
         assert_eq!(state.get_data(), Ok(original));
     }
