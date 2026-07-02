@@ -292,6 +292,7 @@ pub enum MmdsGuestStatus {
     Ok,
     BadRequest,
     NotFound,
+    MethodNotAllowed,
     NotImplemented,
 }
 
@@ -301,6 +302,7 @@ impl MmdsGuestStatus {
             Self::Ok => 200,
             Self::BadRequest => 400,
             Self::NotFound => 404,
+            Self::MethodNotAllowed => 405,
             Self::NotImplemented => 501,
         }
     }
@@ -310,6 +312,7 @@ impl MmdsGuestStatus {
             Self::Ok => "OK",
             Self::BadRequest => "Bad Request",
             Self::NotFound => "Not Found",
+            Self::MethodNotAllowed => "Method Not Allowed",
             Self::NotImplemented => "Not Implemented",
         }
     }
@@ -334,6 +337,7 @@ impl MmdsGuestContentType {
 pub struct MmdsGuestResponse {
     status: MmdsGuestStatus,
     content_type: MmdsGuestContentType,
+    allow: Option<&'static str>,
     body: String,
 }
 
@@ -342,8 +346,14 @@ impl MmdsGuestResponse {
         Self {
             status,
             content_type,
+            allow: None,
             body,
         }
+    }
+
+    fn with_allow_header(mut self, allow: &'static str) -> Self {
+        self.allow = Some(allow);
+        self
     }
 
     pub const fn status(&self) -> MmdsGuestStatus {
@@ -359,15 +369,22 @@ impl MmdsGuestResponse {
     }
 
     pub fn to_http_bytes(&self) -> Vec<u8> {
-        format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n{}",
+        let mut response = format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\n",
             self.status.as_u16(),
             self.status.reason_phrase(),
             self.content_type.as_str(),
-            self.body.len(),
-            self.body
-        )
-        .into_bytes()
+        );
+        if let Some(allow) = self.allow {
+            response.push_str("Allow: ");
+            response.push_str(allow);
+            response.push_str("\r\n");
+        }
+        response.push_str("Content-Length: ");
+        response.push_str(&self.body.len().to_string());
+        response.push_str("\r\n\r\n");
+        response.push_str(&self.body);
+        response.into_bytes()
     }
 }
 
@@ -501,6 +518,17 @@ impl MmdsState {
             ),
             Err(err) => guest_error_response(uri, err),
         }
+    }
+
+    pub fn guest_http_response(&self, request_bytes: &[u8]) -> MmdsGuestResponse {
+        match MmdsGuestRequest::parse_http(request_bytes) {
+            Ok(request) => self.guest_get_response(request.uri(), request.output_format()),
+            Err(err) => guest_request_parse_error_response(err),
+        }
+    }
+
+    pub fn guest_http_response_bytes(&self, request_bytes: &[u8]) -> Vec<u8> {
+        self.guest_http_response(request_bytes).to_http_bytes()
     }
 
     pub fn put_data(&mut self, input: MmdsContentInput) -> Result<(), MmdsDataStoreError> {
@@ -709,6 +737,29 @@ fn guest_error_response(uri: &str, err: MmdsDataStoreError) -> MmdsGuestResponse
     MmdsGuestResponse::new(status, MmdsGuestContentType::PlainText, body)
 }
 
+fn guest_request_parse_error_response(err: MmdsGuestRequestParseError) -> MmdsGuestResponse {
+    let status = match err {
+        MmdsGuestRequestParseError::UnsupportedMethod => MmdsGuestStatus::MethodNotAllowed,
+        MmdsGuestRequestParseError::InvalidUtf8
+        | MmdsGuestRequestParseError::MalformedRequest
+        | MmdsGuestRequestParseError::UnsupportedHttpVersion
+        | MmdsGuestRequestParseError::InvalidUri
+        | MmdsGuestRequestParseError::MalformedHeader
+        | MmdsGuestRequestParseError::DuplicateContentLength
+        | MmdsGuestRequestParseError::InvalidContentLength
+        | MmdsGuestRequestParseError::UnsupportedTransferEncoding
+        | MmdsGuestRequestParseError::UnsupportedBody
+        | MmdsGuestRequestParseError::UnsupportedAccept => MmdsGuestStatus::BadRequest,
+    };
+
+    let response = MmdsGuestResponse::new(status, MmdsGuestContentType::PlainText, err.to_string());
+    if status == MmdsGuestStatus::MethodNotAllowed {
+        return response.with_allow_header("GET");
+    }
+
+    response
+}
+
 fn format_imds(value: &Value) -> Result<String, MmdsDataStoreError> {
     if let Some(map) = value.as_object() {
         let entries = map
@@ -817,6 +868,20 @@ mod tests {
         assert_eq!(response.status(), status);
         assert_eq!(response.content_type(), content_type);
         assert_eq!(response.body(), body);
+    }
+
+    fn assert_guest_http_response(
+        bytes: &[u8],
+        status: MmdsGuestStatus,
+        content_type: MmdsGuestContentType,
+        body: &str,
+    ) {
+        assert_guest_response(
+            initialized_query_state().guest_http_response(bytes),
+            status,
+            content_type,
+            body,
+        );
     }
 
     fn assert_guest_request(
@@ -1070,6 +1135,7 @@ mod tests {
         assert_eq!(MmdsGuestStatus::Ok.as_u16(), 200);
         assert_eq!(MmdsGuestStatus::BadRequest.as_u16(), 400);
         assert_eq!(MmdsGuestStatus::NotFound.as_u16(), 404);
+        assert_eq!(MmdsGuestStatus::MethodNotAllowed.as_u16(), 405);
         assert_eq!(MmdsGuestStatus::NotImplemented.as_u16(), 501);
     }
 
@@ -1081,6 +1147,10 @@ mod tests {
         assert_eq!(
             MmdsGuestStatus::NotImplemented.reason_phrase(),
             "Not Implemented"
+        );
+        assert_eq!(
+            MmdsGuestStatus::MethodNotAllowed.reason_phrase(),
+            "Method Not Allowed"
         );
     }
 
@@ -1265,6 +1335,154 @@ mod tests {
             MmdsGuestContentType::ApplicationJson
         );
         assert_eq!(response.body(), r#""demo.local""#);
+    }
+
+    #[test]
+    fn mmds_guest_http_response_returns_json_success() {
+        let state = initialized_query_state();
+        let response = state.guest_http_response(
+            b"GET /meta-data/hostname HTTP/1.1\r\nAccept: application/json\r\n\r\n",
+        );
+
+        assert_eq!(response.status(), MmdsGuestStatus::Ok);
+        assert_eq!(
+            response.content_type(),
+            MmdsGuestContentType::ApplicationJson
+        );
+        assert_eq!(response.body(), r#""demo.local""#);
+    }
+
+    #[test]
+    fn mmds_guest_http_response_bytes_return_imds_success() {
+        let state = initialized_query_state();
+
+        assert_eq!(
+            state.guest_http_response_bytes(
+                b"GET /meta-data/hostname HTTP/1.1\r\nAccept: */*\r\n\r\n"
+            ),
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 10\r\n\r\ndemo.local"
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn mmds_guest_http_response_maps_uninitialized_store() {
+        let state = MmdsState::default();
+
+        assert_guest_response(
+            state.guest_http_response(
+                b"GET /meta-data/hostname HTTP/1.1\r\nAccept: application/json\r\n\r\n",
+            ),
+            MmdsGuestStatus::BadRequest,
+            MmdsGuestContentType::PlainText,
+            "The MMDS data store is not initialized.",
+        );
+    }
+
+    #[test]
+    fn mmds_guest_http_response_maps_parse_errors() {
+        for (request, status, body) in [
+            (
+                b"GET /meta-data/host\xffname HTTP/1.1\r\n\r\n".as_slice(),
+                MmdsGuestStatus::BadRequest,
+                "MMDS guest HTTP request is not valid UTF-8.",
+            ),
+            (
+                b"GET /meta-data/hostname HTTP/1.1 extra\r\n\r\n",
+                MmdsGuestStatus::BadRequest,
+                "MMDS guest HTTP request is malformed.",
+            ),
+            (
+                b"POST /meta-data/hostname HTTP/1.1\r\n\r\n",
+                MmdsGuestStatus::MethodNotAllowed,
+                "MMDS guest HTTP request method is not supported.",
+            ),
+            (
+                b"GET /meta-data/hostname HTTP/2\r\n\r\n",
+                MmdsGuestStatus::BadRequest,
+                "MMDS guest HTTP request version is not supported.",
+            ),
+            (
+                b"GET * HTTP/1.1\r\n\r\n",
+                MmdsGuestStatus::BadRequest,
+                "Invalid URI.",
+            ),
+            (
+                b"GET /meta-data/hostname HTTP/1.1\r\nBad Header: value\r\n\r\n",
+                MmdsGuestStatus::BadRequest,
+                "MMDS guest HTTP request header is malformed.",
+            ),
+            (
+                b"GET /meta-data/hostname HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+                MmdsGuestStatus::BadRequest,
+                "MMDS guest HTTP request has duplicate Content-Length headers.",
+            ),
+            (
+                b"GET /meta-data/hostname HTTP/1.1\r\nContent-Length: +0\r\n\r\n",
+                MmdsGuestStatus::BadRequest,
+                "MMDS guest HTTP request Content-Length is invalid.",
+            ),
+            (
+                b"GET /meta-data/hostname HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+                MmdsGuestStatus::BadRequest,
+                "MMDS guest HTTP request Transfer-Encoding is not supported.",
+            ),
+            (
+                b"GET /meta-data/hostname HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody",
+                MmdsGuestStatus::BadRequest,
+                "MMDS guest HTTP request body is not supported.",
+            ),
+            (
+                b"GET /meta-data/hostname HTTP/1.1\r\nAccept: application/xml\r\n\r\n",
+                MmdsGuestStatus::BadRequest,
+                "MMDS guest HTTP request Accept header is not supported.",
+            ),
+        ] {
+            assert_guest_http_response(
+                request,
+                status,
+                MmdsGuestContentType::PlainText,
+                body,
+            );
+        }
+    }
+
+    #[test]
+    fn mmds_guest_http_response_bytes_serialize_parse_error() {
+        let state = initialized_query_state();
+
+        assert_eq!(
+            state.guest_http_response_bytes(b"GET /meta-data/hostname\r\n\r\n"),
+            b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 37\r\n\r\nMMDS guest HTTP request is malformed."
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn mmds_guest_http_response_bytes_serialize_method_not_allowed() {
+        let state = initialized_query_state();
+
+        assert_eq!(
+            state.guest_http_response_bytes(b"POST /meta-data/hostname HTTP/1.1\r\n\r\n"),
+            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\nAllow: GET\r\nContent-Length: 48\r\n\r\nMMDS guest HTTP request method is not supported."
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn mmds_guest_http_response_parse_error_does_not_mutate_data_store() {
+        let state = initialized_query_state();
+        let original = state.get_data().expect("data store should be initialized");
+
+        assert_guest_response(
+            state.guest_http_response(
+                b"GET /meta-data/hostname HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody",
+            ),
+            MmdsGuestStatus::BadRequest,
+            MmdsGuestContentType::PlainText,
+            "MMDS guest HTTP request body is not supported.",
+        );
+        assert_eq!(state.get_data(), Ok(original));
     }
 
     #[test]
