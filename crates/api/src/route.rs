@@ -8,6 +8,7 @@ pub enum Endpoint {
     Logger,
     MachineConfig,
     Metrics,
+    Mmds,
     Drive,
     NetworkInterface,
     Vsock,

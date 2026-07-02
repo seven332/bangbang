@@ -204,7 +204,7 @@ The current scaffold does not implement:
 - a Firecracker-jailer replacement
 - privilege dropping
 - host resource brokering
-- network, MMDS, snapshot, or full vsock containment; the current network interface
+- network, MMDS storage or guest access, snapshot, or full vsock containment; the current network interface
   configuration path validates and stores configuration strings, and internal
   virtio-net notification dispatch can parse guest TX descriptor metadata and
   pass validated TX frame payloads to injected packet I/O selected per configured

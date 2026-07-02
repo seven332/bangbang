@@ -1,4 +1,5 @@
 use std::fmt;
+use std::net::Ipv4Addr;
 
 use serde::{Deserialize, Deserializer};
 
@@ -17,6 +18,7 @@ const MAX_MACHINE_CONFIG_VCPUS: u8 = 32;
 pub enum ApiRequest {
     GetInstanceInfo,
     GetMachineConfig,
+    GetMmds,
     GetVmConfig,
     GetVersion,
     PutAction(Box<ActionRequest>),
@@ -25,8 +27,11 @@ pub enum ApiRequest {
     PutLogger(Box<LoggerConfigRequest>),
     PutMachineConfig(Box<MachineConfigRequest>),
     PutMetrics(Box<MetricsConfigRequest>),
+    PutMmds(Box<MmdsContentRequest>),
+    PutMmdsConfig(Box<MmdsConfigRequest>),
     PutNetworkInterface(Box<NetworkInterfaceConfigRequest>),
     PutVsock(Box<VsockConfigRequest>),
+    PatchMmds(Box<MmdsContentRequest>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,6 +279,62 @@ impl MetricsConfigRequest {
 #[serde(deny_unknown_fields)]
 struct MetricsConfigRequestBody {
     metrics_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MmdsContentRequest {
+    value: serde_json::Value,
+}
+
+impl MmdsContentRequest {
+    pub fn value(&self) -> &serde_json::Value {
+        &self.value
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MmdsConfigRequest {
+    network_interfaces: Vec<String>,
+    version: MmdsVersion,
+    ipv4_address: Option<Ipv4Addr>,
+    imds_compat: bool,
+}
+
+impl MmdsConfigRequest {
+    pub fn network_interfaces(&self) -> &[String] {
+        &self.network_interfaces
+    }
+
+    pub const fn version(&self) -> MmdsVersion {
+        self.version
+    }
+
+    pub const fn ipv4_address(&self) -> Option<Ipv4Addr> {
+        self.ipv4_address
+    }
+
+    pub const fn imds_compat(&self) -> bool {
+        self.imds_compat
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub enum MmdsVersion {
+    #[default]
+    V1,
+    V2,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MmdsConfigRequestBody {
+    network_interfaces: Vec<String>,
+    #[serde(default)]
+    version: MmdsVersion,
+    #[serde(default)]
+    ipv4_address: Option<Ipv4Addr>,
+    #[serde(default)]
+    imds_compat: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -920,6 +981,15 @@ pub fn parse_request(bytes: &[u8]) -> Result<ApiRequest, RequestError> {
     if method == "PUT" && path == "/metrics" {
         return parse_metrics_config_request(body);
     }
+    if method == "PUT" && path == "/mmds" {
+        return parse_put_mmds_request(body);
+    }
+    if method == "PATCH" && path == "/mmds" {
+        return parse_patch_mmds_request(body);
+    }
+    if method == "PUT" && path == "/mmds/config" {
+        return parse_mmds_config_request(body);
+    }
     if method == "PUT" && path == "/vsock" {
         return parse_vsock_config_request(body);
     }
@@ -927,6 +997,7 @@ pub fn parse_request(bytes: &[u8]) -> Result<ApiRequest, RequestError> {
     match (method, path) {
         ("GET", "/") => Ok(ApiRequest::GetInstanceInfo),
         ("GET", "/machine-config") => Ok(ApiRequest::GetMachineConfig),
+        ("GET", "/mmds") => Ok(ApiRequest::GetMmds),
         ("GET", "/vm/config") => Ok(ApiRequest::GetVmConfig),
         ("GET", "/version") => Ok(ApiRequest::GetVersion),
         _ => Err(RequestError::InvalidPathMethod),
@@ -1095,6 +1166,42 @@ fn parse_metrics_config_request(body: &[u8]) -> Result<ApiRequest, RequestError>
     })))
 }
 
+fn parse_put_mmds_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
+    Ok(ApiRequest::PutMmds(Box::new(parse_mmds_content_request(
+        body,
+    )?)))
+}
+
+fn parse_patch_mmds_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
+    Ok(ApiRequest::PatchMmds(Box::new(parse_mmds_content_request(
+        body,
+    )?)))
+}
+
+fn parse_mmds_content_request(body: &[u8]) -> Result<MmdsContentRequest, RequestError> {
+    let value = serde_json::from_slice::<serde_json::Value>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+    if !value.is_object() {
+        return Err(RequestError::MalformedRequest);
+    }
+
+    Ok(MmdsContentRequest { value })
+}
+
+fn parse_mmds_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
+    let body = serde_json::from_slice::<MmdsConfigRequestBody>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+
+    validate_mmds_config_request(&body)?;
+
+    Ok(ApiRequest::PutMmdsConfig(Box::new(MmdsConfigRequest {
+        network_interfaces: body.network_interfaces,
+        version: body.version,
+        ipv4_address: body.ipv4_address,
+        imds_compat: body.imds_compat,
+    })))
+}
+
 fn parse_vsock_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
     let body = serde_json::from_slice::<VsockConfigRequestBody>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
@@ -1118,6 +1225,29 @@ fn validate_machine_config_request(body: &MachineConfigRequestBody) -> Result<()
     }
 
     Ok(())
+}
+
+fn validate_mmds_config_request(body: &MmdsConfigRequestBody) -> Result<(), RequestError> {
+    if body.network_interfaces.is_empty()
+        || body
+            .network_interfaces
+            .iter()
+            .any(|iface_id| iface_id.trim().is_empty())
+    {
+        return Err(RequestError::MalformedRequest);
+    }
+
+    if let Some(ipv4_address) = body.ipv4_address
+        && !is_valid_mmds_link_local_ipv4(ipv4_address)
+    {
+        return Err(RequestError::MalformedRequest);
+    }
+
+    Ok(())
+}
+
+fn is_valid_mmds_link_local_ipv4(ipv4_address: Ipv4Addr) -> bool {
+    matches!(ipv4_address.octets(), [169, 254, 1..=254, _])
 }
 
 fn validate_rate_limiter_config(value: &serde_json::Value) -> Result<(), RequestError> {
@@ -1325,6 +1455,7 @@ impl From<ApiRequest> for Endpoint {
         match request {
             ApiRequest::GetInstanceInfo => Self::DescribeInstance,
             ApiRequest::GetMachineConfig => Self::MachineConfig,
+            ApiRequest::GetMmds => Self::Mmds,
             ApiRequest::GetVmConfig => Self::VmConfig,
             ApiRequest::GetVersion => Self::Version,
             ApiRequest::PutAction(_) => Self::Actions,
@@ -1333,6 +1464,9 @@ impl From<ApiRequest> for Endpoint {
             ApiRequest::PutLogger(_) => Self::Logger,
             ApiRequest::PutMachineConfig(_) => Self::MachineConfig,
             ApiRequest::PutMetrics(_) => Self::Metrics,
+            ApiRequest::PutMmds(_) | ApiRequest::PatchMmds(_) | ApiRequest::PutMmdsConfig(_) => {
+                Self::Mmds
+            }
             ApiRequest::PutNetworkInterface(_) => Self::NetworkInterface,
             ApiRequest::PutVsock(_) => Self::Vsock,
         }
@@ -1988,6 +2122,191 @@ mod tests {
         assert_eq!(
             parse_request(&request_with_body("PUT", "/metrics/extra", "{}")),
             Err(RequestError::InvalidPathMethod)
+        );
+    }
+
+    #[test]
+    fn parses_get_mmds() {
+        let request = b"GET /mmds HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+        assert_eq!(parse_request(request), Ok(ApiRequest::GetMmds));
+        assert_eq!(request_total_len(request), Ok(Some(request.len())));
+    }
+
+    #[test]
+    fn parses_put_mmds_with_object_body() {
+        let body = r#"{"latest":{"meta-data":{"ami-id":"ami-123"}}}"#;
+        let request = request_with_body("PUT", "/mmds", body);
+
+        let parsed = parse_request(&request).expect("MMDS PUT request should parse");
+
+        let ApiRequest::PutMmds(content) = parsed else {
+            panic!("expected MMDS PUT request");
+        };
+        assert_eq!(
+            content.value(),
+            &serde_json::json!({"latest":{"meta-data":{"ami-id":"ami-123"}}})
+        );
+        assert_eq!(request_total_len(&request), Ok(Some(request.len())));
+    }
+
+    #[test]
+    fn parses_patch_mmds_with_object_body() {
+        let body = r#"{"latest":{"dynamic":{"instance-identity":"document"}}}"#;
+        let request = request_with_body("PATCH", "/mmds", body);
+
+        let parsed = parse_request(&request).expect("MMDS PATCH request should parse");
+
+        let ApiRequest::PatchMmds(content) = parsed else {
+            panic!("expected MMDS PATCH request");
+        };
+        assert_eq!(
+            content.value(),
+            &serde_json::json!({"latest":{"dynamic":{"instance-identity":"document"}}})
+        );
+        assert_eq!(request_total_len(&request), Ok(Some(request.len())));
+    }
+
+    #[test]
+    fn parses_put_mmds_config_with_minimal_body() {
+        let body = r#"{"network_interfaces":["eth0"]}"#;
+        let request = request_with_body("PUT", "/mmds/config", body);
+
+        let parsed = parse_request(&request).expect("MMDS config request should parse");
+
+        let ApiRequest::PutMmdsConfig(config) = parsed else {
+            panic!("expected MMDS config request");
+        };
+        assert_eq!(config.network_interfaces(), &["eth0".to_string()]);
+        assert_eq!(config.version(), MmdsVersion::V1);
+        assert_eq!(config.ipv4_address(), None);
+        assert!(!config.imds_compat());
+    }
+
+    #[test]
+    fn parses_put_mmds_config_with_complete_body() {
+        let body = r#"{
+            "network_interfaces": ["eth0", "mgmt0"],
+            "version": "V2",
+            "ipv4_address": "169.254.169.250",
+            "imds_compat": true
+        }"#;
+        let request = request_with_body("PUT", "/mmds/config", body);
+
+        let parsed = parse_request(&request).expect("complete MMDS config should parse");
+
+        let ApiRequest::PutMmdsConfig(config) = parsed else {
+            panic!("expected MMDS config request");
+        };
+        assert_eq!(
+            config.network_interfaces(),
+            &["eth0".to_string(), "mgmt0".to_string()]
+        );
+        assert_eq!(config.version(), MmdsVersion::V2);
+        assert_eq!(
+            config.ipv4_address(),
+            Some(std::net::Ipv4Addr::new(169, 254, 169, 250))
+        );
+        assert!(config.imds_compat());
+        assert_eq!(request_total_len(&request), Ok(Some(request.len())));
+    }
+
+    #[test]
+    fn parses_put_mmds_config_with_link_local_ipv4_boundaries() {
+        for ipv4_address in ["169.254.1.0", "169.254.254.255"] {
+            let body =
+                format!(r#"{{"network_interfaces":["eth0"],"ipv4_address":"{ipv4_address}"}}"#);
+            let request = request_with_body("PUT", "/mmds/config", &body);
+
+            let parsed = parse_request(&request).expect("boundary MMDS config should parse");
+
+            let ApiRequest::PutMmdsConfig(config) = parsed else {
+                panic!("expected MMDS config request");
+            };
+            assert_eq!(
+                config.ipv4_address().map(|address| address.to_string()),
+                Some(ipv4_address.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_get_mmds_with_body() {
+        let request = request_with_body("GET", "/mmds", "{}");
+
+        assert_eq!(parse_request(&request), Err(RequestError::GetRequestBody));
+    }
+
+    #[test]
+    fn rejects_put_or_patch_mmds_without_object_body() {
+        for (method, body) in [
+            ("PUT", ""),
+            ("PUT", "[]"),
+            ("PUT", "null"),
+            ("PATCH", ""),
+            ("PATCH", r#""metadata""#),
+            ("PATCH", "42"),
+        ] {
+            assert_eq!(
+                parse_request(&request_with_body(method, "/mmds", body)),
+                Err(RequestError::MalformedRequest)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_put_mmds_config_invalid_body() {
+        for body in [
+            "{}",
+            r#"{"network_interfaces":[]}"#,
+            r#"{"network_interfaces":["eth0",""]}"#,
+            r#"{"network_interfaces":["eth0","   "]}"#,
+            r#"{"network_interfaces":["eth0"],"version":"V3"}"#,
+            r#"{"network_interfaces":["eth0"],"ipv4_address":"127.0.0.1"}"#,
+            r#"{"network_interfaces":["eth0"],"ipv4_address":"169.254.0.1"}"#,
+            r#"{"network_interfaces":["eth0"],"ipv4_address":"169.254.255.1"}"#,
+            r#"{"network_interfaces":["eth0"],"ipv4_address":"not-an-ip"}"#,
+            r#"{"network_interfaces":["eth0"],"imds_compat":"true"}"#,
+            r#"{"network_interfaces":["eth0"],"unknown":true}"#,
+        ] {
+            assert_eq!(
+                parse_request(&request_with_body("PUT", "/mmds/config", body)),
+                Err(RequestError::MalformedRequest)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_mmds_method_or_path() {
+        assert_eq!(
+            parse_request(b"POST /mmds HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+            Err(RequestError::InvalidPathMethod)
+        );
+        assert_eq!(
+            parse_request(&request_with_body("PUT", "/mmds/extra", "{}")),
+            Err(RequestError::InvalidPathMethod)
+        );
+        assert_eq!(
+            parse_request(b"GET /mmds/config HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+            Err(RequestError::InvalidPathMethod)
+        );
+    }
+
+    #[test]
+    fn rejects_put_mmds_payload_over_limit() {
+        let body = "{}";
+        let request = format!(
+            "PUT /mmds HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+            HTTP_MAX_PAYLOAD_SIZE + 1
+        );
+
+        assert_eq!(
+            parse_request(request.as_bytes()),
+            Err(RequestError::PayloadTooLarge)
+        );
+        assert_eq!(
+            request_total_len(request.as_bytes()),
+            Err(RequestError::PayloadTooLarge)
         );
     }
 
@@ -3050,6 +3369,27 @@ mod tests {
         .expect("metrics request should parse");
 
         assert_eq!(Endpoint::from(request), Endpoint::Metrics);
+
+        assert_eq!(Endpoint::from(ApiRequest::GetMmds), Endpoint::Mmds);
+
+        let request = parse_request(&request_with_body("PUT", "/mmds", "{}"))
+            .expect("MMDS PUT request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::Mmds);
+
+        let request = parse_request(&request_with_body("PATCH", "/mmds", "{}"))
+            .expect("MMDS PATCH request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::Mmds);
+
+        let request = parse_request(&request_with_body(
+            "PUT",
+            "/mmds/config",
+            r#"{"network_interfaces":["eth0"]}"#,
+        ))
+        .expect("MMDS config request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::Mmds);
 
         let request = parse_request(&request_with_body(
             "PUT",
