@@ -185,10 +185,12 @@ Firecracker-shaped IMDS text, and can model process-local guest GET response
 status/content-type/body values, parse complete process-local guest HTTP `GET`
 request bytes, map parse failures to deterministic process-local error
 responses without echoing malformed request bytes, and serialize process-local
-HTTP response bytes for future guest delivery. These parsed requests and
-formatted responses remain process-local and are not exposed to the guest yet.
-Future guest-visible MMDS work must validate device, packet, token, and
-TCP/session inputs before making this data reachable from guest code.
+HTTP response bytes for future guest delivery. It also has a process-local
+opaque token authority with bounded active-token storage for future MMDS v2
+handling. These parsed requests, formatted responses, and generated tokens
+remain process-local and are not exposed to the guest yet. Future guest-visible
+MMDS work must validate device, packet, token, and TCP/session inputs before
+making this data reachable from guest code.
 
 ## Multi-Process Operation
 
