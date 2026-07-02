@@ -2235,7 +2235,7 @@ impl VirtioVsockRxQueueDispatch {
         deliveries
             .try_reserve_exact(delivery_capacity)
             .map_err(
-                |source| VirtioVsockRxQueueDispatchError::RequestMetadataAllocation { source },
+                |source| VirtioVsockRxQueueDispatchError::PacketMetadataAllocation { source },
             )?;
 
         Ok(Self {
@@ -2408,7 +2408,7 @@ impl std::error::Error for VirtioVsockRxHeaderWriteError {
 
 #[derive(Debug)]
 pub enum VirtioVsockRxQueueDispatchError {
-    RequestMetadataAllocation {
+    PacketMetadataAllocation {
         source: std::collections::TryReserveError,
     },
     AvailableRing {
@@ -2446,7 +2446,7 @@ impl VirtioVsockRxQueueDispatchError {
             | Self::BufferWrite {
                 completed_dispatch, ..
             } => Some(completed_dispatch),
-            Self::RequestMetadataAllocation { .. } => None,
+            Self::PacketMetadataAllocation { .. } => None,
         }
     }
 }
@@ -2454,10 +2454,10 @@ impl VirtioVsockRxQueueDispatchError {
 impl fmt::Display for VirtioVsockRxQueueDispatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::RequestMetadataAllocation { source } => {
+            Self::PacketMetadataAllocation { source } => {
                 write!(
                     f,
-                    "failed to reserve virtio-vsock RX request metadata: {source}"
+                    "failed to reserve virtio-vsock RX packet metadata: {source}"
                 )
             }
             Self::AvailableRing { source, .. } => {
@@ -2487,7 +2487,7 @@ impl fmt::Display for VirtioVsockRxQueueDispatchError {
             } => {
                 write!(
                     f,
-                    "failed to write virtio-vsock RX request into descriptor head {descriptor_head}: {source}"
+                    "failed to write virtio-vsock RX packet header into descriptor head {descriptor_head}: {source}"
                 )
             }
         }
@@ -2497,7 +2497,7 @@ impl fmt::Display for VirtioVsockRxQueueDispatchError {
 impl std::error::Error for VirtioVsockRxQueueDispatchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::RequestMetadataAllocation { source } => Some(source),
+            Self::PacketMetadataAllocation { source } => Some(source),
             Self::AvailableRing { source, .. } => Some(source),
             Self::UsedRing { source, .. } => Some(source),
             Self::BufferWrite { source, .. } => Some(source),
@@ -2618,7 +2618,7 @@ impl VirtioVsockRxQueue {
                     return Ok(dispatch);
                 }
 
-                if let Err(source) = write_vsock_rx_request_header(memory, &buffer, header) {
+                if let Err(source) = write_vsock_rx_packet_header(memory, &buffer, header) {
                     return Err(VirtioVsockRxQueueDispatchError::BufferWrite {
                         completed_dispatch: Box::new(dispatch),
                         descriptor_head,
@@ -2722,7 +2722,7 @@ fn validate_vsock_rx_buffer_segment_range(
     })
 }
 
-fn write_vsock_rx_request_header(
+fn write_vsock_rx_packet_header(
     memory: &mut GuestMemory,
     buffer: &VirtioVsockRxBuffer,
     header: VirtioVsockPacketHeader,
