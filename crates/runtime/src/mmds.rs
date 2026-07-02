@@ -1,14 +1,23 @@
 //! Backend-neutral MMDS control-plane input and metadata query model.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::net::Ipv4Addr;
 use std::str;
+use std::time::Instant;
 
 use serde_json::{Map, Value};
 
 use crate::network::NetworkInterfaceConfig;
 
 pub const MMDS_DATA_STORE_LIMIT_BYTES: usize = 51_200;
+pub const MMDS_TOKEN_MIN_TTL_SECONDS: u32 = 1;
+pub const MMDS_TOKEN_MAX_TTL_SECONDS: u32 = 21_600;
+pub const MMDS_TOKEN_MAX_ACTIVE_TOKENS: usize = 1_024;
+
+const MMDS_TOKEN_BYTES: usize = 32;
+const MMDS_MILLISECONDS_PER_SECOND: u64 = 1_000;
+const MMDS_TOKEN_GENERATION_ATTEMPTS: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MmdsContentInput {
@@ -389,6 +398,156 @@ impl MmdsGuestResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MmdsTokenError {
+    InvalidTtl { ttl_seconds: u32 },
+    ActiveTokenLimitExceeded { limit: usize },
+    RandomnessUnavailable,
+    TokenCollision,
+}
+
+impl fmt::Display for MmdsTokenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTtl { ttl_seconds } => write!(
+                f,
+                "Invalid MMDS token TTL: {ttl_seconds}. Please provide a value between {MMDS_TOKEN_MIN_TTL_SECONDS} and {MMDS_TOKEN_MAX_TTL_SECONDS}."
+            ),
+            Self::ActiveTokenLimitExceeded { limit } => {
+                write!(f, "The MMDS active token limit was exceeded: {limit}.")
+            }
+            Self::RandomnessUnavailable => f.write_str("MMDS token randomness is unavailable."),
+            Self::TokenCollision => f.write_str("MMDS token generation collided repeatedly."),
+        }
+    }
+}
+
+impl std::error::Error for MmdsTokenError {}
+
+#[derive(Debug, Clone, Copy)]
+enum MmdsTokenClock {
+    System {
+        origin: Instant,
+    },
+    #[cfg(test)]
+    Manual {
+        now_millis: u64,
+    },
+}
+
+impl Default for MmdsTokenClock {
+    fn default() -> Self {
+        Self::System {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl MmdsTokenClock {
+    fn now_millis(&self) -> u64 {
+        match self {
+            Self::System { origin } => {
+                u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+            }
+            #[cfg(test)]
+            Self::Manual { now_millis } => *now_millis,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MmdsTokenAuthority {
+    tokens: HashMap<String, u64>,
+    max_active_tokens: usize,
+    clock: MmdsTokenClock,
+}
+
+impl PartialEq for MmdsTokenAuthority {
+    fn eq(&self, other: &Self) -> bool {
+        self.tokens == other.tokens && self.max_active_tokens == other.max_active_tokens
+    }
+}
+
+impl Eq for MmdsTokenAuthority {}
+
+impl Default for MmdsTokenAuthority {
+    fn default() -> Self {
+        Self::new(MMDS_TOKEN_MAX_ACTIVE_TOKENS)
+    }
+}
+
+impl MmdsTokenAuthority {
+    pub fn new(max_active_tokens: usize) -> Self {
+        Self {
+            tokens: HashMap::new(),
+            max_active_tokens,
+            clock: MmdsTokenClock::default(),
+        }
+    }
+
+    pub fn generate_token(&mut self, ttl_seconds: u32) -> Result<String, MmdsTokenError> {
+        self.validate_ttl(ttl_seconds)?;
+
+        let now_millis = self.clock.now_millis();
+        self.remove_expired_tokens(now_millis);
+        if self.tokens.len() >= self.max_active_tokens {
+            return Err(MmdsTokenError::ActiveTokenLimitExceeded {
+                limit: self.max_active_tokens,
+            });
+        }
+
+        let expiry_millis = token_expiry_millis(now_millis, ttl_seconds);
+        for _ in 0..MMDS_TOKEN_GENERATION_ATTEMPTS {
+            let token = generate_opaque_token()?;
+            if self.tokens.contains_key(&token) {
+                continue;
+            }
+
+            self.tokens.insert(token.clone(), expiry_millis);
+            return Ok(token);
+        }
+
+        Err(MmdsTokenError::TokenCollision)
+    }
+
+    pub fn is_valid(&self, token: &str) -> bool {
+        if token.is_empty() {
+            return false;
+        }
+
+        self.tokens
+            .get(token)
+            .is_some_and(|expiry_millis| *expiry_millis > self.clock.now_millis())
+    }
+
+    fn validate_ttl(&self, ttl_seconds: u32) -> Result<(), MmdsTokenError> {
+        if (MMDS_TOKEN_MIN_TTL_SECONDS..=MMDS_TOKEN_MAX_TTL_SECONDS).contains(&ttl_seconds) {
+            return Ok(());
+        }
+
+        Err(MmdsTokenError::InvalidTtl { ttl_seconds })
+    }
+
+    fn remove_expired_tokens(&mut self, now_millis: u64) {
+        self.tokens
+            .retain(|_, expiry_millis| *expiry_millis > now_millis);
+    }
+
+    #[cfg(test)]
+    fn with_manual_clock(max_active_tokens: usize, now_millis: u64) -> Self {
+        Self {
+            tokens: HashMap::new(),
+            max_active_tokens,
+            clock: MmdsTokenClock::Manual { now_millis },
+        }
+    }
+
+    #[cfg(test)]
+    fn set_now_millis(&mut self, now_millis: u64) {
+        self.clock = MmdsTokenClock::Manual { now_millis };
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MmdsDataStoreError {
     InvalidObject,
     NotFound,
@@ -431,6 +590,7 @@ pub struct MmdsState {
     config: Option<MmdsConfig>,
     value: Option<Value>,
     data_store_limit_bytes: usize,
+    token_authority: MmdsTokenAuthority,
 }
 
 impl Default for MmdsState {
@@ -440,11 +600,12 @@ impl Default for MmdsState {
 }
 
 impl MmdsState {
-    pub const fn new(data_store_limit_bytes: usize) -> Self {
+    pub fn new(data_store_limit_bytes: usize) -> Self {
         Self {
             config: None,
             value: None,
             data_store_limit_bytes,
+            token_authority: MmdsTokenAuthority::default(),
         }
     }
 
@@ -531,6 +692,14 @@ impl MmdsState {
         self.guest_http_response(request_bytes).to_http_bytes()
     }
 
+    pub fn generate_guest_token(&mut self, ttl_seconds: u32) -> Result<String, MmdsTokenError> {
+        self.token_authority.generate_token(ttl_seconds)
+    }
+
+    pub fn is_guest_token_valid(&self, token: &str) -> bool {
+        self.token_authority.is_valid(token)
+    }
+
     pub fn put_data(&mut self, input: MmdsContentInput) -> Result<(), MmdsDataStoreError> {
         let value = input.into_value();
         validate_object(&value)?;
@@ -575,6 +744,35 @@ impl MmdsState {
             MmdsOutputFormat::Json => MmdsGuestContentType::ApplicationJson,
             MmdsOutputFormat::Imds => MmdsGuestContentType::PlainText,
         }
+    }
+}
+
+fn token_expiry_millis(now_millis: u64, ttl_seconds: u32) -> u64 {
+    now_millis.saturating_add(u64::from(ttl_seconds) * MMDS_MILLISECONDS_PER_SECOND)
+}
+
+fn generate_opaque_token() -> Result<String, MmdsTokenError> {
+    let mut bytes = [0_u8; MMDS_TOKEN_BYTES];
+    getrandom::fill(&mut bytes).map_err(|_| MmdsTokenError::RandomnessUnavailable)?;
+
+    Ok(hex_encode(&bytes))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(hex_digit(byte >> 4));
+        output.push(hex_digit(byte & 0x0f));
+    }
+
+    output
+}
+
+fn hex_digit(nibble: u8) -> char {
+    match nibble {
+        0..=9 => char::from(b'0' + nibble),
+        10..=15 => char::from(b'a' + (nibble - 10)),
+        _ => '?',
     }
 }
 
@@ -900,6 +1098,141 @@ mod tests {
         serde_json::to_vec(value)
             .expect("test JSON value should serialize")
             .len()
+    }
+
+    fn assert_mmds_token_shape(token: &str) {
+        assert_eq!(token.len(), MMDS_TOKEN_BYTES * 2);
+        assert!(
+            token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+    }
+
+    #[test]
+    fn mmds_token_authority_accepts_ttl_boundaries() {
+        let mut authority = MmdsTokenAuthority::with_manual_clock(2, 1_000);
+
+        let min_token = authority
+            .generate_token(MMDS_TOKEN_MIN_TTL_SECONDS)
+            .expect("minimum token TTL should be accepted");
+        let max_token = authority
+            .generate_token(MMDS_TOKEN_MAX_TTL_SECONDS)
+            .expect("maximum token TTL should be accepted");
+
+        assert_mmds_token_shape(&min_token);
+        assert_mmds_token_shape(&max_token);
+        assert!(authority.is_valid(&min_token));
+        assert!(authority.is_valid(&max_token));
+    }
+
+    #[test]
+    fn mmds_token_authority_rejects_invalid_ttl_values() {
+        let mut authority = MmdsTokenAuthority::with_manual_clock(2, 1_000);
+
+        assert_eq!(
+            authority.generate_token(0),
+            Err(MmdsTokenError::InvalidTtl { ttl_seconds: 0 })
+        );
+        assert_eq!(
+            authority.generate_token(MMDS_TOKEN_MAX_TTL_SECONDS + 1),
+            Err(MmdsTokenError::InvalidTtl {
+                ttl_seconds: MMDS_TOKEN_MAX_TTL_SECONDS + 1,
+            })
+        );
+        assert!(authority.tokens.is_empty());
+    }
+
+    #[test]
+    fn mmds_token_errors_display_deterministic_messages() {
+        assert_eq!(
+            MmdsTokenError::InvalidTtl { ttl_seconds: 0 }.to_string(),
+            "Invalid MMDS token TTL: 0. Please provide a value between 1 and 21600."
+        );
+        assert_eq!(
+            MmdsTokenError::ActiveTokenLimitExceeded { limit: 1 }.to_string(),
+            "The MMDS active token limit was exceeded: 1."
+        );
+        assert_eq!(
+            MmdsTokenError::RandomnessUnavailable.to_string(),
+            "MMDS token randomness is unavailable."
+        );
+        assert_eq!(
+            MmdsTokenError::TokenCollision.to_string(),
+            "MMDS token generation collided repeatedly."
+        );
+    }
+
+    #[test]
+    fn mmds_token_authority_rejects_unknown_empty_and_expired_tokens() {
+        let mut authority = MmdsTokenAuthority::with_manual_clock(1, 1_000);
+        let token = authority
+            .generate_token(1)
+            .expect("token generation should succeed");
+
+        assert!(authority.is_valid(&token));
+        assert!(!authority.is_valid(""));
+        assert!(!authority.is_valid("not-a-generated-token"));
+
+        authority.set_now_millis(1_999);
+        assert!(authority.is_valid(&token));
+
+        authority.set_now_millis(2_000);
+        assert!(!authority.is_valid(&token));
+    }
+
+    #[test]
+    fn mmds_token_authority_cleans_expired_tokens_before_capacity_check() {
+        let mut authority = MmdsTokenAuthority::with_manual_clock(1, 1_000);
+        let first = authority
+            .generate_token(1)
+            .expect("first token generation should succeed");
+        assert_eq!(authority.tokens.len(), 1);
+
+        authority.set_now_millis(2_000);
+        assert!(!authority.is_valid(&first));
+
+        let second = authority
+            .generate_token(1)
+            .expect("expired token should be cleaned before capacity check");
+
+        assert!(authority.is_valid(&second));
+        assert_eq!(authority.tokens.len(), 1);
+    }
+
+    #[test]
+    fn mmds_token_authority_reports_capacity_exhaustion() {
+        let mut authority = MmdsTokenAuthority::with_manual_clock(1, 1_000);
+        authority
+            .generate_token(1)
+            .expect("first token generation should succeed");
+
+        assert_eq!(
+            authority.generate_token(1),
+            Err(MmdsTokenError::ActiveTokenLimitExceeded { limit: 1 })
+        );
+        assert_eq!(authority.tokens.len(), 1);
+    }
+
+    #[test]
+    fn mmds_state_guest_token_delegates_to_token_authority() {
+        let mut state = MmdsState {
+            token_authority: MmdsTokenAuthority::with_manual_clock(1, 1_000),
+            ..MmdsState::default()
+        };
+        let token = state
+            .generate_guest_token(1)
+            .expect("state token generation should succeed");
+
+        assert!(state.is_guest_token_valid(&token));
+
+        state.token_authority.set_now_millis(2_000);
+        assert!(!state.is_guest_token_valid(&token));
+    }
+
+    #[test]
+    fn mmds_state_equality_ignores_token_clock_origin() {
+        assert_eq!(MmdsState::default(), MmdsState::default());
     }
 
     #[test]
