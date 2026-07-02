@@ -71,6 +71,7 @@ const VIRTIO_VSOCK_EVENT_QUEUE_INDEX_U32: u32 = 2;
 const VIRTIO_VSOCK_PACKET_HEADER_SIZE_U32: u32 = VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32;
 const VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64: u64 = VIRTIO_VSOCK_PACKET_HEADER_SIZE as u64;
 const NONBLOCKING_CONNECT_INTERRUPTED_RETRY_LIMIT: usize = 4;
+const VSOCK_GUEST_RW_PENDING_PACKET_LIMIT: usize = 4;
 const VSOCK_HOST_RW_PENDING_PACKET_LIMIT: usize = 4;
 const VSOCK_HOST_RW_POLL_BATCH_LIMIT: usize = VSOCK_HOST_RW_PENDING_PACKET_LIMIT;
 const VSOCK_HOST_CONNECT_COMMAND: &str = "connect";
@@ -1658,11 +1659,18 @@ enum VsockGuestRwForwardError {
         len: u32,
         source: GuestMemoryAccessError,
     },
-    StreamWrite(std::io::ErrorKind),
-    ShortWrite {
-        expected: usize,
+    PendingBufferFull {
+        limit: usize,
+    },
+    PendingOffsetOutOfBounds {
+        offset: usize,
+        len: usize,
+    },
+    InvalidWriteCount {
+        attempted: usize,
         actual: usize,
     },
+    StreamWrite(std::io::ErrorKind),
     WriteZero {
         expected: usize,
     },
@@ -1704,16 +1712,26 @@ impl fmt::Display for VsockGuestRwForwardError {
                 f,
                 "failed to read guest RW payload segment {descriptor_index} at {address} ({len} bytes): {source}"
             ),
+            Self::PendingBufferFull { limit } => {
+                write!(
+                    f,
+                    "guest RW host stream pending write buffer limit {limit} reached"
+                )
+            }
+            Self::PendingOffsetOutOfBounds { offset, len } => write!(
+                f,
+                "guest RW host stream pending write offset {offset} exceeds payload length {len}"
+            ),
+            Self::InvalidWriteCount { attempted, actual } => write!(
+                f,
+                "guest RW host stream write reported {actual} bytes for {attempted} attempted bytes"
+            ),
             Self::StreamWrite(kind) => {
                 write!(
                     f,
                     "failed to write guest RW payload to host stream: {kind:?}"
                 )
             }
-            Self::ShortWrite { expected, actual } => write!(
-                f,
-                "short guest RW host stream write: wrote {actual} of {expected} bytes"
-            ),
             Self::WriteZero { expected } => write!(
                 f,
                 "guest RW host stream write accepted 0 of {expected} bytes"
@@ -1732,10 +1750,175 @@ impl std::error::Error for VsockGuestRwForwardError {
             | Self::PayloadLenTooLarge { .. }
             | Self::PayloadSegmentTooLarge { .. }
             | Self::PayloadLengthMismatch { .. }
+            | Self::PendingBufferFull { .. }
+            | Self::PendingOffsetOutOfBounds { .. }
+            | Self::InvalidWriteCount { .. }
             | Self::StreamWrite(_)
-            | Self::ShortWrite { .. }
             | Self::WriteZero { .. } => None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VsockGuestRwWriteOutcome {
+    Complete,
+    Blocked { written: usize },
+}
+
+fn write_guest_rw_payload_to_stream(
+    stream: &mut impl io::Write,
+    payload: &[u8],
+) -> Result<VsockGuestRwWriteOutcome, VsockGuestRwForwardError> {
+    let mut remaining = payload;
+    let mut total_written = 0;
+
+    while !remaining.is_empty() {
+        match stream.write(remaining) {
+            Ok(0) => {
+                return Err(VsockGuestRwForwardError::WriteZero {
+                    expected: remaining.len(),
+                });
+            }
+            Ok(written) => {
+                let Some(next_remaining) = remaining.get(written..) else {
+                    return Err(VsockGuestRwForwardError::InvalidWriteCount {
+                        attempted: remaining.len(),
+                        actual: written,
+                    });
+                };
+
+                total_written += written;
+                remaining = next_remaining;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Ok(VsockGuestRwWriteOutcome::Blocked {
+                    written: total_written,
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                return Ok(VsockGuestRwWriteOutcome::Blocked {
+                    written: total_written,
+                });
+            }
+            Err(error) => return Err(VsockGuestRwForwardError::StreamWrite(error.kind())),
+        }
+    }
+
+    Ok(VsockGuestRwWriteOutcome::Complete)
+}
+
+#[derive(Debug)]
+struct VsockGuestRwPendingWrites {
+    payloads: VecDeque<Vec<u8>>,
+    front_offset: usize,
+}
+
+impl VsockGuestRwPendingWrites {
+    const fn new() -> Self {
+        Self {
+            payloads: VecDeque::new(),
+            front_offset: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.payloads.is_empty()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.payloads.len()
+    }
+
+    fn write_or_queue(
+        &mut self,
+        stream: &mut impl io::Write,
+        payload: Vec<u8>,
+    ) -> Result<(), VsockGuestRwForwardError> {
+        if payload.is_empty() {
+            return Ok(());
+        }
+
+        self.flush(stream)?;
+        if !self.is_empty() {
+            return self.push_payload(&payload);
+        }
+
+        match write_guest_rw_payload_to_stream(stream, &payload)? {
+            VsockGuestRwWriteOutcome::Complete => Ok(()),
+            VsockGuestRwWriteOutcome::Blocked { written } => {
+                self.push_payload_suffix(payload, written)
+            }
+        }
+    }
+
+    fn flush(&mut self, stream: &mut impl io::Write) -> Result<(), VsockGuestRwForwardError> {
+        while let Some(payload) = self.payloads.front() {
+            let Some(remaining) = payload.get(self.front_offset..) else {
+                return Err(VsockGuestRwForwardError::PendingOffsetOutOfBounds {
+                    offset: self.front_offset,
+                    len: payload.len(),
+                });
+            };
+
+            if remaining.is_empty() {
+                self.payloads.pop_front();
+                self.front_offset = 0;
+                continue;
+            }
+
+            match write_guest_rw_payload_to_stream(stream, remaining)? {
+                VsockGuestRwWriteOutcome::Complete => {
+                    self.payloads.pop_front();
+                    self.front_offset = 0;
+                }
+                VsockGuestRwWriteOutcome::Blocked { written } => {
+                    self.front_offset += written;
+                    return Ok(());
+                }
+            }
+        }
+
+        self.front_offset = 0;
+        Ok(())
+    }
+
+    fn push_payload(&mut self, payload: &[u8]) -> Result<(), VsockGuestRwForwardError> {
+        if payload.is_empty() {
+            return Ok(());
+        }
+
+        if self.payloads.len() >= VSOCK_GUEST_RW_PENDING_PACKET_LIMIT {
+            return Err(VsockGuestRwForwardError::PendingBufferFull {
+                limit: VSOCK_GUEST_RW_PENDING_PACKET_LIMIT,
+            });
+        }
+
+        let mut pending_payload = Vec::new();
+        pending_payload
+            .try_reserve_exact(payload.len())
+            .map_err(|source| VsockGuestRwForwardError::PayloadAllocationFailed {
+                len: payload.len(),
+                source,
+            })?;
+        pending_payload.extend_from_slice(payload);
+        self.payloads.push_back(pending_payload);
+        Ok(())
+    }
+
+    fn push_payload_suffix(
+        &mut self,
+        payload: Vec<u8>,
+        offset: usize,
+    ) -> Result<(), VsockGuestRwForwardError> {
+        let Some(remaining) = payload.get(offset..) else {
+            return Err(VsockGuestRwForwardError::InvalidWriteCount {
+                attempted: payload.len(),
+                actual: offset,
+            });
+        };
+
+        self.push_payload(remaining)
     }
 }
 
@@ -1743,6 +1926,7 @@ impl std::error::Error for VsockGuestRwForwardError {
 pub struct VsockGuestConnection {
     stream: UnixStream,
     response_packet_pending: bool,
+    pending_guest_rw_writes: VsockGuestRwPendingWrites,
     pending_host_rw_payloads: VecDeque<Vec<u8>>,
 }
 
@@ -1751,6 +1935,7 @@ impl VsockGuestConnection {
         Self {
             stream,
             response_packet_pending: true,
+            pending_guest_rw_writes: VsockGuestRwPendingWrites::new(),
             pending_host_rw_payloads: VecDeque::new(),
         }
     }
@@ -1772,22 +1957,30 @@ impl VsockGuestConnection {
             && self.pending_host_rw_payloads.len() < VSOCK_HOST_RW_PENDING_PACKET_LIMIT
     }
 
-    fn write_guest_rw_payload(&mut self, payload: &[u8]) -> Result<(), VsockGuestRwForwardError> {
-        if payload.is_empty() {
-            return Ok(());
-        }
+    fn write_guest_rw_payload(&mut self, payload: Vec<u8>) -> Result<(), VsockGuestRwForwardError> {
+        self.pending_guest_rw_writes
+            .write_or_queue(&mut self.stream, payload)
+    }
 
-        match self.stream.write(payload) {
-            Ok(written) if written == payload.len() => Ok(()),
-            Ok(0) => Err(VsockGuestRwForwardError::WriteZero {
-                expected: payload.len(),
-            }),
-            Ok(written) => Err(VsockGuestRwForwardError::ShortWrite {
-                expected: payload.len(),
-                actual: written,
-            }),
-            Err(error) => Err(VsockGuestRwForwardError::StreamWrite(error.kind())),
-        }
+    fn flush_pending_guest_rw_writes(&mut self) -> Result<(), VsockGuestRwForwardError> {
+        self.pending_guest_rw_writes.flush(&mut self.stream)
+    }
+
+    fn has_pending_guest_rw_writes(&self) -> bool {
+        !self.pending_guest_rw_writes.is_empty()
+    }
+
+    #[cfg(test)]
+    fn queue_pending_guest_rw_payload_for_test(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<(), VsockGuestRwForwardError> {
+        self.pending_guest_rw_writes.push_payload(payload)
+    }
+
+    #[cfg(test)]
+    fn pending_guest_rw_payload_count(&self) -> usize {
+        self.pending_guest_rw_writes.len()
     }
 
     fn take_pending_response_packet_header(
@@ -1894,6 +2087,26 @@ impl VsockGuestConnectionTable {
             .is_some_and(VsockGuestConnection::has_pending_response_packet)
     }
 
+    #[cfg(test)]
+    fn pending_guest_rw_payload_count(&self, key: VsockGuestConnectionKey) -> Option<usize> {
+        self.connections
+            .get(&key)
+            .map(VsockGuestConnection::pending_guest_rw_payload_count)
+    }
+
+    #[cfg(test)]
+    fn queue_pending_guest_rw_payload_for_test(
+        &mut self,
+        key: VsockGuestConnectionKey,
+        payload: &[u8],
+    ) -> Result<(), VsockGuestRwForwardError> {
+        let Some(connection) = self.connections.get_mut(&key) else {
+            return Err(VsockGuestRwForwardError::MissingConnection);
+        };
+
+        connection.queue_pending_guest_rw_payload_for_test(payload)
+    }
+
     pub fn take_pending_response_packet_header(
         &mut self,
         key: VsockGuestConnectionKey,
@@ -1959,6 +2172,28 @@ impl VsockGuestConnectionTable {
         reset_headers
     }
 
+    fn flush_pending_guest_rw_writes(&mut self, guest_cid: u32) -> Vec<VirtioVsockPacketHeader> {
+        let keys = self.connections.keys().copied().collect::<Vec<_>>();
+        let mut reset_headers = Vec::new();
+
+        for key in keys {
+            let Some(connection) = self.connections.get_mut(&key) else {
+                continue;
+            };
+            if !connection.has_pending_guest_rw_writes() {
+                continue;
+            }
+
+            if connection.flush_pending_guest_rw_writes().is_err() {
+                let removed = self.remove(key);
+                debug_assert!(removed);
+                reset_headers.push(guest_connection_reset_packet_header(key, guest_cid));
+            }
+        }
+
+        reset_headers
+    }
+
     fn forward_guest_rw_packet(
         &mut self,
         memory: &GuestMemory,
@@ -2017,11 +2252,12 @@ impl VsockGuestConnectionTable {
                 source: VsockGuestRwForwardError::MissingConnection,
             });
         };
-        let result = connection.write_guest_rw_payload(&payload);
+        let payload_len = payload.len();
+        let result = connection.write_guest_rw_payload(payload);
         match result {
             Ok(()) => Some(VsockGuestRwOutcome::Forwarded {
                 key,
-                bytes: payload.len(),
+                bytes: payload_len,
             }),
             Err(source) => {
                 let removed = self.remove(key);
@@ -4526,6 +4762,21 @@ impl VirtioVsockDevice {
     }
 
     #[cfg(test)]
+    fn pending_guest_rw_payload_count(&self, key: VsockGuestConnectionKey) -> Option<usize> {
+        self.guest_connections.pending_guest_rw_payload_count(key)
+    }
+
+    #[cfg(test)]
+    fn queue_pending_guest_rw_payload_for_test(
+        &mut self,
+        key: VsockGuestConnectionKey,
+        payload: &[u8],
+    ) -> Result<(), VsockGuestRwForwardError> {
+        self.guest_connections
+            .queue_pending_guest_rw_payload_for_test(key, payload)
+    }
+
+    #[cfg(test)]
     fn set_host_connection_limit(&mut self, limit: usize) {
         self.host_connection_limit = limit;
     }
@@ -4695,6 +4946,16 @@ impl VirtioVsockDevice {
             self.host_connections
                 .poll_host_rw_payloads(&mut scratch, self.guest_cid),
         );
+
+        for header in reset_headers {
+            let _ = self.queue_guest_reset_packet(header);
+        }
+    }
+
+    fn flush_pending_guest_rw_writes(&mut self) {
+        let reset_headers = self
+            .guest_connections
+            .flush_pending_guest_rw_writes(self.guest_cid);
 
         for header in reset_headers {
             let _ = self.queue_guest_reset_packet(header);
@@ -5049,6 +5310,7 @@ impl VirtioVsockDevice {
         }
 
         let host_request_dispatch = self.poll_host_request_connections();
+        self.flush_pending_guest_rw_writes();
         let dispatch_tx = drained_notifications
             .iter()
             .copied()
@@ -6257,8 +6519,9 @@ fn has_control_character(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::VSOCK_HOST_RW_PENDING_PACKET_LIMIT;
+    use super::{VSOCK_GUEST_RW_PENDING_PACKET_LIMIT, VSOCK_HOST_RW_PENDING_PACKET_LIMIT};
 
+    use std::collections::VecDeque;
     use std::error::Error as _;
     use std::fs;
     use std::io;
@@ -6348,6 +6611,51 @@ mod tests {
     const TEST_VSOCK_THIRD_HEADER: GuestAddress = GuestAddress::new(0x8000);
     const TEST_VSOCK_FOURTH_HEADER: GuestAddress = GuestAddress::new(0xb000);
     const TEST_VSOCK_QUEUE_SIZE: u16 = 8;
+
+    #[derive(Debug, Clone, Copy)]
+    enum TestWriteAction {
+        Write(usize),
+        Error(io::ErrorKind),
+    }
+
+    #[derive(Debug)]
+    struct TestGuestRwWriter {
+        actions: VecDeque<TestWriteAction>,
+        written: Vec<u8>,
+    }
+
+    impl TestGuestRwWriter {
+        fn with_actions(actions: impl IntoIterator<Item = TestWriteAction>) -> Self {
+            Self {
+                actions: actions.into_iter().collect(),
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl io::Write for TestGuestRwWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let action = self
+                .actions
+                .pop_front()
+                .unwrap_or(TestWriteAction::Write(buf.len()));
+            match action {
+                TestWriteAction::Write(len) => {
+                    let copy_len = len.min(buf.len());
+                    let Some(bytes) = buf.get(..copy_len) else {
+                        return Err(io::Error::other("test write length out of range"));
+                    };
+                    self.written.extend_from_slice(bytes);
+                    Ok(len)
+                }
+                TestWriteAction::Error(kind) => Err(io::Error::from(kind)),
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn validate(input: VsockConfigInput) -> Result<super::VsockConfig, VsockConfigError> {
         input.validate()
@@ -8246,6 +8554,114 @@ mod tests {
                 .source()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn guest_rw_pending_writes_queue_suffix_after_would_block() {
+        let mut pending = super::VsockGuestRwPendingWrites::new();
+        let mut writer = TestGuestRwWriter::with_actions([
+            TestWriteAction::Write(2),
+            TestWriteAction::Error(io::ErrorKind::WouldBlock),
+        ]);
+
+        pending
+            .write_or_queue(&mut writer, b"hello".to_vec())
+            .expect("blocked suffix should be queued");
+
+        assert_eq!(writer.written, b"he");
+        assert_eq!(pending.len(), 1);
+
+        pending
+            .flush(&mut writer)
+            .expect("queued suffix should flush later");
+
+        assert_eq!(writer.written, b"hello");
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[test]
+    fn guest_rw_pending_writes_flush_before_new_payload() {
+        let mut pending = super::VsockGuestRwPendingWrites::new();
+        pending
+            .push_payload(b"first")
+            .expect("initial pending payload should queue");
+        let mut writer =
+            TestGuestRwWriter::with_actions([TestWriteAction::Write(5), TestWriteAction::Write(6)]);
+
+        pending
+            .write_or_queue(&mut writer, b"second".to_vec())
+            .expect("new payload should write after pending payload");
+
+        assert_eq!(writer.written, b"firstsecond");
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[test]
+    fn guest_rw_pending_writes_queue_new_payload_behind_blocked_pending() {
+        let mut pending = super::VsockGuestRwPendingWrites::new();
+        pending
+            .push_payload(b"first")
+            .expect("initial pending payload should queue");
+        let mut writer =
+            TestGuestRwWriter::with_actions([TestWriteAction::Error(io::ErrorKind::WouldBlock)]);
+
+        pending
+            .write_or_queue(&mut writer, b"second".to_vec())
+            .expect("new payload should queue behind blocked pending payload");
+
+        assert_eq!(writer.written, b"");
+        assert_eq!(pending.len(), 2);
+
+        pending
+            .flush(&mut writer)
+            .expect("queued payloads should flush in order");
+
+        assert_eq!(writer.written, b"firstsecond");
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[test]
+    fn guest_rw_pending_writes_report_buffer_full() {
+        let mut pending = super::VsockGuestRwPendingWrites::new();
+        for _ in 0..VSOCK_GUEST_RW_PENDING_PACKET_LIMIT {
+            pending
+                .push_payload(b"x")
+                .expect("pending payload should fit under limit");
+        }
+        let mut writer =
+            TestGuestRwWriter::with_actions([TestWriteAction::Error(io::ErrorKind::WouldBlock)]);
+
+        let error = pending
+            .write_or_queue(&mut writer, b"overflow".to_vec())
+            .expect_err("blocked full buffer should reject another payload");
+
+        assert!(matches!(
+            error,
+            super::VsockGuestRwForwardError::PendingBufferFull {
+                limit: VSOCK_GUEST_RW_PENDING_PACKET_LIMIT
+            }
+        ));
+        assert_eq!(pending.len(), VSOCK_GUEST_RW_PENDING_PACKET_LIMIT);
+    }
+
+    #[test]
+    fn guest_rw_pending_writes_report_terminal_flush_error() {
+        let mut pending = super::VsockGuestRwPendingWrites::new();
+        pending
+            .push_payload(b"payload")
+            .expect("pending payload should queue");
+        let mut writer =
+            TestGuestRwWriter::with_actions([TestWriteAction::Error(io::ErrorKind::BrokenPipe)]);
+
+        let error = pending
+            .flush(&mut writer)
+            .expect_err("terminal stream error should fail pending flush");
+
+        assert!(matches!(
+            error,
+            super::VsockGuestRwForwardError::StreamWrite(io::ErrorKind::BrokenPipe)
+        ));
+        assert_eq!(pending.len(), 1);
     }
 
     #[test]
@@ -11976,6 +12392,95 @@ mod tests {
         assert_stream_closed(
             &mut accepted,
             "dropping handler should close forwarded guest stream",
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_flush_pending_guest_rw_payload_to_host_stream() {
+        let (mut memory, mut handler, mut accepted) =
+            established_guest_connection_for_test("guest-rw-flush", 52, 4000);
+        let key = VsockGuestConnectionKey::new(52, 4000);
+        let payload = b"queued";
+
+        handler
+            .activation_handler_mut()
+            .queue_pending_guest_rw_payload_for_test(key, payload)
+            .expect("pending guest RW payload should queue");
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_rw_payload_count(key),
+            Some(1)
+        );
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_EVENT_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("event notification should flush pending guest RW");
+
+        assert_eq!(
+            notification.drained_notifications(),
+            &[VIRTIO_VSOCK_EVENT_QUEUE_INDEX]
+        );
+        assert_eq!(notification.event_notifications(), 1);
+        assert_empty_host_request_dispatch(notification.host_request_dispatch());
+        assert_empty_guest_response_dispatch(notification.guest_response_dispatch());
+        assert_empty_guest_request_dispatch(notification.guest_request_dispatch());
+        assert_empty_guest_rw_dispatch(notification.guest_rw_dispatch());
+        assert_empty_guest_reset_dispatch(notification.guest_reset_dispatch());
+        assert!(notification.tx_queue_dispatch().is_none());
+        assert!(notification.rx_queue_dispatch().is_none());
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_rw_payload_count(key),
+            Some(0)
+        );
+        assert_host_payload(&mut accepted, payload);
+
+        drop(handler);
+        assert_stream_closed(
+            &mut accepted,
+            "dropping handler should close flushed guest stream",
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_drop_pending_guest_rw_connection_on_flush_failure() {
+        let (mut memory, mut handler, accepted) =
+            established_guest_connection_for_test("guest-rw-flush-fail", 52, 4000);
+        let key = VsockGuestConnectionKey::new(52, 4000);
+
+        handler
+            .activation_handler_mut()
+            .queue_pending_guest_rw_payload_for_test(key, b"queued")
+            .expect("pending guest RW payload should queue");
+        drop(accepted);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_EVENT_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("pending guest RW flush failure should queue RST");
+
+        assert_eq!(notification.event_notifications(), 1);
+        assert_empty_guest_rw_dispatch(notification.guest_rw_dispatch());
+        assert_empty_guest_reset_dispatch(notification.guest_reset_dispatch());
+        assert!(
+            !handler
+                .activation_handler()
+                .has_guest_connection(VsockGuestConnectionKey::new(52, 4000))
+        );
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_connection_count(),
+            0
+        );
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_reset_packet_count(),
+            1
         );
     }
 
