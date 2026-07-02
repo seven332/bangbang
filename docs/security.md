@@ -94,7 +94,8 @@ is resource-specific:
   zero-byte, or failed host writes for non-empty payloads drop the retained
   stream and queue a guest-visible `VSOCK_OP_RST` instead of buffering
   unbounded data. Established host-initiated and guest-initiated connections
-  can also deliver one bounded pending host `VSOCK_OP_RW` payload at a time
+  can also retain a bounded per-connection backlog of host
+  `VSOCK_OP_RW` payloads and deliver one queued payload at a time
   into validated guest RX buffers. Guest `VSOCK_OP_RST` packets drop matching
   retained host-initiated or guest-initiated streams without queuing guest-visible
   RX output. Full guest `VSOCK_OP_SHUTDOWN` packets drop matching retained
@@ -105,9 +106,8 @@ is resource-specific:
   records the listener socket device and inode, and removes the path on normal
   shutdown only when it still refers to the socket created by this process. It
   does not route CIDs beyond current host/guest checks, dispatch real event
-  payloads, provide host-to-guest data movement beyond one bounded pending
-  packet per established stream, track graceful half-close state, retry
-  buffered RW writes, or implement full credit accounting yet.
+  payloads, track graceful half-close state, retry buffered guest-to-host RW
+  writes, or implement full virtio-vsock credit accounting yet.
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink.
 - `/logger` opens `log_path` during pre-boot configuration when that field is
@@ -245,8 +245,9 @@ The current scaffold does not implement:
   guest-initiated connections can forward bounded guest `VSOCK_OP_RW` payload
   bytes to retained host streams, and failed or incomplete writes drop the
   retained stream before queuing a guest-visible reset. Established
-  host-initiated and guest-initiated connections can deliver one bounded
-  pending host `VSOCK_OP_RW` payload at a time into validated guest RX buffers,
+  host-initiated and guest-initiated connections can retain a bounded
+  per-connection backlog of host `VSOCK_OP_RW` payloads and deliver one queued
+  payload at a time into validated guest RX buffers,
   guest `VSOCK_OP_RST` packets drop matching retained host-initiated or
   guest-initiated streams without queuing guest-visible RX output, and
   full guest `VSOCK_OP_SHUTDOWN` packets drop matching retained streams before
@@ -255,9 +256,8 @@ The current scaffold does not implement:
   listener at `uds_path` and cleans it up only while the path still matches the
   created socket inode. It can accept event queue notifications as no-op
   dispatch metadata, but it still does not route CIDs beyond current host/guest
-  checks, dispatch real event payloads, provide host-to-guest data movement
-  beyond one bounded pending packet per established stream, track graceful
-  half-close state, retry buffered RW writes, or implement full credit accounting
+  checks, dispatch real event payloads, track graceful half-close state, retry
+  buffered guest-to-host RW writes, or implement full virtio-vsock credit accounting
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 
