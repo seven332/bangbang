@@ -2426,6 +2426,32 @@ mod tests {
     }
 
     #[test]
+    fn mmds_guest_http_response_v2_authenticates_before_data_lookup() {
+        let mut state = MmdsState::default();
+        enable_mmds_v2(&mut state);
+
+        assert_guest_response(
+            state.guest_http_response(b"GET /meta-data/hostname HTTP/1.1\r\n\r\n"),
+            MmdsGuestStatus::Unauthorized,
+            MmdsGuestContentType::PlainText,
+            MMDS_GUEST_MISSING_TOKEN,
+        );
+
+        let token = state
+            .generate_guest_token(1)
+            .expect("test token generation should succeed");
+        let request =
+            format!("GET /meta-data/hostname HTTP/1.1\r\nX-metadata-token: {token}\r\n\r\n");
+
+        assert_guest_response(
+            state.guest_http_response(request.as_bytes()),
+            MmdsGuestStatus::BadRequest,
+            MmdsGuestContentType::PlainText,
+            "The MMDS data store is not initialized.",
+        );
+    }
+
+    #[test]
     fn mmds_guest_http_response_bytes_serialize_missing_v2_token() {
         let mut state = initialized_query_state();
         enable_mmds_v2(&mut state);
