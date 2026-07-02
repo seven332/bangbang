@@ -83,7 +83,10 @@ is resource-specific:
   retained host stream. Short or failed acknowledgement writes drop the retained
   connection and release its host local port. Unsupported or orphan
   host-destined guest TX packets can queue bounded guest-visible
-  `VSOCK_OP_RST` headers without opening host paths. Startup also binds a
+  `VSOCK_OP_RST` headers without opening host paths. Supported guest
+  `VSOCK_OP_REQUEST` packets are retained as bounded metadata-only connection
+  attempts for later host socket connection work, without opening
+  `uds_path_<PORT>` sockets in the current implementation. Startup also binds a
   nonblocking host Unix listener at `uds_path`, records the listener socket
   device and inode, and removes the path on normal shutdown only when it still
   refers to the socket created by this process. It does not connect to
@@ -218,6 +221,8 @@ The current scaffold does not implement:
   failed acknowledgement writes drop the retained connection and release its
   host local port. Unsupported or orphan host-destined guest TX packets can
   queue bounded guest-visible `VSOCK_OP_RST` headers without opening host paths.
+  Supported guest `VSOCK_OP_REQUEST` packets are retained as bounded
+  metadata-only connection attempts, and this retention opens no host paths.
   Startup preparation creates a nonblocking host Unix listener at `uds_path` and
   cleans it up only while the path still matches the created socket inode. It
   does not connect guest-initiated `uds_path_<PORT>` sockets, route CIDs beyond

@@ -1064,6 +1064,34 @@ enum VsockHostGuestResponseIgnoreReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VsockGuestConnectionRequestOutcome {
+    Retained {
+        key: VsockGuestConnectionKey,
+    },
+    Ignored {
+        reason: VsockGuestConnectionRequestIgnoreReason,
+    },
+    Dropped {
+        key: VsockGuestConnectionKey,
+        source: VsockGuestConnectionRequestTableError,
+    },
+}
+
+impl VsockGuestConnectionRequestOutcome {
+    const fn suppresses_guest_reset(self) -> bool {
+        matches!(self, Self::Retained { .. })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VsockGuestConnectionRequestIgnoreReason {
+    WrongSourceCid,
+    WrongDestinationCid,
+    UnsupportedPacketType,
+    PayloadPresent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VsockHostConnectionTableError {
     LocalPort(VsockHostLocalPortAllocatorError),
     DuplicateKey { key: VsockHostConnectionKey },
@@ -1093,6 +1121,136 @@ impl std::error::Error for VsockHostConnectionTableError {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct VsockGuestConnectionKey {
+    host_port: u32,
+    guest_port: u32,
+}
+
+impl VsockGuestConnectionKey {
+    pub const fn new(host_port: u32, guest_port: u32) -> Self {
+        Self {
+            host_port,
+            guest_port,
+        }
+    }
+
+    pub const fn host_port(self) -> u32 {
+        self.host_port
+    }
+
+    pub const fn guest_port(self) -> u32 {
+        self.guest_port
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VsockGuestConnectionRequest {
+    key: VsockGuestConnectionKey,
+    header: VirtioVsockPacketHeader,
+}
+
+impl VsockGuestConnectionRequest {
+    fn from_packet(packet: &VirtioVsockTxPacket) -> Self {
+        let header = packet.header();
+        Self {
+            key: VsockGuestConnectionKey::new(header.dst_port(), header.src_port()),
+            header,
+        }
+    }
+
+    pub const fn key(self) -> VsockGuestConnectionKey {
+        self.key
+    }
+
+    pub const fn header(self) -> VirtioVsockPacketHeader {
+        self.header
+    }
+}
+
+#[derive(Debug)]
+pub struct VsockGuestConnectionRequestTable {
+    limit: usize,
+    requests: HashMap<VsockGuestConnectionKey, VsockGuestConnectionRequest>,
+}
+
+impl VsockGuestConnectionRequestTable {
+    pub fn new() -> Self {
+        Self::with_limit(VSOCK_HOST_CONNECTION_LIMIT)
+    }
+
+    fn with_limit(limit: usize) -> Self {
+        Self {
+            limit,
+            requests: HashMap::new(),
+        }
+    }
+
+    pub fn insert(
+        &mut self,
+        request: VsockGuestConnectionRequest,
+    ) -> Result<(), VsockGuestConnectionRequestTableError> {
+        let key = request.key();
+        if self.requests.contains_key(&key) {
+            return Err(VsockGuestConnectionRequestTableError::DuplicateKey { key });
+        }
+
+        if self.requests.len() >= self.limit {
+            return Err(VsockGuestConnectionRequestTableError::LimitExceeded { limit: self.limit });
+        }
+
+        let replaced = self.requests.insert(key, request);
+        debug_assert!(replaced.is_none());
+        Ok(())
+    }
+
+    pub fn get(&self, key: VsockGuestConnectionKey) -> Option<&VsockGuestConnectionRequest> {
+        self.requests.get(&key)
+    }
+
+    pub fn contains(&self, key: VsockGuestConnectionKey) -> bool {
+        self.requests.contains_key(&key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.requests.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.requests.is_empty()
+    }
+}
+
+impl Default for VsockGuestConnectionRequestTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VsockGuestConnectionRequestTableError {
+    LimitExceeded { limit: usize },
+    DuplicateKey { key: VsockGuestConnectionKey },
+}
+
+impl fmt::Display for VsockGuestConnectionRequestTableError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LimitExceeded { limit } => {
+                write!(f, "vsock guest connection request limit {limit} reached")
+            }
+            Self::DuplicateKey { key } => write!(
+                f,
+                "vsock guest connection request already exists for host port {} and guest port {}",
+                key.host_port(),
+                key.guest_port()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VsockGuestConnectionRequestTableError {}
 
 fn socket_path_exists_without_following_links(
     path: &Path,
@@ -3132,6 +3290,7 @@ pub struct VirtioVsockDevice {
     pending_host_connections: VecDeque<VsockHostAcceptedConnection>,
     host_connection_limit: usize,
     host_connections: VsockHostConnectionTable,
+    guest_connection_requests: VsockGuestConnectionRequestTable,
     pending_guest_reset_packets: VecDeque<VirtioVsockPacketHeader>,
 }
 
@@ -3150,6 +3309,7 @@ impl VirtioVsockDevice {
             pending_host_connections: VecDeque::new(),
             host_connection_limit: VSOCK_HOST_CONNECTION_LIMIT,
             host_connections: VsockHostConnectionTable::new(),
+            guest_connection_requests: VsockGuestConnectionRequestTable::new(),
             pending_guest_reset_packets: VecDeque::new(),
         }
     }
@@ -3239,8 +3399,31 @@ impl VirtioVsockDevice {
     }
 
     #[cfg(test)]
+    fn pending_guest_connection_request_count(&self) -> usize {
+        self.guest_connection_requests.len()
+    }
+
+    #[cfg(test)]
+    fn has_guest_connection_request(&self, key: VsockGuestConnectionKey) -> bool {
+        self.guest_connection_requests.contains(key)
+    }
+
+    #[cfg(test)]
+    fn guest_connection_request(
+        &self,
+        key: VsockGuestConnectionKey,
+    ) -> Option<VsockGuestConnectionRequest> {
+        self.guest_connection_requests.get(key).copied()
+    }
+
+    #[cfg(test)]
     fn set_host_connection_limit(&mut self, limit: usize) {
         self.host_connection_limit = limit;
+    }
+
+    #[cfg(test)]
+    fn set_guest_connection_request_limit(&mut self, limit: usize) {
+        self.guest_connection_requests = VsockGuestConnectionRequestTable::with_limit(limit);
     }
 
     pub fn activate_vsock(
@@ -3300,6 +3483,7 @@ impl VirtioVsockDevice {
         self.active_event_queue = None;
         self.pending_host_connections.clear();
         self.host_connections = VsockHostConnectionTable::new();
+        self.guest_connection_requests = VsockGuestConnectionRequestTable::new();
         self.pending_guest_reset_packets.clear();
     }
 
@@ -3419,14 +3603,53 @@ impl VirtioVsockDevice {
         dispatch
     }
 
+    fn retain_guest_connection_request_packet(
+        &mut self,
+        packet: &VirtioVsockTxPacket,
+    ) -> Option<VsockGuestConnectionRequestOutcome> {
+        let header = packet.header();
+        if header.operation() != VIRTIO_VSOCK_OP_REQUEST {
+            return None;
+        }
+        if header.src_cid() != u64::from(self.guest_cid) {
+            return Some(VsockGuestConnectionRequestOutcome::Ignored {
+                reason: VsockGuestConnectionRequestIgnoreReason::WrongSourceCid,
+            });
+        }
+        if header.dst_cid() != VIRTIO_VSOCK_HOST_CID {
+            return Some(VsockGuestConnectionRequestOutcome::Ignored {
+                reason: VsockGuestConnectionRequestIgnoreReason::WrongDestinationCid,
+            });
+        }
+        if header.packet_type() != VIRTIO_VSOCK_PACKET_TYPE_STREAM {
+            return Some(VsockGuestConnectionRequestOutcome::Ignored {
+                reason: VsockGuestConnectionRequestIgnoreReason::UnsupportedPacketType,
+            });
+        }
+        if header.payload_len() != 0 {
+            return Some(VsockGuestConnectionRequestOutcome::Ignored {
+                reason: VsockGuestConnectionRequestIgnoreReason::PayloadPresent,
+            });
+        }
+
+        let request = VsockGuestConnectionRequest::from_packet(packet);
+        let key = request.key();
+        match self.guest_connection_requests.insert(request) {
+            Ok(()) => Some(VsockGuestConnectionRequestOutcome::Retained { key }),
+            Err(source) => Some(VsockGuestConnectionRequestOutcome::Dropped { key, source }),
+        }
+    }
+
     fn dispatch_guest_tx_control_packets(
         &mut self,
         tx_dispatch: &VirtioVsockTxQueueDispatch,
     ) -> (
         VirtioVsockGuestResponseDispatch,
+        VirtioVsockGuestRequestDispatch,
         VirtioVsockGuestResetDispatch,
     ) {
         let mut response_dispatch = VirtioVsockGuestResponseDispatch::new();
+        let mut request_dispatch = VirtioVsockGuestRequestDispatch::new();
         let mut reset_dispatch = VirtioVsockGuestResetDispatch::new();
 
         for packet in tx_dispatch.packets() {
@@ -3441,13 +3664,24 @@ impl VirtioVsockDevice {
                 continue;
             }
 
+            let request_outcome = self.retain_guest_connection_request_packet(packet);
+            if let Some(outcome) = request_outcome {
+                request_dispatch.record(outcome);
+            }
+
+            if request_outcome
+                .is_some_and(VsockGuestConnectionRequestOutcome::suppresses_guest_reset)
+            {
+                continue;
+            }
+
             if let Some(header) = guest_reset_packet_header_for_tx_packet(packet, self.guest_cid) {
                 let queued = self.queue_guest_reset_packet(header);
                 reset_dispatch.record(queued);
             }
         }
 
-        (response_dispatch, reset_dispatch)
+        (response_dispatch, request_dispatch, reset_dispatch)
     }
 
     fn dispatch_drained_queue_notifications(
@@ -3461,6 +3695,7 @@ impl VirtioVsockDevice {
                     drained_notifications,
                     VirtioVsockHostRequestDispatch::new(),
                     VirtioVsockGuestResponseDispatch::new(),
+                    VirtioVsockGuestRequestDispatch::new(),
                     VirtioVsockGuestResetDispatch::new(),
                     None,
                     None,
@@ -3498,6 +3733,7 @@ impl VirtioVsockDevice {
                 drained_notifications,
                 host_request_dispatch,
                 VirtioVsockGuestResponseDispatch::new(),
+                VirtioVsockGuestRequestDispatch::new(),
                 VirtioVsockGuestResetDispatch::new(),
                 None,
                 None,
@@ -3519,7 +3755,12 @@ impl VirtioVsockDevice {
             None
         };
 
-        let (tx_queue_dispatch, guest_response_dispatch, guest_reset_dispatch) = if dispatch_tx {
+        let (
+            tx_queue_dispatch,
+            guest_response_dispatch,
+            guest_request_dispatch,
+            guest_reset_dispatch,
+        ) = if dispatch_tx {
             let Some(queue) = self.active_tx_queue.as_mut() else {
                 return Err(VirtioVsockDeviceNotificationError::Inactive {
                     drained_notifications,
@@ -3528,11 +3769,12 @@ impl VirtioVsockDevice {
 
             match queue.dispatch(memory) {
                 Ok(dispatch) => {
-                    let (guest_response_dispatch, guest_reset_dispatch) =
+                    let (guest_response_dispatch, guest_request_dispatch, guest_reset_dispatch) =
                         self.dispatch_guest_tx_control_packets(&dispatch);
                     (
                         Some(dispatch),
                         guest_response_dispatch,
+                        guest_request_dispatch,
                         guest_reset_dispatch,
                     )
                 }
@@ -3548,6 +3790,7 @@ impl VirtioVsockDevice {
             (
                 None,
                 VirtioVsockGuestResponseDispatch::new(),
+                VirtioVsockGuestRequestDispatch::new(),
                 VirtioVsockGuestResetDispatch::new(),
             )
         };
@@ -3575,6 +3818,7 @@ impl VirtioVsockDevice {
             drained_notifications,
             host_request_dispatch,
             guest_response_dispatch,
+            guest_request_dispatch,
             guest_reset_dispatch,
             rx_queue_dispatch,
             tx_queue_dispatch,
@@ -3683,6 +3927,7 @@ pub struct VirtioVsockDeviceNotificationDispatch {
     drained_notifications: Vec<usize>,
     host_request_dispatch: VirtioVsockHostRequestDispatch,
     guest_response_dispatch: VirtioVsockGuestResponseDispatch,
+    guest_request_dispatch: VirtioVsockGuestRequestDispatch,
     guest_reset_dispatch: VirtioVsockGuestResetDispatch,
     rx_queue_dispatch: Option<VirtioVsockRxQueueDispatch>,
     tx_queue_dispatch: Option<VirtioVsockTxQueueDispatch>,
@@ -3693,6 +3938,7 @@ impl VirtioVsockDeviceNotificationDispatch {
         drained_notifications: Vec<usize>,
         host_request_dispatch: VirtioVsockHostRequestDispatch,
         guest_response_dispatch: VirtioVsockGuestResponseDispatch,
+        guest_request_dispatch: VirtioVsockGuestRequestDispatch,
         guest_reset_dispatch: VirtioVsockGuestResetDispatch,
         rx_queue_dispatch: Option<VirtioVsockRxQueueDispatch>,
         tx_queue_dispatch: Option<VirtioVsockTxQueueDispatch>,
@@ -3701,6 +3947,7 @@ impl VirtioVsockDeviceNotificationDispatch {
             drained_notifications,
             host_request_dispatch,
             guest_response_dispatch,
+            guest_request_dispatch,
             guest_reset_dispatch,
             rx_queue_dispatch,
             tx_queue_dispatch,
@@ -3717,6 +3964,10 @@ impl VirtioVsockDeviceNotificationDispatch {
 
     pub const fn guest_response_dispatch(&self) -> &VirtioVsockGuestResponseDispatch {
         &self.guest_response_dispatch
+    }
+
+    pub const fn guest_request_dispatch(&self) -> &VirtioVsockGuestRequestDispatch {
+        &self.guest_request_dispatch
     }
 
     pub const fn guest_reset_dispatch(&self) -> &VirtioVsockGuestResetDispatch {
@@ -3787,6 +4038,59 @@ impl VirtioVsockGuestResponseDispatch {
             }
             VsockHostGuestResponseOutcome::Dropped { .. } => {
                 self.dropped_connections += 1;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioVsockGuestRequestDispatch {
+    request_packets: usize,
+    retained_requests: usize,
+    ignored_requests: usize,
+    dropped_requests: usize,
+}
+
+impl VirtioVsockGuestRequestDispatch {
+    const fn new() -> Self {
+        Self {
+            request_packets: 0,
+            retained_requests: 0,
+            ignored_requests: 0,
+            dropped_requests: 0,
+        }
+    }
+
+    pub const fn request_packets(&self) -> usize {
+        self.request_packets
+    }
+
+    pub const fn retained_requests(&self) -> usize {
+        self.retained_requests
+    }
+
+    pub const fn ignored_requests(&self) -> usize {
+        self.ignored_requests
+    }
+
+    pub const fn dropped_requests(&self) -> usize {
+        self.dropped_requests
+    }
+
+    fn record(&mut self, outcome: VsockGuestConnectionRequestOutcome) {
+        self.request_packets += 1;
+        match outcome {
+            VsockGuestConnectionRequestOutcome::Retained { key } => {
+                let _ = key;
+                self.retained_requests += 1;
+            }
+            VsockGuestConnectionRequestOutcome::Ignored { reason } => {
+                let _ = reason;
+                self.ignored_requests += 1;
+            }
+            VsockGuestConnectionRequestOutcome::Dropped { key, source } => {
+                let _ = (key, source);
+                self.dropped_requests += 1;
             }
         }
     }
@@ -4429,19 +4733,20 @@ mod tests {
         VSOCK_HOST_CONNECT_REQUEST_MAX_LEN, VSOCK_HOST_LOCAL_PORT_BASE,
         VSOCK_HOST_LOCAL_PORT_CAPACITY, VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE,
         VirtioVsockConfigSpace, VirtioVsockDevice, VirtioVsockDeviceActivationError,
-        VirtioVsockGuestResetDispatch, VirtioVsockGuestResponseDispatch,
-        VirtioVsockHostRequestDispatch, VirtioVsockMmioHandler, VirtioVsockPacketHeader,
-        VirtioVsockPacketLengthError, VirtioVsockQueueBuildError, VirtioVsockRxBufferParseError,
-        VirtioVsockRxPacketKind, VirtioVsockRxQueue, VirtioVsockRxQueueDispatchError,
-        VirtioVsockTxPacket, VirtioVsockTxPacketParseError, VirtioVsockTxQueue,
-        VirtioVsockTxQueueDispatchError, VsockConfigError, VsockConfigInput,
-        VsockHostConnectHandshakeError, VsockHostConnectRequest, VsockHostConnectRequestError,
-        VsockHostConnectionKey, VsockHostConnectionTable, VsockHostConnectionTableError,
-        VsockHostLocalPort, VsockHostLocalPortAllocator, VsockHostLocalPortAllocatorError,
-        VsockHostLocalPortError, VsockHostSocketAcceptError, VsockHostSocketOwner,
-        VsockHostSocketOwnerError, VsockMmioDevice, VsockMmioLayout, VsockMmioRegistrationError,
-        is_transient_host_socket_accept_error, is_transient_host_socket_read_error,
-        parse_vsock_host_connect_request, virtio_vsock_mmio_handler,
+        VirtioVsockGuestRequestDispatch, VirtioVsockGuestResetDispatch,
+        VirtioVsockGuestResponseDispatch, VirtioVsockHostRequestDispatch, VirtioVsockMmioHandler,
+        VirtioVsockPacketHeader, VirtioVsockPacketLengthError, VirtioVsockQueueBuildError,
+        VirtioVsockRxBufferParseError, VirtioVsockRxPacketKind, VirtioVsockRxQueue,
+        VirtioVsockRxQueueDispatchError, VirtioVsockTxPacket, VirtioVsockTxPacketParseError,
+        VirtioVsockTxQueue, VirtioVsockTxQueueDispatchError, VsockConfigError, VsockConfigInput,
+        VsockGuestConnectionKey, VsockHostConnectHandshakeError, VsockHostConnectRequest,
+        VsockHostConnectRequestError, VsockHostConnectionKey, VsockHostConnectionTable,
+        VsockHostConnectionTableError, VsockHostLocalPort, VsockHostLocalPortAllocator,
+        VsockHostLocalPortAllocatorError, VsockHostLocalPortError, VsockHostSocketAcceptError,
+        VsockHostSocketOwner, VsockHostSocketOwnerError, VsockMmioDevice, VsockMmioLayout,
+        VsockMmioRegistrationError, is_transient_host_socket_accept_error,
+        is_transient_host_socket_read_error, parse_vsock_host_connect_request,
+        virtio_vsock_mmio_handler,
     };
 
     static NEXT_TEST_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
@@ -4548,6 +4853,13 @@ mod tests {
         assert_eq!(dispatch.acknowledged_responses(), 0);
         assert_eq!(dispatch.ignored_responses(), 0);
         assert_eq!(dispatch.dropped_connections(), 0);
+    }
+
+    fn assert_empty_guest_request_dispatch(dispatch: &VirtioVsockGuestRequestDispatch) {
+        assert_eq!(dispatch.request_packets(), 0);
+        assert_eq!(dispatch.retained_requests(), 0);
+        assert_eq!(dispatch.ignored_requests(), 0);
+        assert_eq!(dispatch.dropped_requests(), 0);
     }
 
     fn assert_empty_guest_reset_dispatch(dispatch: &VirtioVsockGuestResetDispatch) {
@@ -8746,6 +9058,24 @@ mod tests {
     }
 
     #[test]
+    fn virtio_vsock_device_reset_drops_guest_connection_requests() {
+        let mut device = VirtioVsockDevice::with_guest_cid(42);
+        let key = VsockGuestConnectionKey::new(52, 4000);
+
+        assert!(matches!(
+            device.retain_guest_connection_request_packet(&guest_request_tx_packet(42, 52, 4000)),
+            Some(super::VsockGuestConnectionRequestOutcome::Retained { key: retained })
+                if retained == key
+        ));
+        assert!(device.has_guest_connection_request(key));
+
+        VirtioMmioDeviceActivationHandler::reset(&mut device);
+
+        assert_eq!(device.pending_guest_connection_request_count(), 0);
+        assert!(!device.has_guest_connection_request(key));
+    }
+
+    #[test]
     fn virtio_vsock_device_rejects_not_ready_queue_without_partial_activation() {
         let registers = vsock_device_registers();
         let queues = configured_vsock_queue_registers(Some(4), false);
@@ -9489,6 +9819,14 @@ mod tests {
         let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
 
         activate_vsock_handler(&mut handler);
+        let guest_request_key = VsockGuestConnectionKey::new(52, 4001);
+        assert!(matches!(
+            handler
+                .activation_handler_mut()
+                .retain_guest_connection_request_packet(&guest_request_tx_packet(42, 52, 4001)),
+            Some(super::VsockGuestConnectionRequestOutcome::Retained { key })
+                if key == guest_request_key
+        ));
         let (accepted, mut client, request) =
             accepted_host_connection_with_request("notify-response-ok", 4000);
         let key = handler
@@ -9569,6 +9907,7 @@ mod tests {
                 .dropped_connections(),
             0
         );
+        assert_empty_guest_request_dispatch(tx_notification.guest_request_dispatch());
         let tx = tx_notification
             .tx_queue_dispatch()
             .expect("TX dispatch summary should be present");
@@ -9577,10 +9916,90 @@ mod tests {
         assert_eq!(read_vsock_tx_used_index(&memory), 1);
         assert_eq!(read_vsock_tx_used_element(&memory, 0), (0, 0));
         assert_host_ok_message(&mut client, key.local_port());
+        assert!(
+            handler
+                .activation_handler()
+                .has_guest_connection_request(guest_request_key)
+        );
     }
 
     #[test]
-    fn virtio_vsock_notifications_deliver_guest_reset_for_unsupported_guest_request() {
+    fn virtio_vsock_notifications_retain_guest_connection_request() {
+        let mut memory = vsock_tx_memory();
+        let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
+        let request = guest_request_tx_packet(42, 52, 4000)
+            .header()
+            .with_buffer_allocation(1234);
+
+        activate_vsock_handler(&mut handler);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_HEADER, request);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_tx_available_heads(&mut memory, &[0]);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("TX guest request should retain pending request");
+
+        assert_eq!(
+            notification.drained_notifications(),
+            &[VIRTIO_VSOCK_TX_QUEUE_INDEX]
+        );
+        assert!(notification.needs_queue_interrupt());
+        assert_empty_host_request_dispatch(notification.host_request_dispatch());
+        assert_empty_guest_response_dispatch(notification.guest_response_dispatch());
+        assert_eq!(notification.guest_request_dispatch().request_packets(), 1);
+        assert_eq!(notification.guest_request_dispatch().retained_requests(), 1);
+        assert_eq!(notification.guest_request_dispatch().ignored_requests(), 0);
+        assert_eq!(notification.guest_request_dispatch().dropped_requests(), 0);
+        assert_empty_guest_reset_dispatch(notification.guest_reset_dispatch());
+        assert!(notification.rx_queue_dispatch().is_none());
+        assert_eq!(read_vsock_rx_used_index(&memory), 0);
+        let tx = notification
+            .tx_queue_dispatch()
+            .expect("TX dispatch summary should be present");
+        assert_eq!(tx.processed_packets(), 1);
+        assert_eq!(tx.successful_packets(), 1);
+        assert_eq!(read_vsock_tx_used_index(&memory), 1);
+        assert_eq!(read_vsock_tx_used_element(&memory, 0), (0, 0));
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_connection_request_count(),
+            1
+        );
+        let key = VsockGuestConnectionKey::new(52, 4000);
+        assert!(
+            handler
+                .activation_handler()
+                .has_guest_connection_request(key)
+        );
+        assert_eq!(
+            handler
+                .activation_handler()
+                .guest_connection_request(key)
+                .expect("guest request should be retained")
+                .header(),
+            request
+        );
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_reset_packet_count(),
+            0
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_queue_reset_for_duplicate_guest_request() {
         let mut memory = vsock_tx_memory();
         let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
         let request = guest_request_tx_packet(42, 52, 4000).header();
@@ -9606,57 +10025,97 @@ mod tests {
                 None,
             ),
         );
-        write_vsock_tx_available_heads(&mut memory, &[0]);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_SECOND_HEADER, request);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::readable(
+                TEST_VSOCK_SECOND_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_tx_available_heads(&mut memory, &[0, 1]);
         notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
 
         let notification = handler
             .dispatch_vsock_queue_notifications(&mut memory)
-            .expect("TX guest request should queue and deliver RST");
+            .expect("duplicate guest request should queue RST");
 
-        assert_eq!(
-            notification.drained_notifications(),
-            &[VIRTIO_VSOCK_TX_QUEUE_INDEX]
-        );
-        assert!(notification.needs_queue_interrupt());
-        assert_empty_host_request_dispatch(notification.host_request_dispatch());
-        assert_empty_guest_response_dispatch(notification.guest_response_dispatch());
+        assert_eq!(notification.guest_request_dispatch().request_packets(), 2);
+        assert_eq!(notification.guest_request_dispatch().retained_requests(), 1);
+        assert_eq!(notification.guest_request_dispatch().ignored_requests(), 0);
+        assert_eq!(notification.guest_request_dispatch().dropped_requests(), 1);
         assert_eq!(notification.guest_reset_dispatch().reset_candidates(), 1);
         assert_eq!(notification.guest_reset_dispatch().queued_resets(), 1);
         assert_eq!(notification.guest_reset_dispatch().dropped_resets(), 0);
         let rx = notification
             .rx_queue_dispatch()
-            .expect("queued guest RST should dispatch through RX");
-        assert_eq!(rx.processed_buffers(), 1);
-        assert_eq!(rx.delivered_requests(), 0);
+            .expect("duplicate guest request RST should dispatch");
         assert_eq!(rx.delivered_reset_packets(), 1);
-        assert_eq!(rx.deliveries().len(), 1);
-        assert_eq!(
-            rx.deliveries()[0].packet_kind(),
-            VirtioVsockRxPacketKind::GuestReset
-        );
-        assert_eq!(read_vsock_rx_used_index(&memory), 1);
-        assert_eq!(
-            read_vsock_rx_used_element(&memory, 0),
-            (0, VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32)
-        );
         assert_guest_reset_packet_header(
             read_vsock_packet_header(&memory, TEST_VSOCK_RX_BUFFER),
             42,
             52,
             4000,
         );
-        let tx = notification
-            .tx_queue_dispatch()
-            .expect("TX dispatch summary should be present");
-        assert_eq!(tx.processed_packets(), 1);
-        assert_eq!(tx.successful_packets(), 1);
-        assert_eq!(read_vsock_tx_used_index(&memory), 1);
-        assert_eq!(read_vsock_tx_used_element(&memory, 0), (0, 0));
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_connection_request_count(),
+            1
+        );
         assert_eq!(
             handler
                 .activation_handler()
                 .pending_guest_reset_packet_count(),
             0
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_queue_reset_when_guest_request_limit_is_full() {
+        let mut memory = vsock_tx_memory();
+        let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
+        let request = guest_request_tx_packet(42, 52, 4000).header();
+
+        activate_vsock_handler(&mut handler);
+        handler
+            .activation_handler_mut()
+            .set_guest_connection_request_limit(0);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_HEADER, request);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_tx_available_heads(&mut memory, &[0]);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("full guest request table should queue RST");
+
+        assert_eq!(notification.guest_request_dispatch().request_packets(), 1);
+        assert_eq!(notification.guest_request_dispatch().retained_requests(), 0);
+        assert_eq!(notification.guest_request_dispatch().dropped_requests(), 1);
+        assert_eq!(notification.guest_reset_dispatch().reset_candidates(), 1);
+        assert_eq!(notification.guest_reset_dispatch().queued_resets(), 1);
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_connection_request_count(),
+            0
+        );
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_reset_packet_count(),
+            1
         );
     }
 
@@ -9667,6 +10126,7 @@ mod tests {
         let wrong_destination = guest_request_tx_packet(42, 52, 4000)
             .header()
             .with_dst_cid(VIRTIO_VSOCK_HOST_CID + 1);
+        let wrong_source = guest_request_tx_packet(43, 53, 4001).header();
         let guest_reset = guest_request_tx_packet(42, 53, 4001)
             .header()
             .with_operation(VIRTIO_VSOCK_OP_RST);
@@ -9692,7 +10152,7 @@ mod tests {
                 None,
             ),
         );
-        write_vsock_packet_header(&mut memory, TEST_VSOCK_SECOND_HEADER, guest_reset);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_SECOND_HEADER, wrong_source);
         write_vsock_tx_descriptor(
             &mut memory,
             1,
@@ -9702,7 +10162,17 @@ mod tests {
                 None,
             ),
         );
-        write_vsock_tx_available_heads(&mut memory, &[0, 1]);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_PAYLOAD, guest_reset);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            2,
+            TestDescriptor::readable(
+                TEST_VSOCK_PAYLOAD,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_tx_available_heads(&mut memory, &[0, 1, 2]);
         notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
 
         let notification = handler
@@ -9710,10 +10180,14 @@ mod tests {
             .expect("ignored guest packets should still complete TX");
 
         assert_empty_guest_response_dispatch(notification.guest_response_dispatch());
+        assert_eq!(notification.guest_request_dispatch().request_packets(), 2);
+        assert_eq!(notification.guest_request_dispatch().retained_requests(), 0);
+        assert_eq!(notification.guest_request_dispatch().ignored_requests(), 2);
+        assert_eq!(notification.guest_request_dispatch().dropped_requests(), 0);
         assert_empty_guest_reset_dispatch(notification.guest_reset_dispatch());
         assert!(notification.rx_queue_dispatch().is_none());
         assert_eq!(read_vsock_rx_used_index(&memory), 0);
-        assert_eq!(read_vsock_tx_used_index(&memory), 2);
+        assert_eq!(read_vsock_tx_used_index(&memory), 3);
         assert_eq!(
             handler
                 .activation_handler()
@@ -9729,11 +10203,14 @@ mod tests {
         let unsupported_type = guest_request_tx_packet(42, 52, 4000)
             .header()
             .with_packet_type(0);
+        let payload_request = guest_request_tx_packet(42, 53, 4001)
+            .header()
+            .with_payload_len(1);
         let orphan_response = guest_response_tx_packet(
             42,
             VsockHostLocalPort::try_from_raw(VSOCK_HOST_LOCAL_PORT_BASE)
                 .expect("test local port should be valid"),
-            4001,
+            4002,
         )
         .header();
 
@@ -9748,17 +10225,32 @@ mod tests {
                 None,
             ),
         );
-        write_vsock_packet_header(&mut memory, TEST_VSOCK_SECOND_HEADER, orphan_response);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_SECOND_HEADER, payload_request);
+        write_guest_bytes(
+            &mut memory,
+            vsock_payload_address_after_header(TEST_VSOCK_SECOND_HEADER),
+            &[0xa5],
+        );
         write_vsock_tx_descriptor(
             &mut memory,
             1,
             TestDescriptor::readable(
                 TEST_VSOCK_SECOND_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32 + 1,
+                None,
+            ),
+        );
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_PAYLOAD, orphan_response);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            2,
+            TestDescriptor::readable(
+                TEST_VSOCK_PAYLOAD,
                 VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
                 None,
             ),
         );
-        write_vsock_tx_available_heads(&mut memory, &[0, 1]);
+        write_vsock_tx_available_heads(&mut memory, &[0, 1, 2]);
         notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
 
         let notification = handler
@@ -9770,14 +10262,18 @@ mod tests {
             notification.guest_response_dispatch().ignored_responses(),
             1
         );
-        assert_eq!(notification.guest_reset_dispatch().reset_candidates(), 2);
-        assert_eq!(notification.guest_reset_dispatch().queued_resets(), 2);
+        assert_eq!(notification.guest_request_dispatch().request_packets(), 2);
+        assert_eq!(notification.guest_request_dispatch().retained_requests(), 0);
+        assert_eq!(notification.guest_request_dispatch().ignored_requests(), 2);
+        assert_eq!(notification.guest_request_dispatch().dropped_requests(), 0);
+        assert_eq!(notification.guest_reset_dispatch().reset_candidates(), 3);
+        assert_eq!(notification.guest_reset_dispatch().queued_resets(), 3);
         assert_eq!(notification.guest_reset_dispatch().dropped_resets(), 0);
         assert_eq!(
             handler
                 .activation_handler()
                 .pending_guest_reset_packet_count(),
-            2
+            3
         );
         let rx = notification
             .rx_queue_dispatch()
@@ -9785,7 +10281,7 @@ mod tests {
         assert_eq!(rx.processed_buffers(), 0);
         assert_eq!(rx.delivered_reset_packets(), 0);
         assert_eq!(read_vsock_rx_used_index(&memory), 0);
-        assert_eq!(read_vsock_tx_used_index(&memory), 2);
+        assert_eq!(read_vsock_tx_used_index(&memory), 3);
     }
 
     #[test]
