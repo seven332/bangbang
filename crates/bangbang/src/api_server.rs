@@ -2180,6 +2180,39 @@ mod tests {
     }
 
     #[test]
+    fn serves_mmds_over_unix_socket() {
+        let path = unique_socket_path("mmds");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+        let mut vmm = test_controller();
+        let body = r#"{"latest":{"meta-data":{"ami-id":"ami-123"}}}"#;
+        let request = format!(
+            "PUT /mmds HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        client
+            .write_all(b"GET /mmds HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("client should write request");
+        server
+            .serve_next(&mut vmm)
+            .expect("server should handle one request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("client should read response");
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Content-Type: application/json\r\n"));
+        assert!(response.contains(r#""ami-id":"ami-123""#));
+    }
+
+    #[test]
     fn returns_fault_for_unsupported_path() {
         let path = unique_socket_path("fault");
         let server = ApiServer::bind(&path).expect("server should bind");
