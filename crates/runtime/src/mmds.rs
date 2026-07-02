@@ -908,6 +908,19 @@ mod tests {
     }
 
     #[test]
+    fn guest_get_response_sanitizes_slash_only_uri_to_root() {
+        let state = initialized_query_state();
+        let response = state.guest_get_response("////", MmdsOutputFormat::Json);
+
+        assert_eq!(response.status(), MmdsGuestStatus::Ok);
+        assert_eq!(
+            response.content_type(),
+            MmdsGuestContentType::ApplicationJson
+        );
+        assert_json_value(response.body(), query_value());
+    }
+
+    #[test]
     fn guest_get_response_maps_uninitialized_store() {
         let state = MmdsState::default();
 
