@@ -12070,6 +12070,82 @@ mod tests {
     }
 
     #[test]
+    fn virtio_vsock_notifications_preserve_host_rw_payload_without_rx_buffer() {
+        let (mut memory, mut handler, mut accepted) =
+            established_guest_connection_for_test("host-rw-late", 52, 4000);
+        let payload = b"late-host-rw";
+        accepted
+            .write_all(payload)
+            .expect("late-buffer host payload should write");
+
+        let empty_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("host RW without RX buffer should stay pending");
+
+        assert_empty_host_request_dispatch(empty_notification.host_request_dispatch());
+        assert_empty_guest_response_dispatch(empty_notification.guest_response_dispatch());
+        assert_empty_guest_request_dispatch(empty_notification.guest_request_dispatch());
+        assert_empty_guest_rw_dispatch(empty_notification.guest_rw_dispatch());
+        assert_empty_guest_reset_dispatch(empty_notification.guest_reset_dispatch());
+        assert!(!empty_notification.needs_queue_interrupt());
+        let empty_rx = empty_notification
+            .rx_queue_dispatch()
+            .expect("pending host RW should attempt RX dispatch");
+        assert_eq!(empty_rx.processed_buffers(), 0);
+        assert_eq!(empty_rx.delivered_host_rw_packets(), 0);
+        assert_eq!(read_vsock_rx_used_index(&memory), 1);
+
+        write_vsock_rx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_SECOND_BUFFER,
+                vsock_packet_len_with_payload(payload),
+                None,
+            ),
+        );
+        append_vsock_rx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+
+        let retry_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("late RX buffer should receive pending host RW payload");
+
+        let retry_rx = retry_notification
+            .rx_queue_dispatch()
+            .expect("late RX buffer should produce RX dispatch");
+        assert_eq!(retry_rx.processed_buffers(), 1);
+        assert_eq!(retry_rx.delivered_host_rw_packets(), 1);
+        assert_eq!(retry_rx.delivered_host_rw_bytes(), payload.len());
+        assert_host_rw_packet_header(
+            read_vsock_packet_header(&memory, TEST_VSOCK_RX_SECOND_BUFFER),
+            42,
+            52,
+            4000,
+            payload.len(),
+        );
+        assert_eq!(
+            read_guest_bytes(
+                &memory,
+                vsock_payload_address_after_header(TEST_VSOCK_RX_SECOND_BUFFER),
+                payload.len(),
+            ),
+            payload
+        );
+        assert_eq!(read_vsock_rx_used_index(&memory), 2);
+        assert_eq!(
+            read_vsock_rx_used_element(&memory, 1),
+            (1, vsock_packet_len_with_payload(payload))
+        );
+
+        drop(handler);
+        assert_stream_closed(
+            &mut accepted,
+            "dropping handler should close late-buffer host RW guest stream",
+        );
+    }
+
+    #[test]
     fn virtio_vsock_notifications_preserve_host_rw_payload_after_small_rx_buffer() {
         let (mut memory, mut handler, mut accepted) =
             established_guest_connection_for_test("host-rw-retry", 52, 4000);
