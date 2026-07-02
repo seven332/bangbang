@@ -4650,7 +4650,7 @@ mod tests {
     }
 
     #[test]
-    fn vsock_notification_signal_dispatch_preserves_unsupported_queue_without_signal() {
+    fn vsock_notification_signal_dispatch_preserves_event_noop_without_signal() {
         let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_with_vsock();
         configure_boot_vsock_queues(&mut runtime, &mut mmio_dispatcher);
         notify_boot_vsock_queue(
@@ -4663,29 +4663,25 @@ mod tests {
         let (lines, sink) = RecordingSink::successful();
 
         let result = signal_vsock_queue_interrupts(dispatches, sink.as_ref())
-            .expect("unsupported vsock dispatch should collect");
+            .expect("event no-op vsock dispatch should collect");
 
         let device = &result.as_slice()[0];
         assert!(!device.dispatch().needs_queue_interrupt());
         assert!(!device.queue_interrupt_signaled());
         assert!(device.signal_error().is_none());
         assert!(recorded_lines(&lines).is_empty());
-        let err = device
+        let dispatch = device
             .dispatch()
             .outcome()
-            .dispatch_error()
-            .expect("unsupported queue error should be preserved");
-        assert!(matches!(
-            err,
-            bangbang_runtime::vsock::VirtioVsockDeviceNotificationError::UnsupportedQueue {
-                queue_index: VIRTIO_VSOCK_EVENT_QUEUE_INDEX,
-                ..
-            }
-        ));
+            .dispatched()
+            .expect("event notification should be accepted as no-op dispatch");
         assert_eq!(
-            err.drained_notifications(),
+            dispatch.drained_notifications(),
             [VIRTIO_VSOCK_EVENT_QUEUE_INDEX]
         );
+        assert_eq!(dispatch.event_notifications(), 1);
+        assert!(dispatch.rx_queue_dispatch().is_none());
+        assert!(dispatch.tx_queue_dispatch().is_none());
         assert_eq!(
             read_boot_vsock_mmio_u32(
                 &mut runtime,

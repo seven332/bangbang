@@ -4838,6 +4838,7 @@ impl VirtioVsockDevice {
         if let Some(queue_index) = drained_notifications.iter().copied().find(|queue_index| {
             *queue_index != VIRTIO_VSOCK_RX_QUEUE_INDEX
                 && *queue_index != VIRTIO_VSOCK_TX_QUEUE_INDEX
+                && *queue_index != VIRTIO_VSOCK_EVENT_QUEUE_INDEX
         }) {
             return Err(VirtioVsockDeviceNotificationError::UnsupportedQueue {
                 drained_notifications,
@@ -5072,6 +5073,7 @@ impl VirtioVsockGuestTxControlDispatch {
 #[derive(Debug)]
 pub struct VirtioVsockDeviceNotificationDispatch {
     drained_notifications: Vec<usize>,
+    event_notifications: usize,
     host_request_dispatch: VirtioVsockHostRequestDispatch,
     guest_response_dispatch: VirtioVsockGuestResponseDispatch,
     guest_request_dispatch: VirtioVsockGuestRequestDispatch,
@@ -5082,15 +5084,20 @@ pub struct VirtioVsockDeviceNotificationDispatch {
 }
 
 impl VirtioVsockDeviceNotificationDispatch {
-    const fn new(
+    fn new(
         drained_notifications: Vec<usize>,
         host_request_dispatch: VirtioVsockHostRequestDispatch,
         guest_tx_control_dispatch: VirtioVsockGuestTxControlDispatch,
         rx_queue_dispatch: Option<VirtioVsockRxQueueDispatch>,
         tx_queue_dispatch: Option<VirtioVsockTxQueueDispatch>,
     ) -> Self {
+        let event_notifications = drained_notifications
+            .iter()
+            .filter(|queue_index| **queue_index == VIRTIO_VSOCK_EVENT_QUEUE_INDEX)
+            .count();
         Self {
             drained_notifications,
+            event_notifications,
             host_request_dispatch,
             guest_response_dispatch: guest_tx_control_dispatch.response_dispatch,
             guest_request_dispatch: guest_tx_control_dispatch.request_dispatch,
@@ -5103,6 +5110,10 @@ impl VirtioVsockDeviceNotificationDispatch {
 
     pub fn drained_notifications(&self) -> &[usize] {
         &self.drained_notifications
+    }
+
+    pub const fn event_notifications(&self) -> usize {
+        self.event_notifications
     }
 
     pub const fn host_request_dispatch(&self) -> &VirtioVsockHostRequestDispatch {
@@ -10774,6 +10785,7 @@ mod tests {
             .expect("empty notification drain should be a no-op");
 
         assert_eq!(dispatch.drained_notifications(), &[]);
+        assert_eq!(dispatch.event_notifications(), 0);
         assert_empty_host_request_dispatch(dispatch.host_request_dispatch());
         assert_empty_guest_response_dispatch(dispatch.guest_response_dispatch());
         assert!(dispatch.rx_queue_dispatch().is_none());
@@ -10787,7 +10799,7 @@ mod tests {
         let mut device = VirtioVsockDevice::new();
 
         let error = device
-            .dispatch_drained_queue_notifications(&mut memory, vec![VIRTIO_VSOCK_TX_QUEUE_INDEX])
+            .dispatch_drained_queue_notifications(&mut memory, vec![VIRTIO_VSOCK_EVENT_QUEUE_INDEX])
             .expect_err("notification before activation should fail");
 
         assert!(matches!(
@@ -10796,7 +10808,7 @@ mod tests {
         ));
         assert_eq!(
             error.drained_notifications(),
-            &[VIRTIO_VSOCK_TX_QUEUE_INDEX]
+            &[VIRTIO_VSOCK_EVENT_QUEUE_INDEX]
         );
         assert_eq!(
             error.to_string(),
@@ -11125,40 +11137,36 @@ mod tests {
     }
 
     #[test]
-    fn virtio_vsock_notifications_reject_event_queue_without_dispatch() {
+    fn virtio_vsock_notifications_accept_event_queue_as_noop() {
         let mut memory = vsock_tx_memory();
         let mut handler = virtio_vsock_mmio_handler(3).expect("vsock handler should build");
 
         activate_vsock_handler(&mut handler);
         notify_vsock_queue(&mut handler, VIRTIO_VSOCK_EVENT_QUEUE_INDEX);
 
-        let error = handler
+        let notification = handler
             .dispatch_vsock_queue_notifications(&mut memory)
-            .expect_err("event notification should be unsupported");
+            .expect("event notification should be accepted as no-op work");
 
-        assert!(matches!(
-            error,
-            super::VirtioVsockDeviceNotificationError::UnsupportedQueue {
-                queue_index: VIRTIO_VSOCK_EVENT_QUEUE_INDEX,
-                ..
-            }
-        ));
         assert_eq!(
-            error.drained_notifications(),
+            notification.drained_notifications(),
             &[VIRTIO_VSOCK_EVENT_QUEUE_INDEX]
         );
-        assert_eq!(
-            error.to_string(),
-            "virtio-vsock queue notification for unsupported queue 2"
-        );
-        assert!(error.completed_tx_dispatch().is_none());
-        assert!(error.completed_rx_dispatch().is_none());
+        assert_eq!(notification.event_notifications(), 1);
+        assert_empty_host_request_dispatch(notification.host_request_dispatch());
+        assert_empty_guest_response_dispatch(notification.guest_response_dispatch());
+        assert_empty_guest_request_dispatch(notification.guest_request_dispatch());
+        assert_empty_guest_rw_dispatch(notification.guest_rw_dispatch());
+        assert_empty_guest_reset_dispatch(notification.guest_reset_dispatch());
+        assert!(notification.tx_queue_dispatch().is_none());
+        assert!(notification.rx_queue_dispatch().is_none());
+        assert!(!notification.needs_queue_interrupt());
         assert_eq!(read_interrupt_status(&handler), 0);
         assert!(handler.pending_queue_notifications().is_empty());
     }
 
     #[test]
-    fn virtio_vsock_notifications_reject_mixed_event_queue_without_rx_dispatch() {
+    fn virtio_vsock_notifications_dispatch_mixed_rx_and_event_queue() {
         let mut memory = vsock_tx_memory();
         let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
 
@@ -11182,35 +11190,38 @@ mod tests {
         notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
         notify_vsock_queue(&mut handler, VIRTIO_VSOCK_EVENT_QUEUE_INDEX);
 
-        let error = handler
+        let notification = handler
             .dispatch_vsock_queue_notifications(&mut memory)
-            .expect_err("mixed event notification should be unsupported before RX dispatch");
+            .expect("mixed RX/event notification should dispatch RX work");
 
-        assert!(matches!(
-            error,
-            super::VirtioVsockDeviceNotificationError::UnsupportedQueue {
-                queue_index: VIRTIO_VSOCK_EVENT_QUEUE_INDEX,
-                ..
-            }
-        ));
         assert_eq!(
-            error.drained_notifications(),
+            notification.drained_notifications(),
             &[VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_EVENT_QUEUE_INDEX]
         );
+        assert_eq!(notification.event_notifications(), 1);
         assert!(
-            handler
+            !handler
                 .activation_handler()
                 .has_pending_host_request_packet(key)
         );
-        assert!(error.completed_tx_dispatch().is_none());
-        assert!(error.completed_rx_dispatch().is_none());
-        assert_eq!(read_interrupt_status(&handler), 0);
-        assert_eq!(read_vsock_rx_used_index(&memory), 0);
+        let rx = notification
+            .rx_queue_dispatch()
+            .expect("RX dispatch summary should be present");
+        assert_eq!(rx.processed_buffers(), 1);
+        assert_eq!(rx.delivered_requests(), 1);
+        assert!(rx.needs_queue_interrupt());
+        assert!(notification.tx_queue_dispatch().is_none());
+        assert!(notification.needs_queue_interrupt());
+        assert_eq!(
+            read_interrupt_status(&handler),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        assert_eq!(read_vsock_rx_used_index(&memory), 1);
         assert!(handler.pending_queue_notifications().is_empty());
     }
 
     #[test]
-    fn virtio_vsock_notifications_dispatch_mixed_rx_noop_and_tx_queue() {
+    fn virtio_vsock_notifications_dispatch_mixed_tx_and_event_queue() {
         let mut memory = vsock_tx_memory();
         let mut handler = virtio_vsock_mmio_handler(3).expect("vsock handler should build");
         let header = test_vsock_packet_header().with_payload_len(0);
@@ -11228,22 +11239,19 @@ mod tests {
         );
         write_vsock_tx_available_heads(&mut memory, &[0]);
         notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
-        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_EVENT_QUEUE_INDEX);
 
         let notification = handler
             .dispatch_vsock_queue_notifications(&mut memory)
-            .expect("mixed RX/TX notification should dispatch");
+            .expect("mixed TX/event notification should dispatch");
 
         assert_eq!(
             notification.drained_notifications(),
-            &[VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_TX_QUEUE_INDEX]
+            &[VIRTIO_VSOCK_TX_QUEUE_INDEX, VIRTIO_VSOCK_EVENT_QUEUE_INDEX]
         );
+        assert_eq!(notification.event_notifications(), 1);
         assert!(notification.needs_queue_interrupt());
-        let rx = notification
-            .rx_queue_dispatch()
-            .expect("RX dispatch summary should be present");
-        assert_eq!(rx.processed_buffers(), 0);
-        assert!(!rx.needs_queue_interrupt());
+        assert!(notification.rx_queue_dispatch().is_none());
         let tx = notification
             .tx_queue_dispatch()
             .expect("TX dispatch summary should be present");

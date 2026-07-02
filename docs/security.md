@@ -67,9 +67,10 @@ is resource-specific:
   can attach a guest-visible virtio-vsock device whose internal MMIO handler
   retains active RX, TX, and event queue metadata after `DRIVER_OK`, and the
   runtime has an internal Firecracker-shaped packet header model plus TX
-  descriptor packet parser. Startup-level dispatch can drain RX and TX queue
-  notifications, complete descriptor heads, and signal the allocated vsock
-  queue interrupt line when completed descriptors require it. The runtime can
+  descriptor packet parser. Startup-level dispatch can drain RX, TX, and no-op
+  event queue notifications, complete descriptor heads, and signal the
+  allocated vsock queue interrupt line when completed descriptors require it.
+  The runtime can
   also parse host `CONNECT <PORT>` requests, allocate Firecracker-shaped host
   local ports, retain host-initiated accepted streams in an internal table,
   expose one-shot guest-facing `VSOCK_OP_REQUEST` packet headers for retained
@@ -99,10 +100,10 @@ is resource-specific:
   Startup also binds a nonblocking host Unix listener at `uds_path`,
   records the listener socket device and inode, and removes the path on normal
   shutdown only when it still refers to the socket created by this process. It
-  does not route CIDs beyond current host/guest checks, dispatch event queues,
-  provide host-to-guest data movement beyond one bounded pending packet per
-  established stream, retry buffered RW writes, or implement full credit
-  accounting yet.
+  does not route CIDs beyond current host/guest checks, dispatch real event
+  payloads, provide host-to-guest data movement beyond one bounded pending
+  packet per established stream, retry buffered RW writes, or implement full
+  credit accounting yet.
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink.
 - `/logger` opens `log_path` during pre-boot configuration when that field is
@@ -245,10 +246,11 @@ The current scaffold does not implement:
   and host-stream EOF or read failures drop the retained stream before queuing
   a guest-visible reset. Startup preparation creates a nonblocking host Unix
   listener at `uds_path` and cleans it up only while the path still matches the
-  created socket inode. It still does not route CIDs beyond current host/guest
-  checks, dispatch event queues, provide host-to-guest data movement beyond one
-  bounded pending packet per established stream, retry buffered RW writes, or
-  implement full credit accounting
+  created socket inode. It can accept event queue notifications as no-op
+  dispatch metadata, but it still does not route CIDs beyond current host/guest
+  checks, dispatch real event payloads, provide host-to-guest data movement
+  beyond one bounded pending packet per established stream, retry buffered RW
+  writes, or implement full credit accounting
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 
