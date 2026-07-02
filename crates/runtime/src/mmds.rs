@@ -1079,23 +1079,9 @@ fn parse_guest_content_length(value: &str) -> Result<usize, MmdsGuestRequestPars
 }
 
 fn parse_guest_token_ttl(value: &str) -> Result<u32, MmdsGuestRequestParseError> {
-    if value.is_empty() {
-        return Err(MmdsGuestRequestParseError::InvalidTokenTtl);
-    }
-
-    let mut parsed = 0u32;
-    for byte in value.bytes() {
-        if !byte.is_ascii_digit() {
-            return Err(MmdsGuestRequestParseError::InvalidTokenTtl);
-        }
-
-        parsed = parsed
-            .checked_mul(10)
-            .and_then(|parsed| parsed.checked_add(u32::from(byte - b'0')))
-            .ok_or(MmdsGuestRequestParseError::InvalidTokenTtl)?;
-    }
-
-    Ok(parsed)
+    value
+        .parse::<u32>()
+        .map_err(|_| MmdsGuestRequestParseError::InvalidTokenTtl)
 }
 
 fn parse_guest_accept_header(value: &str) -> Result<MmdsOutputFormat, MmdsGuestRequestParseError> {
@@ -2019,7 +2005,7 @@ mod tests {
     fn mmds_guest_http_response_bytes_include_token_ttl_header() {
         let mut state = initialized_query_state();
         let bytes = state.guest_http_response_bytes(
-            b"PUT /latest/api/token HTTP/1.1\r\nX-aws-ec2-metadata-token-ttl-seconds: 60\r\n\r\n",
+            b"PUT /latest/api/token HTTP/1.1\r\nX-aws-ec2-metadata-token-ttl-seconds: +60\r\n\r\n",
         );
         let response = String::from_utf8(bytes).expect("token response should be UTF-8");
         let (head, token) = response
