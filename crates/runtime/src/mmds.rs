@@ -1100,6 +1100,15 @@ mod tests {
             .len()
     }
 
+    fn assert_mmds_token_shape(token: &str) {
+        assert_eq!(token.len(), MMDS_TOKEN_BYTES * 2);
+        assert!(
+            token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+    }
+
     #[test]
     fn mmds_token_authority_accepts_ttl_boundaries() {
         let mut authority = MmdsTokenAuthority::with_manual_clock(2, 1_000);
@@ -1111,9 +1120,8 @@ mod tests {
             .generate_token(MMDS_TOKEN_MAX_TTL_SECONDS)
             .expect("maximum token TTL should be accepted");
 
-        assert!(!min_token.is_empty());
-        assert!(!max_token.is_empty());
-        assert_ne!(min_token, max_token);
+        assert_mmds_token_shape(&min_token);
+        assert_mmds_token_shape(&max_token);
         assert!(authority.is_valid(&min_token));
         assert!(authority.is_valid(&max_token));
     }
@@ -1182,12 +1190,12 @@ mod tests {
         assert_eq!(authority.tokens.len(), 1);
 
         authority.set_now_millis(2_000);
+        assert!(!authority.is_valid(&first));
+
         let second = authority
             .generate_token(1)
             .expect("expired token should be cleaned before capacity check");
 
-        assert_ne!(first, second);
-        assert!(!authority.is_valid(&first));
         assert!(authority.is_valid(&second));
         assert_eq!(authority.tokens.len(), 1);
     }

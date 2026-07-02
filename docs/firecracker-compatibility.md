@@ -1177,8 +1177,8 @@ methods to `405 Method Not Allowed` with the current `Allow: GET` header and
 other parse failures to `400 Bad Request` plain-text responses without echoing
 malformed request bytes. The runtime also has a process-local opaque token
 authority with Firecracker-compatible TTL bounds of `1..=21600` seconds and a
-bounded active-token store. Firecracker's guest `PUT` token flow and MMDS v2
-GET token enforcement remain deferred.
+default `1024`-entry active-token store. Firecracker's guest `PUT` token flow
+and MMDS v2 GET token enforcement remain deferred.
 Process-local guest response-byte serialization currently emits fixed HTTP/1.1
 response bytes; preserving a guest request's original HTTP version remains
 deferred.
