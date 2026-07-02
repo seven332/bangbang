@@ -319,3 +319,80 @@ fn json_merge_patch(target: &mut Value, patch: &Value) {
 fn is_valid_link_local_ipv4(ipv4_address: Ipv4Addr) -> bool {
     matches!(ipv4_address.octets(), [169, 254, 1..=254, _])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn serialized_len(value: &Value) -> usize {
+        serde_json::to_vec(value)
+            .expect("test JSON value should serialize")
+            .len()
+    }
+
+    #[test]
+    fn put_data_accepts_exact_data_store_limit() {
+        let value = serde_json::json!({"a": ""});
+        let mut state = MmdsState::new(serialized_len(&value));
+
+        state
+            .put_data(MmdsContentInput::new(value.clone()))
+            .expect("exact-limit MMDS value should be accepted");
+
+        assert_eq!(state.get_data(), Ok(value));
+    }
+
+    #[test]
+    fn put_data_rejects_one_byte_over_data_store_limit_without_initializing() {
+        let value = serde_json::json!({"a": ""});
+        let limit_bytes = serialized_len(&value) - 1;
+        let mut state = MmdsState::new(limit_bytes);
+
+        assert_eq!(
+            state.put_data(MmdsContentInput::new(value.clone())),
+            Err(MmdsDataStoreError::DataStoreLimitExceeded {
+                limit_bytes,
+                size_bytes: serialized_len(&value),
+            })
+        );
+        assert_eq!(state.get_data(), Err(MmdsDataStoreError::NotInitialized));
+    }
+
+    #[test]
+    fn patch_data_accepts_exact_data_store_limit() {
+        let original = serde_json::json!({"a": ""});
+        let patch = serde_json::json!({"b": ""});
+        let patched = serde_json::json!({"a": "", "b": ""});
+        let mut state = MmdsState::new(serialized_len(&patched));
+
+        state
+            .put_data(MmdsContentInput::new(original))
+            .expect("initial MMDS value should fit");
+        state
+            .patch_data(MmdsContentInput::new(patch))
+            .expect("exact-limit patched MMDS value should be accepted");
+
+        assert_eq!(state.get_data(), Ok(patched));
+    }
+
+    #[test]
+    fn patch_data_rejects_one_byte_over_data_store_limit_without_mutating() {
+        let original = serde_json::json!({"a": ""});
+        let patch = serde_json::json!({"b": ""});
+        let patched = serde_json::json!({"a": "", "b": ""});
+        let limit_bytes = serialized_len(&patched) - 1;
+        let mut state = MmdsState::new(limit_bytes);
+
+        state
+            .put_data(MmdsContentInput::new(original.clone()))
+            .expect("initial MMDS value should fit");
+        assert_eq!(
+            state.patch_data(MmdsContentInput::new(patch)),
+            Err(MmdsDataStoreError::DataStoreLimitExceeded {
+                limit_bytes,
+                size_bytes: serialized_len(&patched),
+            })
+        );
+        assert_eq!(state.get_data(), Ok(original));
+    }
+}
