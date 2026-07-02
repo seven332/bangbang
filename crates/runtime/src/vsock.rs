@@ -1278,6 +1278,12 @@ impl VsockHostConnectionTable {
             .min()
     }
 
+    fn has_pollable_host_rw_payloads(&self) -> bool {
+        self.connections
+            .values()
+            .any(VsockHostConnection::can_poll_host_rw_payload)
+    }
+
     fn pending_host_rw_packet(
         &self,
         key: VsockHostConnectionKey,
@@ -1822,6 +1828,12 @@ impl VsockGuestConnectionTable {
             .iter()
             .filter_map(|(key, connection)| connection.has_pending_host_rw_packet().then_some(*key))
             .min()
+    }
+
+    fn has_pollable_host_rw_payloads(&self) -> bool {
+        self.connections
+            .values()
+            .any(VsockGuestConnection::can_poll_host_rw_payload)
     }
 
     fn pending_host_rw_packet(
@@ -4588,7 +4600,9 @@ impl VirtioVsockDevice {
         if self.active_rx_queue.is_none() {
             return;
         }
-        if self.guest_connections.is_empty() && self.host_connections.is_empty() {
+        if !self.guest_connections.has_pollable_host_rw_payloads()
+            && !self.host_connections.has_pollable_host_rw_payloads()
+        {
             return;
         }
 
