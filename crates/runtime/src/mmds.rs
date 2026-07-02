@@ -503,6 +503,17 @@ impl MmdsState {
         }
     }
 
+    pub fn guest_http_response(&self, request_bytes: &[u8]) -> MmdsGuestResponse {
+        match MmdsGuestRequest::parse_http(request_bytes) {
+            Ok(request) => self.guest_get_response(request.uri(), request.output_format()),
+            Err(err) => guest_request_parse_error_response(err),
+        }
+    }
+
+    pub fn guest_http_response_bytes(&self, request_bytes: &[u8]) -> Vec<u8> {
+        self.guest_http_response(request_bytes).to_http_bytes()
+    }
+
     pub fn put_data(&mut self, input: MmdsContentInput) -> Result<(), MmdsDataStoreError> {
         let value = input.into_value();
         validate_object(&value)?;
@@ -709,6 +720,14 @@ fn guest_error_response(uri: &str, err: MmdsDataStoreError) -> MmdsGuestResponse
     MmdsGuestResponse::new(status, MmdsGuestContentType::PlainText, body)
 }
 
+fn guest_request_parse_error_response(err: MmdsGuestRequestParseError) -> MmdsGuestResponse {
+    MmdsGuestResponse::new(
+        MmdsGuestStatus::BadRequest,
+        MmdsGuestContentType::PlainText,
+        err.to_string(),
+    )
+}
+
 fn format_imds(value: &Value) -> Result<String, MmdsDataStoreError> {
     if let Some(map) = value.as_object() {
         let entries = map
@@ -817,6 +836,20 @@ mod tests {
         assert_eq!(response.status(), status);
         assert_eq!(response.content_type(), content_type);
         assert_eq!(response.body(), body);
+    }
+
+    fn assert_guest_http_response(
+        bytes: &[u8],
+        status: MmdsGuestStatus,
+        content_type: MmdsGuestContentType,
+        body: &str,
+    ) {
+        assert_guest_response(
+            initialized_query_state().guest_http_response(bytes),
+            status,
+            content_type,
+            body,
+        );
     }
 
     fn assert_guest_request(
@@ -1265,6 +1298,129 @@ mod tests {
             MmdsGuestContentType::ApplicationJson
         );
         assert_eq!(response.body(), r#""demo.local""#);
+    }
+
+    #[test]
+    fn mmds_guest_http_response_returns_json_success() {
+        let state = initialized_query_state();
+        let response = state.guest_http_response(
+            b"GET /meta-data/hostname HTTP/1.1\r\nAccept: application/json\r\n\r\n",
+        );
+
+        assert_eq!(response.status(), MmdsGuestStatus::Ok);
+        assert_eq!(
+            response.content_type(),
+            MmdsGuestContentType::ApplicationJson
+        );
+        assert_eq!(response.body(), r#""demo.local""#);
+    }
+
+    #[test]
+    fn mmds_guest_http_response_bytes_return_imds_success() {
+        let state = initialized_query_state();
+
+        assert_eq!(
+            state.guest_http_response_bytes(
+                b"GET /meta-data/hostname HTTP/1.1\r\nAccept: */*\r\n\r\n"
+            ),
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 10\r\n\r\ndemo.local"
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn mmds_guest_http_response_maps_uninitialized_store() {
+        let state = MmdsState::default();
+
+        assert_guest_response(
+            state.guest_http_response(
+                b"GET /meta-data/hostname HTTP/1.1\r\nAccept: application/json\r\n\r\n",
+            ),
+            MmdsGuestStatus::BadRequest,
+            MmdsGuestContentType::PlainText,
+            "The MMDS data store is not initialized.",
+        );
+    }
+
+    #[test]
+    fn mmds_guest_http_response_maps_parse_errors() {
+        for (request, body) in [
+            (
+                b"GET /meta-data/host\xffname HTTP/1.1\r\n\r\n".as_slice(),
+                "MMDS guest HTTP request is not valid UTF-8.",
+            ),
+            (
+                b"GET /meta-data/hostname HTTP/1.1 extra\r\n\r\n",
+                "MMDS guest HTTP request is malformed.",
+            ),
+            (
+                b"POST /meta-data/hostname HTTP/1.1\r\n\r\n",
+                "MMDS guest HTTP request method is not supported.",
+            ),
+            (
+                b"GET /meta-data/hostname HTTP/2\r\n\r\n",
+                "MMDS guest HTTP request version is not supported.",
+            ),
+            (b"GET * HTTP/1.1\r\n\r\n", "Invalid URI."),
+            (
+                b"GET /meta-data/hostname HTTP/1.1\r\nBad Header: value\r\n\r\n",
+                "MMDS guest HTTP request header is malformed.",
+            ),
+            (
+                b"GET /meta-data/hostname HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+                "MMDS guest HTTP request has duplicate Content-Length headers.",
+            ),
+            (
+                b"GET /meta-data/hostname HTTP/1.1\r\nContent-Length: +0\r\n\r\n",
+                "MMDS guest HTTP request Content-Length is invalid.",
+            ),
+            (
+                b"GET /meta-data/hostname HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+                "MMDS guest HTTP request Transfer-Encoding is not supported.",
+            ),
+            (
+                b"GET /meta-data/hostname HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody",
+                "MMDS guest HTTP request body is not supported.",
+            ),
+            (
+                b"GET /meta-data/hostname HTTP/1.1\r\nAccept: application/xml\r\n\r\n",
+                "MMDS guest HTTP request Accept header is not supported.",
+            ),
+        ] {
+            assert_guest_http_response(
+                request,
+                MmdsGuestStatus::BadRequest,
+                MmdsGuestContentType::PlainText,
+                body,
+            );
+        }
+    }
+
+    #[test]
+    fn mmds_guest_http_response_bytes_serialize_parse_error() {
+        let state = initialized_query_state();
+
+        assert_eq!(
+            state.guest_http_response_bytes(b"GET /meta-data/hostname\r\n\r\n"),
+            b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 37\r\n\r\nMMDS guest HTTP request is malformed."
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn mmds_guest_http_response_parse_error_does_not_mutate_data_store() {
+        let state = initialized_query_state();
+        let original = state.get_data().expect("data store should be initialized");
+
+        assert_guest_response(
+            state.guest_http_response(
+                b"GET /meta-data/hostname HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody",
+            ),
+            MmdsGuestStatus::BadRequest,
+            MmdsGuestContentType::PlainText,
+            "MMDS guest HTTP request body is not supported.",
+        );
+        assert_eq!(state.get_data(), Ok(original));
     }
 
     #[test]
