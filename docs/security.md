@@ -90,11 +90,14 @@ is resource-specific:
   guest-visible `VSOCK_OP_RESPONSE` headers. Connect, duplicate, or retention
   failures deliver guest-visible `VSOCK_OP_RST` headers and retain no stream.
   Established guest-initiated connections can forward bounded guest
-  `VSOCK_OP_RW` payload bytes to the retained host stream. Would-block, short,
-  zero-byte, or failed host writes for non-empty payloads drop the retained
-  stream and queue a guest-visible `VSOCK_OP_RST` instead of buffering
-  unbounded data. Established host-initiated and guest-initiated connections
-  can also retain a bounded four-packet per-connection backlog of host
+  `VSOCK_OP_RW` payload bytes to the retained host stream, keep a bounded
+  four-packet per-connection guest-to-host retry queue for partial or
+  would-block nonblocking writes, and retry pending bytes on later notification
+  dispatch before accepting more guest `RW` data for the same connection.
+  Zero-byte writes, queue overflow, or failed host writes for non-empty payloads
+  drop the retained stream and queue a guest-visible `VSOCK_OP_RST` instead of
+  buffering unbounded data. Established host-initiated and guest-initiated
+  connections can also retain a bounded four-packet per-connection backlog of host
   `VSOCK_OP_RW` payloads and deliver one queued payload at a time
   into validated guest RX buffers. Guest `VSOCK_OP_RST` packets drop matching
   retained host-initiated or guest-initiated streams without queuing guest-visible
@@ -106,8 +109,8 @@ is resource-specific:
   records the listener socket device and inode, and removes the path on normal
   shutdown only when it still refers to the socket created by this process. It
   does not route CIDs beyond current host/guest checks, dispatch real event
-  payloads, track graceful half-close state, retry buffered guest-to-host RW
-  writes, or implement full virtio-vsock credit accounting yet.
+  payloads, track graceful half-close state, or implement full virtio-vsock
+  credit accounting yet.
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink.
 - `/logger` opens `log_path` during pre-boot configuration when that field is
@@ -243,8 +246,11 @@ The current scaffold does not implement:
   `VSOCK_OP_RESPONSE` headers; connect or retention failures deliver
   guest-visible `VSOCK_OP_RST` headers and retain no stream. Established
   guest-initiated connections can forward bounded guest `VSOCK_OP_RW` payload
-  bytes to retained host streams, and failed or incomplete writes drop the
-  retained stream before queuing a guest-visible reset. Established
+  bytes to retained host streams, keep a bounded four-packet per-connection
+  guest-to-host retry queue for partial or would-block nonblocking writes, and
+  retry pending bytes on later notification dispatch before accepting more guest
+  `RW` data for the same connection. Queue overflow or terminal write failures
+  drop the retained stream before queuing a guest-visible reset. Established
   host-initiated and guest-initiated connections can retain a bounded
   four-packet per-connection backlog of host `VSOCK_OP_RW` payloads and deliver
   one queued payload at a time into validated guest RX buffers,
@@ -252,12 +258,13 @@ The current scaffold does not implement:
   guest-initiated streams without queuing guest-visible RX output, and
   full guest `VSOCK_OP_SHUTDOWN` packets drop matching retained streams before
   queuing a guest-visible reset. Host-stream EOF or read failures drop the
-  retained stream before queuing a guest-visible reset. Startup preparation creates a nonblocking host Unix
-  listener at `uds_path` and cleans it up only while the path still matches the
-  created socket inode. It can accept event queue notifications as no-op
+  retained stream before queuing a guest-visible reset. Startup preparation
+  creates a nonblocking host Unix listener at `uds_path` and cleans it up only
+  while the path still matches the created socket inode. It can accept event
+  queue notifications as no-op
   dispatch metadata, but it still does not route CIDs beyond current host/guest
-  checks, dispatch real event payloads, track graceful half-close state, retry
-  buffered guest-to-host RW writes, or implement full virtio-vsock credit accounting
+  checks, dispatch real event payloads, track graceful half-close state, or
+  implement full virtio-vsock credit accounting.
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 
