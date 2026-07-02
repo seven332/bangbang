@@ -8879,6 +8879,11 @@ mod tests {
     #[test]
     fn virtio_vsock_device_activates_and_resets_through_handler() {
         let mut handler = virtio_vsock_mmio_handler(3).expect("vsock handler should build");
+        let reset = super::guest_reset_packet_header_for_tx_packet(
+            &guest_request_tx_packet(3, 52, 4000),
+            3,
+        )
+        .expect("guest request should produce reset header");
 
         assert!(!handler.is_device_activated());
         assert!(!handler.activation_handler().is_activated());
@@ -8894,6 +8899,17 @@ mod tests {
         assert!(handler.activation_handler().active_rx_queue().is_some());
         assert!(handler.activation_handler().active_tx_queue().is_some());
         assert!(handler.activation_handler().active_event_queue().is_some());
+        assert!(
+            handler
+                .activation_handler_mut()
+                .queue_guest_reset_packet(reset)
+        );
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_reset_packet_count(),
+            1
+        );
 
         handler
             .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_INIT)
@@ -8904,6 +8920,12 @@ mod tests {
         assert!(handler.activation_handler().active_rx_queue().is_none());
         assert!(handler.activation_handler().active_tx_queue().is_none());
         assert!(handler.activation_handler().active_event_queue().is_none());
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_reset_packet_count(),
+            0
+        );
     }
 
     #[test]
