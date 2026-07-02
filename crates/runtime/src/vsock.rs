@@ -903,16 +903,11 @@ fn unix_socket_address(path: &Path) -> io::Result<UnixSocketAddress> {
         .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
 
     #[cfg(any(
-        target_os = "freebsd",
         target_os = "dragonfly",
-        target_vendor = "apple",
-        target_os = "ios",
-        target_os = "macos",
+        target_os = "freebsd",
         target_os = "netbsd",
         target_os = "openbsd",
-        target_os = "tvos",
-        target_os = "visionos",
-        target_os = "watchos"
+        target_vendor = "apple"
     ))]
     {
         address.sun_len =
@@ -927,32 +922,22 @@ const fn sockaddr_un_path_offset() -> usize {
 }
 
 #[cfg(any(
-    target_os = "freebsd",
     target_os = "dragonfly",
-    target_vendor = "apple",
-    target_os = "ios",
-    target_os = "macos",
+    target_os = "freebsd",
     target_os = "netbsd",
     target_os = "openbsd",
-    target_os = "tvos",
-    target_os = "visionos",
-    target_os = "watchos"
+    target_vendor = "apple"
 ))]
 const fn sockaddr_un_len_prefix_size() -> usize {
     mem::size_of::<u8>()
 }
 
 #[cfg(not(any(
-    target_os = "freebsd",
     target_os = "dragonfly",
-    target_vendor = "apple",
-    target_os = "ios",
-    target_os = "macos",
+    target_os = "freebsd",
     target_os = "netbsd",
     target_os = "openbsd",
-    target_os = "tvos",
-    target_os = "visionos",
-    target_os = "watchos"
+    target_vendor = "apple"
 )))]
 const fn sockaddr_un_len_prefix_size() -> usize {
     0
