@@ -591,22 +591,6 @@ mod tests {
         assert_eq!(response.body(), body);
     }
 
-    fn expected_guest_http_bytes(
-        status: MmdsGuestStatus,
-        content_type: MmdsGuestContentType,
-        body: &str,
-    ) -> Vec<u8> {
-        format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n{}",
-            status.as_u16(),
-            status.reason_phrase(),
-            content_type.as_str(),
-            body.len(),
-            body
-        )
-        .into_bytes()
-    }
-
     fn serialized_len(value: &Value) -> usize {
         serde_json::to_vec(value)
             .expect("test JSON value should serialize")
@@ -1001,11 +985,8 @@ mod tests {
 
         assert_eq!(
             response.to_http_bytes(),
-            expected_guest_http_bytes(
-                MmdsGuestStatus::Ok,
-                MmdsGuestContentType::ApplicationJson,
-                r#""demo.local""#,
-            )
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\n\r\n\"demo.local\""
+                .to_vec()
         );
     }
 
@@ -1016,11 +997,8 @@ mod tests {
 
         assert_eq!(
             response.to_http_bytes(),
-            expected_guest_http_bytes(
-                MmdsGuestStatus::Ok,
-                MmdsGuestContentType::PlainText,
-                "demo.local",
-            )
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 10\r\n\r\ndemo.local"
+                .to_vec()
         );
     }
 
@@ -1031,11 +1009,8 @@ mod tests {
 
         assert_eq!(
             response.to_http_bytes(),
-            expected_guest_http_bytes(
-                MmdsGuestStatus::NotFound,
-                MmdsGuestContentType::PlainText,
-                "Resource not found: /missing.",
-            )
+            b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 29\r\n\r\nResource not found: /missing."
+                .to_vec()
         );
     }
 
@@ -1046,11 +1021,8 @@ mod tests {
 
         assert_eq!(
             response.to_http_bytes(),
-            expected_guest_http_bytes(
-                MmdsGuestStatus::NotImplemented,
-                MmdsGuestContentType::PlainText,
-                "Cannot retrieve value. The value has an unsupported type.",
-            )
+            b"HTTP/1.1 501 Not Implemented\r\nContent-Type: text/plain\r\nContent-Length: 57\r\n\r\nCannot retrieve value. The value has an unsupported type."
+                .to_vec()
         );
     }
 
