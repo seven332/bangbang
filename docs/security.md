@@ -92,13 +92,17 @@ is resource-specific:
   `VSOCK_OP_RW` payload bytes to the retained host stream. Would-block, short,
   zero-byte, or failed host writes for non-empty payloads drop the retained
   stream and queue a guest-visible `VSOCK_OP_RST` instead of buffering
-  unbounded data.
+  unbounded data. Established host-initiated and guest-initiated connections
+  can also deliver one bounded pending host `VSOCK_OP_RW` payload at a time
+  into validated guest RX buffers. Host-stream EOF or read failures drop the
+  retained stream and queue a guest-visible `VSOCK_OP_RST`.
   Startup also binds a nonblocking host Unix listener at `uds_path`,
   records the listener socket device and inode, and removes the path on normal
   shutdown only when it still refers to the socket created by this process. It
   does not route CIDs beyond current host/guest checks, dispatch event queues,
-  provide host-to-guest data movement, retry buffered RW writes, or implement
-  full credit accounting yet.
+  provide host-to-guest data movement beyond one bounded pending packet per
+  established stream, retry buffered RW writes, or implement full credit
+  accounting yet.
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink.
 - `/logger` opens `log_path` during pre-boot configuration when that field is
@@ -235,12 +239,16 @@ The current scaffold does not implement:
   guest-visible `VSOCK_OP_RST` headers and retain no stream. Established
   guest-initiated connections can forward bounded guest `VSOCK_OP_RW` payload
   bytes to retained host streams, and failed or incomplete writes drop the
-  retained stream before queuing a guest-visible reset. Startup
-  preparation creates a nonblocking host Unix
+  retained stream before queuing a guest-visible reset. Established
+  host-initiated and guest-initiated connections can deliver one bounded
+  pending host `VSOCK_OP_RW` payload at a time into validated guest RX buffers,
+  and host-stream EOF or read failures drop the retained stream before queuing
+  a guest-visible reset. Startup preparation creates a nonblocking host Unix
   listener at `uds_path` and cleans it up only while the path still matches the
   created socket inode. It still does not route CIDs beyond current host/guest
-  checks, dispatch event queues, provide host-to-guest data movement, retry
-  buffered RW writes, or implement full credit accounting
+  checks, dispatch event queues, provide host-to-guest data movement beyond one
+  bounded pending packet per established stream, retry buffered RW writes, or
+  implement full credit accounting
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 
