@@ -13853,6 +13853,61 @@ mod tests {
     }
 
     #[test]
+    fn virtio_vsock_notifications_ignore_partial_shutdown_without_closing_connection() {
+        let (mut memory, mut handler, mut accepted) =
+            established_guest_connection_for_test("guest-partial-shutdown", 52, 4000);
+        let key = VsockGuestConnectionKey::new(52, 4000);
+        let receive_only_shutdown = guest_shutdown_tx_packet(42, 52, 4000)
+            .header()
+            .with_flags(VIRTIO_VSOCK_FLAGS_SHUTDOWN_RCV);
+
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_SECOND_HEADER, receive_only_shutdown);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::readable(
+                TEST_VSOCK_SECOND_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        append_vsock_tx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("partial guest SHUTDOWN should be ignored");
+
+        assert_empty_guest_response_dispatch(notification.guest_response_dispatch());
+        assert_empty_guest_request_dispatch(notification.guest_request_dispatch());
+        assert_empty_guest_rw_dispatch(notification.guest_rw_dispatch());
+        assert_empty_guest_rst_dispatch(notification.guest_rst_dispatch());
+        assert_eq!(notification.guest_shutdown_dispatch().shutdown_packets(), 1);
+        assert_eq!(notification.guest_shutdown_dispatch().ignored_packets(), 1);
+        assert_eq!(
+            notification
+                .guest_shutdown_dispatch()
+                .closed_guest_connections(),
+            0
+        );
+        assert_eq!(notification.guest_shutdown_dispatch().queued_resets(), 0);
+        assert_eq!(notification.guest_shutdown_dispatch().dropped_resets(), 0);
+        assert_empty_guest_reset_dispatch(notification.guest_reset_dispatch());
+        assert!(notification.rx_queue_dispatch().is_none());
+        assert!(handler.activation_handler().has_guest_connection(key));
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_reset_packet_count(),
+            0
+        );
+        assert_eq!(read_vsock_tx_used_index(&memory), 2);
+        accepted
+            .write_all(b"still-open")
+            .expect("partial guest SHUTDOWN should keep guest stream open");
+    }
+
+    #[test]
     fn virtio_vsock_notifications_ignore_invalid_guest_shutdown_without_rx_output() {
         let mut memory = vsock_tx_memory();
         let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
