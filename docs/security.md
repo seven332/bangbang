@@ -182,10 +182,11 @@ control-plane data: any process that can use the API socket can read, replace,
 or patch it. The current implementation bounds the serialized MMDS data store
 to `51200` bytes, can format initialized metadata by path as JSON or
 Firecracker-shaped IMDS text, and can model process-local guest GET response
-status/content-type/body values for future guest delivery. These formatted
-responses remain process-local and are not exposed to the guest yet. Future
-guest-visible MMDS work must validate device, packet, token, and raw guest HTTP
-inputs before making this data reachable from guest code.
+status/content-type/body values and serialize them into process-local HTTP
+response bytes for future guest delivery. These formatted responses remain
+process-local and are not exposed to the guest yet. Future guest-visible MMDS
+work must validate device, packet, token, and raw guest HTTP request inputs
+before making this data reachable from guest code.
 
 ## Multi-Process Operation
 
