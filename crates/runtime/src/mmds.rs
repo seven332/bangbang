@@ -1247,6 +1247,23 @@ mod tests {
     }
 
     #[test]
+    fn mmds_guest_request_feeds_guest_get_response_path() {
+        let state = initialized_query_state();
+        let request = MmdsGuestRequest::parse_http(
+            b"GET /meta-data/hostname HTTP/1.1\r\nAccept: application/json\r\n\r\n",
+        )
+        .expect("test MMDS guest HTTP request should parse");
+        let response = state.guest_get_response(request.uri(), request.output_format());
+
+        assert_eq!(response.status(), MmdsGuestStatus::Ok);
+        assert_eq!(
+            response.content_type(),
+            MmdsGuestContentType::ApplicationJson
+        );
+        assert_eq!(response.body(), r#""demo.local""#);
+    }
+
+    #[test]
     fn mmds_guest_request_parse_errors_display_deterministic_messages() {
         assert_eq!(
             MmdsGuestRequestParseError::InvalidUtf8.to_string(),
