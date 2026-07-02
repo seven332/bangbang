@@ -1165,10 +1165,12 @@ remains rejected until configurable payload limits are introduced explicitly.
 The MMDS data store also uses Firecracker's default fixed `51200` byte
 serialized JSON limit for now; `--mmds-size-limit` remains rejected until a
 separate configuration PR adds it.
-Internal MMDS guest GET response modeling follows the same uninitialized data
-policy: before `PUT /mmds`, it returns a process-local `400` plain-text error
-value rather than a successful response. Process-local guest request parsing
-currently accepts complete HTTP/1.0 or HTTP/1.1 `GET` request buffers and
+Internal MMDS guest GET response modeling checks the configured MMDS v2 token
+requirement before reading metadata. Once a request is permitted to read
+metadata, it follows the same uninitialized data policy: before `PUT /mmds`, it
+returns a process-local `400` plain-text error value rather than a successful
+response. Process-local guest request parsing currently accepts complete
+HTTP/1.0 or HTTP/1.1 `GET` request buffers and
 `PUT /latest/api/token` token request buffers, rejects request bodies and
 transfer encodings, maps GET `Accept: application/json` to JSON output, and
 defaults missing, empty, wildcard, or `text/plain` GET `Accept` headers to IMDS
