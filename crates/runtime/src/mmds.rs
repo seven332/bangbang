@@ -225,7 +225,7 @@ impl MmdsGuestRequest {
         let uri = guest_request_uri_path(uri)?;
         let mut content_length = None;
         let mut output_format = MmdsOutputFormat::Imds;
-        let mut token_ttl = MmdsGuestTokenTtlHeaders::Missing;
+        let mut token_ttl = MmdsGuestTokenTtl::Missing;
         let mut forwarded_for = false;
 
         for line in lines {
@@ -244,13 +244,12 @@ impl MmdsGuestRequest {
                     forwarded_for = true;
                 } else if let Some(header) = MmdsGuestTokenTtlHeader::parse_name(name) {
                     token_ttl = match token_ttl {
-                        MmdsGuestTokenTtlHeaders::Missing => MmdsGuestTokenTtlHeaders::Single {
+                        MmdsGuestTokenTtl::Missing => MmdsGuestTokenTtl::Header {
                             ttl_header: header,
                             ttl_value: value.to_string(),
                         },
-                        MmdsGuestTokenTtlHeaders::Single { .. }
-                        | MmdsGuestTokenTtlHeaders::Duplicate => {
-                            MmdsGuestTokenTtlHeaders::Duplicate
+                        MmdsGuestTokenTtl::Header { .. } | MmdsGuestTokenTtl::Duplicate => {
+                            MmdsGuestTokenTtl::Duplicate
                         }
                     };
                 }
@@ -300,7 +299,7 @@ impl MmdsGuestGetRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MmdsGuestTokenPutRequest {
     uri: String,
-    token_ttl: MmdsGuestTokenTtlHeaders,
+    token_ttl: MmdsGuestTokenTtl,
 }
 
 impl MmdsGuestTokenPutRequest {
@@ -308,21 +307,15 @@ impl MmdsGuestTokenPutRequest {
         &self.uri
     }
 
-    pub fn token_ttl(&self) -> Option<(MmdsGuestTokenTtlHeader, &str)> {
-        match &self.token_ttl {
-            MmdsGuestTokenTtlHeaders::Single {
-                ttl_header,
-                ttl_value,
-            } => Some((*ttl_header, ttl_value.as_str())),
-            MmdsGuestTokenTtlHeaders::Missing | MmdsGuestTokenTtlHeaders::Duplicate => None,
-        }
+    pub fn token_ttl(&self) -> &MmdsGuestTokenTtl {
+        &self.token_ttl
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum MmdsGuestTokenTtlHeaders {
+pub enum MmdsGuestTokenTtl {
     Missing,
-    Single {
+    Header {
         ttl_header: MmdsGuestTokenTtlHeader,
         ttl_value: String,
     },
@@ -912,17 +905,17 @@ impl MmdsState {
             );
         }
 
-        let (ttl_header, ttl_value) = match &request.token_ttl {
-            MmdsGuestTokenTtlHeaders::Missing => {
+        let (ttl_header, ttl_value) = match request.token_ttl() {
+            MmdsGuestTokenTtl::Missing => {
                 return guest_request_parse_error_response(
                     MmdsGuestRequestParseError::MissingTokenTtl,
                 );
             }
-            MmdsGuestTokenTtlHeaders::Single {
+            MmdsGuestTokenTtl::Header {
                 ttl_header,
                 ttl_value,
             } => (*ttl_header, ttl_value.as_str()),
-            MmdsGuestTokenTtlHeaders::Duplicate => {
+            MmdsGuestTokenTtl::Duplicate => {
                 return guest_request_parse_error_response(
                     MmdsGuestRequestParseError::DuplicateTokenTtl,
                 );
@@ -1334,8 +1327,21 @@ mod tests {
         assert_eq!(request.uri(), expected_uri);
         assert_eq!(
             request.token_ttl(),
-            Some((expected_ttl_header, expected_ttl_value))
+            &MmdsGuestTokenTtl::Header {
+                ttl_header: expected_ttl_header,
+                ttl_value: expected_ttl_value.to_string(),
+            }
         );
+    }
+
+    fn assert_guest_token_put_duplicate_ttl(bytes: &[u8]) {
+        let request =
+            MmdsGuestRequest::parse_http(bytes).expect("test MMDS guest HTTP request should parse");
+        let MmdsGuestRequest::TokenPut(request) = request else {
+            panic!("test MMDS guest HTTP request should be token PUT");
+        };
+
+        assert_eq!(request.token_ttl(), &MmdsGuestTokenTtl::Duplicate);
     }
 
     fn serialized_len(value: &Value) -> usize {
@@ -1922,6 +1928,9 @@ mod tests {
             "/latest/api/token",
             MmdsGuestTokenTtlHeader::Metadata,
             "application/json",
+        );
+        assert_guest_token_put_duplicate_ttl(
+            b"PUT /latest/api/token HTTP/1.1\r\nX-metadata-token-ttl-seconds: 1\r\nX-aws-ec2-metadata-token-ttl-seconds: 1\r\n\r\n",
         );
     }
 
