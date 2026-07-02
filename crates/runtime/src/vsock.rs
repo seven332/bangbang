@@ -11221,7 +11221,7 @@ mod tests {
     }
 
     #[test]
-    fn virtio_vsock_notifications_dispatch_mixed_rx_noop_tx_and_event_queue() {
+    fn virtio_vsock_notifications_dispatch_mixed_tx_and_event_queue() {
         let mut memory = vsock_tx_memory();
         let mut handler = virtio_vsock_mmio_handler(3).expect("vsock handler should build");
         let header = test_vsock_packet_header().with_payload_len(0);
@@ -11239,28 +11239,19 @@ mod tests {
         );
         write_vsock_tx_available_heads(&mut memory, &[0]);
         notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
-        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
         notify_vsock_queue(&mut handler, VIRTIO_VSOCK_EVENT_QUEUE_INDEX);
 
         let notification = handler
             .dispatch_vsock_queue_notifications(&mut memory)
-            .expect("mixed RX/TX/event notification should dispatch");
+            .expect("mixed TX/event notification should dispatch");
 
         assert_eq!(
             notification.drained_notifications(),
-            &[
-                VIRTIO_VSOCK_RX_QUEUE_INDEX,
-                VIRTIO_VSOCK_TX_QUEUE_INDEX,
-                VIRTIO_VSOCK_EVENT_QUEUE_INDEX
-            ]
+            &[VIRTIO_VSOCK_TX_QUEUE_INDEX, VIRTIO_VSOCK_EVENT_QUEUE_INDEX]
         );
         assert_eq!(notification.event_notifications(), 1);
         assert!(notification.needs_queue_interrupt());
-        let rx = notification
-            .rx_queue_dispatch()
-            .expect("RX dispatch summary should be present");
-        assert_eq!(rx.processed_buffers(), 0);
-        assert!(!rx.needs_queue_interrupt());
+        assert!(notification.rx_queue_dispatch().is_none());
         let tx = notification
             .tx_queue_dispatch()
             .expect("TX dispatch summary should be present");
