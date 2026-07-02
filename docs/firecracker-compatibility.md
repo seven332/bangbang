@@ -1172,11 +1172,12 @@ currently accepts complete HTTP/1.0 or HTTP/1.1 `GET` request buffers, rejects
 request bodies and transfer encodings, maps `Accept: application/json` to JSON
 output, and defaults missing, empty, wildcard, or `text/plain` `Accept` headers
 to IMDS text output. The runtime can also convert complete process-local guest
-HTTP request buffers into deterministic response bytes, mapping parse failures
-to `400 Bad Request` plain-text responses without echoing malformed request
-bytes. Process-local guest response-byte serialization currently emits fixed
-HTTP/1.1 response bytes; preserving a guest request's original HTTP version
-remains deferred.
+HTTP request buffers into deterministic response bytes, mapping unsupported
+methods to `405 Method Not Allowed` and other parse failures to `400 Bad
+Request` plain-text responses without echoing malformed request bytes.
+Process-local guest response-byte serialization currently emits fixed HTTP/1.1
+response bytes; preserving a guest request's original HTTP version remains
+deferred.
 Invalid path and method errors use the Firecracker `fault_message` body shape
 but intentionally avoid echoing path-like request values.
 The initial blocking API server also uses a short per-connection timeout so an
