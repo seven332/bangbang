@@ -15,9 +15,10 @@ use bangbang_api::http::{
     DriveCacheType as ApiDriveCacheType, DriveConfigRequest, DriveConfigResponse,
     DriveIoEngine as ApiDriveIoEngine, HttpResponse, LoggerConfigRequest,
     LoggerLevel as ApiLoggerLevel, MachineConfigRequest, MachineConfigResponse,
-    MetricsConfigRequest, MmdsConfigRequest, MmdsContentRequest, MmdsVersion as ApiMmdsVersion,
-    NetworkInterfaceConfigRequest, NetworkInterfaceConfigResponse, RequestError, VmConfigResponse,
-    VsockConfigRequest, VsockConfigResponse, parse_request, request_total_len,
+    MetricsConfigRequest, MmdsConfigRequest, MmdsConfigResponse, MmdsContentRequest,
+    MmdsVersion as ApiMmdsVersion, NetworkInterfaceConfigRequest, NetworkInterfaceConfigResponse,
+    RequestError, VmConfigResponse, VsockConfigRequest, VsockConfigResponse, parse_request,
+    request_total_len,
 };
 use bangbang_runtime::block::{DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine};
 use bangbang_runtime::boot::{BootSourceConfig, BootSourceConfigInput};
@@ -28,7 +29,7 @@ use bangbang_runtime::machine::{
 };
 use bangbang_runtime::metrics::MetricsConfigInput;
 use bangbang_runtime::mmds::{
-    MmdsConfigInput, MmdsContentInput, MmdsVersion as RuntimeMmdsVersion,
+    MmdsConfig, MmdsConfigInput, MmdsContentInput, MmdsVersion as RuntimeMmdsVersion,
 };
 #[cfg(test)]
 use bangbang_runtime::network::MAX_NETWORK_INTERFACE_COUNT;
@@ -479,6 +480,7 @@ fn handle_vmm_version(result: Result<VmmData, bangbang_runtime::VmmActionError>)
             VmmData::Empty
             | VmmData::InstanceInformation(_)
             | VmmData::MachineConfiguration(_)
+            | VmmData::MmdsValue(_)
             | VmmData::VmConfiguration(_),
         ) => HttpResponse::fault("version request returned unexpected VMM data."),
         Err(err) => HttpResponse::fault(&err.to_string()),
@@ -495,6 +497,7 @@ fn handle_instance_info(result: Result<VmmData, bangbang_runtime::VmmActionError
             VmmData::Empty
             | VmmData::VmmVersion(_)
             | VmmData::MachineConfiguration(_)
+            | VmmData::MmdsValue(_)
             | VmmData::VmConfiguration(_),
         ) => HttpResponse::fault("instance info request returned unexpected VMM data."),
         Err(err) => HttpResponse::fault(&err.to_string()),
@@ -516,6 +519,7 @@ fn handle_machine_config(
             VmmData::Empty
             | VmmData::VmmVersion(_)
             | VmmData::InstanceInformation(_)
+            | VmmData::MmdsValue(_)
             | VmmData::VmConfiguration(_),
         ) => HttpResponse::fault("machine config request returned unexpected VMM data."),
         Err(err) => HttpResponse::fault(&err.to_string()),
@@ -531,7 +535,8 @@ fn handle_vm_config(result: Result<VmmData, bangbang_runtime::VmmActionError>) -
             VmmData::Empty
             | VmmData::VmmVersion(_)
             | VmmData::InstanceInformation(_)
-            | VmmData::MachineConfiguration(_),
+            | VmmData::MachineConfiguration(_)
+            | VmmData::MmdsValue(_),
         ) => HttpResponse::fault("VM config request returned unexpected VMM data."),
         Err(err) => HttpResponse::fault(&err.to_string()),
     }
@@ -539,6 +544,7 @@ fn handle_vm_config(result: Result<VmmData, bangbang_runtime::VmmActionError>) -
 
 fn handle_mmds(result: Result<VmmData, bangbang_runtime::VmmActionError>) -> HttpResponse {
     match result {
+        Ok(VmmData::MmdsValue(value)) => HttpResponse::mmds(&value),
         Ok(
             VmmData::Empty
             | VmmData::VmmVersion(_)
@@ -557,6 +563,7 @@ fn handle_empty(result: Result<VmmData, bangbang_runtime::VmmActionError>) -> Ht
             VmmData::InstanceInformation(_)
             | VmmData::VmmVersion(_)
             | VmmData::MachineConfiguration(_)
+            | VmmData::MmdsValue(_)
             | VmmData::VmConfiguration(_),
         ) => HttpResponse::fault("no-content request returned unexpected VMM data."),
         Err(err) => HttpResponse::fault(&err.to_string()),
@@ -579,6 +586,7 @@ fn vm_config_response_from_runtime(config: &VmConfiguration) -> VmConfigResponse
             .iter()
             .map(network_interface_config_response_from_runtime)
             .collect(),
+        config.mmds_config().map(mmds_config_response_from_runtime),
         config
             .vsock_config()
             .map(vsock_config_response_from_runtime),
@@ -635,6 +643,19 @@ fn network_interface_config_response_from_runtime(
     response
 }
 
+fn mmds_config_response_from_runtime(config: &MmdsConfig) -> MmdsConfigResponse {
+    let mut response = MmdsConfigResponse::new(
+        config.network_interfaces().to_vec(),
+        mmds_version_name(config.version()),
+        config.imds_compat(),
+    );
+    if let Some(ipv4_address) = config.ipv4_address() {
+        response = response.with_ipv4_address(ipv4_address.to_string());
+    }
+
+    response
+}
+
 fn vsock_config_response_from_runtime(config: &VsockConfig) -> VsockConfigResponse {
     VsockConfigResponse::new(config.guest_cid(), path_text(config.uds_path()))
 }
@@ -668,7 +689,7 @@ fn metrics_config_input_from_request(config: &MetricsConfigRequest) -> MetricsCo
 }
 
 fn mmds_content_input_from_request(content: &MmdsContentRequest) -> MmdsContentInput {
-    MmdsContentInput::new(content.value().to_string())
+    MmdsContentInput::new(content.value().clone())
 }
 
 fn mmds_config_input_from_request(config: &MmdsConfigRequest) -> MmdsConfigInput {
@@ -719,6 +740,13 @@ fn machine_config_huge_pages_name(huge_pages: RuntimeMachineConfigHugePages) -> 
     match huge_pages {
         RuntimeMachineConfigHugePages::None => "None",
         RuntimeMachineConfigHugePages::TwoM => "2M",
+    }
+}
+
+fn mmds_version_name(version: RuntimeMmdsVersion) -> &'static str {
+    match version {
+        RuntimeMmdsVersion::V1 => "V1",
+        RuntimeMmdsVersion::V2 => "V2",
     }
 }
 
@@ -1103,6 +1131,7 @@ mod tests {
         );
         assert!(default_response.body().contains(r#""vcpu_count":1"#));
         assert!(!default_response.body().contains(r#""boot-source":"#));
+        assert!(!default_response.body().contains(r#""mmds-config":"#));
         assert!(!default_response.body().contains(r#""vsock":"#));
         assert_eq!(
             vmm.instance_info().state,
@@ -1163,6 +1192,16 @@ mod tests {
             bangbang_api::http::StatusCode::NoContent
         );
 
+        let mmds_config_body = r#"{"network_interfaces":["eth0"],"version":"V2","ipv4_address":"169.254.169.254","imds_compat":true}"#;
+        let mmds_config_request = format!(
+            "PUT /mmds/config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{mmds_config_body}",
+            mmds_config_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(mmds_config_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
         let vsock_body = r#"{
             "vsock_id": "vsock0",
             "guest_cid": 3,
@@ -1219,6 +1258,15 @@ mod tests {
                 .body()
                 .contains(r#""guest_mac":"12:34:56:78:9a:bc""#)
         );
+        assert!(response.body().contains(r#""mmds-config":"#));
+        assert!(response.body().contains(r#""network_interfaces":["eth0"]"#));
+        assert!(response.body().contains(r#""version":"V2""#));
+        assert!(
+            response
+                .body()
+                .contains(r#""ipv4_address":"169.254.169.254""#)
+        );
+        assert!(response.body().contains(r#""imds_compat":true"#));
         assert!(response.body().contains(r#""vsock":"#));
         assert!(response.body().contains(r#""guest_cid":3"#));
         assert!(response.body().contains(r#""uds_path":"./v.sock""#));
@@ -1230,7 +1278,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatches_mmds_requests_to_unsupported_runtime_actions() {
+    fn dispatches_mmds_requests_to_runtime_store() {
         let mut vmm = test_controller();
 
         let get_response =
@@ -1242,49 +1290,145 @@ mod tests {
         );
         assert_eq!(
             get_response.body(),
-            r#"{"fault_message":"The requested operation is not supported: GetMmds"}"#
+            r#"{"fault_message":"The MMDS data store is not initialized."}"#
         );
 
-        for (method, path, body, action_name) in [
-            ("PUT", "/mmds", r#"{"latest":{"meta-data":{}}}"#, "PutMmds"),
-            (
-                "PATCH",
-                "/mmds",
-                r#"{"latest":{"dynamic":{}}}"#,
-                "PatchMmds",
-            ),
-            (
-                "PUT",
-                "/mmds/config",
-                r#"{"network_interfaces":["eth0"],"version":"V2"}"#,
-                "PutMmdsConfig",
-            ),
-        ] {
-            let request = format!(
-                "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            );
+        let network_body = r#"{"iface_id":"eth0","host_dev_name":"tap0"}"#;
+        let network_request = format!(
+            "PUT /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{network_body}",
+            network_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(network_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
 
-            let response = handle_request_bytes(request.as_bytes(), &mut vmm);
+        let config_body = r#"{"network_interfaces":["eth0"],"version":"V2","ipv4_address":"169.254.169.254","imds_compat":true}"#;
+        let config_request = format!(
+            "PUT /mmds/config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{config_body}",
+            config_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(config_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
 
-            assert_eq!(
-                response.status(),
-                bangbang_api::http::StatusCode::BadRequest
-            );
-            assert_eq!(
-                response.body(),
-                format!(
-                    r#"{{"fault_message":"The requested operation is not supported: {action_name}"}}"#
-                )
-            );
-        }
+        let put_body = r#"{"latest":{"meta-data":{"ami-id":"ami-123","remove-me":true},"user-data":"before"}}"#;
+        let put_request = format!(
+            "PUT /mmds HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{put_body}",
+            put_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(put_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
 
+        let patch_body = r#"{"latest":{"dynamic":{"instance-identity":"document"},"meta-data":{"ami-id":"ami-456","remove-me":null}}}"#;
+        let patch_request = format!(
+            "PATCH /mmds HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{patch_body}",
+            patch_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(patch_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let response =
+            handle_request_bytes(b"GET /mmds HTTP/1.1\r\nHost: localhost\r\n\r\n", &mut vmm);
+
+        assert_eq!(response.status(), bangbang_api::http::StatusCode::Ok);
+        assert!(response.body().contains(r#""ami-id":"ami-456""#));
+        assert!(
+            response
+                .body()
+                .contains(r#""instance-identity":"document""#)
+        );
+        assert!(response.body().contains(r#""user-data":"before""#));
+        assert!(!response.body().contains("remove-me"));
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::NotStarted
         );
         assert!(vmm.boot_source_config().is_none());
         assert!(vmm.drive_configs().is_empty());
+    }
+
+    #[test]
+    fn mmds_config_rejects_unknown_runtime_network_interface_id() {
+        let mut vmm = test_controller();
+        let body = r#"{"network_interfaces":["eth0"]}"#;
+        let request = format!(
+            "PUT /mmds/config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        let response = handle_request_bytes(request.as_bytes(), &mut vmm);
+
+        assert_eq!(
+            response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+        assert_eq!(
+            response.body(),
+            r#"{"fault_message":"MMDS network interface id is not configured: eth0"}"#
+        );
+
+        let put_body = r#"{"latest":{"meta-data":{}}}"#;
+        let put_request = format!(
+            "PUT /mmds HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{put_body}",
+            put_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(put_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let get_response =
+            handle_request_bytes(b"GET /mmds HTTP/1.1\r\nHost: localhost\r\n\r\n", &mut vmm);
+        assert_eq!(get_response.status(), bangbang_api::http::StatusCode::Ok);
+        assert_eq!(get_response.body(), put_body);
+    }
+
+    #[test]
+    fn patch_mmds_without_initialized_store_returns_fault() {
+        let mut vmm = test_controller();
+        let body = r#"{"latest":{"dynamic":{}}}"#;
+        let request = format!(
+            "PATCH /mmds HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        let response = handle_request_bytes(request.as_bytes(), &mut vmm);
+
+        assert_eq!(
+            response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+        assert_eq!(
+            response.body(),
+            r#"{"fault_message":"The MMDS data store is not initialized."}"#
+        );
+        let get_response =
+            handle_request_bytes(b"GET /mmds HTTP/1.1\r\nHost: localhost\r\n\r\n", &mut vmm);
+        assert_eq!(
+            get_response.body(),
+            r#"{"fault_message":"The MMDS data store is not initialized."}"#
+        );
+    }
+
+    #[test]
+    fn put_mmds_request_with_object_body_returns_no_content() {
+        let mut vmm = test_controller();
+        for (method, path, body) in [
+            ("PUT", "/mmds", r#"{"latest":{"meta-data":{}}}"#),
+            ("PATCH", "/mmds", r#"{"latest":{"dynamic":{}}}"#),
+        ] {
+            let request = format!(
+                "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let response = handle_request_bytes(request.as_bytes(), &mut vmm);
+            assert_eq!(response.status(), bangbang_api::http::StatusCode::NoContent);
+        }
     }
 
     #[test]
@@ -2033,6 +2177,39 @@ mod tests {
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::NotStarted
         );
+    }
+
+    #[test]
+    fn serves_mmds_over_unix_socket() {
+        let path = unique_socket_path("mmds");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+        let mut vmm = test_controller();
+        let body = r#"{"latest":{"meta-data":{"ami-id":"ami-123"}}}"#;
+        let request = format!(
+            "PUT /mmds HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        client
+            .write_all(b"GET /mmds HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("client should write request");
+        server
+            .serve_next(&mut vmm)
+            .expect("server should handle one request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("client should read response");
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Content-Type: application/json\r\n"));
+        assert!(response.contains(r#""ami-id":"ami-123""#));
     }
 
     #[test]

@@ -586,6 +586,7 @@ pub struct VmConfigResponse {
     boot_source: Option<BootSourceResponse>,
     drives: Vec<DriveConfigResponse>,
     network_interfaces: Vec<NetworkInterfaceConfigResponse>,
+    mmds_config: Option<MmdsConfigResponse>,
     vsock: Option<VsockConfigResponse>,
 }
 
@@ -595,6 +596,7 @@ impl VmConfigResponse {
         boot_source: Option<BootSourceResponse>,
         drives: Vec<DriveConfigResponse>,
         network_interfaces: Vec<NetworkInterfaceConfigResponse>,
+        mmds_config: Option<MmdsConfigResponse>,
         vsock: Option<VsockConfigResponse>,
     ) -> Self {
         Self {
@@ -602,8 +604,37 @@ impl VmConfigResponse {
             boot_source,
             drives,
             network_interfaces,
+            mmds_config,
             vsock,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MmdsConfigResponse {
+    network_interfaces: Vec<String>,
+    version: String,
+    ipv4_address: Option<String>,
+    imds_compat: bool,
+}
+
+impl MmdsConfigResponse {
+    pub fn new(
+        network_interfaces: impl Into<Vec<String>>,
+        version: impl Into<String>,
+        imds_compat: bool,
+    ) -> Self {
+        Self {
+            network_interfaces: network_interfaces.into(),
+            version: version.into(),
+            ipv4_address: None,
+            imds_compat,
+        }
+    }
+
+    pub fn with_ipv4_address(mut self, ipv4_address: impl Into<String>) -> Self {
+        self.ipv4_address = Some(ipv4_address.into());
+        self
     }
 }
 
@@ -776,6 +807,12 @@ impl HttpResponse {
                     .collect(),
             ),
         );
+        if let Some(mmds_config) = &config.mmds_config {
+            body.insert(
+                "mmds-config".to_string(),
+                mmds_config_response_value(mmds_config),
+            );
+        }
         if let Some(vsock) = &config.vsock {
             body.insert("vsock".to_string(), vsock_config_response_value(vsock));
         }
@@ -783,6 +820,13 @@ impl HttpResponse {
         Self {
             status: StatusCode::Ok,
             body: serde_json::Value::Object(body).to_string(),
+        }
+    }
+
+    pub fn mmds(value: &serde_json::Value) -> Self {
+        Self {
+            status: StatusCode::Ok,
+            body: value.to_string(),
         }
     }
 
@@ -914,6 +958,36 @@ fn network_interface_config_response_value(
     body.insert(
         "iface_id".to_string(),
         serde_json::Value::String(network_interface.iface_id.clone()),
+    );
+
+    serde_json::Value::Object(body)
+}
+
+fn mmds_config_response_value(config: &MmdsConfigResponse) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "imds_compat".to_string(),
+        serde_json::Value::Bool(config.imds_compat),
+    );
+    if let Some(ipv4_address) = &config.ipv4_address {
+        body.insert(
+            "ipv4_address".to_string(),
+            serde_json::Value::String(ipv4_address.clone()),
+        );
+    }
+    body.insert(
+        "network_interfaces".to_string(),
+        serde_json::Value::Array(
+            config
+                .network_interfaces
+                .iter()
+                .map(|iface_id| serde_json::Value::String(iface_id.clone()))
+                .collect(),
+        ),
+    );
+    body.insert(
+        "version".to_string(),
+        serde_json::Value::String(config.version.clone()),
     );
 
     serde_json::Value::Object(body)
@@ -3122,6 +3196,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             None,
+            None,
         ));
         let body: serde_json::Value =
             serde_json::from_str(response.body()).expect("body should be JSON");
@@ -3143,6 +3218,7 @@ mod tests {
         );
         assert_eq!(body.get("boot-source"), None);
         assert_eq!(body.get("logger"), None);
+        assert_eq!(body.get("mmds-config"), None);
         assert_eq!(body.get("vsock"), None);
     }
 
@@ -3156,12 +3232,15 @@ mod tests {
                 .with_partuuid("0eaa91a0-01");
         let network_interface =
             NetworkInterfaceConfigResponse::new("eth0", "tap0").with_guest_mac("12:34:56:78:9a:bc");
+        let mmds_config = MmdsConfigResponse::new(vec!["eth0".to_string()], "V2", true)
+            .with_ipv4_address("169.254.169.254");
         let vsock = VsockConfigResponse::new(3, "./v.sock");
         let response = HttpResponse::vm_config(&VmConfigResponse::new(
             MachineConfigResponse::new(2, 256, false, false, "None"),
             Some(boot_source),
             vec![drive],
             vec![network_interface],
+            Some(mmds_config),
             Some(vsock),
         ));
         let body: serde_json::Value =
@@ -3201,6 +3280,12 @@ mod tests {
                         "iface_id": "eth0",
                     },
                 ],
+                "mmds-config": {
+                    "imds_compat": true,
+                    "ipv4_address": "169.254.169.254",
+                    "network_interfaces": ["eth0"],
+                    "version": "V2",
+                },
                 "vsock": {
                     "guest_cid": 3,
                     "uds_path": "./v.sock",
@@ -3224,6 +3309,7 @@ mod tests {
                 "Sync",
             )],
             vec![NetworkInterfaceConfigResponse::new("eth0", "tap0")],
+            None,
             Some(VsockConfigResponse::new(3, "./v.sock")),
         ));
         let body: serde_json::Value =
@@ -3262,6 +3348,23 @@ mod tests {
             body.get("vsock").and_then(|vsock| vsock.get("vsock_id")),
             None
         );
+    }
+
+    #[test]
+    fn response_body_contains_mmds_value() {
+        let value = serde_json::json!({
+            "latest": {
+                "meta-data": {
+                    "ami-id": "ami-123",
+                },
+            },
+        });
+        let response = HttpResponse::mmds(&value);
+        let body: serde_json::Value =
+            serde_json::from_str(response.body()).expect("body should be JSON");
+
+        assert_eq!(response.status(), StatusCode::Ok);
+        assert_eq!(body, value);
     }
 
     #[test]

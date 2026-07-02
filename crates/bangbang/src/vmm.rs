@@ -1658,6 +1658,8 @@ mod tests {
             | VmmActionError::MachineConfig(_)
             | VmmActionError::MetricsConfig(_)
             | VmmActionError::MetricsFlush(_)
+            | VmmActionError::MmdsConfig(_)
+            | VmmActionError::MmdsDataStore(_)
             | VmmActionError::NetworkInterfaceConfig(_)
             | VmmActionError::VsockConfig(_) => {
                 panic!("vmnet start failure should propagate as hypervisor startup error");

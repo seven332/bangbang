@@ -112,6 +112,7 @@ pub enum VmmData {
     VmmVersion(String),
     InstanceInformation(InstanceInfo),
     MachineConfiguration(machine::MachineConfig),
+    MmdsValue(serde_json::Value),
     VmConfiguration(VmConfiguration),
 }
 
@@ -121,6 +122,7 @@ pub struct VmConfiguration {
     boot_source_config: Option<boot::BootSourceConfig>,
     drive_configs: Vec<block::DriveConfig>,
     network_interface_configs: Vec<network::NetworkInterfaceConfig>,
+    mmds_config: Option<mmds::MmdsConfig>,
     vsock_config: Option<vsock::VsockConfig>,
 }
 
@@ -130,6 +132,7 @@ impl VmConfiguration {
         boot_source_config: Option<boot::BootSourceConfig>,
         drive_configs: Vec<block::DriveConfig>,
         network_interface_configs: Vec<network::NetworkInterfaceConfig>,
+        mmds_config: Option<mmds::MmdsConfig>,
         vsock_config: Option<vsock::VsockConfig>,
     ) -> Self {
         Self {
@@ -137,6 +140,7 @@ impl VmConfiguration {
             boot_source_config,
             drive_configs,
             network_interface_configs,
+            mmds_config,
             vsock_config,
         }
     }
@@ -155,6 +159,10 @@ impl VmConfiguration {
 
     pub fn network_interface_configs(&self) -> &[network::NetworkInterfaceConfig] {
         &self.network_interface_configs
+    }
+
+    pub fn mmds_config(&self) -> Option<&mmds::MmdsConfig> {
+        self.mmds_config.as_ref()
     }
 
     pub fn vsock_config(&self) -> Option<&vsock::VsockConfig> {
@@ -177,6 +185,8 @@ pub enum VmmActionError {
     MachineConfig(machine::MachineConfigError),
     MetricsConfig(metrics::MetricsConfigError),
     MetricsFlush(metrics::MetricsFlushError),
+    MmdsConfig(mmds::MmdsConfigError),
+    MmdsDataStore(mmds::MmdsDataStoreError),
     NetworkInterfaceConfig(network::NetworkInterfaceConfigError),
     VsockConfig(vsock::VsockConfigError),
 }
@@ -203,6 +213,8 @@ impl fmt::Display for VmmActionError {
             Self::MachineConfig(err) => write!(f, "{err}"),
             Self::MetricsConfig(err) => write!(f, "{err}"),
             Self::MetricsFlush(err) => write!(f, "{err}"),
+            Self::MmdsConfig(err) => write!(f, "{err}"),
+            Self::MmdsDataStore(err) => write!(f, "{err}"),
             Self::NetworkInterfaceConfig(err) => write!(f, "{err}"),
             Self::VsockConfig(err) => write!(f, "{err}"),
         }
@@ -219,6 +231,8 @@ impl std::error::Error for VmmActionError {
             Self::MachineConfig(err) => Some(err),
             Self::MetricsConfig(err) => Some(err),
             Self::MetricsFlush(err) => Some(err),
+            Self::MmdsConfig(err) => Some(err),
+            Self::MmdsDataStore(err) => Some(err),
             Self::NetworkInterfaceConfig(err) => Some(err),
             Self::VsockConfig(err) => Some(err),
             Self::MissingBootSource
@@ -238,6 +252,7 @@ pub struct VmmController {
     vsock_config: Option<vsock::VsockConfig>,
     logger_state: logger::LoggerState,
     metrics_state: metrics::MetricsState,
+    mmds_state: mmds::MmdsState,
 }
 
 impl VmmController {
@@ -260,6 +275,7 @@ impl VmmController {
             vsock_config: None,
             logger_state: logger::LoggerState::default(),
             metrics_state: metrics::MetricsState::default(),
+            mmds_state: mmds::MmdsState::default(),
         }
     }
 
@@ -279,6 +295,10 @@ impl VmmController {
         self.vsock_config.as_ref()
     }
 
+    pub fn mmds_config(&self) -> Option<&mmds::MmdsConfig> {
+        self.mmds_state.config()
+    }
+
     pub const fn machine_config(&self) -> machine::MachineConfig {
         self.machine_config
     }
@@ -293,6 +313,7 @@ impl VmmController {
             self.boot_source_config.clone(),
             self.drive_configs.as_slice().to_vec(),
             self.network_interface_configs.as_slice().to_vec(),
+            self.mmds_config().cloned(),
             self.vsock_config.clone(),
         )
     }
@@ -336,7 +357,11 @@ impl VmmController {
                 Ok(VmmData::InstanceInformation(self.instance_info.clone()))
             }
             VmmAction::GetMachineConfig => Ok(VmmData::MachineConfiguration(self.machine_config)),
-            VmmAction::GetMmds => Err(VmmActionError::UnsupportedAction(action_name)),
+            VmmAction::GetMmds => self
+                .mmds_state
+                .get_data()
+                .map(VmmData::MmdsValue)
+                .map_err(VmmActionError::MmdsDataStore),
             VmmAction::GetVmConfig => Ok(VmmData::VmConfiguration(self.vm_config())),
             VmmAction::InstanceStart => {
                 self.preflight_instance_start()?;
@@ -411,10 +436,21 @@ impl VmmController {
 
                 Ok(VmmData::Empty)
             }
-            VmmAction::PutMmds(_) | VmmAction::PatchMmds(_) => {
-                Err(VmmActionError::UnsupportedAction(action_name))
+            VmmAction::PutMmds(input) => {
+                self.mmds_state
+                    .put_data(input)
+                    .map_err(VmmActionError::MmdsDataStore)?;
+
+                Ok(VmmData::Empty)
             }
-            VmmAction::PutMmdsConfig(_) => {
+            VmmAction::PatchMmds(input) => {
+                self.mmds_state
+                    .patch_data(input)
+                    .map_err(VmmActionError::MmdsDataStore)?;
+
+                Ok(VmmData::Empty)
+            }
+            VmmAction::PutMmdsConfig(input) => {
                 if self.instance_info.state != InstanceState::NotStarted {
                     return Err(VmmActionError::UnsupportedState {
                         action: action_name,
@@ -422,7 +458,11 @@ impl VmmController {
                     });
                 }
 
-                Err(VmmActionError::UnsupportedAction(action_name))
+                self.mmds_state
+                    .put_config(input, self.network_interface_configs.as_slice())
+                    .map_err(VmmActionError::MmdsConfig)?;
+
+                Ok(VmmData::Empty)
             }
             VmmAction::PutDrive(config) => {
                 if self.instance_info.state != InstanceState::NotStarted {
@@ -510,7 +550,10 @@ mod tests {
         logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel},
         machine::{DEFAULT_MEM_SIZE_MIB, DEFAULT_VCPU_COUNT, MachineConfigInput},
         metrics::{MetricsConfigError, MetricsConfigInput},
-        mmds::{MmdsConfigInput, MmdsContentInput, MmdsVersion},
+        mmds::{
+            MMDS_DATA_STORE_LIMIT_BYTES, MmdsConfigError, MmdsConfigInput, MmdsContentInput,
+            MmdsDataStoreError, MmdsVersion,
+        },
         network::{
             GuestMacAddress, MAX_NETWORK_INTERFACE_COUNT, NetworkInterfaceConfigError,
             NetworkInterfaceConfigInput,
@@ -535,7 +578,7 @@ mod tests {
     }
 
     fn mmds_content_input() -> MmdsContentInput {
-        MmdsContentInput::new(r#"{"latest":{"meta-data":{}}}"#)
+        MmdsContentInput::new(serde_json::json!({"latest": {"meta-data": {}}}))
     }
 
     fn mmds_config_input() -> MmdsConfigInput {
@@ -660,6 +703,7 @@ mod tests {
         assert_eq!(config.boot_source_config(), None);
         assert!(config.drive_configs().is_empty());
         assert!(config.network_interface_configs().is_empty());
+        assert_eq!(config.mmds_config(), None);
         assert_eq!(config.vsock_config(), None);
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
         assert!(controller.boot_source_config().is_none());
@@ -693,6 +737,13 @@ mod tests {
                 network_input("eth0", "tap0").with_guest_mac("12:34:56:78:9a:bc"),
             ))
             .expect("network interface config should be stored");
+        controller
+            .handle_action(VmmAction::PutMmdsConfig(
+                mmds_config_input()
+                    .with_ipv4_address("169.254.169.254".parse().expect("valid IPv4 address"))
+                    .with_imds_compat(true),
+            ))
+            .expect("MMDS config should be stored");
         controller
             .handle_action(VmmAction::PutVsock(
                 vsock_input(3, "./v.sock").with_vsock_id("vsock0"),
@@ -738,6 +789,14 @@ mod tests {
                 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc,
             ]))
         );
+        let mmds_config = config.mmds_config().expect("MMDS config should be present");
+        assert_eq!(mmds_config.network_interfaces(), &["eth0".to_string()]);
+        assert_eq!(mmds_config.version(), MmdsVersion::V2);
+        assert_eq!(
+            mmds_config.ipv4_address(),
+            Some("169.254.169.254".parse().expect("valid IPv4 address"))
+        );
+        assert!(mmds_config.imds_compat());
         let vsock = config
             .vsock_config()
             .expect("vsock config should be present");
@@ -769,6 +828,7 @@ mod tests {
         assert!(config.boot_source_config().is_some());
         assert!(config.drive_configs().is_empty());
         assert!(config.network_interface_configs().is_empty());
+        assert_eq!(config.mmds_config(), None);
         assert_eq!(config.vsock_config(), None);
     }
 
@@ -851,28 +911,284 @@ mod tests {
     }
 
     #[test]
-    fn mmds_actions_are_unsupported_without_mutating() {
+    fn get_mmds_requires_initialized_data_store_without_mutating() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
 
-        for action in [
-            VmmAction::GetMmds,
-            VmmAction::PutMmds(mmds_content_input()),
-            VmmAction::PatchMmds(mmds_content_input()),
-            VmmAction::PutMmdsConfig(mmds_config_input()),
-        ] {
-            let action_name = action.name();
-            let err = controller
-                .handle_action(action)
-                .expect_err("MMDS action should remain unsupported");
+        let err = controller
+            .handle_action(VmmAction::GetMmds)
+            .expect_err("uninitialized MMDS data store should fail");
 
-            assert_eq!(err, VmmActionError::UnsupportedAction(action_name));
-            assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
-            assert_eq!(controller.machine_config().vcpu_count(), DEFAULT_VCPU_COUNT);
-            assert!(controller.boot_source_config().is_none());
-            assert!(controller.drive_configs().is_empty());
-            assert!(controller.network_interface_configs().is_empty());
-            assert_eq!(controller.vsock_config(), None);
-        }
+        assert_eq!(
+            err,
+            VmmActionError::MmdsDataStore(MmdsDataStoreError::NotInitialized)
+        );
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert_eq!(controller.machine_config().vcpu_count(), DEFAULT_VCPU_COUNT);
+        assert!(controller.boot_source_config().is_none());
+        assert!(controller.drive_configs().is_empty());
+        assert!(controller.network_interface_configs().is_empty());
+        assert_eq!(controller.vsock_config(), None);
+    }
+
+    #[test]
+    fn put_and_get_mmds_data_store_json() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        let value = serde_json::json!({
+            "latest": {
+                "meta-data": {
+                    "ami-id": "ami-123",
+                },
+            },
+        });
+
+        assert_eq!(
+            controller.handle_action(VmmAction::PutMmds(MmdsContentInput::new(value.clone()))),
+            Ok(VmmData::Empty)
+        );
+        assert_eq!(
+            controller.handle_action(VmmAction::GetMmds),
+            Ok(VmmData::MmdsValue(value))
+        );
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+    }
+
+    #[test]
+    fn patch_mmds_data_store_applies_json_merge_patch() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        let original = serde_json::json!({
+            "latest": {
+                "meta-data": {
+                    "ami-id": "ami-old",
+                    "remove-me": true,
+                },
+                "user-data": "before",
+            },
+        });
+        let patch = serde_json::json!({
+            "latest": {
+                "meta-data": {
+                    "ami-id": "ami-new",
+                    "remove-me": null,
+                },
+                "dynamic": {
+                    "instance-identity": "document",
+                },
+            },
+        });
+
+        controller
+            .handle_action(VmmAction::PutMmds(MmdsContentInput::new(original)))
+            .expect("MMDS put should initialize data store");
+        assert_eq!(
+            controller.handle_action(VmmAction::PatchMmds(MmdsContentInput::new(patch))),
+            Ok(VmmData::Empty)
+        );
+
+        assert_eq!(
+            controller.handle_action(VmmAction::GetMmds),
+            Ok(VmmData::MmdsValue(serde_json::json!({
+                "latest": {
+                    "meta-data": {
+                        "ami-id": "ami-new",
+                    },
+                    "user-data": "before",
+                    "dynamic": {
+                        "instance-identity": "document",
+                    },
+                },
+            })))
+        );
+    }
+
+    #[test]
+    fn patch_mmds_requires_initialized_data_store_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
+        let err = controller
+            .handle_action(VmmAction::PatchMmds(mmds_content_input()))
+            .expect_err("patching uninitialized MMDS should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::MmdsDataStore(MmdsDataStoreError::NotInitialized)
+        );
+        assert_eq!(
+            controller.handle_action(VmmAction::GetMmds),
+            Err(VmmActionError::MmdsDataStore(
+                MmdsDataStoreError::NotInitialized
+            ))
+        );
+    }
+
+    #[test]
+    fn put_mmds_rejects_non_object_value_without_initializing_store() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
+        assert_eq!(
+            controller.handle_action(VmmAction::PutMmds(MmdsContentInput::new(
+                serde_json::json!("not-an-object"),
+            ))),
+            Err(VmmActionError::MmdsDataStore(
+                MmdsDataStoreError::InvalidObject
+            ))
+        );
+        assert_eq!(
+            controller.handle_action(VmmAction::GetMmds),
+            Err(VmmActionError::MmdsDataStore(
+                MmdsDataStoreError::NotInitialized
+            ))
+        );
+    }
+
+    #[test]
+    fn patch_mmds_rejects_non_object_value_without_mutating_store() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        let original = serde_json::json!({"latest": {"meta-data": {}}});
+        controller
+            .handle_action(VmmAction::PutMmds(MmdsContentInput::new(original.clone())))
+            .expect("initial MMDS put should succeed");
+
+        assert_eq!(
+            controller.handle_action(VmmAction::PatchMmds(MmdsContentInput::new(
+                serde_json::json!("not-an-object"),
+            ))),
+            Err(VmmActionError::MmdsDataStore(
+                MmdsDataStoreError::InvalidObject
+            ))
+        );
+        assert_eq!(
+            controller.handle_action(VmmAction::GetMmds),
+            Ok(VmmData::MmdsValue(original))
+        );
+    }
+
+    #[test]
+    fn oversized_put_mmds_does_not_mutate_existing_data_store() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        let original = serde_json::json!({"latest": {"meta-data": {}}});
+        let oversized = serde_json::json!({"data": "x".repeat(MMDS_DATA_STORE_LIMIT_BYTES)});
+
+        controller
+            .handle_action(VmmAction::PutMmds(MmdsContentInput::new(original.clone())))
+            .expect("initial MMDS put should succeed");
+        let err = controller
+            .handle_action(VmmAction::PutMmds(MmdsContentInput::new(oversized)))
+            .expect_err("oversized MMDS put should fail");
+
+        let VmmActionError::MmdsDataStore(MmdsDataStoreError::DataStoreLimitExceeded {
+            limit_bytes,
+            size_bytes,
+        }) = err
+        else {
+            panic!("expected MMDS data store limit error");
+        };
+        assert_eq!(limit_bytes, MMDS_DATA_STORE_LIMIT_BYTES);
+        assert!(size_bytes > limit_bytes);
+        assert_eq!(
+            controller.handle_action(VmmAction::GetMmds),
+            Ok(VmmData::MmdsValue(original))
+        );
+    }
+
+    #[test]
+    fn oversized_patch_mmds_does_not_mutate_existing_data_store() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        let original = serde_json::json!({"latest": {"meta-data": {}}});
+        let oversized_patch = serde_json::json!({
+            "latest": {
+                "user-data": "x".repeat(MMDS_DATA_STORE_LIMIT_BYTES),
+            },
+        });
+
+        controller
+            .handle_action(VmmAction::PutMmds(MmdsContentInput::new(original.clone())))
+            .expect("initial MMDS put should succeed");
+        let err = controller
+            .handle_action(VmmAction::PatchMmds(MmdsContentInput::new(oversized_patch)))
+            .expect_err("oversized MMDS patch should fail");
+
+        let VmmActionError::MmdsDataStore(MmdsDataStoreError::DataStoreLimitExceeded {
+            limit_bytes,
+            size_bytes,
+        }) = err
+        else {
+            panic!("expected MMDS data store limit error");
+        };
+        assert_eq!(limit_bytes, MMDS_DATA_STORE_LIMIT_BYTES);
+        assert!(size_bytes > limit_bytes);
+        assert_eq!(
+            controller.handle_action(VmmAction::GetMmds),
+            Ok(VmmData::MmdsValue(original))
+        );
+    }
+
+    #[test]
+    fn mmds_config_validates_existing_network_interface_ids() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
+        let err = controller
+            .handle_action(VmmAction::PutMmdsConfig(mmds_config_input()))
+            .expect_err("unknown interface id should fail");
+        assert_eq!(
+            err,
+            VmmActionError::MmdsConfig(MmdsConfigError::UnknownNetworkInterfaceId {
+                iface_id: "eth0".to_string(),
+            })
+        );
+        assert_eq!(controller.mmds_config(), None);
+
+        controller
+            .handle_action(VmmAction::PutNetworkInterface(network_input(
+                "eth0", "tap0",
+            )))
+            .expect("network interface config should be stored");
+        assert_eq!(
+            controller.handle_action(VmmAction::PutMmdsConfig(
+                mmds_config_input()
+                    .with_ipv4_address("169.254.169.254".parse().expect("valid IPv4 address"))
+                    .with_imds_compat(true),
+            )),
+            Ok(VmmData::Empty)
+        );
+        let config = controller
+            .mmds_config()
+            .expect("MMDS config should be stored");
+        assert_eq!(config.network_interfaces(), &["eth0".to_string()]);
+        assert_eq!(config.version(), MmdsVersion::V2);
+        assert_eq!(
+            config.ipv4_address(),
+            Some("169.254.169.254".parse().expect("valid IPv4 address"))
+        );
+        assert!(config.imds_compat());
+    }
+
+    #[test]
+    fn mmds_config_rejects_empty_interfaces_and_invalid_ipv4() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutNetworkInterface(network_input(
+                "eth0", "tap0",
+            )))
+            .expect("network interface config should be stored");
+
+        assert_eq!(
+            controller.handle_action(VmmAction::PutMmdsConfig(MmdsConfigInput::new(Vec::new()))),
+            Err(VmmActionError::MmdsConfig(
+                MmdsConfigError::EmptyNetworkInterfaceList
+            ))
+        );
+        assert_eq!(
+            controller.handle_action(VmmAction::PutMmdsConfig(
+                mmds_config_input()
+                    .with_ipv4_address("169.254.0.1".parse().expect("valid IPv4 address")),
+            )),
+            Err(VmmActionError::MmdsConfig(
+                MmdsConfigError::InvalidIpv4Address(
+                    "169.254.0.1".parse().expect("valid IPv4 address")
+                )
+            ))
+        );
+        assert_eq!(controller.mmds_config(), None);
     }
 
     #[test]

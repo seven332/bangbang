@@ -39,6 +39,7 @@ version = "0.1.0"
 dependencies = [
  "device_tree",
  "libc",
+ "serde_json",
  "vm-fdt",
 ]
 
