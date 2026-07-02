@@ -1042,6 +1042,20 @@ mod tests {
     }
 
     #[test]
+    fn guest_response_http_bytes_allow_empty_body() {
+        let response = MmdsGuestResponse::new(
+            MmdsGuestStatus::Ok,
+            MmdsGuestContentType::PlainText,
+            String::new(),
+        );
+
+        assert_eq!(
+            response.to_http_bytes(),
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n".to_vec()
+        );
+    }
+
+    #[test]
     fn guest_response_http_bytes_do_not_mutate_response_or_data_store() {
         let state = initialized_query_state();
         let original = state.get_data().expect("data store should be initialized");
