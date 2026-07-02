@@ -194,6 +194,15 @@ impl MmdsGuestStatus {
             Self::NotImplemented => 501,
         }
     }
+
+    pub const fn reason_phrase(&self) -> &'static str {
+        match self {
+            Self::Ok => "OK",
+            Self::BadRequest => "Bad Request",
+            Self::NotFound => "Not Found",
+            Self::NotImplemented => "Not Implemented",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,6 +246,18 @@ impl MmdsGuestResponse {
 
     pub fn body(&self) -> &str {
         &self.body
+    }
+
+    pub fn to_http_bytes(&self) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n{}",
+            self.status.as_u16(),
+            self.status.reason_phrase(),
+            self.content_type.as_str(),
+            self.body.len(),
+            self.body
+        )
+        .into_bytes()
     }
 }
 
@@ -570,6 +591,22 @@ mod tests {
         assert_eq!(response.body(), body);
     }
 
+    fn expected_guest_http_bytes(
+        status: MmdsGuestStatus,
+        content_type: MmdsGuestContentType,
+        body: &str,
+    ) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n{}",
+            status.as_u16(),
+            status.reason_phrase(),
+            content_type.as_str(),
+            body.len(),
+            body
+        )
+        .into_bytes()
+    }
+
     fn serialized_len(value: &Value) -> usize {
         serde_json::to_vec(value)
             .expect("test JSON value should serialize")
@@ -813,6 +850,17 @@ mod tests {
     }
 
     #[test]
+    fn guest_status_reason_phrases_match_http_values() {
+        assert_eq!(MmdsGuestStatus::Ok.reason_phrase(), "OK");
+        assert_eq!(MmdsGuestStatus::BadRequest.reason_phrase(), "Bad Request");
+        assert_eq!(MmdsGuestStatus::NotFound.reason_phrase(), "Not Found");
+        assert_eq!(
+            MmdsGuestStatus::NotImplemented.reason_phrase(),
+            "Not Implemented"
+        );
+    }
+
+    #[test]
     fn guest_content_type_names_match_http_values() {
         assert_eq!(
             MmdsGuestContentType::ApplicationJson.as_str(),
@@ -943,6 +991,95 @@ mod tests {
             MmdsGuestContentType::PlainText,
             "ami-id\nhostname",
         );
+        assert_eq!(state.get_data(), Ok(original));
+    }
+
+    #[test]
+    fn guest_response_http_bytes_serialize_json_success() {
+        let state = initialized_query_state();
+        let response = state.guest_get_response("/meta-data/hostname", MmdsOutputFormat::Json);
+
+        assert_eq!(
+            response.to_http_bytes(),
+            expected_guest_http_bytes(
+                MmdsGuestStatus::Ok,
+                MmdsGuestContentType::ApplicationJson,
+                r#""demo.local""#,
+            )
+        );
+    }
+
+    #[test]
+    fn guest_response_http_bytes_serialize_imds_success() {
+        let state = initialized_query_state();
+        let response = state.guest_get_response("/meta-data/hostname", MmdsOutputFormat::Imds);
+
+        assert_eq!(
+            response.to_http_bytes(),
+            expected_guest_http_bytes(
+                MmdsGuestStatus::Ok,
+                MmdsGuestContentType::PlainText,
+                "demo.local",
+            )
+        );
+    }
+
+    #[test]
+    fn guest_response_http_bytes_serialize_not_found_error() {
+        let state = initialized_query_state();
+        let response = state.guest_get_response("/missing", MmdsOutputFormat::Json);
+
+        assert_eq!(
+            response.to_http_bytes(),
+            expected_guest_http_bytes(
+                MmdsGuestStatus::NotFound,
+                MmdsGuestContentType::PlainText,
+                "Resource not found: /missing.",
+            )
+        );
+    }
+
+    #[test]
+    fn guest_response_http_bytes_serialize_not_implemented_error() {
+        let state = initialized_query_state();
+        let response = state.guest_get_response("/age", MmdsOutputFormat::Imds);
+
+        assert_eq!(
+            response.to_http_bytes(),
+            expected_guest_http_bytes(
+                MmdsGuestStatus::NotImplemented,
+                MmdsGuestContentType::PlainText,
+                "Cannot retrieve value. The value has an unsupported type.",
+            )
+        );
+    }
+
+    #[test]
+    fn guest_response_http_bytes_use_body_byte_length() {
+        let response = MmdsGuestResponse::new(
+            MmdsGuestStatus::Ok,
+            MmdsGuestContentType::PlainText,
+            "héllo".to_string(),
+        );
+
+        assert_eq!(
+            response.to_http_bytes(),
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 6\r\n\r\nh\xc3\xa9llo"
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn guest_response_http_bytes_do_not_mutate_response_or_data_store() {
+        let state = initialized_query_state();
+        let original = state.get_data().expect("data store should be initialized");
+        let response = state.guest_get_response("/meta-data/hostname", MmdsOutputFormat::Imds);
+        let first_bytes = response.to_http_bytes();
+
+        assert_eq!(response.status(), MmdsGuestStatus::Ok);
+        assert_eq!(response.content_type(), MmdsGuestContentType::PlainText);
+        assert_eq!(response.body(), "demo.local");
+        assert_eq!(response.to_http_bytes(), first_bytes);
         assert_eq!(state.get_data(), Ok(original));
     }
 }
