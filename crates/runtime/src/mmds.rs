@@ -2048,6 +2048,16 @@ mod tests {
                 "MMDS guest token TTL header value is invalid.",
             ),
             (
+                b"PUT /latest/api/token HTTP/1.1\r\nX-metadata-token-ttl-seconds: \r\n\r\n",
+                MmdsGuestStatus::BadRequest,
+                "MMDS guest token TTL header value is invalid.",
+            ),
+            (
+                b"PUT /latest/api/token HTTP/1.1\r\nX-metadata-token-ttl-seconds: 4294967296\r\n\r\n",
+                MmdsGuestStatus::BadRequest,
+                "MMDS guest token TTL header value is invalid.",
+            ),
+            (
                 b"PUT /latest/api/token HTTP/1.1\r\nX-metadata-token-ttl-seconds: 1\r\nX-aws-ec2-metadata-token-ttl-seconds: 1\r\n\r\n",
                 MmdsGuestStatus::BadRequest,
                 "MMDS guest token TTL header is duplicated.",
