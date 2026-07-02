@@ -2049,6 +2049,11 @@ mod tests {
                 "MMDS guest token TTL header is duplicated.",
             ),
             (
+                b"PUT /latest/api/token HTTP/1.1\r\nX-metadata-token-ttl-seconds: 0\r\n\r\n",
+                MmdsGuestStatus::BadRequest,
+                "Invalid MMDS token TTL: 0. Please provide a value between 1 and 21600.",
+            ),
+            (
                 b"PUT /latest/api/token HTTP/1.1\r\nX-metadata-token-ttl-seconds: 21601\r\n\r\n",
                 MmdsGuestStatus::BadRequest,
                 "Invalid MMDS token TTL: 21601. Please provide a value between 1 and 21600.",
