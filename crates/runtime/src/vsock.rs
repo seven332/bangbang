@@ -71,6 +71,8 @@ const VIRTIO_VSOCK_EVENT_QUEUE_INDEX_U32: u32 = 2;
 const VIRTIO_VSOCK_PACKET_HEADER_SIZE_U32: u32 = VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32;
 const VIRTIO_VSOCK_PACKET_HEADER_SIZE_U64: u64 = VIRTIO_VSOCK_PACKET_HEADER_SIZE as u64;
 const NONBLOCKING_CONNECT_INTERRUPTED_RETRY_LIMIT: usize = 4;
+const VSOCK_HOST_RW_PENDING_PACKET_LIMIT: usize = 4;
+const VSOCK_HOST_RW_POLL_BATCH_LIMIT: usize = VSOCK_HOST_RW_PENDING_PACKET_LIMIT;
 const VSOCK_HOST_CONNECT_COMMAND: &str = "connect";
 
 pub type VirtioVsockMmioHandler =
@@ -719,7 +721,7 @@ pub struct VsockHostConnection {
     accepted: VsockHostAcceptedConnection,
     request_packet_pending: bool,
     host_ack_sent: bool,
-    pending_host_rw_payload: Option<Vec<u8>>,
+    pending_host_rw_payloads: VecDeque<Vec<u8>>,
 }
 
 impl VsockHostConnection {
@@ -728,7 +730,7 @@ impl VsockHostConnection {
             accepted,
             request_packet_pending: true,
             host_ack_sent: false,
-            pending_host_rw_payload: None,
+            pending_host_rw_payloads: VecDeque::new(),
         }
     }
 
@@ -741,7 +743,7 @@ impl VsockHostConnection {
     }
 
     fn has_pending_host_rw_packet(&self) -> bool {
-        self.pending_host_rw_payload.is_some()
+        !self.pending_host_rw_payloads.is_empty()
     }
 
     #[cfg(test)]
@@ -750,7 +752,9 @@ impl VsockHostConnection {
     }
 
     fn can_poll_host_rw_payload(&self) -> bool {
-        !self.request_packet_pending && self.host_ack_sent && self.pending_host_rw_payload.is_none()
+        !self.request_packet_pending
+            && self.host_ack_sent
+            && self.pending_host_rw_payloads.len() < VSOCK_HOST_RW_PENDING_PACKET_LIMIT
     }
 
     fn acknowledge_guest_response(
@@ -794,7 +798,7 @@ impl VsockHostConnection {
         key: VsockHostConnectionKey,
         guest_cid: u32,
     ) -> Option<VirtioVsockRxPacket> {
-        let payload = self.pending_host_rw_payload.as_ref()?.clone();
+        let payload = self.pending_host_rw_payloads.front()?.clone();
         Some(VirtioVsockRxPacket::new(
             VirtioVsockRxPacketKind::HostRw,
             host_connection_rw_packet_header(key, guest_cid, payload_len_u32(payload.len())),
@@ -803,34 +807,16 @@ impl VsockHostConnection {
     }
 
     fn take_pending_host_rw_payload(&mut self) -> Option<Vec<u8>> {
-        self.pending_host_rw_payload.take()
+        self.pending_host_rw_payloads.pop_front()
     }
 
-    fn poll_host_rw_payload(&mut self, scratch: &mut [u8]) -> VsockHostRwPollOutcome {
+    fn poll_host_rw_payloads(&mut self, scratch: &mut [u8]) -> VsockHostRwPollOutcome {
         if !self.can_poll_host_rw_payload() {
             return VsockHostRwPollOutcome::NoData;
         }
 
         let mut stream = self.accepted.stream();
-        match stream.read(scratch) {
-            Ok(0) => VsockHostRwPollOutcome::Closed,
-            Ok(read_len) => {
-                let Some(bytes) = scratch.get(..read_len) else {
-                    return VsockHostRwPollOutcome::ReadError;
-                };
-                self.pending_host_rw_payload = Some(bytes.to_vec());
-                VsockHostRwPollOutcome::Queued
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                ) =>
-            {
-                VsockHostRwPollOutcome::NoData
-            }
-            Err(_) => VsockHostRwPollOutcome::ReadError,
-        }
+        poll_host_rw_payloads_from_stream(&mut stream, &mut self.pending_host_rw_payloads, scratch)
     }
 }
 
@@ -840,6 +826,67 @@ enum VsockHostRwPollOutcome {
     Queued,
     Closed,
     ReadError,
+}
+
+fn poll_host_rw_payloads_from_stream(
+    stream: &mut impl io::Read,
+    pending_host_rw_payloads: &mut VecDeque<Vec<u8>>,
+    scratch: &mut [u8],
+) -> VsockHostRwPollOutcome {
+    let had_pending_payload = !pending_host_rw_payloads.is_empty();
+    let mut queued_payload = false;
+
+    for _ in 0..VSOCK_HOST_RW_POLL_BATCH_LIMIT {
+        if pending_host_rw_payloads.len() >= VSOCK_HOST_RW_PENDING_PACKET_LIMIT {
+            break;
+        }
+
+        match stream.read(scratch) {
+            Ok(0) => {
+                return if had_pending_payload || queued_payload {
+                    VsockHostRwPollOutcome::Queued
+                } else {
+                    VsockHostRwPollOutcome::Closed
+                };
+            }
+            Ok(read_len) => {
+                let Some(bytes) = scratch.get(..read_len) else {
+                    return if had_pending_payload || queued_payload {
+                        VsockHostRwPollOutcome::Queued
+                    } else {
+                        VsockHostRwPollOutcome::ReadError
+                    };
+                };
+                pending_host_rw_payloads.push_back(bytes.to_vec());
+                queued_payload = true;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                return if queued_payload {
+                    VsockHostRwPollOutcome::Queued
+                } else {
+                    VsockHostRwPollOutcome::NoData
+                };
+            }
+            Err(_) => {
+                return if had_pending_payload || queued_payload {
+                    VsockHostRwPollOutcome::Queued
+                } else {
+                    VsockHostRwPollOutcome::ReadError
+                };
+            }
+        }
+    }
+
+    if queued_payload {
+        VsockHostRwPollOutcome::Queued
+    } else {
+        VsockHostRwPollOutcome::NoData
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1320,7 +1367,7 @@ impl VsockHostConnectionTable {
                 continue;
             };
 
-            match connection.poll_host_rw_payload(scratch) {
+            match connection.poll_host_rw_payloads(scratch) {
                 VsockHostRwPollOutcome::NoData | VsockHostRwPollOutcome::Queued => {}
                 VsockHostRwPollOutcome::Closed | VsockHostRwPollOutcome::ReadError => {
                     let removed = self.remove(key);
@@ -1696,7 +1743,7 @@ impl std::error::Error for VsockGuestRwForwardError {
 pub struct VsockGuestConnection {
     stream: UnixStream,
     response_packet_pending: bool,
-    pending_host_rw_payload: Option<Vec<u8>>,
+    pending_host_rw_payloads: VecDeque<Vec<u8>>,
 }
 
 impl VsockGuestConnection {
@@ -1704,7 +1751,7 @@ impl VsockGuestConnection {
         Self {
             stream,
             response_packet_pending: true,
-            pending_host_rw_payload: None,
+            pending_host_rw_payloads: VecDeque::new(),
         }
     }
 
@@ -1717,11 +1764,12 @@ impl VsockGuestConnection {
     }
 
     fn has_pending_host_rw_packet(&self) -> bool {
-        self.pending_host_rw_payload.is_some()
+        !self.pending_host_rw_payloads.is_empty()
     }
 
     fn can_poll_host_rw_payload(&self) -> bool {
-        !self.response_packet_pending && self.pending_host_rw_payload.is_none()
+        !self.response_packet_pending
+            && self.pending_host_rw_payloads.len() < VSOCK_HOST_RW_PENDING_PACKET_LIMIT
     }
 
     fn write_guest_rw_payload(&mut self, payload: &[u8]) -> Result<(), VsockGuestRwForwardError> {
@@ -1760,7 +1808,7 @@ impl VsockGuestConnection {
         key: VsockGuestConnectionKey,
         guest_cid: u32,
     ) -> Option<VirtioVsockRxPacket> {
-        let payload = self.pending_host_rw_payload.as_ref()?.clone();
+        let payload = self.pending_host_rw_payloads.front()?.clone();
         Some(VirtioVsockRxPacket::new(
             VirtioVsockRxPacketKind::HostRw,
             guest_connection_rw_packet_header(key, guest_cid, payload_len_u32(payload.len())),
@@ -1769,33 +1817,19 @@ impl VsockGuestConnection {
     }
 
     fn take_pending_host_rw_payload(&mut self) -> Option<Vec<u8>> {
-        self.pending_host_rw_payload.take()
+        self.pending_host_rw_payloads.pop_front()
     }
 
-    fn poll_host_rw_payload(&mut self, scratch: &mut [u8]) -> VsockHostRwPollOutcome {
+    fn poll_host_rw_payloads(&mut self, scratch: &mut [u8]) -> VsockHostRwPollOutcome {
         if !self.can_poll_host_rw_payload() {
             return VsockHostRwPollOutcome::NoData;
         }
 
-        match self.stream.read(scratch) {
-            Ok(0) => VsockHostRwPollOutcome::Closed,
-            Ok(read_len) => {
-                let Some(bytes) = scratch.get(..read_len) else {
-                    return VsockHostRwPollOutcome::ReadError;
-                };
-                self.pending_host_rw_payload = Some(bytes.to_vec());
-                VsockHostRwPollOutcome::Queued
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                ) =>
-            {
-                VsockHostRwPollOutcome::NoData
-            }
-            Err(_) => VsockHostRwPollOutcome::ReadError,
-        }
+        poll_host_rw_payloads_from_stream(
+            &mut self.stream,
+            &mut self.pending_host_rw_payloads,
+            scratch,
+        )
     }
 }
 
@@ -1912,7 +1946,7 @@ impl VsockGuestConnectionTable {
                 continue;
             };
 
-            match connection.poll_host_rw_payload(scratch) {
+            match connection.poll_host_rw_payloads(scratch) {
                 VsockHostRwPollOutcome::NoData | VsockHostRwPollOutcome::Queued => {}
                 VsockHostRwPollOutcome::Closed | VsockHostRwPollOutcome::ReadError => {
                     let removed = self.remove(key);
@@ -6223,6 +6257,8 @@ fn has_control_character(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::VSOCK_HOST_RW_PENDING_PACKET_LIMIT;
+
     use std::error::Error as _;
     use std::fs;
     use std::io;
@@ -6555,6 +6591,31 @@ mod tests {
             VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE
         );
         assert_eq!(header.forwarded_count(), 0);
+    }
+
+    fn assert_host_rw_payload_in_guest(
+        memory: &GuestMemory,
+        address: GuestAddress,
+        guest_cid: u32,
+        host_port: u32,
+        guest_port: u32,
+        payload: &[u8],
+    ) {
+        assert_host_rw_packet_header(
+            read_vsock_packet_header(memory, address),
+            guest_cid,
+            host_port,
+            guest_port,
+            payload.len(),
+        );
+        assert_eq!(
+            read_guest_bytes(
+                memory,
+                vsock_payload_address_after_header(address),
+                payload.len(),
+            ),
+            payload
+        );
     }
 
     struct TestUnixListener {
@@ -12605,6 +12666,554 @@ mod tests {
         assert_stream_closed(
             &mut accepted,
             "dropping handler should close retried host RW guest stream",
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_queue_guest_connection_host_rw_backlog_without_rx_buffer() {
+        let (mut memory, mut handler, mut accepted) =
+            established_guest_connection_for_test("host-rw-guest-backlog", 52, 4000);
+        let first_payload = b"first-queued-guest-host-rw";
+        let second_payload = b"second-queued-guest-host-rw";
+
+        accepted
+            .write_all(first_payload)
+            .expect("first host payload should write");
+        let first_empty_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("first host RW should queue without RX buffers");
+        let first_empty_rx = first_empty_notification
+            .rx_queue_dispatch()
+            .expect("first queued host RW should attempt RX dispatch");
+        assert_eq!(first_empty_rx.processed_buffers(), 0);
+        assert_eq!(first_empty_rx.delivered_host_rw_packets(), 0);
+        assert_eq!(read_vsock_rx_used_index(&memory), 1);
+
+        accepted
+            .write_all(second_payload)
+            .expect("second host payload should write");
+        let second_empty_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("second host RW should queue behind the first payload");
+        let second_empty_rx = second_empty_notification
+            .rx_queue_dispatch()
+            .expect("second queued host RW should attempt first RX dispatch");
+        assert_eq!(second_empty_rx.processed_buffers(), 0);
+        assert_eq!(second_empty_rx.delivered_host_rw_packets(), 0);
+        assert_eq!(read_vsock_rx_used_index(&memory), 1);
+
+        write_vsock_rx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_SECOND_BUFFER,
+                vsock_packet_len_with_payload(first_payload),
+                None,
+            ),
+        );
+        append_vsock_rx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+
+        let first_rx_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("first queued host RW should deliver");
+        let first_rx = first_rx_notification
+            .rx_queue_dispatch()
+            .expect("first queued host RW should produce RX dispatch");
+        assert_eq!(first_rx.processed_buffers(), 1);
+        assert_eq!(first_rx.delivered_host_rw_packets(), 1);
+        assert_eq!(first_rx.delivered_host_rw_bytes(), first_payload.len());
+        assert_host_rw_payload_in_guest(
+            &memory,
+            TEST_VSOCK_RX_SECOND_BUFFER,
+            42,
+            52,
+            4000,
+            first_payload,
+        );
+        assert_eq!(read_vsock_rx_used_index(&memory), 2);
+        assert_eq!(
+            read_vsock_rx_used_element(&memory, 1),
+            (1, vsock_packet_len_with_payload(first_payload))
+        );
+
+        write_vsock_rx_descriptor(
+            &mut memory,
+            2,
+            TestDescriptor::writable(
+                TEST_VSOCK_PAYLOAD,
+                vsock_packet_len_with_payload(second_payload),
+                None,
+            ),
+        );
+        append_vsock_rx_available_head(&mut memory, 2, 2, 3);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+
+        let second_rx_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("second queued host RW should deliver");
+        let second_rx = second_rx_notification
+            .rx_queue_dispatch()
+            .expect("second queued host RW should produce RX dispatch");
+        assert_eq!(second_rx.processed_buffers(), 1);
+        assert_eq!(second_rx.delivered_host_rw_packets(), 1);
+        assert_eq!(second_rx.delivered_host_rw_bytes(), second_payload.len());
+        assert_host_rw_payload_in_guest(&memory, TEST_VSOCK_PAYLOAD, 42, 52, 4000, second_payload);
+        assert_eq!(read_vsock_rx_used_index(&memory), 3);
+        assert_eq!(
+            read_vsock_rx_used_element(&memory, 2),
+            (2, vsock_packet_len_with_payload(second_payload))
+        );
+
+        drop(handler);
+        assert_stream_closed(
+            &mut accepted,
+            "dropping handler should close queued guest host RW stream",
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_queue_host_connection_rw_backlog_without_rx_buffer() {
+        let (mut memory, mut handler, mut client, key) =
+            established_host_connection_for_test("host-rw-host-backlog", 4000);
+        let first_payload = b"first-queued-host-host-rw";
+        let second_payload = b"second-queued-host-host-rw";
+
+        client
+            .write_all(first_payload)
+            .expect("first host-initiated payload should write");
+        let first_empty_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("first host-initiated RW should queue without RX buffers");
+        assert_eq!(
+            first_empty_notification
+                .rx_queue_dispatch()
+                .expect("queued host-initiated RW should attempt RX dispatch")
+                .delivered_host_rw_packets(),
+            0
+        );
+        assert_eq!(read_vsock_rx_used_index(&memory), 1);
+
+        client
+            .write_all(second_payload)
+            .expect("second host-initiated payload should write");
+        let second_empty_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("second host-initiated RW should queue behind the first payload");
+        assert_eq!(
+            second_empty_notification
+                .rx_queue_dispatch()
+                .expect("queued host-initiated RW should attempt first RX dispatch")
+                .delivered_host_rw_packets(),
+            0
+        );
+        assert_eq!(read_vsock_rx_used_index(&memory), 1);
+
+        write_vsock_rx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_SECOND_BUFFER,
+                vsock_packet_len_with_payload(first_payload),
+                None,
+            ),
+        );
+        append_vsock_rx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+
+        let first_rx_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("first queued host-initiated RW should deliver");
+        let first_rx = first_rx_notification
+            .rx_queue_dispatch()
+            .expect("first queued host-initiated RW should produce RX dispatch");
+        assert_eq!(first_rx.delivered_host_rw_packets(), 1);
+        assert_eq!(first_rx.delivered_host_rw_bytes(), first_payload.len());
+        assert_host_rw_payload_in_guest(
+            &memory,
+            TEST_VSOCK_RX_SECOND_BUFFER,
+            42,
+            key.local_port().raw(),
+            4000,
+            first_payload,
+        );
+        assert_eq!(read_vsock_rx_used_index(&memory), 2);
+
+        write_vsock_rx_descriptor(
+            &mut memory,
+            2,
+            TestDescriptor::writable(
+                TEST_VSOCK_PAYLOAD,
+                vsock_packet_len_with_payload(second_payload),
+                None,
+            ),
+        );
+        append_vsock_rx_available_head(&mut memory, 2, 2, 3);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+
+        let second_rx_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("second queued host-initiated RW should deliver");
+        let second_rx = second_rx_notification
+            .rx_queue_dispatch()
+            .expect("second queued host-initiated RW should produce RX dispatch");
+        assert_eq!(second_rx.delivered_host_rw_packets(), 1);
+        assert_eq!(second_rx.delivered_host_rw_bytes(), second_payload.len());
+        assert_host_rw_payload_in_guest(
+            &memory,
+            TEST_VSOCK_PAYLOAD,
+            42,
+            key.local_port().raw(),
+            4000,
+            second_payload,
+        );
+        assert_eq!(read_vsock_rx_used_index(&memory), 3);
+
+        drop(handler);
+        assert_stream_closed(
+            &mut client,
+            "dropping handler should close queued host-initiated RW stream",
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_keep_host_rw_backlog_bounded_without_rx_buffer() {
+        let (mut memory, mut handler, mut accepted) =
+            established_guest_connection_for_test("host-rw-bounded-backlog", 52, 4000);
+        let payloads: [&[u8]; VSOCK_HOST_RW_PENDING_PACKET_LIMIT + 1] = [
+            b"bounded-host-rw-0",
+            b"bounded-host-rw-1",
+            b"bounded-host-rw-2",
+            b"bounded-host-rw-3",
+            b"bounded-host-rw-4",
+        ];
+        let rx_buffers = [
+            TEST_VSOCK_RX_SECOND_BUFFER,
+            TEST_VSOCK_PAYLOAD,
+            TEST_VSOCK_SECOND_PAYLOAD,
+            TEST_VSOCK_THIRD_HEADER,
+            TEST_VSOCK_FOURTH_HEADER,
+        ];
+
+        for payload in payloads
+            .iter()
+            .copied()
+            .take(VSOCK_HOST_RW_PENDING_PACKET_LIMIT)
+        {
+            accepted
+                .write_all(payload)
+                .expect("host payload should write into bounded backlog");
+            let notification = handler
+                .dispatch_vsock_queue_notifications(&mut memory)
+                .expect("host payload should queue while RX buffers are unavailable");
+            let rx = notification
+                .rx_queue_dispatch()
+                .expect("queued host RW should attempt RX dispatch");
+            assert_eq!(rx.processed_buffers(), 0);
+            assert_eq!(rx.delivered_host_rw_packets(), 0);
+        }
+
+        accepted
+            .write_all(payloads[VSOCK_HOST_RW_PENDING_PACKET_LIMIT])
+            .expect("extra host payload should stay readable after backlog fills");
+        let full_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("full backlog should avoid polling another host RW payload");
+        let full_rx = full_notification
+            .rx_queue_dispatch()
+            .expect("full backlog should still attempt RX dispatch");
+        assert_eq!(full_rx.processed_buffers(), 0);
+        assert_eq!(full_rx.delivered_host_rw_packets(), 0);
+        assert_eq!(read_vsock_rx_used_index(&memory), 1);
+
+        for (index, (payload, rx_buffer)) in payloads.iter().copied().zip(rx_buffers).enumerate() {
+            let descriptor_index =
+                u16::try_from(index + 1).expect("test descriptor index should fit");
+            write_vsock_rx_descriptor(
+                &mut memory,
+                descriptor_index,
+                TestDescriptor::writable(rx_buffer, vsock_packet_len_with_payload(payload), None),
+            );
+            append_vsock_rx_available_head(
+                &mut memory,
+                index + 1,
+                descriptor_index,
+                descriptor_index + 1,
+            );
+            notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+
+            let notification = handler
+                .dispatch_vsock_queue_notifications(&mut memory)
+                .expect("queued host RW should deliver in backlog order");
+            let rx = notification
+                .rx_queue_dispatch()
+                .expect("queued host RW should produce RX dispatch");
+            assert_eq!(rx.processed_buffers(), 1);
+            assert_eq!(rx.delivered_host_rw_packets(), 1);
+            assert_eq!(rx.delivered_host_rw_bytes(), payload.len());
+            assert_host_rw_payload_in_guest(&memory, rx_buffer, 42, 52, 4000, payload);
+            assert_eq!(
+                read_vsock_rx_used_element(&memory, index + 1),
+                (
+                    u32::from(descriptor_index),
+                    vsock_packet_len_with_payload(payload)
+                )
+            );
+        }
+
+        assert_eq!(read_vsock_rx_used_index(&memory), 6);
+
+        drop(handler);
+        assert_stream_closed(
+            &mut accepted,
+            "dropping handler should close bounded backlog host RW stream",
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_preserve_host_rw_backlog_after_small_rx_buffer() {
+        let (mut memory, mut handler, mut accepted) =
+            established_guest_connection_for_test("host-rw-backlog-retry", 52, 4000);
+        let first_payload = b"retry-backlog-first";
+        let second_payload = b"retry-backlog-second";
+
+        accepted
+            .write_all(first_payload)
+            .expect("first retry backlog payload should write");
+        handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("first retry backlog payload should queue");
+        accepted
+            .write_all(second_payload)
+            .expect("second retry backlog payload should write");
+        handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("second retry backlog payload should queue");
+
+        write_vsock_rx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_SECOND_BUFFER,
+                vsock_packet_len_with_payload(first_payload) - 1,
+                None,
+            ),
+        );
+        append_vsock_rx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+
+        let small_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("small RX buffer should preserve queued backlog");
+        let small_rx = small_notification
+            .rx_queue_dispatch()
+            .expect("small RX buffer should produce RX dispatch");
+        assert_eq!(small_rx.processed_buffers(), 1);
+        assert_eq!(small_rx.delivered_host_rw_packets(), 0);
+        assert_eq!(small_rx.buffer_too_small_failures(), 1);
+        assert_eq!(read_vsock_rx_used_index(&memory), 2);
+        assert_eq!(read_vsock_rx_used_element(&memory, 1), (1, 0));
+
+        write_vsock_rx_descriptor(
+            &mut memory,
+            2,
+            TestDescriptor::writable(
+                TEST_VSOCK_PAYLOAD,
+                vsock_packet_len_with_payload(first_payload),
+                None,
+            ),
+        );
+        append_vsock_rx_available_head(&mut memory, 2, 2, 3);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+
+        let first_retry_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("retry RX buffer should receive first queued payload");
+        let first_retry_rx = first_retry_notification
+            .rx_queue_dispatch()
+            .expect("first retry RX should produce dispatch");
+        assert_eq!(first_retry_rx.delivered_host_rw_packets(), 1);
+        assert_eq!(
+            first_retry_rx.delivered_host_rw_bytes(),
+            first_payload.len()
+        );
+        assert_host_rw_payload_in_guest(&memory, TEST_VSOCK_PAYLOAD, 42, 52, 4000, first_payload);
+        assert_eq!(read_vsock_rx_used_index(&memory), 3);
+
+        write_vsock_rx_descriptor(
+            &mut memory,
+            3,
+            TestDescriptor::writable(
+                TEST_VSOCK_SECOND_PAYLOAD,
+                vsock_packet_len_with_payload(second_payload),
+                None,
+            ),
+        );
+        append_vsock_rx_available_head(&mut memory, 3, 3, 4);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+
+        let second_retry_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("retry RX buffer should receive remaining queued payload");
+        let second_retry_rx = second_retry_notification
+            .rx_queue_dispatch()
+            .expect("second retry RX should produce dispatch");
+        assert_eq!(second_retry_rx.delivered_host_rw_packets(), 1);
+        assert_eq!(
+            second_retry_rx.delivered_host_rw_bytes(),
+            second_payload.len()
+        );
+        assert_host_rw_payload_in_guest(
+            &memory,
+            TEST_VSOCK_SECOND_PAYLOAD,
+            42,
+            52,
+            4000,
+            second_payload,
+        );
+        assert_eq!(read_vsock_rx_used_index(&memory), 4);
+
+        drop(handler);
+        assert_stream_closed(
+            &mut accepted,
+            "dropping handler should close retried backlog host RW stream",
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_deliver_queued_host_rw_before_closed_stream_reset() {
+        let (mut memory, mut handler, mut accepted) =
+            established_guest_connection_for_test("host-rw-close-backlog", 52, 4000);
+        let first_payload = b"close-backlog-first";
+        let second_payload = b"close-backlog-second";
+
+        accepted
+            .write_all(first_payload)
+            .expect("first close backlog payload should write");
+        handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("first close backlog payload should queue");
+        accepted
+            .write_all(second_payload)
+            .expect("second close backlog payload should write");
+        handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("second close backlog payload should queue");
+        drop(accepted);
+
+        write_vsock_rx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_SECOND_BUFFER,
+                vsock_packet_len_with_payload(first_payload),
+                None,
+            ),
+        );
+        append_vsock_rx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+        let first_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("first queued payload should deliver before closed-stream reset");
+        assert_eq!(
+            first_notification
+                .rx_queue_dispatch()
+                .expect("first queued payload should produce RX dispatch")
+                .delivered_host_rw_packets(),
+            1
+        );
+        assert_host_rw_payload_in_guest(
+            &memory,
+            TEST_VSOCK_RX_SECOND_BUFFER,
+            42,
+            52,
+            4000,
+            first_payload,
+        );
+        assert!(
+            handler
+                .activation_handler()
+                .has_guest_connection(VsockGuestConnectionKey::new(52, 4000))
+        );
+
+        write_vsock_rx_descriptor(
+            &mut memory,
+            2,
+            TestDescriptor::writable(
+                TEST_VSOCK_PAYLOAD,
+                vsock_packet_len_with_payload(second_payload),
+                None,
+            ),
+        );
+        append_vsock_rx_available_head(&mut memory, 2, 2, 3);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+        let second_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("second queued payload should deliver before closed-stream reset");
+        assert_eq!(
+            second_notification
+                .rx_queue_dispatch()
+                .expect("second queued payload should produce RX dispatch")
+                .delivered_host_rw_packets(),
+            1
+        );
+        assert_host_rw_payload_in_guest(&memory, TEST_VSOCK_PAYLOAD, 42, 52, 4000, second_payload);
+        assert!(
+            handler
+                .activation_handler()
+                .has_guest_connection(VsockGuestConnectionKey::new(52, 4000))
+        );
+
+        let reset_pending_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("closed stream should queue reset after queued payloads drain");
+        let reset_pending_rx = reset_pending_notification
+            .rx_queue_dispatch()
+            .expect("queued reset should attempt RX dispatch");
+        assert_eq!(reset_pending_rx.processed_buffers(), 0);
+        assert_eq!(reset_pending_rx.delivered_reset_packets(), 0);
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_connection_count(),
+            0
+        );
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_reset_packet_count(),
+            1
+        );
+
+        write_vsock_rx_descriptor(
+            &mut memory,
+            3,
+            TestDescriptor::writable(
+                TEST_VSOCK_SECOND_PAYLOAD,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        append_vsock_rx_available_head(&mut memory, 3, 3, 4);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+        let reset_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("queued reset should deliver after payload backlog");
+        let reset_rx = reset_notification
+            .rx_queue_dispatch()
+            .expect("reset should produce RX dispatch");
+        assert_eq!(reset_rx.delivered_reset_packets(), 1);
+        assert_guest_reset_packet_header(
+            read_vsock_packet_header(&memory, TEST_VSOCK_SECOND_PAYLOAD),
+            42,
+            52,
+            4000,
+        );
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_reset_packet_count(),
+            0
         );
     }
 
