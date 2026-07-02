@@ -8,7 +8,7 @@ The current repository defines crate boundaries, endpoint names, a minimal
 HTTP-over-Unix-socket API server for `GET /`, `GET /version`,
 `GET /vm/config`, `GET /machine-config`, pre-boot `PUT /machine-config`
 configuration storage, pre-boot `PUT /boot-source` configuration storage, pre-boot `PUT /drives/{drive_id}`
-configuration storage, pre-boot `PUT /network-interfaces/{iface_id}` configuration storage, pre-boot `PUT /vsock` configuration storage plus an internal virtio-vsock config-space, packet header model, TX descriptor packet parser, TX available-ring drain helper with used-ring descriptor completion, prepared device resource, host Unix socket listener owner, accepted host stream owner, bounded accepted-stream polling and retention, accepted-stream `CONNECT <PORT>` handshake reader, host local port allocator, retained host connection table model with pending host-initiated request packet headers, RX delivery and late RX retry for host request packet headers, guest `RESPONSE` acknowledgement for retained host-initiated connections, bounded guest-visible `RST` queueing for unsupported or orphan host-destined guest packets, bounded guest-initiated `uds_path_<PORT>` connection handling with guest `RESPONSE` or `RST` header delivery, guest `RW` payload forwarding to retained host streams for established guest-initiated connections, bounded host-to-guest `RW` delivery from established retained streams into guest RX buffers, MMIO registration helper, MMIO handler skeleton with active queue metadata retention and handler-level RX/TX notification dispatch, startup FDT attachment, and boot-runtime/HVF RX/TX notification dispatch with queue interrupt signaling, pre-boot `PUT /metrics` output configuration, pre-boot `PUT /logger` output configuration, process-owned `PUT /actions` startup with an internal boot run-loop worker across bounded step windows, runtime `FlushMetrics` with a minimal per-process metrics sink, a macOS-gated internal vmnet descriptor, lifecycle, start owner, concrete system start/stop backend, and packet descriptor boundary model for future host networking, a backend-neutral VM trait, a minimal VMM action/data model with internal
+configuration storage, pre-boot `PUT /network-interfaces/{iface_id}` configuration storage, pre-boot `PUT /vsock` configuration storage plus an internal virtio-vsock config-space, packet header model, TX descriptor packet parser, TX available-ring drain helper with used-ring descriptor completion, prepared device resource, host Unix socket listener owner, accepted host stream owner, bounded accepted-stream polling and retention, accepted-stream `CONNECT <PORT>` handshake reader, host local port allocator, retained host connection table model with pending host-initiated request packet headers, RX delivery and late RX retry for host request packet headers, guest `RESPONSE` acknowledgement for retained host-initiated connections, bounded guest-visible `RST` queueing for unsupported or orphan host-destined guest packets, bounded guest-initiated `uds_path_<PORT>` connection handling with guest `RESPONSE` or `RST` header delivery, guest `RW` payload forwarding to retained host streams for established guest-initiated connections, bounded host-to-guest `RW` delivery from established retained streams into guest RX buffers, MMIO registration helper, MMIO handler skeleton with active queue metadata retention, handler-level RX/TX notification dispatch, no-op event notification handling, startup FDT attachment, and boot-runtime/HVF RX/TX notification dispatch plus no-op event notification handling with queue interrupt signaling, pre-boot `PUT /metrics` output configuration, pre-boot `PUT /logger` output configuration, process-owned `PUT /actions` startup with an internal boot run-loop worker across bounded step windows, runtime `FlushMetrics` with a minimal per-process metrics sink, a macOS-gated internal vmnet descriptor, lifecycle, start owner, concrete system start/stop backend, and packet descriptor boundary model for future host networking, a backend-neutral VM trait, a minimal VMM action/data model with internal
 `InstanceStart` preflight, transactional startup executor, and successful-start state transition helpers, backend-neutral guest
 physical address and aarch64 DRAM layout/access primitives, arm64 boot
 placement helpers, internal boot-source validation and arm64 kernel/initrd
@@ -602,8 +602,8 @@ The runtime crate has an internal virtio-vsock prepared resource, MMIO
 registration helper, config-space, 44-byte little-endian packet header model,
 guest-readable TX descriptor packet parser, TX available-ring drain helper with
 used-ring descriptor completion,
-MMIO handler skeleton with active queue metadata retention and RX/TX
-notification dispatch, and startup FDT attachment. It uses the
+MMIO handler skeleton with active queue metadata retention, RX/TX notification
+dispatch, no-op event notification handling, and startup FDT attachment. It uses the
 virtio device id `19`, three 256-entry RX, TX, and event queues, Firecracker's
 `VERSION_1`, `IN_ORDER`, and `EVENT_IDX` feature bits, and a guest-CID config
 field that supports Firecracker-shaped 8-byte and 4-byte-half reads. Config
@@ -615,13 +615,14 @@ returns payload segment metadata trimmed to the advertised payload length. The
 TX drain helper consumes available TX descriptor chains from the active queue
 into parsed packet metadata while preserving queue progress and publishes
 zero-length used-ring completions for consumed descriptor heads. The handler can
-drain RX and TX queue notifications, dispatch the active RX queue for pending
-host request headers, dispatch the active TX queue, preserve completed RX/TX
-dispatch metadata on errors, and mark the virtio queue interrupt status when
-completed descriptors require guest notification. Boot runtime resources can
-dispatch the registered vsock MMIO handler's RX/TX notifications, and internal
-HVF boot sessions can signal the allocated vsock SPI line from those dispatch
-summaries. The prepared resource preserves the validated guest CID, socket path,
+drain RX, TX, and no-op event queue notifications, dispatch the active RX queue
+for pending host request headers, dispatch the active TX queue, preserve
+completed RX/TX dispatch metadata on errors, and mark the virtio queue
+interrupt status when completed descriptors require guest notification. Boot
+runtime resources can dispatch the registered vsock MMIO handler's RX/TX
+notifications plus no-op event notifications, and internal HVF boot sessions can
+signal the allocated vsock SPI line from those dispatch summaries. The prepared
+resource preserves the validated guest CID, socket path,
 config-space, and inactive device state. Arm64 startup resource assembly can
 bind and own the nonblocking host listener at `uds_path`, retain that owner in
 the internal vsock device resource, and expose one configured vsock device in
