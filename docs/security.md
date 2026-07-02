@@ -95,8 +95,10 @@ is resource-specific:
   stream and queue a guest-visible `VSOCK_OP_RST` instead of buffering
   unbounded data. Established host-initiated and guest-initiated connections
   can also deliver one bounded pending host `VSOCK_OP_RW` payload at a time
-  into validated guest RX buffers. Host-stream EOF or read failures drop the
-  retained stream and queue a guest-visible `VSOCK_OP_RST`.
+  into validated guest RX buffers. Guest `VSOCK_OP_RST` packets drop matching
+  retained host-initiated or guest-initiated streams without queuing guest-visible
+  RX output. Host-stream EOF or read failures drop the retained stream and
+  queue a guest-visible `VSOCK_OP_RST`.
   Startup also binds a nonblocking host Unix listener at `uds_path`,
   records the listener socket device and inode, and removes the path on normal
   shutdown only when it still refers to the socket created by this process. It
@@ -243,14 +245,16 @@ The current scaffold does not implement:
   retained stream before queuing a guest-visible reset. Established
   host-initiated and guest-initiated connections can deliver one bounded
   pending host `VSOCK_OP_RW` payload at a time into validated guest RX buffers,
-  and host-stream EOF or read failures drop the retained stream before queuing
+  guest `VSOCK_OP_RST` packets drop matching retained host-initiated or
+  guest-initiated streams without queuing guest-visible RX output, and
+  host-stream EOF or read failures drop the retained stream before queuing
   a guest-visible reset. Startup preparation creates a nonblocking host Unix
   listener at `uds_path` and cleans it up only while the path still matches the
   created socket inode. It can accept event queue notifications as no-op
   dispatch metadata, but it still does not route CIDs beyond current host/guest
   checks, dispatch real event payloads, provide host-to-guest data movement
-  beyond one bounded pending packet per established stream, retry buffered RW
-  writes, or implement full credit accounting
+  beyond one bounded pending packet per established stream, implement graceful
+  shutdown, retry buffered RW writes, or implement full credit accounting
 - complete production logging or metrics policy
 - public run-loop control or public serial streaming policy
 
