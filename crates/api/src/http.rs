@@ -1238,12 +1238,16 @@ fn validate_mmds_config_request(body: &MmdsConfigRequestBody) -> Result<(), Requ
     }
 
     if let Some(ipv4_address) = body.ipv4_address
-        && !ipv4_address.is_link_local()
+        && !is_valid_mmds_link_local_ipv4(ipv4_address)
     {
         return Err(RequestError::MalformedRequest);
     }
 
     Ok(())
+}
+
+fn is_valid_mmds_link_local_ipv4(ipv4_address: Ipv4Addr) -> bool {
+    matches!(ipv4_address.octets(), [169, 254, 1..=254, _])
 }
 
 fn validate_rate_limiter_config(value: &serde_json::Value) -> Result<(), RequestError> {
@@ -2208,6 +2212,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_put_mmds_config_with_link_local_ipv4_boundaries() {
+        for ipv4_address in ["169.254.1.0", "169.254.254.255"] {
+            let body =
+                format!(r#"{{"network_interfaces":["eth0"],"ipv4_address":"{ipv4_address}"}}"#);
+            let request = request_with_body("PUT", "/mmds/config", &body);
+
+            let parsed = parse_request(&request).expect("boundary MMDS config should parse");
+
+            let ApiRequest::PutMmdsConfig(config) = parsed else {
+                panic!("expected MMDS config request");
+            };
+            assert_eq!(
+                config.ipv4_address().map(|address| address.to_string()),
+                Some(ipv4_address.to_string())
+            );
+        }
+    }
+
+    #[test]
     fn rejects_get_mmds_with_body() {
         let request = request_with_body("GET", "/mmds", "{}");
 
@@ -2240,6 +2263,8 @@ mod tests {
             r#"{"network_interfaces":["eth0","   "]}"#,
             r#"{"network_interfaces":["eth0"],"version":"V3"}"#,
             r#"{"network_interfaces":["eth0"],"ipv4_address":"127.0.0.1"}"#,
+            r#"{"network_interfaces":["eth0"],"ipv4_address":"169.254.0.1"}"#,
+            r#"{"network_interfaces":["eth0"],"ipv4_address":"169.254.255.1"}"#,
             r#"{"network_interfaces":["eth0"],"ipv4_address":"not-an-ip"}"#,
             r#"{"network_interfaces":["eth0"],"imds_compat":"true"}"#,
             r#"{"network_interfaces":["eth0"],"unknown":true}"#,
