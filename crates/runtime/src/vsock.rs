@@ -6139,6 +6139,7 @@ mod tests {
     const TEST_VSOCK_SECOND_HEADER: GuestAddress = GuestAddress::new(0x5000);
     const TEST_VSOCK_PAYLOAD: GuestAddress = GuestAddress::new(0x6000);
     const TEST_VSOCK_SECOND_PAYLOAD: GuestAddress = GuestAddress::new(0x7000);
+    const TEST_VSOCK_THIRD_HEADER: GuestAddress = GuestAddress::new(0x8000);
     const TEST_VSOCK_QUEUE_SIZE: u16 = 8;
 
     fn validate(input: VsockConfigInput) -> Result<super::VsockConfig, VsockConfigError> {
@@ -13286,7 +13287,6 @@ mod tests {
         let unmatched = guest_request_tx_packet(42, 52, 4000)
             .header()
             .with_operation(VIRTIO_VSOCK_OP_RST);
-        let unmatched_address = GuestAddress::new(0x8000);
 
         activate_vsock_handler(&mut handler);
         write_vsock_rx_descriptor(
@@ -13326,7 +13326,7 @@ mod tests {
             ),
             (
                 4,
-                unmatched_address,
+                TEST_VSOCK_THIRD_HEADER,
                 unmatched,
                 VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
             ),
