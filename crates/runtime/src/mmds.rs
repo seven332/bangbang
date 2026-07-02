@@ -225,7 +225,7 @@ impl MmdsGuestRequest {
         let uri = guest_request_uri_path(uri)?;
         let mut content_length = None;
         let mut output_format = MmdsOutputFormat::Imds;
-        let mut ttl_header = None;
+        let mut token_ttl = MmdsGuestTokenTtlHeaders::Missing;
         let mut forwarded_for = false;
 
         for line in lines {
@@ -243,10 +243,16 @@ impl MmdsGuestRequest {
                 if name.eq_ignore_ascii_case(MMDS_GUEST_X_FORWARDED_FOR) {
                     forwarded_for = true;
                 } else if let Some(header) = MmdsGuestTokenTtlHeader::parse_name(name) {
-                    if ttl_header.is_some() {
-                        return Err(MmdsGuestRequestParseError::DuplicateTokenTtl);
-                    }
-                    ttl_header = Some((header, parse_guest_token_ttl(value)?));
+                    token_ttl = match token_ttl {
+                        MmdsGuestTokenTtlHeaders::Missing => MmdsGuestTokenTtlHeaders::Single {
+                            ttl_header: header,
+                            ttl_value: value.to_string(),
+                        },
+                        MmdsGuestTokenTtlHeaders::Single { .. }
+                        | MmdsGuestTokenTtlHeaders::Duplicate => {
+                            MmdsGuestTokenTtlHeaders::Duplicate
+                        }
+                    };
                 }
             }
         }
@@ -268,10 +274,7 @@ impl MmdsGuestRequest {
 
                 Ok(Self::TokenPut(MmdsGuestTokenPutRequest {
                     uri: uri.to_string(),
-                    token_ttl: ttl_header.map(|(ttl_header, ttl_seconds)| MmdsGuestTokenTtl {
-                        ttl_header,
-                        ttl_seconds,
-                    }),
+                    token_ttl,
                 }))
             }
         }
@@ -297,7 +300,7 @@ impl MmdsGuestGetRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MmdsGuestTokenPutRequest {
     uri: String,
-    token_ttl: Option<MmdsGuestTokenTtl>,
+    token_ttl: MmdsGuestTokenTtlHeaders,
 }
 
 impl MmdsGuestTokenPutRequest {
@@ -305,18 +308,25 @@ impl MmdsGuestTokenPutRequest {
         &self.uri
     }
 
-    pub const fn token_ttl(&self) -> Option<(MmdsGuestTokenTtlHeader, u32)> {
-        match self.token_ttl {
-            Some(token_ttl) => Some((token_ttl.ttl_header, token_ttl.ttl_seconds)),
-            None => None,
+    pub fn token_ttl(&self) -> Option<(MmdsGuestTokenTtlHeader, &str)> {
+        match &self.token_ttl {
+            MmdsGuestTokenTtlHeaders::Single {
+                ttl_header,
+                ttl_value,
+            } => Some((*ttl_header, ttl_value.as_str())),
+            MmdsGuestTokenTtlHeaders::Missing | MmdsGuestTokenTtlHeaders::Duplicate => None,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MmdsGuestTokenTtl {
-    ttl_header: MmdsGuestTokenTtlHeader,
-    ttl_seconds: u32,
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MmdsGuestTokenTtlHeaders {
+    Missing,
+    Single {
+        ttl_header: MmdsGuestTokenTtlHeader,
+        ttl_value: String,
+    },
+    Duplicate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -902,8 +912,27 @@ impl MmdsState {
             );
         }
 
-        let Some((ttl_header, ttl_seconds)) = request.token_ttl() else {
-            return guest_request_parse_error_response(MmdsGuestRequestParseError::MissingTokenTtl);
+        let (ttl_header, ttl_value) = match &request.token_ttl {
+            MmdsGuestTokenTtlHeaders::Missing => {
+                return guest_request_parse_error_response(
+                    MmdsGuestRequestParseError::MissingTokenTtl,
+                );
+            }
+            MmdsGuestTokenTtlHeaders::Single {
+                ttl_header,
+                ttl_value,
+            } => (*ttl_header, ttl_value.as_str()),
+            MmdsGuestTokenTtlHeaders::Duplicate => {
+                return guest_request_parse_error_response(
+                    MmdsGuestRequestParseError::DuplicateTokenTtl,
+                );
+            }
+        };
+        let ttl_seconds = match parse_guest_token_ttl(ttl_value) {
+            Ok(ttl_seconds) => ttl_seconds,
+            Err(err) => {
+                return guest_request_parse_error_response(err);
+            }
         };
 
         match self.generate_guest_token(ttl_seconds) {
@@ -1294,7 +1323,7 @@ mod tests {
         bytes: &[u8],
         expected_uri: &str,
         expected_ttl_header: MmdsGuestTokenTtlHeader,
-        expected_ttl_seconds: u32,
+        expected_ttl_value: &str,
     ) {
         let request =
             MmdsGuestRequest::parse_http(bytes).expect("test MMDS guest HTTP request should parse");
@@ -1305,7 +1334,7 @@ mod tests {
         assert_eq!(request.uri(), expected_uri);
         assert_eq!(
             request.token_ttl(),
-            Some((expected_ttl_header, expected_ttl_seconds))
+            Some((expected_ttl_header, expected_ttl_value))
         );
     }
 
@@ -1874,40 +1903,36 @@ mod tests {
             b"PUT /latest/api/token HTTP/1.1\r\nX-metadata-token-ttl-seconds: 60\r\n\r\n",
             "/latest/api/token",
             MmdsGuestTokenTtlHeader::Metadata,
-            60,
+            "60",
         );
         assert_guest_token_put_request(
             b"PUT /latest/api/token HTTP/1.1\r\nX-aws-ec2-metadata-token-ttl-seconds: 21600\r\n\r\n",
             "/latest/api/token",
             MmdsGuestTokenTtlHeader::AwsEc2Metadata,
-            MMDS_TOKEN_MAX_TTL_SECONDS,
+            "21600",
         );
         assert_guest_token_put_request(
             b"PUT http://169.254.169.254/latest/api/token HTTP/1.1\r\nx-MeTaDaTa-ToKeN-TtL-SeCoNdS: 1\r\n\r\n",
             "/latest/api/token",
             MmdsGuestTokenTtlHeader::Metadata,
-            MMDS_TOKEN_MIN_TTL_SECONDS,
+            "1",
+        );
+        assert_guest_token_put_request(
+            b"PUT /latest/api/token HTTP/1.1\r\nX-metadata-token-ttl-seconds: application/json\r\n\r\n",
+            "/latest/api/token",
+            MmdsGuestTokenTtlHeader::Metadata,
+            "application/json",
         );
     }
 
     #[test]
-    fn mmds_guest_request_rejects_invalid_token_put_headers() {
-        for (request, err) in [
-            (
-                b"PUT /latest/api/token HTTP/1.1\r\nX-metadata-token-ttl-seconds: application/json\r\n\r\n".as_slice(),
-                MmdsGuestRequestParseError::InvalidTokenTtl,
-            ),
-            (
-                b"PUT /latest/api/token HTTP/1.1\r\nX-metadata-token-ttl-seconds: 1\r\nX-aws-ec2-metadata-token-ttl-seconds: 1\r\n\r\n",
-                MmdsGuestRequestParseError::DuplicateTokenTtl,
-            ),
-            (
+    fn mmds_guest_request_rejects_forwarded_for_token_put_header() {
+        assert_eq!(
+            MmdsGuestRequest::parse_http(
                 b"PUT /latest/api/token HTTP/1.1\r\nX-metadata-token-ttl-seconds: 1\r\nX-Forwarded-For: 127.0.0.1\r\n\r\n",
-                MmdsGuestRequestParseError::UnsupportedForwardedFor,
             ),
-        ] {
-            assert_eq!(MmdsGuestRequest::parse_http(request), Err(err));
-        }
+            Err(MmdsGuestRequestParseError::UnsupportedForwardedFor)
+        );
     }
 
     #[test]
@@ -2014,6 +2039,11 @@ mod tests {
                 "MMDS guest token TTL header value is invalid.",
             ),
             (
+                b"PUT /latest/api/token HTTP/1.1\r\nX-metadata-token-ttl-seconds: 1\r\nX-aws-ec2-metadata-token-ttl-seconds: 1\r\n\r\n",
+                MmdsGuestStatus::BadRequest,
+                "MMDS guest token TTL header is duplicated.",
+            ),
+            (
                 b"PUT /latest/api/token HTTP/1.1\r\nX-metadata-token-ttl-seconds: 21601\r\n\r\n",
                 MmdsGuestStatus::BadRequest,
                 "Invalid MMDS token TTL: 21601. Please provide a value between 1 and 21600.",
@@ -2025,6 +2055,16 @@ mod tests {
             ),
             (
                 b"PUT /wrong HTTP/1.1\r\n\r\n",
+                MmdsGuestStatus::NotFound,
+                "Resource not found: /wrong.",
+            ),
+            (
+                b"PUT /wrong HTTP/1.1\r\nX-metadata-token-ttl-seconds: application/json\r\n\r\n",
+                MmdsGuestStatus::NotFound,
+                "Resource not found: /wrong.",
+            ),
+            (
+                b"PUT /wrong HTTP/1.1\r\nX-metadata-token-ttl-seconds: 1\r\nX-aws-ec2-metadata-token-ttl-seconds: 1\r\n\r\n",
                 MmdsGuestStatus::NotFound,
                 "Resource not found: /wrong.",
             ),
