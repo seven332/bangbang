@@ -8,6 +8,7 @@ pub mod logger;
 pub mod machine;
 pub mod memory;
 pub mod metrics;
+pub mod mmds;
 pub mod mmio;
 pub mod network;
 pub mod serial;
@@ -65,6 +66,7 @@ pub enum VmmAction {
     GetVmmVersion,
     GetVmInstanceInfo,
     GetMachineConfig,
+    GetMmds,
     GetVmConfig,
     InstanceStart,
     FlushMetrics,
@@ -72,6 +74,9 @@ pub enum VmmAction {
     PutLogger(logger::LoggerConfigInput),
     PutMachineConfig(machine::MachineConfigInput),
     PutMetrics(metrics::MetricsConfigInput),
+    PutMmds(mmds::MmdsContentInput),
+    PatchMmds(mmds::MmdsContentInput),
+    PutMmdsConfig(mmds::MmdsConfigInput),
     PutDrive(block::DriveConfigInput),
     PutNetworkInterface(network::NetworkInterfaceConfigInput),
     PutVsock(vsock::VsockConfigInput),
@@ -83,6 +88,7 @@ impl VmmAction {
             Self::GetVmmVersion => "GetVmmVersion",
             Self::GetVmInstanceInfo => "GetVmInstanceInfo",
             Self::GetMachineConfig => "GetMachineConfig",
+            Self::GetMmds => "GetMmds",
             Self::GetVmConfig => "GetVmConfig",
             Self::InstanceStart => "InstanceStart",
             Self::FlushMetrics => "FlushMetrics",
@@ -90,6 +96,9 @@ impl VmmAction {
             Self::PutLogger(_) => "PutLogger",
             Self::PutMachineConfig(_) => "PutMachineConfig",
             Self::PutMetrics(_) => "PutMetrics",
+            Self::PutMmds(_) => "PutMmds",
+            Self::PatchMmds(_) => "PatchMmds",
+            Self::PutMmdsConfig(_) => "PutMmdsConfig",
             Self::PutDrive(_) => "PutDrive",
             Self::PutNetworkInterface(_) => "PutNetworkInterface",
             Self::PutVsock(_) => "PutVsock",
@@ -327,6 +336,7 @@ impl VmmController {
                 Ok(VmmData::InstanceInformation(self.instance_info.clone()))
             }
             VmmAction::GetMachineConfig => Ok(VmmData::MachineConfiguration(self.machine_config)),
+            VmmAction::GetMmds => Err(VmmActionError::UnsupportedAction(action_name)),
             VmmAction::GetVmConfig => Ok(VmmData::VmConfiguration(self.vm_config())),
             VmmAction::InstanceStart => {
                 self.preflight_instance_start()?;
@@ -400,6 +410,19 @@ impl VmmController {
                     .map_err(VmmActionError::MetricsConfig)?;
 
                 Ok(VmmData::Empty)
+            }
+            VmmAction::PutMmds(_) | VmmAction::PatchMmds(_) => {
+                Err(VmmActionError::UnsupportedAction(action_name))
+            }
+            VmmAction::PutMmdsConfig(_) => {
+                if self.instance_info.state != InstanceState::NotStarted {
+                    return Err(VmmActionError::UnsupportedState {
+                        action: action_name,
+                        state: self.instance_info.state,
+                    });
+                }
+
+                Err(VmmActionError::UnsupportedAction(action_name))
             }
             VmmAction::PutDrive(config) => {
                 if self.instance_info.state != InstanceState::NotStarted {
@@ -487,6 +510,7 @@ mod tests {
         logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel},
         machine::{DEFAULT_MEM_SIZE_MIB, DEFAULT_VCPU_COUNT, MachineConfigInput},
         metrics::{MetricsConfigError, MetricsConfigInput},
+        mmds::{MmdsConfigInput, MmdsContentInput, MmdsVersion},
         network::{
             GuestMacAddress, MAX_NETWORK_INTERFACE_COUNT, NetworkInterfaceConfigError,
             NetworkInterfaceConfigInput,
@@ -508,6 +532,14 @@ mod tests {
 
     fn boot_source_input(kernel_image_path: &str) -> BootSourceConfigInput {
         BootSourceConfigInput::new(kernel_image_path)
+    }
+
+    fn mmds_content_input() -> MmdsContentInput {
+        MmdsContentInput::new(r#"{"latest":{"meta-data":{}}}"#)
+    }
+
+    fn mmds_config_input() -> MmdsConfigInput {
+        MmdsConfigInput::new(vec!["eth0".to_string()]).with_version(MmdsVersion::V2)
     }
 
     fn unique_metrics_path(name: &str) -> PathBuf {
@@ -745,6 +777,7 @@ mod tests {
         assert_eq!(VmmAction::GetVmConfig.name(), "GetVmConfig");
         assert_eq!(VmmAction::InstanceStart.name(), "InstanceStart");
         assert_eq!(VmmAction::FlushMetrics.name(), "FlushMetrics");
+        assert_eq!(VmmAction::GetMmds.name(), "GetMmds");
         assert_eq!(
             VmmAction::PutLogger(LoggerConfigInput::new()).name(),
             "PutLogger"
@@ -756,6 +789,15 @@ mod tests {
         assert_eq!(
             VmmAction::PutVsock(vsock_input(3, "./v.sock")).name(),
             "PutVsock"
+        );
+        assert_eq!(VmmAction::PutMmds(mmds_content_input()).name(), "PutMmds");
+        assert_eq!(
+            VmmAction::PatchMmds(mmds_content_input()).name(),
+            "PatchMmds"
+        );
+        assert_eq!(
+            VmmAction::PutMmdsConfig(mmds_config_input()).name(),
+            "PutMmdsConfig"
         );
     }
 
@@ -806,6 +848,59 @@ mod tests {
         assert!(controller.boot_source_config().is_none());
         assert!(controller.drive_configs().is_empty());
         assert!(controller.network_interface_configs().is_empty());
+    }
+
+    #[test]
+    fn mmds_actions_are_unsupported_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
+        for action in [
+            VmmAction::GetMmds,
+            VmmAction::PutMmds(mmds_content_input()),
+            VmmAction::PatchMmds(mmds_content_input()),
+            VmmAction::PutMmdsConfig(mmds_config_input()),
+        ] {
+            let action_name = action.name();
+            let err = controller
+                .handle_action(action)
+                .expect_err("MMDS action should remain unsupported");
+
+            assert_eq!(err, VmmActionError::UnsupportedAction(action_name));
+            assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+            assert_eq!(controller.machine_config().vcpu_count(), DEFAULT_VCPU_COUNT);
+            assert!(controller.boot_source_config().is_none());
+            assert!(controller.drive_configs().is_empty());
+            assert!(controller.network_interface_configs().is_empty());
+            assert_eq!(controller.vsock_config(), None);
+        }
+    }
+
+    #[test]
+    fn mmds_config_action_rejects_running_state_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller
+            .commit_instance_start()
+            .expect("start commit should set running state");
+
+        let err = controller
+            .handle_action(VmmAction::PutMmdsConfig(mmds_config_input()))
+            .expect_err("running MMDS config should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::UnsupportedState {
+                action: "PutMmdsConfig",
+                state: InstanceState::Running,
+            }
+        );
+        assert_eq!(controller.instance_info().state, InstanceState::Running);
+        assert!(controller.boot_source_config().is_some());
+        assert!(controller.drive_configs().is_empty());
+        assert!(controller.network_interface_configs().is_empty());
+        assert_eq!(controller.vsock_config(), None);
     }
 
     #[test]

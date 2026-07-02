@@ -15,9 +15,9 @@ use bangbang_api::http::{
     DriveCacheType as ApiDriveCacheType, DriveConfigRequest, DriveConfigResponse,
     DriveIoEngine as ApiDriveIoEngine, HttpResponse, LoggerConfigRequest,
     LoggerLevel as ApiLoggerLevel, MachineConfigRequest, MachineConfigResponse,
-    MetricsConfigRequest, NetworkInterfaceConfigRequest, NetworkInterfaceConfigResponse,
-    RequestError, VmConfigResponse, VsockConfigRequest, VsockConfigResponse, parse_request,
-    request_total_len,
+    MetricsConfigRequest, MmdsConfigRequest, MmdsContentRequest, MmdsVersion as ApiMmdsVersion,
+    NetworkInterfaceConfigRequest, NetworkInterfaceConfigResponse, RequestError, VmConfigResponse,
+    VsockConfigRequest, VsockConfigResponse, parse_request, request_total_len,
 };
 use bangbang_runtime::block::{DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine};
 use bangbang_runtime::boot::{BootSourceConfig, BootSourceConfigInput};
@@ -27,6 +27,9 @@ use bangbang_runtime::machine::{
     MachineConfigHugePages as RuntimeMachineConfigHugePages, MachineConfigInput,
 };
 use bangbang_runtime::metrics::MetricsConfigInput;
+use bangbang_runtime::mmds::{
+    MmdsConfigInput, MmdsContentInput, MmdsVersion as RuntimeMmdsVersion,
+};
 #[cfg(test)]
 use bangbang_runtime::network::MAX_NETWORK_INTERFACE_COUNT;
 use bangbang_runtime::network::{NetworkInterfaceConfig, NetworkInterfaceConfigInput};
@@ -409,6 +412,7 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::GetMachineConfig => {
             handle_machine_config(vmm.handle_action(VmmAction::GetMachineConfig))
         }
+        ApiRequest::GetMmds => handle_mmds(vmm.handle_action(VmmAction::GetMmds)),
         ApiRequest::GetVmConfig => handle_vm_config(vmm.handle_action(VmmAction::GetVmConfig)),
         ApiRequest::PutAction(action) => {
             handle_empty(vmm.handle_action(action_from_request(action.as_ref())))
@@ -425,6 +429,15 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PutMetrics(config) => handle_empty(vmm.handle_action(VmmAction::PutMetrics(
             metrics_config_input_from_request(config.as_ref()),
         ))),
+        ApiRequest::PutMmds(content) => handle_empty(vmm.handle_action(VmmAction::PutMmds(
+            mmds_content_input_from_request(content.as_ref()),
+        ))),
+        ApiRequest::PatchMmds(content) => handle_empty(vmm.handle_action(VmmAction::PatchMmds(
+            mmds_content_input_from_request(content.as_ref()),
+        ))),
+        ApiRequest::PutMmdsConfig(config) => handle_empty(vmm.handle_action(
+            VmmAction::PutMmdsConfig(mmds_config_input_from_request(config.as_ref())),
+        )),
         ApiRequest::PutDrive(config) => handle_empty(vmm.handle_action(VmmAction::PutDrive(
             drive_config_input_from_request(config.as_ref()),
         ))),
@@ -520,6 +533,19 @@ fn handle_vm_config(result: Result<VmmData, bangbang_runtime::VmmActionError>) -
             | VmmData::InstanceInformation(_)
             | VmmData::MachineConfiguration(_),
         ) => HttpResponse::fault("VM config request returned unexpected VMM data."),
+        Err(err) => HttpResponse::fault(&err.to_string()),
+    }
+}
+
+fn handle_mmds(result: Result<VmmData, bangbang_runtime::VmmActionError>) -> HttpResponse {
+    match result {
+        Ok(
+            VmmData::Empty
+            | VmmData::VmmVersion(_)
+            | VmmData::InstanceInformation(_)
+            | VmmData::MachineConfiguration(_)
+            | VmmData::VmConfiguration(_),
+        ) => HttpResponse::fault("MMDS request returned unexpected VMM data."),
         Err(err) => HttpResponse::fault(&err.to_string()),
     }
 }
@@ -639,6 +665,25 @@ fn machine_config_input_from_request(config: &MachineConfigRequest) -> MachineCo
 
 fn metrics_config_input_from_request(config: &MetricsConfigRequest) -> MetricsConfigInput {
     MetricsConfigInput::new(config.metrics_path())
+}
+
+fn mmds_content_input_from_request(content: &MmdsContentRequest) -> MmdsContentInput {
+    MmdsContentInput::new(content.value().to_string())
+}
+
+fn mmds_config_input_from_request(config: &MmdsConfigRequest) -> MmdsConfigInput {
+    let mut input = MmdsConfigInput::new(config.network_interfaces().to_vec())
+        .with_version(match config.version() {
+            ApiMmdsVersion::V1 => RuntimeMmdsVersion::V1,
+            ApiMmdsVersion::V2 => RuntimeMmdsVersion::V2,
+        })
+        .with_imds_compat(config.imds_compat());
+
+    if let Some(ipv4_address) = config.ipv4_address() {
+        input = input.with_ipv4_address(ipv4_address);
+    }
+
+    input
 }
 
 fn logger_config_input_from_request(config: &LoggerConfigRequest) -> LoggerConfigInput {
@@ -1182,6 +1227,135 @@ mod tests {
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::NotStarted
         );
+    }
+
+    #[test]
+    fn dispatches_mmds_requests_to_unsupported_runtime_actions() {
+        let mut vmm = test_controller();
+
+        let get_response =
+            handle_request_bytes(b"GET /mmds HTTP/1.1\r\nHost: localhost\r\n\r\n", &mut vmm);
+
+        assert_eq!(
+            get_response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+        assert_eq!(
+            get_response.body(),
+            r#"{"fault_message":"The requested operation is not supported: GetMmds"}"#
+        );
+
+        for (method, path, body, action_name) in [
+            ("PUT", "/mmds", r#"{"latest":{"meta-data":{}}}"#, "PutMmds"),
+            (
+                "PATCH",
+                "/mmds",
+                r#"{"latest":{"dynamic":{}}}"#,
+                "PatchMmds",
+            ),
+            (
+                "PUT",
+                "/mmds/config",
+                r#"{"network_interfaces":["eth0"],"version":"V2"}"#,
+                "PutMmdsConfig",
+            ),
+        ] {
+            let request = format!(
+                "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+
+            let response = handle_request_bytes(request.as_bytes(), &mut vmm);
+
+            assert_eq!(
+                response.status(),
+                bangbang_api::http::StatusCode::BadRequest
+            );
+            assert_eq!(
+                response.body(),
+                format!(
+                    r#"{{"fault_message":"The requested operation is not supported: {action_name}"}}"#
+                )
+            );
+        }
+
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::NotStarted
+        );
+        assert!(vmm.boot_source_config().is_none());
+        assert!(vmm.drive_configs().is_empty());
+    }
+
+    #[test]
+    fn invalid_mmds_config_request_does_not_reach_runtime() {
+        let mut vmm = test_controller();
+        let body = r#"{"network_interfaces":[]}"#;
+        let request = format!(
+            "PUT /mmds/config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        let response = handle_request_bytes(request.as_bytes(), &mut vmm);
+
+        assert_eq!(
+            response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+        assert_eq!(
+            response.body(),
+            r#"{"fault_message":"Malformed HTTP request."}"#
+        );
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::NotStarted
+        );
+        assert!(vmm.boot_source_config().is_none());
+        assert!(vmm.drive_configs().is_empty());
+    }
+
+    #[test]
+    fn mmds_config_after_start_returns_state_fault() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let boot_body = r#"{"kernel_image_path":"/tmp/vmlinux"}"#;
+        let boot_request = format!(
+            "PUT /boot-source HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{boot_body}",
+            boot_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_body = r#"{"action_type":"InstanceStart"}"#;
+        let start_request = format!(
+            "PUT /actions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{start_body}",
+            start_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(start_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let body = r#"{"network_interfaces":["eth0"]}"#;
+        let request = format!(
+            "PUT /mmds/config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let response = handle_request_bytes(request.as_bytes(), &mut vmm);
+
+        assert_eq!(
+            response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+        assert_eq!(
+            response.body(),
+            r#"{"fault_message":"The requested operation is not supported in Running state: PutMmdsConfig"}"#
+        );
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::Running
+        );
+        assert!(vmm.boot_source_config().is_some());
     }
 
     #[test]
