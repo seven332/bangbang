@@ -337,6 +337,7 @@ impl MmdsGuestContentType {
 pub struct MmdsGuestResponse {
     status: MmdsGuestStatus,
     content_type: MmdsGuestContentType,
+    allow: Option<&'static str>,
     body: String,
 }
 
@@ -345,8 +346,14 @@ impl MmdsGuestResponse {
         Self {
             status,
             content_type,
+            allow: None,
             body,
         }
+    }
+
+    fn with_allow_header(mut self, allow: &'static str) -> Self {
+        self.allow = Some(allow);
+        self
     }
 
     pub const fn status(&self) -> MmdsGuestStatus {
@@ -362,15 +369,22 @@ impl MmdsGuestResponse {
     }
 
     pub fn to_http_bytes(&self) -> Vec<u8> {
-        format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n{}",
+        let mut response = format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\n",
             self.status.as_u16(),
             self.status.reason_phrase(),
             self.content_type.as_str(),
-            self.body.len(),
-            self.body
-        )
-        .into_bytes()
+        );
+        if let Some(allow) = self.allow {
+            response.push_str("Allow: ");
+            response.push_str(allow);
+            response.push_str("\r\n");
+        }
+        response.push_str("Content-Length: ");
+        response.push_str(&self.body.len().to_string());
+        response.push_str("\r\n\r\n");
+        response.push_str(&self.body);
+        response.into_bytes()
     }
 }
 
@@ -738,7 +752,12 @@ fn guest_request_parse_error_response(err: MmdsGuestRequestParseError) -> MmdsGu
         | MmdsGuestRequestParseError::UnsupportedAccept => MmdsGuestStatus::BadRequest,
     };
 
-    MmdsGuestResponse::new(status, MmdsGuestContentType::PlainText, err.to_string())
+    let response = MmdsGuestResponse::new(status, MmdsGuestContentType::PlainText, err.to_string());
+    if status == MmdsGuestStatus::MethodNotAllowed {
+        return response.with_allow_header("GET");
+    }
+
+    response
 }
 
 fn format_imds(value: &Value) -> Result<String, MmdsDataStoreError> {
@@ -1445,7 +1464,7 @@ mod tests {
 
         assert_eq!(
             state.guest_http_response_bytes(b"POST /meta-data/hostname HTTP/1.1\r\n\r\n"),
-            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\nContent-Length: 48\r\n\r\nMMDS guest HTTP request method is not supported."
+            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\nAllow: GET\r\nContent-Length: 48\r\n\r\nMMDS guest HTTP request method is not supported."
                 .to_vec()
         );
     }

@@ -1173,8 +1173,9 @@ request bodies and transfer encodings, maps `Accept: application/json` to JSON
 output, and defaults missing, empty, wildcard, or `text/plain` `Accept` headers
 to IMDS text output. The runtime can also convert complete process-local guest
 HTTP request buffers into deterministic response bytes, mapping unsupported
-methods to `405 Method Not Allowed` and other parse failures to `400 Bad
-Request` plain-text responses without echoing malformed request bytes.
+methods to `405 Method Not Allowed` with the current `Allow: GET` header and
+other parse failures to `400 Bad Request` plain-text responses without echoing
+malformed request bytes. Firecracker's guest `PUT` token flow remains deferred.
 Process-local guest response-byte serialization currently emits fixed HTTP/1.1
 response bytes; preserving a guest request's original HTTP version remains
 deferred.
