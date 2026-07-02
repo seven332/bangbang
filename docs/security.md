@@ -103,8 +103,12 @@ is resource-specific:
   retained host-initiated or guest-initiated streams without queuing guest-visible
   RX output. Full guest `VSOCK_OP_SHUTDOWN` packets drop matching retained
   streams, release the host local port when applicable, and queue a
-  guest-visible `VSOCK_OP_RST`. Host-stream EOF or read failures drop the
-  retained stream and queue a guest-visible `VSOCK_OP_RST`.
+  guest-visible `VSOCK_OP_RST`. Valid guest `VSOCK_OP_CREDIT_UPDATE` packets
+  for established retained streams are consumed without queuing a reset, and
+  valid guest `VSOCK_OP_CREDIT_REQUEST` packets queue zero-payload guest-visible
+  `VSOCK_OP_CREDIT_UPDATE` headers on the existing RX path. Host-stream EOF or
+  read failures drop the retained stream and queue a guest-visible
+  `VSOCK_OP_RST`.
   Startup also binds a nonblocking host Unix listener at `uds_path`,
   records the listener socket device and inode, and removes the path on normal
   shutdown only when it still refers to the socket created by this process. It
@@ -257,8 +261,12 @@ The current scaffold does not implement:
   guest `VSOCK_OP_RST` packets drop matching retained host-initiated or
   guest-initiated streams without queuing guest-visible RX output, and
   full guest `VSOCK_OP_SHUTDOWN` packets drop matching retained streams before
-  queuing a guest-visible reset. Host-stream EOF or read failures drop the
-  retained stream before queuing a guest-visible reset. Startup preparation
+  queuing a guest-visible reset. Valid guest `VSOCK_OP_CREDIT_UPDATE` packets
+  for established retained streams are consumed without queuing a reset, and
+  valid guest `VSOCK_OP_CREDIT_REQUEST` packets queue zero-payload guest-visible
+  `VSOCK_OP_CREDIT_UPDATE` headers on the existing RX path. Host-stream EOF or
+  read failures drop the retained stream before queuing a guest-visible reset.
+  Startup preparation
   creates a nonblocking host Unix listener at `uds_path` and cleans it up only
   while the path still matches the created socket inode. It can accept event
   queue notifications as no-op

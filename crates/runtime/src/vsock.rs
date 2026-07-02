@@ -722,6 +722,7 @@ pub struct VsockHostConnection {
     accepted: VsockHostAcceptedConnection,
     request_packet_pending: bool,
     host_ack_sent: bool,
+    pending_credit_update_packet: bool,
     pending_host_rw_payloads: VecDeque<Vec<u8>>,
 }
 
@@ -731,6 +732,7 @@ impl VsockHostConnection {
             accepted,
             request_packet_pending: true,
             host_ack_sent: false,
+            pending_credit_update_packet: false,
             pending_host_rw_payloads: VecDeque::new(),
         }
     }
@@ -745,6 +747,14 @@ impl VsockHostConnection {
 
     fn has_pending_host_rw_packet(&self) -> bool {
         !self.pending_host_rw_payloads.is_empty()
+    }
+
+    const fn has_pending_credit_update_packet(&self) -> bool {
+        self.pending_credit_update_packet
+    }
+
+    const fn is_established(&self) -> bool {
+        !self.request_packet_pending && self.host_ack_sent
     }
 
     #[cfg(test)]
@@ -792,6 +802,23 @@ impl VsockHostConnection {
         self.request_packet_pending = false;
 
         Some(host_connection_request_packet_header(key, guest_cid))
+    }
+
+    fn queue_pending_credit_update_packet(&mut self) {
+        self.pending_credit_update_packet = true;
+    }
+
+    fn take_pending_credit_update_packet_header(
+        &mut self,
+        key: VsockHostConnectionKey,
+        guest_cid: u32,
+    ) -> Option<VirtioVsockPacketHeader> {
+        if !self.pending_credit_update_packet {
+            return None;
+        }
+        self.pending_credit_update_packet = false;
+
+        Some(host_connection_credit_update_packet_header(key, guest_cid))
     }
 
     fn pending_host_rw_packet(
@@ -960,6 +987,20 @@ fn host_connection_reset_packet_header(
         .with_buffer_allocation(VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE)
 }
 
+fn host_connection_credit_update_packet_header(
+    key: VsockHostConnectionKey,
+    guest_cid: u32,
+) -> VirtioVsockPacketHeader {
+    VirtioVsockPacketHeader::new()
+        .with_src_cid(VIRTIO_VSOCK_HOST_CID)
+        .with_dst_cid(u64::from(guest_cid))
+        .with_src_port(key.local_port().raw())
+        .with_dst_port(key.peer_port())
+        .with_packet_type(VIRTIO_VSOCK_PACKET_TYPE_STREAM)
+        .with_operation(VIRTIO_VSOCK_OP_CREDIT_UPDATE)
+        .with_buffer_allocation(VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE)
+}
+
 fn guest_connection_response_packet_header(
     key: VsockGuestConnectionKey,
     guest_cid: u32,
@@ -1001,6 +1042,20 @@ fn guest_connection_reset_packet_header(
         .with_dst_port(key.guest_port())
         .with_packet_type(VIRTIO_VSOCK_PACKET_TYPE_STREAM)
         .with_operation(VIRTIO_VSOCK_OP_RST)
+        .with_buffer_allocation(VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE)
+}
+
+fn guest_connection_credit_update_packet_header(
+    key: VsockGuestConnectionKey,
+    guest_cid: u32,
+) -> VirtioVsockPacketHeader {
+    VirtioVsockPacketHeader::new()
+        .with_src_cid(VIRTIO_VSOCK_HOST_CID)
+        .with_dst_cid(u64::from(guest_cid))
+        .with_src_port(key.host_port())
+        .with_dst_port(key.guest_port())
+        .with_packet_type(VIRTIO_VSOCK_PACKET_TYPE_STREAM)
+        .with_operation(VIRTIO_VSOCK_OP_CREDIT_UPDATE)
         .with_buffer_allocation(VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE)
 }
 
@@ -1326,6 +1381,63 @@ impl VsockHostConnectionTable {
             .take_pending_request_packet_header(key, guest_cid)
     }
 
+    #[cfg(test)]
+    fn has_pending_credit_update_packet(&self, key: VsockHostConnectionKey) -> bool {
+        self.connections
+            .get(&key)
+            .is_some_and(VsockHostConnection::has_pending_credit_update_packet)
+    }
+
+    fn queue_pending_credit_update_packet(
+        &mut self,
+        key: VsockHostConnectionKey,
+    ) -> Result<(), VsockGuestCreditError> {
+        let Some(connection) = self.connections.get_mut(&key) else {
+            return Err(VsockGuestCreditError::MissingConnection);
+        };
+        if !connection.is_established() {
+            return Err(VsockGuestCreditError::ConnectionNotEstablished);
+        }
+
+        connection.queue_pending_credit_update_packet();
+        Ok(())
+    }
+
+    fn consume_credit_update_packet(
+        &self,
+        key: VsockHostConnectionKey,
+    ) -> Result<(), VsockGuestCreditError> {
+        let Some(connection) = self.connections.get(&key) else {
+            return Err(VsockGuestCreditError::MissingConnection);
+        };
+        if !connection.is_established() {
+            return Err(VsockGuestCreditError::ConnectionNotEstablished);
+        }
+
+        Ok(())
+    }
+
+    fn take_pending_credit_update_packet_header(
+        &mut self,
+        key: VsockHostConnectionKey,
+        guest_cid: u32,
+    ) -> Option<VirtioVsockPacketHeader> {
+        self.connections
+            .get_mut(&key)?
+            .take_pending_credit_update_packet_header(key, guest_cid)
+    }
+
+    fn first_pending_credit_update_packet_key(&self) -> Option<VsockHostConnectionKey> {
+        self.connections
+            .iter()
+            .filter_map(|(key, connection)| {
+                connection
+                    .has_pending_credit_update_packet()
+                    .then_some(*key)
+            })
+            .min()
+    }
+
     fn first_pending_host_rw_packet_key(&self) -> Option<VsockHostConnectionKey> {
         self.connections
             .iter()
@@ -1604,6 +1716,38 @@ enum VsockGuestShutdownIgnoreReason {
     PayloadPresent,
     MissingFullShutdownFlags,
     MissingConnection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VsockGuestCreditOutcome {
+    Updated,
+    Requested,
+    Ignored {
+        reason: VsockGuestCreditIgnoreReason,
+    },
+}
+
+impl VsockGuestCreditOutcome {
+    const fn suppresses_guest_reset(self) -> bool {
+        matches!(self, Self::Updated | Self::Requested)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VsockGuestCreditIgnoreReason {
+    WrongSourceCid,
+    WrongDestinationCid,
+    UnsupportedPacketType,
+    PayloadPresent,
+    InvalidLocalPort,
+    MissingConnection,
+    ConnectionNotEstablished,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VsockGuestCreditError {
+    MissingConnection,
+    ConnectionNotEstablished,
 }
 
 #[derive(Debug)]
@@ -1926,6 +2070,7 @@ impl VsockGuestRwPendingWrites {
 pub struct VsockGuestConnection {
     stream: UnixStream,
     response_packet_pending: bool,
+    pending_credit_update_packet: bool,
     pending_guest_rw_writes: VsockGuestRwPendingWrites,
     pending_host_rw_payloads: VecDeque<Vec<u8>>,
 }
@@ -1935,6 +2080,7 @@ impl VsockGuestConnection {
         Self {
             stream,
             response_packet_pending: true,
+            pending_credit_update_packet: false,
             pending_guest_rw_writes: VsockGuestRwPendingWrites::new(),
             pending_host_rw_payloads: VecDeque::new(),
         }
@@ -1950,6 +2096,14 @@ impl VsockGuestConnection {
 
     fn has_pending_host_rw_packet(&self) -> bool {
         !self.pending_host_rw_payloads.is_empty()
+    }
+
+    const fn has_pending_credit_update_packet(&self) -> bool {
+        self.pending_credit_update_packet
+    }
+
+    const fn is_established(&self) -> bool {
+        !self.response_packet_pending
     }
 
     fn can_poll_host_rw_payload(&self) -> bool {
@@ -1994,6 +2148,23 @@ impl VsockGuestConnection {
         self.response_packet_pending = false;
 
         Some(guest_connection_response_packet_header(key, guest_cid))
+    }
+
+    fn queue_pending_credit_update_packet(&mut self) {
+        self.pending_credit_update_packet = true;
+    }
+
+    fn take_pending_credit_update_packet_header(
+        &mut self,
+        key: VsockGuestConnectionKey,
+        guest_cid: u32,
+    ) -> Option<VirtioVsockPacketHeader> {
+        if !self.pending_credit_update_packet {
+            return None;
+        }
+        self.pending_credit_update_packet = false;
+
+        Some(guest_connection_credit_update_packet_header(key, guest_cid))
     }
 
     fn pending_host_rw_packet(
@@ -2115,6 +2286,63 @@ impl VsockGuestConnectionTable {
         self.connections
             .get_mut(&key)?
             .take_pending_response_packet_header(key, guest_cid)
+    }
+
+    #[cfg(test)]
+    fn has_pending_credit_update_packet(&self, key: VsockGuestConnectionKey) -> bool {
+        self.connections
+            .get(&key)
+            .is_some_and(VsockGuestConnection::has_pending_credit_update_packet)
+    }
+
+    fn queue_pending_credit_update_packet(
+        &mut self,
+        key: VsockGuestConnectionKey,
+    ) -> Result<(), VsockGuestCreditError> {
+        let Some(connection) = self.connections.get_mut(&key) else {
+            return Err(VsockGuestCreditError::MissingConnection);
+        };
+        if !connection.is_established() {
+            return Err(VsockGuestCreditError::ConnectionNotEstablished);
+        }
+
+        connection.queue_pending_credit_update_packet();
+        Ok(())
+    }
+
+    fn consume_credit_update_packet(
+        &self,
+        key: VsockGuestConnectionKey,
+    ) -> Result<(), VsockGuestCreditError> {
+        let Some(connection) = self.connections.get(&key) else {
+            return Err(VsockGuestCreditError::MissingConnection);
+        };
+        if !connection.is_established() {
+            return Err(VsockGuestCreditError::ConnectionNotEstablished);
+        }
+
+        Ok(())
+    }
+
+    fn take_pending_credit_update_packet_header(
+        &mut self,
+        key: VsockGuestConnectionKey,
+        guest_cid: u32,
+    ) -> Option<VirtioVsockPacketHeader> {
+        self.connections
+            .get_mut(&key)?
+            .take_pending_credit_update_packet_header(key, guest_cid)
+    }
+
+    fn first_pending_credit_update_packet_key(&self) -> Option<VsockGuestConnectionKey> {
+        self.connections
+            .iter()
+            .filter_map(|(key, connection)| {
+                connection
+                    .has_pending_credit_update_packet()
+                    .then_some(*key)
+            })
+            .min()
     }
 
     fn first_pending_host_rw_packet_key(&self) -> Option<VsockGuestConnectionKey> {
@@ -3530,6 +3758,7 @@ pub enum VirtioVsockRxPacketKind {
     HostRequest,
     GuestResponse,
     GuestReset,
+    CreditUpdate,
     HostRw,
 }
 
@@ -3539,6 +3768,7 @@ pub struct VirtioVsockRxQueueDispatch {
     delivered_requests: usize,
     delivered_responses: usize,
     delivered_reset_packets: usize,
+    delivered_credit_updates: usize,
     delivered_host_rw_packets: usize,
     delivered_host_rw_bytes: usize,
     buffer_parse_failures: usize,
@@ -3555,6 +3785,7 @@ impl VirtioVsockRxQueueDispatch {
             delivered_requests: 0,
             delivered_responses: 0,
             delivered_reset_packets: 0,
+            delivered_credit_updates: 0,
             delivered_host_rw_packets: 0,
             delivered_host_rw_bytes: 0,
             buffer_parse_failures: 0,
@@ -3580,6 +3811,7 @@ impl VirtioVsockRxQueueDispatch {
             delivered_requests: 0,
             delivered_responses: 0,
             delivered_reset_packets: 0,
+            delivered_credit_updates: 0,
             delivered_host_rw_packets: 0,
             delivered_host_rw_bytes: 0,
             buffer_parse_failures: 0,
@@ -3606,6 +3838,10 @@ impl VirtioVsockRxQueueDispatch {
         self.delivered_reset_packets
     }
 
+    pub const fn delivered_credit_updates(&self) -> usize {
+        self.delivered_credit_updates
+    }
+
     pub const fn delivered_host_rw_packets(&self) -> usize {
         self.delivered_host_rw_packets
     }
@@ -3619,6 +3855,7 @@ impl VirtioVsockRxQueueDispatch {
             VirtioVsockRxPacketKind::HostRequest => self.delivered_requests,
             VirtioVsockRxPacketKind::GuestResponse => self.delivered_responses,
             VirtioVsockRxPacketKind::GuestReset => self.delivered_reset_packets,
+            VirtioVsockRxPacketKind::CreditUpdate => self.delivered_credit_updates,
             VirtioVsockRxPacketKind::HostRw => self.delivered_host_rw_packets,
         }
     }
@@ -3660,6 +3897,9 @@ impl VirtioVsockRxQueueDispatch {
                     }
                     VirtioVsockRxPacketKind::GuestReset => {
                         self.delivered_reset_packets += 1;
+                    }
+                    VirtioVsockRxPacketKind::CreditUpdate => {
+                        self.delivered_credit_updates += 1;
                     }
                     VirtioVsockRxPacketKind::HostRw => {
                         self.delivered_host_rw_packets += 1;
@@ -4564,6 +4804,14 @@ enum VirtioVsockPendingRxPacket {
         key: VsockHostConnectionKey,
         header: VirtioVsockPacketHeader,
     },
+    GuestConnectionCreditUpdate {
+        key: VsockGuestConnectionKey,
+        header: VirtioVsockPacketHeader,
+    },
+    HostConnectionCreditUpdate {
+        key: VsockHostConnectionKey,
+        header: VirtioVsockPacketHeader,
+    },
     GuestConnectionRw {
         key: VsockGuestConnectionKey,
     },
@@ -4594,6 +4842,11 @@ impl VirtioVsockPendingRxPacket {
                 VirtioVsockRxPacketKind::HostRequest,
                 header,
             )),
+            Self::GuestConnectionCreditUpdate { header, .. }
+            | Self::HostConnectionCreditUpdate { header, .. } => Some(Self::header_only_rx_packet(
+                VirtioVsockRxPacketKind::CreditUpdate,
+                header,
+            )),
             Self::GuestConnectionRw { key } => device
                 .guest_connections
                 .pending_host_rw_packet(key, device.guest_cid),
@@ -4608,6 +4861,9 @@ impl VirtioVsockPendingRxPacket {
             Self::GuestReset { .. } => VirtioVsockRxPacketKind::GuestReset,
             Self::GuestResponse { .. } => VirtioVsockRxPacketKind::GuestResponse,
             Self::HostRequest { .. } => VirtioVsockRxPacketKind::HostRequest,
+            Self::GuestConnectionCreditUpdate { .. } | Self::HostConnectionCreditUpdate { .. } => {
+                VirtioVsockRxPacketKind::CreditUpdate
+            }
             Self::GuestConnectionRw { .. } | Self::HostConnectionRw { .. } => {
                 VirtioVsockRxPacketKind::HostRw
             }
@@ -4732,6 +4988,11 @@ impl VirtioVsockDevice {
     }
 
     #[cfg(test)]
+    fn has_pending_host_credit_update_packet(&self, key: VsockHostConnectionKey) -> bool {
+        self.host_connections.has_pending_credit_update_packet(key)
+    }
+
+    #[cfg(test)]
     fn has_host_connection(&self, key: VsockHostConnectionKey) -> bool {
         self.host_connections.contains(key)
     }
@@ -4759,6 +5020,11 @@ impl VirtioVsockDevice {
     #[cfg(test)]
     fn has_pending_guest_response_packet(&self, key: VsockGuestConnectionKey) -> bool {
         self.guest_connections.has_pending_response_packet(key)
+    }
+
+    #[cfg(test)]
+    fn has_pending_guest_credit_update_packet(&self, key: VsockGuestConnectionKey) -> bool {
+        self.guest_connections.has_pending_credit_update_packet(key)
     }
 
     #[cfg(test)]
@@ -4875,6 +5141,32 @@ impl VirtioVsockDevice {
                     .first_pending_host_rw_packet_key()
                     .map(|key| VirtioVsockPendingRxPacket::HostConnectionRw { key })
             })
+            .or_else(|| {
+                self.guest_connections
+                    .first_pending_credit_update_packet_key()
+                    .map(
+                        |key| VirtioVsockPendingRxPacket::GuestConnectionCreditUpdate {
+                            key,
+                            header: guest_connection_credit_update_packet_header(
+                                key,
+                                self.guest_cid,
+                            ),
+                        },
+                    )
+            })
+            .or_else(|| {
+                self.host_connections
+                    .first_pending_credit_update_packet_key()
+                    .map(
+                        |key| VirtioVsockPendingRxPacket::HostConnectionCreditUpdate {
+                            key,
+                            header: host_connection_credit_update_packet_header(
+                                key,
+                                self.guest_cid,
+                            ),
+                        },
+                    )
+            })
     }
 
     fn consume_pending_rx_packet(&mut self, packet: VirtioVsockPendingRxPacket) {
@@ -4893,6 +5185,18 @@ impl VirtioVsockDevice {
                 let consumed = self
                     .host_connections
                     .take_pending_request_packet_header(key, self.guest_cid);
+                debug_assert_eq!(consumed, Some(header));
+            }
+            VirtioVsockPendingRxPacket::GuestConnectionCreditUpdate { key, header } => {
+                let consumed = self
+                    .guest_connections
+                    .take_pending_credit_update_packet_header(key, self.guest_cid);
+                debug_assert_eq!(consumed, Some(header));
+            }
+            VirtioVsockPendingRxPacket::HostConnectionCreditUpdate { key, header } => {
+                let consumed = self
+                    .host_connections
+                    .take_pending_credit_update_packet_header(key, self.guest_cid);
                 debug_assert_eq!(consumed, Some(header));
             }
             VirtioVsockPendingRxPacket::GuestConnectionRw { key } => {
@@ -5110,6 +5414,96 @@ impl VirtioVsockDevice {
         (host_connection_closed, guest_connection_closed)
     }
 
+    fn credit_guest_connection_packet(
+        &mut self,
+        packet: &VirtioVsockTxPacket,
+    ) -> Option<VsockGuestCreditOutcome> {
+        let header = packet.header();
+        let operation = header.operation();
+        if operation != VIRTIO_VSOCK_OP_CREDIT_UPDATE && operation != VIRTIO_VSOCK_OP_CREDIT_REQUEST
+        {
+            return None;
+        }
+        if header.src_cid() != u64::from(self.guest_cid) {
+            return Some(VsockGuestCreditOutcome::Ignored {
+                reason: VsockGuestCreditIgnoreReason::WrongSourceCid,
+            });
+        }
+        if header.dst_cid() != VIRTIO_VSOCK_HOST_CID {
+            return Some(VsockGuestCreditOutcome::Ignored {
+                reason: VsockGuestCreditIgnoreReason::WrongDestinationCid,
+            });
+        }
+        if header.packet_type() != VIRTIO_VSOCK_PACKET_TYPE_STREAM {
+            return Some(VsockGuestCreditOutcome::Ignored {
+                reason: VsockGuestCreditIgnoreReason::UnsupportedPacketType,
+            });
+        }
+        if header.payload_len() != 0 {
+            return Some(VsockGuestCreditOutcome::Ignored {
+                reason: VsockGuestCreditIgnoreReason::PayloadPresent,
+            });
+        }
+
+        let host_key = VsockHostLocalPort::try_from_raw(header.dst_port())
+            .map(|local_port| VsockHostConnectionKey::new(local_port, header.src_port()));
+        let host_result = host_key.ok().and_then(|key| {
+            self.host_connections.contains(key).then(|| {
+                if operation == VIRTIO_VSOCK_OP_CREDIT_REQUEST {
+                    self.host_connections
+                        .queue_pending_credit_update_packet(key)
+                } else {
+                    self.host_connections.consume_credit_update_packet(key)
+                }
+            })
+        });
+        if let Some(result @ Ok(())) = host_result {
+            return Some(Self::guest_credit_outcome(operation, result));
+        }
+
+        let guest_key = VsockGuestConnectionKey::new(header.dst_port(), header.src_port());
+        let guest_result = if operation == VIRTIO_VSOCK_OP_CREDIT_REQUEST {
+            self.guest_connections
+                .queue_pending_credit_update_packet(guest_key)
+        } else {
+            self.guest_connections
+                .consume_credit_update_packet(guest_key)
+        };
+        if guest_result != Err(VsockGuestCreditError::MissingConnection) {
+            return Some(Self::guest_credit_outcome(operation, guest_result));
+        }
+        if let Some(result) = host_result {
+            return Some(Self::guest_credit_outcome(operation, result));
+        }
+
+        let reason = if host_key.is_ok() {
+            VsockGuestCreditIgnoreReason::MissingConnection
+        } else {
+            VsockGuestCreditIgnoreReason::InvalidLocalPort
+        };
+        Some(VsockGuestCreditOutcome::Ignored { reason })
+    }
+
+    fn guest_credit_outcome(
+        operation: u16,
+        result: Result<(), VsockGuestCreditError>,
+    ) -> VsockGuestCreditOutcome {
+        match result {
+            Ok(()) if operation == VIRTIO_VSOCK_OP_CREDIT_UPDATE => {
+                VsockGuestCreditOutcome::Updated
+            }
+            Ok(()) => VsockGuestCreditOutcome::Requested,
+            Err(VsockGuestCreditError::MissingConnection) => VsockGuestCreditOutcome::Ignored {
+                reason: VsockGuestCreditIgnoreReason::MissingConnection,
+            },
+            Err(VsockGuestCreditError::ConnectionNotEstablished) => {
+                VsockGuestCreditOutcome::Ignored {
+                    reason: VsockGuestCreditIgnoreReason::ConnectionNotEstablished,
+                }
+            }
+        }
+    }
+
     fn reset_guest_connection_packet(
         &mut self,
         packet: &VirtioVsockTxPacket,
@@ -5211,6 +5605,7 @@ impl VirtioVsockDevice {
         let mut response_dispatch = VirtioVsockGuestResponseDispatch::new();
         let mut request_dispatch = VirtioVsockGuestRequestDispatch::new();
         let mut rw_dispatch = VirtioVsockGuestRwDispatch::new();
+        let mut credit_dispatch = VirtioVsockGuestCreditDispatch::new();
         let mut guest_rst_dispatch = VirtioVsockGuestRstDispatch::new();
         let mut guest_shutdown_dispatch = VirtioVsockGuestShutdownDispatch::new();
         let mut reset_dispatch = VirtioVsockGuestResetDispatch::new();
@@ -5252,6 +5647,15 @@ impl VirtioVsockDevice {
                 continue;
             }
 
+            let credit_outcome = self.credit_guest_connection_packet(packet);
+            if let Some(outcome) = credit_outcome {
+                credit_dispatch.record(packet.header().operation(), outcome);
+            }
+
+            if credit_outcome.is_some_and(VsockGuestCreditOutcome::suppresses_guest_reset) {
+                continue;
+            }
+
             if let Some(outcome) = self.reset_guest_connection_packet(packet) {
                 guest_rst_dispatch.record(outcome);
                 continue;
@@ -5272,6 +5676,7 @@ impl VirtioVsockDevice {
             response_dispatch,
             request_dispatch,
             rw_dispatch,
+            credit_dispatch,
             guest_rst_dispatch,
             guest_shutdown_dispatch,
             reset_dispatch,
@@ -5506,6 +5911,7 @@ struct VirtioVsockGuestTxControlDispatch {
     response_dispatch: VirtioVsockGuestResponseDispatch,
     request_dispatch: VirtioVsockGuestRequestDispatch,
     rw_dispatch: VirtioVsockGuestRwDispatch,
+    credit_dispatch: VirtioVsockGuestCreditDispatch,
     guest_rst_dispatch: VirtioVsockGuestRstDispatch,
     guest_shutdown_dispatch: VirtioVsockGuestShutdownDispatch,
     reset_dispatch: VirtioVsockGuestResetDispatch,
@@ -5517,6 +5923,7 @@ impl VirtioVsockGuestTxControlDispatch {
             VirtioVsockGuestResponseDispatch::new(),
             VirtioVsockGuestRequestDispatch::new(),
             VirtioVsockGuestRwDispatch::new(),
+            VirtioVsockGuestCreditDispatch::new(),
             VirtioVsockGuestRstDispatch::new(),
             VirtioVsockGuestShutdownDispatch::new(),
             VirtioVsockGuestResetDispatch::new(),
@@ -5527,6 +5934,7 @@ impl VirtioVsockGuestTxControlDispatch {
         response_dispatch: VirtioVsockGuestResponseDispatch,
         request_dispatch: VirtioVsockGuestRequestDispatch,
         rw_dispatch: VirtioVsockGuestRwDispatch,
+        credit_dispatch: VirtioVsockGuestCreditDispatch,
         guest_rst_dispatch: VirtioVsockGuestRstDispatch,
         guest_shutdown_dispatch: VirtioVsockGuestShutdownDispatch,
         reset_dispatch: VirtioVsockGuestResetDispatch,
@@ -5535,6 +5943,7 @@ impl VirtioVsockGuestTxControlDispatch {
             response_dispatch,
             request_dispatch,
             rw_dispatch,
+            credit_dispatch,
             guest_rst_dispatch,
             guest_shutdown_dispatch,
             reset_dispatch,
@@ -5550,6 +5959,7 @@ pub struct VirtioVsockDeviceNotificationDispatch {
     guest_response_dispatch: VirtioVsockGuestResponseDispatch,
     guest_request_dispatch: VirtioVsockGuestRequestDispatch,
     guest_rw_dispatch: VirtioVsockGuestRwDispatch,
+    guest_credit_dispatch: VirtioVsockGuestCreditDispatch,
     guest_rst_dispatch: VirtioVsockGuestRstDispatch,
     guest_shutdown_dispatch: VirtioVsockGuestShutdownDispatch,
     guest_reset_dispatch: VirtioVsockGuestResetDispatch,
@@ -5576,6 +5986,7 @@ impl VirtioVsockDeviceNotificationDispatch {
             guest_response_dispatch: guest_tx_control_dispatch.response_dispatch,
             guest_request_dispatch: guest_tx_control_dispatch.request_dispatch,
             guest_rw_dispatch: guest_tx_control_dispatch.rw_dispatch,
+            guest_credit_dispatch: guest_tx_control_dispatch.credit_dispatch,
             guest_rst_dispatch: guest_tx_control_dispatch.guest_rst_dispatch,
             guest_shutdown_dispatch: guest_tx_control_dispatch.guest_shutdown_dispatch,
             guest_reset_dispatch: guest_tx_control_dispatch.reset_dispatch,
@@ -5606,6 +6017,10 @@ impl VirtioVsockDeviceNotificationDispatch {
 
     pub const fn guest_rw_dispatch(&self) -> &VirtioVsockGuestRwDispatch {
         &self.guest_rw_dispatch
+    }
+
+    pub const fn guest_credit_dispatch(&self) -> &VirtioVsockGuestCreditDispatch {
+        &self.guest_credit_dispatch
     }
 
     pub const fn guest_rst_dispatch(&self) -> &VirtioVsockGuestRstDispatch {
@@ -5797,6 +6212,71 @@ impl VirtioVsockGuestRwDispatch {
             VsockGuestRwOutcome::Dropped { key, source } => {
                 let _ = (key, source);
                 self.dropped_connections += 1;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioVsockGuestCreditDispatch {
+    credit_packets: usize,
+    update_packets: usize,
+    request_packets: usize,
+    queued_updates: usize,
+    ignored_packets: usize,
+}
+
+impl VirtioVsockGuestCreditDispatch {
+    const fn new() -> Self {
+        Self {
+            credit_packets: 0,
+            update_packets: 0,
+            request_packets: 0,
+            queued_updates: 0,
+            ignored_packets: 0,
+        }
+    }
+
+    pub const fn credit_packets(&self) -> usize {
+        self.credit_packets
+    }
+
+    pub const fn update_packets(&self) -> usize {
+        self.update_packets
+    }
+
+    pub const fn request_packets(&self) -> usize {
+        self.request_packets
+    }
+
+    pub const fn queued_updates(&self) -> usize {
+        self.queued_updates
+    }
+
+    pub const fn ignored_packets(&self) -> usize {
+        self.ignored_packets
+    }
+
+    fn record(&mut self, operation: u16, outcome: VsockGuestCreditOutcome) {
+        self.credit_packets += 1;
+        match operation {
+            VIRTIO_VSOCK_OP_CREDIT_UPDATE => {
+                self.update_packets += 1;
+            }
+            VIRTIO_VSOCK_OP_CREDIT_REQUEST => {
+                self.request_packets += 1;
+            }
+            _ => {}
+        }
+
+        match outcome {
+            VsockGuestCreditOutcome::Updated => {}
+            VsockGuestCreditOutcome::Requested => {
+                self.queued_updates += 1;
+            }
+            VsockGuestCreditOutcome::Ignored { reason } => {
+                let _ = reason;
+                self.ignored_packets += 1;
             }
         }
     }
@@ -6566,13 +7046,14 @@ mod tests {
         VSOCK_HOST_CONNECT_REQUEST_MAX_LEN, VSOCK_HOST_LOCAL_PORT_BASE,
         VSOCK_HOST_LOCAL_PORT_CAPACITY, VSOCK_HOST_LOCAL_PORT_END_EXCLUSIVE,
         VirtioVsockConfigSpace, VirtioVsockDevice, VirtioVsockDeviceActivationError,
-        VirtioVsockGuestRequestDispatch, VirtioVsockGuestResetDispatch,
-        VirtioVsockGuestResponseDispatch, VirtioVsockGuestRstDispatch, VirtioVsockGuestRwDispatch,
-        VirtioVsockGuestShutdownDispatch, VirtioVsockHostRequestDispatch, VirtioVsockMmioHandler,
-        VirtioVsockPacketHeader, VirtioVsockPacketLengthError, VirtioVsockQueueBuildError,
-        VirtioVsockRxBufferParseError, VirtioVsockRxPacketKind, VirtioVsockRxQueue,
-        VirtioVsockRxQueueDispatchError, VirtioVsockTxPacket, VirtioVsockTxPacketParseError,
-        VirtioVsockTxQueue, VirtioVsockTxQueueDispatchError, VsockConfigError, VsockConfigInput,
+        VirtioVsockGuestCreditDispatch, VirtioVsockGuestRequestDispatch,
+        VirtioVsockGuestResetDispatch, VirtioVsockGuestResponseDispatch,
+        VirtioVsockGuestRstDispatch, VirtioVsockGuestRwDispatch, VirtioVsockGuestShutdownDispatch,
+        VirtioVsockHostRequestDispatch, VirtioVsockMmioHandler, VirtioVsockPacketHeader,
+        VirtioVsockPacketLengthError, VirtioVsockQueueBuildError, VirtioVsockRxBufferParseError,
+        VirtioVsockRxPacketKind, VirtioVsockRxQueue, VirtioVsockRxQueueDispatchError,
+        VirtioVsockTxPacket, VirtioVsockTxPacketParseError, VirtioVsockTxQueue,
+        VirtioVsockTxQueueDispatchError, VsockConfigError, VsockConfigInput,
         VsockGuestConnectionKey, VsockHostConnectHandshakeError, VsockHostConnectRequest,
         VsockHostConnectRequestError, VsockHostConnectionKey, VsockHostConnectionTable,
         VsockHostConnectionTableError, VsockHostLocalPort, VsockHostLocalPortAllocator,
@@ -6751,6 +7232,14 @@ mod tests {
         assert_eq!(dispatch.dropped_connections(), 0);
     }
 
+    fn assert_empty_guest_credit_dispatch(dispatch: &VirtioVsockGuestCreditDispatch) {
+        assert_eq!(dispatch.credit_packets(), 0);
+        assert_eq!(dispatch.update_packets(), 0);
+        assert_eq!(dispatch.request_packets(), 0);
+        assert_eq!(dispatch.queued_updates(), 0);
+        assert_eq!(dispatch.ignored_packets(), 0);
+    }
+
     fn assert_empty_guest_rst_dispatch(dispatch: &VirtioVsockGuestRstDispatch) {
         assert_eq!(dispatch.rst_packets(), 0);
         assert_eq!(dispatch.closed_host_connections(), 0);
@@ -6868,6 +7357,27 @@ mod tests {
         assert_eq!(header.payload_len(), 0);
         assert_eq!(header.packet_type(), VIRTIO_VSOCK_PACKET_TYPE_STREAM);
         assert_eq!(header.operation(), VIRTIO_VSOCK_OP_RESPONSE);
+        assert_eq!(header.flags(), 0);
+        assert_eq!(
+            header.buffer_allocation(),
+            VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE
+        );
+        assert_eq!(header.forwarded_count(), 0);
+    }
+
+    fn assert_credit_update_packet_header(
+        header: VirtioVsockPacketHeader,
+        guest_cid: u32,
+        host_port: u32,
+        guest_port: u32,
+    ) {
+        assert_eq!(header.src_cid(), VIRTIO_VSOCK_HOST_CID);
+        assert_eq!(header.dst_cid(), u64::from(guest_cid));
+        assert_eq!(header.src_port(), host_port);
+        assert_eq!(header.dst_port(), guest_port);
+        assert_eq!(header.payload_len(), 0);
+        assert_eq!(header.packet_type(), VIRTIO_VSOCK_PACKET_TYPE_STREAM);
+        assert_eq!(header.operation(), VIRTIO_VSOCK_OP_CREDIT_UPDATE);
         assert_eq!(header.flags(), 0);
         assert_eq!(
             header.buffer_allocation(),
@@ -6998,6 +7508,23 @@ mod tests {
                 .with_dst_port(host_port)
                 .with_packet_type(VIRTIO_VSOCK_PACKET_TYPE_STREAM)
                 .with_operation(VIRTIO_VSOCK_OP_RW),
+        )
+    }
+
+    fn guest_credit_tx_packet(
+        guest_cid: u32,
+        host_port: u32,
+        guest_port: u32,
+        operation: u16,
+    ) -> VirtioVsockTxPacket {
+        guest_tx_packet_with_header(
+            VirtioVsockPacketHeader::new()
+                .with_src_cid(u64::from(guest_cid))
+                .with_dst_cid(VIRTIO_VSOCK_HOST_CID)
+                .with_src_port(guest_port)
+                .with_dst_port(host_port)
+                .with_packet_type(VIRTIO_VSOCK_PACKET_TYPE_STREAM)
+                .with_operation(operation),
         )
     }
 
@@ -11610,6 +12137,7 @@ mod tests {
         assert_eq!(dispatch.event_notifications(), 0);
         assert_empty_host_request_dispatch(dispatch.host_request_dispatch());
         assert_empty_guest_response_dispatch(dispatch.guest_response_dispatch());
+        assert_empty_guest_credit_dispatch(dispatch.guest_credit_dispatch());
         assert!(dispatch.rx_queue_dispatch().is_none());
         assert!(dispatch.tx_queue_dispatch().is_none());
         assert!(!dispatch.needs_queue_interrupt());
@@ -12344,6 +12872,531 @@ mod tests {
             &mut accepted,
             "dropping handler should close retained guest stream after test",
         );
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_accept_credit_update_for_host_connection_without_reset() {
+        let (mut memory, mut handler, mut client, key) =
+            established_host_connection_for_test("credit-update-host", 4000);
+        let packet = guest_credit_tx_packet(
+            42,
+            key.local_port().raw(),
+            key.peer_port(),
+            VIRTIO_VSOCK_OP_CREDIT_UPDATE,
+        )
+        .header();
+
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_SECOND_HEADER, packet);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::readable(
+                TEST_VSOCK_SECOND_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        append_vsock_tx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("credit update should be consumed");
+
+        assert_empty_guest_response_dispatch(notification.guest_response_dispatch());
+        assert_empty_guest_request_dispatch(notification.guest_request_dispatch());
+        assert_empty_guest_rw_dispatch(notification.guest_rw_dispatch());
+        assert_eq!(notification.guest_credit_dispatch().credit_packets(), 1);
+        assert_eq!(notification.guest_credit_dispatch().update_packets(), 1);
+        assert_eq!(notification.guest_credit_dispatch().request_packets(), 0);
+        assert_eq!(notification.guest_credit_dispatch().queued_updates(), 0);
+        assert_eq!(notification.guest_credit_dispatch().ignored_packets(), 0);
+        assert_empty_guest_reset_dispatch(notification.guest_reset_dispatch());
+        assert!(notification.rx_queue_dispatch().is_none());
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_reset_packet_count(),
+            0
+        );
+        assert!(
+            !handler
+                .activation_handler()
+                .has_pending_host_credit_update_packet(key)
+        );
+        assert!(handler.activation_handler().has_host_connection(key));
+        assert_no_host_message(&mut client);
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_accept_credit_update_for_guest_connection_without_reset() {
+        let (mut memory, mut handler, mut accepted) =
+            established_guest_connection_for_test("credit-update-guest", 52, 4000);
+        let key = VsockGuestConnectionKey::new(52, 4000);
+        let packet = guest_credit_tx_packet(42, 52, 4000, VIRTIO_VSOCK_OP_CREDIT_UPDATE).header();
+
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_SECOND_HEADER, packet);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::readable(
+                TEST_VSOCK_SECOND_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        append_vsock_tx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("credit update should be consumed");
+
+        assert_empty_guest_response_dispatch(notification.guest_response_dispatch());
+        assert_empty_guest_request_dispatch(notification.guest_request_dispatch());
+        assert_empty_guest_rw_dispatch(notification.guest_rw_dispatch());
+        assert_eq!(notification.guest_credit_dispatch().credit_packets(), 1);
+        assert_eq!(notification.guest_credit_dispatch().update_packets(), 1);
+        assert_eq!(notification.guest_credit_dispatch().request_packets(), 0);
+        assert_eq!(notification.guest_credit_dispatch().queued_updates(), 0);
+        assert_eq!(notification.guest_credit_dispatch().ignored_packets(), 0);
+        assert_empty_guest_reset_dispatch(notification.guest_reset_dispatch());
+        assert!(notification.rx_queue_dispatch().is_none());
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_reset_packet_count(),
+            0
+        );
+        assert!(
+            !handler
+                .activation_handler()
+                .has_pending_guest_credit_update_packet(key)
+        );
+        assert!(handler.activation_handler().has_guest_connection(key));
+
+        drop(handler);
+        assert_stream_closed(
+            &mut accepted,
+            "dropping handler should close retained guest stream",
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_queue_credit_update_for_host_credit_request() {
+        let (mut memory, mut handler, mut client, key) =
+            established_host_connection_for_test("credit-request-host", 4000);
+        let packet = guest_credit_tx_packet(
+            42,
+            key.local_port().raw(),
+            key.peer_port(),
+            VIRTIO_VSOCK_OP_CREDIT_REQUEST,
+        )
+        .header();
+
+        write_vsock_rx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_SECOND_BUFFER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        append_vsock_rx_available_head(&mut memory, 1, 1, 2);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_SECOND_HEADER, packet);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::readable(
+                TEST_VSOCK_SECOND_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        append_vsock_tx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("credit request should queue and deliver update");
+
+        assert_empty_guest_response_dispatch(notification.guest_response_dispatch());
+        assert_empty_guest_request_dispatch(notification.guest_request_dispatch());
+        assert_empty_guest_rw_dispatch(notification.guest_rw_dispatch());
+        assert_eq!(notification.guest_credit_dispatch().credit_packets(), 1);
+        assert_eq!(notification.guest_credit_dispatch().update_packets(), 0);
+        assert_eq!(notification.guest_credit_dispatch().request_packets(), 1);
+        assert_eq!(notification.guest_credit_dispatch().queued_updates(), 1);
+        assert_eq!(notification.guest_credit_dispatch().ignored_packets(), 0);
+        assert_empty_guest_reset_dispatch(notification.guest_reset_dispatch());
+        let rx = notification
+            .rx_queue_dispatch()
+            .expect("credit update should dispatch through RX");
+        assert_eq!(rx.delivered_credit_updates(), 1);
+        assert_eq!(rx.delivered_reset_packets(), 0);
+        assert_eq!(read_vsock_rx_used_index(&memory), 2);
+        assert_eq!(
+            read_vsock_rx_used_element(&memory, 1),
+            (1, VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32)
+        );
+        assert_credit_update_packet_header(
+            read_vsock_packet_header(&memory, TEST_VSOCK_RX_SECOND_BUFFER),
+            42,
+            key.local_port().raw(),
+            key.peer_port(),
+        );
+        assert!(
+            !handler
+                .activation_handler()
+                .has_pending_host_credit_update_packet(key)
+        );
+        assert_no_host_message(&mut client);
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_queue_credit_update_for_guest_credit_request() {
+        let (mut memory, mut handler, mut accepted) =
+            established_guest_connection_for_test("credit-request-guest", 52, 4000);
+        let key = VsockGuestConnectionKey::new(52, 4000);
+        let packet = guest_credit_tx_packet(42, 52, 4000, VIRTIO_VSOCK_OP_CREDIT_REQUEST).header();
+
+        write_vsock_rx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_SECOND_BUFFER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        append_vsock_rx_available_head(&mut memory, 1, 1, 2);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_SECOND_HEADER, packet);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::readable(
+                TEST_VSOCK_SECOND_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        append_vsock_tx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("credit request should queue and deliver update");
+
+        assert_empty_guest_response_dispatch(notification.guest_response_dispatch());
+        assert_empty_guest_request_dispatch(notification.guest_request_dispatch());
+        assert_empty_guest_rw_dispatch(notification.guest_rw_dispatch());
+        assert_eq!(notification.guest_credit_dispatch().credit_packets(), 1);
+        assert_eq!(notification.guest_credit_dispatch().update_packets(), 0);
+        assert_eq!(notification.guest_credit_dispatch().request_packets(), 1);
+        assert_eq!(notification.guest_credit_dispatch().queued_updates(), 1);
+        assert_eq!(notification.guest_credit_dispatch().ignored_packets(), 0);
+        assert_empty_guest_reset_dispatch(notification.guest_reset_dispatch());
+        let rx = notification
+            .rx_queue_dispatch()
+            .expect("credit update should dispatch through RX");
+        assert_eq!(rx.delivered_credit_updates(), 1);
+        assert_eq!(rx.delivered_reset_packets(), 0);
+        assert_eq!(read_vsock_rx_used_index(&memory), 2);
+        assert_eq!(
+            read_vsock_rx_used_element(&memory, 1),
+            (1, VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32)
+        );
+        assert_credit_update_packet_header(
+            read_vsock_packet_header(&memory, TEST_VSOCK_RX_SECOND_BUFFER),
+            42,
+            52,
+            4000,
+        );
+        assert!(
+            !handler
+                .activation_handler()
+                .has_pending_guest_credit_update_packet(key)
+        );
+
+        drop(handler);
+        assert_stream_closed(
+            &mut accepted,
+            "dropping handler should close retained guest stream",
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_match_guest_credit_when_host_tuple_is_not_established() {
+        let guest_host_port = VSOCK_HOST_LOCAL_PORT_BASE;
+        let guest_port = 4000;
+        let (mut memory, mut handler, mut accepted) = established_guest_connection_for_test(
+            "credit-guest-host-tuple-collision",
+            guest_host_port,
+            guest_port,
+        );
+        let guest_key = VsockGuestConnectionKey::new(guest_host_port, guest_port);
+        let (host_accepted, mut host_client, host_request) =
+            accepted_host_connection_with_request("credit-host-tuple-collision", guest_port);
+        let host_key = handler
+            .activation_handler_mut()
+            .insert_accepted_host_connection(host_accepted, host_request)
+            .expect("pending host connection should insert with colliding tuple");
+        let packet = guest_credit_tx_packet(
+            42,
+            guest_host_port,
+            guest_port,
+            VIRTIO_VSOCK_OP_CREDIT_REQUEST,
+        )
+        .header();
+
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_SECOND_HEADER, packet);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::readable(
+                TEST_VSOCK_SECOND_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        append_vsock_tx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("guest credit request should not be captured by pending host tuple");
+
+        assert_eq!(host_key.local_port().raw(), guest_host_port);
+        assert_eq!(host_key.peer_port(), guest_port);
+        assert_eq!(notification.guest_credit_dispatch().credit_packets(), 1);
+        assert_eq!(notification.guest_credit_dispatch().request_packets(), 1);
+        assert_eq!(notification.guest_credit_dispatch().queued_updates(), 1);
+        assert_eq!(notification.guest_credit_dispatch().ignored_packets(), 0);
+        assert_empty_guest_reset_dispatch(notification.guest_reset_dispatch());
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_reset_packet_count(),
+            0
+        );
+        assert!(
+            handler
+                .activation_handler()
+                .has_pending_host_request_packet(host_key)
+        );
+        assert!(
+            handler
+                .activation_handler()
+                .has_pending_guest_credit_update_packet(guest_key)
+        );
+        assert_no_host_message(&mut host_client);
+
+        drop(handler);
+        assert_stream_closed(
+            &mut accepted,
+            "dropping handler should close retained guest stream",
+        );
+        assert_stream_closed(
+            &mut host_client,
+            "dropping handler should close retained host stream",
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_deliver_host_rw_before_credit_update() {
+        let (mut memory, mut handler, mut accepted) =
+            established_guest_connection_for_test("credit-after-rw", 52, 4000);
+        let key = VsockGuestConnectionKey::new(52, 4000);
+        let payload = b"host-before-credit";
+        let packet = guest_credit_tx_packet(42, 52, 4000, VIRTIO_VSOCK_OP_CREDIT_REQUEST).header();
+
+        accepted
+            .write_all(payload)
+            .expect("host payload should write before credit request");
+        write_vsock_rx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_SECOND_BUFFER,
+                vsock_packet_len_with_payload(payload),
+                None,
+            ),
+        );
+        append_vsock_rx_available_head(&mut memory, 1, 1, 2);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_SECOND_HEADER, packet);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::readable(
+                TEST_VSOCK_SECOND_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        append_vsock_tx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let rw_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("host RW should be delivered before pending credit update");
+
+        assert_eq!(rw_notification.guest_credit_dispatch().credit_packets(), 1);
+        assert_eq!(rw_notification.guest_credit_dispatch().queued_updates(), 1);
+        let rw = rw_notification
+            .rx_queue_dispatch()
+            .expect("host RW should dispatch through RX");
+        assert_eq!(rw.delivered_host_rw_packets(), 1);
+        assert_eq!(rw.delivered_credit_updates(), 0);
+        assert_host_rw_payload_in_guest(
+            &memory,
+            TEST_VSOCK_RX_SECOND_BUFFER,
+            42,
+            52,
+            4000,
+            payload,
+        );
+        assert!(
+            handler
+                .activation_handler()
+                .has_pending_guest_credit_update_packet(key)
+        );
+
+        write_vsock_rx_descriptor(
+            &mut memory,
+            2,
+            TestDescriptor::writable(
+                TEST_VSOCK_PAYLOAD,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        append_vsock_rx_available_head(&mut memory, 2, 2, 3);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+
+        let credit_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("pending credit update should deliver after host RW");
+
+        let credit = credit_notification
+            .rx_queue_dispatch()
+            .expect("credit update should dispatch through RX");
+        assert_eq!(credit.delivered_host_rw_packets(), 0);
+        assert_eq!(credit.delivered_credit_updates(), 1);
+        assert_credit_update_packet_header(
+            read_vsock_packet_header(&memory, TEST_VSOCK_PAYLOAD),
+            42,
+            52,
+            4000,
+        );
+        assert!(
+            !handler
+                .activation_handler()
+                .has_pending_guest_credit_update_packet(key)
+        );
+
+        drop(handler);
+        assert_stream_closed(
+            &mut accepted,
+            "dropping handler should close retained guest stream",
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_retain_reset_fallback_for_invalid_credit_packets() {
+        let mut memory = vsock_tx_memory();
+        let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
+        let wrong_source =
+            guest_credit_tx_packet(43, 52, 4000, VIRTIO_VSOCK_OP_CREDIT_UPDATE).header();
+        let wrong_destination = guest_credit_tx_packet(42, 52, 4001, VIRTIO_VSOCK_OP_CREDIT_UPDATE)
+            .header()
+            .with_dst_cid(VIRTIO_VSOCK_HOST_CID + 1);
+        let unsupported_type = guest_credit_tx_packet(42, 52, 4002, VIRTIO_VSOCK_OP_CREDIT_REQUEST)
+            .header()
+            .with_packet_type(0);
+        let payload_update = guest_credit_tx_packet(42, 53, 4003, VIRTIO_VSOCK_OP_CREDIT_UPDATE)
+            .header()
+            .with_payload_len(1);
+        let orphan_request =
+            guest_credit_tx_packet(42, 54, 4004, VIRTIO_VSOCK_OP_CREDIT_REQUEST).header();
+
+        activate_vsock_handler(&mut handler);
+        for (index, address, header, len) in [
+            (
+                0,
+                TEST_VSOCK_HEADER,
+                wrong_source,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+            ),
+            (
+                1,
+                TEST_VSOCK_SECOND_HEADER,
+                wrong_destination,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+            ),
+            (
+                2,
+                TEST_VSOCK_THIRD_HEADER,
+                unsupported_type,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+            ),
+            (
+                3,
+                TEST_VSOCK_PAYLOAD,
+                payload_update,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32 + 1,
+            ),
+            (
+                4,
+                TEST_VSOCK_FOURTH_HEADER,
+                orphan_request,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+            ),
+        ] {
+            write_vsock_packet_header(&mut memory, address, header);
+            write_vsock_tx_descriptor(
+                &mut memory,
+                index,
+                TestDescriptor::readable(address, len, None),
+            );
+        }
+        write_guest_bytes(
+            &mut memory,
+            vsock_payload_address_after_header(TEST_VSOCK_PAYLOAD),
+            &[0xa5],
+        );
+        write_vsock_tx_available_heads(&mut memory, &[0, 1, 2, 3, 4]);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("invalid credit packets should still complete TX");
+
+        assert_empty_guest_response_dispatch(notification.guest_response_dispatch());
+        assert_empty_guest_request_dispatch(notification.guest_request_dispatch());
+        assert_empty_guest_rw_dispatch(notification.guest_rw_dispatch());
+        assert_eq!(notification.guest_credit_dispatch().credit_packets(), 5);
+        assert_eq!(notification.guest_credit_dispatch().update_packets(), 3);
+        assert_eq!(notification.guest_credit_dispatch().request_packets(), 2);
+        assert_eq!(notification.guest_credit_dispatch().queued_updates(), 0);
+        assert_eq!(notification.guest_credit_dispatch().ignored_packets(), 5);
+        assert_empty_guest_rst_dispatch(notification.guest_rst_dispatch());
+        assert_empty_guest_shutdown_dispatch(notification.guest_shutdown_dispatch());
+        assert_eq!(notification.guest_reset_dispatch().reset_candidates(), 3);
+        assert_eq!(notification.guest_reset_dispatch().queued_resets(), 3);
+        assert_eq!(notification.guest_reset_dispatch().dropped_resets(), 0);
+        assert_eq!(
+            handler
+                .activation_handler()
+                .pending_guest_reset_packet_count(),
+            3
+        );
+        let rx = notification
+            .rx_queue_dispatch()
+            .expect("pending guest RST should attempt RX dispatch");
+        assert_eq!(rx.processed_buffers(), 0);
+        assert_eq!(rx.delivered_credit_updates(), 0);
+        assert_eq!(rx.delivered_reset_packets(), 0);
     }
 
     #[test]
