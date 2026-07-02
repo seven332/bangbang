@@ -1158,7 +1158,9 @@ fn guest_reset_packet_header_for_tx_packet(
     if header.src_cid() != u64::from(guest_cid) || header.dst_cid() != VIRTIO_VSOCK_HOST_CID {
         return None;
     }
-    if header.operation() == VIRTIO_VSOCK_OP_RST {
+    if header.operation() == VIRTIO_VSOCK_OP_RST
+        && header.packet_type() == VIRTIO_VSOCK_PACKET_TYPE_STREAM
+    {
         return None;
     }
 
@@ -1526,7 +1528,6 @@ enum VsockGuestRstOutcome {
 enum VsockGuestRstIgnoreReason {
     WrongSourceCid,
     WrongDestinationCid,
-    UnsupportedPacketType,
     PayloadPresent,
     MissingConnection,
 }
@@ -4793,9 +4794,7 @@ impl VirtioVsockDevice {
             });
         }
         if header.packet_type() != VIRTIO_VSOCK_PACKET_TYPE_STREAM {
-            return Some(VsockGuestRstOutcome::Ignored {
-                reason: VsockGuestRstIgnoreReason::UnsupportedPacketType,
-            });
+            return None;
         }
         if header.payload_len() != 0 {
             return Some(VsockGuestRstOutcome::Ignored {
@@ -13276,10 +13275,6 @@ mod tests {
         let wrong_source = guest_request_tx_packet(43, 52, 4000)
             .header()
             .with_operation(VIRTIO_VSOCK_OP_RST);
-        let unsupported_type = guest_request_tx_packet(42, 52, 4000)
-            .header()
-            .with_operation(VIRTIO_VSOCK_OP_RST)
-            .with_packet_type(0);
         let payload_reset = guest_request_tx_packet(42, 52, 4000)
             .header()
             .with_operation(VIRTIO_VSOCK_OP_RST)
@@ -13315,18 +13310,12 @@ mod tests {
             (
                 2,
                 TEST_VSOCK_PAYLOAD,
-                unsupported_type,
-                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
-            ),
-            (
-                3,
-                TEST_VSOCK_SECOND_PAYLOAD,
                 payload_reset,
                 VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32 + 1,
             ),
             (
-                4,
-                TEST_VSOCK_THIRD_HEADER,
+                3,
+                TEST_VSOCK_SECOND_PAYLOAD,
                 unmatched,
                 VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
             ),
@@ -13340,10 +13329,10 @@ mod tests {
         }
         write_guest_bytes(
             &mut memory,
-            vsock_payload_address_after_header(TEST_VSOCK_SECOND_PAYLOAD),
+            vsock_payload_address_after_header(TEST_VSOCK_PAYLOAD),
             &[0xa5],
         );
-        write_vsock_tx_available_heads(&mut memory, &[0, 1, 2, 3, 4]);
+        write_vsock_tx_available_heads(&mut memory, &[0, 1, 2, 3]);
         notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
 
         let notification = handler
@@ -13353,8 +13342,8 @@ mod tests {
         assert_empty_guest_response_dispatch(notification.guest_response_dispatch());
         assert_empty_guest_request_dispatch(notification.guest_request_dispatch());
         assert_empty_guest_rw_dispatch(notification.guest_rw_dispatch());
-        assert_eq!(notification.guest_rst_dispatch().rst_packets(), 5);
-        assert_eq!(notification.guest_rst_dispatch().ignored_packets(), 5);
+        assert_eq!(notification.guest_rst_dispatch().rst_packets(), 4);
+        assert_eq!(notification.guest_rst_dispatch().ignored_packets(), 4);
         assert_eq!(
             notification.guest_rst_dispatch().closed_host_connections(),
             0
@@ -13366,7 +13355,7 @@ mod tests {
         assert_empty_guest_reset_dispatch(notification.guest_reset_dispatch());
         assert!(notification.rx_queue_dispatch().is_none());
         assert_eq!(read_vsock_rx_used_index(&memory), 0);
-        assert_eq!(read_vsock_tx_used_index(&memory), 5);
+        assert_eq!(read_vsock_tx_used_index(&memory), 4);
         assert_eq!(
             handler
                 .activation_handler()
@@ -13381,6 +13370,10 @@ mod tests {
         let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
         let unsupported_type = guest_request_tx_packet(42, 52, 4000)
             .header()
+            .with_packet_type(0);
+        let unsupported_rst_type = guest_request_tx_packet(42, 54, 4003)
+            .header()
+            .with_operation(VIRTIO_VSOCK_OP_RST)
             .with_packet_type(0);
         let payload_request = guest_request_tx_packet(42, 53, 4001)
             .header()
@@ -13429,7 +13422,17 @@ mod tests {
                 None,
             ),
         );
-        write_vsock_tx_available_heads(&mut memory, &[0, 1, 2]);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_THIRD_HEADER, unsupported_rst_type);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            3,
+            TestDescriptor::readable(
+                TEST_VSOCK_THIRD_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_tx_available_heads(&mut memory, &[0, 1, 2, 3]);
         notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
 
         let notification = handler
@@ -13445,14 +13448,15 @@ mod tests {
         assert_eq!(notification.guest_request_dispatch().retained_requests(), 0);
         assert_eq!(notification.guest_request_dispatch().ignored_requests(), 2);
         assert_eq!(notification.guest_request_dispatch().dropped_requests(), 0);
-        assert_eq!(notification.guest_reset_dispatch().reset_candidates(), 3);
-        assert_eq!(notification.guest_reset_dispatch().queued_resets(), 3);
+        assert_empty_guest_rst_dispatch(notification.guest_rst_dispatch());
+        assert_eq!(notification.guest_reset_dispatch().reset_candidates(), 4);
+        assert_eq!(notification.guest_reset_dispatch().queued_resets(), 4);
         assert_eq!(notification.guest_reset_dispatch().dropped_resets(), 0);
         assert_eq!(
             handler
                 .activation_handler()
                 .pending_guest_reset_packet_count(),
-            3
+            4
         );
         let rx = notification
             .rx_queue_dispatch()
@@ -13460,7 +13464,7 @@ mod tests {
         assert_eq!(rx.processed_buffers(), 0);
         assert_eq!(rx.delivered_reset_packets(), 0);
         assert_eq!(read_vsock_rx_used_index(&memory), 0);
-        assert_eq!(read_vsock_tx_used_index(&memory), 3);
+        assert_eq!(read_vsock_tx_used_index(&memory), 4);
     }
 
     #[test]
