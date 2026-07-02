@@ -5133,6 +5133,16 @@ impl VirtioVsockDevice {
             })
             .or_else(|| {
                 self.guest_connections
+                    .first_pending_host_rw_packet_key()
+                    .map(|key| VirtioVsockPendingRxPacket::GuestConnectionRw { key })
+            })
+            .or_else(|| {
+                self.host_connections
+                    .first_pending_host_rw_packet_key()
+                    .map(|key| VirtioVsockPendingRxPacket::HostConnectionRw { key })
+            })
+            .or_else(|| {
+                self.guest_connections
                     .first_pending_credit_update_packet_key()
                     .map(
                         |key| VirtioVsockPendingRxPacket::GuestConnectionCreditUpdate {
@@ -5156,16 +5166,6 @@ impl VirtioVsockDevice {
                             ),
                         },
                     )
-            })
-            .or_else(|| {
-                self.guest_connections
-                    .first_pending_host_rw_packet_key()
-                    .map(|key| VirtioVsockPendingRxPacket::GuestConnectionRw { key })
-            })
-            .or_else(|| {
-                self.host_connections
-                    .first_pending_host_rw_packet_key()
-                    .map(|key| VirtioVsockPendingRxPacket::HostConnectionRw { key })
             })
     }
 
@@ -13104,6 +13104,105 @@ mod tests {
         );
         assert_credit_update_packet_header(
             read_vsock_packet_header(&memory, TEST_VSOCK_RX_SECOND_BUFFER),
+            42,
+            52,
+            4000,
+        );
+        assert!(
+            !handler
+                .activation_handler()
+                .has_pending_guest_credit_update_packet(key)
+        );
+
+        drop(handler);
+        assert_stream_closed(
+            &mut accepted,
+            "dropping handler should close retained guest stream",
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_deliver_host_rw_before_credit_update() {
+        let (mut memory, mut handler, mut accepted) =
+            established_guest_connection_for_test("credit-after-rw", 52, 4000);
+        let key = VsockGuestConnectionKey::new(52, 4000);
+        let payload = b"host-before-credit";
+        let packet = guest_credit_tx_packet(42, 52, 4000, VIRTIO_VSOCK_OP_CREDIT_REQUEST).header();
+
+        accepted
+            .write_all(payload)
+            .expect("host payload should write before credit request");
+        write_vsock_rx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_SECOND_BUFFER,
+                vsock_packet_len_with_payload(payload),
+                None,
+            ),
+        );
+        append_vsock_rx_available_head(&mut memory, 1, 1, 2);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_SECOND_HEADER, packet);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::readable(
+                TEST_VSOCK_SECOND_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        append_vsock_tx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let rw_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("host RW should be delivered before pending credit update");
+
+        assert_eq!(rw_notification.guest_credit_dispatch().credit_packets(), 1);
+        assert_eq!(rw_notification.guest_credit_dispatch().queued_updates(), 1);
+        let rw = rw_notification
+            .rx_queue_dispatch()
+            .expect("host RW should dispatch through RX");
+        assert_eq!(rw.delivered_host_rw_packets(), 1);
+        assert_eq!(rw.delivered_credit_updates(), 0);
+        assert_host_rw_payload_in_guest(
+            &memory,
+            TEST_VSOCK_RX_SECOND_BUFFER,
+            42,
+            52,
+            4000,
+            payload,
+        );
+        assert!(
+            handler
+                .activation_handler()
+                .has_pending_guest_credit_update_packet(key)
+        );
+
+        write_vsock_rx_descriptor(
+            &mut memory,
+            2,
+            TestDescriptor::writable(
+                TEST_VSOCK_PAYLOAD,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        append_vsock_rx_available_head(&mut memory, 2, 2, 3);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+
+        let credit_notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("pending credit update should deliver after host RW");
+
+        let credit = credit_notification
+            .rx_queue_dispatch()
+            .expect("credit update should dispatch through RX");
+        assert_eq!(credit.delivered_host_rw_packets(), 0);
+        assert_eq!(credit.delivered_credit_updates(), 1);
+        assert_credit_update_packet_header(
+            read_vsock_packet_header(&memory, TEST_VSOCK_PAYLOAD),
             42,
             52,
             4000,
