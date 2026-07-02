@@ -2099,6 +2099,27 @@ mod tests {
     }
 
     #[test]
+    fn mmds_guest_http_response_token_put_errors_do_not_create_tokens() {
+        for request in [
+            b"PUT /latest/api/token HTTP/1.1\r\nX-metadata-token-ttl-seconds: application/json\r\n\r\n".as_slice(),
+            b"PUT /latest/api/token HTTP/1.1\r\nX-metadata-token-ttl-seconds: 1\r\nX-aws-ec2-metadata-token-ttl-seconds: 1\r\n\r\n",
+            b"PUT /wrong HTTP/1.1\r\nX-metadata-token-ttl-seconds: 1\r\n\r\n",
+        ] {
+            let mut state = initialized_query_state();
+            state.token_authority = MmdsTokenAuthority::with_manual_clock(1, 1_000);
+
+            assert_ne!(
+                state.guest_http_response(request).status(),
+                MmdsGuestStatus::Ok
+            );
+            let token = state
+                .generate_guest_token(1)
+                .expect("failed token PUT should not consume token capacity");
+            assert!(state.is_guest_token_valid(&token));
+        }
+    }
+
+    #[test]
     fn mmds_guest_http_response_get_does_not_enforce_tokens_yet() {
         let mut state = initialized_query_state();
         let response = state.guest_http_response(
