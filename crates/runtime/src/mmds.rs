@@ -171,15 +171,23 @@ impl fmt::Display for MmdsConfigError {
 
 impl std::error::Error for MmdsConfigError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmdsOutputFormat {
+    Json,
+    Imds,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MmdsDataStoreError {
     InvalidObject,
+    NotFound,
     NotInitialized,
     DataStoreLimitExceeded {
         limit_bytes: usize,
         size_bytes: usize,
     },
     Serialization,
+    UnsupportedValueType,
 }
 
 impl fmt::Display for MmdsDataStoreError {
@@ -188,6 +196,7 @@ impl fmt::Display for MmdsDataStoreError {
             Self::InvalidObject => {
                 f.write_str("The MMDS data store request body must be a JSON object.")
             }
+            Self::NotFound => f.write_str("The MMDS resource does not exist."),
             Self::NotInitialized => f.write_str("The MMDS data store is not initialized."),
             Self::DataStoreLimitExceeded {
                 limit_bytes,
@@ -197,6 +206,9 @@ impl fmt::Display for MmdsDataStoreError {
                 "The MMDS data store size limit was exceeded: {size_bytes} bytes > {limit_bytes} bytes"
             ),
             Self::Serialization => f.write_str("The MMDS data store could not be serialized."),
+            Self::UnsupportedValueType => {
+                f.write_str("Cannot retrieve MMDS value. The value has an unsupported type.")
+            }
         }
     }
 }
@@ -249,6 +261,30 @@ impl MmdsState {
             .ok_or(MmdsDataStoreError::NotInitialized)
     }
 
+    pub fn query_data(
+        &self,
+        path: &str,
+        output_format: MmdsOutputFormat,
+    ) -> Result<String, MmdsDataStoreError> {
+        let value = self
+            .value
+            .as_ref()
+            .ok_or(MmdsDataStoreError::NotInitialized)?;
+        let pointer_path = mmds_pointer_path(path);
+        let query_value = value
+            .pointer(pointer_path)
+            .ok_or(MmdsDataStoreError::NotFound)?;
+
+        if self.config.as_ref().is_some_and(MmdsConfig::imds_compat) {
+            return format_imds(query_value);
+        }
+
+        match output_format {
+            MmdsOutputFormat::Json => Ok(query_value.to_string()),
+            MmdsOutputFormat::Imds => format_imds(query_value),
+        }
+    }
+
     pub fn put_data(&mut self, input: MmdsContentInput) -> Result<(), MmdsDataStoreError> {
         let value = input.into_value();
         validate_object(&value)?;
@@ -283,6 +319,31 @@ impl MmdsState {
 
         Ok(())
     }
+}
+
+fn mmds_pointer_path(path: &str) -> &str {
+    path.strip_suffix('/').unwrap_or(path)
+}
+
+fn format_imds(value: &Value) -> Result<String, MmdsDataStoreError> {
+    if let Some(map) = value.as_object() {
+        let entries = map
+            .iter()
+            .map(|(key, value)| {
+                if value.is_object() {
+                    format!("{key}/")
+                } else {
+                    key.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        return Ok(entries.join("\n"));
+    }
+
+    value
+        .as_str()
+        .map(ToOwned::to_owned)
+        .ok_or(MmdsDataStoreError::UnsupportedValueType)
 }
 
 fn validate_object(value: &Value) -> Result<(), MmdsDataStoreError> {
@@ -323,6 +384,45 @@ fn is_valid_link_local_ipv4(ipv4_address: Ipv4Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn query_value() -> Value {
+        serde_json::json!({
+            "age": 43,
+            "member": false,
+            "meta-data": {
+                "ami-id": "ami-123",
+                "hostname": "demo.local",
+            },
+            "nothing": null,
+            "phones": [
+                "+401234567",
+                "+441234567",
+            ],
+            "user-data": "hello",
+        })
+    }
+
+    fn initialized_query_state() -> MmdsState {
+        let mut state = MmdsState::default();
+        state
+            .put_data(MmdsContentInput::new(query_value()))
+            .expect("test MMDS value should initialize");
+        state
+    }
+
+    fn enable_imds_compat(state: &mut MmdsState) {
+        state.config = Some(MmdsConfig {
+            network_interfaces: vec!["eth0".to_string()],
+            version: MmdsVersion::V1,
+            ipv4_address: None,
+            imds_compat: true,
+        });
+    }
+
+    fn assert_json_value(output: &str, expected: Value) {
+        let value = serde_json::from_str::<Value>(output).expect("query output should be JSON");
+        assert_eq!(value, expected);
+    }
 
     fn serialized_len(value: &Value) -> usize {
         serde_json::to_vec(value)
@@ -392,6 +492,139 @@ mod tests {
                 limit_bytes,
                 size_bytes: serialized_len(&patched),
             })
+        );
+        assert_eq!(state.get_data(), Ok(original));
+    }
+
+    #[test]
+    fn query_data_requires_initialized_data_store() {
+        let state = MmdsState::default();
+
+        assert_eq!(
+            state.query_data("/", MmdsOutputFormat::Json),
+            Err(MmdsDataStoreError::NotInitialized)
+        );
+    }
+
+    #[test]
+    fn query_data_returns_root_object_json() {
+        let state = initialized_query_state();
+        let output = state
+            .query_data("/", MmdsOutputFormat::Json)
+            .expect("root JSON query should succeed");
+
+        assert_json_value(&output, query_value());
+    }
+
+    #[test]
+    fn query_data_lists_root_object_as_imds() {
+        let state = initialized_query_state();
+
+        assert_eq!(
+            state.query_data("/", MmdsOutputFormat::Imds),
+            Ok("age\nmember\nmeta-data/\nnothing\nphones\nuser-data".to_string())
+        );
+    }
+
+    #[test]
+    fn query_data_lists_nested_object_and_formats_string_leaf_as_imds() {
+        let state = initialized_query_state();
+
+        assert_eq!(
+            state.query_data("/meta-data", MmdsOutputFormat::Imds),
+            Ok("ami-id\nhostname".to_string())
+        );
+        assert_eq!(
+            state.query_data("/meta-data/hostname", MmdsOutputFormat::Imds),
+            Ok("demo.local".to_string())
+        );
+    }
+
+    #[test]
+    fn query_data_ignores_trailing_slash_for_lookup() {
+        let state = initialized_query_state();
+
+        assert_eq!(
+            state.query_data("/meta-data/", MmdsOutputFormat::Imds),
+            Ok("ami-id\nhostname".to_string())
+        );
+        assert_eq!(
+            state.query_data("/phones/", MmdsOutputFormat::Json),
+            Ok(r#"["+401234567","+441234567"]"#.to_string())
+        );
+    }
+
+    #[test]
+    fn query_data_returns_json_for_arrays_and_scalars() {
+        let state = initialized_query_state();
+
+        assert_eq!(
+            state.query_data("/phones", MmdsOutputFormat::Json),
+            Ok(r#"["+401234567","+441234567"]"#.to_string())
+        );
+        assert_eq!(
+            state.query_data("/phones/0", MmdsOutputFormat::Json),
+            Ok(r#""+401234567""#.to_string())
+        );
+        assert_eq!(
+            state.query_data("/age", MmdsOutputFormat::Json),
+            Ok("43".to_string())
+        );
+        assert_eq!(
+            state.query_data("/member", MmdsOutputFormat::Json),
+            Ok("false".to_string())
+        );
+        assert_eq!(
+            state.query_data("/nothing", MmdsOutputFormat::Json),
+            Ok("null".to_string())
+        );
+    }
+
+    #[test]
+    fn query_data_rejects_missing_path() {
+        let state = initialized_query_state();
+
+        assert_eq!(
+            state.query_data("/meta-data/missing", MmdsOutputFormat::Json),
+            Err(MmdsDataStoreError::NotFound)
+        );
+    }
+
+    #[test]
+    fn query_data_rejects_unsupported_imds_value_types() {
+        let state = initialized_query_state();
+
+        for path in ["/age", "/member", "/nothing", "/phones"] {
+            assert_eq!(
+                state.query_data(path, MmdsOutputFormat::Imds),
+                Err(MmdsDataStoreError::UnsupportedValueType)
+            );
+        }
+    }
+
+    #[test]
+    fn query_data_imds_compat_forces_imds_formatting() {
+        let mut state = initialized_query_state();
+        enable_imds_compat(&mut state);
+
+        assert_eq!(
+            state.query_data("/meta-data", MmdsOutputFormat::Json),
+            Ok("ami-id\nhostname".to_string())
+        );
+        assert_eq!(
+            state.query_data("/age", MmdsOutputFormat::Json),
+            Err(MmdsDataStoreError::UnsupportedValueType)
+        );
+    }
+
+    #[test]
+    fn query_data_does_not_mutate_data_store() {
+        let state = initialized_query_state();
+        let original = state.get_data().expect("data store should be initialized");
+
+        assert_eq!(
+            state.query_data("/meta-data", MmdsOutputFormat::Imds),
+            Ok("ami-id\nhostname".to_string())
         );
         assert_eq!(state.get_data(), Ok(original));
     }
