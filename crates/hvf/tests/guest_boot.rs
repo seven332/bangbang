@@ -232,7 +232,6 @@ impl GuestBlockBacking {
                 .as_nanos()
         );
         path.push(unique);
-        let backing = Self { path };
         let mut sector = vec![0; bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE as usize];
         assert!(
             marker.len() <= sector.len(),
@@ -242,8 +241,9 @@ impl GuestBlockBacking {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&backing.path)
+            .open(&path)
             .expect("guest block backing should create");
+        let backing = Self { path };
         file.write_all(&sector)
             .expect("guest block backing sector should write");
         backing
