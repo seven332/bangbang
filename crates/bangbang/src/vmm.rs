@@ -13,6 +13,7 @@ use bangbang_hvf::{
 };
 use bangbang_runtime::block::BlockMmioLayout;
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
+use bangbang_runtime::metrics::{BootRunLoopMetricStatus, MetricsDiagnostics};
 use bangbang_runtime::mmds::{MmdsConfig, MmdsStateHandle, MmdsStateLockError};
 use bangbang_runtime::mmio::MmioRegionId;
 use bangbang_runtime::network::{
@@ -59,10 +60,18 @@ const DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT: usize = 1024;
 const HVF_BOOT_RUN_LOOP_THREAD_NAME: &str = "bangbang-hvf-boot-loop";
 
 pub(crate) trait InstanceStartExecutor {
-    type Session;
+    type Session: ProcessSessionDiagnostics;
 
     fn start(&mut self, controller: &VmmController) -> Result<Self::Session, BackendError>;
 }
+
+pub(crate) trait ProcessSessionDiagnostics {
+    fn metrics_diagnostics(&self) -> MetricsDiagnostics {
+        MetricsDiagnostics::default()
+    }
+}
+
+impl ProcessSessionDiagnostics for () {}
 
 pub(crate) trait VmmRequestHandler {
     fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError>;
@@ -143,6 +152,7 @@ where
     pub(crate) fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
         match action {
             VmmAction::InstanceStart => self.start_instance(),
+            VmmAction::FlushMetrics => self.flush_metrics(),
             action => self.controller.handle_action(action),
         }
     }
@@ -169,6 +179,16 @@ where
             },
             Err(err) => Err(err),
         }
+    }
+
+    fn flush_metrics(&mut self) -> Result<VmmData, VmmActionError> {
+        let diagnostics = self
+            .started_session
+            .as_ref()
+            .map(ProcessSessionDiagnostics::metrics_diagnostics)
+            .unwrap_or_default();
+
+        self.controller.flush_metrics_with_diagnostics(&diagnostics)
     }
 }
 
@@ -820,6 +840,21 @@ where
     }
 }
 
+impl<S> ProcessSessionDiagnostics for BootRunLoopSupervisor<S>
+where
+    S: BootRunLoopSession,
+{
+    fn metrics_diagnostics(&self) -> MetricsDiagnostics {
+        let status = match self.status() {
+            BootRunLoopWorkerStatus::Running => BootRunLoopMetricStatus::Running,
+            BootRunLoopWorkerStatus::Exited(_) => BootRunLoopMetricStatus::Exited,
+            BootRunLoopWorkerStatus::Failed(_) => BootRunLoopMetricStatus::Failed,
+        };
+
+        MetricsDiagnostics::new().with_boot_run_loop_status(status)
+    }
+}
+
 impl<S> Drop for BootRunLoopSupervisor<S>
 where
     S: BootRunLoopSession,
@@ -865,7 +900,7 @@ fn default_hvf_boot_session_config(
 mod tests {
     use std::collections::VecDeque;
     use std::fmt;
-    use std::fs::{File, remove_file};
+    use std::fs::{self, File, remove_file};
     use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -875,6 +910,7 @@ mod tests {
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::fdt::{Arm64FdtRegion, Arm64FdtVirtioMmioDevice};
     use bangbang_runtime::interrupt::GuestInterruptLine;
+    use bangbang_runtime::metrics::{BootRunLoopMetricStatus, MetricsConfigInput};
     use bangbang_runtime::mmds::{MmdsConfigInput, MmdsStateHandle};
     use bangbang_runtime::mmio::MmioRegion;
     use bangbang_runtime::network::{
@@ -905,9 +941,10 @@ mod tests {
         DEFAULT_VSOCK_MMIO_BASE, DEFAULT_VSOCK_MMIO_REGION_ID, EmptyProcessNetworkRxPacketSource,
         HvfInstanceStartExecutor, InstanceStartExecutor, NetworkPacketIoRunLoopSession,
         NoopProcessNetworkTxPacketSink, ProcessHvfBootSession, ProcessMmdsPacketDetourConfig,
-        ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError, ProcessVmm,
-        ProcessVmnetPacketIoBackendFactory, default_hvf_boot_run_loop_step_limit,
-        default_hvf_boot_session_config, process_vmnet_packet_io_provider_from_configs,
+        ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError,
+        ProcessSessionDiagnostics, ProcessVmm, ProcessVmnetPacketIoBackendFactory,
+        default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
+        process_vmnet_packet_io_provider_from_configs,
     };
 
     static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -940,6 +977,46 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct FakeSession {
         id: u64,
+    }
+
+    impl ProcessSessionDiagnostics for FakeSession {}
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct DiagnosticSession {
+        status: BootRunLoopMetricStatus,
+    }
+
+    impl ProcessSessionDiagnostics for DiagnosticSession {
+        fn metrics_diagnostics(&self) -> bangbang_runtime::metrics::MetricsDiagnostics {
+            bangbang_runtime::metrics::MetricsDiagnostics::new()
+                .with_boot_run_loop_status(self.status)
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct DiagnosticStarter {
+        status: BootRunLoopMetricStatus,
+        calls: usize,
+    }
+
+    impl DiagnosticStarter {
+        const fn new(status: BootRunLoopMetricStatus) -> Self {
+            Self { status, calls: 0 }
+        }
+    }
+
+    impl InstanceStartExecutor for DiagnosticStarter {
+        type Session = DiagnosticSession;
+
+        fn start(
+            &mut self,
+            _controller: &bangbang_runtime::VmmController,
+        ) -> Result<Self::Session, BackendError> {
+            self.calls += 1;
+            Ok(DiagnosticSession {
+                status: self.status,
+            })
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -1857,6 +1934,10 @@ mod tests {
             5
         );
         assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Running);
+        assert_eq!(
+            supervisor.metrics_diagnostics().boot_run_loop_status(),
+            Some(BootRunLoopMetricStatus::Running)
+        );
         assert_eq!(drop_count.load(Ordering::SeqCst), 0);
 
         drop(supervisor);
@@ -1914,6 +1995,10 @@ mod tests {
         assert_eq!(
             supervisor.wait_for_terminal_status(),
             BootRunLoopWorkerStatus::Exited(FakeRunLoopOutcome::Terminal)
+        );
+        assert_eq!(
+            supervisor.metrics_diagnostics().boot_run_loop_status(),
+            Some(BootRunLoopMetricStatus::Exited)
         );
         assert_eq!(control.request_stop_count(), 0);
         assert_eq!(drop_count.load(Ordering::SeqCst), 0);
@@ -2053,6 +2138,10 @@ mod tests {
             supervisor.wait_for_terminal_status(),
             BootRunLoopWorkerStatus::Failed("fake run loop failed".to_string())
         );
+        assert_eq!(
+            supervisor.metrics_diagnostics().boot_run_loop_status(),
+            Some(BootRunLoopMetricStatus::Failed)
+        );
         assert_eq!(control.request_stop_count(), 0);
         assert_eq!(drop_count.load(Ordering::SeqCst), 0);
 
@@ -2089,6 +2178,36 @@ mod tests {
         assert_eq!(vmm.instance_info().state, InstanceState::Running);
         assert_eq!(vmm.starter.calls, 1);
         assert_eq!(vmm.started_session, Some(FakeSession { id: 7 }));
+    }
+
+    #[test]
+    fn flush_metrics_includes_started_session_diagnostics() {
+        let metrics = TempFilePath::create("metrics");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            "0.1.0",
+            "bangbang",
+            DiagnosticStarter::new(BootRunLoopMetricStatus::Failed),
+        );
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            metrics.path(),
+        )))
+        .expect("metrics should configure");
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        vmm.handle_action(VmmAction::FlushMetrics)
+            .expect("metrics should flush");
+
+        assert_eq!(vmm.starter.calls, 1);
+        assert_eq!(
+            fs::read_to_string(metrics.path()).expect("metrics output should read"),
+            "{\"vmm\":{\"boot_run_loop_status\":\"failed\",\"metrics_flush_count\":1}}\n"
+        );
     }
 
     #[test]

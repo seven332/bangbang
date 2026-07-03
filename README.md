@@ -123,7 +123,9 @@ curl --unix-socket /tmp/bangbang.socket \
 ```
 
 Configured metrics output records a minimal JSON line for successful runtime
-`FlushMetrics` actions.
+`FlushMetrics` actions. After `InstanceStart`, the line also includes a
+`boot_run_loop_status` summary such as `running`, `exited`, or `failed` when a
+process-owned boot worker exists.
 
 Configure logger output before boot:
 

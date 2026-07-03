@@ -899,10 +899,12 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use bangbang_runtime::logger::{LoggerConfigInput, LoggerWriteError};
-    use bangbang_runtime::metrics::MetricsConfigInput;
+    use bangbang_runtime::metrics::{
+        BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics,
+    };
     use bangbang_runtime::{BackendError, VmmActionError};
 
-    use crate::vmm::{InstanceStartExecutor, ProcessVmm};
+    use crate::vmm::{InstanceStartExecutor, ProcessSessionDiagnostics, ProcessVmm};
 
     use super::*;
 
@@ -910,12 +912,47 @@ mod tests {
 
     #[derive(Debug, Clone)]
     struct TestInstanceStarter {
-        result: Result<(), BackendError>,
+        result: Result<TestSession, BackendError>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct TestSession {
+        boot_run_loop_status: Option<BootRunLoopMetricStatus>,
+    }
+
+    impl TestSession {
+        const fn without_boot_run_loop_status() -> Self {
+            Self {
+                boot_run_loop_status: None,
+            }
+        }
+
+        const fn with_boot_run_loop_status(status: BootRunLoopMetricStatus) -> Self {
+            Self {
+                boot_run_loop_status: Some(status),
+            }
+        }
+    }
+
+    impl ProcessSessionDiagnostics for TestSession {
+        fn metrics_diagnostics(&self) -> MetricsDiagnostics {
+            self.boot_run_loop_status
+                .map(|status| MetricsDiagnostics::new().with_boot_run_loop_status(status))
+                .unwrap_or_default()
+        }
     }
 
     impl TestInstanceStarter {
         const fn success() -> Self {
-            Self { result: Ok(()) }
+            Self {
+                result: Ok(TestSession::without_boot_run_loop_status()),
+            }
+        }
+
+        const fn success_with_boot_run_loop_status(status: BootRunLoopMetricStatus) -> Self {
+            Self {
+                result: Ok(TestSession::with_boot_run_loop_status(status)),
+            }
         }
 
         const fn failure() -> Self {
@@ -926,7 +963,7 @@ mod tests {
     }
 
     impl InstanceStartExecutor for TestInstanceStarter {
-        type Session = ();
+        type Session = TestSession;
 
         fn start(
             &mut self,
@@ -2123,6 +2160,47 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
             "{\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+
+        fs::remove_file(metrics_path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn configured_metrics_flush_writes_boot_run_loop_status_over_unix_socket() {
+        let mut vmm =
+            test_controller_with_starter(TestInstanceStarter::success_with_boot_run_loop_status(
+                BootRunLoopMetricStatus::Running,
+            ));
+        let metrics_path = unique_socket_path("metrics-boot-loop").with_extension("metrics");
+        let metrics_body = format!(r#"{{"metrics_path":"{}"}}"#, metrics_path.to_string_lossy());
+        let metrics_request = format!(
+            "PUT /metrics HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{metrics_body}",
+            metrics_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(metrics_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_request = format!(
+            "PUT /boot-source HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{boot_body}",
+            boot_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response =
+            put_action_over_socket(&mut vmm, "start-with-boot-loop", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let flush_response =
+            put_action_over_socket(&mut vmm, "flush-with-boot-loop", "FlushMetrics");
+
+        assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert_eq!(
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
+            "{\"vmm\":{\"boot_run_loop_status\":\"running\",\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("fixture should clean up");
