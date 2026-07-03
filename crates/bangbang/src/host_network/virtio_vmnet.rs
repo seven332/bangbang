@@ -105,7 +105,7 @@ impl MmdsPacketDetour {
             })?;
             return Ok(true);
         }
-        if classified.is_acknowledgement_only() {
+        if classified.acknowledges_initial_synchronization_response() {
             return Ok(true);
         }
         if classified.is_empty_fin_close_request() {
@@ -2529,6 +2529,7 @@ mod tests {
     fn tx_sink_consumes_mmds_ack_only_without_response() {
         let mut packet = mmds_tcp_packet(b"");
         set_tcp_flags(&mut packet, TCP_FLAG_ACK);
+        set_tcp_acknowledgement_number(&mut packet, 1);
         let mut memory = tx_memory();
         let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
         let response_queue = MmdsResponseQueue::with_capacity(2);
@@ -2554,6 +2555,51 @@ mod tests {
             .expect("test state lock should succeed");
         assert_eq!(state.backend.write_calls, 0);
         assert!(state.backend.written_packets.is_empty());
+        drop(state);
+        assert_eq!(
+            mmds_state
+                .with(Clone::clone)
+                .expect("MMDS state should lock"),
+            state_before
+        );
+        assert!(
+            response_queue
+                .responses()
+                .expect("MMDS response queue should read")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn tx_sink_forwards_mmds_ack_only_with_unexpected_acknowledgement() {
+        let mut packet = mmds_tcp_packet(b"");
+        set_tcp_flags(&mut packet, TCP_FLAG_ACK);
+        set_tcp_acknowledgement_number(&mut packet, 0);
+        let mut memory = tx_memory();
+        let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        let mmds_state = v2_mmds_state_handle();
+        let state_before = mmds_state
+            .with(Clone::clone)
+            .expect("MMDS state should lock");
+        let mut packet_io = packet_io_with_mmds_detour(
+            FakeVmnetPacketIoBackend::default(),
+            mmds_state.clone(),
+            response_queue.clone(),
+        );
+
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &frame)
+            .expect("MMDS ACK-only TX should forward unexpected acknowledgement");
+
+        let state = packet_io
+            .tx_sink()
+            .shared
+            .lock()
+            .expect("test state lock should succeed");
+        assert_eq!(state.backend.write_calls, 1);
+        assert_eq!(state.backend.written_packets, [packet]);
         drop(state);
         assert_eq!(
             mmds_state
