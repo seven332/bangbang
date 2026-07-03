@@ -130,6 +130,9 @@ impl MmdsPacketDetour {
         if classified.payload().is_empty() {
             return Ok(false);
         }
+        if classified.has_unsupported_payload_control_flags() {
+            return Ok(false);
+        }
         if !classified.has_initial_synchronization_acknowledgement() {
             return Ok(false);
         }
@@ -2899,6 +2902,59 @@ mod tests {
     }
 
     #[test]
+    fn tx_sink_forwards_mmds_payload_control_flags_without_mmds_response() {
+        for flags in [
+            TCP_FLAG_SYN,
+            TCP_FLAG_SYN | TCP_FLAG_ACK,
+            TCP_FLAG_FIN,
+            TCP_FLAG_FIN | TCP_FLAG_ACK,
+            TCP_FLAG_FIN | TCP_FLAG_PSH | TCP_FLAG_ACK,
+            TCP_FLAG_SYN | TCP_FLAG_FIN | TCP_FLAG_ACK,
+        ] {
+            let mut packet = mmds_tcp_packet(b"GET /meta-data/hostname HTTP/1.1\r\n\r\n");
+            set_tcp_flags(&mut packet, flags);
+            let mut memory = tx_memory();
+            let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
+            let response_queue = MmdsResponseQueue::with_capacity(2);
+            let mmds_state = v2_mmds_state_handle();
+            let state_before = mmds_state
+                .with(Clone::clone)
+                .expect("MMDS state should lock");
+            let mut packet_io = packet_io_with_mmds_detour(
+                FakeVmnetPacketIoBackend::default(),
+                mmds_state.clone(),
+                response_queue.clone(),
+            );
+
+            packet_io
+                .tx_sink()
+                .transmit_frame(&memory, &frame)
+                .expect("MMDS payload control packet should forward");
+
+            let state = packet_io
+                .tx_sink()
+                .shared
+                .lock()
+                .expect("test state lock should succeed");
+            assert_eq!(state.backend.write_calls, 1);
+            assert_eq!(state.backend.written_packets, [packet]);
+            drop(state);
+            assert_eq!(
+                mmds_state
+                    .with(Clone::clone)
+                    .expect("MMDS state should lock"),
+                state_before
+            );
+            assert!(
+                response_queue
+                    .responses()
+                    .expect("MMDS response queue should read")
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
     fn tx_sink_keeps_payload_carrying_mmds_packet_out_of_reset_path() {
         let mut packet = mmds_tcp_packet(b"GET /meta-data/hostname HTTP/1.1\r\n\r\n");
         set_tcp_flags(&mut packet, TCP_FLAG_PSH | TCP_FLAG_ACK);
@@ -3351,6 +3407,84 @@ mod tests {
             mmds_response_body(&responses[0]),
             b"The MMDS data store is not initialized."
         );
+    }
+
+    #[test]
+    fn tx_sink_forwards_later_split_mmds_payload_control_without_buffer_append() {
+        for flags in [TCP_FLAG_SYN | TCP_FLAG_ACK, TCP_FLAG_FIN | TCP_FLAG_ACK] {
+            let first_payload = b"GET /meta-data/host";
+            let second_payload = b"name HTTP/1.1\r\n\r\n";
+            let first_sequence_number = 0x1000;
+            let second_sequence_number = first_sequence_number
+                + u32::try_from(first_payload.len()).expect("test payload length should fit u32");
+            let first_packet = mmds_tcp_packet_from_source(
+                TEST_SOURCE_TCP_PORT,
+                first_sequence_number,
+                first_payload,
+            );
+            let mut invalid_second_packet = mmds_tcp_packet_from_source(
+                TEST_SOURCE_TCP_PORT,
+                second_sequence_number,
+                second_payload,
+            );
+            set_tcp_flags(&mut invalid_second_packet, flags);
+            let valid_second_packet = mmds_tcp_packet_from_source(
+                TEST_SOURCE_TCP_PORT,
+                second_sequence_number,
+                second_payload,
+            );
+            let mut memory = tx_memory();
+            let response_queue = MmdsResponseQueue::with_capacity(2);
+            let mut packet_io = packet_io_with_mmds_detour(
+                FakeVmnetPacketIoBackend::default(),
+                MmdsStateHandle::default(),
+                response_queue.clone(),
+            );
+
+            let first_frame = tx_frame(&mut memory, &[(&first_packet, PAYLOAD_ADDRESS)]);
+            packet_io
+                .tx_sink()
+                .transmit_frame(&memory, &first_frame)
+                .expect("first MMDS split GET fragment should detour");
+
+            let invalid_second_frame =
+                tx_frame(&mut memory, &[(&invalid_second_packet, PAYLOAD_ADDRESS)]);
+            packet_io
+                .tx_sink()
+                .transmit_frame(&memory, &invalid_second_frame)
+                .expect("MMDS later split payload control should forward");
+
+            let state = packet_io
+                .tx_sink()
+                .shared
+                .lock()
+                .expect("test state lock should succeed");
+            assert_eq!(state.backend.write_calls, 1);
+            assert_eq!(state.backend.written_packets, [invalid_second_packet]);
+            drop(state);
+            assert!(
+                response_queue
+                    .responses()
+                    .expect("MMDS response queue should read")
+                    .is_empty()
+            );
+
+            let valid_second_frame =
+                tx_frame(&mut memory, &[(&valid_second_packet, PAYLOAD_ADDRESS)]);
+            packet_io
+                .tx_sink()
+                .transmit_frame(&memory, &valid_second_frame)
+                .expect("valid second MMDS split GET fragment should still complete request");
+
+            let responses = response_queue
+                .responses()
+                .expect("MMDS response queue should read");
+            assert_eq!(responses.len(), 1);
+            assert_eq!(
+                mmds_response_body(&responses[0]),
+                b"The MMDS data store is not initialized."
+            );
+        }
     }
 
     #[test]
