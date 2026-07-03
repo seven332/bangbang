@@ -787,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_log_path_value() {
+    fn rejects_missing_logger_arg_values() {
         let err = parse(&["--log-path", "--id"]).expect_err("missing log path value should fail");
 
         assert_eq!(err, "missing value for --log-path");
