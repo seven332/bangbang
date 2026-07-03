@@ -759,14 +759,19 @@ existing virtio-mmio device-configuration path and rejects config writes.
 The runtime model is wired to successful pre-boot `PUT /drives/{drive_id}` VMM
 configuration storage. Public `InstanceStart` startup can call block-device
 preparation, MMIO registration, and FDT device description for initial
-configured drives, and the internal boot run loop across bounded step windows
-can dispatch active block queue notifications and signal interrupts. The signed
-`guest_boot` integration target now validates that the pinned Firecracker arm64
-kernel can discover the first virtio-block device as `/dev/vda` and read a
-marker from a temporary host backing file through the raw block device. Guest
-writes, rootfs boot, block hotplug, cache-mode expansion, and rate limiting
-remain deferred. It does not select a root block device for boot, provide a
-public runner control, implement rate limiting, support
+configured drives. When a configured drive is the root device, startup appends
+Firecracker-style root-drive kernel command-line arguments before writing FDT
+`chosen.bootargs`: `root=PARTUUID=<partuuid>` when `partuuid` is configured,
+otherwise `root=/dev/vda`, followed by `ro` for read-only drives or `rw` for
+writable drives. The final command line is still checked against the arm64
+2048-byte command-line limit after these automatic arguments are appended.
+The internal boot run loop across bounded step windows can dispatch active
+block queue notifications and signal interrupts. The signed `guest_boot`
+integration target now validates that the pinned Firecracker arm64 kernel can
+discover the first virtio-block device as `/dev/vda` and read a marker from a
+temporary host backing file through the raw block device. Guest writes, rootfs
+boot, block hotplug, cache-mode expansion, and rate limiting remain deferred.
+It does not provide a public runner control, implement rate limiting, support
 vhost-user-block sockets, or use an async I/O engine. Internal HVF boot sessions
 can signal block SPI interrupts after boot-runtime block notification dispatch.
 

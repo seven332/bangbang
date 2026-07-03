@@ -5,11 +5,13 @@ use std::fmt;
 
 use crate::VmmController;
 use crate::block::{
-    BlockMmioDeviceRegistration, BlockMmioLayout, BlockMmioRegistrationError,
+    BlockMmioDeviceRegistration, BlockMmioLayout, BlockMmioRegistrationError, DriveConfig,
     PreparedBlockDeviceError, PreparedBlockDevices, VirtioBlockDeviceNotificationDispatch,
     VirtioBlockDeviceNotificationError, VirtioBlockMmioHandler,
 };
-use crate::boot::{BootSource, BootSourceConfig, BootSourceLoadError, LoadedBootSource};
+use crate::boot::{
+    BootCommandLineError, BootSource, BootSourceConfig, BootSourceLoadError, LoadedBootSource,
+};
 use crate::fdt::{
     Arm64FdtBootInfo, Arm64FdtConfig, Arm64FdtError, Arm64FdtGic, Arm64FdtGuestMemoryWrite,
     Arm64FdtRegion, Arm64FdtSerialDevice, Arm64FdtTimerInterrupts, Arm64FdtVirtioMmioDevice,
@@ -736,6 +738,9 @@ pub enum Arm64BootResourceError {
     BootSourceLoad {
         source: BootSourceLoadError,
     },
+    RootDriveCommandLine {
+        source: BootCommandLineError,
+    },
     PrepareBlockDevices {
         source: PreparedBlockDeviceError,
     },
@@ -806,6 +811,12 @@ impl fmt::Display for Arm64BootResourceError {
             Self::BootSourceLoad { source } => {
                 write!(f, "failed to load boot source: {source}")
             }
+            Self::RootDriveCommandLine { source } => {
+                write!(
+                    f,
+                    "failed to append root-drive kernel command-line arguments: {source}"
+                )
+            }
             Self::PrepareBlockDevices { source } => {
                 write!(f, "failed to prepare block devices: {source}")
             }
@@ -859,6 +870,7 @@ impl std::error::Error for Arm64BootResourceError {
             Self::MemoryLayout { source } => Some(source),
             Self::GuestMemoryAllocation { source } => Some(source),
             Self::BootSourceLoad { source } => Some(source),
+            Self::RootDriveCommandLine { source } => Some(source),
             Self::PrepareBlockDevices { source } => Some(source),
             Self::PrepareNetworkDevices { source } => Some(source),
             Self::PrepareVsockDevice { source } => Some(source),
@@ -961,9 +973,10 @@ impl Arm64BootResources {
         let mut memory = GuestMemory::allocate(&layout)
             .map_err(|source| Arm64BootResourceError::GuestMemoryAllocation { source })?;
         let boot_source = boot_source_from_config(boot_source_config);
-        let loaded_boot_source = boot_source
+        let mut loaded_boot_source = boot_source
             .load(&layout, &mut memory)
             .map_err(|source| Arm64BootResourceError::BootSourceLoad { source })?;
+        append_root_drive_command_line(&mut loaded_boot_source, controller.drive_configs())?;
 
         let prepared_blocks =
             PreparedBlockDevices::from_config_slice(controller.drive_configs())
@@ -1094,6 +1107,29 @@ fn boot_source_from_config(config: &BootSourceConfig) -> BootSource {
         source = source.with_boot_args(boot_args.to_string());
     }
     source
+}
+
+fn append_root_drive_command_line(
+    loaded_boot_source: &mut LoadedBootSource,
+    drive_configs: &[DriveConfig],
+) -> Result<(), Arm64BootResourceError> {
+    if let Some(root_drive) = drive_configs.iter().find(|config| config.is_root_device()) {
+        let root_arg = root_drive
+            .partuuid()
+            .map(|partuuid| format!("root=PARTUUID={partuuid}"))
+            .unwrap_or_else(|| "root=/dev/vda".to_string());
+        let mode_arg = if root_drive.is_read_only() {
+            "ro"
+        } else {
+            "rw"
+        };
+        loaded_boot_source.command_line = loaded_boot_source
+            .command_line
+            .with_appended_kernel_args([root_arg.as_str(), mode_arg])
+            .map_err(|source| Arm64BootResourceError::RootDriveCommandLine { source })?;
+    }
+
+    Ok(())
 }
 
 fn validate_block_interrupt_line_count(
@@ -1298,7 +1334,10 @@ mod tests {
         VIRTIO_BLOCK_REQUEST_TYPE_IN, VIRTIO_BLOCK_SECTOR_SIZE, VIRTIO_BLOCK_STATUS_OK,
         VIRTIO_BLOCK_STATUS_SIZE,
     };
-    use crate::boot::{BootPayloadKind, BootSourceConfigInput, BootSourceLoadError};
+    use crate::boot::{
+        BootCommandLineError, BootPayloadKind, BootSourceConfigInput, BootSourceLoadError,
+        DEFAULT_KERNEL_COMMAND_LINE,
+    };
     use crate::fdt::{Arm64FdtError, Arm64FdtGic, Arm64FdtRegion, Arm64FdtTimerInterrupts};
     use crate::interrupt::{DeviceInterruptKind, GuestInterruptLine};
     use crate::machine::MachineConfigInput;
@@ -1443,6 +1482,21 @@ mod tests {
     }
 
     fn controller_with_kernel_and_memory(kernel: &Path, mem_size_mib: u64) -> crate::VmmController {
+        controller_with_kernel_memory_and_boot_args(kernel, mem_size_mib, None)
+    }
+
+    fn controller_with_kernel_and_boot_args(
+        kernel: &Path,
+        boot_args: &str,
+    ) -> crate::VmmController {
+        controller_with_kernel_memory_and_boot_args(kernel, TEST_MEMORY_MIB, Some(boot_args))
+    }
+
+    fn controller_with_kernel_memory_and_boot_args(
+        kernel: &Path,
+        mem_size_mib: u64,
+        boot_args: Option<&str>,
+    ) -> crate::VmmController {
         let mut controller = crate::VmmController::new("test", "0.1.0", "bangbang");
         controller
             .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(
@@ -1450,10 +1504,12 @@ mod tests {
                 mem_size_mib,
             )))
             .expect("machine config should be stored");
+        let mut boot_source = BootSourceConfigInput::new(kernel.to_path_buf());
+        if let Some(args) = boot_args {
+            boot_source = boot_source.with_boot_args(args);
+        }
         controller
-            .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
-                kernel.to_path_buf(),
-            )))
+            .handle_action(VmmAction::PutBootSource(boot_source))
             .expect("boot source should be stored");
         controller
     }
@@ -1468,13 +1524,26 @@ mod tests {
         path: &Path,
         is_root_device: bool,
     ) {
+        add_drive_with_options(controller, id, path, is_root_device, None, None);
+    }
+
+    fn add_drive_with_options(
+        controller: &mut crate::VmmController,
+        id: &str,
+        path: &Path,
+        is_root_device: bool,
+        is_read_only: Option<bool>,
+        partuuid: Option<&str>,
+    ) {
+        let mut input = DriveConfigInput::new(id, id, path.to_path_buf(), is_root_device);
+        if let Some(read_only) = is_read_only {
+            input = input.with_is_read_only(read_only);
+        }
+        if let Some(partuuid) = partuuid {
+            input = input.with_partuuid(partuuid);
+        }
         controller
-            .handle_action(VmmAction::PutDrive(DriveConfigInput::new(
-                id,
-                id,
-                path.to_path_buf(),
-                is_root_device,
-            )))
+            .handle_action(VmmAction::PutDrive(input))
             .expect("drive config should be stored");
     }
 
@@ -2655,6 +2724,15 @@ mod tests {
         DeviceTree::load(&bytes).expect("assembled FDT should parse")
     }
 
+    fn fdt_bootargs(resources: &Arm64BootResources) -> String {
+        read_fdt(resources)
+            .find("/chosen")
+            .expect("assembled FDT should contain /chosen")
+            .prop_str("bootargs")
+            .expect("assembled FDT should contain bootargs")
+            .to_string()
+    }
+
     #[test]
     fn assembles_boot_resources_without_drives() {
         let kernel = temp_file("kernel", &arm64_image());
@@ -2679,6 +2757,11 @@ mod tests {
         assert!(resources.vsock_device.is_none());
         assert!(resources.serial_device.is_none());
         assert!(resources.mmio_dispatcher.regions().is_empty());
+        assert_eq!(
+            resources.loaded_boot_source.command_line.as_str(),
+            DEFAULT_KERNEL_COMMAND_LINE
+        );
+        assert_eq!(fdt_bootargs(&resources), DEFAULT_KERNEL_COMMAND_LINE);
         assert!(read_fdt(&resources).find("/uart@40002000").is_none());
         assert!(read_fdt(&resources).find("/virtio_mmio@40006000").is_none());
     }
@@ -2710,6 +2793,161 @@ mod tests {
             line(32)
         );
         assert_eq!(resources.mmio_dispatcher.regions().len(), 1);
+    }
+
+    #[test]
+    fn assembles_boot_resources_with_read_only_root_drive_boot_args() {
+        let kernel = temp_file("kernel-root-ro", &arm64_image());
+        let block = temp_file("block-root-ro", &[0x5a; 512]);
+        let mut controller = controller_with_kernel_and_boot_args(kernel.path(), "console=ttyS0");
+        add_drive_with_options(
+            &mut controller,
+            "rootfs",
+            block.path(),
+            true,
+            Some(true),
+            None,
+        );
+
+        let resources =
+            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[line(32)]))
+                .expect("boot resources should assemble with read-only root drive");
+
+        assert_eq!(
+            resources.loaded_boot_source.command_line.as_str(),
+            "console=ttyS0 root=/dev/vda ro"
+        );
+        assert_eq!(fdt_bootargs(&resources), "console=ttyS0 root=/dev/vda ro");
+    }
+
+    #[test]
+    fn assembles_boot_resources_with_writable_root_drive_boot_args() {
+        let kernel = temp_file("kernel-root-rw", &arm64_image());
+        let block = temp_file("block-root-rw", &[0x5a; 512]);
+        let mut controller = controller_with_kernel_and_boot_args(kernel.path(), "console=ttyS0");
+        add_drive_with_options(
+            &mut controller,
+            "rootfs",
+            block.path(),
+            true,
+            Some(false),
+            None,
+        );
+
+        let resources =
+            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[line(32)]))
+                .expect("boot resources should assemble with writable root drive");
+
+        assert_eq!(
+            resources.loaded_boot_source.command_line.as_str(),
+            "console=ttyS0 root=/dev/vda rw"
+        );
+        assert_eq!(fdt_bootargs(&resources), "console=ttyS0 root=/dev/vda rw");
+    }
+
+    #[test]
+    fn assembles_boot_resources_with_partuuid_root_drive_boot_args() {
+        let kernel = temp_file("kernel-root-partuuid", &arm64_image());
+        let block = temp_file("block-root-partuuid", &[0x5a; 512]);
+        let mut controller = controller_with_kernel_and_boot_args(kernel.path(), "console=ttyS0");
+        add_drive_with_options(
+            &mut controller,
+            "rootfs",
+            block.path(),
+            true,
+            Some(true),
+            Some("0eaa91a0-01"),
+        );
+
+        let resources =
+            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[line(32)]))
+                .expect("boot resources should assemble with PARTUUID root drive");
+
+        assert_eq!(
+            resources.loaded_boot_source.command_line.as_str(),
+            "console=ttyS0 root=PARTUUID=0eaa91a0-01 ro"
+        );
+        assert_eq!(
+            fdt_bootargs(&resources),
+            "console=ttyS0 root=PARTUUID=0eaa91a0-01 ro"
+        );
+    }
+
+    #[test]
+    fn assembles_boot_resources_does_not_append_root_args_for_non_root_drive() {
+        let kernel = temp_file("kernel-non-root", &arm64_image());
+        let block = temp_file("block-non-root", &[0x5a; 512]);
+        let mut controller = controller_with_kernel_and_boot_args(kernel.path(), "console=ttyS0");
+        add_drive_with_options(
+            &mut controller,
+            "data",
+            block.path(),
+            false,
+            Some(true),
+            Some("0eaa91a0-01"),
+        );
+
+        let resources =
+            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[line(32)]))
+                .expect("boot resources should assemble with non-root drive");
+
+        assert_eq!(
+            resources.loaded_boot_source.command_line.as_str(),
+            "console=ttyS0"
+        );
+        assert_eq!(fdt_bootargs(&resources), "console=ttyS0");
+    }
+
+    #[test]
+    fn assembles_boot_resources_appends_root_args_before_init_args() {
+        let kernel = temp_file("kernel-root-init-args", &arm64_image());
+        let block = temp_file("block-root-init-args", &[0x5a; 512]);
+        let mut controller =
+            controller_with_kernel_and_boot_args(kernel.path(), "console=ttyS0 -- /init");
+        add_drive_with_options(
+            &mut controller,
+            "rootfs",
+            block.path(),
+            true,
+            Some(true),
+            None,
+        );
+
+        let resources =
+            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[line(32)]))
+                .expect("boot resources should assemble with root drive and init args");
+
+        assert_eq!(
+            resources.loaded_boot_source.command_line.as_str(),
+            "console=ttyS0 root=/dev/vda ro -- /init"
+        );
+        assert_eq!(
+            fdt_bootargs(&resources),
+            "console=ttyS0 root=/dev/vda ro -- /init"
+        );
+    }
+
+    #[test]
+    fn root_drive_boot_args_overflow_fails_before_block_preparation() {
+        let kernel = temp_file("kernel-root-overflow", &arm64_image());
+        let boot_args = "a".repeat(aarch64::CMDLINE_MAX_SIZE - 1);
+        let mut controller = controller_with_kernel_and_boot_args(kernel.path(), &boot_args);
+        add_drive(
+            &mut controller,
+            "rootfs",
+            &missing_path("root-overflow-block"),
+        );
+
+        let err =
+            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[line(32)]))
+                .expect_err("root-drive boot args should exceed command-line limit");
+
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::RootDriveCommandLine {
+                source: BootCommandLineError::TooLarge { .. }
+            }
+        ));
     }
 
     #[test]

@@ -175,16 +175,20 @@ into the generated ext4 image keep the local extraction ownership rather than
 Firecracker's root-owned demo ownership. This is suitable for local development
 artifacts and is not a substitute for a production rootfs build process.
 
-bangbang currently does not append Firecracker-style root-drive command-line
-arguments automatically. Until that behavior is implemented, rootfs boot tests
-must pass explicit boot args such as:
+bangbang appends Firecracker-style root-drive command-line arguments during
+startup resource assembly when a configured drive has `is_root_device=true`.
+Root drives with `partuuid` append `root=PARTUUID=<partuuid>`; other root
+virtio-block drives append `root=/dev/vda`. Read-only root drives append `ro`,
+and writable root drives append `rw`. Rootfs boot tests should still pass the
+other boot args they need, for example:
 
 ```sh
-console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro
+console=ttyS0 reboot=k panic=1 pci=off
 ```
 
-Use `ro` when attaching the cached squashfs rootfs as a read-only drive. Use
-`rw` only with a writable scratch copy of the generated ext4 image.
+Set `is_read_only=true` when attaching the cached squashfs rootfs so the guest
+receives `ro`. Use writable root mode only with a scratch copy of the generated
+ext4 image.
 
 ## PR Expectations
 
