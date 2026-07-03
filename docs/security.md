@@ -190,7 +190,10 @@ Firecracker-shaped IMDS text, and can model process-local guest GET response
 status/content-type/body values, parse complete process-local guest HTTP `GET`
 request bytes, map parse failures to deterministic process-local error
 responses without echoing malformed request bytes, and serialize process-local
-HTTP response bytes for guest delivery. It can synthesize deterministic
+HTTP response bytes for guest delivery while preserving only accepted
+`HTTP/1.0` or `HTTP/1.1` status-line versions. Malformed request lines and
+unsupported versions use the default safe parse-error response without echoing
+arbitrary version tokens. It can synthesize deterministic
 Ethernet/ARP replies, Ethernet/IPv4/TCP SYN-ACK frames, and Ethernet/IPv4/TCP
 response frames carrying those bytes, expose queued response frames through the
 matching virtio-net RX source, and schedule one bounded post-TX RX retry when
