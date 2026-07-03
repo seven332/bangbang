@@ -6,7 +6,10 @@ use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use bangbang_runtime::memory::{GuestMemory, GuestMemoryAccessError};
-use bangbang_runtime::mmds::{MmdsStateHandle, MmdsStateLockError, classify_mmds_guest_tcp_packet};
+use bangbang_runtime::mmds::{
+    MmdsGuestTcpResponseFrameError, MmdsStateHandle, MmdsStateLockError,
+    classify_mmds_guest_tcp_packet,
+};
 use bangbang_runtime::network::{
     VIRTIO_NET_MAX_BUFFER_SIZE, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
     VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame, VirtioNetworkTxPacketSink,
@@ -84,8 +87,13 @@ impl MmdsPacketDetour {
         }
 
         self.response_queue.push_with(|| {
-            self.mmds_state
+            let response = self
+                .mmds_state
                 .with_mut(|state| state.guest_http_response_bytes(classified.payload()))
+                .map_err(MmdsPacketDetourError::MmdsState)?;
+            classified
+                .response_frame(&response)
+                .map_err(MmdsPacketDetourError::ResponseFrame)
         })?;
         Ok(true)
     }
@@ -114,7 +122,7 @@ impl MmdsResponseQueue {
 
     fn push_with(
         &self,
-        response: impl FnOnce() -> Result<Vec<u8>, MmdsStateLockError>,
+        response: impl FnOnce() -> Result<Vec<u8>, MmdsPacketDetourError>,
     ) -> Result<(), MmdsPacketDetourError> {
         let mut state = self
             .state
@@ -128,7 +136,7 @@ impl MmdsResponseQueue {
             ));
         }
 
-        let response = response().map_err(MmdsPacketDetourError::MmdsState)?;
+        let response = response()?;
         state.responses.push_back(response);
         Ok(())
     }
@@ -171,6 +179,7 @@ impl std::error::Error for MmdsResponseQueueError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MmdsPacketDetourError {
     MmdsState(MmdsStateLockError),
+    ResponseFrame(MmdsGuestTcpResponseFrameError),
     ResponseQueue(MmdsResponseQueueError),
 }
 
@@ -178,6 +187,7 @@ impl fmt::Display for MmdsPacketDetourError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MmdsState(source) => write!(f, "{source}"),
+            Self::ResponseFrame(source) => write!(f, "{source}"),
             Self::ResponseQueue(source) => write!(f, "{source}"),
         }
     }
@@ -187,6 +197,7 @@ impl std::error::Error for MmdsPacketDetourError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::MmdsState(source) => Some(source),
+            Self::ResponseFrame(source) => Some(source),
             Self::ResponseQueue(source) => Some(source),
         }
     }
@@ -959,7 +970,14 @@ mod tests {
         handle
     }
 
-    fn mmds_response_body(response: &[u8]) -> &[u8] {
+    fn mmds_response_frame_tcp_payload(response_frame: &[u8]) -> &[u8] {
+        response_frame
+            .get(ETHERNET_HEADER_LEN + IPV4_HEADER_LEN + TCP_HEADER_LEN..)
+            .expect("MMDS response frame should include TCP payload")
+    }
+
+    fn mmds_response_body(response_frame: &[u8]) -> &[u8] {
+        let response = mmds_response_frame_tcp_payload(response_frame);
         let separator = b"\r\n\r\n";
         let body_start = response
             .windows(separator.len())
@@ -1123,7 +1141,7 @@ mod tests {
     }
 
     #[test]
-    fn tx_sink_detours_mmds_packet_and_retains_response() {
+    fn tx_sink_detours_mmds_packet_and_retains_response_frame() {
         let payload = b"GET /meta-data/hostname HTTP/1.1\r\nAccept: application/json\r\n\r\n";
         let packet = mmds_tcp_packet(payload);
         let mut memory = tx_memory();
@@ -1153,7 +1171,7 @@ mod tests {
             .expect("MMDS response queue should read");
         assert_eq!(responses.len(), 1);
         assert!(
-            std::str::from_utf8(&responses[0])
+            std::str::from_utf8(mmds_response_frame_tcp_payload(&responses[0]))
                 .expect("response should be UTF-8")
                 .starts_with("HTTP/1.1 400 Bad Request")
         );

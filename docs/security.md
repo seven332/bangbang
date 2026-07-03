@@ -185,7 +185,9 @@ Firecracker-shaped IMDS text, and can model process-local guest GET response
 status/content-type/body values, parse complete process-local guest HTTP `GET`
 request bytes, map parse failures to deterministic process-local error
 responses without echoing malformed request bytes, and serialize process-local
-HTTP response bytes for future guest delivery. It also has a process-local
+HTTP response bytes for future guest delivery. It can synthesize single-packet
+Ethernet/IPv4/TCP response frames carrying those bytes for future virtio-net RX
+delivery. It also has a process-local
 opaque token authority with a default `1024`-entry active-token store and can
 model process-local guest `PUT /latest/api/token` exchanges that return
 generated tokens. When MMDS v2 is configured, process-local guest GET handling
@@ -199,10 +201,11 @@ non-candidates. For non-empty candidate TCP payloads, the runtime can produce
 the same process-local HTTP response bytes as the existing guest HTTP helper,
 including token PUT and MMDS v2 GET token enforcement. The process vmnet TX
 path detours those non-empty candidates only for interfaces listed in the MMDS
-config, retains generated response bytes in a bounded process-local queue, and
-does not forward handled request payloads to vmnet. This still does not
-reassemble fragments, buffer split TCP requests, track TCP state, synthesize
-response packets, or deliver responses through virtio-net RX. Future
+config, synthesizes response frames from the single-packet request context,
+retains those frames in a bounded process-local queue, and does not forward
+handled request payloads to vmnet. This still does not reassemble fragments,
+buffer split TCP requests, track TCP state, or deliver responses through
+virtio-net RX. Future
 guest-visible MMDS work must validate device, packet, token, and TCP/session
 inputs before making this data reachable from guest code.
 
@@ -245,8 +248,9 @@ The current scaffold does not implement:
   cleanup-owning packet backend for retaining stop-on-drop ownership while
   delegating packet I/O, and an internal virtio-net adapter that can move
   packets between vmnet and the runtime packet traits, detour configured
-  non-empty MMDS TX payloads before vmnet forwarding, and retain bounded
-  process-local MMDS response bytes for future guest-visible delivery, plus an
+  non-empty MMDS TX payloads before vmnet forwarding, synthesize single-packet
+  MMDS response frames, and retain bounded process-local MMDS response frames
+  for future guest-visible delivery, plus an
   internal provider that can select prebuilt adapters by configured interface
   ID and an internal `host_dev_name` mapping for
   `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>`. The current
