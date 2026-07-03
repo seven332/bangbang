@@ -81,7 +81,12 @@ if [[ "$format" != "ext4" && "$ext4_size_set" == true ]]; then
   exit 2
 fi
 
-if [[ ! "$ext4_size" =~ ^[0-9]+[KkMmGgTt]?$ ]]; then
+if [[ ! "$ext4_size" =~ ^([0-9]+)[KkMmGgTt]?$ ]]; then
+  echo "invalid ext4 size: $ext4_size" >&2
+  usage >&2
+  exit 2
+fi
+if [[ "${BASH_REMATCH[1]}" =~ ^0+$ ]]; then
   echo "invalid ext4 size: $ext4_size" >&2
   usage >&2
   exit 2
