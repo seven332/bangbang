@@ -47,6 +47,11 @@ fn boots_firecracker_kernel_to_guest_marker() {
         "guest boot test without a drive should not observe block-read marker\nserial output:\n{}",
         String::from_utf8_lossy(&observation.serial_bytes)
     );
+    assert!(
+        !bytes_contain_marker(&observation.serial_bytes, BLOCK_WRITE_MARKER),
+        "guest boot test without a drive should not observe block-write marker\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
