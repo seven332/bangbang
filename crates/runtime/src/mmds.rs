@@ -209,6 +209,11 @@ impl<'a> MmdsGuestTcpPacket<'a> {
         self.tcp_flags == TCP_FLAG_ACK && self.payload.is_empty()
     }
 
+    pub fn is_empty_fin_close_request(self) -> bool {
+        (self.tcp_flags == TCP_FLAG_FIN || self.tcp_flags == (TCP_FLAG_FIN | TCP_FLAG_ACK))
+            && self.payload.is_empty()
+    }
+
     pub const fn response_context(self) -> MmdsGuestTcpResponseContext {
         MmdsGuestTcpResponseContext {
             source_ethernet_address: self.source_ethernet_address,
@@ -237,6 +242,13 @@ impl<'a> MmdsGuestTcpPacket<'a> {
         }
         self.response_context().syn_ack_response_frame()
     }
+
+    pub fn fin_close_response_frames(self) -> Result<[Vec<u8>; 2], MmdsGuestTcpResponseFrameError> {
+        if !self.is_empty_fin_close_request() {
+            return Err(MmdsGuestTcpResponseFrameError::NotConnectionCloseRequest);
+        }
+        self.response_context().fin_close_response_frames()
+    }
 }
 
 impl MmdsGuestTcpResponseContext {
@@ -261,6 +273,28 @@ impl MmdsGuestTcpResponseContext {
                 sequence_number: MMDS_GUEST_TCP_SYN_ACK_SEQUENCE_NUMBER,
                 acknowledgement_number: self.sequence_number.wrapping_add(1),
                 tcp_flags: TCP_FLAG_SYN | TCP_FLAG_ACK,
+                tcp_payload: &[],
+            },
+        )
+    }
+
+    fn fin_close_response_frames(self) -> Result<[Vec<u8>; 2], MmdsGuestTcpResponseFrameError> {
+        Ok([
+            self.control_response_frame(TCP_FLAG_ACK)?,
+            self.control_response_frame(TCP_FLAG_FIN | TCP_FLAG_ACK)?,
+        ])
+    }
+
+    fn control_response_frame(
+        self,
+        tcp_flags: u8,
+    ) -> Result<Vec<u8>, MmdsGuestTcpResponseFrameError> {
+        mmds_guest_tcp_response_frame_with_parts(
+            self,
+            MmdsGuestTcpResponseFrameParts {
+                sequence_number: self.acknowledgement_number,
+                acknowledgement_number: self.response_acknowledgement_number(0),
+                tcp_flags,
                 tcp_payload: &[],
             },
         )
@@ -540,6 +574,7 @@ impl std::error::Error for MmdsGuestArpResponseFrameError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MmdsGuestTcpResponseFrameError {
     InternalFrameLayout,
+    NotConnectionCloseRequest,
     NotInitialSynchronizationRequest,
     PayloadTooLarge { payload_len: usize },
     RequestPayloadTooLarge { request_payload_len: usize },
@@ -551,6 +586,9 @@ impl fmt::Display for MmdsGuestTcpResponseFrameError {
             Self::InternalFrameLayout => {
                 f.write_str("MMDS guest TCP response frame internal layout is invalid")
             }
+            Self::NotConnectionCloseRequest => f.write_str(
+                "MMDS guest TCP FIN close response requires an empty FIN request packet",
+            ),
             Self::NotInitialSynchronizationRequest => f.write_str(
                 "MMDS guest TCP SYN-ACK response requires an initial SYN request packet",
             ),
@@ -2457,6 +2495,39 @@ mod tests {
     }
 
     #[test]
+    fn identifies_empty_mmds_guest_tcp_fin_close_packet() {
+        let tcp_start = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN;
+
+        for flags in [TCP_FLAG_FIN, TCP_FLAG_FIN | TCP_FLAG_ACK] {
+            let mut fin_packet = test_mmds_tcp_packet(b"");
+            fin_packet[tcp_start + TCP_FLAGS_OFFSET] = flags;
+            let fin = classify_mmds_guest_tcp_packet(&fin_packet, test_mmds_ipv4_address())
+                .expect("MMDS TCP FIN close packet should classify");
+            assert!(fin.is_empty_fin_close_request());
+        }
+
+        for flags in [
+            TCP_FLAG_ACK,
+            TCP_FLAG_SYN,
+            TEST_TCP_FLAG_RST,
+            TCP_FLAG_FIN | TEST_TCP_FLAG_RST,
+        ] {
+            let mut control_packet = test_mmds_tcp_packet(b"");
+            control_packet[tcp_start + TCP_FLAGS_OFFSET] = flags;
+            let control = classify_mmds_guest_tcp_packet(&control_packet, test_mmds_ipv4_address())
+                .expect("MMDS TCP control packet should classify");
+            assert!(!control.is_empty_fin_close_request());
+        }
+
+        let mut fin_with_payload = test_mmds_tcp_packet(b"payload");
+        fin_with_payload[tcp_start + TCP_FLAGS_OFFSET] = TCP_FLAG_FIN | TCP_FLAG_ACK;
+        let fin_with_payload =
+            classify_mmds_guest_tcp_packet(&fin_with_payload, test_mmds_ipv4_address())
+                .expect("MMDS TCP FIN with payload should classify");
+        assert!(!fin_with_payload.is_empty_fin_close_request());
+    }
+
+    #[test]
     fn mmds_guest_tcp_syn_ack_response_frame_targets_requester() {
         let tcp_start = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN;
         let mut packet = test_mmds_tcp_packet(b"");
@@ -2553,6 +2624,110 @@ mod tests {
         assert_eq!(
             classified.syn_ack_response_frame(),
             Err(MmdsGuestTcpResponseFrameError::NotInitialSynchronizationRequest)
+        );
+    }
+
+    #[test]
+    fn mmds_guest_tcp_fin_close_response_frames_ack_and_close_requester() {
+        let tcp_start = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN;
+        let mut packet = test_mmds_tcp_packet(b"");
+        packet[tcp_start + TCP_FLAGS_OFFSET] = TCP_FLAG_FIN | TCP_FLAG_ACK;
+        write_packet_u32(
+            &mut packet,
+            tcp_start + TCP_SEQUENCE_NUMBER_OFFSET,
+            0x0102_0304,
+        );
+        write_packet_u32(
+            &mut packet,
+            tcp_start + TCP_ACKNOWLEDGEMENT_NUMBER_OFFSET,
+            0x1112_1314,
+        );
+        let classified = classify_mmds_guest_tcp_packet(&packet, test_mmds_ipv4_address())
+            .expect("MMDS TCP FIN close packet should classify");
+
+        let [ack, fin_ack] = classified
+            .fin_close_response_frames()
+            .expect("FIN close response frames should synthesize");
+
+        for (response, flags) in [
+            (ack.as_slice(), TCP_FLAG_ACK),
+            (fin_ack.as_slice(), TCP_FLAG_FIN | TCP_FLAG_ACK),
+        ] {
+            assert_eq!(
+                response.len(),
+                ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN + TCP_MIN_HEADER_LEN
+            );
+            assert_eq!(
+                packet_array::<ETHERNET_MAC_ADDRESS_LEN>(
+                    response,
+                    ETHERNET_DESTINATION_ADDRESS_OFFSET
+                ),
+                Some(test_source_ethernet_address().octets())
+            );
+            assert_eq!(
+                packet_array::<ETHERNET_MAC_ADDRESS_LEN>(response, ETHERNET_SOURCE_ADDRESS_OFFSET),
+                Some(test_destination_ethernet_address().octets())
+            );
+
+            let ipv4_header = response
+                .get(ETHERNET_HEADER_LEN..ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN)
+                .expect("response frame should include IPv4 header");
+            assert_eq!(
+                packet_u16(ipv4_header, IPV4_TOTAL_LENGTH_OFFSET),
+                Some(
+                    u16::try_from(IPV4_MIN_HEADER_LEN + TCP_MIN_HEADER_LEN).expect("len fits u16")
+                )
+            );
+            assert_eq!(
+                packet_ipv4_address(ipv4_header, IPV4_SOURCE_ADDRESS_OFFSET),
+                Some(test_mmds_ipv4_address())
+            );
+            assert_eq!(
+                packet_ipv4_address(ipv4_header, IPV4_DESTINATION_ADDRESS_OFFSET),
+                Some(test_source_ipv4_address())
+            );
+            assert_eq!(internet_checksum(ipv4_header), 0);
+
+            let tcp_segment = response_frame_tcp_segment(response);
+            assert_eq!(
+                packet_u16(tcp_segment, TCP_SOURCE_PORT_OFFSET),
+                Some(MMDS_GUEST_TCP_PORT)
+            );
+            assert_eq!(
+                packet_u16(tcp_segment, TCP_DESTINATION_PORT_OFFSET),
+                Some(49152)
+            );
+            assert_eq!(
+                packet_u32(tcp_segment, TCP_SEQUENCE_NUMBER_OFFSET),
+                Some(0x1112_1314)
+            );
+            assert_eq!(
+                packet_u32(tcp_segment, TCP_ACKNOWLEDGEMENT_NUMBER_OFFSET),
+                Some(0x0102_0305)
+            );
+            assert_eq!(tcp_segment.get(TCP_FLAGS_OFFSET), Some(&flags));
+            assert_eq!(
+                tcp_ipv4_checksum(
+                    test_mmds_ipv4_address(),
+                    test_source_ipv4_address(),
+                    u16::try_from(tcp_segment.len()).expect("TCP segment length should fit u16"),
+                    tcp_segment,
+                ),
+                0
+            );
+            assert!(response_frame_tcp_payload(response).is_empty());
+        }
+    }
+
+    #[test]
+    fn mmds_guest_tcp_fin_close_response_frames_reject_non_fin_close() {
+        let packet = test_mmds_tcp_packet(b"");
+        let classified = classify_mmds_guest_tcp_packet(&packet, test_mmds_ipv4_address())
+            .expect("empty MMDS TCP packet should classify");
+
+        assert_eq!(
+            classified.fin_close_response_frames(),
+            Err(MmdsGuestTcpResponseFrameError::NotConnectionCloseRequest)
         );
     }
 
