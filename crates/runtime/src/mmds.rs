@@ -17,7 +17,10 @@ pub const MMDS_TOKEN_MIN_TTL_SECONDS: u32 = 1;
 pub const MMDS_TOKEN_MAX_TTL_SECONDS: u32 = 21_600;
 pub const MMDS_TOKEN_MAX_ACTIVE_TOKENS: usize = 1_024;
 pub const DEFAULT_MMDS_IPV4_ADDRESS: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
+pub const DEFAULT_MMDS_MAC_ADDRESS: EthernetMacAddress =
+    EthernetMacAddress::from_octets([0x06, 0x01, 0x23, 0x45, 0x67, 0x01]);
 
+const ETHERNET_ETHERTYPE_ARP: u16 = 0x0806;
 const ETHERNET_ETHERTYPE_IPV4: u16 = 0x0800;
 const ETHERNET_DESTINATION_ADDRESS_OFFSET: usize = 0;
 const ETHERNET_ETHERTYPE_OFFSET: usize = 12;
@@ -50,6 +53,21 @@ const TCP_MIN_HEADER_WORDS: u8 = 5;
 const TCP_MIN_HEADER_LEN: usize = 20;
 const TCP_SEQUENCE_NUMBER_OFFSET: usize = 4;
 const TCP_SOURCE_PORT_OFFSET: usize = 0;
+const ARP_ETHERNET_IPV4_LEN: usize = 28;
+const ARP_HARDWARE_ADDRESS_LEN_OFFSET: usize = 4;
+const ARP_HARDWARE_ADDRESS_LEN_ETHERNET: u8 = ETHERNET_MAC_ADDRESS_LEN as u8;
+const ARP_HARDWARE_TYPE_ETHERNET: u16 = 1;
+const ARP_HARDWARE_TYPE_OFFSET: usize = 0;
+const ARP_OPERATION_OFFSET: usize = 6;
+const ARP_OPERATION_REPLY: u16 = 2;
+const ARP_OPERATION_REQUEST: u16 = 1;
+const ARP_PROTOCOL_ADDRESS_LEN_IPV4: u8 = 4;
+const ARP_PROTOCOL_ADDRESS_LEN_OFFSET: usize = 5;
+const ARP_PROTOCOL_TYPE_IPV4: u16 = ETHERNET_ETHERTYPE_IPV4;
+const ARP_PROTOCOL_TYPE_OFFSET: usize = 2;
+const ARP_SENDER_HARDWARE_ADDRESS_OFFSET: usize = 8;
+const ARP_SENDER_PROTOCOL_ADDRESS_OFFSET: usize = 14;
+const ARP_TARGET_PROTOCOL_ADDRESS_OFFSET: usize = 24;
 const MMDS_TOKEN_BYTES: usize = 32;
 const MMDS_GUEST_ALLOW_METHODS: &str = "GET, PUT";
 const MMDS_GUEST_INVALID_TOKEN: &str = "MMDS token not valid.";
@@ -94,6 +112,15 @@ pub struct MmdsGuestTcpPacket<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MmdsGuestArpRequest {
+    source_ethernet_address: EthernetMacAddress,
+    destination_ethernet_address: EthernetMacAddress,
+    sender_hardware_address: EthernetMacAddress,
+    sender_protocol_address: Ipv4Addr,
+    target_protocol_address: Ipv4Addr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MmdsGuestTcpResponseContext {
     source_ethernet_address: EthernetMacAddress,
     destination_ethernet_address: EthernetMacAddress,
@@ -104,6 +131,32 @@ pub struct MmdsGuestTcpResponseContext {
     sequence_number: u32,
     acknowledgement_number: u32,
     tcp_flags: u8,
+}
+
+impl MmdsGuestArpRequest {
+    pub const fn source_ethernet_address(self) -> EthernetMacAddress {
+        self.source_ethernet_address
+    }
+
+    pub const fn destination_ethernet_address(self) -> EthernetMacAddress {
+        self.destination_ethernet_address
+    }
+
+    pub const fn sender_hardware_address(self) -> EthernetMacAddress {
+        self.sender_hardware_address
+    }
+
+    pub const fn sender_protocol_address(self) -> Ipv4Addr {
+        self.sender_protocol_address
+    }
+
+    pub const fn target_protocol_address(self) -> Ipv4Addr {
+        self.target_protocol_address
+    }
+
+    pub fn response_frame(self) -> Result<Vec<u8>, MmdsGuestArpResponseFrameError> {
+        mmds_guest_arp_response_frame(self, DEFAULT_MMDS_MAC_ADDRESS)
+    }
 }
 
 impl<'a> MmdsGuestTcpPacket<'a> {
@@ -184,6 +237,60 @@ impl MmdsGuestTcpResponseContext {
 
         mmds_guest_tcp_response_frame(self, tcp_payload, request_payload_len)
     }
+}
+
+pub fn classify_mmds_guest_arp_request(
+    packet: &[u8],
+    mmds_ipv4_address: Ipv4Addr,
+) -> Option<MmdsGuestArpRequest> {
+    let destination_ethernet_address =
+        EthernetMacAddress::from_octets(packet_array::<ETHERNET_MAC_ADDRESS_LEN>(
+            packet,
+            ETHERNET_DESTINATION_ADDRESS_OFFSET,
+        )?);
+    let source_ethernet_address =
+        EthernetMacAddress::from_octets(packet_array::<ETHERNET_MAC_ADDRESS_LEN>(
+            packet,
+            ETHERNET_SOURCE_ADDRESS_OFFSET,
+        )?);
+    let ethertype = packet_u16(packet, ETHERNET_ETHERTYPE_OFFSET)?;
+    if ethertype != ETHERNET_ETHERTYPE_ARP {
+        return None;
+    }
+
+    let arp_packet = packet
+        .get(ETHERNET_HEADER_LEN..)?
+        .get(..ARP_ETHERNET_IPV4_LEN)?;
+    if packet_u16(arp_packet, ARP_HARDWARE_TYPE_OFFSET)? != ARP_HARDWARE_TYPE_ETHERNET
+        || packet_u16(arp_packet, ARP_PROTOCOL_TYPE_OFFSET)? != ARP_PROTOCOL_TYPE_IPV4
+        || *arp_packet.get(ARP_HARDWARE_ADDRESS_LEN_OFFSET)? != ARP_HARDWARE_ADDRESS_LEN_ETHERNET
+        || *arp_packet.get(ARP_PROTOCOL_ADDRESS_LEN_OFFSET)? != ARP_PROTOCOL_ADDRESS_LEN_IPV4
+        || packet_u16(arp_packet, ARP_OPERATION_OFFSET)? != ARP_OPERATION_REQUEST
+    {
+        return None;
+    }
+
+    let target_protocol_address =
+        packet_ipv4_address(arp_packet, ARP_TARGET_PROTOCOL_ADDRESS_OFFSET)?;
+    if target_protocol_address != mmds_ipv4_address {
+        return None;
+    }
+
+    Some(MmdsGuestArpRequest {
+        source_ethernet_address,
+        destination_ethernet_address,
+        sender_hardware_address: EthernetMacAddress::from_octets(packet_array::<
+            ETHERNET_MAC_ADDRESS_LEN,
+        >(
+            arp_packet,
+            ARP_SENDER_HARDWARE_ADDRESS_OFFSET,
+        )?),
+        sender_protocol_address: packet_ipv4_address(
+            arp_packet,
+            ARP_SENDER_PROTOCOL_ADDRESS_OFFSET,
+        )?,
+        target_protocol_address,
+    })
 }
 
 pub fn classify_mmds_guest_tcp_packet(
@@ -269,6 +376,30 @@ pub fn classify_mmds_guest_tcp_packet(
     })
 }
 
+fn mmds_guest_arp_response_frame(
+    request: MmdsGuestArpRequest,
+    mmds_mac_address: EthernetMacAddress,
+) -> Result<Vec<u8>, MmdsGuestArpResponseFrameError> {
+    let mut frame = Vec::with_capacity(ETHERNET_HEADER_LEN + ARP_ETHERNET_IPV4_LEN);
+    frame.extend_from_slice(&request.sender_hardware_address.octets());
+    frame.extend_from_slice(&mmds_mac_address.octets());
+    frame.extend_from_slice(&ETHERNET_ETHERTYPE_ARP.to_be_bytes());
+    frame.extend_from_slice(&ARP_HARDWARE_TYPE_ETHERNET.to_be_bytes());
+    frame.extend_from_slice(&ARP_PROTOCOL_TYPE_IPV4.to_be_bytes());
+    frame.push(ARP_HARDWARE_ADDRESS_LEN_ETHERNET);
+    frame.push(ARP_PROTOCOL_ADDRESS_LEN_IPV4);
+    frame.extend_from_slice(&ARP_OPERATION_REPLY.to_be_bytes());
+    frame.extend_from_slice(&mmds_mac_address.octets());
+    frame.extend_from_slice(&request.target_protocol_address.octets());
+    frame.extend_from_slice(&request.sender_hardware_address.octets());
+    frame.extend_from_slice(&request.sender_protocol_address.octets());
+
+    if frame.len() == ETHERNET_HEADER_LEN + ARP_ETHERNET_IPV4_LEN {
+        return Ok(frame);
+    }
+    Err(MmdsGuestArpResponseFrameError::InternalFrameLayout)
+}
+
 fn mmds_guest_tcp_response_frame(
     request: MmdsGuestTcpResponseContext,
     tcp_payload: &[u8],
@@ -342,6 +473,23 @@ fn mmds_guest_tcp_response_frame(
 
     Ok(frame)
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MmdsGuestArpResponseFrameError {
+    InternalFrameLayout,
+}
+
+impl fmt::Display for MmdsGuestArpResponseFrameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InternalFrameLayout => {
+                f.write_str("MMDS guest ARP response frame internal layout is invalid")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MmdsGuestArpResponseFrameError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MmdsGuestTcpResponseFrameError {
@@ -1796,6 +1944,8 @@ mod tests {
     use super::*;
     use crate::network::NetworkInterfaceConfigInput;
 
+    const ARP_TARGET_HARDWARE_ADDRESS_OFFSET: usize = 18;
+
     fn query_value() -> Value {
         serde_json::json!({
             "age": 43,
@@ -1862,6 +2012,23 @@ mod tests {
 
     fn test_source_ethernet_address() -> EthernetMacAddress {
         EthernetMacAddress::from_octets([0x02, 0x00, 0x00, 0x00, 0x00, 0x02])
+    }
+
+    fn test_arp_request(target_ipv4_address: Ipv4Addr) -> Vec<u8> {
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&test_destination_ethernet_address().octets());
+        packet.extend_from_slice(&test_source_ethernet_address().octets());
+        packet.extend_from_slice(&ETHERNET_ETHERTYPE_ARP.to_be_bytes());
+        packet.extend_from_slice(&ARP_HARDWARE_TYPE_ETHERNET.to_be_bytes());
+        packet.extend_from_slice(&ARP_PROTOCOL_TYPE_IPV4.to_be_bytes());
+        packet.push(ARP_HARDWARE_ADDRESS_LEN_ETHERNET);
+        packet.push(ARP_PROTOCOL_ADDRESS_LEN_IPV4);
+        packet.extend_from_slice(&ARP_OPERATION_REQUEST.to_be_bytes());
+        packet.extend_from_slice(&test_source_ethernet_address().octets());
+        packet.extend_from_slice(&test_source_ipv4_address().octets());
+        packet.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        packet.extend_from_slice(&target_ipv4_address.octets());
+        packet
     }
 
     fn test_tcp_sequence_number() -> u32 {
@@ -1964,6 +2131,12 @@ mod tests {
             .expect("response frame should include TCP payload")
     }
 
+    fn response_frame_arp_payload(frame: &[u8]) -> &[u8] {
+        frame
+            .get(ETHERNET_HEADER_LEN..ETHERNET_HEADER_LEN + ARP_ETHERNET_IPV4_LEN)
+            .expect("response frame should include ARP payload")
+    }
+
     fn assert_json_value(output: &str, expected: Value) {
         let value = serde_json::from_str::<Value>(output).expect("query output should be JSON");
         assert_eq!(value, expected);
@@ -1988,6 +2161,147 @@ mod tests {
     ) {
         let mut state = initialized_query_state();
         assert_guest_response(state.guest_http_response(bytes), status, content_type, body);
+    }
+
+    #[test]
+    fn classifies_mmds_guest_arp_request() {
+        let packet = test_arp_request(test_mmds_ipv4_address());
+
+        let classified = classify_mmds_guest_arp_request(&packet, test_mmds_ipv4_address())
+            .expect("MMDS ARP request should classify");
+
+        assert_eq!(
+            classified.source_ethernet_address(),
+            test_source_ethernet_address()
+        );
+        assert_eq!(
+            classified.destination_ethernet_address(),
+            test_destination_ethernet_address()
+        );
+        assert_eq!(
+            classified.sender_hardware_address(),
+            test_source_ethernet_address()
+        );
+        assert_eq!(
+            classified.sender_protocol_address(),
+            test_source_ipv4_address()
+        );
+        assert_eq!(
+            classified.target_protocol_address(),
+            test_mmds_ipv4_address()
+        );
+    }
+
+    #[test]
+    fn mmds_guest_arp_response_frame_targets_requester() {
+        let packet = test_arp_request(test_mmds_ipv4_address());
+        let classified = classify_mmds_guest_arp_request(&packet, test_mmds_ipv4_address())
+            .expect("MMDS ARP request should classify");
+
+        let response = classified
+            .response_frame()
+            .expect("ARP response frame should synthesize");
+
+        assert_eq!(response.len(), ETHERNET_HEADER_LEN + ARP_ETHERNET_IPV4_LEN);
+        assert_eq!(
+            packet_array::<ETHERNET_MAC_ADDRESS_LEN>(
+                &response,
+                ETHERNET_DESTINATION_ADDRESS_OFFSET
+            ),
+            Some(test_source_ethernet_address().octets())
+        );
+        assert_eq!(
+            packet_array::<ETHERNET_MAC_ADDRESS_LEN>(&response, ETHERNET_SOURCE_ADDRESS_OFFSET),
+            Some(DEFAULT_MMDS_MAC_ADDRESS.octets())
+        );
+        assert_eq!(
+            packet_u16(&response, ETHERNET_ETHERTYPE_OFFSET),
+            Some(ETHERNET_ETHERTYPE_ARP)
+        );
+
+        let arp = response_frame_arp_payload(&response);
+        assert_eq!(
+            packet_u16(arp, ARP_HARDWARE_TYPE_OFFSET),
+            Some(ARP_HARDWARE_TYPE_ETHERNET)
+        );
+        assert_eq!(
+            packet_u16(arp, ARP_PROTOCOL_TYPE_OFFSET),
+            Some(ARP_PROTOCOL_TYPE_IPV4)
+        );
+        assert_eq!(
+            arp.get(ARP_HARDWARE_ADDRESS_LEN_OFFSET),
+            Some(&ARP_HARDWARE_ADDRESS_LEN_ETHERNET)
+        );
+        assert_eq!(
+            arp.get(ARP_PROTOCOL_ADDRESS_LEN_OFFSET),
+            Some(&ARP_PROTOCOL_ADDRESS_LEN_IPV4)
+        );
+        assert_eq!(
+            packet_u16(arp, ARP_OPERATION_OFFSET),
+            Some(ARP_OPERATION_REPLY)
+        );
+        assert_eq!(
+            packet_array::<ETHERNET_MAC_ADDRESS_LEN>(arp, ARP_SENDER_HARDWARE_ADDRESS_OFFSET),
+            Some(DEFAULT_MMDS_MAC_ADDRESS.octets())
+        );
+        assert_eq!(
+            packet_ipv4_address(arp, ARP_SENDER_PROTOCOL_ADDRESS_OFFSET),
+            Some(test_mmds_ipv4_address())
+        );
+        assert_eq!(
+            packet_array::<ETHERNET_MAC_ADDRESS_LEN>(arp, ARP_TARGET_HARDWARE_ADDRESS_OFFSET),
+            Some(test_source_ethernet_address().octets())
+        );
+        assert_eq!(
+            packet_ipv4_address(arp, ARP_TARGET_PROTOCOL_ADDRESS_OFFSET),
+            Some(test_source_ipv4_address())
+        );
+    }
+
+    #[test]
+    fn mmds_guest_arp_classifier_rejects_non_mmds_or_malformed_requests() {
+        let wrong_target = test_arp_request(Ipv4Addr::new(192, 0, 2, 99));
+        let mut reply = test_arp_request(test_mmds_ipv4_address());
+        write_packet_u16(
+            &mut reply,
+            ETHERNET_HEADER_LEN + ARP_OPERATION_OFFSET,
+            ARP_OPERATION_REPLY,
+        );
+        let mut wrong_hardware_type = test_arp_request(test_mmds_ipv4_address());
+        write_packet_u16(
+            &mut wrong_hardware_type,
+            ETHERNET_HEADER_LEN + ARP_HARDWARE_TYPE_OFFSET,
+            2,
+        );
+        let mut wrong_protocol_type = test_arp_request(test_mmds_ipv4_address());
+        write_packet_u16(
+            &mut wrong_protocol_type,
+            ETHERNET_HEADER_LEN + ARP_PROTOCOL_TYPE_OFFSET,
+            0x86dd,
+        );
+        let mut wrong_hardware_len = test_arp_request(test_mmds_ipv4_address());
+        wrong_hardware_len[ETHERNET_HEADER_LEN + ARP_HARDWARE_ADDRESS_LEN_OFFSET] = 5;
+        let mut wrong_protocol_len = test_arp_request(test_mmds_ipv4_address());
+        wrong_protocol_len[ETHERNET_HEADER_LEN + ARP_PROTOCOL_ADDRESS_LEN_OFFSET] = 16;
+        let truncated = test_arp_request(test_mmds_ipv4_address())
+            .into_iter()
+            .take(ETHERNET_HEADER_LEN + ARP_ETHERNET_IPV4_LEN - 1)
+            .collect::<Vec<_>>();
+
+        for packet in [
+            wrong_target,
+            reply,
+            wrong_hardware_type,
+            wrong_protocol_type,
+            wrong_hardware_len,
+            wrong_protocol_len,
+            truncated,
+        ] {
+            assert_eq!(
+                classify_mmds_guest_arp_request(&packet, test_mmds_ipv4_address()),
+                None
+            );
+        }
     }
 
     #[test]
