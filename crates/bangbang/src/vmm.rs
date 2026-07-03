@@ -824,6 +824,15 @@ where
         self.status.wait_for_terminal_status()
     }
 
+    fn metric_status(&self) -> BootRunLoopMetricStatus {
+        let current = self.status.lock_status();
+        match &*current {
+            BootRunLoopWorkerStatus::Running => BootRunLoopMetricStatus::Running,
+            BootRunLoopWorkerStatus::Exited(_) => BootRunLoopMetricStatus::Exited,
+            BootRunLoopWorkerStatus::Failed(_) => BootRunLoopMetricStatus::Failed,
+        }
+    }
+
     fn stop_and_join(&mut self) {
         let Some(worker) = self.worker.take() else {
             return;
@@ -845,13 +854,7 @@ where
     S: BootRunLoopSession,
 {
     fn metrics_diagnostics(&self) -> MetricsDiagnostics {
-        let status = match self.status() {
-            BootRunLoopWorkerStatus::Running => BootRunLoopMetricStatus::Running,
-            BootRunLoopWorkerStatus::Exited(_) => BootRunLoopMetricStatus::Exited,
-            BootRunLoopWorkerStatus::Failed(_) => BootRunLoopMetricStatus::Failed,
-        };
-
-        MetricsDiagnostics::new().with_boot_run_loop_status(status)
+        MetricsDiagnostics::new().with_boot_run_loop_status(self.metric_status())
     }
 }
 
