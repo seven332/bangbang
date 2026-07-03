@@ -43,6 +43,7 @@ pub enum RequestError {
     MalformedRequest,
     PayloadTooLarge,
     SendCtrlAltDelUnsupported,
+    SnapshotUnsupported,
 }
 
 impl RequestError {
@@ -55,6 +56,7 @@ impl RequestError {
             Self::MalformedRequest => "Malformed HTTP request.",
             Self::PayloadTooLarge => "HTTP request payload exceeds the configured limit.",
             Self::SendCtrlAltDelUnsupported => "SendCtrlAltDel does not supported on aarch64.",
+            Self::SnapshotUnsupported => "Snapshot and restore are not supported.",
         }
     }
 }
@@ -1066,6 +1068,9 @@ pub fn parse_request(bytes: &[u8]) -> Result<ApiRequest, RequestError> {
     }
     if method == "PUT" && path == "/vsock" {
         return parse_vsock_config_request(body);
+    }
+    if method == "PUT" && (path == "/snapshot/create" || path == "/snapshot/load") {
+        return Err(RequestError::SnapshotUnsupported);
     }
 
     match (method, path) {
@@ -3068,6 +3073,28 @@ mod tests {
         let request = b"GET /unknown HTTP/1.1\r\n\r\n";
 
         assert_eq!(parse_request(request), Err(RequestError::InvalidPathMethod));
+    }
+
+    #[test]
+    fn rejects_snapshot_create_as_unsupported() {
+        let request = request_with_body("PUT", "/snapshot/create", "{}");
+
+        let err = parse_request(&request).expect_err("snapshot create should be unsupported");
+        assert_eq!(err, RequestError::SnapshotUnsupported);
+        assert_eq!(
+            err.fault_message(),
+            "Snapshot and restore are not supported."
+        );
+    }
+
+    #[test]
+    fn rejects_snapshot_load_as_unsupported() {
+        let request = request_with_body("PUT", "/snapshot/load", "{}");
+
+        assert_eq!(
+            parse_request(&request),
+            Err(RequestError::SnapshotUnsupported)
+        );
     }
 
     #[test]
