@@ -132,10 +132,11 @@ impl MmdsPacketDetour {
         }
 
         let key = MmdsRequestBufferKey::from_packet(classified);
-        if let Some(request) = self
-            .request_buffers
-            .append_existing(key, classified.payload())?
-        {
+        if let Some(request) = self.request_buffers.append_existing(
+            key,
+            classified.sequence_number(),
+            classified.payload(),
+        )? {
             self.queue_response(
                 request.response_context,
                 request.payload.len(),
@@ -156,6 +157,7 @@ impl MmdsPacketDetour {
         self.request_buffers.start_request(
             key,
             classified.response_context(),
+            classified.sequence_number(),
             classified.payload(),
         )?;
         Ok(true)
@@ -204,6 +206,7 @@ impl MmdsRequestBuffers {
     fn append_existing(
         &mut self,
         key: MmdsRequestBufferKey,
+        sequence_number: u32,
         payload: &[u8],
     ) -> Result<Option<MmdsBufferedRequest>, MmdsRequestBufferError> {
         let Some(index) = self.entries.iter().position(|entry| entry.key == key) else {
@@ -211,7 +214,7 @@ impl MmdsRequestBuffers {
         };
 
         let mut entry = self.entries.swap_remove(index);
-        entry.append_payload(payload, self.request_len_limit)?;
+        entry.append_payload(sequence_number, payload, self.request_len_limit)?;
         if entry.is_complete() {
             return Ok(Some(entry.into_buffered_request()));
         }
@@ -224,6 +227,7 @@ impl MmdsRequestBuffers {
         &mut self,
         key: MmdsRequestBufferKey,
         response_context: MmdsGuestTcpResponseContext,
+        sequence_number: u32,
         payload: &[u8],
     ) -> Result<(), MmdsRequestBufferError> {
         if payload.len() > self.request_len_limit {
@@ -237,6 +241,11 @@ impl MmdsRequestBuffers {
                 capacity: self.capacity,
             });
         }
+        let next_sequence_number = mmds_request_next_sequence_number(
+            sequence_number,
+            payload.len(),
+            self.request_len_limit,
+        )?;
 
         let mut buffered_payload = Vec::new();
         buffered_payload
@@ -252,6 +261,7 @@ impl MmdsRequestBuffers {
         self.entries.push(MmdsRequestBufferEntry {
             key,
             response_context,
+            next_sequence_number,
             payload: buffered_payload,
         });
         Ok(())
@@ -262,15 +272,23 @@ impl MmdsRequestBuffers {
 struct MmdsRequestBufferEntry {
     key: MmdsRequestBufferKey,
     response_context: MmdsGuestTcpResponseContext,
+    next_sequence_number: u32,
     payload: Vec<u8>,
 }
 
 impl MmdsRequestBufferEntry {
     fn append_payload(
         &mut self,
+        sequence_number: u32,
         payload: &[u8],
         request_len_limit: usize,
     ) -> Result<(), MmdsRequestBufferError> {
+        if sequence_number != self.next_sequence_number {
+            return Err(MmdsRequestBufferError::UnexpectedSequence {
+                expected: self.next_sequence_number,
+                actual: sequence_number,
+            });
+        }
         let len = self.payload.len().checked_add(payload.len()).ok_or(
             MmdsRequestBufferError::RequestTooLarge {
                 len: usize::MAX,
@@ -283,11 +301,14 @@ impl MmdsRequestBufferEntry {
                 limit: request_len_limit,
             });
         }
+        let next_sequence_number =
+            mmds_request_next_sequence_number(sequence_number, payload.len(), request_len_limit)?;
 
         self.payload
             .try_reserve_exact(payload.len())
             .map_err(|source| MmdsRequestBufferError::PayloadAllocation { len, source })?;
         self.payload.extend_from_slice(payload);
+        self.next_sequence_number = next_sequence_number;
         Ok(())
     }
 
@@ -307,6 +328,19 @@ impl MmdsRequestBufferEntry {
 struct MmdsBufferedRequest {
     response_context: MmdsGuestTcpResponseContext,
     payload: Vec<u8>,
+}
+
+fn mmds_request_next_sequence_number(
+    sequence_number: u32,
+    payload_len: usize,
+    request_len_limit: usize,
+) -> Result<u32, MmdsRequestBufferError> {
+    let payload_len =
+        u32::try_from(payload_len).map_err(|_| MmdsRequestBufferError::RequestTooLarge {
+            len: payload_len,
+            limit: request_len_limit,
+        })?;
+    Ok(sequence_number.wrapping_add(payload_len))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -331,6 +365,7 @@ impl MmdsRequestBufferKey {
 #[derive(Debug)]
 enum MmdsRequestBufferError {
     Full { capacity: usize },
+    UnexpectedSequence { expected: u32, actual: u32 },
     RequestTooLarge { len: usize, limit: usize },
     PayloadAllocation { len: usize, source: TryReserveError },
     EntryAllocation { source: TryReserveError },
@@ -342,6 +377,10 @@ impl fmt::Display for MmdsRequestBufferError {
             Self::Full { capacity } => {
                 write!(f, "MMDS request buffer is full at capacity {capacity}")
             }
+            Self::UnexpectedSequence { expected, actual } => write!(
+                f,
+                "MMDS request buffer expected TCP sequence number {expected} but received {actual}"
+            ),
             Self::RequestTooLarge { len, limit } => {
                 write!(f, "MMDS request buffer length {len} exceeds limit {limit}")
             }
@@ -362,7 +401,9 @@ impl std::error::Error for MmdsRequestBufferError {
             Self::PayloadAllocation { source, .. } | Self::EntryAllocation { source } => {
                 Some(source)
             }
-            Self::Full { .. } | Self::RequestTooLarge { .. } => None,
+            Self::Full { .. } | Self::UnexpectedSequence { .. } | Self::RequestTooLarge { .. } => {
+                None
+            }
         }
     }
 }
@@ -3048,6 +3089,195 @@ mod tests {
             mmds_state
                 .with(|state| state.is_guest_token_valid(token))
                 .expect("MMDS state should lock")
+        );
+    }
+
+    #[test]
+    fn tx_sink_rejects_mmds_sequence_gap_for_split_token_put_without_state_mutation() {
+        let first_payload = b"PUT /latest/api/token HTTP/1.1\r\n";
+        let second_payload = b"X-metadata-token-ttl-seconds: 60\r\n\r\n";
+        let first_sequence_number = 0x1000;
+        let expected_sequence_number = first_sequence_number
+            + u32::try_from(first_payload.len()).expect("test payload length should fit u32");
+        let actual_sequence_number = expected_sequence_number + 1;
+        let first_packet =
+            mmds_tcp_packet_from_source(TEST_SOURCE_TCP_PORT, first_sequence_number, first_payload);
+        let skipped_packet = mmds_tcp_packet_from_source(
+            TEST_SOURCE_TCP_PORT,
+            actual_sequence_number,
+            second_payload,
+        );
+        let mut memory = tx_memory();
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        let mmds_state = v2_mmds_state_handle();
+        let state_before = mmds_state
+            .with(Clone::clone)
+            .expect("MMDS state should lock");
+        let mut packet_io = packet_io_with_mmds_detour(
+            FakeVmnetPacketIoBackend::default(),
+            mmds_state.clone(),
+            response_queue.clone(),
+        );
+
+        let first_frame = tx_frame(&mut memory, &[(&first_packet, PAYLOAD_ADDRESS)]);
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &first_frame)
+            .expect("first MMDS split token PUT fragment should detour");
+
+        let skipped_frame = tx_frame(&mut memory, &[(&skipped_packet, PAYLOAD_ADDRESS)]);
+        let error = packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &skipped_frame)
+            .expect_err("non-contiguous MMDS fragment should fail TX");
+
+        assert!(error.message().contains(&format!(
+            "expected TCP sequence number {expected_sequence_number}"
+        )));
+        assert!(
+            error
+                .message()
+                .contains(&format!("received {actual_sequence_number}"))
+        );
+        assert_eq!(
+            mmds_state
+                .with(Clone::clone)
+                .expect("MMDS state should lock"),
+            state_before
+        );
+        assert!(
+            response_queue
+                .responses()
+                .expect("MMDS response queue should read")
+                .is_empty()
+        );
+        let state = packet_io
+            .tx_sink()
+            .shared
+            .lock()
+            .expect("test state lock should succeed");
+        assert_eq!(state.backend.write_calls, 0);
+        assert!(state.backend.written_packets.is_empty());
+    }
+
+    #[test]
+    fn tx_sink_drops_mmds_sequence_buffer_after_duplicate_fragment() {
+        let first_payload = b"GET /meta-data/host";
+        let second_payload = b"name HTTP/1.1\r\n";
+        let third_payload = b"\r\n";
+        let first_sequence_number = 0x1000;
+        let second_sequence_number = first_sequence_number
+            + u32::try_from(first_payload.len()).expect("test payload length should fit u32");
+        let third_sequence_number = second_sequence_number
+            + u32::try_from(second_payload.len()).expect("test payload length should fit u32");
+        let first_packet =
+            mmds_tcp_packet_from_source(TEST_SOURCE_TCP_PORT, first_sequence_number, first_payload);
+        let duplicate_packet =
+            mmds_tcp_packet_from_source(TEST_SOURCE_TCP_PORT, first_sequence_number, first_payload);
+        let second_packet = mmds_tcp_packet_from_source(
+            TEST_SOURCE_TCP_PORT,
+            second_sequence_number,
+            second_payload,
+        );
+        let third_packet =
+            mmds_tcp_packet_from_source(TEST_SOURCE_TCP_PORT, third_sequence_number, third_payload);
+        let mut memory = tx_memory();
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        let mut packet_io = packet_io_with_mmds_detour(
+            FakeVmnetPacketIoBackend::default(),
+            MmdsStateHandle::default(),
+            response_queue.clone(),
+        );
+
+        let first_frame = tx_frame(&mut memory, &[(&first_packet, PAYLOAD_ADDRESS)]);
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &first_frame)
+            .expect("first MMDS split GET fragment should detour");
+
+        let duplicate_frame = tx_frame(&mut memory, &[(&duplicate_packet, PAYLOAD_ADDRESS)]);
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &duplicate_frame)
+            .expect_err("duplicate MMDS split fragment should fail TX");
+
+        assert!(
+            response_queue
+                .responses()
+                .expect("MMDS response queue should read")
+                .is_empty()
+        );
+
+        for packet in [&second_packet, &third_packet] {
+            let frame = tx_frame(&mut memory, &[(packet, PAYLOAD_ADDRESS)]);
+            packet_io
+                .tx_sink()
+                .transmit_frame(&memory, &frame)
+                .expect("suffix after dropped buffer should become a new request");
+        }
+
+        let responses = response_queue
+            .responses()
+            .expect("MMDS response queue should read");
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            mmds_response_body(&responses[0]),
+            b"MMDS guest HTTP request is malformed."
+        );
+        let state = packet_io
+            .tx_sink()
+            .shared
+            .lock()
+            .expect("test state lock should succeed");
+        assert_eq!(state.backend.write_calls, 0);
+        assert!(state.backend.written_packets.is_empty());
+    }
+
+    #[test]
+    fn tx_sink_buffers_split_mmds_sequence_wraparound() {
+        let first_payload = b"GET /meta-data/host";
+        let second_payload = b"name HTTP/1.1\r\n\r\n";
+        let first_payload_len =
+            u32::try_from(first_payload.len()).expect("test payload length should fit u32");
+        let first_sequence_number = u32::MAX.wrapping_sub(first_payload_len).wrapping_add(1);
+        let second_sequence_number = 0;
+        let first_packet =
+            mmds_tcp_packet_from_source(TEST_SOURCE_TCP_PORT, first_sequence_number, first_payload);
+        let second_packet = mmds_tcp_packet_from_source(
+            TEST_SOURCE_TCP_PORT,
+            second_sequence_number,
+            second_payload,
+        );
+        let mut memory = tx_memory();
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        let mut packet_io = packet_io_with_mmds_detour(
+            FakeVmnetPacketIoBackend::default(),
+            MmdsStateHandle::default(),
+            response_queue.clone(),
+        );
+
+        for packet in [&first_packet, &second_packet] {
+            let frame = tx_frame(&mut memory, &[(packet, PAYLOAD_ADDRESS)]);
+            packet_io
+                .tx_sink()
+                .transmit_frame(&memory, &frame)
+                .expect("MMDS split GET fragment should detour");
+        }
+
+        let responses = response_queue
+            .responses()
+            .expect("MMDS response queue should read");
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            mmds_response_body(&responses[0]),
+            b"The MMDS data store is not initialized."
+        );
+        assert_eq!(
+            mmds_response_frame_acknowledgement_number(&responses[0]),
+            first_sequence_number.wrapping_add(
+                u32::try_from(first_payload.len() + second_payload.len())
+                    .expect("test payload length should fit u32")
+            )
         );
     }
 

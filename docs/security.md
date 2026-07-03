@@ -217,7 +217,9 @@ MMDS ARP requests, pure empty-payload MMDS SYN packets, pure empty-payload MMDS
 ACK-only packets, pure empty-payload MMDS FIN close packets, unsupported
 empty-payload MMDS control packets, guest-sent MMDS RST packets, and
 non-empty candidates only for interfaces listed in the MMDS config, buffers
-ordered split request headers in bounded per-interface process state,
+split request headers in bounded per-interface process state only when each
+fragment starts at the next expected TCP sequence number, rejects
+non-contiguous buffered fragments before appending guest bytes,
 synthesizes response frames from deterministic ARP context, deterministic
 SYN-ACK context, minimal FIN close context, minimal RST context, or the first
 TCP request fragment context, retains those frames in bounded per-interface queues, delivers queued
@@ -272,7 +274,7 @@ The current scaffold does not implement:
   ARP requests, pure empty-payload MMDS SYN packets, pure empty-payload MMDS
   ACK-only packets, pure empty-payload MMDS FIN close packets, unsupported
   empty-payload MMDS control packets, guest-sent MMDS RST packets, and non-empty
-  MMDS TX payloads before vmnet forwarding, buffer ordered split MMDS request headers,
+  MMDS TX payloads before vmnet forwarding, buffer contiguous split MMDS request headers,
   synthesize deterministic ARP replies, MMDS SYN-ACK frames, minimal MMDS RST
   frames, and MMDS TCP response frames, retain bounded per-interface MMDS response queues,
   and expose queued responses through virtio-net RX with bounded post-TX retry, plus an
