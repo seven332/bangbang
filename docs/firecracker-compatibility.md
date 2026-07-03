@@ -726,14 +726,15 @@ configured and builds vmnet packet I/O for configured interfaces during
 chains into `VirtioNetworkTxFrame` metadata, publishes used-ring
 completions with length 0, delivers parsed frames to an injected internal packet
 sink, preserves parse, sink, and partial-dispatch errors, and marks queue
-interrupt status when descriptor heads complete and the negotiated used-event
-threshold requires notification. RX dispatch uses an injected
+interrupt status when descriptor heads complete unless negotiated `EVENT_IDX`
+suppresses the notification. RX dispatch uses an injected
 internal packet source, can perform one bounded post-TX RX retry when that
 source reports already-ready packets, copies a zeroed 12-byte virtio-net header
 plus packet payload into validated guest-writable RX buffers, publishes
 used-ring completions with the written length, preserves malformed-buffer and
 partial-dispatch metadata, and marks queue interrupt status when RX buffers
-complete and the negotiated used-event threshold requires notification. On macOS, the process crate also defines internal vmnet descriptor,
+complete unless negotiated `EVENT_IDX` suppresses the notification. On macOS,
+the process crate also defines internal vmnet descriptor,
 lifecycle, start owner, packet descriptor, and concrete system start/stop
 backend boundaries with vmnet mode, status, operation error, XPC descriptor
 configuration, retained dispatch queue ownership, completion-status mapping,
