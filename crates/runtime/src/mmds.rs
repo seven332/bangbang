@@ -1823,11 +1823,13 @@ mod tests {
         for packet in [wrong_destination, truncated] {
             let mut state = initialized_query_state();
             state.token_authority = MmdsTokenAuthority::with_manual_clock(1, 1_000);
+            let original = state.get_data().expect("data store should be initialized");
 
             assert_eq!(
                 state.guest_tcp_packet_response_bytes(&packet, test_mmds_ipv4_address()),
                 None
             );
+            assert_eq!(state.get_data(), Ok(original));
             let token = state
                 .generate_guest_token(1)
                 .expect("ignored packet should not consume token capacity");
@@ -1840,11 +1842,13 @@ mod tests {
         let packet = test_mmds_tcp_packet(b"");
         let mut state = initialized_query_state();
         state.token_authority = MmdsTokenAuthority::with_manual_clock(1, 1_000);
+        let original = state.get_data().expect("data store should be initialized");
 
         assert_eq!(
             state.guest_tcp_packet_response_bytes(&packet, test_mmds_ipv4_address()),
             None
         );
+        assert_eq!(state.get_data(), Ok(original));
         let token = state
             .generate_guest_token(1)
             .expect("empty TCP payload should not consume token capacity");
@@ -1858,11 +1862,13 @@ mod tests {
         let mut expected_state = initialized_query_state();
         let expected = expected_state.guest_http_response_bytes(request);
         let mut state = initialized_query_state();
+        let original = state.get_data().expect("data store should be initialized");
 
         assert_eq!(
             state.guest_tcp_packet_response_bytes(&packet, test_mmds_ipv4_address()),
             Some(expected)
         );
+        assert_eq!(state.get_data(), Ok(original));
     }
 
     #[test]
