@@ -24,7 +24,8 @@ use crate::virtio_mmio::{
 };
 use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
-    VirtqueueDescriptorChain, VirtqueueUsedRing, VirtqueueUsedRingError,
+    VirtqueueDescriptorChain, VirtqueueNotificationSuppression, VirtqueueUsedRing,
+    VirtqueueUsedRingError, VirtqueueUsedRingPublication,
 };
 
 pub const VIRTIO_BLOCK_DEVICE_ID: u32 = 2;
@@ -414,7 +415,8 @@ impl VirtioBlockConfigSpace {
     }
 
     pub const fn available_features(self) -> u64 {
-        let mut features = virtio_feature_bit(VIRTIO_FEATURE_VERSION_1);
+        let mut features = virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
+            | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX);
         if matches!(self.cache_type, DriveCacheType::Writeback) {
             features |= virtio_feature_bit(VIRTIO_BLOCK_FEATURE_FLUSH);
         }
@@ -453,6 +455,10 @@ impl VirtioMmioDeviceConfigHandler for VirtioBlockConfigSpace {
 
 const fn virtio_feature_bit(feature: u32) -> u64 {
     1_u64 << feature
+}
+
+fn virtio_feature_enabled(features: u64, feature: u32) -> bool {
+    features & virtio_feature_bit(feature) != 0
 }
 
 fn read_virtio_block_capacity_bytes(
@@ -1106,15 +1112,27 @@ impl std::error::Error for VirtioBlockQueueBuildError {
 pub struct VirtioBlockQueue {
     available: VirtqueueAvailableRing,
     used: VirtqueueUsedRing,
+    event_idx_enabled: bool,
 }
 
 impl VirtioBlockQueue {
     pub const fn new(available: VirtqueueAvailableRing, used: VirtqueueUsedRing) -> Self {
-        Self { available, used }
+        Self {
+            available,
+            used,
+            event_idx_enabled: false,
+        }
     }
 
     pub fn from_mmio_queue_state(
         queue: &VirtioMmioQueueState,
+    ) -> Result<Self, VirtioBlockQueueBuildError> {
+        Self::from_mmio_queue_state_with_event_idx(queue, false)
+    }
+
+    fn from_mmio_queue_state_with_event_idx(
+        queue: &VirtioMmioQueueState,
+        event_idx_enabled: bool,
     ) -> Result<Self, VirtioBlockQueueBuildError> {
         if !queue.ready() {
             return Err(VirtioBlockQueueBuildError::QueueNotReady);
@@ -1129,7 +1147,11 @@ impl VirtioBlockQueue {
         let used = VirtqueueUsedRing::new(queue.device_ring(), queue.size())
             .map_err(|source| VirtioBlockQueueBuildError::UsedRing { source })?;
 
-        Ok(Self::new(available, used))
+        Ok(Self {
+            available,
+            used,
+            event_idx_enabled,
+        })
     }
 
     pub const fn available_ring(&self) -> &VirtqueueAvailableRing {
@@ -1138,6 +1160,10 @@ impl VirtioBlockQueue {
 
     pub const fn used_ring(&self) -> &VirtqueueUsedRing {
         &self.used
+    }
+
+    pub const fn event_idx_enabled(&self) -> bool {
+        self.event_idx_enabled
     }
 
     pub fn dispatch(
@@ -1176,11 +1202,20 @@ impl VirtioBlockQueue {
                     ),
                 };
 
-            self.used
-                .publish_used_element(
+            let notification_suppression =
+                self.notification_suppression(memory).map_err(|source| {
+                    VirtioBlockQueueDispatchError::AvailableRing {
+                        completed_dispatch: Box::new(dispatch.clone()),
+                        source,
+                    }
+                })?;
+            let publication = self
+                .used
+                .publish_used_element_with_notification(
                     memory,
                     completion.descriptor_head(),
                     completion.bytes_written_to_guest(),
+                    notification_suppression,
                 )
                 .map_err(|source| VirtioBlockQueueDispatchError::UsedRing {
                     completed_dispatch: Box::new(dispatch.clone()),
@@ -1188,10 +1223,23 @@ impl VirtioBlockQueue {
                     bytes_written_to_guest: completion.bytes_written_to_guest(),
                     source,
                 })?;
-            dispatch.record(outcome);
+            dispatch.record(outcome, publication);
         }
 
         Ok(dispatch)
+    }
+
+    fn notification_suppression(
+        &self,
+        memory: &GuestMemory,
+    ) -> Result<VirtqueueNotificationSuppression, VirtqueueAvailableRingError> {
+        if self.event_idx_enabled {
+            Ok(VirtqueueNotificationSuppression::EventIdx {
+                used_event: self.available.used_event(memory)?,
+            })
+        } else {
+            Ok(VirtqueueNotificationSuppression::Disabled)
+        }
     }
 }
 
@@ -1204,6 +1252,7 @@ pub struct VirtioBlockQueueDispatch {
     unsupported_requests: usize,
     status_write_failures: usize,
     first_parse_failure: Option<VirtioBlockRequestError>,
+    needs_queue_interrupt: bool,
 }
 
 impl VirtioBlockQueueDispatch {
@@ -1236,11 +1285,16 @@ impl VirtioBlockQueueDispatch {
     }
 
     pub const fn needs_queue_interrupt(&self) -> bool {
-        self.processed_requests != 0
+        self.needs_queue_interrupt
     }
 
-    fn record(&mut self, outcome: VirtioBlockQueueDispatchOutcome) {
+    fn record(
+        &mut self,
+        outcome: VirtioBlockQueueDispatchOutcome,
+        publication: VirtqueueUsedRingPublication,
+    ) {
         self.processed_requests += 1;
+        self.needs_queue_interrupt |= publication.needs_queue_interrupt();
         match outcome {
             VirtioBlockQueueDispatchOutcome::Ok => {
                 self.successful_requests += 1;
@@ -2060,6 +2114,8 @@ impl VirtioBlockDevice {
             return Err(VirtioBlockDeviceActivationError::AlreadyActive);
         }
 
+        let event_idx_enabled =
+            virtio_feature_enabled(activation.driver_features(), VIRTIO_RING_FEATURE_EVENT_IDX);
         let queue_index = 0;
         let queue = activation
             .queue(queue_index)
@@ -2068,12 +2124,11 @@ impl VirtioBlockDevice {
                 source,
             })
             .and_then(|queue| {
-                VirtioBlockQueue::from_mmio_queue_state(queue).map_err(|source| {
-                    VirtioBlockDeviceActivationError::QueueBuild {
+                VirtioBlockQueue::from_mmio_queue_state_with_event_idx(queue, event_idx_enabled)
+                    .map_err(|source| VirtioBlockDeviceActivationError::QueueBuild {
                         queue_index,
                         source,
-                    }
-                })
+                    })
             })?;
         self.active_queue = Some(queue);
 
@@ -2919,6 +2974,7 @@ mod tests {
     const TEST_USED_RING_IDX_OFFSET: u64 = 2;
     const TEST_USED_RING_RING_OFFSET: u64 = 4;
     const TEST_USED_RING_ELEMENT_SIZE: u64 = 8;
+    const EVENT_IDX_DRIVER_FEATURE: u32 = 1_u32 << VIRTIO_RING_FEATURE_EVENT_IDX;
     const HEADER_ADDR: GuestAddress = GuestAddress::new(0x2000);
     const DATA_ADDR: GuestAddress = GuestAddress::new(0x3000);
     const STATUS_ADDR: GuestAddress = GuestAddress::new(0x4000);
@@ -3105,6 +3161,33 @@ mod tests {
         queue_size: u16,
         device_ring: GuestAddress,
     ) {
+        configure_block_notification_handler_queue_with_features(
+            handler,
+            queue_size,
+            device_ring,
+            0,
+        );
+    }
+
+    fn configure_block_notification_handler_queue_with_event_idx(
+        handler: &mut VirtioMmioRegisterHandler<VirtioBlockConfigSpace, VirtioBlockDevice>,
+        queue_size: u16,
+        device_ring: GuestAddress,
+    ) {
+        configure_block_notification_handler_queue_with_features(
+            handler,
+            queue_size,
+            device_ring,
+            EVENT_IDX_DRIVER_FEATURE,
+        );
+    }
+
+    fn configure_block_notification_handler_queue_with_features(
+        handler: &mut VirtioMmioRegisterHandler<VirtioBlockConfigSpace, VirtioBlockDevice>,
+        queue_size: u16,
+        device_ring: GuestAddress,
+        driver_features_low: u32,
+    ) {
         handler
             .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
             .expect("status should accept ACKNOWLEDGE");
@@ -3114,6 +3197,14 @@ mod tests {
                 VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
             )
             .expect("status should accept DRIVER");
+        if driver_features_low != 0 {
+            handler
+                .write_register(VirtioMmioRegister::DriverFeaturesSel, 0)
+                .expect("driver feature select should write");
+            handler
+                .write_register(VirtioMmioRegister::DriverFeatures, driver_features_low)
+                .expect("driver features should write");
+        }
         handler
             .write_register(VirtioMmioRegister::Status, QUEUE_CONFIG_STATUS)
             .expect("status should accept FEATURES_OK");
@@ -3361,6 +3452,15 @@ mod tests {
             .expect("available entry address should not overflow")
     }
 
+    fn available_ring_used_event_address(queue_size: u16) -> GuestAddress {
+        TEST_AVAILABLE_RING
+            .checked_add(
+                TEST_AVAILABLE_RING_RING_OFFSET
+                    + u64::from(queue_size) * TEST_AVAILABLE_RING_ENTRY_SIZE,
+            )
+            .expect("available used-event address should not overflow")
+    }
+
     fn used_ring_idx_address() -> GuestAddress {
         TEST_USED_RING
             .checked_add(TEST_USED_RING_IDX_OFFSET)
@@ -3389,6 +3489,14 @@ mod tests {
             memory,
             available_ring_idx_address(),
             u16::try_from(heads.len()).expect("test available length should fit in u16"),
+        );
+    }
+
+    fn write_available_used_event(memory: &mut GuestMemory, queue_size: u16, used_event: u16) {
+        write_guest_u16(
+            memory,
+            available_ring_used_event_address(queue_size),
+            used_event,
         );
     }
 
@@ -4540,7 +4648,8 @@ mod tests {
 
     #[test]
     fn config_space_tracks_cache_and_read_only_features() {
-        let base_features = 1_u64 << VIRTIO_FEATURE_VERSION_1;
+        let event_idx_feature = 1_u64 << VIRTIO_RING_FEATURE_EVENT_IDX;
+        let base_features = (1_u64 << VIRTIO_FEATURE_VERSION_1) | event_idx_feature;
         let flush_feature = 1_u64 << VIRTIO_BLOCK_FEATURE_FLUSH;
         let read_only_feature = 1_u64 << VIRTIO_BLOCK_FEATURE_READ_ONLY;
 
@@ -4548,9 +4657,9 @@ mod tests {
             VirtioBlockConfigSpace::new(512, false, DriveCacheType::Unsafe).available_features(),
             base_features
         );
-        assert_eq!(
+        assert_ne!(
             VirtioBlockConfigSpace::new(512, false, DriveCacheType::Unsafe).available_features()
-                & (1_u64 << VIRTIO_RING_FEATURE_EVENT_IDX),
+                & event_idx_feature,
             0
         );
         assert_eq!(
@@ -5501,6 +5610,7 @@ mod tests {
         assert_eq!(queue.used_ring().used_ring(), TEST_USED_RING);
         assert_eq!(queue.used_ring().queue_size(), 4);
         assert_eq!(queue.used_ring().next_used(), 0);
+        assert!(!queue.event_idx_enabled());
     }
 
     #[test]
@@ -5971,6 +6081,193 @@ mod tests {
                 VIRTIO_BLOCK_SECTOR_SIZE as u32 + VIRTIO_BLOCK_STATUS_SIZE,
             )
         );
+    }
+
+    #[test]
+    fn block_device_notification_dispatch_suppresses_interrupt_with_event_idx() {
+        let queue_size = 4;
+        let mut memory = request_memory();
+        let payload = sector_payload(0x7a);
+        let file = temp_file("block-notify-event-idx-suppressed.img", &payload);
+        let backing = open_backing(file.as_path(), true).expect("backing should open");
+        let mut handler = block_notification_handler(backing, &VIRTIO_BLOCK_QUEUE_SIZES);
+        configure_block_notification_handler_queue_with_event_idx(
+            &mut handler,
+            queue_size,
+            TEST_USED_RING,
+        );
+        activate_block_notification_handler(&mut handler);
+        write_queued_request(
+            &mut memory,
+            0,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            0,
+            HEADER_ADDR,
+            Some((DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as u32, true)),
+            STATUS_ADDR,
+        );
+        write_available_heads(&mut memory, &[0]);
+        write_available_used_event(&mut memory, queue_size, 1);
+        handler
+            .write_register(VirtioMmioRegister::QueueNotify, 0)
+            .expect("queue notification should write");
+
+        let notification = handler
+            .dispatch_block_queue_notifications(&mut memory)
+            .expect("event-idx notification dispatch should succeed");
+
+        assert_eq!(notification.drained_notifications(), [0]);
+        let dispatch = notification
+            .queue_dispatch()
+            .expect("queue dispatch summary should be present");
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_requests(), 1);
+        assert!(!notification.needs_queue_interrupt());
+        assert!(!dispatch.needs_queue_interrupt());
+        assert_eq!(read_interrupt_status(&handler), 0);
+        assert!(
+            handler
+                .activation_handler()
+                .active_queue()
+                .expect("block queue should remain active")
+                .event_idx_enabled()
+        );
+        assert_eq!(
+            read_guest_bytes(&memory, DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as usize),
+            payload
+        );
+        assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_OK);
+        assert_eq!(
+            read_used_element(&memory, 0),
+            (
+                0,
+                VIRTIO_BLOCK_SECTOR_SIZE as u32 + VIRTIO_BLOCK_STATUS_SIZE,
+            )
+        );
+    }
+
+    #[test]
+    fn block_device_notification_dispatch_interrupts_at_event_idx_threshold() {
+        let queue_size = 4;
+        let mut memory = request_memory();
+        let payload = sector_payload(0x7b);
+        let file = temp_file("block-notify-event-idx-threshold.img", &payload);
+        let backing = open_backing(file.as_path(), true).expect("backing should open");
+        let mut handler = block_notification_handler(backing, &VIRTIO_BLOCK_QUEUE_SIZES);
+        configure_block_notification_handler_queue_with_event_idx(
+            &mut handler,
+            queue_size,
+            TEST_USED_RING,
+        );
+        activate_block_notification_handler(&mut handler);
+        write_queued_request(
+            &mut memory,
+            0,
+            VIRTIO_BLOCK_REQUEST_TYPE_IN,
+            0,
+            HEADER_ADDR,
+            Some((DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as u32, true)),
+            STATUS_ADDR,
+        );
+        write_available_heads(&mut memory, &[0]);
+        write_available_used_event(&mut memory, queue_size, 0);
+        handler
+            .write_register(VirtioMmioRegister::QueueNotify, 0)
+            .expect("queue notification should write");
+
+        let notification = handler
+            .dispatch_block_queue_notifications(&mut memory)
+            .expect("event-idx threshold dispatch should succeed");
+
+        assert_eq!(notification.drained_notifications(), [0]);
+        let dispatch = notification
+            .queue_dispatch()
+            .expect("queue dispatch summary should be present");
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_requests(), 1);
+        assert!(notification.needs_queue_interrupt());
+        assert!(dispatch.needs_queue_interrupt());
+        assert_eq!(
+            read_interrupt_status(&handler),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        assert!(
+            handler
+                .activation_handler()
+                .active_queue()
+                .expect("block queue should remain active")
+                .event_idx_enabled()
+        );
+        assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_OK);
+        assert_eq!(
+            read_used_element(&memory, 0),
+            (
+                0,
+                VIRTIO_BLOCK_SECTOR_SIZE as u32 + VIRTIO_BLOCK_STATUS_SIZE,
+            )
+        );
+    }
+
+    #[test]
+    fn block_device_notification_dispatch_preserves_suppressed_partial_event_idx_error() {
+        let queue_size = 4;
+        let mut memory = request_memory();
+        let file = temp_file(
+            "block-notify-event-idx-partial-dispatch-error.img",
+            &sector_payload(0x7c),
+        );
+        let backing = open_backing(file.as_path(), false).expect("backing should open");
+        let mut handler = block_notification_handler(backing, &VIRTIO_BLOCK_QUEUE_SIZES);
+        configure_block_notification_handler_queue_with_event_idx(
+            &mut handler,
+            queue_size,
+            TEST_USED_RING,
+        );
+        activate_block_notification_handler(&mut handler);
+        write_queued_request(
+            &mut memory,
+            0,
+            VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
+            0,
+            HEADER_ADDR,
+            None,
+            STATUS_ADDR,
+        );
+        write_available_heads(&mut memory, &[0, TEST_QUEUE_SIZE]);
+        write_available_used_event(&mut memory, queue_size, 1);
+        handler
+            .write_register(VirtioMmioRegister::QueueNotify, 0)
+            .expect("queue notification should write");
+
+        let error = handler
+            .dispatch_block_queue_notifications(&mut memory)
+            .expect_err("invalid second available head should fail notification dispatch");
+
+        match &error {
+            VirtioBlockDeviceNotificationError::QueueDispatch {
+                source: VirtioBlockQueueDispatchError::AvailableRing { .. },
+                ..
+            } => {}
+            other => panic!("expected available ring dispatch error, got {other:?}"),
+        }
+        assert_eq!(error.drained_notifications(), [0]);
+        let completed_dispatch = error
+            .completed_dispatch()
+            .expect("queue dispatch error should preserve partial summary");
+        assert_eq!(completed_dispatch.processed_requests(), 1);
+        assert_eq!(completed_dispatch.successful_requests(), 1);
+        assert!(!completed_dispatch.needs_queue_interrupt());
+        assert_eq!(read_interrupt_status(&handler), 0);
+        assert!(handler.pending_queue_notifications().is_empty());
+        let active_queue = handler
+            .activation_handler()
+            .active_queue()
+            .expect("block queue should remain active");
+        assert!(active_queue.event_idx_enabled());
+        assert_eq!(active_queue.available_ring().next_avail(), 1);
+        assert_eq!(active_queue.used_ring().next_used(), 1);
+        assert_eq!(read_used_index(&memory), 1);
+        assert_eq!(read_used_element(&memory, 0), (0, VIRTIO_BLOCK_STATUS_SIZE));
     }
 
     #[test]
