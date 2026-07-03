@@ -2797,15 +2797,24 @@ mod tests {
                 .expect("MMDS TCP payload packet without ACK flag should classify");
         assert!(!no_ack_flag.has_initial_synchronization_acknowledgement());
 
-        let mut wrong_ack_packet = payload_packet;
-        write_packet_u32(
-            &mut wrong_ack_packet,
-            tcp_start + TCP_ACKNOWLEDGEMENT_NUMBER_OFFSET,
-            MMDS_GUEST_TCP_SYN_ACK_SEQUENCE_NUMBER.wrapping_add(2),
-        );
-        let wrong_ack = classify_mmds_guest_tcp_packet(&wrong_ack_packet, test_mmds_ipv4_address())
-            .expect("MMDS TCP payload packet with wrong ACK number should classify");
-        assert!(!wrong_ack.has_initial_synchronization_acknowledgement());
+        let expected_acknowledgement_number =
+            MMDS_GUEST_TCP_SYN_ACK_SEQUENCE_NUMBER.wrapping_add(1);
+        for acknowledgement_number in [
+            expected_acknowledgement_number.wrapping_sub(1),
+            expected_acknowledgement_number.wrapping_add(1),
+            MMDS_GUEST_TCP_SYN_ACK_SEQUENCE_NUMBER.wrapping_sub(1),
+        ] {
+            let mut wrong_ack_packet = payload_packet.clone();
+            write_packet_u32(
+                &mut wrong_ack_packet,
+                tcp_start + TCP_ACKNOWLEDGEMENT_NUMBER_OFFSET,
+                acknowledgement_number,
+            );
+            let wrong_ack =
+                classify_mmds_guest_tcp_packet(&wrong_ack_packet, test_mmds_ipv4_address())
+                    .expect("MMDS TCP payload packet with wrong ACK number should classify");
+            assert!(!wrong_ack.has_initial_synchronization_acknowledgement());
+        }
     }
 
     #[test]
