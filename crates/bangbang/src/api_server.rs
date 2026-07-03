@@ -1990,8 +1990,7 @@ mod tests {
             bangbang_api::http::StatusCode::NoContent
         );
 
-        let start_response =
-            put_action_over_socket(&mut vmm, "start-with-api-logger", "InstanceStart");
+        let start_response = put_action_over_socket(&mut vmm, "api-log", "InstanceStart");
         assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
 
         assert_eq!(

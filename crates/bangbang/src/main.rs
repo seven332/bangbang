@@ -791,6 +791,14 @@ mod tests {
         let err = parse(&["--log-path", "--id"]).expect_err("missing log path value should fail");
 
         assert_eq!(err, "missing value for --log-path");
+
+        let err = parse(&["--level", "--id"]).expect_err("missing level value should fail");
+
+        assert_eq!(err, "missing value for --level");
+
+        let err = parse(&["--module", "--id"]).expect_err("missing module value should fail");
+
+        assert_eq!(err, "missing value for --module");
     }
 
     #[test]
@@ -824,6 +832,21 @@ mod tests {
             .expect_err("duplicate level arg should fail");
 
         assert_eq!(err, "duplicate argument: --level");
+
+        let err = parse(&["--log-path", "/tmp/one.log", "--log-path", "/tmp/two.log"])
+            .expect_err("duplicate log-path arg should fail");
+
+        assert_eq!(err, "duplicate argument: --log-path");
+
+        let err = parse(&["--module", "api_server", "--module", "runtime"])
+            .expect_err("duplicate module arg should fail");
+
+        assert_eq!(err, "duplicate argument: --module");
+
+        let err = parse(&["--show-log-origin", "--show-log-origin"])
+            .expect_err("duplicate show-log-origin flag should fail");
+
+        assert_eq!(err, "duplicate argument: --show-log-origin");
     }
 
     #[test]
@@ -946,6 +969,20 @@ mod tests {
         assert_eq!(
             err,
             "unsupported argument syntax for --log-path; use --log-path <VALUE>"
+        );
+
+        let err = parse(&["--level=Info"]).expect_err("equals syntax should fail");
+
+        assert_eq!(
+            err,
+            "unsupported argument syntax for --level; use --level <VALUE>"
+        );
+
+        let err = parse(&["--module=api_server"]).expect_err("equals syntax should fail");
+
+        assert_eq!(
+            err,
+            "unsupported argument syntax for --module; use --module <VALUE>"
         );
     }
 
