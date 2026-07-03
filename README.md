@@ -195,7 +195,7 @@ rules, guest boot artifact caching, and local verification expectations.
 
 - `0`: help or version completed successfully, or the API server exited without
   error.
-- `153`: startup argument parsing or validation failed. This matches
-  Firecracker's argument-parsing exit code.
-- `1`: non-argument process failure, including API socket bind or accept
-  failures.
+- `153`: startup argument parsing failed before process configuration began.
+  This matches Firecracker's argument-parsing exit code.
+- `1`: process failure, including startup metrics/logger configuration, API
+  socket bind, or API accept failures.

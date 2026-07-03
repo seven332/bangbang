@@ -153,8 +153,8 @@ The current executable uses a small process exit status contract:
 | Exit status | Current meaning | Compatibility notes |
 | --- | --- | --- |
 | `0` | Help or version completed successfully, or the API server exited without error, including handled `SIGINT`/`SIGTERM` shutdown. | Matches Firecracker's success status. |
-| `153` | Startup argument parsing or validation failed. | Matches Firecracker's `ArgParsing` exit code. |
-| `1` | API socket bind or accept failure. | Used for non-argument process failures before more specific Firecracker-compatible process errors exist. Per-connection read/write errors do not terminate the API server. |
+| `153` | Startup argument parsing failed before process configuration began. | Matches Firecracker's `ArgParsing` exit code. |
+| `1` | Process failure, including startup metrics/logger configuration, API socket bind, signal handler registration, or API accept failure. | Used for non-argument process failures before more specific Firecracker-compatible process errors exist. Per-connection read/write errors do not terminate the API server. |
 
 Firecracker also defines bad-configuration and signal-specific exit codes.
 bangbang does not expose those until the corresponding configuration loading,
