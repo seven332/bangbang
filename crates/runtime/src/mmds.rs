@@ -4673,6 +4673,19 @@ mod tests {
             b"HTTP/1.0 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 152\r\n\r\nToken time to live value not found. Use `X-metadata-token-ttl-seconds` or `X-aws-ec2-metadata-token-ttl-seconds` header to specify the token's lifetime."
                 .to_vec()
         );
+
+        let mut state = initialized_query_state();
+        enable_mmds_v2(&mut state);
+        let expected = format!(
+            "HTTP/1.0 401 Unauthorized\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+            MMDS_GUEST_MISSING_TOKEN.len(),
+            MMDS_GUEST_MISSING_TOKEN
+        )
+        .into_bytes();
+        assert_eq!(
+            state.guest_http_response_bytes(b"GET /meta-data/hostname HTTP/1.0\r\n\r\n"),
+            expected
+        );
     }
 
     #[test]
