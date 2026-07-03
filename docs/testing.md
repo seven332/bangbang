@@ -143,6 +143,49 @@ sector contains `BANGBANG_BLOCK_READ_OK`, mounts `devtmpfs` from the tiny
 `/init`, reads `/dev/vda`, and expects the marker to appear on serial. Rootfs
 boot and guest writes are separate follow-up coverage.
 
+The pinned Firecracker CI rootfs artifact can be prepared separately:
+
+```sh
+scripts/fetch-firecracker-rootfs.sh
+```
+
+By default this stores and verifies
+`.tmp/guest-artifacts/firecracker-ci/v1.15/aarch64/ubuntu-24.04.squashfs` and
+prints its path. The script verifies the pinned SHA-256 before reusing or
+installing the cached squashfs. The upstream Firecracker artifact is a
+read-only squashfs; do not mutate it in tests.
+
+To prepare a local ext4 image from that squashfs, install the local tools and
+request ext4 output:
+
+```sh
+brew install squashfs e2fsprogs
+scripts/fetch-firecracker-rootfs.sh --format ext4
+```
+
+Homebrew's `e2fsprogs` package is keg-only, so `mkfs.ext4` is not normally on
+`PATH`. The script first looks for `mkfs.ext4` on `PATH`, then checks
+`$(brew --prefix e2fsprogs)/sbin/mkfs.ext4`. Set `BANGBANG_MKFS_EXT4` to
+override the tool path. The generated ext4 image is stored under
+`.tmp/guest-artifacts/bangbang/rootfs/`; tests that need writable rootfs state
+should use a scratch copy of that image.
+
+The ext4 preparation path intentionally does not require `sudo`. Files copied
+into the generated ext4 image keep the local extraction ownership rather than
+Firecracker's root-owned demo ownership. This is suitable for local development
+artifacts and is not a substitute for a production rootfs build process.
+
+bangbang currently does not append Firecracker-style root-drive command-line
+arguments automatically. Until that behavior is implemented, rootfs boot tests
+must pass explicit boot args such as:
+
+```sh
+console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro
+```
+
+Use `ro` when attaching the cached squashfs rootfs as a read-only drive. Use
+`rw` only with a writable scratch copy of the generated ext4 image.
+
 ## PR Expectations
 
 Bug fixes should include a regression test unless the behavior cannot be tested
