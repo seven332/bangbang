@@ -228,6 +228,12 @@ impl<'a> MmdsGuestTcpPacket<'a> {
         self.tcp_flags & TCP_FLAG_RST != 0
     }
 
+    pub fn has_unsupported_payload_control_flags(self) -> bool {
+        !self.payload.is_empty()
+            && !self.is_reset_control()
+            && self.tcp_flags & (TCP_FLAG_SYN | TCP_FLAG_FIN) != 0
+    }
+
     pub fn is_unsupported_empty_control_reset_request(self) -> bool {
         self.payload.is_empty()
             && !self.is_initial_synchronization_request()
@@ -2884,6 +2890,55 @@ mod tests {
         let psh = classify_mmds_guest_tcp_packet(&psh_packet, test_mmds_ipv4_address())
             .expect("MMDS TCP PSH control packet should classify");
         assert!(!psh.is_reset_control());
+    }
+
+    #[test]
+    fn identifies_unsupported_mmds_guest_tcp_payload_control_flags() {
+        let tcp_start = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN;
+
+        for flags in [
+            TCP_FLAG_SYN,
+            TCP_FLAG_SYN | TCP_FLAG_ACK,
+            TCP_FLAG_FIN,
+            TCP_FLAG_FIN | TCP_FLAG_ACK,
+            TCP_FLAG_FIN | TCP_FLAG_PSH | TCP_FLAG_ACK,
+            TCP_FLAG_SYN | TCP_FLAG_FIN | TCP_FLAG_ACK,
+        ] {
+            let mut packet = test_mmds_tcp_packet(b"payload");
+            packet[tcp_start + TCP_FLAGS_OFFSET] = flags;
+            let payload_control = classify_mmds_guest_tcp_packet(&packet, test_mmds_ipv4_address())
+                .expect("MMDS TCP payload control packet should classify");
+            assert!(payload_control.has_unsupported_payload_control_flags());
+        }
+
+        for flags in [
+            TCP_FLAG_ACK,
+            TCP_FLAG_PSH | TCP_FLAG_ACK,
+            TCP_FLAG_PSH,
+            TCP_FLAG_RST,
+            TCP_FLAG_RST | TCP_FLAG_ACK,
+            TCP_FLAG_RST | TCP_FLAG_FIN,
+        ] {
+            let mut packet = test_mmds_tcp_packet(b"payload");
+            packet[tcp_start + TCP_FLAGS_OFFSET] = flags;
+            let supported_or_separate_control =
+                classify_mmds_guest_tcp_packet(&packet, test_mmds_ipv4_address())
+                    .expect("MMDS TCP payload packet should classify");
+            assert!(!supported_or_separate_control.has_unsupported_payload_control_flags());
+        }
+
+        for flags in [
+            TCP_FLAG_SYN,
+            TCP_FLAG_FIN,
+            TCP_FLAG_FIN | TCP_FLAG_ACK,
+            TCP_FLAG_SYN | TCP_FLAG_FIN | TCP_FLAG_ACK,
+        ] {
+            let mut packet = test_mmds_tcp_packet(b"");
+            packet[tcp_start + TCP_FLAGS_OFFSET] = flags;
+            let empty_control = classify_mmds_guest_tcp_packet(&packet, test_mmds_ipv4_address())
+                .expect("MMDS TCP empty control packet should classify");
+            assert!(!empty_control.has_unsupported_payload_control_flags());
+        }
     }
 
     #[test]

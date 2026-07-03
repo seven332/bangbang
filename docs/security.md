@@ -215,15 +215,19 @@ Unsupported empty-payload TCP control candidates queue deterministic RST frames
 without touching MMDS data or token state, and guest-sent packets carrying RST
 are consumed without response even when they also carry payload bytes.
 For non-empty candidate TCP payloads that acknowledge that deterministic
-SYN-ACK, the runtime can produce the same process-local HTTP response bytes as
-the existing guest HTTP helper, including token PUT and MMDS v2 GET token
-enforcement. The process vmnet TX path detours
+SYN-ACK and do not carry unsupported SYN or FIN payload control flags, the
+runtime can produce the same process-local HTTP response bytes as the existing
+guest HTTP helper, including token PUT and MMDS v2 GET token enforcement.
+Non-empty candidates carrying SYN or FIN are not interpreted as process-local
+MMDS HTTP requests. The process vmnet TX path detours
 MMDS ARP requests, pure empty-payload MMDS SYN packets, pure empty-payload MMDS
 ACK-only packets that acknowledge bangbang's deterministic SYN-ACK, pure
 empty-payload MMDS FIN close packets, unsupported empty-payload MMDS control
-packets, guest-sent MMDS packets carrying RST, and non-empty candidates that
-acknowledge bangbang's deterministic SYN-ACK only for interfaces listed in the
-MMDS config, buffers split request headers in bounded per-interface process
+packets, guest-sent MMDS packets carrying RST, and non-empty candidates on
+interfaces listed in the MMDS config when they acknowledge bangbang's
+deterministic SYN-ACK and do not carry unsupported SYN or FIN payload control
+flags,
+buffers split request headers in bounded per-interface process
 state only when each fragment starts at the next expected TCP sequence number,
 rejects non-contiguous buffered fragments before appending guest bytes,
 synthesizes response frames from deterministic ARP context, deterministic

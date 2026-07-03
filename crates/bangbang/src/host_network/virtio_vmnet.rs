@@ -130,6 +130,9 @@ impl MmdsPacketDetour {
         if classified.payload().is_empty() {
             return Ok(false);
         }
+        if classified.has_unsupported_payload_control_flags() {
+            return Ok(false);
+        }
         if !classified.has_initial_synchronization_acknowledgement() {
             return Ok(false);
         }
@@ -2882,6 +2885,59 @@ mod tests {
                 .expect("test state lock should succeed");
             assert_eq!(state.backend.write_calls, 0);
             assert!(state.backend.written_packets.is_empty());
+            drop(state);
+            assert_eq!(
+                mmds_state
+                    .with(Clone::clone)
+                    .expect("MMDS state should lock"),
+                state_before
+            );
+            assert!(
+                response_queue
+                    .responses()
+                    .expect("MMDS response queue should read")
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn tx_sink_forwards_mmds_payload_control_flags_without_mmds_response() {
+        for flags in [
+            TCP_FLAG_SYN,
+            TCP_FLAG_SYN | TCP_FLAG_ACK,
+            TCP_FLAG_FIN,
+            TCP_FLAG_FIN | TCP_FLAG_ACK,
+            TCP_FLAG_FIN | TCP_FLAG_PSH | TCP_FLAG_ACK,
+            TCP_FLAG_SYN | TCP_FLAG_FIN | TCP_FLAG_ACK,
+        ] {
+            let mut packet = mmds_tcp_packet(b"GET /meta-data/hostname HTTP/1.1\r\n\r\n");
+            set_tcp_flags(&mut packet, flags);
+            let mut memory = tx_memory();
+            let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
+            let response_queue = MmdsResponseQueue::with_capacity(2);
+            let mmds_state = v2_mmds_state_handle();
+            let state_before = mmds_state
+                .with(Clone::clone)
+                .expect("MMDS state should lock");
+            let mut packet_io = packet_io_with_mmds_detour(
+                FakeVmnetPacketIoBackend::default(),
+                mmds_state.clone(),
+                response_queue.clone(),
+            );
+
+            packet_io
+                .tx_sink()
+                .transmit_frame(&memory, &frame)
+                .expect("MMDS payload control packet should forward");
+
+            let state = packet_io
+                .tx_sink()
+                .shared
+                .lock()
+                .expect("test state lock should succeed");
+            assert_eq!(state.backend.write_calls, 1);
+            assert_eq!(state.backend.written_packets, [packet]);
             drop(state);
             assert_eq!(
                 mmds_state
