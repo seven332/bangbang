@@ -2202,6 +2202,7 @@ mod tests {
             .response_frame()
             .expect("ARP response frame should synthesize");
 
+        assert_eq!(response.len(), ETHERNET_HEADER_LEN + ARP_ETHERNET_IPV4_LEN);
         assert_eq!(
             packet_array::<ETHERNET_MAC_ADDRESS_LEN>(
                 &response,
@@ -2280,6 +2281,8 @@ mod tests {
         );
         let mut wrong_hardware_len = test_arp_request(test_mmds_ipv4_address());
         wrong_hardware_len[ETHERNET_HEADER_LEN + ARP_HARDWARE_ADDRESS_LEN_OFFSET] = 5;
+        let mut wrong_protocol_len = test_arp_request(test_mmds_ipv4_address());
+        wrong_protocol_len[ETHERNET_HEADER_LEN + ARP_PROTOCOL_ADDRESS_LEN_OFFSET] = 16;
         let truncated = test_arp_request(test_mmds_ipv4_address())
             .into_iter()
             .take(ETHERNET_HEADER_LEN + ARP_ETHERNET_IPV4_LEN - 1)
@@ -2291,6 +2294,7 @@ mod tests {
             wrong_hardware_type,
             wrong_protocol_type,
             wrong_hardware_len,
+            wrong_protocol_len,
             truncated,
         ] {
             assert_eq!(
