@@ -69,6 +69,7 @@ const ARP_SENDER_HARDWARE_ADDRESS_OFFSET: usize = 8;
 const ARP_SENDER_PROTOCOL_ADDRESS_OFFSET: usize = 14;
 const ARP_TARGET_PROTOCOL_ADDRESS_OFFSET: usize = 24;
 const MMDS_TOKEN_BYTES: usize = 32;
+const MMDS_GUEST_TCP_SYN_ACK_SEQUENCE_NUMBER: u32 = 0;
 const MMDS_GUEST_ALLOW_METHODS: &str = "GET, PUT";
 const MMDS_GUEST_INVALID_TOKEN: &str = "MMDS token not valid.";
 const MMDS_GUEST_MISSING_TOKEN: &str = "No MMDS token provided. Use `X-metadata-token` or `X-aws-ec2-metadata-token` header to specify the session token.";
@@ -200,6 +201,10 @@ impl<'a> MmdsGuestTcpPacket<'a> {
         self.payload
     }
 
+    pub fn is_initial_synchronization_request(self) -> bool {
+        self.tcp_flags == TCP_FLAG_SYN && self.payload.is_empty()
+    }
+
     pub const fn response_context(self) -> MmdsGuestTcpResponseContext {
         MmdsGuestTcpResponseContext {
             source_ethernet_address: self.source_ethernet_address,
@@ -221,6 +226,10 @@ impl<'a> MmdsGuestTcpPacket<'a> {
         self.response_context()
             .response_frame(tcp_payload, self.payload.len())
     }
+
+    pub fn syn_ack_response_frame(self) -> Result<Vec<u8>, MmdsGuestTcpResponseFrameError> {
+        self.response_context().syn_ack_response_frame()
+    }
 }
 
 impl MmdsGuestTcpResponseContext {
@@ -236,6 +245,18 @@ impl MmdsGuestTcpResponseContext {
         })?;
 
         mmds_guest_tcp_response_frame(self, tcp_payload, request_payload_len)
+    }
+
+    fn syn_ack_response_frame(self) -> Result<Vec<u8>, MmdsGuestTcpResponseFrameError> {
+        mmds_guest_tcp_response_frame_with_parts(
+            self,
+            MmdsGuestTcpResponseFrameParts {
+                sequence_number: MMDS_GUEST_TCP_SYN_ACK_SEQUENCE_NUMBER,
+                acknowledgement_number: self.sequence_number.wrapping_add(1),
+                tcp_flags: TCP_FLAG_SYN | TCP_FLAG_ACK,
+                tcp_payload: &[],
+            },
+        )
     }
 }
 
@@ -405,23 +426,45 @@ fn mmds_guest_tcp_response_frame(
     tcp_payload: &[u8],
     request_payload_len: u32,
 ) -> Result<Vec<u8>, MmdsGuestTcpResponseFrameError> {
+    mmds_guest_tcp_response_frame_with_parts(
+        request,
+        MmdsGuestTcpResponseFrameParts {
+            sequence_number: request.acknowledgement_number,
+            acknowledgement_number: request.response_acknowledgement_number(request_payload_len),
+            tcp_flags: TCP_FLAG_PSH | TCP_FLAG_ACK,
+            tcp_payload,
+        },
+    )
+}
+
+struct MmdsGuestTcpResponseFrameParts<'a> {
+    sequence_number: u32,
+    acknowledgement_number: u32,
+    tcp_flags: u8,
+    tcp_payload: &'a [u8],
+}
+
+fn mmds_guest_tcp_response_frame_with_parts(
+    request: MmdsGuestTcpResponseContext,
+    parts: MmdsGuestTcpResponseFrameParts<'_>,
+) -> Result<Vec<u8>, MmdsGuestTcpResponseFrameError> {
     let ipv4_total_len = IPV4_MIN_HEADER_LEN
         .checked_add(TCP_MIN_HEADER_LEN)
-        .and_then(|len| len.checked_add(tcp_payload.len()))
+        .and_then(|len| len.checked_add(parts.tcp_payload.len()))
         .filter(|len| *len <= IPV4_MAX_TOTAL_LENGTH)
         .ok_or(MmdsGuestTcpResponseFrameError::PayloadTooLarge {
-            payload_len: tcp_payload.len(),
+            payload_len: parts.tcp_payload.len(),
         })?;
     let ipv4_total_len = u16::try_from(ipv4_total_len).map_err(|_| {
         MmdsGuestTcpResponseFrameError::PayloadTooLarge {
-            payload_len: tcp_payload.len(),
+            payload_len: parts.tcp_payload.len(),
         }
     })?;
     let tcp_segment_len = TCP_MIN_HEADER_LEN
-        .checked_add(tcp_payload.len())
+        .checked_add(parts.tcp_payload.len())
         .and_then(|len| u16::try_from(len).ok())
         .ok_or(MmdsGuestTcpResponseFrameError::PayloadTooLarge {
-            payload_len: tcp_payload.len(),
+            payload_len: parts.tcp_payload.len(),
         })?;
     let mut frame = Vec::with_capacity(ETHERNET_HEADER_LEN + usize::from(ipv4_total_len));
     frame.extend_from_slice(&request.source_ethernet_address.octets());
@@ -445,21 +488,17 @@ fn mmds_guest_tcp_response_frame(
     }
     frame.extend_from_slice(&ipv4_header);
 
-    let mut tcp_segment = Vec::with_capacity(TCP_MIN_HEADER_LEN + tcp_payload.len());
+    let mut tcp_segment = Vec::with_capacity(TCP_MIN_HEADER_LEN + parts.tcp_payload.len());
     tcp_segment.extend_from_slice(&request.destination_port.to_be_bytes());
     tcp_segment.extend_from_slice(&request.source_port.to_be_bytes());
-    tcp_segment.extend_from_slice(&request.acknowledgement_number.to_be_bytes());
-    tcp_segment.extend_from_slice(
-        &request
-            .response_acknowledgement_number(request_payload_len)
-            .to_be_bytes(),
-    );
+    tcp_segment.extend_from_slice(&parts.sequence_number.to_be_bytes());
+    tcp_segment.extend_from_slice(&parts.acknowledgement_number.to_be_bytes());
     tcp_segment.push(TCP_MIN_HEADER_WORDS << 4);
-    tcp_segment.push(TCP_FLAG_PSH | TCP_FLAG_ACK);
+    tcp_segment.push(parts.tcp_flags);
     tcp_segment.extend_from_slice(&4096_u16.to_be_bytes());
     tcp_segment.extend_from_slice(&0_u16.to_be_bytes());
     tcp_segment.extend_from_slice(&0_u16.to_be_bytes());
-    tcp_segment.extend_from_slice(tcp_payload);
+    tcp_segment.extend_from_slice(parts.tcp_payload);
     let tcp_checksum = tcp_ipv4_checksum(
         request.destination_ipv4_address,
         request.source_ipv4_address,
@@ -2343,6 +2382,123 @@ mod tests {
             classified.payload(),
             b"GET /latest/meta-data HTTP/1.1\r\n\r\n"
         );
+    }
+
+    #[test]
+    fn identifies_initial_mmds_guest_tcp_syn_packet() {
+        let tcp_start = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN;
+        let mut syn_packet = test_mmds_tcp_packet(b"");
+        syn_packet[tcp_start + TCP_FLAGS_OFFSET] = TCP_FLAG_SYN;
+        let syn = classify_mmds_guest_tcp_packet(&syn_packet, test_mmds_ipv4_address())
+            .expect("MMDS TCP SYN packet should classify");
+
+        assert!(syn.is_initial_synchronization_request());
+
+        let mut syn_ack_packet = syn_packet.clone();
+        syn_ack_packet[tcp_start + TCP_FLAGS_OFFSET] = TCP_FLAG_SYN | TCP_FLAG_ACK;
+        let syn_ack = classify_mmds_guest_tcp_packet(&syn_ack_packet, test_mmds_ipv4_address())
+            .expect("MMDS TCP SYN-ACK packet should classify");
+        assert!(!syn_ack.is_initial_synchronization_request());
+
+        let empty_ack_packet = test_mmds_tcp_packet(b"");
+        let empty_ack = classify_mmds_guest_tcp_packet(&empty_ack_packet, test_mmds_ipv4_address())
+            .expect("empty MMDS TCP packet should classify");
+        assert!(!empty_ack.is_initial_synchronization_request());
+
+        let mut syn_with_payload = test_mmds_tcp_packet(b"payload");
+        syn_with_payload[tcp_start + TCP_FLAGS_OFFSET] = TCP_FLAG_SYN;
+        let syn_with_payload =
+            classify_mmds_guest_tcp_packet(&syn_with_payload, test_mmds_ipv4_address())
+                .expect("MMDS TCP SYN with payload should classify");
+        assert!(!syn_with_payload.is_initial_synchronization_request());
+    }
+
+    #[test]
+    fn mmds_guest_tcp_syn_ack_response_frame_targets_requester() {
+        let tcp_start = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN;
+        let mut packet = test_mmds_tcp_packet(b"");
+        packet[tcp_start + TCP_FLAGS_OFFSET] = TCP_FLAG_SYN;
+        write_packet_u32(
+            &mut packet,
+            tcp_start + TCP_SEQUENCE_NUMBER_OFFSET,
+            u32::MAX,
+        );
+        write_packet_u32(
+            &mut packet,
+            tcp_start + TCP_ACKNOWLEDGEMENT_NUMBER_OFFSET,
+            0,
+        );
+        let classified = classify_mmds_guest_tcp_packet(&packet, test_mmds_ipv4_address())
+            .expect("MMDS TCP SYN packet should classify");
+
+        let response = classified
+            .syn_ack_response_frame()
+            .expect("SYN-ACK response frame should synthesize");
+
+        assert_eq!(
+            response.len(),
+            ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN + TCP_MIN_HEADER_LEN
+        );
+        assert_eq!(
+            packet_array::<ETHERNET_MAC_ADDRESS_LEN>(
+                &response,
+                ETHERNET_DESTINATION_ADDRESS_OFFSET
+            ),
+            Some(test_source_ethernet_address().octets())
+        );
+        assert_eq!(
+            packet_array::<ETHERNET_MAC_ADDRESS_LEN>(&response, ETHERNET_SOURCE_ADDRESS_OFFSET),
+            Some(test_destination_ethernet_address().octets())
+        );
+
+        let ipv4_header = response
+            .get(ETHERNET_HEADER_LEN..ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN)
+            .expect("response frame should include IPv4 header");
+        assert_eq!(
+            packet_u16(ipv4_header, IPV4_TOTAL_LENGTH_OFFSET),
+            Some(u16::try_from(IPV4_MIN_HEADER_LEN + TCP_MIN_HEADER_LEN).expect("len fits u16"))
+        );
+        assert_eq!(
+            packet_ipv4_address(ipv4_header, IPV4_SOURCE_ADDRESS_OFFSET),
+            Some(test_mmds_ipv4_address())
+        );
+        assert_eq!(
+            packet_ipv4_address(ipv4_header, IPV4_DESTINATION_ADDRESS_OFFSET),
+            Some(test_source_ipv4_address())
+        );
+        assert_eq!(internet_checksum(ipv4_header), 0);
+
+        let tcp_segment = response_frame_tcp_segment(&response);
+        assert_eq!(
+            packet_u16(tcp_segment, TCP_SOURCE_PORT_OFFSET),
+            Some(MMDS_GUEST_TCP_PORT)
+        );
+        assert_eq!(
+            packet_u16(tcp_segment, TCP_DESTINATION_PORT_OFFSET),
+            Some(49152)
+        );
+        assert_eq!(
+            packet_u32(tcp_segment, TCP_SEQUENCE_NUMBER_OFFSET),
+            Some(MMDS_GUEST_TCP_SYN_ACK_SEQUENCE_NUMBER)
+        );
+        assert_eq!(
+            packet_u32(tcp_segment, TCP_ACKNOWLEDGEMENT_NUMBER_OFFSET),
+            Some(0)
+        );
+        assert_eq!(
+            tcp_segment.get(TCP_FLAGS_OFFSET),
+            Some(&(TCP_FLAG_SYN | TCP_FLAG_ACK))
+        );
+        assert_eq!(
+            tcp_ipv4_checksum(
+                test_mmds_ipv4_address(),
+                test_source_ipv4_address(),
+                u16::try_from(tcp_segment.len()).expect("TCP segment length should fit u16"),
+                tcp_segment,
+            ),
+            0
+        );
+        assert!(response_frame_tcp_payload(&response).is_empty());
     }
 
     #[test]

@@ -97,6 +97,14 @@ impl MmdsPacketDetour {
         else {
             return Ok(false);
         };
+        if classified.is_initial_synchronization_request() {
+            self.response_queue.push_with(|| {
+                classified
+                    .syn_ack_response_frame()
+                    .map_err(MmdsPacketDetourError::ResponseFrame)
+            })?;
+            return Ok(true);
+        }
         if classified.payload().is_empty() {
             return Ok(false);
         }
@@ -1148,6 +1156,11 @@ mod tests {
     const ETHERNET_ETHERTYPE_IPV4: u16 = 0x0800;
     const IPV4_HEADER_LEN: usize = 20;
     const TCP_HEADER_LEN: usize = 20;
+    const TCP_SEQUENCE_NUMBER_OFFSET: usize = 4;
+    const TCP_ACKNOWLEDGEMENT_NUMBER_OFFSET: usize = 8;
+    const TCP_FLAGS_OFFSET: usize = 13;
+    const TCP_FLAG_ACK: u8 = 0x10;
+    const TCP_FLAG_SYN: u8 = 0x02;
     const ARP_HARDWARE_TYPE_ETHERNET: u16 = 1;
     const ARP_OPERATION_REQUEST: u16 = 1;
     const ARP_OPERATION_REPLY: u16 = 2;
@@ -1411,6 +1424,17 @@ mod tests {
         )
     }
 
+    fn set_tcp_flags(packet: &mut [u8], flags: u8) {
+        let tcp = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN;
+        packet[tcp + TCP_FLAGS_OFFSET] = flags;
+    }
+
+    fn mmds_tcp_syn_packet(sequence_number: u32) -> Vec<u8> {
+        let mut packet = mmds_tcp_packet_from_source(TEST_SOURCE_TCP_PORT, sequence_number, b"");
+        set_tcp_flags(&mut packet, TCP_FLAG_SYN);
+        packet
+    }
+
     fn arp_ipv4_request(target_ipv4_address: Ipv4Addr, operation: u16) -> Vec<u8> {
         arp_ipv4_request_from(TEST_SOURCE_IPV4_ADDRESS, target_ipv4_address, operation)
     }
@@ -1475,10 +1499,27 @@ mod tests {
     fn mmds_response_frame_acknowledgement_number(response_frame: &[u8]) -> u32 {
         let tcp = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN;
         u32::from_be_bytes(
-            response_frame[tcp + 8..tcp + 12]
+            response_frame[tcp + TCP_ACKNOWLEDGEMENT_NUMBER_OFFSET
+                ..tcp + TCP_ACKNOWLEDGEMENT_NUMBER_OFFSET + 4]
                 .try_into()
                 .expect("MMDS response frame should include TCP acknowledgement number"),
         )
+    }
+
+    fn mmds_response_frame_sequence_number(response_frame: &[u8]) -> u32 {
+        let tcp = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN;
+        u32::from_be_bytes(
+            response_frame[tcp + TCP_SEQUENCE_NUMBER_OFFSET..tcp + TCP_SEQUENCE_NUMBER_OFFSET + 4]
+                .try_into()
+                .expect("MMDS response frame should include TCP sequence number"),
+        )
+    }
+
+    fn mmds_response_frame_tcp_flags(response_frame: &[u8]) -> u8 {
+        let tcp = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN;
+        *response_frame
+            .get(tcp + TCP_FLAGS_OFFSET)
+            .expect("MMDS response frame should include TCP flags")
     }
 
     fn mmds_arp_reply_target_protocol_address(response_frame: &[u8]) -> Ipv4Addr {
@@ -2284,8 +2325,8 @@ mod tests {
     }
 
     #[test]
-    fn tx_sink_forwards_empty_mmds_payload_when_detour_configured() {
-        let packet = mmds_tcp_packet(b"");
+    fn tx_sink_detours_mmds_syn_and_retains_syn_ack_frame() {
+        let packet = mmds_tcp_syn_packet(u32::MAX);
         let mut memory = tx_memory();
         let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
         let response_queue = MmdsResponseQueue::with_capacity(2);
@@ -2298,7 +2339,86 @@ mod tests {
         packet_io
             .tx_sink()
             .transmit_frame(&memory, &frame)
-            .expect("empty-payload MMDS TX should forward");
+            .expect("MMDS SYN should detour");
+
+        let state = packet_io
+            .tx_sink()
+            .shared
+            .lock()
+            .expect("test state lock should succeed");
+        assert_eq!(state.backend.write_calls, 0);
+        drop(state);
+        let responses = response_queue
+            .responses()
+            .expect("MMDS response queue should read");
+        assert_eq!(responses.len(), 1);
+        assert_eq!(mmds_response_frame_sequence_number(&responses[0]), 0);
+        assert_eq!(mmds_response_frame_acknowledgement_number(&responses[0]), 0);
+        assert_eq!(
+            mmds_response_frame_tcp_flags(&responses[0]),
+            TCP_FLAG_SYN | TCP_FLAG_ACK
+        );
+        assert!(
+            mmds_response_frame_tcp_payload(&responses[0]).is_empty(),
+            "SYN-ACK should not carry MMDS HTTP payload"
+        );
+    }
+
+    #[test]
+    fn packet_io_delivers_detoured_mmds_syn_ack_through_rx_source() {
+        let packet = mmds_tcp_syn_packet(0x0102_0304);
+        let mut memory = tx_memory();
+        let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        let mut packet_io = packet_io_with_mmds_detour(
+            FakeVmnetPacketIoBackend::default().with_read_result(Ok(Some(vec![0xaa]))),
+            MmdsStateHandle::default(),
+            response_queue,
+        );
+
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &frame)
+            .expect("MMDS SYN should detour");
+        let response = packet_io
+            .rx_source()
+            .peek_packet()
+            .expect("MMDS SYN-ACK RX should succeed")
+            .expect("MMDS SYN-ACK should be present");
+
+        assert_eq!(
+            mmds_response_frame_acknowledgement_number(response.bytes()),
+            0x0102_0305
+        );
+        assert_eq!(
+            mmds_response_frame_tcp_flags(response.bytes()),
+            TCP_FLAG_SYN | TCP_FLAG_ACK
+        );
+        let state = packet_io
+            .rx_source()
+            .shared
+            .lock()
+            .expect("test state lock should succeed");
+        assert_eq!(state.backend.read_calls, 0);
+    }
+
+    #[test]
+    fn tx_sink_forwards_empty_non_syn_mmds_payload_when_detour_configured() {
+        let mut packet = mmds_tcp_packet(b"");
+        set_tcp_flags(&mut packet, TCP_FLAG_ACK);
+        let mut memory = tx_memory();
+        let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        let mut packet_io = packet_io_with_mmds_detour(
+            FakeVmnetPacketIoBackend::default(),
+            MmdsStateHandle::default(),
+            response_queue.clone(),
+        );
+
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &frame)
+            .expect("empty non-SYN MMDS TX should forward");
 
         let state = packet_io
             .tx_sink()
