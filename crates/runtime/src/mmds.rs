@@ -902,6 +902,30 @@ pub enum MmdsOutputFormat {
     Imds,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MmdsGuestHttpVersion {
+    Http10,
+    #[default]
+    Http11,
+}
+
+impl MmdsGuestHttpVersion {
+    fn parse(version: &str) -> Result<Self, MmdsGuestRequestParseError> {
+        match version {
+            "HTTP/1.0" => Ok(Self::Http10),
+            "HTTP/1.1" => Ok(Self::Http11),
+            _ => Err(MmdsGuestRequestParseError::UnsupportedHttpVersion),
+        }
+    }
+
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Http10 => "HTTP/1.0",
+            Self::Http11 => "HTTP/1.1",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MmdsGuestRequest {
     Get(MmdsGuestGetRequest),
@@ -916,22 +940,44 @@ impl MmdsGuestRequest {
         }
     }
 
+    pub const fn http_version(&self) -> MmdsGuestHttpVersion {
+        match self {
+            Self::Get(request) => request.http_version(),
+            Self::TokenPut(request) => request.http_version(),
+        }
+    }
+
     pub fn parse_http(bytes: &[u8]) -> Result<Self, MmdsGuestRequestParseError> {
-        let request = str::from_utf8(bytes).map_err(|_| MmdsGuestRequestParseError::InvalidUtf8)?;
+        Self::parse_http_with_version(bytes).map_err(MmdsGuestRequestParseFailure::into_error)
+    }
+
+    fn parse_http_with_version(bytes: &[u8]) -> Result<Self, MmdsGuestRequestParseFailure> {
+        let request = str::from_utf8(bytes).map_err(|_| {
+            MmdsGuestRequestParseFailure::without_version(MmdsGuestRequestParseError::InvalidUtf8)
+        })?;
         let (head, body) = request
             .split_once("\r\n\r\n")
-            .ok_or(MmdsGuestRequestParseError::MalformedRequest)?;
+            .ok_or(MmdsGuestRequestParseError::MalformedRequest)
+            .map_err(MmdsGuestRequestParseFailure::without_version)?;
         let mut lines = head.split("\r\n");
         let request_line = lines
             .next()
-            .ok_or(MmdsGuestRequestParseError::MalformedRequest)?;
-        let (method, uri, version) = parse_guest_request_line(request_line)?;
-        let method = MmdsGuestRequestMethod::parse(method)?;
-        if version != "HTTP/1.0" && version != "HTTP/1.1" {
-            return Err(MmdsGuestRequestParseError::UnsupportedHttpVersion);
-        }
+            .ok_or(MmdsGuestRequestParseError::MalformedRequest)
+            .map_err(MmdsGuestRequestParseFailure::without_version)?;
+        let (method, uri, version) = parse_guest_request_line(request_line)
+            .map_err(MmdsGuestRequestParseFailure::without_version)?;
+        let http_version = MmdsGuestHttpVersion::parse(version);
+        let method = MmdsGuestRequestMethod::parse(method).map_err(|err| {
+            if let Ok(http_version) = http_version {
+                MmdsGuestRequestParseFailure::with_version(http_version, err)
+            } else {
+                MmdsGuestRequestParseFailure::without_version(err)
+            }
+        })?;
+        let http_version = http_version.map_err(MmdsGuestRequestParseFailure::without_version)?;
 
-        let uri = guest_request_uri_path(uri)?;
+        let uri = guest_request_uri_path(uri)
+            .map_err(|err| MmdsGuestRequestParseFailure::with_version(http_version, err))?;
         let mut content_length = None;
         let mut output_format = MmdsOutputFormat::Imds;
         let mut token = MmdsGuestToken::Missing;
@@ -939,16 +985,26 @@ impl MmdsGuestRequest {
         let mut forwarded_for = false;
 
         for line in lines {
-            let (name, value) = parse_guest_request_header(line)?;
+            let (name, value) = parse_guest_request_header(line)
+                .map_err(|err| MmdsGuestRequestParseFailure::with_version(http_version, err))?;
             if name.eq_ignore_ascii_case("Content-Length") {
                 if content_length.is_some() {
-                    return Err(MmdsGuestRequestParseError::DuplicateContentLength);
+                    return Err(MmdsGuestRequestParseFailure::with_version(
+                        http_version,
+                        MmdsGuestRequestParseError::DuplicateContentLength,
+                    ));
                 }
-                content_length = Some(parse_guest_content_length(value)?);
+                content_length = Some(parse_guest_content_length(value).map_err(|err| {
+                    MmdsGuestRequestParseFailure::with_version(http_version, err)
+                })?);
             } else if name.eq_ignore_ascii_case("Transfer-Encoding") {
-                return Err(MmdsGuestRequestParseError::UnsupportedTransferEncoding);
+                return Err(MmdsGuestRequestParseFailure::with_version(
+                    http_version,
+                    MmdsGuestRequestParseError::UnsupportedTransferEncoding,
+                ));
             } else if method == MmdsGuestRequestMethod::Get && name.eq_ignore_ascii_case("Accept") {
-                output_format = parse_guest_accept_header(value)?;
+                output_format = parse_guest_accept_header(value)
+                    .map_err(|err| MmdsGuestRequestParseFailure::with_version(http_version, err))?;
             } else if method == MmdsGuestRequestMethod::Get {
                 if let Some(header) = MmdsGuestTokenHeader::parse_name(name) {
                     token = match token {
@@ -980,21 +1036,29 @@ impl MmdsGuestRequest {
 
         let content_length = content_length.unwrap_or(0);
         if content_length != 0 || !body.is_empty() {
-            return Err(MmdsGuestRequestParseError::UnsupportedBody);
+            return Err(MmdsGuestRequestParseFailure::with_version(
+                http_version,
+                MmdsGuestRequestParseError::UnsupportedBody,
+            ));
         }
 
         match method {
             MmdsGuestRequestMethod::Get => Ok(Self::Get(MmdsGuestGetRequest {
+                http_version,
                 uri: uri.to_string(),
                 output_format,
                 token,
             })),
             MmdsGuestRequestMethod::Put => {
                 if forwarded_for {
-                    return Err(MmdsGuestRequestParseError::UnsupportedForwardedFor);
+                    return Err(MmdsGuestRequestParseFailure::with_version(
+                        http_version,
+                        MmdsGuestRequestParseError::UnsupportedForwardedFor,
+                    ));
                 }
 
                 Ok(Self::TokenPut(MmdsGuestTokenPutRequest {
+                    http_version,
                     uri: uri.to_string(),
                     token_ttl,
                 }))
@@ -1003,14 +1067,48 @@ impl MmdsGuestRequest {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MmdsGuestRequestParseFailure {
+    error: MmdsGuestRequestParseError,
+    http_version: Option<MmdsGuestHttpVersion>,
+}
+
+impl MmdsGuestRequestParseFailure {
+    const fn without_version(error: MmdsGuestRequestParseError) -> Self {
+        Self {
+            error,
+            http_version: None,
+        }
+    }
+
+    const fn with_version(
+        http_version: MmdsGuestHttpVersion,
+        error: MmdsGuestRequestParseError,
+    ) -> Self {
+        Self {
+            error,
+            http_version: Some(http_version),
+        }
+    }
+
+    const fn into_error(self) -> MmdsGuestRequestParseError {
+        self.error
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MmdsGuestGetRequest {
+    http_version: MmdsGuestHttpVersion,
     uri: String,
     output_format: MmdsOutputFormat,
     token: MmdsGuestToken,
 }
 
 impl MmdsGuestGetRequest {
+    pub const fn http_version(&self) -> MmdsGuestHttpVersion {
+        self.http_version
+    }
+
     pub fn uri(&self) -> &str {
         &self.uri
     }
@@ -1026,11 +1124,16 @@ impl MmdsGuestGetRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MmdsGuestTokenPutRequest {
+    http_version: MmdsGuestHttpVersion,
     uri: String,
     token_ttl: MmdsGuestTokenTtl,
 }
 
 impl MmdsGuestTokenPutRequest {
+    pub const fn http_version(&self) -> MmdsGuestHttpVersion {
+        self.http_version
+    }
+
     pub fn uri(&self) -> &str {
         &self.uri
     }
@@ -1239,6 +1342,7 @@ impl MmdsGuestContentType {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MmdsGuestResponse {
+    http_version: MmdsGuestHttpVersion,
     status: MmdsGuestStatus,
     content_type: MmdsGuestContentType,
     allow: Option<&'static str>,
@@ -1249,6 +1353,7 @@ pub struct MmdsGuestResponse {
 impl MmdsGuestResponse {
     fn new(status: MmdsGuestStatus, content_type: MmdsGuestContentType, body: String) -> Self {
         Self {
+            http_version: MmdsGuestHttpVersion::default(),
             status,
             content_type,
             allow: None,
@@ -1259,6 +1364,11 @@ impl MmdsGuestResponse {
 
     fn with_allow_header(mut self, allow: &'static str) -> Self {
         self.allow = Some(allow);
+        self
+    }
+
+    fn with_http_version(mut self, http_version: MmdsGuestHttpVersion) -> Self {
+        self.http_version = http_version;
         self
     }
 
@@ -1281,7 +1391,8 @@ impl MmdsGuestResponse {
 
     pub fn to_http_bytes(&self) -> Vec<u8> {
         let mut response = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\n",
+            "{} {} {}\r\nContent-Type: {}\r\n",
+            self.http_version.as_str(),
             self.status.as_u16(),
             self.status.reason_phrase(),
             self.content_type.as_str(),
@@ -1637,10 +1748,21 @@ impl MmdsState {
     }
 
     pub fn guest_http_response(&mut self, request_bytes: &[u8]) -> MmdsGuestResponse {
-        match MmdsGuestRequest::parse_http(request_bytes) {
-            Ok(MmdsGuestRequest::Get(request)) => self.guest_get_http_response(&request),
-            Ok(MmdsGuestRequest::TokenPut(request)) => self.guest_token_put_response(&request),
-            Err(err) => guest_request_parse_error_response(err),
+        match MmdsGuestRequest::parse_http_with_version(request_bytes) {
+            Ok(MmdsGuestRequest::Get(request)) => self
+                .guest_get_http_response(&request)
+                .with_http_version(request.http_version()),
+            Ok(MmdsGuestRequest::TokenPut(request)) => self
+                .guest_token_put_response(&request)
+                .with_http_version(request.http_version()),
+            Err(failure) => {
+                let response = guest_request_parse_error_response(failure.error);
+                if let Some(http_version) = failure.http_version {
+                    response.with_http_version(http_version)
+                } else {
+                    response
+                }
+            }
         }
     }
 
@@ -3405,6 +3527,21 @@ mod tests {
     }
 
     #[test]
+    fn mmds_guest_tcp_packet_response_bytes_preserve_http_10_response_version() {
+        let request = b"GET /meta-data/hostname HTTP/1.0\r\nAccept: */*\r\n\r\n";
+        let packet = test_mmds_tcp_packet(request);
+        let mut state = initialized_query_state();
+
+        assert_eq!(
+            state.guest_tcp_packet_response_bytes(&packet, test_mmds_ipv4_address()),
+            Some(
+                b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 10\r\n\r\ndemo.local"
+                    .to_vec()
+            )
+        );
+    }
+
+    #[test]
     fn mmds_guest_tcp_packet_response_bytes_ignore_non_candidates_without_mutating() {
         let wrong_destination = test_tcp_packet(
             Ipv4Addr::new(169, 254, 169, 250),
@@ -4073,6 +4210,29 @@ mod tests {
     }
 
     #[test]
+    fn mmds_guest_request_preserves_supported_http_versions() {
+        let request = MmdsGuestRequest::parse_http(
+            b"GET /meta-data/hostname HTTP/1.0\r\nAccept: application/json\r\n\r\n",
+        )
+        .expect("HTTP/1.0 GET request should parse");
+        assert_eq!(request.http_version(), MmdsGuestHttpVersion::Http10);
+        let MmdsGuestRequest::Get(request) = request else {
+            panic!("test MMDS guest HTTP request should be GET");
+        };
+        assert_eq!(request.http_version(), MmdsGuestHttpVersion::Http10);
+
+        let request = MmdsGuestRequest::parse_http(
+            b"PUT /latest/api/token HTTP/1.1\r\nX-metadata-token-ttl-seconds: 60\r\n\r\n",
+        )
+        .expect("HTTP/1.1 token PUT request should parse");
+        assert_eq!(request.http_version(), MmdsGuestHttpVersion::Http11);
+        let MmdsGuestRequest::TokenPut(request) = request else {
+            panic!("test MMDS guest HTTP request should be token PUT");
+        };
+        assert_eq!(request.http_version(), MmdsGuestHttpVersion::Http11);
+    }
+
+    #[test]
     fn mmds_guest_request_parses_imds_accept_variants() {
         for request in [
             b"GET /meta-data/hostname HTTP/1.1\r\nAccept:\r\n\r\n".as_slice(),
@@ -4120,6 +4280,10 @@ mod tests {
     fn mmds_guest_request_rejects_unsupported_method_and_version() {
         assert_eq!(
             MmdsGuestRequest::parse_http(b"POST /meta-data/hostname HTTP/1.1\r\n\r\n"),
+            Err(MmdsGuestRequestParseError::UnsupportedMethod)
+        );
+        assert_eq!(
+            MmdsGuestRequest::parse_http(b"POST /meta-data/hostname HTTP/2\r\n\r\n"),
             Err(MmdsGuestRequestParseError::UnsupportedMethod)
         );
         assert_eq!(
@@ -4334,6 +4498,19 @@ mod tests {
     }
 
     #[test]
+    fn mmds_guest_http_response_bytes_preserve_http_10_get_success() {
+        let mut state = initialized_query_state();
+
+        assert_eq!(
+            state.guest_http_response_bytes(
+                b"GET /meta-data/hostname HTTP/1.0\r\nAccept: */*\r\n\r\n"
+            ),
+            b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 10\r\n\r\ndemo.local"
+                .to_vec()
+        );
+    }
+
+    #[test]
     fn mmds_guest_http_response_generates_token_for_put() {
         let mut state = initialized_query_state();
         let response = state.guest_http_response(
@@ -4344,6 +4521,25 @@ mod tests {
         assert_eq!(response.content_type(), MmdsGuestContentType::PlainText);
         assert_mmds_token_shape(response.body());
         assert!(state.is_guest_token_valid(response.body()));
+    }
+
+    #[test]
+    fn mmds_guest_http_response_bytes_preserve_http_10_token_put_success() {
+        let mut state = initialized_query_state();
+        let bytes = state.guest_http_response_bytes(
+            b"PUT /latest/api/token HTTP/1.0\r\nX-aws-ec2-metadata-token-ttl-seconds: +60\r\n\r\n",
+        );
+        let response = String::from_utf8(bytes).expect("token response should be UTF-8");
+        let (head, token) = response
+            .split_once("\r\n\r\n")
+            .expect("token response should include header terminator");
+
+        assert_eq!(
+            head,
+            "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nX-aws-ec2-metadata-token-ttl-seconds: 60\r\nContent-Length: 64"
+        );
+        assert_mmds_token_shape(token);
+        assert!(state.is_guest_token_valid(token));
     }
 
     #[test]
@@ -4442,6 +4638,41 @@ mod tests {
                 body,
             );
         }
+    }
+
+    #[test]
+    fn mmds_guest_http_response_bytes_preserve_http_10_errors_with_supported_version() {
+        let mut state = MmdsState::default();
+        assert_eq!(
+            state.guest_http_response_bytes(
+                b"GET /meta-data/hostname HTTP/1.0\r\nAccept: application/json\r\n\r\n"
+            ),
+            b"HTTP/1.0 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 39\r\n\r\nThe MMDS data store is not initialized."
+                .to_vec()
+        );
+
+        let mut state = initialized_query_state();
+        assert_eq!(
+            state.guest_http_response_bytes(b"POST /meta-data/hostname HTTP/1.0\r\n\r\n"),
+            b"HTTP/1.0 405 Method Not Allowed\r\nContent-Type: text/plain\r\nAllow: GET, PUT\r\nContent-Length: 48\r\n\r\nMMDS guest HTTP request method is not supported."
+                .to_vec()
+        );
+
+        let mut state = initialized_query_state();
+        assert_eq!(
+            state.guest_http_response_bytes(
+                b"GET /meta-data/hostname HTTP/1.0\r\nAccept: application/xml\r\n\r\n"
+            ),
+            b"HTTP/1.0 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 55\r\n\r\nMMDS guest HTTP request Accept header is not supported."
+                .to_vec()
+        );
+
+        let mut state = initialized_query_state();
+        assert_eq!(
+            state.guest_http_response_bytes(b"PUT /latest/api/token HTTP/1.0\r\n\r\n"),
+            b"HTTP/1.0 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 152\r\n\r\nToken time to live value not found. Use `X-metadata-token-ttl-seconds` or `X-aws-ec2-metadata-token-ttl-seconds` header to specify the token's lifetime."
+                .to_vec()
+        );
     }
 
     #[test]
@@ -4747,6 +4978,17 @@ mod tests {
         assert_eq!(
             state.guest_http_response_bytes(b"GET /meta-data/hostname\r\n\r\n"),
             b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 37\r\n\r\nMMDS guest HTTP request is malformed."
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn mmds_guest_http_response_bytes_keep_default_version_for_unsupported_version_error() {
+        let mut state = initialized_query_state();
+
+        assert_eq!(
+            state.guest_http_response_bytes(b"GET /meta-data/hostname HTTP/2\r\n\r\n"),
+            b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 49\r\n\r\nMMDS guest HTTP request version is not supported."
                 .to_vec()
         );
     }
