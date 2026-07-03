@@ -17,6 +17,12 @@ const BLOCK_READ_MARKER: &[u8] = b"BANGBANG_BLOCK_READ_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const BLOCK_WRITE_MARKER: &[u8] = b"BANGBANG_BLOCK_WRITE_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const ROOTFS_READ_MARKER: &[u8] = b"BANGBANG_ROOTFS_READ_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const ROOTFS_OS_RELEASE_ID: &[u8] = b"ID=ubuntu";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const ROOTFS_OS_RELEASE_CODENAME: &[u8] = b"VERSION_CODENAME=noble";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const CMDLINE_BEGIN_MARKER: &[u8] = b"BANGBANG_CMDLINE_BEGIN";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const CMDLINE_END_MARKER: &[u8] = b"BANGBANG_CMDLINE_END";
@@ -52,6 +58,11 @@ fn boots_firecracker_kernel_to_guest_marker() {
         "guest boot test without a drive should not observe block-write marker\nserial output:\n{}",
         String::from_utf8_lossy(&observation.serial_bytes)
     );
+    assert!(
+        !bytes_contain_marker(&observation.serial_bytes, ROOTFS_READ_MARKER),
+        "guest boot test without a drive should not observe rootfs-read marker\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -83,6 +94,11 @@ fn boots_firecracker_kernel_and_reads_virtio_block_marker() {
     assert!(
         !bytes_contain_marker(&observation.serial_bytes, BLOCK_WRITE_MARKER),
         "guest block read test with a read-only drive should not observe block-write marker\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+    assert!(
+        !bytes_contain_marker(&observation.serial_bytes, ROOTFS_READ_MARKER),
+        "guest block read test with a raw marker drive should not observe rootfs-read marker\nserial output:\n{}",
         String::from_utf8_lossy(&observation.serial_bytes)
     );
 }
@@ -122,6 +138,11 @@ fn boots_firecracker_kernel_and_writes_virtio_block_marker() {
         String::from_utf8_lossy(BLOCK_WRITE_MARKER),
         backing_bytes
     );
+    assert!(
+        !bytes_contain_marker(&observation.serial_bytes, ROOTFS_READ_MARKER),
+        "guest block write test with a raw writable drive should not observe rootfs-read marker\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -155,6 +176,58 @@ fn boots_firecracker_kernel_with_root_drive_boot_args() {
     assert!(
         !bytes_contain_marker(&observation.serial_bytes, BLOCK_WRITE_MARKER),
         "guest root-drive cmdline test with a read-only drive should not observe block-write marker\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+    assert!(
+        !bytes_contain_marker(&observation.serial_bytes, ROOTFS_READ_MARKER),
+        "guest root-drive cmdline test with a raw marker drive should not observe rootfs-read marker\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn boots_firecracker_kernel_and_reads_firecracker_rootfs() {
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::DriveConfigInput;
+
+    let _test_lock = GUEST_BOOT_TEST_LOCK
+        .lock()
+        .expect("guest boot integration test lock should not be poisoned");
+    let rootfs_path = env_path("BANGBANG_GUEST_ROOTFS_PATH");
+    let observation =
+        run_guest_boot_until_marker("guest-rootfs-read", ROOTFS_READ_MARKER, |controller| {
+            controller
+                .handle_action(VmmAction::PutDrive(
+                    DriveConfigInput::new("rootfs", "rootfs", rootfs_path.as_path(), true)
+                        .with_is_read_only(true),
+                ))
+                .expect("guest rootfs drive should configure");
+        });
+
+    assert_guest_boot_observed_marker(&observation, ROOTFS_READ_MARKER, "rootfs-read marker");
+    assert!(
+        bytes_contain_marker(&observation.serial_bytes, BOOT_MARKER),
+        "guest rootfs read test should still observe boot marker\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+    assert!(
+        bytes_contain_marker(&observation.serial_bytes, ROOTFS_OS_RELEASE_ID),
+        "guest rootfs read test should observe os-release ID\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+    assert!(
+        bytes_contain_marker(&observation.serial_bytes, ROOTFS_OS_RELEASE_CODENAME),
+        "guest rootfs read test should observe os-release codename\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+    let cmdline = guest_cmdline_capture(&observation);
+    assert_guest_cmdline_contains_arg(cmdline, b"root=/dev/vda");
+    assert_guest_cmdline_contains_arg(cmdline, b"ro");
+    assert_guest_cmdline_contains_arg(cmdline, b"rdinit=/init");
+    assert!(
+        !bytes_contain_marker(&observation.serial_bytes, BLOCK_WRITE_MARKER),
+        "guest rootfs read test with a read-only rootfs should not observe block-write marker\nserial output:\n{}",
         String::from_utf8_lossy(&observation.serial_bytes)
     );
 }

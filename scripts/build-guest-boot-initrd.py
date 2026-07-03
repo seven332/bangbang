@@ -14,14 +14,19 @@ BOOT_MARKER = b"BANGBANG_BOOT_OK\n"
 BLOCK_READ_MARKER = b"BANGBANG_BLOCK_READ_OK"
 BLOCK_WRITE_MARKER = b"BANGBANG_BLOCK_WRITE_OK"
 BLOCK_WRITE_SECTOR_SIZE = 512
+ROOTFS_READ_MARKER = b"BANGBANG_ROOTFS_READ_OK"
+ROOTFS_OS_RELEASE_READ_SIZE = 256
 CMDLINE_BEGIN_MARKER = b"BANGBANG_CMDLINE_BEGIN\n"
 CMDLINE_END_MARKER = b"BANGBANG_CMDLINE_END\n"
 DEV_TMPFS_NAME = b"devtmpfs\0"
 DEV_PATH = b"/dev\0"
+MNT_PATH = b"/mnt\0"
 PROC_FS_NAME = b"proc\0"
 PROC_PATH = b"/proc\0"
 PROC_CMDLINE_PATH = b"/proc/cmdline\0"
+SQUASHFS_NAME = b"squashfs\0"
 VDA_PATH = b"/dev/vda\0"
+ROOTFS_OS_RELEASE_PATH = b"/mnt/etc/os-release\0"
 DEFAULT_RELATIVE_OUTPUT = Path("bangbang/guest-boot/initrd.cpio")
 CPIO_NEWC_HEADER_SIZE = 110
 CPIO_TRAILER = "TRAILER!!!"
@@ -34,6 +39,7 @@ ELF_PROGRAM_HEADER_SIZE = 0x38
 
 AT_FDCWD_U64 = (1 << 64) - 100
 AARCH64_COND_NE = 1
+LINUX_MOUNT_FLAG_RDONLY = 1
 LINUX_OPEN_FLAG_RDWR = 2
 LINUX_AARCH64_SYSCALL_MOUNT = 40
 LINUX_AARCH64_SYSCALL_OPENAT = 56
@@ -229,6 +235,48 @@ def build_guest_init_code(addresses: dict[str, int]) -> bytes:
     code.emit(
         b"".join(
             (
+                mov_imm_64(0, addresses["vda"]),
+                mov_imm_64(1, addresses["mnt"]),
+                mov_imm_64(2, addresses["squashfs"]),
+                movz_64(3, LINUX_MOUNT_FLAG_RDONLY),
+                movz_64(4, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_MOUNT),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond("after_rootfs_attempt", AARCH64_COND_NE)
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(0, AT_FDCWD_U64),
+                mov_imm_64(1, addresses["rootfs_os_release"]),
+                movz_64(2, 0),
+                movz_64(3, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_OPENAT),
+                svc_0(),
+                mov_imm_64(1, addresses["rootfs_os_release_buffer"]),
+                movz_64(2, ROOTFS_OS_RELEASE_READ_SIZE),
+                movz_64(8, LINUX_AARCH64_SYSCALL_READ),
+                svc_0(),
+                cmp_imm_64(0, ROOTFS_OS_RELEASE_READ_SIZE),
+            )
+        )
+    )
+    code.branch_cond("after_rootfs_attempt", AARCH64_COND_NE)
+    code.emit(
+        write_syscalls(
+            1,
+            addresses["rootfs_os_release_buffer"],
+            ROOTFS_OS_RELEASE_READ_SIZE,
+        )
+    )
+    code.emit(write_syscalls(1, addresses["rootfs_read_marker"], len(ROOTFS_READ_MARKER)))
+    code.label("after_rootfs_attempt")
+    code.emit(
+        b"".join(
+            (
                 mov_imm_64(0, AT_FDCWD_U64),
                 mov_imm_64(1, addresses["vda"]),
                 movz_64(2, 0),
@@ -296,14 +344,19 @@ def guest_init_data() -> list[tuple[str, bytes]]:
         ("cmdline_end_marker", CMDLINE_END_MARKER),
         ("devtmpfs", DEV_TMPFS_NAME),
         ("dev", DEV_PATH),
+        ("mnt", MNT_PATH),
         ("procfs", PROC_FS_NAME),
         ("proc", PROC_PATH),
         ("proc_cmdline", PROC_CMDLINE_PATH),
+        ("squashfs", SQUASHFS_NAME),
         ("vda", VDA_PATH),
+        ("rootfs_os_release", ROOTFS_OS_RELEASE_PATH),
         ("cmdline_buffer", bytes(GUEST_CMDLINE_BUFFER_SIZE)),
+        ("rootfs_os_release_buffer", bytes(ROOTFS_OS_RELEASE_READ_SIZE)),
         ("block_read_buffer", bytes(len(BLOCK_READ_MARKER))),
         ("block_write_marker", BLOCK_WRITE_MARKER),
         ("block_write_sector", block_write_sector()),
+        ("rootfs_read_marker", ROOTFS_READ_MARKER),
     ]
 
 
@@ -436,15 +489,16 @@ def build_initrd() -> bytes:
         (
             cpio_entry(name="dev", ino=1, mode=S_IFDIR | 0o755, nlink=2),
             cpio_entry(name="proc", ino=2, mode=S_IFDIR | 0o755, nlink=2),
+            cpio_entry(name="mnt", ino=3, mode=S_IFDIR | 0o755, nlink=2),
             cpio_entry(
                 name="dev/console",
-                ino=3,
+                ino=4,
                 mode=S_IFCHR | 0o600,
                 rdevmajor=5,
                 rdevminor=1,
             ),
-            cpio_entry(name="init", ino=4, mode=S_IFREG | 0o755, data=guest_init),
-            cpio_entry(name="TRAILER!!!", ino=5, mode=0, nlink=1),
+            cpio_entry(name="init", ino=5, mode=S_IFREG | 0o755, data=guest_init),
+            cpio_entry(name="TRAILER!!!", ino=6, mode=0, nlink=1),
         )
     )
     return pad512(archive)
@@ -538,7 +592,7 @@ def validate_initrd(data: bytes) -> None:
     parsed = parse_newc_entries(data)
     entries = {str(entry["name"]): entry for entry in parsed}
     names = [str(entry["name"]) for entry in parsed]
-    expected_names = ["dev", "proc", "dev/console", "init", CPIO_TRAILER]
+    expected_names = ["dev", "proc", "mnt", "dev/console", "init", CPIO_TRAILER]
     if names != expected_names:
         raise RuntimeError(f"guest initrd entries {names!r} do not match {expected_names!r}")
 
@@ -549,6 +603,10 @@ def validate_initrd(data: bytes) -> None:
     proc = required_entry(entries, "proc")
     if file_type(proc["mode"]) != S_IFDIR:
         raise RuntimeError("guest initrd proc entry is not a directory")
+
+    mnt = required_entry(entries, "mnt")
+    if file_type(mnt["mode"]) != S_IFDIR:
+        raise RuntimeError("guest initrd mnt entry is not a directory")
 
     console = required_entry(entries, "dev/console")
     if file_type(console["mode"]) != S_IFCHR:
@@ -564,7 +622,12 @@ def validate_initrd(data: bytes) -> None:
         raise RuntimeError("guest initrd init payload is not an ELF file")
     if BOOT_MARKER not in payload:
         raise RuntimeError("guest initrd init payload does not contain the boot marker")
-    for marker in (CMDLINE_BEGIN_MARKER, CMDLINE_END_MARKER, BLOCK_WRITE_MARKER):
+    for marker in (
+        CMDLINE_BEGIN_MARKER,
+        CMDLINE_END_MARKER,
+        BLOCK_WRITE_MARKER,
+        ROOTFS_READ_MARKER,
+    ):
         if marker not in payload:
             raise RuntimeError(
                 f"guest initrd init payload does not contain {marker!r}"
@@ -574,10 +637,13 @@ def validate_initrd(data: bytes) -> None:
     for guest_path in (
         DEV_TMPFS_NAME,
         DEV_PATH,
+        MNT_PATH,
         PROC_FS_NAME,
         PROC_PATH,
         PROC_CMDLINE_PATH,
+        SQUASHFS_NAME,
         VDA_PATH,
+        ROOTFS_OS_RELEASE_PATH,
     ):
         if guest_path not in payload:
             raise RuntimeError(

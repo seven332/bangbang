@@ -208,9 +208,11 @@ fi
 
 guest_kernel_path=""
 guest_initrd_path=""
+guest_rootfs_path=""
 if contains guest_boot "${selected_tests[@]}"; then
   guest_kernel_path="$(scripts/fetch-firecracker-kernel.sh)"
   guest_initrd_path="$(scripts/build-guest-boot-initrd.py --check)"
+  guest_rootfs_path="$(scripts/fetch-firecracker-rootfs.sh)"
 fi
 
 target_triple="aarch64-apple-darwin"
@@ -257,10 +259,12 @@ for index in "${!signed_test_bins[@]}"; do
       if [[ "${#test_args[@]}" -eq 0 ]]; then
         BANGBANG_GUEST_KERNEL_PATH="$guest_kernel_path" \
           BANGBANG_GUEST_INITRD_PATH="$guest_initrd_path" \
+          BANGBANG_GUEST_ROOTFS_PATH="$guest_rootfs_path" \
           "$test_bin" --test-threads=1
       else
         BANGBANG_GUEST_KERNEL_PATH="$guest_kernel_path" \
           BANGBANG_GUEST_INITRD_PATH="$guest_initrd_path" \
+          BANGBANG_GUEST_ROOTFS_PATH="$guest_rootfs_path" \
           "$test_bin" --test-threads=1 "${test_args[@]}"
       fi
       ;;

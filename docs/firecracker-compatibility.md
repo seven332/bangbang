@@ -771,8 +771,11 @@ integration target now validates that the pinned Firecracker arm64 kernel can
 discover the first virtio-block device as `/dev/vda` and read a marker from a
 temporary host backing file through the raw block device. The same target also
 validates a basic writable-drive path by writing a marker from the guest to
-`/dev/vda` and checking the scratch host backing file. Rootfs boot, block
-hotplug, cache-mode expansion, and rate limiting remain deferred.
+`/dev/vda` and checking the scratch host backing file. It also attaches the
+pinned Firecracker squashfs rootfs as a read-only root drive, mounts it from the
+deterministic initrd, and reads `/mnt/etc/os-release` from the guest. Full
+rootfs boot, block hotplug, cache-mode expansion, and rate limiting remain
+deferred.
 It does not provide a public runner control, implement rate limiting, support
 vhost-user-block sockets, or use an async I/O engine. Internal HVF boot sessions
 can signal block SPI interrupts after boot-runtime block notification dispatch.

@@ -36,7 +36,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: .tmp/guest-artifacts
-          key: guest-artifacts-firecracker-v1.15-aarch64-vmlinux-6.1.155-e3544b10603acbf3db492cb52e000d22ba202cb4b63b9add027565683e11c591
+          key: guest-artifacts-firecracker-v1.15-aarch64-vmlinux-6.1.155-e3544b10603acbf3db492cb52e000d22ba202cb4b63b9add027565683e11c591-rootfs-ubuntu-24.04-0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608
 
       - name: Fetch Firecracker guest kernel
         run: scripts/fetch-firecracker-kernel.sh
