@@ -91,11 +91,18 @@ impl MetricsState {
     }
 
     pub fn flush(&mut self) -> Result<bool, MetricsFlushError> {
+        self.flush_with_diagnostics(&MetricsDiagnostics::default())
+    }
+
+    pub fn flush_with_diagnostics(
+        &mut self,
+        diagnostics: &MetricsDiagnostics,
+    ) -> Result<bool, MetricsFlushError> {
         let Some(sink) = &mut self.sink else {
             return Ok(false);
         };
         let next_flush_count = self.flush_count.saturating_add(1);
-        sink.write_minimal_metrics(next_flush_count)?;
+        sink.write_minimal_metrics(next_flush_count, diagnostics)?;
         self.flush_count = next_flush_count;
 
         Ok(true)
@@ -104,6 +111,45 @@ impl MetricsState {
     #[cfg(test)]
     pub const fn is_configured(&self) -> bool {
         self.sink.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetricsDiagnostics {
+    boot_run_loop_status: Option<BootRunLoopMetricStatus>,
+}
+
+impl MetricsDiagnostics {
+    pub const fn new() -> Self {
+        Self {
+            boot_run_loop_status: None,
+        }
+    }
+
+    pub const fn with_boot_run_loop_status(mut self, status: BootRunLoopMetricStatus) -> Self {
+        self.boot_run_loop_status = Some(status);
+        self
+    }
+
+    pub const fn boot_run_loop_status(&self) -> Option<BootRunLoopMetricStatus> {
+        self.boot_run_loop_status
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootRunLoopMetricStatus {
+    Running,
+    Exited,
+    Failed,
+}
+
+impl BootRunLoopMetricStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Exited => "exited",
+            Self::Failed => "failed",
+        }
     }
 }
 
@@ -127,12 +173,28 @@ impl MetricsSink {
         })
     }
 
-    fn write_minimal_metrics(&mut self, flush_count: u64) -> Result<(), MetricsFlushError> {
-        writeln!(
-            self.writer,
-            r#"{{"vmm":{{"metrics_flush_count":{flush_count}}}}}"#
-        )
-        .map_err(|err| MetricsFlushError::Write(err.kind()))?;
+    fn write_minimal_metrics(
+        &mut self,
+        flush_count: u64,
+        diagnostics: &MetricsDiagnostics,
+    ) -> Result<(), MetricsFlushError> {
+        let mut vmm = serde_json::Map::new();
+        if let Some(status) = diagnostics.boot_run_loop_status() {
+            vmm.insert(
+                "boot_run_loop_status".to_string(),
+                serde_json::Value::String(status.as_str().to_string()),
+            );
+        }
+        vmm.insert(
+            "metrics_flush_count".to_string(),
+            serde_json::Value::Number(flush_count.into()),
+        );
+
+        let mut root = serde_json::Map::new();
+        root.insert("vmm".to_string(), serde_json::Value::Object(vmm));
+
+        writeln!(self.writer, "{}", serde_json::Value::Object(root))
+            .map_err(|err| MetricsFlushError::Write(err.kind()))?;
         self.writer
             .flush()
             .map_err(|err| MetricsFlushError::Write(err.kind()))
@@ -146,7 +208,10 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{MetricsConfigError, MetricsConfigInput, MetricsFlushError, MetricsState};
+    use super::{
+        BootRunLoopMetricStatus, MetricsConfigError, MetricsConfigInput, MetricsDiagnostics,
+        MetricsFlushError, MetricsState,
+    };
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -203,6 +268,27 @@ mod tests {
         assert_eq!(
             output,
             "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"vmm\":{\"metrics_flush_count\":2}}\n"
+        );
+
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn writes_boot_run_loop_diagnostics_when_provided() {
+        let path = unique_metrics_path("diagnostics");
+        let mut state = MetricsState::default();
+        let diagnostics =
+            MetricsDiagnostics::new().with_boot_run_loop_status(BootRunLoopMetricStatus::Failed);
+
+        state
+            .configure(MetricsConfigInput::new(&path))
+            .expect("metrics should configure");
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("metrics output should be readable");
+        assert_eq!(
+            output,
+            "{\"vmm\":{\"boot_run_loop_status\":\"failed\",\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(path).expect("fixture should clean up");

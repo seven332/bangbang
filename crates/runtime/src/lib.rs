@@ -385,20 +385,7 @@ impl VmmController {
                 Err(VmmActionError::UnsupportedAction(action_name))
             }
             VmmAction::FlushMetrics => {
-                if self.instance_info.state != InstanceState::Running {
-                    return Err(VmmActionError::UnsupportedState {
-                        action: action_name,
-                        state: self.instance_info.state,
-                    });
-                }
-
-                self.metrics_state
-                    .flush()
-                    .map_err(VmmActionError::MetricsFlush)?;
-                self.logger_state
-                    .log_action(VmmAction::FlushMetrics.name())
-                    .map_err(VmmActionError::LoggerWrite)?;
-                Ok(VmmData::Empty)
+                self.flush_metrics_with_diagnostics(&metrics::MetricsDiagnostics::default())
             }
             VmmAction::PutBootSource(config) => {
                 if self.instance_info.state != InstanceState::NotStarted {
@@ -531,6 +518,26 @@ impl VmmController {
                 Ok(VmmData::Empty)
             }
         }
+    }
+
+    pub fn flush_metrics_with_diagnostics(
+        &mut self,
+        diagnostics: &metrics::MetricsDiagnostics,
+    ) -> Result<VmmData, VmmActionError> {
+        if self.instance_info.state != InstanceState::Running {
+            return Err(VmmActionError::UnsupportedState {
+                action: VmmAction::FlushMetrics.name(),
+                state: self.instance_info.state,
+            });
+        }
+
+        self.metrics_state
+            .flush_with_diagnostics(diagnostics)
+            .map_err(VmmActionError::MetricsFlush)?;
+        self.logger_state
+            .log_action(VmmAction::FlushMetrics.name())
+            .map_err(VmmActionError::LoggerWrite)?;
+        Ok(VmmData::Empty)
     }
 }
 
