@@ -117,9 +117,10 @@ misconfigured hosts fail.
 
 ## Guest Boot Artifacts
 
-Guest boot tests use the pinned Firecracker arm64 kernel and a deterministic
-tiny initrd. The integration runner prepares both when `guest_boot` is selected.
-To prepare only the kernel cache, run:
+Guest boot tests use the pinned Firecracker arm64 kernel, a deterministic tiny
+initrd, and the pinned Firecracker rootfs artifact. The integration runner
+prepares them when `guest_boot` is selected. To prepare only the kernel cache,
+run:
 
 ```sh
 scripts/fetch-firecracker-kernel.sh
@@ -145,7 +146,12 @@ mounts procfs and writes `/proc/cmdline` to serial between deterministic markers
 so a root-drive scenario can verify guest-visible `root=/dev/vda ro` arguments.
 A writable virtio-block scenario writes `BANGBANG_BLOCK_WRITE_OK` from the
 guest to `/dev/vda`, and the host-side test verifies the marker in a scratch
-backing file. Rootfs boot remains separate follow-up coverage.
+backing file. A rootfs artifact scenario attaches the cached Firecracker
+squashfs as a read-only root drive, mounts it from the tiny initrd, reads
+`/mnt/etc/os-release`, and expects `BANGBANG_ROOTFS_READ_OK` plus stable Ubuntu
+os-release content on serial. This verifies guest-visible rootfs access through
+virtio-block; full rootfs boot with an init process from that rootfs remains
+separate follow-up coverage.
 
 The pinned Firecracker CI rootfs artifact can be prepared separately:
 
@@ -157,7 +163,9 @@ By default this stores and verifies
 `.tmp/guest-artifacts/firecracker-ci/v1.15/aarch64/ubuntu-24.04.squashfs` and
 prints its path. The script verifies the pinned SHA-256 before reusing or
 installing the cached squashfs. The upstream Firecracker artifact is a
-read-only squashfs; do not mutate it in tests.
+read-only squashfs; do not mutate it in tests. The signed `guest_boot`
+integration target uses this cached squashfs directly for its read-only rootfs
+access scenario.
 
 To prepare a local ext4 image from that squashfs, install the local tools and
 request ext4 output:
