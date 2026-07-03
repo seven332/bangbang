@@ -39,7 +39,9 @@ LINUX_AARCH64_SYSCALL_WRITE = 64
 LINUX_AARCH64_SYSCALL_EXIT = 93
 # The tiny init has no UART drain loop, so keep serial writes within the FIFO depth.
 GUEST_SERIAL_WRITE_CHUNK_SIZE = 16
-GUEST_CMDLINE_BUFFER_SIZE = 512
+# Match bangbang's arm64 command-line capacity so the serial capture can include
+# any valid guest command line plus the zero-filled tail after a shorter read.
+GUEST_CMDLINE_BUFFER_SIZE = 2048
 
 S_IFDIR = 0o040000
 S_IFCHR = 0o020000
