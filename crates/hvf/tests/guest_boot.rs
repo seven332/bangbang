@@ -15,6 +15,10 @@ const BOOT_MARKER: &[u8] = b"BANGBANG_BOOT_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const BLOCK_READ_MARKER: &[u8] = b"BANGBANG_BLOCK_READ_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const CMDLINE_BEGIN_MARKER: &[u8] = b"BANGBANG_CMDLINE_BEGIN";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const CMDLINE_END_MARKER: &[u8] = b"BANGBANG_CMDLINE_END";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/init";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const GUEST_BOOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -69,6 +73,36 @@ fn boots_firecracker_kernel_and_reads_virtio_block_marker() {
         "guest block read test should still observe boot marker\nserial output:\n{}",
         String::from_utf8_lossy(&observation.serial_bytes)
     );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn boots_firecracker_kernel_with_root_drive_boot_args() {
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::DriveConfigInput;
+
+    let _test_lock = GUEST_BOOT_TEST_LOCK
+        .lock()
+        .expect("guest boot integration test lock should not be poisoned");
+    let backing = GuestBlockBacking::new(BLOCK_READ_MARKER);
+    let observation = run_guest_boot_until_marker(
+        "guest-root-drive-cmdline",
+        CMDLINE_END_MARKER,
+        |controller| {
+            controller
+                .handle_action(VmmAction::PutDrive(
+                    DriveConfigInput::new("rootfs", "rootfs", backing.path(), true)
+                        .with_is_read_only(true),
+                ))
+                .expect("guest root drive should configure");
+        },
+    );
+
+    assert_guest_boot_observed_marker(&observation, CMDLINE_END_MARKER, "cmdline end marker");
+    let cmdline = guest_cmdline_capture(&observation);
+    assert_guest_cmdline_contains_arg(cmdline, b"root=/dev/vda");
+    assert_guest_cmdline_contains_arg(cmdline, b"ro");
+    assert_guest_cmdline_contains_arg(cmdline, b"rdinit=/init");
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -319,7 +353,7 @@ impl Drop for GuestBootWatchdog {
 struct GuestBootDiagnostics {
     kernel_path: std::path::PathBuf,
     initrd_path: std::path::PathBuf,
-    boot_args: &'static str,
+    boot_args: String,
     boot_pc: u64,
     fdt_address: u64,
     fdt_size: usize,
@@ -357,11 +391,16 @@ impl GuestBootDiagnostics {
             session.serial_interrupt_line(),
             "guest boot test runtime and HVF serial interrupt metadata should match"
         );
+        let boot_args = resources
+            .loaded_boot_source
+            .command_line
+            .as_str()
+            .to_string();
 
         Self {
             kernel_path,
             initrd_path,
-            boot_args: BOOT_ARGS,
+            boot_args,
             boot_pc: session.boot_registers().kernel_entry.raw_value(),
             fdt_address: resources.fdt.address.raw_value(),
             fdt_size: resources.fdt.size,
@@ -573,7 +612,7 @@ fn validate_pre_run_boot_metadata(
     let resources = session.runtime_resources();
     assert_eq!(
         resources.loaded_boot_source.command_line.as_str(),
-        BOOT_ARGS,
+        diagnostics.boot_args,
         "guest boot test boot args should match diagnostics"
     );
     assert_eq!(
@@ -597,7 +636,7 @@ fn validate_pre_run_boot_metadata(
     let chosen = tree
         .find("/chosen")
         .expect("guest boot test FDT should contain /chosen");
-    assert_eq!(chosen.prop_str("bootargs").unwrap(), BOOT_ARGS);
+    assert_eq!(chosen.prop_str("bootargs").unwrap(), diagnostics.boot_args);
     assert_eq!(
         chosen.prop_u64("linux,initrd-start").unwrap(),
         diagnostics.initrd_address
@@ -681,6 +720,52 @@ fn bytes_contain_marker(bytes: &[u8], marker: &[u8]) -> bool {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn guest_cmdline_capture(observation: &GuestBootObservation) -> &[u8] {
+    bytes_between_markers(
+        &observation.serial_bytes,
+        CMDLINE_BEGIN_MARKER,
+        CMDLINE_END_MARKER,
+    )
+    .unwrap_or_else(|| {
+        panic!(
+            "guest serial output did not contain marker-bounded /proc/cmdline\nserial output:\n{}",
+            String::from_utf8_lossy(&observation.serial_bytes)
+        )
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn bytes_between_markers<'a>(bytes: &'a [u8], begin: &[u8], end: &[u8]) -> Option<&'a [u8]> {
+    let begin_start = bytes
+        .windows(begin.len())
+        .position(|window| window == begin)?;
+    let content_start = begin_start + begin.len();
+    let content = &bytes[content_start..];
+    let end_start = content
+        .windows(end.len())
+        .position(|window| window == end)?;
+
+    Some(&content[..end_start])
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn assert_guest_cmdline_contains_arg(cmdline: &[u8], expected: &[u8]) {
+    assert!(
+        guest_cmdline_contains_arg(cmdline, expected),
+        "guest /proc/cmdline did not contain argument {:?}\ncmdline bytes:\n{}",
+        String::from_utf8_lossy(expected),
+        String::from_utf8_lossy(cmdline)
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn guest_cmdline_contains_arg(cmdline: &[u8], expected: &[u8]) -> bool {
+    cmdline
+        .split(|byte| byte.is_ascii_whitespace() || *byte == 0)
+        .any(|arg| arg == expected)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn serial_tail_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
 
@@ -699,7 +784,8 @@ fn serial_tail_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         GuestBootDiagnostics, GuestBootFailureReport, GuestBootRunDiagnostics,
-        bytes_contain_marker, run_loop_completed_steps,
+        bytes_between_markers, bytes_contain_marker, guest_cmdline_contains_arg,
+        run_loop_completed_steps,
     };
 
     #[test]
@@ -757,7 +843,7 @@ mod tests {
         let boot = GuestBootDiagnostics {
             kernel_path: "/tmp/vmlinux".into(),
             initrd_path: "/tmp/initrd.cpio".into(),
-            boot_args: super::BOOT_ARGS,
+            boot_args: super::BOOT_ARGS.to_string(),
             boot_pc: 0x8020_0000,
             fdt_address: 0x87e0_0000,
             fdt_size: 4096,
@@ -820,5 +906,27 @@ mod tests {
             b"BANGBANG_BOOT_OK\r\n",
             super::BOOT_MARKER
         ));
+    }
+
+    #[test]
+    fn bytes_between_markers_extracts_payload() {
+        assert_eq!(
+            bytes_between_markers(b"prefix BEGINpayloadEND suffix", b"BEGIN", b"END"),
+            Some(&b"payload"[..])
+        );
+        assert_eq!(
+            bytes_between_markers(b"prefix BEGINpayload suffix", b"BEGIN", b"END"),
+            None
+        );
+    }
+
+    #[test]
+    fn guest_cmdline_arg_match_requires_exact_token() {
+        let cmdline = b"console=ttyS0 root=/dev/vda ro\0";
+
+        assert!(guest_cmdline_contains_arg(cmdline, b"root=/dev/vda"));
+        assert!(guest_cmdline_contains_arg(cmdline, b"ro"));
+        assert!(!guest_cmdline_contains_arg(cmdline, b"root=/dev"));
+        assert!(!guest_cmdline_contains_arg(cmdline, b"r"));
     }
 }

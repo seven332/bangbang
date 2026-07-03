@@ -140,8 +140,10 @@ integration test. The test succeeds when the guest emits `BANGBANG_BOOT_OK` on
 the internal serial console. The same signed target also includes a raw
 virtio-block read scenario: the test configures one temporary drive whose first
 sector contains `BANGBANG_BLOCK_READ_OK`, mounts `devtmpfs` from the tiny
-`/init`, reads `/dev/vda`, and expects the marker to appear on serial. Rootfs
-boot and guest writes are separate follow-up coverage.
+`/init`, reads `/dev/vda`, and expects the marker to appear on serial. It also
+mounts procfs and writes `/proc/cmdline` to serial between deterministic markers
+so a root-drive scenario can verify guest-visible `root=/dev/vda ro` arguments.
+Rootfs boot and guest writes are separate follow-up coverage.
 
 The pinned Firecracker CI rootfs artifact can be prepared separately:
 
