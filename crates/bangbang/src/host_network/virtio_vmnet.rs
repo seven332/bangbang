@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use bangbang_runtime::memory::{GuestMemory, GuestMemoryAccessError};
 use bangbang_runtime::mmds::{
-    MmdsGuestTcpPacket, MmdsGuestTcpResponseContext, MmdsGuestTcpResponseFrameError,
-    MmdsStateHandle, MmdsStateLockError, classify_mmds_guest_tcp_packet,
+    MmdsGuestArpResponseFrameError, MmdsGuestTcpPacket, MmdsGuestTcpResponseContext,
+    MmdsGuestTcpResponseFrameError, MmdsStateHandle, MmdsStateLockError,
+    classify_mmds_guest_arp_request, classify_mmds_guest_tcp_packet,
 };
 use bangbang_runtime::network::{
     VIRTIO_NET_MAX_BUFFER_SIZE, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
@@ -83,6 +84,15 @@ impl MmdsPacketDetour {
     }
 
     fn detour_packet(&mut self, packet: &[u8]) -> Result<bool, MmdsPacketDetourError> {
+        if let Some(arp_request) = classify_mmds_guest_arp_request(packet, self.mmds_ipv4_address) {
+            self.response_queue.push_priority_with(|| {
+                arp_request
+                    .response_frame()
+                    .map_err(MmdsPacketDetourError::ArpResponseFrame)
+            })?;
+            return Ok(true);
+        }
+
         let Some(classified) = classify_mmds_guest_tcp_packet(packet, self.mmds_ipv4_address)
         else {
             return Ok(false);
@@ -364,6 +374,21 @@ impl MmdsResponseQueue {
         &self,
         response: impl FnOnce() -> Result<Vec<u8>, MmdsPacketDetourError>,
     ) -> Result<(), MmdsPacketDetourError> {
+        self.push_with_direction(response, MmdsResponseQueueDirection::Normal)
+    }
+
+    fn push_priority_with(
+        &self,
+        response: impl FnOnce() -> Result<Vec<u8>, MmdsPacketDetourError>,
+    ) -> Result<(), MmdsPacketDetourError> {
+        self.push_with_direction(response, MmdsResponseQueueDirection::Priority)
+    }
+
+    fn push_with_direction(
+        &self,
+        response: impl FnOnce() -> Result<Vec<u8>, MmdsPacketDetourError>,
+        direction: MmdsResponseQueueDirection,
+    ) -> Result<(), MmdsPacketDetourError> {
         let mut state = self
             .state
             .lock()
@@ -377,7 +402,26 @@ impl MmdsResponseQueue {
         }
 
         let response = response()?;
-        state.responses.push_back(response);
+        match direction {
+            MmdsResponseQueueDirection::Normal => state.responses.push_back(MmdsQueuedResponse {
+                priority: MmdsResponseQueuePriority::Normal,
+                frame: response,
+            }),
+            MmdsResponseQueueDirection::Priority => {
+                let insert_at = state
+                    .responses
+                    .iter()
+                    .position(|queued| queued.priority == MmdsResponseQueuePriority::Normal)
+                    .unwrap_or(state.responses.len());
+                state.responses.insert(
+                    insert_at,
+                    MmdsQueuedResponse {
+                        priority: MmdsResponseQueuePriority::Priority,
+                        frame: response,
+                    },
+                );
+            }
+        }
         Ok(())
     }
 
@@ -389,7 +433,7 @@ impl MmdsResponseQueue {
         let Some(response) = state.responses.front() else {
             return Ok(None);
         };
-        let len = response.len();
+        let len = response.frame.len();
         let Some(target) = buffer.get_mut(..len) else {
             return Err(MmdsResponseQueueError::ResponseFrameTooLarge {
                 len,
@@ -397,7 +441,7 @@ impl MmdsResponseQueue {
             });
         };
 
-        target.copy_from_slice(response);
+        target.copy_from_slice(&response.frame);
         Ok(Some(len))
     }
 
@@ -424,7 +468,11 @@ impl MmdsResponseQueue {
             .state
             .lock()
             .map_err(|_| MmdsResponseQueueError::Poisoned)?;
-        Ok(state.responses.iter().cloned().collect())
+        Ok(state
+            .responses
+            .iter()
+            .map(|response| response.frame.clone())
+            .collect())
     }
 
     #[cfg(test)]
@@ -436,7 +484,25 @@ impl MmdsResponseQueue {
 #[derive(Debug)]
 struct MmdsResponseQueueState {
     capacity: usize,
-    responses: VecDeque<Vec<u8>>,
+    responses: VecDeque<MmdsQueuedResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MmdsQueuedResponse {
+    priority: MmdsResponseQueuePriority,
+    frame: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MmdsResponseQueueDirection {
+    Normal,
+    Priority,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MmdsResponseQueuePriority {
+    Normal,
+    Priority,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -465,6 +531,7 @@ impl std::error::Error for MmdsResponseQueueError {}
 
 #[derive(Debug)]
 enum MmdsPacketDetourError {
+    ArpResponseFrame(MmdsGuestArpResponseFrameError),
     MmdsState(MmdsStateLockError),
     RequestBuffer(MmdsRequestBufferError),
     ResponseFrame(MmdsGuestTcpResponseFrameError),
@@ -474,6 +541,7 @@ enum MmdsPacketDetourError {
 impl fmt::Display for MmdsPacketDetourError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ArpResponseFrame(source) => write!(f, "{source}"),
             Self::MmdsState(source) => write!(f, "{source}"),
             Self::RequestBuffer(source) => write!(f, "{source}"),
             Self::ResponseFrame(source) => write!(f, "{source}"),
@@ -485,6 +553,7 @@ impl fmt::Display for MmdsPacketDetourError {
 impl std::error::Error for MmdsPacketDetourError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::ArpResponseFrame(source) => Some(source),
             Self::MmdsState(source) => Some(source),
             Self::RequestBuffer(source) => Some(source),
             Self::ResponseFrame(source) => Some(source),
@@ -1047,8 +1116,8 @@ mod tests {
         GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
     };
     use bangbang_runtime::mmds::{
-        DEFAULT_MMDS_IPV4_ADDRESS, MMDS_GUEST_TCP_PORT, MmdsConfigInput, MmdsStateHandle,
-        MmdsVersion,
+        DEFAULT_MMDS_IPV4_ADDRESS, DEFAULT_MMDS_MAC_ADDRESS, MMDS_GUEST_TCP_PORT, MmdsConfigInput,
+        MmdsStateHandle, MmdsVersion,
     };
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::network::{
@@ -1073,11 +1142,26 @@ mod tests {
     const HEADER_ADDRESS: GuestAddress = GuestAddress::new(0x2000);
     const PAYLOAD_ADDRESS: GuestAddress = GuestAddress::new(0x3000);
     const SECOND_PAYLOAD_ADDRESS: GuestAddress = GuestAddress::new(0x4000);
+    const THIRD_PAYLOAD_ADDRESS: GuestAddress = GuestAddress::new(0x5000);
     const ETHERNET_HEADER_LEN: usize = 14;
+    const ETHERNET_ETHERTYPE_ARP: u16 = 0x0806;
+    const ETHERNET_ETHERTYPE_IPV4: u16 = 0x0800;
     const IPV4_HEADER_LEN: usize = 20;
     const TCP_HEADER_LEN: usize = 20;
+    const ARP_HARDWARE_TYPE_ETHERNET: u16 = 1;
+    const ARP_OPERATION_REQUEST: u16 = 1;
+    const ARP_OPERATION_REPLY: u16 = 2;
+    const ARP_PROTOCOL_TYPE_IPV4: u16 = ETHERNET_ETHERTYPE_IPV4;
+    const ARP_HEADER_LEN: usize = 28;
+    const ARP_OPERATION_OFFSET: usize = 6;
+    const ARP_SENDER_HARDWARE_ADDRESS_OFFSET: usize = 8;
+    const ARP_SENDER_PROTOCOL_ADDRESS_OFFSET: usize = 14;
+    const ARP_TARGET_HARDWARE_ADDRESS_OFFSET: usize = 18;
+    const ARP_TARGET_PROTOCOL_ADDRESS_OFFSET: usize = 24;
     const TEST_SOURCE_IPV4_ADDRESS: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
     const TEST_SOURCE_TCP_PORT: u16 = 49_152;
+    const TEST_SOURCE_ETHERNET_ADDRESS: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+    const TEST_DESTINATION_ETHERNET_ADDRESS: [u8; 6] = [0xff; 6];
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct FakeInterface;
@@ -1327,6 +1411,35 @@ mod tests {
         )
     }
 
+    fn arp_ipv4_request(target_ipv4_address: Ipv4Addr, operation: u16) -> Vec<u8> {
+        arp_ipv4_request_from(TEST_SOURCE_IPV4_ADDRESS, target_ipv4_address, operation)
+    }
+
+    fn arp_ipv4_request_from(
+        source_ipv4_address: Ipv4Addr,
+        target_ipv4_address: Ipv4Addr,
+        operation: u16,
+    ) -> Vec<u8> {
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&TEST_DESTINATION_ETHERNET_ADDRESS);
+        packet.extend_from_slice(&TEST_SOURCE_ETHERNET_ADDRESS);
+        packet.extend_from_slice(&ETHERNET_ETHERTYPE_ARP.to_be_bytes());
+        packet.extend_from_slice(&ARP_HARDWARE_TYPE_ETHERNET.to_be_bytes());
+        packet.extend_from_slice(&ARP_PROTOCOL_TYPE_IPV4.to_be_bytes());
+        packet.push(6);
+        packet.push(4);
+        packet.extend_from_slice(&operation.to_be_bytes());
+        packet.extend_from_slice(&TEST_SOURCE_ETHERNET_ADDRESS);
+        packet.extend_from_slice(&source_ipv4_address.octets());
+        packet.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        packet.extend_from_slice(&target_ipv4_address.octets());
+        packet
+    }
+
+    fn mmds_arp_request() -> Vec<u8> {
+        arp_ipv4_request(DEFAULT_MMDS_IPV4_ADDRESS, ARP_OPERATION_REQUEST)
+    }
+
     fn v2_mmds_state_handle() -> MmdsStateHandle {
         let handle = MmdsStateHandle::default();
         let configured_network_interface =
@@ -1351,6 +1464,14 @@ mod tests {
             .expect("MMDS response frame should include TCP payload")
     }
 
+    fn ethernet_ethertype(frame: &[u8]) -> u16 {
+        u16::from_be_bytes(
+            frame[12..14]
+                .try_into()
+                .expect("Ethernet frame should include ethertype"),
+        )
+    }
+
     fn mmds_response_frame_acknowledgement_number(response_frame: &[u8]) -> u32 {
         let tcp = ETHERNET_HEADER_LEN + IPV4_HEADER_LEN;
         u32::from_be_bytes(
@@ -1358,6 +1479,67 @@ mod tests {
                 .try_into()
                 .expect("MMDS response frame should include TCP acknowledgement number"),
         )
+    }
+
+    fn mmds_arp_reply_target_protocol_address(response_frame: &[u8]) -> Ipv4Addr {
+        let arp = response_frame
+            .get(ETHERNET_HEADER_LEN..)
+            .expect("ARP reply should include payload");
+        let octets: [u8; 4] = arp
+            .get(ARP_TARGET_PROTOCOL_ADDRESS_OFFSET..ARP_TARGET_PROTOCOL_ADDRESS_OFFSET + 4)
+            .expect("ARP reply should include target protocol address")
+            .try_into()
+            .expect("ARP target protocol address should be 4 bytes");
+        Ipv4Addr::from(octets)
+    }
+
+    fn assert_mmds_arp_reply(response_frame: &[u8], target_ipv4_address: Ipv4Addr) {
+        assert_eq!(response_frame.len(), ETHERNET_HEADER_LEN + ARP_HEADER_LEN);
+        assert_eq!(
+            response_frame
+                .get(0..6)
+                .expect("ARP reply should include destination MAC"),
+            TEST_SOURCE_ETHERNET_ADDRESS
+        );
+        assert_eq!(
+            response_frame
+                .get(6..12)
+                .expect("ARP reply should include source MAC"),
+            DEFAULT_MMDS_MAC_ADDRESS.octets()
+        );
+        assert_eq!(ethernet_ethertype(response_frame), ETHERNET_ETHERTYPE_ARP);
+
+        let arp = response_frame
+            .get(ETHERNET_HEADER_LEN..)
+            .expect("ARP reply should include payload");
+        assert_eq!(
+            u16::from_be_bytes(
+                arp[ARP_OPERATION_OFFSET..ARP_OPERATION_OFFSET + 2]
+                    .try_into()
+                    .expect("ARP reply should include operation")
+            ),
+            ARP_OPERATION_REPLY
+        );
+        assert_eq!(
+            arp.get(ARP_SENDER_HARDWARE_ADDRESS_OFFSET..ARP_SENDER_HARDWARE_ADDRESS_OFFSET + 6)
+                .expect("ARP reply should include sender hardware address"),
+            DEFAULT_MMDS_MAC_ADDRESS.octets()
+        );
+        assert_eq!(
+            arp.get(ARP_SENDER_PROTOCOL_ADDRESS_OFFSET..ARP_SENDER_PROTOCOL_ADDRESS_OFFSET + 4)
+                .expect("ARP reply should include sender protocol address"),
+            target_ipv4_address.octets()
+        );
+        assert_eq!(
+            arp.get(ARP_TARGET_HARDWARE_ADDRESS_OFFSET..ARP_TARGET_HARDWARE_ADDRESS_OFFSET + 6)
+                .expect("ARP reply should include target hardware address"),
+            TEST_SOURCE_ETHERNET_ADDRESS
+        );
+        assert_eq!(
+            arp.get(ARP_TARGET_PROTOCOL_ADDRESS_OFFSET..ARP_TARGET_PROTOCOL_ADDRESS_OFFSET + 4)
+                .expect("ARP reply should include target protocol address"),
+            TEST_SOURCE_IPV4_ADDRESS.octets()
+        );
     }
 
     fn mmds_response_body(response_frame: &[u8]) -> &[u8] {
@@ -1627,6 +1809,289 @@ mod tests {
                 .expect("MMDS response queue should read")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn tx_sink_detours_mmds_arp_request_and_retains_reply_frame() {
+        let packet = mmds_arp_request();
+        let mut memory = tx_memory();
+        let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        let mut packet_io = packet_io_with_mmds_detour(
+            FakeVmnetPacketIoBackend::default(),
+            MmdsStateHandle::default(),
+            response_queue.clone(),
+        );
+
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &frame)
+            .expect("MMDS ARP request should detour");
+
+        let state = packet_io
+            .tx_sink()
+            .shared
+            .lock()
+            .expect("test state lock should succeed");
+        assert_eq!(state.backend.write_calls, 0);
+        drop(state);
+        let responses = response_queue
+            .responses()
+            .expect("MMDS response queue should read");
+        assert_eq!(responses.len(), 1);
+        assert_mmds_arp_reply(&responses[0], DEFAULT_MMDS_IPV4_ADDRESS);
+    }
+
+    #[test]
+    fn packet_io_delivers_detoured_mmds_arp_reply_through_rx_source() {
+        let packet = mmds_arp_request();
+        let mut memory = tx_memory();
+        let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        let mut packet_io = packet_io_with_mmds_detour(
+            FakeVmnetPacketIoBackend::default().with_read_result(Ok(Some(vec![0xaa]))),
+            MmdsStateHandle::default(),
+            response_queue,
+        );
+
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &frame)
+            .expect("MMDS ARP request should detour");
+        let response = packet_io
+            .rx_source()
+            .peek_packet()
+            .expect("MMDS ARP reply RX should succeed")
+            .expect("MMDS ARP reply should be present");
+
+        assert_mmds_arp_reply(response.bytes(), DEFAULT_MMDS_IPV4_ADDRESS);
+        let state = packet_io
+            .rx_source()
+            .shared
+            .lock()
+            .expect("test state lock should succeed");
+        assert_eq!(state.backend.read_calls, 0);
+    }
+
+    #[test]
+    fn tx_sink_detours_only_configured_mmds_arp_ipv4_address() {
+        let configured_mmds_address = Ipv4Addr::new(169, 254, 169, 253);
+        let configured_packet = arp_ipv4_request(configured_mmds_address, ARP_OPERATION_REQUEST);
+        let default_packet = mmds_arp_request();
+        let mut memory = tx_memory();
+        let configured_frame = tx_frame(&mut memory, &[(&configured_packet, PAYLOAD_ADDRESS)]);
+        let default_frame = tx_frame(&mut memory, &[(&default_packet, SECOND_PAYLOAD_ADDRESS)]);
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        let detour = MmdsPacketDetour::new(
+            MmdsStateHandle::default(),
+            configured_mmds_address,
+            response_queue.clone(),
+        );
+        let mut packet_io = VmnetVirtioNetworkPacketIo::with_mmds_detour(
+            FakeVmnetPacketIoBackend::default(),
+            fake_interface(),
+            detour,
+        )
+        .expect("packet I/O with MMDS detour should build");
+
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &configured_frame)
+            .expect("configured MMDS ARP request should detour");
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &default_frame)
+            .expect("default MMDS ARP request should forward");
+
+        let state = packet_io
+            .tx_sink()
+            .shared
+            .lock()
+            .expect("test state lock should succeed");
+        assert_eq!(state.backend.write_calls, 1);
+        assert_eq!(state.backend.written_packets, [default_packet]);
+        drop(state);
+        let responses = response_queue
+            .responses()
+            .expect("MMDS response queue should read");
+        assert_eq!(responses.len(), 1);
+        assert_mmds_arp_reply(&responses[0], configured_mmds_address);
+    }
+
+    #[test]
+    fn tx_sink_forwards_non_mmds_or_malformed_arp_when_detour_configured() {
+        let wrong_target = arp_ipv4_request(Ipv4Addr::new(192, 0, 2, 99), ARP_OPERATION_REQUEST);
+        let arp_reply = arp_ipv4_request(DEFAULT_MMDS_IPV4_ADDRESS, ARP_OPERATION_REPLY);
+        let truncated = mmds_arp_request()
+            .into_iter()
+            .take(ETHERNET_HEADER_LEN + ARP_HEADER_LEN - 1)
+            .collect::<Vec<_>>();
+        let mut memory = tx_memory();
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        let mut packet_io = packet_io_with_mmds_detour(
+            FakeVmnetPacketIoBackend::default(),
+            MmdsStateHandle::default(),
+            response_queue.clone(),
+        );
+
+        for packet in [&wrong_target, &arp_reply, &truncated] {
+            let frame = tx_frame(&mut memory, &[(packet, PAYLOAD_ADDRESS)]);
+            packet_io
+                .tx_sink()
+                .transmit_frame(&memory, &frame)
+                .expect("non-MMDS ARP packet should forward");
+        }
+
+        let state = packet_io
+            .tx_sink()
+            .shared
+            .lock()
+            .expect("test state lock should succeed");
+        assert_eq!(state.backend.write_calls, 3);
+        assert_eq!(
+            state.backend.written_packets,
+            [wrong_target, arp_reply, truncated]
+        );
+        drop(state);
+        assert!(
+            response_queue
+                .responses()
+                .expect("MMDS response queue should read")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn tx_sink_mmds_arp_queue_overflow_does_not_mutate_token_state() {
+        let packet = mmds_arp_request();
+        let mut memory = tx_memory();
+        let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
+        let response_queue = MmdsResponseQueue::with_capacity(0);
+        let mmds_state = v2_mmds_state_handle();
+        let state_before = mmds_state
+            .with(Clone::clone)
+            .expect("MMDS state should lock");
+        let mut packet_io = packet_io_with_mmds_detour(
+            FakeVmnetPacketIoBackend::default(),
+            mmds_state.clone(),
+            response_queue,
+        );
+
+        let error = packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &frame)
+            .expect_err("queue overflow should fail MMDS ARP TX");
+
+        assert!(
+            error
+                .message()
+                .contains("MMDS packet detour failed: MMDS response queue is full at capacity 0")
+        );
+        assert_eq!(
+            mmds_state
+                .with(Clone::clone)
+                .expect("MMDS state should lock"),
+            state_before
+        );
+        let state = packet_io
+            .tx_sink()
+            .shared
+            .lock()
+            .expect("test state lock should succeed");
+        assert_eq!(state.backend.write_calls, 0);
+    }
+
+    #[test]
+    fn tx_sink_prioritizes_mmds_arp_reply_before_queued_tcp_response() {
+        let tcp_packet = mmds_tcp_packet(b"GET /meta-data/hostname HTTP/1.1\r\n\r\n");
+        let arp_packet = mmds_arp_request();
+        let mut memory = tx_memory();
+        let tcp_frame = tx_frame(&mut memory, &[(&tcp_packet, PAYLOAD_ADDRESS)]);
+        let arp_frame = tx_frame(&mut memory, &[(&arp_packet, SECOND_PAYLOAD_ADDRESS)]);
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        let mut packet_io = packet_io_with_mmds_detour(
+            FakeVmnetPacketIoBackend::default(),
+            MmdsStateHandle::default(),
+            response_queue.clone(),
+        );
+
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &tcp_frame)
+            .expect("MMDS TCP request should detour");
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &arp_frame)
+            .expect("MMDS ARP request should detour");
+
+        let responses = response_queue
+            .responses()
+            .expect("MMDS response queue should read");
+        assert_eq!(responses.len(), 2);
+        assert_eq!(ethernet_ethertype(&responses[0]), ETHERNET_ETHERTYPE_ARP);
+        assert_mmds_arp_reply(&responses[0], DEFAULT_MMDS_IPV4_ADDRESS);
+        assert_eq!(ethernet_ethertype(&responses[1]), ETHERNET_ETHERTYPE_IPV4);
+        assert_eq!(
+            mmds_response_body(&responses[1]),
+            b"The MMDS data store is not initialized."
+        );
+    }
+
+    #[test]
+    fn tx_sink_preserves_mmds_arp_reply_order_before_queued_tcp_response() {
+        let tcp_packet = mmds_tcp_packet(b"GET /meta-data/hostname HTTP/1.1\r\n\r\n");
+        let first_arp_source_ipv4 = Ipv4Addr::new(192, 0, 2, 10);
+        let second_arp_source_ipv4 = Ipv4Addr::new(192, 0, 2, 11);
+        let first_arp_packet = arp_ipv4_request_from(
+            first_arp_source_ipv4,
+            DEFAULT_MMDS_IPV4_ADDRESS,
+            ARP_OPERATION_REQUEST,
+        );
+        let second_arp_packet = arp_ipv4_request_from(
+            second_arp_source_ipv4,
+            DEFAULT_MMDS_IPV4_ADDRESS,
+            ARP_OPERATION_REQUEST,
+        );
+        let mut memory = tx_memory();
+        let tcp_frame = tx_frame(&mut memory, &[(&tcp_packet, PAYLOAD_ADDRESS)]);
+        let first_arp_frame = tx_frame(&mut memory, &[(&first_arp_packet, SECOND_PAYLOAD_ADDRESS)]);
+        let second_arp_frame =
+            tx_frame(&mut memory, &[(&second_arp_packet, THIRD_PAYLOAD_ADDRESS)]);
+        let response_queue = MmdsResponseQueue::with_capacity(3);
+        let mut packet_io = packet_io_with_mmds_detour(
+            FakeVmnetPacketIoBackend::default(),
+            MmdsStateHandle::default(),
+            response_queue.clone(),
+        );
+
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &tcp_frame)
+            .expect("MMDS TCP request should detour");
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &first_arp_frame)
+            .expect("first MMDS ARP request should detour");
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &second_arp_frame)
+            .expect("second MMDS ARP request should detour");
+
+        let responses = response_queue
+            .responses()
+            .expect("MMDS response queue should read");
+        assert_eq!(responses.len(), 3);
+        assert_eq!(ethernet_ethertype(&responses[0]), ETHERNET_ETHERTYPE_ARP);
+        assert_eq!(
+            mmds_arp_reply_target_protocol_address(&responses[0]),
+            first_arp_source_ipv4
+        );
+        assert_eq!(ethernet_ethertype(&responses[1]), ETHERNET_ETHERTYPE_ARP);
+        assert_eq!(
+            mmds_arp_reply_target_protocol_address(&responses[1]),
+            second_arp_source_ipv4
+        );
+        assert_eq!(ethernet_ethertype(&responses[2]), ETHERNET_ETHERTYPE_IPV4);
     }
 
     #[test]
