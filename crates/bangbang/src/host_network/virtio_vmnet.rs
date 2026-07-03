@@ -105,6 +105,9 @@ impl MmdsPacketDetour {
             })?;
             return Ok(true);
         }
+        if classified.is_acknowledgement_only() {
+            return Ok(true);
+        }
         if classified.payload().is_empty() {
             return Ok(false);
         }
@@ -1160,6 +1163,7 @@ mod tests {
     const TCP_ACKNOWLEDGEMENT_NUMBER_OFFSET: usize = 8;
     const TCP_FLAGS_OFFSET: usize = 13;
     const TCP_FLAG_ACK: u8 = 0x10;
+    const TCP_FLAG_FIN: u8 = 0x01;
     const TCP_FLAG_SYN: u8 = 0x02;
     const ARP_HARDWARE_TYPE_ETHERNET: u16 = 1;
     const ARP_OPERATION_REQUEST: u16 = 1;
@@ -2403,9 +2407,53 @@ mod tests {
     }
 
     #[test]
-    fn tx_sink_forwards_empty_non_syn_mmds_payload_when_detour_configured() {
+    fn tx_sink_consumes_mmds_ack_only_without_response() {
         let mut packet = mmds_tcp_packet(b"");
         set_tcp_flags(&mut packet, TCP_FLAG_ACK);
+        let mut memory = tx_memory();
+        let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        let mmds_state = v2_mmds_state_handle();
+        let state_before = mmds_state
+            .with(Clone::clone)
+            .expect("MMDS state should lock");
+        let mut packet_io = packet_io_with_mmds_detour(
+            FakeVmnetPacketIoBackend::default(),
+            mmds_state.clone(),
+            response_queue.clone(),
+        );
+
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &frame)
+            .expect("MMDS ACK-only TX should detour");
+
+        let state = packet_io
+            .tx_sink()
+            .shared
+            .lock()
+            .expect("test state lock should succeed");
+        assert_eq!(state.backend.write_calls, 0);
+        assert!(state.backend.written_packets.is_empty());
+        drop(state);
+        assert_eq!(
+            mmds_state
+                .with(Clone::clone)
+                .expect("MMDS state should lock"),
+            state_before
+        );
+        assert!(
+            response_queue
+                .responses()
+                .expect("MMDS response queue should read")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn tx_sink_forwards_empty_non_ack_mmds_payload_when_detour_configured() {
+        let mut packet = mmds_tcp_packet(b"");
+        set_tcp_flags(&mut packet, TCP_FLAG_FIN);
         let mut memory = tx_memory();
         let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
         let response_queue = MmdsResponseQueue::with_capacity(2);
@@ -2418,7 +2466,7 @@ mod tests {
         packet_io
             .tx_sink()
             .transmit_frame(&memory, &frame)
-            .expect("empty non-SYN MMDS TX should forward");
+            .expect("empty non-ACK MMDS TX should forward");
 
         let state = packet_io
             .tx_sink()
