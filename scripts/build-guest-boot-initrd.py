@@ -12,8 +12,13 @@ from pathlib import Path
 
 BOOT_MARKER = b"BANGBANG_BOOT_OK\n"
 BLOCK_READ_MARKER = b"BANGBANG_BLOCK_READ_OK"
+CMDLINE_BEGIN_MARKER = b"BANGBANG_CMDLINE_BEGIN\n"
+CMDLINE_END_MARKER = b"BANGBANG_CMDLINE_END\n"
 DEV_TMPFS_NAME = b"devtmpfs\0"
 DEV_PATH = b"/dev\0"
+PROC_FS_NAME = b"proc\0"
+PROC_PATH = b"/proc\0"
+PROC_CMDLINE_PATH = b"/proc/cmdline\0"
 VDA_PATH = b"/dev/vda\0"
 DEFAULT_RELATIVE_OUTPUT = Path("bangbang/guest-boot/initrd.cpio")
 CPIO_NEWC_HEADER_SIZE = 110
@@ -34,6 +39,7 @@ LINUX_AARCH64_SYSCALL_WRITE = 64
 LINUX_AARCH64_SYSCALL_EXIT = 93
 # The tiny init has no UART drain loop, so keep serial writes within the FIFO depth.
 GUEST_SERIAL_WRITE_CHUNK_SIZE = 16
+GUEST_CMDLINE_BUFFER_SIZE = 512
 
 S_IFDIR = 0o040000
 S_IFCHR = 0o020000
@@ -161,6 +167,40 @@ def build_guest_init_code(addresses: dict[str, int]) -> bytes:
     code.emit(
         b"".join(
             (
+                mov_imm_64(0, addresses["procfs"]),
+                mov_imm_64(1, addresses["proc"]),
+                mov_imm_64(2, addresses["procfs"]),
+                movz_64(3, 0),
+                movz_64(4, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_MOUNT),
+                svc_0(),
+            )
+        )
+    )
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(0, AT_FDCWD_U64),
+                mov_imm_64(1, addresses["proc_cmdline"]),
+                movz_64(2, 0),
+                movz_64(3, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_OPENAT),
+                svc_0(),
+                mov_imm_64(1, addresses["cmdline_buffer"]),
+                movz_64(2, GUEST_CMDLINE_BUFFER_SIZE),
+                movz_64(8, LINUX_AARCH64_SYSCALL_READ),
+                svc_0(),
+            )
+        )
+    )
+    code.emit(
+        write_syscalls(1, addresses["cmdline_begin_marker"], len(CMDLINE_BEGIN_MARKER))
+    )
+    code.emit(write_syscalls(1, addresses["cmdline_buffer"], GUEST_CMDLINE_BUFFER_SIZE))
+    code.emit(write_syscalls(1, addresses["cmdline_end_marker"], len(CMDLINE_END_MARKER)))
+    code.emit(
+        b"".join(
+            (
                 mov_imm_64(0, AT_FDCWD_U64),
                 mov_imm_64(1, addresses["vda"]),
                 movz_64(2, 0),
@@ -194,9 +234,15 @@ def build_guest_init_code(addresses: dict[str, int]) -> bytes:
 def guest_init_data() -> list[tuple[str, bytes]]:
     return [
         ("boot_marker", BOOT_MARKER),
+        ("cmdline_begin_marker", CMDLINE_BEGIN_MARKER),
+        ("cmdline_end_marker", CMDLINE_END_MARKER),
         ("devtmpfs", DEV_TMPFS_NAME),
         ("dev", DEV_PATH),
+        ("procfs", PROC_FS_NAME),
+        ("proc", PROC_PATH),
+        ("proc_cmdline", PROC_CMDLINE_PATH),
         ("vda", VDA_PATH),
+        ("cmdline_buffer", bytes(GUEST_CMDLINE_BUFFER_SIZE)),
         ("block_read_buffer", bytes(len(BLOCK_READ_MARKER))),
     ]
 
@@ -329,15 +375,16 @@ def build_initrd() -> bytes:
     archive = b"".join(
         (
             cpio_entry(name="dev", ino=1, mode=S_IFDIR | 0o755, nlink=2),
+            cpio_entry(name="proc", ino=2, mode=S_IFDIR | 0o755, nlink=2),
             cpio_entry(
                 name="dev/console",
-                ino=2,
+                ino=3,
                 mode=S_IFCHR | 0o600,
                 rdevmajor=5,
                 rdevminor=1,
             ),
-            cpio_entry(name="init", ino=3, mode=S_IFREG | 0o755, data=guest_init),
-            cpio_entry(name="TRAILER!!!", ino=4, mode=0, nlink=1),
+            cpio_entry(name="init", ino=4, mode=S_IFREG | 0o755, data=guest_init),
+            cpio_entry(name="TRAILER!!!", ino=5, mode=0, nlink=1),
         )
     )
     return pad512(archive)
@@ -431,13 +478,17 @@ def validate_initrd(data: bytes) -> None:
     parsed = parse_newc_entries(data)
     entries = {str(entry["name"]): entry for entry in parsed}
     names = [str(entry["name"]) for entry in parsed]
-    expected_names = ["dev", "dev/console", "init", CPIO_TRAILER]
+    expected_names = ["dev", "proc", "dev/console", "init", CPIO_TRAILER]
     if names != expected_names:
         raise RuntimeError(f"guest initrd entries {names!r} do not match {expected_names!r}")
 
     dev = required_entry(entries, "dev")
     if file_type(dev["mode"]) != S_IFDIR:
         raise RuntimeError("guest initrd dev entry is not a directory")
+
+    proc = required_entry(entries, "proc")
+    if file_type(proc["mode"]) != S_IFDIR:
+        raise RuntimeError("guest initrd proc entry is not a directory")
 
     console = required_entry(entries, "dev/console")
     if file_type(console["mode"]) != S_IFCHR:
@@ -453,7 +504,19 @@ def validate_initrd(data: bytes) -> None:
         raise RuntimeError("guest initrd init payload is not an ELF file")
     if BOOT_MARKER not in payload:
         raise RuntimeError("guest initrd init payload does not contain the boot marker")
-    for guest_path in (DEV_TMPFS_NAME, DEV_PATH, VDA_PATH):
+    for marker in (CMDLINE_BEGIN_MARKER, CMDLINE_END_MARKER):
+        if marker not in payload:
+            raise RuntimeError(
+                f"guest initrd init payload does not contain {marker!r}"
+            )
+    for guest_path in (
+        DEV_TMPFS_NAME,
+        DEV_PATH,
+        PROC_FS_NAME,
+        PROC_PATH,
+        PROC_CMDLINE_PATH,
+        VDA_PATH,
+    ):
         if guest_path not in payload:
             raise RuntimeError(
                 f"guest initrd init payload does not contain {guest_path!r}"
