@@ -3,7 +3,7 @@
 use std::collections::{TryReserveError, VecDeque};
 use std::fmt;
 use std::net::Ipv4Addr;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use bangbang_runtime::memory::{GuestMemory, GuestMemoryAccessError};
 use bangbang_runtime::mmds::{
@@ -166,9 +166,11 @@ impl MmdsResponseQueue {
     }
 
     fn may_have_response(&self) -> bool {
-        self.state
-            .lock()
-            .map_or(true, |state| !state.responses.is_empty())
+        match self.state.try_lock() {
+            Ok(state) => !state.responses.is_empty(),
+            Err(TryLockError::Poisoned(_)) => true,
+            Err(TryLockError::WouldBlock) => false,
+        }
     }
 
     fn pop_front(&self) -> Result<(), MmdsResponseQueueError> {
@@ -1385,6 +1387,33 @@ mod tests {
             .lock()
             .expect("test state lock should succeed");
         assert_eq!(state.backend.read_calls, 0);
+    }
+
+    #[test]
+    fn rx_source_retry_after_tx_hint_is_false_for_contended_mmds_queue_without_vmnet_read() {
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        push_mmds_response(&response_queue, &[0xaa, 0xbb]);
+        let mut packet_io = packet_io_with_mmds_detour(
+            FakeVmnetPacketIoBackend::default().with_read_result(Ok(Some(vec![0xcc]))),
+            MmdsStateHandle::default(),
+            response_queue.clone(),
+        );
+        let queue_guard = response_queue
+            .state
+            .lock()
+            .expect("test response queue lock should succeed");
+
+        assert!(!packet_io.rx_source().retry_after_tx_hint());
+        let state = packet_io
+            .rx_source()
+            .shared
+            .lock()
+            .expect("test state lock should succeed");
+        assert_eq!(state.backend.read_calls, 0);
+
+        drop(state);
+        drop(queue_guard);
+        assert!(packet_io.rx_source().retry_after_tx_hint());
     }
 
     #[test]
