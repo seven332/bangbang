@@ -1164,6 +1164,53 @@ mod tests {
     }
 
     #[test]
+    fn tx_sink_detours_only_configured_mmds_ipv4_address() {
+        let configured_mmds_address = Ipv4Addr::new(169, 254, 169, 253);
+        let payload = b"GET /meta-data/hostname HTTP/1.1\r\n\r\n";
+        let configured_packet =
+            tcp_ipv4_packet(configured_mmds_address, MMDS_GUEST_TCP_PORT, payload);
+        let default_packet = mmds_tcp_packet(payload);
+        let mut memory = tx_memory();
+        let configured_frame = tx_frame(&mut memory, &[(&configured_packet, PAYLOAD_ADDRESS)]);
+        let default_frame = tx_frame(&mut memory, &[(&default_packet, SECOND_PAYLOAD_ADDRESS)]);
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        let detour = MmdsPacketDetour::new(
+            MmdsStateHandle::default(),
+            configured_mmds_address,
+            response_queue.clone(),
+        );
+        let mut packet_io = VmnetVirtioNetworkPacketIo::with_mmds_detour(
+            FakeVmnetPacketIoBackend::default(),
+            fake_interface(),
+            detour,
+        )
+        .expect("packet I/O with MMDS detour should build");
+
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &configured_frame)
+            .expect("configured MMDS address TX should detour");
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &default_frame)
+            .expect("default MMDS address TX should forward");
+
+        let state = packet_io
+            .tx_sink()
+            .shared
+            .lock()
+            .expect("test state lock should succeed");
+        assert_eq!(state.backend.write_calls, 1);
+        assert_eq!(state.backend.written_packets, [default_packet]);
+        drop(state);
+
+        let responses = response_queue
+            .responses()
+            .expect("MMDS response queue should read");
+        assert_eq!(responses.len(), 1);
+    }
+
+    #[test]
     fn tx_sink_forwards_non_mmds_packet_when_detour_configured() {
         let packet = tcp_ipv4_packet(
             Ipv4Addr::new(192, 0, 2, 99),
