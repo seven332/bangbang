@@ -1107,7 +1107,7 @@ impl VirtioNetworkDevice {
                 });
             };
 
-            match queue.dispatch_with_source_packet_limit(memory, rx_source, Some(1)) {
+            match queue.dispatch_ready_source(memory, rx_source) {
                 Ok(dispatch) => Some(dispatch),
                 Err(source) => {
                     return Err(VirtioNetworkDeviceNotificationError::RxQueueDispatch {
@@ -1187,23 +1187,30 @@ impl VirtioNetworkRxQueue {
         memory: &mut GuestMemory,
         rx_source: &mut (impl VirtioNetworkRxPacketSource + ?Sized),
     ) -> Result<VirtioNetworkRxQueueDispatch, VirtioNetworkRxQueueDispatchError> {
-        self.dispatch_with_source_packet_limit(memory, rx_source, None)
+        self.dispatch_with_source_hint_policy(memory, rx_source, false)
     }
 
-    fn dispatch_with_source_packet_limit(
+    fn dispatch_ready_source(
         &mut self,
         memory: &mut GuestMemory,
         rx_source: &mut (impl VirtioNetworkRxPacketSource + ?Sized),
-        max_consumed_packets: Option<usize>,
+    ) -> Result<VirtioNetworkRxQueueDispatch, VirtioNetworkRxQueueDispatchError> {
+        self.dispatch_with_source_hint_policy(memory, rx_source, true)
+    }
+
+    fn dispatch_with_source_hint_policy(
+        &mut self,
+        memory: &mut GuestMemory,
+        rx_source: &mut (impl VirtioNetworkRxPacketSource + ?Sized),
+        require_ready_hint: bool,
     ) -> Result<VirtioNetworkRxQueueDispatch, VirtioNetworkRxQueueDispatchError> {
         let mut dispatch =
             VirtioNetworkRxQueueDispatch::with_capacity(self.available.queue_size())?;
-        if max_consumed_packets == Some(0) {
-            return Ok(dispatch);
-        }
-        let mut consumed_packets = 0;
 
         loop {
+            if require_ready_hint && !rx_source.retry_after_tx_hint() {
+                break;
+            }
             let action = {
                 let packet = match rx_source.peek_packet() {
                     Ok(Some(packet)) => packet,
@@ -1333,10 +1340,6 @@ impl VirtioNetworkRxQueue {
                 VirtioNetworkRxQueueDispatchAction::Consume(outcome) => {
                     rx_source.consume_packet();
                     dispatch.record(outcome);
-                    consumed_packets += 1;
-                    if max_consumed_packets.is_some_and(|max| consumed_packets >= max) {
-                        break;
-                    }
                 }
             }
         }
@@ -6952,20 +6955,29 @@ mod tests {
         let mut memory = tx_frame_memory();
         let mut handler = network_activation_handler();
         let mut sink = RecordingTxPacketSink::default();
-        let mut source = RecordingRxPacketSource::with_packets(vec![vec![0xca, 0xfe]])
+        let mut source = RecordingRxPacketSource::with_packets(vec![vec![0xca, 0xfe], vec![0xba]])
             .with_retry_after_tx_hint();
 
         configure_network_handler_queues(&mut handler);
         activate_network_handler(&mut handler);
         write_rx_descriptors(
             &mut memory,
-            &[TestDescriptor::writable(
-                TEST_RX_BUFFER,
-                u32::try_from(VIRTIO_NET_RX_MIN_BUFFER_SIZE).expect("RX minimum should fit u32"),
-                None,
-            )],
+            &[
+                TestDescriptor::writable(
+                    TEST_RX_BUFFER,
+                    u32::try_from(VIRTIO_NET_RX_MIN_BUFFER_SIZE)
+                        .expect("RX minimum should fit u32"),
+                    None,
+                ),
+                TestDescriptor::writable(
+                    TEST_RX_SECOND_BUFFER,
+                    u32::try_from(VIRTIO_NET_RX_MIN_BUFFER_SIZE)
+                        .expect("RX minimum should fit u32"),
+                    None,
+                ),
+            ],
         );
-        write_rx_available_heads(&mut memory, &[0]);
+        write_rx_available_heads(&mut memory, &[0, 1]);
         write_tx_header(&mut memory, TEST_TX_HEADER);
         write_tx_payload(&mut memory, TEST_TX_PAYLOAD, &[0x10]);
         tx_descriptor_chain(
@@ -7006,13 +7018,14 @@ mod tests {
         let rx_dispatch = notification
             .post_tx_rx_queue_dispatch()
             .expect("post-TX RX dispatch summary should be present");
-        assert_eq!(rx_dispatch.processed_buffers(), 1);
-        assert_eq!(rx_dispatch.delivered_packets(), 1);
-        assert_eq!(source.peek_calls, 1);
-        assert_eq!(source.consume_calls, 1);
+        assert_eq!(rx_dispatch.processed_buffers(), 2);
+        assert_eq!(rx_dispatch.delivered_packets(), 2);
+        assert_eq!(source.peek_calls, 2);
+        assert_eq!(source.consume_calls, 2);
         assert_eq!(source.remaining_packets(), 0);
-        assert_eq!(read_rx_used_index(&memory), 1);
+        assert_eq!(read_rx_used_index(&memory), 2);
         assert_eq!(read_rx_used_element(&memory, 0), (0, rx_used_len(2)));
+        assert_eq!(read_rx_used_element(&memory, 1), (1, rx_used_len(1)));
         assert_eq!(
             read_guest_bytes(
                 &memory,
@@ -7022,6 +7035,16 @@ mod tests {
                 2,
             ),
             vec![0xca, 0xfe]
+        );
+        assert_eq!(
+            read_guest_bytes(
+                &memory,
+                TEST_RX_SECOND_BUFFER
+                    .checked_add(u64::from(VIRTIO_NET_TX_HEADER_SIZE))
+                    .expect("second RX payload address should not overflow"),
+                1,
+            ),
+            vec![0xba]
         );
         assert!(notification.needs_queue_interrupt());
         assert_eq!(
