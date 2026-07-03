@@ -130,6 +130,9 @@ impl MmdsPacketDetour {
         if classified.payload().is_empty() {
             return Ok(false);
         }
+        if !classified.has_initial_synchronization_acknowledgement() {
+            return Ok(false);
+        }
 
         let key = MmdsRequestBufferKey::from_packet(classified);
         if let Some(request) = self.request_buffers.append_existing(
@@ -1269,6 +1272,7 @@ mod tests {
     const TEST_SOURCE_TCP_PORT: u16 = 49_152;
     const TEST_SOURCE_ETHERNET_ADDRESS: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
     const TEST_DESTINATION_ETHERNET_ADDRESS: [u8; 6] = [0xff; 6];
+    const MMDS_SYN_ACK_ACKNOWLEDGEMENT_NUMBER: u32 = 1;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct FakeInterface;
@@ -1501,7 +1505,7 @@ mod tests {
     }
 
     fn mmds_tcp_packet(payload: &[u8]) -> Vec<u8> {
-        tcp_ipv4_packet(DEFAULT_MMDS_IPV4_ADDRESS, MMDS_GUEST_TCP_PORT, payload)
+        mmds_tcp_packet_from_source(TEST_SOURCE_TCP_PORT, 0, payload)
     }
 
     fn mmds_tcp_packet_from_source(
@@ -1509,13 +1513,18 @@ mod tests {
         sequence_number: u32,
         payload: &[u8],
     ) -> Vec<u8> {
-        tcp_ipv4_packet_from_source(
+        let mut packet = tcp_ipv4_packet_from_source(
             DEFAULT_MMDS_IPV4_ADDRESS,
             MMDS_GUEST_TCP_PORT,
             source_port,
             sequence_number,
             payload,
-        )
+        );
+        if !payload.is_empty() {
+            set_tcp_flags(&mut packet, TCP_FLAG_PSH | TCP_FLAG_ACK);
+            set_tcp_acknowledgement_number(&mut packet, MMDS_SYN_ACK_ACKNOWLEDGEMENT_NUMBER);
+        }
+        packet
     }
 
     fn set_tcp_flags(packet: &mut [u8], flags: u8) {
@@ -2367,8 +2376,10 @@ mod tests {
     fn tx_sink_detours_only_configured_mmds_ipv4_address() {
         let configured_mmds_address = Ipv4Addr::new(169, 254, 169, 253);
         let payload = b"GET /meta-data/hostname HTTP/1.1\r\n\r\n";
-        let configured_packet =
+        let mut configured_packet =
             tcp_ipv4_packet(configured_mmds_address, MMDS_GUEST_TCP_PORT, payload);
+        set_tcp_flags(&mut configured_packet, TCP_FLAG_PSH | TCP_FLAG_ACK);
+        set_tcp_acknowledgement_number(&mut configured_packet, MMDS_SYN_ACK_ACKNOWLEDGEMENT_NUMBER);
         let default_packet = mmds_tcp_packet(payload);
         let mut memory = tx_memory();
         let configured_frame = tx_frame(&mut memory, &[(&configured_packet, PAYLOAD_ADDRESS)]);
@@ -2592,6 +2603,50 @@ mod tests {
             .tx_sink()
             .transmit_frame(&memory, &frame)
             .expect("MMDS ACK-only TX should forward unexpected acknowledgement");
+
+        let state = packet_io
+            .tx_sink()
+            .shared
+            .lock()
+            .expect("test state lock should succeed");
+        assert_eq!(state.backend.write_calls, 1);
+        assert_eq!(state.backend.written_packets, [packet]);
+        drop(state);
+        assert_eq!(
+            mmds_state
+                .with(Clone::clone)
+                .expect("MMDS state should lock"),
+            state_before
+        );
+        assert!(
+            response_queue
+                .responses()
+                .expect("MMDS response queue should read")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn tx_sink_forwards_mmds_payload_with_unexpected_acknowledgement() {
+        let mut packet = mmds_tcp_packet(b"GET /meta-data/hostname HTTP/1.1\r\n\r\n");
+        set_tcp_acknowledgement_number(&mut packet, 0);
+        let mut memory = tx_memory();
+        let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        let mmds_state = v2_mmds_state_handle();
+        let state_before = mmds_state
+            .with(Clone::clone)
+            .expect("MMDS state should lock");
+        let mut packet_io = packet_io_with_mmds_detour(
+            FakeVmnetPacketIoBackend::default(),
+            mmds_state.clone(),
+            response_queue.clone(),
+        );
+
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &frame)
+            .expect("MMDS payload with unexpected ACK should forward");
 
         let state = packet_io
             .tx_sink()
@@ -3075,6 +3130,133 @@ mod tests {
             .lock()
             .expect("test state lock should succeed");
         assert_eq!(state.backend.write_calls, 0);
+    }
+
+    #[test]
+    fn tx_sink_forwards_first_split_mmds_payload_with_unexpected_acknowledgement() {
+        let mut packet =
+            mmds_tcp_packet_from_source(TEST_SOURCE_TCP_PORT, 0x1000, b"GET /meta-data/host");
+        set_tcp_acknowledgement_number(&mut packet, 0);
+        let mut memory = tx_memory();
+        let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        let mmds_state = MmdsStateHandle::default();
+        let state_before = mmds_state
+            .with(Clone::clone)
+            .expect("MMDS state should lock");
+        let mut packet_io = packet_io_with_mmds_detour(
+            FakeVmnetPacketIoBackend::default(),
+            mmds_state.clone(),
+            response_queue.clone(),
+        );
+
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &frame)
+            .expect("MMDS first split payload with unexpected ACK should forward");
+
+        let state = packet_io
+            .tx_sink()
+            .shared
+            .lock()
+            .expect("test state lock should succeed");
+        assert_eq!(state.backend.write_calls, 1);
+        assert_eq!(state.backend.written_packets, [packet]);
+        drop(state);
+        assert_eq!(
+            mmds_state
+                .with(Clone::clone)
+                .expect("MMDS state should lock"),
+            state_before
+        );
+        assert!(
+            response_queue
+                .responses()
+                .expect("MMDS response queue should read")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn tx_sink_forwards_later_split_mmds_payload_with_unexpected_acknowledgement() {
+        let first_payload = b"GET /meta-data/host";
+        let second_payload = b"name HTTP/1.1\r\n\r\n";
+        let first_sequence_number = 0x1000;
+        let second_sequence_number = first_sequence_number
+            + u32::try_from(first_payload.len()).expect("test payload length should fit u32");
+        let first_packet =
+            mmds_tcp_packet_from_source(TEST_SOURCE_TCP_PORT, first_sequence_number, first_payload);
+        let mut invalid_second_packet = mmds_tcp_packet_from_source(
+            TEST_SOURCE_TCP_PORT,
+            second_sequence_number,
+            second_payload,
+        );
+        set_tcp_acknowledgement_number(&mut invalid_second_packet, 0);
+        let valid_second_packet = mmds_tcp_packet_from_source(
+            TEST_SOURCE_TCP_PORT,
+            second_sequence_number,
+            second_payload,
+        );
+        let mut memory = tx_memory();
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        let mmds_state = MmdsStateHandle::default();
+        let state_before = mmds_state
+            .with(Clone::clone)
+            .expect("MMDS state should lock");
+        let mut packet_io = packet_io_with_mmds_detour(
+            FakeVmnetPacketIoBackend::default(),
+            mmds_state.clone(),
+            response_queue.clone(),
+        );
+
+        let first_frame = tx_frame(&mut memory, &[(&first_packet, PAYLOAD_ADDRESS)]);
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &first_frame)
+            .expect("first MMDS split GET fragment should detour");
+
+        let invalid_second_frame =
+            tx_frame(&mut memory, &[(&invalid_second_packet, PAYLOAD_ADDRESS)]);
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &invalid_second_frame)
+            .expect("MMDS later split payload with unexpected ACK should forward");
+
+        let state = packet_io
+            .tx_sink()
+            .shared
+            .lock()
+            .expect("test state lock should succeed");
+        assert_eq!(state.backend.write_calls, 1);
+        assert_eq!(state.backend.written_packets, [invalid_second_packet]);
+        drop(state);
+        assert_eq!(
+            mmds_state
+                .with(Clone::clone)
+                .expect("MMDS state should lock"),
+            state_before
+        );
+        assert!(
+            response_queue
+                .responses()
+                .expect("MMDS response queue should read")
+                .is_empty()
+        );
+
+        let valid_second_frame = tx_frame(&mut memory, &[(&valid_second_packet, PAYLOAD_ADDRESS)]);
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &valid_second_frame)
+            .expect("valid second MMDS split GET fragment should still complete request");
+
+        let responses = response_queue
+            .responses()
+            .expect("MMDS response queue should read");
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            mmds_response_body(&responses[0]),
+            b"The MMDS data store is not initialized."
+        );
     }
 
     #[test]
