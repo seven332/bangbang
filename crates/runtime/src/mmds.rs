@@ -2866,12 +2866,18 @@ mod tests {
             assert!(reset.is_reset_control());
         }
 
-        let mut reset_with_payload = test_mmds_tcp_packet(b"payload");
-        reset_with_payload[tcp_start + TCP_FLAGS_OFFSET] = TCP_FLAG_RST | TCP_FLAG_ACK;
-        let reset_with_payload =
-            classify_mmds_guest_tcp_packet(&reset_with_payload, test_mmds_ipv4_address())
-                .expect("MMDS TCP reset with payload should classify");
-        assert!(reset_with_payload.is_reset_control());
+        for flags in [
+            TCP_FLAG_RST,
+            TCP_FLAG_RST | TCP_FLAG_ACK,
+            TCP_FLAG_RST | TCP_FLAG_PSH,
+        ] {
+            let mut reset_with_payload = test_mmds_tcp_packet(b"payload");
+            reset_with_payload[tcp_start + TCP_FLAGS_OFFSET] = flags;
+            let reset_with_payload =
+                classify_mmds_guest_tcp_packet(&reset_with_payload, test_mmds_ipv4_address())
+                    .expect("MMDS TCP reset with payload should classify");
+            assert!(reset_with_payload.is_reset_control());
+        }
 
         let mut psh_packet = test_mmds_tcp_packet(b"");
         psh_packet[tcp_start + TCP_FLAGS_OFFSET] = TCP_FLAG_PSH;
