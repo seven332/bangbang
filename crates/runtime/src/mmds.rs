@@ -228,6 +228,9 @@ impl<'a> MmdsGuestTcpPacket<'a> {
     }
 
     pub fn syn_ack_response_frame(self) -> Result<Vec<u8>, MmdsGuestTcpResponseFrameError> {
+        if !self.is_initial_synchronization_request() {
+            return Err(MmdsGuestTcpResponseFrameError::NotInitialSynchronizationRequest);
+        }
         self.response_context().syn_ack_response_frame()
     }
 }
@@ -533,6 +536,7 @@ impl std::error::Error for MmdsGuestArpResponseFrameError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MmdsGuestTcpResponseFrameError {
     InternalFrameLayout,
+    NotInitialSynchronizationRequest,
     PayloadTooLarge { payload_len: usize },
     RequestPayloadTooLarge { request_payload_len: usize },
 }
@@ -543,6 +547,9 @@ impl fmt::Display for MmdsGuestTcpResponseFrameError {
             Self::InternalFrameLayout => {
                 f.write_str("MMDS guest TCP response frame internal layout is invalid")
             }
+            Self::NotInitialSynchronizationRequest => f.write_str(
+                "MMDS guest TCP SYN-ACK response requires an initial SYN request packet",
+            ),
             Self::PayloadTooLarge { payload_len } => write!(
                 f,
                 "MMDS guest TCP response payload length {payload_len} exceeds IPv4 frame capacity"
@@ -2499,6 +2506,18 @@ mod tests {
             0
         );
         assert!(response_frame_tcp_payload(&response).is_empty());
+    }
+
+    #[test]
+    fn mmds_guest_tcp_syn_ack_response_frame_rejects_non_initial_syn() {
+        let packet = test_mmds_tcp_packet(b"");
+        let classified = classify_mmds_guest_tcp_packet(&packet, test_mmds_ipv4_address())
+            .expect("empty MMDS TCP packet should classify");
+
+        assert_eq!(
+            classified.syn_ack_response_frame(),
+            Err(MmdsGuestTcpResponseFrameError::NotInitialSynchronizationRequest)
+        );
     }
 
     #[test]

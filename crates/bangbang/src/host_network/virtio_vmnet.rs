@@ -2474,6 +2474,43 @@ mod tests {
     }
 
     #[test]
+    fn tx_sink_reports_mmds_syn_queue_overflow_without_vmnet_write() {
+        let packet = mmds_tcp_syn_packet(0);
+        let mut memory = tx_memory();
+        let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
+        let response_queue = MmdsResponseQueue::with_capacity(0);
+        let mut packet_io = packet_io_with_mmds_detour(
+            FakeVmnetPacketIoBackend::default(),
+            MmdsStateHandle::default(),
+            response_queue.clone(),
+        );
+
+        let error = packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &frame)
+            .expect_err("SYN-ACK queue overflow should fail TX");
+
+        assert!(
+            error
+                .message()
+                .contains("MMDS packet detour failed: MMDS response queue is full at capacity 0")
+        );
+        let state = packet_io
+            .tx_sink()
+            .shared
+            .lock()
+            .expect("test state lock should succeed");
+        assert_eq!(state.backend.write_calls, 0);
+        drop(state);
+        assert!(
+            response_queue
+                .responses()
+                .expect("MMDS response queue should read")
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn tx_sink_mmds_queue_overflow_does_not_mutate_token_state() {
         let packet = mmds_tcp_packet(
             b"PUT /latest/api/token HTTP/1.1\r\nX-metadata-token-ttl-seconds: 60\r\n\r\n",
