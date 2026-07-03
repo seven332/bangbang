@@ -1649,6 +1649,9 @@ mod tests {
         write_packet_u16(&mut arp_packet, ETHERNET_ETHERTYPE_OFFSET, 0x0806);
         let mut udp_packet = test_tcp_packet(test_mmds_ipv4_address(), 80, &[], &[], b"");
         udp_packet[ETHERNET_HEADER_LEN + IPV4_PROTOCOL_OFFSET] = 17;
+        let mut ipv6_version_packet = test_tcp_packet(test_mmds_ipv4_address(), 80, &[], &[], b"");
+        ipv6_version_packet[ETHERNET_HEADER_LEN + IPV4_VERSION_IHL_OFFSET] = (6 << 4)
+            | u8::try_from(IPV4_MIN_HEADER_LEN / 4).expect("test IPv4 header length should fit u8");
 
         assert_eq!(
             classify_mmds_guest_tcp_packet(&arp_packet, test_mmds_ipv4_address()),
@@ -1656,6 +1659,10 @@ mod tests {
         );
         assert_eq!(
             classify_mmds_guest_tcp_packet(&udp_packet, test_mmds_ipv4_address()),
+            None
+        );
+        assert_eq!(
+            classify_mmds_guest_tcp_packet(&ipv6_version_packet, test_mmds_ipv4_address()),
             None
         );
     }
