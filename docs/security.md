@@ -195,10 +195,13 @@ are not exposed to the guest through networking yet. The runtime can classify
 raw Ethernet/IPv4/TCP guest packet bytes as MMDS candidates only when they
 target the configured MMDS IPv4 address and TCP port `80`; malformed,
 truncated, fragmented, non-TCP, and non-MMDS packets are ignored as
-non-candidates. The classifier does not reassemble fragments, track TCP state,
-parse HTTP from packet payloads, or deliver responses. Future guest-visible
-MMDS work must validate device, packet, token, and TCP/session inputs before
-making this data reachable from guest code.
+non-candidates. For non-empty candidate TCP payloads, the runtime can produce
+the same process-local HTTP response bytes as the existing guest HTTP helper,
+including token PUT and MMDS v2 GET token enforcement. This still does not
+reassemble fragments, buffer split TCP requests, track TCP state, synthesize
+response packets, or deliver responses through virtio-net RX. Future
+guest-visible MMDS work must validate device, packet, token, and TCP/session
+inputs before making this data reachable from guest code.
 
 ## Multi-Process Operation
 

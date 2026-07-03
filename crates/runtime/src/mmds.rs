@@ -1023,6 +1023,19 @@ impl MmdsState {
         self.guest_http_response(request_bytes).to_http_bytes()
     }
 
+    pub fn guest_tcp_packet_response_bytes(
+        &mut self,
+        packet: &[u8],
+        mmds_ipv4_address: Ipv4Addr,
+    ) -> Option<Vec<u8>> {
+        let packet = classify_mmds_guest_tcp_packet(packet, mmds_ipv4_address)?;
+        if packet.payload().is_empty() {
+            return None;
+        }
+
+        Some(self.guest_http_response_bytes(packet.payload()))
+    }
+
     pub fn generate_guest_token(&mut self, ttl_seconds: u32) -> Result<String, MmdsTokenError> {
         self.token_authority.generate_token(ttl_seconds)
     }
@@ -1553,6 +1566,16 @@ mod tests {
         packet
     }
 
+    fn test_mmds_tcp_packet(payload: &[u8]) -> Vec<u8> {
+        test_tcp_packet(
+            test_mmds_ipv4_address(),
+            MMDS_GUEST_TCP_PORT,
+            &[],
+            &[],
+            payload,
+        )
+    }
+
     fn write_packet_u16(packet: &mut [u8], offset: usize, value: u16) {
         let bytes = value.to_be_bytes();
         packet[offset] = bytes[0];
@@ -1760,6 +1783,119 @@ mod tests {
         assert_eq!(
             classify_mmds_guest_tcp_packet(&tcp_header_past_segment, test_mmds_ipv4_address()),
             None
+        );
+    }
+
+    #[test]
+    fn mmds_guest_tcp_packet_response_bytes_return_http_response() {
+        let request = b"GET /meta-data/hostname HTTP/1.1\r\nAccept: */*\r\n\r\n";
+        let packet = test_mmds_tcp_packet(request);
+        let mut expected_state = initialized_query_state();
+        let expected = expected_state.guest_http_response_bytes(request);
+        let mut state = initialized_query_state();
+
+        assert_eq!(
+            state.guest_tcp_packet_response_bytes(&packet, test_mmds_ipv4_address()),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn mmds_guest_tcp_packet_response_bytes_ignore_non_candidates_without_mutating() {
+        let wrong_destination = test_tcp_packet(
+            Ipv4Addr::new(169, 254, 169, 250),
+            MMDS_GUEST_TCP_PORT,
+            &[],
+            &[],
+            b"PUT /latest/api/token HTTP/1.1\r\nX-metadata-token-ttl-seconds: 60\r\n\r\n",
+        );
+        let truncated = test_tcp_packet(
+            test_mmds_ipv4_address(),
+            MMDS_GUEST_TCP_PORT,
+            &[],
+            &[],
+            b"PUT /latest/api/token HTTP/1.1\r\nX-metadata-token-ttl-seconds: 60\r\n\r\n",
+        )
+        .into_iter()
+        .take(ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN + TCP_MIN_HEADER_LEN - 1)
+        .collect::<Vec<_>>();
+
+        for packet in [wrong_destination, truncated] {
+            let mut state = initialized_query_state();
+            state.token_authority = MmdsTokenAuthority::with_manual_clock(1, 1_000);
+
+            assert_eq!(
+                state.guest_tcp_packet_response_bytes(&packet, test_mmds_ipv4_address()),
+                None
+            );
+            let token = state
+                .generate_guest_token(1)
+                .expect("ignored packet should not consume token capacity");
+            assert!(state.is_guest_token_valid(&token));
+        }
+    }
+
+    #[test]
+    fn mmds_guest_tcp_packet_response_bytes_ignore_empty_payload_without_mutating() {
+        let packet = test_mmds_tcp_packet(b"");
+        let mut state = initialized_query_state();
+        state.token_authority = MmdsTokenAuthority::with_manual_clock(1, 1_000);
+
+        assert_eq!(
+            state.guest_tcp_packet_response_bytes(&packet, test_mmds_ipv4_address()),
+            None
+        );
+        let token = state
+            .generate_guest_token(1)
+            .expect("empty TCP payload should not consume token capacity");
+        assert!(state.is_guest_token_valid(&token));
+    }
+
+    #[test]
+    fn mmds_guest_tcp_packet_response_bytes_serialize_parse_errors() {
+        let request = b"GET /meta-data/hostname\r\n\r\n";
+        let packet = test_mmds_tcp_packet(request);
+        let mut expected_state = initialized_query_state();
+        let expected = expected_state.guest_http_response_bytes(request);
+        let mut state = initialized_query_state();
+
+        assert_eq!(
+            state.guest_tcp_packet_response_bytes(&packet, test_mmds_ipv4_address()),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn mmds_guest_tcp_packet_response_bytes_preserve_token_flow() {
+        let mut state = initialized_query_state();
+        enable_mmds_v2(&mut state);
+        state.token_authority = MmdsTokenAuthority::with_manual_clock(2, 1_000);
+        let put_packet = test_mmds_tcp_packet(
+            b"PUT /latest/api/token HTTP/1.1\r\nX-metadata-token-ttl-seconds: 60\r\n\r\n",
+        );
+
+        let token_response = state
+            .guest_tcp_packet_response_bytes(&put_packet, test_mmds_ipv4_address())
+            .expect("token PUT packet should produce response bytes");
+        let token_response =
+            String::from_utf8(token_response).expect("token response should be UTF-8");
+        let (_head, token) = token_response
+            .split_once("\r\n\r\n")
+            .expect("token response should include header terminator");
+        assert_mmds_token_shape(token);
+        assert!(state.is_guest_token_valid(token));
+
+        let get_request = format!(
+            "GET /meta-data/hostname HTTP/1.1\r\nAccept: application/json\r\nX-metadata-token: {token}\r\n\r\n"
+        );
+        let get_packet = test_mmds_tcp_packet(get_request.as_bytes());
+
+        assert_eq!(
+            state.guest_tcp_packet_response_bytes(&get_packet, test_mmds_ipv4_address()),
+            Some(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\n\r\n\"demo.local\""
+                    .to_vec()
+            )
         );
     }
 
