@@ -417,8 +417,7 @@ impl VirtioBlockConfigSpace {
     }
 
     pub const fn available_features(self) -> u64 {
-        let features = virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
-            | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX);
+        let features = virtio_feature_bit(VIRTIO_FEATURE_VERSION_1);
         if self.is_read_only {
             features | virtio_feature_bit(VIRTIO_BLOCK_FEATURE_READ_ONLY)
         } else {
@@ -4526,12 +4525,16 @@ mod tests {
 
     #[test]
     fn config_space_tracks_read_only_feature() {
-        let base_features =
-            (1_u64 << VIRTIO_FEATURE_VERSION_1) | (1_u64 << VIRTIO_RING_FEATURE_EVENT_IDX);
+        let base_features = 1_u64 << VIRTIO_FEATURE_VERSION_1;
 
         assert_eq!(
             VirtioBlockConfigSpace::new(512, false).available_features(),
             base_features
+        );
+        assert_eq!(
+            VirtioBlockConfigSpace::new(512, false).available_features()
+                & (1_u64 << VIRTIO_RING_FEATURE_EVENT_IDX),
+            0
         );
         assert_eq!(
             VirtioBlockConfigSpace::new(512, true).available_features(),
