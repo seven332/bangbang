@@ -899,6 +899,7 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use bangbang_runtime::logger::{LoggerConfigInput, LoggerWriteError};
+    use bangbang_runtime::metrics::MetricsConfigInput;
     use bangbang_runtime::{BackendError, VmmActionError};
 
     use crate::vmm::{InstanceStartExecutor, ProcessVmm};
@@ -2125,6 +2126,57 @@ mod tests {
         );
 
         fs::remove_file(metrics_path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn api_metrics_update_after_startup_metrics_preserves_startup_sink() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let startup_metrics_path = unique_socket_path("startup-metrics").with_extension("metrics");
+        let api_metrics_path = unique_socket_path("api-metrics").with_extension("metrics");
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            &startup_metrics_path,
+        )))
+        .expect("startup metrics config should apply");
+        let metrics_body = format!(
+            r#"{{"metrics_path":"{}"}}"#,
+            api_metrics_path.to_string_lossy()
+        );
+        let metrics_request = format!(
+            "PUT /metrics HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{metrics_body}",
+            metrics_body.len()
+        );
+        let metrics_response = handle_request_bytes(metrics_request.as_bytes(), &mut vmm);
+        assert_eq!(
+            metrics_response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+        assert_eq!(
+            metrics_response.body(),
+            r#"{"fault_message":"metrics system is already initialized"}"#
+        );
+
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_request = format!(
+            "PUT /boot-source HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{boot_body}",
+            boot_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "met-start", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let flush_response = put_action_over_socket(&mut vmm, "met-flush", "FlushMetrics");
+        assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        assert_eq!(
+            fs::read_to_string(&startup_metrics_path)
+                .expect("startup metrics output should be readable"),
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+        assert!(!api_metrics_path.exists());
+
+        fs::remove_file(startup_metrics_path).expect("startup fixture should clean up");
     }
 
     #[test]

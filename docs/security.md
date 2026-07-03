@@ -116,7 +116,8 @@ is resource-specific:
   payloads, track graceful half-close state, or implement full virtio-vsock
   credit accounting yet.
 - `/metrics` opens the output path during pre-boot configuration and keeps a
-  per-process metrics sink.
+  per-process metrics sink. The `--metrics-path` startup CLI flag uses the same
+  sink and host-path error redaction rules before the API socket is served.
 - `/logger` opens `log_path` during pre-boot configuration when that field is
   present and keeps a per-process logger sink. Successful `InstanceStart` and
   `FlushMetrics` can append minimal action-event lines to that sink when the

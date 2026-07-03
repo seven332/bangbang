@@ -106,7 +106,7 @@ serves `GET /`, `GET /version`, `GET /vm/config`, `GET /machine-config`,
 pre-boot `PUT /machine-config`, pre-boot `PUT /boot-source` configuration storage, and
 pre-boot `PUT /drives/{drive_id}` configuration storage, pre-boot
 `PUT /network-interfaces/{iface_id}` configuration storage, pre-boot `PUT /vsock` configuration storage, pre-boot `PUT /metrics`
-output configuration, pre-boot `PUT /logger` output configuration, logger startup CLI configuration, plus process-routed `PUT /actions` startup and metrics
+output configuration, pre-boot `PUT /logger` output configuration, metrics and logger startup CLI configuration, plus process-routed `PUT /actions` startup and metrics
 flush with an internal boot run-loop worker across bounded step windows or
 state/configuration faults, but does not load a configuration file or provide
 public run-loop control.
@@ -115,6 +115,7 @@ public run-loop control.
 | --- | --- | --- |
 | `--api-sock <PATH>` | binds the API Unix socket | Firecracker defaults to `/run/firecracker.socket`; bangbang defaults to `/tmp/bangbang.socket` because macOS does not normally provide `/run`. This is an intentional host-platform difference. |
 | `--id <ID>` | parsed and stored | Defaults to Firecracker's `anonymous-instance`. IDs must be 1 to 64 bytes and contain only ASCII alphanumeric characters or `-`. |
+| `--metrics-path <PATH>` | configures metrics output before API serving | Uses the same per-process metrics sink and redacted host-path error policy as `PUT /metrics`. A later duplicate `PUT /metrics` request fails without replacing this sink. |
 | `--log-path <PATH>` | configures logger output before API serving | Uses the same per-process logger sink and redacted host-path error policy as `PUT /logger`. |
 | `--level <LEVEL>` | configures logger level before API serving | Accepts the existing logger levels `Off`, `Trace`, `Debug`, `Info`, `Warn`, `Warning`, and `Error`; minimal action logs are emitted only when the configured level allows `Info`. |
 | `--module <MODULE>` | stored for future logger filtering | Matches the stored `PUT /logger` field but does not filter the current minimal action logs yet. |
@@ -123,7 +124,7 @@ public run-loop control.
 | `--help`, `-h` | prints help | Help describes the current API socket scope. |
 | `--version`, `-V` | prints version | `-V` is retained from the existing bangbang scaffold. |
 | `--config-file`, `--no-api` | rejected | Deferred until VM configuration models and no-API startup behavior exist. |
-| seccomp, metrics CLI, snapshot, MMDS, boot timer, payload-size, and PCI process flags | rejected | These Firecracker options are Linux-specific, observability-related, or tied to later capability work. The API-level `PUT /metrics` subset is supported separately; metrics CLI flags remain deferred. |
+| seccomp, snapshot, MMDS, boot timer, payload-size, and PCI process flags | rejected | These Firecracker options are Linux-specific or tied to later capability work. |
 
 bangbang intentionally treats `--id` alphanumeric characters as ASCII only.
 This is stricter than Firecracker `v1.16.0`'s Rust validator, which accepts
@@ -152,8 +153,8 @@ The current executable uses a small process exit status contract:
 | Exit status | Current meaning | Compatibility notes |
 | --- | --- | --- |
 | `0` | Help or version completed successfully, or the API server exited without error, including handled `SIGINT`/`SIGTERM` shutdown. | Matches Firecracker's success status. |
-| `153` | Startup argument parsing or validation failed. | Matches Firecracker's `ArgParsing` exit code. |
-| `1` | API socket bind or accept failure. | Used for non-argument process failures before more specific Firecracker-compatible process errors exist. Per-connection read/write errors do not terminate the API server. |
+| `153` | Startup argument parsing failed before process configuration began. | Matches Firecracker's `ArgParsing` exit code. |
+| `1` | Process failure, including startup metrics/logger configuration, API socket bind, signal handler registration, or API accept failure. | Used for non-argument process failures before more specific Firecracker-compatible process errors exist. Per-connection read/write errors do not terminate the API server. |
 
 Firecracker also defines bad-configuration and signal-specific exit codes.
 bangbang does not expose those until the corresponding configuration loading,
@@ -304,7 +305,7 @@ exist.
 | `PUT /logger` | `module` | optional | Stored as logger filtering configuration for future log integration. |
 | `PUT /logger` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /actions` | `action_type=InstanceStart` | process-routed; internal startup execution across bounded step windows implemented | Validates stored boot-source and state preflight first, then attempts owned HVF boot-session preparation with an internal serial MMIO console and starts the process-owned internal boot run-loop worker across bounded step windows. Success returns `204 No Content`, writes one minimal logger action line when configured and enabled, and commits `Running`; preparation, worker-start, or logger-output failures return a fault without mutating state. Public run-loop control and public serial streaming remain deferred. |
-| `PUT /actions` | `action_type=FlushMetrics` | runtime-only; minimal execution implemented | Rejected before startup. After startup, returns `204 No Content`; if `/metrics` was configured, appends one minimal JSON line, and if `/logger` was configured and enabled, appends one minimal action line. Full Firecracker counters, periodic flush, and full logger integration remain deferred. |
+| `PUT /actions` | `action_type=FlushMetrics` | runtime-only; minimal execution implemented | Rejected before startup. After startup, returns `204 No Content`; if metrics output was configured, appends one minimal JSON line, and if logger output was configured and enabled, appends one minimal action line. Full Firecracker counters, periodic flush, and full logger integration remain deferred. |
 | `PUT /actions` | `action_type=SendCtrlAltDel` | intentionally unsupported; parser rejected | Firecracker gates this on x86 keyboard behavior; the first target is Apple Silicon. |
 | `PUT /actions` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 
@@ -341,14 +342,15 @@ startup preparation is attempted; when preflight succeeds, the process VMM owner
 prepares an owned HVF boot session, starts a process-owned internal boot
 run-loop worker across bounded step windows, and marks the instance `Running`
 only after that worker handle is retained.
-The API and VMM state path implement the `PUT /metrics` field policy above as a
-pre-boot-only per-process output sink. Duplicate initialization fails without
-replacing the original sink. `FlushMetrics` is runtime-only: it fails before
-startup, succeeds without writing when the sink is unconfigured, and writes one
-minimal JSON line when `/metrics` configured an output path. Public run-loop
-control, guest boot output, public runner loop scheduling, full Firecracker
-metrics counters, periodic metrics flush, full logger integration, and metrics
-CLI flags remain deferred.
+The process startup path and API/VMM state path implement the metrics field
+policy above as a pre-boot-only per-process output sink. Startup CLI can
+initialize the metrics sink before the API socket is served. Duplicate
+initialization fails without replacing the original sink. `FlushMetrics` is
+runtime-only: it fails before startup, succeeds without writing when the sink is
+unconfigured, and writes one minimal JSON line when `--metrics-path` or
+`PUT /metrics` configured an output path. Public run-loop control, guest boot
+output, public runner loop scheduling, full Firecracker metrics counters,
+periodic metrics flush, and full logger integration remain deferred.
 The process startup path and API/VMM state path implement the logger field
 policy above as pre-boot-only per-process observability configuration. Startup
 CLI flags can configure the initial logger before the API socket is served.
@@ -1271,8 +1273,8 @@ Their eventual support level should follow the endpoint matrix:
 - pmem
 - entropy device configuration
 - serial customization
-- full logger integration, full Firecracker metrics counters, periodic metrics
-  flush, and metrics CLI configuration
+- full logger integration, full Firecracker metrics counters, and periodic
+  metrics flush
 - memory hotplug
 - pause and resume VM state updates
 - PATCH and DELETE hotplug/update behavior
