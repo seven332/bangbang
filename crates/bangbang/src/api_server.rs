@@ -898,7 +898,8 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use bangbang_runtime::BackendError;
+    use bangbang_runtime::logger::LoggerWriteError;
+    use bangbang_runtime::{BackendError, VmmActionError};
 
     use crate::vmm::{InstanceStartExecutor, ProcessVmm};
 
@@ -949,6 +950,18 @@ mod tests {
         version: &str,
     ) -> ProcessVmm<TestInstanceStarter> {
         ProcessVmm::with_starter(id, version, "bangbang", TestInstanceStarter::failure())
+    }
+
+    #[test]
+    fn handle_empty_maps_logger_write_errors_to_fault() {
+        let response = handle_empty(Err(VmmActionError::LoggerWrite(LoggerWriteError::Write(
+            std::io::ErrorKind::BrokenPipe,
+        ))));
+
+        assert_eq!(
+            response.body(),
+            r#"{"fault_message":"failed to write logger output: BrokenPipe"}"#
+        );
     }
 
     fn unique_socket_path(name: &str) -> PathBuf {
@@ -1893,6 +1906,49 @@ mod tests {
         );
         assert_eq!(config_response.status(), bangbang_api::http::StatusCode::Ok);
         assert!(!config_response.body().contains("logger"));
+
+        fs::remove_file(logger_path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn configured_logger_records_actions_over_api_requests() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let logger_path = unique_socket_path("logger-actions").with_extension("log");
+        let logger_body = format!(
+            r#"{{
+                "log_path": "{}",
+                "level": "Info",
+                "show_level": true
+            }}"#,
+            logger_path.to_string_lossy()
+        );
+        let logger_request = format!(
+            "PUT /logger HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{logger_body}",
+            logger_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(logger_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_request = format!(
+            "PUT /boot-source HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{boot_body}",
+            boot_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let start_response = put_action_over_socket(&mut vmm, "start-with-logger", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let flush_response = put_action_over_socket(&mut vmm, "flush-with-logger", "FlushMetrics");
+        assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        assert_eq!(
+            fs::read_to_string(&logger_path).expect("logger output should be readable"),
+            "level=Info action=InstanceStart\nlevel=Info action=FlushMetrics\n"
+        );
 
         fs::remove_file(logger_path).expect("fixture should clean up");
     }

@@ -118,7 +118,9 @@ is resource-specific:
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink.
 - `/logger` opens `log_path` during pre-boot configuration when that field is
-  present and keeps a per-process logger sink.
+  present and keeps a per-process logger sink. Successful `InstanceStart` and
+  `FlushMetrics` can append minimal action-event lines to that sink when the
+  configured level allows `Info`.
 - `scripts/run-integration-tests.sh` creates temporary files for signed
   integration tests and removes them when the wrapper exits normally. Its
   generated guest initrd is cached under `.tmp/guest-artifacts` by default.
@@ -172,9 +174,10 @@ images per microVM and avoid sharing writable backing files between multiple
 bangbang processes.
 
 Metrics and logger outputs are host observability state, not guest
-configuration, and are intentionally omitted from `GET /vm/config`. Future full
-logging and metrics support must avoid leaking host paths or unexpected guest
-data in error messages.
+configuration, and are intentionally omitted from `GET /vm/config`. Current
+logger action events are host VMM events only and do not expose guest serial
+output. Future full logging and metrics support must avoid leaking host paths
+or unexpected guest data in error messages.
 
 MMDS control-plane contents are process-local in-memory JSON state configured
 through the unauthenticated local API socket. Treat metadata as sensitive host

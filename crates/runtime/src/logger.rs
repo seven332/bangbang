@@ -1,5 +1,6 @@
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
+use std::io::{LineWriter, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -24,6 +25,17 @@ impl LoggerLevel {
             Self::Info => "Info",
             Self::Warn => "Warn",
             Self::Error => "Error",
+        }
+    }
+
+    const fn allows(self, level: Self) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Error => matches!(level, Self::Error),
+            Self::Warn => matches!(level, Self::Warn | Self::Error),
+            Self::Info => matches!(level, Self::Info | Self::Warn | Self::Error),
+            Self::Debug => matches!(level, Self::Debug | Self::Info | Self::Warn | Self::Error),
+            Self::Trace => !matches!(level, Self::Off),
         }
     }
 }
@@ -167,6 +179,21 @@ impl fmt::Display for LoggerConfigError {
 
 impl std::error::Error for LoggerConfigError {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoggerWriteError {
+    Write(std::io::ErrorKind),
+}
+
+impl fmt::Display for LoggerWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Write(kind) => write!(f, "failed to write logger output: {kind:?}"),
+        }
+    }
+}
+
+impl std::error::Error for LoggerWriteError {}
+
 #[derive(Debug)]
 pub struct LoggerState {
     sink: Option<LoggerSink>,
@@ -212,6 +239,21 @@ impl LoggerState {
         Ok(())
     }
 
+    pub(crate) fn log_action(&mut self, action: &str) -> Result<bool, LoggerWriteError> {
+        const ACTION_LEVEL: LoggerLevel = LoggerLevel::Info;
+
+        if !self.level.allows(ACTION_LEVEL) {
+            return Ok(false);
+        }
+
+        let Some(sink) = &mut self.sink else {
+            return Ok(false);
+        };
+
+        sink.write_action(self.show_level, ACTION_LEVEL, action)?;
+        Ok(true)
+    }
+
     pub const fn level(&self) -> LoggerLevel {
         self.level
     }
@@ -234,9 +276,14 @@ impl LoggerState {
     }
 }
 
-#[derive(Debug)]
 struct LoggerSink {
-    _file: File,
+    writer: LineWriter<Box<dyn Write + Send>>,
+}
+
+impl fmt::Debug for LoggerSink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoggerSink").finish_non_exhaustive()
+    }
 }
 
 impl LoggerSink {
@@ -249,18 +296,46 @@ impl LoggerSink {
             .open(path)
             .map_err(|err| LoggerConfigError::OpenFile(err.kind()))?;
 
-        Ok(Self { _file: file })
+        Ok(Self::from_writer(file))
+    }
+
+    fn from_writer(writer: impl Write + Send + 'static) -> Self {
+        Self {
+            writer: LineWriter::new(Box::new(writer)),
+        }
+    }
+
+    fn write_action(
+        &mut self,
+        show_level: bool,
+        level: LoggerLevel,
+        action: &str,
+    ) -> Result<(), LoggerWriteError> {
+        if show_level {
+            writeln!(self.writer, "level={} action={action}", level.as_str())
+                .map_err(|err| LoggerWriteError::Write(err.kind()))?;
+        } else {
+            writeln!(self.writer, "action={action}")
+                .map_err(|err| LoggerWriteError::Write(err.kind()))?;
+        }
+        self.writer
+            .flush()
+            .map_err(|err| LoggerWriteError::Write(err.kind()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::{Error, ErrorKind, Write};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{LoggerConfigError, LoggerConfigInput, LoggerLevel, LoggerState};
+    use super::{
+        LoggerConfigError, LoggerConfigInput, LoggerLevel, LoggerSink, LoggerState,
+        LoggerWriteError,
+    };
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -274,6 +349,19 @@ mod tests {
             "bangbang-logger-test-{}-{nanos}-{id}-{name}",
             std::process::id()
         ))
+    }
+
+    #[derive(Debug)]
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(Error::from(ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -358,6 +446,95 @@ mod tests {
         assert_eq!(state.module(), Some("bangbang"));
 
         fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn log_action_without_configuration_is_noop() {
+        let mut state = LoggerState::default();
+
+        assert_eq!(state.log_action("InstanceStart"), Ok(false));
+        assert!(!state.is_configured());
+    }
+
+    #[test]
+    fn log_action_writes_minimal_action_lines() {
+        let path = unique_logger_path("actions");
+        let mut state = LoggerState::default();
+        state
+            .configure(LoggerConfigInput::new().with_log_path(&path))
+            .expect("logger should configure");
+
+        assert_eq!(state.log_action("InstanceStart"), Ok(true));
+        assert_eq!(state.log_action("FlushMetrics"), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("logger output should be readable");
+        assert_eq!(output, "action=InstanceStart\naction=FlushMetrics\n");
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn log_action_includes_level_when_configured() {
+        let path = unique_logger_path("actions-with-level");
+        let mut state = LoggerState::default();
+        state
+            .configure(
+                LoggerConfigInput::new()
+                    .with_log_path(&path)
+                    .with_show_level(true),
+            )
+            .expect("logger should configure");
+
+        assert_eq!(state.log_action("InstanceStart"), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("logger output should be readable");
+        assert_eq!(output, "level=Info action=InstanceStart\n");
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn log_action_respects_level_filter_and_reconfiguration() {
+        let path = unique_logger_path("filtered-actions");
+        let mut state = LoggerState::default();
+        state
+            .configure(
+                LoggerConfigInput::new()
+                    .with_log_path(&path)
+                    .with_level(LoggerLevel::Warn),
+            )
+            .expect("logger should configure");
+
+        assert_eq!(state.log_action("InstanceStart"), Ok(false));
+        assert_eq!(
+            fs::read_to_string(&path).expect("logger output should be readable"),
+            ""
+        );
+
+        state
+            .configure(LoggerConfigInput::new().with_level(LoggerLevel::Debug))
+            .expect("logger should update level without replacing sink");
+        assert_eq!(state.log_action("FlushMetrics"), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("logger output should be readable");
+        assert_eq!(output, "action=FlushMetrics\n");
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn log_action_reports_write_errors_without_path_details() {
+        let mut state = LoggerState {
+            sink: Some(LoggerSink::from_writer(FailingWriter)),
+            level: LoggerLevel::Info,
+            show_level: false,
+            show_log_origin: false,
+            module: None,
+        };
+
+        let err = state
+            .log_action("InstanceStart")
+            .expect_err("failing writer should report logger write error");
+
+        assert_eq!(err, LoggerWriteError::Write(ErrorKind::BrokenPipe));
+        assert_eq!(err.to_string(), "failed to write logger output: BrokenPipe");
     }
 
     #[test]

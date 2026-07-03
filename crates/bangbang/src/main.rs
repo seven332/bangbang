@@ -349,7 +349,8 @@ fn help_text() -> String {
             "pre-boot PUT /machine-config, pre-boot PUT /boot-source, ",
             "pre-boot PUT /drives/{{drive_id}}, pre-boot ",
             "PUT /network-interfaces/{{iface_id}}, pre-boot PUT /vsock, ",
-            "pre-boot PUT /metrics, and pre-boot PUT /logger configuration storage over the API ",
+            "pre-boot PUT /metrics, and pre-boot PUT /logger configuration ",
+            "with minimal action logs over the API ",
             "socket; PUT /actions starts a process-owned HVF boot run-loop ",
             "worker across bounded step windows for InstanceStart, but public ",
             "run-loop control is not implemented yet."
@@ -523,7 +524,7 @@ mod tests {
         assert!(help.contains("pre-boot PUT /boot-source"));
         assert!(help.contains("pre-boot PUT /drives/{drive_id}"));
         assert!(help.contains("pre-boot PUT /metrics"));
-        assert!(help.contains("pre-boot PUT /logger configuration storage"));
+        assert!(help.contains("pre-boot PUT /logger configuration with minimal action logs"));
         assert!(help.contains("PUT /actions starts a process-owned HVF boot run-loop worker"));
         assert!(help.contains("across bounded step windows for InstanceStart"));
         assert!(help.contains("public run-loop control is not implemented yet"));
