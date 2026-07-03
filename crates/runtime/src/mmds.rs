@@ -2130,6 +2130,27 @@ mod tests {
     }
 
     #[test]
+    fn mmds_guest_tcp_response_frame_accepts_exact_ipv4_capacity() {
+        let packet = test_mmds_tcp_packet(b"GET /meta-data/hostname HTTP/1.1\r\n\r\n");
+        let classified = classify_mmds_guest_tcp_packet(&packet, test_mmds_ipv4_address())
+            .expect("MMDS TCP packet should classify");
+        let payload = vec![0; IPV4_MAX_TOTAL_LENGTH - IPV4_MIN_HEADER_LEN - TCP_MIN_HEADER_LEN];
+
+        let response = classified
+            .response_frame(&payload)
+            .expect("max-sized response frame should synthesize");
+
+        let ipv4_header = response
+            .get(ETHERNET_HEADER_LEN..ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN)
+            .expect("response frame should include IPv4 header");
+        assert_eq!(
+            packet_u16(ipv4_header, IPV4_TOTAL_LENGTH_OFFSET),
+            Some(u16::MAX)
+        );
+        assert_eq!(response_frame_tcp_payload(&response).len(), payload.len());
+    }
+
+    #[test]
     fn mmds_guest_tcp_response_frame_rejects_payload_past_ipv4_capacity() {
         let packet = test_mmds_tcp_packet(b"GET /meta-data/hostname HTTP/1.1\r\n\r\n");
         let classified = classify_mmds_guest_tcp_packet(&packet, test_mmds_ipv4_address())
