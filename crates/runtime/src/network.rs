@@ -516,6 +516,15 @@ impl<'a> VirtioNetworkRxPacket<'a> {
 }
 
 pub trait VirtioNetworkRxPacketSource {
+    /// Returns whether an RX retry is known to be useful after TX dispatch.
+    ///
+    /// Implementations must keep this cheap, non-consuming, and nonblocking.
+    /// Sources that would need to perform host I/O to answer should keep the
+    /// default `false` value and wait for a normal RX queue notification.
+    fn retry_after_tx_hint(&self) -> bool {
+        false
+    }
+
     fn peek_packet(
         &mut self,
     ) -> Result<Option<VirtioNetworkRxPacket<'_>>, VirtioNetworkRxPacketSourceError>;
@@ -1020,6 +1029,7 @@ impl VirtioNetworkDevice {
                 drained_notifications,
                 None,
                 None,
+                None,
             ));
         }
 
@@ -1060,6 +1070,7 @@ impl VirtioNetworkDevice {
                     return Err(VirtioNetworkDeviceNotificationError::RxQueueDispatch {
                         drained_notifications,
                         completed_tx_dispatch: None,
+                        completed_initial_rx_dispatch: None,
                         source,
                     });
                 }
@@ -1089,10 +1100,33 @@ impl VirtioNetworkDevice {
             None
         };
 
+        let post_tx_rx_queue_dispatch = if dispatch_tx && rx_source.retry_after_tx_hint() {
+            let Some(queue) = self.active_rx_queue.as_mut() else {
+                return Err(VirtioNetworkDeviceNotificationError::Inactive {
+                    drained_notifications,
+                });
+            };
+
+            match queue.dispatch_with_source_packet_limit(memory, rx_source, Some(1)) {
+                Ok(dispatch) => Some(dispatch),
+                Err(source) => {
+                    return Err(VirtioNetworkDeviceNotificationError::RxQueueDispatch {
+                        drained_notifications,
+                        completed_tx_dispatch: tx_queue_dispatch.map(Box::new),
+                        completed_initial_rx_dispatch: rx_queue_dispatch.map(Box::new),
+                        source,
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(VirtioNetworkDeviceNotificationDispatch::new(
             drained_notifications,
             rx_queue_dispatch,
             tx_queue_dispatch,
+            post_tx_rx_queue_dispatch,
         ))
     }
 }
@@ -1153,8 +1187,21 @@ impl VirtioNetworkRxQueue {
         memory: &mut GuestMemory,
         rx_source: &mut (impl VirtioNetworkRxPacketSource + ?Sized),
     ) -> Result<VirtioNetworkRxQueueDispatch, VirtioNetworkRxQueueDispatchError> {
+        self.dispatch_with_source_packet_limit(memory, rx_source, None)
+    }
+
+    fn dispatch_with_source_packet_limit(
+        &mut self,
+        memory: &mut GuestMemory,
+        rx_source: &mut (impl VirtioNetworkRxPacketSource + ?Sized),
+        max_consumed_packets: Option<usize>,
+    ) -> Result<VirtioNetworkRxQueueDispatch, VirtioNetworkRxQueueDispatchError> {
         let mut dispatch =
             VirtioNetworkRxQueueDispatch::with_capacity(self.available.queue_size())?;
+        if max_consumed_packets == Some(0) {
+            return Ok(dispatch);
+        }
+        let mut consumed_packets = 0;
 
         loop {
             let action = {
@@ -1286,6 +1333,10 @@ impl VirtioNetworkRxQueue {
                 VirtioNetworkRxQueueDispatchAction::Consume(outcome) => {
                     rx_source.consume_packet();
                     dispatch.record(outcome);
+                    consumed_packets += 1;
+                    if max_consumed_packets.is_some_and(|max| consumed_packets >= max) {
+                        break;
+                    }
                 }
             }
         }
@@ -2143,6 +2194,9 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioNetwor
                     .completed_tx_dispatch()
                     .is_some_and(VirtioNetworkTxQueueDispatch::needs_queue_interrupt)
                     || error
+                        .completed_initial_rx_dispatch()
+                        .is_some_and(VirtioNetworkRxQueueDispatch::needs_queue_interrupt)
+                    || error
                         .completed_rx_dispatch()
                         .is_some_and(VirtioNetworkRxQueueDispatch::needs_queue_interrupt)
             }
@@ -2175,6 +2229,9 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioNetwor
                 error
                     .completed_tx_dispatch()
                     .is_some_and(VirtioNetworkTxQueueDispatch::needs_queue_interrupt)
+                    || error
+                        .completed_initial_rx_dispatch()
+                        .is_some_and(VirtioNetworkRxQueueDispatch::needs_queue_interrupt)
                     || error
                         .completed_rx_dispatch()
                         .is_some_and(VirtioNetworkRxQueueDispatch::needs_queue_interrupt)
@@ -2782,6 +2839,7 @@ pub struct VirtioNetworkDeviceNotificationDispatch {
     drained_notifications: Vec<usize>,
     rx_queue_dispatch: Option<VirtioNetworkRxQueueDispatch>,
     tx_queue_dispatch: Option<VirtioNetworkTxQueueDispatch>,
+    post_tx_rx_queue_dispatch: Option<VirtioNetworkRxQueueDispatch>,
 }
 
 impl VirtioNetworkDeviceNotificationDispatch {
@@ -2789,11 +2847,13 @@ impl VirtioNetworkDeviceNotificationDispatch {
         drained_notifications: Vec<usize>,
         rx_queue_dispatch: Option<VirtioNetworkRxQueueDispatch>,
         tx_queue_dispatch: Option<VirtioNetworkTxQueueDispatch>,
+        post_tx_rx_queue_dispatch: Option<VirtioNetworkRxQueueDispatch>,
     ) -> Self {
         Self {
             drained_notifications,
             rx_queue_dispatch,
             tx_queue_dispatch,
+            post_tx_rx_queue_dispatch,
         }
     }
 
@@ -2809,12 +2869,20 @@ impl VirtioNetworkDeviceNotificationDispatch {
         self.rx_queue_dispatch.as_ref()
     }
 
+    pub const fn post_tx_rx_queue_dispatch(&self) -> Option<&VirtioNetworkRxQueueDispatch> {
+        self.post_tx_rx_queue_dispatch.as_ref()
+    }
+
     pub fn needs_queue_interrupt(&self) -> bool {
         self.tx_queue_dispatch
             .as_ref()
             .is_some_and(VirtioNetworkTxQueueDispatch::needs_queue_interrupt)
             || self
                 .rx_queue_dispatch
+                .as_ref()
+                .is_some_and(VirtioNetworkRxQueueDispatch::needs_queue_interrupt)
+            || self
+                .post_tx_rx_queue_dispatch
                 .as_ref()
                 .is_some_and(VirtioNetworkRxQueueDispatch::needs_queue_interrupt)
     }
@@ -2837,6 +2905,7 @@ pub enum VirtioNetworkDeviceNotificationError {
     RxQueueDispatch {
         drained_notifications: Vec<usize>,
         completed_tx_dispatch: Option<Box<VirtioNetworkTxQueueDispatch>>,
+        completed_initial_rx_dispatch: Option<Box<VirtioNetworkRxQueueDispatch>>,
         source: VirtioNetworkRxQueueDispatchError,
     },
 }
@@ -2873,6 +2942,21 @@ impl VirtioNetworkDeviceNotificationError {
                 None => None,
             },
             Self::Inactive { .. } | Self::UnsupportedQueue { .. } => None,
+        }
+    }
+
+    pub const fn completed_initial_rx_dispatch(&self) -> Option<&VirtioNetworkRxQueueDispatch> {
+        match self {
+            Self::RxQueueDispatch {
+                completed_initial_rx_dispatch,
+                ..
+            } => match completed_initial_rx_dispatch {
+                Some(dispatch) => Some(dispatch),
+                None => None,
+            },
+            Self::Inactive { .. }
+            | Self::UnsupportedQueue { .. }
+            | Self::TxQueueDispatch { .. } => None,
         }
     }
 
@@ -3944,6 +4028,9 @@ mod tests {
         peek_calls: usize,
         consume_calls: usize,
         fail_on_peek: Option<usize>,
+        retry_after_tx_hint: bool,
+        empty_peeks_before_packets: usize,
+        empty_peeks_after_first_consume: usize,
     }
 
     impl RecordingRxPacketSource {
@@ -3954,6 +4041,9 @@ mod tests {
                 peek_calls: 0,
                 consume_calls: 0,
                 fail_on_peek: None,
+                retry_after_tx_hint: false,
+                empty_peeks_before_packets: 0,
+                empty_peeks_after_first_consume: 0,
             }
         }
 
@@ -3964,15 +4054,32 @@ mod tests {
                 peek_calls: 0,
                 consume_calls: 0,
                 fail_on_peek: Some(fail_on_peek),
+                retry_after_tx_hint: false,
+                empty_peeks_before_packets: 0,
+                empty_peeks_after_first_consume: 0,
             }
         }
 
         fn remaining_packets(&self) -> usize {
             self.packets.len().saturating_sub(self.next_packet)
         }
+
+        fn with_retry_after_tx_hint(mut self) -> Self {
+            self.retry_after_tx_hint = true;
+            self
+        }
+
+        fn with_empty_peeks_after_first_consume(mut self, empty_peeks: usize) -> Self {
+            self.empty_peeks_after_first_consume = empty_peeks;
+            self
+        }
     }
 
     impl VirtioNetworkRxPacketSource for RecordingRxPacketSource {
+        fn retry_after_tx_hint(&self) -> bool {
+            self.retry_after_tx_hint && self.remaining_packets() != 0
+        }
+
         fn peek_packet(
             &mut self,
         ) -> Result<Option<VirtioNetworkRxPacket<'_>>, VirtioNetworkRxPacketSourceError> {
@@ -3982,6 +4089,10 @@ mod tests {
                     "test source failure on peek {}",
                     self.peek_calls
                 )));
+            }
+            if self.empty_peeks_before_packets != 0 {
+                self.empty_peeks_before_packets -= 1;
+                return Ok(None);
             }
 
             Ok(self
@@ -3994,6 +4105,10 @@ mod tests {
         fn consume_packet(&mut self) {
             self.consume_calls += 1;
             self.next_packet += 1;
+            if self.next_packet == 1 && self.empty_peeks_after_first_consume != 0 {
+                self.empty_peeks_before_packets = self.empty_peeks_after_first_consume;
+                self.empty_peeks_after_first_consume = 0;
+            }
         }
     }
 
@@ -6826,6 +6941,344 @@ mod tests {
         assert_eq!(sink.packets, [vec![0xde, 0xad, 0xbe, 0xef]]);
         assert_eq!(read_tx_used_index(&memory), 1);
         assert_eq!(read_tx_used_element(&memory, 0), (0, 0));
+        assert_eq!(
+            read_interrupt_status(&handler),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+    }
+
+    #[test]
+    fn virtio_network_notifications_post_tx_rx_hint_delivers_without_rx_notification() {
+        let mut memory = tx_frame_memory();
+        let mut handler = network_activation_handler();
+        let mut sink = RecordingTxPacketSink::default();
+        let mut source = RecordingRxPacketSource::with_packets(vec![vec![0xca, 0xfe]])
+            .with_retry_after_tx_hint();
+
+        configure_network_handler_queues(&mut handler);
+        activate_network_handler(&mut handler);
+        write_rx_descriptors(
+            &mut memory,
+            &[TestDescriptor::writable(
+                TEST_RX_BUFFER,
+                u32::try_from(VIRTIO_NET_RX_MIN_BUFFER_SIZE).expect("RX minimum should fit u32"),
+                None,
+            )],
+        );
+        write_rx_available_heads(&mut memory, &[0]);
+        write_tx_header(&mut memory, TEST_TX_HEADER);
+        write_tx_payload(&mut memory, TEST_TX_PAYLOAD, &[0x10]);
+        tx_descriptor_chain(
+            &mut memory,
+            &[
+                TestDescriptor::readable(TEST_TX_HEADER, VIRTIO_NET_TX_HEADER_SIZE, Some(1)),
+                TestDescriptor::readable(TEST_TX_PAYLOAD, 1, None),
+            ],
+        );
+        write_tx_available_heads(&mut memory, &[0]);
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_TX_QUEUE_INDEX
+                    .try_into()
+                    .expect("TX queue index should fit"),
+            )
+            .expect("TX notification should write");
+
+        let notification = handler
+            .dispatch_network_queue_notifications_with_packet_io(
+                &mut memory,
+                &mut sink,
+                &mut source,
+            )
+            .expect("TX queue notification should run post-TX RX retry");
+
+        assert_eq!(
+            notification.drained_notifications(),
+            [VIRTIO_NET_TX_QUEUE_INDEX]
+        );
+        assert!(notification.rx_queue_dispatch().is_none());
+        let tx_dispatch = notification
+            .tx_queue_dispatch()
+            .expect("TX dispatch summary should be present");
+        assert_eq!(tx_dispatch.processed_frames(), 1);
+        assert_eq!(tx_dispatch.successful_frames(), 1);
+        let rx_dispatch = notification
+            .post_tx_rx_queue_dispatch()
+            .expect("post-TX RX dispatch summary should be present");
+        assert_eq!(rx_dispatch.processed_buffers(), 1);
+        assert_eq!(rx_dispatch.delivered_packets(), 1);
+        assert_eq!(source.peek_calls, 1);
+        assert_eq!(source.consume_calls, 1);
+        assert_eq!(source.remaining_packets(), 0);
+        assert_eq!(read_rx_used_index(&memory), 1);
+        assert_eq!(read_rx_used_element(&memory, 0), (0, rx_used_len(2)));
+        assert_eq!(
+            read_guest_bytes(
+                &memory,
+                TEST_RX_BUFFER
+                    .checked_add(u64::from(VIRTIO_NET_TX_HEADER_SIZE))
+                    .expect("RX payload address should not overflow"),
+                2,
+            ),
+            vec![0xca, 0xfe]
+        );
+        assert!(notification.needs_queue_interrupt());
+        assert_eq!(
+            read_interrupt_status(&handler),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+    }
+
+    #[test]
+    fn virtio_network_notifications_post_tx_rx_without_hint_does_not_poll_source() {
+        let mut memory = tx_frame_memory();
+        let mut handler = network_activation_handler();
+        let mut sink = RecordingTxPacketSink::default();
+        let mut source = RecordingRxPacketSource::with_packets(vec![vec![0x21]]);
+
+        configure_network_handler_queues(&mut handler);
+        activate_network_handler(&mut handler);
+        write_tx_header(&mut memory, TEST_TX_HEADER);
+        write_tx_payload(&mut memory, TEST_TX_PAYLOAD, &[0x11]);
+        tx_descriptor_chain(
+            &mut memory,
+            &[
+                TestDescriptor::readable(TEST_TX_HEADER, VIRTIO_NET_TX_HEADER_SIZE, Some(1)),
+                TestDescriptor::readable(TEST_TX_PAYLOAD, 1, None),
+            ],
+        );
+        write_tx_available_heads(&mut memory, &[0]);
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_TX_QUEUE_INDEX
+                    .try_into()
+                    .expect("TX queue index should fit"),
+            )
+            .expect("TX notification should write");
+
+        let notification = handler
+            .dispatch_network_queue_notifications_with_packet_io(
+                &mut memory,
+                &mut sink,
+                &mut source,
+            )
+            .expect("TX queue notification should dispatch without RX retry");
+
+        assert!(notification.rx_queue_dispatch().is_none());
+        assert!(notification.post_tx_rx_queue_dispatch().is_none());
+        assert_eq!(source.peek_calls, 0);
+        assert_eq!(source.consume_calls, 0);
+        assert_eq!(source.remaining_packets(), 1);
+        assert_eq!(read_rx_used_index(&memory), 0);
+        assert_eq!(sink.calls, 1);
+    }
+
+    #[test]
+    fn virtio_network_notifications_post_tx_rx_hint_without_rx_buffer_keeps_packet() {
+        let mut memory = tx_frame_memory();
+        let mut handler = network_activation_handler();
+        let mut sink = RecordingTxPacketSink::default();
+        let mut source =
+            RecordingRxPacketSource::with_packets(vec![vec![0x31]]).with_retry_after_tx_hint();
+
+        configure_network_handler_queues(&mut handler);
+        activate_network_handler(&mut handler);
+        write_tx_header(&mut memory, TEST_TX_HEADER);
+        write_tx_payload(&mut memory, TEST_TX_PAYLOAD, &[0x12]);
+        tx_descriptor_chain(
+            &mut memory,
+            &[
+                TestDescriptor::readable(TEST_TX_HEADER, VIRTIO_NET_TX_HEADER_SIZE, Some(1)),
+                TestDescriptor::readable(TEST_TX_PAYLOAD, 1, None),
+            ],
+        );
+        write_tx_available_heads(&mut memory, &[0]);
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_TX_QUEUE_INDEX
+                    .try_into()
+                    .expect("TX queue index should fit"),
+            )
+            .expect("TX notification should write");
+
+        let notification = handler
+            .dispatch_network_queue_notifications_with_packet_io(
+                &mut memory,
+                &mut sink,
+                &mut source,
+            )
+            .expect("post-TX RX retry should no-op without RX buffers");
+
+        let rx_dispatch = notification
+            .post_tx_rx_queue_dispatch()
+            .expect("post-TX RX dispatch summary should be present");
+        assert_eq!(rx_dispatch.processed_buffers(), 0);
+        assert_eq!(rx_dispatch.delivered_packets(), 0);
+        assert_eq!(source.peek_calls, 1);
+        assert_eq!(source.consume_calls, 0);
+        assert_eq!(source.remaining_packets(), 1);
+        assert_eq!(read_rx_used_index(&memory), 0);
+        assert!(notification.needs_queue_interrupt());
+    }
+
+    #[test]
+    fn virtio_network_notifications_post_tx_rx_failure_preserves_tx_metadata() {
+        let mut memory = tx_frame_memory();
+        let mut handler = network_activation_handler();
+        let mut sink = RecordingTxPacketSink::default();
+        let mut source = RecordingRxPacketSource::failing_on_peek(1, vec![vec![0x41]])
+            .with_retry_after_tx_hint();
+
+        configure_network_handler_queues(&mut handler);
+        activate_network_handler(&mut handler);
+        write_tx_header(&mut memory, TEST_TX_HEADER);
+        write_tx_payload(&mut memory, TEST_TX_PAYLOAD, &[0x13]);
+        tx_descriptor_chain(
+            &mut memory,
+            &[
+                TestDescriptor::readable(TEST_TX_HEADER, VIRTIO_NET_TX_HEADER_SIZE, Some(1)),
+                TestDescriptor::readable(TEST_TX_PAYLOAD, 1, None),
+            ],
+        );
+        write_tx_available_heads(&mut memory, &[0]);
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_TX_QUEUE_INDEX
+                    .try_into()
+                    .expect("TX queue index should fit"),
+            )
+            .expect("TX notification should write");
+
+        let error = handler
+            .dispatch_network_queue_notifications_with_packet_io(
+                &mut memory,
+                &mut sink,
+                &mut source,
+            )
+            .expect_err("post-TX RX source failure should fail dispatch");
+
+        match &error {
+            VirtioNetworkDeviceNotificationError::RxQueueDispatch {
+                source: VirtioNetworkRxQueueDispatchError::PacketSource { .. },
+                ..
+            } => {}
+            other => panic!("expected post-TX RX source error, got {other:?}"),
+        }
+        assert_eq!(error.drained_notifications(), [VIRTIO_NET_TX_QUEUE_INDEX]);
+        let tx_dispatch = error
+            .completed_tx_dispatch()
+            .expect("completed TX dispatch metadata should be preserved");
+        assert_eq!(tx_dispatch.processed_frames(), 1);
+        assert_eq!(tx_dispatch.successful_frames(), 1);
+        assert!(error.completed_initial_rx_dispatch().is_none());
+        let rx_dispatch = error
+            .completed_rx_dispatch()
+            .expect("failed post-TX RX dispatch metadata should be preserved");
+        assert_eq!(rx_dispatch.processed_buffers(), 0);
+        assert_eq!(rx_dispatch.source_failures(), 1);
+        assert_eq!(source.peek_calls, 1);
+        assert_eq!(source.consume_calls, 0);
+        assert_eq!(source.remaining_packets(), 1);
+        assert_eq!(sink.calls, 1);
+        assert_eq!(
+            read_interrupt_status(&handler),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+    }
+
+    #[test]
+    fn virtio_network_notifications_post_tx_rx_keeps_initial_and_retry_metadata() {
+        let mut memory = tx_frame_memory();
+        let mut handler = network_activation_handler();
+        let mut sink = RecordingTxPacketSink::default();
+        let mut source = RecordingRxPacketSource::with_packets(vec![vec![0x51], vec![0x52, 0x53]])
+            .with_retry_after_tx_hint()
+            .with_empty_peeks_after_first_consume(1);
+
+        configure_network_handler_queues(&mut handler);
+        activate_network_handler(&mut handler);
+        write_rx_descriptors(
+            &mut memory,
+            &[
+                TestDescriptor::writable(
+                    TEST_RX_BUFFER,
+                    u32::try_from(VIRTIO_NET_RX_MIN_BUFFER_SIZE)
+                        .expect("RX minimum should fit u32"),
+                    None,
+                ),
+                TestDescriptor::writable(
+                    TEST_RX_SECOND_BUFFER,
+                    u32::try_from(VIRTIO_NET_RX_MIN_BUFFER_SIZE)
+                        .expect("RX minimum should fit u32"),
+                    None,
+                ),
+            ],
+        );
+        write_rx_available_heads(&mut memory, &[0, 1]);
+        write_tx_header(&mut memory, TEST_TX_HEADER);
+        write_tx_payload(&mut memory, TEST_TX_PAYLOAD, &[0x14]);
+        tx_descriptor_chain(
+            &mut memory,
+            &[
+                TestDescriptor::readable(TEST_TX_HEADER, VIRTIO_NET_TX_HEADER_SIZE, Some(1)),
+                TestDescriptor::readable(TEST_TX_PAYLOAD, 1, None),
+            ],
+        );
+        write_tx_available_heads(&mut memory, &[0]);
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_RX_QUEUE_INDEX
+                    .try_into()
+                    .expect("RX queue index should fit"),
+            )
+            .expect("RX notification should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_TX_QUEUE_INDEX
+                    .try_into()
+                    .expect("TX queue index should fit"),
+            )
+            .expect("TX notification should write");
+
+        let notification = handler
+            .dispatch_network_queue_notifications_with_packet_io(
+                &mut memory,
+                &mut sink,
+                &mut source,
+            )
+            .expect("RX+TX notifications should keep initial and post-TX RX metadata");
+
+        assert_eq!(
+            notification.drained_notifications(),
+            [VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_QUEUE_INDEX]
+        );
+        let initial_rx_dispatch = notification
+            .rx_queue_dispatch()
+            .expect("initial RX dispatch summary should be present");
+        assert_eq!(initial_rx_dispatch.processed_buffers(), 1);
+        assert_eq!(initial_rx_dispatch.delivered_packets(), 1);
+        let tx_dispatch = notification
+            .tx_queue_dispatch()
+            .expect("TX dispatch summary should be present");
+        assert_eq!(tx_dispatch.processed_frames(), 1);
+        assert_eq!(tx_dispatch.successful_frames(), 1);
+        let post_tx_rx_dispatch = notification
+            .post_tx_rx_queue_dispatch()
+            .expect("post-TX RX dispatch summary should be present");
+        assert_eq!(post_tx_rx_dispatch.processed_buffers(), 1);
+        assert_eq!(post_tx_rx_dispatch.delivered_packets(), 1);
+        assert_eq!(source.peek_calls, 3);
+        assert_eq!(source.consume_calls, 2);
+        assert_eq!(source.remaining_packets(), 0);
+        assert_eq!(read_rx_used_index(&memory), 2);
+        assert_eq!(read_rx_used_element(&memory, 0), (0, rx_used_len(1)));
+        assert_eq!(read_rx_used_element(&memory, 1), (1, rx_used_len(2)));
         assert_eq!(
             read_interrupt_status(&handler),
             DeviceInterruptKind::Queue.status().bits()

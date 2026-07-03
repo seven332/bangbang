@@ -191,8 +191,9 @@ status/content-type/body values, parse complete process-local guest HTTP `GET`
 request bytes, map parse failures to deterministic process-local error
 responses without echoing malformed request bytes, and serialize process-local
 HTTP response bytes for guest delivery. It can synthesize single-packet
-Ethernet/IPv4/TCP response frames carrying those bytes and expose queued
-response frames through the matching virtio-net RX source. It also has a process-local
+Ethernet/IPv4/TCP response frames carrying those bytes, expose queued response
+frames through the matching virtio-net RX source, and schedule one bounded
+post-TX RX retry when that source reports a queued response. It also has a process-local
 opaque token authority with a default `1024`-entry active-token store and can
 model process-local guest `PUT /latest/api/token` exchanges that return
 generated tokens. When MMDS v2 is configured, process-local guest GET handling
@@ -206,8 +207,8 @@ including token PUT and MMDS v2 GET token enforcement. The process vmnet TX
 path detours those non-empty candidates only for interfaces listed in the MMDS
 config, synthesizes response frames from the single-packet request context,
 retains those frames in bounded per-interface queues, delivers queued frames
-through the matching virtio-net RX source, and does not forward handled request
-payloads to vmnet. This still does not reassemble fragments, buffer split TCP
+through the matching virtio-net RX source with a bounded post-TX RX retry, and
+does not forward handled request payloads to vmnet. This still does not reassemble fragments, buffer split TCP
 requests, track TCP state, or implement retransmission policy. Future
 guest-visible MMDS work must continue validating device, packet, token, and
 TCP/session inputs before expanding the guest-visible data path.
@@ -253,7 +254,7 @@ The current scaffold does not implement:
   packets between vmnet and the runtime packet traits, detour configured
   non-empty MMDS TX payloads before vmnet forwarding, synthesize single-packet
   MMDS response frames, retain bounded per-interface MMDS response queues, and
-  expose queued responses through virtio-net RX, plus an
+  expose queued responses through virtio-net RX with bounded post-TX retry, plus an
   internal provider that can select prebuilt adapters by configured interface
   ID and an internal `host_dev_name` mapping for
   `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>`. The current
