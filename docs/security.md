@@ -282,14 +282,14 @@ The current scaffold does not implement:
   ARP requests, pure empty-payload MMDS SYN packets, pure empty-payload MMDS
   ACK-only packets that acknowledge bangbang's deterministic SYN-ACK, pure
   empty-payload MMDS FIN close packets, unsupported empty-payload MMDS control
-  packets, guest-sent MMDS RST packets, and non-empty MMDS TX payloads that
-  acknowledge bangbang's deterministic SYN-ACK before vmnet forwarding, buffer
-  contiguous split MMDS request headers,
+  packets, guest-sent MMDS packets carrying RST, and non-empty MMDS TX payloads
+  that acknowledge bangbang's deterministic SYN-ACK before vmnet forwarding,
+  buffer contiguous split MMDS request headers,
   synthesize deterministic ARP replies, MMDS SYN-ACK frames, minimal MMDS RST
-  frames, and MMDS TCP response frames, retain bounded per-interface MMDS response queues,
-  and expose queued responses through virtio-net RX with bounded post-TX retry, plus an
-  internal provider that can select prebuilt adapters by configured interface
-  ID and an internal `host_dev_name` mapping for
+  frames, and MMDS TCP response frames, retain bounded per-interface MMDS
+  response queues, and expose queued responses through virtio-net RX with
+  bounded post-TX retry, plus an internal provider that can select prebuilt
+  adapters by configured interface ID and an internal `host_dev_name` mapping for
   `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>`. The current
   model stores at most 16 configured network interfaces. Startup revalidates
   that limit before opening vmnet resources, opens them only when configured
