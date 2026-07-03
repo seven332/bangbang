@@ -993,6 +993,18 @@ mod tests {
         VmnetVirtioNetworkPacketIoProviderEntry::new(iface_id, packet_io(backend))
     }
 
+    fn provider_entry_with_mmds_detour(
+        iface_id: &str,
+        backend: FakeVmnetPacketIoBackend,
+        mmds_state: MmdsStateHandle,
+        response_queue: MmdsResponseQueue,
+    ) -> VmnetVirtioNetworkPacketIoProviderEntry<FakeVmnetPacketIoBackend> {
+        VmnetVirtioNetworkPacketIoProviderEntry::new(
+            iface_id,
+            packet_io_with_mmds_detour(backend, mmds_state, response_queue),
+        )
+    }
+
     fn network_device(iface_id: &str) -> Arm64BootNetworkDevice {
         let mut configs = NetworkInterfaceConfigs::new();
         configs
@@ -1584,6 +1596,49 @@ mod tests {
         assert_eq!(
             error.message(),
             "missing vmnet packet I/O for interface eth1"
+        );
+    }
+
+    #[test]
+    fn provider_forwards_mmds_packet_on_interface_without_detour() {
+        let packet = mmds_tcp_packet(b"GET /meta-data/hostname HTTP/1.1\r\n\r\n");
+        let mut memory = tx_memory();
+        let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        let mut provider = VmnetVirtioNetworkPacketIoProvider::new(vec![
+            provider_entry_with_mmds_detour(
+                "eth0",
+                FakeVmnetPacketIoBackend::default(),
+                MmdsStateHandle::default(),
+                response_queue.clone(),
+            ),
+            provider_entry("eth1", FakeVmnetPacketIoBackend::default()),
+        ])
+        .expect("provider should build");
+
+        let eth1 = provider
+            .entries
+            .iter_mut()
+            .find(|entry| entry.iface_id() == "eth1")
+            .expect("eth1 entry should exist");
+        eth1.packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &frame)
+            .expect("eth1 TX should forward");
+
+        let eth1_state = eth1
+            .packet_io
+            .tx_sink()
+            .shared
+            .lock()
+            .expect("eth1 state lock should succeed");
+        assert_eq!(eth1_state.backend.write_calls, 1);
+        assert_eq!(eth1_state.backend.written_packets, [packet]);
+        assert!(
+            response_queue
+                .responses()
+                .expect("MMDS response queue should read")
+                .is_empty()
         );
     }
 
