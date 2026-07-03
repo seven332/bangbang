@@ -212,8 +212,8 @@ that deterministic SYN-ACK are consumed without queueing a response. Pure
 empty-payload TCP FIN close candidates queue
 deterministic ACK and FIN-ACK frames without touching MMDS data or token state.
 Unsupported empty-payload TCP control candidates queue deterministic RST frames
-without touching MMDS data or token state, and guest-sent RST controls are
-consumed without response to avoid reset loops.
+without touching MMDS data or token state, and guest-sent packets carrying RST
+are consumed without response even when they also carry payload bytes.
 For non-empty candidate TCP payloads that acknowledge that deterministic
 SYN-ACK, the runtime can produce the same process-local HTTP response bytes as
 the existing guest HTTP helper, including token PUT and MMDS v2 GET token
@@ -221,16 +221,17 @@ enforcement. The process vmnet TX path detours
 MMDS ARP requests, pure empty-payload MMDS SYN packets, pure empty-payload MMDS
 ACK-only packets that acknowledge bangbang's deterministic SYN-ACK, pure
 empty-payload MMDS FIN close packets, unsupported empty-payload MMDS control
-packets, guest-sent MMDS RST packets, and non-empty candidates that acknowledge
-bangbang's deterministic SYN-ACK only for interfaces listed in the MMDS config, buffers
-split request headers in bounded per-interface process state only when each
-fragment starts at the next expected TCP sequence number, rejects
-non-contiguous buffered fragments before appending guest bytes,
+packets, guest-sent MMDS packets carrying RST, and non-empty candidates that
+acknowledge bangbang's deterministic SYN-ACK only for interfaces listed in the
+MMDS config, buffers split request headers in bounded per-interface process
+state only when each fragment starts at the next expected TCP sequence number,
+rejects non-contiguous buffered fragments before appending guest bytes,
 synthesizes response frames from deterministic ARP context, deterministic
 SYN-ACK context, minimal FIN close context, minimal RST context, or the first
-TCP request fragment context, retains those frames in bounded per-interface queues, delivers queued
-frames through the matching virtio-net RX source with a bounded post-TX RX
-retry, and does not forward handled request payloads to vmnet. This still does
+TCP request fragment context, retains those frames in bounded per-interface
+queues, delivers queued frames through the matching virtio-net RX source with a
+bounded post-TX RX retry, and does not forward handled request payloads to
+vmnet. This still does
 not manage a full ARP cache, emit gratuitous ARP, implement ARP
 timeouts/retries, validate broader TCP ACK numbers beyond the narrow ACK-only
 and non-empty payload SYN-ACK acknowledgement paths, reassemble out-of-order TCP
@@ -281,14 +282,14 @@ The current scaffold does not implement:
   ARP requests, pure empty-payload MMDS SYN packets, pure empty-payload MMDS
   ACK-only packets that acknowledge bangbang's deterministic SYN-ACK, pure
   empty-payload MMDS FIN close packets, unsupported empty-payload MMDS control
-  packets, guest-sent MMDS RST packets, and non-empty MMDS TX payloads that
-  acknowledge bangbang's deterministic SYN-ACK before vmnet forwarding, buffer
-  contiguous split MMDS request headers,
+  packets, guest-sent MMDS packets carrying RST, and non-empty MMDS TX payloads
+  that acknowledge bangbang's deterministic SYN-ACK before vmnet forwarding,
+  buffer contiguous split MMDS request headers,
   synthesize deterministic ARP replies, MMDS SYN-ACK frames, minimal MMDS RST
-  frames, and MMDS TCP response frames, retain bounded per-interface MMDS response queues,
-  and expose queued responses through virtio-net RX with bounded post-TX retry, plus an
-  internal provider that can select prebuilt adapters by configured interface
-  ID and an internal `host_dev_name` mapping for
+  frames, and MMDS TCP response frames, retain bounded per-interface MMDS
+  response queues, and expose queued responses through virtio-net RX with
+  bounded post-TX retry, plus an internal provider that can select prebuilt
+  adapters by configured interface ID and an internal `host_dev_name` mapping for
   `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>`. The current
   model stores at most 16 configured network interfaces. Startup revalidates
   that limit before opening vmnet resources, opens them only when configured

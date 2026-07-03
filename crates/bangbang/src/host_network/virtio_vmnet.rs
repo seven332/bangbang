@@ -116,7 +116,7 @@ impl MmdsPacketDetour {
             })?;
             return Ok(true);
         }
-        if classified.is_empty_reset_control() {
+        if classified.is_reset_control() {
             return Ok(true);
         }
         if classified.is_unsupported_empty_control_reset_request() {
@@ -2846,6 +2846,56 @@ mod tests {
                 .expect("MMDS response queue should read")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn tx_sink_consumes_payload_carrying_mmds_guest_rst_without_response() {
+        for flags in [
+            TCP_FLAG_RST,
+            TCP_FLAG_RST | TCP_FLAG_ACK,
+            TCP_FLAG_RST | TCP_FLAG_PSH,
+        ] {
+            let mut packet = mmds_tcp_packet(b"GET /meta-data/hostname HTTP/1.1\r\n\r\n");
+            set_tcp_flags(&mut packet, flags);
+            let mut memory = tx_memory();
+            let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
+            let response_queue = MmdsResponseQueue::with_capacity(2);
+            let mmds_state = v2_mmds_state_handle();
+            let state_before = mmds_state
+                .with(Clone::clone)
+                .expect("MMDS state should lock");
+            let mut packet_io = packet_io_with_mmds_detour(
+                FakeVmnetPacketIoBackend::default(),
+                mmds_state.clone(),
+                response_queue.clone(),
+            );
+
+            packet_io
+                .tx_sink()
+                .transmit_frame(&memory, &frame)
+                .expect("MMDS payload RST should detour without response");
+
+            let state = packet_io
+                .tx_sink()
+                .shared
+                .lock()
+                .expect("test state lock should succeed");
+            assert_eq!(state.backend.write_calls, 0);
+            assert!(state.backend.written_packets.is_empty());
+            drop(state);
+            assert_eq!(
+                mmds_state
+                    .with(Clone::clone)
+                    .expect("MMDS state should lock"),
+                state_before
+            );
+            assert!(
+                response_queue
+                    .responses()
+                    .expect("MMDS response queue should read")
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

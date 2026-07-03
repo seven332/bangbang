@@ -224,8 +224,8 @@ impl<'a> MmdsGuestTcpPacket<'a> {
             && self.payload.is_empty()
     }
 
-    pub fn is_empty_reset_control(self) -> bool {
-        self.tcp_flags & TCP_FLAG_RST != 0 && self.payload.is_empty()
+    pub fn is_reset_control(self) -> bool {
+        self.tcp_flags & TCP_FLAG_RST != 0
     }
 
     pub fn is_unsupported_empty_control_reset_request(self) -> bool {
@@ -233,7 +233,7 @@ impl<'a> MmdsGuestTcpPacket<'a> {
             && !self.is_initial_synchronization_request()
             && !self.is_acknowledgement_only()
             && !self.is_empty_fin_close_request()
-            && !self.is_empty_reset_control()
+            && !self.is_reset_control()
     }
 
     pub const fn response_context(self) -> MmdsGuestTcpResponseContext {
@@ -2851,7 +2851,7 @@ mod tests {
     }
 
     #[test]
-    fn identifies_empty_mmds_guest_tcp_reset_control_packet() {
+    fn identifies_mmds_guest_tcp_reset_control_packet() {
         let tcp_start = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN;
 
         for flags in [
@@ -2863,21 +2863,27 @@ mod tests {
             reset_packet[tcp_start + TCP_FLAGS_OFFSET] = flags;
             let reset = classify_mmds_guest_tcp_packet(&reset_packet, test_mmds_ipv4_address())
                 .expect("MMDS TCP reset control packet should classify");
-            assert!(reset.is_empty_reset_control());
+            assert!(reset.is_reset_control());
         }
 
-        let mut reset_with_payload = test_mmds_tcp_packet(b"payload");
-        reset_with_payload[tcp_start + TCP_FLAGS_OFFSET] = TCP_FLAG_RST | TCP_FLAG_ACK;
-        let reset_with_payload =
-            classify_mmds_guest_tcp_packet(&reset_with_payload, test_mmds_ipv4_address())
-                .expect("MMDS TCP reset with payload should classify");
-        assert!(!reset_with_payload.is_empty_reset_control());
+        for flags in [
+            TCP_FLAG_RST,
+            TCP_FLAG_RST | TCP_FLAG_ACK,
+            TCP_FLAG_RST | TCP_FLAG_PSH,
+        ] {
+            let mut reset_with_payload = test_mmds_tcp_packet(b"payload");
+            reset_with_payload[tcp_start + TCP_FLAGS_OFFSET] = flags;
+            let reset_with_payload =
+                classify_mmds_guest_tcp_packet(&reset_with_payload, test_mmds_ipv4_address())
+                    .expect("MMDS TCP reset with payload should classify");
+            assert!(reset_with_payload.is_reset_control());
+        }
 
         let mut psh_packet = test_mmds_tcp_packet(b"");
         psh_packet[tcp_start + TCP_FLAGS_OFFSET] = TCP_FLAG_PSH;
         let psh = classify_mmds_guest_tcp_packet(&psh_packet, test_mmds_ipv4_address())
             .expect("MMDS TCP PSH control packet should classify");
-        assert!(!psh.is_empty_reset_control());
+        assert!(!psh.is_reset_control());
     }
 
     #[test]
