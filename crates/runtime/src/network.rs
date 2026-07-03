@@ -20,7 +20,8 @@ use crate::virtio_mmio::{
 };
 use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
-    VirtqueueDescriptorChain, VirtqueueUsedRing, VirtqueueUsedRingError,
+    VirtqueueDescriptorChain, VirtqueueNotificationSuppression, VirtqueueUsedRing,
+    VirtqueueUsedRingError, VirtqueueUsedRingPublication,
 };
 
 const MAC_ADDRESS_LEN: usize = 6;
@@ -972,23 +973,23 @@ impl VirtioNetworkDevice {
             return Err(VirtioNetworkDeviceActivationError::AlreadyActive);
         }
 
+        let event_idx_enabled =
+            virtio_feature_enabled(activation.driver_features(), VIRTIO_RING_FEATURE_EVENT_IDX);
         let active_rx_queue = active_network_queue_state(activation, VIRTIO_NET_RX_QUEUE_INDEX_U32)
             .and_then(|queue| {
-                VirtioNetworkRxQueue::from_mmio_queue_state(queue).map_err(|source| {
-                    VirtioNetworkDeviceActivationError::RxQueueBuild {
+                VirtioNetworkRxQueue::from_mmio_queue_state_with_event_idx(queue, event_idx_enabled)
+                    .map_err(|source| VirtioNetworkDeviceActivationError::RxQueueBuild {
                         queue_index: VIRTIO_NET_RX_QUEUE_INDEX_U32,
                         source,
-                    }
-                })
+                    })
             })?;
         let active_tx_queue = active_network_queue_state(activation, VIRTIO_NET_TX_QUEUE_INDEX_U32)
             .and_then(|queue| {
-                VirtioNetworkTxQueue::from_mmio_queue_state(queue).map_err(|source| {
-                    VirtioNetworkDeviceActivationError::TxQueueBuild {
+                VirtioNetworkTxQueue::from_mmio_queue_state_with_event_idx(queue, event_idx_enabled)
+                    .map_err(|source| VirtioNetworkDeviceActivationError::TxQueueBuild {
                         queue_index: VIRTIO_NET_TX_QUEUE_INDEX_U32,
                         source,
-                    }
-                })
+                    })
             })?;
 
         self.active_rx_queue = Some(active_rx_queue);
@@ -1136,11 +1137,19 @@ pub struct VirtioNetworkRxQueue {
     queue_state: VirtioMmioQueueState,
     available: VirtqueueAvailableRing,
     used: VirtqueueUsedRing,
+    event_idx_enabled: bool,
 }
 
 impl VirtioNetworkRxQueue {
     pub fn from_mmio_queue_state(
         queue: VirtioMmioQueueState,
+    ) -> Result<Self, VirtioNetworkRxQueueBuildError> {
+        Self::from_mmio_queue_state_with_event_idx(queue, false)
+    }
+
+    fn from_mmio_queue_state_with_event_idx(
+        queue: VirtioMmioQueueState,
+        event_idx_enabled: bool,
     ) -> Result<Self, VirtioNetworkRxQueueBuildError> {
         if !queue.ready() {
             return Err(VirtioNetworkRxQueueBuildError::QueueNotReady);
@@ -1159,6 +1168,7 @@ impl VirtioNetworkRxQueue {
             queue_state: queue,
             available,
             used,
+            event_idx_enabled,
         })
     }
 
@@ -1172,6 +1182,10 @@ impl VirtioNetworkRxQueue {
 
     pub const fn used_ring(&self) -> &VirtqueueUsedRing {
         &self.used
+    }
+
+    pub const fn event_idx_enabled(&self) -> bool {
+        self.event_idx_enabled
     }
 
     pub fn dispatch(
@@ -1266,16 +1280,34 @@ impl VirtioNetworkRxQueue {
                 match VirtioNetworkRxBuffer::parse(memory, &chain) {
                     Ok(buffer) => {
                         if u64::from(bytes_written_to_guest) > buffer.len() {
-                            if let Err(source) =
-                                self.used.publish_used_element(memory, descriptor_head, 0)
+                            let notification_suppression = match self
+                                .notification_suppression(memory)
                             {
-                                return Err(VirtioNetworkRxQueueDispatchError::UsedRing {
-                                    completed_dispatch: Box::new(dispatch),
+                                Ok(notification_suppression) => notification_suppression,
+                                Err(source) => {
+                                    return Err(VirtioNetworkRxQueueDispatchError::AvailableRing {
+                                        completed_dispatch: Box::new(dispatch),
+                                        source,
+                                    });
+                                }
+                            };
+                            let publication =
+                                match self.used.publish_used_element_with_notification(
+                                    memory,
                                     descriptor_head,
-                                    bytes_written_to_guest: 0,
-                                    source,
-                                });
-                            }
+                                    0,
+                                    notification_suppression,
+                                ) {
+                                    Ok(publication) => publication,
+                                    Err(source) => {
+                                        return Err(VirtioNetworkRxQueueDispatchError::UsedRing {
+                                            completed_dispatch: Box::new(dispatch),
+                                            descriptor_head,
+                                            bytes_written_to_guest: 0,
+                                            source,
+                                        });
+                                    }
+                                };
                             VirtioNetworkRxQueueDispatchAction::Record(
                                 VirtioNetworkRxQueueDispatchOutcome::BufferTooSmall(
                                     VirtioNetworkRxBufferTooSmall {
@@ -1284,6 +1316,7 @@ impl VirtioNetworkRxQueue {
                                         required_len: u64::from(bytes_written_to_guest),
                                     },
                                 ),
+                                publication,
                             )
                         } else {
                             if let Err(source) = write_rx_packet_to_buffer(memory, &buffer, packet)
@@ -1294,18 +1327,34 @@ impl VirtioNetworkRxQueue {
                                     source,
                                 });
                             }
-                            if let Err(source) = self.used.publish_used_element(
-                                memory,
-                                descriptor_head,
-                                bytes_written_to_guest,
-                            ) {
-                                return Err(VirtioNetworkRxQueueDispatchError::UsedRing {
-                                    completed_dispatch: Box::new(dispatch),
+                            let notification_suppression = match self
+                                .notification_suppression(memory)
+                            {
+                                Ok(notification_suppression) => notification_suppression,
+                                Err(source) => {
+                                    return Err(VirtioNetworkRxQueueDispatchError::AvailableRing {
+                                        completed_dispatch: Box::new(dispatch),
+                                        source,
+                                    });
+                                }
+                            };
+                            let publication =
+                                match self.used.publish_used_element_with_notification(
+                                    memory,
                                     descriptor_head,
                                     bytes_written_to_guest,
-                                    source,
-                                });
-                            }
+                                    notification_suppression,
+                                ) {
+                                    Ok(publication) => publication,
+                                    Err(source) => {
+                                        return Err(VirtioNetworkRxQueueDispatchError::UsedRing {
+                                            completed_dispatch: Box::new(dispatch),
+                                            descriptor_head,
+                                            bytes_written_to_guest,
+                                            source,
+                                        });
+                                    }
+                                };
                             VirtioNetworkRxQueueDispatchAction::Consume(
                                 VirtioNetworkRxQueueDispatchOutcome::Delivered(
                                     VirtioNetworkRxPacketDelivery {
@@ -1314,37 +1363,69 @@ impl VirtioNetworkRxQueue {
                                         bytes_written_to_guest,
                                     },
                                 ),
+                                publication,
                             )
                         }
                     }
                     Err(source) => {
-                        if let Err(used_source) =
-                            self.used.publish_used_element(memory, descriptor_head, 0)
-                        {
-                            return Err(VirtioNetworkRxQueueDispatchError::UsedRing {
-                                completed_dispatch: Box::new(dispatch),
-                                descriptor_head,
-                                bytes_written_to_guest: 0,
-                                source: used_source,
-                            });
-                        }
+                        let notification_suppression = match self.notification_suppression(memory) {
+                            Ok(notification_suppression) => notification_suppression,
+                            Err(source) => {
+                                return Err(VirtioNetworkRxQueueDispatchError::AvailableRing {
+                                    completed_dispatch: Box::new(dispatch),
+                                    source,
+                                });
+                            }
+                        };
+                        let publication = match self.used.publish_used_element_with_notification(
+                            memory,
+                            descriptor_head,
+                            0,
+                            notification_suppression,
+                        ) {
+                            Ok(publication) => publication,
+                            Err(used_source) => {
+                                return Err(VirtioNetworkRxQueueDispatchError::UsedRing {
+                                    completed_dispatch: Box::new(dispatch),
+                                    descriptor_head,
+                                    bytes_written_to_guest: 0,
+                                    source: used_source,
+                                });
+                            }
+                        };
                         VirtioNetworkRxQueueDispatchAction::Record(
                             VirtioNetworkRxQueueDispatchOutcome::BufferParseError(source),
+                            publication,
                         )
                     }
                 }
             };
 
             match action {
-                VirtioNetworkRxQueueDispatchAction::Record(outcome) => dispatch.record(outcome),
-                VirtioNetworkRxQueueDispatchAction::Consume(outcome) => {
+                VirtioNetworkRxQueueDispatchAction::Record(outcome, publication) => {
+                    dispatch.record(outcome, publication);
+                }
+                VirtioNetworkRxQueueDispatchAction::Consume(outcome, publication) => {
                     rx_source.consume_packet();
-                    dispatch.record(outcome);
+                    dispatch.record(outcome, publication);
                 }
             }
         }
 
         Ok(dispatch)
+    }
+
+    fn notification_suppression(
+        &self,
+        memory: &GuestMemory,
+    ) -> Result<VirtqueueNotificationSuppression, VirtqueueAvailableRingError> {
+        if self.event_idx_enabled {
+            Ok(VirtqueueNotificationSuppression::EventIdx {
+                used_event: self.available.used_event(memory)?,
+            })
+        } else {
+            Ok(VirtqueueNotificationSuppression::Disabled)
+        }
     }
 }
 
@@ -1436,6 +1517,7 @@ pub struct VirtioNetworkRxQueueDispatch {
     first_buffer_parse_failure: Option<VirtioNetworkRxBufferParseError>,
     first_buffer_too_small: Option<VirtioNetworkRxBufferTooSmall>,
     first_source_failure: Option<VirtioNetworkRxPacketSourceError>,
+    needs_queue_interrupt: bool,
 }
 
 impl VirtioNetworkRxQueueDispatch {
@@ -1457,6 +1539,7 @@ impl VirtioNetworkRxQueueDispatch {
             first_buffer_parse_failure: None,
             first_buffer_too_small: None,
             first_source_failure: None,
+            needs_queue_interrupt: false,
         })
     }
 
@@ -1497,11 +1580,16 @@ impl VirtioNetworkRxQueueDispatch {
     }
 
     pub const fn needs_queue_interrupt(&self) -> bool {
-        self.processed_buffers != 0
+        self.needs_queue_interrupt
     }
 
-    fn record(&mut self, outcome: VirtioNetworkRxQueueDispatchOutcome) {
+    fn record(
+        &mut self,
+        outcome: VirtioNetworkRxQueueDispatchOutcome,
+        publication: VirtqueueUsedRingPublication,
+    ) {
         self.processed_buffers += 1;
+        self.needs_queue_interrupt |= publication.needs_queue_interrupt();
         match outcome {
             VirtioNetworkRxQueueDispatchOutcome::Delivered(delivery) => {
                 self.delivered_packets += 1;
@@ -1539,8 +1627,14 @@ enum VirtioNetworkRxQueueDispatchOutcome {
 
 #[derive(Debug)]
 enum VirtioNetworkRxQueueDispatchAction {
-    Record(VirtioNetworkRxQueueDispatchOutcome),
-    Consume(VirtioNetworkRxQueueDispatchOutcome),
+    Record(
+        VirtioNetworkRxQueueDispatchOutcome,
+        VirtqueueUsedRingPublication,
+    ),
+    Consume(
+        VirtioNetworkRxQueueDispatchOutcome,
+        VirtqueueUsedRingPublication,
+    ),
 }
 
 #[derive(Debug)]
@@ -1850,11 +1944,19 @@ pub struct VirtioNetworkTxQueue {
     queue_state: VirtioMmioQueueState,
     available: VirtqueueAvailableRing,
     used: VirtqueueUsedRing,
+    event_idx_enabled: bool,
 }
 
 impl VirtioNetworkTxQueue {
     pub fn from_mmio_queue_state(
         queue: VirtioMmioQueueState,
+    ) -> Result<Self, VirtioNetworkTxQueueBuildError> {
+        Self::from_mmio_queue_state_with_event_idx(queue, false)
+    }
+
+    fn from_mmio_queue_state_with_event_idx(
+        queue: VirtioMmioQueueState,
+        event_idx_enabled: bool,
     ) -> Result<Self, VirtioNetworkTxQueueBuildError> {
         if !queue.ready() {
             return Err(VirtioNetworkTxQueueBuildError::QueueNotReady);
@@ -1873,6 +1975,7 @@ impl VirtioNetworkTxQueue {
             queue_state: queue,
             available,
             used,
+            event_idx_enabled,
         })
     }
 
@@ -1886,6 +1989,10 @@ impl VirtioNetworkTxQueue {
 
     pub const fn used_ring(&self) -> &VirtqueueUsedRing {
         &self.used
+    }
+
+    pub const fn event_idx_enabled(&self) -> bool {
+        self.event_idx_enabled
     }
 
     pub fn dispatch(
@@ -1921,14 +2028,31 @@ impl VirtioNetworkTxQueue {
                 }
             };
             let frame = VirtioNetworkTxFrame::parse(memory, &chain);
-            if let Err(source) = self.used.publish_used_element(memory, descriptor_head, 0) {
-                return Err(VirtioNetworkTxQueueDispatchError::UsedRing {
-                    completed_dispatch: Box::new(dispatch),
-                    descriptor_head,
-                    bytes_written_to_guest: 0,
-                    source,
-                });
-            }
+            let notification_suppression = match self.notification_suppression(memory) {
+                Ok(notification_suppression) => notification_suppression,
+                Err(source) => {
+                    return Err(VirtioNetworkTxQueueDispatchError::AvailableRing {
+                        completed_dispatch: Box::new(dispatch),
+                        source,
+                    });
+                }
+            };
+            let publication = match self.used.publish_used_element_with_notification(
+                memory,
+                descriptor_head,
+                0,
+                notification_suppression,
+            ) {
+                Ok(publication) => publication,
+                Err(source) => {
+                    return Err(VirtioNetworkTxQueueDispatchError::UsedRing {
+                        completed_dispatch: Box::new(dispatch),
+                        descriptor_head,
+                        bytes_written_to_guest: 0,
+                        source,
+                    });
+                }
+            };
             let outcome = match frame {
                 Ok(frame) => {
                     let sink_error = tx_sink.transmit_frame(memory, &frame).err();
@@ -1936,10 +2060,23 @@ impl VirtioNetworkTxQueue {
                 }
                 Err(source) => VirtioNetworkTxQueueDispatchOutcome::ParseError(source),
             };
-            dispatch.record(outcome);
+            dispatch.record(outcome, publication);
         }
 
         Ok(dispatch)
+    }
+
+    fn notification_suppression(
+        &self,
+        memory: &GuestMemory,
+    ) -> Result<VirtqueueNotificationSuppression, VirtqueueAvailableRingError> {
+        if self.event_idx_enabled {
+            Ok(VirtqueueNotificationSuppression::EventIdx {
+                used_event: self.available.used_event(memory)?,
+            })
+        } else {
+            Ok(VirtqueueNotificationSuppression::Disabled)
+        }
     }
 }
 
@@ -1984,6 +2121,7 @@ pub struct VirtioNetworkTxQueueDispatch {
     frames: Vec<VirtioNetworkTxFrame>,
     first_parse_failure: Option<VirtioNetworkTxFrameParseError>,
     first_sink_failure: Option<VirtioNetworkTxPacketSinkError>,
+    needs_queue_interrupt: bool,
 }
 
 impl VirtioNetworkTxQueueDispatch {
@@ -2004,6 +2142,7 @@ impl VirtioNetworkTxQueueDispatch {
             frames,
             first_parse_failure: None,
             first_sink_failure: None,
+            needs_queue_interrupt: false,
         })
     }
 
@@ -2040,11 +2179,16 @@ impl VirtioNetworkTxQueueDispatch {
     }
 
     pub const fn needs_queue_interrupt(&self) -> bool {
-        self.processed_frames != 0
+        self.needs_queue_interrupt
     }
 
-    fn record(&mut self, outcome: VirtioNetworkTxQueueDispatchOutcome) {
+    fn record(
+        &mut self,
+        outcome: VirtioNetworkTxQueueDispatchOutcome,
+        publication: VirtqueueUsedRingPublication,
+    ) {
         self.processed_frames += 1;
+        self.needs_queue_interrupt |= publication.needs_queue_interrupt();
         match outcome {
             VirtioNetworkTxQueueDispatchOutcome::Ok { frame, sink_error } => {
                 self.successful_frames += 1;
@@ -3408,6 +3552,10 @@ fn active_network_queue_state(
     Ok(queue)
 }
 
+fn virtio_feature_enabled(features: u64, feature: u32) -> bool {
+    features & (1_u64 << feature) != 0
+}
+
 impl FromStr for GuestMacAddress {
     type Err = NetworkInterfaceConfigError;
 
@@ -3854,6 +4002,29 @@ mod tests {
             .expect("status should accept FEATURES_OK");
     }
 
+    fn put_network_handler_in_queue_config_state_with_event_idx(
+        handler: &mut VirtioNetworkMmioHandler,
+    ) {
+        handler
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
+            .expect("status should accept ACKNOWLEDGE");
+        handler
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            )
+            .expect("status should accept DRIVER");
+        handler
+            .write_register(
+                VirtioMmioRegister::DriverFeatures,
+                1_u32 << VIRTIO_RING_FEATURE_EVENT_IDX,
+            )
+            .expect("event index feature should write");
+        handler
+            .write_register(VirtioMmioRegister::Status, QUEUE_CONFIG_STATUS)
+            .expect("status should accept FEATURES_OK");
+    }
+
     fn configure_network_handler_queue(
         handler: &mut VirtioNetworkMmioHandler,
         queue_index: u32,
@@ -3891,6 +4062,24 @@ mod tests {
 
     fn configure_network_handler_queues(handler: &mut VirtioNetworkMmioHandler) {
         put_network_handler_in_queue_config_state(handler);
+        configure_network_handler_queue(
+            handler,
+            VIRTIO_NET_RX_QUEUE_INDEX
+                .try_into()
+                .expect("RX queue index should fit"),
+            TEST_QUEUE_SIZE,
+        );
+        configure_network_handler_queue(
+            handler,
+            VIRTIO_NET_TX_QUEUE_INDEX
+                .try_into()
+                .expect("TX queue index should fit"),
+            TEST_QUEUE_SIZE,
+        );
+    }
+
+    fn configure_network_handler_queues_with_event_idx(handler: &mut VirtioNetworkMmioHandler) {
+        put_network_handler_in_queue_config_state_with_event_idx(handler);
         configure_network_handler_queue(
             handler,
             VIRTIO_NET_RX_QUEUE_INDEX
@@ -4270,6 +4459,12 @@ mod tests {
             .expect("RX available ring entry address should not overflow")
     }
 
+    fn rx_available_ring_used_event_address() -> GuestAddress {
+        TEST_RX_AVAILABLE_RING
+            .checked_add(4 + u64::from(TEST_QUEUE_SIZE) * 2)
+            .expect("RX available ring used_event address should not overflow")
+    }
+
     fn write_rx_available_heads(memory: &mut GuestMemory, heads: &[u16]) {
         for (index, head) in heads.iter().copied().enumerate() {
             write_guest_u16(memory, rx_available_ring_entry_address(index), head);
@@ -4279,6 +4474,10 @@ mod tests {
             rx_available_ring_idx_address(),
             u16::try_from(heads.len()).expect("test RX available head count should fit"),
         );
+    }
+
+    fn write_rx_available_used_event(memory: &mut GuestMemory, used_event: u16) {
+        write_guest_u16(memory, rx_available_ring_used_event_address(), used_event);
     }
 
     fn rx_used_ring_idx_address() -> GuestAddress {
@@ -4331,6 +4530,12 @@ mod tests {
             .expect("available ring entry address should not overflow")
     }
 
+    fn tx_available_ring_used_event_address() -> GuestAddress {
+        TEST_TX_AVAILABLE_RING
+            .checked_add(4 + u64::from(TEST_QUEUE_SIZE) * 2)
+            .expect("TX available ring used_event address should not overflow")
+    }
+
     fn write_tx_available_heads(memory: &mut GuestMemory, heads: &[u16]) {
         for (index, head) in heads.iter().copied().enumerate() {
             write_guest_u16(memory, tx_available_ring_entry_address(index), head);
@@ -4340,6 +4545,10 @@ mod tests {
             tx_available_ring_idx_address(),
             u16::try_from(heads.len()).expect("test available head count should fit"),
         );
+    }
+
+    fn write_tx_available_used_event(memory: &mut GuestMemory, used_event: u16) {
+        write_guest_u16(memory, tx_available_ring_used_event_address(), used_event);
     }
 
     fn tx_used_ring_idx_address() -> GuestAddress {
@@ -7354,6 +7563,162 @@ mod tests {
         assert_eq!(active_tx_queue.available_ring().next_avail(), 0);
         assert_eq!(active_tx_queue.used_ring().next_used(), 0);
         assert_eq!(read_tx_used_index(&memory), 0);
+    }
+
+    #[test]
+    fn virtio_network_notifications_suppress_rx_interrupt_with_event_idx() {
+        let mut memory = tx_frame_memory();
+        let mut handler = network_activation_handler();
+        let mut sink = RecordingTxPacketSink::default();
+        let mut source = RecordingRxPacketSource::with_packets(vec![vec![0x41]]);
+
+        configure_network_handler_queues_with_event_idx(&mut handler);
+        activate_network_handler(&mut handler);
+        write_rx_descriptors(
+            &mut memory,
+            &[TestDescriptor::writable(
+                TEST_RX_BUFFER,
+                u32::try_from(VIRTIO_NET_RX_MIN_BUFFER_SIZE).expect("RX minimum should fit u32"),
+                None,
+            )],
+        );
+        write_rx_available_heads(&mut memory, &[0]);
+        write_rx_available_used_event(&mut memory, 1);
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_RX_QUEUE_INDEX
+                    .try_into()
+                    .expect("RX queue index should fit"),
+            )
+            .expect("RX notification should write");
+
+        let notification = handler
+            .dispatch_network_queue_notifications_with_packet_io(
+                &mut memory,
+                &mut sink,
+                &mut source,
+            )
+            .expect("event-index RX notification should dispatch");
+
+        let active_rx_queue = handler
+            .activation_handler()
+            .active_rx_dispatch_queue()
+            .expect("RX dispatch queue should be active");
+        assert!(active_rx_queue.event_idx_enabled());
+        let rx_dispatch = notification
+            .rx_queue_dispatch()
+            .expect("RX dispatch summary should be present");
+        assert_eq!(rx_dispatch.processed_buffers(), 1);
+        assert_eq!(rx_dispatch.delivered_packets(), 1);
+        assert!(!rx_dispatch.needs_queue_interrupt());
+        assert!(!notification.needs_queue_interrupt());
+        assert_eq!(read_interrupt_status(&handler), 0);
+        assert_eq!(read_rx_used_index(&memory), 1);
+        assert_eq!(read_rx_used_element(&memory, 0), (0, rx_used_len(1)));
+        assert_eq!(source.consume_calls, 1);
+        assert_eq!(sink.calls, 0);
+    }
+
+    #[test]
+    fn virtio_network_notifications_suppress_tx_interrupt_with_event_idx() {
+        let mut memory = tx_frame_memory();
+        let mut handler = network_activation_handler();
+        let mut sink = RecordingTxPacketSink::default();
+
+        configure_network_handler_queues_with_event_idx(&mut handler);
+        activate_network_handler(&mut handler);
+        write_tx_header(&mut memory, TEST_TX_HEADER);
+        write_tx_payload(&mut memory, TEST_TX_PAYLOAD, &[0x20]);
+        tx_descriptor_chain(
+            &mut memory,
+            &[
+                TestDescriptor::readable(TEST_TX_HEADER, VIRTIO_NET_TX_HEADER_SIZE, Some(1)),
+                TestDescriptor::readable(TEST_TX_PAYLOAD, 1, None),
+            ],
+        );
+        write_tx_available_heads(&mut memory, &[0]);
+        write_tx_available_used_event(&mut memory, 1);
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_TX_QUEUE_INDEX
+                    .try_into()
+                    .expect("TX queue index should fit"),
+            )
+            .expect("TX notification should write");
+
+        let notification = handler
+            .dispatch_network_queue_notifications_with_tx_sink(&mut memory, &mut sink)
+            .expect("event-index TX notification should dispatch");
+
+        let active_tx_queue = handler
+            .activation_handler()
+            .active_tx_dispatch_queue()
+            .expect("TX dispatch queue should be active");
+        assert!(active_tx_queue.event_idx_enabled());
+        let tx_dispatch = notification
+            .tx_queue_dispatch()
+            .expect("TX dispatch summary should be present");
+        assert_eq!(tx_dispatch.processed_frames(), 1);
+        assert_eq!(tx_dispatch.successful_frames(), 1);
+        assert!(!tx_dispatch.needs_queue_interrupt());
+        assert!(!notification.needs_queue_interrupt());
+        assert_eq!(read_interrupt_status(&handler), 0);
+        assert_eq!(read_tx_used_index(&memory), 1);
+        assert_eq!(read_tx_used_element(&memory, 0), (0, 0));
+        assert_eq!(sink.calls, 1);
+    }
+
+    #[test]
+    fn virtio_network_notifications_preserve_suppressed_partial_tx_error_with_event_idx() {
+        let mut memory = tx_frame_memory();
+        let mut handler = network_activation_handler();
+        let mut sink = RecordingTxPacketSink::default();
+
+        configure_network_handler_queues_with_event_idx(&mut handler);
+        activate_network_handler(&mut handler);
+        write_tx_header(&mut memory, TEST_TX_HEADER);
+        write_tx_payload(&mut memory, TEST_TX_PAYLOAD, &[0x30]);
+        tx_descriptor_chain(
+            &mut memory,
+            &[
+                TestDescriptor::readable(TEST_TX_HEADER, VIRTIO_NET_TX_HEADER_SIZE, Some(1)),
+                TestDescriptor::readable(TEST_TX_PAYLOAD, 1, None),
+            ],
+        );
+        write_tx_available_heads(&mut memory, &[0, TEST_QUEUE_SIZE]);
+        write_tx_available_used_event(&mut memory, 1);
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                VIRTIO_NET_TX_QUEUE_INDEX
+                    .try_into()
+                    .expect("TX queue index should fit"),
+            )
+            .expect("TX notification should write");
+
+        let error = handler
+            .dispatch_network_queue_notifications_with_tx_sink(&mut memory, &mut sink)
+            .expect_err("invalid second TX descriptor head should fail");
+
+        assert!(matches!(
+            error,
+            VirtioNetworkDeviceNotificationError::TxQueueDispatch {
+                source: VirtioNetworkTxQueueDispatchError::AvailableRing { .. },
+                ..
+            }
+        ));
+        let completed = error
+            .completed_tx_dispatch()
+            .expect("completed TX dispatch metadata should be preserved");
+        assert_eq!(completed.processed_frames(), 1);
+        assert_eq!(completed.successful_frames(), 1);
+        assert!(!completed.needs_queue_interrupt());
+        assert_eq!(read_interrupt_status(&handler), 0);
+        assert_eq!(read_tx_used_index(&memory), 1);
+        assert_eq!(read_tx_used_element(&memory, 0), (0, 0));
+        assert_eq!(sink.calls, 1);
     }
 
     #[test]

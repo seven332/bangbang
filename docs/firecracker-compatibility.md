@@ -644,7 +644,10 @@ headers across descriptor boundaries, validates readable descriptor ranges, and
 returns payload segment metadata trimmed to the advertised payload length. The
 TX drain helper consumes available TX descriptor chains from the active queue
 into parsed packet metadata while preserving queue progress and publishes
-zero-length used-ring completions for consumed descriptor heads. The handler can
+zero-length used-ring completions for consumed descriptor heads. When
+`EVENT_IDX` is negotiated, RX and TX dispatch use the available-ring
+`used_event` value to decide whether completed descriptors require a queue
+interrupt. The handler can
 drain RX, TX, and no-op event queue notifications, dispatch the active RX queue
 for pending host request headers, dispatch the active TX queue, preserve
 completed RX/TX dispatch metadata on errors, and mark the virtio queue
@@ -723,13 +726,15 @@ configured and builds vmnet packet I/O for configured interfaces during
 chains into `VirtioNetworkTxFrame` metadata, publishes used-ring
 completions with length 0, delivers parsed frames to an injected internal packet
 sink, preserves parse, sink, and partial-dispatch errors, and marks queue
-interrupt status when descriptor heads complete. RX dispatch uses an injected
+interrupt status when descriptor heads complete unless negotiated `EVENT_IDX`
+suppresses the notification. RX dispatch uses an injected
 internal packet source, can perform one bounded post-TX RX retry when that
 source reports already-ready packets, copies a zeroed 12-byte virtio-net header
 plus packet payload into validated guest-writable RX buffers, publishes
 used-ring completions with the written length, preserves malformed-buffer and
 partial-dispatch metadata, and marks queue interrupt status when RX buffers
-complete. On macOS, the process crate also defines internal vmnet descriptor,
+complete unless negotiated `EVENT_IDX` suppresses the notification. On macOS,
+the process crate also defines internal vmnet descriptor,
 lifecycle, start owner, packet descriptor, and concrete system start/stop
 backend boundaries with vmnet mode, status, operation error, XPC descriptor
 configuration, retained dispatch queue ownership, completion-status mapping,
@@ -981,8 +986,10 @@ against caller-supplied guest memory. Internal HVF boot sessions can signal
 needed block, network, and vsock SPI interrupts from those dispatch summaries, but
 future public scheduler and device policy remain deferred. The
 virtqueue model can publish one used-ring completion element with validated
-layout, mapped-memory checks, wrapping, and release ordering, but batching,
-event-index notification suppression, and device-backed completion loops are
+layout, mapped-memory checks, wrapping, and release ordering. Network and vsock
+RX/TX dispatch honor negotiated used-event interrupt suppression for each
+published completion, while batching, avail-event kick suppression,
+virtio-block `EVENT_IDX` advertisement, and device-backed completion loops are
 still deferred.
 
 The runtime crate also contains backend-neutral interrupt signaling groundwork.
