@@ -83,6 +83,35 @@ impl KernelCommandLine {
     pub fn as_bytes_with_nul(&self) -> &[u8] {
         &self.bytes_with_nul
     }
+
+    pub(crate) fn with_appended_kernel_args<I, S>(
+        &self,
+        args: I,
+    ) -> Result<Self, BootCommandLineError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let command_line = canonical_command_line(self.as_str())?;
+        let mut text = command_line.boot_args.to_string();
+
+        for arg in args {
+            let arg = arg.as_ref().trim();
+            if !text.is_empty() && !arg.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(arg);
+        }
+
+        if !command_line.init_args.is_empty() {
+            if !text.is_empty() {
+                text.push_str(INIT_ARGS_SEPARATOR);
+            }
+            text.push_str(command_line.init_args);
+        }
+
+        validate_command_line_text(Some(&text))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1071,6 +1100,7 @@ mod tests {
         ARM64_IMAGE_TEXT_OFFSET_OFFSET, ARM64_LEGACY_TEXT_OFFSET, BootCommandLineError,
         BootPayloadKind, BootSource, BootSourceConfigError, BootSourceConfigInput,
         BootSourceLoadError, DEFAULT_KERNEL_COMMAND_LINE, INIT_ARGS_SEPARATOR, KernelImageError,
+        validate_command_line_text,
     };
     use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, aarch64};
 
@@ -1411,6 +1441,35 @@ mod tests {
             loaded.command_line.as_bytes_with_nul(),
             b"a=\"b -- c\" d -- /init\0"
         );
+    }
+
+    #[test]
+    fn appends_kernel_args_before_existing_init_args() {
+        let command_line = validate_command_line_text(Some(" console=ttyS0  --  /init "))
+            .expect("base command line should validate");
+
+        let updated = command_line
+            .with_appended_kernel_args(["root=/dev/vda", "ro"])
+            .expect("appended command line should validate");
+
+        assert_eq!(updated.as_str(), "console=ttyS0 root=/dev/vda ro -- /init");
+        assert_eq!(
+            updated.as_bytes_with_nul(),
+            b"console=ttyS0 root=/dev/vda ro -- /init\0"
+        );
+    }
+
+    #[test]
+    fn rejects_command_line_when_appended_kernel_args_exceed_limit() {
+        let command_line =
+            validate_command_line_text(Some(&"a".repeat(aarch64::CMDLINE_MAX_SIZE - 1)))
+                .expect("base command line should fit exactly");
+
+        let err = command_line
+            .with_appended_kernel_args(["root=/dev/vda", "rw"])
+            .expect_err("appended command line should exceed limit");
+
+        assert!(matches!(err, BootCommandLineError::TooLarge { .. }));
     }
 
     #[test]
