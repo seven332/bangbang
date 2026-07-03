@@ -2148,6 +2148,16 @@ mod tests {
             Some(u16::MAX)
         );
         assert_eq!(response_frame_tcp_payload(&response).len(), payload.len());
+        let tcp_segment = response_frame_tcp_segment(&response);
+        assert_eq!(
+            tcp_ipv4_checksum(
+                test_mmds_ipv4_address(),
+                test_source_ipv4_address(),
+                u16::try_from(tcp_segment.len()).expect("TCP segment length should fit u16"),
+                tcp_segment,
+            ),
+            0
+        );
     }
 
     #[test]
