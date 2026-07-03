@@ -772,9 +772,9 @@ The runtime crate can derive an internal virtio-block configuration space from
 the backing length. It reports capacity as full 512-byte sectors, matching
 Firecracker's truncation of non-sector-aligned tails, exposes the virtio block
 device id and one 256-entry queue shape, always advertises
-`VIRTIO_F_VERSION_1`, and advertises `VIRTIO_BLK_F_RO` only for read-only
-drives. It does not advertise `VIRTIO_RING_F_EVENT_IDX` until event-index
-notification semantics are implemented.
+`VIRTIO_F_VERSION_1` and `VIRTIO_RING_F_EVENT_IDX`, advertises
+`VIRTIO_BLK_F_FLUSH` for `cache_type=Writeback`, and advertises
+`VIRTIO_BLK_F_RO` for read-only drives.
 The config handler supports bounded read-only capacity reads through the
 existing virtio-mmio device-configuration path and rejects config writes.
 
@@ -986,11 +986,11 @@ against caller-supplied guest memory. Internal HVF boot sessions can signal
 needed block, network, and vsock SPI interrupts from those dispatch summaries, but
 future public scheduler and device policy remain deferred. The
 virtqueue model can publish one used-ring completion element with validated
-layout, mapped-memory checks, wrapping, and release ordering. Network and vsock
-RX/TX dispatch honor negotiated used-event interrupt suppression for each
-published completion, while batching, avail-event kick suppression,
-virtio-block `EVENT_IDX` advertisement, and device-backed completion loops are
-still deferred.
+layout, mapped-memory checks, wrapping, and release ordering. Virtio-block
+queue dispatch, network RX/TX dispatch, and vsock RX/TX dispatch honor
+negotiated used-event interrupt suppression for each published completion,
+while batching, avail-event kick suppression, and device-backed completion loops
+are still deferred.
 
 The runtime crate also contains backend-neutral interrupt signaling groundwork.
 It can validate nonzero guest interrupt lines, represent queue and
