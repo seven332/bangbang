@@ -15,6 +15,8 @@ const BOOT_MARKER: &[u8] = b"BANGBANG_BOOT_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const BLOCK_READ_MARKER: &[u8] = b"BANGBANG_BLOCK_READ_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const BLOCK_WRITE_MARKER: &[u8] = b"BANGBANG_BLOCK_WRITE_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const CMDLINE_BEGIN_MARKER: &[u8] = b"BANGBANG_CMDLINE_BEGIN";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const CMDLINE_END_MARKER: &[u8] = b"BANGBANG_CMDLINE_END";
@@ -73,6 +75,48 @@ fn boots_firecracker_kernel_and_reads_virtio_block_marker() {
         "guest block read test should still observe boot marker\nserial output:\n{}",
         String::from_utf8_lossy(&observation.serial_bytes)
     );
+    assert!(
+        !bytes_contain_marker(&observation.serial_bytes, BLOCK_WRITE_MARKER),
+        "guest block read test with a read-only drive should not observe block-write marker\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn boots_firecracker_kernel_and_writes_virtio_block_marker() {
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::DriveConfigInput;
+
+    let _test_lock = GUEST_BOOT_TEST_LOCK
+        .lock()
+        .expect("guest boot integration test lock should not be poisoned");
+    let backing = GuestBlockBacking::zeroed();
+    let observation =
+        run_guest_boot_until_marker("guest-block-write", BLOCK_WRITE_MARKER, |controller| {
+            controller
+                .handle_action(VmmAction::PutDrive(DriveConfigInput::new(
+                    "data",
+                    "data",
+                    backing.path(),
+                    false,
+                )))
+                .expect("guest block write drive should configure");
+        });
+
+    assert_guest_boot_observed_marker(&observation, BLOCK_WRITE_MARKER, "block-write marker");
+    assert!(
+        bytes_contain_marker(&observation.serial_bytes, BOOT_MARKER),
+        "guest block write test should still observe boot marker\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+    let backing_bytes = backing.bytes();
+    assert!(
+        backing_bytes.starts_with(BLOCK_WRITE_MARKER),
+        "guest block write test should mutate backing with marker {:?}; backing bytes: {:?}",
+        String::from_utf8_lossy(BLOCK_WRITE_MARKER),
+        backing_bytes
+    );
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -103,6 +147,11 @@ fn boots_firecracker_kernel_with_root_drive_boot_args() {
     assert_guest_cmdline_contains_arg(cmdline, b"root=/dev/vda");
     assert_guest_cmdline_contains_arg(cmdline, b"ro");
     assert_guest_cmdline_contains_arg(cmdline, b"rdinit=/init");
+    assert!(
+        !bytes_contain_marker(&observation.serial_bytes, BLOCK_WRITE_MARKER),
+        "guest root-drive cmdline test with a read-only drive should not observe block-write marker\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -283,8 +332,16 @@ impl GuestBlockBacking {
         backing
     }
 
+    fn zeroed() -> Self {
+        Self::new(&[])
+    }
+
     fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        std::fs::read(&self.path).expect("guest block backing should read")
     }
 }
 
