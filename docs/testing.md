@@ -150,8 +150,7 @@ backing file. A rootfs artifact scenario attaches the cached Firecracker
 squashfs as a read-only root drive, mounts it from the tiny initrd, reads
 `/mnt/etc/os-release`, and expects `BANGBANG_ROOTFS_READ_OK` plus stable Ubuntu
 os-release content on serial. This verifies guest-visible rootfs access through
-virtio-block; full rootfs boot with an init process from that rootfs remains
-separate follow-up coverage.
+virtio-block.
 
 The pinned Firecracker CI rootfs artifact can be prepared separately:
 
@@ -186,6 +185,18 @@ The ext4 preparation path intentionally does not require `sudo`. Files copied
 into the generated ext4 image keep the local extraction ownership rather than
 Firecracker's root-owned demo ownership. This is suitable for local development
 artifacts and is not a substitute for a production rootfs build process.
+
+The signed `guest_boot` target also validates a deterministic direct-rootfs
+boot. For that scenario, `scripts/run-integration-tests.sh` prepares
+`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v4.ext4`
+after confirming the host can execute HVF. The generated image is an ext4 copy
+of the pinned Firecracker rootfs with a test-specific
+`/bangbang-direct-rootfs-init` script added before image creation. The test
+boots without the tiny initrd, attaches that ext4 image as a read-only root
+drive, passes `init=/bangbang-direct-rootfs-init`, and expects deterministic
+serial markers plus Ubuntu os-release content from `/etc/os-release`. This
+proves the kernel mounted the virtio-block root drive as `/`; it does not claim
+that bangbang can boot an arbitrary distro image through its default init.
 
 bangbang appends Firecracker-style root-drive command-line arguments during
 startup resource assembly when a configured drive has `is_root_device=true`.

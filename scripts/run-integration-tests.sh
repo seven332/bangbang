@@ -209,6 +209,7 @@ fi
 guest_kernel_path=""
 guest_initrd_path=""
 guest_rootfs_path=""
+guest_ext4_rootfs_path=""
 if contains guest_boot "${selected_tests[@]}"; then
   guest_kernel_path="$(scripts/fetch-firecracker-kernel.sh)"
   guest_initrd_path="$(scripts/build-guest-boot-initrd.py --check)"
@@ -250,6 +251,13 @@ if [[ "$hv_disable" == "1" ]]; then
   finish_unsupported "Hypervisor.framework is disabled on this host"
 fi
 
+if contains guest_boot "${selected_tests[@]}"; then
+  guest_ext4_rootfs_path="$(scripts/fetch-firecracker-rootfs.sh \
+    --format ext4 \
+    --ext4-size 512M \
+    --direct-boot-init)"
+fi
+
 for index in "${!signed_test_bins[@]}"; do
   test_name="${signed_test_names[$index]}"
   test_bin="${signed_test_bins[$index]}"
@@ -260,11 +268,13 @@ for index in "${!signed_test_bins[@]}"; do
         BANGBANG_GUEST_KERNEL_PATH="$guest_kernel_path" \
           BANGBANG_GUEST_INITRD_PATH="$guest_initrd_path" \
           BANGBANG_GUEST_ROOTFS_PATH="$guest_rootfs_path" \
+          BANGBANG_GUEST_EXT4_ROOTFS_PATH="$guest_ext4_rootfs_path" \
           "$test_bin" --test-threads=1
       else
         BANGBANG_GUEST_KERNEL_PATH="$guest_kernel_path" \
           BANGBANG_GUEST_INITRD_PATH="$guest_initrd_path" \
           BANGBANG_GUEST_ROOTFS_PATH="$guest_rootfs_path" \
+          BANGBANG_GUEST_EXT4_ROOTFS_PATH="$guest_ext4_rootfs_path" \
           "$test_bin" --test-threads=1 "${test_args[@]}"
       fi
       ;;
