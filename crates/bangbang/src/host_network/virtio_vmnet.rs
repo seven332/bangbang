@@ -1483,9 +1483,13 @@ mod tests {
         packet
     }
 
-    fn mmds_tcp_fin_close_packet(sequence_number: u32, acknowledgement_number: u32) -> Vec<u8> {
+    fn mmds_tcp_fin_close_packet(
+        sequence_number: u32,
+        acknowledgement_number: u32,
+        flags: u8,
+    ) -> Vec<u8> {
         let mut packet = mmds_tcp_packet_from_source(TEST_SOURCE_TCP_PORT, sequence_number, b"");
-        set_tcp_flags(&mut packet, TCP_FLAG_FIN | TCP_FLAG_ACK);
+        set_tcp_flags(&mut packet, flags);
         set_tcp_acknowledgement_number(&mut packet, acknowledgement_number);
         packet
     }
@@ -2502,54 +2506,56 @@ mod tests {
     }
 
     #[test]
-    fn tx_sink_detours_mmds_fin_close_and_retains_close_frames() {
+    fn tx_sink_detours_mmds_fin_close_packets_and_retains_close_frames() {
         let sequence_number = 0x0102_0304;
         let acknowledgement_number = 0x1112_1314;
-        let packet = mmds_tcp_fin_close_packet(sequence_number, acknowledgement_number);
-        let mut memory = tx_memory();
-        let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
-        let response_queue = MmdsResponseQueue::with_capacity(2);
-        let mut packet_io = packet_io_with_mmds_detour(
-            FakeVmnetPacketIoBackend::default(),
-            MmdsStateHandle::default(),
-            response_queue.clone(),
-        );
+        for flags in [TCP_FLAG_FIN, TCP_FLAG_FIN | TCP_FLAG_ACK] {
+            let packet = mmds_tcp_fin_close_packet(sequence_number, acknowledgement_number, flags);
+            let mut memory = tx_memory();
+            let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
+            let response_queue = MmdsResponseQueue::with_capacity(2);
+            let mut packet_io = packet_io_with_mmds_detour(
+                FakeVmnetPacketIoBackend::default(),
+                MmdsStateHandle::default(),
+                response_queue.clone(),
+            );
 
-        packet_io
-            .tx_sink()
-            .transmit_frame(&memory, &frame)
-            .expect("MMDS FIN close should detour");
+            packet_io
+                .tx_sink()
+                .transmit_frame(&memory, &frame)
+                .expect("MMDS FIN close should detour");
 
-        let state = packet_io
-            .tx_sink()
-            .shared
-            .lock()
-            .expect("test state lock should succeed");
-        assert_eq!(state.backend.write_calls, 0);
-        assert!(state.backend.written_packets.is_empty());
-        drop(state);
-        let responses = response_queue
-            .responses()
-            .expect("MMDS response queue should read");
-        assert_eq!(responses.len(), 2);
-        assert_eq!(mmds_response_frame_tcp_flags(&responses[0]), TCP_FLAG_ACK);
-        assert_eq!(
-            mmds_response_frame_tcp_flags(&responses[1]),
-            TCP_FLAG_FIN | TCP_FLAG_ACK
-        );
-        for response in responses {
+            let state = packet_io
+                .tx_sink()
+                .shared
+                .lock()
+                .expect("test state lock should succeed");
+            assert_eq!(state.backend.write_calls, 0);
+            assert!(state.backend.written_packets.is_empty());
+            drop(state);
+            let responses = response_queue
+                .responses()
+                .expect("MMDS response queue should read");
+            assert_eq!(responses.len(), 2);
+            assert_eq!(mmds_response_frame_tcp_flags(&responses[0]), TCP_FLAG_ACK);
             assert_eq!(
-                mmds_response_frame_sequence_number(&response),
-                acknowledgement_number
+                mmds_response_frame_tcp_flags(&responses[1]),
+                TCP_FLAG_FIN | TCP_FLAG_ACK
             );
-            assert_eq!(
-                mmds_response_frame_acknowledgement_number(&response),
-                sequence_number.wrapping_add(1)
-            );
-            assert!(
-                mmds_response_frame_tcp_payload(&response).is_empty(),
-                "MMDS FIN close response should not carry HTTP payload"
-            );
+            for response in responses {
+                assert_eq!(
+                    mmds_response_frame_sequence_number(&response),
+                    acknowledgement_number
+                );
+                assert_eq!(
+                    mmds_response_frame_acknowledgement_number(&response),
+                    sequence_number.wrapping_add(1)
+                );
+                assert!(
+                    mmds_response_frame_tcp_payload(&response).is_empty(),
+                    "MMDS FIN close response should not carry HTTP payload"
+                );
+            }
         }
     }
 
@@ -2589,7 +2595,7 @@ mod tests {
 
     #[test]
     fn tx_sink_reports_mmds_fin_close_queue_overflow_without_partial_enqueue() {
-        let packet = mmds_tcp_fin_close_packet(0, 1);
+        let packet = mmds_tcp_fin_close_packet(0, 1, TCP_FLAG_FIN | TCP_FLAG_ACK);
         let mut memory = tx_memory();
         let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
         let response_queue = MmdsResponseQueue::with_capacity(1);
