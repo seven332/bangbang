@@ -11,10 +11,28 @@ use serde_json::{Map, Value};
 use crate::network::NetworkInterfaceConfig;
 
 pub const MMDS_DATA_STORE_LIMIT_BYTES: usize = 51_200;
+pub const MMDS_GUEST_TCP_PORT: u16 = 80;
 pub const MMDS_TOKEN_MIN_TTL_SECONDS: u32 = 1;
 pub const MMDS_TOKEN_MAX_TTL_SECONDS: u32 = 21_600;
 pub const MMDS_TOKEN_MAX_ACTIVE_TOKENS: usize = 1_024;
 
+const ETHERNET_ETHERTYPE_IPV4: u16 = 0x0800;
+const ETHERNET_ETHERTYPE_OFFSET: usize = 12;
+const ETHERNET_HEADER_LEN: usize = 14;
+const IPV4_DESTINATION_ADDRESS_OFFSET: usize = 16;
+const IPV4_FLAGS_FRAGMENT_OFFSET_OFFSET: usize = 6;
+const IPV4_REJECT_FLAGS_FRAGMENT_MASK: u16 = 0xbfff;
+const IPV4_MIN_HEADER_LEN: usize = 20;
+const IPV4_PROTOCOL_OFFSET: usize = 9;
+const IPV4_PROTOCOL_TCP: u8 = 6;
+const IPV4_SOURCE_ADDRESS_OFFSET: usize = 12;
+const IPV4_TOTAL_LENGTH_OFFSET: usize = 2;
+const IPV4_VERSION: u8 = 4;
+const IPV4_VERSION_IHL_OFFSET: usize = 0;
+const TCP_DATA_OFFSET_OFFSET: usize = 12;
+const TCP_DESTINATION_PORT_OFFSET: usize = 2;
+const TCP_MIN_HEADER_LEN: usize = 20;
+const TCP_SOURCE_PORT_OFFSET: usize = 0;
 const MMDS_TOKEN_BYTES: usize = 32;
 const MMDS_GUEST_ALLOW_METHODS: &str = "GET, PUT";
 const MMDS_GUEST_INVALID_TOKEN: &str = "MMDS token not valid.";
@@ -28,6 +46,115 @@ const MMDS_GUEST_X_METADATA_TOKEN: &str = "X-metadata-token";
 const MMDS_GUEST_X_METADATA_TOKEN_TTL_SECONDS: &str = "X-metadata-token-ttl-seconds";
 const MMDS_MILLISECONDS_PER_SECOND: u64 = 1_000;
 const MMDS_TOKEN_GENERATION_ATTEMPTS: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MmdsGuestTcpPacket<'a> {
+    source_ipv4_address: Ipv4Addr,
+    destination_ipv4_address: Ipv4Addr,
+    source_port: u16,
+    destination_port: u16,
+    payload: &'a [u8],
+}
+
+impl<'a> MmdsGuestTcpPacket<'a> {
+    pub const fn source_ipv4_address(self) -> Ipv4Addr {
+        self.source_ipv4_address
+    }
+
+    pub const fn destination_ipv4_address(self) -> Ipv4Addr {
+        self.destination_ipv4_address
+    }
+
+    pub const fn source_port(self) -> u16 {
+        self.source_port
+    }
+
+    pub const fn destination_port(self) -> u16 {
+        self.destination_port
+    }
+
+    pub const fn payload(self) -> &'a [u8] {
+        self.payload
+    }
+}
+
+pub fn classify_mmds_guest_tcp_packet(
+    packet: &[u8],
+    mmds_ipv4_address: Ipv4Addr,
+) -> Option<MmdsGuestTcpPacket<'_>> {
+    let ethertype = packet_u16(packet, ETHERNET_ETHERTYPE_OFFSET)?;
+    if ethertype != ETHERNET_ETHERTYPE_IPV4 {
+        return None;
+    }
+
+    let ipv4_packet = packet.get(ETHERNET_HEADER_LEN..)?;
+    let version_ihl = *ipv4_packet.get(IPV4_VERSION_IHL_OFFSET)?;
+    if version_ihl >> 4 != IPV4_VERSION {
+        return None;
+    }
+
+    let ipv4_header_len = usize::from(version_ihl & 0x0f) * 4;
+    if ipv4_header_len < IPV4_MIN_HEADER_LEN {
+        return None;
+    }
+
+    let total_len = usize::from(packet_u16(ipv4_packet, IPV4_TOTAL_LENGTH_OFFSET)?);
+    if total_len < ipv4_header_len.saturating_add(TCP_MIN_HEADER_LEN) {
+        return None;
+    }
+
+    let ipv4_packet = ipv4_packet.get(..total_len)?;
+    if *ipv4_packet.get(IPV4_PROTOCOL_OFFSET)? != IPV4_PROTOCOL_TCP {
+        return None;
+    }
+
+    if packet_u16(ipv4_packet, IPV4_FLAGS_FRAGMENT_OFFSET_OFFSET)? & IPV4_REJECT_FLAGS_FRAGMENT_MASK
+        != 0
+    {
+        return None;
+    }
+
+    let destination_ipv4_address =
+        packet_ipv4_address(ipv4_packet, IPV4_DESTINATION_ADDRESS_OFFSET)?;
+    if destination_ipv4_address != mmds_ipv4_address {
+        return None;
+    }
+
+    let source_ipv4_address = packet_ipv4_address(ipv4_packet, IPV4_SOURCE_ADDRESS_OFFSET)?;
+    let tcp_segment = ipv4_packet.get(ipv4_header_len..)?;
+    let destination_port = packet_u16(tcp_segment, TCP_DESTINATION_PORT_OFFSET)?;
+    if destination_port != MMDS_GUEST_TCP_PORT {
+        return None;
+    }
+
+    let source_port = packet_u16(tcp_segment, TCP_SOURCE_PORT_OFFSET)?;
+    let tcp_data_offset = usize::from(*tcp_segment.get(TCP_DATA_OFFSET_OFFSET)? >> 4) * 4;
+    if tcp_data_offset < TCP_MIN_HEADER_LEN {
+        return None;
+    }
+
+    let payload = tcp_segment.get(tcp_data_offset..)?;
+    Some(MmdsGuestTcpPacket {
+        source_ipv4_address,
+        destination_ipv4_address,
+        source_port,
+        destination_port,
+        payload,
+    })
+}
+
+fn packet_ipv4_address(packet: &[u8], offset: usize) -> Option<Ipv4Addr> {
+    Some(Ipv4Addr::from(packet_array::<4>(packet, offset)?))
+}
+
+fn packet_u16(packet: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_be_bytes(packet_array::<2>(packet, offset)?))
+}
+
+fn packet_array<const N: usize>(packet: &[u8], offset: usize) -> Option<[u8; N]> {
+    let end = offset.checked_add(N)?;
+    packet.get(offset..end)?.try_into().ok()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MmdsContentInput {
@@ -1362,6 +1489,76 @@ mod tests {
         });
     }
 
+    fn test_mmds_ipv4_address() -> Ipv4Addr {
+        Ipv4Addr::new(169, 254, 169, 254)
+    }
+
+    fn test_source_ipv4_address() -> Ipv4Addr {
+        Ipv4Addr::new(192, 0, 2, 10)
+    }
+
+    fn test_tcp_packet(
+        destination_ipv4_address: Ipv4Addr,
+        destination_port: u16,
+        ipv4_options: &[u8],
+        tcp_options: &[u8],
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let ipv4_header_len = IPV4_MIN_HEADER_LEN + ipv4_options.len();
+        let tcp_header_len = TCP_MIN_HEADER_LEN + tcp_options.len();
+        assert_eq!(ipv4_header_len % 4, 0);
+        assert_eq!(tcp_header_len % 4, 0);
+
+        let ipv4_total_len = ipv4_header_len
+            .checked_add(tcp_header_len)
+            .and_then(|len| len.checked_add(payload.len()))
+            .expect("test IPv4 total length should not overflow");
+        let ipv4_total_len =
+            u16::try_from(ipv4_total_len).expect("test IPv4 total length should fit u16");
+
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+        packet.extend_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
+        packet.extend_from_slice(&ETHERNET_ETHERTYPE_IPV4.to_be_bytes());
+
+        packet.push(
+            (IPV4_VERSION << 4)
+                | u8::try_from(ipv4_header_len / 4).expect("test IPv4 header length should fit u8"),
+        );
+        packet.push(0);
+        packet.extend_from_slice(&ipv4_total_len.to_be_bytes());
+        packet.extend_from_slice(&0x1234_u16.to_be_bytes());
+        packet.extend_from_slice(&0_u16.to_be_bytes());
+        packet.push(64);
+        packet.push(IPV4_PROTOCOL_TCP);
+        packet.extend_from_slice(&0_u16.to_be_bytes());
+        packet.extend_from_slice(&test_source_ipv4_address().octets());
+        packet.extend_from_slice(&destination_ipv4_address.octets());
+        packet.extend_from_slice(ipv4_options);
+
+        packet.extend_from_slice(&49152_u16.to_be_bytes());
+        packet.extend_from_slice(&destination_port.to_be_bytes());
+        packet.extend_from_slice(&0_u32.to_be_bytes());
+        packet.extend_from_slice(&0_u32.to_be_bytes());
+        packet.push(
+            u8::try_from(tcp_header_len / 4).expect("test TCP header length should fit u8") << 4,
+        );
+        packet.push(0x18);
+        packet.extend_from_slice(&4096_u16.to_be_bytes());
+        packet.extend_from_slice(&0_u16.to_be_bytes());
+        packet.extend_from_slice(&0_u16.to_be_bytes());
+        packet.extend_from_slice(tcp_options);
+        packet.extend_from_slice(payload);
+
+        packet
+    }
+
+    fn write_packet_u16(packet: &mut [u8], offset: usize, value: u16) {
+        let bytes = value.to_be_bytes();
+        packet[offset] = bytes[0];
+        packet[offset + 1] = bytes[1];
+    }
+
     fn assert_json_value(output: &str, expected: Value) {
         let value = serde_json::from_str::<Value>(output).expect("query output should be JSON");
         assert_eq!(value, expected);
@@ -1386,6 +1583,184 @@ mod tests {
     ) {
         let mut state = initialized_query_state();
         assert_guest_response(state.guest_http_response(bytes), status, content_type, body);
+    }
+
+    #[test]
+    fn classifies_mmds_guest_tcp_packet() {
+        let mut packet = test_tcp_packet(
+            test_mmds_ipv4_address(),
+            MMDS_GUEST_TCP_PORT,
+            &[],
+            &[],
+            b"GET /latest/meta-data HTTP/1.1\r\n\r\n",
+        );
+        packet.extend_from_slice(&[0xaa; 8]);
+
+        let classified = classify_mmds_guest_tcp_packet(&packet, test_mmds_ipv4_address())
+            .expect("MMDS TCP packet should classify");
+
+        assert_eq!(classified.source_ipv4_address(), test_source_ipv4_address());
+        assert_eq!(
+            classified.destination_ipv4_address(),
+            test_mmds_ipv4_address()
+        );
+        assert_eq!(classified.source_port(), 49152);
+        assert_eq!(classified.destination_port(), MMDS_GUEST_TCP_PORT);
+        assert_eq!(
+            classified.payload(),
+            b"GET /latest/meta-data HTTP/1.1\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn classifies_mmds_guest_tcp_packet_with_ipv4_and_tcp_options() {
+        let packet = test_tcp_packet(
+            test_mmds_ipv4_address(),
+            MMDS_GUEST_TCP_PORT,
+            &[1, 2, 3, 4],
+            &[1, 1, 1, 1],
+            b"body",
+        );
+
+        let classified = classify_mmds_guest_tcp_packet(&packet, test_mmds_ipv4_address())
+            .expect("MMDS TCP packet with options should classify");
+
+        assert_eq!(classified.payload(), b"body");
+    }
+
+    #[test]
+    fn mmds_guest_tcp_classifier_rejects_non_mmds_destination() {
+        let wrong_ip = test_tcp_packet(Ipv4Addr::new(169, 254, 169, 250), 80, &[], &[], b"");
+        let wrong_port = test_tcp_packet(test_mmds_ipv4_address(), 8080, &[], &[], b"");
+
+        assert_eq!(
+            classify_mmds_guest_tcp_packet(&wrong_ip, test_mmds_ipv4_address()),
+            None
+        );
+        assert_eq!(
+            classify_mmds_guest_tcp_packet(&wrong_port, test_mmds_ipv4_address()),
+            None
+        );
+    }
+
+    #[test]
+    fn mmds_guest_tcp_classifier_rejects_non_ipv4_or_non_tcp_packets() {
+        let mut arp_packet = test_tcp_packet(test_mmds_ipv4_address(), 80, &[], &[], b"");
+        write_packet_u16(&mut arp_packet, ETHERNET_ETHERTYPE_OFFSET, 0x0806);
+        let mut udp_packet = test_tcp_packet(test_mmds_ipv4_address(), 80, &[], &[], b"");
+        udp_packet[ETHERNET_HEADER_LEN + IPV4_PROTOCOL_OFFSET] = 17;
+        let mut ipv6_version_packet = test_tcp_packet(test_mmds_ipv4_address(), 80, &[], &[], b"");
+        ipv6_version_packet[ETHERNET_HEADER_LEN + IPV4_VERSION_IHL_OFFSET] = (6 << 4)
+            | u8::try_from(IPV4_MIN_HEADER_LEN / 4).expect("test IPv4 header length should fit u8");
+
+        assert_eq!(
+            classify_mmds_guest_tcp_packet(&arp_packet, test_mmds_ipv4_address()),
+            None
+        );
+        assert_eq!(
+            classify_mmds_guest_tcp_packet(&udp_packet, test_mmds_ipv4_address()),
+            None
+        );
+        assert_eq!(
+            classify_mmds_guest_tcp_packet(&ipv6_version_packet, test_mmds_ipv4_address()),
+            None
+        );
+    }
+
+    #[test]
+    fn mmds_guest_tcp_classifier_rejects_truncated_packets() {
+        let packet = test_tcp_packet(test_mmds_ipv4_address(), 80, &[], &[], b"");
+
+        for len in [
+            0,
+            ETHERNET_HEADER_LEN - 1,
+            ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN - 1,
+            ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN + TCP_MIN_HEADER_LEN - 1,
+        ] {
+            assert_eq!(
+                classify_mmds_guest_tcp_packet(&packet[..len], test_mmds_ipv4_address()),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn mmds_guest_tcp_classifier_rejects_invalid_ipv4_flags_and_fragments() {
+        let fragment_offset = ETHERNET_HEADER_LEN + IPV4_FLAGS_FRAGMENT_OFFSET_OFFSET;
+        let mut reserved_flag = test_tcp_packet(test_mmds_ipv4_address(), 80, &[], &[], b"payload");
+        write_packet_u16(&mut reserved_flag, fragment_offset, 0x8000);
+        let mut more_fragments =
+            test_tcp_packet(test_mmds_ipv4_address(), 80, &[], &[], b"payload");
+        write_packet_u16(&mut more_fragments, fragment_offset, 0x2000);
+        let mut nonzero_fragment_offset =
+            test_tcp_packet(test_mmds_ipv4_address(), 80, &[], &[], b"payload");
+        write_packet_u16(&mut nonzero_fragment_offset, fragment_offset, 1);
+        let mut dont_fragment = test_tcp_packet(test_mmds_ipv4_address(), 80, &[], &[], b"payload");
+        write_packet_u16(&mut dont_fragment, fragment_offset, 0x4000);
+
+        assert_eq!(
+            classify_mmds_guest_tcp_packet(&reserved_flag, test_mmds_ipv4_address()),
+            None
+        );
+        assert_eq!(
+            classify_mmds_guest_tcp_packet(&more_fragments, test_mmds_ipv4_address()),
+            None
+        );
+        assert_eq!(
+            classify_mmds_guest_tcp_packet(&nonzero_fragment_offset, test_mmds_ipv4_address()),
+            None
+        );
+        assert!(classify_mmds_guest_tcp_packet(&dont_fragment, test_mmds_ipv4_address()).is_some());
+    }
+
+    #[test]
+    fn mmds_guest_tcp_classifier_rejects_invalid_ipv4_lengths() {
+        let mut short_ihl = test_tcp_packet(test_mmds_ipv4_address(), 80, &[], &[], b"");
+        short_ihl[ETHERNET_HEADER_LEN + IPV4_VERSION_IHL_OFFSET] = (IPV4_VERSION << 4) | 4;
+        let mut short_total_len = test_tcp_packet(test_mmds_ipv4_address(), 80, &[], &[], b"");
+        write_packet_u16(
+            &mut short_total_len,
+            ETHERNET_HEADER_LEN + IPV4_TOTAL_LENGTH_OFFSET,
+            39,
+        );
+        let mut total_len_past_frame = test_tcp_packet(test_mmds_ipv4_address(), 80, &[], &[], b"");
+        write_packet_u16(
+            &mut total_len_past_frame,
+            ETHERNET_HEADER_LEN + IPV4_TOTAL_LENGTH_OFFSET,
+            41,
+        );
+
+        assert_eq!(
+            classify_mmds_guest_tcp_packet(&short_ihl, test_mmds_ipv4_address()),
+            None
+        );
+        assert_eq!(
+            classify_mmds_guest_tcp_packet(&short_total_len, test_mmds_ipv4_address()),
+            None
+        );
+        assert_eq!(
+            classify_mmds_guest_tcp_packet(&total_len_past_frame, test_mmds_ipv4_address()),
+            None
+        );
+    }
+
+    #[test]
+    fn mmds_guest_tcp_classifier_rejects_invalid_tcp_lengths() {
+        let tcp_data_offset = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN + TCP_DATA_OFFSET_OFFSET;
+        let mut short_tcp_header = test_tcp_packet(test_mmds_ipv4_address(), 80, &[], &[], b"");
+        short_tcp_header[tcp_data_offset] = 4 << 4;
+        let mut tcp_header_past_segment =
+            test_tcp_packet(test_mmds_ipv4_address(), 80, &[], &[], b"");
+        tcp_header_past_segment[tcp_data_offset] = 6 << 4;
+
+        assert_eq!(
+            classify_mmds_guest_tcp_packet(&short_tcp_header, test_mmds_ipv4_address()),
+            None
+        );
+        assert_eq!(
+            classify_mmds_guest_tcp_packet(&tcp_header_past_segment, test_mmds_ipv4_address()),
+            None
+        );
     }
 
     fn assert_guest_request(

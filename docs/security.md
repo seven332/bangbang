@@ -191,9 +191,14 @@ model process-local guest `PUT /latest/api/token` exchanges that return
 generated tokens. When MMDS v2 is configured, process-local guest GET handling
 requires a valid generated token before returning metadata. These parsed
 requests, formatted responses, and generated tokens remain process-local and
-are not exposed to the guest through networking yet. Future guest-visible MMDS
-work must validate device, packet, token, and TCP/session inputs before making
-this data reachable from guest code.
+are not exposed to the guest through networking yet. The runtime can classify
+raw Ethernet/IPv4/TCP guest packet bytes as MMDS candidates only when they
+target the configured MMDS IPv4 address and TCP port `80`; malformed,
+truncated, fragmented, non-TCP, and non-MMDS packets are ignored as
+non-candidates. The classifier does not reassemble fragments, track TCP state,
+parse HTTP from packet payloads, or deliver responses. Future guest-visible
+MMDS work must validate device, packet, token, and TCP/session inputs before
+making this data reachable from guest code.
 
 ## Multi-Process Operation
 
