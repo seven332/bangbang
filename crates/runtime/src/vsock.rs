@@ -27,7 +27,8 @@ use crate::virtio_mmio::{
 };
 use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
-    VirtqueueDescriptorChain, VirtqueueUsedRing, VirtqueueUsedRingError,
+    VirtqueueDescriptorChain, VirtqueueNotificationSuppression, VirtqueueUsedRing,
+    VirtqueueUsedRingError, VirtqueueUsedRingPublication,
 };
 
 pub const MIN_GUEST_CID: u32 = 3;
@@ -3776,6 +3777,7 @@ pub struct VirtioVsockRxQueueDispatch {
     deliveries: Vec<VirtioVsockRxPacketDelivery>,
     first_buffer_parse_failure: Option<VirtioVsockRxBufferParseError>,
     first_buffer_too_small: Option<VirtioVsockRxBufferTooSmall>,
+    needs_queue_interrupt: bool,
 }
 
 impl VirtioVsockRxQueueDispatch {
@@ -3793,6 +3795,7 @@ impl VirtioVsockRxQueueDispatch {
             deliveries: Vec::new(),
             first_buffer_parse_failure: None,
             first_buffer_too_small: None,
+            needs_queue_interrupt: false,
         }
     }
 
@@ -3819,6 +3822,7 @@ impl VirtioVsockRxQueueDispatch {
             deliveries,
             first_buffer_parse_failure: None,
             first_buffer_too_small: None,
+            needs_queue_interrupt: false,
         })
     }
 
@@ -3881,11 +3885,16 @@ impl VirtioVsockRxQueueDispatch {
     }
 
     pub const fn needs_queue_interrupt(&self) -> bool {
-        self.processed_buffers != 0
+        self.needs_queue_interrupt
     }
 
-    fn record(&mut self, outcome: VirtioVsockRxQueueDispatchOutcome) {
+    fn record(
+        &mut self,
+        outcome: VirtioVsockRxQueueDispatchOutcome,
+        publication: VirtqueueUsedRingPublication,
+    ) {
         self.processed_buffers += 1;
+        self.needs_queue_interrupt |= publication.needs_queue_interrupt();
         match outcome {
             VirtioVsockRxQueueDispatchOutcome::Delivered(delivery) => {
                 match delivery.packet_kind() {
@@ -4167,11 +4176,19 @@ pub struct VirtioVsockRxQueue {
     queue_state: VirtioMmioQueueState,
     available: VirtqueueAvailableRing,
     used: VirtqueueUsedRing,
+    event_idx_enabled: bool,
 }
 
 impl VirtioVsockRxQueue {
     pub fn from_mmio_queue_state(
         queue: VirtioMmioQueueState,
+    ) -> Result<Self, VirtioVsockQueueBuildError> {
+        Self::from_mmio_queue_state_with_event_idx(queue, false)
+    }
+
+    fn from_mmio_queue_state_with_event_idx(
+        queue: VirtioMmioQueueState,
+        event_idx_enabled: bool,
     ) -> Result<Self, VirtioVsockQueueBuildError> {
         validate_active_vsock_queue(queue)?;
         let available = VirtqueueAvailableRing::new(
@@ -4187,6 +4204,7 @@ impl VirtioVsockRxQueue {
             queue_state: queue,
             available,
             used,
+            event_idx_enabled,
         })
     }
 
@@ -4200,6 +4218,10 @@ impl VirtioVsockRxQueue {
 
     pub const fn used_ring(&self) -> &VirtqueueUsedRing {
         &self.used
+    }
+
+    pub const fn event_idx_enabled(&self) -> bool {
+        self.event_idx_enabled
     }
 
     pub fn dispatch_host_request(
@@ -4255,22 +4277,41 @@ impl VirtioVsockRxQueue {
             Ok(buffer) => {
                 let required_len = packet.required_len();
                 if required_len > buffer.len() {
-                    if let Err(source) = self.used.publish_used_element(memory, descriptor_head, 0)
-                    {
-                        return Err(VirtioVsockRxQueueDispatchError::UsedRing {
-                            completed_dispatch: Box::new(dispatch),
-                            descriptor_head,
-                            bytes_written_to_guest: 0,
-                            source,
-                        });
-                    }
-                    dispatch.record(VirtioVsockRxQueueDispatchOutcome::BufferTooSmall(
-                        VirtioVsockRxBufferTooSmall {
-                            descriptor_head,
-                            len: buffer.len(),
-                            required_len,
-                        },
-                    ));
+                    let notification_suppression = match self.notification_suppression(memory) {
+                        Ok(notification_suppression) => notification_suppression,
+                        Err(source) => {
+                            return Err(VirtioVsockRxQueueDispatchError::AvailableRing {
+                                completed_dispatch: Box::new(dispatch),
+                                source,
+                            });
+                        }
+                    };
+                    let publication = match self.used.publish_used_element_with_notification(
+                        memory,
+                        descriptor_head,
+                        0,
+                        notification_suppression,
+                    ) {
+                        Ok(publication) => publication,
+                        Err(source) => {
+                            return Err(VirtioVsockRxQueueDispatchError::UsedRing {
+                                completed_dispatch: Box::new(dispatch),
+                                descriptor_head,
+                                bytes_written_to_guest: 0,
+                                source,
+                            });
+                        }
+                    };
+                    dispatch.record(
+                        VirtioVsockRxQueueDispatchOutcome::BufferTooSmall(
+                            VirtioVsockRxBufferTooSmall {
+                                descriptor_head,
+                                len: buffer.len(),
+                                required_len,
+                            },
+                        ),
+                        publication,
+                    );
                     return Ok(dispatch);
                 }
 
@@ -4282,41 +4323,88 @@ impl VirtioVsockRxQueue {
                     });
                 }
                 let bytes_written_to_guest = packet.bytes_written_to_guest();
-                if let Err(source) =
-                    self.used
-                        .publish_used_element(memory, descriptor_head, bytes_written_to_guest)
-                {
-                    return Err(VirtioVsockRxQueueDispatchError::UsedRing {
-                        completed_dispatch: Box::new(dispatch),
-                        descriptor_head,
-                        bytes_written_to_guest,
-                        source,
-                    });
-                }
-                dispatch.record(VirtioVsockRxQueueDispatchOutcome::Delivered(
-                    VirtioVsockRxPacketDelivery {
+                let notification_suppression = match self.notification_suppression(memory) {
+                    Ok(notification_suppression) => notification_suppression,
+                    Err(source) => {
+                        return Err(VirtioVsockRxQueueDispatchError::AvailableRing {
+                            completed_dispatch: Box::new(dispatch),
+                            source,
+                        });
+                    }
+                };
+                let publication = match self.used.publish_used_element_with_notification(
+                    memory,
+                    descriptor_head,
+                    bytes_written_to_guest,
+                    notification_suppression,
+                ) {
+                    Ok(publication) => publication,
+                    Err(source) => {
+                        return Err(VirtioVsockRxQueueDispatchError::UsedRing {
+                            completed_dispatch: Box::new(dispatch),
+                            descriptor_head,
+                            bytes_written_to_guest,
+                            source,
+                        });
+                    }
+                };
+                dispatch.record(
+                    VirtioVsockRxQueueDispatchOutcome::Delivered(VirtioVsockRxPacketDelivery {
                         packet_kind: packet.packet_kind(),
                         descriptor_head,
                         bytes_written_to_guest,
                         payload_bytes_written_to_guest: packet.payload_bytes_written_to_guest(),
-                    },
-                ));
+                    }),
+                    publication,
+                );
             }
             Err(source) => {
-                if let Err(used_source) = self.used.publish_used_element(memory, descriptor_head, 0)
-                {
-                    return Err(VirtioVsockRxQueueDispatchError::UsedRing {
-                        completed_dispatch: Box::new(dispatch),
-                        descriptor_head,
-                        bytes_written_to_guest: 0,
-                        source: used_source,
-                    });
-                }
-                dispatch.record(VirtioVsockRxQueueDispatchOutcome::BufferParseError(source));
+                let notification_suppression = match self.notification_suppression(memory) {
+                    Ok(notification_suppression) => notification_suppression,
+                    Err(source) => {
+                        return Err(VirtioVsockRxQueueDispatchError::AvailableRing {
+                            completed_dispatch: Box::new(dispatch),
+                            source,
+                        });
+                    }
+                };
+                let publication = match self.used.publish_used_element_with_notification(
+                    memory,
+                    descriptor_head,
+                    0,
+                    notification_suppression,
+                ) {
+                    Ok(publication) => publication,
+                    Err(used_source) => {
+                        return Err(VirtioVsockRxQueueDispatchError::UsedRing {
+                            completed_dispatch: Box::new(dispatch),
+                            descriptor_head,
+                            bytes_written_to_guest: 0,
+                            source: used_source,
+                        });
+                    }
+                };
+                dispatch.record(
+                    VirtioVsockRxQueueDispatchOutcome::BufferParseError(source),
+                    publication,
+                );
             }
         }
 
         Ok(dispatch)
+    }
+
+    fn notification_suppression(
+        &self,
+        memory: &GuestMemory,
+    ) -> Result<VirtqueueNotificationSuppression, VirtqueueAvailableRingError> {
+        if self.event_idx_enabled {
+            Ok(VirtqueueNotificationSuppression::EventIdx {
+                used_event: self.available.used_event(memory)?,
+            })
+        } else {
+            Ok(VirtqueueNotificationSuppression::Disabled)
+        }
     }
 }
 
@@ -4483,11 +4571,19 @@ pub struct VirtioVsockTxQueue {
     queue_state: VirtioMmioQueueState,
     available: VirtqueueAvailableRing,
     used: VirtqueueUsedRing,
+    event_idx_enabled: bool,
 }
 
 impl VirtioVsockTxQueue {
     pub fn from_mmio_queue_state(
         queue: VirtioMmioQueueState,
+    ) -> Result<Self, VirtioVsockQueueBuildError> {
+        Self::from_mmio_queue_state_with_event_idx(queue, false)
+    }
+
+    fn from_mmio_queue_state_with_event_idx(
+        queue: VirtioMmioQueueState,
+        event_idx_enabled: bool,
     ) -> Result<Self, VirtioVsockQueueBuildError> {
         validate_active_vsock_queue(queue)?;
         let available = VirtqueueAvailableRing::new(
@@ -4503,6 +4599,7 @@ impl VirtioVsockTxQueue {
             queue_state: queue,
             available,
             used,
+            event_idx_enabled,
         })
     }
 
@@ -4516,6 +4613,10 @@ impl VirtioVsockTxQueue {
 
     pub const fn used_ring(&self) -> &VirtqueueUsedRing {
         &self.used
+    }
+
+    pub const fn event_idx_enabled(&self) -> bool {
+        self.event_idx_enabled
     }
 
     pub fn dispatch(
@@ -4542,24 +4643,59 @@ impl VirtioVsockTxQueue {
             };
 
             let packet = VirtioVsockTxPacket::parse(memory, &chain);
-            if let Err(source) = self.used.publish_used_element(memory, descriptor_head, 0) {
-                return Err(VirtioVsockTxQueueDispatchError::UsedRing {
-                    completed_dispatch: Box::new(dispatch),
-                    descriptor_head,
-                    bytes_written_to_guest: 0,
-                    source,
-                });
-            }
+            let notification_suppression = match self.notification_suppression(memory) {
+                Ok(notification_suppression) => notification_suppression,
+                Err(source) => {
+                    return Err(VirtioVsockTxQueueDispatchError::AvailableRing {
+                        completed_dispatch: Box::new(dispatch),
+                        source,
+                    });
+                }
+            };
+            let publication = match self.used.publish_used_element_with_notification(
+                memory,
+                descriptor_head,
+                0,
+                notification_suppression,
+            ) {
+                Ok(publication) => publication,
+                Err(source) => {
+                    return Err(VirtioVsockTxQueueDispatchError::UsedRing {
+                        completed_dispatch: Box::new(dispatch),
+                        descriptor_head,
+                        bytes_written_to_guest: 0,
+                        source,
+                    });
+                }
+            };
 
             match packet {
-                Ok(packet) => dispatch.record(VirtioVsockTxQueueDispatchOutcome::Ok(packet)),
+                Ok(packet) => {
+                    dispatch.record(VirtioVsockTxQueueDispatchOutcome::Ok(packet), publication);
+                }
                 Err(source) => {
-                    dispatch.record(VirtioVsockTxQueueDispatchOutcome::ParseError(source));
+                    dispatch.record(
+                        VirtioVsockTxQueueDispatchOutcome::ParseError(source),
+                        publication,
+                    );
                 }
             }
         }
 
         Ok(dispatch)
+    }
+
+    fn notification_suppression(
+        &self,
+        memory: &GuestMemory,
+    ) -> Result<VirtqueueNotificationSuppression, VirtqueueAvailableRingError> {
+        if self.event_idx_enabled {
+            Ok(VirtqueueNotificationSuppression::EventIdx {
+                used_event: self.available.used_event(memory)?,
+            })
+        } else {
+            Ok(VirtqueueNotificationSuppression::Disabled)
+        }
     }
 }
 
@@ -4570,6 +4706,7 @@ pub struct VirtioVsockTxQueueDispatch {
     parse_failures: usize,
     packets: Vec<VirtioVsockTxPacket>,
     first_parse_failure: Option<VirtioVsockTxPacketParseError>,
+    needs_queue_interrupt: bool,
 }
 
 impl VirtioVsockTxQueueDispatch {
@@ -4587,6 +4724,7 @@ impl VirtioVsockTxQueueDispatch {
             parse_failures: 0,
             packets,
             first_parse_failure: None,
+            needs_queue_interrupt: false,
         })
     }
 
@@ -4611,11 +4749,16 @@ impl VirtioVsockTxQueueDispatch {
     }
 
     pub const fn needs_queue_interrupt(&self) -> bool {
-        self.processed_packets != 0
+        self.needs_queue_interrupt
     }
 
-    fn record(&mut self, outcome: VirtioVsockTxQueueDispatchOutcome) {
+    fn record(
+        &mut self,
+        outcome: VirtioVsockTxQueueDispatchOutcome,
+        publication: VirtqueueUsedRingPublication,
+    ) {
         self.processed_packets += 1;
+        self.needs_queue_interrupt |= publication.needs_queue_interrupt();
         match outcome {
             VirtioVsockTxQueueDispatchOutcome::Ok(packet) => {
                 self.successful_packets += 1;
@@ -5067,23 +5210,23 @@ impl VirtioVsockDevice {
             });
         }
 
+        let event_idx_enabled =
+            virtio_feature_enabled(activation.driver_features(), VIRTIO_RING_FEATURE_EVENT_IDX);
         let active_rx_queue = active_vsock_queue_state(activation, VIRTIO_VSOCK_RX_QUEUE_INDEX_U32)
             .and_then(|queue| {
-                VirtioVsockRxQueue::from_mmio_queue_state(queue).map_err(|source| {
-                    VirtioVsockDeviceActivationError::RxQueueBuild {
+                VirtioVsockRxQueue::from_mmio_queue_state_with_event_idx(queue, event_idx_enabled)
+                    .map_err(|source| VirtioVsockDeviceActivationError::RxQueueBuild {
                         queue_index: VIRTIO_VSOCK_RX_QUEUE_INDEX_U32,
                         source,
-                    }
-                })
+                    })
             })?;
         let active_tx_queue = active_vsock_queue_state(activation, VIRTIO_VSOCK_TX_QUEUE_INDEX_U32)
             .and_then(|queue| {
-                VirtioVsockTxQueue::from_mmio_queue_state(queue).map_err(|source| {
-                    VirtioVsockDeviceActivationError::TxQueueBuild {
+                VirtioVsockTxQueue::from_mmio_queue_state_with_event_idx(queue, event_idx_enabled)
+                    .map_err(|source| VirtioVsockDeviceActivationError::TxQueueBuild {
                         queue_index: VIRTIO_VSOCK_TX_QUEUE_INDEX_U32,
                         source,
-                    }
-                })
+                    })
             })?;
         let active_event_queue =
             active_vsock_queue_state(activation, VIRTIO_VSOCK_EVENT_QUEUE_INDEX_U32).and_then(
@@ -6620,6 +6763,10 @@ fn active_vsock_queue_state(
     })
 }
 
+fn virtio_feature_enabled(features: u64, feature: u32) -> bool {
+    features & (1_u64 << feature) != 0
+}
+
 impl VirtioMmioDeviceActivationHandler for VirtioVsockDevice {
     fn activate(
         &mut self,
@@ -7830,6 +7977,27 @@ mod tests {
             .expect("status should accept FEATURES_OK");
     }
 
+    fn advance_handler_to_features_ok_with_event_idx(handler: &mut VirtioVsockMmioHandler) {
+        handler
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
+            .expect("status should accept ACKNOWLEDGE");
+        handler
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            )
+            .expect("status should accept DRIVER");
+        handler
+            .write_register(
+                VirtioMmioRegister::DriverFeatures,
+                1_u32 << VIRTIO_RING_FEATURE_EVENT_IDX,
+            )
+            .expect("event index feature should write");
+        handler
+            .write_register(VirtioMmioRegister::Status, QUEUE_CONFIG_STATUS)
+            .expect("status should accept FEATURES_OK");
+    }
+
     fn guest_address_low(address: GuestAddress) -> u32 {
         u32::try_from(address.raw_value()).expect("test guest address should fit in low half")
     }
@@ -7878,6 +8046,14 @@ mod tests {
 
     fn activate_vsock_handler(handler: &mut VirtioVsockMmioHandler) {
         advance_handler_to_features_ok(handler);
+        configure_vsock_queues(handler);
+        handler
+            .write_register(VirtioMmioRegister::Status, DRIVER_OK_STATUS)
+            .expect("DRIVER_OK should activate vsock device");
+    }
+
+    fn activate_vsock_handler_with_event_idx(handler: &mut VirtioVsockMmioHandler) {
+        advance_handler_to_features_ok_with_event_idx(handler);
         configure_vsock_queues(handler);
         handler
             .write_register(VirtioMmioRegister::Status, DRIVER_OK_STATUS)
@@ -8102,6 +8278,12 @@ mod tests {
             .expect("vsock TX available entry should write");
     }
 
+    fn vsock_tx_available_used_event_address() -> GuestAddress {
+        TEST_VSOCK_TX_AVAILABLE_RING
+            .checked_add(4 + u64::from(TEST_VSOCK_QUEUE_SIZE) * 2)
+            .expect("vsock TX available used_event address should not overflow")
+    }
+
     fn write_vsock_tx_available_heads(memory: &mut GuestMemory, heads: &[u16]) {
         for (slot, head) in heads.iter().copied().enumerate() {
             write_vsock_tx_available_entry(memory, slot, head);
@@ -8110,6 +8292,10 @@ mod tests {
             memory,
             u16::try_from(heads.len()).expect("available head count should fit"),
         );
+    }
+
+    fn write_vsock_tx_available_used_event(memory: &mut GuestMemory, used_event: u16) {
+        write_guest_u16(memory, vsock_tx_available_used_event_address(), used_event);
     }
 
     fn append_vsock_tx_available_head(
@@ -8221,6 +8407,12 @@ mod tests {
         bytes
     }
 
+    fn write_guest_u16(memory: &mut GuestMemory, address: GuestAddress, value: u16) {
+        memory
+            .write_slice(&value.to_le_bytes(), address)
+            .expect("test guest u16 should write");
+    }
+
     fn read_guest_u16(memory: &GuestMemory, address: GuestAddress) -> u16 {
         let mut bytes = [0; 2];
         memory
@@ -8255,6 +8447,17 @@ mod tests {
     }
 
     fn vsock_tx_queue_with_used_ring(device_ring: GuestAddress) -> VirtioVsockTxQueue {
+        vsock_tx_queue_with_used_ring_and_event_idx(device_ring, false)
+    }
+
+    fn vsock_tx_queue_with_event_idx() -> VirtioVsockTxQueue {
+        vsock_tx_queue_with_used_ring_and_event_idx(TEST_VSOCK_TX_USED_RING, true)
+    }
+
+    fn vsock_tx_queue_with_used_ring_and_event_idx(
+        device_ring: GuestAddress,
+        event_idx_enabled: bool,
+    ) -> VirtioVsockTxQueue {
         let mut queues = VirtioMmioQueueRegisters::new(&VIRTIO_VSOCK_QUEUE_SIZES)
             .expect("queue table should build");
         let queue_index =
@@ -8300,7 +8503,8 @@ mod tests {
         let queue_state = *queues
             .queue(queue_index)
             .expect("TX queue state should be configured");
-        VirtioVsockTxQueue::from_mmio_queue_state(queue_state).expect("TX queue should build")
+        VirtioVsockTxQueue::from_mmio_queue_state_with_event_idx(queue_state, event_idx_enabled)
+            .expect("TX queue should build")
     }
 
     fn write_vsock_rx_descriptor(memory: &mut GuestMemory, index: u16, descriptor: TestDescriptor) {
@@ -8343,6 +8547,12 @@ mod tests {
             .expect("vsock RX available entry should write");
     }
 
+    fn vsock_rx_available_used_event_address() -> GuestAddress {
+        TEST_VSOCK_RX_AVAILABLE_RING
+            .checked_add(4 + u64::from(TEST_VSOCK_QUEUE_SIZE) * 2)
+            .expect("vsock RX available used_event address should not overflow")
+    }
+
     fn write_vsock_rx_available_heads(memory: &mut GuestMemory, heads: &[u16]) {
         for (slot, head) in heads.iter().copied().enumerate() {
             write_vsock_rx_available_entry(memory, slot, head);
@@ -8351,6 +8561,10 @@ mod tests {
             memory,
             u16::try_from(heads.len()).expect("available head count should fit"),
         );
+    }
+
+    fn write_vsock_rx_available_used_event(memory: &mut GuestMemory, used_event: u16) {
+        write_guest_u16(memory, vsock_rx_available_used_event_address(), used_event);
     }
 
     fn append_vsock_rx_available_head(
@@ -8407,6 +8621,17 @@ mod tests {
     }
 
     fn vsock_rx_queue_with_used_ring(device_ring: GuestAddress) -> VirtioVsockRxQueue {
+        vsock_rx_queue_with_used_ring_and_event_idx(device_ring, false)
+    }
+
+    fn vsock_rx_queue_with_event_idx() -> VirtioVsockRxQueue {
+        vsock_rx_queue_with_used_ring_and_event_idx(TEST_VSOCK_RX_USED_RING, true)
+    }
+
+    fn vsock_rx_queue_with_used_ring_and_event_idx(
+        device_ring: GuestAddress,
+        event_idx_enabled: bool,
+    ) -> VirtioVsockRxQueue {
         let mut queues = VirtioMmioQueueRegisters::new(&VIRTIO_VSOCK_QUEUE_SIZES)
             .expect("queue table should build");
         let queue_index =
@@ -8452,7 +8677,8 @@ mod tests {
         let queue_state = *queues
             .queue(queue_index)
             .expect("RX queue state should be configured");
-        VirtioVsockRxQueue::from_mmio_queue_state(queue_state).expect("RX queue should build")
+        VirtioVsockRxQueue::from_mmio_queue_state_with_event_idx(queue_state, event_idx_enabled)
+            .expect("RX queue should build")
     }
 
     #[test]
@@ -10668,6 +10894,43 @@ mod tests {
     }
 
     #[test]
+    fn virtio_vsock_rx_queue_dispatch_suppresses_interrupt_with_event_idx() {
+        let mut memory = vsock_tx_memory();
+        let mut queue = vsock_rx_queue_with_event_idx();
+        let mut table = VsockHostConnectionTable::new();
+        let (key, _client) =
+            insert_accepted_host_connection_for_test(&mut table, "rx-event-idx", 4000);
+        write_vsock_rx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_BUFFER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_rx_available_heads(&mut memory, &[0]);
+        write_vsock_rx_available_used_event(&mut memory, 1);
+
+        let dispatch = queue
+            .dispatch_host_request(&mut memory, &mut table, key, 42)
+            .expect("event-index host request should dispatch");
+
+        assert!(queue.event_idx_enabled());
+        assert_eq!(dispatch.processed_buffers(), 1);
+        assert_eq!(dispatch.delivered_requests(), 1);
+        assert!(!dispatch.needs_queue_interrupt());
+        assert_eq!(queue.available_ring().next_avail(), 1);
+        assert_eq!(queue.used_ring().next_used(), 1);
+        assert_eq!(read_vsock_rx_used_index(&memory), 1);
+        assert_eq!(
+            read_vsock_rx_used_element(&memory, 0),
+            (0, VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32)
+        );
+        assert!(!table.has_pending_request_packet(key));
+    }
+
+    #[test]
     fn virtio_vsock_rx_queue_dispatch_without_pending_request_is_noop() {
         let mut memory = vsock_tx_memory();
         let mut queue = vsock_rx_queue();
@@ -11465,6 +11728,38 @@ mod tests {
     }
 
     #[test]
+    fn virtio_vsock_tx_queue_dispatch_suppresses_interrupt_with_event_idx() {
+        let mut memory = vsock_tx_memory();
+        let mut queue = vsock_tx_queue_with_event_idx();
+        let header = test_vsock_packet_header().with_payload_len(0);
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_HEADER, header);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(
+                TEST_VSOCK_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        write_vsock_tx_available_heads(&mut memory, &[0]);
+        write_vsock_tx_available_used_event(&mut memory, 1);
+
+        let dispatch = queue
+            .dispatch(&mut memory)
+            .expect("event-index TX packet should dispatch");
+
+        assert!(queue.event_idx_enabled());
+        assert_eq!(dispatch.processed_packets(), 1);
+        assert_eq!(dispatch.successful_packets(), 1);
+        assert!(!dispatch.needs_queue_interrupt());
+        assert_eq!(queue.available_ring().next_avail(), 1);
+        assert_eq!(queue.used_ring().next_used(), 1);
+        assert_eq!(read_vsock_tx_used_index(&memory), 1);
+        assert_eq!(read_vsock_tx_used_element(&memory, 0), (0, 0));
+    }
+
+    #[test]
     fn virtio_vsock_tx_queue_dispatch_preserves_next_avail_across_calls() {
         let mut memory = vsock_tx_memory();
         let mut queue = vsock_tx_queue();
@@ -11839,6 +12134,28 @@ mod tests {
                 .queue_state(),
             event_queue
         );
+    }
+
+    #[test]
+    fn virtio_vsock_handler_activation_enables_event_idx_for_rx_tx_queues() {
+        let mut handler = virtio_vsock_mmio_handler(42).expect("vsock handler should build");
+
+        activate_vsock_handler_with_event_idx(&mut handler);
+
+        let device = handler.activation_handler();
+        assert!(
+            device
+                .active_rx_dispatch_queue()
+                .expect("RX queue should be active")
+                .event_idx_enabled()
+        );
+        assert!(
+            device
+                .active_tx_dispatch_queue()
+                .expect("TX queue should be active")
+                .event_idx_enabled()
+        );
+        assert!(device.active_event_dispatch_queue().is_some());
     }
 
     #[test]
