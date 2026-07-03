@@ -111,7 +111,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v3"
+direct_boot_variant="direct-boot-v4"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -360,7 +360,7 @@ if [ -r /proc/cmdline ]; then
   emit_line BANGBANG_CMDLINE_END
 fi
 emit_line BANGBANG_DIRECT_ROOTFS_BOOT_OK
-while :; do :; done
+exec sleep 3600
 EOF
   chmod 0755 "$init_path"
 }
