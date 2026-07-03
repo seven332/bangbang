@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::Ipv4Addr;
 use std::str;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde_json::{Map, Value};
@@ -15,6 +16,7 @@ pub const MMDS_GUEST_TCP_PORT: u16 = 80;
 pub const MMDS_TOKEN_MIN_TTL_SECONDS: u32 = 1;
 pub const MMDS_TOKEN_MAX_TTL_SECONDS: u32 = 21_600;
 pub const MMDS_TOKEN_MAX_ACTIVE_TOKENS: usize = 1_024;
+pub const DEFAULT_MMDS_IPV4_ADDRESS: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
 
 const ETHERNET_ETHERTYPE_IPV4: u16 = 0x0800;
 const ETHERNET_ETHERTYPE_OFFSET: usize = 12;
@@ -283,6 +285,10 @@ impl MmdsConfig {
 
     pub const fn ipv4_address(&self) -> Option<Ipv4Addr> {
         self.ipv4_address
+    }
+
+    pub fn effective_ipv4_address(&self) -> Ipv4Addr {
+        self.ipv4_address.unwrap_or(DEFAULT_MMDS_IPV4_ADDRESS)
     }
 
     pub const fn imds_compat(&self) -> bool {
@@ -923,6 +929,53 @@ pub struct MmdsState {
     token_authority: MmdsTokenAuthority,
 }
 
+#[derive(Debug, Clone)]
+pub struct MmdsStateHandle {
+    state: Arc<Mutex<MmdsState>>,
+}
+
+impl Default for MmdsStateHandle {
+    fn default() -> Self {
+        Self::new(MmdsState::default())
+    }
+}
+
+impl MmdsStateHandle {
+    pub fn new(state: MmdsState) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(state)),
+        }
+    }
+
+    pub fn with<R>(&self, f: impl FnOnce(&MmdsState) -> R) -> Result<R, MmdsStateLockError> {
+        let state = self.state.lock().map_err(|_| MmdsStateLockError)?;
+        Ok(f(&state))
+    }
+
+    pub fn with_mut<R>(
+        &self,
+        f: impl FnOnce(&mut MmdsState) -> R,
+    ) -> Result<R, MmdsStateLockError> {
+        let mut state = self.state.lock().map_err(|_| MmdsStateLockError)?;
+        Ok(f(&mut state))
+    }
+
+    pub fn config(&self) -> Result<Option<MmdsConfig>, MmdsStateLockError> {
+        self.with(|state| state.config().cloned())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MmdsStateLockError;
+
+impl fmt::Display for MmdsStateLockError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("MMDS state lock is poisoned")
+    }
+}
+
+impl std::error::Error for MmdsStateLockError {}
+
 impl Default for MmdsState {
     fn default() -> Self {
         Self::new(MMDS_DATA_STORE_LIMIT_BYTES)
@@ -1449,6 +1502,7 @@ fn is_valid_link_local_ipv4(ipv4_address: Ipv4Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::NetworkInterfaceConfigInput;
 
     fn query_value() -> Value {
         serde_json::json!({
@@ -2124,6 +2178,55 @@ mod tests {
     #[test]
     fn mmds_state_equality_ignores_token_clock_origin() {
         assert_eq!(MmdsState::default(), MmdsState::default());
+    }
+
+    #[test]
+    fn mmds_state_handle_shares_mutations() {
+        let handle = MmdsStateHandle::default();
+        let cloned = handle.clone();
+        let value = query_value();
+
+        handle
+            .with_mut(|state| state.put_data(MmdsContentInput::new(value.clone())))
+            .expect("MMDS handle should lock")
+            .expect("MMDS data should store");
+
+        assert_eq!(
+            cloned
+                .with(MmdsState::get_data)
+                .expect("cloned MMDS handle should lock"),
+            Ok(value)
+        );
+    }
+
+    #[test]
+    fn mmds_config_effective_ipv4_address_uses_default_or_configured_value() {
+        let mut state = MmdsState::default();
+        enable_mmds_v1(&mut state);
+        assert_eq!(
+            state
+                .config()
+                .expect("MMDS config should be present")
+                .effective_ipv4_address(),
+            DEFAULT_MMDS_IPV4_ADDRESS
+        );
+
+        state
+            .put_config(
+                MmdsConfigInput::new(vec!["eth0".to_string()])
+                    .with_ipv4_address(Ipv4Addr::new(169, 254, 169, 253)),
+                &[NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0")
+                    .validate()
+                    .expect("network config should validate")],
+            )
+            .expect("MMDS config should store");
+        assert_eq!(
+            state
+                .config()
+                .expect("MMDS config should be present")
+                .effective_ipv4_address(),
+            Ipv4Addr::new(169, 254, 169, 253)
+        );
     }
 
     #[test]
