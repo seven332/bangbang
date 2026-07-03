@@ -173,7 +173,10 @@ to observe it and how it is bounded.
 Block devices can expose host file contents to the guest and can write to the
 backing file when configured read-write. Operators should use dedicated disk
 images per microVM and avoid sharing writable backing files between multiple
-bangbang processes.
+bangbang processes. The default `cache_type=Unsafe` mode does not advertise
+guest flush support. When `cache_type=Writeback` is configured, the block device
+advertises guest flush support and handles flush requests through the backing
+file `sync_all()` path.
 
 Metrics and logger outputs are host observability state, not guest
 configuration, and are intentionally omitted from `GET /vm/config`. Current
