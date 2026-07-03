@@ -280,7 +280,7 @@ exist.
 | `PUT /drives/{drive_id}` | `path_on_host` | required | The API/VMM path records this value only after rejecting empty paths; it does not open or stat the path yet. Future validation must cover access, file type, and path redaction in errors. |
 | `PUT /drives/{drive_id}` | `is_read_only` | optional | The internal model defaults omitted virtio-block drives to read-write. |
 | `PUT /drives/{drive_id}` | `partuuid` | optional | Only meaningful for root-device boot selection. |
-| `PUT /drives/{drive_id}` | `cache_type` | optional when `Unsafe`; deferred when `Writeback` | The internal model accepts omitted/default `Unsafe` and rejects `Writeback` as unsupported. |
+| `PUT /drives/{drive_id}` | `cache_type` | optional when `Unsafe`; supported when `Writeback` | The internal model accepts omitted/default `Unsafe` and explicit `Writeback`. `Unsafe` does not advertise `VIRTIO_BLK_F_FLUSH`; `Writeback` advertises it and routes guest flush requests through the backing flush path. |
 | `PUT /drives/{drive_id}` | `rate_limiter` | optional when absent or `null`; deferred when configured | The internal model rejects configured rate limiters; non-null rate limiting is tied to future block I/O performance work in #13. |
 | `PUT /drives/{drive_id}` | `io_engine` | optional when `Sync`; rejected when `Async` | The internal model accepts omitted/default `Sync` and rejects `Async`; `Async` is tied to Linux io_uring and does not directly map to the first macOS target. |
 | `PUT /drives/{drive_id}` | `socket` | optional when absent or `null`; deferred when set | The internal model rejects configured sockets; vhost-user-block is outside the first tier. |
@@ -566,10 +566,11 @@ values as nonempty alphanumeric strings with `_`, requires the two IDs to
 match, rejects an empty `path_on_host` without opening or statting host files,
 and normalizes omitted `is_read_only` to read-write.
 
-The internal model accepts omitted/default `cache_type=Unsafe` and
-`io_engine=Sync`, and rejects `Writeback`, `Async`, configured rate limiters,
-and configured sockets as unsupported. Displayed errors avoid echoing
-`path_on_host` so future API code can preserve host path redaction.
+The internal model accepts omitted/default `cache_type=Unsafe`, explicit
+`cache_type=Writeback`, and omitted/default `io_engine=Sync`, and rejects
+`Async`, configured rate limiters, and configured sockets as unsupported.
+Displayed errors avoid echoing `path_on_host` so future API code can preserve
+host path redaction.
 
 The runtime crate can also open the normalized `path_on_host` as a regular
 host file, preserve the configured read-only mode, report byte length, and
@@ -578,6 +579,11 @@ request execution. It rejects non-regular backing paths before data I/O and
 rejects read-only writes before mutating the file. Backing errors also avoid
 echoing `path_on_host`. This host-file opening path is internal and not invoked
 by public drive configuration yet.
+
+Virtio-block feature negotiation follows the selected cache mode:
+`cache_type=Unsafe` keeps the flush feature hidden, while
+`cache_type=Writeback` advertises `VIRTIO_BLK_F_FLUSH` and uses the existing
+backing-file flush path for guest flush requests.
 
 ## Internal Network Interface Configuration
 

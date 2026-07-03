@@ -2714,7 +2714,7 @@ mod tests {
     }
 
     #[test]
-    fn returns_fault_for_unsupported_drive_cache_without_storing() {
+    fn configures_writeback_drive_over_unix_socket() {
         let path = unique_socket_path("drive-cache");
         let server = ApiServer::bind(&path).expect("server should bind");
         let mut client = UnixStream::connect(&path).expect("client should connect");
@@ -2742,11 +2742,15 @@ mod tests {
             .read_to_string(&mut response)
             .expect("client should read response");
 
-        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        assert!(
-            response.contains(r#"{"fault_message":"drive cache_type Writeback is not supported"}"#)
-        );
-        assert!(vmm.drive_configs().is_empty());
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(response.contains("Content-Length: 0\r\n"));
+        assert!(response.ends_with("\r\n\r\n"));
+        assert_eq!(vmm.drive_configs().len(), 1);
+        let config = &vmm.drive_configs()[0];
+        assert_eq!(config.drive_id(), "rootfs");
+        assert_eq!(config.path_on_host(), PathBuf::from("/tmp/rootfs.ext4"));
+        assert!(config.is_root_device());
+        assert_eq!(config.cache_type(), DriveCacheType::Writeback);
     }
 
     #[test]

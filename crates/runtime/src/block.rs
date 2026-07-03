@@ -35,6 +35,7 @@ pub const VIRTIO_BLOCK_SECTOR_SHIFT: u32 = 9;
 pub const VIRTIO_BLOCK_SECTOR_SIZE: u64 = 1 << VIRTIO_BLOCK_SECTOR_SHIFT;
 pub const VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE: usize = 8;
 pub const VIRTIO_BLOCK_FEATURE_READ_ONLY: u32 = 5;
+pub const VIRTIO_BLOCK_FEATURE_FLUSH: u32 = 9;
 pub const VIRTIO_RING_FEATURE_EVENT_IDX: u32 = 29;
 pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
 pub const VIRTIO_BLOCK_REQUEST_HEADER_SIZE: u32 = 16;
@@ -262,10 +263,6 @@ impl TryFrom<DriveConfigInput> for DriveConfig {
         }
 
         let cache_type = input.cache_type.unwrap_or_default();
-        if cache_type != DriveCacheType::Unsafe {
-            return Err(DriveConfigError::UnsupportedCacheType { cache_type });
-        }
-
         let io_engine = input.io_engine.unwrap_or_default();
         if io_engine != DriveIoEngine::Sync {
             return Err(DriveConfigError::UnsupportedIoEngine { io_engine });
@@ -352,9 +349,6 @@ pub enum DriveConfigError {
         body_drive_id: String,
     },
     EmptyPathOnHost,
-    UnsupportedCacheType {
-        cache_type: DriveCacheType,
-    },
     UnsupportedIoEngine {
         io_engine: DriveIoEngine,
     },
@@ -375,9 +369,6 @@ impl fmt::Display for DriveConfigError {
             }
             Self::MismatchedDriveId { .. } => f.write_str("path drive_id must match body drive_id"),
             Self::EmptyPathOnHost => f.write_str("drive path_on_host must not be empty"),
-            Self::UnsupportedCacheType { cache_type } => {
-                write!(f, "drive cache_type {cache_type} is not supported")
-            }
             Self::UnsupportedIoEngine { io_engine } => {
                 write!(f, "drive io_engine {io_engine} is not supported")
             }
@@ -394,18 +385,20 @@ impl std::error::Error for DriveConfigError {}
 pub struct VirtioBlockConfigSpace {
     capacity_sectors: u64,
     is_read_only: bool,
+    cache_type: DriveCacheType,
 }
 
 impl VirtioBlockConfigSpace {
-    pub const fn new(backing_len: u64, is_read_only: bool) -> Self {
+    pub const fn new(backing_len: u64, is_read_only: bool, cache_type: DriveCacheType) -> Self {
         Self {
             capacity_sectors: backing_len >> VIRTIO_BLOCK_SECTOR_SHIFT,
             is_read_only,
+            cache_type,
         }
     }
 
-    pub fn from_backing(backing: &BlockFileBacking) -> Self {
-        Self::new(backing.len(), backing.is_read_only())
+    pub fn from_backing(backing: &BlockFileBacking, cache_type: DriveCacheType) -> Self {
+        Self::new(backing.len(), backing.is_read_only(), cache_type)
     }
 
     pub const fn capacity_sectors(self) -> u64 {
@@ -416,13 +409,19 @@ impl VirtioBlockConfigSpace {
         self.is_read_only
     }
 
+    pub const fn cache_type(self) -> DriveCacheType {
+        self.cache_type
+    }
+
     pub const fn available_features(self) -> u64 {
-        let features = virtio_feature_bit(VIRTIO_FEATURE_VERSION_1);
-        if self.is_read_only {
-            features | virtio_feature_bit(VIRTIO_BLOCK_FEATURE_READ_ONLY)
-        } else {
-            features
+        let mut features = virtio_feature_bit(VIRTIO_FEATURE_VERSION_1);
+        if matches!(self.cache_type, DriveCacheType::Writeback) {
+            features |= virtio_feature_bit(VIRTIO_BLOCK_FEATURE_FLUSH);
         }
+        if self.is_read_only {
+            features |= virtio_feature_bit(VIRTIO_BLOCK_FEATURE_READ_ONLY);
+        }
+        features
     }
 
     const fn capacity_bytes(self) -> [u8; VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE] {
@@ -2101,7 +2100,7 @@ impl PreparedBlockDevice {
                 source,
             }
         })?;
-        let config_space = VirtioBlockConfigSpace::from_backing(&backing);
+        let config_space = VirtioBlockConfigSpace::from_backing(&backing, config.cache_type());
         let device_id = VirtioBlockDeviceId::from_bytes(config.drive_id().as_bytes());
         let device = VirtioBlockDevice::new(backing, device_id);
 
@@ -2893,18 +2892,18 @@ mod tests {
         BlockMmioRegistrationError, DriveCacheType, DriveConfig, DriveConfigError,
         DriveConfigInput, DriveConfigs, DriveIdSource, DriveIoEngine, PreparedBlockDeviceError,
         PreparedBlockDevices, VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE, VIRTIO_BLOCK_DEVICE_ID,
-        VIRTIO_BLOCK_FEATURE_READ_ONLY, VIRTIO_BLOCK_ID_BYTES, VIRTIO_BLOCK_QUEUE_COUNT,
-        VIRTIO_BLOCK_QUEUE_SIZE, VIRTIO_BLOCK_QUEUE_SIZES, VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
-        VIRTIO_BLOCK_REQUEST_TYPE_FLUSH, VIRTIO_BLOCK_REQUEST_TYPE_GET_ID,
-        VIRTIO_BLOCK_REQUEST_TYPE_IN, VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT,
-        VIRTIO_BLOCK_SECTOR_SIZE, VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK,
-        VIRTIO_BLOCK_STATUS_SIZE, VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1,
-        VIRTIO_RING_FEATURE_EVENT_IDX, VirtioBlockConfigSpace, VirtioBlockDevice,
-        VirtioBlockDeviceActivationError, VirtioBlockDeviceId, VirtioBlockDeviceNotificationError,
-        VirtioBlockQueue, VirtioBlockQueueBuildError, VirtioBlockQueueDispatchError,
-        VirtioBlockRequest, VirtioBlockRequestCompletion, VirtioBlockRequestError,
-        VirtioBlockRequestExecutionError, VirtioBlockRequestExecutionOutcome,
-        VirtioBlockRequestType, normalize_completion_status,
+        VIRTIO_BLOCK_FEATURE_FLUSH, VIRTIO_BLOCK_FEATURE_READ_ONLY, VIRTIO_BLOCK_ID_BYTES,
+        VIRTIO_BLOCK_QUEUE_COUNT, VIRTIO_BLOCK_QUEUE_SIZE, VIRTIO_BLOCK_QUEUE_SIZES,
+        VIRTIO_BLOCK_REQUEST_HEADER_SIZE, VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
+        VIRTIO_BLOCK_REQUEST_TYPE_GET_ID, VIRTIO_BLOCK_REQUEST_TYPE_IN,
+        VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT, VIRTIO_BLOCK_SECTOR_SIZE,
+        VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK, VIRTIO_BLOCK_STATUS_SIZE,
+        VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1, VIRTIO_RING_FEATURE_EVENT_IDX,
+        VirtioBlockConfigSpace, VirtioBlockDevice, VirtioBlockDeviceActivationError,
+        VirtioBlockDeviceId, VirtioBlockDeviceNotificationError, VirtioBlockQueue,
+        VirtioBlockQueueBuildError, VirtioBlockQueueDispatchError, VirtioBlockRequest,
+        VirtioBlockRequestCompletion, VirtioBlockRequestError, VirtioBlockRequestExecutionError,
+        VirtioBlockRequestExecutionOutcome, VirtioBlockRequestType, normalize_completion_status,
     };
 
     static NEXT_TEMP_PATH_ID: AtomicUsize = AtomicUsize::new(0);
@@ -3089,7 +3088,7 @@ mod tests {
         backing: BlockFileBacking,
         queue_max_sizes: &[u16],
     ) -> VirtioMmioRegisterHandler<VirtioBlockConfigSpace, VirtioBlockDevice> {
-        let config = VirtioBlockConfigSpace::from_backing(&backing);
+        let config = VirtioBlockConfigSpace::from_backing(&backing, DriveCacheType::Unsafe);
         let device = VirtioBlockDevice::new(backing, TEST_DEVICE_ID);
         VirtioMmioRegisterHandler::with_device_config_and_activation(
             VIRTIO_BLOCK_DEVICE_ID,
@@ -3484,7 +3483,8 @@ mod tests {
     fn block_device_registers() -> VirtioMmioDeviceRegisters {
         VirtioMmioDeviceRegisters::new(
             VIRTIO_BLOCK_DEVICE_ID,
-            VirtioBlockConfigSpace::new(VIRTIO_BLOCK_SECTOR_SIZE, false).available_features(),
+            VirtioBlockConfigSpace::new(VIRTIO_BLOCK_SECTOR_SIZE, false, DriveCacheType::Unsafe)
+                .available_features(),
         )
     }
 
@@ -3730,20 +3730,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_cache_type() {
-        let err = validate(input().with_cache_type(DriveCacheType::Writeback))
-            .expect_err("Writeback cache should be unsupported");
+    fn accepts_writeback_cache_type() {
+        let config = validate(input().with_cache_type(DriveCacheType::Writeback))
+            .expect("Writeback cache should be supported");
 
-        assert_eq!(
-            err,
-            DriveConfigError::UnsupportedCacheType {
-                cache_type: DriveCacheType::Writeback,
-            }
-        );
-        assert_eq!(
-            err.to_string(),
-            "drive cache_type Writeback is not supported"
-        );
+        assert_eq!(config.cache_type(), DriveCacheType::Writeback);
     }
 
     #[test]
@@ -3968,6 +3959,28 @@ mod tests {
             .write_at(1, b"Z")
             .expect("read-write prepared backing should write");
         assert_eq!(fs::read(file.as_path()).expect("file should read"), b"aZc");
+    }
+
+    #[test]
+    fn prepared_block_devices_preserve_writeback_cache_type() {
+        let file = temp_file("prepared-writeback.img", &[0; 512]);
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(
+                DriveConfigInput::new("data", "data", file.as_path(), false)
+                    .with_cache_type(DriveCacheType::Writeback),
+            )
+            .expect("writeback drive config should insert");
+
+        let prepared = PreparedBlockDevices::from_configs(&configs)
+            .expect("writeback block device should prepare");
+
+        let config_space = prepared.as_slice()[0].config_space();
+        assert_eq!(config_space.cache_type(), DriveCacheType::Writeback);
+        assert_ne!(
+            config_space.available_features() & (1_u64 << VIRTIO_BLOCK_FEATURE_FLUSH),
+            0
+        );
     }
 
     #[test]
@@ -4485,6 +4498,7 @@ mod tests {
         assert_eq!(VIRTIO_BLOCK_SECTOR_SIZE, 512);
         assert_eq!(VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE, 8);
         assert_eq!(VIRTIO_BLOCK_FEATURE_READ_ONLY, 5);
+        assert_eq!(VIRTIO_BLOCK_FEATURE_FLUSH, 9);
         assert_eq!(VIRTIO_RING_FEATURE_EVENT_IDX, 29);
         assert_eq!(VIRTIO_FEATURE_VERSION_1, 32);
         assert_eq!(VIRTIO_BLOCK_REQUEST_HEADER_SIZE, 16);
@@ -4501,44 +4515,55 @@ mod tests {
 
     #[test]
     fn config_space_reports_sector_capacity() {
-        let config = VirtioBlockConfigSpace::new(4096, false);
+        let config = VirtioBlockConfigSpace::new(4096, false, DriveCacheType::Unsafe);
 
         assert_eq!(config.capacity_sectors(), 8);
         assert!(!config.is_read_only());
+        assert_eq!(config.cache_type(), DriveCacheType::Unsafe);
     }
 
     #[test]
     fn config_space_truncates_unaligned_tail() {
         assert_eq!(
-            VirtioBlockConfigSpace::new(511, false).capacity_sectors(),
+            VirtioBlockConfigSpace::new(511, false, DriveCacheType::Unsafe).capacity_sectors(),
             0
         );
         assert_eq!(
-            VirtioBlockConfigSpace::new(512, false).capacity_sectors(),
+            VirtioBlockConfigSpace::new(512, false, DriveCacheType::Unsafe).capacity_sectors(),
             1
         );
         assert_eq!(
-            VirtioBlockConfigSpace::new(4097, false).capacity_sectors(),
+            VirtioBlockConfigSpace::new(4097, false, DriveCacheType::Unsafe).capacity_sectors(),
             8
         );
     }
 
     #[test]
-    fn config_space_tracks_read_only_feature() {
+    fn config_space_tracks_cache_and_read_only_features() {
         let base_features = 1_u64 << VIRTIO_FEATURE_VERSION_1;
+        let flush_feature = 1_u64 << VIRTIO_BLOCK_FEATURE_FLUSH;
+        let read_only_feature = 1_u64 << VIRTIO_BLOCK_FEATURE_READ_ONLY;
 
         assert_eq!(
-            VirtioBlockConfigSpace::new(512, false).available_features(),
+            VirtioBlockConfigSpace::new(512, false, DriveCacheType::Unsafe).available_features(),
             base_features
         );
         assert_eq!(
-            VirtioBlockConfigSpace::new(512, false).available_features()
+            VirtioBlockConfigSpace::new(512, false, DriveCacheType::Unsafe).available_features()
                 & (1_u64 << VIRTIO_RING_FEATURE_EVENT_IDX),
             0
         );
         assert_eq!(
-            VirtioBlockConfigSpace::new(512, true).available_features(),
-            base_features | (1_u64 << VIRTIO_BLOCK_FEATURE_READ_ONLY)
+            VirtioBlockConfigSpace::new(512, false, DriveCacheType::Writeback).available_features(),
+            base_features | flush_feature
+        );
+        assert_eq!(
+            VirtioBlockConfigSpace::new(512, true, DriveCacheType::Unsafe).available_features(),
+            base_features | read_only_feature
+        );
+        assert_eq!(
+            VirtioBlockConfigSpace::new(512, true, DriveCacheType::Writeback).available_features(),
+            base_features | read_only_feature | flush_feature
         );
     }
 
@@ -4546,16 +4571,21 @@ mod tests {
     fn config_space_can_be_derived_from_backing() {
         let file = temp_file("config-space.img", &[0; 1024]);
         let backing = open_backing(file.as_path(), true).expect("backing should open");
-        let config = VirtioBlockConfigSpace::from_backing(&backing);
+        let config = VirtioBlockConfigSpace::from_backing(&backing, DriveCacheType::Writeback);
 
         assert_eq!(config.capacity_sectors(), 2);
         assert!(config.is_read_only());
+        assert_eq!(config.cache_type(), DriveCacheType::Writeback);
     }
 
     #[test]
     fn config_space_reads_full_and_partial_capacity() {
         let sectors = 0x0102_0304_u64;
-        let config = VirtioBlockConfigSpace::new(sectors << VIRTIO_BLOCK_SECTOR_SHIFT, false);
+        let config = VirtioBlockConfigSpace::new(
+            sectors << VIRTIO_BLOCK_SECTOR_SHIFT,
+            false,
+            DriveCacheType::Unsafe,
+        );
         let expected = sectors.to_le_bytes();
 
         assert_eq!(
@@ -4580,7 +4610,7 @@ mod tests {
 
     #[test]
     fn config_space_reads_ending_at_capacity_boundary() {
-        let config = VirtioBlockConfigSpace::new(u64::MAX, false);
+        let config = VirtioBlockConfigSpace::new(u64::MAX, false, DriveCacheType::Unsafe);
         let expected = config.capacity_sectors().to_le_bytes();
 
         assert_eq!(
@@ -4599,7 +4629,7 @@ mod tests {
 
     #[test]
     fn config_space_rejects_out_of_bounds_reads() {
-        let config = VirtioBlockConfigSpace::new(512, false);
+        let config = VirtioBlockConfigSpace::new(512, false, DriveCacheType::Unsafe);
 
         assert!(matches!(
             read_block_config(config, 8, 1),
@@ -4613,7 +4643,7 @@ mod tests {
 
     #[test]
     fn config_space_rejects_writes_after_driver_status() {
-        let config = VirtioBlockConfigSpace::new(512, false);
+        let config = VirtioBlockConfigSpace::new(512, false, DriveCacheType::Unsafe);
 
         assert!(matches!(
             write_block_config_after_driver(config, 0, &[1, 2, 3, 4]),
@@ -5575,7 +5605,7 @@ mod tests {
     fn block_device_activation_runs_through_mmio_register_handler_and_reset() {
         let file = temp_file("block-device-mmio-handler.img", &sector_payload(0x12));
         let backing = open_backing(file.as_path(), false).expect("backing should open");
-        let config = VirtioBlockConfigSpace::from_backing(&backing);
+        let config = VirtioBlockConfigSpace::from_backing(&backing, DriveCacheType::Unsafe);
         let device = VirtioBlockDevice::new(backing, TEST_DEVICE_ID);
         let mut handler = VirtioMmioRegisterHandler::with_device_config_and_activation(
             VIRTIO_BLOCK_DEVICE_ID,
