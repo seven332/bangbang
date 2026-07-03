@@ -963,14 +963,6 @@ impl MmdsStateHandle {
     pub fn config(&self) -> Result<Option<MmdsConfig>, MmdsStateLockError> {
         self.with(|state| state.config().cloned())
     }
-
-    pub fn guest_tcp_packet_response_bytes(
-        &self,
-        packet: &[u8],
-        mmds_ipv4_address: Ipv4Addr,
-    ) -> Result<Option<Vec<u8>>, MmdsStateLockError> {
-        self.with_mut(|state| state.guest_tcp_packet_response_bytes(packet, mmds_ipv4_address))
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
