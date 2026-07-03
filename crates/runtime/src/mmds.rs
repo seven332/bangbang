@@ -93,6 +93,19 @@ pub struct MmdsGuestTcpPacket<'a> {
     payload: &'a [u8],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MmdsGuestTcpResponseContext {
+    source_ethernet_address: EthernetMacAddress,
+    destination_ethernet_address: EthernetMacAddress,
+    source_ipv4_address: Ipv4Addr,
+    destination_ipv4_address: Ipv4Addr,
+    source_port: u16,
+    destination_port: u16,
+    sequence_number: u32,
+    acknowledgement_number: u32,
+    tcp_flags: u8,
+}
+
 impl<'a> MmdsGuestTcpPacket<'a> {
     pub const fn source_ethernet_address(self) -> EthernetMacAddress {
         self.source_ethernet_address
@@ -134,11 +147,42 @@ impl<'a> MmdsGuestTcpPacket<'a> {
         self.payload
     }
 
+    pub const fn response_context(self) -> MmdsGuestTcpResponseContext {
+        MmdsGuestTcpResponseContext {
+            source_ethernet_address: self.source_ethernet_address,
+            destination_ethernet_address: self.destination_ethernet_address,
+            source_ipv4_address: self.source_ipv4_address,
+            destination_ipv4_address: self.destination_ipv4_address,
+            source_port: self.source_port,
+            destination_port: self.destination_port,
+            sequence_number: self.sequence_number,
+            acknowledgement_number: self.acknowledgement_number,
+            tcp_flags: self.tcp_flags,
+        }
+    }
+
     pub fn response_frame(
         self,
         tcp_payload: &[u8],
     ) -> Result<Vec<u8>, MmdsGuestTcpResponseFrameError> {
-        mmds_guest_tcp_response_frame(self, tcp_payload)
+        self.response_context()
+            .response_frame(tcp_payload, self.payload.len())
+    }
+}
+
+impl MmdsGuestTcpResponseContext {
+    pub fn response_frame(
+        self,
+        tcp_payload: &[u8],
+        request_payload_len: usize,
+    ) -> Result<Vec<u8>, MmdsGuestTcpResponseFrameError> {
+        let request_payload_len = u32::try_from(request_payload_len).map_err(|_| {
+            MmdsGuestTcpResponseFrameError::RequestPayloadTooLarge {
+                request_payload_len,
+            }
+        })?;
+
+        mmds_guest_tcp_response_frame(self, tcp_payload, request_payload_len)
     }
 }
 
@@ -226,8 +270,9 @@ pub fn classify_mmds_guest_tcp_packet(
 }
 
 fn mmds_guest_tcp_response_frame(
-    request: MmdsGuestTcpPacket<'_>,
+    request: MmdsGuestTcpResponseContext,
     tcp_payload: &[u8],
+    request_payload_len: u32,
 ) -> Result<Vec<u8>, MmdsGuestTcpResponseFrameError> {
     let ipv4_total_len = IPV4_MIN_HEADER_LEN
         .checked_add(TCP_MIN_HEADER_LEN)
@@ -247,12 +292,6 @@ fn mmds_guest_tcp_response_frame(
         .ok_or(MmdsGuestTcpResponseFrameError::PayloadTooLarge {
             payload_len: tcp_payload.len(),
         })?;
-    let request_payload_len = u32::try_from(request.payload.len()).map_err(|_| {
-        MmdsGuestTcpResponseFrameError::PayloadTooLarge {
-            payload_len: request.payload.len(),
-        }
-    })?;
-
     let mut frame = Vec::with_capacity(ETHERNET_HEADER_LEN + usize::from(ipv4_total_len));
     frame.extend_from_slice(&request.source_ethernet_address.octets());
     frame.extend_from_slice(&request.destination_ethernet_address.octets());
@@ -308,6 +347,7 @@ fn mmds_guest_tcp_response_frame(
 pub enum MmdsGuestTcpResponseFrameError {
     InternalFrameLayout,
     PayloadTooLarge { payload_len: usize },
+    RequestPayloadTooLarge { request_payload_len: usize },
 }
 
 impl fmt::Display for MmdsGuestTcpResponseFrameError {
@@ -320,13 +360,19 @@ impl fmt::Display for MmdsGuestTcpResponseFrameError {
                 f,
                 "MMDS guest TCP response payload length {payload_len} exceeds IPv4 frame capacity"
             ),
+            Self::RequestPayloadTooLarge {
+                request_payload_len,
+            } => write!(
+                f,
+                "MMDS guest TCP request payload length {request_payload_len} exceeds TCP acknowledgement capacity"
+            ),
         }
     }
 }
 
 impl std::error::Error for MmdsGuestTcpResponseFrameError {}
 
-impl MmdsGuestTcpPacket<'_> {
+impl MmdsGuestTcpResponseContext {
     fn response_acknowledgement_number(self, request_payload_len: u32) -> u32 {
         let mut acknowledgement = self.sequence_number.wrapping_add(request_payload_len);
         if self.tcp_flags & TCP_FLAG_SYN != 0 {
@@ -2126,6 +2172,50 @@ mod tests {
                     .wrapping_add(u32::try_from(request.len()).expect("request len should fit u32"))
                     .wrapping_add(2)
             )
+        );
+    }
+
+    #[test]
+    fn mmds_guest_tcp_response_context_acknowledges_explicit_payload_len() {
+        let first_fragment = b"GET /meta-data/";
+        let full_request_len = first_fragment.len() + b"hostname HTTP/1.1\r\n\r\n".len();
+        let packet = test_mmds_tcp_packet(first_fragment);
+        let classified = classify_mmds_guest_tcp_packet(&packet, test_mmds_ipv4_address())
+            .expect("MMDS TCP packet should classify");
+        let response_context = classified.response_context();
+
+        let response = response_context
+            .response_frame(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+                full_request_len,
+            )
+            .expect("response frame should synthesize");
+        let tcp_segment = response_frame_tcp_segment(&response);
+
+        assert_eq!(
+            packet_u32(tcp_segment, TCP_ACKNOWLEDGEMENT_NUMBER_OFFSET),
+            Some(
+                test_tcp_sequence_number()
+                    .wrapping_add(u32::try_from(full_request_len).expect("test len should fit"))
+            )
+        );
+    }
+
+    #[test]
+    fn mmds_guest_tcp_response_context_rejects_request_payload_len_past_tcp_capacity() {
+        let packet = test_mmds_tcp_packet(b"GET /meta-data/");
+        let classified = classify_mmds_guest_tcp_packet(&packet, test_mmds_ipv4_address())
+            .expect("MMDS TCP packet should classify");
+        let request_payload_len = (u32::MAX as usize) + 1;
+
+        assert_eq!(
+            classified.response_context().response_frame(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+                request_payload_len
+            ),
+            Err(MmdsGuestTcpResponseFrameError::RequestPayloadTooLarge {
+                request_payload_len
+            })
         );
     }
 
