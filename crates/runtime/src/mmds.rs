@@ -241,6 +241,12 @@ fn mmds_guest_tcp_response_frame(
             payload_len: tcp_payload.len(),
         }
     })?;
+    let tcp_segment_len = TCP_MIN_HEADER_LEN
+        .checked_add(tcp_payload.len())
+        .and_then(|len| u16::try_from(len).ok())
+        .ok_or(MmdsGuestTcpResponseFrameError::PayloadTooLarge {
+            payload_len: tcp_payload.len(),
+        })?;
     let request_payload_len = u32::try_from(request.payload.len()).map_err(|_| {
         MmdsGuestTcpResponseFrameError::PayloadTooLarge {
             payload_len: request.payload.len(),
@@ -287,6 +293,7 @@ fn mmds_guest_tcp_response_frame(
     let tcp_checksum = tcp_ipv4_checksum(
         request.destination_ipv4_address,
         request.source_ipv4_address,
+        tcp_segment_len,
         &tcp_segment,
     );
     if !packet_write_u16(&mut tcp_segment, TCP_CHECKSUM_OFFSET, tcp_checksum) {
@@ -361,18 +368,14 @@ fn packet_write_u16(packet: &mut [u8], offset: usize, value: u16) -> bool {
 fn tcp_ipv4_checksum(
     source_ipv4_address: Ipv4Addr,
     destination_ipv4_address: Ipv4Addr,
+    tcp_segment_len: u16,
     tcp_segment: &[u8],
 ) -> u16 {
     let mut sum = 0_u32;
     sum = checksum_add_bytes(sum, &source_ipv4_address.octets());
     sum = checksum_add_bytes(sum, &destination_ipv4_address.octets());
     sum = checksum_add_bytes(sum, &[0, IPV4_PROTOCOL_TCP]);
-    sum = checksum_add_bytes(
-        sum,
-        &u16::try_from(tcp_segment.len())
-            .unwrap_or(u16::MAX)
-            .to_be_bytes(),
-    );
+    sum = checksum_add_bytes(sum, &tcp_segment_len.to_be_bytes());
     sum = checksum_add_bytes(sum, tcp_segment);
     checksum_finish(sum)
 }
@@ -2059,6 +2062,7 @@ mod tests {
             tcp_ipv4_checksum(
                 test_mmds_ipv4_address(),
                 test_source_ipv4_address(),
+                u16::try_from(tcp_segment.len()).expect("TCP segment length should fit u16"),
                 tcp_segment,
             ),
             0
