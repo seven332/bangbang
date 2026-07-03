@@ -316,7 +316,6 @@ struct ProcessMmdsPacketDetourConfig {
     mmds_state: MmdsStateHandle,
     mmds_ipv4_address: Ipv4Addr,
     network_interfaces: Vec<String>,
-    response_queue: MmdsResponseQueue,
 }
 
 impl ProcessMmdsPacketDetourConfig {
@@ -325,7 +324,6 @@ impl ProcessMmdsPacketDetourConfig {
             mmds_state,
             mmds_ipv4_address: config.effective_ipv4_address(),
             network_interfaces: config.network_interfaces().to_vec(),
-            response_queue: MmdsResponseQueue::default(),
         }
     }
 
@@ -341,7 +339,7 @@ impl ProcessMmdsPacketDetourConfig {
         Some(MmdsPacketDetour::new(
             self.mmds_state.clone(),
             self.mmds_ipv4_address,
-            self.response_queue.clone(),
+            MmdsResponseQueue::default(),
         ))
     }
 }
@@ -1641,9 +1639,18 @@ mod tests {
             &mmds_config,
         );
 
-        assert!(detour_config.detour_for_interface("eth0").is_some());
+        let eth0 = detour_config
+            .detour_for_interface("eth0")
+            .expect("eth0 should have an MMDS detour");
         assert!(detour_config.detour_for_interface("eth1").is_none());
-        assert!(detour_config.detour_for_interface("eth2").is_some());
+        let eth2 = detour_config
+            .detour_for_interface("eth2")
+            .expect("eth2 should have an MMDS detour");
+        assert!(
+            !eth0
+                .response_queue()
+                .shares_state_with(&eth2.response_queue())
+        );
     }
 
     #[test]

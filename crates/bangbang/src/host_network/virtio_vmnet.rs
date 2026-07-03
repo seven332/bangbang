@@ -97,6 +97,10 @@ impl MmdsPacketDetour {
         })?;
         Ok(true)
     }
+
+    pub(crate) fn response_queue(&self) -> MmdsResponseQueue {
+        self.response_queue.clone()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +145,35 @@ impl MmdsResponseQueue {
         Ok(())
     }
 
+    fn copy_front_into(&self, buffer: &mut [u8]) -> Result<Option<usize>, MmdsResponseQueueError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| MmdsResponseQueueError::Poisoned)?;
+        let Some(response) = state.responses.front() else {
+            return Ok(None);
+        };
+        let len = response.len();
+        let Some(target) = buffer.get_mut(..len) else {
+            return Err(MmdsResponseQueueError::ResponseFrameTooLarge {
+                len,
+                buffer_len: buffer.len(),
+            });
+        };
+
+        target.copy_from_slice(response);
+        Ok(Some(len))
+    }
+
+    fn pop_front(&self) -> Result<(), MmdsResponseQueueError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MmdsResponseQueueError::Poisoned)?;
+        state.responses.pop_front();
+        Ok(())
+    }
+
     #[cfg(test)]
     fn responses(&self) -> Result<Vec<Vec<u8>>, MmdsResponseQueueError> {
         let state = self
@@ -148,6 +181,11 @@ impl MmdsResponseQueue {
             .lock()
             .map_err(|_| MmdsResponseQueueError::Poisoned)?;
         Ok(state.responses.iter().cloned().collect())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
     }
 }
 
@@ -161,6 +199,7 @@ struct MmdsResponseQueueState {
 enum MmdsResponseQueueError {
     Full { capacity: usize },
     Poisoned,
+    ResponseFrameTooLarge { len: usize, buffer_len: usize },
 }
 
 impl fmt::Display for MmdsResponseQueueError {
@@ -170,6 +209,10 @@ impl fmt::Display for MmdsResponseQueueError {
                 write!(f, "MMDS response queue is full at capacity {capacity}")
             }
             Self::Poisoned => f.write_str("MMDS response queue lock is poisoned"),
+            Self::ResponseFrameTooLarge { len, buffer_len } => write!(
+                f,
+                "MMDS response frame length {len} exceeds RX buffer length {buffer_len}"
+            ),
         }
     }
 }
@@ -258,10 +301,15 @@ where
             backend,
             interface,
         }));
+        let mmds_response_queue = mmds_detour.as_ref().map(MmdsPacketDetour::response_queue);
 
         Ok(Self {
             tx_sink: VmnetVirtioNetworkTxPacketSink::new(Arc::clone(&shared), mmds_detour),
-            rx_source: VmnetVirtioNetworkRxPacketSource::new(shared, rx_buffer_len)?,
+            rx_source: VmnetVirtioNetworkRxPacketSource::new(
+                shared,
+                rx_buffer_len,
+                mmds_response_queue,
+            )?,
         })
     }
 
@@ -441,7 +489,8 @@ where
 {
     shared: Arc<Mutex<VmnetVirtioNetworkPacketIoState<B>>>,
     read_buffer: Vec<u8>,
-    cached_packet_len: Option<usize>,
+    cached_packet: Option<CachedRxPacket>,
+    mmds_response_queue: Option<MmdsResponseQueue>,
 }
 
 impl<B> VmnetVirtioNetworkRxPacketSource<B>
@@ -451,6 +500,7 @@ where
     fn new(
         shared: Arc<Mutex<VmnetVirtioNetworkPacketIoState<B>>>,
         rx_buffer_len: usize,
+        mmds_response_queue: Option<MmdsResponseQueue>,
     ) -> Result<Self, VmnetVirtioNetworkPacketIoBuildError> {
         if rx_buffer_len == 0 {
             return Err(VmnetVirtioNetworkPacketIoBuildError::EmptyRxBuffer);
@@ -470,14 +520,27 @@ where
         Ok(Self {
             shared,
             read_buffer,
-            cached_packet_len: None,
+            cached_packet: None,
+            mmds_response_queue,
         })
     }
 
     fn cached_packet(&self) -> Option<VirtioNetworkRxPacket<'_>> {
-        let len = self.cached_packet_len?;
+        let len = self.cached_packet?.len;
         self.read_buffer.get(..len).map(VirtioNetworkRxPacket::new)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CachedRxPacket {
+    len: usize,
+    source: CachedRxPacketSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CachedRxPacketSource {
+    MmdsResponse,
+    Vmnet,
 }
 
 impl<B> VirtioNetworkRxPacketSource for VmnetVirtioNetworkRxPacketSource<B>
@@ -487,7 +550,19 @@ where
     fn peek_packet(
         &mut self,
     ) -> Result<Option<VirtioNetworkRxPacket<'_>>, VirtioNetworkRxPacketSourceError> {
-        if self.cached_packet_len.is_some() {
+        if self.cached_packet.is_some() {
+            return Ok(self.cached_packet());
+        }
+
+        if let Some(mmds_response_queue) = &self.mmds_response_queue
+            && let Some(len) = mmds_response_queue
+                .copy_front_into(&mut self.read_buffer)
+                .map_err(rx_mmds_response_queue_error)?
+        {
+            self.cached_packet = Some(CachedRxPacket {
+                len,
+                source: CachedRxPacketSource::MmdsResponse,
+            });
             return Ok(self.cached_packet());
         }
 
@@ -502,14 +577,22 @@ where
         };
         if let Some(len) = packet_len {
             validate_rx_packet_len(len, self.read_buffer.len())?;
+            self.cached_packet = Some(CachedRxPacket {
+                len,
+                source: CachedRxPacketSource::Vmnet,
+            });
         }
 
-        self.cached_packet_len = packet_len;
         Ok(self.cached_packet())
     }
 
     fn consume_packet(&mut self) {
-        self.cached_packet_len = None;
+        if let Some(cached_packet) = self.cached_packet.take()
+            && cached_packet.source == CachedRxPacketSource::MmdsResponse
+            && let Some(mmds_response_queue) = &self.mmds_response_queue
+        {
+            let _ = mmds_response_queue.pop_front();
+        }
     }
 }
 
@@ -672,6 +755,12 @@ fn rx_error(source: VmnetPacketDescriptorError) -> VirtioNetworkRxPacketSourceEr
 
 fn rx_vmnet_error(source: VmnetPacketIoError) -> VirtioNetworkRxPacketSourceError {
     VirtioNetworkRxPacketSourceError::new(format!("vmnet RX packet read failed: {source}"))
+}
+
+fn rx_mmds_response_queue_error(
+    source: MmdsResponseQueueError,
+) -> VirtioNetworkRxPacketSourceError {
+    VirtioNetworkRxPacketSourceError::new(format!("MMDS response queue read failed: {source}"))
 }
 
 fn validate_rx_packet_len(
@@ -1004,6 +1093,21 @@ mod tests {
             .expect("packet I/O with MMDS detour should build")
     }
 
+    fn push_mmds_response(response_queue: &MmdsResponseQueue, response: &[u8]) {
+        response_queue
+            .push_with(|| Ok(response.to_vec()))
+            .expect("test MMDS response should queue");
+    }
+
+    fn poison_mmds_response_queue(response_queue: &MmdsResponseQueue) {
+        let state = Arc::clone(&response_queue.state);
+        let _ = std::thread::spawn(move || {
+            let _guard = state.lock().expect("test queue lock should succeed");
+            panic!("poison test MMDS response queue");
+        })
+        .join();
+    }
+
     fn provider_entry(
         iface_id: &str,
         backend: FakeVmnetPacketIoBackend,
@@ -1178,6 +1282,55 @@ mod tests {
         assert_eq!(
             mmds_response_body(&responses[0]),
             b"The MMDS data store is not initialized."
+        );
+    }
+
+    #[test]
+    fn packet_io_delivers_detoured_mmds_response_through_rx_source() {
+        let payload = b"GET /meta-data/hostname HTTP/1.1\r\nAccept: application/json\r\n\r\n";
+        let packet = mmds_tcp_packet(payload);
+        let mut memory = tx_memory();
+        let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        let mut packet_io = packet_io_with_mmds_detour(
+            FakeVmnetPacketIoBackend::default().with_read_result(Ok(Some(vec![0xaa]))),
+            MmdsStateHandle::default(),
+            response_queue.clone(),
+        );
+
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &frame)
+            .expect("MMDS TX should detour");
+        let response = packet_io
+            .rx_source()
+            .peek_packet()
+            .expect("MMDS response RX should succeed")
+            .expect("MMDS response should be present");
+
+        assert!(
+            std::str::from_utf8(mmds_response_frame_tcp_payload(response.bytes()))
+                .expect("response should be UTF-8")
+                .starts_with("HTTP/1.1 400 Bad Request")
+        );
+        assert_eq!(
+            mmds_response_body(response.bytes()),
+            b"The MMDS data store is not initialized."
+        );
+        let state = packet_io
+            .rx_source()
+            .shared
+            .lock()
+            .expect("test state lock should succeed");
+        assert_eq!(state.backend.read_calls, 0);
+        drop(state);
+
+        packet_io.rx_source().consume_packet();
+        assert!(
+            response_queue
+                .responses()
+                .expect("MMDS response queue should read")
+                .is_empty()
         );
     }
 
@@ -1527,6 +1680,148 @@ mod tests {
     }
 
     #[test]
+    fn rx_source_prioritizes_mmds_response_before_vmnet_packet() {
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        push_mmds_response(&response_queue, &[0xaa, 0xbb]);
+        let backend = FakeVmnetPacketIoBackend::default().with_read_result(Ok(Some(vec![0x33])));
+        let mut packet_io =
+            packet_io_with_mmds_detour(backend, MmdsStateHandle::default(), response_queue.clone());
+
+        let response = packet_io
+            .rx_source()
+            .peek_packet()
+            .expect("MMDS response peek should succeed")
+            .expect("MMDS response should be present");
+        assert_eq!(response.bytes(), &[0xaa, 0xbb]);
+        let state = packet_io
+            .rx_source()
+            .shared
+            .lock()
+            .expect("test state lock should succeed");
+        assert_eq!(state.backend.read_calls, 0);
+        drop(state);
+
+        packet_io.rx_source().consume_packet();
+        let vmnet_packet = packet_io
+            .rx_source()
+            .peek_packet()
+            .expect("vmnet packet peek should succeed")
+            .expect("vmnet packet should be present");
+        assert_eq!(vmnet_packet.bytes(), &[0x33]);
+        let state = packet_io
+            .rx_source()
+            .shared
+            .lock()
+            .expect("test state lock should succeed");
+        assert_eq!(state.backend.read_calls, 1);
+    }
+
+    #[test]
+    fn rx_source_caches_mmds_response_until_consumed() {
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        push_mmds_response(&response_queue, &[0x11]);
+        push_mmds_response(&response_queue, &[0x22]);
+        let mut packet_io = packet_io_with_mmds_detour(
+            FakeVmnetPacketIoBackend::default(),
+            MmdsStateHandle::default(),
+            response_queue.clone(),
+        );
+
+        let first = packet_io
+            .rx_source()
+            .peek_packet()
+            .expect("first MMDS peek should succeed")
+            .expect("first MMDS response should be present");
+        assert_eq!(first.bytes(), &[0x11]);
+        let repeated = packet_io
+            .rx_source()
+            .peek_packet()
+            .expect("repeated MMDS peek should succeed")
+            .expect("cached MMDS response should be present");
+        assert_eq!(repeated.bytes(), &[0x11]);
+        assert_eq!(
+            response_queue
+                .responses()
+                .expect("MMDS response queue should read"),
+            [vec![0x11], vec![0x22]]
+        );
+
+        packet_io.rx_source().consume_packet();
+        let second = packet_io
+            .rx_source()
+            .peek_packet()
+            .expect("second MMDS peek should succeed")
+            .expect("second MMDS response should be present");
+        assert_eq!(second.bytes(), &[0x22]);
+        assert_eq!(
+            response_queue
+                .responses()
+                .expect("MMDS response queue should read"),
+            [vec![0x22]]
+        );
+    }
+
+    #[test]
+    fn rx_source_rejects_oversized_mmds_response_without_dequeueing() {
+        let response_queue = MmdsResponseQueue::with_capacity(1);
+        push_mmds_response(&response_queue, &[0xaa, 0xbb, 0xcc]);
+        let mut packet_io = VmnetVirtioNetworkPacketIo::with_rx_buffer_len_and_mmds_detour(
+            FakeVmnetPacketIoBackend::default(),
+            fake_interface(),
+            2,
+            Some(MmdsPacketDetour::new(
+                MmdsStateHandle::default(),
+                DEFAULT_MMDS_IPV4_ADDRESS,
+                response_queue.clone(),
+            )),
+        )
+        .expect("packet I/O with MMDS detour should build");
+
+        let error = packet_io
+            .rx_source()
+            .peek_packet()
+            .expect_err("oversized MMDS response should fail");
+
+        assert!(error.message().contains(
+            "MMDS response queue read failed: MMDS response frame length 3 exceeds RX buffer length 2"
+        ));
+        assert_eq!(
+            response_queue
+                .responses()
+                .expect("MMDS response queue should read"),
+            [vec![0xaa, 0xbb, 0xcc]]
+        );
+    }
+
+    #[test]
+    fn rx_source_reports_poisoned_mmds_response_queue() {
+        let response_queue = MmdsResponseQueue::with_capacity(1);
+        let mut packet_io = packet_io_with_mmds_detour(
+            FakeVmnetPacketIoBackend::default().with_read_result(Ok(Some(vec![0x10]))),
+            MmdsStateHandle::default(),
+            response_queue.clone(),
+        );
+        poison_mmds_response_queue(&response_queue);
+
+        let error = packet_io
+            .rx_source()
+            .peek_packet()
+            .expect_err("poisoned MMDS response queue should fail before vmnet read");
+
+        assert!(
+            error
+                .message()
+                .contains("MMDS response queue read failed: MMDS response queue lock is poisoned")
+        );
+        let state = packet_io
+            .rx_source()
+            .shared
+            .lock()
+            .expect("vmnet state lock should not be poisoned");
+        assert_eq!(state.backend.read_calls, 0);
+    }
+
+    #[test]
     fn rx_source_reports_vmnet_read_failure() {
         let backend = FakeVmnetPacketIoBackend::default()
             .with_read_result(Err(unexpected_count_error(VmnetOperation::ReadPackets)));
@@ -1705,6 +2000,61 @@ mod tests {
                 .expect("MMDS response queue should read")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn provider_keeps_mmds_response_delivery_on_configured_interface() {
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        push_mmds_response(&response_queue, &[0xa0]);
+        let mut provider = VmnetVirtioNetworkPacketIoProvider::new(vec![
+            provider_entry_with_mmds_detour(
+                "eth0",
+                FakeVmnetPacketIoBackend::default(),
+                MmdsStateHandle::default(),
+                response_queue.clone(),
+            ),
+            provider_entry(
+                "eth1",
+                FakeVmnetPacketIoBackend::default().with_read_result(Ok(Some(vec![0xb0]))),
+            ),
+        ])
+        .expect("provider should build");
+
+        {
+            let eth1 = provider
+                .entries
+                .iter_mut()
+                .find(|entry| entry.iface_id() == "eth1")
+                .expect("eth1 entry should exist");
+            let packet = eth1
+                .packet_io
+                .rx_source()
+                .peek_packet()
+                .expect("eth1 RX should succeed")
+                .expect("eth1 vmnet packet should exist");
+            assert_eq!(packet.bytes(), &[0xb0]);
+        }
+        assert_eq!(
+            response_queue
+                .responses()
+                .expect("MMDS response queue should read"),
+            [vec![0xa0]]
+        );
+
+        {
+            let eth0 = provider
+                .entries
+                .iter_mut()
+                .find(|entry| entry.iface_id() == "eth0")
+                .expect("eth0 entry should exist");
+            let packet = eth0
+                .packet_io
+                .rx_source()
+                .peek_packet()
+                .expect("eth0 RX should succeed")
+                .expect("eth0 MMDS response should exist");
+            assert_eq!(packet.bytes(), &[0xa0]);
+        }
     }
 
     #[test]
