@@ -212,8 +212,9 @@ per-interface process state, synthesizes response frames from deterministic ARP
 context or the first TCP request fragment context, retains those frames in
 bounded per-interface queues, delivers queued frames through the matching
 virtio-net RX source with a bounded post-TX RX retry, and does not forward
-handled request payloads to vmnet. This still does not reassemble out-of-order
-TCP data, track TCP state, implement retransmission policy, or handle
+handled request payloads to vmnet. This still does not manage a full ARP cache,
+emit gratuitous ARP, implement ARP timeouts/retries, reassemble out-of-order TCP
+data, track TCP state, implement retransmission policy, or handle
 FIN/RST/session timeouts. Future
 guest-visible MMDS work must continue validating device, packet, token, and
 TCP/session inputs before expanding the guest-visible data path.
