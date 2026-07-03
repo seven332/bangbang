@@ -204,20 +204,22 @@ Ethernet/IPv4/TCP guest packet bytes as MMDS candidates only when they target
 the configured MMDS IPv4 address and TCP port `80`; malformed, truncated,
 fragmented, non-TCP, and non-MMDS packets are ignored as non-candidates. For
 pure empty-payload TCP SYN candidates, the runtime can synthesize deterministic
-SYN-ACK frames. For non-empty candidate TCP payloads, the runtime can produce
-the same process-local HTTP response bytes as the existing guest HTTP helper,
-including token PUT and MMDS v2 GET token enforcement. The process vmnet TX
-path detours MMDS ARP requests, pure empty-payload MMDS SYN packets, and those
-non-empty candidates only for interfaces listed in the MMDS config, buffers
-ordered split request headers in bounded per-interface process state,
+SYN-ACK frames, and pure empty-payload TCP ACK-only candidates are consumed
+without queueing a response. For non-empty candidate TCP payloads, the runtime
+can produce the same process-local HTTP response bytes as the existing guest
+HTTP helper, including token PUT and MMDS v2 GET token enforcement. The process
+vmnet TX path detours MMDS ARP requests, pure empty-payload MMDS SYN packets,
+pure empty-payload MMDS ACK-only packets, and those non-empty candidates only
+for interfaces listed in the MMDS config, buffers ordered split request headers
+in bounded per-interface process state,
 synthesizes response frames from deterministic ARP context, deterministic
 SYN-ACK context, or the first TCP request fragment context, retains those
 frames in bounded per-interface queues, delivers queued frames through the
 matching virtio-net RX source with a bounded post-TX RX retry, and does not
-forward handled request payloads to vmnet. This still does not manage a full ARP cache,
-emit gratuitous ARP, implement ARP timeouts/retries, reassemble out-of-order TCP
-data, track TCP state, implement retransmission policy, or handle
-FIN/RST/session timeouts. Future
+forward handled request payloads to vmnet. This still does not manage a full
+ARP cache, emit gratuitous ARP, implement ARP timeouts/retries, validate TCP
+ACK numbers, reassemble out-of-order TCP data, track TCP state, implement
+retransmission policy, or handle FIN/RST/session timeouts. Future
 guest-visible MMDS work must continue validating device, packet, token, and
 TCP/session inputs before expanding the guest-visible data path.
 
@@ -260,8 +262,9 @@ The current scaffold does not implement:
   cleanup-owning packet backend for retaining stop-on-drop ownership while
   delegating packet I/O, and an internal virtio-net adapter that can move
   packets between vmnet and the runtime packet traits, detour configured MMDS
-  ARP requests, pure empty-payload MMDS SYN packets, and non-empty MMDS TX
-  payloads before vmnet forwarding, buffer ordered split MMDS request headers,
+  ARP requests, pure empty-payload MMDS SYN packets, pure empty-payload MMDS
+  ACK-only packets, and non-empty MMDS TX payloads before vmnet forwarding,
+  buffer ordered split MMDS request headers,
   synthesize deterministic ARP replies, MMDS SYN-ACK frames, and MMDS TCP
   response frames, retain bounded per-interface MMDS response queues,
   and expose queued responses through virtio-net RX with bounded post-TX retry, plus an

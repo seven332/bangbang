@@ -205,6 +205,10 @@ impl<'a> MmdsGuestTcpPacket<'a> {
         self.tcp_flags == TCP_FLAG_SYN && self.payload.is_empty()
     }
 
+    pub fn is_acknowledgement_only(self) -> bool {
+        self.tcp_flags == TCP_FLAG_ACK && self.payload.is_empty()
+    }
+
     pub const fn response_context(self) -> MmdsGuestTcpResponseContext {
         MmdsGuestTcpResponseContext {
             source_ethernet_address: self.source_ethernet_address,
@@ -1991,6 +1995,7 @@ mod tests {
     use crate::network::NetworkInterfaceConfigInput;
 
     const ARP_TARGET_HARDWARE_ADDRESS_OFFSET: usize = 18;
+    const TEST_TCP_FLAG_RST: u8 = 0x04;
 
     fn query_value() -> Value {
         serde_json::json!({
@@ -2418,6 +2423,37 @@ mod tests {
             classify_mmds_guest_tcp_packet(&syn_with_payload, test_mmds_ipv4_address())
                 .expect("MMDS TCP SYN with payload should classify");
         assert!(!syn_with_payload.is_initial_synchronization_request());
+    }
+
+    #[test]
+    fn identifies_mmds_guest_tcp_acknowledgement_only_packet() {
+        let tcp_start = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN;
+        let mut ack_packet = test_mmds_tcp_packet(b"");
+        ack_packet[tcp_start + TCP_FLAGS_OFFSET] = TCP_FLAG_ACK;
+        let ack = classify_mmds_guest_tcp_packet(&ack_packet, test_mmds_ipv4_address())
+            .expect("MMDS TCP ACK-only packet should classify");
+
+        assert!(ack.is_acknowledgement_only());
+
+        for flags in [
+            TCP_FLAG_SYN,
+            TCP_FLAG_SYN | TCP_FLAG_ACK,
+            TCP_FLAG_FIN,
+            TEST_TCP_FLAG_RST,
+        ] {
+            let mut control_packet = ack_packet.clone();
+            control_packet[tcp_start + TCP_FLAGS_OFFSET] = flags;
+            let control = classify_mmds_guest_tcp_packet(&control_packet, test_mmds_ipv4_address())
+                .expect("MMDS TCP control packet should classify");
+            assert!(!control.is_acknowledgement_only());
+        }
+
+        let mut ack_with_payload = test_mmds_tcp_packet(b"payload");
+        ack_with_payload[tcp_start + TCP_FLAGS_OFFSET] = TCP_FLAG_ACK;
+        let ack_with_payload =
+            classify_mmds_guest_tcp_packet(&ack_with_payload, test_mmds_ipv4_address())
+                .expect("MMDS TCP ACK with payload should classify");
+        assert!(!ack_with_payload.is_acknowledgement_only());
     }
 
     #[test]
