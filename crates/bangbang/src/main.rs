@@ -18,6 +18,7 @@ use signal_hook::{SigId, low_level};
 use vmm::ProcessVmm;
 
 use bangbang_runtime::logger::{LoggerConfigInput, LoggerLevel};
+use bangbang_runtime::metrics::MetricsConfigInput;
 use bangbang_runtime::{VmmAction, VmmActionError};
 
 const DEFAULT_API_SOCK_PATH: &str = "/tmp/bangbang.socket";
@@ -32,7 +33,6 @@ const UNSUPPORTED_FIRECRACKER_ARGS: &[&str] = &[
     "enable-pci",
     "http-api-max-payload-size",
     "metadata",
-    "metrics-path",
     "mmds-size-limit",
     "no-api",
     "no-seccomp",
@@ -71,6 +71,7 @@ fn run() -> Result<(), ProcessError> {
                 api_sock,
                 id,
                 logger_config,
+                metrics_config,
             } = config;
 
             println!("bangbang {}", env!("CARGO_PKG_VERSION"));
@@ -80,6 +81,7 @@ fn run() -> Result<(), ProcessError> {
             );
 
             let mut vmm = ProcessVmm::new(id, env!("CARGO_PKG_VERSION"), APP_NAME);
+            apply_startup_metrics_config(&mut vmm, metrics_config)?;
             apply_startup_logger_config(&mut vmm, logger_config)?;
             let mut shutdown_signal = ShutdownSignal::install()?;
             let server = ApiServer::bind(&api_sock).map_err(ProcessError::ApiServer)?;
@@ -89,6 +91,22 @@ fn run() -> Result<(), ProcessError> {
                 .run_until(&mut vmm, shutdown_wakeup)
                 .map_err(ProcessError::ApiServer)?;
         }
+    }
+
+    Ok(())
+}
+
+fn apply_startup_metrics_config<S>(
+    vmm: &mut ProcessVmm<S>,
+    metrics_config: Option<MetricsConfigInput>,
+) -> Result<(), ProcessError>
+where
+    S: vmm::InstanceStartExecutor,
+{
+    if let Some(metrics_config) = metrics_config {
+        vmm.handle_action(VmmAction::PutMetrics(metrics_config))
+            .map(|_| ())
+            .map_err(ProcessError::StartupConfiguration)?;
     }
 
     Ok(())
@@ -241,6 +259,7 @@ struct StartupConfig {
     api_sock: String,
     id: String,
     logger_config: Option<LoggerConfigInput>,
+    metrics_config: Option<MetricsConfigInput>,
 }
 
 impl Default for StartupConfig {
@@ -249,6 +268,7 @@ impl Default for StartupConfig {
             api_sock: DEFAULT_API_SOCK_PATH.to_string(),
             id: DEFAULT_INSTANCE_ID.to_string(),
             logger_config: None,
+            metrics_config: None,
         }
     }
 }
@@ -305,6 +325,7 @@ impl Args {
         let mut logger_config_seen = false;
         let mut log_path_seen = false;
         let mut level_seen = false;
+        let mut metrics_path_seen = false;
         let mut module_seen = false;
         let mut show_level_seen = false;
         let mut show_log_origin_seen = false;
@@ -353,6 +374,15 @@ impl Args {
                     logger_config = logger_config.with_level(level);
                     logger_config_seen = true;
                     level_seen = true;
+                    index += 2;
+                }
+                "--metrics-path" => {
+                    if metrics_path_seen {
+                        return Err("duplicate argument: --metrics-path".to_string());
+                    }
+                    let value = take_value(&args, index, "--metrics-path")?;
+                    config.metrics_config = Some(MetricsConfigInput::new(value));
+                    metrics_path_seen = true;
                     index += 2;
                 }
                 "--module" => {
@@ -434,6 +464,7 @@ fn help_text() -> String {
             "                         Accepts 1-64 bytes, ASCII alphanumeric or '-'\n",
             "      --log-path <PATH>  Logger output file or FIFO path\n",
             "      --level <LEVEL>    Logger level: Off, Trace, Debug, Info, Warn, or Error\n",
+            "      --metrics-path <PATH>  Metrics output file or FIFO path\n",
             "      --module <MODULE>  Logger module filter stored for future log integration\n",
             "      --show-level       Include level in minimal logger action lines\n",
             "      --show-log-origin  Store log-origin flag for future log integration\n",
@@ -444,9 +475,9 @@ fn help_text() -> String {
             "pre-boot PUT /machine-config, pre-boot PUT /boot-source, ",
             "pre-boot PUT /drives/{{drive_id}}, pre-boot ",
             "PUT /network-interfaces/{{iface_id}}, pre-boot PUT /vsock, ",
-            "pre-boot PUT /metrics, and pre-boot PUT /logger configuration ",
-            "with minimal action logs over the API or logger startup CLI ",
-            "socket; PUT /actions starts a process-owned HVF boot run-loop ",
+            "pre-boot PUT /metrics and startup metrics output configuration, ",
+            "and pre-boot PUT /logger and startup logger configuration with ",
+            "minimal action logs; PUT /actions starts a process-owned HVF boot run-loop ",
             "worker across bounded step windows for InstanceStart, but public ",
             "run-loop control is not implemented yet."
         ),
@@ -517,6 +548,7 @@ fn unsupported_equals_syntax(arg: &str) -> Option<&'static str> {
         ("--id=", "id"),
         ("--log-path=", "log-path"),
         ("--level=", "level"),
+        ("--metrics-path=", "metrics-path"),
         ("--module=", "module"),
     ]
     .into_iter()
@@ -533,6 +565,7 @@ mod tests {
 
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel};
+    use bangbang_runtime::metrics::{MetricsConfigError, MetricsConfigInput};
     use bangbang_runtime::{BackendError, VmmAction};
 
     use crate::vmm::{InstanceStartExecutor, ProcessVmm};
@@ -578,6 +611,17 @@ mod tests {
         ))
     }
 
+    fn unique_metrics_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bangbang-main-test-{}-{nanos}-{name}.metrics",
+            std::process::id()
+        ))
+    }
+
     #[test]
     fn process_exit_code_value_matches_argument_parsing_contract() {
         assert_eq!(ProcessExitCode::ProcessFailure.value(), 1);
@@ -601,6 +645,16 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "startup configuration error: logger path must not be empty"
+        );
+
+        let err = ProcessError::StartupConfiguration(
+            bangbang_runtime::VmmActionError::MetricsConfig(MetricsConfigError::EmptyPath),
+        );
+
+        assert_eq!(err.exit_code(), ProcessExitCode::ProcessFailure);
+        assert_eq!(
+            err.to_string(),
+            "startup configuration error: metrics path must not be empty"
         );
     }
 
@@ -653,6 +707,7 @@ mod tests {
         assert_eq!(config.api_sock, DEFAULT_API_SOCK_PATH);
         assert_eq!(config.id, DEFAULT_INSTANCE_ID);
         assert_eq!(config.logger_config, None);
+        assert_eq!(config.metrics_config, None);
     }
 
     #[test]
@@ -673,8 +728,11 @@ mod tests {
         assert!(help.contains("pre-boot PUT /boot-source"));
         assert!(help.contains("pre-boot PUT /drives/{drive_id}"));
         assert!(help.contains("pre-boot PUT /metrics"));
-        assert!(help.contains("pre-boot PUT /logger configuration with minimal action logs"));
+        assert!(help.contains("startup metrics output configuration"));
+        assert!(help.contains("pre-boot PUT /logger and startup logger configuration"));
+        assert!(help.contains("minimal action logs"));
         assert!(help.contains("--log-path <PATH>"));
+        assert!(help.contains("--metrics-path <PATH>"));
         assert!(help.contains("--show-level"));
         assert!(help.contains("PUT /actions starts a process-owned HVF boot run-loop worker"));
         assert!(help.contains("across bounded step windows for InstanceStart"));
@@ -724,6 +782,7 @@ mod tests {
         assert_eq!(config.api_sock, "/tmp/custom.socket");
         assert_eq!(config.id, DEFAULT_INSTANCE_ID);
         assert_eq!(config.logger_config, None);
+        assert_eq!(config.metrics_config, None);
     }
 
     #[test]
@@ -733,6 +792,7 @@ mod tests {
         assert_eq!(config.api_sock, DEFAULT_API_SOCK_PATH);
         assert_eq!(config.id, "demo-1");
         assert_eq!(config.logger_config, None);
+        assert_eq!(config.metrics_config, None);
     }
 
     #[test]
@@ -763,13 +823,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_metrics_startup_args() {
+        let config = parse_run(&["--metrics-path", "/tmp/bangbang.metrics"])
+            .expect("metrics startup arg should parse");
+
+        assert_eq!(
+            config.metrics_config,
+            Some(MetricsConfigInput::new("/tmp/bangbang.metrics"))
+        );
+    }
+
+    #[test]
     fn parse_startup_args_together() {
-        let config = parse_run(&["--api-sock", "/tmp/custom.socket", "--id", "demo-1"])
-            .expect("startup args should parse");
+        let config = parse_run(&[
+            "--api-sock",
+            "/tmp/custom.socket",
+            "--id",
+            "demo-1",
+            "--metrics-path",
+            "/tmp/bangbang.metrics",
+        ])
+        .expect("startup args should parse");
 
         assert_eq!(config.api_sock, "/tmp/custom.socket");
         assert_eq!(config.id, "demo-1");
         assert_eq!(config.logger_config, None);
+        assert_eq!(
+            config.metrics_config,
+            Some(MetricsConfigInput::new("/tmp/bangbang.metrics"))
+        );
     }
 
     #[test]
@@ -787,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_logger_arg_values() {
+    fn rejects_missing_observability_arg_values() {
         let err = parse(&["--log-path", "--id"]).expect_err("missing log path value should fail");
 
         assert_eq!(err, "missing value for --log-path");
@@ -799,6 +881,11 @@ mod tests {
         let err = parse(&["--module", "--id"]).expect_err("missing module value should fail");
 
         assert_eq!(err, "missing value for --module");
+
+        let err =
+            parse(&["--metrics-path", "--id"]).expect_err("missing metrics path value should fail");
+
+        assert_eq!(err, "missing value for --metrics-path");
     }
 
     #[test]
@@ -822,7 +909,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_logger_args() {
+    fn rejects_duplicate_observability_args() {
         let err = parse(&["--show-level", "--show-level"])
             .expect_err("duplicate show-level flag should fail");
 
@@ -847,6 +934,16 @@ mod tests {
             .expect_err("duplicate show-log-origin flag should fail");
 
         assert_eq!(err, "duplicate argument: --show-log-origin");
+
+        let err = parse(&[
+            "--metrics-path",
+            "/tmp/one.metrics",
+            "--metrics-path",
+            "/tmp/two.metrics",
+        ])
+        .expect_err("duplicate metrics-path arg should fail");
+
+        assert_eq!(err, "duplicate argument: --metrics-path");
     }
 
     #[test]
@@ -984,6 +1081,14 @@ mod tests {
             err,
             "unsupported argument syntax for --module; use --module <VALUE>"
         );
+
+        let err =
+            parse(&["--metrics-path=/tmp/secret.metrics"]).expect_err("equals syntax should fail");
+
+        assert_eq!(
+            err,
+            "unsupported argument syntax for --metrics-path; use --metrics-path <VALUE>"
+        );
     }
 
     #[test]
@@ -1030,6 +1135,35 @@ mod tests {
     }
 
     #[test]
+    fn applies_startup_metrics_config_before_actions() {
+        let path = unique_metrics_path("flush");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        super::apply_startup_metrics_config(&mut vmm, Some(MetricsConfigInput::new(&path)))
+            .expect("startup metrics config should apply");
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("instance start should succeed");
+        vmm.handle_action(VmmAction::FlushMetrics)
+            .expect("flush metrics should succeed");
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("metrics output should be readable"),
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
     fn startup_logger_config_errors_do_not_echo_path() {
         let path = unique_logger_path("missing-parent").join("logger");
         let mut vmm = ProcessVmm::with_starter(
@@ -1050,6 +1184,29 @@ mod tests {
             err,
             ProcessError::StartupConfiguration(bangbang_runtime::VmmActionError::LoggerConfig(
                 LoggerConfigError::OpenFile(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn startup_metrics_config_errors_do_not_echo_path() {
+        let path = unique_metrics_path("missing-parent").join("metrics");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        let err =
+            super::apply_startup_metrics_config(&mut vmm, Some(MetricsConfigInput::new(&path)))
+                .expect_err("missing parent should fail startup metrics config");
+
+        assert!(!err.to_string().contains(path.to_string_lossy().as_ref()));
+        assert!(matches!(
+            err,
+            ProcessError::StartupConfiguration(bangbang_runtime::VmmActionError::MetricsConfig(
+                MetricsConfigError::OpenFile(_)
             ))
         ));
     }

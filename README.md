@@ -34,6 +34,8 @@ cargo run -p bangbang -- --api-sock /tmp/bangbang.socket --id demo-1
   `/tmp/bangbang.socket`.
 - `--id <ID>` records the microVM identifier. The default is
   `anonymous-instance`.
+- `--metrics-path <PATH>` configures the same per-process metrics sink as
+  `PUT /metrics` before the API socket is served.
 - `--log-path <PATH>`, `--level <LEVEL>`, `--module <MODULE>`,
   `--show-level`, and `--show-log-origin` configure the same per-process
   logger state as `PUT /logger` before the API socket is served.
@@ -43,12 +45,13 @@ The API socket is an unauthenticated local control interface. Filesystem
 permissions on the socket path and parent directory are the access-control
 boundary, so use a private directory or restrictive umask on multi-user hosts.
 
-Start with logger output configured:
+Start with metrics and logger output configured:
 
 ```sh
 cargo run -p bangbang -- \
   --api-sock /tmp/bangbang.socket \
   --id demo-1 \
+  --metrics-path /tmp/bangbang.metrics \
   --log-path /tmp/bangbang.log \
   --level Info \
   --show-level
@@ -109,6 +112,18 @@ curl --unix-socket /tmp/bangbang.socket \
   -H 'Content-Type: application/json' \
   -d '{"guest_cid":3,"uds_path":"./v.sock"}'
 ```
+
+Configure metrics output before boot:
+
+```sh
+curl --unix-socket /tmp/bangbang.socket \
+  -X PUT http://localhost/metrics \
+  -H 'Content-Type: application/json' \
+  -d '{"metrics_path":"/tmp/bangbang.metrics"}'
+```
+
+Configured metrics output records a minimal JSON line for successful runtime
+`FlushMetrics` actions.
 
 Configure logger output before boot:
 
