@@ -312,11 +312,12 @@ impl LoggerSink {
         action: &str,
     ) -> Result<(), LoggerWriteError> {
         if show_level {
-            write!(self.writer, "level={} ", level.as_str())
+            writeln!(self.writer, "level={} action={action}", level.as_str())
+                .map_err(|err| LoggerWriteError::Write(err.kind()))?;
+        } else {
+            writeln!(self.writer, "action={action}")
                 .map_err(|err| LoggerWriteError::Write(err.kind()))?;
         }
-        writeln!(self.writer, "action={action}")
-            .map_err(|err| LoggerWriteError::Write(err.kind()))?;
         self.writer
             .flush()
             .map_err(|err| LoggerWriteError::Write(err.kind()))

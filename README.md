@@ -96,7 +96,7 @@ curl --unix-socket /tmp/bangbang.socket \
   -d '{"guest_cid":3,"uds_path":"./v.sock"}'
 ```
 
-Record pre-boot logger output:
+Configure logger output before boot:
 
 ```sh
 curl --unix-socket /tmp/bangbang.socket \
