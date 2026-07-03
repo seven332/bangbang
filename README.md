@@ -34,11 +34,25 @@ cargo run -p bangbang -- --api-sock /tmp/bangbang.socket --id demo-1
   `/tmp/bangbang.socket`.
 - `--id <ID>` records the microVM identifier. The default is
   `anonymous-instance`.
+- `--log-path <PATH>`, `--level <LEVEL>`, `--module <MODULE>`,
+  `--show-level`, and `--show-log-origin` configure the same per-process
+  logger state as `PUT /logger` before the API socket is served.
 - `--help`, `-h`, `--version`, and `-V` are supported.
 
 The API socket is an unauthenticated local control interface. Filesystem
 permissions on the socket path and parent directory are the access-control
 boundary, so use a private directory or restrictive umask on multi-user hosts.
+
+Start with logger output configured:
+
+```sh
+cargo run -p bangbang -- \
+  --api-sock /tmp/bangbang.socket \
+  --id demo-1 \
+  --log-path /tmp/bangbang.log \
+  --level Info \
+  --show-level
+```
 
 ## API Examples
 
