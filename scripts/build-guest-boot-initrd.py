@@ -12,6 +12,8 @@ from pathlib import Path
 
 BOOT_MARKER = b"BANGBANG_BOOT_OK\n"
 BLOCK_READ_MARKER = b"BANGBANG_BLOCK_READ_OK"
+BLOCK_WRITE_MARKER = b"BANGBANG_BLOCK_WRITE_OK"
+BLOCK_WRITE_SECTOR_SIZE = 512
 CMDLINE_BEGIN_MARKER = b"BANGBANG_CMDLINE_BEGIN\n"
 CMDLINE_END_MARKER = b"BANGBANG_CMDLINE_END\n"
 DEV_TMPFS_NAME = b"devtmpfs\0"
@@ -32,10 +34,12 @@ ELF_PROGRAM_HEADER_SIZE = 0x38
 
 AT_FDCWD_U64 = (1 << 64) - 100
 AARCH64_COND_NE = 1
+LINUX_OPEN_FLAG_RDWR = 2
 LINUX_AARCH64_SYSCALL_MOUNT = 40
 LINUX_AARCH64_SYSCALL_OPENAT = 56
 LINUX_AARCH64_SYSCALL_READ = 63
 LINUX_AARCH64_SYSCALL_WRITE = 64
+LINUX_AARCH64_SYSCALL_FSYNC = 82
 LINUX_AARCH64_SYSCALL_EXIT = 93
 # The tiny init has no UART drain loop, so keep serial writes within the FIFO depth.
 GUEST_SERIAL_WRITE_CHUNK_SIZE = 16
@@ -70,6 +74,11 @@ def mov_imm_64(register: int, value: int) -> bytes:
             movk_64(register, (value >> 48) & 0xFFFF, 48),
         )
     )
+
+
+def mov_reg_64(destination: int, source: int) -> bytes:
+    instruction = 0xAA0003E0 | (source << 16) | destination
+    return struct.pack("<I", instruction)
 
 
 def svc_0() -> bytes:
@@ -150,6 +159,23 @@ def write_syscalls(fd: int, buffer_vaddr: int, size: int) -> bytes:
     return b"".join(chunks)
 
 
+def write_from_open_fd(buffer_vaddr: int, size: int) -> bytes:
+    return b"".join(
+        (
+            mov_imm_64(1, buffer_vaddr),
+            movz_64(2, size),
+            movz_64(8, LINUX_AARCH64_SYSCALL_WRITE),
+            svc_0(),
+        )
+    )
+
+
+def block_write_sector() -> bytes:
+    if len(BLOCK_WRITE_MARKER) > BLOCK_WRITE_SECTOR_SIZE:
+        raise RuntimeError("guest block write marker does not fit in one sector")
+    return BLOCK_WRITE_MARKER + bytes(BLOCK_WRITE_SECTOR_SIZE - len(BLOCK_WRITE_MARKER))
+
+
 def build_guest_init_code(addresses: dict[str, int]) -> bytes:
     code = Aarch64CodeBuilder()
     code.emit(write_syscalls(1, addresses["boot_marker"], len(BOOT_MARKER)))
@@ -219,6 +245,36 @@ def build_guest_init_code(addresses: dict[str, int]) -> bytes:
     )
     code.branch_cond("exit", AARCH64_COND_NE)
     code.emit(write_syscalls(1, addresses["block_read_buffer"], len(BLOCK_READ_MARKER)))
+    code.emit(
+        b"".join(
+            (
+                mov_imm_64(0, AT_FDCWD_U64),
+                mov_imm_64(1, addresses["vda"]),
+                movz_64(2, LINUX_OPEN_FLAG_RDWR),
+                movz_64(3, 0),
+                movz_64(8, LINUX_AARCH64_SYSCALL_OPENAT),
+                svc_0(),
+                mov_reg_64(19, 0),
+                write_from_open_fd(
+                    addresses["block_write_sector"], BLOCK_WRITE_SECTOR_SIZE
+                ),
+                cmp_imm_64(0, BLOCK_WRITE_SECTOR_SIZE),
+            )
+        )
+    )
+    code.branch_cond("exit", AARCH64_COND_NE)
+    code.emit(
+        b"".join(
+            (
+                mov_reg_64(0, 19),
+                movz_64(8, LINUX_AARCH64_SYSCALL_FSYNC),
+                svc_0(),
+                cmp_imm_64(0, 0),
+            )
+        )
+    )
+    code.branch_cond("exit", AARCH64_COND_NE)
+    code.emit(write_syscalls(1, addresses["block_write_marker"], len(BLOCK_WRITE_MARKER)))
     code.label("exit")
     code.emit(
         b"".join(
@@ -246,6 +302,8 @@ def guest_init_data() -> list[tuple[str, bytes]]:
         ("vda", VDA_PATH),
         ("cmdline_buffer", bytes(GUEST_CMDLINE_BUFFER_SIZE)),
         ("block_read_buffer", bytes(len(BLOCK_READ_MARKER))),
+        ("block_write_marker", BLOCK_WRITE_MARKER),
+        ("block_write_sector", block_write_sector()),
     ]
 
 
@@ -506,11 +564,13 @@ def validate_initrd(data: bytes) -> None:
         raise RuntimeError("guest initrd init payload is not an ELF file")
     if BOOT_MARKER not in payload:
         raise RuntimeError("guest initrd init payload does not contain the boot marker")
-    for marker in (CMDLINE_BEGIN_MARKER, CMDLINE_END_MARKER):
+    for marker in (CMDLINE_BEGIN_MARKER, CMDLINE_END_MARKER, BLOCK_WRITE_MARKER):
         if marker not in payload:
             raise RuntimeError(
                 f"guest initrd init payload does not contain {marker!r}"
             )
+    if block_write_sector() not in payload:
+        raise RuntimeError("guest initrd init payload does not contain the write sector")
     for guest_path in (
         DEV_TMPFS_NAME,
         DEV_PATH,

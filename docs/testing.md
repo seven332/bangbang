@@ -143,7 +143,9 @@ sector contains `BANGBANG_BLOCK_READ_OK`, mounts `devtmpfs` from the tiny
 `/init`, reads `/dev/vda`, and expects the marker to appear on serial. It also
 mounts procfs and writes `/proc/cmdline` to serial between deterministic markers
 so a root-drive scenario can verify guest-visible `root=/dev/vda ro` arguments.
-Rootfs boot and guest writes are separate follow-up coverage.
+A writable virtio-block scenario writes `BANGBANG_BLOCK_WRITE_OK` from the
+guest to `/dev/vda`, and the host-side test verifies the marker in a scratch
+backing file. Rootfs boot remains separate follow-up coverage.
 
 The pinned Firecracker CI rootfs artifact can be prepared separately:
 
