@@ -16,6 +16,8 @@ use crate::exit::{
 };
 use crate::vcpu::HvfRegister;
 
+const AARCH64_ZERO_REGISTER: u8 = 31;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HvfMmioCompletionError {
     UnsupportedRegister {
@@ -156,17 +158,17 @@ pub(crate) fn build_mmio_operation(
     mut read_register: impl FnMut(HvfRegister) -> Result<u64, BackendError>,
 ) -> Result<MmioOperation, HvfMmioCompletionError> {
     match access.direction() {
-        HvfMmioDirection::Read => {
-            let _register = mmio_gpr(access.register())?;
-
-            MmioOperation::read(access.runtime_access())
-                .map_err(|source| HvfMmioCompletionError::Operation { source })
-        }
+        HvfMmioDirection::Read => MmioOperation::read(access.runtime_access())
+            .map_err(|source| HvfMmioCompletionError::Operation { source }),
         HvfMmioDirection::Write => {
-            let register = mmio_gpr(access.register())?;
-            let value = read_register(register).map_err(|source| {
-                HvfMmioCompletionError::RegisterReadFailed { register, source }
-            })?;
+            let value = if is_zero_register(access.register()) {
+                0
+            } else {
+                let register = mmio_gpr(access.register())?;
+                read_register(register).map_err(|source| {
+                    HvfMmioCompletionError::RegisterReadFailed { register, source }
+                })?
+            };
             let data = register_value_to_access_bytes(value, access.size())?;
 
             MmioOperation::write(access.runtime_access(), data)
@@ -196,6 +198,10 @@ pub(crate) fn complete_mmio_read(
         });
     }
 
+    if is_zero_register(access.register()) {
+        return Ok(());
+    }
+
     let register = mmio_gpr(access.register())?;
     let value = read_data_register_value(data, access.sign_extend(), access.register_width());
     set_register(register, value)
@@ -221,6 +227,10 @@ pub(crate) fn dispatch_mmio_access(
     }
 
     Ok(outcome)
+}
+
+const fn is_zero_register(register: HvfMmioRegister) -> bool {
+    register.raw_value() == AARCH64_ZERO_REGISTER
 }
 
 fn mmio_gpr(register: HvfMmioRegister) -> Result<HvfRegister, HvfMmioCompletionError> {
@@ -558,32 +568,30 @@ mod tests {
     }
 
     #[test]
-    fn write_access_rejects_guest_register_thirty_one() {
+    fn write_access_uses_zero_for_guest_register_thirty_one() {
         let access = resolved_access(
-            HvfMmioAccessSize::Byte,
+            HvfMmioAccessSize::Word,
             HvfMmioDirection::Write,
             31,
             false,
             HvfMmioRegisterWidth::Bits64,
         );
         let mut register_read = false;
-        let err = build_mmio_operation(access, |_| {
+        let operation = build_mmio_operation(access, |_| {
             register_read = true;
             Ok(0)
         })
-        .expect_err("register thirty-one should be rejected");
+        .expect("register thirty-one write should use zero");
 
-        assert_eq!(
-            err,
-            HvfMmioCompletionError::UnsupportedRegister {
-                register: HvfMmioRegister::new(31).expect("register should exist")
-            }
-        );
+        let MmioOperation::Write { data, .. } = operation else {
+            panic!("expected write operation");
+        };
+        assert_eq!(data.as_slice(), [0, 0, 0, 0]);
         assert!(!register_read);
     }
 
     #[test]
-    fn read_access_rejects_guest_register_thirty_one_before_operation_build() {
+    fn read_access_allows_guest_register_thirty_one_without_register_read() {
         let access = resolved_access(
             HvfMmioAccessSize::Byte,
             HvfMmioDirection::Read,
@@ -591,16 +599,14 @@ mod tests {
             false,
             HvfMmioRegisterWidth::Bits64,
         );
-        let err = build_mmio_operation(access, |_| {
+        let operation = build_mmio_operation(access, |_| {
             Err(BackendError::InvalidState("read register should not run"))
         })
-        .expect_err("register thirty-one should be rejected");
+        .expect("register thirty-one read operation should build");
 
         assert_eq!(
-            err,
-            HvfMmioCompletionError::UnsupportedRegister {
-                register: HvfMmioRegister::new(31).expect("register should exist")
-            }
+            operation,
+            MmioOperation::read(access.runtime_access()).expect("runtime read should build")
         );
     }
 
@@ -765,7 +771,7 @@ mod tests {
     }
 
     #[test]
-    fn read_completion_rejects_guest_register_thirty_one() {
+    fn read_completion_discards_guest_register_thirty_one() {
         let access = resolved_access(
             HvfMmioAccessSize::Byte,
             HvfMmioDirection::Read,
@@ -774,18 +780,12 @@ mod tests {
             HvfMmioRegisterWidth::Bits64,
         );
         let mut register_write = false;
-        let err = complete_mmio_read(access, bytes(&[0]), |_, _| {
+        complete_mmio_read(access, bytes(&[0]), |_, _| {
             register_write = true;
             Ok(())
         })
-        .expect_err("register thirty-one should be rejected");
+        .expect("register thirty-one read completion should be discarded");
 
-        assert_eq!(
-            err,
-            HvfMmioCompletionError::UnsupportedRegister {
-                register: HvfMmioRegister::new(31).expect("register should exist")
-            }
-        );
         assert!(!register_write);
     }
 
@@ -884,7 +884,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_rejects_unsupported_read_register_before_handler() {
+    fn dispatch_read_to_guest_register_thirty_one_calls_handler_without_completion_write() {
         let access = resolved_access(
             HvfMmioAccessSize::Byte,
             HvfMmioDirection::Read,
@@ -898,17 +898,39 @@ mod tests {
             Ok(()),
         );
 
-        let err = dispatch_mmio_access(access, &mut dispatcher, &mut registers)
-            .expect_err("unsupported read register should fail before dispatch");
+        let outcome = dispatch_mmio_access(access, &mut dispatcher, &mut registers)
+            .expect("zero register read should dispatch without completion write");
 
-        assert_eq!(
-            err,
-            HvfMmioDispatchError::Operation {
-                source: HvfMmioCompletionError::UnsupportedRegister {
-                    register: HvfMmioRegister::new(31).expect("register should exist")
-                }
-            }
+        assert_eq!(outcome, MmioDispatchOutcome::Read { data: bytes(&[0]) });
+        assert!(registers.reads.is_empty());
+        assert!(registers.writes.is_empty());
+
+        let state = state
+            .lock()
+            .expect("handler state lock should not be poisoned");
+        assert_eq!(state.reads, vec![access.runtime_access()]);
+        assert!(state.writes.is_empty());
+    }
+
+    #[test]
+    fn dispatch_write_from_guest_register_thirty_one_writes_zero_bytes_without_register_read() {
+        let access = resolved_access(
+            HvfMmioAccessSize::Halfword,
+            HvfMmioDirection::Write,
+            31,
+            false,
+            HvfMmioRegisterWidth::Bits64,
         );
+        let (mut dispatcher, state) = dispatcher_with_handler(Ok(bytes(&[0, 0])), Ok(()));
+        let mut registers = FakeRegisters::new(
+            Err(BackendError::InvalidState("read register should not run")),
+            Ok(()),
+        );
+
+        let outcome = dispatch_mmio_access(access, &mut dispatcher, &mut registers)
+            .expect("zero register write should dispatch");
+
+        assert_eq!(outcome, MmioDispatchOutcome::Write);
         assert!(registers.reads.is_empty());
         assert!(registers.writes.is_empty());
 
@@ -916,7 +938,10 @@ mod tests {
             .lock()
             .expect("handler state lock should not be poisoned");
         assert!(state.reads.is_empty());
-        assert!(state.writes.is_empty());
+        assert_eq!(
+            state.writes,
+            vec![(access.runtime_access(), bytes(&[0, 0]))]
+        );
     }
 
     #[test]

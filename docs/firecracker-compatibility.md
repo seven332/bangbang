@@ -18,7 +18,8 @@ validation model, internal virtio-net config-space, activation, TX frame parser,
 preparation and MMIO registration helpers, an internal virtio-block
 config-space capacity model, an internal virtio-block request parser, single-request
 executor, queue dispatcher, MMIO queue-state bridge, resettable activation
-state, notification/interrupt-status dispatch helper, an internal TX-only
+state, notification/interrupt-status dispatch helper, guest-visible raw block
+read validation through the signed HVF boot test, an internal TX-only
 serial MMIO output device model with shared bounded capture support, and a minimal
 Hypervisor.framework VM create/destroy wrapper, a current-thread HVF vCPU
 create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding,
@@ -749,16 +750,22 @@ The runtime crate can derive an internal virtio-block configuration space from
 the backing length. It reports capacity as full 512-byte sectors, matching
 Firecracker's truncation of non-sector-aligned tails, exposes the virtio block
 device id and one 256-entry queue shape, always advertises
-`VIRTIO_F_VERSION_1` and `VIRTIO_RING_F_EVENT_IDX`, and advertises
-`VIRTIO_BLK_F_RO` only for read-only drives.
+`VIRTIO_F_VERSION_1`, and advertises `VIRTIO_BLK_F_RO` only for read-only
+drives. It does not advertise `VIRTIO_RING_F_EVENT_IDX` until event-index
+notification semantics are implemented.
 The config handler supports bounded read-only capacity reads through the
 existing virtio-mmio device-configuration path and rejects config writes.
 
 The runtime model is wired to successful pre-boot `PUT /drives/{drive_id}` VMM
 configuration storage. Public `InstanceStart` startup can call block-device
 preparation, MMIO registration, and FDT device description for initial
-configured drives, and the internal boot run loop across bounded step windows can dispatch active
-block notifications. It does not select a root block device for boot, provide an
+configured drives, and the internal boot run loop across bounded step windows
+can dispatch active block queue notifications and signal interrupts. The signed
+`guest_boot` integration target now validates that the pinned Firecracker arm64
+kernel can discover the first virtio-block device as `/dev/vda` and read a
+marker from a temporary host backing file through the raw block device. Guest
+writes, rootfs boot, block hotplug, cache-mode expansion, and rate limiting
+remain deferred. It does not select a root block device for boot, provide a
 public runner control, implement rate limiting, support
 vhost-user-block sockets, or use an async I/O engine. Internal HVF boot sessions
 can signal block SPI interrupts after boot-runtime block notification dispatch.

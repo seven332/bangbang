@@ -137,7 +137,11 @@ The `guest_boot` runner also generates a deterministic tiny initrd under
 `.tmp/guest-artifacts/bangbang/guest-boot/` by default. That initrd contains its
 own `/init`, so a rootfs drive is not required for the minimal guest boot
 integration test. The test succeeds when the guest emits `BANGBANG_BOOT_OK` on
-the internal serial console.
+the internal serial console. The same signed target also includes a raw
+virtio-block read scenario: the test configures one temporary drive whose first
+sector contains `BANGBANG_BLOCK_READ_OK`, mounts `devtmpfs` from the tiny
+`/init`, reads `/dev/vda`, and expects the marker to appear on serial. Rootfs
+boot and guest writes are separate follow-up coverage.
 
 ## PR Expectations
 

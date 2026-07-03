@@ -13,6 +13,8 @@ static GUEST_BOOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const BOOT_MARKER: &[u8] = b"BANGBANG_BOOT_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const BLOCK_READ_MARKER: &[u8] = b"BANGBANG_BLOCK_READ_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/init";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const GUEST_BOOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -28,6 +30,53 @@ const VSOCK_MMIO_BASE: u64 = 0x7000_0000;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn boots_firecracker_kernel_to_guest_marker() {
+    let _test_lock = GUEST_BOOT_TEST_LOCK
+        .lock()
+        .expect("guest boot integration test lock should not be poisoned");
+    let observation = run_guest_boot_until_marker("guest-boot", BOOT_MARKER, |_| {});
+
+    assert_guest_boot_observed_marker(&observation, BOOT_MARKER, "boot marker");
+    assert!(
+        !bytes_contain_marker(&observation.serial_bytes, BLOCK_READ_MARKER),
+        "guest boot test without a drive should not observe block-read marker\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn boots_firecracker_kernel_and_reads_virtio_block_marker() {
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::DriveConfigInput;
+
+    let _test_lock = GUEST_BOOT_TEST_LOCK
+        .lock()
+        .expect("guest boot integration test lock should not be poisoned");
+    let backing = GuestBlockBacking::new(BLOCK_READ_MARKER);
+    let observation =
+        run_guest_boot_until_marker("guest-block-read", BLOCK_READ_MARKER, |controller| {
+            controller
+                .handle_action(VmmAction::PutDrive(
+                    DriveConfigInput::new("data", "data", backing.path(), false)
+                        .with_is_read_only(true),
+                ))
+                .expect("guest block read drive should configure");
+        });
+
+    assert_guest_boot_observed_marker(&observation, BLOCK_READ_MARKER, "block-read marker");
+    assert!(
+        bytes_contain_marker(&observation.serial_bytes, BOOT_MARKER),
+        "guest block read test should still observe boot marker\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn run_guest_boot_until_marker(
+    instance_id: &str,
+    marker: &[u8],
+    configure_controller: impl FnOnce(&mut bangbang_runtime::VmmController),
+) -> GuestBootObservation {
     use std::num::NonZeroUsize;
     use std::time::Instant;
 
@@ -43,13 +92,10 @@ fn boots_firecracker_kernel_to_guest_marker() {
     use bangbang_runtime::vsock::VsockMmioLayout;
     use bangbang_runtime::{VmmAction, VmmController};
 
-    let _test_lock = GUEST_BOOT_TEST_LOCK
-        .lock()
-        .expect("guest boot integration test lock should not be poisoned");
     let kernel_path = env_path("BANGBANG_GUEST_KERNEL_PATH");
     let initrd_path = env_path("BANGBANG_GUEST_INITRD_PATH");
     let serial_output = SharedSerialOutputBuffer::default();
-    let mut controller = VmmController::new("guest-boot", "0.1.0", "bangbang");
+    let mut controller = VmmController::new(instance_id, "0.1.0", "bangbang");
     controller
         .handle_action(VmmAction::PutBootSource(
             BootSourceConfigInput::new(kernel_path.clone())
@@ -57,6 +103,7 @@ fn boots_firecracker_kernel_to_guest_marker() {
                 .with_boot_args(BOOT_ARGS),
         ))
         .expect("guest boot test boot source should configure");
+    configure_controller(&mut controller);
     let serial_address = GuestAddress::new(SERIAL_MMIO_BASE);
     let config = HvfArm64BootSessionConfig::new(
         BlockMmioLayout::new(GuestAddress::new(BLOCK_MMIO_BASE), MmioRegionId::new(1)),
@@ -85,7 +132,7 @@ fn boots_firecracker_kernel_to_guest_marker() {
     let mut terminal_outcome = None;
 
     while started_at.elapsed() < GUEST_BOOT_TIMEOUT {
-        if serial_contains_marker(&serial_output) {
+        if serial_contains_marker(&serial_output, marker) {
             break;
         }
 
@@ -96,7 +143,7 @@ fn boots_firecracker_kernel_to_guest_marker() {
             .expect("guest boot test run-loop should not fail before marker");
         run_diagnostics.record_loop_outcome(&outcome);
 
-        if serial_contains_marker(&serial_output) {
+        if serial_contains_marker(&serial_output, marker) {
             break;
         }
 
@@ -106,7 +153,7 @@ fn boots_firecracker_kernel_to_guest_marker() {
         }
     }
 
-    let marker_observed = serial_contains_marker(&serial_output);
+    let marker_observed = serial_contains_marker(&serial_output, marker);
     let stop_requested_after_loop = if marker_observed {
         false
     } else {
@@ -123,26 +170,94 @@ fn boots_firecracker_kernel_to_guest_marker() {
         marker_observed,
         stop_requested_after_loop,
         watchdog_timed_out,
-        serial_bytes.len(),
+        &serial_bytes,
         terminal_outcome.as_ref(),
     );
     session
         .shutdown()
         .expect("guest boot test session should shut down");
 
+    GuestBootObservation {
+        boot_diagnostics,
+        run_diagnostics,
+        serial_bytes,
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn assert_guest_boot_observed_marker(
+    observation: &GuestBootObservation,
+    marker: &[u8],
+    marker_name: &str,
+) {
     assert!(
-        !watchdog_timed_out,
+        !observation.run_diagnostics.watchdog_timed_out,
         "guest boot test watchdog canceled the vCPU run\n{}\nserial output:\n{}",
-        GuestBootFailureReport::new(&boot_diagnostics, &run_diagnostics),
-        String::from_utf8_lossy(&serial_bytes)
+        GuestBootFailureReport::new(&observation.boot_diagnostics, &observation.run_diagnostics),
+        String::from_utf8_lossy(&observation.serial_bytes)
     );
     assert!(
-        bytes_contain_marker(&serial_bytes),
-        "guest boot test did not observe marker {:?}\n{}\nserial output:\n{}",
-        String::from_utf8_lossy(BOOT_MARKER),
-        GuestBootFailureReport::new(&boot_diagnostics, &run_diagnostics),
-        String::from_utf8_lossy(&serial_bytes)
+        bytes_contain_marker(&observation.serial_bytes, marker),
+        "guest boot test did not observe {marker_name} {:?}\n{}\nserial output:\n{}",
+        String::from_utf8_lossy(marker),
+        GuestBootFailureReport::new(&observation.boot_diagnostics, &observation.run_diagnostics),
+        String::from_utf8_lossy(&observation.serial_bytes)
     );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct GuestBootObservation {
+    boot_diagnostics: GuestBootDiagnostics,
+    run_diagnostics: GuestBootRunDiagnostics,
+    serial_bytes: Vec<u8>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct GuestBlockBacking {
+    path: std::path::PathBuf,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl GuestBlockBacking {
+    fn new(marker: &[u8]) -> Self {
+        use std::io::Write;
+
+        let mut path = std::env::temp_dir();
+        let unique = format!(
+            "bangbang-guest-block-read-{}-{}.img",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("guest block backing timestamp should be after epoch")
+                .as_nanos()
+        );
+        path.push(unique);
+        let mut sector = vec![0; bangbang_runtime::block::VIRTIO_BLOCK_SECTOR_SIZE as usize];
+        assert!(
+            marker.len() <= sector.len(),
+            "guest block marker should fit in one sector"
+        );
+        sector[..marker.len()].copy_from_slice(marker);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("guest block backing should create");
+        file.write_all(&sector)
+            .expect("guest block backing sector should write");
+        Self { path }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for GuestBlockBacking {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -273,11 +388,13 @@ struct GuestBootRunDiagnostics {
     unknown_steps: usize,
     terminal_outcome: Option<String>,
     last_step: Option<String>,
+    last_mmio_step: Option<String>,
     elapsed: Option<std::time::Duration>,
     marker_observed: bool,
     stop_requested_after_loop: bool,
     watchdog_timed_out: bool,
     serial_byte_count: usize,
+    serial_tail_hex: Option<String>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -297,6 +414,7 @@ impl GuestBootRunDiagnostics {
             }
             bangbang_hvf::HvfVcpuRunStepOutcome::Mmio { .. } => {
                 self.mmio_steps += 1;
+                self.last_mmio_step = Some(format!("{step:?}"));
             }
             bangbang_hvf::HvfVcpuRunStepOutcome::VtimerActivated => {
                 self.virtual_timer_steps += 1;
@@ -333,14 +451,15 @@ impl GuestBootRunDiagnostics {
         marker_observed: bool,
         stop_requested_after_loop: bool,
         watchdog_timed_out: bool,
-        serial_byte_count: usize,
+        serial_bytes: &[u8],
         terminal_outcome: Option<&bangbang_hvf::HvfArm64BootRunLoopOutcome>,
     ) {
         self.elapsed = Some(elapsed);
         self.marker_observed = marker_observed;
         self.stop_requested_after_loop = stop_requested_after_loop;
         self.watchdog_timed_out = watchdog_timed_out;
-        self.serial_byte_count = serial_byte_count;
+        self.serial_byte_count = serial_bytes.len();
+        self.serial_tail_hex = Some(serial_tail_hex(serial_bytes));
         if let Some(outcome) = terminal_outcome {
             self.terminal_outcome = Some(format!("{outcome:?}"));
         }
@@ -385,6 +504,8 @@ impl std::fmt::Display for GuestBootFailureReport<'_> {
             .unwrap_or_else(|| "unknown".to_string());
         let terminal = self.run.terminal_outcome.as_deref().unwrap_or("none");
         let last_step = self.run.last_step.as_deref().unwrap_or("none");
+        let last_mmio_step = self.run.last_mmio_step.as_deref().unwrap_or("none");
+        let serial_tail_hex = self.run.serial_tail_hex.as_deref().unwrap_or("none");
 
         writeln!(f, "guest boot diagnostics:")?;
         writeln!(f, "  classification: {}", self.run.timeout_classification())?;
@@ -417,6 +538,8 @@ impl std::fmt::Display for GuestBootFailureReport<'_> {
         )?;
         writeln!(f, "  terminal outcome: {terminal}")?;
         writeln!(f, "  last raw step: {last_step}")?;
+        writeln!(f, "  last MMIO step: {last_mmio_step}")?;
+        writeln!(f, "  serial tail hex: {serial_tail_hex}")?;
         writeln!(f, "  kernel path: {}", self.boot.kernel_path.display())?;
         writeln!(f, "  initrd path: {}", self.boot.initrd_path.display())?;
         writeln!(f, "  boot args: {}", self.boot.boot_args)?;
@@ -540,19 +663,35 @@ fn env_path(name: &str) -> std::path::PathBuf {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn serial_contains_marker(output: &bangbang_runtime::serial::SharedSerialOutputBuffer) -> bool {
+fn serial_contains_marker(
+    output: &bangbang_runtime::serial::SharedSerialOutputBuffer,
+    marker: &[u8],
+) -> bool {
     output
         .bytes()
         .expect("guest boot test serial output should read")
-        .windows(BOOT_MARKER.len())
-        .any(|window| window == BOOT_MARKER)
+        .windows(marker.len())
+        .any(|window| window == marker)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn bytes_contain_marker(bytes: &[u8]) -> bool {
-    bytes
-        .windows(BOOT_MARKER.len())
-        .any(|window| window == BOOT_MARKER)
+fn bytes_contain_marker(bytes: &[u8], marker: &[u8]) -> bool {
+    bytes.windows(marker.len()).any(|window| window == marker)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn serial_tail_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut tail = String::new();
+    let start = bytes.len().saturating_sub(64);
+    for (index, byte) in bytes[start..].iter().copied().enumerate() {
+        if index > 0 {
+            tail.push(' ');
+        }
+        write!(&mut tail, "{byte:02x}").expect("hex tail write should not fail");
+    }
+    tail
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
@@ -573,7 +712,7 @@ mod tests {
             false,
             true,
             false,
-            0,
+            &[],
             None,
         );
 
@@ -584,6 +723,7 @@ mod tests {
         assert_eq!(diagnostics.run_loop_calls, 1);
         assert_eq!(diagnostics.step_limit_outcomes, 1);
         assert_eq!(diagnostics.virtual_timer_steps, 1);
+        assert_eq!(diagnostics.last_mmio_step, None);
     }
 
     #[test]
@@ -597,7 +737,7 @@ mod tests {
             false,
             true,
             true,
-            0,
+            &[],
             Some(&outcome),
         );
 
@@ -632,7 +772,7 @@ mod tests {
             false,
             true,
             false,
-            0,
+            &[],
             None,
         );
 
@@ -675,6 +815,9 @@ mod tests {
 
     #[test]
     fn marker_match_accepts_tty_crlf_translation() {
-        assert!(bytes_contain_marker(b"BANGBANG_BOOT_OK\r\n"));
+        assert!(bytes_contain_marker(
+            b"BANGBANG_BOOT_OK\r\n",
+            super::BOOT_MARKER
+        ));
     }
 }
