@@ -108,6 +108,7 @@ ext4_path="${prepared_dir}/${rootfs_name}-${ext4_size}.ext4"
 tmp_file=""
 tmp_ext4=""
 extract_dir=""
+mkfs_ext4=""
 
 cleanup() {
   if [[ -n "$tmp_file" && -e "$tmp_file" ]]; then
@@ -204,12 +205,12 @@ find_mkfs_ext4() {
   local prefix
 
   if [[ -n "${BANGBANG_MKFS_EXT4:-}" ]]; then
-    if [[ -x "$BANGBANG_MKFS_EXT4" ]]; then
+    if [[ -f "$BANGBANG_MKFS_EXT4" && -x "$BANGBANG_MKFS_EXT4" ]]; then
       printf '%s\n' "$BANGBANG_MKFS_EXT4"
       return
     fi
 
-    echo "BANGBANG_MKFS_EXT4 does not point to an executable: $BANGBANG_MKFS_EXT4" >&2
+    echo "BANGBANG_MKFS_EXT4 does not point to a regular executable file: $BANGBANG_MKFS_EXT4" >&2
     exit 1
   fi
 
@@ -222,7 +223,7 @@ find_mkfs_ext4() {
     prefix="$(brew --prefix e2fsprogs 2>/dev/null || true)"
     if [[ -n "$prefix" ]]; then
       candidate="${prefix}/sbin/mkfs.ext4"
-      if [[ -x "$candidate" ]]; then
+      if [[ -f "$candidate" && -x "$candidate" ]]; then
         printf '%s\n' "$candidate"
         return
       fi
@@ -233,9 +234,7 @@ find_mkfs_ext4() {
   exit 1
 }
 
-prepare_ext4() {
-  local mkfs_ext4
-
+check_ext4_output_path() {
   if [[ -L "$ext4_path" ]]; then
     echo "prepared ext4 rootfs path must not be a symlink: $ext4_path" >&2
     exit 1
@@ -245,18 +244,38 @@ prepare_ext4() {
     echo "prepared ext4 rootfs path exists but is not a regular file: $ext4_path" >&2
     exit 1
   fi
+}
+
+ensure_ext4_tools() {
+  if ! command -v unsquashfs >/dev/null 2>&1; then
+    echo "unsquashfs is required to prepare an ext4 rootfs; install squashfs" >&2
+    exit 1
+  fi
+
+  if [[ -z "$mkfs_ext4" ]]; then
+    mkfs_ext4="$(find_mkfs_ext4)"
+  fi
+}
+
+preflight_ext4_preparation() {
+  check_ext4_output_path
+
+  if [[ -f "$ext4_path" ]]; then
+    return
+  fi
+
+  ensure_ext4_tools
+}
+
+prepare_ext4() {
+  check_ext4_output_path
 
   if [[ -f "$ext4_path" ]]; then
     echo "using prepared ext4 rootfs artifact: $ext4_path" >&2
     return
   fi
 
-  if ! command -v unsquashfs >/dev/null 2>&1; then
-    echo "unsquashfs is required to prepare an ext4 rootfs; install squashfs" >&2
-    exit 1
-  fi
-
-  mkfs_ext4="$(find_mkfs_ext4)"
+  ensure_ext4_tools
 
   mkdir -p "$prepared_dir"
   extract_dir="$(mktemp -d "${prepared_dir}/${rootfs_name}.extract.XXXXXX")"
@@ -274,6 +293,10 @@ prepare_ext4() {
   rm -rf "$extract_dir"
   extract_dir=""
 }
+
+if [[ "$format" == "ext4" ]]; then
+  preflight_ext4_preparation
+fi
 
 fetch_squashfs
 
