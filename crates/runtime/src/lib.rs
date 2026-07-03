@@ -187,6 +187,7 @@ pub enum VmmActionError {
     MetricsFlush(metrics::MetricsFlushError),
     MmdsConfig(mmds::MmdsConfigError),
     MmdsDataStore(mmds::MmdsDataStoreError),
+    MmdsState(mmds::MmdsStateLockError),
     NetworkInterfaceConfig(network::NetworkInterfaceConfigError),
     VsockConfig(vsock::VsockConfigError),
 }
@@ -215,6 +216,7 @@ impl fmt::Display for VmmActionError {
             Self::MetricsFlush(err) => write!(f, "{err}"),
             Self::MmdsConfig(err) => write!(f, "{err}"),
             Self::MmdsDataStore(err) => write!(f, "{err}"),
+            Self::MmdsState(err) => write!(f, "{err}"),
             Self::NetworkInterfaceConfig(err) => write!(f, "{err}"),
             Self::VsockConfig(err) => write!(f, "{err}"),
         }
@@ -233,6 +235,7 @@ impl std::error::Error for VmmActionError {
             Self::MetricsFlush(err) => Some(err),
             Self::MmdsConfig(err) => Some(err),
             Self::MmdsDataStore(err) => Some(err),
+            Self::MmdsState(err) => Some(err),
             Self::NetworkInterfaceConfig(err) => Some(err),
             Self::VsockConfig(err) => Some(err),
             Self::MissingBootSource
@@ -252,7 +255,7 @@ pub struct VmmController {
     vsock_config: Option<vsock::VsockConfig>,
     logger_state: logger::LoggerState,
     metrics_state: metrics::MetricsState,
-    mmds_state: mmds::MmdsState,
+    mmds_state: mmds::MmdsStateHandle,
 }
 
 impl VmmController {
@@ -275,7 +278,7 @@ impl VmmController {
             vsock_config: None,
             logger_state: logger::LoggerState::default(),
             metrics_state: metrics::MetricsState::default(),
-            mmds_state: mmds::MmdsState::default(),
+            mmds_state: mmds::MmdsStateHandle::default(),
         }
     }
 
@@ -295,7 +298,11 @@ impl VmmController {
         self.vsock_config.as_ref()
     }
 
-    pub fn mmds_config(&self) -> Option<&mmds::MmdsConfig> {
+    pub fn mmds_state_handle(&self) -> mmds::MmdsStateHandle {
+        self.mmds_state.clone()
+    }
+
+    pub fn mmds_config(&self) -> Result<Option<mmds::MmdsConfig>, mmds::MmdsStateLockError> {
         self.mmds_state.config()
     }
 
@@ -307,15 +314,15 @@ impl VmmController {
         self.boot_source_config.as_ref()
     }
 
-    pub fn vm_config(&self) -> VmConfiguration {
-        VmConfiguration::new(
+    pub fn vm_config(&self) -> Result<VmConfiguration, mmds::MmdsStateLockError> {
+        Ok(VmConfiguration::new(
             self.machine_config,
             self.boot_source_config.clone(),
             self.drive_configs.as_slice().to_vec(),
             self.network_interface_configs.as_slice().to_vec(),
-            self.mmds_config().cloned(),
+            self.mmds_config()?,
             self.vsock_config.clone(),
-        )
+        ))
     }
 
     pub fn preflight_instance_start(&self) -> Result<(), VmmActionError> {
@@ -359,10 +366,14 @@ impl VmmController {
             VmmAction::GetMachineConfig => Ok(VmmData::MachineConfiguration(self.machine_config)),
             VmmAction::GetMmds => self
                 .mmds_state
-                .get_data()
+                .with(mmds::MmdsState::get_data)
+                .map_err(VmmActionError::MmdsState)?
                 .map(VmmData::MmdsValue)
                 .map_err(VmmActionError::MmdsDataStore),
-            VmmAction::GetVmConfig => Ok(VmmData::VmConfiguration(self.vm_config())),
+            VmmAction::GetVmConfig => self
+                .vm_config()
+                .map(VmmData::VmConfiguration)
+                .map_err(VmmActionError::MmdsState),
             VmmAction::InstanceStart => {
                 self.preflight_instance_start()?;
                 Err(VmmActionError::UnsupportedAction(action_name))
@@ -438,14 +449,16 @@ impl VmmController {
             }
             VmmAction::PutMmds(input) => {
                 self.mmds_state
-                    .put_data(input)
+                    .with_mut(|state| state.put_data(input))
+                    .map_err(VmmActionError::MmdsState)?
                     .map_err(VmmActionError::MmdsDataStore)?;
 
                 Ok(VmmData::Empty)
             }
             VmmAction::PatchMmds(input) => {
                 self.mmds_state
-                    .patch_data(input)
+                    .with_mut(|state| state.patch_data(input))
+                    .map_err(VmmActionError::MmdsState)?
                     .map_err(VmmActionError::MmdsDataStore)?;
 
                 Ok(VmmData::Empty)
@@ -459,7 +472,10 @@ impl VmmController {
                 }
 
                 self.mmds_state
-                    .put_config(input, self.network_interface_configs.as_slice())
+                    .with_mut(|state| {
+                        state.put_config(input, self.network_interface_configs.as_slice())
+                    })
+                    .map_err(VmmActionError::MmdsState)?
                     .map_err(VmmActionError::MmdsConfig)?;
 
                 Ok(VmmData::Empty)
@@ -1135,7 +1151,7 @@ mod tests {
                 iface_id: "eth0".to_string(),
             })
         );
-        assert_eq!(controller.mmds_config(), None);
+        assert_eq!(controller.mmds_config(), Ok(None));
 
         controller
             .handle_action(VmmAction::PutNetworkInterface(network_input(
@@ -1152,6 +1168,7 @@ mod tests {
         );
         let config = controller
             .mmds_config()
+            .expect("MMDS state should lock")
             .expect("MMDS config should be stored");
         assert_eq!(config.network_interfaces(), &["eth0".to_string()]);
         assert_eq!(config.version(), MmdsVersion::V2);
@@ -1188,7 +1205,7 @@ mod tests {
                 )
             ))
         );
-        assert_eq!(controller.mmds_config(), None);
+        assert_eq!(controller.mmds_config(), Ok(None));
     }
 
     #[test]

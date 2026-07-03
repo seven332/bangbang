@@ -1,4 +1,5 @@
 use std::fmt;
+use std::net::Ipv4Addr;
 use std::num::NonZeroUsize;
 #[cfg(test)]
 use std::sync::Condvar;
@@ -12,6 +13,7 @@ use bangbang_hvf::{
 };
 use bangbang_runtime::block::BlockMmioLayout;
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
+use bangbang_runtime::mmds::{MmdsConfig, MmdsStateHandle, MmdsStateLockError};
 use bangbang_runtime::mmio::MmioRegionId;
 use bangbang_runtime::network::{
     NetworkInterfaceConfig, NetworkInterfaceConfigError, NetworkMmioLayout, VirtioNetworkRxPacket,
@@ -27,9 +29,9 @@ use bangbang_runtime::vsock::VsockMmioLayout;
 use bangbang_runtime::{BackendError, VmmAction, VmmActionError, VmmController, VmmData};
 
 use crate::host_network::virtio_vmnet::{
-    VmnetVirtioNetworkPacketIo, VmnetVirtioNetworkPacketIoBuildError,
-    VmnetVirtioNetworkPacketIoProvider, VmnetVirtioNetworkPacketIoProviderBuildError,
-    VmnetVirtioNetworkPacketIoProviderEntry,
+    MmdsPacketDetour, MmdsResponseQueue, VmnetVirtioNetworkPacketIo,
+    VmnetVirtioNetworkPacketIoBuildError, VmnetVirtioNetworkPacketIoProvider,
+    VmnetVirtioNetworkPacketIoProviderBuildError, VmnetVirtioNetworkPacketIoProviderEntry,
 };
 use crate::host_network::vmnet::{
     StartedVmnetPacketIoBackend, SystemVmnetInterfaceBackend, VmnetHostDeviceNameConfigError,
@@ -194,14 +196,12 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
     type Session = HvfBootRunLoopSupervisor;
 
     fn start(&mut self, controller: &VmmController) -> Result<Self::Session, BackendError> {
-        let packet_io = ProcessNetworkPacketIoProvider::from_network_configs(
-            controller.network_interface_configs(),
-        )
-        .map_err(|err| {
-            BackendError::Hypervisor(format!(
-                "failed to build network packet I/O provider: {err}"
-            ))
-        })?;
+        let packet_io =
+            ProcessNetworkPacketIoProvider::from_controller(controller).map_err(|err| {
+                BackendError::Hypervisor(format!(
+                    "failed to build network packet I/O provider: {err}"
+                ))
+            })?;
         let session = OwnedHvfArm64BootSession::new(controller, self.boot_session_config())
             .map_err(|err| BackendError::Hypervisor(err.to_string()))?;
         let session = ProcessHvfBootSession::new(session, packet_io);
@@ -266,8 +266,32 @@ pub(crate) enum ProcessNetworkPacketIoProvider {
 }
 
 impl ProcessNetworkPacketIoProvider {
+    fn from_controller(
+        controller: &VmmController,
+    ) -> Result<Self, ProcessNetworkPacketIoProviderBuildError> {
+        let mmds_config = controller
+            .mmds_config()
+            .map_err(|source| ProcessNetworkPacketIoProviderBuildError::MmdsState { source })?;
+        let mmds_detour = mmds_config.as_ref().map(|config| {
+            ProcessMmdsPacketDetourConfig::from_mmds_config(controller.mmds_state_handle(), config)
+        });
+
+        Self::from_network_configs_and_mmds_detour(
+            controller.network_interface_configs(),
+            mmds_detour.as_ref(),
+        )
+    }
+
+    #[cfg(test)]
     fn from_network_configs(
         configs: &[NetworkInterfaceConfig],
+    ) -> Result<Self, ProcessNetworkPacketIoProviderBuildError> {
+        Self::from_network_configs_and_mmds_detour(configs, None)
+    }
+
+    fn from_network_configs_and_mmds_detour(
+        configs: &[NetworkInterfaceConfig],
+        mmds_detour: Option<&ProcessMmdsPacketDetourConfig>,
     ) -> Result<Self, ProcessNetworkPacketIoProviderBuildError> {
         validate_network_interface_count(configs.len()).map_err(|source| {
             ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { source }
@@ -278,7 +302,47 @@ impl ProcessNetworkPacketIoProvider {
         }
 
         let mut factory = SystemProcessVmnetPacketIoBackendFactory;
-        process_vmnet_packet_io_provider_from_configs(configs, &mut factory).map(Self::Vmnet)
+        process_vmnet_packet_io_provider_from_configs_with_mmds_detour(
+            configs,
+            &mut factory,
+            mmds_detour,
+        )
+        .map(Self::Vmnet)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProcessMmdsPacketDetourConfig {
+    mmds_state: MmdsStateHandle,
+    mmds_ipv4_address: Ipv4Addr,
+    network_interfaces: Vec<String>,
+    response_queue: MmdsResponseQueue,
+}
+
+impl ProcessMmdsPacketDetourConfig {
+    fn from_mmds_config(mmds_state: MmdsStateHandle, config: &MmdsConfig) -> Self {
+        Self {
+            mmds_state,
+            mmds_ipv4_address: config.effective_ipv4_address(),
+            network_interfaces: config.network_interfaces().to_vec(),
+            response_queue: MmdsResponseQueue::default(),
+        }
+    }
+
+    fn detour_for_interface(&self, iface_id: &str) -> Option<MmdsPacketDetour> {
+        if !self
+            .network_interfaces
+            .iter()
+            .any(|configured_iface_id| configured_iface_id == iface_id)
+        {
+            return None;
+        }
+
+        Some(MmdsPacketDetour::new(
+            self.mmds_state.clone(),
+            self.mmds_ipv4_address,
+            self.response_queue.clone(),
+        ))
     }
 }
 
@@ -298,6 +362,9 @@ impl Arm64BootNetworkPacketIoProvider for ProcessNetworkPacketIoProvider {
 enum ProcessNetworkPacketIoProviderBuildError {
     NetworkInterfaceCount {
         source: NetworkInterfaceConfigError,
+    },
+    MmdsState {
+        source: MmdsStateLockError,
     },
     HostDeviceName {
         iface_id: String,
@@ -321,6 +388,9 @@ impl fmt::Display for ProcessNetworkPacketIoProviderBuildError {
         match self {
             Self::NetworkInterfaceCount { source } => {
                 write!(f, "unsupported network interface count: {source}")
+            }
+            Self::MmdsState { source } => {
+                write!(f, "failed to access MMDS state: {source}")
             }
             Self::HostDeviceName { iface_id, source } => {
                 write!(
@@ -351,6 +421,7 @@ impl std::error::Error for ProcessNetworkPacketIoProviderBuildError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::NetworkInterfaceCount { source } => Some(source),
+            Self::MmdsState { source } => Some(source),
             Self::HostDeviceName { source, .. } => Some(source),
             Self::Start { source, .. } => Some(source),
             Self::PacketIoBuild { source, .. } => Some(source),
@@ -376,9 +447,25 @@ impl ProcessVmnetPacketIoBackendFactory for SystemProcessVmnetPacketIoBackendFac
     }
 }
 
+#[cfg(test)]
 fn process_vmnet_packet_io_provider_from_configs<F>(
     configs: &[NetworkInterfaceConfig],
     factory: &mut F,
+) -> Result<
+    VmnetVirtioNetworkPacketIoProvider<StartedVmnetPacketIoBackend<F::Backend>>,
+    ProcessNetworkPacketIoProviderBuildError,
+>
+where
+    F: ProcessVmnetPacketIoBackendFactory,
+    F::Backend: VmnetPacketIoBackend<Interface = <F::Backend as VmnetInterfaceBackend>::Interface>,
+{
+    process_vmnet_packet_io_provider_from_configs_with_mmds_detour(configs, factory, None)
+}
+
+fn process_vmnet_packet_io_provider_from_configs_with_mmds_detour<F>(
+    configs: &[NetworkInterfaceConfig],
+    factory: &mut F,
+    mmds_detour: Option<&ProcessMmdsPacketDetourConfig>,
 ) -> Result<
     VmnetVirtioNetworkPacketIoProvider<StartedVmnetPacketIoBackend<F::Backend>>,
     ProcessNetworkPacketIoProviderBuildError,
@@ -408,12 +495,19 @@ where
                 iface_id: iface_id.to_string(),
                 source,
             })?;
-        let packet_io = VmnetVirtioNetworkPacketIo::new(backend, interface).map_err(|source| {
-            ProcessNetworkPacketIoProviderBuildError::PacketIoBuild {
+        let detour = mmds_detour.and_then(|detour| detour.detour_for_interface(iface_id));
+        let packet_io = match detour {
+            Some(detour) => {
+                VmnetVirtioNetworkPacketIo::with_mmds_detour(backend, interface, detour)
+            }
+            None => VmnetVirtioNetworkPacketIo::new(backend, interface),
+        }
+        .map_err(
+            |source| ProcessNetworkPacketIoProviderBuildError::PacketIoBuild {
                 iface_id: iface_id.to_string(),
                 source,
-            }
-        })?;
+            },
+        )?;
 
         entries.push(VmnetVirtioNetworkPacketIoProviderEntry::new(
             iface_id, packet_io,
@@ -783,6 +877,7 @@ mod tests {
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::fdt::{Arm64FdtRegion, Arm64FdtVirtioMmioDevice};
     use bangbang_runtime::interrupt::GuestInterruptLine;
+    use bangbang_runtime::mmds::{MmdsConfigInput, MmdsStateHandle};
     use bangbang_runtime::mmio::MmioRegion;
     use bangbang_runtime::network::{
         MAX_NETWORK_INTERFACE_COUNT, NetworkInterfaceConfig, NetworkInterfaceConfigError,
@@ -811,10 +906,10 @@ mod tests {
         DEFAULT_NETWORK_MMIO_REGION_ID, DEFAULT_SERIAL_MMIO_BASE, DEFAULT_SERIAL_MMIO_REGION_ID,
         DEFAULT_VSOCK_MMIO_BASE, DEFAULT_VSOCK_MMIO_REGION_ID, EmptyProcessNetworkRxPacketSource,
         HvfInstanceStartExecutor, InstanceStartExecutor, NetworkPacketIoRunLoopSession,
-        NoopProcessNetworkTxPacketSink, ProcessHvfBootSession, ProcessNetworkPacketIoProvider,
-        ProcessNetworkPacketIoProviderBuildError, ProcessVmm, ProcessVmnetPacketIoBackendFactory,
-        default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
-        process_vmnet_packet_io_provider_from_configs,
+        NoopProcessNetworkTxPacketSink, ProcessHvfBootSession, ProcessMmdsPacketDetourConfig,
+        ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError, ProcessVmm,
+        ProcessVmnetPacketIoBackendFactory, default_hvf_boot_run_loop_step_limit,
+        default_hvf_boot_session_config, process_vmnet_packet_io_provider_from_configs,
     };
 
     static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -1532,6 +1627,26 @@ mod tests {
     }
 
     #[test]
+    fn process_mmds_packet_detour_config_matches_only_configured_interfaces() {
+        let configs = network_configs([
+            ("eth0", "vmnet:shared"),
+            ("eth1", "vmnet:shared"),
+            ("eth2", "vmnet:shared"),
+        ]);
+        let mmds_config = MmdsConfigInput::new(vec!["eth0".to_string(), "eth2".to_string()])
+            .validate(&configs)
+            .expect("MMDS config should validate");
+        let detour_config = ProcessMmdsPacketDetourConfig::from_mmds_config(
+            MmdsStateHandle::default(),
+            &mmds_config,
+        );
+
+        assert!(detour_config.detour_for_interface("eth0").is_some());
+        assert!(detour_config.detour_for_interface("eth1").is_none());
+        assert!(detour_config.detour_for_interface("eth2").is_some());
+    }
+
+    #[test]
     fn process_vmnet_packet_io_provider_rejects_over_limit_before_backend() {
         let configs = validated_network_configs(MAX_NETWORK_INTERFACE_COUNT + 1);
         let mut factory = RecordingVmnetPacketIoBackendFactory::default();
@@ -1550,6 +1665,7 @@ mod tests {
                 );
             }
             ProcessNetworkPacketIoProviderBuildError::HostDeviceName { .. }
+            | ProcessNetworkPacketIoProviderBuildError::MmdsState { .. }
             | ProcessNetworkPacketIoProviderBuildError::Start { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::ProviderBuild { .. } => {
@@ -1572,6 +1688,7 @@ mod tests {
                 assert_eq!(iface_id, "eth0");
             }
             ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { .. }
+            | ProcessNetworkPacketIoProviderBuildError::MmdsState { .. }
             | ProcessNetworkPacketIoProviderBuildError::Start { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::ProviderBuild { .. } => {
@@ -1594,6 +1711,7 @@ mod tests {
                 assert_eq!(iface_id, "eth1");
             }
             ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { .. }
+            | ProcessNetworkPacketIoProviderBuildError::MmdsState { .. }
             | ProcessNetworkPacketIoProviderBuildError::Start { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::ProviderBuild { .. } => {
@@ -1660,6 +1778,7 @@ mod tests {
             | VmmActionError::MetricsFlush(_)
             | VmmActionError::MmdsConfig(_)
             | VmmActionError::MmdsDataStore(_)
+            | VmmActionError::MmdsState(_)
             | VmmActionError::NetworkInterfaceConfig(_)
             | VmmActionError::VsockConfig(_) => {
                 panic!("vmnet start failure should propagate as hypervisor startup error");

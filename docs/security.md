@@ -197,7 +197,10 @@ target the configured MMDS IPv4 address and TCP port `80`; malformed,
 truncated, fragmented, non-TCP, and non-MMDS packets are ignored as
 non-candidates. For non-empty candidate TCP payloads, the runtime can produce
 the same process-local HTTP response bytes as the existing guest HTTP helper,
-including token PUT and MMDS v2 GET token enforcement. This still does not
+including token PUT and MMDS v2 GET token enforcement. The process vmnet TX
+path detours those non-empty candidates only for interfaces listed in the MMDS
+config, retains generated response bytes in a bounded process-local queue, and
+does not forward handled request payloads to vmnet. This still does not
 reassemble fragments, buffer split TCP requests, track TCP state, synthesize
 response packets, or deliver responses through virtio-net RX. Future
 guest-visible MMDS work must validate device, packet, token, and TCP/session
@@ -241,9 +244,11 @@ The current scaffold does not implement:
   packet descriptor, single-packet system read/write backend boundaries, a
   cleanup-owning packet backend for retaining stop-on-drop ownership while
   delegating packet I/O, and an internal virtio-net adapter that can move
-  packets between vmnet and the runtime packet traits for future host
-  networking, plus an internal provider that can select prebuilt adapters by
-  configured interface ID and an internal `host_dev_name` mapping for
+  packets between vmnet and the runtime packet traits, detour configured
+  non-empty MMDS TX payloads before vmnet forwarding, and retain bounded
+  process-local MMDS response bytes for future guest-visible delivery, plus an
+  internal provider that can select prebuilt adapters by configured interface
+  ID and an internal `host_dev_name` mapping for
   `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>`. The current
   model stores at most 16 configured network interfaces. Startup revalidates
   that limit before opening vmnet resources, opens them only when configured
