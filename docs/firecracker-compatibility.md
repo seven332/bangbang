@@ -790,8 +790,13 @@ temporary host backing file through the raw block device. The same target also
 validates a basic writable-drive path by writing a marker from the guest to
 `/dev/vda` and checking the scratch host backing file. It also attaches the
 pinned Firecracker squashfs rootfs as a read-only root drive, mounts it from the
-deterministic initrd, and reads `/mnt/etc/os-release` from the guest. Full
-rootfs boot, block hotplug, cache-mode expansion, and rate limiting remain
+deterministic initrd, and reads `/mnt/etc/os-release` from the guest. Direct
+root-drive boot validation is covered by a generated ext4 variant of the same
+Firecracker rootfs that adds a deterministic test init, boots without an initrd,
+mounts the virtio-block root drive as `/`, reads `/etc/os-release`, and
+validates guest-visible `root=/dev/vda ro` command-line arguments. This does
+not yet claim arbitrary distro rootfs boot or default Ubuntu systemd startup.
+Block hotplug, remaining cache-mode semantics, and rate limiting remain
 deferred.
 It does not provide a public runner control, implement rate limiting, support
 vhost-user-block sockets, or use an async I/O engine. Internal HVF boot sessions

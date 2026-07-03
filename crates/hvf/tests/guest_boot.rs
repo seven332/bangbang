@@ -19,6 +19,8 @@ const BLOCK_WRITE_MARKER: &[u8] = b"BANGBANG_BLOCK_WRITE_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const ROOTFS_READ_MARKER: &[u8] = b"BANGBANG_ROOTFS_READ_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const DIRECT_ROOTFS_BOOT_MARKER: &[u8] = b"BANGBANG_DIRECT_ROOTFS_BOOT_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const ROOTFS_OS_RELEASE_ID: &[u8] = b"ID=ubuntu";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const ROOTFS_OS_RELEASE_CODENAME: &[u8] = b"VERSION_CODENAME=noble";
@@ -27,7 +29,10 @@ const CMDLINE_BEGIN_MARKER: &[u8] = b"BANGBANG_CMDLINE_BEGIN";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const CMDLINE_END_MARKER: &[u8] = b"BANGBANG_CMDLINE_END";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/init";
+const INITRD_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/init";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const DIRECT_ROOTFS_BOOT_ARGS: &str =
+    "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const GUEST_BOOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -233,9 +238,87 @@ fn boots_firecracker_kernel_and_reads_firecracker_rootfs() {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn boots_firecracker_kernel_from_ext4_rootfs() {
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::DriveConfigInput;
+
+    let _test_lock = GUEST_BOOT_TEST_LOCK
+        .lock()
+        .expect("guest boot integration test lock should not be poisoned");
+    let rootfs_path = env_path("BANGBANG_GUEST_EXT4_ROOTFS_PATH");
+    let observation = run_guest_boot_without_initrd_until_marker(
+        "guest-ext4-rootfs-boot",
+        DIRECT_ROOTFS_BOOT_MARKER,
+        DIRECT_ROOTFS_BOOT_ARGS,
+        |controller| {
+            controller
+                .handle_action(VmmAction::PutDrive(
+                    DriveConfigInput::new("rootfs", "rootfs", rootfs_path.as_path(), true)
+                        .with_is_read_only(true),
+                ))
+                .expect("guest ext4 rootfs drive should configure");
+        },
+    );
+
+    assert_guest_boot_observed_marker(
+        &observation,
+        DIRECT_ROOTFS_BOOT_MARKER,
+        "direct rootfs boot marker",
+    );
+    assert!(
+        bytes_contain_marker(&observation.serial_bytes, ROOTFS_OS_RELEASE_ID),
+        "direct rootfs boot should read os-release ID from /\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+    assert!(
+        bytes_contain_marker(&observation.serial_bytes, ROOTFS_OS_RELEASE_CODENAME),
+        "direct rootfs boot should read os-release codename from /\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+    let cmdline = guest_cmdline_capture(&observation);
+    assert_guest_cmdline_contains_arg(cmdline, b"root=/dev/vda");
+    assert_guest_cmdline_contains_arg(cmdline, b"ro");
+    assert_guest_cmdline_contains_arg(cmdline, b"init=/bangbang-direct-rootfs-init");
+    assert!(
+        !guest_cmdline_contains_arg(cmdline, b"rdinit=/init"),
+        "direct rootfs boot should not rely on the tiny initrd: {}",
+        String::from_utf8_lossy(cmdline)
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run_guest_boot_until_marker(
     instance_id: &str,
     marker: &[u8],
+    configure_controller: impl FnOnce(&mut bangbang_runtime::VmmController),
+) -> GuestBootObservation {
+    let initrd_path = env_path("BANGBANG_GUEST_INITRD_PATH");
+    run_guest_boot_with_boot_source(
+        instance_id,
+        marker,
+        Some(initrd_path),
+        INITRD_BOOT_ARGS,
+        configure_controller,
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn run_guest_boot_without_initrd_until_marker(
+    instance_id: &str,
+    marker: &[u8],
+    boot_args: &str,
+    configure_controller: impl FnOnce(&mut bangbang_runtime::VmmController),
+) -> GuestBootObservation {
+    run_guest_boot_with_boot_source(instance_id, marker, None, boot_args, configure_controller)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn run_guest_boot_with_boot_source(
+    instance_id: &str,
+    marker: &[u8],
+    initrd_path: Option<std::path::PathBuf>,
+    boot_args: &str,
     configure_controller: impl FnOnce(&mut bangbang_runtime::VmmController),
 ) -> GuestBootObservation {
     use std::num::NonZeroUsize;
@@ -254,15 +337,14 @@ fn run_guest_boot_until_marker(
     use bangbang_runtime::{VmmAction, VmmController};
 
     let kernel_path = env_path("BANGBANG_GUEST_KERNEL_PATH");
-    let initrd_path = env_path("BANGBANG_GUEST_INITRD_PATH");
     let serial_output = SharedSerialOutputBuffer::default();
     let mut controller = VmmController::new(instance_id, "0.1.0", "bangbang");
+    let mut boot_source = BootSourceConfigInput::new(kernel_path.clone()).with_boot_args(boot_args);
+    if let Some(path) = initrd_path.as_ref() {
+        boot_source = boot_source.with_initrd_path(path.clone());
+    }
     controller
-        .handle_action(VmmAction::PutBootSource(
-            BootSourceConfigInput::new(kernel_path.clone())
-                .with_initrd_path(initrd_path.clone())
-                .with_boot_args(BOOT_ARGS),
-        ))
+        .handle_action(VmmAction::PutBootSource(boot_source))
         .expect("guest boot test boot source should configure");
     configure_controller(&mut controller);
     let serial_address = GuestAddress::new(SERIAL_MMIO_BASE);
@@ -487,13 +569,13 @@ impl Drop for GuestBootWatchdog {
 #[derive(Debug, Clone)]
 struct GuestBootDiagnostics {
     kernel_path: std::path::PathBuf,
-    initrd_path: std::path::PathBuf,
+    initrd_path: Option<std::path::PathBuf>,
     boot_args: String,
     boot_pc: u64,
     fdt_address: u64,
     fdt_size: usize,
-    initrd_address: u64,
-    initrd_size: u64,
+    initrd_address: Option<u64>,
+    initrd_size: Option<u64>,
     serial_mmio_base: u64,
     serial_mmio_size: u64,
     serial_interrupt_line: u32,
@@ -504,14 +586,15 @@ impl GuestBootDiagnostics {
     fn from_session(
         session: &bangbang_hvf::OwnedHvfArm64BootSession,
         kernel_path: std::path::PathBuf,
-        initrd_path: std::path::PathBuf,
+        initrd_path: Option<std::path::PathBuf>,
         expected_serial_address: bangbang_runtime::memory::GuestAddress,
     ) -> Self {
         let resources = session.runtime_resources();
-        let initrd = resources
-            .loaded_boot_source
-            .initrd
-            .expect("guest boot test initrd should be loaded");
+        let initrd = resources.loaded_boot_source.initrd;
+        let (initrd_address, initrd_size) = match initrd {
+            Some(loaded) => (Some(loaded.address.raw_value()), Some(loaded.size)),
+            None => (None, None),
+        };
         let serial = resources
             .serial_device
             .as_ref()
@@ -539,8 +622,8 @@ impl GuestBootDiagnostics {
             boot_pc: session.boot_registers().kernel_entry.raw_value(),
             fdt_address: resources.fdt.address.raw_value(),
             fdt_size: resources.fdt.size,
-            initrd_address: initrd.address.raw_value(),
-            initrd_size: initrd.size,
+            initrd_address,
+            initrd_size,
             serial_mmio_base: serial.region.range().start().raw_value(),
             serial_mmio_size: serial.region.range().size(),
             serial_interrupt_line: serial.fdt_device.interrupt_line.raw_value(),
@@ -716,7 +799,10 @@ impl std::fmt::Display for GuestBootFailureReport<'_> {
         writeln!(f, "  last MMIO step: {last_mmio_step}")?;
         writeln!(f, "  serial tail hex: {serial_tail_hex}")?;
         writeln!(f, "  kernel path: {}", self.boot.kernel_path.display())?;
-        writeln!(f, "  initrd path: {}", self.boot.initrd_path.display())?;
+        match self.boot.initrd_path.as_ref() {
+            Some(path) => writeln!(f, "  initrd path: {}", path.display())?,
+            None => writeln!(f, "  initrd path: none")?,
+        }
         writeln!(f, "  boot args: {}", self.boot.boot_args)?;
         writeln!(f, "  boot PC: 0x{:x}", self.boot.boot_pc)?;
         writeln!(
@@ -724,11 +810,13 @@ impl std::fmt::Display for GuestBootFailureReport<'_> {
             "  FDT: address=0x{:x}, size={}",
             self.boot.fdt_address, self.boot.fdt_size
         )?;
-        writeln!(
-            f,
-            "  initrd: address=0x{:x}, size={}",
-            self.boot.initrd_address, self.boot.initrd_size
-        )?;
+        match (self.boot.initrd_address, self.boot.initrd_size) {
+            (Some(address), Some(size)) => {
+                writeln!(f, "  initrd: address=0x{address:x}, size={size}")?;
+            }
+            (None, None) => writeln!(f, "  initrd: none")?,
+            _ => writeln!(f, "  initrd: inconsistent metadata")?,
+        }
         writeln!(
             f,
             "  serial: base=0x{:x}, size={}, interrupt_line={}",
@@ -754,11 +842,9 @@ fn validate_pre_run_boot_metadata(
         resources
             .loaded_boot_source
             .initrd
-            .expect("guest boot test initrd should be loaded")
-            .address
-            .raw_value(),
+            .map(|loaded| loaded.address.raw_value()),
         diagnostics.initrd_address,
-        "guest boot test initrd address should match diagnostics"
+        "guest boot test loaded initrd address should match diagnostics"
     );
 
     let mut fdt_bytes = vec![0; resources.fdt.size];
@@ -772,14 +858,17 @@ fn validate_pre_run_boot_metadata(
         .find("/chosen")
         .expect("guest boot test FDT should contain /chosen");
     assert_eq!(chosen.prop_str("bootargs").unwrap(), diagnostics.boot_args);
-    assert_eq!(
-        chosen.prop_u64("linux,initrd-start").unwrap(),
-        diagnostics.initrd_address
-    );
-    assert_eq!(
-        chosen.prop_u64("linux,initrd-end").unwrap(),
-        diagnostics.initrd_address + diagnostics.initrd_size
-    );
+    match (diagnostics.initrd_address, diagnostics.initrd_size) {
+        (Some(address), Some(size)) => {
+            assert_eq!(chosen.prop_u64("linux,initrd-start").unwrap(), address);
+            assert_eq!(chosen.prop_u64("linux,initrd-end").unwrap(), address + size);
+        }
+        (None, None) => {
+            assert!(!chosen.has_prop("linux,initrd-start"));
+            assert!(!chosen.has_prop("linux,initrd-end"));
+        }
+        _ => panic!("guest boot test initrd diagnostics should be internally consistent"),
+    }
 
     let serial_node_path = format!("/uart@{:x}", diagnostics.serial_mmio_base);
     let serial = tree
@@ -977,13 +1066,13 @@ mod tests {
     fn guest_boot_failure_report_includes_boot_and_run_context() {
         let boot = GuestBootDiagnostics {
             kernel_path: "/tmp/vmlinux".into(),
-            initrd_path: "/tmp/initrd.cpio".into(),
-            boot_args: super::BOOT_ARGS.to_string(),
+            initrd_path: Some("/tmp/initrd.cpio".into()),
+            boot_args: super::INITRD_BOOT_ARGS.to_string(),
             boot_pc: 0x8020_0000,
             fdt_address: 0x87e0_0000,
             fdt_size: 4096,
-            initrd_address: 0x87df_f000,
-            initrd_size: 512,
+            initrd_address: Some(0x87df_f000),
+            initrd_size: Some(512),
             serial_mmio_base: 0x4000_0000,
             serial_mmio_size: 4096,
             serial_interrupt_line: 32,
