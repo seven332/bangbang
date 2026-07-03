@@ -898,7 +898,8 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use bangbang_runtime::BackendError;
+    use bangbang_runtime::logger::LoggerWriteError;
+    use bangbang_runtime::{BackendError, VmmActionError};
 
     use crate::vmm::{InstanceStartExecutor, ProcessVmm};
 
@@ -949,6 +950,18 @@ mod tests {
         version: &str,
     ) -> ProcessVmm<TestInstanceStarter> {
         ProcessVmm::with_starter(id, version, "bangbang", TestInstanceStarter::failure())
+    }
+
+    #[test]
+    fn handle_empty_maps_logger_write_errors_to_fault() {
+        let response = handle_empty(Err(VmmActionError::LoggerWrite(LoggerWriteError::Write(
+            std::io::ErrorKind::BrokenPipe,
+        ))));
+
+        assert_eq!(
+            response.body(),
+            r#"{"fault_message":"failed to write logger output: BrokenPipe"}"#
+        );
     }
 
     fn unique_socket_path(name: &str) -> PathBuf {

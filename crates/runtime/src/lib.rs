@@ -182,6 +182,7 @@ pub enum VmmActionError {
     BootSourceConfig(boot::BootSourceConfigError),
     DriveConfig(block::DriveConfigError),
     LoggerConfig(logger::LoggerConfigError),
+    LoggerWrite(logger::LoggerWriteError),
     MachineConfig(machine::MachineConfigError),
     MetricsConfig(metrics::MetricsConfigError),
     MetricsFlush(metrics::MetricsFlushError),
@@ -211,6 +212,7 @@ impl fmt::Display for VmmActionError {
             Self::BootSourceConfig(err) => write!(f, "{err}"),
             Self::DriveConfig(err) => write!(f, "{err}"),
             Self::LoggerConfig(err) => write!(f, "{err}"),
+            Self::LoggerWrite(err) => write!(f, "{err}"),
             Self::MachineConfig(err) => write!(f, "{err}"),
             Self::MetricsConfig(err) => write!(f, "{err}"),
             Self::MetricsFlush(err) => write!(f, "{err}"),
@@ -230,6 +232,7 @@ impl std::error::Error for VmmActionError {
             Self::BootSourceConfig(err) => Some(err),
             Self::DriveConfig(err) => Some(err),
             Self::LoggerConfig(err) => Some(err),
+            Self::LoggerWrite(err) => Some(err),
             Self::MachineConfig(err) => Some(err),
             Self::MetricsConfig(err) => Some(err),
             Self::MetricsFlush(err) => Some(err),
@@ -350,6 +353,9 @@ impl VmmController {
     {
         self.preflight_instance_start()?;
         executor(self).map_err(VmmActionError::InstanceStart)?;
+        self.logger_state
+            .log_action(VmmAction::InstanceStart.name())
+            .map_err(VmmActionError::LoggerWrite)?;
         self.instance_info.state = InstanceState::Running;
         Ok(VmmData::Empty)
     }
@@ -389,6 +395,9 @@ impl VmmController {
                 self.metrics_state
                     .flush()
                     .map_err(VmmActionError::MetricsFlush)?;
+                self.logger_state
+                    .log_action(VmmAction::FlushMetrics.name())
+                    .map_err(VmmActionError::LoggerWrite)?;
                 Ok(VmmData::Empty)
             }
             VmmAction::PutBootSource(config) => {
@@ -563,7 +572,7 @@ mod tests {
         boot::{
             BootCommandLineError, BootPayloadKind, BootSourceConfigError, BootSourceConfigInput,
         },
-        logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel},
+        logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel, LoggerWriteError},
         machine::{DEFAULT_MEM_SIZE_MIB, DEFAULT_VCPU_COUNT, MachineConfigInput},
         metrics::{MetricsConfigError, MetricsConfigInput},
         mmds::{
@@ -1408,6 +1417,60 @@ mod tests {
     }
 
     #[test]
+    fn start_instance_with_configured_logger_writes_action_log() {
+        let path = unique_logger_path("start-action");
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new()
+                    .with_log_path(&path)
+                    .with_show_level(true),
+            ))
+            .expect("logger config should be stored");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+
+        controller
+            .start_instance_with(|_| Ok(()))
+            .expect("startup executor success should commit running state");
+
+        assert_eq!(controller.instance_info().state, InstanceState::Running);
+        assert_eq!(
+            fs::read_to_string(&path).expect("logger output should be readable"),
+            "level=Info action=InstanceStart\n"
+        );
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn start_instance_with_executor_failure_does_not_write_logger_action() {
+        let path = unique_logger_path("start-action-failure");
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new().with_log_path(&path),
+            ))
+            .expect("logger config should be stored");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        let source = BackendError::InvalidState("fake startup failed");
+
+        let err = controller
+            .start_instance_with(|_| Err(source.clone()))
+            .expect_err("startup executor failure should be surfaced");
+
+        assert_eq!(err, VmmActionError::InstanceStart(source));
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert_eq!(
+            fs::read_to_string(&path).expect("logger output should be readable"),
+            ""
+        );
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
     fn start_instance_with_missing_boot_source_does_not_invoke_executor() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         let called = Cell::new(false);
@@ -1536,6 +1599,34 @@ mod tests {
             Ok(VmmData::Empty)
         );
         assert_eq!(controller.instance_info().state, InstanceState::Running);
+    }
+
+    #[test]
+    fn flush_metrics_after_start_writes_configured_logger_action() {
+        let path = unique_logger_path("flush-action");
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new().with_log_path(&path),
+            ))
+            .expect("logger config should be stored");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller
+            .commit_instance_start()
+            .expect("start commit should set running state");
+
+        assert_eq!(
+            controller.handle_action(VmmAction::FlushMetrics),
+            Ok(VmmData::Empty)
+        );
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("logger output should be readable"),
+            "action=InstanceStart\naction=FlushMetrics\n"
+        );
+        fs::remove_file(path).expect("fixture should clean up");
     }
 
     #[test]
@@ -1836,6 +1927,15 @@ mod tests {
         );
         assert!(!controller.logger_state.is_configured());
         assert_eq!(controller.logger_state.level(), LoggerLevel::Info);
+    }
+
+    #[test]
+    fn logger_write_error_preserves_redacted_source() {
+        let err =
+            VmmActionError::LoggerWrite(LoggerWriteError::Write(std::io::ErrorKind::BrokenPipe));
+
+        assert_eq!(err.to_string(), "failed to write logger output: BrokenPipe");
+        assert!(err.source().is_some());
     }
 
     #[test]

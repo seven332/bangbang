@@ -1773,6 +1773,7 @@ mod tests {
             | VmmActionError::BootSourceConfig(_)
             | VmmActionError::DriveConfig(_)
             | VmmActionError::LoggerConfig(_)
+            | VmmActionError::LoggerWrite(_)
             | VmmActionError::MachineConfig(_)
             | VmmActionError::MetricsConfig(_)
             | VmmActionError::MetricsFlush(_)
