@@ -116,6 +116,17 @@ impl MmdsPacketDetour {
             })?;
             return Ok(true);
         }
+        if classified.is_empty_reset_control() {
+            return Ok(true);
+        }
+        if classified.is_unsupported_empty_control_reset_request() {
+            self.response_queue.push_with(|| {
+                classified
+                    .reset_response_frame()
+                    .map_err(MmdsPacketDetourError::ResponseFrame)
+            })?;
+            return Ok(true);
+        }
         if classified.payload().is_empty() {
             return Ok(false);
         }
@@ -1200,6 +1211,7 @@ mod tests {
     const TCP_FLAGS_OFFSET: usize = 13;
     const TCP_FLAG_ACK: u8 = 0x10;
     const TCP_FLAG_FIN: u8 = 0x01;
+    const TCP_FLAG_PSH: u8 = 0x08;
     const TCP_FLAG_RST: u8 = 0x04;
     const TCP_FLAG_SYN: u8 = 0x02;
     const ARP_HARDWARE_TYPE_ETHERNET: u16 = 1;
@@ -1484,6 +1496,17 @@ mod tests {
     }
 
     fn mmds_tcp_fin_close_packet(
+        sequence_number: u32,
+        acknowledgement_number: u32,
+        flags: u8,
+    ) -> Vec<u8> {
+        let mut packet = mmds_tcp_packet_from_source(TEST_SOURCE_TCP_PORT, sequence_number, b"");
+        set_tcp_flags(&mut packet, flags);
+        set_tcp_acknowledgement_number(&mut packet, acknowledgement_number);
+        packet
+    }
+
+    fn mmds_tcp_empty_control_packet(
         sequence_number: u32,
         acknowledgement_number: u32,
         flags: u8,
@@ -2560,9 +2583,14 @@ mod tests {
     }
 
     #[test]
-    fn tx_sink_forwards_empty_non_fin_mmds_payload_when_detour_configured() {
-        let mut packet = mmds_tcp_packet(b"");
-        set_tcp_flags(&mut packet, TCP_FLAG_RST);
+    fn tx_sink_detours_mmds_reset_candidate_and_retains_reset_frame() {
+        let sequence_number = 0x0102_0304;
+        let acknowledgement_number = 0x1112_1314;
+        let packet = mmds_tcp_empty_control_packet(
+            sequence_number,
+            acknowledgement_number,
+            TCP_FLAG_PSH | TCP_FLAG_ACK,
+        );
         let mut memory = tx_memory();
         let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
         let response_queue = MmdsResponseQueue::with_capacity(2);
@@ -2575,21 +2603,94 @@ mod tests {
         packet_io
             .tx_sink()
             .transmit_frame(&memory, &frame)
-            .expect("empty non-FIN MMDS TX should forward");
+            .expect("MMDS reset candidate should detour");
 
         let state = packet_io
             .tx_sink()
             .shared
             .lock()
             .expect("test state lock should succeed");
-        assert_eq!(state.backend.write_calls, 1);
-        assert_eq!(state.backend.written_packets, [packet]);
+        assert_eq!(state.backend.write_calls, 0);
+        assert!(state.backend.written_packets.is_empty());
+        drop(state);
+        let responses = response_queue
+            .responses()
+            .expect("MMDS response queue should read");
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            mmds_response_frame_sequence_number(&responses[0]),
+            acknowledgement_number
+        );
+        assert_eq!(mmds_response_frame_acknowledgement_number(&responses[0]), 0);
+        assert_eq!(mmds_response_frame_tcp_flags(&responses[0]), TCP_FLAG_RST);
+        assert!(
+            mmds_response_frame_tcp_payload(&responses[0]).is_empty(),
+            "MMDS reset response should not carry HTTP payload"
+        );
+    }
+
+    #[test]
+    fn tx_sink_consumes_mmds_guest_rst_without_response() {
+        let packet = mmds_tcp_empty_control_packet(0x0102_0304, 0x1112_1314, TCP_FLAG_RST);
+        let mut memory = tx_memory();
+        let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        let mut packet_io = packet_io_with_mmds_detour(
+            FakeVmnetPacketIoBackend::default(),
+            MmdsStateHandle::default(),
+            response_queue.clone(),
+        );
+
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &frame)
+            .expect("MMDS guest RST should detour without response");
+
+        let state = packet_io
+            .tx_sink()
+            .shared
+            .lock()
+            .expect("test state lock should succeed");
+        assert_eq!(state.backend.write_calls, 0);
+        assert!(state.backend.written_packets.is_empty());
         drop(state);
         assert!(
             response_queue
                 .responses()
                 .expect("MMDS response queue should read")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn tx_sink_keeps_payload_carrying_mmds_packet_out_of_reset_path() {
+        let mut packet = mmds_tcp_packet(b"GET /meta-data/hostname HTTP/1.1\r\n\r\n");
+        set_tcp_flags(&mut packet, TCP_FLAG_PSH | TCP_FLAG_ACK);
+        let mut memory = tx_memory();
+        let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        let mut packet_io = packet_io_with_mmds_detour(
+            FakeVmnetPacketIoBackend::default(),
+            MmdsStateHandle::default(),
+            response_queue.clone(),
+        );
+
+        packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &frame)
+            .expect("MMDS payload request should detour");
+
+        let responses = response_queue
+            .responses()
+            .expect("MMDS response queue should read");
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            mmds_response_frame_tcp_flags(&responses[0]),
+            TCP_FLAG_PSH | TCP_FLAG_ACK
+        );
+        assert!(
+            !mmds_response_frame_tcp_payload(&responses[0]).is_empty(),
+            "MMDS payload request should receive HTTP response bytes, not a reset"
         );
     }
 
@@ -2621,6 +2722,45 @@ mod tests {
             .lock()
             .expect("test state lock should succeed");
         assert_eq!(state.backend.write_calls, 0);
+        drop(state);
+        assert!(
+            response_queue
+                .responses()
+                .expect("MMDS response queue should read")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn tx_sink_reports_mmds_reset_queue_overflow_without_vmnet_write() {
+        let packet =
+            mmds_tcp_empty_control_packet(0x0102_0304, 0x1112_1314, TCP_FLAG_PSH | TCP_FLAG_ACK);
+        let mut memory = tx_memory();
+        let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
+        let response_queue = MmdsResponseQueue::with_capacity(0);
+        let mut packet_io = packet_io_with_mmds_detour(
+            FakeVmnetPacketIoBackend::default(),
+            MmdsStateHandle::default(),
+            response_queue.clone(),
+        );
+
+        let error = packet_io
+            .tx_sink()
+            .transmit_frame(&memory, &frame)
+            .expect_err("MMDS reset queue overflow should fail TX");
+
+        assert!(
+            error
+                .message()
+                .contains("MMDS packet detour failed: MMDS response queue is full at capacity 0")
+        );
+        let state = packet_io
+            .tx_sink()
+            .shared
+            .lock()
+            .expect("test state lock should succeed");
+        assert_eq!(state.backend.write_calls, 0);
+        assert!(state.backend.written_packets.is_empty());
         drop(state);
         assert!(
             response_queue

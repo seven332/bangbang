@@ -47,6 +47,7 @@ const TCP_DESTINATION_PORT_OFFSET: usize = 2;
 const TCP_FLAG_ACK: u8 = 0x10;
 const TCP_FLAG_FIN: u8 = 0x01;
 const TCP_FLAG_PSH: u8 = 0x08;
+const TCP_FLAG_RST: u8 = 0x04;
 const TCP_FLAG_SYN: u8 = 0x02;
 const TCP_FLAGS_OFFSET: usize = 13;
 const TCP_MIN_HEADER_WORDS: u8 = 5;
@@ -214,6 +215,18 @@ impl<'a> MmdsGuestTcpPacket<'a> {
             && self.payload.is_empty()
     }
 
+    pub fn is_empty_reset_control(self) -> bool {
+        self.tcp_flags & TCP_FLAG_RST != 0 && self.payload.is_empty()
+    }
+
+    pub fn is_unsupported_empty_control_reset_request(self) -> bool {
+        self.payload.is_empty()
+            && !self.is_initial_synchronization_request()
+            && !self.is_acknowledgement_only()
+            && !self.is_empty_fin_close_request()
+            && !self.is_empty_reset_control()
+    }
+
     pub const fn response_context(self) -> MmdsGuestTcpResponseContext {
         MmdsGuestTcpResponseContext {
             source_ethernet_address: self.source_ethernet_address,
@@ -249,6 +262,13 @@ impl<'a> MmdsGuestTcpPacket<'a> {
         }
         self.response_context().fin_close_response_frames()
     }
+
+    pub fn reset_response_frame(self) -> Result<Vec<u8>, MmdsGuestTcpResponseFrameError> {
+        if !self.is_unsupported_empty_control_reset_request() {
+            return Err(MmdsGuestTcpResponseFrameError::NotUnsupportedEmptyControlRequest);
+        }
+        self.response_context().reset_response_frame()
+    }
 }
 
 impl MmdsGuestTcpResponseContext {
@@ -283,6 +303,26 @@ impl MmdsGuestTcpResponseContext {
             self.control_response_frame(TCP_FLAG_ACK)?,
             self.control_response_frame(TCP_FLAG_FIN | TCP_FLAG_ACK)?,
         ])
+    }
+
+    fn reset_response_frame(self) -> Result<Vec<u8>, MmdsGuestTcpResponseFrameError> {
+        let parts = if self.tcp_flags & TCP_FLAG_ACK != 0 {
+            MmdsGuestTcpResponseFrameParts {
+                sequence_number: self.acknowledgement_number,
+                acknowledgement_number: 0,
+                tcp_flags: TCP_FLAG_RST,
+                tcp_payload: &[],
+            }
+        } else {
+            MmdsGuestTcpResponseFrameParts {
+                sequence_number: 0,
+                acknowledgement_number: self.sequence_number,
+                tcp_flags: TCP_FLAG_RST | TCP_FLAG_ACK,
+                tcp_payload: &[],
+            }
+        };
+
+        mmds_guest_tcp_response_frame_with_parts(self, parts)
     }
 
     fn control_response_frame(
@@ -576,6 +616,7 @@ pub enum MmdsGuestTcpResponseFrameError {
     InternalFrameLayout,
     NotConnectionCloseRequest,
     NotInitialSynchronizationRequest,
+    NotUnsupportedEmptyControlRequest,
     PayloadTooLarge { payload_len: usize },
     RequestPayloadTooLarge { request_payload_len: usize },
 }
@@ -591,6 +632,9 @@ impl fmt::Display for MmdsGuestTcpResponseFrameError {
             ),
             Self::NotInitialSynchronizationRequest => f.write_str(
                 "MMDS guest TCP SYN-ACK response requires an initial SYN request packet",
+            ),
+            Self::NotUnsupportedEmptyControlRequest => f.write_str(
+                "MMDS guest TCP RST response requires an unsupported empty control packet",
             ),
             Self::PayloadTooLarge { payload_len } => write!(
                 f,
@@ -2033,7 +2077,6 @@ mod tests {
     use crate::network::NetworkInterfaceConfigInput;
 
     const ARP_TARGET_HARDWARE_ADDRESS_OFFSET: usize = 18;
-    const TEST_TCP_FLAG_RST: u8 = 0x04;
 
     fn query_value() -> Value {
         serde_json::json!({
@@ -2224,6 +2267,72 @@ mod tests {
         frame
             .get(ETHERNET_HEADER_LEN..ETHERNET_HEADER_LEN + ARP_ETHERNET_IPV4_LEN)
             .expect("response frame should include ARP payload")
+    }
+
+    fn assert_empty_tcp_response_frame(
+        response: &[u8],
+        expected_sequence_number: u32,
+        expected_acknowledgement_number: u32,
+        expected_tcp_flags: u8,
+    ) {
+        assert_eq!(
+            response.len(),
+            ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN + TCP_MIN_HEADER_LEN
+        );
+        assert_eq!(
+            packet_array::<ETHERNET_MAC_ADDRESS_LEN>(response, ETHERNET_DESTINATION_ADDRESS_OFFSET),
+            Some(test_source_ethernet_address().octets())
+        );
+        assert_eq!(
+            packet_array::<ETHERNET_MAC_ADDRESS_LEN>(response, ETHERNET_SOURCE_ADDRESS_OFFSET),
+            Some(test_destination_ethernet_address().octets())
+        );
+
+        let ipv4_header = response
+            .get(ETHERNET_HEADER_LEN..ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN)
+            .expect("response frame should include IPv4 header");
+        assert_eq!(
+            packet_u16(ipv4_header, IPV4_TOTAL_LENGTH_OFFSET),
+            Some(u16::try_from(IPV4_MIN_HEADER_LEN + TCP_MIN_HEADER_LEN).expect("len fits u16"))
+        );
+        assert_eq!(
+            packet_ipv4_address(ipv4_header, IPV4_SOURCE_ADDRESS_OFFSET),
+            Some(test_mmds_ipv4_address())
+        );
+        assert_eq!(
+            packet_ipv4_address(ipv4_header, IPV4_DESTINATION_ADDRESS_OFFSET),
+            Some(test_source_ipv4_address())
+        );
+        assert_eq!(internet_checksum(ipv4_header), 0);
+
+        let tcp_segment = response_frame_tcp_segment(response);
+        assert_eq!(
+            packet_u16(tcp_segment, TCP_SOURCE_PORT_OFFSET),
+            Some(MMDS_GUEST_TCP_PORT)
+        );
+        assert_eq!(
+            packet_u16(tcp_segment, TCP_DESTINATION_PORT_OFFSET),
+            Some(49152)
+        );
+        assert_eq!(
+            packet_u32(tcp_segment, TCP_SEQUENCE_NUMBER_OFFSET),
+            Some(expected_sequence_number)
+        );
+        assert_eq!(
+            packet_u32(tcp_segment, TCP_ACKNOWLEDGEMENT_NUMBER_OFFSET),
+            Some(expected_acknowledgement_number)
+        );
+        assert_eq!(tcp_segment.get(TCP_FLAGS_OFFSET), Some(&expected_tcp_flags));
+        assert_eq!(
+            tcp_ipv4_checksum(
+                test_mmds_ipv4_address(),
+                test_source_ipv4_address(),
+                u16::try_from(tcp_segment.len()).expect("TCP segment length should fit u16"),
+                tcp_segment,
+            ),
+            0
+        );
+        assert!(response_frame_tcp_payload(response).is_empty());
     }
 
     fn assert_json_value(output: &str, expected: Value) {
@@ -2477,7 +2586,7 @@ mod tests {
             TCP_FLAG_SYN,
             TCP_FLAG_SYN | TCP_FLAG_ACK,
             TCP_FLAG_FIN,
-            TEST_TCP_FLAG_RST,
+            TCP_FLAG_RST,
         ] {
             let mut control_packet = ack_packet.clone();
             control_packet[tcp_start + TCP_FLAGS_OFFSET] = flags;
@@ -2509,8 +2618,8 @@ mod tests {
         for flags in [
             TCP_FLAG_ACK,
             TCP_FLAG_SYN,
-            TEST_TCP_FLAG_RST,
-            TCP_FLAG_FIN | TEST_TCP_FLAG_RST,
+            TCP_FLAG_RST,
+            TCP_FLAG_FIN | TCP_FLAG_RST,
         ] {
             let mut control_packet = test_mmds_tcp_packet(b"");
             control_packet[tcp_start + TCP_FLAGS_OFFSET] = flags;
@@ -2525,6 +2634,79 @@ mod tests {
             classify_mmds_guest_tcp_packet(&fin_with_payload, test_mmds_ipv4_address())
                 .expect("MMDS TCP FIN with payload should classify");
         assert!(!fin_with_payload.is_empty_fin_close_request());
+    }
+
+    #[test]
+    fn identifies_empty_mmds_guest_tcp_reset_control_packet() {
+        let tcp_start = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN;
+
+        for flags in [
+            TCP_FLAG_RST,
+            TCP_FLAG_RST | TCP_FLAG_ACK,
+            TCP_FLAG_FIN | TCP_FLAG_RST,
+        ] {
+            let mut reset_packet = test_mmds_tcp_packet(b"");
+            reset_packet[tcp_start + TCP_FLAGS_OFFSET] = flags;
+            let reset = classify_mmds_guest_tcp_packet(&reset_packet, test_mmds_ipv4_address())
+                .expect("MMDS TCP reset control packet should classify");
+            assert!(reset.is_empty_reset_control());
+        }
+
+        let mut reset_with_payload = test_mmds_tcp_packet(b"payload");
+        reset_with_payload[tcp_start + TCP_FLAGS_OFFSET] = TCP_FLAG_RST | TCP_FLAG_ACK;
+        let reset_with_payload =
+            classify_mmds_guest_tcp_packet(&reset_with_payload, test_mmds_ipv4_address())
+                .expect("MMDS TCP reset with payload should classify");
+        assert!(!reset_with_payload.is_empty_reset_control());
+
+        let mut psh_packet = test_mmds_tcp_packet(b"");
+        psh_packet[tcp_start + TCP_FLAGS_OFFSET] = TCP_FLAG_PSH;
+        let psh = classify_mmds_guest_tcp_packet(&psh_packet, test_mmds_ipv4_address())
+            .expect("MMDS TCP PSH control packet should classify");
+        assert!(!psh.is_empty_reset_control());
+    }
+
+    #[test]
+    fn identifies_unsupported_empty_mmds_guest_tcp_control_reset_request() {
+        let tcp_start = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN;
+
+        for flags in [
+            0,
+            TCP_FLAG_PSH,
+            TCP_FLAG_PSH | TCP_FLAG_ACK,
+            TCP_FLAG_SYN | TCP_FLAG_ACK,
+            TCP_FLAG_FIN | TCP_FLAG_PSH,
+        ] {
+            let mut unsupported_packet = test_mmds_tcp_packet(b"");
+            unsupported_packet[tcp_start + TCP_FLAGS_OFFSET] = flags;
+            let unsupported =
+                classify_mmds_guest_tcp_packet(&unsupported_packet, test_mmds_ipv4_address())
+                    .expect("MMDS TCP unsupported control packet should classify");
+            assert!(unsupported.is_unsupported_empty_control_reset_request());
+        }
+
+        for flags in [
+            TCP_FLAG_SYN,
+            TCP_FLAG_ACK,
+            TCP_FLAG_FIN,
+            TCP_FLAG_FIN | TCP_FLAG_ACK,
+            TCP_FLAG_RST,
+            TCP_FLAG_RST | TCP_FLAG_ACK,
+        ] {
+            let mut excluded_packet = test_mmds_tcp_packet(b"");
+            excluded_packet[tcp_start + TCP_FLAGS_OFFSET] = flags;
+            let excluded =
+                classify_mmds_guest_tcp_packet(&excluded_packet, test_mmds_ipv4_address())
+                    .expect("MMDS TCP excluded control packet should classify");
+            assert!(!excluded.is_unsupported_empty_control_reset_request());
+        }
+
+        let mut psh_with_payload = test_mmds_tcp_packet(b"payload");
+        psh_with_payload[tcp_start + TCP_FLAGS_OFFSET] = TCP_FLAG_PSH | TCP_FLAG_ACK;
+        let psh_with_payload =
+            classify_mmds_guest_tcp_packet(&psh_with_payload, test_mmds_ipv4_address())
+                .expect("MMDS TCP payload packet should classify");
+        assert!(!psh_with_payload.is_unsupported_empty_control_reset_request());
     }
 
     #[test]
@@ -2728,6 +2910,88 @@ mod tests {
         assert_eq!(
             classified.fin_close_response_frames(),
             Err(MmdsGuestTcpResponseFrameError::NotConnectionCloseRequest)
+        );
+    }
+
+    #[test]
+    fn mmds_guest_tcp_reset_response_frame_targets_requester_with_ack_flag() {
+        let tcp_start = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN;
+        let mut packet = test_mmds_tcp_packet(b"");
+        packet[tcp_start + TCP_FLAGS_OFFSET] = TCP_FLAG_PSH | TCP_FLAG_ACK;
+        write_packet_u32(
+            &mut packet,
+            tcp_start + TCP_SEQUENCE_NUMBER_OFFSET,
+            0x0102_0304,
+        );
+        write_packet_u32(
+            &mut packet,
+            tcp_start + TCP_ACKNOWLEDGEMENT_NUMBER_OFFSET,
+            0x1112_1314,
+        );
+        let classified = classify_mmds_guest_tcp_packet(&packet, test_mmds_ipv4_address())
+            .expect("MMDS TCP reset candidate should classify");
+
+        let response = classified
+            .reset_response_frame()
+            .expect("RST response frame should synthesize");
+
+        assert_empty_tcp_response_frame(&response, 0x1112_1314, 0, TCP_FLAG_RST);
+    }
+
+    #[test]
+    fn mmds_guest_tcp_reset_response_frame_targets_requester_without_ack_flag() {
+        let tcp_start = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN;
+        let mut packet = test_mmds_tcp_packet(b"");
+        packet[tcp_start + TCP_FLAGS_OFFSET] = TCP_FLAG_FIN | TCP_FLAG_PSH;
+        write_packet_u32(
+            &mut packet,
+            tcp_start + TCP_SEQUENCE_NUMBER_OFFSET,
+            0x0102_0304,
+        );
+        write_packet_u32(
+            &mut packet,
+            tcp_start + TCP_ACKNOWLEDGEMENT_NUMBER_OFFSET,
+            0x1112_1314,
+        );
+        let classified = classify_mmds_guest_tcp_packet(&packet, test_mmds_ipv4_address())
+            .expect("MMDS TCP reset candidate should classify");
+
+        let response = classified
+            .reset_response_frame()
+            .expect("RST response frame should synthesize");
+
+        assert_empty_tcp_response_frame(&response, 0, 0x0102_0304, TCP_FLAG_RST | TCP_FLAG_ACK);
+    }
+
+    #[test]
+    fn mmds_guest_tcp_reset_response_frame_rejects_supported_reset_and_payload_packets() {
+        let tcp_start = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN;
+
+        for flags in [
+            TCP_FLAG_SYN,
+            TCP_FLAG_ACK,
+            TCP_FLAG_FIN,
+            TCP_FLAG_FIN | TCP_FLAG_ACK,
+            TCP_FLAG_RST,
+            TCP_FLAG_RST | TCP_FLAG_ACK,
+        ] {
+            let mut packet = test_mmds_tcp_packet(b"");
+            packet[tcp_start + TCP_FLAGS_OFFSET] = flags;
+            let classified = classify_mmds_guest_tcp_packet(&packet, test_mmds_ipv4_address())
+                .expect("MMDS TCP packet should classify");
+            assert_eq!(
+                classified.reset_response_frame(),
+                Err(MmdsGuestTcpResponseFrameError::NotUnsupportedEmptyControlRequest)
+            );
+        }
+
+        let mut payload_packet = test_mmds_tcp_packet(b"payload");
+        payload_packet[tcp_start + TCP_FLAGS_OFFSET] = TCP_FLAG_PSH | TCP_FLAG_ACK;
+        let payload = classify_mmds_guest_tcp_packet(&payload_packet, test_mmds_ipv4_address())
+            .expect("MMDS TCP payload packet should classify");
+        assert_eq!(
+            payload.reset_response_frame(),
+            Err(MmdsGuestTcpResponseFrameError::NotUnsupportedEmptyControlRequest)
         );
     }
 

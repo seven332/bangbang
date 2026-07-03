@@ -207,22 +207,26 @@ pure empty-payload TCP SYN candidates, the runtime can synthesize deterministic
 SYN-ACK frames, and pure empty-payload TCP ACK-only candidates are consumed
 without queueing a response. Pure empty-payload TCP FIN close candidates queue
 deterministic ACK and FIN-ACK frames without touching MMDS data or token state.
+Unsupported empty-payload TCP control candidates queue deterministic RST frames
+without touching MMDS data or token state, and guest-sent RST controls are
+consumed without response to avoid reset loops.
 For non-empty candidate TCP payloads, the runtime can produce the same
 process-local HTTP response bytes as the existing guest HTTP helper, including
 token PUT and MMDS v2 GET token enforcement. The process vmnet TX path detours
 MMDS ARP requests, pure empty-payload MMDS SYN packets, pure empty-payload MMDS
-ACK-only packets, pure empty-payload MMDS FIN close packets, and those
+ACK-only packets, pure empty-payload MMDS FIN close packets, unsupported
+empty-payload MMDS control packets, guest-sent MMDS RST packets, and
 non-empty candidates only for interfaces listed in the MMDS config, buffers
 ordered split request headers in bounded per-interface process state,
 synthesizes response frames from deterministic ARP context, deterministic
-SYN-ACK context, minimal FIN close context, or the first TCP request fragment
-context, retains those frames in bounded per-interface queues, delivers queued
+SYN-ACK context, minimal FIN close context, minimal RST context, or the first
+TCP request fragment context, retains those frames in bounded per-interface queues, delivers queued
 frames through the matching virtio-net RX source with a bounded post-TX RX
 retry, and does not forward handled request payloads to vmnet. This still does
 not manage a full ARP cache, emit gratuitous ARP, implement ARP
 timeouts/retries, validate TCP ACK numbers, reassemble out-of-order TCP data,
-track TCP state, implement retransmission policy, generate RSTs, or handle
-session timeouts. Future
+track TCP state, implement retransmission policy, implement a full stateful RST
+policy, or handle session timeouts. Future
 guest-visible MMDS work must continue validating device, packet, token, and
 TCP/session inputs before expanding the guest-visible data path.
 
@@ -266,10 +270,11 @@ The current scaffold does not implement:
   delegating packet I/O, and an internal virtio-net adapter that can move
   packets between vmnet and the runtime packet traits, detour configured MMDS
   ARP requests, pure empty-payload MMDS SYN packets, pure empty-payload MMDS
-  ACK-only packets, pure empty-payload MMDS FIN close packets, and non-empty
+  ACK-only packets, pure empty-payload MMDS FIN close packets, unsupported
+  empty-payload MMDS control packets, guest-sent MMDS RST packets, and non-empty
   MMDS TX payloads before vmnet forwarding, buffer ordered split MMDS request headers,
-  synthesize deterministic ARP replies, MMDS SYN-ACK frames, and MMDS TCP
-  response frames, retain bounded per-interface MMDS response queues,
+  synthesize deterministic ARP replies, MMDS SYN-ACK frames, minimal MMDS RST
+  frames, and MMDS TCP response frames, retain bounded per-interface MMDS response queues,
   and expose queued responses through virtio-net RX with bounded post-TX retry, plus an
   internal provider that can select prebuilt adapters by configured interface
   ID and an internal `host_dev_name` mapping for
