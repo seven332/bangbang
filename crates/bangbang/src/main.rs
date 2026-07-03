@@ -17,6 +17,9 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::{SigId, low_level};
 use vmm::ProcessVmm;
 
+use bangbang_runtime::logger::{LoggerConfigInput, LoggerLevel};
+use bangbang_runtime::{VmmAction, VmmActionError};
+
 const DEFAULT_API_SOCK_PATH: &str = "/tmp/bangbang.socket";
 const DEFAULT_INSTANCE_ID: &str = "anonymous-instance";
 const APP_NAME: &str = "bangbang";
@@ -28,18 +31,13 @@ const UNSUPPORTED_FIRECRACKER_ARGS: &[&str] = &[
     "describe-snapshot",
     "enable-pci",
     "http-api-max-payload-size",
-    "level",
-    "log-path",
     "metadata",
     "metrics-path",
     "mmds-size-limit",
-    "module",
     "no-api",
     "no-seccomp",
     "parent-cpu-time-us",
     "seccomp-filter",
-    "show-level",
-    "show-log-origin",
     "snapshot-version",
     "start-time-cpu-us",
     "start-time-us",
@@ -69,21 +67,44 @@ fn run() -> Result<(), ProcessError> {
             return Ok(());
         }
         Command::Run(config) => {
+            let StartupConfig {
+                api_sock,
+                id,
+                logger_config,
+            } = config;
+
             println!("bangbang {}", env!("CARGO_PKG_VERSION"));
             println!(
                 "hvf target supported: {}",
                 HvfBackend::is_supported_target()
             );
 
+            let mut vmm = ProcessVmm::new(id, env!("CARGO_PKG_VERSION"), APP_NAME);
+            apply_startup_logger_config(&mut vmm, logger_config)?;
             let mut shutdown_signal = ShutdownSignal::install()?;
-            let server = ApiServer::bind(&config.api_sock).map_err(ProcessError::ApiServer)?;
-            let mut vmm = ProcessVmm::new(config.id, env!("CARGO_PKG_VERSION"), APP_NAME);
+            let server = ApiServer::bind(&api_sock).map_err(ProcessError::ApiServer)?;
             println!("status: API server listening; VM execution loop is not implemented yet");
             let shutdown_wakeup = shutdown_signal.wakeup_reader();
             server
                 .run_until(&mut vmm, shutdown_wakeup)
                 .map_err(ProcessError::ApiServer)?;
         }
+    }
+
+    Ok(())
+}
+
+fn apply_startup_logger_config<S>(
+    vmm: &mut ProcessVmm<S>,
+    logger_config: Option<LoggerConfigInput>,
+) -> Result<(), ProcessError>
+where
+    S: vmm::InstanceStartExecutor,
+{
+    if let Some(logger_config) = logger_config {
+        vmm.handle_action(VmmAction::PutLogger(logger_config))
+            .map(|_| ())
+            .map_err(ProcessError::StartupConfiguration)?;
     }
 
     Ok(())
@@ -117,6 +138,7 @@ enum ProcessError {
     ApiServer(ApiServerError),
     ArgumentParsing(String),
     SignalHandler(std::io::ErrorKind),
+    StartupConfiguration(VmmActionError),
 }
 
 impl ProcessError {
@@ -125,6 +147,7 @@ impl ProcessError {
             Self::ApiServer(_) => ProcessExitCode::ProcessFailure,
             Self::ArgumentParsing(_) => ProcessExitCode::ArgumentParsing,
             Self::SignalHandler(_) => ProcessExitCode::ProcessFailure,
+            Self::StartupConfiguration(_) => ProcessExitCode::ProcessFailure,
         }
     }
 }
@@ -136,6 +159,9 @@ impl fmt::Display for ProcessError {
             Self::ArgumentParsing(message) => f.write_str(message),
             Self::SignalHandler(kind) => {
                 write!(f, "failed to register shutdown signal handler: {kind:?}")
+            }
+            Self::StartupConfiguration(err) => {
+                write!(f, "startup configuration error: {err}")
             }
         }
     }
@@ -214,6 +240,7 @@ enum Command {
 struct StartupConfig {
     api_sock: String,
     id: String,
+    logger_config: Option<LoggerConfigInput>,
 }
 
 impl Default for StartupConfig {
@@ -221,6 +248,7 @@ impl Default for StartupConfig {
         Self {
             api_sock: DEFAULT_API_SOCK_PATH.to_string(),
             id: DEFAULT_INSTANCE_ID.to_string(),
+            logger_config: None,
         }
     }
 }
@@ -273,6 +301,13 @@ impl Args {
         let mut config = StartupConfig::default();
         let mut api_sock_seen = false;
         let mut id_seen = false;
+        let mut logger_config = LoggerConfigInput::new();
+        let mut logger_config_seen = false;
+        let mut log_path_seen = false;
+        let mut level_seen = false;
+        let mut module_seen = false;
+        let mut show_level_seen = false;
+        let mut show_log_origin_seen = false;
         let mut index = 0;
 
         while let Some(arg) = args.get(index) {
@@ -297,6 +332,57 @@ impl Args {
                     id_seen = true;
                     index += 2;
                 }
+                "--log-path" => {
+                    if log_path_seen {
+                        return Err("duplicate argument: --log-path".to_string());
+                    }
+                    let value = take_value(&args, index, "--log-path")?;
+                    logger_config = logger_config.with_log_path(value);
+                    logger_config_seen = true;
+                    log_path_seen = true;
+                    index += 2;
+                }
+                "--level" => {
+                    if level_seen {
+                        return Err("duplicate argument: --level".to_string());
+                    }
+                    let value = take_value(&args, index, "--level")?;
+                    let level = value
+                        .parse::<LoggerLevel>()
+                        .map_err(|err| format!("invalid --level: {err}"))?;
+                    logger_config = logger_config.with_level(level);
+                    logger_config_seen = true;
+                    level_seen = true;
+                    index += 2;
+                }
+                "--module" => {
+                    if module_seen {
+                        return Err("duplicate argument: --module".to_string());
+                    }
+                    let value = take_value(&args, index, "--module")?;
+                    logger_config = logger_config.with_module(value);
+                    logger_config_seen = true;
+                    module_seen = true;
+                    index += 2;
+                }
+                "--show-level" => {
+                    if show_level_seen {
+                        return Err("duplicate argument: --show-level".to_string());
+                    }
+                    logger_config = logger_config.with_show_level(true);
+                    logger_config_seen = true;
+                    show_level_seen = true;
+                    index += 1;
+                }
+                "--show-log-origin" => {
+                    if show_log_origin_seen {
+                        return Err("duplicate argument: --show-log-origin".to_string());
+                    }
+                    logger_config = logger_config.with_show_log_origin(true);
+                    logger_config_seen = true;
+                    show_log_origin_seen = true;
+                    index += 1;
+                }
                 other => {
                     if let Some(name) = unsupported_firecracker_arg(other) {
                         return Err(format!("unsupported Firecracker argument: --{name}"));
@@ -315,6 +401,10 @@ impl Args {
                     return Err("unexpected positional argument".to_string());
                 }
             }
+        }
+
+        if logger_config_seen {
+            config.logger_config = Some(logger_config);
         }
 
         Ok(Self {
@@ -342,6 +432,11 @@ fn help_text() -> String {
             "      --api-sock <PATH>  Unix domain socket path for the API server [default: {}]\n",
             "      --id <ID>          MicroVM unique identifier [default: {}]\n",
             "                         Accepts 1-64 bytes, ASCII alphanumeric or '-'\n",
+            "      --log-path <PATH>  Logger output file or FIFO path\n",
+            "      --level <LEVEL>    Logger level: Off, Trace, Debug, Info, Warn, or Error\n",
+            "      --module <MODULE>  Logger module filter stored for future log integration\n",
+            "      --show-level       Include level in minimal logger action lines\n",
+            "      --show-log-origin  Store log-origin flag for future log integration\n",
             "  -V, --version          Print version\n",
             "  -h, --help             Print help\n\n",
             "Current scope:\n",
@@ -350,7 +445,7 @@ fn help_text() -> String {
             "pre-boot PUT /drives/{{drive_id}}, pre-boot ",
             "PUT /network-interfaces/{{iface_id}}, pre-boot PUT /vsock, ",
             "pre-boot PUT /metrics, and pre-boot PUT /logger configuration ",
-            "with minimal action logs over the API ",
+            "with minimal action logs over the API or logger startup CLI ",
             "socket; PUT /actions starts a process-owned HVF boot run-loop ",
             "worker across bounded step windows for InstanceStart, but public ",
             "run-loop control is not implemented yet."
@@ -417,20 +512,49 @@ fn display_arg_name(arg: &str) -> &str {
 }
 
 fn unsupported_equals_syntax(arg: &str) -> Option<&'static str> {
-    [("--api-sock=", "api-sock"), ("--id=", "id")]
-        .into_iter()
-        .find_map(|(prefix, name)| arg.starts_with(prefix).then_some(name))
+    [
+        ("--api-sock=", "api-sock"),
+        ("--id=", "id"),
+        ("--log-path=", "log-path"),
+        ("--level=", "level"),
+        ("--module=", "module"),
+    ]
+    .into_iter()
+    .find_map(|(prefix, name)| arg.starts_with(prefix).then_some(name))
 }
 
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::fs;
     use std::os::unix::ffi::OsStringExt;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel};
+    use bangbang_runtime::{BackendError, VmmAction};
+
+    use crate::vmm::{InstanceStartExecutor, ProcessVmm};
 
     use super::{
         ApiServerError, Args, Command, DEFAULT_API_SOCK_PATH, DEFAULT_INSTANCE_ID,
         MAX_INSTANCE_ID_LEN, ProcessError, ProcessExitCode, StartupConfig, parse_process_args,
     };
+
+    #[derive(Debug, Clone)]
+    struct TestInstanceStarter;
+
+    impl InstanceStartExecutor for TestInstanceStarter {
+        type Session = ();
+
+        fn start(
+            &mut self,
+            _controller: &bangbang_runtime::VmmController,
+        ) -> Result<Self::Session, BackendError> {
+            Ok(())
+        }
+    }
 
     fn parse(args: &[&str]) -> Result<Args, String> {
         Args::parse(args.iter().map(|arg| arg.to_string()))
@@ -441,6 +565,17 @@ mod tests {
             Command::Run(config) => Ok(config),
             command => Err(format!("expected run command, got {command:?}")),
         }
+    }
+
+    fn unique_logger_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bangbang-main-test-{}-{nanos}-{name}.log",
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -454,6 +589,19 @@ mod tests {
         let err = ProcessError::ApiServer(ApiServerError::SocketPathExists);
 
         assert_eq!(err.exit_code(), ProcessExitCode::ProcessFailure);
+    }
+
+    #[test]
+    fn startup_configuration_error_maps_to_process_failure_exit_code() {
+        let err = ProcessError::StartupConfiguration(
+            bangbang_runtime::VmmActionError::LoggerConfig(LoggerConfigError::EmptyPath),
+        );
+
+        assert_eq!(err.exit_code(), ProcessExitCode::ProcessFailure);
+        assert_eq!(
+            err.to_string(),
+            "startup configuration error: logger path must not be empty"
+        );
     }
 
     #[test]
@@ -504,6 +652,7 @@ mod tests {
 
         assert_eq!(config.api_sock, DEFAULT_API_SOCK_PATH);
         assert_eq!(config.id, DEFAULT_INSTANCE_ID);
+        assert_eq!(config.logger_config, None);
     }
 
     #[test]
@@ -525,6 +674,8 @@ mod tests {
         assert!(help.contains("pre-boot PUT /drives/{drive_id}"));
         assert!(help.contains("pre-boot PUT /metrics"));
         assert!(help.contains("pre-boot PUT /logger configuration with minimal action logs"));
+        assert!(help.contains("--log-path <PATH>"));
+        assert!(help.contains("--show-level"));
         assert!(help.contains("PUT /actions starts a process-owned HVF boot run-loop worker"));
         assert!(help.contains("across bounded step windows for InstanceStart"));
         assert!(help.contains("public run-loop control is not implemented yet"));
@@ -572,6 +723,7 @@ mod tests {
 
         assert_eq!(config.api_sock, "/tmp/custom.socket");
         assert_eq!(config.id, DEFAULT_INSTANCE_ID);
+        assert_eq!(config.logger_config, None);
     }
 
     #[test]
@@ -580,6 +732,34 @@ mod tests {
 
         assert_eq!(config.api_sock, DEFAULT_API_SOCK_PATH);
         assert_eq!(config.id, "demo-1");
+        assert_eq!(config.logger_config, None);
+    }
+
+    #[test]
+    fn parse_logger_startup_args() {
+        let config = parse_run(&[
+            "--log-path",
+            "/tmp/bangbang.log",
+            "--level",
+            "Warning",
+            "--module",
+            "api_server",
+            "--show-level",
+            "--show-log-origin",
+        ])
+        .expect("logger startup args should parse");
+
+        assert_eq!(
+            config.logger_config,
+            Some(
+                LoggerConfigInput::new()
+                    .with_log_path("/tmp/bangbang.log")
+                    .with_level(LoggerLevel::Warn)
+                    .with_module("api_server")
+                    .with_show_level(true)
+                    .with_show_log_origin(true)
+            )
+        );
     }
 
     #[test]
@@ -589,6 +769,7 @@ mod tests {
 
         assert_eq!(config.api_sock, "/tmp/custom.socket");
         assert_eq!(config.id, "demo-1");
+        assert_eq!(config.logger_config, None);
     }
 
     #[test]
@@ -603,6 +784,13 @@ mod tests {
         let err = parse(&["--id", "--api-sock"]).expect_err("missing id value should fail");
 
         assert_eq!(err, "missing value for --id");
+    }
+
+    #[test]
+    fn rejects_missing_log_path_value() {
+        let err = parse(&["--log-path", "--id"]).expect_err("missing log path value should fail");
+
+        assert_eq!(err, "missing value for --log-path");
     }
 
     #[test]
@@ -623,6 +811,19 @@ mod tests {
         let err = parse(&["--id", "one", "--id", "two"]).expect_err("duplicate id should fail");
 
         assert_eq!(err, "duplicate argument: --id");
+    }
+
+    #[test]
+    fn rejects_duplicate_logger_args() {
+        let err = parse(&["--show-level", "--show-level"])
+            .expect_err("duplicate show-level flag should fail");
+
+        assert_eq!(err, "duplicate argument: --show-level");
+
+        let err = parse(&["--level", "Info", "--level", "Debug"])
+            .expect_err("duplicate level arg should fail");
+
+        assert_eq!(err, "duplicate argument: --level");
     }
 
     #[test]
@@ -739,6 +940,81 @@ mod tests {
             err,
             "unsupported argument syntax for --api-sock; use --api-sock <VALUE>"
         );
+
+        let err = parse(&["--log-path=/tmp/secret.log"]).expect_err("equals syntax should fail");
+
+        assert_eq!(
+            err,
+            "unsupported argument syntax for --log-path; use --log-path <VALUE>"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_logger_level() {
+        let err = parse(&["--level", "verbose"]).expect_err("invalid level should fail");
+
+        assert_eq!(err, "invalid --level: logger level is invalid");
+    }
+
+    #[test]
+    fn applies_startup_logger_config_before_actions() {
+        let path = unique_logger_path("actions");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        super::apply_startup_logger_config(
+            &mut vmm,
+            Some(
+                LoggerConfigInput::new()
+                    .with_log_path(&path)
+                    .with_show_level(true),
+            ),
+        )
+        .expect("startup logger config should apply");
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("instance start should succeed");
+        vmm.handle_action(VmmAction::FlushMetrics)
+            .expect("flush metrics should succeed");
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("logger output should be readable"),
+            "level=Info action=InstanceStart\nlevel=Info action=FlushMetrics\n"
+        );
+
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn startup_logger_config_errors_do_not_echo_path() {
+        let path = unique_logger_path("missing-parent").join("logger");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        let err = super::apply_startup_logger_config(
+            &mut vmm,
+            Some(LoggerConfigInput::new().with_log_path(&path)),
+        )
+        .expect_err("missing parent should fail startup logger config");
+
+        assert!(!err.to_string().contains(path.to_string_lossy().as_ref()));
+        assert!(matches!(
+            err,
+            ProcessError::StartupConfiguration(bangbang_runtime::VmmActionError::LoggerConfig(
+                LoggerConfigError::OpenFile(_)
+            ))
+        ));
     }
 
     #[test]

@@ -120,7 +120,8 @@ is resource-specific:
 - `/logger` opens `log_path` during pre-boot configuration when that field is
   present and keeps a per-process logger sink. Successful `InstanceStart` and
   `FlushMetrics` can append minimal action-event lines to that sink when the
-  configured level allows `Info`.
+  configured level allows `Info`. Logger startup CLI flags use the same sink and
+  host-path error redaction rules before the API socket is served.
 - `scripts/run-integration-tests.sh` creates temporary files for signed
   integration tests and removes them when the wrapper exits normally. Its
   generated guest initrd is cached under `.tmp/guest-artifacts` by default.
