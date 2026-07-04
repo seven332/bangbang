@@ -79,6 +79,7 @@ pub enum VmmAction {
     PatchMmds(mmds::MmdsContentInput),
     PutMmdsConfig(mmds::MmdsConfigInput),
     PutDrive(block::DriveConfigInput),
+    UpdateBlockDevice(block::DriveUpdateInput),
     PutNetworkInterface(network::NetworkInterfaceConfigInput),
     PutVsock(vsock::VsockConfigInput),
 }
@@ -102,6 +103,7 @@ impl VmmAction {
             Self::PatchMmds(_) => "PatchMmds",
             Self::PutMmdsConfig(_) => "PutMmdsConfig",
             Self::PutDrive(_) => "PutDrive",
+            Self::UpdateBlockDevice(_) => "UpdateBlockDevice",
             Self::PutNetworkInterface(_) => "PutNetworkInterface",
             Self::PutVsock(_) => "PutVsock",
         }
@@ -522,6 +524,16 @@ impl VmmController {
 
                 Ok(VmmData::Empty)
             }
+            VmmAction::UpdateBlockDevice(_) => {
+                if self.instance_info.state == InstanceState::NotStarted {
+                    return Err(VmmActionError::UnsupportedState {
+                        action: action_name,
+                        state: self.instance_info.state,
+                    });
+                }
+
+                Err(VmmActionError::UnsupportedAction(action_name))
+            }
             VmmAction::PutNetworkInterface(config) => {
                 if self.instance_info.state != InstanceState::NotStarted {
                     return Err(VmmActionError::UnsupportedState {
@@ -607,7 +619,7 @@ mod tests {
 
     use super::{
         BackendError, InstanceState, VmmAction, VmmActionError, VmmController, VmmData,
-        block::{DriveConfigError, DriveConfigInput},
+        block::{DriveConfigError, DriveConfigInput, DriveUpdateInput},
         boot::{
             BootCommandLineError, BootPayloadKind, BootSourceConfigError, BootSourceConfigInput,
         },
@@ -2489,6 +2501,67 @@ mod tests {
             }
         );
         assert!(controller.drive_configs().is_empty());
+    }
+
+    #[test]
+    fn update_block_device_rejects_not_started_state_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutDrive(drive_input(
+                "rootfs",
+                "/tmp/rootfs.ext4",
+                true,
+            )))
+            .expect("initial drive config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::UpdateBlockDevice(DriveUpdateInput::new(
+                "rootfs",
+                "rootfs",
+                Some(PathBuf::from("/tmp/replaced.ext4")),
+            )))
+            .expect_err("pre-boot drive update should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::UnsupportedState {
+                action: "UpdateBlockDevice",
+                state: InstanceState::NotStarted,
+            }
+        );
+        assert_eq!(controller.drive_configs().len(), 1);
+        assert_eq!(
+            controller.drive_configs()[0].path_on_host(),
+            Path::new("/tmp/rootfs.ext4")
+        );
+    }
+
+    #[test]
+    fn update_block_device_running_is_unsupported_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutDrive(drive_input(
+                "rootfs",
+                "/tmp/rootfs.ext4",
+                true,
+            )))
+            .expect("initial drive config should be stored");
+        controller.instance_info.state = InstanceState::Running;
+
+        let err = controller
+            .handle_action(VmmAction::UpdateBlockDevice(DriveUpdateInput::new(
+                "rootfs",
+                "rootfs",
+                Some(PathBuf::from("/tmp/replaced.ext4")),
+            )))
+            .expect_err("runtime drive update should remain unsupported");
+
+        assert_eq!(err, VmmActionError::UnsupportedAction("UpdateBlockDevice"));
+        assert_eq!(controller.drive_configs().len(), 1);
+        assert_eq!(
+            controller.drive_configs()[0].path_on_host(),
+            Path::new("/tmp/rootfs.ext4")
+        );
     }
 
     #[test]

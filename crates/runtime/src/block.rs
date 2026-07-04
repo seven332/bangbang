@@ -68,6 +68,39 @@ pub struct DriveConfigInput {
     socket: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriveUpdateInput {
+    path_drive_id: String,
+    body_drive_id: String,
+    path_on_host: Option<PathBuf>,
+}
+
+impl DriveUpdateInput {
+    pub fn new(
+        path_drive_id: impl Into<String>,
+        body_drive_id: impl Into<String>,
+        path_on_host: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            path_drive_id: path_drive_id.into(),
+            body_drive_id: body_drive_id.into(),
+            path_on_host,
+        }
+    }
+
+    pub fn path_drive_id(&self) -> &str {
+        &self.path_drive_id
+    }
+
+    pub fn body_drive_id(&self) -> &str {
+        &self.body_drive_id
+    }
+
+    pub fn path_on_host(&self) -> Option<&Path> {
+        self.path_on_host.as_deref()
+    }
+}
+
 impl DriveConfigInput {
     pub fn new(
         path_drive_id: impl Into<String>,

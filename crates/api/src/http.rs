@@ -24,6 +24,7 @@ pub enum ApiRequest {
     PutAction(Box<ActionRequest>),
     PutBootSource(Box<BootSourceRequest>),
     PutDrive(Box<DriveConfigRequest>),
+    PatchDrive(Box<DrivePatchRequest>),
     PutLogger(Box<LoggerConfigRequest>),
     PutMachineConfig(Box<MachineConfigRequest>),
     PatchMachineConfig(Box<MachineConfigPatchRequest>),
@@ -739,6 +740,27 @@ impl MmdsConfigResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrivePatchRequest {
+    path_drive_id: String,
+    body_drive_id: String,
+    path_on_host: Option<String>,
+}
+
+impl DrivePatchRequest {
+    pub fn path_drive_id(&self) -> &str {
+        &self.path_drive_id
+    }
+
+    pub fn body_drive_id(&self) -> &str {
+        &self.body_drive_id
+    }
+
+    pub fn path_on_host(&self) -> Option<&str> {
+        self.path_on_host.as_deref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VsockConfigResponse {
     guest_cid: u32,
     uds_path: String,
@@ -771,6 +793,16 @@ struct DriveConfigRequestBody {
     rate_limiter: Option<serde_json::Value>,
     #[serde(default)]
     socket: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DrivePatchRequestBody {
+    drive_id: String,
+    #[serde(default)]
+    path_on_host: Option<String>,
+    #[serde(default)]
+    rate_limiter: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1155,7 +1187,12 @@ pub fn parse_request_with_limit(
         return Err(RequestError::PmemUnsupported);
     }
 
-    if matches!(method, "PATCH" | "DELETE") && drive_path_id(path).is_some() {
+    if method == "PATCH"
+        && let Some(path_drive_id) = drive_path_id(path)
+    {
+        return parse_drive_patch_request(path_drive_id, body);
+    }
+    if method == "DELETE" && drive_path_id(path).is_some() {
         return Err(RequestError::DriveUpdateUnsupported);
     }
     if matches!(method, "PATCH" | "DELETE") && network_interface_path_id(path).is_some() {
@@ -1334,6 +1371,24 @@ fn parse_drive_config_request(
         io_engine: body.io_engine,
         rate_limiter_configured,
         socket: body.socket,
+    })))
+}
+
+fn parse_drive_patch_request(path_drive_id: &str, body: &[u8]) -> Result<ApiRequest, RequestError> {
+    let body = serde_json::from_slice::<DrivePatchRequestBody>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+    if path_drive_id != body.drive_id {
+        return Err(RequestError::MismatchedDriveId);
+    }
+    if let Some(rate_limiter) = &body.rate_limiter {
+        validate_rate_limiter_config(rate_limiter)?;
+        return Err(RequestError::DriveUpdateUnsupported);
+    }
+
+    Ok(ApiRequest::PatchDrive(Box::new(DrivePatchRequest {
+        path_drive_id: path_drive_id.to_string(),
+        body_drive_id: body.drive_id,
+        path_on_host: body.path_on_host,
     })))
 }
 
@@ -1738,7 +1793,7 @@ impl From<ApiRequest> for Endpoint {
             ApiRequest::GetVersion => Self::Version,
             ApiRequest::PutAction(_) => Self::Actions,
             ApiRequest::PutBootSource(_) => Self::BootSource,
-            ApiRequest::PutDrive(_) => Self::Drive,
+            ApiRequest::PutDrive(_) | ApiRequest::PatchDrive(_) => Self::Drive,
             ApiRequest::PutLogger(_) => Self::Logger,
             ApiRequest::PutMachineConfig(_) => Self::MachineConfig,
             ApiRequest::PatchMachineConfig(_) => Self::MachineConfig,
@@ -3302,42 +3357,122 @@ mod tests {
     }
 
     #[test]
-    fn rejects_drive_update_and_hot_unplug_as_unsupported() {
-        for (route, request) in [
-            (
-                "PATCH /drives/rootfs",
-                request_with_body("PATCH", "/drives/rootfs", r#"{"drive_id":"rootfs"}"#),
-            ),
-            (
-                "DELETE /drives/rootfs",
-                b"DELETE /drives/rootfs HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
-            ),
-        ] {
-            let err = parse_request(&request).expect_err("drive update should be unsupported");
-            assert_eq!(err, RequestError::DriveUpdateUnsupported, "{route}");
-            assert_eq!(err.fault_message(), "Drive updates are not supported.");
-        }
+    fn parses_patch_drive_with_path_update() {
+        let request = request_with_body(
+            "PATCH",
+            "/drives/rootfs",
+            r#"{"drive_id":"rootfs","path_on_host":"/tmp/replaced.ext4"}"#,
+        );
+
+        let parsed = parse_request(&request).expect("drive patch should parse");
+
+        let ApiRequest::PatchDrive(config) = parsed else {
+            panic!("expected drive patch request");
+        };
+        assert_eq!(config.path_drive_id(), "rootfs");
+        assert_eq!(config.body_drive_id(), "rootfs");
+        assert_eq!(config.path_on_host(), Some("/tmp/replaced.ext4"));
     }
 
     #[test]
-    fn rejects_drive_update_without_parsing_body() {
-        for method in ["PATCH", "DELETE"] {
-            let malformed_body = request_with_body(method, "/drives/rootfs", "not-json");
-            let empty_body = format!(
-                "{method} /drives/rootfs HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
-            );
+    fn parses_patch_drive_with_only_drive_id() {
+        let request = request_with_body("PATCH", "/drives/rootfs", r#"{"drive_id":"rootfs"}"#);
 
-            assert_eq!(
-                parse_request(&malformed_body),
-                Err(RequestError::DriveUpdateUnsupported),
-                "{method}"
-            );
-            assert_eq!(
-                parse_request(empty_body.as_bytes()),
-                Err(RequestError::DriveUpdateUnsupported),
-                "{method}"
-            );
-        }
+        let parsed = parse_request(&request).expect("drive patch should parse");
+
+        let ApiRequest::PatchDrive(config) = parsed else {
+            panic!("expected drive patch request");
+        };
+        assert_eq!(config.path_drive_id(), "rootfs");
+        assert_eq!(config.body_drive_id(), "rootfs");
+        assert_eq!(config.path_on_host(), None);
+    }
+
+    #[test]
+    fn parses_patch_drive_with_null_optional_fields() {
+        let request = request_with_body(
+            "PATCH",
+            "/drives/rootfs",
+            r#"{"drive_id":"rootfs","path_on_host":null,"rate_limiter":null}"#,
+        );
+
+        let parsed = parse_request(&request).expect("drive patch should parse");
+
+        let ApiRequest::PatchDrive(config) = parsed else {
+            panic!("expected drive patch request");
+        };
+        assert_eq!(config.path_drive_id(), "rootfs");
+        assert_eq!(config.body_drive_id(), "rootfs");
+        assert_eq!(config.path_on_host(), None);
+    }
+
+    #[test]
+    fn rejects_patch_drive_malformed_body() {
+        let request = request_with_body("PATCH", "/drives/rootfs", "not-json");
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_patch_drive_missing_drive_id() {
+        let request = request_with_body("PATCH", "/drives/rootfs", r#"{"path_on_host":"x"}"#);
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_patch_drive_mismatched_drive_id() {
+        let request = request_with_body("PATCH", "/drives/rootfs", r#"{"drive_id":"data"}"#);
+
+        assert_eq!(
+            parse_request(&request),
+            Err(RequestError::MismatchedDriveId)
+        );
+    }
+
+    #[test]
+    fn rejects_patch_drive_unknown_field() {
+        let request = request_with_body(
+            "PATCH",
+            "/drives/rootfs",
+            r#"{"drive_id":"rootfs","is_read_only":true}"#,
+        );
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_patch_drive_invalid_rate_limiter_shape() {
+        let request = request_with_body(
+            "PATCH",
+            "/drives/rootfs",
+            r#"{"drive_id":"rootfs","rate_limiter":"unsupported"}"#,
+        );
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_patch_drive_configured_rate_limiter_as_unsupported_update() {
+        let request = request_with_body(
+            "PATCH",
+            "/drives/rootfs",
+            r#"{"drive_id":"rootfs","rate_limiter":{"ops":{"size":100,"one_time_burst":null,"refill_time":1000}}}"#,
+        );
+
+        assert_eq!(
+            parse_request(&request),
+            Err(RequestError::DriveUpdateUnsupported)
+        );
+    }
+
+    #[test]
+    fn rejects_drive_hot_unplug_as_unsupported_without_parsing_body() {
+        let request = b"DELETE /drives/rootfs HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec();
+
+        let err = parse_request(&request).expect_err("drive hot-unplug should be unsupported");
+        assert_eq!(err, RequestError::DriveUpdateUnsupported);
+        assert_eq!(err.fault_message(), "Drive updates are not supported.");
     }
 
     #[test]
@@ -4607,6 +4742,15 @@ mod tests {
             }"#,
         ))
         .expect("drive request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::Drive);
+
+        let request = parse_request(&request_with_body(
+            "PATCH",
+            "/drives/rootfs",
+            r#"{"drive_id":"rootfs"}"#,
+        ))
+        .expect("drive patch request should parse");
 
         assert_eq!(Endpoint::from(request), Endpoint::Drive);
 
