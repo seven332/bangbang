@@ -1672,7 +1672,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_machine_config_request_does_not_mutate_vmm_state() {
+    fn machine_config_faults_do_not_mutate_vmm_state() {
         let mut vmm = test_controller();
         let body = r#"{"vcpu_count":2,"mem_size_mib":256}"#;
         let request = format!(
@@ -1698,10 +1698,11 @@ mod tests {
         );
         assert_eq!(
             response.body(),
-            r#"{"fault_message":"Malformed HTTP request."}"#
+            r#"{"fault_message":"machine track_dirty_pages is not supported"}"#
         );
         assert_eq!(vmm.machine_config().vcpu_count(), 2);
         assert_eq!(vmm.machine_config().mem_size_mib(), 256);
+        assert!(!vmm.machine_config().track_dirty_pages());
 
         let invalid_patch_body = r#"{"mem_size_mib":0}"#;
         let invalid_patch_request = format!(
@@ -1721,6 +1722,27 @@ mod tests {
         );
         assert_eq!(vmm.machine_config().vcpu_count(), 2);
         assert_eq!(vmm.machine_config().mem_size_mib(), 256);
+        assert!(!vmm.machine_config().track_dirty_pages());
+
+        let unsupported_patch_body = r#"{"track_dirty_pages":true}"#;
+        let unsupported_patch_request = format!(
+            "PATCH /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{unsupported_patch_body}",
+            unsupported_patch_body.len()
+        );
+
+        let response = handle_request_bytes(unsupported_patch_request.as_bytes(), &mut vmm);
+
+        assert_eq!(
+            response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+        assert_eq!(
+            response.body(),
+            r#"{"fault_message":"machine track_dirty_pages is not supported"}"#
+        );
+        assert_eq!(vmm.machine_config().vcpu_count(), 2);
+        assert_eq!(vmm.machine_config().mem_size_mib(), 256);
+        assert!(!vmm.machine_config().track_dirty_pages());
     }
 
     #[test]
@@ -3211,6 +3233,34 @@ mod tests {
         assert!(response.ends_with("\r\n\r\n"));
         assert_eq!(vmm.machine_config().vcpu_count(), 2);
         assert_eq!(vmm.machine_config().mem_size_mib(), 512);
+
+        let mut client =
+            UnixStream::connect(&path).expect("client should connect for unsupported patch");
+        let patch_body = r#"{"track_dirty_pages":true}"#;
+        let patch_request = format!(
+            "PATCH /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{patch_body}",
+            patch_body.len()
+        );
+
+        client
+            .write_all(patch_request.as_bytes())
+            .expect("client should write unsupported patch request");
+        server
+            .serve_next(&mut vmm)
+            .expect("server should handle unsupported patch request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("client should read unsupported patch response");
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(
+            response.contains(r#"{"fault_message":"machine track_dirty_pages is not supported"}"#)
+        );
+        assert_eq!(vmm.machine_config().vcpu_count(), 2);
+        assert_eq!(vmm.machine_config().mem_size_mib(), 512);
+        assert!(!vmm.machine_config().track_dirty_pages());
     }
 
     #[test]
