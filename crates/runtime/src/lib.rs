@@ -73,6 +73,7 @@ pub enum VmmAction {
     PutBootSource(boot::BootSourceConfigInput),
     PutLogger(logger::LoggerConfigInput),
     PutMachineConfig(machine::MachineConfigInput),
+    PatchMachineConfig(machine::MachineConfigPatchInput),
     PutMetrics(metrics::MetricsConfigInput),
     PutMmds(mmds::MmdsContentInput),
     PatchMmds(mmds::MmdsContentInput),
@@ -95,6 +96,7 @@ impl VmmAction {
             Self::PutBootSource(_) => "PutBootSource",
             Self::PutLogger(_) => "PutLogger",
             Self::PutMachineConfig(_) => "PutMachineConfig",
+            Self::PatchMachineConfig(_) => "PatchMachineConfig",
             Self::PutMetrics(_) => "PutMetrics",
             Self::PutMmds(_) => "PutMmds",
             Self::PatchMmds(_) => "PatchMmds",
@@ -429,6 +431,20 @@ impl VmmController {
 
                 Ok(VmmData::Empty)
             }
+            VmmAction::PatchMachineConfig(config) => {
+                if self.instance_info.state != InstanceState::NotStarted {
+                    return Err(VmmActionError::UnsupportedState {
+                        action: action_name,
+                        state: self.instance_info.state,
+                    });
+                }
+
+                self.machine_config = config
+                    .apply_to(self.machine_config)
+                    .map_err(VmmActionError::MachineConfig)?;
+
+                Ok(VmmData::Empty)
+            }
             VmmAction::PutMetrics(config) => {
                 if self.instance_info.state != InstanceState::NotStarted {
                     return Err(VmmActionError::UnsupportedState {
@@ -580,7 +596,10 @@ mod tests {
             BootCommandLineError, BootPayloadKind, BootSourceConfigError, BootSourceConfigInput,
         },
         logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel, LoggerWriteError},
-        machine::{DEFAULT_MEM_SIZE_MIB, DEFAULT_VCPU_COUNT, MachineConfigInput},
+        machine::{
+            DEFAULT_MEM_SIZE_MIB, DEFAULT_VCPU_COUNT, MachineConfigError, MachineConfigInput,
+            MachineConfigPatchInput,
+        },
         metrics::{MetricsConfigError, MetricsConfigInput},
         mmds::{
             MMDS_DATA_STORE_LIMIT_BYTES, MmdsConfigError, MmdsConfigInput, MmdsContentInput,
@@ -2005,6 +2024,86 @@ mod tests {
             err,
             VmmActionError::UnsupportedState {
                 action: "PutMachineConfig",
+                state: InstanceState::Running,
+            }
+        );
+        assert_eq!(controller.machine_config().vcpu_count(), 2);
+        assert_eq!(controller.machine_config().mem_size_mib(), 256);
+    }
+
+    #[test]
+    fn patch_machine_config_merges_with_previous_config() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 256)))
+            .expect("initial machine config should be stored");
+
+        assert_eq!(
+            controller.handle_action(VmmAction::PatchMachineConfig(
+                MachineConfigPatchInput::new().with_mem_size_mib(512),
+            )),
+            Ok(VmmData::Empty)
+        );
+
+        assert_eq!(controller.machine_config().vcpu_count(), 2);
+        assert_eq!(controller.machine_config().mem_size_mib(), 512);
+    }
+
+    #[test]
+    fn patch_machine_config_rejects_empty_patch_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 256)))
+            .expect("initial machine config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PatchMachineConfig(MachineConfigPatchInput::new()))
+            .expect_err("empty patch should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::MachineConfig(MachineConfigError::EmptyPatch)
+        );
+        assert_eq!(controller.machine_config().vcpu_count(), 2);
+        assert_eq!(controller.machine_config().mem_size_mib(), 256);
+    }
+
+    #[test]
+    fn patch_machine_config_rejects_invalid_input_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 256)))
+            .expect("initial machine config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PatchMachineConfig(
+                MachineConfigPatchInput::new().with_vcpu_count(0),
+            ))
+            .expect_err("invalid machine config patch should fail");
+
+        assert_eq!(err.to_string(), "machine vcpu_count must be in 1..=32");
+        assert_eq!(controller.machine_config().vcpu_count(), 2);
+        assert_eq!(controller.machine_config().mem_size_mib(), 256);
+    }
+
+    #[test]
+    fn patch_machine_config_rejects_running_state_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 256)))
+            .expect("initial machine config should be stored");
+        controller.instance_info.state = InstanceState::Running;
+
+        let err = controller
+            .handle_action(VmmAction::PatchMachineConfig(
+                MachineConfigPatchInput::new().with_mem_size_mib(512),
+            ))
+            .expect_err("running machine config patch should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::UnsupportedState {
+                action: "PatchMachineConfig",
                 state: InstanceState::Running,
             }
         );
