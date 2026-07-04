@@ -6,6 +6,7 @@ pub enum Endpoint {
     VmConfig,
     Actions,
     BootSource,
+    CpuConfig,
     Logger,
     MachineConfig,
     Metrics,

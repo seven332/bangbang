@@ -142,6 +142,20 @@ fn executable_configures_vm_before_start() {
         "failed PATCH /drives/rootfs must not mutate drive path; response:\n{vm_config}"
     );
 
+    let cpu_config_response = http_put_json(&socket_path, "/cpu-config", "{}");
+    assert_bad_request_response(&cpu_config_response, "PUT /cpu-config");
+    assert_response_contains(
+        &cpu_config_response,
+        r#"{"fault_message":"The requested operation is not supported: PutCpuConfig"}"#,
+        "PUT /cpu-config",
+    );
+    let instance_info_after_cpu_config = http_get(&socket_path, "/");
+    assert_response_contains(
+        &instance_info_after_cpu_config,
+        r#""state":"Not started""#,
+        "GET / after failed PUT /cpu-config",
+    );
+
     let vm_state_response = http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#);
     assert_bad_request_response(&vm_state_response, "PATCH /vm");
     assert_response_contains(
