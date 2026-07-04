@@ -4061,27 +4061,20 @@ mod tests {
 
     #[test]
     fn rejects_non_exact_pmem_paths_as_invalid_path_method() {
-        for (route, request) in [
-            ("PUT /pmem", request_with_body("PUT", "/pmem", "{}")),
-            ("PUT /pmem/", request_with_body("PUT", "/pmem/", "{}")),
-            (
-                "PUT /pmem/pmem0/extra",
-                request_with_body("PUT", "/pmem/pmem0/extra", "{}"),
-            ),
-            (
-                "PATCH /pmem/pmem-0",
-                request_with_body("PATCH", "/pmem/pmem-0", "{}"),
-            ),
-            (
-                "DELETE /pmem/pmem-0",
-                request_with_body("DELETE", "/pmem/pmem-0", "{}"),
-            ),
-        ] {
-            assert_eq!(
-                parse_request(&request),
-                Err(RequestError::InvalidPathMethod),
-                "{route}"
-            );
+        for method in ["PUT", "PATCH", "DELETE"] {
+            for path in [
+                "/pmem",
+                "/pmem/",
+                "/pmem/pmem0/extra",
+                "/pmem/pmem-0",
+                "/pmem/pmem0?debug=true",
+            ] {
+                assert_eq!(
+                    parse_request(&request_with_body(method, path, "{}")),
+                    Err(RequestError::InvalidPathMethod),
+                    "{method} {path}"
+                );
+            }
         }
     }
 
