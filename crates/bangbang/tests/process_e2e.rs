@@ -14,7 +14,8 @@ use std::os::unix::fs::MetadataExt;
 
 use support::{
     BangbangProcess, TestDir, assert_clean_shutdown, assert_no_content_response,
-    assert_ok_response, assert_response_contains, http_get, http_put_json, json_string, path_text,
+    assert_ok_response, assert_response_contains, http_get, http_json, http_put_json, json_string,
+    path_text,
 };
 
 const BANGBANG_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -128,6 +129,111 @@ fn executable_configures_vm_before_start() {
 }
 
 #[test]
+fn executable_serves_and_patches_machine_config() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    let default_config = http_get(&socket_path, "/machine-config");
+    assert_ok_response(&default_config, "GET /machine-config default");
+    assert_response_contains(
+        &default_config,
+        r#""vcpu_count":1"#,
+        "GET /machine-config default",
+    );
+    assert_response_contains(
+        &default_config,
+        r#""mem_size_mib":128"#,
+        "GET /machine-config default",
+    );
+    assert_response_contains(
+        &default_config,
+        r#""smt":false"#,
+        "GET /machine-config default",
+    );
+    assert_response_contains(
+        &default_config,
+        r#""track_dirty_pages":false"#,
+        "GET /machine-config default",
+    );
+    assert_response_contains(
+        &default_config,
+        r#""huge_pages":"None""#,
+        "GET /machine-config default",
+    );
+
+    let put_response = http_put_json(
+        &socket_path,
+        "/machine-config",
+        r#"{"vcpu_count":2,"mem_size_mib":256}"#,
+    );
+    assert_no_content_response(&put_response, "PUT /machine-config");
+
+    let patched_response = http_json(
+        &socket_path,
+        "PATCH",
+        "/machine-config",
+        r#"{"mem_size_mib":512}"#,
+    );
+    assert_no_content_response(&patched_response, "PATCH /machine-config");
+
+    let patched_config = http_get(&socket_path, "/machine-config");
+    assert_ok_response(&patched_config, "GET /machine-config patched");
+    assert_response_contains(
+        &patched_config,
+        r#""vcpu_count":2"#,
+        "GET /machine-config patched",
+    );
+    assert_response_contains(
+        &patched_config,
+        r#""mem_size_mib":512"#,
+        "GET /machine-config patched",
+    );
+    assert_response_contains(
+        &patched_config,
+        r#""track_dirty_pages":false"#,
+        "GET /machine-config patched",
+    );
+
+    let invalid_patch_response = http_json(
+        &socket_path,
+        "PATCH",
+        "/machine-config",
+        r#"{"track_dirty_pages":true}"#,
+    );
+    assert_bad_request_response(&invalid_patch_response, "PATCH /machine-config invalid");
+    assert_response_contains(
+        &invalid_patch_response,
+        r#"{"fault_message":"machine track_dirty_pages is not supported"}"#,
+        "PATCH /machine-config invalid",
+    );
+
+    let after_invalid_patch = http_get(&socket_path, "/machine-config");
+    assert_ok_response(
+        &after_invalid_patch,
+        "GET /machine-config after invalid patch",
+    );
+    assert_response_contains(
+        &after_invalid_patch,
+        r#""vcpu_count":2"#,
+        "GET /machine-config after invalid patch",
+    );
+    assert_response_contains(
+        &after_invalid_patch,
+        r#""mem_size_mib":512"#,
+        "GET /machine-config after invalid patch",
+    );
+    assert_response_contains(
+        &after_invalid_patch,
+        r#""track_dirty_pages":false"#,
+        "GET /machine-config after invalid patch",
+    );
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
 fn executable_fails_when_api_socket_path_exists_without_removing_it() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
@@ -199,6 +305,13 @@ fn concurrent_executables_keep_api_sockets_isolated() {
     let second_output = second_bangbang.terminate();
     assert_clean_shutdown(first_output, &first_socket_path, "first bangbang");
     assert_clean_shutdown(second_output, &second_socket_path, "second bangbang");
+}
+
+fn assert_bad_request_response(response: &str, request_name: &str) {
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+        "{request_name} should return 400 Bad Request; response:\n{response}"
+    );
 }
 
 fn assert_instance_info_matches(

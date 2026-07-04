@@ -29,7 +29,11 @@ pub(crate) fn http_get(socket_path: &Path, path: &str) -> String {
 }
 
 pub(crate) fn http_put_json(socket_path: &Path, path: &str, body: &str) -> String {
-    http_request(socket_path, "PUT", path, Some(body))
+    http_json(socket_path, "PUT", path, body)
+}
+
+pub(crate) fn http_json(socket_path: &Path, method: &str, path: &str, body: &str) -> String {
+    http_request(socket_path, method, path, Some(body))
 }
 
 fn http_request(socket_path: &Path, method: &str, path: &str, body: Option<&str>) -> String {
