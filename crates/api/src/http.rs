@@ -46,6 +46,7 @@ pub enum RequestError {
     MalformedRequest,
     PayloadTooLarge,
     SendCtrlAltDelUnsupported,
+    SerialUnsupported,
     SnapshotUnsupported,
 }
 
@@ -61,6 +62,7 @@ impl RequestError {
             Self::MalformedRequest => "Malformed HTTP request.",
             Self::PayloadTooLarge => "HTTP request payload exceeds the configured limit.",
             Self::SendCtrlAltDelUnsupported => "SendCtrlAltDel is not supported on aarch64.",
+            Self::SerialUnsupported => "Serial device is not supported.",
             Self::SnapshotUnsupported => "Snapshot and restore are not supported.",
         }
     }
@@ -1142,6 +1144,9 @@ pub fn parse_request_with_limit(
     }
     if method == "PUT" && path == "/entropy" {
         return Err(RequestError::EntropyUnsupported);
+    }
+    if method == "PUT" && path == "/serial" {
+        return Err(RequestError::SerialUnsupported);
     }
     if method == "PUT" && path == "/logger" {
         return parse_logger_config_request(body);
@@ -3429,6 +3434,40 @@ mod tests {
     #[test]
     fn rejects_non_exact_entropy_path_as_invalid_path_method() {
         let request = request_with_body("PUT", "/entropy/extra", "{}");
+
+        assert_eq!(
+            parse_request(&request),
+            Err(RequestError::InvalidPathMethod)
+        );
+    }
+
+    #[test]
+    fn rejects_serial_as_unsupported() {
+        let request = request_with_body("PUT", "/serial", "{}");
+
+        let err = parse_request(&request).expect_err("serial should be unsupported");
+        assert_eq!(err, RequestError::SerialUnsupported);
+        assert_eq!(err.fault_message(), "Serial device is not supported.");
+    }
+
+    #[test]
+    fn rejects_serial_as_unsupported_without_parsing_body() {
+        let malformed_body = request_with_body("PUT", "/serial", "not-json");
+        let empty_body = b"PUT /serial HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n";
+
+        assert_eq!(
+            parse_request(&malformed_body),
+            Err(RequestError::SerialUnsupported)
+        );
+        assert_eq!(
+            parse_request(empty_body),
+            Err(RequestError::SerialUnsupported)
+        );
+    }
+
+    #[test]
+    fn rejects_non_exact_serial_path_as_invalid_path_method() {
+        let request = request_with_body("PUT", "/serial/extra", "{}");
 
         assert_eq!(
             parse_request(&request),
