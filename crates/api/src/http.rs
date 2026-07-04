@@ -1473,10 +1473,6 @@ fn validate_machine_config_request(body: &MachineConfigRequestBody) -> Result<()
     if body.mem_size_mib == 0 {
         return Err(RequestError::MalformedRequest);
     }
-    if body.smt || body.huge_pages != MachineConfigHugePages::None {
-        return Err(RequestError::MalformedRequest);
-    }
-
     Ok(())
 }
 
@@ -1494,10 +1490,6 @@ fn validate_machine_config_patch_request(
     if body.mem_size_mib == Some(0) {
         return Err(RequestError::MalformedRequest);
     }
-    if body.smt == Some(true) || body.huge_pages == Some(MachineConfigHugePages::TwoM) {
-        return Err(RequestError::MalformedRequest);
-    }
-
     Ok(())
 }
 
@@ -2347,13 +2339,17 @@ mod tests {
 
     #[test]
     fn rejects_put_machine_config_invalid_field_type() {
-        let body = r#"{
-            "vcpu_count": "1",
-            "mem_size_mib": 128
-        }"#;
-        let request = request_with_body("PUT", "/machine-config", body);
-
-        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+        for body in [
+            r#"{"vcpu_count":"1","mem_size_mib":128}"#,
+            r#"{"vcpu_count":1,"mem_size_mib":128,"smt":"true"}"#,
+            r#"{"vcpu_count":1,"mem_size_mib":128,"huge_pages":2}"#,
+        ] {
+            assert_eq!(
+                parse_request(&request_with_body("PUT", "/machine-config", body)),
+                Err(RequestError::MalformedRequest),
+                "{body}"
+            );
+        }
     }
 
     #[test]
@@ -2371,15 +2367,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_put_machine_config_unsupported_values() {
+    fn parses_put_machine_config_with_runtime_unsupported_values() {
         for body in [
             r#"{"vcpu_count":1,"mem_size_mib":128,"smt":true}"#,
             r#"{"vcpu_count":1,"mem_size_mib":128,"huge_pages":"2M"}"#,
         ] {
-            assert_eq!(
-                parse_request(&request_with_body("PUT", "/machine-config", body)),
-                Err(RequestError::MalformedRequest)
-            );
+            let parsed = parse_request(&request_with_body("PUT", "/machine-config", body))
+                .expect("known unsupported machine config value should parse");
+
+            let ApiRequest::PutMachineConfig(config) = parsed else {
+                panic!("expected machine-config request");
+            };
+            if body.contains(r#""smt":true"#) {
+                assert!(config.smt(), "{body}");
+            }
+            if body.contains(r#""huge_pages":"2M""#) {
+                assert_eq!(config.huge_pages(), MachineConfigHugePages::TwoM, "{body}");
+            }
         }
     }
 
@@ -2532,12 +2536,35 @@ mod tests {
     }
 
     #[test]
-    fn rejects_patch_machine_config_unsupported_values() {
-        for body in [r#"{"smt":true}"#, r#"{"huge_pages":"2M"}"#] {
+    fn rejects_patch_machine_config_invalid_field_type() {
+        for body in [r#"{"smt":"true"}"#, r#"{"huge_pages":2}"#] {
             assert_eq!(
                 parse_request(&request_with_body("PATCH", "/machine-config", body)),
-                Err(RequestError::MalformedRequest)
+                Err(RequestError::MalformedRequest),
+                "{body}"
             );
+        }
+    }
+
+    #[test]
+    fn parses_patch_machine_config_with_runtime_unsupported_values() {
+        for body in [r#"{"smt":true}"#, r#"{"huge_pages":"2M"}"#] {
+            let parsed = parse_request(&request_with_body("PATCH", "/machine-config", body))
+                .expect("known unsupported machine config patch value should parse");
+
+            let ApiRequest::PatchMachineConfig(config) = parsed else {
+                panic!("expected machine-config patch request");
+            };
+            if body.contains(r#""smt":true"#) {
+                assert_eq!(config.smt(), Some(true), "{body}");
+            }
+            if body.contains(r#""huge_pages":"2M""#) {
+                assert_eq!(
+                    config.huge_pages(),
+                    Some(MachineConfigHugePages::TwoM),
+                    "{body}"
+                );
+            }
         }
     }
 
@@ -2550,6 +2577,24 @@ mod tests {
                 r#"{"vcpu_count":1,"mem_size_mib":128,"cpu_template":"M7G"}"#,
             ),
             ("PATCH", "/machine-config", r#"{"cpu_template":"M7G"}"#),
+        ] {
+            assert_eq!(
+                parse_request(&request_with_body(method, path, body)),
+                Err(RequestError::MalformedRequest),
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_machine_config_unknown_huge_pages() {
+        for (method, path, body) in [
+            (
+                "PUT",
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":128,"huge_pages":"7M"}"#,
+            ),
+            ("PATCH", "/machine-config", r#"{"huge_pages":"7M"}"#),
         ] {
             assert_eq!(
                 parse_request(&request_with_body(method, path, body)),
