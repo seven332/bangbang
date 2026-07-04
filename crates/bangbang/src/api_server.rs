@@ -2860,6 +2860,80 @@ mod tests {
     }
 
     #[test]
+    fn returns_fault_for_balloon_endpoints() {
+        for (index, (route, request)) in [
+            (
+                "GET /balloon",
+                b"GET /balloon HTTP/1.1\r\nHost: localhost\r\n\r\n".as_slice(),
+            ),
+            (
+                "GET /balloon/statistics",
+                b"GET /balloon/statistics HTTP/1.1\r\nHost: localhost\r\n\r\n".as_slice(),
+            ),
+            (
+                "GET /balloon/hinting/status",
+                b"GET /balloon/hinting/status HTTP/1.1\r\nHost: localhost\r\n\r\n".as_slice(),
+            ),
+            (
+                "PUT /balloon",
+                b"PUT /balloon HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}"
+                    .as_slice(),
+            ),
+            (
+                "PATCH /balloon",
+                b"PATCH /balloon HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}"
+                    .as_slice(),
+            ),
+            (
+                "PATCH /balloon/statistics",
+                b"PATCH /balloon/statistics HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}"
+                    .as_slice(),
+            ),
+            (
+                "PATCH /balloon/hinting/start",
+                b"PATCH /balloon/hinting/start HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}"
+                    .as_slice(),
+            ),
+            (
+                "PATCH /balloon/hinting/stop",
+                b"PATCH /balloon/hinting/stop HTTP/1.1\r\nHost: localhost\r\n\r\n".as_slice(),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let socket_name = format!("b{index}");
+            let path = unique_socket_path(&socket_name);
+            let server = ApiServer::bind(&path).expect("server should bind");
+            let mut client = UnixStream::connect(&path).expect("client should connect");
+
+            client
+                .write_all(request)
+                .expect("client should write request");
+            let mut vmm = test_controller();
+            server
+                .serve_next(&mut vmm)
+                .expect("server should handle one request");
+
+            let mut response = String::new();
+            client
+                .read_to_string(&mut response)
+                .expect("client should read response");
+
+            assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{route}");
+            assert!(
+                response.contains(r#"{"fault_message":"Balloon device is not supported."}"#),
+                "{route}"
+            );
+            assert_eq!(
+                vmm.instance_info().state,
+                bangbang_runtime::InstanceState::NotStarted,
+                "{route}"
+            );
+        }
+    }
+
+    #[test]
     fn returns_fault_for_serial_endpoint() {
         let path = unique_socket_path("serial-fault");
         let server = ApiServer::bind(&path).expect("server should bind");
