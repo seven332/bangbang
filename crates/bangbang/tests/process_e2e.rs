@@ -7,6 +7,7 @@
     clippy::unwrap_used
 )]
 
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -66,6 +67,74 @@ fn executable_serves_api_and_shuts_down_cleanly() {
 }
 
 #[test]
+fn executable_configures_vm_before_start() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let kernel_path = test_dir.path().join("vmlinux");
+    let rootfs_path = test_dir.path().join("rootfs.ext4");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    let machine_response = http_put_json(
+        &socket_path,
+        "/machine-config",
+        r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+    );
+    assert_no_content_response(&machine_response, "PUT /machine-config");
+
+    let kernel_path = path_text(&kernel_path);
+    let kernel_path_json = json_string(kernel_path);
+    let boot_body = format!(
+        r#"{{"kernel_image_path":{kernel_path_json},"boot_args":"console=hvc0 reboot=k panic=1"}}"#
+    );
+    let boot_response = http_put_json(&socket_path, "/boot-source", &boot_body);
+    assert_no_content_response(&boot_response, "PUT /boot-source");
+
+    let rootfs_path = path_text(&rootfs_path);
+    let rootfs_path_json = json_string(rootfs_path);
+    let drive_body = format!(
+        r#"{{
+            "drive_id":"rootfs",
+            "path_on_host":{rootfs_path_json},
+            "is_root_device":true,
+            "is_read_only":true,
+            "partuuid":"0eaa91a0-01"
+        }}"#
+    );
+    let drive_response = http_put_json(&socket_path, "/drives/rootfs", &drive_body);
+    assert_no_content_response(&drive_response, "PUT /drives/rootfs");
+
+    let vm_config = http_get(&socket_path, "/vm/config");
+    assert_ok_response(&vm_config, "GET /vm/config");
+    assert_response_contains(&vm_config, r#""machine-config":"#, "GET /vm/config");
+    assert_response_contains(&vm_config, r#""vcpu_count":1"#, "GET /vm/config");
+    assert_response_contains(&vm_config, r#""mem_size_mib":256"#, "GET /vm/config");
+    assert_response_contains(&vm_config, r#""boot-source":"#, "GET /vm/config");
+    assert_response_contains(
+        &vm_config,
+        &format!(r#""kernel_image_path":{kernel_path_json}"#),
+        "GET /vm/config",
+    );
+    assert_response_contains(
+        &vm_config,
+        r#""boot_args":"console=hvc0 reboot=k panic=1""#,
+        "GET /vm/config",
+    );
+    assert_response_contains(&vm_config, r#""drives":["#, "GET /vm/config");
+    assert_response_contains(&vm_config, r#""drive_id":"rootfs""#, "GET /vm/config");
+    assert_response_contains(
+        &vm_config,
+        &format!(r#""path_on_host":{rootfs_path_json}"#),
+        "GET /vm/config",
+    );
+    assert_response_contains(&vm_config, r#""is_root_device":true"#, "GET /vm/config");
+    assert_response_contains(&vm_config, r#""is_read_only":true"#, "GET /vm/config");
+    assert_response_contains(&vm_config, r#""partuuid":"0eaa91a0-01""#, "GET /vm/config");
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
 fn concurrent_executables_keep_api_sockets_isolated() {
     let first_dir = TestDir::new();
     let second_dir = TestDir::new();
@@ -97,6 +166,14 @@ fn concurrent_executables_keep_api_sockets_isolated() {
 }
 
 fn http_get(socket_path: &Path, path: &str) -> String {
+    http_request(socket_path, "GET", path, None)
+}
+
+fn http_put_json(socket_path: &Path, path: &str, body: &str) -> String {
+    http_request(socket_path, "PUT", path, Some(body))
+}
+
+fn http_request(socket_path: &Path, method: &str, path: &str, body: Option<&str>) -> String {
     let mut stream = UnixStream::connect(socket_path).expect("client should connect");
     stream
         .set_read_timeout(Some(HTTP_IO_TIMEOUT))
@@ -104,7 +181,16 @@ fn http_get(socket_path: &Path, path: &str) -> String {
     stream
         .set_write_timeout(Some(HTTP_IO_TIMEOUT))
         .expect("client should set write timeout");
-    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let mut request =
+        format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
+    if let Some(body) = body {
+        request.push_str("Content-Type: application/json\r\n");
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        request.push_str("\r\n");
+        request.push_str(body);
+    } else {
+        request.push_str("\r\n");
+    }
 
     stream
         .write_all(request.as_bytes())
@@ -115,6 +201,33 @@ fn http_get(socket_path: &Path, path: &str) -> String {
         .read_to_string(&mut response)
         .expect("client should read response");
     response
+}
+
+fn path_text(path: &Path) -> &str {
+    path.to_str().expect("test path should be valid UTF-8")
+}
+
+fn json_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\u{08}' => escaped.push_str("\\b"),
+            '\u{0c}' => escaped.push_str("\\f"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            control if control.is_control() => {
+                write!(&mut escaped, "\\u{:04x}", u32::from(control))
+                    .expect("writing to String should succeed");
+            }
+            other => escaped.push(other),
+        }
+    }
+    escaped.push('"');
+    escaped
 }
 
 fn assert_instance_info_matches(
@@ -154,6 +267,18 @@ fn assert_ok_response(response: &str, request_name: &str) {
     assert!(
         response.starts_with("HTTP/1.1 200 OK\r\n"),
         "{request_name} should return 200 OK; response:\n{response}"
+    );
+}
+
+fn assert_no_content_response(response: &str, request_name: &str) {
+    assert!(
+        response.starts_with("HTTP/1.1 204 No Content\r\n"),
+        "{request_name} should return 204 No Content; response:\n{response}"
+    );
+    assert_response_contains(response, "Content-Length: 0\r\n", request_name);
+    assert!(
+        response.ends_with("\r\n\r\n"),
+        "{request_name} should not return a response body; response:\n{response}"
     );
 }
 
