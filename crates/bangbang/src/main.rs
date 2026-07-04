@@ -29,6 +29,7 @@ use bangbang_runtime::{VmmAction, VmmActionError};
 const DEFAULT_API_SOCK_PATH: &str = "/tmp/bangbang.socket";
 const DEFAULT_INSTANCE_ID: &str = "anonymous-instance";
 const APP_NAME: &str = "bangbang";
+const CONFIG_FILE_MAX_BYTES: u64 = 1024 * 1024;
 const MIN_INSTANCE_ID_LEN: usize = 1;
 const MAX_INSTANCE_ID_LEN: usize = 64;
 const UNSUPPORTED_FIRECRACKER_ARGS: &[&str] = &[
@@ -146,6 +147,9 @@ fn config_file_actions(config_file: &str) -> Result<Vec<VmmAction>, ConfigFileEr
         .map_err(|err| ConfigFileError::Read(err.kind()))?;
     if !metadata.file_type().is_file() {
         return Err(ConfigFileError::NotRegular);
+    }
+    if metadata.len() > CONFIG_FILE_MAX_BYTES {
+        return Err(ConfigFileError::TooLarge);
     }
 
     let mut contents = String::new();
@@ -417,6 +421,7 @@ impl std::error::Error for ProcessError {}
 enum ConfigFileError {
     Read(std::io::ErrorKind),
     NotRegular,
+    TooLarge,
     Malformed,
     MissingSection(&'static str),
     UnknownSection(String),
@@ -439,6 +444,10 @@ impl fmt::Display for ConfigFileError {
         match self {
             Self::Read(kind) => write!(f, "failed to read config file: {kind:?}"),
             Self::NotRegular => f.write_str("config file must be a regular file"),
+            Self::TooLarge => write!(
+                f,
+                "config file exceeds {CONFIG_FILE_MAX_BYTES} byte size limit"
+            ),
             Self::Malformed => f.write_str("malformed config file"),
             Self::MissingSection(section) => {
                 write!(f, "config file is missing required section: {section}")
@@ -1817,6 +1826,21 @@ mod tests {
         assert_eq!(err, super::ConfigFileError::NotRegular);
 
         fs::remove_dir(config_path).expect("fixture directory should clean up");
+    }
+
+    #[test]
+    fn config_file_rejects_oversized_file_before_reading() {
+        let config_path = unique_config_path("oversized");
+        let file = fs::File::create(&config_path).expect("fixture file should be created");
+        file.set_len(super::CONFIG_FILE_MAX_BYTES + 1)
+            .expect("fixture file should be sized");
+
+        let err = super::config_file_actions(config_path.to_str().expect("UTF-8 path"))
+            .expect_err("oversized config file should fail before reading");
+
+        assert_eq!(err, super::ConfigFileError::TooLarge);
+
+        fs::remove_file(config_path).expect("fixture file should clean up");
     }
 
     #[test]
