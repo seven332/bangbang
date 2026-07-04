@@ -18,7 +18,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const BANGBANG_BIN: &str = env!("CARGO_BIN_EXE_bangbang");
+const BANGBANG_VERSION: &str = env!("CARGO_PKG_VERSION");
 const STARTUP_READY_LINE: &str = "status: API server listening";
+const HTTP_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
@@ -40,11 +42,19 @@ fn executable_serves_api_and_shuts_down_cleanly() {
     assert_response_contains(&instance_info, r#""app_name":"bangbang""#, "GET /");
     assert_response_contains(&instance_info, &format!(r#""id":"{instance_id}""#), "GET /");
     assert_response_contains(&instance_info, r#""state":"Not started""#, "GET /");
-    assert_response_contains(&instance_info, r#""vmm_version":"0.1.0""#, "GET /");
+    assert_response_contains(
+        &instance_info,
+        &format!(r#""vmm_version":"{BANGBANG_VERSION}""#),
+        "GET /",
+    );
 
     let version = http_get(&socket_path, "/version");
     assert_ok_response(&version, "GET /version");
-    assert_response_contains(&version, r#""firecracker_version":"0.1.0""#, "GET /version");
+    assert_response_contains(
+        &version,
+        &format!(r#""firecracker_version":"{BANGBANG_VERSION}""#),
+        "GET /version",
+    );
 
     let vm_config = http_get(&socket_path, "/vm/config");
     assert_ok_response(&vm_config, "GET /vm/config");
@@ -68,7 +78,13 @@ fn executable_serves_api_and_shuts_down_cleanly() {
 
 fn http_get(socket_path: &Path, path: &str) -> String {
     let mut stream = UnixStream::connect(socket_path).expect("client should connect");
-    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    stream
+        .set_read_timeout(Some(HTTP_IO_TIMEOUT))
+        .expect("client should set read timeout");
+    stream
+        .set_write_timeout(Some(HTTP_IO_TIMEOUT))
+        .expect("client should set write timeout");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
 
     stream
         .write_all(request.as_bytes())
