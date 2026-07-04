@@ -181,6 +181,48 @@ fn executable_no_api_config_file_rejected_drive_socket_does_not_publish_socket()
 }
 
 #[test]
+fn executable_config_file_rejected_serial_rate_limiter_does_not_publish_socket() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let (config_path, serial_output_path) = write_rejected_serial_rate_limiter_config(&test_dir);
+    let instance_id = test_dir.instance_id();
+
+    let output = BangbangProcess::start_with_extra_args_expect_failure(
+        &socket_path,
+        &instance_id,
+        &["--config-file", path_text(&config_path)],
+    );
+
+    assert_rejected_serial_config_failure(
+        &output,
+        &socket_path,
+        &serial_output_path,
+        "config-file rejected serial rate limiter",
+    );
+}
+
+#[test]
+fn executable_no_api_config_file_rejected_serial_rate_limiter_does_not_publish_socket() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let (config_path, serial_output_path) = write_rejected_serial_rate_limiter_config(&test_dir);
+    let instance_id = test_dir.instance_id();
+
+    let output = BangbangProcess::start_with_extra_args_expect_failure(
+        &socket_path,
+        &instance_id,
+        &["--config-file", path_text(&config_path), "--no-api"],
+    );
+
+    assert_rejected_serial_config_failure(
+        &output,
+        &socket_path,
+        &serial_output_path,
+        "no-api config-file rejected serial rate limiter",
+    );
+}
+
+#[test]
 fn executable_configures_vm_before_start() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
@@ -868,6 +910,26 @@ fn write_rejected_drive_socket_config(
     (config_path, private_socket_path)
 }
 
+fn write_rejected_serial_rate_limiter_config(
+    test_dir: &TestDir,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let config_path = test_dir.path().join("vm-config.json");
+    let serial_output_path = test_dir.path().join("private-serial.out");
+    let serial_output_path_json = json_string(path_text(&serial_output_path));
+    let config = format!(
+        r#"{{
+            "boot-source": {{"kernel_image_path": "/tmp/vmlinux"}},
+            "serial": {{
+                "serial_out_path": {serial_output_path_json},
+                "rate_limiter": {{"bandwidth": {{"size": 1, "refill_time": 1}}}}
+            }}
+        }}"#
+    );
+    fs::write(&config_path, config).expect("config file should be written");
+
+    (config_path, serial_output_path)
+}
+
 fn assert_rejected_drive_socket_config_failure(
     output: &support::CompletedProcess,
     socket_path: &std::path::Path,
@@ -916,6 +978,57 @@ fn assert_rejected_drive_socket_config_failure(
     assert!(
         !private_socket_path.exists(),
         "{case_name} must not create rejected drive socket path"
+    );
+}
+
+fn assert_rejected_serial_config_failure(
+    output: &support::CompletedProcess,
+    socket_path: &std::path::Path,
+    serial_output_path: &std::path::Path,
+    case_name: &str,
+) {
+    assert!(
+        !output.status.success(),
+        "{case_name} should fail startup; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        !socket_path.exists(),
+        "{case_name} should fail before API socket publication"
+    );
+    assert!(
+        !output.stdout.contains("status: API server listening"),
+        "{case_name} must not report API readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !output.stdout.contains("status: VM running without API"),
+        "{case_name} must not report no-api readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        output.stderr.contains(
+            "bangbang: config-file error: failed to apply config-file action: serial output rate limiting is not supported"
+        ),
+        "{case_name} stderr should describe config-file serial rejection; stderr:\n{}",
+        output.stderr
+    );
+    let serial_output_path_text = path_text(serial_output_path);
+    assert!(
+        !output.stdout.contains(serial_output_path_text),
+        "{case_name} stdout must not echo private serial output path; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !output.stderr.contains(serial_output_path_text),
+        "{case_name} stderr must not echo private serial output path; stderr:\n{}",
+        output.stderr
+    );
+    assert!(
+        !serial_output_path.exists(),
+        "{case_name} must not create rejected serial output path"
     );
 }
 

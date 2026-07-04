@@ -109,7 +109,8 @@ pre-boot `PUT /machine-config`, pre-boot `PUT /boot-source` configuration storag
 pre-boot `PUT /drives/{drive_id}` configuration storage, recognized
 `PATCH /drives/{drive_id}` update rejection, pre-boot
 `PUT /network-interfaces/{iface_id}` configuration storage, pre-boot `PUT /vsock` configuration storage, pre-boot `PUT /metrics`
-output configuration, pre-boot `PUT /logger` output configuration, metrics and logger startup CLI configuration, plus process-routed `PUT /actions` startup and metrics
+output configuration, pre-boot `PUT /logger` output configuration, pre-boot
+`PUT /serial` output configuration, metrics and logger startup CLI configuration, plus process-routed `PUT /actions` startup and metrics
 flush with an internal boot run-loop worker across bounded step windows or
 state/configuration faults. The process can also read `--config-file` for the
 supported startup subset, start the VM before serving the API socket, and then
@@ -146,7 +147,7 @@ compatibility decision expands the CLI parser.
 
 `--config-file` currently accepts the supported Firecracker-shaped sections
 `machine-config`, `boot-source`, `drives`, `network-interfaces`,
-`mmds-config`, `vsock`, `metrics`, `logger`, and `cpu-config`. The
+`mmds-config`, `vsock`, `metrics`, `logger`, `serial`, and `cpu-config`. The
 `cpu-config` section is parsed through the same request model as
 `PUT /cpu-config` and still fails as an unsupported CPU configuration action.
 Known unsupported sections such as `balloon`, `entropy`, `memory-hotplug`, and
@@ -1173,8 +1174,8 @@ behavior.
 The current scaffold implements the first HTTP API behavior for `GET /`,
 `GET /version`, `GET /vm/config`, pre-boot `/machine-config` configuration
 storage, pre-boot `PUT /boot-source`, `PUT /drives/{drive_id}`, and
-`PUT /network-interfaces/{iface_id}`, `PUT /vsock`, and `PUT /metrics` and
-`PUT /logger` configuration storage, plus
+`PUT /network-interfaces/{iface_id}`, `PUT /vsock`, `PUT /metrics`,
+`PUT /logger`, and `PUT /serial` configuration storage, plus
 process-routed `PUT /actions` startup with a bounded internal boot run-loop
 worker and runtime metrics flush handling. The
 policy below is the compatibility target for future request parsing, VMM action
