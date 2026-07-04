@@ -631,7 +631,7 @@ impl VirtioBlockRequest {
         let status = validate_status_descriptor(status_descriptor)?;
 
         Ok(Self {
-            descriptor_head: header.index(),
+            descriptor_head: chain.head_index(),
             request_type,
             sector: header_data.sector,
             data,
@@ -2954,9 +2954,10 @@ mod tests {
         VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
     };
     use crate::virtio_queue::{
-        VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
-        VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptorChain,
-        VirtqueueUsedRing, VirtqueueUsedRingError, read_descriptor_chain,
+        VIRTQUEUE_DESC_F_INDIRECT, VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE,
+        VIRTQUEUE_DESCRIPTOR_SIZE, VirtqueueAvailableRing, VirtqueueAvailableRingError,
+        VirtqueueDescriptorChain, VirtqueueDescriptorChainOptions, VirtqueueUsedRing,
+        VirtqueueUsedRingError, read_descriptor_chain,
     };
 
     use super::{
@@ -2984,6 +2985,7 @@ mod tests {
     const TEST_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x1000);
     const TEST_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x5000);
     const TEST_USED_RING: GuestAddress = GuestAddress::new(0x6000);
+    const TEST_INDIRECT_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x7000);
     const TEST_QUEUE_SIZE: u16 = 8;
     const TEST_MEMORY_SIZE: u64 = 0x10_000;
     const TEST_AVAILABLE_RING_IDX_OFFSET: u64 = 2;
@@ -3386,6 +3388,15 @@ mod tests {
                 next: next_index,
             }
         }
+
+        const fn indirect(address: GuestAddress, len: u32) -> Self {
+            Self {
+                address,
+                len,
+                flags: VIRTQUEUE_DESC_F_INDIRECT,
+                next: 0,
+            }
+        }
     }
 
     fn request_memory() -> GuestMemory {
@@ -3414,6 +3425,15 @@ mod tests {
     }
 
     fn write_descriptor(memory: &mut GuestMemory, index: u16, descriptor: TestDescriptor) {
+        write_descriptor_at(memory, TEST_DESCRIPTOR_TABLE, index, descriptor);
+    }
+
+    fn write_descriptor_at(
+        memory: &mut GuestMemory,
+        descriptor_table: GuestAddress,
+        index: u16,
+        descriptor: TestDescriptor,
+    ) {
         let mut bytes = [0; VIRTQUEUE_DESCRIPTOR_SIZE];
         let (address_bytes, tail) = bytes.split_at_mut(8);
         let (len_bytes, tail) = tail.split_at_mut(4);
@@ -3423,7 +3443,7 @@ mod tests {
         flags_bytes.copy_from_slice(&descriptor.flags.to_le_bytes());
         next_bytes.copy_from_slice(&descriptor.next.to_le_bytes());
 
-        let descriptor_address = TEST_DESCRIPTOR_TABLE
+        let descriptor_address = descriptor_table
             .checked_add(
                 u64::from(index)
                     * u64::try_from(VIRTQUEUE_DESCRIPTOR_SIZE).expect("descriptor size should fit"),
@@ -3553,6 +3573,21 @@ mod tests {
             TEST_QUEUE_SIZE,
         )
         .expect("available ring should build");
+        let used = VirtqueueUsedRing::new(TEST_USED_RING, TEST_QUEUE_SIZE)
+            .expect("used ring should build");
+        VirtioBlockQueue::new(available, used)
+    }
+
+    fn block_queue_with_indirect_descriptors() -> VirtioBlockQueue {
+        let available = VirtqueueAvailableRing::new(
+            TEST_DESCRIPTOR_TABLE,
+            TEST_AVAILABLE_RING,
+            TEST_QUEUE_SIZE,
+        )
+        .expect("available ring should build")
+        .with_descriptor_chain_options(
+            VirtqueueDescriptorChainOptions::new().with_indirect_descriptors(true),
+        );
         let used = VirtqueueUsedRing::new(TEST_USED_RING, TEST_QUEUE_SIZE)
             .expect("used ring should build");
         VirtioBlockQueue::new(available, used)
@@ -6682,6 +6717,62 @@ mod tests {
             read_used_element(&memory, 0),
             (
                 0,
+                VIRTIO_BLOCK_SECTOR_SIZE as u32 + VIRTIO_BLOCK_STATUS_SIZE,
+            )
+        );
+    }
+
+    #[test]
+    fn block_queue_dispatch_indirect_read_publishes_outer_descriptor_head() {
+        let mut memory = request_memory();
+        let payload = sector_payload(0x8c);
+        let file = temp_file("queue-indirect-read.img", &payload);
+        let backing = open_backing(file.as_path(), true).expect("backing should open");
+        let outer_head = 4;
+        let indirect_table_len = u32::try_from(3 * VIRTQUEUE_DESCRIPTOR_SIZE)
+            .expect("indirect table length should fit in u32");
+        write_request_header(&mut memory, HEADER_ADDR, VIRTIO_BLOCK_REQUEST_TYPE_IN, 0);
+        write_descriptor(
+            &mut memory,
+            outer_head,
+            TestDescriptor::indirect(TEST_INDIRECT_DESCRIPTOR_TABLE, indirect_table_len),
+        );
+        write_descriptor_at(
+            &mut memory,
+            TEST_INDIRECT_DESCRIPTOR_TABLE,
+            0,
+            TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+        );
+        write_descriptor_at(
+            &mut memory,
+            TEST_INDIRECT_DESCRIPTOR_TABLE,
+            1,
+            TestDescriptor::writable(DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as u32, Some(2)),
+        );
+        write_descriptor_at(
+            &mut memory,
+            TEST_INDIRECT_DESCRIPTOR_TABLE,
+            2,
+            TestDescriptor::writable(STATUS_ADDR, VIRTIO_BLOCK_STATUS_SIZE, None),
+        );
+        write_available_heads(&mut memory, &[outer_head]);
+        let mut queue = block_queue_with_indirect_descriptors();
+
+        let dispatch = queue
+            .dispatch(&mut memory, &backing, TEST_DEVICE_ID)
+            .expect("indirect read queue dispatch should succeed");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_requests(), 1);
+        assert_eq!(
+            read_guest_bytes(&memory, DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as usize),
+            payload
+        );
+        assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_OK);
+        assert_eq!(
+            read_used_element(&memory, 0),
+            (
+                u32::from(outer_head),
                 VIRTIO_BLOCK_SECTOR_SIZE as u32 + VIRTIO_BLOCK_STATUS_SIZE,
             )
         );
