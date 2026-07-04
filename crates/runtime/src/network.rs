@@ -397,6 +397,7 @@ impl VirtioNetworkTxFrame {
         memory: &GuestMemory,
         chain: &VirtqueueDescriptorChain,
     ) -> Result<Self, VirtioNetworkTxFrameParseError> {
+        let descriptor_head = chain.head_index();
         let header_descriptor = network_descriptor_at(chain, 0, 1)?;
         validate_tx_header_descriptor(header_descriptor)?;
         let header = read_virtio_network_tx_header(memory, header_descriptor)?;
@@ -429,13 +430,11 @@ impl VirtioNetworkTxFrame {
         }
 
         if payload_segments.is_empty() {
-            return Err(VirtioNetworkTxFrameParseError::MissingPayload {
-                descriptor_head: header_descriptor.index(),
-            });
+            return Err(VirtioNetworkTxFrameParseError::MissingPayload { descriptor_head });
         }
 
         Ok(Self {
-            descriptor_head: header_descriptor.index(),
+            descriptor_head,
             header,
             payload_segments,
             payload_len,
@@ -775,14 +774,14 @@ impl VirtioNetworkRxBuffer {
         memory: &GuestMemory,
         chain: &VirtqueueDescriptorChain,
     ) -> Result<Self, VirtioNetworkRxBufferParseError> {
-        let descriptor_head = chain
-            .descriptors()
-            .first()
-            .ok_or(VirtioNetworkRxBufferParseError::DescriptorChainTooShort {
+        if chain.is_empty() {
+            return Err(VirtioNetworkRxBufferParseError::DescriptorChainTooShort {
                 expected: 1,
                 actual: chain.len(),
-            })?
-            .index();
+            });
+        }
+
+        let descriptor_head = chain.head_index();
         let mut segments = Vec::new();
         segments.try_reserve_exact(chain.len()).map_err(|source| {
             VirtioNetworkRxBufferParseError::BufferSegmentsAllocationFailed {
@@ -3806,8 +3805,9 @@ mod tests {
         VirtioMmioRegister, VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
     };
     use crate::virtio_queue::{
-        VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
-        VirtqueueDescriptorChain, read_descriptor_chain,
+        VIRTQUEUE_DESC_F_INDIRECT, VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE,
+        VIRTQUEUE_DESCRIPTOR_SIZE, VirtqueueDescriptorChain, VirtqueueDescriptorChainOptions,
+        read_descriptor_chain, read_descriptor_chain_with_options,
     };
 
     use super::{
@@ -3835,12 +3835,14 @@ mod tests {
     const TEST_RX_USED_RING: GuestAddress = GuestAddress::new(0x12_0000);
     const TEST_RX_BUFFER: GuestAddress = GuestAddress::new(0x13_0000);
     const TEST_RX_SECOND_BUFFER: GuestAddress = GuestAddress::new(0x14_0000);
+    const TEST_RX_INDIRECT_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x15_0000);
     const TEST_TX_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x20_0000);
     const TEST_TX_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x21_0000);
     const TEST_TX_USED_RING: GuestAddress = GuestAddress::new(0x22_0000);
     const TEST_TX_HEADER: GuestAddress = GuestAddress::new(0x23_0000);
     const TEST_TX_PAYLOAD: GuestAddress = GuestAddress::new(0x24_0000);
     const TEST_TX_SECOND_PAYLOAD: GuestAddress = GuestAddress::new(0x25_0000);
+    const TEST_TX_INDIRECT_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x26_0000);
     const TEST_TX_MEMORY_SIZE: u64 = 0x30_0000;
     const TEST_QUEUE_SIZE: u16 = 8;
     const TEST_RETRY_QUEUE_SIZE: u16 = 16;
@@ -4234,6 +4236,15 @@ mod tests {
                 next: next_index,
             }
         }
+
+        const fn indirect(address: GuestAddress, len: u32) -> Self {
+            Self {
+                address,
+                len,
+                flags: VIRTQUEUE_DESC_F_INDIRECT,
+                next: 0,
+            }
+        }
     }
 
     #[derive(Debug, Default)]
@@ -4430,6 +4441,19 @@ mod tests {
     }
 
     fn write_tx_descriptor(memory: &mut GuestMemory, index: u16, descriptor: TestDescriptor) {
+        write_descriptor_at(memory, TEST_TX_DESCRIPTOR_TABLE, index, descriptor);
+    }
+
+    fn write_rx_descriptor(memory: &mut GuestMemory, index: u16, descriptor: TestDescriptor) {
+        write_descriptor_at(memory, TEST_RX_DESCRIPTOR_TABLE, index, descriptor);
+    }
+
+    fn write_descriptor_at(
+        memory: &mut GuestMemory,
+        descriptor_table: GuestAddress,
+        index: u16,
+        descriptor: TestDescriptor,
+    ) {
         let mut bytes = [0; VIRTQUEUE_DESCRIPTOR_SIZE];
         let (address_bytes, tail) = bytes.split_at_mut(8);
         let (len_bytes, tail) = tail.split_at_mut(4);
@@ -4439,7 +4463,7 @@ mod tests {
         flags_bytes.copy_from_slice(&descriptor.flags.to_le_bytes());
         next_bytes.copy_from_slice(&descriptor.next.to_le_bytes());
 
-        let descriptor_address = TEST_TX_DESCRIPTOR_TABLE
+        let descriptor_address = descriptor_table
             .checked_add(
                 u64::from(index)
                     * u64::try_from(VIRTQUEUE_DESCRIPTOR_SIZE).expect("descriptor size should fit"),
@@ -4448,27 +4472,6 @@ mod tests {
         memory
             .write_slice(&bytes, descriptor_address)
             .expect("descriptor should write");
-    }
-
-    fn write_rx_descriptor(memory: &mut GuestMemory, index: u16, descriptor: TestDescriptor) {
-        let mut bytes = [0; VIRTQUEUE_DESCRIPTOR_SIZE];
-        let (address_bytes, tail) = bytes.split_at_mut(8);
-        let (len_bytes, tail) = tail.split_at_mut(4);
-        let (flags_bytes, next_bytes) = tail.split_at_mut(2);
-        address_bytes.copy_from_slice(&descriptor.address.raw_value().to_le_bytes());
-        len_bytes.copy_from_slice(&descriptor.len.to_le_bytes());
-        flags_bytes.copy_from_slice(&descriptor.flags.to_le_bytes());
-        next_bytes.copy_from_slice(&descriptor.next.to_le_bytes());
-
-        let descriptor_address = TEST_RX_DESCRIPTOR_TABLE
-            .checked_add(
-                u64::from(index)
-                    * u64::try_from(VIRTQUEUE_DESCRIPTOR_SIZE).expect("descriptor size should fit"),
-            )
-            .expect("descriptor address should not overflow");
-        memory
-            .write_slice(&bytes, descriptor_address)
-            .expect("RX descriptor should write");
     }
 
     fn tx_descriptor_chain(
@@ -4485,6 +4488,73 @@ mod tests {
 
         read_descriptor_chain(memory, TEST_TX_DESCRIPTOR_TABLE, TEST_QUEUE_SIZE, 0)
             .expect("TX descriptor chain should read")
+    }
+
+    fn tx_indirect_descriptor_chain(
+        memory: &mut GuestMemory,
+        outer_head: u16,
+        descriptors: &[TestDescriptor],
+    ) -> VirtqueueDescriptorChain {
+        write_indirect_descriptor_chain(
+            memory,
+            TEST_TX_DESCRIPTOR_TABLE,
+            TEST_TX_INDIRECT_DESCRIPTOR_TABLE,
+            outer_head,
+            descriptors,
+        )
+    }
+
+    fn rx_indirect_descriptor_chain(
+        memory: &mut GuestMemory,
+        outer_head: u16,
+        descriptors: &[TestDescriptor],
+    ) -> VirtqueueDescriptorChain {
+        write_indirect_descriptor_chain(
+            memory,
+            TEST_RX_DESCRIPTOR_TABLE,
+            TEST_RX_INDIRECT_DESCRIPTOR_TABLE,
+            outer_head,
+            descriptors,
+        )
+    }
+
+    fn write_indirect_descriptor_chain(
+        memory: &mut GuestMemory,
+        descriptor_table: GuestAddress,
+        indirect_table: GuestAddress,
+        outer_head: u16,
+        descriptors: &[TestDescriptor],
+    ) -> VirtqueueDescriptorChain {
+        let indirect_table_len = u32::try_from(
+            descriptors
+                .len()
+                .checked_mul(VIRTQUEUE_DESCRIPTOR_SIZE)
+                .expect("indirect descriptor table len should not overflow"),
+        )
+        .expect("indirect descriptor table len should fit in u32");
+        write_descriptor_at(
+            memory,
+            descriptor_table,
+            outer_head,
+            TestDescriptor::indirect(indirect_table, indirect_table_len),
+        );
+        for (index, descriptor) in descriptors.iter().copied().enumerate() {
+            write_descriptor_at(
+                memory,
+                indirect_table,
+                u16::try_from(index).expect("test indirect descriptor index should fit"),
+                descriptor,
+            );
+        }
+
+        read_descriptor_chain_with_options(
+            memory,
+            descriptor_table,
+            TEST_QUEUE_SIZE,
+            outer_head,
+            VirtqueueDescriptorChainOptions::new().with_indirect_descriptors(true),
+        )
+        .expect("indirect descriptor chain should read")
     }
 
     fn write_rx_descriptors(memory: &mut GuestMemory, descriptors: &[TestDescriptor]) {
@@ -5578,6 +5648,33 @@ mod tests {
     }
 
     #[test]
+    fn virtio_network_tx_frame_parser_indirect_chain_uses_outer_descriptor_head() {
+        let mut memory = tx_frame_memory();
+        write_tx_header(&mut memory, TEST_TX_HEADER);
+        let outer_head = 4;
+        let chain = tx_indirect_descriptor_chain(
+            &mut memory,
+            outer_head,
+            &[
+                TestDescriptor::readable(TEST_TX_HEADER, VIRTIO_NET_TX_HEADER_SIZE, Some(1)),
+                TestDescriptor::readable(TEST_TX_PAYLOAD, 4, None),
+            ],
+        );
+
+        let frame = parse_tx_frame(&memory, &chain).expect("indirect TX frame should parse");
+
+        assert_eq!(frame.descriptor_head(), outer_head);
+        assert_eq!(frame.payload_len(), 4);
+        let segment = frame
+            .payload_segments()
+            .first()
+            .expect("indirect TX payload segment should exist");
+        assert_eq!(segment.descriptor_index(), 1);
+        assert_eq!(segment.address(), TEST_TX_PAYLOAD);
+        assert_eq!(segment.len(), 4);
+    }
+
+    #[test]
     fn virtio_network_tx_frame_parser_accepts_header_remainder_and_split_payload() {
         let mut memory = tx_frame_memory();
         write_tx_header(&mut memory, TEST_TX_HEADER);
@@ -5695,6 +5792,28 @@ mod tests {
         assert!(matches!(
             parse_tx_frame(&memory, &chain),
             Err(VirtioNetworkTxFrameParseError::MissingPayload { descriptor_head: 0 })
+        ));
+    }
+
+    #[test]
+    fn virtio_network_tx_frame_parser_indirect_missing_payload_uses_outer_descriptor_head() {
+        let mut memory = tx_frame_memory();
+        write_tx_header(&mut memory, TEST_TX_HEADER);
+        let outer_head = 5;
+        let chain = tx_indirect_descriptor_chain(
+            &mut memory,
+            outer_head,
+            &[TestDescriptor::readable(
+                TEST_TX_HEADER,
+                VIRTIO_NET_TX_HEADER_SIZE,
+                None,
+            )],
+        );
+
+        assert!(matches!(
+            parse_tx_frame(&memory, &chain),
+            Err(VirtioNetworkTxFrameParseError::MissingPayload { descriptor_head })
+                if descriptor_head == outer_head
         ));
     }
 
@@ -5834,6 +5953,31 @@ mod tests {
         assert_eq!(segment.address(), TEST_TX_PAYLOAD);
         assert_eq!(segment.len(), len);
         assert!(!segment.is_empty());
+    }
+
+    #[test]
+    fn virtio_network_rx_buffer_parser_indirect_chain_uses_outer_descriptor_head() {
+        let mut memory = tx_frame_memory();
+        let len = u32::try_from(VIRTIO_NET_RX_MIN_BUFFER_SIZE)
+            .expect("RX minimum should fit in descriptor len");
+        let outer_head = 6;
+        let chain = rx_indirect_descriptor_chain(
+            &mut memory,
+            outer_head,
+            &[TestDescriptor::writable(TEST_RX_BUFFER, len, None)],
+        );
+
+        let buffer = parse_rx_buffer(&memory, &chain).expect("indirect RX buffer should parse");
+
+        assert_eq!(buffer.descriptor_head(), outer_head);
+        assert_eq!(buffer.len(), VIRTIO_NET_RX_MIN_BUFFER_SIZE);
+        let segment = buffer
+            .segments()
+            .first()
+            .expect("indirect RX buffer segment should exist");
+        assert_eq!(segment.descriptor_index(), 0);
+        assert_eq!(segment.address(), TEST_RX_BUFFER);
+        assert_eq!(segment.len(), len);
     }
 
     #[test]
