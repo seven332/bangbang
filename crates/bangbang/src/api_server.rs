@@ -1131,27 +1131,13 @@ mod tests {
         socket_name: &str,
         action_type: &str,
     ) -> String {
-        let path = unique_socket_path(socket_name);
-        let server = ApiServer::bind(&path).expect("server should bind");
-        let mut client = UnixStream::connect(&path).expect("client should connect");
         let body = format!(r#"{{"action_type":"{action_type}"}}"#);
         let request = format!(
             "PUT /actions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
 
-        client
-            .write_all(request.as_bytes())
-            .expect("client should write request");
-        server
-            .serve_next(vmm)
-            .expect("server should handle one request");
-
-        let mut response = String::new();
-        client
-            .read_to_string(&mut response)
-            .expect("client should read response");
-        response
+        request_over_socket(vmm, socket_name, &request)
     }
 
     fn unique_temp_dir(name: &str) -> PathBuf {
