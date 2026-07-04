@@ -120,6 +120,19 @@ the `bangbang` process boundary:
 cargo test -p bangbang --test process_e2e --all-features --locked
 ```
 
+Run the same process-level e2e test against a signed `bangbang` executable:
+
+```sh
+scripts/run-signed-process-tests.sh
+```
+
+This builds and signs a temporary `bangbang` executable, then sets
+`BANGBANG_PROCESS_E2E_BIN` so `process_e2e` launches that signed binary instead
+of Cargo's default test binary. The script verifies process startup, API socket
+serving, configuration requests, multi-process socket isolation, and clean
+shutdown. It requires macOS Apple Silicon because the signed executable target
+is `aarch64-apple-darwin`, but it does not start HVF or send `InstanceStart`.
+
 Build a signed `bangbang` executable artifact for future HVF-backed process e2e
 tests without running it:
 

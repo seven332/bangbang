@@ -18,7 +18,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const BANGBANG_BIN: &str = env!("CARGO_BIN_EXE_bangbang");
+const DEFAULT_BANGBANG_BIN: &str = env!("CARGO_BIN_EXE_bangbang");
+const BANGBANG_PROCESS_E2E_BIN_ENV: &str = "BANGBANG_PROCESS_E2E_BIN";
 const BANGBANG_VERSION: &str = env!("CARGO_PKG_VERSION");
 const STARTUP_READY_LINE: &str = "status: API server listening";
 const HTTP_IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -326,6 +327,7 @@ impl Drop for TestDir {
 
 #[derive(Debug)]
 struct BangbangProcess {
+    binary_path: PathBuf,
     child: Option<Child>,
     stdout: Option<OutputReader>,
     stderr: Option<OutputReader>,
@@ -334,7 +336,8 @@ struct BangbangProcess {
 
 impl BangbangProcess {
     fn start(socket_path: &Path, instance_id: &str) -> Self {
-        let mut child = Command::new(BANGBANG_BIN)
+        let binary_path = bangbang_bin();
+        let mut child = Command::new(&binary_path)
             .arg("--api-sock")
             .arg(socket_path)
             .arg("--id")
@@ -342,13 +345,19 @@ impl BangbangProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("bangbang process should start");
+            .unwrap_or_else(|err| {
+                panic!(
+                    "bangbang process should start from {}: {err}",
+                    binary_path.display()
+                )
+            });
 
         let stdout = child.stdout.take().expect("stdout should be piped");
         let stderr = child.stderr.take().expect("stderr should be piped");
         let (stdout, ready) = OutputReader::stdout(stdout);
         let stderr = OutputReader::stderr(stderr);
         let mut process = Self {
+            binary_path,
             child: Some(child),
             stdout: Some(stdout),
             stderr: Some(stderr),
@@ -365,8 +374,11 @@ impl BangbangProcess {
             Err(err) => {
                 let output = self.force_stop_and_collect();
                 panic!(
-                    "bangbang did not report API readiness before timeout: {err:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-                    output.status, output.stdout, output.stderr
+                    "bangbang did not report API readiness before timeout: {err:?}; binary: {}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    self.binary_path.display(),
+                    output.status,
+                    output.stdout,
+                    output.stderr
                 );
             }
         }
@@ -422,6 +434,16 @@ impl Drop for BangbangProcess {
         if let Some(stderr) = self.stderr.take() {
             let _ = stderr.try_join();
         }
+    }
+}
+
+fn bangbang_bin() -> PathBuf {
+    match std::env::var_os(BANGBANG_PROCESS_E2E_BIN_ENV) {
+        Some(path) if path.is_empty() => {
+            panic!("{BANGBANG_PROCESS_E2E_BIN_ENV} must not be empty")
+        }
+        Some(path) => PathBuf::from(path),
+        None => PathBuf::from(DEFAULT_BANGBANG_BIN),
     }
 }
 

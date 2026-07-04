@@ -53,8 +53,8 @@ jobs:
       - name: Run HVF unit tests
         run: cargo test -p bangbang-hvf --lib --all-features --locked
 
-      - name: Build and sign bangbang executable
-        run: scripts/build-signed-bangbang.sh --output .tmp/signed-bangbang/bangbang
+      - name: Run signed process e2e tests
+        run: scripts/run-signed-process-tests.sh
 
       - name: Build and sign integration tests
         run: scripts/run-integration-tests.sh --allow-unsupported
