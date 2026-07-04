@@ -3594,6 +3594,26 @@ mod tests {
                 b"DELETE /balloon HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
             ),
             ("POST /balloon", request_with_body("POST", "/balloon", "{}")),
+            (
+                "PUT /balloon/statistics",
+                request_with_body("PUT", "/balloon/statistics", "{}"),
+            ),
+            (
+                "PUT /balloon/hinting/start",
+                request_with_body("PUT", "/balloon/hinting/start", "{}"),
+            ),
+            (
+                "GET /balloon/hinting/start",
+                b"GET /balloon/hinting/start HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            ),
+            (
+                "GET /balloon/hinting/stop",
+                b"GET /balloon/hinting/stop HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            ),
+            (
+                "PATCH /balloon/hinting/status",
+                request_with_body("PATCH", "/balloon/hinting/status", "{}"),
+            ),
         ];
 
         for (route, request) in requests {
