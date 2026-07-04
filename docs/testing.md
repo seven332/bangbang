@@ -173,11 +173,12 @@ and signs a temporary `bangbang` executable, prepares the pinned Firecracker
 kernel, deterministic tiny initrd, and generated direct-boot ext4 rootfs,
 starts `bangbang` as a child process, configures the VM through the Unix-socket
 API, sends `InstanceStart`, and waits for the guest to write deterministic
-markers to scratch block backing files. The tiny-initrd scenario writes
-`BANGBANG_BLOCK_WRITE_OK`; the direct-rootfs scenario boots the generated ext4
-rootfs without an initrd and writes `BANGBANG_DIRECT_ROOTFS_BLOCK_OK` through a
-second writable drive. This verifies the public process/API/HVF path without
-requiring public serial output.
+markers to host-observable outputs. The tiny-initrd scenario writes
+`BANGBANG_BLOCK_WRITE_OK` to both a scratch block backing file and the configured
+serial output file; the direct-rootfs scenario boots the generated ext4 rootfs
+without an initrd and writes `BANGBANG_DIRECT_ROOTFS_BLOCK_OK` through a second
+writable drive. This verifies the public process/API/HVF path, including public
+serial output redirection.
 
 Hosted macOS CI may use:
 
