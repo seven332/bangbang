@@ -400,7 +400,7 @@ mod macos_arm64 {
             use std::os::fd::AsRawFd;
 
             let ident = libc::uintptr_t::try_from(file.as_raw_fd())
-                .map_err(|_| "block backing file descriptor did not fit uintptr_t".to_string())?;
+                .map_err(|_| "watched file descriptor did not fit uintptr_t".to_string())?;
             let change = libc::kevent {
                 ident,
                 filter: libc::EVFILT_VNODE,
@@ -426,7 +426,7 @@ mod macos_arm64 {
                 Ok(())
             } else {
                 Err(format!(
-                    "failed to register block backing kqueue watch: {}",
+                    "failed to register file kqueue watch: {}",
                     std::io::Error::last_os_error()
                 ))
             }
@@ -454,14 +454,12 @@ mod macos_arm64 {
                     return Ok(());
                 }
                 if result == 0 {
-                    return Err("timed out waiting for block backing write event".to_string());
+                    return Err("timed out waiting for file write event".to_string());
                 }
 
                 let err = std::io::Error::last_os_error();
                 if err.kind() != std::io::ErrorKind::Interrupted {
-                    return Err(format!(
-                        "failed while waiting for block backing write: {err}"
-                    ));
+                    return Err(format!("failed while waiting for file write: {err}"));
                 }
             }
         }
