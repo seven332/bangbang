@@ -331,6 +331,11 @@ fn executable_rejects_unsupported_drive_options_without_mutating() {
                 &format!(r#""path_on_host":{accepted_drive_path_json}"#),
                 request_name,
             );
+            assert_eq!(
+                vm_config.matches(r#""drive_id":"#).count(),
+                1,
+                "{request_name} must keep only the accepted drive; response:\n{vm_config}"
+            );
             assert!(
                 !vm_config.contains(&format!(r#""drive_id":"{rejected_drive_id}""#)),
                 "{request_name} must not store rejected drive {rejected_drive_id}; response:\n{vm_config}"
