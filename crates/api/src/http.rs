@@ -44,6 +44,7 @@ pub enum RequestError {
     MismatchedDriveId,
     MismatchedInterfaceId,
     MalformedRequest,
+    MemoryHotplugUnsupported,
     PayloadTooLarge,
     SendCtrlAltDelUnsupported,
     SerialUnsupported,
@@ -61,6 +62,7 @@ impl RequestError {
             Self::MismatchedDriveId => "path drive_id must match body drive_id.",
             Self::MismatchedInterfaceId => "path iface_id must match body iface_id.",
             Self::MalformedRequest => "Malformed HTTP request.",
+            Self::MemoryHotplugUnsupported => "Memory hotplug is not supported.",
             Self::PayloadTooLarge => "HTTP request payload exceeds the configured limit.",
             Self::SendCtrlAltDelUnsupported => "SendCtrlAltDel is not supported on aarch64.",
             Self::SerialUnsupported => "Serial device is not supported.",
@@ -1123,6 +1125,10 @@ pub fn parse_request_with_limit(
 
     if method == "GET" && request_body.has_content() {
         return Err(RequestError::GetRequestBody);
+    }
+
+    if matches!(method, "GET" | "PUT" | "PATCH") && path == "/hotplug/memory" {
+        return Err(RequestError::MemoryHotplugUnsupported);
     }
 
     if method == "PUT"
@@ -3444,6 +3450,75 @@ mod tests {
             parse_request(&request),
             Err(RequestError::InvalidPathMethod)
         );
+    }
+
+    #[test]
+    fn rejects_memory_hotplug_methods_as_unsupported() {
+        let get_request = b"GET /hotplug/memory HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let err = parse_request(get_request).expect_err("memory hotplug should be unsupported");
+        assert_eq!(err, RequestError::MemoryHotplugUnsupported, "GET");
+        assert_eq!(err.fault_message(), "Memory hotplug is not supported.");
+
+        for method in ["PUT", "PATCH"] {
+            let request = request_with_body(method, "/hotplug/memory", r#"{"size_mib":128}"#);
+            let err = parse_request(&request).expect_err("memory hotplug should be unsupported");
+            assert_eq!(err, RequestError::MemoryHotplugUnsupported, "{method}");
+            assert_eq!(err.fault_message(), "Memory hotplug is not supported.");
+        }
+    }
+
+    #[test]
+    fn rejects_memory_hotplug_body_methods_without_parsing_body() {
+        for method in ["PUT", "PATCH"] {
+            let malformed_body = request_with_body(method, "/hotplug/memory", "not-json");
+            let empty_body = format!(
+                "{method} /hotplug/memory HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+            );
+
+            assert_eq!(
+                parse_request(&malformed_body),
+                Err(RequestError::MemoryHotplugUnsupported),
+                "{method}"
+            );
+            assert_eq!(
+                parse_request(empty_body.as_bytes()),
+                Err(RequestError::MemoryHotplugUnsupported),
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_memory_hotplug_get_with_body_before_endpoint_handling() {
+        let request = request_with_body("GET", "/hotplug/memory", "{}");
+
+        assert_eq!(parse_request(&request), Err(RequestError::GetRequestBody));
+    }
+
+    #[test]
+    fn rejects_non_exact_memory_hotplug_path_as_invalid_path_method() {
+        let requests = [
+            (
+                "GET",
+                b"GET /hotplug/memory/extra HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            ),
+            (
+                "PUT",
+                request_with_body("PUT", "/hotplug/memory/extra", "{}"),
+            ),
+            (
+                "PATCH",
+                request_with_body("PATCH", "/hotplug/memory/extra", "{}"),
+            ),
+        ];
+
+        for (method, request) in requests {
+            assert_eq!(
+                parse_request(&request),
+                Err(RequestError::InvalidPathMethod),
+                "{method}"
+            );
+        }
     }
 
     #[test]
