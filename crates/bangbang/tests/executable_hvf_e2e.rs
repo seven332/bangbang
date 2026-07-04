@@ -483,6 +483,129 @@ mod macos_arm64 {
         assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang direct rootfs");
     }
 
+    #[test]
+    fn signed_executable_starts_from_config_file_with_direct_rootfs() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let config_path = test_dir.path().join("vm-config.json");
+        let data_backing_path = test_dir.path().join("data.img");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+
+        create_zeroed_block_backing(&data_backing_path);
+
+        let kernel_path_json = json_string(path_text(&kernel_path));
+        let boot_args_json = json_string(DIRECT_ROOTFS_BOOT_ARGS);
+        let rootfs_path_json = json_string(path_text(&rootfs_path));
+        let data_backing_path_json = json_string(path_text(&data_backing_path));
+        let config = format!(
+            r#"{{
+                "machine-config": {{"vcpu_count": 1, "mem_size_mib": 256}},
+                "boot-source": {{
+                    "kernel_image_path": {kernel_path_json},
+                    "boot_args": {boot_args_json}
+                }},
+                "drives": [
+                    {{
+                        "drive_id": "rootfs",
+                        "path_on_host": {rootfs_path_json},
+                        "is_root_device": true,
+                        "is_read_only": true
+                    }},
+                    {{
+                        "drive_id": "data",
+                        "path_on_host": {data_backing_path_json},
+                        "is_root_device": false,
+                        "is_read_only": false
+                    }}
+                ]
+            }}"#
+        );
+        fs::write(&config_path, config).expect("direct rootfs config file should be written");
+
+        let mut bangbang = BangbangProcess::start_with_extra_args(
+            &socket_path,
+            &instance_id,
+            &["--config-file", path_text(&config_path)],
+        );
+
+        assert!(
+            socket_path.exists(),
+            "API-enabled config-file startup should publish an API socket"
+        );
+
+        let running_instance_info = http_get(&socket_path, "/");
+        assert_ok_response(
+            &running_instance_info,
+            "GET / after config-file direct rootfs startup",
+        );
+        assert_response_contains(
+            &running_instance_info,
+            &format!(r#""id":"{instance_id}""#),
+            "GET / after config-file direct rootfs startup",
+        );
+        assert_response_contains(
+            &running_instance_info,
+            r#""state":"Running""#,
+            "GET / after config-file direct rootfs startup",
+        );
+
+        let vm_config = http_get(&socket_path, "/vm/config");
+        assert_ok_response(
+            &vm_config,
+            "GET /vm/config after config-file direct rootfs startup",
+        );
+        assert_response_contains(
+            &vm_config,
+            r#""drive_id":"rootfs""#,
+            "GET /vm/config after config-file direct rootfs startup",
+        );
+        assert_response_contains(
+            &vm_config,
+            &format!(r#""path_on_host":{rootfs_path_json}"#),
+            "GET /vm/config after config-file direct rootfs startup",
+        );
+        assert_response_contains(
+            &vm_config,
+            r#""is_root_device":true"#,
+            "GET /vm/config after config-file direct rootfs startup",
+        );
+        assert_response_contains(
+            &vm_config,
+            r#""is_read_only":true"#,
+            "GET /vm/config after config-file direct rootfs startup",
+        );
+        assert_response_contains(
+            &vm_config,
+            r#""drive_id":"data""#,
+            "GET /vm/config after config-file direct rootfs startup",
+        );
+        assert_response_contains(
+            &vm_config,
+            &format!(r#""path_on_host":{data_backing_path_json}"#),
+            "GET /vm/config after config-file direct rootfs startup",
+        );
+
+        if let Err(err) = wait_for_file_prefix_marker(
+            &data_backing_path,
+            DIRECT_ROOTFS_BLOCK_MARKER,
+            GUEST_EXECUTION_TIMEOUT,
+        ) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "config-file direct rootfs guest did not write block marker through signed bangbang executable: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
+        assert_clean_shutdown(
+            bangbang.terminate(),
+            &socket_path,
+            "bangbang config-file direct rootfs",
+        );
+    }
+
     fn env_path(name: &str) -> PathBuf {
         match std::env::var_os(name) {
             Some(value) if value.is_empty() => panic!("{name} must not be empty"),

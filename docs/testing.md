@@ -172,14 +172,16 @@ This target runs the dedicated `executable_hvf_e2e` Cargo test target. It builds
 and signs a temporary `bangbang` executable, prepares the pinned Firecracker
 kernel, deterministic tiny initrd, and generated direct-boot ext4 rootfs,
 starts `bangbang` as a child process, configures the VM through the Unix-socket
-API, sends `InstanceStart`, and waits for the guest to write deterministic
-markers to host-observable outputs. The tiny-initrd scenario writes
-`BANGBANG_BLOCK_WRITE_OK` to both a scratch block backing file and the configured
-serial output file, and it verifies configured metrics and logger outputs after
-runtime `FlushMetrics`; the direct-rootfs scenario boots the generated ext4
-rootfs without an initrd and writes `BANGBANG_DIRECT_ROOTFS_BLOCK_OK` through a
-second writable drive. This verifies the public process/API/HVF path, including
-public serial output redirection and minimal observability output.
+API or a Firecracker-shaped config file depending on the scenario, and waits for
+the guest to write deterministic markers to host-observable outputs. The
+tiny-initrd scenarios write `BANGBANG_BLOCK_WRITE_OK` to scratch block backing
+files. The API-request scenario also verifies the configured serial output file,
+and the API-request plus API-enabled config-file scenarios verify metrics and
+logger outputs after runtime `FlushMetrics`; the direct-rootfs scenarios boot
+the generated ext4 rootfs without an initrd and write
+`BANGBANG_DIRECT_ROOTFS_BLOCK_OK` through a second writable drive. This verifies
+the public process/API/config-file/HVF path, including public serial output
+redirection and minimal observability output.
 
 Hosted macOS CI may use:
 
