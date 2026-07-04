@@ -135,6 +135,7 @@ where
 }
 
 fn config_file_actions(config_file: &str) -> Result<Vec<VmmAction>, ConfigFileError> {
+    // Keep special files such as FIFOs from hanging startup before file-type validation.
     let mut file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
