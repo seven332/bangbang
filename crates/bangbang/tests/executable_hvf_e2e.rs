@@ -38,6 +38,8 @@ mod macos_arm64 {
         let socket_path = test_dir.path().join("api.socket");
         let backing_path = test_dir.path().join("data.img");
         let serial_output_path = test_dir.path().join("serial.out");
+        let metrics_path = test_dir.path().join("metrics.out");
+        let logger_path = test_dir.path().join("logger.out");
         let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
         let initrd_path = env_path(BANGBANG_GUEST_INITRD_PATH_ENV);
         let instance_id = test_dir.instance_id();
@@ -87,6 +89,16 @@ mod macos_arm64 {
         let serial_response = http_put_json(&socket_path, "/serial", &serial_body);
         assert_no_content_response(&serial_response, "PUT /serial");
 
+        let metrics_path_json = json_string(path_text(&metrics_path));
+        let metrics_body = format!(r#"{{"metrics_path":{metrics_path_json}}}"#);
+        let metrics_response = http_put_json(&socket_path, "/metrics", &metrics_body);
+        assert_no_content_response(&metrics_response, "PUT /metrics");
+
+        let logger_path_json = json_string(path_text(&logger_path));
+        let logger_body = format!(r#"{{"log_path":{logger_path_json}}}"#);
+        let logger_response = http_put_json(&socket_path, "/logger", &logger_body);
+        assert_no_content_response(&logger_response, "PUT /logger");
+
         let start_response = http_put_json(
             &socket_path,
             "/actions",
@@ -113,6 +125,8 @@ mod macos_arm64 {
             r#"{"action_type":"FlushMetrics"}"#,
         );
         assert_no_content_response(&flush_metrics_response, "PUT /actions FlushMetrics");
+        assert_metrics_output(&metrics_path);
+        assert_logger_output(&logger_path);
 
         let second_start_response = http_put_json(
             &socket_path,
@@ -278,6 +292,40 @@ mod macos_arm64 {
             .create_new(true)
             .open(path)
             .expect("empty test output file should create");
+    }
+
+    fn assert_metrics_output(path: &Path) {
+        let output = fs::read_to_string(path).unwrap_or_else(|err| {
+            panic!(
+                "metrics output {} should be readable: {err}",
+                path.display()
+            )
+        });
+
+        assert!(
+            output.contains(r#""metrics_flush_count":1"#),
+            "metrics output should include first flush count; output:\n{output}"
+        );
+        assert!(
+            output.contains(r#""boot_run_loop_status":"running""#)
+                || output.contains(r#""boot_run_loop_status":"exited""#),
+            "metrics output should include a non-failed boot run-loop status; output:\n{output}"
+        );
+        assert!(
+            !output.contains(r#""boot_run_loop_status":"failed""#),
+            "metrics output should not report failed boot run-loop status; output:\n{output}"
+        );
+    }
+
+    fn assert_logger_output(path: &Path) {
+        let output = fs::read_to_string(path).unwrap_or_else(|err| {
+            panic!("logger output {} should be readable: {err}", path.display())
+        });
+
+        assert_eq!(
+            output, "action=InstanceStart\naction=FlushMetrics\n",
+            "logger output should include the expected action records"
+        );
     }
 
     fn wait_for_file_prefix_marker(
