@@ -34,7 +34,7 @@ cargo run -p bangbang -- --api-sock /tmp/bangbang.socket --id demo-1
   `/tmp/bangbang.socket`.
 - `--config-file <PATH>` reads a Firecracker-shaped JSON configuration for the
   supported startup subset from a readable regular file up to 1 MiB, starts the
-  VM, then serves the API socket. `--no-api` is not supported yet.
+  VM, then serves the API socket unless `--no-api` is set.
 - `--http-api-max-payload-size <BYTES>` sets the maximum accepted HTTP API
   request size. The default is `51200` bytes.
 - `--id <ID>` records the microVM identifier. The default is
@@ -47,6 +47,8 @@ cargo run -p bangbang -- --api-sock /tmp/bangbang.socket --id demo-1
 - `--log-path <PATH>`, `--level <LEVEL>`, `--module <MODULE>`,
   `--show-level`, and `--show-log-origin` configure the same per-process
   logger state as `PUT /logger` before the API socket is served.
+- `--no-api` requires `--config-file <PATH>`, starts from that configuration
+  without publishing an API socket, and exits cleanly on `SIGINT` or `SIGTERM`.
 - `--help`, `-h`, `--version`, and `-V` are supported.
 
 The API socket is an unauthenticated local control interface. Filesystem
@@ -71,6 +73,14 @@ Start from a configuration file while keeping the API socket enabled:
 cargo run -p bangbang -- \
   --api-sock /tmp/bangbang.socket \
   --config-file /tmp/bangbang-vm.json
+```
+
+Start from a configuration file without publishing an API socket:
+
+```sh
+cargo run -p bangbang -- \
+  --config-file /tmp/bangbang-vm.json \
+  --no-api
 ```
 
 ## API Examples
@@ -213,9 +223,10 @@ rules, guest boot artifact caching, and local verification expectations.
 
 ## Exit Status
 
-- `0`: help or version completed successfully, or the API server exited without
-  error.
+- `0`: help or version completed successfully, the API server exited without
+  error, or no-api mode handled `SIGINT`/`SIGTERM`.
 - `153`: startup argument parsing failed before process configuration began.
   This matches Firecracker's argument-parsing exit code.
 - `1`: process failure, including config-file startup, startup metrics/logger
-  configuration, API socket bind, or API accept failures.
+  configuration, API socket bind, shutdown signal handling, or API accept
+  failures.
