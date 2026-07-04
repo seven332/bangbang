@@ -33,8 +33,8 @@ cargo run -p bangbang -- --api-sock /tmp/bangbang.socket --id demo-1
 - `--api-sock <PATH>` sets the Unix socket path. The default is
   `/tmp/bangbang.socket`.
 - `--config-file <PATH>` reads a Firecracker-shaped JSON configuration for the
-  supported startup subset, starts the VM, then serves the API socket. `--no-api`
-  is not supported yet.
+  supported startup subset from a readable regular file, starts the VM, then
+  serves the API socket. `--no-api` is not supported yet.
 - `--http-api-max-payload-size <BYTES>` sets the maximum accepted HTTP API
   request size. The default is `51200` bytes.
 - `--id <ID>` records the microVM identifier. The default is

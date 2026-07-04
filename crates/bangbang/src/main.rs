@@ -2,6 +2,8 @@ use std::env;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::IntoRawFd;
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
@@ -133,8 +135,21 @@ where
 }
 
 fn config_file_actions(config_file: &str) -> Result<Vec<VmmAction>, ConfigFileError> {
-    let contents =
-        fs::read_to_string(config_file).map_err(|err| ConfigFileError::Read(err.kind()))?;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(config_file)
+        .map_err(|err| ConfigFileError::Read(err.kind()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|err| ConfigFileError::Read(err.kind()))?;
+    if !metadata.file_type().is_file() {
+        return Err(ConfigFileError::NotRegular);
+    }
+
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .map_err(|err| ConfigFileError::Read(err.kind()))?;
     config_file_actions_from_str(&contents)
 }
 
@@ -400,6 +415,7 @@ impl std::error::Error for ProcessError {}
 #[derive(Debug, PartialEq, Eq)]
 enum ConfigFileError {
     Read(std::io::ErrorKind),
+    NotRegular,
     Malformed,
     MissingSection(&'static str),
     UnknownSection(String),
@@ -421,6 +437,7 @@ impl fmt::Display for ConfigFileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Read(kind) => write!(f, "failed to read config file: {kind:?}"),
+            Self::NotRegular => f.write_str("config file must be a regular file"),
             Self::Malformed => f.write_str("malformed config file"),
             Self::MissingSection(section) => {
                 write!(f, "config file is missing required section: {section}")
@@ -1786,6 +1803,19 @@ mod tests {
             err,
             super::ConfigFileError::MalformedSection { section: "drives" }
         );
+    }
+
+    #[test]
+    fn config_file_rejects_non_regular_file() {
+        let config_path = unique_config_path("directory");
+        fs::create_dir(&config_path).expect("fixture directory should be created");
+
+        let err = super::config_file_actions(config_path.to_str().expect("UTF-8 path"))
+            .expect_err("config directory should fail before reading");
+
+        assert_eq!(err, super::ConfigFileError::NotRegular);
+
+        fs::remove_dir(config_path).expect("fixture directory should clean up");
     }
 
     #[test]
