@@ -13,9 +13,9 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 
 use support::{
-    BangbangProcess, TestDir, assert_clean_shutdown, assert_no_content_response,
-    assert_ok_response, assert_response_contains, http_get, http_json, http_put_json, json_string,
-    path_text,
+    BangbangProcess, TestDir, assert_bad_request_response, assert_clean_shutdown,
+    assert_no_content_response, assert_ok_response, assert_response_contains, http_get, http_json,
+    http_put_json, json_string, path_text,
 };
 
 const BANGBANG_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -305,13 +305,6 @@ fn concurrent_executables_keep_api_sockets_isolated() {
     let second_output = second_bangbang.terminate();
     assert_clean_shutdown(first_output, &first_socket_path, "first bangbang");
     assert_clean_shutdown(second_output, &second_socket_path, "second bangbang");
-}
-
-fn assert_bad_request_response(response: &str, request_name: &str) {
-    assert!(
-        response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
-        "{request_name} should return 400 Bad Request; response:\n{response}"
-    );
 }
 
 fn assert_instance_info_matches(
