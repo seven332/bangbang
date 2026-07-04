@@ -819,9 +819,12 @@ pinned Firecracker squashfs rootfs as a read-only root drive, mounts it from the
 deterministic initrd, and reads `/mnt/etc/os-release` from the guest. Direct
 root-drive boot validation is covered by a generated ext4 variant of the same
 Firecracker rootfs that adds a deterministic test init, boots without an initrd,
-mounts the virtio-block root drive as `/`, reads `/etc/os-release`, and
-validates guest-visible `root=/dev/vda ro` command-line arguments. This does
-not yet claim arbitrary distro rootfs boot or default Ubuntu systemd startup.
+mounts the virtio-block root drive as `/`, and reads `/etc/os-release`; the
+signed `guest_boot` target validates guest-visible `root=/dev/vda ro`
+command-line arguments through captured serial output, and the signed
+executable HVF e2e target validates the same direct-rootfs path through public
+API configuration plus a host-observed scratch block marker. This does not yet
+claim arbitrary distro rootfs boot or default Ubuntu systemd startup.
 Block hotplug, remaining cache-mode semantics, and rate limiting remain
 deferred.
 It does not provide a public runner control, implement rate limiting, support

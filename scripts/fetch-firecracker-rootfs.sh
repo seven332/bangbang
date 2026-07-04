@@ -14,7 +14,9 @@ Options:
                    Only valid with --format ext4.
   --direct-boot-init
                    Add a deterministic bangbang direct-rootfs boot init script
-                   to the generated ext4 image. Only valid with --format ext4.
+                   to the generated ext4 image. The init emits serial markers
+                   and writes an optional /dev/vdb marker when that drive
+                   exists. Only valid with --format ext4.
   -h, --help       Show this help.
 
 Environment:
@@ -111,7 +113,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v4"
+direct_boot_variant="direct-boot-v6"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -339,6 +341,15 @@ emit_line() {
   printf '\n'
 }
 
+mount_if_directory() {
+  fs_type=$1
+  source=$2
+  target=$3
+  if [ -d "$target" ]; then
+    mount -t "$fs_type" "$source" "$target" 2>/dev/null || true
+  fi
+}
+
 emit_line BANGBANG_DIRECT_ROOTFS_BOOT_BEGIN
 if [ -r /etc/os-release ]; then
   id_line=$(grep -m 1 '^ID=' /etc/os-release 2>/dev/null || true)
@@ -350,14 +361,16 @@ if [ -r /etc/os-release ]; then
     emit_line "$codename_line"
   fi
 fi
-if [ -d /proc ]; then
-  mount -t proc proc /proc 2>/dev/null || true
-fi
+mount_if_directory proc proc /proc
+mount_if_directory devtmpfs devtmpfs /dev
 if [ -r /proc/cmdline ]; then
   emit_line BANGBANG_CMDLINE_BEGIN
   cmdline=$(cat /proc/cmdline 2>/dev/null || true)
   emit_line "$cmdline"
   emit_line BANGBANG_CMDLINE_END
+fi
+if [ -b /dev/vdb ]; then
+  printf '%-512s' BANGBANG_DIRECT_ROOTFS_BLOCK_OK >/dev/vdb 2>/dev/null || true
 fi
 emit_line BANGBANG_DIRECT_ROOTFS_BOOT_OK
 exec sleep 3600
