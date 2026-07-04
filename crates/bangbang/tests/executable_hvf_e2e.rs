@@ -13,6 +13,7 @@ mod support;
 mod macos_arm64 {
     use std::fs;
     use std::io::Read;
+    use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
@@ -40,6 +41,7 @@ mod macos_arm64 {
         let serial_output_path = test_dir.path().join("serial.out");
         let metrics_path = test_dir.path().join("metrics.out");
         let logger_path = test_dir.path().join("logger.out");
+        let uds_path = test_dir.path().join("vsock.sock");
         let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
         let initrd_path = env_path(BANGBANG_GUEST_INITRD_PATH_ENV);
         let instance_id = test_dir.instance_id();
@@ -99,6 +101,15 @@ mod macos_arm64 {
         let logger_response = http_put_json(&socket_path, "/logger", &logger_body);
         assert_no_content_response(&logger_response, "PUT /logger");
 
+        let uds_path_json = json_string(path_text(&uds_path));
+        let vsock_body = format!(r#"{{"guest_cid":3,"uds_path":{uds_path_json}}}"#);
+        let vsock_response = http_put_json(&socket_path, "/vsock", &vsock_body);
+        assert_no_content_response(&vsock_response, "PUT /vsock");
+        assert!(
+            !uds_path.exists(),
+            "PUT /vsock should store config without binding the host socket path"
+        );
+
         let start_response = http_put_json(
             &socket_path,
             "/actions",
@@ -118,6 +129,25 @@ mod macos_arm64 {
             r#""state":"Running""#,
             "GET / after InstanceStart",
         );
+
+        let vm_config = http_get(&socket_path, "/vm/config");
+        assert_ok_response(&vm_config, "GET /vm/config after InstanceStart");
+        assert_response_contains(
+            &vm_config,
+            r#""guest_cid":3"#,
+            "GET /vm/config after InstanceStart",
+        );
+        assert_response_contains(
+            &vm_config,
+            &format!(r#""uds_path":{uds_path_json}"#),
+            "GET /vm/config after InstanceStart",
+        );
+        UnixStream::connect(&uds_path).unwrap_or_else(|err| {
+            panic!(
+                "InstanceStart should bind the configured vsock listener at {}: {err}",
+                uds_path.display()
+            )
+        });
 
         let flush_metrics_response = http_put_json(
             &socket_path,
@@ -178,6 +208,10 @@ mod macos_arm64 {
         }
 
         assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+        assert!(
+            !uds_path.exists(),
+            "bangbang shutdown should remove its owned vsock listener path"
+        );
     }
 
     #[test]
