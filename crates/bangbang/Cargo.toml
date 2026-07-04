@@ -13,5 +13,10 @@ dispatch2 = "0.3.1"
 libc = "0.2"
 signal-hook = "0.3"
 
+[[test]]
+name = "executable_hvf_e2e"
+path = "tests/executable_hvf_e2e.rs"
+test = false
+
 [lints]
 workspace = true

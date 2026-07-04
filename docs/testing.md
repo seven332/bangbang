@@ -41,9 +41,16 @@ workspace test command. They should start `env!("CARGO_BIN_EXE_bangbang")`, use
 unique temporary resources, wait on explicit process or socket readiness
 signals, and shut the child down with normal signals when testing owned cleanup.
 
-Use HVF integration tests for behavior that creates HVF VMs, vCPUs, GIC state,
-mapped guest memory, signed test binaries, or guest boot execution. These tests
-live in `crates/hvf/tests/` and must run through
+Keep tests that require a signed executable or real HVF execution in separate
+Cargo test targets from unsigned tests. Do not hide signing or HVF requirements
+behind `#[ignore]` in a normal test target. Mark the dedicated target with
+`test = false` in that crate's `Cargo.toml` so `--all-targets` does not run it
+accidentally, then run it explicitly from the signed integration runner.
+
+Use HVF crate integration tests for behavior that creates HVF VMs, vCPUs, GIC
+state, mapped guest memory, signed test binaries, or guest boot execution
+through the `bangbang-hvf` crate. These tests live in `crates/hvf/tests/` and
+must run through
 `scripts/run-integration-tests.sh` so the binaries are signed with the
 `com.apple.security.hypervisor` entitlement. Do not add real HVF tests to the
 unsigned workspace test path.
@@ -96,8 +103,15 @@ cargo check --workspace --all-targets --all-features --locked
 cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf
 cargo test -p bangbang-hvf --lib --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo clippy -p bangbang --test executable_hvf_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings
+cargo clippy -p bangbang-hvf --test hvf_lifecycle --all-features --locked --target aarch64-apple-darwin -- -D warnings
+cargo clippy -p bangbang-hvf --test guest_boot --all-features --locked --target aarch64-apple-darwin -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 ```
+
+The explicit clippy commands cover signed integration targets declared with
+`test = false`; ordinary `--all-targets` commands intentionally do not select
+them.
 
 Run signed HVF integration tests on macOS Apple Silicon without
 `--allow-unsupported`:
@@ -111,6 +125,7 @@ Run one signed integration test target when the change is narrower:
 ```sh
 scripts/run-integration-tests.sh --test hvf_lifecycle
 scripts/run-integration-tests.sh --test guest_boot
+scripts/run-integration-tests.sh --test executable_hvf_e2e
 ```
 
 Run only the process-level executable e2e test when the change is limited to
@@ -144,6 +159,20 @@ This requires macOS `codesign` and the `aarch64-apple-darwin` Rust target. The
 command only builds and signs the executable; HVF execution remains the job of
 the signed integration runner.
 
+Run executable-level HVF e2e through the signed integration runner:
+
+```sh
+scripts/run-integration-tests.sh --test executable_hvf_e2e
+```
+
+This target runs the dedicated `executable_hvf_e2e` Cargo test target. It builds
+and signs a temporary `bangbang` executable, prepares the pinned Firecracker
+kernel plus the deterministic tiny initrd, starts `bangbang` as a child process,
+configures the VM through the Unix-socket API, sends `InstanceStart`, and waits
+for the guest to write `BANGBANG_BLOCK_WRITE_OK` to a scratch block backing
+file. It verifies the public process/API/HVF path without requiring public
+serial output. It does not cover direct rootfs boot through the executable path.
+
 Hosted macOS CI may use:
 
 ```sh
@@ -156,10 +185,11 @@ misconfigured hosts fail.
 
 ## Guest Boot Artifacts
 
-Guest boot tests use the pinned Firecracker arm64 kernel, a deterministic tiny
-initrd, and the pinned Firecracker rootfs artifact. The integration runner
-prepares them when `guest_boot` is selected. To prepare only the kernel cache,
-run:
+Guest boot and executable HVF e2e tests use the pinned Firecracker arm64 kernel
+and a deterministic tiny initrd. Guest boot tests also use the pinned
+Firecracker rootfs artifact. The integration runner prepares the relevant
+artifacts when `guest_boot` or `executable_hvf_e2e` is selected. To prepare only
+the kernel cache, run:
 
 ```sh
 scripts/fetch-firecracker-kernel.sh

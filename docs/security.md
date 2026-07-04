@@ -144,10 +144,11 @@ the `com.apple.security.hypervisor` entitlement on binaries that enter HVF.
 
 The unsigned Rust test path runs only non-HVF unit tests. Real HVF integration
 tests must run through `scripts/run-integration-tests.sh`. This wrapper builds
-the HVF test binaries, creates a temporary entitlement plist, ad-hoc signs
-copies, and runs the signed copies with one test thread. CI may use
-`--allow-unsupported` only to compile and sign on runners that cannot execute
-HVF; local HVF verification should fail when HVF is unavailable.
+the selected HVF test binaries or executable e2e artifacts, creates a temporary
+entitlement plist when signing is needed, ad-hoc signs copies, and runs signed
+targets with one test thread. CI may use `--allow-unsupported` only to compile
+and sign on runners that cannot execute HVF; local HVF verification should fail
+when HVF is unavailable.
 
 ## Guest Data Exposure
 

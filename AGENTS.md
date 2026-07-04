@@ -19,6 +19,9 @@ Unit tests live next to the code they exercise under each crate’s `src/` tree.
 - `cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf`: run non-HVF tests with all targets and features enabled.
 - `cargo test -p bangbang-hvf --lib --all-features --locked`: run unsigned HVF unit tests.
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: run lint checks with warnings treated as errors.
+- `cargo clippy -p bangbang --test executable_hvf_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings`: lint the signed executable HVF e2e target.
+- `cargo clippy -p bangbang-hvf --test hvf_lifecycle --all-features --locked --target aarch64-apple-darwin -- -D warnings`: lint the signed HVF lifecycle target.
+- `cargo clippy -p bangbang-hvf --test guest_boot --all-features --locked --target aarch64-apple-darwin -- -D warnings`: lint the signed guest boot target.
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked`: build documentation without dependency docs.
 - `scripts/run-integration-tests.sh`: sign and run HVF-backed integration tests on macOS Apple Silicon; use `--allow-unsupported` only for CI runners that cannot execute HVF.
 - `cargo run -p bangbang`: run the current VMM process skeleton.
@@ -41,7 +44,7 @@ Unsafe code must stay isolated behind small FFI wrappers, with `SAFETY:` comment
 
 Use Rust’s built-in test framework with `#[test]`. Add focused unit tests for argument parsing, error formatting, and backend state transitions as those surfaces grow. Test names should describe behavior, such as `parse_help_arg` or `displays_hypervisor_error`.
 
-Real Hypervisor.framework integration tests must stay in `crates/hvf/tests/` and run through `scripts/run-integration-tests.sh` so the test binary is signed and unsupported hosts are handled explicitly. Do not run or add real HVF integration tests through the unsigned workspace test path.
+Real Hypervisor.framework integration tests must run through `scripts/run-integration-tests.sh` so binaries are signed and unsupported hosts are handled explicitly. HVF crate integration tests live in `crates/hvf/tests/`; executable-level HVF e2e tests may live under the owning executable crate as dedicated `test = false` Cargo targets. Do not run or add real HVF integration tests through the unsigned workspace test path.
 
 ## Commit & Pull Request Guidelines
 

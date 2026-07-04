@@ -1421,11 +1421,12 @@ surface:
 - unit tests for parsing, configuration, and state transitions
 - golden tests for Firecracker-shaped API responses once the API exists
 - real HVF-backed integration tests on macOS Apple Silicon through
-  `scripts/run-integration-tests.sh`, which signs the `bangbang-hvf`
-  integration tests with the `com.apple.security.hypervisor` entitlement before
-  running them; the script prepares the pinned Firecracker kernel plus
-  generated tiny initrd for guest boot tests and fails when the host cannot run
-  HVF tests unless CI explicitly uses `--allow-unsupported` after build/sign
+  `scripts/run-integration-tests.sh`, which signs the selected HVF test
+  binaries or executable e2e artifacts with the
+  `com.apple.security.hypervisor` entitlement before running them; the script
+  prepares the pinned Firecracker kernel plus generated tiny initrd for guest
+  boot and executable HVF e2e tests, and fails when the host cannot run HVF
+  tests unless CI explicitly uses `--allow-unsupported` after build/sign
   validation
 
 ## Security and Performance Scope
