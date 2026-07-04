@@ -256,6 +256,124 @@ fn executable_configures_vm_before_start() {
 }
 
 #[test]
+fn executable_configures_network_and_mmds() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start_with_extra_args(
+        &socket_path,
+        &instance_id,
+        &["--mmds-size-limit", "512"],
+    );
+
+    let network_response = http_put_json(
+        &socket_path,
+        "/network-interfaces/eth0",
+        r#"{"iface_id":"eth0","host_dev_name":"vmnet:shared","guest_mac":"12:34:56:78:9A:BC","mtu":1500}"#,
+    );
+    assert_no_content_response(&network_response, "PUT /network-interfaces/eth0");
+
+    let mmds_config_response = http_put_json(
+        &socket_path,
+        "/mmds/config",
+        r#"{"network_interfaces":["eth0"],"version":"V2","ipv4_address":"169.254.169.254","imds_compat":true}"#,
+    );
+    assert_no_content_response(&mmds_config_response, "PUT /mmds/config");
+
+    let vm_config = http_get(&socket_path, "/vm/config");
+    assert_ok_response(&vm_config, "GET /vm/config");
+    assert_response_contains(&vm_config, r#""network-interfaces":["#, "GET /vm/config");
+    assert_response_contains(&vm_config, r#""iface_id":"eth0""#, "GET /vm/config");
+    assert_response_contains(
+        &vm_config,
+        r#""host_dev_name":"vmnet:shared""#,
+        "GET /vm/config",
+    );
+    assert_response_contains(
+        &vm_config,
+        r#""guest_mac":"12:34:56:78:9a:bc""#,
+        "GET /vm/config",
+    );
+    assert_response_contains(&vm_config, r#""mtu":1500"#, "GET /vm/config");
+    assert_response_contains(&vm_config, r#""mmds-config":"#, "GET /vm/config");
+    assert_response_contains(
+        &vm_config,
+        r#""network_interfaces":["eth0"]"#,
+        "GET /vm/config",
+    );
+    assert_response_contains(&vm_config, r#""version":"V2""#, "GET /vm/config");
+    assert_response_contains(
+        &vm_config,
+        r#""ipv4_address":"169.254.169.254""#,
+        "GET /vm/config",
+    );
+    assert_response_contains(&vm_config, r#""imds_compat":true"#, "GET /vm/config");
+
+    let put_mmds_response = http_put_json(
+        &socket_path,
+        "/mmds",
+        r#"{"latest":{"meta-data":{"ami-id":"ami-bangbang","remove-me":"yes"},"user-data":"before"}}"#,
+    );
+    assert_no_content_response(&put_mmds_response, "PUT /mmds");
+
+    let patch_mmds_response = http_json(
+        &socket_path,
+        "PATCH",
+        "/mmds",
+        r#"{"latest":{"dynamic":{"instance-identity":"document"},"meta-data":{"ami-id":"ami-updated","remove-me":null}}}"#,
+    );
+    assert_no_content_response(&patch_mmds_response, "PATCH /mmds");
+
+    let mmds_data = http_get(&socket_path, "/mmds");
+    assert_ok_response(&mmds_data, "GET /mmds");
+    assert_response_contains(&mmds_data, r#""ami-id":"ami-updated""#, "GET /mmds");
+    assert_response_contains(&mmds_data, r#""user-data":"before""#, "GET /mmds");
+    assert_response_contains(&mmds_data, r#""instance-identity":"document""#, "GET /mmds");
+    assert!(
+        !mmds_data.contains("remove-me"),
+        "PATCH /mmds should remove null-valued fields; response:\n{mmds_data}"
+    );
+
+    let oversized_value = "x".repeat(600);
+    let oversized_value_json = json_string(&oversized_value);
+    let oversized_patch_body = format!(r#"{{"latest":{{"user-data":{oversized_value_json}}}}}"#);
+    let oversized_response = http_json(&socket_path, "PATCH", "/mmds", &oversized_patch_body);
+    assert_bad_request_response(&oversized_response, "oversized PATCH /mmds");
+    assert_response_contains(
+        &oversized_response,
+        "The MMDS data store size limit was exceeded",
+        "oversized PATCH /mmds",
+    );
+
+    let mmds_after_oversized_patch = http_get(&socket_path, "/mmds");
+    assert_ok_response(
+        &mmds_after_oversized_patch,
+        "GET /mmds after oversized patch",
+    );
+    assert_response_contains(
+        &mmds_after_oversized_patch,
+        r#""ami-id":"ami-updated""#,
+        "GET /mmds after oversized patch",
+    );
+    assert_response_contains(
+        &mmds_after_oversized_patch,
+        r#""user-data":"before""#,
+        "GET /mmds after oversized patch",
+    );
+    assert_response_contains(
+        &mmds_after_oversized_patch,
+        r#""instance-identity":"document""#,
+        "GET /mmds after oversized patch",
+    );
+    assert!(
+        !mmds_after_oversized_patch.contains(&oversized_value),
+        "oversized PATCH /mmds must not partially mutate the data store; response:\n{mmds_after_oversized_patch}"
+    );
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
 fn executable_serves_and_patches_machine_config() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
