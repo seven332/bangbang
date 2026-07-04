@@ -255,7 +255,7 @@ compatibility targets.
 | `PUT` | `/entropy` | recognized; rejected | Returns an entropy-specific unsupported fault. Real virtio-rng configuration storage, rate limiting, guest randomness wiring, and startup resource attachment need a dedicated device design. |
 | `PUT` | `/serial` | recognized; rejected | Returns a serial-specific unsupported fault. Public serial configuration storage, host output redirection, rate limiting, and integration with the existing internal serial capture path need a dedicated design. |
 | `GET`, `PUT`, `PATCH` | `/hotplug/memory` | deferred | Requires memory hotplug device and runtime update design. |
-| `PATCH` | `/vm` | deferred | Pause and resume state rules need future VMM action and run-loop control design. |
+| `PATCH` | `/vm` | recognized; rejected | Returns a VM-state-specific unsupported fault. Real pause/resume state rules, VMM actions, and public run-loop control need a dedicated design. |
 | `PATCH` | `/drives/{drive_id}`, `/network-interfaces/{iface_id}` | deferred | Hotplug and runtime update behavior belongs with the relevant device issues. |
 | `DELETE` | `/drives/{drive_id}`, `/pmem/{id}`, `/network-interfaces/{iface_id}` | deferred | Firecracker routes these hot-unplug requests in `parsed_request.rs`, but they are not in the `v1.16.0` swagger surface; support needs an explicit compatibility decision. |
 

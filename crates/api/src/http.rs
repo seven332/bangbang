@@ -48,6 +48,7 @@ pub enum RequestError {
     SendCtrlAltDelUnsupported,
     SerialUnsupported,
     SnapshotUnsupported,
+    VmStateUpdateUnsupported,
 }
 
 impl RequestError {
@@ -64,6 +65,7 @@ impl RequestError {
             Self::SendCtrlAltDelUnsupported => "SendCtrlAltDel is not supported on aarch64.",
             Self::SerialUnsupported => "Serial device is not supported.",
             Self::SnapshotUnsupported => "Snapshot and restore are not supported.",
+            Self::VmStateUpdateUnsupported => "VM state updates are not supported.",
         }
     }
 }
@@ -1156,6 +1158,9 @@ pub fn parse_request_with_limit(
     }
     if method == "PATCH" && path == "/machine-config" {
         return parse_machine_config_patch_request(body);
+    }
+    if method == "PATCH" && path == "/vm" {
+        return Err(RequestError::VmStateUpdateUnsupported);
     }
     if method == "PUT" && path == "/metrics" {
         return parse_metrics_config_request(body);
@@ -3468,6 +3473,40 @@ mod tests {
     #[test]
     fn rejects_non_exact_serial_path_as_invalid_path_method() {
         let request = request_with_body("PUT", "/serial/extra", "{}");
+
+        assert_eq!(
+            parse_request(&request),
+            Err(RequestError::InvalidPathMethod)
+        );
+    }
+
+    #[test]
+    fn rejects_vm_state_update_as_unsupported() {
+        let request = request_with_body("PATCH", "/vm", r#"{"state":"Paused"}"#);
+
+        let err = parse_request(&request).expect_err("VM state updates should be unsupported");
+        assert_eq!(err, RequestError::VmStateUpdateUnsupported);
+        assert_eq!(err.fault_message(), "VM state updates are not supported.");
+    }
+
+    #[test]
+    fn rejects_vm_state_update_as_unsupported_without_parsing_body() {
+        let malformed_body = request_with_body("PATCH", "/vm", "not-json");
+        let empty_body = b"PATCH /vm HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n";
+
+        assert_eq!(
+            parse_request(&malformed_body),
+            Err(RequestError::VmStateUpdateUnsupported)
+        );
+        assert_eq!(
+            parse_request(empty_body),
+            Err(RequestError::VmStateUpdateUnsupported)
+        );
+    }
+
+    #[test]
+    fn rejects_non_exact_vm_state_update_path_as_invalid_path_method() {
+        let request = request_with_body("PATCH", "/vm/extra", r#"{"state":"Paused"}"#);
 
         assert_eq!(
             parse_request(&request),
