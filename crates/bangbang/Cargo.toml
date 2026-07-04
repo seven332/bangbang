@@ -11,6 +11,7 @@ bangbang-runtime = { path = "../runtime" }
 block2 = "0.6.2"
 dispatch2 = "0.3.1"
 libc = "0.2"
+serde_json = "1"
 signal-hook = "0.3"
 
 [[test]]

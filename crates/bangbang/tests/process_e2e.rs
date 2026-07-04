@@ -61,6 +61,40 @@ fn executable_serves_api_and_shuts_down_cleanly() {
 }
 
 #[test]
+fn executable_config_file_failure_does_not_publish_socket() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let config_path = test_dir.path().join("vm-config.json");
+    let instance_id = test_dir.instance_id();
+    fs::write(&config_path, "{").expect("malformed config file should be written");
+
+    let output = BangbangProcess::start_with_extra_args_expect_failure(
+        &socket_path,
+        &instance_id,
+        &["--config-file", path_text(&config_path)],
+    );
+
+    assert!(
+        !output.status.success(),
+        "malformed config file should fail startup; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        !socket_path.exists(),
+        "malformed config file should fail before API socket publication"
+    );
+    assert!(
+        output
+            .stderr
+            .contains("bangbang: config-file error: malformed config file"),
+        "stderr should describe config-file parse failure without JSON contents; stderr:\n{}",
+        output.stderr
+    );
+}
+
+#[test]
 fn executable_configures_vm_before_start() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");

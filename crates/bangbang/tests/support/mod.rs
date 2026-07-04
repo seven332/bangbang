@@ -202,27 +202,45 @@ impl BangbangProcess {
     pub(crate) fn start_expect_failure(socket_path: &Path, instance_id: &str) -> CompletedProcess {
         let mut process = Self::spawn(socket_path, instance_id);
 
-        match process.ready.recv_timeout(STARTUP_TIMEOUT) {
+        process.wait_for_startup_failure()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "shared integration-test support is compiled once per test target"
+    )]
+    pub(crate) fn start_with_extra_args_expect_failure(
+        socket_path: &Path,
+        instance_id: &str,
+        extra_args: &[&str],
+    ) -> CompletedProcess {
+        let mut process = Self::spawn_with_extra_args(socket_path, instance_id, extra_args);
+
+        process.wait_for_startup_failure()
+    }
+
+    fn wait_for_startup_failure(&mut self) -> CompletedProcess {
+        match self.ready.recv_timeout(STARTUP_TIMEOUT) {
             Ok(()) => {
-                let output = process.force_stop_and_collect();
+                let output = self.force_stop_and_collect();
                 panic!(
                     "bangbang reported API readiness but startup failure was expected; binary: {}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-                    process.binary_path.display(),
+                    self.binary_path.display(),
                     output.status,
                     output.stdout,
                     output.stderr
                 );
             }
             Err(RecvTimeoutError::Disconnected) => {
-                let child = process.child.take().expect("child should still be owned");
+                let child = self.child.take().expect("child should still be owned");
                 let status = wait_for_child_exit(child, SHUTDOWN_TIMEOUT);
-                process.collect_output(status)
+                self.collect_output(status)
             }
             Err(RecvTimeoutError::Timeout) => {
-                let output = process.force_stop_and_collect();
+                let output = self.force_stop_and_collect();
                 panic!(
                     "bangbang did not fail before timeout; binary: {}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-                    process.binary_path.display(),
+                    self.binary_path.display(),
                     output.status,
                     output.stdout,
                     output.stderr
@@ -232,12 +250,17 @@ impl BangbangProcess {
     }
 
     fn spawn(socket_path: &Path, instance_id: &str) -> Self {
+        Self::spawn_with_extra_args(socket_path, instance_id, &[])
+    }
+
+    fn spawn_with_extra_args(socket_path: &Path, instance_id: &str, extra_args: &[&str]) -> Self {
         let binary_path = bangbang_bin();
         let mut child = Command::new(&binary_path)
             .arg("--api-sock")
             .arg(socket_path)
             .arg("--id")
             .arg(instance_id)
+            .args(extra_args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

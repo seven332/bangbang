@@ -12,6 +12,7 @@ dependencies = [
  "block2",
  "dispatch2",
  "libc",
+ "serde_json",
  "signal-hook",
 ]
 
