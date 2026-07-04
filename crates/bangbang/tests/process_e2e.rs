@@ -256,6 +256,48 @@ fn executable_configures_vm_before_start() {
 }
 
 #[test]
+fn executable_configures_writeback_drive_cache_type() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let drive_path = test_dir.path().join("writeback.img");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    let drive_path_json = json_string(path_text(&drive_path));
+    let drive_body = format!(
+        r#"{{
+            "drive_id":"cache",
+            "path_on_host":{drive_path_json},
+            "is_root_device":false,
+            "is_read_only":false,
+            "cache_type":"Writeback"
+        }}"#
+    );
+    let drive_response = http_put_json(&socket_path, "/drives/cache", &drive_body);
+    assert_no_content_response(&drive_response, "PUT /drives/cache");
+
+    let vm_config = http_get(&socket_path, "/vm/config");
+    assert_ok_response(&vm_config, "GET /vm/config after writeback drive");
+    assert_response_contains(
+        &vm_config,
+        r#""drive_id":"cache""#,
+        "GET /vm/config after writeback drive",
+    );
+    assert_response_contains(
+        &vm_config,
+        &format!(r#""path_on_host":{drive_path_json}"#),
+        "GET /vm/config after writeback drive",
+    );
+    assert_response_contains(
+        &vm_config,
+        r#""cache_type":"Writeback""#,
+        "GET /vm/config after writeback drive",
+    );
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
 fn executable_configures_network_and_mmds() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
