@@ -451,6 +451,7 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PutBootSource(config) => handle_empty(vmm.handle_action(
             VmmAction::PutBootSource(boot_source_input_from_request(config.as_ref())),
         )),
+        ApiRequest::PutCpuConfig(_) => handle_empty(vmm.handle_action(VmmAction::PutCpuConfig)),
         ApiRequest::PutLogger(config) => handle_empty(vmm.handle_action(VmmAction::PutLogger(
             logger_config_input_from_request(config.as_ref()),
         ))),
@@ -2969,31 +2970,63 @@ mod tests {
     }
 
     #[test]
-    fn returns_fault_for_cpu_config_endpoint() {
-        let path = unique_socket_path("cpu-fault");
-        let server = ApiServer::bind(&path).expect("server should bind");
-        let mut client = UnixStream::connect(&path).expect("client should connect");
-
-        client
-            .write_all(
-                b"PUT /cpu-config HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
-            )
-            .expect("client should write request");
+    fn not_started_state_rejects_cpu_config_without_mutating() {
         let mut vmm = test_controller();
-        server
-            .serve_next(&mut vmm)
-            .expect("server should handle one request");
+        let request = "PUT /cpu-config HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}";
 
-        let mut response = String::new();
-        client
-            .read_to_string(&mut response)
-            .expect("client should read response");
+        let response = request_over_socket(&mut vmm, "cpu-cfg-ns", request);
 
         assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        assert!(response.contains(r#"{"fault_message":"CPU config is not supported."}"#));
+        assert!(response.contains(
+            r#"{"fault_message":"The requested operation is not supported: PutCpuConfig"}"#
+        ));
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::NotStarted
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_cpu_config_without_mutating() {
+        let mut vmm = test_controller();
+        let request =
+            "PUT /cpu-config HTTP/1.1\r\nHost: localhost\r\nContent-Length: 8\r\n\r\nnot-json";
+
+        let response = request_over_socket(&mut vmm, "cpu-cfg-bad", request);
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.contains(r#"{"fault_message":"Malformed HTTP request."}"#));
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::NotStarted
+        );
+    }
+
+    #[test]
+    fn running_state_rejects_cpu_config_without_mutating() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_request = format!(
+            "PUT /boot-source HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{boot_body}",
+            boot_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "cpu-cfg-start", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let request = "PUT /cpu-config HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}";
+
+        let response = request_over_socket(&mut vmm, "cpu-cfg-run", request);
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.contains(
+            r#"{"fault_message":"The requested operation is not supported in Running state: PutCpuConfig"}"#
+        ));
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::Running
         );
     }
 

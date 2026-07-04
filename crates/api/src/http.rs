@@ -13,6 +13,8 @@ const TOKEN_BUCKET_SIZE_FIELD: &str = "size";
 const TOKEN_BUCKET_ONE_TIME_BURST_FIELD: &str = "one_time_burst";
 const TOKEN_BUCKET_REFILL_TIME_FIELD: &str = "refill_time";
 const MAX_MACHINE_CONFIG_VCPUS: u8 = 32;
+const ARM64_KVM_REG_SIZE_MASK: u64 = 0x00f0_0000_0000_0000;
+const ARM64_KVM_REG_SIZE_SHIFT: u32 = 52;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiRequest {
@@ -23,6 +25,7 @@ pub enum ApiRequest {
     GetVersion,
     PutAction(Box<ActionRequest>),
     PutBootSource(Box<BootSourceRequest>),
+    PutCpuConfig(Box<CpuConfigRequest>),
     PutDrive(Box<DriveConfigRequest>),
     PatchDrive(Box<DrivePatchRequest>),
     PatchVmState(Box<VmStateUpdateRequest>),
@@ -40,7 +43,6 @@ pub enum ApiRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestError {
     BalloonUnsupported,
-    CpuConfigUnsupported,
     DriveUpdateUnsupported,
     EntropyUnsupported,
     GetRequestBody,
@@ -61,7 +63,6 @@ impl RequestError {
     pub fn fault_message(&self) -> &'static str {
         match self {
             Self::BalloonUnsupported => "Balloon device is not supported.",
-            Self::CpuConfigUnsupported => "CPU config is not supported.",
             Self::DriveUpdateUnsupported => "Drive updates are not supported.",
             Self::EntropyUnsupported => "Entropy device is not supported.",
             Self::GetRequestBody => "GET request cannot have a body.",
@@ -119,6 +120,9 @@ enum ActionTypeBody {
     InstanceStart,
     SendCtrlAltDel,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuConfigRequest;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmStateUpdateRequest {
@@ -1244,7 +1248,7 @@ pub fn parse_request_with_limit(
         return parse_boot_source_request(body);
     }
     if method == "PUT" && path == "/cpu-config" {
-        return Err(RequestError::CpuConfigUnsupported);
+        return parse_cpu_config_request(body);
     }
     if method == "PUT" && path == "/entropy" {
         return Err(RequestError::EntropyUnsupported);
@@ -1359,6 +1363,199 @@ fn parse_vm_state_update_request(body: &[u8]) -> Result<ApiRequest, RequestError
     Ok(ApiRequest::PatchVmState(Box::new(VmStateUpdateRequest {
         state,
     })))
+}
+
+fn parse_cpu_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
+    let value = serde_json::from_slice::<serde_json::Value>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+    validate_cpu_config_value(&value).map_err(|()| RequestError::MalformedRequest)?;
+
+    Ok(ApiRequest::PutCpuConfig(Box::new(CpuConfigRequest)))
+}
+
+fn validate_cpu_config_value(value: &serde_json::Value) -> Result<(), ()> {
+    let object = value.as_object().ok_or(())?;
+
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "kvm_capabilities" | "reg_modifiers" | "vcpu_features"
+        ) {
+            return Err(());
+        }
+    }
+
+    if let Some(kvm_capabilities) = object.get("kvm_capabilities") {
+        validate_cpu_config_array(kvm_capabilities, validate_kvm_capability)?;
+    }
+    if let Some(reg_modifiers) = object.get("reg_modifiers") {
+        validate_cpu_config_array(reg_modifiers, validate_arm_register_modifier)?;
+    }
+    if let Some(vcpu_features) = object.get("vcpu_features") {
+        validate_cpu_config_array(vcpu_features, validate_vcpu_feature)?;
+    }
+
+    Ok(())
+}
+
+fn validate_cpu_config_array(
+    value: &serde_json::Value,
+    mut validate_item: impl FnMut(&serde_json::Value) -> Result<(), ()>,
+) -> Result<(), ()> {
+    let values = value.as_array().ok_or(())?;
+
+    for item in values {
+        validate_item(item)?;
+    }
+
+    Ok(())
+}
+
+fn validate_kvm_capability(value: &serde_json::Value) -> Result<(), ()> {
+    let capability = value.as_str().ok_or(())?;
+    let capability = capability.strip_prefix('!').unwrap_or(capability);
+
+    if capability.is_empty() {
+        return Err(());
+    }
+
+    capability.parse::<u32>().map(|_| ()).map_err(|_| ())
+}
+
+fn validate_arm_register_modifier(value: &serde_json::Value) -> Result<(), ()> {
+    let object = exact_object(value, &["addr", "bitmap"])?;
+
+    let register_id = validate_prefixed_u64(required_field(object, "addr")?)?;
+    let register_bits = validate_arm64_register_bits(register_id)?;
+    let bitmap = validate_bitmap(required_field(object, "bitmap")?, u128::BITS)?;
+
+    if let Some(limit) = register_bitmap_limit(register_bits)
+        && (bitmap.value > limit || bitmap.filter > limit)
+    {
+        return Err(());
+    }
+
+    Ok(())
+}
+
+fn validate_vcpu_feature(value: &serde_json::Value) -> Result<(), ()> {
+    let object = exact_object(value, &["index", "bitmap"])?;
+
+    validate_u32_number(required_field(object, "index")?)?;
+    validate_bitmap(required_field(object, "bitmap")?, u32::BITS).map(|_| ())
+}
+
+fn exact_object<'value>(
+    value: &'value serde_json::Value,
+    fields: &[&str],
+) -> Result<&'value serde_json::Map<String, serde_json::Value>, ()> {
+    let object = value.as_object().ok_or(())?;
+
+    for field in fields {
+        if !object.contains_key(*field) {
+            return Err(());
+        }
+    }
+    for key in object.keys() {
+        if !fields.contains(&key.as_str()) {
+            return Err(());
+        }
+    }
+
+    Ok(object)
+}
+
+fn required_field<'value>(
+    object: &'value serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<&'value serde_json::Value, ()> {
+    object.get(field).ok_or(())
+}
+
+fn validate_prefixed_u64(value: &serde_json::Value) -> Result<u64, ()> {
+    let string = value.as_str().ok_or(())?;
+    parse_prefixed_integer(string, u64::from_str_radix)
+}
+
+fn parse_prefixed_integer<T>(
+    value: &str,
+    parse: impl Fn(&str, u32) -> Result<T, std::num::ParseIntError>,
+) -> Result<T, ()> {
+    let (digits, radix) = if let Some(binary) = value.strip_prefix("0b") {
+        (binary, 2)
+    } else if let Some(hex) = value.strip_prefix("0x") {
+        (hex, 16)
+    } else {
+        return Err(());
+    };
+
+    if digits.is_empty() {
+        return Err(());
+    }
+
+    parse(digits, radix).map_err(|_| ())
+}
+
+fn validate_u32_number(value: &serde_json::Value) -> Result<(), ()> {
+    let number = value.as_u64().ok_or(())?;
+
+    u32::try_from(number).map(|_| ()).map_err(|_| ())
+}
+
+fn validate_arm64_register_bits(register_id: u64) -> Result<u32, ()> {
+    match (register_id & ARM64_KVM_REG_SIZE_MASK) >> ARM64_KVM_REG_SIZE_SHIFT {
+        2 => Ok(32),
+        3 => Ok(64),
+        4 => Ok(128),
+        _ => Err(()),
+    }
+}
+
+fn register_bitmap_limit(register_bits: u32) -> Option<u128> {
+    if register_bits == u128::BITS {
+        None
+    } else {
+        Some((1_u128 << register_bits) - 1)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CpuTemplateBitmap {
+    filter: u128,
+    value: u128,
+}
+
+fn validate_bitmap(value: &serde_json::Value, max_bits: u32) -> Result<CpuTemplateBitmap, ()> {
+    let bitmap = value.as_str().ok_or(())?;
+    let bitmap = bitmap.strip_prefix("0b").unwrap_or(bitmap);
+    let mut bit_count = 0;
+    let mut filter = 0;
+    let mut value = 0;
+
+    for byte in bitmap.bytes().rev() {
+        if bit_count == max_bits {
+            return Err(());
+        }
+
+        match byte {
+            b'_' => {}
+            b'x' => {
+                bit_count += 1;
+            }
+            b'0' => {
+                filter |= 1_u128 << bit_count;
+                bit_count += 1;
+            }
+            b'1' => {
+                filter |= 1_u128 << bit_count;
+                value |= 1_u128 << bit_count;
+                bit_count += 1;
+            }
+            _ => return Err(()),
+        }
+    }
+
+    Ok(CpuTemplateBitmap { filter, value })
 }
 
 fn parse_boot_source_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
@@ -1836,6 +2033,7 @@ impl From<ApiRequest> for Endpoint {
             ApiRequest::PatchVmState(_) => Self::VmState,
             ApiRequest::PutAction(_) => Self::Actions,
             ApiRequest::PutBootSource(_) => Self::BootSource,
+            ApiRequest::PutCpuConfig(_) => Self::CpuConfig,
             ApiRequest::PutDrive(_) | ApiRequest::PatchDrive(_) => Self::Drive,
             ApiRequest::PutLogger(_) => Self::Logger,
             ApiRequest::PutMachineConfig(_) => Self::MachineConfig,
@@ -3900,28 +4098,73 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cpu_config_as_unsupported() {
+    fn parses_empty_cpu_config_request() {
         let request = request_with_body("PUT", "/cpu-config", "{}");
 
-        let err = parse_request(&request).expect_err("cpu-config should be unsupported");
-        assert_eq!(err, RequestError::CpuConfigUnsupported);
-        assert_eq!(err.fault_message(), "CPU config is not supported.");
+        let parsed = parse_request(&request).expect("empty cpu-config should parse");
+
+        let ApiRequest::PutCpuConfig(_) = parsed else {
+            panic!("expected cpu-config request");
+        };
     }
 
     #[test]
-    fn rejects_cpu_config_as_unsupported_without_parsing_body() {
-        let malformed_body = request_with_body("PUT", "/cpu-config", "not-json");
-        let empty_body =
-            b"PUT /cpu-config HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n";
+    fn parses_firecracker_shaped_cpu_config_request() {
+        let body = r#"{
+            "kvm_capabilities": ["1", "!2"],
+            "reg_modifiers": [
+                {
+                    "addr": "0x0030000000000000",
+                    "bitmap": "0bx00100x0x1xxxx01xxx1xxxxxxxxxxx1"
+                }
+            ],
+            "vcpu_features": [
+                {
+                    "index": 0,
+                    "bitmap": "0b1100000"
+                }
+            ]
+        }"#;
+        let request = request_with_body("PUT", "/cpu-config", body);
 
-        assert_eq!(
-            parse_request(&malformed_body),
-            Err(RequestError::CpuConfigUnsupported)
+        let parsed = parse_request(&request).expect("cpu-config should parse");
+
+        let ApiRequest::PutCpuConfig(_) = parsed else {
+            panic!("expected cpu-config request");
+        };
+    }
+
+    #[test]
+    fn rejects_malformed_cpu_config_bodies() {
+        for body in [
+            "not-json",
+            "",
+            "[]",
+            "null",
+            r#"{"unknown":[]}"#,
+            r#"{"kvm_capabilities":null}"#,
+            r#"{"kvm_capabilities":["!"]}"#,
+            r#"{"kvm_capabilities":["!a2"]}"#,
+            r#"{"cpuid_modifiers":[]}"#,
+            r#"{"msr_modifiers":[]}"#,
+            r#"{"reg_modifiers":[{"addr":"0x1"}]}"#,
+            r#"{"reg_modifiers":[{"addr":"1","bitmap":"0b1"}]}"#,
+            r#"{"reg_modifiers":[{"addr":"0x1","bitmap":"0b2"}]}"#,
+            r#"{"reg_modifiers":[{"addr":"0x0010000000000000","bitmap":"0b1"}]}"#,
+            r#"{"vcpu_features":[{"index":4294967296,"bitmap":"0b1"}]}"#,
+        ] {
+            let request = request_with_body("PUT", "/cpu-config", body);
+
+            assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+        }
+
+        let high_bit_body = format!(
+            r#"{{"reg_modifiers":[{{"addr":"0x0030000000000000","bitmap":"0b1{}"}}]}}"#,
+            "0".repeat(64)
         );
-        assert_eq!(
-            parse_request(empty_body),
-            Err(RequestError::CpuConfigUnsupported)
-        );
+        let request = request_with_body("PUT", "/cpu-config", &high_bit_body);
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
     }
 
     #[test]
@@ -4790,6 +5033,11 @@ mod tests {
         .expect("boot-source request should parse");
 
         assert_eq!(Endpoint::from(request), Endpoint::BootSource);
+
+        let request = parse_request(&request_with_body("PUT", "/cpu-config", "{}"))
+            .expect("cpu-config request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::CpuConfig);
 
         let request = parse_request(&request_with_body("PUT", "/logger", "{}"))
             .expect("logger request should parse");

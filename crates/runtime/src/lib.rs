@@ -73,6 +73,7 @@ pub enum VmmAction {
     Resume,
     FlushMetrics,
     PutBootSource(boot::BootSourceConfigInput),
+    PutCpuConfig,
     PutLogger(logger::LoggerConfigInput),
     PutMachineConfig(machine::MachineConfigInput),
     PatchMachineConfig(machine::MachineConfigPatchInput),
@@ -99,6 +100,7 @@ impl VmmAction {
             Self::Resume => "Resume",
             Self::FlushMetrics => "FlushMetrics",
             Self::PutBootSource(_) => "PutBootSource",
+            Self::PutCpuConfig => "PutCpuConfig",
             Self::PutLogger(_) => "PutLogger",
             Self::PutMachineConfig(_) => "PutMachineConfig",
             Self::PatchMachineConfig(_) => "PatchMachineConfig",
@@ -436,6 +438,16 @@ impl VmmController {
                 );
 
                 Ok(VmmData::Empty)
+            }
+            VmmAction::PutCpuConfig => {
+                if self.instance_info.state != InstanceState::NotStarted {
+                    return Err(VmmActionError::UnsupportedState {
+                        action: action_name,
+                        state: self.instance_info.state,
+                    });
+                }
+
+                Err(VmmActionError::UnsupportedAction(action_name))
             }
             VmmAction::PutLogger(config) => {
                 if self.instance_info.state != InstanceState::NotStarted {
@@ -936,6 +948,7 @@ mod tests {
         assert_eq!(VmmAction::Pause.name(), "Pause");
         assert_eq!(VmmAction::Resume.name(), "Resume");
         assert_eq!(VmmAction::FlushMetrics.name(), "FlushMetrics");
+        assert_eq!(VmmAction::PutCpuConfig.name(), "PutCpuConfig");
         assert_eq!(VmmAction::GetMmds.name(), "GetMmds");
         assert_eq!(
             VmmAction::PutLogger(LoggerConfigInput::new()).name(),
@@ -1035,6 +1048,50 @@ mod tests {
                 assert_eq!(controller.instance_info().state, state);
                 assert!(controller.boot_source_config().is_some());
             }
+        }
+    }
+
+    #[test]
+    fn put_cpu_config_rejects_not_started_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PutCpuConfig)
+            .expect_err("CPU config should remain unsupported");
+
+        assert_eq!(
+            err,
+            VmmActionError::UnsupportedAction(VmmAction::PutCpuConfig.name())
+        );
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert!(controller.boot_source_config().is_some());
+    }
+
+    #[test]
+    fn put_cpu_config_rejects_running_or_paused_without_mutating() {
+        for state in [InstanceState::Running, InstanceState::Paused] {
+            let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+            controller
+                .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+                .expect("boot source config should be stored");
+            controller.instance_info.state = state;
+
+            let err = controller
+                .handle_action(VmmAction::PutCpuConfig)
+                .expect_err("CPU config should reject runtime mutation");
+
+            assert_eq!(
+                err,
+                VmmActionError::UnsupportedState {
+                    action: VmmAction::PutCpuConfig.name(),
+                    state,
+                }
+            );
+            assert_eq!(controller.instance_info().state, state);
+            assert!(controller.boot_source_config().is_some());
         }
     }
 
