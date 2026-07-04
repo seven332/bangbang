@@ -511,6 +511,48 @@ fn vm_state_action_from_request(update: &VmStateUpdateRequest) -> VmmAction {
     }
 }
 
+pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<VmmAction> {
+    match request {
+        ApiRequest::PutBootSource(config) => Some(VmmAction::PutBootSource(
+            boot_source_input_from_request(config.as_ref()),
+        )),
+        ApiRequest::PutCpuConfig(_) => Some(VmmAction::PutCpuConfig),
+        ApiRequest::PutDrive(config) => Some(VmmAction::PutDrive(drive_config_input_from_request(
+            config.as_ref(),
+        ))),
+        ApiRequest::PutLogger(config) => Some(VmmAction::PutLogger(
+            logger_config_input_from_request(config.as_ref()),
+        )),
+        ApiRequest::PutMachineConfig(config) => Some(VmmAction::PutMachineConfig(
+            machine_config_input_from_request(config.as_ref()),
+        )),
+        ApiRequest::PutMetrics(config) => Some(VmmAction::PutMetrics(
+            metrics_config_input_from_request(config.as_ref()),
+        )),
+        ApiRequest::PutMmdsConfig(config) => Some(VmmAction::PutMmdsConfig(
+            mmds_config_input_from_request(config.as_ref()),
+        )),
+        ApiRequest::PutNetworkInterface(config) => Some(VmmAction::PutNetworkInterface(
+            network_interface_config_input_from_request(config.as_ref()),
+        )),
+        ApiRequest::PutVsock(config) => Some(VmmAction::PutVsock(vsock_config_input_from_request(
+            config.as_ref(),
+        ))),
+        ApiRequest::GetInstanceInfo
+        | ApiRequest::GetMachineConfig
+        | ApiRequest::GetMmds
+        | ApiRequest::GetVmConfig
+        | ApiRequest::GetVersion
+        | ApiRequest::PatchDrive(_)
+        | ApiRequest::PatchMachineConfig(_)
+        | ApiRequest::PatchMmds(_)
+        | ApiRequest::PatchVmState(_)
+        | ApiRequest::PutAction(_)
+        | ApiRequest::PutMmds(_)
+        | ApiRequest::PutSerial(_) => None,
+    }
+}
+
 fn boot_source_input_from_request(config: &BootSourceRequest) -> BootSourceConfigInput {
     let mut input = BootSourceConfigInput::new(config.kernel_image_path());
 

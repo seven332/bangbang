@@ -1,6 +1,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
+use std::fs;
 use std::os::unix::io::IntoRawFd;
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
@@ -11,8 +12,9 @@ mod api_server;
 pub mod host_network;
 mod vmm;
 
-use api_server::{ApiServer, ApiServerError};
+use api_server::{ApiServer, ApiServerError, config_vmm_action_from_api_request};
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
+use bangbang_api::http::{RequestError, parse_request_with_limit};
 use bangbang_hvf::HvfBackend;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::{SigId, low_level};
@@ -29,7 +31,6 @@ const MIN_INSTANCE_ID_LEN: usize = 1;
 const MAX_INSTANCE_ID_LEN: usize = 64;
 const UNSUPPORTED_FIRECRACKER_ARGS: &[&str] = &[
     "boot-timer",
-    "config-file",
     "describe-snapshot",
     "enable-pci",
     "metadata",
@@ -69,6 +70,7 @@ fn run() -> Result<(), ProcessError> {
             let effective_mmds_size_limit = config.effective_mmds_size_limit();
             let StartupConfig {
                 api_sock,
+                config_file,
                 http_api_max_payload_size,
                 id,
                 logger_config,
@@ -90,6 +92,7 @@ fn run() -> Result<(), ProcessError> {
             );
             apply_startup_metrics_config(&mut vmm, metrics_config)?;
             apply_startup_logger_config(&mut vmm, logger_config)?;
+            apply_startup_config_file(&mut vmm, config_file.as_deref())?;
             let mut shutdown_signal = ShutdownSignal::install()?;
             let server =
                 ApiServer::bind_with_max_payload_size(&api_sock, http_api_max_payload_size)
@@ -103,6 +106,201 @@ fn run() -> Result<(), ProcessError> {
     }
 
     Ok(())
+}
+
+fn apply_startup_config_file<S>(
+    vmm: &mut ProcessVmm<S>,
+    config_file: Option<&str>,
+) -> Result<(), ProcessError>
+where
+    S: vmm::InstanceStartExecutor,
+{
+    let Some(config_file) = config_file else {
+        return Ok(());
+    };
+    let actions = config_file_actions(config_file).map_err(ProcessError::ConfigFile)?;
+
+    for action in actions {
+        vmm.handle_action(action)
+            .map_err(ConfigFileError::Apply)
+            .map_err(ProcessError::ConfigFile)?;
+    }
+
+    vmm.handle_action(VmmAction::InstanceStart)
+        .map(|_| ())
+        .map_err(ConfigFileError::Apply)
+        .map_err(ProcessError::ConfigFile)
+}
+
+fn config_file_actions(config_file: &str) -> Result<Vec<VmmAction>, ConfigFileError> {
+    let contents =
+        fs::read_to_string(config_file).map_err(|err| ConfigFileError::Read(err.kind()))?;
+    config_file_actions_from_str(&contents)
+}
+
+fn config_file_actions_from_str(contents: &str) -> Result<Vec<VmmAction>, ConfigFileError> {
+    let value = serde_json::from_str::<serde_json::Value>(contents)
+        .map_err(|_| ConfigFileError::Malformed)?;
+    let object = value.as_object().ok_or(ConfigFileError::Malformed)?;
+
+    validate_config_file_sections(object)?;
+
+    let mut requests = Vec::new();
+    if let Some(machine_config) = object.get("machine-config") {
+        requests.push(config_section_request(
+            "machine-config",
+            "PUT",
+            "/machine-config".to_string(),
+            machine_config,
+        )?);
+    }
+
+    let boot_source = object
+        .get("boot-source")
+        .ok_or(ConfigFileError::MissingSection("boot-source"))?;
+    requests.push(config_section_request(
+        "boot-source",
+        "PUT",
+        "/boot-source".to_string(),
+        boot_source,
+    )?);
+
+    if let Some(drives) = object.get("drives") {
+        for drive in config_section_array("drives", drives)? {
+            let drive_id = config_section_string_field("drives", drive, "drive_id")?;
+            requests.push(config_section_request(
+                "drives",
+                "PUT",
+                format!("/drives/{drive_id}"),
+                drive,
+            )?);
+        }
+    }
+
+    if let Some(network_interfaces) = object.get("network-interfaces") {
+        for network_interface in config_section_array("network-interfaces", network_interfaces)? {
+            let iface_id =
+                config_section_string_field("network-interfaces", network_interface, "iface_id")?;
+            requests.push(config_section_request(
+                "network-interfaces",
+                "PUT",
+                format!("/network-interfaces/{iface_id}"),
+                network_interface,
+            )?);
+        }
+    }
+
+    if let Some(mmds_config) = object.get("mmds-config") {
+        requests.push(config_section_request(
+            "mmds-config",
+            "PUT",
+            "/mmds/config".to_string(),
+            mmds_config,
+        )?);
+    }
+
+    if let Some(vsock) = object.get("vsock") {
+        requests.push(config_section_request(
+            "vsock",
+            "PUT",
+            "/vsock".to_string(),
+            vsock,
+        )?);
+    }
+
+    if let Some(cpu_config) = object.get("cpu-config") {
+        requests.push(config_section_request(
+            "cpu-config",
+            "PUT",
+            "/cpu-config".to_string(),
+            cpu_config,
+        )?);
+    }
+
+    if let Some(metrics) = object.get("metrics") {
+        requests.push(config_section_request(
+            "metrics",
+            "PUT",
+            "/metrics".to_string(),
+            metrics,
+        )?);
+    }
+
+    if let Some(logger) = object.get("logger") {
+        requests.push(config_section_request(
+            "logger",
+            "PUT",
+            "/logger".to_string(),
+            logger,
+        )?);
+    }
+
+    requests
+        .into_iter()
+        .map(|(section, request)| {
+            config_vmm_action_from_api_request(request)
+                .ok_or(ConfigFileError::UnsupportedRequest { section })
+        })
+        .collect()
+}
+
+fn validate_config_file_sections(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), ConfigFileError> {
+    for section in object.keys() {
+        match section.as_str() {
+            "boot-source" | "cpu-config" | "drives" | "logger" | "machine-config" | "metrics"
+            | "mmds-config" | "network-interfaces" | "vsock" => {}
+            "balloon" | "entropy" | "memory-hotplug" | "pmem" => {
+                return Err(ConfigFileError::UnsupportedSection(section.clone()));
+            }
+            _ => return Err(ConfigFileError::UnknownSection(section.clone())),
+        }
+    }
+
+    Ok(())
+}
+
+fn config_section_array<'value>(
+    section: &'static str,
+    value: &'value serde_json::Value,
+) -> Result<&'value [serde_json::Value], ConfigFileError> {
+    value
+        .as_array()
+        .map(Vec::as_slice)
+        .ok_or(ConfigFileError::MalformedSection { section })
+}
+
+fn config_section_string_field<'value>(
+    section: &'static str,
+    value: &'value serde_json::Value,
+    field: &'static str,
+) -> Result<&'value str, ConfigFileError> {
+    value
+        .as_object()
+        .and_then(|object| object.get(field))
+        .and_then(serde_json::Value::as_str)
+        .ok_or(ConfigFileError::MalformedSection { section })
+}
+
+fn config_section_request(
+    section: &'static str,
+    method: &str,
+    path: String,
+    body: &serde_json::Value,
+) -> Result<(&'static str, bangbang_api::http::ApiRequest), ConfigFileError> {
+    let body =
+        serde_json::to_vec(body).map_err(|_| ConfigFileError::MalformedSection { section })?;
+    let header = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let mut request = header.into_bytes();
+    request.extend_from_slice(&body);
+
+    parse_request_with_limit(&request, usize::MAX)
+        .map(|request| (section, request))
+        .map_err(|source| ConfigFileError::Request { section, source })
 }
 
 fn apply_startup_metrics_config<S>(
@@ -164,6 +362,7 @@ impl ProcessExitCode {
 enum ProcessError {
     ApiServer(ApiServerError),
     ArgumentParsing(String),
+    ConfigFile(ConfigFileError),
     SignalHandler(std::io::ErrorKind),
     StartupConfiguration(VmmActionError),
 }
@@ -173,6 +372,7 @@ impl ProcessError {
         match self {
             Self::ApiServer(_) => ProcessExitCode::ProcessFailure,
             Self::ArgumentParsing(_) => ProcessExitCode::ArgumentParsing,
+            Self::ConfigFile(_) => ProcessExitCode::ProcessFailure,
             Self::SignalHandler(_) => ProcessExitCode::ProcessFailure,
             Self::StartupConfiguration(_) => ProcessExitCode::ProcessFailure,
         }
@@ -184,6 +384,7 @@ impl fmt::Display for ProcessError {
         match self {
             Self::ApiServer(err) => write!(f, "API server error: {err}"),
             Self::ArgumentParsing(message) => f.write_str(message),
+            Self::ConfigFile(err) => write!(f, "config-file error: {err}"),
             Self::SignalHandler(kind) => {
                 write!(f, "failed to register shutdown signal handler: {kind:?}")
             }
@@ -195,6 +396,56 @@ impl fmt::Display for ProcessError {
 }
 
 impl std::error::Error for ProcessError {}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ConfigFileError {
+    Read(std::io::ErrorKind),
+    Malformed,
+    MissingSection(&'static str),
+    UnknownSection(String),
+    UnsupportedSection(String),
+    MalformedSection {
+        section: &'static str,
+    },
+    Request {
+        section: &'static str,
+        source: RequestError,
+    },
+    UnsupportedRequest {
+        section: &'static str,
+    },
+    Apply(VmmActionError),
+}
+
+impl fmt::Display for ConfigFileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(kind) => write!(f, "failed to read config file: {kind:?}"),
+            Self::Malformed => f.write_str("malformed config file"),
+            Self::MissingSection(section) => {
+                write!(f, "config file is missing required section: {section}")
+            }
+            Self::UnknownSection(section) => write!(f, "unknown config-file section: {section}"),
+            Self::UnsupportedSection(section) => {
+                write!(f, "unsupported config-file section: {section}")
+            }
+            Self::MalformedSection { section } => {
+                write!(f, "malformed config-file section: {section}")
+            }
+            Self::Request { section, source } => write!(
+                f,
+                "invalid config-file section {section}: {}",
+                source.fault_message()
+            ),
+            Self::UnsupportedRequest { section } => {
+                write!(f, "unsupported config-file request in section: {section}")
+            }
+            Self::Apply(err) => write!(f, "failed to apply config-file action: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for ConfigFileError {}
 
 #[derive(Debug)]
 struct ShutdownSignal {
@@ -266,6 +517,7 @@ enum Command {
 #[derive(Debug, PartialEq, Eq)]
 struct StartupConfig {
     api_sock: String,
+    config_file: Option<String>,
     http_api_max_payload_size: usize,
     id: String,
     logger_config: Option<LoggerConfigInput>,
@@ -277,6 +529,7 @@ impl Default for StartupConfig {
     fn default() -> Self {
         Self {
             api_sock: DEFAULT_API_SOCK_PATH.to_string(),
+            config_file: None,
             http_api_max_payload_size: HTTP_MAX_PAYLOAD_SIZE,
             id: DEFAULT_INSTANCE_ID.to_string(),
             logger_config: None,
@@ -340,6 +593,7 @@ impl Args {
 
         let mut config = StartupConfig::default();
         let mut api_sock_seen = false;
+        let mut config_file_seen = false;
         let mut http_api_max_payload_size_seen = false;
         let mut id_seen = false;
         let mut logger_config = LoggerConfigInput::new();
@@ -363,6 +617,16 @@ impl Args {
                     validate_api_sock(&value)?;
                     config.api_sock = value;
                     api_sock_seen = true;
+                    index += 2;
+                }
+                "--config-file" => {
+                    if config_file_seen {
+                        return Err("duplicate argument: --config-file".to_string());
+                    }
+                    let value = take_value(&args, index, "--config-file")?;
+                    validate_config_file_path(&value)?;
+                    config.config_file = Some(value);
+                    config_file_seen = true;
                     index += 2;
                 }
                 "--http-api-max-payload-size" => {
@@ -500,6 +764,8 @@ fn help_text() -> String {
             "  bangbang [OPTIONS]\n\n",
             "Options:\n",
             "      --api-sock <PATH>  Unix domain socket path for the API server [default: {}]\n",
+            "      --config-file <PATH>\n",
+            "                         Firecracker-shaped config file for API-enabled startup\n",
             "      --http-api-max-payload-size <BYTES>\n",
             "                         Maximum HTTP API request size [default: {}]\n",
             "      --id <ID>          MicroVM unique identifier [default: {}]\n",
@@ -521,7 +787,9 @@ fn help_text() -> String {
             "PUT /network-interfaces/{{iface_id}}, pre-boot PUT /vsock, ",
             "pre-boot PUT /metrics and startup metrics output configuration, ",
             "and pre-boot PUT /logger and startup logger configuration with ",
-            "minimal action logs; PATCH /vm parses Paused and Resumed state requests ",
+            "minimal action logs; --config-file can apply the same supported ",
+            "pre-boot configuration and start the VM before API serving; ",
+            "PATCH /vm parses Paused and Resumed state requests ",
             "as unsupported lifecycle actions; PUT /cpu-config parses custom CPU ",
             "template requests as unsupported CPU configuration actions; ",
             "PUT /actions starts a process-owned ",
@@ -556,6 +824,18 @@ fn validate_api_sock(api_sock: &str) -> Result<(), String> {
 
 fn parse_http_api_max_payload_size(value: &str) -> Result<usize, String> {
     parse_positive_usize_arg(value, "http-api-max-payload-size")
+}
+
+fn validate_config_file_path(config_file: &str) -> Result<(), String> {
+    if config_file.is_empty() {
+        return Err("invalid --config-file: path must not be empty".to_string());
+    }
+
+    if config_file.chars().any(char::is_control) {
+        return Err("invalid --config-file: path must not contain control characters".to_string());
+    }
+
+    Ok(())
 }
 
 fn parse_mmds_size_limit(value: &str) -> Result<usize, String> {
@@ -613,6 +893,7 @@ fn display_arg_name(arg: &str) -> &str {
 fn unsupported_equals_syntax(arg: &str) -> Option<&'static str> {
     [
         ("--api-sock=", "api-sock"),
+        ("--config-file=", "config-file"),
         ("--http-api-max-payload-size=", "http-api-max-payload-size"),
         ("--id=", "id"),
         ("--log-path=", "log-path"),
@@ -636,7 +917,7 @@ mod tests {
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel};
     use bangbang_runtime::metrics::{MetricsConfigError, MetricsConfigInput};
-    use bangbang_runtime::{BackendError, VmmAction};
+    use bangbang_runtime::{BackendError, InstanceState, VmmAction};
 
     use crate::vmm::{InstanceStartExecutor, ProcessVmm};
 
@@ -689,6 +970,17 @@ mod tests {
             .as_nanos();
         std::env::temp_dir().join(format!(
             "bangbang-main-test-{}-{nanos}-{name}.metrics",
+            std::process::id()
+        ))
+    }
+
+    fn unique_config_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bangbang-main-test-{}-{nanos}-{name}.json",
             std::process::id()
         ))
     }
@@ -776,6 +1068,7 @@ mod tests {
         let config = parse_run(&[]).expect("empty args should parse");
 
         assert_eq!(config.api_sock, DEFAULT_API_SOCK_PATH);
+        assert_eq!(config.config_file, None);
         assert_eq!(config.http_api_max_payload_size, HTTP_MAX_PAYLOAD_SIZE);
         assert_eq!(config.mmds_size_limit, None);
         assert_eq!(config.effective_mmds_size_limit(), HTTP_MAX_PAYLOAD_SIZE);
@@ -797,6 +1090,7 @@ mod tests {
 
         assert!(help.contains("Serves GET /, GET /version"));
         assert!(help.contains("GET /vm/config"));
+        assert!(help.contains("--config-file <PATH>"));
         assert!(help.contains("GET /machine-config"));
         assert!(help.contains("pre-boot PUT /machine-config"));
         assert!(help.contains("pre-boot PUT /boot-source"));
@@ -805,6 +1099,7 @@ mod tests {
         assert!(help.contains("startup metrics output configuration"));
         assert!(help.contains("pre-boot PUT /logger and startup logger configuration"));
         assert!(help.contains("minimal action logs"));
+        assert!(help.contains("--config-file can apply the same supported pre-boot configuration"));
         assert!(help.contains("PATCH /vm parses Paused and Resumed state requests"));
         assert!(help.contains("PUT /cpu-config parses custom CPU template requests"));
         assert!(help.contains("--log-path <PATH>"));
@@ -858,10 +1153,22 @@ mod tests {
             parse_run(&["--api-sock", "/tmp/custom.socket"]).expect("api socket arg should parse");
 
         assert_eq!(config.api_sock, "/tmp/custom.socket");
+        assert_eq!(config.config_file, None);
         assert_eq!(config.http_api_max_payload_size, HTTP_MAX_PAYLOAD_SIZE);
         assert_eq!(config.id, DEFAULT_INSTANCE_ID);
         assert_eq!(config.logger_config, None);
         assert_eq!(config.metrics_config, None);
+    }
+
+    #[test]
+    fn parse_config_file_arg() {
+        let config = parse_run(&["--config-file", "/tmp/bangbang-config.json"])
+            .expect("config-file arg should parse");
+
+        assert_eq!(
+            config.config_file,
+            Some("/tmp/bangbang-config.json".to_string())
+        );
     }
 
     #[test]
@@ -959,6 +1266,8 @@ mod tests {
         let config = parse_run(&[
             "--api-sock",
             "/tmp/custom.socket",
+            "--config-file",
+            "/tmp/bangbang-config.json",
             "--id",
             "demo-1",
             "--http-api-max-payload-size",
@@ -971,6 +1280,10 @@ mod tests {
         .expect("startup args should parse");
 
         assert_eq!(config.api_sock, "/tmp/custom.socket");
+        assert_eq!(
+            config.config_file,
+            Some("/tmp/bangbang-config.json".to_string())
+        );
         assert_eq!(config.http_api_max_payload_size, 65_536);
         assert_eq!(config.mmds_size_limit, Some(4096));
         assert_eq!(config.id, "demo-1");
@@ -986,6 +1299,13 @@ mod tests {
         let err = parse(&["--api-sock"]).expect_err("missing api socket value should fail");
 
         assert_eq!(err, "missing value for --api-sock");
+    }
+
+    #[test]
+    fn rejects_missing_config_file_value() {
+        let err = parse(&["--config-file"]).expect_err("missing config file value should fail");
+
+        assert_eq!(err, "missing value for --config-file");
     }
 
     #[test]
@@ -1041,6 +1361,19 @@ mod tests {
         .expect_err("duplicate api socket should fail");
 
         assert_eq!(err, "duplicate argument: --api-sock");
+    }
+
+    #[test]
+    fn rejects_duplicate_config_file() {
+        let err = parse(&[
+            "--config-file",
+            "/tmp/one.json",
+            "--config-file",
+            "/tmp/two.json",
+        ])
+        .expect_err("duplicate config-file should fail");
+
+        assert_eq!(err, "duplicate argument: --config-file");
     }
 
     #[test]
@@ -1184,6 +1517,24 @@ mod tests {
     }
 
     #[test]
+    fn rejects_empty_config_file_path() {
+        let err = parse(&["--config-file", ""]).expect_err("empty config file should fail");
+
+        assert_eq!(err, "invalid --config-file: path must not be empty");
+    }
+
+    #[test]
+    fn rejects_config_file_path_with_control_character() {
+        let err = parse(&["--config-file", "/tmp/bangbang\n.json"])
+            .expect_err("config file with control character should fail");
+
+        assert_eq!(
+            err,
+            "invalid --config-file: path must not contain control characters"
+        );
+    }
+
+    #[test]
     fn rejects_empty_id() {
         let err = parse(&["--id", ""]).expect_err("empty id should fail");
 
@@ -1243,20 +1594,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_firecracker_config_file_arg() {
-        let err = parse(&["--config-file", "vm.json"]).expect_err("unsupported arg should fail");
-
-        assert_eq!(err, "unsupported Firecracker argument: --config-file");
-    }
-
-    #[test]
-    fn rejects_unsupported_firecracker_config_file_equals_arg() {
-        let err = parse(&["--config-file=vm.json"]).expect_err("unsupported arg should fail");
-
-        assert_eq!(err, "unsupported Firecracker argument: --config-file");
-    }
-
-    #[test]
     fn rejects_unsupported_firecracker_no_api_arg() {
         let err = parse(&["--no-api"]).expect_err("unsupported flag should fail");
 
@@ -1278,6 +1615,14 @@ mod tests {
         assert_eq!(
             err,
             "unsupported argument syntax for --api-sock; use --api-sock <VALUE>"
+        );
+
+        let err =
+            parse(&["--config-file=/tmp/secret.json"]).expect_err("equals syntax should fail");
+
+        assert_eq!(
+            err,
+            "unsupported argument syntax for --config-file; use --config-file <VALUE>"
         );
 
         let err =
@@ -1330,6 +1675,150 @@ mod tests {
         let err = parse(&["--level", "verbose"]).expect_err("invalid level should fail");
 
         assert_eq!(err, "invalid --level: logger level is invalid");
+    }
+
+    #[test]
+    fn applies_config_file_and_starts_instance() {
+        let config_path = unique_config_path("startup");
+        let metrics_path = unique_metrics_path("config-file");
+        let logger_path = unique_logger_path("config-file");
+        let metrics_path_json =
+            serde_json::to_string(metrics_path.to_str().expect("UTF-8 metrics path"))
+                .expect("path should encode");
+        let logger_path_json =
+            serde_json::to_string(logger_path.to_str().expect("UTF-8 logger path"))
+                .expect("path should encode");
+        let config = format!(
+            r#"{{
+                "machine-config": {{"vcpu_count": 1, "mem_size_mib": 128}},
+                "boot-source": {{
+                    "kernel_image_path": "/tmp/vmlinux",
+                    "boot_args": "console=hvc0 reboot=k panic=1"
+                }},
+                "drives": [{{
+                    "drive_id": "rootfs",
+                    "path_on_host": "/tmp/rootfs.ext4",
+                    "is_root_device": true,
+                    "is_read_only": true
+                }}],
+                "metrics": {{"metrics_path": {metrics_path_json}}},
+                "logger": {{"log_path": {logger_path_json}, "show_level": true}}
+            }}"#
+        );
+        fs::write(&config_path, config).expect("config file should be written");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        super::apply_startup_config_file(&mut vmm, Some(config_path.to_str().expect("UTF-8 path")))
+            .expect("config file should apply and start");
+
+        assert_eq!(vmm.instance_info().state, InstanceState::Running);
+        assert!(vmm.has_started_session());
+        assert_eq!(vmm.machine_config().vcpu_count(), 1);
+        assert_eq!(vmm.machine_config().mem_size_mib(), 128);
+        assert!(vmm.boot_source_config().is_some());
+        assert_eq!(vmm.drive_configs().len(), 1);
+
+        vmm.handle_action(VmmAction::FlushMetrics)
+            .expect("flush metrics should succeed");
+        assert_eq!(
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&logger_path).expect("logger output should be readable"),
+            "level=Info action=InstanceStart\nlevel=Info action=FlushMetrics\n"
+        );
+
+        fs::remove_file(config_path).expect("fixture config should clean up");
+        fs::remove_file(metrics_path).expect("fixture metrics should clean up");
+        fs::remove_file(logger_path).expect("fixture logger should clean up");
+    }
+
+    #[test]
+    fn config_file_requires_boot_source_before_mutating() {
+        let err = super::config_file_actions_from_str(
+            r#"{"machine-config":{"vcpu_count":1,"mem_size_mib":128}}"#,
+        )
+        .expect_err("missing boot-source should fail");
+
+        assert_eq!(err, super::ConfigFileError::MissingSection("boot-source"));
+    }
+
+    #[test]
+    fn config_file_rejects_unknown_section() {
+        let err = super::config_file_actions_from_str(
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"unknown":{}}"#,
+        )
+        .expect_err("unknown config section should fail");
+
+        assert_eq!(
+            err,
+            super::ConfigFileError::UnknownSection("unknown".to_string())
+        );
+    }
+
+    #[test]
+    fn config_file_rejects_unsupported_section_before_apply() {
+        let err = super::config_file_actions_from_str(
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"entropy":{}}"#,
+        )
+        .expect_err("unsupported config section should fail");
+
+        assert_eq!(
+            err,
+            super::ConfigFileError::UnsupportedSection("entropy".to_string())
+        );
+    }
+
+    #[test]
+    fn config_file_rejects_malformed_drive_array() {
+        let err = super::config_file_actions_from_str(
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"drives":{}}"#,
+        )
+        .expect_err("malformed drives should fail");
+
+        assert_eq!(
+            err,
+            super::ConfigFileError::MalformedSection { section: "drives" }
+        );
+    }
+
+    #[test]
+    fn config_file_runtime_errors_do_not_start_instance() {
+        let config_path = unique_config_path("cpu-config");
+        fs::write(
+            &config_path,
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"cpu-config":{}}"#,
+        )
+        .expect("config file should be written");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        let err = super::apply_startup_config_file(
+            &mut vmm,
+            Some(config_path.to_str().expect("UTF-8 path")),
+        )
+        .expect_err("unsupported cpu-config should fail");
+
+        assert!(matches!(
+            err,
+            ProcessError::ConfigFile(super::ConfigFileError::Apply(
+                bangbang_runtime::VmmActionError::UnsupportedAction("PutCpuConfig")
+            ))
+        ));
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+
+        fs::remove_file(config_path).expect("fixture config should clean up");
     }
 
     #[test]

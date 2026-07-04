@@ -111,8 +111,10 @@ pre-boot `PUT /drives/{drive_id}` configuration storage, recognized
 `PUT /network-interfaces/{iface_id}` configuration storage, pre-boot `PUT /vsock` configuration storage, pre-boot `PUT /metrics`
 output configuration, pre-boot `PUT /logger` output configuration, metrics and logger startup CLI configuration, plus process-routed `PUT /actions` startup and metrics
 flush with an internal boot run-loop worker across bounded step windows or
-state/configuration faults, but does not load a configuration file or provide
-public run-loop control.
+state/configuration faults. The process can also read an API-enabled
+`--config-file` for the supported startup subset, start the VM before serving
+the API socket, and then keep the API socket available for runtime requests.
+It does not provide `--no-api` or public run-loop control yet.
 
 | Argument | Current behavior | Compatibility notes |
 | --- | --- | --- |
@@ -126,9 +128,10 @@ public run-loop control.
 | `--show-level` | enables level prefix for minimal action logs | Writes `level=Info` before minimal `InstanceStart` and `FlushMetrics` action lines. |
 | `--show-log-origin` | enables origin field for minimal action logs | Writes `origin=<file>:<line>` before minimal `InstanceStart` and `FlushMetrics` action names. Full Firecracker logger integration remains deferred. |
 | `--mmds-size-limit <BYTES>` | configures the maximum serialized MMDS data-store size | When omitted, follows the effective HTTP API payload limit like Firecracker; with default HTTP settings this is `51200` bytes. Zero, malformed, duplicate, and equals-syntax values are rejected during argument parsing. |
+| `--config-file <PATH>` | API-enabled startup implemented for supported subset | Reads a Firecracker-shaped JSON configuration before binding the API socket, applies supported sections through the same validation path as matching API requests, starts the VM with `InstanceStart`, then serves the API socket. Malformed, unknown, unsupported, or invalid sections fail before socket publication. |
 | `--help`, `-h` | prints help | Help describes the current API socket scope. |
 | `--version`, `-V` | prints version | `-V` is retained from the existing bangbang scaffold. |
-| `--config-file`, `--no-api` | rejected | Deferred until VM configuration models and no-API startup behavior exist. |
+| `--no-api` | rejected | Deferred until a separate no-API process mode can start and drive the VM without an API socket. |
 | seccomp, snapshot, metadata, boot timer, and PCI process flags | rejected | These Firecracker options are Linux-specific or tied to later capability work. |
 
 bangbang intentionally treats `--id` alphanumeric characters as ASCII only.
@@ -138,6 +141,16 @@ Unicode alphanumeric characters.
 Only the Firecracker-style `--arg value` form is supported for the initial
 startup arguments. The `--arg=value` form is rejected until a separate
 compatibility decision expands the CLI parser.
+
+`--config-file` currently accepts the supported Firecracker-shaped sections
+`machine-config`, `boot-source`, `drives`, `network-interfaces`,
+`mmds-config`, `vsock`, `metrics`, `logger`, and `cpu-config`. The
+`cpu-config` section is parsed through the same request model as
+`PUT /cpu-config` and still fails as an unsupported CPU configuration action.
+Known unsupported sections such as `balloon`, `entropy`, `memory-hotplug`, and
+`pmem` fail before the API socket is published. The config-file path does not
+load MMDS data; Firecracker's separate metadata startup argument remains
+unsupported.
 
 CLI values are untrusted input. Current validation rejects invalid IDs, empty
 socket paths, and socket paths containing control characters. API startup also
@@ -159,7 +172,7 @@ The current executable uses a small process exit status contract:
 | --- | --- | --- |
 | `0` | Help or version completed successfully, or the API server exited without error, including handled `SIGINT`/`SIGTERM` shutdown. | Matches Firecracker's success status. |
 | `153` | Startup argument parsing failed before process configuration began. | Matches Firecracker's `ArgParsing` exit code. |
-| `1` | Process failure, including startup metrics/logger configuration, API socket bind, signal handler registration, or API accept failure. | Used for non-argument process failures before more specific Firecracker-compatible process errors exist. Per-connection read/write errors do not terminate the API server. |
+| `1` | Process failure, including config-file startup, startup metrics/logger configuration, API socket bind, signal handler registration, or API accept failure. | Used for non-argument process failures before more specific Firecracker-compatible process errors exist. Per-connection read/write errors do not terminate the API server. |
 
 Firecracker also defines bad-configuration and signal-specific exit codes.
 bangbang does not expose those until the corresponding configuration loading,

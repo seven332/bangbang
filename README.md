@@ -32,6 +32,9 @@ cargo run -p bangbang -- --api-sock /tmp/bangbang.socket --id demo-1
 
 - `--api-sock <PATH>` sets the Unix socket path. The default is
   `/tmp/bangbang.socket`.
+- `--config-file <PATH>` reads a Firecracker-shaped JSON configuration for the
+  supported startup subset, starts the VM, then serves the API socket. `--no-api`
+  is not supported yet.
 - `--http-api-max-payload-size <BYTES>` sets the maximum accepted HTTP API
   request size. The default is `51200` bytes.
 - `--id <ID>` records the microVM identifier. The default is
@@ -60,6 +63,14 @@ cargo run -p bangbang -- \
   --log-path /tmp/bangbang.log \
   --level Info \
   --show-level
+```
+
+Start from a configuration file while keeping the API socket enabled:
+
+```sh
+cargo run -p bangbang -- \
+  --api-sock /tmp/bangbang.socket \
+  --config-file /tmp/bangbang-vm.json
 ```
 
 ## API Examples
@@ -206,5 +217,5 @@ rules, guest boot artifact caching, and local verification expectations.
   error.
 - `153`: startup argument parsing failed before process configuration began.
   This matches Firecracker's argument-parsing exit code.
-- `1`: process failure, including startup metrics/logger configuration, API
-  socket bind, or API accept failures.
+- `1`: process failure, including config-file startup, startup metrics/logger
+  configuration, API socket bind, or API accept failures.
