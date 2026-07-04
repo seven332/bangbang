@@ -222,6 +222,7 @@ mod macos_arm64 {
         let backing_path = test_dir.path().join("data.img");
         let metrics_path = test_dir.path().join("metrics.out");
         let logger_path = test_dir.path().join("logger.out");
+        let uds_path = test_dir.path().join("config-file-vsock.sock");
         let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
         let initrd_path = env_path(BANGBANG_GUEST_INITRD_PATH_ENV);
         let instance_id = test_dir.instance_id();
@@ -234,6 +235,7 @@ mod macos_arm64 {
         let backing_path_json = json_string(path_text(&backing_path));
         let metrics_path_json = json_string(path_text(&metrics_path));
         let logger_path_json = json_string(path_text(&logger_path));
+        let uds_path_json = json_string(path_text(&uds_path));
         let config = format!(
             r#"{{
                 "machine-config": {{"vcpu_count": 1, "mem_size_mib": 256}},
@@ -248,6 +250,7 @@ mod macos_arm64 {
                     "is_root_device": false,
                     "is_read_only": false
                 }}],
+                "vsock": {{"guest_cid": 3, "uds_path": {uds_path_json}}},
                 "metrics": {{"metrics_path": {metrics_path_json}}},
                 "logger": {{"log_path": {logger_path_json}}}
             }}"#
@@ -310,6 +313,22 @@ mod macos_arm64 {
             &format!(r#""path_on_host":{backing_path_json}"#),
             "GET /vm/config after config-file startup",
         );
+        assert_response_contains(
+            &vm_config,
+            r#""guest_cid":3"#,
+            "GET /vm/config after config-file startup",
+        );
+        assert_response_contains(
+            &vm_config,
+            &format!(r#""uds_path":{uds_path_json}"#),
+            "GET /vm/config after config-file startup",
+        );
+        UnixStream::connect(&uds_path).unwrap_or_else(|err| {
+            panic!(
+                "config-file startup should bind the configured vsock listener at {}: {err}",
+                uds_path.display()
+            )
+        });
 
         let second_start_response = http_put_json(
             &socket_path,
@@ -361,6 +380,10 @@ mod macos_arm64 {
         }
 
         assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang config file");
+        assert!(
+            !uds_path.exists(),
+            "bangbang config-file shutdown should remove its owned vsock listener path"
+        );
     }
 
     #[test]

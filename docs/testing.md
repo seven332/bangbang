@@ -175,14 +175,14 @@ starts `bangbang` as a child process, configures the VM through the Unix-socket
 API or a Firecracker-shaped config file depending on the scenario, and waits for
 the guest to write deterministic markers to host-observable outputs. The
 tiny-initrd scenarios write `BANGBANG_BLOCK_WRITE_OK` to scratch block backing
-files. The API-request scenario also verifies the configured serial output file,
-vsock listener binding during `InstanceStart`, and owned vsock listener cleanup
-on shutdown. The API-request plus API-enabled config-file scenarios verify
-metrics and logger outputs after runtime `FlushMetrics`. The direct-rootfs
-scenarios boot the generated ext4 rootfs without an initrd and write
-`BANGBANG_DIRECT_ROOTFS_BLOCK_OK` through a second writable drive. This verifies
-the public process/API/config-file/HVF path, including public serial output
-redirection and minimal observability output.
+files. The API-request scenario also verifies the configured serial output file.
+The API-request and API-enabled config-file scenarios verify vsock listener
+binding during startup and owned vsock listener cleanup on shutdown. The same
+scenarios verify metrics and logger outputs after runtime `FlushMetrics`. The
+direct-rootfs scenarios boot the generated ext4 rootfs without an initrd and
+write `BANGBANG_DIRECT_ROOTFS_BLOCK_OK` through a second writable drive. This
+verifies the public process/API/config-file/HVF path, including public serial
+output redirection and minimal observability output.
 
 Hosted macOS CI may use:
 
