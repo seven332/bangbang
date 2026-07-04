@@ -1609,10 +1609,17 @@ fn parse_logger_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> 
 fn parse_serial_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
     let body = serde_json::from_slice::<SerialConfigRequestBody>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
+    let rate_limiter_configured = match &body.rate_limiter {
+        Some(rate_limiter) => {
+            validate_rate_limiter_config(rate_limiter)?;
+            true
+        }
+        None => false,
+    };
 
     Ok(ApiRequest::PutSerial(Box::new(SerialConfigRequest {
         serial_out_path: body.serial_out_path,
-        rate_limiter_configured: body.rate_limiter.is_some(),
+        rate_limiter_configured,
     })))
 }
 
@@ -4614,6 +4621,19 @@ mod tests {
         };
         assert_eq!(config.serial_out_path(), None);
         assert!(config.rate_limiter_configured());
+    }
+
+    #[test]
+    fn rejects_invalid_serial_rate_limiter_shape() {
+        for body in [
+            r#"{"rate_limiter":"unsupported"}"#,
+            r#"{"rate_limiter":{"bad":{"size":1,"refill_time":1}}}"#,
+            r#"{"rate_limiter":{"bandwidth":{"size":1}}}"#,
+        ] {
+            let request = request_with_body("PUT", "/serial", body);
+
+            assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+        }
     }
 
     #[test]
