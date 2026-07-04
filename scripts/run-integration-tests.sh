@@ -182,8 +182,7 @@ PY
   for index in "${!test_bins[@]}"; do
     test_bin="${test_bins[$index]}"
     signed_test_bin="$tmp_dir/$(basename "$test_bin").$index"
-    cp "$test_bin" "$signed_test_bin"
-    codesign --force --sign - --entitlements "$entitlements" "$signed_test_bin"
+    scripts/sign-hvf-binary.sh "$test_bin" "$signed_test_bin"
     signed_test_names+=("$test_name")
     signed_test_bins+=("$signed_test_bin")
   done
@@ -217,18 +216,6 @@ if contains guest_boot "${selected_tests[@]}"; then
 fi
 
 target_triple="aarch64-apple-darwin"
-
-entitlements="$tmp_dir/hvf-entitlements.plist"
-cat > "$entitlements" <<'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>com.apple.security.hypervisor</key>
-  <true/>
-</dict>
-</plist>
-EOF
 
 signed_test_names=()
 signed_test_bins=()
