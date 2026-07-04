@@ -24,8 +24,8 @@ use crate::virtio_mmio::{
 };
 use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
-    VirtqueueDescriptorChain, VirtqueueNotificationSuppression, VirtqueueUsedRing,
-    VirtqueueUsedRingError, VirtqueueUsedRingPublication,
+    VirtqueueDescriptorChain, VirtqueueDescriptorChainOptions, VirtqueueNotificationSuppression,
+    VirtqueueUsedRing, VirtqueueUsedRingError, VirtqueueUsedRingPublication,
 };
 
 pub const VIRTIO_BLOCK_DEVICE_ID: u32 = 2;
@@ -37,6 +37,7 @@ pub const VIRTIO_BLOCK_SECTOR_SIZE: u64 = 1 << VIRTIO_BLOCK_SECTOR_SHIFT;
 pub const VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE: usize = 8;
 pub const VIRTIO_BLOCK_FEATURE_READ_ONLY: u32 = 5;
 pub const VIRTIO_BLOCK_FEATURE_FLUSH: u32 = 9;
+pub const VIRTIO_RING_FEATURE_INDIRECT_DESC: u32 = 28;
 pub const VIRTIO_RING_FEATURE_EVENT_IDX: u32 = 29;
 pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
 pub const VIRTIO_BLOCK_REQUEST_HEADER_SIZE: u32 = 16;
@@ -416,6 +417,7 @@ impl VirtioBlockConfigSpace {
 
     pub const fn available_features(self) -> u64 {
         let mut features = virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
+            | virtio_feature_bit(VIRTIO_RING_FEATURE_INDIRECT_DESC)
             | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX);
         if matches!(self.cache_type, DriveCacheType::Writeback) {
             features |= virtio_feature_bit(VIRTIO_BLOCK_FEATURE_FLUSH);
@@ -1127,12 +1129,13 @@ impl VirtioBlockQueue {
     pub fn from_mmio_queue_state(
         queue: &VirtioMmioQueueState,
     ) -> Result<Self, VirtioBlockQueueBuildError> {
-        Self::from_mmio_queue_state_with_event_idx(queue, false)
+        Self::from_mmio_queue_state_with_event_idx(queue, false, false)
     }
 
     fn from_mmio_queue_state_with_event_idx(
         queue: &VirtioMmioQueueState,
         event_idx_enabled: bool,
+        indirect_descriptors_enabled: bool,
     ) -> Result<Self, VirtioBlockQueueBuildError> {
         if !queue.ready() {
             return Err(VirtioBlockQueueBuildError::QueueNotReady);
@@ -1144,6 +1147,10 @@ impl VirtioBlockQueue {
             queue.size(),
         )
         .map_err(|source| VirtioBlockQueueBuildError::AvailableRing { source })?;
+        let available = available.with_descriptor_chain_options(
+            VirtqueueDescriptorChainOptions::new()
+                .with_indirect_descriptors(indirect_descriptors_enabled),
+        );
         let used = VirtqueueUsedRing::new(queue.device_ring(), queue.size())
             .map_err(|source| VirtioBlockQueueBuildError::UsedRing { source })?;
 
@@ -1409,10 +1416,11 @@ impl VirtioBlockQueueDispatchError {
 }
 
 fn descriptor_chain_head(chain: &VirtqueueDescriptorChain) -> Option<u16> {
-    chain
-        .descriptors()
-        .first()
-        .map(|descriptor| descriptor.index())
+    if chain.is_empty() {
+        None
+    } else {
+        Some(chain.head_index())
+    }
 }
 
 fn normalize_completion_status(
@@ -2116,6 +2124,10 @@ impl VirtioBlockDevice {
 
         let event_idx_enabled =
             virtio_feature_enabled(activation.driver_features(), VIRTIO_RING_FEATURE_EVENT_IDX);
+        let indirect_descriptors_enabled = virtio_feature_enabled(
+            activation.driver_features(),
+            VIRTIO_RING_FEATURE_INDIRECT_DESC,
+        );
         let queue_index = 0;
         let queue = activation
             .queue(queue_index)
@@ -2124,11 +2136,15 @@ impl VirtioBlockDevice {
                 source,
             })
             .and_then(|queue| {
-                VirtioBlockQueue::from_mmio_queue_state_with_event_idx(queue, event_idx_enabled)
-                    .map_err(|source| VirtioBlockDeviceActivationError::QueueBuild {
-                        queue_index,
-                        source,
-                    })
+                VirtioBlockQueue::from_mmio_queue_state_with_event_idx(
+                    queue,
+                    event_idx_enabled,
+                    indirect_descriptors_enabled,
+                )
+                .map_err(|source| VirtioBlockDeviceActivationError::QueueBuild {
+                    queue_index,
+                    source,
+                })
             })?;
         self.active_queue = Some(queue);
 
@@ -2954,11 +2970,12 @@ mod tests {
         VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT, VIRTIO_BLOCK_SECTOR_SIZE,
         VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK, VIRTIO_BLOCK_STATUS_SIZE,
         VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1, VIRTIO_RING_FEATURE_EVENT_IDX,
-        VirtioBlockConfigSpace, VirtioBlockDevice, VirtioBlockDeviceActivationError,
-        VirtioBlockDeviceId, VirtioBlockDeviceNotificationError, VirtioBlockQueue,
-        VirtioBlockQueueBuildError, VirtioBlockQueueDispatchError, VirtioBlockRequest,
-        VirtioBlockRequestCompletion, VirtioBlockRequestError, VirtioBlockRequestExecutionError,
-        VirtioBlockRequestExecutionOutcome, VirtioBlockRequestType, normalize_completion_status,
+        VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioBlockConfigSpace, VirtioBlockDevice,
+        VirtioBlockDeviceActivationError, VirtioBlockDeviceId, VirtioBlockDeviceNotificationError,
+        VirtioBlockQueue, VirtioBlockQueueBuildError, VirtioBlockQueueDispatchError,
+        VirtioBlockRequest, VirtioBlockRequestCompletion, VirtioBlockRequestError,
+        VirtioBlockRequestExecutionError, VirtioBlockRequestExecutionOutcome,
+        VirtioBlockRequestType, normalize_completion_status,
     };
 
     static NEXT_TEMP_PATH_ID: AtomicUsize = AtomicUsize::new(0);
@@ -2975,6 +2992,7 @@ mod tests {
     const TEST_USED_RING_RING_OFFSET: u64 = 4;
     const TEST_USED_RING_ELEMENT_SIZE: u64 = 8;
     const EVENT_IDX_DRIVER_FEATURE: u32 = 1_u32 << VIRTIO_RING_FEATURE_EVENT_IDX;
+    const INDIRECT_DESC_DRIVER_FEATURE: u32 = 1_u32 << VIRTIO_RING_FEATURE_INDIRECT_DESC;
     const HEADER_ADDR: GuestAddress = GuestAddress::new(0x2000);
     const DATA_ADDR: GuestAddress = GuestAddress::new(0x3000);
     const STATUS_ADDR: GuestAddress = GuestAddress::new(0x4000);
@@ -4607,6 +4625,7 @@ mod tests {
         assert_eq!(VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE, 8);
         assert_eq!(VIRTIO_BLOCK_FEATURE_READ_ONLY, 5);
         assert_eq!(VIRTIO_BLOCK_FEATURE_FLUSH, 9);
+        assert_eq!(VIRTIO_RING_FEATURE_INDIRECT_DESC, 28);
         assert_eq!(VIRTIO_RING_FEATURE_EVENT_IDX, 29);
         assert_eq!(VIRTIO_FEATURE_VERSION_1, 32);
         assert_eq!(VIRTIO_BLOCK_REQUEST_HEADER_SIZE, 16);
@@ -4648,14 +4667,21 @@ mod tests {
 
     #[test]
     fn config_space_tracks_cache_and_read_only_features() {
+        let indirect_feature = 1_u64 << VIRTIO_RING_FEATURE_INDIRECT_DESC;
         let event_idx_feature = 1_u64 << VIRTIO_RING_FEATURE_EVENT_IDX;
-        let base_features = (1_u64 << VIRTIO_FEATURE_VERSION_1) | event_idx_feature;
+        let base_features =
+            (1_u64 << VIRTIO_FEATURE_VERSION_1) | indirect_feature | event_idx_feature;
         let flush_feature = 1_u64 << VIRTIO_BLOCK_FEATURE_FLUSH;
         let read_only_feature = 1_u64 << VIRTIO_BLOCK_FEATURE_READ_ONLY;
 
         assert_eq!(
             VirtioBlockConfigSpace::new(512, false, DriveCacheType::Unsafe).available_features(),
             base_features
+        );
+        assert_ne!(
+            VirtioBlockConfigSpace::new(512, false, DriveCacheType::Unsafe).available_features()
+                & indirect_feature,
+            0
         );
         assert_ne!(
             VirtioBlockConfigSpace::new(512, false, DriveCacheType::Unsafe).available_features()
@@ -5709,6 +5735,32 @@ mod tests {
         assert_eq!(queue.available_ring().queue_size(), 4);
         assert_eq!(queue.used_ring().used_ring(), TEST_USED_RING);
         assert_eq!(queue.used_ring().queue_size(), 4);
+    }
+
+    #[test]
+    fn block_device_activation_enables_indirect_descriptors_when_negotiated() {
+        let file = temp_file("block-device-activate-indirect.img", &sector_payload(0x11));
+        let backing = open_backing(file.as_path(), false).expect("backing should open");
+        let mut handler = block_notification_handler(backing, &VIRTIO_BLOCK_QUEUE_SIZES);
+        configure_block_notification_handler_queue_with_features(
+            &mut handler,
+            4,
+            TEST_USED_RING,
+            INDIRECT_DESC_DRIVER_FEATURE,
+        );
+
+        activate_block_notification_handler(&mut handler);
+
+        let active_queue = handler
+            .activation_handler()
+            .active_queue()
+            .expect("active queue should be stored");
+        assert!(
+            active_queue
+                .available_ring()
+                .descriptor_chain_options()
+                .indirect_descriptors()
+        );
     }
 
     #[test]

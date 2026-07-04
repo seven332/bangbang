@@ -27,8 +27,8 @@ use crate::virtio_mmio::{
 };
 use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
-    VirtqueueDescriptorChain, VirtqueueNotificationSuppression, VirtqueueUsedRing,
-    VirtqueueUsedRingError, VirtqueueUsedRingPublication,
+    VirtqueueDescriptorChain, VirtqueueDescriptorChainOptions, VirtqueueNotificationSuppression,
+    VirtqueueUsedRing, VirtqueueUsedRingError, VirtqueueUsedRingPublication,
 };
 
 pub const MIN_GUEST_CID: u32 = 3;
@@ -55,6 +55,7 @@ pub const VIRTIO_VSOCK_OP_CREDIT_UPDATE: u16 = 6;
 pub const VIRTIO_VSOCK_OP_CREDIT_REQUEST: u16 = 7;
 pub const VIRTIO_VSOCK_FLAGS_SHUTDOWN_RCV: u32 = 1;
 pub const VIRTIO_VSOCK_FLAGS_SHUTDOWN_SEND: u32 = 2;
+pub const VIRTIO_RING_FEATURE_INDIRECT_DESC: u32 = 28;
 pub const VIRTIO_RING_FEATURE_EVENT_IDX: u32 = 29;
 pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
 pub const VIRTIO_FEATURE_IN_ORDER: u32 = 35;
@@ -3497,6 +3498,7 @@ impl VirtioVsockConfigSpace {
     pub const fn available_features(self) -> u64 {
         virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
             | virtio_feature_bit(VIRTIO_FEATURE_IN_ORDER)
+            | virtio_feature_bit(VIRTIO_RING_FEATURE_INDIRECT_DESC)
             | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX)
     }
 
@@ -4183,12 +4185,13 @@ impl VirtioVsockRxQueue {
     pub fn from_mmio_queue_state(
         queue: VirtioMmioQueueState,
     ) -> Result<Self, VirtioVsockQueueBuildError> {
-        Self::from_mmio_queue_state_with_event_idx(queue, false)
+        Self::from_mmio_queue_state_with_event_idx(queue, false, false)
     }
 
     fn from_mmio_queue_state_with_event_idx(
         queue: VirtioMmioQueueState,
         event_idx_enabled: bool,
+        indirect_descriptors_enabled: bool,
     ) -> Result<Self, VirtioVsockQueueBuildError> {
         validate_active_vsock_queue(queue)?;
         let available = VirtqueueAvailableRing::new(
@@ -4197,6 +4200,10 @@ impl VirtioVsockRxQueue {
             queue.size(),
         )
         .map_err(|source| VirtioVsockQueueBuildError::AvailableRing { source })?;
+        let available = available.with_descriptor_chain_options(
+            VirtqueueDescriptorChainOptions::new()
+                .with_indirect_descriptors(indirect_descriptors_enabled),
+        );
         let used = VirtqueueUsedRing::new(queue.device_ring(), queue.size())
             .map_err(|source| VirtioVsockQueueBuildError::UsedRing { source })?;
 
@@ -4578,12 +4585,13 @@ impl VirtioVsockTxQueue {
     pub fn from_mmio_queue_state(
         queue: VirtioMmioQueueState,
     ) -> Result<Self, VirtioVsockQueueBuildError> {
-        Self::from_mmio_queue_state_with_event_idx(queue, false)
+        Self::from_mmio_queue_state_with_event_idx(queue, false, false)
     }
 
     fn from_mmio_queue_state_with_event_idx(
         queue: VirtioMmioQueueState,
         event_idx_enabled: bool,
+        indirect_descriptors_enabled: bool,
     ) -> Result<Self, VirtioVsockQueueBuildError> {
         validate_active_vsock_queue(queue)?;
         let available = VirtqueueAvailableRing::new(
@@ -4592,6 +4600,10 @@ impl VirtioVsockTxQueue {
             queue.size(),
         )
         .map_err(|source| VirtioVsockQueueBuildError::AvailableRing { source })?;
+        let available = available.with_descriptor_chain_options(
+            VirtqueueDescriptorChainOptions::new()
+                .with_indirect_descriptors(indirect_descriptors_enabled),
+        );
         let used = VirtqueueUsedRing::new(queue.device_ring(), queue.size())
             .map_err(|source| VirtioVsockQueueBuildError::UsedRing { source })?;
 
@@ -4915,10 +4927,11 @@ impl std::error::Error for VirtioVsockQueueBuildError {
 }
 
 fn descriptor_chain_head(chain: &VirtqueueDescriptorChain) -> Option<u16> {
-    chain
-        .descriptors()
-        .first()
-        .map(|descriptor| descriptor.index())
+    if chain.is_empty() {
+        None
+    } else {
+        Some(chain.head_index())
+    }
 }
 
 fn validate_active_vsock_queue(
@@ -5212,21 +5225,33 @@ impl VirtioVsockDevice {
 
         let event_idx_enabled =
             virtio_feature_enabled(activation.driver_features(), VIRTIO_RING_FEATURE_EVENT_IDX);
+        let indirect_descriptors_enabled = virtio_feature_enabled(
+            activation.driver_features(),
+            VIRTIO_RING_FEATURE_INDIRECT_DESC,
+        );
         let active_rx_queue = active_vsock_queue_state(activation, VIRTIO_VSOCK_RX_QUEUE_INDEX_U32)
             .and_then(|queue| {
-                VirtioVsockRxQueue::from_mmio_queue_state_with_event_idx(queue, event_idx_enabled)
-                    .map_err(|source| VirtioVsockDeviceActivationError::RxQueueBuild {
-                        queue_index: VIRTIO_VSOCK_RX_QUEUE_INDEX_U32,
-                        source,
-                    })
+                VirtioVsockRxQueue::from_mmio_queue_state_with_event_idx(
+                    queue,
+                    event_idx_enabled,
+                    indirect_descriptors_enabled,
+                )
+                .map_err(|source| VirtioVsockDeviceActivationError::RxQueueBuild {
+                    queue_index: VIRTIO_VSOCK_RX_QUEUE_INDEX_U32,
+                    source,
+                })
             })?;
         let active_tx_queue = active_vsock_queue_state(activation, VIRTIO_VSOCK_TX_QUEUE_INDEX_U32)
             .and_then(|queue| {
-                VirtioVsockTxQueue::from_mmio_queue_state_with_event_idx(queue, event_idx_enabled)
-                    .map_err(|source| VirtioVsockDeviceActivationError::TxQueueBuild {
-                        queue_index: VIRTIO_VSOCK_TX_QUEUE_INDEX_U32,
-                        source,
-                    })
+                VirtioVsockTxQueue::from_mmio_queue_state_with_event_idx(
+                    queue,
+                    event_idx_enabled,
+                    indirect_descriptors_enabled,
+                )
+                .map_err(|source| VirtioVsockDeviceActivationError::TxQueueBuild {
+                    queue_index: VIRTIO_VSOCK_TX_QUEUE_INDEX_U32,
+                    source,
+                })
             })?;
         let active_event_queue =
             active_vsock_queue_state(activation, VIRTIO_VSOCK_EVENT_QUEUE_INDEX_U32).and_then(
@@ -7180,9 +7205,9 @@ mod tests {
 
     use super::{
         MIN_GUEST_CID, PreparedVsockDevice, VIRTIO_FEATURE_IN_ORDER, VIRTIO_FEATURE_VERSION_1,
-        VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_VSOCK_CONFIG_GUEST_CID_SIZE,
-        VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE, VIRTIO_VSOCK_DEVICE_ID,
-        VIRTIO_VSOCK_EVENT_QUEUE_INDEX, VIRTIO_VSOCK_FLAGS_SHUTDOWN_RCV,
+        VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_RING_FEATURE_INDIRECT_DESC,
+        VIRTIO_VSOCK_CONFIG_GUEST_CID_SIZE, VIRTIO_VSOCK_CONNECTION_BUFFER_SIZE,
+        VIRTIO_VSOCK_DEVICE_ID, VIRTIO_VSOCK_EVENT_QUEUE_INDEX, VIRTIO_VSOCK_FLAGS_SHUTDOWN_RCV,
         VIRTIO_VSOCK_FLAGS_SHUTDOWN_SEND, VIRTIO_VSOCK_HOST_CID,
         VIRTIO_VSOCK_MAX_PACKET_BUFFER_SIZE, VIRTIO_VSOCK_OP_CREDIT_REQUEST,
         VIRTIO_VSOCK_OP_CREDIT_UPDATE, VIRTIO_VSOCK_OP_REQUEST, VIRTIO_VSOCK_OP_RESPONSE,
@@ -8503,8 +8528,12 @@ mod tests {
         let queue_state = *queues
             .queue(queue_index)
             .expect("TX queue state should be configured");
-        VirtioVsockTxQueue::from_mmio_queue_state_with_event_idx(queue_state, event_idx_enabled)
-            .expect("TX queue should build")
+        VirtioVsockTxQueue::from_mmio_queue_state_with_event_idx(
+            queue_state,
+            event_idx_enabled,
+            false,
+        )
+        .expect("TX queue should build")
     }
 
     fn write_vsock_rx_descriptor(memory: &mut GuestMemory, index: u16, descriptor: TestDescriptor) {
@@ -8677,8 +8706,12 @@ mod tests {
         let queue_state = *queues
             .queue(queue_index)
             .expect("RX queue state should be configured");
-        VirtioVsockRxQueue::from_mmio_queue_state_with_event_idx(queue_state, event_idx_enabled)
-            .expect("RX queue should build")
+        VirtioVsockRxQueue::from_mmio_queue_state_with_event_idx(
+            queue_state,
+            event_idx_enabled,
+            false,
+        )
+        .expect("RX queue should build")
     }
 
     #[test]
@@ -10681,6 +10714,10 @@ mod tests {
         assert_eq!(VIRTIO_VSOCK_QUEUE_SIZE, 256);
         assert_eq!(VIRTIO_VSOCK_QUEUE_SIZES, [256, 256, 256]);
         assert_eq!(VIRTIO_VSOCK_CONFIG_GUEST_CID_SIZE, 8);
+        assert_eq!(VIRTIO_RING_FEATURE_INDIRECT_DESC, 28);
+        assert_eq!(VIRTIO_RING_FEATURE_EVENT_IDX, 29);
+        assert_eq!(VIRTIO_FEATURE_VERSION_1, 32);
+        assert_eq!(VIRTIO_FEATURE_IN_ORDER, 35);
     }
 
     #[test]
@@ -11955,6 +11992,7 @@ mod tests {
         let features = config.available_features();
         let expected_features = (1_u64 << VIRTIO_FEATURE_VERSION_1)
             | (1_u64 << VIRTIO_FEATURE_IN_ORDER)
+            | (1_u64 << VIRTIO_RING_FEATURE_INDIRECT_DESC)
             | (1_u64 << VIRTIO_RING_FEATURE_EVENT_IDX);
 
         assert_eq!(config.guest_cid(), 3);
