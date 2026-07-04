@@ -17,9 +17,9 @@ mod macos_arm64 {
     use std::time::{Duration, Instant};
 
     use crate::support::{
-        BangbangProcess, TestDir, assert_clean_shutdown, assert_no_content_response,
-        assert_ok_response, assert_response_contains, http_get, http_put_json, json_string,
-        path_text,
+        BangbangProcess, TestDir, assert_bad_request_response, assert_clean_shutdown,
+        assert_no_content_response, assert_ok_response, assert_response_contains, http_get,
+        http_put_json, json_string, path_text,
     };
 
     const BANGBANG_GUEST_KERNEL_PATH_ENV: &str = "BANGBANG_GUEST_KERNEL_PATH";
@@ -102,6 +102,33 @@ mod macos_arm64 {
             r#"{"action_type":"FlushMetrics"}"#,
         );
         assert_no_content_response(&flush_metrics_response, "PUT /actions FlushMetrics");
+
+        let second_start_response = http_put_json(
+            &socket_path,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        );
+        assert_bad_request_response(&second_start_response, "PUT /actions second InstanceStart");
+        assert_response_contains(
+            &second_start_response,
+            r#"{"fault_message":"The requested operation is not supported in Running state: InstanceStart"}"#,
+            "PUT /actions second InstanceStart",
+        );
+
+        let post_start_machine_response = http_put_json(
+            &socket_path,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        );
+        assert_bad_request_response(
+            &post_start_machine_response,
+            "PUT /machine-config after InstanceStart",
+        );
+        assert_response_contains(
+            &post_start_machine_response,
+            r#"{"fault_message":"The requested operation is not supported in Running state: PutMachineConfig"}"#,
+            "PUT /machine-config after InstanceStart",
+        );
 
         if let Err(err) =
             wait_for_file_prefix_marker(&backing_path, BLOCK_WRITE_MARKER, GUEST_EXECUTION_TIMEOUT)

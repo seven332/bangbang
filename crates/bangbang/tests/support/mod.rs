@@ -130,6 +130,13 @@ pub(crate) fn assert_no_content_response(response: &str, request_name: &str) {
     );
 }
 
+pub(crate) fn assert_bad_request_response(response: &str, request_name: &str) {
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+        "{request_name} should return 400 Bad Request; response:\n{response}"
+    );
+}
+
 pub(crate) fn assert_response_contains(response: &str, expected: &str, request_name: &str) {
     assert!(
         response.contains(expected),
