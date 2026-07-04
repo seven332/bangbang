@@ -1000,9 +1000,9 @@ main descriptor head for used-ring completions. The virtqueue model can publish
 one used-ring completion element with validated layout, mapped-memory checks,
 wrapping, and release ordering. Virtio-block queue dispatch, network RX/TX
 dispatch, and vsock RX/TX dispatch honor negotiated used-event interrupt
-suppression for each published completion,
-while batching, avail-event kick suppression, and device-backed completion loops
-are still deferred.
+suppression for each published completion and publish a shared used-ring
+`avail_event` hint for available-buffer notification suppression, while
+batching and device-backed completion loops are still deferred.
 
 The runtime crate also contains backend-neutral interrupt signaling groundwork.
 It can validate nonzero guest interrupt lines, represent queue and

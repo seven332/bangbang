@@ -1243,6 +1243,7 @@ impl VirtioBlockQueue {
         if self.event_idx_enabled {
             Ok(VirtqueueNotificationSuppression::EventIdx {
                 used_event: self.available.used_event(memory)?,
+                avail_event: self.available.next_avail(),
             })
         } else {
             Ok(VirtqueueNotificationSuppression::Disabled)
@@ -3493,6 +3494,14 @@ mod tests {
             .expect("used entry address should not overflow")
     }
 
+    fn used_ring_avail_event_address(queue_size: u16) -> GuestAddress {
+        TEST_USED_RING
+            .checked_add(
+                TEST_USED_RING_RING_OFFSET + u64::from(queue_size) * TEST_USED_RING_ELEMENT_SIZE,
+            )
+            .expect("used avail-event address should not overflow")
+    }
+
     fn write_available_heads(memory: &mut GuestMemory, heads: &[u16]) {
         for (ring_index, head) in heads.iter().copied().enumerate() {
             write_guest_u16(
@@ -3520,6 +3529,10 @@ mod tests {
 
     fn read_used_index(memory: &GuestMemory) -> u16 {
         read_guest_u16(memory, used_ring_idx_address())
+    }
+
+    fn read_used_avail_event(memory: &GuestMemory, queue_size: u16) -> u16 {
+        read_guest_u16(memory, used_ring_avail_event_address(queue_size))
     }
 
     fn read_used_element(memory: &GuestMemory, ring_index: u16) -> (u32, u32) {
@@ -6196,6 +6209,7 @@ mod tests {
                 VIRTIO_BLOCK_SECTOR_SIZE as u32 + VIRTIO_BLOCK_STATUS_SIZE,
             )
         );
+        assert_eq!(read_used_avail_event(&memory, queue_size), 1);
     }
 
     #[test]
