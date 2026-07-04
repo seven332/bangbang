@@ -1103,19 +1103,14 @@ mod tests {
         env::temp_dir().join(format!("bb-{name}-{}-{nanos}.sock", std::process::id()))
     }
 
-    fn put_action_over_socket(
+    fn request_over_socket(
         vmm: &mut impl VmmRequestHandler,
         socket_name: &str,
-        action_type: &str,
+        request: &str,
     ) -> String {
         let path = unique_socket_path(socket_name);
         let server = ApiServer::bind(&path).expect("server should bind");
         let mut client = UnixStream::connect(&path).expect("client should connect");
-        let body = format!(r#"{{"action_type":"{action_type}"}}"#);
-        let request = format!(
-            "PUT /actions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        );
 
         client
             .write_all(request.as_bytes())
@@ -1129,6 +1124,20 @@ mod tests {
             .read_to_string(&mut response)
             .expect("client should read response");
         response
+    }
+
+    fn put_action_over_socket(
+        vmm: &mut impl VmmRequestHandler,
+        socket_name: &str,
+        action_type: &str,
+    ) -> String {
+        let body = format!(r#"{{"action_type":"{action_type}"}}"#);
+        let request = format!(
+            "PUT /actions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        request_over_socket(vmm, socket_name, &request)
     }
 
     fn unique_temp_dir(name: &str) -> PathBuf {
@@ -3446,6 +3455,33 @@ mod tests {
     }
 
     #[test]
+    fn returns_fault_for_configured_drive_rate_limiter_without_storing() {
+        let body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "/tmp/rootfs.ext4",
+            "is_root_device": true,
+            "rate_limiter": {
+                "bandwidth": {
+                    "size": 1000,
+                    "one_time_burst": 1000,
+                    "refill_time": 100
+                }
+            }
+        }"#;
+        let request = format!(
+            "PUT /drives/rootfs HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut vmm = test_controller();
+
+        let response = request_over_socket(&mut vmm, "drive-rate-limiter", &request);
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.contains(r#"{"fault_message":"drive rate_limiter is not supported"}"#));
+        assert!(vmm.drive_configs().is_empty());
+    }
+
+    #[test]
     fn stores_network_mtu() {
         let mut vmm = test_controller();
         let body = r#"{
@@ -3470,6 +3506,53 @@ mod tests {
         assert!(config_response.body().contains(r#""iface_id":"eth0""#));
         assert!(config_response.body().contains(r#""host_dev_name":"tap0""#));
         assert!(config_response.body().contains(r#""mtu":1500"#));
+    }
+
+    #[test]
+    fn returns_fault_for_configured_network_rate_limiters_without_storing() {
+        for (field, message, socket_name) in [
+            (
+                "rx_rate_limiter",
+                "network rx_rate_limiter is not supported",
+                "net-rx-rate-limiter",
+            ),
+            (
+                "tx_rate_limiter",
+                "network tx_rate_limiter is not supported",
+                "net-tx-rate-limiter",
+            ),
+        ] {
+            let body = format!(
+                r#"{{
+                    "iface_id": "eth0",
+                    "host_dev_name": "tap0",
+                    "{field}": {{
+                        "ops": {{
+                            "size": 1000,
+                            "one_time_burst": 1000,
+                            "refill_time": 100
+                        }}
+                    }}
+                }}"#
+            );
+            let request = format!(
+                "PUT /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let mut vmm = test_controller();
+
+            let response = request_over_socket(&mut vmm, socket_name, &request);
+
+            assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+            assert!(response.contains(&format!(r#"{{"fault_message":"{message}"}}"#)));
+            let data = vmm
+                .handle_action(VmmAction::GetVmConfig)
+                .expect("VM config should be returned");
+            let VmmData::VmConfiguration(config) = data else {
+                panic!("expected VM config");
+            };
+            assert!(config.network_interface_configs().is_empty());
+        }
     }
 
     #[test]
