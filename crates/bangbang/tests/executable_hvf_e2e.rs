@@ -37,11 +37,13 @@ mod macos_arm64 {
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join("api.socket");
         let backing_path = test_dir.path().join("data.img");
+        let serial_output_path = test_dir.path().join("serial.out");
         let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
         let initrd_path = env_path(BANGBANG_GUEST_INITRD_PATH_ENV);
         let instance_id = test_dir.instance_id();
 
         create_zeroed_block_backing(&backing_path);
+        create_empty_file(&serial_output_path);
 
         let mut bangbang = BangbangProcess::start(&socket_path, &instance_id);
 
@@ -79,6 +81,11 @@ mod macos_arm64 {
         );
         let drive_response = http_put_json(&socket_path, "/drives/data", &drive_body);
         assert_no_content_response(&drive_response, "PUT /drives/data");
+
+        let serial_output_path_json = json_string(path_text(&serial_output_path));
+        let serial_body = format!(r#"{{"serial_out_path":{serial_output_path_json}}}"#);
+        let serial_response = http_put_json(&socket_path, "/serial", &serial_body);
+        assert_no_content_response(&serial_response, "PUT /serial");
 
         let start_response = http_put_json(
             &socket_path,
@@ -140,6 +147,18 @@ mod macos_arm64 {
             let output = bangbang.force_stop_and_collect();
             panic!(
                 "guest did not write block marker through signed bangbang executable: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
+        if let Err(err) = wait_for_file_contains_marker(
+            &serial_output_path,
+            BLOCK_WRITE_MARKER,
+            GUEST_EXECUTION_TIMEOUT,
+        ) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "guest serial output file did not contain block marker through signed bangbang executable: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                 output.status, output.stdout, output.stderr
             );
         }
@@ -253,6 +272,14 @@ mod macos_arm64 {
             .expect("guest block backing should be one sector");
     }
 
+    fn create_empty_file(path: &Path) {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("empty test output file should create");
+    }
+
     fn wait_for_file_prefix_marker(
         path: &Path,
         marker: &[u8],
@@ -290,6 +317,43 @@ mod macos_arm64 {
         }
     }
 
+    fn wait_for_file_contains_marker(
+        path: &Path,
+        marker: &[u8],
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let file = fs::File::open(path).map_err(|err| {
+            format!(
+                "failed to open serial output {} for marker wait: {err}",
+                path.display()
+            )
+        })?;
+        if file_contains_marker(path, marker)? {
+            return Ok(());
+        }
+
+        let kqueue = Kqueue::new()?;
+        kqueue.watch_writes(&file)?;
+        let started_at = Instant::now();
+
+        loop {
+            if file_contains_marker(path, marker)? {
+                return Ok(());
+            }
+
+            let Some(remaining) = timeout.checked_sub(started_at.elapsed()) else {
+                return Err(format!(
+                    "timed out after {:?} waiting for marker {:?} in {}",
+                    timeout,
+                    String::from_utf8_lossy(marker),
+                    path.display()
+                ));
+            };
+
+            kqueue.wait_for_write(remaining)?;
+        }
+    }
+
     fn file_starts_with_marker(path: &Path, marker: &[u8]) -> Result<bool, String> {
         let mut file = fs::File::open(path)
             .map_err(|err| format!("failed to open block backing {}: {err}", path.display()))?;
@@ -299,6 +363,17 @@ mod macos_arm64 {
             .map_err(|err| format!("failed to read block backing {}: {err}", path.display()))?;
 
         Ok(bytes_read == marker.len() && buffer == marker)
+    }
+
+    fn file_contains_marker(path: &Path, marker: &[u8]) -> Result<bool, String> {
+        if marker.is_empty() {
+            return Ok(true);
+        }
+
+        let bytes = fs::read(path)
+            .map_err(|err| format!("failed to read serial output {}: {err}", path.display()))?;
+
+        Ok(bytes.windows(marker.len()).any(|window| window == marker))
     }
 
     #[derive(Debug)]
