@@ -33,6 +33,11 @@ pub const VIRTIO_NET_QUEUE_SIZE: u16 = 256;
 pub const VIRTIO_NET_QUEUE_SIZES: [u16; VIRTIO_NET_QUEUE_COUNT] =
     [VIRTIO_NET_QUEUE_SIZE; VIRTIO_NET_QUEUE_COUNT];
 pub const VIRTIO_NET_CONFIG_MAC_SIZE: usize = MAC_ADDRESS_LEN;
+pub const VIRTIO_NET_CONFIG_MTU_OFFSET: u64 = 10;
+pub const VIRTIO_NET_CONFIG_MTU_SIZE: usize = 2;
+pub const VIRTIO_NET_MIN_MTU: u16 = 68;
+pub const VIRTIO_NET_MAX_MTU: u16 = u16::MAX;
+pub const VIRTIO_NET_F_MTU: u32 = 3;
 pub const VIRTIO_NET_F_MAC: u32 = 5;
 pub const VIRTIO_RING_FEATURE_EVENT_IDX: u32 = 29;
 pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
@@ -53,7 +58,7 @@ pub struct NetworkInterfaceConfigInput {
     body_iface_id: String,
     host_dev_name: String,
     guest_mac: Option<String>,
-    mtu_configured: bool,
+    mtu: Option<u16>,
     rx_rate_limiter_configured: bool,
     tx_rate_limiter_configured: bool,
 }
@@ -69,7 +74,7 @@ impl NetworkInterfaceConfigInput {
             body_iface_id: body_iface_id.into(),
             host_dev_name: host_dev_name.into(),
             guest_mac: None,
-            mtu_configured: false,
+            mtu: None,
             rx_rate_limiter_configured: false,
             tx_rate_limiter_configured: false,
         }
@@ -91,8 +96,8 @@ impl NetworkInterfaceConfigInput {
         self.guest_mac.as_deref()
     }
 
-    pub const fn mtu_configured(&self) -> bool {
-        self.mtu_configured
+    pub const fn mtu(&self) -> Option<u16> {
+        self.mtu
     }
 
     pub const fn rx_rate_limiter_configured(&self) -> bool {
@@ -108,8 +113,8 @@ impl NetworkInterfaceConfigInput {
         self
     }
 
-    pub const fn with_mtu_configured(mut self) -> Self {
-        self.mtu_configured = true;
+    pub const fn with_mtu(mut self, mtu: u16) -> Self {
+        self.mtu = Some(mtu);
         self
     }
 
@@ -133,6 +138,7 @@ pub struct NetworkInterfaceConfig {
     iface_id: String,
     host_dev_name: String,
     guest_mac: Option<GuestMacAddress>,
+    mtu: Option<u16>,
 }
 
 impl NetworkInterfaceConfig {
@@ -146,6 +152,10 @@ impl NetworkInterfaceConfig {
 
     pub const fn guest_mac(&self) -> Option<GuestMacAddress> {
         self.guest_mac
+    }
+
+    pub const fn mtu(&self) -> Option<u16> {
+        self.mtu
     }
 }
 
@@ -166,8 +176,10 @@ impl TryFrom<NetworkInterfaceConfigInput> for NetworkInterfaceConfig {
             return Err(NetworkInterfaceConfigError::EmptyHostDeviceName);
         }
 
-        if input.mtu_configured {
-            return Err(NetworkInterfaceConfigError::UnsupportedMtu);
+        if let Some(mtu) = input.mtu
+            && !(VIRTIO_NET_MIN_MTU..=VIRTIO_NET_MAX_MTU).contains(&mtu)
+        {
+            return Err(NetworkInterfaceConfigError::InvalidMtu { mtu });
         }
         if input.rx_rate_limiter_configured {
             return Err(NetworkInterfaceConfigError::UnsupportedRxRateLimiter);
@@ -185,6 +197,7 @@ impl TryFrom<NetworkInterfaceConfigInput> for NetworkInterfaceConfig {
             iface_id: input.path_iface_id,
             host_dev_name: input.host_dev_name,
             guest_mac,
+            mtu: input.mtu,
         })
     }
 }
@@ -238,25 +251,33 @@ impl NetworkInterfaceConfigs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtioNetworkConfigSpace {
     guest_mac: Option<GuestMacAddress>,
+    mtu: Option<u16>,
 }
 
 impl VirtioNetworkConfigSpace {
-    pub const fn new(guest_mac: Option<GuestMacAddress>) -> Self {
-        Self { guest_mac }
+    pub const fn new(guest_mac: Option<GuestMacAddress>, mtu: Option<u16>) -> Self {
+        Self { guest_mac, mtu }
     }
 
     pub const fn guest_mac(self) -> Option<GuestMacAddress> {
         self.guest_mac
     }
 
+    pub const fn mtu(self) -> Option<u16> {
+        self.mtu
+    }
+
     pub const fn available_features(self) -> u64 {
-        let features = virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
+        let mut features = virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
             | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX);
         if self.guest_mac.is_some() {
-            features | virtio_feature_bit(VIRTIO_NET_F_MAC)
-        } else {
-            features
+            features |= virtio_feature_bit(VIRTIO_NET_F_MAC);
         }
+        if self.mtu.is_some() {
+            features |= virtio_feature_bit(VIRTIO_NET_F_MTU);
+        }
+
+        features
     }
 
     const fn mac_bytes(self) -> Option<[u8; VIRTIO_NET_CONFIG_MAC_SIZE]> {
@@ -272,14 +293,7 @@ impl VirtioMmioDeviceConfigHandler for VirtioNetworkConfigSpace {
         &self,
         access: VirtioMmioDeviceConfigAccess,
     ) -> Result<MmioAccessBytes, VirtioMmioDeviceConfigError> {
-        let Some(mac) = self.mac_bytes() else {
-            return Err(VirtioMmioDeviceConfigError::UnsupportedRead {
-                offset: access.offset(),
-                len: access.len(),
-            });
-        };
-        let bytes = read_virtio_network_mac_bytes(&mac, access)?;
-        MmioAccessBytes::new(bytes).map_err(network_config_bytes_error)
+        read_virtio_network_config_bytes(self.mac_bytes(), self.mtu, access)
     }
 
     fn write_device_config(
@@ -2418,7 +2432,7 @@ impl PreparedNetworkDevice {
         Self {
             iface_id: config.iface_id().to_string(),
             host_dev_name: config.host_dev_name().to_string(),
-            config_space: VirtioNetworkConfigSpace::new(config.guest_mac()),
+            config_space: VirtioNetworkConfigSpace::new(config.guest_mac(), config.mtu()),
             device: VirtioNetworkDevice::new(),
         }
     }
@@ -3266,10 +3280,11 @@ const fn virtio_feature_bit(feature: u32) -> u64 {
     1_u64 << feature
 }
 
-fn read_virtio_network_mac_bytes(
-    mac: &[u8; VIRTIO_NET_CONFIG_MAC_SIZE],
+fn read_virtio_network_config_bytes(
+    mac: Option<[u8; VIRTIO_NET_CONFIG_MAC_SIZE]>,
+    mtu: Option<u16>,
     access: VirtioMmioDeviceConfigAccess,
-) -> Result<&[u8], VirtioMmioDeviceConfigError> {
+) -> Result<MmioAccessBytes, VirtioMmioDeviceConfigError> {
     let offset = usize::try_from(access.offset()).map_err(|_| {
         VirtioMmioDeviceConfigError::UnsupportedRead {
             offset: access.offset(),
@@ -3283,11 +3298,38 @@ fn read_virtio_network_mac_bytes(
         });
     };
 
-    mac.get(offset..end)
-        .ok_or(VirtioMmioDeviceConfigError::UnsupportedRead {
-            offset: access.offset(),
-            len: access.len(),
-        })
+    if let Some(mac) = mac
+        && let Some(bytes) = mac.get(offset..end)
+    {
+        return MmioAccessBytes::new(bytes).map_err(network_config_bytes_error);
+    }
+
+    if let Some(mtu) = mtu {
+        let mtu_offset = usize::try_from(VIRTIO_NET_CONFIG_MTU_OFFSET).map_err(|_| {
+            VirtioMmioDeviceConfigError::UnsupportedRead {
+                offset: access.offset(),
+                len: access.len(),
+            }
+        })?;
+        let Some(mtu_end) = mtu_offset.checked_add(VIRTIO_NET_CONFIG_MTU_SIZE) else {
+            return Err(VirtioMmioDeviceConfigError::UnsupportedRead {
+                offset: access.offset(),
+                len: access.len(),
+            });
+        };
+        if offset >= mtu_offset && end <= mtu_end {
+            let relative_offset = offset - mtu_offset;
+            let bytes = mtu.to_le_bytes();
+            if let Some(bytes) = bytes.get(relative_offset..relative_offset + access.len()) {
+                return MmioAccessBytes::new(bytes).map_err(network_config_bytes_error);
+            }
+        }
+    }
+
+    Err(VirtioMmioDeviceConfigError::UnsupportedRead {
+        offset: access.offset(),
+        len: access.len(),
+    })
 }
 
 fn network_config_bytes_error(source: MmioAccessBytesError) -> VirtioMmioDeviceConfigError {
@@ -3635,7 +3677,9 @@ pub enum NetworkInterfaceConfigError {
         count: usize,
         max: usize,
     },
-    UnsupportedMtu,
+    InvalidMtu {
+        mtu: u16,
+    },
     UnsupportedRxRateLimiter,
     UnsupportedTxRateLimiter,
 }
@@ -3661,7 +3705,12 @@ impl fmt::Display for NetworkInterfaceConfigError {
             Self::TooManyNetworkInterfaces { max, .. } => {
                 write!(f, "network interface count exceeds maximum {max}")
             }
-            Self::UnsupportedMtu => f.write_str("network mtu is not supported"),
+            Self::InvalidMtu { mtu } => {
+                write!(
+                    f,
+                    "network mtu {mtu} is out of range [{VIRTIO_NET_MIN_MTU}, {VIRTIO_NET_MAX_MTU}]"
+                )
+            }
             Self::UnsupportedRxRateLimiter => {
                 f.write_str("network rx_rate_limiter is not supported")
             }
@@ -3735,15 +3784,16 @@ mod tests {
         NetworkInterfaceConfigError, NetworkInterfaceConfigInput, NetworkInterfaceConfigs,
         NetworkMmioDevices, NetworkMmioLayout, NetworkMmioRegistrationError,
         PreparedNetworkDevices, VIRTIO_FEATURE_VERSION_1, VIRTIO_NET_CONFIG_MAC_SIZE,
-        VIRTIO_NET_DEVICE_ID, VIRTIO_NET_F_MAC, VIRTIO_NET_MAX_BUFFER_SIZE, VIRTIO_NET_QUEUE_COUNT,
-        VIRTIO_NET_QUEUE_SIZE, VIRTIO_NET_QUEUE_SIZES, VIRTIO_NET_RX_MIN_BUFFER_SIZE,
-        VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_HEADER_SIZE, VIRTIO_NET_TX_QUEUE_INDEX,
-        VIRTIO_RING_FEATURE_EVENT_IDX, VirtioNetworkConfigSpace, VirtioNetworkDevice,
-        VirtioNetworkDeviceActivationError, VirtioNetworkDeviceNotificationError,
-        VirtioNetworkMmioHandler, VirtioNetworkRxBuffer, VirtioNetworkRxBufferParseError,
-        VirtioNetworkRxPacket, VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError,
-        VirtioNetworkRxQueueDispatchError, VirtioNetworkTxFrame, VirtioNetworkTxFrameParseError,
-        VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
+        VIRTIO_NET_CONFIG_MTU_OFFSET, VIRTIO_NET_CONFIG_MTU_SIZE, VIRTIO_NET_DEVICE_ID,
+        VIRTIO_NET_F_MAC, VIRTIO_NET_F_MTU, VIRTIO_NET_MAX_BUFFER_SIZE, VIRTIO_NET_MAX_MTU,
+        VIRTIO_NET_MIN_MTU, VIRTIO_NET_QUEUE_COUNT, VIRTIO_NET_QUEUE_SIZE, VIRTIO_NET_QUEUE_SIZES,
+        VIRTIO_NET_RX_MIN_BUFFER_SIZE, VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_HEADER_SIZE,
+        VIRTIO_NET_TX_QUEUE_INDEX, VIRTIO_RING_FEATURE_EVENT_IDX, VirtioNetworkConfigSpace,
+        VirtioNetworkDevice, VirtioNetworkDeviceActivationError,
+        VirtioNetworkDeviceNotificationError, VirtioNetworkMmioHandler, VirtioNetworkRxBuffer,
+        VirtioNetworkRxBufferParseError, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
+        VirtioNetworkRxPacketSourceError, VirtioNetworkRxQueueDispatchError, VirtioNetworkTxFrame,
+        VirtioNetworkTxFrameParseError, VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
         VirtioNetworkTxQueueDispatchError,
     };
 
@@ -3822,7 +3872,7 @@ mod tests {
     }
 
     fn network_activation_handler() -> VirtioNetworkMmioHandler {
-        let config = VirtioNetworkConfigSpace::new(Some(test_guest_mac()));
+        let config = VirtioNetworkConfigSpace::new(Some(test_guest_mac()), None);
         VirtioMmioRegisterHandler::with_device_config_and_activation(
             VIRTIO_NET_DEVICE_ID,
             config.available_features(),
@@ -3905,7 +3955,7 @@ mod tests {
     }
 
     fn network_device_registers() -> VirtioMmioDeviceRegisters {
-        let config = VirtioNetworkConfigSpace::new(Some(test_guest_mac()));
+        let config = VirtioNetworkConfigSpace::new(Some(test_guest_mac()), None);
         VirtioMmioDeviceRegisters::new(VIRTIO_NET_DEVICE_ID, config.available_features())
     }
 
@@ -4615,6 +4665,7 @@ mod tests {
         assert_eq!(config.iface_id(), "eth0");
         assert_eq!(config.host_dev_name(), "tap0");
         assert_eq!(config.guest_mac(), None);
+        assert_eq!(config.mtu(), None);
     }
 
     #[test]
@@ -4625,6 +4676,18 @@ mod tests {
         let guest_mac = config.guest_mac().expect("guest MAC should be stored");
         assert_eq!(guest_mac.octets(), [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc]);
         assert_eq!(guest_mac.to_string(), "12:34:56:78:9a:bc");
+        assert_eq!(config.mtu(), None);
+    }
+
+    #[test]
+    fn accepts_network_interface_config_with_mtu_bounds() {
+        let min_config = validate(input().with_mtu(VIRTIO_NET_MIN_MTU))
+            .expect("minimum network MTU should be valid");
+        let max_config = validate(input().with_mtu(VIRTIO_NET_MAX_MTU))
+            .expect("maximum network MTU should be valid");
+
+        assert_eq!(min_config.mtu(), Some(VIRTIO_NET_MIN_MTU));
+        assert_eq!(max_config.mtu(), Some(VIRTIO_NET_MAX_MTU));
     }
 
     #[test]
@@ -4759,11 +4822,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_deferred_fields() {
+    fn rejects_invalid_network_mtu() {
         assert_eq!(
-            validate(input().with_mtu_configured()),
-            Err(NetworkInterfaceConfigError::UnsupportedMtu)
+            validate(input().with_mtu(VIRTIO_NET_MIN_MTU - 1)),
+            Err(NetworkInterfaceConfigError::InvalidMtu {
+                mtu: VIRTIO_NET_MIN_MTU - 1,
+            })
         );
+    }
+
+    #[test]
+    fn rejects_deferred_fields() {
         assert_eq!(
             validate(input().with_rx_rate_limiter_configured()),
             Err(NetworkInterfaceConfigError::UnsupportedRxRateLimiter)
@@ -4778,7 +4847,7 @@ mod tests {
     fn network_interface_config_input_exposes_firecracker_shape() {
         let input = input()
             .with_guest_mac("12:34:56:78:9a:bc")
-            .with_mtu_configured()
+            .with_mtu(1500)
             .with_rx_rate_limiter_configured()
             .with_tx_rate_limiter_configured();
 
@@ -4786,7 +4855,7 @@ mod tests {
         assert_eq!(input.body_iface_id(), "eth0");
         assert_eq!(input.host_dev_name(), "tap0");
         assert_eq!(input.guest_mac(), Some("12:34:56:78:9a:bc"));
-        assert!(input.mtu_configured());
+        assert_eq!(input.mtu(), Some(1500));
         assert!(input.rx_rate_limiter_configured());
         assert!(input.tx_rate_limiter_configured());
     }
@@ -4796,6 +4865,17 @@ mod tests {
         let err = NetworkInterfaceConfigError::UnsupportedRxRateLimiter;
 
         assert_eq!(err.to_string(), "network rx_rate_limiter is not supported");
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn network_interface_config_errors_display_mtu_bounds() {
+        let err = NetworkInterfaceConfigError::InvalidMtu { mtu: 67 };
+
+        assert_eq!(
+            err.to_string(),
+            "network mtu 67 is out of range [68, 65535]"
+        );
         assert!(std::error::Error::source(&err).is_none());
     }
 
@@ -4904,6 +4984,28 @@ mod tests {
     }
 
     #[test]
+    fn network_interface_configs_reject_invalid_mtu_without_mutating() {
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(input().with_mtu(1500))
+            .expect("initial network config should be stored");
+
+        let err = configs
+            .insert(input().with_mtu(VIRTIO_NET_MIN_MTU - 1))
+            .expect_err("invalid replacement MTU should fail");
+
+        assert_eq!(
+            err,
+            NetworkInterfaceConfigError::InvalidMtu {
+                mtu: VIRTIO_NET_MIN_MTU - 1,
+            }
+        );
+        assert_eq!(configs.as_slice().len(), 1);
+        assert_eq!(configs.as_slice()[0].iface_id(), "eth0");
+        assert_eq!(configs.as_slice()[0].mtu(), Some(1500));
+    }
+
+    #[test]
     fn network_interface_configs_replace_existing_interface_at_limit() {
         let mut configs = NetworkInterfaceConfigs::new();
 
@@ -4964,6 +5066,7 @@ mod tests {
         assert_eq!(device.iface_id(), "eth0");
         assert_eq!(device.host_dev_name(), "tap0");
         assert_eq!(device.config_space().guest_mac(), None);
+        assert_eq!(device.config_space().mtu(), None);
         assert_eq!(device.config_space().available_features(), base_features);
         assert!(!device.device().is_activated());
     }
@@ -4988,6 +5091,31 @@ mod tests {
             virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
                 | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX)
                 | virtio_feature_bit(VIRTIO_NET_F_MAC)
+        );
+        assert!(!device.device().is_activated());
+    }
+
+    #[test]
+    fn prepared_network_devices_prepare_interface_with_mtu() {
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(input().with_mtu(1500))
+            .expect("network config should be stored");
+
+        let devices =
+            PreparedNetworkDevices::from_configs(&configs).expect("network device should prepare");
+        let device = devices
+            .as_slice()
+            .first()
+            .expect("prepared network device should exist");
+
+        assert_eq!(device.config_space().guest_mac(), None);
+        assert_eq!(device.config_space().mtu(), Some(1500));
+        assert_eq!(
+            device.config_space().available_features(),
+            virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
+                | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX)
+                | virtio_feature_bit(VIRTIO_NET_F_MTU)
         );
         assert!(!device.device().is_activated());
     }
@@ -5814,24 +5942,39 @@ mod tests {
     }
 
     #[test]
-    fn virtio_network_config_space_tracks_guest_mac_feature() {
+    fn virtio_network_config_space_tracks_configured_features() {
         let base_features = virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
             | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX);
-        let without_mac = VirtioNetworkConfigSpace::new(None);
-        let with_mac = VirtioNetworkConfigSpace::new(Some(test_guest_mac()));
+        let without_mac = VirtioNetworkConfigSpace::new(None, None);
+        let with_mac = VirtioNetworkConfigSpace::new(Some(test_guest_mac()), None);
+        let with_mtu = VirtioNetworkConfigSpace::new(None, Some(1500));
+        let with_mac_and_mtu = VirtioNetworkConfigSpace::new(Some(test_guest_mac()), Some(1500));
 
         assert_eq!(without_mac.guest_mac(), None);
+        assert_eq!(without_mac.mtu(), None);
         assert_eq!(without_mac.available_features(), base_features);
         assert_eq!(with_mac.guest_mac(), Some(test_guest_mac()));
         assert_eq!(
             with_mac.available_features(),
             base_features | virtio_feature_bit(VIRTIO_NET_F_MAC)
         );
+        assert_eq!(with_mtu.guest_mac(), None);
+        assert_eq!(with_mtu.mtu(), Some(1500));
+        assert_eq!(
+            with_mtu.available_features(),
+            base_features | virtio_feature_bit(VIRTIO_NET_F_MTU)
+        );
+        assert_eq!(
+            with_mac_and_mtu.available_features(),
+            base_features
+                | virtio_feature_bit(VIRTIO_NET_F_MAC)
+                | virtio_feature_bit(VIRTIO_NET_F_MTU)
+        );
     }
 
     #[test]
     fn virtio_network_config_space_reads_mac_bytes() {
-        let config = VirtioNetworkConfigSpace::new(Some(test_guest_mac()));
+        let config = VirtioNetworkConfigSpace::new(Some(test_guest_mac()), None);
 
         assert_eq!(
             read_network_config(config, 0, 4)
@@ -5866,11 +6009,40 @@ mod tests {
     }
 
     #[test]
-    fn virtio_network_config_space_rejects_unsupported_reads() {
-        let config = VirtioNetworkConfigSpace::new(Some(test_guest_mac()));
+    fn virtio_network_config_space_reads_mtu_bytes() {
+        let config = VirtioNetworkConfigSpace::new(None, Some(1500));
+        let mtu_bytes = 1500_u16.to_le_bytes();
 
         assert_eq!(
-            read_network_config(VirtioNetworkConfigSpace::new(None), 0, 1),
+            read_network_config(
+                config,
+                VIRTIO_NET_CONFIG_MTU_OFFSET,
+                VIRTIO_NET_CONFIG_MTU_SIZE
+            )
+            .expect("MTU config halfword should read")
+            .as_slice(),
+            &mtu_bytes
+        );
+        assert_eq!(
+            read_network_config(config, VIRTIO_NET_CONFIG_MTU_OFFSET, 1)
+                .expect("low MTU byte should read")
+                .as_slice(),
+            &mtu_bytes[0..1]
+        );
+        assert_eq!(
+            read_network_config(config, VIRTIO_NET_CONFIG_MTU_OFFSET + 1, 1)
+                .expect("high MTU byte should read")
+                .as_slice(),
+            &mtu_bytes[1..2]
+        );
+    }
+
+    #[test]
+    fn virtio_network_config_space_rejects_unsupported_reads() {
+        let config = VirtioNetworkConfigSpace::new(Some(test_guest_mac()), None);
+
+        assert_eq!(
+            read_network_config(VirtioNetworkConfigSpace::new(None, None), 0, 1),
             Err(VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead { offset: 0, len: 1 })
         );
         assert_eq!(
@@ -5881,13 +6053,52 @@ mod tests {
             read_network_config(config, 5, 2),
             Err(VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead { offset: 5, len: 2 })
         );
+        assert_eq!(
+            read_network_config(
+                config,
+                VIRTIO_NET_CONFIG_MTU_OFFSET,
+                VIRTIO_NET_CONFIG_MTU_SIZE
+            ),
+            Err(
+                VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead {
+                    offset: VIRTIO_NET_CONFIG_MTU_OFFSET,
+                    len: VIRTIO_NET_CONFIG_MTU_SIZE,
+                }
+            )
+        );
+        assert_eq!(
+            read_network_config(
+                VirtioNetworkConfigSpace::new(None, Some(1500)),
+                VIRTIO_NET_CONFIG_MTU_OFFSET - 1,
+                VIRTIO_NET_CONFIG_MTU_SIZE,
+            ),
+            Err(
+                VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead {
+                    offset: VIRTIO_NET_CONFIG_MTU_OFFSET - 1,
+                    len: VIRTIO_NET_CONFIG_MTU_SIZE,
+                }
+            )
+        );
+        assert_eq!(
+            read_network_config(
+                VirtioNetworkConfigSpace::new(None, Some(1500)),
+                VIRTIO_NET_CONFIG_MTU_OFFSET,
+                VIRTIO_NET_CONFIG_MTU_SIZE + 2,
+            ),
+            Err(
+                VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead {
+                    offset: VIRTIO_NET_CONFIG_MTU_OFFSET,
+                    len: VIRTIO_NET_CONFIG_MTU_SIZE + 2,
+                }
+            )
+        );
     }
 
     #[test]
     fn virtio_network_config_space_rejects_writes_after_driver_status() {
         assert_eq!(
             write_network_config_after_driver(
-                VirtioNetworkConfigSpace::new(Some(test_guest_mac())),
+                VirtioNetworkConfigSpace::new(Some(test_guest_mac()), None),
                 0,
                 &[1, 2, 3, 4],
             ),
@@ -5897,7 +6108,7 @@ mod tests {
 
     #[test]
     fn virtio_network_config_space_runs_through_mmio_register_handler() {
-        let config = VirtioNetworkConfigSpace::new(Some(test_guest_mac()));
+        let config = VirtioNetworkConfigSpace::new(Some(test_guest_mac()), None);
         let mut handler = network_handler(config);
 
         assert_eq!(handler.device_registers().device_id(), VIRTIO_NET_DEVICE_ID);

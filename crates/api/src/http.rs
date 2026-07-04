@@ -401,7 +401,7 @@ pub struct NetworkInterfaceConfigRequest {
     body_iface_id: String,
     host_dev_name: String,
     guest_mac: Option<String>,
-    mtu_configured: bool,
+    mtu: Option<u16>,
     rx_rate_limiter_configured: bool,
     tx_rate_limiter_configured: bool,
 }
@@ -423,8 +423,8 @@ impl NetworkInterfaceConfigRequest {
         self.guest_mac.as_deref()
     }
 
-    pub const fn mtu_configured(&self) -> bool {
-        self.mtu_configured
+    pub const fn mtu(&self) -> Option<u16> {
+        self.mtu
     }
 
     pub const fn rx_rate_limiter_configured(&self) -> bool {
@@ -565,6 +565,7 @@ pub struct NetworkInterfaceConfigResponse {
     iface_id: String,
     host_dev_name: String,
     guest_mac: Option<String>,
+    mtu: Option<u16>,
 }
 
 impl NetworkInterfaceConfigResponse {
@@ -573,11 +574,17 @@ impl NetworkInterfaceConfigResponse {
             iface_id: iface_id.into(),
             host_dev_name: host_dev_name.into(),
             guest_mac: None,
+            mtu: None,
         }
     }
 
     pub fn with_guest_mac(mut self, guest_mac: impl Into<String>) -> Self {
         self.guest_mac = Some(guest_mac.into());
+        self
+    }
+
+    pub const fn with_mtu(mut self, mtu: u16) -> Self {
+        self.mtu = Some(mtu);
         self
     }
 }
@@ -953,6 +960,12 @@ fn network_interface_config_response_value(
             serde_json::Value::String(guest_mac.clone()),
         );
     }
+    if let Some(mtu) = network_interface.mtu {
+        body.insert(
+            "mtu".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(mtu)),
+        );
+    }
     body.insert(
         "host_dev_name".to_string(),
         serde_json::Value::String(network_interface.host_dev_name.clone()),
@@ -1211,7 +1224,7 @@ fn parse_network_interface_config_request(
             body_iface_id: body.iface_id,
             host_dev_name: body.host_dev_name,
             guest_mac: body.guest_mac,
-            mtu_configured: body.mtu.is_some(),
+            mtu: body.mtu,
             rx_rate_limiter_configured,
             tx_rate_limiter_configured,
         },
@@ -2840,7 +2853,7 @@ mod tests {
         assert_eq!(config.body_iface_id(), "eth0");
         assert_eq!(config.host_dev_name(), "tap0");
         assert_eq!(config.guest_mac(), None);
-        assert!(!config.mtu_configured());
+        assert_eq!(config.mtu(), None);
         assert!(!config.rx_rate_limiter_configured());
         assert!(!config.tx_rate_limiter_configured());
     }
@@ -2878,7 +2891,7 @@ mod tests {
         assert_eq!(config.body_iface_id(), "eth0");
         assert_eq!(config.host_dev_name(), "tap0");
         assert_eq!(config.guest_mac(), Some("12:34:56:78:9a:bc"));
-        assert!(config.mtu_configured());
+        assert_eq!(config.mtu(), Some(1500));
         assert!(config.rx_rate_limiter_configured());
         assert!(config.tx_rate_limiter_configured());
     }
@@ -2901,7 +2914,7 @@ mod tests {
             panic!("expected network interface request");
         };
         assert_eq!(config.guest_mac(), None);
-        assert!(!config.mtu_configured());
+        assert_eq!(config.mtu(), None);
         assert!(!config.rx_rate_limiter_configured());
         assert!(!config.tx_rate_limiter_configured());
     }
@@ -3257,8 +3270,9 @@ mod tests {
         let drive =
             DriveConfigResponse::new("rootfs", "/tmp/rootfs.ext4", true, true, "Unsafe", "Sync")
                 .with_partuuid("0eaa91a0-01");
-        let network_interface =
-            NetworkInterfaceConfigResponse::new("eth0", "tap0").with_guest_mac("12:34:56:78:9a:bc");
+        let network_interface = NetworkInterfaceConfigResponse::new("eth0", "tap0")
+            .with_guest_mac("12:34:56:78:9a:bc")
+            .with_mtu(1500);
         let mmds_config = MmdsConfigResponse::new(vec!["eth0".to_string()], "V2", true)
             .with_ipv4_address("169.254.169.254");
         let vsock = VsockConfigResponse::new(3, "./v.sock");
@@ -3305,6 +3319,7 @@ mod tests {
                         "guest_mac": "12:34:56:78:9a:bc",
                         "host_dev_name": "tap0",
                         "iface_id": "eth0",
+                        "mtu": 1500,
                     },
                 ],
                 "mmds-config": {

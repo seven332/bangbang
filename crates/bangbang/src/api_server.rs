@@ -639,6 +639,9 @@ fn network_interface_config_response_from_runtime(
     if let Some(guest_mac) = config.guest_mac() {
         response = response.with_guest_mac(guest_mac.to_string());
     }
+    if let Some(mtu) = config.mtu() {
+        response = response.with_mtu(mtu);
+    }
 
     response
 }
@@ -798,8 +801,8 @@ fn network_interface_config_input_from_request(
     if let Some(guest_mac) = config.guest_mac() {
         input = input.with_guest_mac(guest_mac);
     }
-    if config.mtu_configured() {
-        input = input.with_mtu_configured();
+    if let Some(mtu) = config.mtu() {
+        input = input.with_mtu(mtu);
     }
     if config.rx_rate_limiter_configured() {
         input = input.with_rx_rate_limiter_configured();
@@ -2370,7 +2373,8 @@ mod tests {
         .expect("drive config should be stored");
         vmm.handle_action(VmmAction::PutNetworkInterface(
             NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0")
-                .with_guest_mac("12:34:56:78:9a:bc"),
+                .with_guest_mac("12:34:56:78:9a:bc")
+                .with_mtu(1500),
         ))
         .expect("network interface config should be stored");
         vmm.handle_action(VmmAction::PutVsock(
@@ -2409,6 +2413,7 @@ mod tests {
         assert!(response.contains(r#""iface_id":"eth0""#));
         assert!(response.contains(r#""host_dev_name":"tap0""#));
         assert!(response.contains(r#""guest_mac":"12:34:56:78:9a:bc""#));
+        assert!(response.contains(r#""mtu":1500"#));
         assert!(response.contains(r#""vsock":"#));
         assert!(response.contains(r#""guest_cid":3"#));
         assert!(response.contains(r#""uds_path":"./v.sock""#));
@@ -2721,12 +2726,43 @@ mod tests {
     }
 
     #[test]
-    fn returns_fault_for_unsupported_network_mtu_without_storing() {
+    fn stores_network_mtu() {
         let mut vmm = test_controller();
         let body = r#"{
             "iface_id": "eth0",
             "host_dev_name": "tap0",
             "mtu": 1500
+        }"#;
+        let request = format!(
+            "PUT /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        let response = handle_request_bytes(request.as_bytes(), &mut vmm);
+
+        assert_eq!(response.status(), bangbang_api::http::StatusCode::NoContent);
+
+        let config_response = handle_request_bytes(
+            b"GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &mut vmm,
+        );
+        assert_eq!(config_response.status(), bangbang_api::http::StatusCode::Ok);
+        assert!(config_response.body().contains(r#""iface_id":"eth0""#));
+        assert!(config_response.body().contains(r#""host_dev_name":"tap0""#));
+        assert!(config_response.body().contains(r#""mtu":1500"#));
+    }
+
+    #[test]
+    fn returns_fault_for_invalid_network_mtu_without_storing() {
+        let mut vmm = test_controller();
+        vmm.handle_action(VmmAction::PutNetworkInterface(
+            NetworkInterfaceConfigInput::new("eth0", "eth0", "tap0").with_mtu(1500),
+        ))
+        .expect("initial network config should be stored");
+        let body = r#"{
+            "iface_id": "eth0",
+            "host_dev_name": "tap0",
+            "mtu": 67
         }"#;
         let request = format!(
             "PUT /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
@@ -2741,7 +2777,7 @@ mod tests {
         );
         assert_eq!(
             response.body(),
-            r#"{"fault_message":"network mtu is not supported"}"#
+            r#"{"fault_message":"network mtu 67 is out of range [68, 65535]"}"#
         );
 
         let config_response = handle_request_bytes(
@@ -2749,11 +2785,9 @@ mod tests {
             &mut vmm,
         );
         assert_eq!(config_response.status(), bangbang_api::http::StatusCode::Ok);
-        assert!(
-            config_response
-                .body()
-                .contains(r#""network-interfaces":[]"#)
-        );
+        assert!(config_response.body().contains(r#""iface_id":"eth0""#));
+        assert!(config_response.body().contains(r#""host_dev_name":"tap0""#));
+        assert!(config_response.body().contains(r#""mtu":1500"#));
     }
 
     #[test]
