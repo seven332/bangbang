@@ -167,11 +167,14 @@ scripts/run-integration-tests.sh --test executable_hvf_e2e
 
 This target runs the dedicated `executable_hvf_e2e` Cargo test target. It builds
 and signs a temporary `bangbang` executable, prepares the pinned Firecracker
-kernel plus the deterministic tiny initrd, starts `bangbang` as a child process,
-configures the VM through the Unix-socket API, sends `InstanceStart`, and waits
-for the guest to write `BANGBANG_BLOCK_WRITE_OK` to a scratch block backing
-file. It verifies the public process/API/HVF path without requiring public
-serial output. It does not cover direct rootfs boot through the executable path.
+kernel, deterministic tiny initrd, and generated direct-boot ext4 rootfs,
+starts `bangbang` as a child process, configures the VM through the Unix-socket
+API, sends `InstanceStart`, and waits for the guest to write deterministic
+markers to scratch block backing files. The tiny-initrd scenario writes
+`BANGBANG_BLOCK_WRITE_OK`; the direct-rootfs scenario boots the generated ext4
+rootfs without an initrd and writes `BANGBANG_DIRECT_ROOTFS_BLOCK_OK` through a
+second writable drive. This verifies the public process/API/HVF path without
+requiring public serial output.
 
 Hosted macOS CI may use:
 
@@ -185,11 +188,10 @@ misconfigured hosts fail.
 
 ## Guest Boot Artifacts
 
-Guest boot and executable HVF e2e tests use the pinned Firecracker arm64 kernel
-and a deterministic tiny initrd. Guest boot tests also use the pinned
-Firecracker rootfs artifact. The integration runner prepares the relevant
-artifacts when `guest_boot` or `executable_hvf_e2e` is selected. To prepare only
-the kernel cache, run:
+Guest boot and executable HVF e2e tests use the pinned Firecracker arm64 kernel,
+a deterministic tiny initrd, and rootfs artifacts where their scenarios require
+them. The integration runner prepares the relevant artifacts when `guest_boot`
+or `executable_hvf_e2e` is selected. To prepare only the kernel cache, run:
 
 ```sh
 scripts/fetch-firecracker-kernel.sh
@@ -255,17 +257,21 @@ into the generated ext4 image keep the local extraction ownership rather than
 Firecracker's root-owned demo ownership. This is suitable for local development
 artifacts and is not a substitute for a production rootfs build process.
 
-The signed `guest_boot` target also validates a deterministic direct-rootfs
-boot. For that scenario, `scripts/run-integration-tests.sh` prepares
-`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v4.ext4`
+The signed `guest_boot` and executable HVF e2e targets also validate a
+deterministic direct-rootfs boot. For those scenarios,
+`scripts/run-integration-tests.sh` prepares
+`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v6.ext4`
 after confirming the host can execute HVF. The generated image is an ext4 copy
 of the pinned Firecracker rootfs with a test-specific
 `/bangbang-direct-rootfs-init` script added before image creation. The test
 boots without the tiny initrd, attaches that ext4 image as a read-only root
-drive, passes `init=/bangbang-direct-rootfs-init`, and expects deterministic
-serial markers plus Ubuntu os-release content from `/etc/os-release`. This
-proves the kernel mounted the virtio-block root drive as `/`; it does not claim
-that bangbang can boot an arbitrary distro image through its default init.
+drive, and passes `init=/bangbang-direct-rootfs-init`. The `guest_boot` target
+expects deterministic serial markers plus Ubuntu os-release content from
+`/etc/os-release`; the executable HVF e2e target observes
+`BANGBANG_DIRECT_ROOTFS_BLOCK_OK` in a second writable scratch drive because it
+does not expose public serial output. This proves the kernel mounted the
+virtio-block root drive as `/`; it does not claim that bangbang can boot an
+arbitrary distro image through its default init.
 
 bangbang appends Firecracker-style root-drive command-line arguments during
 startup resource assembly when a configured drive has `is_root_device=true`.

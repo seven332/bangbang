@@ -267,7 +267,7 @@ if [[ "$hv_disable" == "1" ]]; then
   finish_unsupported "Hypervisor.framework is disabled on this host"
 fi
 
-if contains guest_boot "${selected_tests[@]}"; then
+if contains guest_boot "${selected_tests[@]}" || contains executable_hvf_e2e "${selected_tests[@]}"; then
   guest_ext4_rootfs_path="$(scripts/fetch-firecracker-rootfs.sh \
     --format ext4 \
     --ext4-size 512M \
@@ -313,6 +313,7 @@ if contains executable_hvf_e2e "${selected_tests[@]}"; then
     BANGBANG_PROCESS_E2E_BIN="$executable_hvf_e2e_bangbang" \
       BANGBANG_GUEST_KERNEL_PATH="$guest_kernel_path" \
       BANGBANG_GUEST_INITRD_PATH="$guest_initrd_path" \
+      BANGBANG_GUEST_EXT4_ROOTFS_PATH="$guest_ext4_rootfs_path" \
       cargo test \
         -p bangbang \
         --test executable_hvf_e2e \
@@ -325,6 +326,7 @@ if contains executable_hvf_e2e "${selected_tests[@]}"; then
     BANGBANG_PROCESS_E2E_BIN="$executable_hvf_e2e_bangbang" \
       BANGBANG_GUEST_KERNEL_PATH="$guest_kernel_path" \
       BANGBANG_GUEST_INITRD_PATH="$guest_initrd_path" \
+      BANGBANG_GUEST_EXT4_ROOTFS_PATH="$guest_ext4_rootfs_path" \
       cargo test \
         -p bangbang \
         --test executable_hvf_e2e \
