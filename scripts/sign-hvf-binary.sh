@@ -46,7 +46,15 @@ if ! command -v codesign >/dev/null 2>&1; then
 fi
 
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/bangbang-hvf-sign.XXXXXX")"
-trap 'rm -rf "$tmp_dir"' EXIT
+signed_tmp=""
+
+cleanup() {
+  if [[ -n "$signed_tmp" ]]; then
+    rm -f "$signed_tmp"
+  fi
+  rm -rf "$tmp_dir"
+}
+trap cleanup EXIT
 
 entitlements="$tmp_dir/hvf-entitlements.plist"
 cat > "$entitlements" <<'EOF'
@@ -60,6 +68,17 @@ cat > "$entitlements" <<'EOF'
 </plist>
 EOF
 
-mkdir -p "$(dirname "$output")"
-cp "$input" "$output"
-codesign --force --sign - --entitlements "$entitlements" "$output"
+output_dir="$(dirname "$output")"
+output_name="$(basename "$output")"
+
+if [[ "$output_name" == "." || "$output_name" == "/" ]]; then
+  echo "output path must name a file: $output" >&2
+  exit 2
+fi
+
+mkdir -p "$output_dir"
+signed_tmp="$(mktemp "$output_dir/.$output_name.signed.XXXXXX")"
+cp -p "$input" "$signed_tmp"
+codesign --force --sign - --entitlements "$entitlements" "$signed_tmp"
+mv -f "$signed_tmp" "$output"
+signed_tmp=""
