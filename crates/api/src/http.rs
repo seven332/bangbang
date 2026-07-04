@@ -47,6 +47,7 @@ pub enum RequestError {
     MalformedRequest,
     MemoryHotplugUnsupported,
     PayloadTooLarge,
+    PmemUnsupported,
     SendCtrlAltDelUnsupported,
     SerialUnsupported,
     SnapshotUnsupported,
@@ -66,6 +67,7 @@ impl RequestError {
             Self::MalformedRequest => "Malformed HTTP request.",
             Self::MemoryHotplugUnsupported => "Memory hotplug is not supported.",
             Self::PayloadTooLarge => "HTTP request payload exceeds the configured limit.",
+            Self::PmemUnsupported => "Pmem device is not supported.",
             Self::SendCtrlAltDelUnsupported => "SendCtrlAltDel is not supported on aarch64.",
             Self::SerialUnsupported => "Serial device is not supported.",
             Self::SnapshotUnsupported => "Snapshot and restore are not supported.",
@@ -1137,6 +1139,10 @@ pub fn parse_request_with_limit(
         return Err(RequestError::MemoryHotplugUnsupported);
     }
 
+    if matches!(method, "PUT" | "PATCH") && pmem_path_id(path).is_some() {
+        return Err(RequestError::PmemUnsupported);
+    }
+
     if method == "PUT"
         && let Some(path_drive_id) = drive_path_id(path)
     {
@@ -1218,21 +1224,18 @@ fn is_balloon_endpoint(method: &str, path: &str) -> bool {
 }
 
 fn drive_path_id(path: &str) -> Option<&str> {
-    let rest = path.strip_prefix("/drives/")?;
-    if rest.is_empty()
-        || rest.contains('/')
-        || !rest
-            .chars()
-            .all(|character| character == '_' || character.is_alphanumeric())
-    {
-        return None;
-    }
-
-    Some(rest)
+    single_segment_id(path.strip_prefix("/drives/")?)
 }
 
 fn network_interface_path_id(path: &str) -> Option<&str> {
-    let rest = path.strip_prefix("/network-interfaces/")?;
+    single_segment_id(path.strip_prefix("/network-interfaces/")?)
+}
+
+fn pmem_path_id(path: &str) -> Option<&str> {
+    single_segment_id(path.strip_prefix("/pmem/")?)
+}
+
+fn single_segment_id(rest: &str) -> Option<&str> {
     if rest.is_empty()
         || rest.contains('/')
         || !rest
@@ -3690,6 +3693,95 @@ mod tests {
                 parse_request(&request),
                 Err(RequestError::InvalidPathMethod),
                 "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_pmem_methods_as_unsupported() {
+        for (route, request) in [
+            (
+                "PUT /pmem/pmem0",
+                request_with_body("PUT", "/pmem/pmem0", r#"{"id":"pmem0"}"#),
+            ),
+            (
+                "PATCH /pmem/pmem0",
+                request_with_body("PATCH", "/pmem/pmem0", r#"{"id":"pmem0"}"#),
+            ),
+            (
+                "PUT /pmem/pmem_0",
+                request_with_body("PUT", "/pmem/pmem_0", r#"{"id":"pmem_0"}"#),
+            ),
+        ] {
+            let err = parse_request(&request).expect_err("pmem should be unsupported");
+            assert_eq!(err, RequestError::PmemUnsupported, "{route}");
+            assert_eq!(err.fault_message(), "Pmem device is not supported.");
+        }
+    }
+
+    #[test]
+    fn rejects_pmem_body_methods_without_parsing_body() {
+        for method in ["PUT", "PATCH"] {
+            let malformed_body = request_with_body(method, "/pmem/pmem0", "not-json");
+            let empty_body = format!(
+                "{method} /pmem/pmem0 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+            );
+
+            assert_eq!(
+                parse_request(&malformed_body),
+                Err(RequestError::PmemUnsupported),
+                "{method}"
+            );
+            assert_eq!(
+                parse_request(empty_body.as_bytes()),
+                Err(RequestError::PmemUnsupported),
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_exact_pmem_paths_as_invalid_path_method() {
+        for (route, request) in [
+            ("PUT /pmem", request_with_body("PUT", "/pmem", "{}")),
+            ("PUT /pmem/", request_with_body("PUT", "/pmem/", "{}")),
+            (
+                "PUT /pmem/pmem0/extra",
+                request_with_body("PUT", "/pmem/pmem0/extra", "{}"),
+            ),
+            (
+                "PATCH /pmem/pmem-0",
+                request_with_body("PATCH", "/pmem/pmem-0", "{}"),
+            ),
+        ] {
+            assert_eq!(
+                parse_request(&request),
+                Err(RequestError::InvalidPathMethod),
+                "{route}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_pmem_methods_as_invalid_path_method() {
+        for (route, request) in [
+            (
+                "GET /pmem/pmem0",
+                b"GET /pmem/pmem0 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            ),
+            (
+                "DELETE /pmem/pmem0",
+                b"DELETE /pmem/pmem0 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            ),
+            (
+                "POST /pmem/pmem0",
+                request_with_body("POST", "/pmem/pmem0", "{}"),
+            ),
+        ] {
+            assert_eq!(
+                parse_request(&request),
+                Err(RequestError::InvalidPathMethod),
+                "{route}"
             );
         }
     }
