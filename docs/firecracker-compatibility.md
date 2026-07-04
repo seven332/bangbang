@@ -92,10 +92,10 @@ socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
 `GET /machine-config`, pre-boot `PUT /machine-config`, pre-boot
 `PUT /boot-source`, pre-boot `PUT /drives/{drive_id}`, pre-boot
 `PUT /network-interfaces/{iface_id}`, pre-boot `PUT /vsock`, pre-boot
-`PUT /metrics`, pre-boot `PUT /logger`, parsed `PUT /actions`, and recognized
-`PATCH /drives/{drive_id}` requests already map through a minimal internal VMM
+`PUT /metrics`, pre-boot `PUT /logger`, parsed `PUT /actions`, parsed
+`PATCH /vm`, and recognized `PATCH /drives/{drive_id}` requests already map through a minimal internal VMM
 action/data boundary. Validation rejects malformed boot-source, drive update,
-and actions requests before VMM state mutation.
+VM state update, and actions requests before VMM state mutation.
 Successful `InstanceStart` startup, the `Running` transition, and an internal boot run-loop worker across bounded step windows are implemented with an internal serial MMIO
 console capture path and retained internal active, terminal-outcome, or error worker status. `FlushMetrics` is implemented as a runtime-only minimal JSON-line flush through per-process metrics state, and includes a terse `boot_run_loop_status` summary when a process-owned boot worker exists. `PUT /logger` is implemented as pre-boot per-process observability configuration with minimal successful `InstanceStart` and `FlushMetrics` action-event output; public run-loop control, public serial
 streaming, full Firecracker metrics counters, periodic flush, and full logger integration remain deferred.
@@ -257,7 +257,7 @@ compatibility targets.
 | `PUT` | `/entropy` | recognized; rejected | Returns an entropy-specific unsupported fault. Real virtio-rng configuration storage, rate limiting, guest randomness wiring, and startup resource attachment need a dedicated device design. |
 | `PUT` | `/serial` | recognized; rejected | Returns a serial-specific unsupported fault. Public serial configuration storage, host output redirection, rate limiting, and integration with the existing internal serial capture path need a dedicated design. |
 | `GET`, `PUT`, `PATCH` | `/hotplug/memory` | recognized; rejected | Returns a memory-hotplug-specific unsupported fault. Real virtio-mem device support, guest memory accounting, and runtime memory update behavior need a dedicated design. |
-| `PATCH` | `/vm` | recognized; rejected | Returns a VM-state-specific unsupported fault. Real pause/resume state rules, VMM actions, and public run-loop control need a dedicated design. |
+| `PATCH` | `/vm` | recognized; rejected | Parses the Firecracker-shaped VM state request with required `state` values `Paused` and `Resumed`, then routes valid requests through `Pause` or `Resume` VMM actions. Requests before startup fail as unsupported in `Not started` state, and runtime requests fail as unsupported actions without mutating VM state. Real pause/resume state transitions and public run-loop control remain deferred. |
 | `PATCH` | `/drives/{drive_id}` | recognized; rejected | Parses the Firecracker-shaped block-device update request with required `drive_id`, optional `path_on_host`, and optional `rate_limiter`, then routes valid updates through `UpdateBlockDevice`. Pre-boot requests fail as post-boot-only operations and runtime requests fail as unsupported actions without mutating stored drive configuration. Configured rate limiters remain unsupported until block update behavior exists. |
 | `PATCH` | `/network-interfaces/{iface_id}` | recognized; rejected | Returns device-update-specific unsupported faults. Real network-interface updates, runtime mutation, and hotplug behavior need dedicated device designs. |
 | `DELETE` | `/drives/{drive_id}`, `/pmem/{id}`, `/network-interfaces/{iface_id}` | recognized; rejected | Firecracker routes these hot-unplug requests in `parsed_request.rs`, but they are not in the `v1.16.0` swagger surface. bangbang returns existing device-update or pmem unsupported faults; real hot-unplug behavior remains deferred. |
@@ -1202,8 +1202,8 @@ The first API implementation should model the same broad stages as Firecracker:
   capture, and transitions the process out of pre-boot state on success
 - runtime: the microVM is running; pre-boot-only configuration requests should
   fail with a Firecracker-shaped unsupported-state error
-- paused/resumed: deferred until `/vm` state update work defines pause and
-  resume behavior
+- paused/resumed: `PATCH /vm` parses `Paused` and `Resumed` requests, but real
+  pause and resume behavior remains deferred
 
 ### Initial Operation State Matrix
 
@@ -1366,7 +1366,7 @@ Their eventual support level should follow the endpoint matrix:
 - full logger integration, full Firecracker metrics counters, and periodic
   metrics flush
 - memory hotplug
-- pause and resume VM state updates
+- real pause and resume VM state transitions
 - PATCH and DELETE hotplug/update behavior
 
 Non-initial features should be introduced through narrower capability work that

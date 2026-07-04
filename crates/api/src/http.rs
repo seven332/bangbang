@@ -25,6 +25,7 @@ pub enum ApiRequest {
     PutBootSource(Box<BootSourceRequest>),
     PutDrive(Box<DriveConfigRequest>),
     PatchDrive(Box<DrivePatchRequest>),
+    PatchVmState(Box<VmStateUpdateRequest>),
     PutLogger(Box<LoggerConfigRequest>),
     PutMachineConfig(Box<MachineConfigRequest>),
     PatchMachineConfig(Box<MachineConfigPatchRequest>),
@@ -54,7 +55,6 @@ pub enum RequestError {
     SendCtrlAltDelUnsupported,
     SerialUnsupported,
     SnapshotUnsupported,
-    VmStateUpdateUnsupported,
 }
 
 impl RequestError {
@@ -78,7 +78,6 @@ impl RequestError {
             Self::SendCtrlAltDelUnsupported => "SendCtrlAltDel is not supported on aarch64.",
             Self::SerialUnsupported => "Serial device is not supported.",
             Self::SnapshotUnsupported => "Snapshot and restore are not supported.",
-            Self::VmStateUpdateUnsupported => "VM state updates are not supported.",
         }
     }
 }
@@ -119,6 +118,35 @@ enum ActionTypeBody {
     FlushMetrics,
     InstanceStart,
     SendCtrlAltDel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmStateUpdateRequest {
+    state: VmStateUpdate,
+}
+
+impl VmStateUpdateRequest {
+    pub const fn state(&self) -> VmStateUpdate {
+        self.state
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmStateUpdate {
+    Paused,
+    Resumed,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VmStateUpdateRequestBody {
+    state: VmStateUpdateBody,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+enum VmStateUpdateBody {
+    Paused,
+    Resumed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1234,7 +1262,7 @@ pub fn parse_request_with_limit(
         return parse_machine_config_patch_request(body);
     }
     if method == "PATCH" && path == "/vm" {
-        return Err(RequestError::VmStateUpdateUnsupported);
+        return parse_vm_state_update_request(body);
     }
     if method == "PUT" && path == "/metrics" {
         return parse_metrics_config_request(body);
@@ -1316,6 +1344,20 @@ fn parse_action_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
 
     Ok(ApiRequest::PutAction(Box::new(ActionRequest {
         action_type,
+    })))
+}
+
+fn parse_vm_state_update_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
+    let body = serde_json::from_slice::<VmStateUpdateRequestBody>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+
+    let state = match body.state {
+        VmStateUpdateBody::Paused => VmStateUpdate::Paused,
+        VmStateUpdateBody::Resumed => VmStateUpdate::Resumed,
+    };
+
+    Ok(ApiRequest::PatchVmState(Box::new(VmStateUpdateRequest {
+        state,
     })))
 }
 
@@ -1791,6 +1833,7 @@ impl From<ApiRequest> for Endpoint {
             ApiRequest::GetMmds => Self::Mmds,
             ApiRequest::GetVmConfig => Self::VmConfig,
             ApiRequest::GetVersion => Self::Version,
+            ApiRequest::PatchVmState(_) => Self::VmState,
             ApiRequest::PutAction(_) => Self::Actions,
             ApiRequest::PutBootSource(_) => Self::BootSource,
             ApiRequest::PutDrive(_) | ApiRequest::PatchDrive(_) => Self::Drive,
@@ -4268,27 +4311,43 @@ mod tests {
     }
 
     #[test]
-    fn rejects_vm_state_update_as_unsupported() {
+    fn parses_vm_state_update_pause() {
         let request = request_with_body("PATCH", "/vm", r#"{"state":"Paused"}"#);
 
-        let err = parse_request(&request).expect_err("VM state updates should be unsupported");
-        assert_eq!(err, RequestError::VmStateUpdateUnsupported);
-        assert_eq!(err.fault_message(), "VM state updates are not supported.");
+        let parsed = parse_request(&request).expect("VM state update should parse");
+
+        let ApiRequest::PatchVmState(update) = parsed else {
+            panic!("expected VM state update request");
+        };
+        assert_eq!(update.state(), VmStateUpdate::Paused);
     }
 
     #[test]
-    fn rejects_vm_state_update_as_unsupported_without_parsing_body() {
-        let malformed_body = request_with_body("PATCH", "/vm", "not-json");
-        let empty_body = b"PATCH /vm HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n";
+    fn parses_vm_state_update_resume() {
+        let request = request_with_body("PATCH", "/vm", r#"{"state":"Resumed"}"#);
 
-        assert_eq!(
-            parse_request(&malformed_body),
-            Err(RequestError::VmStateUpdateUnsupported)
-        );
-        assert_eq!(
-            parse_request(empty_body),
-            Err(RequestError::VmStateUpdateUnsupported)
-        );
+        let parsed = parse_request(&request).expect("VM state update should parse");
+
+        let ApiRequest::PatchVmState(update) = parsed else {
+            panic!("expected VM state update request");
+        };
+        assert_eq!(update.state(), VmStateUpdate::Resumed);
+    }
+
+    #[test]
+    fn rejects_malformed_vm_state_update_bodies() {
+        for body in [
+            "not-json",
+            "",
+            "{}",
+            r#"{"state":null}"#,
+            r#"{"state":"Running"}"#,
+            r#"{"state":"Paused","unknown":true}"#,
+        ] {
+            let request = request_with_body("PATCH", "/vm", body);
+
+            assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+        }
     }
 
     #[test]
@@ -4709,6 +4768,11 @@ mod tests {
             Endpoint::MachineConfig
         );
         assert_eq!(Endpoint::from(ApiRequest::GetVmConfig), Endpoint::VmConfig);
+        let request = parse_request(&request_with_body("PATCH", "/vm", r#"{"state":"Paused"}"#))
+            .expect("VM state update request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::VmState);
+
         let request = parse_request(&request_with_body(
             "PUT",
             "/actions",

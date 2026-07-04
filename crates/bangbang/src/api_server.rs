@@ -18,8 +18,9 @@ use bangbang_api::http::{
     LoggerLevel as ApiLoggerLevel, MachineConfigPatchRequest, MachineConfigRequest,
     MachineConfigResponse, MetricsConfigRequest, MmdsConfigRequest, MmdsConfigResponse,
     MmdsContentRequest, MmdsVersion as ApiMmdsVersion, NetworkInterfaceConfigRequest,
-    NetworkInterfaceConfigResponse, RequestError, VmConfigResponse, VsockConfigRequest,
-    VsockConfigResponse, parse_request_with_limit, request_total_len_with_limit,
+    NetworkInterfaceConfigResponse, RequestError, VmConfigResponse, VmStateUpdate,
+    VmStateUpdateRequest, VsockConfigRequest, VsockConfigResponse, parse_request_with_limit,
+    request_total_len_with_limit,
 };
 use bangbang_runtime::block::{
     DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine, DriveUpdateInput,
@@ -477,6 +478,9 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PatchDrive(config) => handle_empty(vmm.handle_action(
             VmmAction::UpdateBlockDevice(drive_update_input_from_request(config.as_ref())),
         )),
+        ApiRequest::PatchVmState(update) => {
+            handle_empty(vmm.handle_action(vm_state_action_from_request(update.as_ref())))
+        }
         ApiRequest::PutNetworkInterface(config) => {
             handle_empty(vmm.handle_action(VmmAction::PutNetworkInterface(
                 network_interface_config_input_from_request(config.as_ref()),
@@ -492,6 +496,13 @@ fn action_from_request(action: &ActionRequest) -> VmmAction {
     match action.action_type() {
         ActionType::InstanceStart => VmmAction::InstanceStart,
         ActionType::FlushMetrics => VmmAction::FlushMetrics,
+    }
+}
+
+fn vm_state_action_from_request(update: &VmStateUpdateRequest) -> VmmAction {
+    match update.state() {
+        VmStateUpdate::Paused => VmmAction::Pause,
+        VmStateUpdate::Resumed => VmmAction::Resume,
     }
 }
 
@@ -3115,31 +3126,64 @@ mod tests {
     }
 
     #[test]
-    fn returns_fault_for_vm_state_update_endpoint() {
-        let path = unique_socket_path("vm-state-fault");
-        let server = ApiServer::bind(&path).expect("server should bind");
-        let mut client = UnixStream::connect(&path).expect("client should connect");
-
-        client
-            .write_all(
-                b"PATCH /vm HTTP/1.1\r\nHost: localhost\r\nContent-Length: 18\r\n\r\n{\"state\":\"Paused\"}",
-            )
-            .expect("client should write request");
+    fn not_started_state_rejects_vm_state_update_without_mutating() {
         let mut vmm = test_controller();
-        server
-            .serve_next(&mut vmm)
-            .expect("server should handle one request");
+        let request = "PATCH /vm HTTP/1.1\r\nHost: localhost\r\nContent-Length: 18\r\n\r\n{\"state\":\"Paused\"}";
 
-        let mut response = String::new();
-        client
-            .read_to_string(&mut response)
-            .expect("client should read response");
+        let response = request_over_socket(&mut vmm, "vm-state-not-started", request);
 
         assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        assert!(response.contains(r#"{"fault_message":"VM state updates are not supported."}"#));
+        assert!(response.contains(
+            r#"{"fault_message":"The requested operation is not supported in Not started state: Pause"}"#
+        ));
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::NotStarted
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_vm_state_update_without_mutating() {
+        let mut vmm = test_controller();
+        let request = "PATCH /vm HTTP/1.1\r\nHost: localhost\r\nContent-Length: 19\r\n\r\n{\"state\":\"Running\"}";
+
+        let response = request_over_socket(&mut vmm, "vm-state-malformed", request);
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.contains(r#"{"fault_message":"Malformed HTTP request."}"#));
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::NotStarted
+        );
+    }
+
+    #[test]
+    fn running_state_rejects_vm_state_update_without_mutating() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_request = format!(
+            "PUT /boot-source HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{boot_body}",
+            boot_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "vm-state-start", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let request = "PATCH /vm HTTP/1.1\r\nHost: localhost\r\nContent-Length: 19\r\n\r\n{\"state\":\"Resumed\"}";
+
+        let response = request_over_socket(&mut vmm, "vm-state-running", request);
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(
+            response.contains(
+                r#"{"fault_message":"The requested operation is not supported: Resume"}"#
+            )
+        );
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::Running
         );
     }
 
