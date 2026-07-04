@@ -37,6 +37,7 @@ pub enum ApiRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestError {
+    BalloonUnsupported,
     CpuConfigUnsupported,
     EntropyUnsupported,
     GetRequestBody,
@@ -55,6 +56,7 @@ pub enum RequestError {
 impl RequestError {
     pub fn fault_message(&self) -> &'static str {
         match self {
+            Self::BalloonUnsupported => "Balloon device is not supported.",
             Self::CpuConfigUnsupported => "CPU config is not supported.",
             Self::EntropyUnsupported => "Entropy device is not supported.",
             Self::GetRequestBody => "GET request cannot have a body.",
@@ -1127,6 +1129,10 @@ pub fn parse_request_with_limit(
         return Err(RequestError::GetRequestBody);
     }
 
+    if is_balloon_endpoint(method, path) {
+        return Err(RequestError::BalloonUnsupported);
+    }
+
     if matches!(method, "GET" | "PUT" | "PATCH") && path == "/hotplug/memory" {
         return Err(RequestError::MemoryHotplugUnsupported);
     }
@@ -1195,6 +1201,20 @@ pub fn parse_request_with_limit(
         ("GET", "/version") => Ok(ApiRequest::GetVersion),
         _ => Err(RequestError::InvalidPathMethod),
     }
+}
+
+fn is_balloon_endpoint(method: &str, path: &str) -> bool {
+    matches!(
+        (method, path),
+        ("GET", "/balloon")
+            | ("GET", "/balloon/statistics")
+            | ("GET", "/balloon/hinting/status")
+            | ("PUT", "/balloon")
+            | ("PATCH", "/balloon")
+            | ("PATCH", "/balloon/statistics")
+            | ("PATCH", "/balloon/hinting/start")
+            | ("PATCH", "/balloon/hinting/stop")
+    )
 }
 
 fn drive_path_id(path: &str) -> Option<&str> {
@@ -3450,6 +3470,139 @@ mod tests {
             parse_request(&request),
             Err(RequestError::InvalidPathMethod)
         );
+    }
+
+    #[test]
+    fn rejects_balloon_methods_as_unsupported() {
+        let requests = [
+            (
+                "GET /balloon",
+                b"GET /balloon HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            ),
+            (
+                "GET /balloon/statistics",
+                b"GET /balloon/statistics HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            ),
+            (
+                "GET /balloon/hinting/status",
+                b"GET /balloon/hinting/status HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            ),
+            ("PUT /balloon", request_with_body("PUT", "/balloon", "{}")),
+            (
+                "PATCH /balloon",
+                request_with_body("PATCH", "/balloon", "{}"),
+            ),
+            (
+                "PATCH /balloon/statistics",
+                request_with_body("PATCH", "/balloon/statistics", "{}"),
+            ),
+            (
+                "PATCH /balloon/hinting/start",
+                request_with_body("PATCH", "/balloon/hinting/start", "{}"),
+            ),
+            (
+                "PATCH /balloon/hinting/stop",
+                b"PATCH /balloon/hinting/stop HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            ),
+        ];
+
+        for (route, request) in requests {
+            let err = parse_request(&request).expect_err("balloon should be unsupported");
+            assert_eq!(err, RequestError::BalloonUnsupported, "{route}");
+            assert_eq!(err.fault_message(), "Balloon device is not supported.");
+        }
+    }
+
+    #[test]
+    fn rejects_balloon_body_methods_without_parsing_body() {
+        for (method, path) in [
+            ("PUT", "/balloon"),
+            ("PATCH", "/balloon"),
+            ("PATCH", "/balloon/statistics"),
+            ("PATCH", "/balloon/hinting/start"),
+            ("PATCH", "/balloon/hinting/stop"),
+        ] {
+            let malformed_body = request_with_body(method, path, "not-json");
+            let empty_body =
+                format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+
+            assert_eq!(
+                parse_request(&malformed_body),
+                Err(RequestError::BalloonUnsupported),
+                "{method} {path}"
+            );
+            assert_eq!(
+                parse_request(empty_body.as_bytes()),
+                Err(RequestError::BalloonUnsupported),
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_balloon_get_with_body_before_endpoint_handling() {
+        for path in ["/balloon", "/balloon/statistics", "/balloon/hinting/status"] {
+            let request = request_with_body("GET", path, "{}");
+
+            assert_eq!(
+                parse_request(&request),
+                Err(RequestError::GetRequestBody),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_exact_balloon_paths_as_invalid_path_method() {
+        let requests = [
+            (
+                "GET /balloon/extra",
+                b"GET /balloon/extra HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            ),
+            (
+                "GET /balloon/hinting",
+                b"GET /balloon/hinting HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            ),
+            (
+                "PUT /balloon/extra",
+                request_with_body("PUT", "/balloon/extra", "{}"),
+            ),
+            (
+                "PATCH /balloon/hinting",
+                request_with_body("PATCH", "/balloon/hinting", "{}"),
+            ),
+            (
+                "PATCH /balloon/hinting/status",
+                request_with_body("PATCH", "/balloon/hinting/status", "{}"),
+            ),
+        ];
+
+        for (route, request) in requests {
+            assert_eq!(
+                parse_request(&request),
+                Err(RequestError::InvalidPathMethod),
+                "{route}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_balloon_methods_as_invalid_path_method() {
+        let requests = [
+            (
+                "DELETE /balloon",
+                b"DELETE /balloon HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            ),
+            ("POST /balloon", request_with_body("POST", "/balloon", "{}")),
+        ];
+
+        for (route, request) in requests {
+            assert_eq!(
+                parse_request(&request),
+                Err(RequestError::InvalidPathMethod),
+                "{route}"
+            );
+        }
     }
 
     #[test]
