@@ -179,6 +179,48 @@ pub(crate) struct BangbangProcess {
 
 impl BangbangProcess {
     pub(crate) fn start(socket_path: &Path, instance_id: &str) -> Self {
+        let mut process = Self::spawn(socket_path, instance_id);
+        process.wait_until_ready();
+        process
+    }
+
+    #[allow(
+        dead_code,
+        reason = "shared integration-test support is compiled once per test target"
+    )]
+    pub(crate) fn start_expect_failure(socket_path: &Path, instance_id: &str) -> CompletedProcess {
+        let mut process = Self::spawn(socket_path, instance_id);
+
+        match process.ready.recv_timeout(STARTUP_TIMEOUT) {
+            Ok(()) => {
+                let output = process.force_stop_and_collect();
+                panic!(
+                    "bangbang reported API readiness but startup failure was expected; binary: {}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    process.binary_path.display(),
+                    output.status,
+                    output.stdout,
+                    output.stderr
+                );
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let child = process.child.take().expect("child should still be owned");
+                let status = wait_for_child_exit(child, SHUTDOWN_TIMEOUT);
+                process.collect_output(status)
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let output = process.force_stop_and_collect();
+                panic!(
+                    "bangbang did not fail before timeout; binary: {}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    process.binary_path.display(),
+                    output.status,
+                    output.stdout,
+                    output.stderr
+                );
+            }
+        }
+    }
+
+    fn spawn(socket_path: &Path, instance_id: &str) -> Self {
         let binary_path = bangbang_bin();
         let mut child = Command::new(&binary_path)
             .arg("--api-sock")
@@ -199,16 +241,13 @@ impl BangbangProcess {
         let stderr = child.stderr.take().expect("stderr should be piped");
         let (stdout, ready) = OutputReader::stdout(stdout);
         let stderr = OutputReader::stderr(stderr);
-        let mut process = Self {
+        Self {
             binary_path,
             child: Some(child),
             stdout: Some(stdout),
             stderr: Some(stderr),
             ready,
-        };
-
-        process.wait_until_ready();
-        process
+        }
     }
 
     fn wait_until_ready(&mut self) {
