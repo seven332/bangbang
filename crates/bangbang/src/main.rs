@@ -1853,6 +1853,24 @@ mod tests {
     }
 
     #[test]
+    fn config_file_accepts_exact_size_limit() {
+        let config_path = unique_config_path("exact-size");
+        let mut config = r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"}}"#.to_string();
+        config.extend(std::iter::repeat_n(
+            ' ',
+            super::CONFIG_FILE_MAX_BYTES - config.len(),
+        ));
+        fs::write(&config_path, config).expect("fixture file should be written");
+
+        let actions = super::config_file_actions(config_path.to_str().expect("UTF-8 path"))
+            .expect("exact limit config file should parse");
+
+        assert!(matches!(actions.as_slice(), [VmmAction::PutBootSource(_)]));
+
+        fs::remove_file(config_path).expect("fixture file should clean up");
+    }
+
+    #[test]
     fn config_file_runtime_errors_do_not_start_instance() {
         let config_path = unique_config_path("cpu-config");
         fs::write(
