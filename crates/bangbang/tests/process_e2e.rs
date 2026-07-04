@@ -374,6 +374,79 @@ fn executable_configures_network_and_mmds() {
 }
 
 #[test]
+fn executable_configures_vsock() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let uds_path = test_dir.path().join("v.sock");
+    let invalid_uds_path = test_dir.path().join("private-v.sock");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    let uds_path_json = json_string(path_text(&uds_path));
+    let vsock_body = format!(r#"{{"vsock_id":"vsock0","guest_cid":3,"uds_path":{uds_path_json}}}"#);
+    let vsock_response = http_put_json(&socket_path, "/vsock", &vsock_body);
+    assert_no_content_response(&vsock_response, "PUT /vsock");
+    assert!(
+        !uds_path.exists(),
+        "PUT /vsock should store config without binding the host socket path"
+    );
+
+    let vm_config = http_get(&socket_path, "/vm/config");
+    assert_ok_response(&vm_config, "GET /vm/config");
+    assert_response_contains(&vm_config, r#""vsock":"#, "GET /vm/config");
+    assert_response_contains(&vm_config, r#""guest_cid":3"#, "GET /vm/config");
+    assert_response_contains(
+        &vm_config,
+        &format!(r#""uds_path":{uds_path_json}"#),
+        "GET /vm/config",
+    );
+    assert!(
+        !vm_config.contains("vsock_id"),
+        "GET /vm/config should not emit deprecated vsock_id; response:\n{vm_config}"
+    );
+
+    let invalid_uds_path_json = json_string(path_text(&invalid_uds_path));
+    let invalid_vsock_body = format!(r#"{{"guest_cid":2,"uds_path":{invalid_uds_path_json}}}"#);
+    let invalid_vsock_response = http_put_json(&socket_path, "/vsock", &invalid_vsock_body);
+    assert_bad_request_response(&invalid_vsock_response, "invalid PUT /vsock");
+    assert_response_contains(
+        &invalid_vsock_response,
+        r#"{"fault_message":"vsock guest_cid 2 is below minimum 3"}"#,
+        "invalid PUT /vsock",
+    );
+    assert!(
+        !invalid_vsock_response.contains(path_text(&invalid_uds_path)),
+        "invalid PUT /vsock should not echo the rejected private path; response:\n{invalid_vsock_response}"
+    );
+    assert!(
+        !invalid_uds_path.exists(),
+        "invalid PUT /vsock should not create the rejected host socket path"
+    );
+
+    let vm_config_after_invalid_vsock = http_get(&socket_path, "/vm/config");
+    assert_ok_response(
+        &vm_config_after_invalid_vsock,
+        "GET /vm/config after invalid PUT /vsock",
+    );
+    assert_response_contains(
+        &vm_config_after_invalid_vsock,
+        r#""guest_cid":3"#,
+        "GET /vm/config after invalid PUT /vsock",
+    );
+    assert_response_contains(
+        &vm_config_after_invalid_vsock,
+        &format!(r#""uds_path":{uds_path_json}"#),
+        "GET /vm/config after invalid PUT /vsock",
+    );
+    assert!(
+        !vm_config_after_invalid_vsock.contains(path_text(&invalid_uds_path)),
+        "invalid PUT /vsock must not mutate stored config; response:\n{vm_config_after_invalid_vsock}"
+    );
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
 fn executable_serves_and_patches_machine_config() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
