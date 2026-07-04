@@ -98,6 +98,22 @@ fn executable_configures_vm_before_start() {
     let drive_response = http_put_json(&socket_path, "/drives/rootfs", &drive_body);
     assert_no_content_response(&drive_response, "PUT /drives/rootfs");
 
+    let replaced_rootfs_path_json = json_string(path_text(&test_dir.path().join("replaced.ext4")));
+    let drive_patch_body = format!(
+        r#"{{
+            "drive_id":"rootfs",
+            "path_on_host":{replaced_rootfs_path_json}
+        }}"#
+    );
+    let drive_patch_response =
+        http_json(&socket_path, "PATCH", "/drives/rootfs", &drive_patch_body);
+    assert_bad_request_response(&drive_patch_response, "PATCH /drives/rootfs");
+    assert_response_contains(
+        &drive_patch_response,
+        r#"{"fault_message":"The requested operation is not supported in Not started state: UpdateBlockDevice"}"#,
+        "PATCH /drives/rootfs",
+    );
+
     let vm_config = http_get(&socket_path, "/vm/config");
     assert_ok_response(&vm_config, "GET /vm/config");
     assert_response_contains(&vm_config, r#""machine-config":"#, "GET /vm/config");
@@ -120,6 +136,10 @@ fn executable_configures_vm_before_start() {
         &vm_config,
         &format!(r#""path_on_host":{rootfs_path_json}"#),
         "GET /vm/config",
+    );
+    assert!(
+        !vm_config.contains(&format!(r#""path_on_host":{replaced_rootfs_path_json}"#)),
+        "failed PATCH /drives/rootfs must not mutate drive path; response:\n{vm_config}"
     );
     assert_response_contains(&vm_config, r#""is_root_device":true"#, "GET /vm/config");
     assert_response_contains(&vm_config, r#""is_read_only":true"#, "GET /vm/config");

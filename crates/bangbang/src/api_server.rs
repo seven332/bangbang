@@ -14,14 +14,16 @@ use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_api::http::{
     ActionRequest, ActionType, ApiRequest, BootSourceRequest, BootSourceResponse,
     DriveCacheType as ApiDriveCacheType, DriveConfigRequest, DriveConfigResponse,
-    DriveIoEngine as ApiDriveIoEngine, HttpResponse, LoggerConfigRequest,
+    DriveIoEngine as ApiDriveIoEngine, DrivePatchRequest, HttpResponse, LoggerConfigRequest,
     LoggerLevel as ApiLoggerLevel, MachineConfigPatchRequest, MachineConfigRequest,
     MachineConfigResponse, MetricsConfigRequest, MmdsConfigRequest, MmdsConfigResponse,
     MmdsContentRequest, MmdsVersion as ApiMmdsVersion, NetworkInterfaceConfigRequest,
     NetworkInterfaceConfigResponse, RequestError, VmConfigResponse, VsockConfigRequest,
     VsockConfigResponse, parse_request_with_limit, request_total_len_with_limit,
 };
-use bangbang_runtime::block::{DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine};
+use bangbang_runtime::block::{
+    DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine, DriveUpdateInput,
+};
 use bangbang_runtime::boot::{BootSourceConfig, BootSourceConfigInput};
 use bangbang_runtime::logger::{LoggerConfigInput, LoggerLevel};
 use bangbang_runtime::machine::{
@@ -472,6 +474,9 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PutDrive(config) => handle_empty(vmm.handle_action(VmmAction::PutDrive(
             drive_config_input_from_request(config.as_ref()),
         ))),
+        ApiRequest::PatchDrive(config) => handle_empty(vmm.handle_action(
+            VmmAction::UpdateBlockDevice(drive_update_input_from_request(config.as_ref())),
+        )),
         ApiRequest::PutNetworkInterface(config) => {
             handle_empty(vmm.handle_action(VmmAction::PutNetworkInterface(
                 network_interface_config_input_from_request(config.as_ref()),
@@ -857,6 +862,14 @@ fn drive_config_input_from_request(config: &DriveConfigRequest) -> DriveConfigIn
     }
 
     input
+}
+
+fn drive_update_input_from_request(config: &DrivePatchRequest) -> DriveUpdateInput {
+    DriveUpdateInput::new(
+        config.path_drive_id(),
+        config.body_drive_id(),
+        config.path_on_host().map(std::path::PathBuf::from),
+    )
 }
 
 fn network_interface_config_input_from_request(
@@ -3224,13 +3237,6 @@ mod tests {
     fn returns_fault_for_device_update_endpoints() {
         for (name, method, path, body, fault_message) in [
             (
-                "drive",
-                "PATCH",
-                "/drives/rootfs",
-                r#"{"drive_id":"rootfs"}"#,
-                r#"{"fault_message":"Drive updates are not supported."}"#,
-            ),
-            (
                 "drive-delete",
                 "DELETE",
                 "/drives/rootfs",
@@ -3609,6 +3615,85 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
         assert!(response.contains(r#"{"fault_message":"drive rate_limiter is not supported"}"#));
         assert!(vmm.drive_configs().is_empty());
+    }
+
+    #[test]
+    fn returns_state_fault_for_preboot_drive_patch_without_mutating() {
+        let mut vmm = test_controller();
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new("rootfs", "rootfs", "/tmp/rootfs.ext4", true)
+                .with_is_read_only(true),
+        ))
+        .expect("initial drive should configure");
+        let body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "/tmp/replaced.ext4"
+        }"#;
+        let request = format!(
+            "PATCH /drives/rootfs HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        let response = request_over_socket(&mut vmm, "drive-patch-preboot", &request);
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.contains(
+            r#"{"fault_message":"The requested operation is not supported in Not started state: UpdateBlockDevice"}"#
+        ));
+        assert_eq!(vmm.drive_configs().len(), 1);
+        let config = &vmm.drive_configs()[0];
+        assert_eq!(
+            config.path_on_host(),
+            std::path::Path::new("/tmp/rootfs.ext4")
+        );
+        assert!(config.is_read_only());
+    }
+
+    #[test]
+    fn running_state_rejects_drive_patch_without_mutating() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new("rootfs", "rootfs", "/tmp/rootfs.ext4", true)
+                .with_is_read_only(true),
+        ))
+        .expect("initial drive should configure");
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_request = format!(
+            "PUT /boot-source HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{boot_body}",
+            boot_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "drive-patch-start", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "/tmp/replaced.ext4"
+        }"#;
+        let request = format!(
+            "PATCH /drives/rootfs HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        let response = request_over_socket(&mut vmm, "drive-patch-running", &request);
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.contains(
+            r#"{"fault_message":"The requested operation is not supported: UpdateBlockDevice"}"#
+        ));
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::Running
+        );
+        assert_eq!(vmm.drive_configs().len(), 1);
+        let config = &vmm.drive_configs()[0];
+        assert_eq!(
+            config.path_on_host(),
+            std::path::Path::new("/tmp/rootfs.ext4")
+        );
+        assert!(config.is_read_only());
     }
 
     #[test]
