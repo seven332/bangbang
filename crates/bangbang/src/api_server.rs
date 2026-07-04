@@ -2916,6 +2916,51 @@ mod tests {
     }
 
     #[test]
+    fn returns_fault_for_memory_hotplug_endpoints() {
+        for (method, request) in [
+            (
+                "get",
+                b"GET /hotplug/memory HTTP/1.1\r\nHost: localhost\r\n\r\n".as_slice(),
+            ),
+            (
+                "put",
+                b"PUT /hotplug/memory HTTP/1.1\r\nHost: localhost\r\nContent-Length: 16\r\n\r\n{\"size_mib\":128}"
+                    .as_slice(),
+            ),
+            (
+                "patch",
+                b"PATCH /hotplug/memory HTTP/1.1\r\nHost: localhost\r\nContent-Length: 16\r\n\r\n{\"size_mib\":256}"
+                    .as_slice(),
+            ),
+        ] {
+            let socket_name = format!("mh-{method}");
+            let path = unique_socket_path(&socket_name);
+            let server = ApiServer::bind(&path).expect("server should bind");
+            let mut client = UnixStream::connect(&path).expect("client should connect");
+
+            client
+                .write_all(request)
+                .expect("client should write request");
+            let mut vmm = test_controller();
+            server
+                .serve_next(&mut vmm)
+                .expect("server should handle one request");
+
+            let mut response = String::new();
+            client
+                .read_to_string(&mut response)
+                .expect("client should read response");
+
+            assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+            assert!(response.contains(r#"{"fault_message":"Memory hotplug is not supported."}"#));
+            assert_eq!(
+                vmm.instance_info().state,
+                bangbang_runtime::InstanceState::NotStarted
+            );
+        }
+    }
+
+    #[test]
     fn returns_fault_for_send_ctrl_alt_del_action() {
         let path = unique_socket_path("cad-fault");
         let server = ApiServer::bind(&path).expect("server should bind");
