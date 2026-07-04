@@ -11,5 +11,15 @@ libc = "0.2"
 [dev-dependencies]
 device_tree = "1.1.0"
 
+[[test]]
+name = "guest_boot"
+path = "tests/guest_boot.rs"
+test = false
+
+[[test]]
+name = "hvf_lifecycle"
+path = "tests/hvf_lifecycle.rs"
+test = false
+
 [lints]
 workspace = true

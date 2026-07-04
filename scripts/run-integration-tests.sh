@@ -1,24 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-supported_tests=(hvf_lifecycle guest_boot)
+supported_tests=(hvf_lifecycle guest_boot executable_hvf_e2e)
 
 usage() {
   cat <<'EOF'
 Usage: scripts/run-integration-tests.sh [--allow-unsupported] [--test NAME]... [-- TEST_ARGS...]
 
-Build and sign bangbang integration tests that require Hypervisor.framework
-entitlements, then run them when the host supports HVF execution.
+Build and sign bangbang integration test artifacts that require
+Hypervisor.framework entitlements, then run them when the host supports HVF
+execution.
 
 Options:
   --allow-unsupported  Exit 0 instead of 1 when the host cannot execute HVF.
   --test NAME          Run one integration test target. Can be repeated.
-                       Supported values: hvf_lifecycle, guest_boot.
+                       Supported values: hvf_lifecycle, guest_boot,
+                       executable_hvf_e2e.
   -h, --help           Show this help.
 
-Arguments after -- are passed to each signed Rust test binary, except
---test-threads because the wrapper always runs integration tests with one test
-thread.
+Arguments after -- are passed to each signed Rust test binary or executable
+e2e cargo test invocation, except --test-threads because the wrapper always
+runs integration tests with one test thread.
 EOF
 }
 
@@ -188,6 +190,19 @@ PY
   done
 }
 
+build_executable_hvf_e2e() {
+  executable_hvf_e2e_bangbang="$tmp_dir/bangbang"
+  scripts/build-signed-bangbang.sh --output "$executable_hvf_e2e_bangbang"
+
+  cargo test \
+    -p bangbang \
+    --test executable_hvf_e2e \
+    --all-features \
+    --locked \
+    --target "$target_triple" \
+    --no-run
+}
+
 host_os="$(uname -s)"
 host_arch="$(uname -m)"
 
@@ -209,9 +224,11 @@ guest_kernel_path=""
 guest_initrd_path=""
 guest_rootfs_path=""
 guest_ext4_rootfs_path=""
-if contains guest_boot "${selected_tests[@]}"; then
+if contains guest_boot "${selected_tests[@]}" || contains executable_hvf_e2e "${selected_tests[@]}"; then
   guest_kernel_path="$(scripts/fetch-firecracker-kernel.sh)"
   guest_initrd_path="$(scripts/build-guest-boot-initrd.py --check)"
+fi
+if contains guest_boot "${selected_tests[@]}"; then
   guest_rootfs_path="$(scripts/fetch-firecracker-rootfs.sh)"
 fi
 
@@ -219,9 +236,21 @@ target_triple="aarch64-apple-darwin"
 
 signed_test_names=()
 signed_test_bins=()
+executable_hvf_e2e_bangbang=""
 
 for test_name in "${selected_tests[@]}"; do
-  build_and_sign_test "$test_name"
+  case "$test_name" in
+    executable_hvf_e2e)
+      build_executable_hvf_e2e
+      ;;
+    guest_boot | hvf_lifecycle)
+      build_and_sign_test "$test_name"
+      ;;
+    *)
+      echo "unsupported integration test target after selection: $test_name" >&2
+      exit 1
+      ;;
+  esac
 done
 
 if [[ "$host_arch" != "arm64" ]]; then
@@ -278,3 +307,32 @@ for index in "${!signed_test_bins[@]}"; do
       ;;
   esac
 done
+
+if contains executable_hvf_e2e "${selected_tests[@]}"; then
+  if [[ "${#test_args[@]}" -eq 0 ]]; then
+    BANGBANG_PROCESS_E2E_BIN="$executable_hvf_e2e_bangbang" \
+      BANGBANG_GUEST_KERNEL_PATH="$guest_kernel_path" \
+      BANGBANG_GUEST_INITRD_PATH="$guest_initrd_path" \
+      cargo test \
+        -p bangbang \
+        --test executable_hvf_e2e \
+        --all-features \
+        --locked \
+        --target "$target_triple" \
+        -- \
+        --test-threads=1
+  else
+    BANGBANG_PROCESS_E2E_BIN="$executable_hvf_e2e_bangbang" \
+      BANGBANG_GUEST_KERNEL_PATH="$guest_kernel_path" \
+      BANGBANG_GUEST_INITRD_PATH="$guest_initrd_path" \
+      cargo test \
+        -p bangbang \
+        --test executable_hvf_e2e \
+        --all-features \
+        --locked \
+        --target "$target_triple" \
+        -- \
+        --test-threads=1 \
+        "${test_args[@]}"
+  fi
+fi

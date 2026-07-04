@@ -25,6 +25,9 @@ cargo check --workspace --all-targets --all-features --locked
 cargo test --workspace --all-targets --all-features --locked --exclude bangbang-hvf
 cargo test -p bangbang-hvf --lib --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo clippy -p bangbang --test executable_hvf_e2e --all-features --locked --target aarch64-apple-darwin -- -D warnings
+cargo clippy -p bangbang-hvf --test hvf_lifecycle --all-features --locked --target aarch64-apple-darwin -- -D warnings
+cargo clippy -p bangbang-hvf --test guest_boot --all-features --locked --target aarch64-apple-darwin -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 ```
 

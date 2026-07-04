@@ -94,7 +94,7 @@ fn run() -> Result<(), ProcessError> {
             let server =
                 ApiServer::bind_with_max_payload_size(&api_sock, http_api_max_payload_size)
                     .map_err(ProcessError::ApiServer)?;
-            println!("status: API server listening; VM execution loop is not implemented yet");
+            println!("status: API server listening");
             let shutdown_wakeup = shutdown_signal.wakeup_reader();
             server
                 .run_until(&mut vmm, shutdown_wakeup)
