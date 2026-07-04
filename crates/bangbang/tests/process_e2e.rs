@@ -418,6 +418,10 @@ fn executable_configures_vsock() {
         !invalid_vsock_response.contains(path_text(&invalid_uds_path)),
         "invalid PUT /vsock should not echo the rejected private path; response:\n{invalid_vsock_response}"
     );
+    assert!(
+        !invalid_uds_path.exists(),
+        "invalid PUT /vsock should not create the rejected host socket path"
+    );
 
     let vm_config_after_invalid_vsock = http_get(&socket_path, "/vm/config");
     assert_ok_response(
