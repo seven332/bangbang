@@ -3497,12 +3497,28 @@ mod tests {
 
     #[test]
     fn rejects_non_exact_memory_hotplug_path_as_invalid_path_method() {
-        let request = request_with_body("PUT", "/hotplug/memory/extra", "{}");
+        let requests = [
+            (
+                "GET",
+                b"GET /hotplug/memory/extra HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            ),
+            (
+                "PUT",
+                request_with_body("PUT", "/hotplug/memory/extra", "{}"),
+            ),
+            (
+                "PATCH",
+                request_with_body("PATCH", "/hotplug/memory/extra", "{}"),
+            ),
+        ];
 
-        assert_eq!(
-            parse_request(&request),
-            Err(RequestError::InvalidPathMethod)
-        );
+        for (method, request) in requests {
+            assert_eq!(
+                parse_request(&request),
+                Err(RequestError::InvalidPathMethod),
+                "{method}"
+            );
+        }
     }
 
     #[test]
