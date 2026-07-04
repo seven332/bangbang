@@ -120,7 +120,7 @@ public run-loop control.
 | `--level <LEVEL>` | configures logger level before API serving | Accepts the existing logger levels `Off`, `Trace`, `Debug`, `Info`, `Warn`, `Warning`, and `Error`; minimal action logs are emitted only when the configured level allows `Info`. |
 | `--module <MODULE>` | stored for future logger filtering | Matches the stored `PUT /logger` field but does not filter the current minimal action logs yet. |
 | `--show-level` | enables level prefix for minimal action logs | Writes `level=Info` before minimal `InstanceStart` and `FlushMetrics` action lines. |
-| `--show-log-origin` | stored for future logger formatting | Full Firecracker origin formatting remains deferred. |
+| `--show-log-origin` | enables origin field for minimal action logs | Writes `origin=<file>:<line>` before minimal `InstanceStart` and `FlushMetrics` action names. Full Firecracker logger integration remains deferred. |
 | `--help`, `-h` | prints help | Help describes the current API socket scope. |
 | `--version`, `-V` | prints version | `-V` is retained from the existing bangbang scaffold. |
 | `--config-file`, `--no-api` | rejected | Deferred until VM configuration models and no-API startup behavior exist. |
@@ -301,7 +301,7 @@ exist.
 | `PUT /logger` | `log_path` | optional | Host path to the logger output file or FIFO. When present, the runtime opens it as per-process observability state and redacts path details from API-facing open errors. When omitted, the existing sink is left unchanged. |
 | `PUT /logger` | `level` | optional | Case-insensitive values `Off`, `Trace`, `Debug`, `Info`, `Warn`, `Warning`, and `Error` are accepted. `Warning` is normalized to `Warn`. |
 | `PUT /logger` | `show_level` | optional | When true, minimal action log lines include a `level=Info` prefix. |
-| `PUT /logger` | `show_log_origin` | optional | Stored as logger formatting configuration for future log integration. |
+| `PUT /logger` | `show_log_origin` | optional | When true, minimal action log lines include an `origin=<file>:<line>` field for the runtime action callsite. |
 | `PUT /logger` | `module` | optional | Stored as logger filtering configuration for future log integration. |
 | `PUT /logger` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /actions` | `action_type=InstanceStart` | process-routed; internal startup execution across bounded step windows implemented | Validates stored boot-source and state preflight first, then attempts owned HVF boot-session preparation with an internal serial MMIO console and starts the process-owned internal boot run-loop worker across bounded step windows. Success returns `204 No Content`, writes one minimal logger action line when configured and enabled, and commits `Running`; preparation, worker-start, or logger-output failures return a fault without mutating state. Public run-loop control and public serial streaming remain deferred. |
@@ -358,7 +358,9 @@ Repeated pre-boot `PUT /logger` requests update only the fields they provide,
 including after startup CLI configuration. Runtime requests fail without opening
 a new output path. The configured logger sink records minimal successful
 `InstanceStart` and `FlushMetrics` action lines when the logger level allows
-`Info`; it is not wired into the full process logging backend yet.
+`Info`. `show_level` adds `level=Info`, and `show_log_origin` adds the runtime
+action callsite as `origin=<file>:<line>`. It is not wired into the full process
+logging backend yet.
 The API and VMM state path implement the `PUT /vsock` field policy above as a
 pre-boot-only guest configuration section. Valid requests replace the stored
 vsock config and return `204 No Content`; invalid requests fail without
@@ -1188,7 +1190,7 @@ The first API implementation should model the same broad stages as Firecracker:
 | `PATCH /mmds` | implemented after data initialization; `204` empty response | implemented after data initialization; `204` empty response | Applies RFC 7396 merge-patch semantics to the stored JSON object. Oversized patched results are rejected without mutating the previous value. |
 | `PUT /mmds/config` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Stores control-plane MMDS config before startup after validating that each listed interface ID already exists in the configured network interface set. At startup, the configured interfaces can enable the implemented guest-visible MMDS packet path; runtime MMDS config updates and public packet movement remain deferred. |
 | `PUT /metrics` | implemented; `204` empty response on successful output initialization | unsupported after start; `400` `fault_message` | Metrics output is process observability state, not guest configuration. Duplicate initialization fails. |
-| `PUT /logger` | implemented; `204` empty response on successful pre-boot configuration | unsupported after start; `400` `fault_message` | Logger output is process observability state, not guest configuration. Repeated pre-boot requests update provided fields; minimal successful action logging exists, but full log routing remains deferred. |
+| `PUT /logger` | implemented; `204` empty response on successful pre-boot configuration | unsupported after start; `400` `fault_message` | Logger output is process observability state, not guest configuration. Repeated pre-boot requests update provided fields; minimal successful action logging supports configured level and origin fields, but full log routing remains deferred. |
 | `PUT /actions` with `InstanceStart` | process-routed; `204` after successful owned HVF startup with internal boot run-loop worker across bounded step windows or `400` preflight/preparation/logger-output fault | unsupported after start; `400` `fault_message` | Commits `Running` only after the owned HVF boot-session worker with internal serial capture is retained and configured action logging succeeds. The worker keeps internal active, terminal-outcome, or error status; public run-loop control and public serial streaming remain deferred. |
 | `PUT /actions` with `FlushMetrics` | VMM-routed; `400` unsupported-state `fault_message` | implemented; `204` empty response or `400` logger/metrics output fault | Firecracker treats this as runtime-only. bangbang writes one minimal JSON line when metrics output was configured, including `boot_run_loop_status` as `running`, `exited`, or `failed` when a process-owned boot worker exists, writes one minimal action line when logger output is configured and enabled, and otherwise succeeds without writing. |
 | `PUT /actions` with `SendCtrlAltDel` | intentionally unsupported; parser returns `400` `fault_message` | intentionally unsupported; `400` `fault_message` | Firecracker rejects this on aarch64; bangbang's first target is Apple Silicon. |

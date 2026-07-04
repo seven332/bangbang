@@ -1959,7 +1959,8 @@ mod tests {
             r#"{{
                 "log_path": "{}",
                 "level": "Info",
-                "show_level": true
+                "show_level": true,
+                "show_log_origin": true
             }}"#,
             logger_path.to_string_lossy()
         );
@@ -1986,12 +1987,38 @@ mod tests {
         let flush_response = put_action_over_socket(&mut vmm, "flush-with-logger", "FlushMetrics");
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
 
-        assert_eq!(
-            fs::read_to_string(&logger_path).expect("logger output should be readable"),
-            "level=Info action=InstanceStart\nlevel=Info action=FlushMetrics\n"
-        );
+        let output = fs::read_to_string(&logger_path).expect("logger output should be readable");
+        let mut lines = output.lines();
+        assert_action_log_with_origin(lines.next(), "InstanceStart");
+        assert_action_log_with_origin(lines.next(), "FlushMetrics");
+        assert_eq!(lines.next(), None);
 
         fs::remove_file(logger_path).expect("fixture should clean up");
+    }
+
+    fn assert_action_log_with_origin(line: Option<&str>, action: &str) {
+        let line = line.expect("logger output should include action line");
+        assert!(line.starts_with("level=Info origin="));
+        assert!(line.ends_with(&format!(" action={action}")));
+
+        let suffix = format!(" action={action}");
+        let origin = line
+            .strip_prefix("level=Info origin=")
+            .expect("logger output should include origin prefix")
+            .strip_suffix(&suffix)
+            .expect("logger output should include action suffix");
+        let (file, line_number) = origin
+            .rsplit_once(':')
+            .expect("logger origin should include file and line");
+
+        assert!(
+            file.ends_with("crates/runtime/src/lib.rs"),
+            "unexpected origin file: {file}"
+        );
+        assert!(
+            line_number.parse::<u32>().is_ok(),
+            "unexpected origin line: {line_number}"
+        );
     }
 
     #[test]
