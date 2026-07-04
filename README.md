@@ -32,6 +32,8 @@ cargo run -p bangbang -- --api-sock /tmp/bangbang.socket --id demo-1
 
 - `--api-sock <PATH>` sets the Unix socket path. The default is
   `/tmp/bangbang.socket`.
+- `--http-api-max-payload-size <BYTES>` sets the maximum accepted HTTP API
+  request size. The default is `51200` bytes.
 - `--id <ID>` records the microVM identifier. The default is
   `anonymous-instance`.
 - `--metrics-path <PATH>` configures the same per-process metrics sink as

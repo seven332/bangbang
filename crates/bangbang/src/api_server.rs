@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_api::http::{
     ActionRequest, ActionType, ApiRequest, BootSourceRequest, BootSourceResponse,
@@ -18,7 +19,7 @@ use bangbang_api::http::{
     MachineConfigResponse, MetricsConfigRequest, MmdsConfigRequest, MmdsConfigResponse,
     MmdsContentRequest, MmdsVersion as ApiMmdsVersion, NetworkInterfaceConfigRequest,
     NetworkInterfaceConfigResponse, RequestError, VmConfigResponse, VsockConfigRequest,
-    VsockConfigResponse, parse_request, request_total_len,
+    VsockConfigResponse, parse_request_with_limit, request_total_len_with_limit,
 };
 use bangbang_runtime::block::{DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine};
 use bangbang_runtime::boot::{BootSourceConfig, BootSourceConfigInput};
@@ -78,11 +79,20 @@ impl std::error::Error for ApiServerError {}
 #[derive(Debug)]
 pub(crate) struct ApiServer {
     listener: UnixListener,
+    http_api_max_payload_size: usize,
     _socket_guard: SocketGuard,
 }
 
 impl ApiServer {
+    #[cfg(test)]
     pub(crate) fn bind(path: impl AsRef<Path>) -> Result<Self, ApiServerError> {
+        Self::bind_with_max_payload_size(path, HTTP_MAX_PAYLOAD_SIZE)
+    }
+
+    pub(crate) fn bind_with_max_payload_size(
+        path: impl AsRef<Path>,
+        http_api_max_payload_size: usize,
+    ) -> Result<Self, ApiServerError> {
         let path = path.as_ref();
 
         if path_exists_without_following_links(path)? {
@@ -98,6 +108,7 @@ impl ApiServer {
 
         Ok(Self {
             listener,
+            http_api_max_payload_size,
             _socket_guard: socket_guard,
         })
     }
@@ -137,7 +148,7 @@ impl ApiServer {
             .set_nonblocking(false)
             .map_err(|err| ApiServerError::Connection(err.kind()))?;
 
-        let _ = handle_connection(&mut stream, vmm);
+        let _ = handle_connection(&mut stream, vmm, self.http_api_max_payload_size);
 
         Ok(())
     }
@@ -383,23 +394,38 @@ enum RequestRead {
 fn handle_connection(
     stream: &mut UnixStream,
     vmm: &mut impl VmmRequestHandler,
+    http_api_max_payload_size: usize,
 ) -> Result<(), ApiServerError> {
     stream
         .set_write_timeout(Some(CONNECTION_TIMEOUT))
         .map_err(|err| ApiServerError::Connection(err.kind()))?;
 
-    let response = match read_request(stream, CONNECTION_TIMEOUT)? {
-        RequestRead::Complete(request) => handle_request_bytes(&request, vmm),
-        RequestRead::TooLarge => HttpResponse::fault(RequestError::PayloadTooLarge.fault_message()),
-    };
+    let response =
+        match read_request_with_limit(stream, CONNECTION_TIMEOUT, http_api_max_payload_size)? {
+            RequestRead::Complete(request) => {
+                handle_request_bytes_with_limit(&request, vmm, http_api_max_payload_size)
+            }
+            RequestRead::TooLarge => {
+                HttpResponse::fault(RequestError::PayloadTooLarge.fault_message())
+            }
+        };
 
     stream
         .write_all(&response.to_http_bytes())
         .map_err(|err| ApiServerError::Connection(err.kind()))
 }
 
+#[cfg(test)]
 fn handle_request_bytes(bytes: &[u8], vmm: &mut impl VmmRequestHandler) -> HttpResponse {
-    match parse_request(bytes) {
+    handle_request_bytes_with_limit(bytes, vmm, HTTP_MAX_PAYLOAD_SIZE)
+}
+
+fn handle_request_bytes_with_limit(
+    bytes: &[u8],
+    vmm: &mut impl VmmRequestHandler,
+    http_api_max_payload_size: usize,
+) -> HttpResponse {
+    match parse_request_with_limit(bytes, http_api_max_payload_size) {
         Ok(request) => handle_api_request(request, vmm),
         Err(err) => HttpResponse::fault(err.fault_message()),
     }
@@ -861,23 +887,37 @@ fn vsock_config_input_from_request(config: &VsockConfigRequest) -> VsockConfigIn
     input
 }
 
-fn read_request(stream: &mut UnixStream, timeout: Duration) -> Result<RequestRead, ApiServerError> {
+fn read_request_with_limit(
+    stream: &mut UnixStream,
+    timeout: Duration,
+    http_api_max_payload_size: usize,
+) -> Result<RequestRead, ApiServerError> {
     let deadline = Instant::now() + timeout;
     let mut now = Instant::now;
 
-    read_request_until(stream, deadline, &mut now)
+    read_request_until_with_limit(stream, deadline, &mut now, http_api_max_payload_size)
 }
 
+#[cfg(test)]
 fn read_request_until(
     stream: &mut UnixStream,
     deadline: Instant,
     now: &mut impl FnMut() -> Instant,
 ) -> Result<RequestRead, ApiServerError> {
+    read_request_until_with_limit(stream, deadline, now, HTTP_MAX_PAYLOAD_SIZE)
+}
+
+fn read_request_until_with_limit(
+    stream: &mut UnixStream,
+    deadline: Instant,
+    now: &mut impl FnMut() -> Instant,
+    http_api_max_payload_size: usize,
+) -> Result<RequestRead, ApiServerError> {
     let mut request = Vec::new();
     let mut chunk = [0; READ_CHUNK_SIZE];
 
     loop {
-        match request_total_len(&request) {
+        match request_total_len_with_limit(&request, http_api_max_payload_size) {
             Ok(Some(total_len)) if request.len() >= total_len => {
                 request.truncate(total_len);
                 return Ok(RequestRead::Complete(request));
@@ -887,7 +927,7 @@ fn read_request_until(
             Err(_) => return Ok(RequestRead::Complete(request)),
         }
 
-        let remaining = HTTP_MAX_PAYLOAD_SIZE.saturating_sub(request.len());
+        let remaining = http_api_max_payload_size.saturating_sub(request.len());
         if remaining == 0 {
             return Ok(RequestRead::TooLarge);
         }
@@ -3110,6 +3150,81 @@ mod tests {
                 r#"{"fault_message":"HTTP request payload exceeds the configured limit."}"#
             )
         );
+    }
+
+    #[test]
+    fn returns_fault_for_request_over_configured_payload_limit_without_mutation() {
+        let path = unique_socket_path("small-limit");
+        let logger_path = unique_socket_path("small-limit-output").with_extension("log");
+        let server = ApiServer::bind_with_max_payload_size(&path, 64).expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+        let body = format!(
+            r#"{{"log_path":"{}","module":"{}"}}"#,
+            logger_path.to_string_lossy(),
+            "a".repeat(64)
+        );
+        let request = format!(
+            "PUT /logger HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        client
+            .write_all(request.as_bytes())
+            .expect("client should write request");
+        let mut vmm = test_controller();
+        server
+            .serve_next(&mut vmm)
+            .expect("server should handle one request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("client should read response");
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(
+            response.contains(
+                r#"{"fault_message":"HTTP request payload exceeds the configured limit."}"#
+            )
+        );
+        assert!(!logger_path.exists());
+    }
+
+    #[test]
+    fn accepts_request_above_default_with_configured_payload_limit() {
+        let path = unique_socket_path("large-limit");
+        let module = "a".repeat(HTTP_MAX_PAYLOAD_SIZE);
+        let body = format!(r#"{{"module":"{module}"}}"#);
+        let request = format!(
+            "PUT /logger HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        assert!(request.len() > HTTP_MAX_PAYLOAD_SIZE);
+        let server = ApiServer::bind_with_max_payload_size(&path, request.len())
+            .expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+        let client_handle = thread::spawn(move || {
+            client
+                .write_all(request.as_bytes())
+                .expect("client should write request");
+            let mut response = String::new();
+            client
+                .read_to_string(&mut response)
+                .expect("client should read response");
+            response
+        });
+        let mut vmm = test_controller();
+        server
+            .serve_next(&mut vmm)
+            .expect("server should handle one request");
+
+        let response = client_handle
+            .join()
+            .expect("client thread should not panic");
+
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(response.contains("Content-Length: 0\r\n"));
+        assert!(response.ends_with("\r\n\r\n"));
     }
 
     #[test]
