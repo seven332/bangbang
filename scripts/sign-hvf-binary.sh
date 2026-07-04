@@ -40,6 +40,18 @@ if [[ -z "$output" ]]; then
   exit 2
 fi
 
+case "$output" in
+  */)
+    echo "output path must name a file: $output" >&2
+    exit 2
+    ;;
+esac
+
+if [[ -d "$output" ]]; then
+  echo "output path must not be an existing directory: $output" >&2
+  exit 2
+fi
+
 if ! command -v codesign >/dev/null 2>&1; then
   echo "codesign is required to sign HVF binaries" >&2
   exit 1
