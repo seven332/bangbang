@@ -29,7 +29,9 @@ use bangbang_runtime::{VmmAction, VmmActionError};
 const DEFAULT_API_SOCK_PATH: &str = "/tmp/bangbang.socket";
 const DEFAULT_INSTANCE_ID: &str = "anonymous-instance";
 const APP_NAME: &str = "bangbang";
-const CONFIG_FILE_MAX_BYTES: u64 = 1024 * 1024;
+const CONFIG_FILE_MAX_BYTES: usize = 1024 * 1024;
+const CONFIG_FILE_MAX_BYTES_U64: u64 = CONFIG_FILE_MAX_BYTES as u64;
+const CONFIG_FILE_READ_LIMIT_BYTES: u64 = CONFIG_FILE_MAX_BYTES_U64 + 1;
 const MIN_INSTANCE_ID_LEN: usize = 1;
 const MAX_INSTANCE_ID_LEN: usize = 64;
 const UNSUPPORTED_FIRECRACKER_ARGS: &[&str] = &[
@@ -137,7 +139,7 @@ where
 
 fn config_file_actions(config_file: &str) -> Result<Vec<VmmAction>, ConfigFileError> {
     // Keep special files such as FIFOs from hanging startup before file-type validation.
-    let mut file = fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(config_file)
@@ -148,13 +150,20 @@ fn config_file_actions(config_file: &str) -> Result<Vec<VmmAction>, ConfigFileEr
     if !metadata.file_type().is_file() {
         return Err(ConfigFileError::NotRegular);
     }
-    if metadata.len() > CONFIG_FILE_MAX_BYTES {
+    if metadata.len() > CONFIG_FILE_MAX_BYTES_U64 {
         return Err(ConfigFileError::TooLarge);
     }
 
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)
+    // Re-check through a capped reader in case the file grows after metadata validation.
+    let mut contents = Vec::new();
+    file.take(CONFIG_FILE_READ_LIMIT_BYTES)
+        .read_to_end(&mut contents)
         .map_err(|err| ConfigFileError::Read(err.kind()))?;
+    if contents.len() > CONFIG_FILE_MAX_BYTES {
+        return Err(ConfigFileError::TooLarge);
+    }
+    let contents = String::from_utf8(contents)
+        .map_err(|_| ConfigFileError::Read(std::io::ErrorKind::InvalidData))?;
     config_file_actions_from_str(&contents)
 }
 
@@ -1832,7 +1841,7 @@ mod tests {
     fn config_file_rejects_oversized_file_before_reading() {
         let config_path = unique_config_path("oversized");
         let file = fs::File::create(&config_path).expect("fixture file should be created");
-        file.set_len(super::CONFIG_FILE_MAX_BYTES + 1)
+        file.set_len(super::CONFIG_FILE_MAX_BYTES_U64 + 1)
             .expect("fixture file should be sized");
 
         let err = super::config_file_actions(config_path.to_str().expect("UTF-8 path"))
