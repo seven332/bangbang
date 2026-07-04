@@ -270,6 +270,15 @@ fn config_file_actions_from_str(contents: &str) -> Result<Vec<VmmAction>, Config
         )?);
     }
 
+    if let Some(serial) = object.get("serial") {
+        requests.push(config_section_request(
+            "serial",
+            "PUT",
+            "/serial".to_string(),
+            serial,
+        )?);
+    }
+
     requests
         .into_iter()
         .map(|(section, request)| {
@@ -285,7 +294,7 @@ fn validate_config_file_sections(
     for section in object.keys() {
         match section.as_str() {
             "boot-source" | "cpu-config" | "drives" | "logger" | "machine-config" | "metrics"
-            | "mmds-config" | "network-interfaces" | "vsock" => {}
+            | "mmds-config" | "network-interfaces" | "serial" | "vsock" => {}
             "balloon" | "entropy" | "memory-hotplug" | "pmem" => {
                 return Err(ConfigFileError::UnsupportedSection(section.clone()));
             }
@@ -1004,6 +1013,7 @@ mod tests {
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel};
     use bangbang_runtime::metrics::{MetricsConfigError, MetricsConfigInput};
+    use bangbang_runtime::serial::SerialConfigError;
     use bangbang_runtime::{BackendError, InstanceState, VmmAction};
 
     use crate::vmm::{InstanceStartExecutor, ProcessVmm};
@@ -1057,6 +1067,17 @@ mod tests {
             .as_nanos();
         std::env::temp_dir().join(format!(
             "bangbang-main-test-{}-{nanos}-{name}.metrics",
+            std::process::id()
+        ))
+    }
+
+    fn unique_serial_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bangbang-main-test-{}-{nanos}-{name}.serial",
             std::process::id()
         ))
     }
@@ -1805,11 +1826,15 @@ mod tests {
         let config_path = unique_config_path("startup");
         let metrics_path = unique_metrics_path("config-file");
         let logger_path = unique_logger_path("config-file");
+        let serial_path = unique_serial_path("config-file");
         let metrics_path_json =
             serde_json::to_string(metrics_path.to_str().expect("UTF-8 metrics path"))
                 .expect("path should encode");
         let logger_path_json =
             serde_json::to_string(logger_path.to_str().expect("UTF-8 logger path"))
+                .expect("path should encode");
+        let serial_path_json =
+            serde_json::to_string(serial_path.to_str().expect("UTF-8 serial path"))
                 .expect("path should encode");
         let config = format!(
             r#"{{
@@ -1825,7 +1850,8 @@ mod tests {
                     "is_read_only": true
                 }}],
                 "metrics": {{"metrics_path": {metrics_path_json}}},
-                "logger": {{"log_path": {logger_path_json}, "show_level": true}}
+                "logger": {{"log_path": {logger_path_json}, "show_level": true}},
+                "serial": {{"serial_out_path": {serial_path_json}}}
             }}"#
         );
         fs::write(&config_path, config).expect("config file should be written");
@@ -1845,6 +1871,10 @@ mod tests {
         assert_eq!(vmm.machine_config().mem_size_mib(), 128);
         assert!(vmm.boot_source_config().is_some());
         assert_eq!(vmm.drive_configs().len(), 1);
+        assert_eq!(
+            vmm.serial_config().serial_out_path(),
+            Some(serial_path.as_path())
+        );
 
         vmm.handle_action(VmmAction::FlushMetrics)
             .expect("flush metrics should succeed");
@@ -1986,6 +2016,48 @@ mod tests {
         ));
         assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
         assert!(!vmm.has_started_session());
+
+        fs::remove_file(config_path).expect("fixture config should clean up");
+    }
+
+    #[test]
+    fn config_file_serial_errors_do_not_start_instance() {
+        let config_path = unique_config_path("serial-rate-limiter");
+        fs::write(
+            &config_path,
+            r#"{
+                "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
+                "serial":{
+                    "serial_out_path":"/tmp/private-serial.out",
+                    "rate_limiter":{"bandwidth":{"size":1,"refill_time":1}}
+                }
+            }"#,
+        )
+        .expect("config file should be written");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        let err = super::apply_startup_config_file(
+            &mut vmm,
+            Some(config_path.to_str().expect("UTF-8 path")),
+        )
+        .expect_err("unsupported serial rate limiter should fail");
+
+        assert!(matches!(
+            err,
+            ProcessError::ConfigFile(super::ConfigFileError::Apply(
+                bangbang_runtime::VmmActionError::SerialConfig(
+                    SerialConfigError::RateLimiterUnsupported
+                )
+            ))
+        ));
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+        assert_eq!(vmm.serial_config().serial_out_path(), None);
 
         fs::remove_file(config_path).expect("fixture config should clean up");
     }

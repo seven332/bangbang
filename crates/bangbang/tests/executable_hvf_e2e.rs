@@ -220,6 +220,7 @@ mod macos_arm64 {
         let socket_path = test_dir.path().join("api.socket");
         let config_path = test_dir.path().join("vm-config.json");
         let backing_path = test_dir.path().join("data.img");
+        let serial_output_path = test_dir.path().join("serial.out");
         let metrics_path = test_dir.path().join("metrics.out");
         let logger_path = test_dir.path().join("logger.out");
         let uds_path = test_dir.path().join("config-file-vsock.sock");
@@ -228,11 +229,13 @@ mod macos_arm64 {
         let instance_id = test_dir.instance_id();
 
         create_zeroed_block_backing(&backing_path);
+        create_empty_file(&serial_output_path);
 
         let kernel_path_json = json_string(path_text(&kernel_path));
         let initrd_path_json = json_string(path_text(&initrd_path));
         let boot_args_json = json_string(GUEST_BOOT_ARGS);
         let backing_path_json = json_string(path_text(&backing_path));
+        let serial_output_path_json = json_string(path_text(&serial_output_path));
         let metrics_path_json = json_string(path_text(&metrics_path));
         let logger_path_json = json_string(path_text(&logger_path));
         let uds_path_json = json_string(path_text(&uds_path));
@@ -252,7 +255,8 @@ mod macos_arm64 {
                 }}],
                 "vsock": {{"guest_cid": 3, "uds_path": {uds_path_json}}},
                 "metrics": {{"metrics_path": {metrics_path_json}}},
-                "logger": {{"log_path": {logger_path_json}}}
+                "logger": {{"log_path": {logger_path_json}}},
+                "serial": {{"serial_out_path": {serial_output_path_json}}}
             }}"#
         );
         fs::write(&config_path, config).expect("config file should be written");
@@ -378,6 +382,17 @@ mod macos_arm64 {
                 output.status, output.stdout, output.stderr
             );
         }
+        if let Err(err) = wait_for_file_contains_marker(
+            &serial_output_path,
+            BLOCK_WRITE_MARKER,
+            GUEST_EXECUTION_TIMEOUT,
+        ) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "config-file guest serial output file did not contain block marker through signed bangbang executable: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
 
         assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang config file");
         assert!(
@@ -392,6 +407,7 @@ mod macos_arm64 {
         let socket_path = test_dir.path().join("api.socket");
         let config_path = test_dir.path().join("vm-config.json");
         let backing_path = test_dir.path().join("data.img");
+        let serial_output_path = test_dir.path().join("serial.out");
         let logger_path = test_dir.path().join("logger.out");
         let uds_path = test_dir.path().join("no-api-config-file-vsock.sock");
         let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
@@ -399,11 +415,13 @@ mod macos_arm64 {
         let instance_id = test_dir.instance_id();
 
         create_zeroed_block_backing(&backing_path);
+        create_empty_file(&serial_output_path);
 
         let kernel_path_json = json_string(path_text(&kernel_path));
         let initrd_path_json = json_string(path_text(&initrd_path));
         let boot_args_json = json_string(GUEST_BOOT_ARGS);
         let backing_path_json = json_string(path_text(&backing_path));
+        let serial_output_path_json = json_string(path_text(&serial_output_path));
         let logger_path_json = json_string(path_text(&logger_path));
         let uds_path_json = json_string(path_text(&uds_path));
         let config = format!(
@@ -421,7 +439,8 @@ mod macos_arm64 {
                     "is_read_only": false
                 }}],
                 "vsock": {{"guest_cid": 3, "uds_path": {uds_path_json}}},
-                "logger": {{"log_path": {logger_path_json}}}
+                "logger": {{"log_path": {logger_path_json}}},
+                "serial": {{"serial_out_path": {serial_output_path_json}}}
             }}"#
         );
         fs::write(&config_path, config).expect("config file should be written");
@@ -449,6 +468,17 @@ mod macos_arm64 {
             let output = bangbang.force_stop_and_collect();
             panic!(
                 "no-api config-file guest did not write block marker through signed bangbang executable: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        if let Err(err) = wait_for_file_contains_marker(
+            &serial_output_path,
+            BLOCK_WRITE_MARKER,
+            GUEST_EXECUTION_TIMEOUT,
+        ) {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "no-api config-file guest serial output file did not contain block marker through signed bangbang executable: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                 output.status, output.stdout, output.stderr
             );
         }

@@ -535,6 +535,9 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         ApiRequest::PutNetworkInterface(config) => Some(VmmAction::PutNetworkInterface(
             network_interface_config_input_from_request(config.as_ref()),
         )),
+        ApiRequest::PutSerial(config) => Some(VmmAction::PutSerial(
+            serial_config_input_from_request(config.as_ref()),
+        )),
         ApiRequest::PutVsock(config) => Some(VmmAction::PutVsock(vsock_config_input_from_request(
             config.as_ref(),
         ))),
@@ -548,8 +551,7 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         | ApiRequest::PatchMmds(_)
         | ApiRequest::PatchVmState(_)
         | ApiRequest::PutAction(_)
-        | ApiRequest::PutMmds(_)
-        | ApiRequest::PutSerial(_) => None,
+        | ApiRequest::PutMmds(_) => None,
     }
 }
 
