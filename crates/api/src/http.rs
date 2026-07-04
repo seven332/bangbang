@@ -39,6 +39,7 @@ pub enum ApiRequest {
 pub enum RequestError {
     BalloonUnsupported,
     CpuConfigUnsupported,
+    DriveUpdateUnsupported,
     EntropyUnsupported,
     GetRequestBody,
     InvalidPathMethod,
@@ -46,6 +47,7 @@ pub enum RequestError {
     MismatchedInterfaceId,
     MalformedRequest,
     MemoryHotplugUnsupported,
+    NetworkInterfaceUpdateUnsupported,
     PayloadTooLarge,
     PmemUnsupported,
     SendCtrlAltDelUnsupported,
@@ -59,6 +61,7 @@ impl RequestError {
         match self {
             Self::BalloonUnsupported => "Balloon device is not supported.",
             Self::CpuConfigUnsupported => "CPU config is not supported.",
+            Self::DriveUpdateUnsupported => "Drive updates are not supported.",
             Self::EntropyUnsupported => "Entropy device is not supported.",
             Self::GetRequestBody => "GET request cannot have a body.",
             Self::InvalidPathMethod => "Invalid request method and/or path.",
@@ -66,6 +69,9 @@ impl RequestError {
             Self::MismatchedInterfaceId => "path iface_id must match body iface_id.",
             Self::MalformedRequest => "Malformed HTTP request.",
             Self::MemoryHotplugUnsupported => "Memory hotplug is not supported.",
+            Self::NetworkInterfaceUpdateUnsupported => {
+                "Network interface updates are not supported."
+            }
             Self::PayloadTooLarge => "HTTP request payload exceeds the configured limit.",
             Self::PmemUnsupported => "Pmem device is not supported.",
             Self::SendCtrlAltDelUnsupported => "SendCtrlAltDel is not supported on aarch64.",
@@ -1141,6 +1147,13 @@ pub fn parse_request_with_limit(
 
     if matches!(method, "PUT" | "PATCH") && pmem_path_id(path).is_some() {
         return Err(RequestError::PmemUnsupported);
+    }
+
+    if method == "PATCH" && drive_path_id(path).is_some() {
+        return Err(RequestError::DriveUpdateUnsupported);
+    }
+    if method == "PATCH" && network_interface_path_id(path).is_some() {
+        return Err(RequestError::NetworkInterfaceUpdateUnsupported);
     }
 
     if method == "PUT"
@@ -3155,6 +3168,84 @@ mod tests {
     }
 
     #[test]
+    fn rejects_drive_update_as_unsupported() {
+        let request = request_with_body("PATCH", "/drives/rootfs", r#"{"drive_id":"rootfs"}"#);
+
+        let err = parse_request(&request).expect_err("drive update should be unsupported");
+        assert_eq!(err, RequestError::DriveUpdateUnsupported);
+        assert_eq!(err.fault_message(), "Drive updates are not supported.");
+    }
+
+    #[test]
+    fn rejects_drive_update_without_parsing_body() {
+        let malformed_body = request_with_body("PATCH", "/drives/rootfs", "not-json");
+        let empty_body =
+            b"PATCH /drives/rootfs HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n";
+
+        assert_eq!(
+            parse_request(&malformed_body),
+            Err(RequestError::DriveUpdateUnsupported)
+        );
+        assert_eq!(
+            parse_request(empty_body),
+            Err(RequestError::DriveUpdateUnsupported)
+        );
+    }
+
+    #[test]
+    fn rejects_non_exact_drive_update_paths_as_invalid_path_method() {
+        for (route, request) in [
+            ("PATCH /drives", request_with_body("PATCH", "/drives", "{}")),
+            (
+                "PATCH /drives/",
+                request_with_body("PATCH", "/drives/", "{}"),
+            ),
+            (
+                "PATCH /drives/rootfs/extra",
+                request_with_body("PATCH", "/drives/rootfs/extra", "{}"),
+            ),
+            (
+                "PATCH /drives/root-fs",
+                request_with_body("PATCH", "/drives/root-fs", "{}"),
+            ),
+            (
+                "PATCH /drives/rootfs?debug=true",
+                request_with_body("PATCH", "/drives/rootfs?debug=true", "{}"),
+            ),
+        ] {
+            assert_eq!(
+                parse_request(&request),
+                Err(RequestError::InvalidPathMethod),
+                "{route}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_drive_update_methods_as_invalid_path_method() {
+        for (route, request) in [
+            (
+                "GET /drives/rootfs",
+                b"GET /drives/rootfs HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            ),
+            (
+                "DELETE /drives/rootfs",
+                b"DELETE /drives/rootfs HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            ),
+            (
+                "POST /drives/rootfs",
+                request_with_body("POST", "/drives/rootfs", "{}"),
+            ),
+        ] {
+            assert_eq!(
+                parse_request(&request),
+                Err(RequestError::InvalidPathMethod),
+                "{route}"
+            );
+        }
+    }
+
+    #[test]
     fn parses_put_network_interface_with_minimal_body() {
         let body = r#"{
             "iface_id": "eth0",
@@ -3373,6 +3464,94 @@ mod tests {
         let request = request_with_body("GET", "/network-interfaces/eth0", "{}");
 
         assert_eq!(parse_request(&request), Err(RequestError::GetRequestBody));
+    }
+
+    #[test]
+    fn rejects_network_interface_update_as_unsupported() {
+        let request = request_with_body(
+            "PATCH",
+            "/network-interfaces/eth0",
+            r#"{"iface_id":"eth0"}"#,
+        );
+
+        let err =
+            parse_request(&request).expect_err("network interface update should be unsupported");
+        assert_eq!(err, RequestError::NetworkInterfaceUpdateUnsupported);
+        assert_eq!(
+            err.fault_message(),
+            "Network interface updates are not supported."
+        );
+    }
+
+    #[test]
+    fn rejects_network_interface_update_without_parsing_body() {
+        let malformed_body = request_with_body("PATCH", "/network-interfaces/eth0", "not-json");
+        let empty_body = b"PATCH /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n";
+
+        assert_eq!(
+            parse_request(&malformed_body),
+            Err(RequestError::NetworkInterfaceUpdateUnsupported)
+        );
+        assert_eq!(
+            parse_request(empty_body),
+            Err(RequestError::NetworkInterfaceUpdateUnsupported)
+        );
+    }
+
+    #[test]
+    fn rejects_non_exact_network_interface_update_paths_as_invalid_path_method() {
+        for (route, request) in [
+            (
+                "PATCH /network-interfaces",
+                request_with_body("PATCH", "/network-interfaces", "{}"),
+            ),
+            (
+                "PATCH /network-interfaces/",
+                request_with_body("PATCH", "/network-interfaces/", "{}"),
+            ),
+            (
+                "PATCH /network-interfaces/eth0/extra",
+                request_with_body("PATCH", "/network-interfaces/eth0/extra", "{}"),
+            ),
+            (
+                "PATCH /network-interfaces/eth-0",
+                request_with_body("PATCH", "/network-interfaces/eth-0", "{}"),
+            ),
+            (
+                "PATCH /network-interfaces/eth0?debug=true",
+                request_with_body("PATCH", "/network-interfaces/eth0?debug=true", "{}"),
+            ),
+        ] {
+            assert_eq!(
+                parse_request(&request),
+                Err(RequestError::InvalidPathMethod),
+                "{route}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_network_interface_update_methods_as_invalid_path_method() {
+        for (route, request) in [
+            (
+                "GET /network-interfaces/eth0",
+                b"GET /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            ),
+            (
+                "DELETE /network-interfaces/eth0",
+                b"DELETE /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            ),
+            (
+                "POST /network-interfaces/eth0",
+                request_with_body("POST", "/network-interfaces/eth0", "{}"),
+            ),
+        ] {
+            assert_eq!(
+                parse_request(&request),
+                Err(RequestError::InvalidPathMethod),
+                "{route}"
+            );
+        }
     }
 
     #[test]

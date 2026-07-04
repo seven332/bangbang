@@ -3076,6 +3076,53 @@ mod tests {
     }
 
     #[test]
+    fn returns_fault_for_device_update_endpoints() {
+        for (name, path, body, fault_message) in [
+            (
+                "drive",
+                "/drives/rootfs",
+                r#"{"drive_id":"rootfs"}"#,
+                r#"{"fault_message":"Drive updates are not supported."}"#,
+            ),
+            (
+                "net",
+                "/network-interfaces/eth0",
+                r#"{"iface_id":"eth0"}"#,
+                r#"{"fault_message":"Network interface updates are not supported."}"#,
+            ),
+        ] {
+            let socket_name = format!("du-{name}");
+            let socket_path = unique_socket_path(&socket_name);
+            let server = ApiServer::bind(&socket_path).expect("server should bind");
+            let mut client = UnixStream::connect(&socket_path).expect("client should connect");
+            let request = format!(
+                "PATCH {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+
+            client
+                .write_all(request.as_bytes())
+                .expect("client should write request");
+            let mut vmm = test_controller();
+            server
+                .serve_next(&mut vmm)
+                .expect("server should handle one request");
+
+            let mut response = String::new();
+            client
+                .read_to_string(&mut response)
+                .expect("client should read response");
+
+            assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+            assert!(response.contains(fault_message));
+            assert_eq!(
+                vmm.instance_info().state,
+                bangbang_runtime::InstanceState::NotStarted
+            );
+        }
+    }
+
+    #[test]
     fn returns_fault_for_send_ctrl_alt_del_action() {
         let path = unique_socket_path("cad-fault");
         let server = ApiServer::bind(&path).expect("server should bind");
