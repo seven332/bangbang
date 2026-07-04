@@ -133,11 +133,13 @@ Configure logger output before boot:
 curl --unix-socket /tmp/bangbang.socket \
   -X PUT http://localhost/logger \
   -H 'Content-Type: application/json' \
-  -d '{"log_path":"/tmp/bangbang.log","level":"Info","show_level":true}'
+  -d '{"log_path":"/tmp/bangbang.log","level":"Info","show_level":true,"show_log_origin":true}'
 ```
 
 Configured logger output records minimal successful `InstanceStart` and
-`FlushMetrics` action events. Full internal log routing remains deferred.
+`FlushMetrics` action events. `show_level` adds `level=Info`, and
+`show_log_origin` adds the runtime action callsite as `origin=<file>:<line>`.
+Full internal log routing remains deferred.
 
 Submit an `InstanceStart` action:
 

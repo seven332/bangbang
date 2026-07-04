@@ -2,6 +2,7 @@ use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{LineWriter, Write};
 use std::os::unix::fs::OpenOptionsExt;
+use std::panic::Location;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -239,6 +240,7 @@ impl LoggerState {
         Ok(())
     }
 
+    #[track_caller]
     pub(crate) fn log_action(&mut self, action: &str) -> Result<bool, LoggerWriteError> {
         const ACTION_LEVEL: LoggerLevel = LoggerLevel::Info;
 
@@ -250,7 +252,13 @@ impl LoggerState {
             return Ok(false);
         };
 
-        sink.write_action(self.show_level, ACTION_LEVEL, action)?;
+        sink.write_action(
+            self.show_level,
+            self.show_log_origin,
+            Location::caller(),
+            ACTION_LEVEL,
+            action,
+        )?;
         Ok(true)
     }
 
@@ -308,16 +316,29 @@ impl LoggerSink {
     fn write_action(
         &mut self,
         show_level: bool,
+        show_log_origin: bool,
+        origin: &Location<'_>,
         level: LoggerLevel,
         action: &str,
     ) -> Result<(), LoggerWriteError> {
-        if show_level {
-            writeln!(self.writer, "level={} action={action}", level.as_str())
-                .map_err(|err| LoggerWriteError::Write(err.kind()))?;
-        } else {
-            writeln!(self.writer, "action={action}")
-                .map_err(|err| LoggerWriteError::Write(err.kind()))?;
+        match (show_level, show_log_origin) {
+            (true, true) => writeln!(
+                self.writer,
+                "level={} origin={}:{} action={action}",
+                level.as_str(),
+                origin.file(),
+                origin.line()
+            ),
+            (true, false) => writeln!(self.writer, "level={} action={action}", level.as_str()),
+            (false, true) => writeln!(
+                self.writer,
+                "origin={}:{} action={action}",
+                origin.file(),
+                origin.line()
+            ),
+            (false, false) => writeln!(self.writer, "action={action}"),
         }
+        .map_err(|err| LoggerWriteError::Write(err.kind()))?;
         self.writer
             .flush()
             .map_err(|err| LoggerWriteError::Write(err.kind()))
@@ -362,6 +383,38 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    fn assert_action_output_with_origin(output: &str, level: Option<LoggerLevel>, action: &str) {
+        let mut lines = output.lines();
+        let line = lines
+            .next()
+            .expect("logger output should include action line");
+        assert_eq!(lines.next(), None);
+
+        let prefix = level.map_or_else(
+            || "origin=".to_string(),
+            |level| format!("level={} origin=", level.as_str()),
+        );
+        assert!(line.starts_with(&prefix));
+
+        let suffix = format!(" action={action}");
+        assert!(line.ends_with(&suffix));
+
+        let origin = line
+            .strip_prefix(&prefix)
+            .expect("logger output should include origin prefix")
+            .strip_suffix(&suffix)
+            .expect("logger output should include action suffix");
+        let (file, line_number) = origin
+            .rsplit_once(':')
+            .expect("logger origin should include file and line");
+
+        assert!(file.ends_with(file!()), "unexpected origin file: {file}");
+        assert!(
+            line_number.parse::<u32>().is_ok(),
+            "unexpected origin line: {line_number}"
+        );
     }
 
     #[test]
@@ -488,6 +541,45 @@ mod tests {
 
         let output = fs::read_to_string(&path).expect("logger output should be readable");
         assert_eq!(output, "level=Info action=InstanceStart\n");
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn log_action_includes_origin_when_configured() {
+        let path = unique_logger_path("actions-with-origin");
+        let mut state = LoggerState::default();
+        state
+            .configure(
+                LoggerConfigInput::new()
+                    .with_log_path(&path)
+                    .with_show_log_origin(true),
+            )
+            .expect("logger should configure");
+
+        assert_eq!(state.log_action("InstanceStart"), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("logger output should be readable");
+        assert_action_output_with_origin(&output, None, "InstanceStart");
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn log_action_includes_level_and_origin_when_configured() {
+        let path = unique_logger_path("actions-with-level-origin");
+        let mut state = LoggerState::default();
+        state
+            .configure(
+                LoggerConfigInput::new()
+                    .with_log_path(&path)
+                    .with_show_level(true)
+                    .with_show_log_origin(true),
+            )
+            .expect("logger should configure");
+
+        assert_eq!(state.log_action("FlushMetrics"), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("logger output should be readable");
+        assert_action_output_with_origin(&output, Some(LoggerLevel::Info), "FlushMetrics");
         fs::remove_file(path).expect("fixture should clean up");
     }
 

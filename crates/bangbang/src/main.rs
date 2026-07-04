@@ -467,7 +467,7 @@ fn help_text() -> String {
             "      --metrics-path <PATH>  Metrics output file or FIFO path\n",
             "      --module <MODULE>  Logger module filter stored for future log integration\n",
             "      --show-level       Include level in minimal logger action lines\n",
-            "      --show-log-origin  Store log-origin flag for future log integration\n",
+            "      --show-log-origin  Include callsite origin in minimal logger action lines\n",
             "  -V, --version          Print version\n",
             "  -h, --help             Print help\n\n",
             "Current scope:\n",
