@@ -81,6 +81,7 @@ pub enum VmmAction {
     PutMmds(mmds::MmdsContentInput),
     PatchMmds(mmds::MmdsContentInput),
     PutMmdsConfig(mmds::MmdsConfigInput),
+    PutSerial(serial::SerialConfigInput),
     PutDrive(block::DriveConfigInput),
     UpdateBlockDevice(block::DriveUpdateInput),
     PutNetworkInterface(network::NetworkInterfaceConfigInput),
@@ -108,6 +109,7 @@ impl VmmAction {
             Self::PutMmds(_) => "PutMmds",
             Self::PatchMmds(_) => "PatchMmds",
             Self::PutMmdsConfig(_) => "PutMmdsConfig",
+            Self::PutSerial(_) => "PutSerial",
             Self::PutDrive(_) => "PutDrive",
             Self::UpdateBlockDevice(_) => "UpdateBlockDevice",
             Self::PutNetworkInterface(_) => "PutNetworkInterface",
@@ -200,6 +202,7 @@ pub enum VmmActionError {
     MmdsDataStore(mmds::MmdsDataStoreError),
     MmdsState(mmds::MmdsStateLockError),
     NetworkInterfaceConfig(network::NetworkInterfaceConfigError),
+    SerialConfig(serial::SerialConfigError),
     VsockConfig(vsock::VsockConfigError),
 }
 
@@ -230,6 +233,7 @@ impl fmt::Display for VmmActionError {
             Self::MmdsDataStore(err) => write!(f, "{err}"),
             Self::MmdsState(err) => write!(f, "{err}"),
             Self::NetworkInterfaceConfig(err) => write!(f, "{err}"),
+            Self::SerialConfig(err) => write!(f, "{err}"),
             Self::VsockConfig(err) => write!(f, "{err}"),
         }
     }
@@ -250,6 +254,7 @@ impl std::error::Error for VmmActionError {
             Self::MmdsDataStore(err) => Some(err),
             Self::MmdsState(err) => Some(err),
             Self::NetworkInterfaceConfig(err) => Some(err),
+            Self::SerialConfig(err) => Some(err),
             Self::VsockConfig(err) => Some(err),
             Self::MissingBootSource
             | Self::UnsupportedAction(_)
@@ -266,6 +271,7 @@ pub struct VmmController {
     drive_configs: block::DriveConfigs,
     network_interface_configs: network::NetworkInterfaceConfigs,
     vsock_config: Option<vsock::VsockConfig>,
+    serial_config: serial::SerialConfig,
     logger_state: logger::LoggerState,
     metrics_state: metrics::MetricsState,
     mmds_state: mmds::MmdsStateHandle,
@@ -303,6 +309,7 @@ impl VmmController {
             drive_configs: block::DriveConfigs::new(),
             network_interface_configs: network::NetworkInterfaceConfigs::new(),
             vsock_config: None,
+            serial_config: serial::SerialConfig::default(),
             logger_state: logger::LoggerState::default(),
             metrics_state: metrics::MetricsState::default(),
             mmds_state: mmds::MmdsStateHandle::new(mmds::MmdsState::new(
@@ -325,6 +332,10 @@ impl VmmController {
 
     pub fn vsock_config(&self) -> Option<&vsock::VsockConfig> {
         self.vsock_config.as_ref()
+    }
+
+    pub const fn serial_config(&self) -> &serial::SerialConfig {
+        &self.serial_config
     }
 
     pub fn mmds_state_handle(&self) -> mmds::MmdsStateHandle {
@@ -536,6 +547,18 @@ impl VmmController {
 
                 Ok(VmmData::Empty)
             }
+            VmmAction::PutSerial(config) => {
+                if self.instance_info.state != InstanceState::NotStarted {
+                    return Err(VmmActionError::UnsupportedState {
+                        action: action_name,
+                        state: self.instance_info.state,
+                    });
+                }
+
+                self.serial_config = config.validate().map_err(VmmActionError::SerialConfig)?;
+
+                Ok(VmmData::Empty)
+            }
             VmmAction::PutDrive(config) => {
                 if self.instance_info.state != InstanceState::NotStarted {
                     return Err(VmmActionError::UnsupportedState {
@@ -663,6 +686,7 @@ mod tests {
             GuestMacAddress, MAX_NETWORK_INTERFACE_COUNT, NetworkInterfaceConfigError,
             NetworkInterfaceConfigInput,
         },
+        serial::{SerialConfigError, SerialConfigInput},
         vsock::{MIN_GUEST_CID, VsockConfigError, VsockConfigInput},
     };
 
@@ -676,6 +700,10 @@ mod tests {
 
     fn vsock_input(guest_cid: u32, uds_path: &str) -> VsockConfigInput {
         VsockConfigInput::new(guest_cid, uds_path)
+    }
+
+    fn serial_input(serial_out_path: &str) -> SerialConfigInput {
+        SerialConfigInput::new().with_serial_out_path(serial_out_path)
     }
 
     fn boot_source_input(kernel_image_path: &str) -> BootSourceConfigInput {
@@ -749,6 +777,7 @@ mod tests {
         assert!(controller.drive_configs().is_empty());
         assert!(controller.network_interface_configs().is_empty());
         assert_eq!(controller.vsock_config(), None);
+        assert_eq!(controller.serial_config().serial_out_path(), None);
     }
 
     #[test]
@@ -819,6 +848,7 @@ mod tests {
         assert!(controller.drive_configs().is_empty());
         assert!(controller.network_interface_configs().is_empty());
         assert!(controller.vsock_config().is_none());
+        assert_eq!(controller.serial_config().serial_out_path(), None);
     }
 
     #[test]
@@ -961,6 +991,10 @@ mod tests {
         assert_eq!(
             VmmAction::PutVsock(vsock_input(3, "./v.sock")).name(),
             "PutVsock"
+        );
+        assert_eq!(
+            VmmAction::PutSerial(serial_input("/tmp/serial.out")).name(),
+            "PutSerial"
         );
         assert_eq!(VmmAction::PutMmds(mmds_content_input()).name(), "PutMmds");
         assert_eq!(
@@ -2831,6 +2865,134 @@ mod tests {
             }
         );
         assert!(controller.network_interface_configs().is_empty());
+    }
+
+    #[test]
+    fn handles_put_serial_config() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
+        assert_eq!(
+            controller.handle_action(VmmAction::PutSerial(serial_input("/tmp/serial.out"))),
+            Ok(VmmData::Empty)
+        );
+
+        assert_eq!(
+            controller.serial_config().serial_out_path(),
+            Some(Path::new("/tmp/serial.out"))
+        );
+    }
+
+    #[test]
+    fn put_serial_config_clear_request_replaces_existing_config() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutSerial(serial_input("/tmp/serial.out")))
+            .expect("initial serial config should be stored");
+
+        controller
+            .handle_action(VmmAction::PutSerial(SerialConfigInput::new()))
+            .expect("serial clear request should be stored");
+
+        assert_eq!(controller.serial_config().serial_out_path(), None);
+    }
+
+    #[test]
+    fn put_serial_config_rejects_empty_path_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutSerial(serial_input("/tmp/original.out")))
+            .expect("initial serial config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PutSerial(serial_input("")))
+            .expect_err("empty serial output path should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::SerialConfig(SerialConfigError::EmptyOutputPath)
+        );
+        assert_eq!(err.to_string(), "serial output path must not be empty");
+        assert_eq!(
+            controller.serial_config().serial_out_path(),
+            Some(Path::new("/tmp/original.out"))
+        );
+    }
+
+    #[test]
+    fn put_serial_config_rejects_control_character_path_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutSerial(serial_input("/tmp/original.out")))
+            .expect("initial serial config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PutSerial(serial_input("/tmp/bad\npath")))
+            .expect_err("control-character serial output path should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::SerialConfig(SerialConfigError::InvalidOutputPath)
+        );
+        assert_eq!(
+            err.to_string(),
+            "serial output path must not contain control characters"
+        );
+        assert_eq!(
+            controller.serial_config().serial_out_path(),
+            Some(Path::new("/tmp/original.out"))
+        );
+    }
+
+    #[test]
+    fn put_serial_config_rejects_rate_limiter_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutSerial(serial_input("/tmp/original.out")))
+            .expect("initial serial config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PutSerial(
+                SerialConfigInput::new().with_rate_limiter_configured(),
+            ))
+            .expect_err("serial rate limiter should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::SerialConfig(SerialConfigError::RateLimiterUnsupported)
+        );
+        assert_eq!(
+            err.to_string(),
+            "serial output rate limiting is not supported"
+        );
+        assert_eq!(
+            controller.serial_config().serial_out_path(),
+            Some(Path::new("/tmp/original.out"))
+        );
+    }
+
+    #[test]
+    fn put_serial_config_rejects_running_state_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutSerial(serial_input("/tmp/original.out")))
+            .expect("initial serial config should be stored");
+        controller.instance_info.state = InstanceState::Running;
+
+        let err = controller
+            .handle_action(VmmAction::PutSerial(serial_input("/tmp/replacement.out")))
+            .expect_err("running serial config should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::UnsupportedState {
+                action: "PutSerial",
+                state: InstanceState::Running,
+            }
+        );
+        assert_eq!(
+            controller.serial_config().serial_out_path(),
+            Some(Path::new("/tmp/original.out"))
+        );
     }
 
     #[test]

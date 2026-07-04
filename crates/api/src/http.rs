@@ -36,6 +36,7 @@ pub enum ApiRequest {
     PutMmds(Box<MmdsContentRequest>),
     PutMmdsConfig(Box<MmdsConfigRequest>),
     PutNetworkInterface(Box<NetworkInterfaceConfigRequest>),
+    PutSerial(Box<SerialConfigRequest>),
     PutVsock(Box<VsockConfigRequest>),
     PatchMmds(Box<MmdsContentRequest>),
 }
@@ -55,7 +56,6 @@ pub enum RequestError {
     PayloadTooLarge,
     PmemUnsupported,
     SendCtrlAltDelUnsupported,
-    SerialUnsupported,
     SnapshotUnsupported,
 }
 
@@ -77,7 +77,6 @@ impl RequestError {
             Self::PayloadTooLarge => "HTTP request payload exceeds the configured limit.",
             Self::PmemUnsupported => "Pmem device is not supported.",
             Self::SendCtrlAltDelUnsupported => "SendCtrlAltDel is not supported on aarch64.",
-            Self::SerialUnsupported => "Serial device is not supported.",
             Self::SnapshotUnsupported => "Snapshot and restore are not supported.",
         }
     }
@@ -254,6 +253,31 @@ struct LoggerConfigRequestBody {
     show_log_origin: Option<bool>,
     #[serde(default)]
     module: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SerialConfigRequest {
+    serial_out_path: Option<String>,
+    rate_limiter_configured: bool,
+}
+
+impl SerialConfigRequest {
+    pub fn serial_out_path(&self) -> Option<&str> {
+        self.serial_out_path.as_deref()
+    }
+
+    pub const fn rate_limiter_configured(&self) -> bool {
+        self.rate_limiter_configured
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SerialConfigRequestBody {
+    #[serde(default)]
+    serial_out_path: Option<String>,
+    #[serde(default)]
+    rate_limiter: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1254,7 +1278,7 @@ pub fn parse_request_with_limit(
         return Err(RequestError::EntropyUnsupported);
     }
     if method == "PUT" && path == "/serial" {
-        return Err(RequestError::SerialUnsupported);
+        return parse_serial_config_request(body);
     }
     if method == "PUT" && path == "/logger" {
         return parse_logger_config_request(body);
@@ -1579,6 +1603,16 @@ fn parse_logger_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> 
         show_level: body.show_level,
         show_log_origin: body.show_log_origin,
         module: body.module,
+    })))
+}
+
+fn parse_serial_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
+    let body = serde_json::from_slice::<SerialConfigRequestBody>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+
+    Ok(ApiRequest::PutSerial(Box::new(SerialConfigRequest {
+        serial_out_path: body.serial_out_path,
+        rate_limiter_configured: body.rate_limiter.is_some(),
     })))
 }
 
@@ -2043,6 +2077,7 @@ impl From<ApiRequest> for Endpoint {
                 Self::Mmds
             }
             ApiRequest::PutNetworkInterface(_) => Self::NetworkInterface,
+            ApiRequest::PutSerial(_) => Self::Serial,
             ApiRequest::PutVsock(_) => Self::Vsock,
         }
     }
@@ -4520,27 +4555,87 @@ mod tests {
     }
 
     #[test]
-    fn rejects_serial_as_unsupported() {
-        let request = request_with_body("PUT", "/serial", "{}");
+    fn parses_serial_config_with_output_path() {
+        let request =
+            request_with_body("PUT", "/serial", r#"{"serial_out_path":"/tmp/serial.out"}"#);
 
-        let err = parse_request(&request).expect_err("serial should be unsupported");
-        assert_eq!(err, RequestError::SerialUnsupported);
-        assert_eq!(err.fault_message(), "Serial device is not supported.");
+        let parsed = parse_request(&request).expect("serial config should parse");
+
+        let ApiRequest::PutSerial(config) = parsed else {
+            panic!("expected serial config request");
+        };
+        assert_eq!(config.serial_out_path(), Some("/tmp/serial.out"));
+        assert!(!config.rate_limiter_configured());
     }
 
     #[test]
-    fn rejects_serial_as_unsupported_without_parsing_body() {
+    fn parses_serial_config_clear_request() {
+        for body in [r#"{}"#, r#"{"serial_out_path":null}"#] {
+            let parsed = parse_request(&request_with_body("PUT", "/serial", body))
+                .expect("serial clear request should parse");
+
+            let ApiRequest::PutSerial(config) = parsed else {
+                panic!("expected serial config request");
+            };
+            assert_eq!(config.serial_out_path(), None);
+            assert!(!config.rate_limiter_configured());
+        }
+    }
+
+    #[test]
+    fn parses_serial_config_with_null_rate_limiter_as_unconfigured() {
+        let request = request_with_body(
+            "PUT",
+            "/serial",
+            r#"{"serial_out_path":"/tmp/serial.out","rate_limiter":null}"#,
+        );
+
+        let parsed = parse_request(&request).expect("serial config should parse");
+
+        let ApiRequest::PutSerial(config) = parsed else {
+            panic!("expected serial config request");
+        };
+        assert_eq!(config.serial_out_path(), Some("/tmp/serial.out"));
+        assert!(!config.rate_limiter_configured());
+    }
+
+    #[test]
+    fn marks_serial_rate_limiter_as_configured() {
+        let request = request_with_body(
+            "PUT",
+            "/serial",
+            r#"{"rate_limiter":{"bandwidth":{"size":1,"refill_time":1}}}"#,
+        );
+
+        let parsed = parse_request(&request).expect("serial config should parse");
+
+        let ApiRequest::PutSerial(config) = parsed else {
+            panic!("expected serial config request");
+        };
+        assert_eq!(config.serial_out_path(), None);
+        assert!(config.rate_limiter_configured());
+    }
+
+    #[test]
+    fn rejects_malformed_serial_config_body() {
         let malformed_body = request_with_body("PUT", "/serial", "not-json");
         let empty_body = b"PUT /serial HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n";
 
         assert_eq!(
             parse_request(&malformed_body),
-            Err(RequestError::SerialUnsupported)
+            Err(RequestError::MalformedRequest)
         );
         assert_eq!(
             parse_request(empty_body),
-            Err(RequestError::SerialUnsupported)
+            Err(RequestError::MalformedRequest)
         );
+    }
+
+    #[test]
+    fn rejects_unknown_serial_config_fields() {
+        let request = request_with_body("PUT", "/serial", r#"{"bad":true}"#);
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
     }
 
     #[test]

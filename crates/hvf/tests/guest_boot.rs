@@ -332,7 +332,7 @@ fn run_guest_boot_with_boot_source(
     use bangbang_runtime::memory::GuestAddress;
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::network::NetworkMmioLayout;
-    use bangbang_runtime::serial::SharedSerialOutputBuffer;
+    use bangbang_runtime::serial::{SharedSerialOutput, SharedSerialOutputBuffer};
     use bangbang_runtime::vsock::VsockMmioLayout;
     use bangbang_runtime::{VmmAction, VmmController};
 
@@ -359,7 +359,7 @@ fn run_guest_boot_with_boot_source(
     .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
         MmioRegionId::new(0),
         serial_address,
-        serial_output.clone(),
+        SharedSerialOutput::from(serial_output.clone()),
     ));
     let mut session = OwnedHvfArm64BootSession::new(&controller, config)
         .expect("guest boot test session should prepare");

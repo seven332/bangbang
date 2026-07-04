@@ -2,6 +2,10 @@
 
 use std::collections::TryReserveError;
 use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::io::Write as _;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::mmio::{
@@ -30,6 +34,104 @@ pub const SERIAL_OUTPUT_BUFFER_DEFAULT_LIMIT: usize = 64 * 1024;
 pub trait SerialOutput: fmt::Debug + Send {
     fn write_byte(&mut self, byte: u8) -> Result<(), SerialOutputError>;
 }
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SerialConfigInput {
+    serial_out_path: Option<String>,
+    rate_limiter_configured: bool,
+}
+
+impl SerialConfigInput {
+    pub const fn new() -> Self {
+        Self {
+            serial_out_path: None,
+            rate_limiter_configured: false,
+        }
+    }
+
+    pub fn with_serial_out_path(mut self, serial_out_path: impl Into<String>) -> Self {
+        self.serial_out_path = Some(serial_out_path.into());
+        self
+    }
+
+    pub const fn with_rate_limiter_configured(mut self) -> Self {
+        self.rate_limiter_configured = true;
+        self
+    }
+
+    pub fn serial_out_path(&self) -> Option<&str> {
+        self.serial_out_path.as_deref()
+    }
+
+    pub const fn rate_limiter_configured(&self) -> bool {
+        self.rate_limiter_configured
+    }
+
+    pub fn validate(self) -> Result<SerialConfig, SerialConfigError> {
+        SerialConfig::try_from(self)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SerialConfig {
+    serial_out_path: Option<PathBuf>,
+}
+
+impl SerialConfig {
+    pub fn serial_out_path(&self) -> Option<&Path> {
+        self.serial_out_path.as_deref()
+    }
+}
+
+impl TryFrom<SerialConfigInput> for SerialConfig {
+    type Error = SerialConfigError;
+
+    fn try_from(input: SerialConfigInput) -> Result<Self, Self::Error> {
+        if input.rate_limiter_configured {
+            return Err(SerialConfigError::RateLimiterUnsupported);
+        }
+
+        if let Some(serial_out_path) = input.serial_out_path.as_deref() {
+            if serial_out_path.is_empty() {
+                return Err(SerialConfigError::EmptyOutputPath);
+            }
+            if has_control_character(serial_out_path) {
+                return Err(SerialConfigError::InvalidOutputPath);
+            }
+        }
+
+        Ok(Self {
+            serial_out_path: input.serial_out_path.map(PathBuf::from),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SerialConfigError {
+    EmptyOutputPath,
+    InvalidOutputPath,
+    RateLimiterUnsupported,
+    OpenOutput(std::io::ErrorKind),
+}
+
+impl fmt::Display for SerialConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyOutputPath => f.write_str("serial output path must not be empty"),
+            Self::InvalidOutputPath => {
+                f.write_str("serial output path must not contain control characters")
+            }
+            Self::RateLimiterUnsupported => {
+                f.write_str("serial output rate limiting is not supported")
+            }
+            Self::OpenOutput(kind) => {
+                write!(f, "serial output could not be initialized: {kind:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SerialConfigError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SerialOutputBuffer {
@@ -131,6 +233,63 @@ impl SerialOutput for SharedSerialOutputBuffer {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct SharedSerialOutput {
+    output: Arc<Mutex<Box<dyn SerialOutput>>>,
+}
+
+impl SharedSerialOutput {
+    pub fn new(output: impl SerialOutput + 'static) -> Self {
+        Self {
+            output: Arc::new(Mutex::new(Box::new(output))),
+        }
+    }
+}
+
+impl From<SharedSerialOutputBuffer> for SharedSerialOutput {
+    fn from(output: SharedSerialOutputBuffer) -> Self {
+        Self::new(output)
+    }
+}
+
+impl SerialOutput for SharedSerialOutput {
+    fn write_byte(&mut self, byte: u8) -> Result<(), SerialOutputError> {
+        let mut output = self
+            .output
+            .lock()
+            .map_err(|_| SerialOutputError::lock_poisoned())?;
+
+        output.write_byte(byte)
+    }
+}
+
+#[derive(Debug)]
+pub struct SerialOutputFile {
+    file: File,
+}
+
+impl SerialOutputFile {
+    pub fn open(path: &Path) -> Result<Self, SerialConfigError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|err| SerialConfigError::OpenOutput(err.kind()))?;
+
+        Ok(Self { file })
+    }
+}
+
+impl SerialOutput for SerialOutputFile {
+    fn write_byte(&mut self, byte: u8) -> Result<(), SerialOutputError> {
+        self.file
+            .write_all(&[byte])
+            .map_err(|err| SerialOutputError::file_write(err.kind()))
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DiscardSerialOutput;
 
@@ -167,7 +326,11 @@ impl SerialOutputError {
     }
 
     fn lock_poisoned() -> Self {
-        Self::new("serial output buffer lock was poisoned")
+        Self::new("serial output lock was poisoned")
+    }
+
+    fn file_write(kind: std::io::ErrorKind) -> Self {
+        Self::new(format!("serial output file write failed: {kind:?}"))
     }
 }
 
@@ -480,10 +643,17 @@ fn single_data_byte(offset: u64, data: MmioAccessBytes) -> Result<u8, SerialMmio
         })
 }
 
+fn has_control_character(value: &str) -> bool {
+    value.chars().any(char::is_control)
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
+    use std::fs;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         SERIAL_INTERRUPT_ENABLE_REGISTER_OFFSET,
@@ -493,8 +663,9 @@ mod tests {
         SERIAL_LINE_STATUS_REGISTER_OFFSET, SERIAL_MMIO_DEVICE_WINDOW_SIZE,
         SERIAL_MODEM_CONTROL_REGISTER_OFFSET, SERIAL_MODEM_STATUS_REGISTER_OFFSET,
         SERIAL_OUTPUT_BUFFER_DEFAULT_LIMIT, SERIAL_SCRATCH_REGISTER_OFFSET,
-        SERIAL_TRANSMIT_REGISTER_OFFSET, SerialMmioDevice, SerialMmioError, SerialOutput,
-        SerialOutputBuffer, SerialOutputError, SharedSerialOutputBuffer,
+        SERIAL_TRANSMIT_REGISTER_OFFSET, SerialConfigError, SerialConfigInput, SerialMmioDevice,
+        SerialMmioError, SerialOutput, SerialOutputBuffer, SerialOutputError, SerialOutputFile,
+        SharedSerialOutput, SharedSerialOutputBuffer,
     };
     use crate::memory::GuestAddress;
     use crate::mmio::{
@@ -518,6 +689,17 @@ mod tests {
 
     fn bytes(data: &[u8]) -> MmioAccessBytes {
         MmioAccessBytes::new(data).expect("test bytes should be valid")
+    }
+
+    fn unique_serial_output_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bangbang-serial-test-{}-{nanos}-{name}",
+            std::process::id()
+        ))
     }
 
     fn write(
@@ -780,6 +962,96 @@ mod tests {
         assert_eq!(first.bytes().expect("shared bytes should read"), b"a");
         assert_eq!(second.bytes().expect("shared bytes should read"), b"a");
         assert_eq!(first.limit().expect("shared limit should read"), 1);
+    }
+
+    #[test]
+    fn shared_serial_output_clones_share_wrapped_output() {
+        let buffer = SharedSerialOutputBuffer::default();
+        let mut first = SharedSerialOutput::from(buffer.clone());
+        let mut second = first.clone();
+
+        first.write_byte(b'a').expect("first byte should write");
+        second.write_byte(b'b').expect("second byte should write");
+
+        assert_eq!(buffer.bytes().expect("shared bytes should read"), b"ab");
+    }
+
+    #[test]
+    fn validates_serial_config_output_path() {
+        let config = SerialConfigInput::new()
+            .with_serial_out_path("/tmp/serial.out")
+            .validate()
+            .expect("serial config should validate");
+
+        assert_eq!(config.serial_out_path(), Some(Path::new("/tmp/serial.out")));
+    }
+
+    #[test]
+    fn validates_serial_config_clear_request() {
+        let config = SerialConfigInput::new()
+            .validate()
+            .expect("serial clear request should validate");
+
+        assert_eq!(config.serial_out_path(), None);
+    }
+
+    #[test]
+    fn rejects_invalid_serial_config_without_path_echo() {
+        for (input, expected, message) in [
+            (
+                SerialConfigInput::new().with_serial_out_path(""),
+                SerialConfigError::EmptyOutputPath,
+                "serial output path must not be empty",
+            ),
+            (
+                SerialConfigInput::new().with_serial_out_path("/tmp/bad\npath"),
+                SerialConfigError::InvalidOutputPath,
+                "serial output path must not contain control characters",
+            ),
+            (
+                SerialConfigInput::new().with_rate_limiter_configured(),
+                SerialConfigError::RateLimiterUnsupported,
+                "serial output rate limiting is not supported",
+            ),
+        ] {
+            let err = input
+                .validate()
+                .expect_err("invalid serial config should fail");
+
+            assert_eq!(err, expected);
+            assert_eq!(err.to_string(), message);
+            assert!(!err.to_string().contains("/tmp/bad"));
+        }
+    }
+
+    #[test]
+    fn file_output_writes_serial_bytes() {
+        let path = unique_serial_output_path("file-output");
+        let mut output = SerialOutputFile::open(&path).expect("serial output file should open");
+
+        output.write_byte(b'a').expect("first byte should write");
+        output.write_byte(b'b').expect("second byte should write");
+
+        assert_eq!(fs::read(&path).expect("serial output should read"), b"ab");
+        fs::remove_file(path).expect("serial output should clean up");
+    }
+
+    #[test]
+    fn file_output_open_error_is_redacted() {
+        let path = unique_serial_output_path("missing-parent").join("serial.out");
+
+        let err = SerialOutputFile::open(&path)
+            .expect_err("serial output with missing parent should fail");
+
+        assert_eq!(
+            err,
+            SerialConfigError::OpenOutput(std::io::ErrorKind::NotFound)
+        );
+        assert_eq!(
+            err.to_string(),
+            "serial output could not be initialized: NotFound"
+        );
+        assert!(!err.to_string().contains("missing-parent"));
     }
 
     #[derive(Debug)]

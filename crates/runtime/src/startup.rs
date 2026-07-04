@@ -32,7 +32,7 @@ use crate::network::{
     VirtioNetworkDeviceNotificationError, VirtioNetworkMmioHandler, VirtioNetworkRxPacketSource,
     VirtioNetworkTxPacketSink,
 };
-use crate::serial::{SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialMmioDevice, SharedSerialOutputBuffer};
+use crate::serial::{SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialMmioDevice, SharedSerialOutput};
 use crate::vsock::{
     PreparedVsockDevice, PreparedVsockDeviceError, VirtioVsockDeviceNotificationDispatch,
     VirtioVsockDeviceNotificationError, VirtioVsockMmioHandler, VsockMmioDeviceRegistration,
@@ -60,7 +60,7 @@ pub struct Arm64BootSerialDeviceConfig {
     pub region_id: MmioRegionId,
     pub address: crate::memory::GuestAddress,
     pub interrupt_line: GuestInterruptLine,
-    pub output: SharedSerialOutputBuffer,
+    pub output: SharedSerialOutput,
 }
 
 impl Arm64BootSerialDeviceConfig {
@@ -68,7 +68,7 @@ impl Arm64BootSerialDeviceConfig {
         region_id: MmioRegionId,
         address: crate::memory::GuestAddress,
         interrupt_line: GuestInterruptLine,
-        output: SharedSerialOutputBuffer,
+        output: SharedSerialOutput,
     ) -> Self {
         Self {
             region_id,
@@ -570,7 +570,7 @@ pub struct Arm64BootVsockDevice {
 #[derive(Debug, Clone)]
 pub struct Arm64BootSerialDevice {
     pub region: MmioRegion,
-    pub output: SharedSerialOutputBuffer,
+    pub output: SharedSerialOutput,
     pub fdt_device: Arm64FdtSerialDevice,
 }
 
@@ -1355,7 +1355,7 @@ mod tests {
     };
     use crate::serial::{
         SERIAL_MMIO_DEVICE_WINDOW_SIZE, SERIAL_TRANSMIT_REGISTER_OFFSET, SerialMmioDevice,
-        SharedSerialOutputBuffer,
+        SerialOutputFile, SharedSerialOutput, SharedSerialOutputBuffer,
     };
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
@@ -1636,7 +1636,12 @@ mod tests {
     ) -> (Arm64BootSerialDeviceConfig, SharedSerialOutputBuffer) {
         let output = SharedSerialOutputBuffer::default();
         (
-            Arm64BootSerialDeviceConfig::new(region_id, address, interrupt_line, output.clone()),
+            Arm64BootSerialDeviceConfig::new(
+                region_id,
+                address,
+                interrupt_line,
+                SharedSerialOutput::from(output.clone()),
+            ),
             output,
         )
     }
@@ -3235,6 +3240,40 @@ mod tests {
             .find("/uart@40002000")
             .expect("serial node should be in assembled FDT");
         assert_eq!(serial_node.prop_str("compatible").unwrap(), "ns16550a");
+    }
+
+    #[test]
+    fn serial_mmio_can_write_to_file_output_sink() {
+        let kernel = temp_file("kernel-with-serial-file", &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+        let serial_output = temp_file("serial-file-output", b"");
+        let file_output =
+            SerialOutputFile::open(serial_output.path()).expect("serial output file should open");
+        let serial = Arm64BootSerialDeviceConfig::new(
+            MmioRegionId::new(9),
+            TEST_SERIAL_MMIO_BASE,
+            line(32),
+            SharedSerialOutput::new(file_output),
+        );
+        let config = Arm64BootResourceConfig {
+            serial_device: Some(serial),
+            ..valid_config(&[])
+        };
+        let mut resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("boot resources should assemble with serial file output");
+
+        write_serial_byte(
+            &mut resources,
+            TEST_SERIAL_MMIO_BASE
+                .checked_add(SERIAL_TRANSMIT_REGISTER_OFFSET)
+                .expect("serial TX address should not overflow"),
+            b'F',
+        );
+
+        assert_eq!(
+            fs::read(serial_output.path()).expect("serial output should read"),
+            b"F"
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@ use bangbang_runtime::interrupt::{
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
 use bangbang_runtime::mmio::{MmioDispatcher, MmioRegionId};
 use bangbang_runtime::network::NetworkMmioLayout;
-use bangbang_runtime::serial::SharedSerialOutputBuffer;
+use bangbang_runtime::serial::SharedSerialOutput;
 use bangbang_runtime::startup::{
     Arm64BootBlockNotificationDispatch, Arm64BootBlockNotificationDispatchError,
     Arm64BootBlockNotificationDispatches, Arm64BootNetworkNotificationDispatch,
@@ -73,15 +73,11 @@ impl HvfArm64BootSessionConfig {
 pub struct HvfArm64BootSerialDeviceConfig {
     pub region_id: MmioRegionId,
     pub address: GuestAddress,
-    pub output: SharedSerialOutputBuffer,
+    pub output: SharedSerialOutput,
 }
 
 impl HvfArm64BootSerialDeviceConfig {
-    pub fn new(
-        region_id: MmioRegionId,
-        address: GuestAddress,
-        output: SharedSerialOutputBuffer,
-    ) -> Self {
+    pub fn new(region_id: MmioRegionId, address: GuestAddress, output: SharedSerialOutput) -> Self {
         Self {
             region_id,
             address,
@@ -2057,7 +2053,7 @@ mod tests {
         VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame,
         VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
     };
-    use bangbang_runtime::serial::SharedSerialOutputBuffer;
+    use bangbang_runtime::serial::{SharedSerialOutput, SharedSerialOutputBuffer};
     use bangbang_runtime::startup::{
         Arm64BootBlockNotificationDispatches, Arm64BootNetworkNotificationDispatches,
         Arm64BootNetworkNotificationOutcome, Arm64BootNetworkPacketIo,
@@ -5372,7 +5368,7 @@ mod tests {
         let serial = HvfArm64BootSerialDeviceConfig::new(
             MmioRegionId::new(7),
             GuestAddress::new(0x4000_0000),
-            SharedSerialOutputBuffer::default(),
+            SharedSerialOutput::from(SharedSerialOutputBuffer::default()),
         );
 
         let network_layout =
