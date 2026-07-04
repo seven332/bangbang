@@ -251,7 +251,7 @@ compatibility targets.
 | `GET`, `PATCH` | `/balloon/statistics` | recognized; rejected | Returns a balloon-specific unsupported fault. Real statistics polling and guest-reported memory accounting need a dedicated design. |
 | `PATCH` | `/balloon/hinting/start`, `/balloon/hinting/stop` | recognized; rejected | Returns a balloon-specific unsupported fault. Real free-page hinting and reporting need a dedicated design. |
 | `GET` | `/balloon/hinting/status` | recognized; rejected | Returns a balloon-specific unsupported fault. Real free-page hinting state tracking needs a dedicated design. |
-| `PUT`, `PATCH` | `/pmem/{id}` | deferred | Requires a separate pmem device design. |
+| `PUT`, `PATCH` | `/pmem/{id}` | recognized; rejected | Returns a pmem-specific unsupported fault. Real pmem device configuration, guest attachment, rate limiting, and runtime update behavior need a dedicated device design. |
 | `PUT` | `/entropy` | recognized; rejected | Returns an entropy-specific unsupported fault. Real virtio-rng configuration storage, rate limiting, guest randomness wiring, and startup resource attachment need a dedicated device design. |
 | `PUT` | `/serial` | recognized; rejected | Returns a serial-specific unsupported fault. Public serial configuration storage, host output redirection, rate limiting, and integration with the existing internal serial capture path need a dedicated design. |
 | `GET`, `PUT`, `PATCH` | `/hotplug/memory` | recognized; rejected | Returns a memory-hotplug-specific unsupported fault. Real virtio-mem device support, guest memory accounting, and runtime memory update behavior need a dedicated design. |
