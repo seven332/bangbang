@@ -521,9 +521,10 @@ fn help_text() -> String {
             "PUT /network-interfaces/{{iface_id}}, pre-boot PUT /vsock, ",
             "pre-boot PUT /metrics and startup metrics output configuration, ",
             "and pre-boot PUT /logger and startup logger configuration with ",
-            "minimal action logs; PUT /actions starts a process-owned HVF boot run-loop ",
-            "worker across bounded step windows for InstanceStart, but public ",
-            "run-loop control is not implemented yet."
+            "minimal action logs; PATCH /vm parses Paused and Resumed state requests ",
+            "as unsupported lifecycle actions; PUT /actions starts a process-owned ",
+            "HVF boot run-loop worker across bounded step windows for InstanceStart, ",
+            "but public run-loop control is not implemented yet."
         ),
         env!("CARGO_PKG_VERSION"),
         DEFAULT_API_SOCK_PATH,
@@ -802,6 +803,7 @@ mod tests {
         assert!(help.contains("startup metrics output configuration"));
         assert!(help.contains("pre-boot PUT /logger and startup logger configuration"));
         assert!(help.contains("minimal action logs"));
+        assert!(help.contains("PATCH /vm parses Paused and Resumed state requests"));
         assert!(help.contains("--log-path <PATH>"));
         assert!(help.contains("--metrics-path <PATH>"));
         assert!(help.contains("--http-api-max-payload-size <BYTES>"));

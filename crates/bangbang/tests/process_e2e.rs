@@ -141,6 +141,21 @@ fn executable_configures_vm_before_start() {
         !vm_config.contains(&format!(r#""path_on_host":{replaced_rootfs_path_json}"#)),
         "failed PATCH /drives/rootfs must not mutate drive path; response:\n{vm_config}"
     );
+
+    let vm_state_response = http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#);
+    assert_bad_request_response(&vm_state_response, "PATCH /vm");
+    assert_response_contains(
+        &vm_state_response,
+        r#"{"fault_message":"The requested operation is not supported in Not started state: Pause"}"#,
+        "PATCH /vm",
+    );
+    let instance_info_after_vm_state_patch = http_get(&socket_path, "/");
+    assert_response_contains(
+        &instance_info_after_vm_state_patch,
+        r#""state":"Not started""#,
+        "GET / after failed PATCH /vm",
+    );
+
     assert_response_contains(&vm_config, r#""is_root_device":true"#, "GET /vm/config");
     assert_response_contains(&vm_config, r#""is_read_only":true"#, "GET /vm/config");
     assert_response_contains(&vm_config, r#""partuuid":"0eaa91a0-01""#, "GET /vm/config");
