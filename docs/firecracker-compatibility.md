@@ -1151,8 +1151,9 @@ The implemented `GET /version` path flows through the minimal VMM action model
 as `GetVmmVersion` and returns VMM version data. The implemented `GET /` path
 flows through the same boundary as `GetVmInstanceInfo` and returns
 Firecracker-shaped instance information. Parsed `/machine-config` requests
-flow through `GetMachineConfig` and `PutMachineConfig` and read or replace
-stored machine configuration state. `GET /vm/config` flows through
+flow through `GetMachineConfig`, `PutMachineConfig`, and `PatchMachineConfig`
+and read, replace, or partially update stored machine configuration state.
+`GET /vm/config` flows through
 `GetVmConfig` and returns the supported accumulated configuration subset:
 `machine-config`, `boot-source` when configured, the `drives` array, and the
 `network-interfaces` array, plus `vsock` when configured.
