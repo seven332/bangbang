@@ -393,6 +393,7 @@ mod macos_arm64 {
         let config_path = test_dir.path().join("vm-config.json");
         let backing_path = test_dir.path().join("data.img");
         let logger_path = test_dir.path().join("logger.out");
+        let uds_path = test_dir.path().join("no-api-config-file-vsock.sock");
         let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
         let initrd_path = env_path(BANGBANG_GUEST_INITRD_PATH_ENV);
         let instance_id = test_dir.instance_id();
@@ -404,6 +405,7 @@ mod macos_arm64 {
         let boot_args_json = json_string(GUEST_BOOT_ARGS);
         let backing_path_json = json_string(path_text(&backing_path));
         let logger_path_json = json_string(path_text(&logger_path));
+        let uds_path_json = json_string(path_text(&uds_path));
         let config = format!(
             r#"{{
                 "machine-config": {{"vcpu_count": 1, "mem_size_mib": 256}},
@@ -418,6 +420,7 @@ mod macos_arm64 {
                     "is_root_device": false,
                     "is_read_only": false
                 }}],
+                "vsock": {{"guest_cid": 3, "uds_path": {uds_path_json}}},
                 "logger": {{"log_path": {logger_path_json}}}
             }}"#
         );
@@ -433,6 +436,12 @@ mod macos_arm64 {
             !socket_path.exists(),
             "no-api config-file startup must not publish an API socket"
         );
+        UnixStream::connect(&uds_path).unwrap_or_else(|err| {
+            panic!(
+                "no-api config-file startup should bind the configured vsock listener at {}: {err}",
+                uds_path.display()
+            )
+        });
 
         if let Err(err) =
             wait_for_file_prefix_marker(&backing_path, BLOCK_WRITE_MARKER, GUEST_EXECUTION_TIMEOUT)
@@ -449,6 +458,10 @@ mod macos_arm64 {
             bangbang.terminate(),
             &socket_path,
             "bangbang no-api config file",
+        );
+        assert!(
+            !uds_path.exists(),
+            "bangbang no-api config-file shutdown should remove its owned vsock listener path"
         );
     }
 
