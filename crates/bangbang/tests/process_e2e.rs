@@ -9,6 +9,9 @@
 
 mod support;
 
+use std::fs;
+use std::os::unix::fs::MetadataExt;
+
 use support::{
     BangbangProcess, TestDir, assert_clean_shutdown, assert_no_content_response,
     assert_ok_response, assert_response_contains, http_get, http_put_json, json_string, path_text,
@@ -122,6 +125,49 @@ fn executable_configures_vm_before_start() {
     assert_response_contains(&vm_config, r#""partuuid":"0eaa91a0-01""#, "GET /vm/config");
 
     assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
+fn executable_fails_when_api_socket_path_exists_without_removing_it() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let instance_id = test_dir.instance_id();
+    fs::write(&socket_path, "existing file").expect("fixture file should be written");
+    let original_metadata =
+        fs::symlink_metadata(&socket_path).expect("existing file metadata should be readable");
+
+    let output = BangbangProcess::start_expect_failure(&socket_path, &instance_id);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "existing API socket path should fail with process failure; stdout:\n{}\nstderr:\n{}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        output
+            .stderr
+            .contains("API server error: API socket path already exists"),
+        "stderr should explain the API socket bind failure; stderr:\n{}",
+        output.stderr
+    );
+    assert!(
+        !output.stdout.contains("status: API server listening"),
+        "failed startup must not report API readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert_eq!(
+        fs::read_to_string(&socket_path).expect("existing file should remain readable"),
+        "existing file"
+    );
+    let current_metadata =
+        fs::symlink_metadata(&socket_path).expect("existing file metadata should remain readable");
+    assert_eq!(
+        (current_metadata.dev(), current_metadata.ino()),
+        (original_metadata.dev(), original_metadata.ino()),
+        "failed startup must not replace the existing API socket path"
+    );
 }
 
 #[test]
