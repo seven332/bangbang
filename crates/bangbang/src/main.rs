@@ -33,7 +33,6 @@ const UNSUPPORTED_FIRECRACKER_ARGS: &[&str] = &[
     "describe-snapshot",
     "enable-pci",
     "metadata",
-    "mmds-size-limit",
     "no-api",
     "no-seccomp",
     "parent-cpu-time-us",
@@ -67,11 +66,13 @@ fn run() -> Result<(), ProcessError> {
             return Ok(());
         }
         Command::Run(config) => {
+            let effective_mmds_size_limit = config.effective_mmds_size_limit();
             let StartupConfig {
                 api_sock,
                 http_api_max_payload_size,
                 id,
                 logger_config,
+                mmds_size_limit: _,
                 metrics_config,
             } = config;
 
@@ -81,7 +82,12 @@ fn run() -> Result<(), ProcessError> {
                 HvfBackend::is_supported_target()
             );
 
-            let mut vmm = ProcessVmm::new(id, env!("CARGO_PKG_VERSION"), APP_NAME);
+            let mut vmm = ProcessVmm::new(
+                id,
+                env!("CARGO_PKG_VERSION"),
+                APP_NAME,
+                effective_mmds_size_limit,
+            );
             apply_startup_metrics_config(&mut vmm, metrics_config)?;
             apply_startup_logger_config(&mut vmm, logger_config)?;
             let mut shutdown_signal = ShutdownSignal::install()?;
@@ -263,6 +269,7 @@ struct StartupConfig {
     http_api_max_payload_size: usize,
     id: String,
     logger_config: Option<LoggerConfigInput>,
+    mmds_size_limit: Option<usize>,
     metrics_config: Option<MetricsConfigInput>,
 }
 
@@ -273,8 +280,16 @@ impl Default for StartupConfig {
             http_api_max_payload_size: HTTP_MAX_PAYLOAD_SIZE,
             id: DEFAULT_INSTANCE_ID.to_string(),
             logger_config: None,
+            mmds_size_limit: None,
             metrics_config: None,
         }
+    }
+}
+
+impl StartupConfig {
+    fn effective_mmds_size_limit(&self) -> usize {
+        self.mmds_size_limit
+            .unwrap_or(self.http_api_max_payload_size)
     }
 }
 
@@ -331,6 +346,7 @@ impl Args {
         let mut logger_config_seen = false;
         let mut log_path_seen = false;
         let mut level_seen = false;
+        let mut mmds_size_limit_seen = false;
         let mut metrics_path_seen = false;
         let mut module_seen = false;
         let mut show_level_seen = false;
@@ -389,6 +405,15 @@ impl Args {
                     logger_config = logger_config.with_level(level);
                     logger_config_seen = true;
                     level_seen = true;
+                    index += 2;
+                }
+                "--mmds-size-limit" => {
+                    if mmds_size_limit_seen {
+                        return Err("duplicate argument: --mmds-size-limit".to_string());
+                    }
+                    let value = take_value(&args, index, "--mmds-size-limit")?;
+                    config.mmds_size_limit = Some(parse_mmds_size_limit(&value)?);
+                    mmds_size_limit_seen = true;
                     index += 2;
                 }
                 "--metrics-path" => {
@@ -482,6 +507,8 @@ fn help_text() -> String {
             "      --log-path <PATH>  Logger output file or FIFO path\n",
             "      --level <LEVEL>    Logger level: Off, Trace, Debug, Info, Warn, or Error\n",
             "      --metrics-path <PATH>  Metrics output file or FIFO path\n",
+            "      --mmds-size-limit <BYTES>\n",
+            "                         MMDS data store size; defaults to HTTP API limit\n",
             "      --module <MODULE>  Logger module filter stored for future log integration\n",
             "      --show-level       Include level in minimal logger action lines\n",
             "      --show-log-origin  Include callsite origin in minimal logger action lines\n",
@@ -525,17 +552,23 @@ fn validate_api_sock(api_sock: &str) -> Result<(), String> {
 }
 
 fn parse_http_api_max_payload_size(value: &str) -> Result<usize, String> {
-    let max_payload_size = value.parse::<usize>().map_err(|_| {
-        "invalid --http-api-max-payload-size: value must be a positive integer".to_string()
-    })?;
+    parse_positive_usize_arg(value, "http-api-max-payload-size")
+}
 
-    if max_payload_size == 0 {
-        return Err(
-            "invalid --http-api-max-payload-size: value must be greater than 0".to_string(),
-        );
+fn parse_mmds_size_limit(value: &str) -> Result<usize, String> {
+    parse_positive_usize_arg(value, "mmds-size-limit")
+}
+
+fn parse_positive_usize_arg(value: &str, name: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid --{name}: value must be a positive integer"))?;
+
+    if parsed == 0 {
+        return Err(format!("invalid --{name}: value must be greater than 0"));
     }
 
-    Ok(max_payload_size)
+    Ok(parsed)
 }
 
 fn validate_instance_id(id: &str) -> Result<(), String> {
@@ -582,6 +615,7 @@ fn unsupported_equals_syntax(arg: &str) -> Option<&'static str> {
         ("--log-path=", "log-path"),
         ("--level=", "level"),
         ("--metrics-path=", "metrics-path"),
+        ("--mmds-size-limit=", "mmds-size-limit"),
         ("--module=", "module"),
     ]
     .into_iter()
@@ -740,6 +774,8 @@ mod tests {
 
         assert_eq!(config.api_sock, DEFAULT_API_SOCK_PATH);
         assert_eq!(config.http_api_max_payload_size, HTTP_MAX_PAYLOAD_SIZE);
+        assert_eq!(config.mmds_size_limit, None);
+        assert_eq!(config.effective_mmds_size_limit(), HTTP_MAX_PAYLOAD_SIZE);
         assert_eq!(config.id, DEFAULT_INSTANCE_ID);
         assert_eq!(config.logger_config, None);
         assert_eq!(config.metrics_config, None);
@@ -769,6 +805,7 @@ mod tests {
         assert!(help.contains("--log-path <PATH>"));
         assert!(help.contains("--metrics-path <PATH>"));
         assert!(help.contains("--http-api-max-payload-size <BYTES>"));
+        assert!(help.contains("--mmds-size-limit <BYTES>"));
         assert!(help.contains("--show-level"));
         assert!(help.contains("PUT /actions starts a process-owned HVF boot run-loop worker"));
         assert!(help.contains("across bounded step windows for InstanceStart"));
@@ -831,6 +868,39 @@ mod tests {
     }
 
     #[test]
+    fn parse_mmds_size_limit_arg() {
+        let config =
+            parse_run(&["--mmds-size-limit", "65536"]).expect("MMDS size limit should parse");
+
+        assert_eq!(config.mmds_size_limit, Some(65_536));
+        assert_eq!(config.effective_mmds_size_limit(), 65_536);
+    }
+
+    #[test]
+    fn mmds_size_limit_inherits_http_api_max_payload_size_when_omitted() {
+        let config = parse_run(&["--http-api-max-payload-size", "65536"])
+            .expect("HTTP payload size should parse");
+
+        assert_eq!(config.mmds_size_limit, None);
+        assert_eq!(config.effective_mmds_size_limit(), 65_536);
+    }
+
+    #[test]
+    fn explicit_mmds_size_limit_overrides_http_api_max_payload_size() {
+        let config = parse_run(&[
+            "--http-api-max-payload-size",
+            "65536",
+            "--mmds-size-limit",
+            "4096",
+        ])
+        .expect("MMDS size limit should parse");
+
+        assert_eq!(config.http_api_max_payload_size, 65_536);
+        assert_eq!(config.mmds_size_limit, Some(4096));
+        assert_eq!(config.effective_mmds_size_limit(), 4096);
+    }
+
+    #[test]
     fn parse_id_arg() {
         let config = parse_run(&["--id", "demo-1"]).expect("id arg should parse");
 
@@ -888,6 +958,8 @@ mod tests {
             "demo-1",
             "--http-api-max-payload-size",
             "65536",
+            "--mmds-size-limit",
+            "4096",
             "--metrics-path",
             "/tmp/bangbang.metrics",
         ])
@@ -895,6 +967,7 @@ mod tests {
 
         assert_eq!(config.api_sock, "/tmp/custom.socket");
         assert_eq!(config.http_api_max_payload_size, 65_536);
+        assert_eq!(config.mmds_size_limit, Some(4096));
         assert_eq!(config.id, "demo-1");
         assert_eq!(config.logger_config, None);
         assert_eq!(
@@ -923,6 +996,13 @@ mod tests {
             .expect_err("missing payload size value should fail");
 
         assert_eq!(err, "missing value for --http-api-max-payload-size");
+    }
+
+    #[test]
+    fn rejects_missing_mmds_size_limit_value() {
+        let err = parse(&["--mmds-size-limit", "--id"]).expect_err("missing MMDS size should fail");
+
+        assert_eq!(err, "missing value for --mmds-size-limit");
     }
 
     #[test]
@@ -972,6 +1052,14 @@ mod tests {
     }
 
     #[test]
+    fn rejects_duplicate_mmds_size_limit() {
+        let err = parse(&["--mmds-size-limit", "65536", "--mmds-size-limit", "65537"])
+            .expect_err("duplicate MMDS size should fail");
+
+        assert_eq!(err, "duplicate argument: --mmds-size-limit");
+    }
+
+    #[test]
     fn rejects_duplicate_id() {
         let err = parse(&["--id", "one", "--id", "two"]).expect_err("duplicate id should fail");
 
@@ -1005,6 +1093,32 @@ mod tests {
         assert_eq!(
             err,
             "invalid --http-api-max-payload-size: value must be a positive integer"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_mmds_size_limit() {
+        let err = parse(&["--mmds-size-limit", "0"]).expect_err("zero MMDS size should fail");
+
+        assert_eq!(
+            err,
+            "invalid --mmds-size-limit: value must be greater than 0"
+        );
+
+        let err =
+            parse(&["--mmds-size-limit", "abc"]).expect_err("non-numeric MMDS size should fail");
+
+        assert_eq!(
+            err,
+            "invalid --mmds-size-limit: value must be a positive integer"
+        );
+
+        let err = parse(&["--mmds-size-limit", "999999999999999999999999999999"])
+            .expect_err("overflowing MMDS size should fail");
+
+        assert_eq!(
+            err,
+            "invalid --mmds-size-limit: value must be a positive integer"
         );
     }
 
@@ -1196,6 +1310,13 @@ mod tests {
         assert_eq!(
             err,
             "unsupported argument syntax for --metrics-path; use --metrics-path <VALUE>"
+        );
+
+        let err = parse(&["--mmds-size-limit=65536"]).expect_err("equals syntax should fail");
+
+        assert_eq!(
+            err,
+            "unsupported argument syntax for --mmds-size-limit; use --mmds-size-limit <VALUE>"
         );
     }
 

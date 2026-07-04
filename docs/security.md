@@ -190,7 +190,8 @@ MMDS control-plane contents are process-local in-memory JSON state configured
 through the unauthenticated local API socket. Treat metadata as sensitive host
 control-plane data: any process that can use the API socket can read, replace,
 or patch it. The current implementation bounds the serialized MMDS data store
-to `51200` bytes, can format initialized metadata by path as JSON or
+to the effective `--mmds-size-limit` value, inherited from the HTTP API payload
+limit when omitted, can format initialized metadata by path as JSON or
 Firecracker-shaped IMDS text, and can model process-local guest GET response
 status/content-type/body values, parse complete process-local guest HTTP `GET`
 request bytes, map parse failures to deterministic process-local error

@@ -38,6 +38,9 @@ cargo run -p bangbang -- --api-sock /tmp/bangbang.socket --id demo-1
   `anonymous-instance`.
 - `--metrics-path <PATH>` configures the same per-process metrics sink as
   `PUT /metrics` before the API socket is served.
+- `--mmds-size-limit <BYTES>` sets the maximum serialized MMDS data-store size.
+  When omitted, it inherits the HTTP API request-size limit, which defaults to
+  `51200` bytes.
 - `--log-path <PATH>`, `--level <LEVEL>`, `--module <MODULE>`,
   `--show-level`, and `--show-log-origin` configure the same per-process
   logger state as `PUT /logger` before the API socket is served.

@@ -123,10 +123,11 @@ public run-loop control.
 | `--module <MODULE>` | stored for future logger filtering | Matches the stored `PUT /logger` field but does not filter the current minimal action logs yet. |
 | `--show-level` | enables level prefix for minimal action logs | Writes `level=Info` before minimal `InstanceStart` and `FlushMetrics` action lines. |
 | `--show-log-origin` | enables origin field for minimal action logs | Writes `origin=<file>:<line>` before minimal `InstanceStart` and `FlushMetrics` action names. Full Firecracker logger integration remains deferred. |
+| `--mmds-size-limit <BYTES>` | configures the maximum serialized MMDS data-store size | When omitted, follows the effective HTTP API payload limit like Firecracker; with default HTTP settings this is `51200` bytes. Zero, malformed, duplicate, and equals-syntax values are rejected during argument parsing. |
 | `--help`, `-h` | prints help | Help describes the current API socket scope. |
 | `--version`, `-V` | prints version | `-V` is retained from the existing bangbang scaffold. |
 | `--config-file`, `--no-api` | rejected | Deferred until VM configuration models and no-API startup behavior exist. |
-| seccomp, snapshot, MMDS, boot timer, and PCI process flags | rejected | These Firecracker options are Linux-specific or tied to later capability work. |
+| seccomp, snapshot, metadata, boot timer, and PCI process flags | rejected | These Firecracker options are Linux-specific or tied to later capability work. |
 
 bangbang intentionally treats `--id` alphanumeric characters as ASCII only.
 This is stricter than Firecracker `v1.16.0`'s Rust validator, which accepts
@@ -1232,9 +1233,10 @@ shape.
 The initial API implementation uses Firecracker's default `51200` byte HTTP
 request payload limit unless `--http-api-max-payload-size <BYTES>` configures a
 different per-process API socket request limit.
-The MMDS data store also uses Firecracker's default fixed `51200` byte
-serialized JSON limit for now; `--mmds-size-limit` remains rejected until a
-separate configuration PR adds it.
+The MMDS data store uses the effective `--mmds-size-limit <BYTES>` value as its
+serialized JSON limit. When that argument is omitted, the limit follows the
+effective HTTP API payload limit like Firecracker; with default HTTP settings
+this remains `51200` bytes.
 Internal MMDS guest GET response modeling checks the configured MMDS v2 token
 requirement before reading metadata. Once a request is permitted to read
 metadata, it follows the same uninitialized data policy: before `PUT /mmds`, it
