@@ -38,6 +38,7 @@ pub enum ApiRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestError {
     CpuConfigUnsupported,
+    EntropyUnsupported,
     GetRequestBody,
     InvalidPathMethod,
     MismatchedDriveId,
@@ -52,6 +53,7 @@ impl RequestError {
     pub fn fault_message(&self) -> &'static str {
         match self {
             Self::CpuConfigUnsupported => "CPU config is not supported.",
+            Self::EntropyUnsupported => "Entropy device is not supported.",
             Self::GetRequestBody => "GET request cannot have a body.",
             Self::InvalidPathMethod => "Invalid request method and/or path.",
             Self::MismatchedDriveId => "path drive_id must match body drive_id.",
@@ -1137,6 +1139,9 @@ pub fn parse_request_with_limit(
     }
     if method == "PUT" && path == "/cpu-config" {
         return Err(RequestError::CpuConfigUnsupported);
+    }
+    if method == "PUT" && path == "/entropy" {
+        return Err(RequestError::EntropyUnsupported);
     }
     if method == "PUT" && path == "/logger" {
         return parse_logger_config_request(body);
@@ -3390,6 +3395,40 @@ mod tests {
     #[test]
     fn rejects_non_exact_cpu_config_path_as_invalid_path_method() {
         let request = request_with_body("PUT", "/cpu-config/extra", "{}");
+
+        assert_eq!(
+            parse_request(&request),
+            Err(RequestError::InvalidPathMethod)
+        );
+    }
+
+    #[test]
+    fn rejects_entropy_as_unsupported() {
+        let request = request_with_body("PUT", "/entropy", "{}");
+
+        let err = parse_request(&request).expect_err("entropy should be unsupported");
+        assert_eq!(err, RequestError::EntropyUnsupported);
+        assert_eq!(err.fault_message(), "Entropy device is not supported.");
+    }
+
+    #[test]
+    fn rejects_entropy_as_unsupported_without_parsing_body() {
+        let malformed_body = request_with_body("PUT", "/entropy", "not-json");
+        let empty_body = b"PUT /entropy HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n";
+
+        assert_eq!(
+            parse_request(&malformed_body),
+            Err(RequestError::EntropyUnsupported)
+        );
+        assert_eq!(
+            parse_request(empty_body),
+            Err(RequestError::EntropyUnsupported)
+        );
+    }
+
+    #[test]
+    fn rejects_non_exact_entropy_path_as_invalid_path_method() {
+        let request = request_with_body("PUT", "/entropy/extra", "{}");
 
         assert_eq!(
             parse_request(&request),

@@ -252,7 +252,8 @@ compatibility targets.
 | `PATCH` | `/balloon/hinting/start`, `/balloon/hinting/stop` | deferred | Requires balloon free-page hinting design. |
 | `GET` | `/balloon/hinting/status` | deferred | Requires balloon free-page hinting design. |
 | `PUT`, `PATCH` | `/pmem/{id}` | deferred | Requires a separate pmem device design. |
-| `PUT` | `/entropy`, `/serial` | deferred | Requires separate device and macOS/HVF design work. |
+| `PUT` | `/entropy` | recognized; rejected | Returns an entropy-specific unsupported fault. Real virtio-rng configuration storage, rate limiting, guest randomness wiring, and startup resource attachment need a dedicated device design. |
+| `PUT` | `/serial` | deferred | Requires separate serial customization and macOS/HVF design work. |
 | `GET`, `PUT`, `PATCH` | `/hotplug/memory` | deferred | Requires memory hotplug device and runtime update design. |
 | `PATCH` | `/vm` | deferred | Pause and resume state rules need future VMM action and run-loop control design. |
 | `PATCH` | `/drives/{drive_id}`, `/network-interfaces/{iface_id}` | deferred | Hotplug and runtime update behavior belongs with the relevant device issues. |
