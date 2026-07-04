@@ -35,11 +35,11 @@ must leave the new test passing in the documented command set.
 
 Use process-level executable tests when the behavior depends on the real
 `bangbang` binary, process arguments, Unix-socket publication, signal handling,
-or process-owned cleanup but does not enter HVF. These tests live under
-`crates/bangbang/tests/` and run in the normal unsigned workspace test command.
-They should start `env!("CARGO_BIN_EXE_bangbang")`, use unique temporary
-resources, wait on explicit process or socket readiness signals, and shut the
-child down with normal signals when testing owned cleanup.
+HTTP-over-socket API mutation, or process-owned cleanup but does not enter HVF.
+These tests live under `crates/bangbang/tests/` and run in the normal unsigned
+workspace test command. They should start `env!("CARGO_BIN_EXE_bangbang")`, use
+unique temporary resources, wait on explicit process or socket readiness
+signals, and shut the child down with normal signals when testing owned cleanup.
 
 Use HVF integration tests for behavior that creates HVF VMs, vCPUs, GIC state,
 mapped guest memory, signed test binaries, or guest boot execution. These tests
