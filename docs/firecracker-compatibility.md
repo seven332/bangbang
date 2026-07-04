@@ -294,7 +294,7 @@ exist.
 | `PUT /drives/{drive_id}` | `cache_type` | optional when `Unsafe`; supported when `Writeback` | The internal model accepts omitted/default `Unsafe` and explicit `Writeback`. `Unsafe` does not advertise `VIRTIO_BLK_F_FLUSH`; `Writeback` advertises it and routes guest flush requests through the backing flush path. |
 | `PUT /drives/{drive_id}` | `rate_limiter` | optional when absent or `null`; rejected when configured | The internal model rejects configured rate limiters with `drive rate_limiter is not supported`; non-null rate limiting needs future block I/O performance work. |
 | `PUT /drives/{drive_id}` | `io_engine` | optional when `Sync`; rejected when `Async` | The internal model accepts omitted/default `Sync` and rejects `Async`; `Async` is tied to Linux io_uring and does not directly map to the first macOS target. |
-| `PUT /drives/{drive_id}` | `socket` | optional when absent or `null`; deferred when set | The internal model rejects configured sockets; vhost-user-block is outside the first tier. |
+| `PUT /drives/{drive_id}` | `socket` | optional when absent or `null`; rejected when configured | The internal model rejects configured sockets with `drive socket is not supported`; vhost-user-block is outside the first tier. |
 | `PUT /drives/{drive_id}` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /network-interfaces/{iface_id}` | path `iface_id` | required | The API parser captures this value, and the internal model validates it as nonempty alphanumeric or `_`, matching Firecracker's `checked_id` rule. |
 | `PUT /network-interfaces/{iface_id}` | body `iface_id` | required | The API parser rejects requests where this does not match the path `iface_id`. |
