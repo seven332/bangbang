@@ -2305,6 +2305,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_patch_machine_config_treating_null_fields_as_omitted() {
+        let body = r#"{
+            "vcpu_count": 2,
+            "smt": null,
+            "cpu_template": null
+        }"#;
+        let request = request_with_body("PATCH", "/machine-config", body);
+
+        let parsed = parse_request(&request).expect("machine-config patch nulls should parse");
+
+        let ApiRequest::PatchMachineConfig(config) = parsed else {
+            panic!("expected machine-config patch request");
+        };
+        assert_eq!(config.vcpu_count(), Some(2));
+        assert_eq!(config.smt(), None);
+        assert_eq!(config.cpu_template(), None);
+    }
+
+    #[test]
     fn rejects_patch_machine_config_empty_body() {
         for body in [r#"{}"#, r#"{"smt":null}"#] {
             assert_eq!(
