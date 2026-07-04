@@ -58,7 +58,7 @@ configured interface ID, boot block, virtio-net, and virtio-vsock queue
 interrupt signaling,
 virtual timer PPI assertion, per-controller metrics and logger output state, and an initial process startup argument model.
 There is no broader API request body model beyond the initial boot-source,
-drive configuration, drive update, network-interface configuration, vsock configuration, machine-configuration, metrics, logger, and actions bodies, public guest
+drive configuration, drive update, network-interface configuration, vsock configuration, machine-configuration, metrics, logger, serial, and actions bodies, public guest
 execution beyond internal startup execution across bounded step windows, public run-loop control, complete interrupt
 delivery, including timer EOI/deactivation-driven unmasking,
 general HVF runner-loop notification scheduling, public serial output streaming,
@@ -92,12 +92,12 @@ socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
 `GET /machine-config`, pre-boot `PUT /machine-config`, pre-boot
 `PUT /boot-source`, pre-boot `PUT /drives/{drive_id}`, pre-boot
 `PUT /network-interfaces/{iface_id}`, pre-boot `PUT /vsock`, pre-boot
-`PUT /metrics`, pre-boot `PUT /logger`, parsed `PUT /actions`, parsed
+`PUT /metrics`, pre-boot `PUT /logger`, pre-boot `PUT /serial`, parsed `PUT /actions`, parsed
 `PATCH /vm`, and recognized `PATCH /drives/{drive_id}` requests already map through a minimal internal VMM
 action/data boundary. Validation rejects malformed boot-source, drive update,
 VM state update, and actions requests before VMM state mutation.
-Successful `InstanceStart` startup, the `Running` transition, and an internal boot run-loop worker across bounded step windows are implemented with an internal serial MMIO
-console capture path and retained internal active, terminal-outcome, or error worker status. `FlushMetrics` is implemented as a runtime-only minimal JSON-line flush through per-process metrics state, and includes a terse `boot_run_loop_status` summary when a process-owned boot worker exists. `PUT /logger` is implemented as pre-boot per-process observability configuration with minimal successful `InstanceStart` and `FlushMetrics` action-event output; public run-loop control, public serial
+Successful `InstanceStart` startup, the `Running` transition, and an internal boot run-loop worker across bounded step windows are implemented with configured or default internal serial MMIO
+output and retained internal active, terminal-outcome, or error worker status. `FlushMetrics` is implemented as a runtime-only minimal JSON-line flush through per-process metrics state, and includes a terse `boot_run_loop_status` summary when a process-owned boot worker exists. `PUT /logger` is implemented as pre-boot per-process observability configuration with minimal successful `InstanceStart` and `FlushMetrics` action-event output; public run-loop control, public serial
 streaming, full Firecracker metrics counters, periodic flush, and full logger integration remain deferred.
 
 ## Process Startup CLI
@@ -240,9 +240,10 @@ compatibility targets.
 | `PUT` | `/boot-source` | supported target; implemented | Stores guest kernel path, optional initrd path, and optional boot arguments before boot; host files are opened during startup preparation. |
 | `PUT` | `/drives/{drive_id}` | supported target; implemented | Stores initial virtio-block device configuration before boot; backing files are opened during startup preparation. |
 | `PUT` | `/metrics` | supported target; minimal subset implemented | Stores process metrics output before boot, opens the configured file/FIFO path with nonblocking output semantics, and omits metrics from `GET /vm/config` because it is not guest configuration. Duplicate initialization returns a fault. |
-| `PUT` | `/actions` | supported target; internal startup execution and minimal metrics flush implemented | Parses `InstanceStart` and `FlushMetrics` request bodies and routes them through the process VMM owner. `InstanceStart` validates stored boot-source and state preflight, prepares an owned HVF boot session with an internal serial MMIO console on success, starts a process-owned internal boot run-loop worker across bounded step windows, writes one minimal action log line when logger output is configured and enabled, and commits `Running` only after the worker handle and action log are retained. `FlushMetrics` is rejected before startup and returns `204 No Content` after startup; configured metrics output receives one minimal JSON line, configured logger output receives one minimal action log line when enabled, and unconfigured metrics/logger output is a no-op success. |
+| `PUT` | `/actions` | supported target; internal startup execution and minimal metrics flush implemented | Parses `InstanceStart` and `FlushMetrics` request bodies and routes them through the process VMM owner. `InstanceStart` validates stored boot-source and state preflight, prepares an owned HVF boot session with the configured serial output path or the default internal serial MMIO console on success, starts a process-owned internal boot run-loop worker across bounded step windows, writes one minimal action log line when logger output is configured and enabled, and commits `Running` only after the worker handle and action log are retained. `FlushMetrics` is rejected before startup and returns `204 No Content` after startup; configured metrics output receives one minimal JSON line, configured logger output receives one minimal action log line when enabled, and unconfigured metrics/logger output is a no-op success. |
 | `PUT` | `/actions` with `SendCtrlAltDel` | intentionally unsupported; parser rejected | Firecracker gates this action on x86 keyboard behavior; the first bangbang target is Apple Silicon. |
 | `PUT` | `/logger` | supported target; minimal subset implemented | Stores process logger configuration before boot, opens `log_path` with nonblocking output semantics when provided, accepts optional Firecracker-shaped level/show/module fields, and omits logger state from `GET /vm/config` because it is not guest configuration. Successful `InstanceStart` and `FlushMetrics` append deterministic `action=...` lines when the configured level allows `Info`; full internal log routing remains deferred. |
+| `PUT` | `/serial` | supported target; output path subset implemented | Stores Firecracker-shaped pre-boot serial output configuration with optional `serial_out_path`; `{}` and `"serial_out_path": null` clear the configured public output path. `InstanceStart` opens the configured file/FIFO path with nonblocking output semantics and routes guest TX serial MMIO bytes to it. Serial input/stdin, configured `rate_limiter`, metrics, and public streaming remain deferred. |
 | `PUT` | `/cpu-config` | recognized; aarch64 parser implemented; runtime rejected | Parses Firecracker aarch64 custom CPU template request bodies, including empty `{}`. Malformed JSON, unknown fields, x86-only fields, invalid numeric strings, and invalid bitmap strings return the normal malformed-request fault. Valid requests route to `PutCpuConfig`: pre-boot requests fail as an unsupported action, and post-start requests fail as unsupported state without mutating VM configuration. Real custom CPU template storage, static template behavior, CPU vendor/model checks, and HVF CPU feature wiring remain deferred. |
 | `PUT` | `/network-interfaces/{iface_id}` | supported target; configuration storage implemented | Stores up to 16 initial virtio-net configurations before boot without opening host networking resources. Startup preparation attaches configured interfaces as virtio-mmio devices in the MMIO dispatcher and guest FDT. `InstanceStart` revalidates the interface count before opening vmnet resources, then selects vmnet packet I/O only for `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>` host device names; unsupported names fail startup before `Running` is committed. Internal network notification dispatch can route each configured interface through selected packet I/O, parse TX descriptors through a packet sink boundary, and copy injected RX packets into guest buffers through a packet source boundary. Public packet movement, runtime updates, PATCH, and DELETE remain deferred to future virtio-net update work. |
 | `PUT` | `/vsock` | supported target; startup listener attachment, host stream accept, bounded accepted-stream `CONNECT` polling, host local port allocation/table ownership, pending host request packet modeling, guest `RESPONSE` acknowledgement, guest `RST` cleanup, full guest `SHUTDOWN` cleanup, bounded guest-visible `RST` queueing, bounded guest `REQUEST` connect handling, guest `RW` payload forwarding with bounded guest-to-host retry buffering, bounded four-packet per-connection host-to-guest `RW` backlog and delivery, minimal guest credit control packet handling, RX/TX notification dispatch, and event notification no-op handling implemented | Stores one initial virtio-vsock configuration before boot without opening host resources during the API request. Startup preparation binds a nonblocking host Unix listener at `uds_path`, keeps ownership in the internal vsock device resource, and removes the path on shutdown only when it still refers to the created socket. Startup also attaches the configured device as one virtio-mmio FDT node backed by the internal MMIO handler, which retains active RX, TX, and event queue metadata after `DRIVER_OK`. The runtime has a Firecracker-shaped packet header model, internal TX descriptor packet parser, TX available-ring drain helper that publishes zero-length TX used-ring completions, a host socket accept helper that returns one owned nonblocking stream per dispatch pass, bounded accepted-stream retention across partial handshakes and retained connection records, an accepted-stream `CONNECT <PORT>` handshake reader, host local port allocator, and host connection table model that retains accepted streams under Firecracker-shaped host-initiated connection keys and exposes a one-shot `VSOCK_OP_REQUEST` packet header for the guest-facing connection request. The RX dispatch path can select pending reset packets before guest responses and host requests, deliver packet headers into writable guest RX descriptors, and publish used-ring completions while preserving pending packets on malformed buffers or used-ring failures. Runtime dispatch also retries RX delivery when host requests, guest responses, reset packets, credit updates, or host-to-guest `RW` payloads are pending, so a host `CONNECT`, guest `REQUEST`, host stream payload, guest credit request, or guest TX reset candidate arriving after an earlier RX queue notification can still be delivered without a second guest RX notification. The handler and startup notification path can drain RX, TX, and no-op event queue notifications, acknowledge guest `RESPONSE` packets for delivered host requests by writing `OK <local_port>\n` to the retained host stream, drop matching retained host-initiated or guest-initiated connections on guest `VSOCK_OP_RST` packets without queuing guest-visible RX output, treat guest `VSOCK_OP_SHUTDOWN` packets with both receive and send shutdown flags as full cleanup for matching retained host-initiated or guest-initiated connections while queuing a guest-visible `VSOCK_OP_RST`, consume valid guest `VSOCK_OP_CREDIT_UPDATE` packets for established retained streams without queuing a reset, respond to valid guest `VSOCK_OP_CREDIT_REQUEST` packets with zero-payload guest-visible `VSOCK_OP_CREDIT_UPDATE` headers, queue bounded zero-payload `VSOCK_OP_RST` headers for unsupported or orphan host-destined guest TX packets, attempt nonblocking connects for supported guest `VSOCK_OP_REQUEST` packets to Firecracker-shaped `${uds_path}_${PORT}` sockets, retain successful guest-initiated streams with a pending `VSOCK_OP_RESPONSE`, forward bounded `VSOCK_OP_RW` payload bytes from established guest-initiated connections to the retained host stream through a bounded four-packet per-connection guest-to-host retry queue for partial or would-block nonblocking writes, retain a bounded four-packet per-connection backlog of host `VSOCK_OP_RW` payloads from established host-initiated or guest-initiated streams and deliver one queued payload at a time into guest RX buffers, queue `VSOCK_OP_RST` when connect, retention, RW forwarding overflow or terminal failure, host-stream EOF, or host-stream read fails, complete queued descriptors, mark the virtio queue interrupt status pending, and signal the allocated vsock interrupt line from the HVF boot loop. Full graceful half-close state tracking, full virtio-vsock credit accounting, guest CID routing beyond current host/guest checks, full event payload dispatch, runtime updates, PATCH, and DELETE remain deferred to future virtio-vsock update work. |
@@ -255,7 +256,6 @@ compatibility targets.
 | `GET` | `/balloon/hinting/status` | recognized; rejected | Returns a balloon-specific unsupported fault. Real free-page hinting state tracking needs a dedicated design. |
 | `PUT`, `PATCH` | `/pmem/{id}` | recognized; rejected | Returns a pmem-specific unsupported fault. Real pmem device configuration, guest attachment, rate limiting, and runtime update behavior need a dedicated device design. |
 | `PUT` | `/entropy` | recognized; rejected | Returns an entropy-specific unsupported fault. Real virtio-rng configuration storage, rate limiting, guest randomness wiring, and startup resource attachment need a dedicated device design. |
-| `PUT` | `/serial` | recognized; rejected | Returns a serial-specific unsupported fault. Public serial configuration storage, host output redirection, rate limiting, and integration with the existing internal serial capture path need a dedicated design. |
 | `GET`, `PUT`, `PATCH` | `/hotplug/memory` | recognized; rejected | Returns a memory-hotplug-specific unsupported fault. Real virtio-mem device support, guest memory accounting, and runtime memory update behavior need a dedicated design. |
 | `PATCH` | `/vm` | recognized; rejected | Parses the Firecracker-shaped VM state request with required `state` values `Paused` and `Resumed`, then routes valid requests through `Pause` or `Resume` VMM actions. Requests before startup fail as unsupported in `Not started` state, and runtime requests fail as unsupported actions without mutating VM state. Real pause/resume state transitions and public run-loop control remain deferred. |
 | `PATCH` | `/drives/{drive_id}` | recognized; rejected | Parses the Firecracker-shaped block-device update request with required `drive_id`, optional `path_on_host`, and optional `rate_limiter`, then routes valid updates through `UpdateBlockDevice`. Pre-boot requests fail as post-boot-only operations and runtime requests fail as unsupported actions without mutating stored drive configuration. Configured rate limiters remain unsupported until block update behavior exists. |
@@ -323,7 +323,10 @@ exist.
 | `PUT /logger` | `show_log_origin` | optional | When true, minimal action log lines include an `origin=<file>:<line>` field for the runtime action callsite. |
 | `PUT /logger` | `module` | optional | Stored as logger filtering configuration for future log integration. |
 | `PUT /logger` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
-| `PUT /actions` | `action_type=InstanceStart` | process-routed; internal startup execution across bounded step windows implemented | Validates stored boot-source and state preflight first, then attempts owned HVF boot-session preparation with an internal serial MMIO console and starts the process-owned internal boot run-loop worker across bounded step windows. Success returns `204 No Content`, writes one minimal logger action line when configured and enabled, and commits `Running`; preparation, worker-start, or logger-output failures return a fault without mutating state. Public run-loop control and public serial streaming remain deferred. |
+| `PUT /serial` | `serial_out_path` | optional | Host path to the serial output file or FIFO. The runtime stores it before boot, startup opens it as per-process observability output, and API-facing open errors redact path details. Omit the field or set it to `null` to clear the configured public output path. |
+| `PUT /serial` | `rate_limiter` | unsupported when configured | Missing or `null` values are accepted; configured values return a fault without mutating previous serial output configuration. |
+| `PUT /serial` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
+| `PUT /actions` | `action_type=InstanceStart` | process-routed; internal startup execution across bounded step windows implemented | Validates stored boot-source and state preflight first, then attempts owned HVF boot-session preparation with configured serial output or the default internal serial MMIO console and starts the process-owned internal boot run-loop worker across bounded step windows. Success returns `204 No Content`, writes one minimal logger action line when configured and enabled, and commits `Running`; preparation, worker-start, or logger-output failures return a fault without mutating state. Public run-loop control and public serial streaming remain deferred. |
 | `PUT /actions` | `action_type=FlushMetrics` | runtime-only; minimal execution implemented | Rejected before startup. After startup, returns `204 No Content`; if metrics output was configured, appends one minimal JSON line, and if logger output was configured and enabled, appends one minimal action line. Full Firecracker counters, periodic flush, and full logger integration remain deferred. |
 | `PUT /actions` | `action_type=SendCtrlAltDel` | intentionally unsupported; parser rejected | Firecracker gates this on x86 keyboard behavior; the first target is Apple Silicon. |
 | `PUT /actions` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
@@ -972,15 +975,15 @@ errors for unsupported widths, invalid offsets, read-only writes, and output
 sink failures. Output is captured through an injected sink instead of global
 state, and the provided in-memory sink has an explicit byte limit, so
 independent device instances do not share guest console data or grow host
-memory without a caller-chosen bound. A shared bounded sink lets the internal
+memory without a caller-chosen bound. A shared sink lets the internal
 boot-resource assembly path register a serial handler while retaining an output
-handle for later startup wiring or tests. The internal arm64 FDT builder can
-describe the same serial MMIO descriptor as a Firecracker-shaped `uart@...`
-node, but this is still internal groundwork only: the public `/serial`
-endpoint, kernel `earlycon` wiring, runner-loop console capture, serial
-input/RX, rate limiting, metrics, and host file output configuration are still
-deferred. The first internal guest boot integration test uses this bounded capture
-path directly without adding public serial streaming.
+handle for default internal capture or a configured file-backed output path.
+The internal arm64 FDT builder can describe the same serial MMIO descriptor as
+a Firecracker-shaped `uart@...` node. Public `/serial` supports pre-boot
+`serial_out_path` storage and startup-time host output redirection; kernel
+`earlycon` wiring, serial input/RX, rate limiting, metrics, and public serial
+streaming remain deferred. The first internal guest boot integration test uses
+the bounded capture path directly.
 
 The runtime crate can decode checked MMIO operations into typed virtio-mmio
 generic-register or device-configuration accesses for the Firecracker `v1.16.0`
@@ -1123,7 +1126,7 @@ resulting MMIO exit is handled on the vCPU-owning thread without global state.
 The boot session can also expose a cloneable cancellation-only handle for an
 in-flight run step without exposing the full runner. Public `InstanceStart`
 now starts a process-owned internal boot run-loop worker across bounded step windows with retained internal worker status and an owned
-HVF boot session and internal serial MMIO console after successful startup. A
+HVF boot session plus configured or default internal serial output after successful startup. A
 bounded internal
 boot-session run-loop pump now composes that one-step path with boot block,
 virtio-net, and virtio-vsock notification dispatch between successful MMIO steps and virtual
@@ -1171,7 +1174,7 @@ and read, replace, or partially update stored machine configuration state.
 `GetVmConfig` and returns the supported accumulated configuration subset:
 `machine-config`, `boot-source` when configured, the `drives` array, and the
 `network-interfaces` array, plus `vsock` when configured.
-Observability state such as metrics and logger configuration is omitted. Unsupported top-level sections are omitted until their models exist. The implemented pre-boot drive path flows
+Observability state such as metrics, logger, and serial output configuration is omitted. Unsupported top-level sections are omitted until their models exist. The implemented pre-boot drive path flows
 through `PutDrive` and records validated configuration state. The implemented
 pre-boot network-interface path flows through `PutNetworkInterface` and records
 validated configuration state without opening host networking resources. Parsed
@@ -1182,14 +1185,16 @@ boot-source configuration state. Parsed `/metrics` requests flow through
 `PutMetrics` and initialize per-process metrics output state that is not part of
 guest configuration. Parsed `/logger` requests flow through `PutLogger` and
 initialize or update per-process logger configuration state that is not part of
-guest configuration. Parsed `/actions` requests flow through
-`InstanceStart` and `FlushMetrics` VMM actions. `InstanceStart` first validates
-stored boot-source and state preflight, then the process VMM owner prepares and
-starts an owned HVF boot-session worker with an internal serial MMIO console
-and bounded capture buffer. It marks the instance `Running` only after the
-bounded internal worker handle is retained; `FlushMetrics` fails before startup,
-then succeeds after startup and writes one minimal JSON line only when metrics
-output was configured.
+guest configuration. Parsed `/serial` requests flow through `PutSerial` and
+store pre-boot serial output configuration that is also omitted from
+`GET /vm/config`. Parsed `/actions` requests flow through `InstanceStart` and
+`FlushMetrics` VMM actions. `InstanceStart` first validates stored boot-source
+and state preflight, then the process VMM owner prepares and starts an owned
+HVF boot-session worker with the configured serial output path or the default
+internal serial MMIO capture buffer. It marks the instance `Running` only after
+the bounded internal worker handle is retained; `FlushMetrics` fails before
+startup, then succeeds after startup and writes one minimal JSON line only when
+metrics output was configured.
 
 ### Initial API State Model
 
@@ -1198,8 +1203,9 @@ The first API implementation should model the same broad stages as Firecracker:
 - pre-boot: configuration requests are accepted and stored before guest
   execution starts
 - starting: `PUT /actions` with `InstanceStart` validates the accumulated
-  configuration, prepares the owned HVF startup session with internal serial
-  capture, and transitions the process out of pre-boot state on success
+  configuration, prepares the owned HVF startup session with configured or
+  default internal serial output, and transitions the process out of pre-boot
+  state on success
 - runtime: the microVM is running; pre-boot-only configuration requests should
   fail with a Firecracker-shaped unsupported-state error
 - paused/resumed: `PATCH /vm` parses `Paused` and `Resumed` requests, but real
@@ -1226,7 +1232,8 @@ The first API implementation should model the same broad stages as Firecracker:
 | `PUT /mmds/config` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Stores control-plane MMDS config before startup after validating that each listed interface ID already exists in the configured network interface set. At startup, the configured interfaces can enable the implemented guest-visible MMDS packet path; runtime MMDS config updates and public packet movement remain deferred. |
 | `PUT /metrics` | implemented; `204` empty response on successful output initialization | unsupported after start; `400` `fault_message` | Metrics output is process observability state, not guest configuration. Duplicate initialization fails. |
 | `PUT /logger` | implemented; `204` empty response on successful pre-boot configuration | unsupported after start; `400` `fault_message` | Logger output is process observability state, not guest configuration. Repeated pre-boot requests update provided fields; minimal successful action logging supports configured level and origin fields, but full log routing remains deferred. |
-| `PUT /actions` with `InstanceStart` | process-routed; `204` after successful owned HVF startup with internal boot run-loop worker across bounded step windows or `400` preflight/preparation/logger-output fault | unsupported after start; `400` `fault_message` | Commits `Running` only after the owned HVF boot-session worker with internal serial capture is retained and configured action logging succeeds. The worker keeps internal active, terminal-outcome, or error status; public run-loop control and public serial streaming remain deferred. |
+| `PUT /serial` | implemented; `204` empty response on successful pre-boot output configuration or clear request | unsupported after start; `400` `fault_message` | Serial output is process observability state, not guest configuration. Valid `serial_out_path` values are stored without opening host resources during the request; startup opens the path and routes guest TX serial bytes to it. Empty/control-character paths and configured rate limiters are rejected without mutating previous serial output configuration. |
+| `PUT /actions` with `InstanceStart` | process-routed; `204` after successful owned HVF startup with internal boot run-loop worker across bounded step windows or `400` preflight/preparation/logger-output fault | unsupported after start; `400` `fault_message` | Commits `Running` only after the owned HVF boot-session worker with configured serial output or default internal serial capture is retained and configured action logging succeeds. The worker keeps internal active, terminal-outcome, or error status; public run-loop control and public serial streaming remain deferred. |
 | `PUT /actions` with `FlushMetrics` | VMM-routed; `400` unsupported-state `fault_message` | implemented; `204` empty response or `400` logger/metrics output fault | Firecracker treats this as runtime-only. bangbang writes one minimal JSON line when metrics output was configured, including `boot_run_loop_status` as `running`, `exited`, or `failed` when a process-owned boot worker exists, writes one minimal action line when logger output is configured and enabled, and otherwise succeeds without writing. |
 | `PUT /actions` with `SendCtrlAltDel` | intentionally unsupported; parser returns `400` `fault_message` | intentionally unsupported; `400` `fault_message` | Firecracker rejects this on aarch64; bangbang's first target is Apple Silicon. |
 | Non-initial endpoints from the endpoint matrix | `400` `fault_message` until their capability exists | `400` `fault_message` until their capability exists | Covers planned later and deferred endpoints; a later capability PR may define more specific state behavior. |
@@ -1362,7 +1369,7 @@ Their eventual support level should follow the endpoint matrix:
 - balloon devices and balloon statistics
 - pmem
 - entropy device configuration
-- serial customization
+- serial input, serial rate limiting, public serial streaming, and serial metrics
 - full logger integration, full Firecracker metrics counters, and periodic
   metrics flush
 - memory hotplug

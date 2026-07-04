@@ -18,9 +18,9 @@ use bangbang_api::http::{
     LoggerLevel as ApiLoggerLevel, MachineConfigPatchRequest, MachineConfigRequest,
     MachineConfigResponse, MetricsConfigRequest, MmdsConfigRequest, MmdsConfigResponse,
     MmdsContentRequest, MmdsVersion as ApiMmdsVersion, NetworkInterfaceConfigRequest,
-    NetworkInterfaceConfigResponse, RequestError, VmConfigResponse, VmStateUpdate,
-    VmStateUpdateRequest, VsockConfigRequest, VsockConfigResponse, parse_request_with_limit,
-    request_total_len_with_limit,
+    NetworkInterfaceConfigResponse, RequestError, SerialConfigRequest, VmConfigResponse,
+    VmStateUpdate, VmStateUpdateRequest, VsockConfigRequest, VsockConfigResponse,
+    parse_request_with_limit, request_total_len_with_limit,
 };
 use bangbang_runtime::block::{
     DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine, DriveUpdateInput,
@@ -39,6 +39,7 @@ use bangbang_runtime::mmds::{
 #[cfg(test)]
 use bangbang_runtime::network::MAX_NETWORK_INTERFACE_COUNT;
 use bangbang_runtime::network::{NetworkInterfaceConfig, NetworkInterfaceConfigInput};
+use bangbang_runtime::serial::SerialConfigInput;
 use bangbang_runtime::vsock::{VsockConfig, VsockConfigInput};
 use bangbang_runtime::{VmConfiguration, VmmAction, VmmData};
 
@@ -487,6 +488,9 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
                 network_interface_config_input_from_request(config.as_ref()),
             )))
         }
+        ApiRequest::PutSerial(config) => handle_empty(vmm.handle_action(VmmAction::PutSerial(
+            serial_config_input_from_request(config.as_ref()),
+        ))),
         ApiRequest::PutVsock(config) => handle_empty(vmm.handle_action(VmmAction::PutVsock(
             vsock_config_input_from_request(config.as_ref()),
         ))),
@@ -904,6 +908,19 @@ fn network_interface_config_input_from_request(
     }
     if config.tx_rate_limiter_configured() {
         input = input.with_tx_rate_limiter_configured();
+    }
+
+    input
+}
+
+fn serial_config_input_from_request(config: &SerialConfigRequest) -> SerialConfigInput {
+    let mut input = SerialConfigInput::new();
+
+    if let Some(serial_out_path) = config.serial_out_path() {
+        input = input.with_serial_out_path(serial_out_path);
+    }
+    if config.rate_limiter_configured() {
+        input = input.with_rate_limiter_configured();
     }
 
     input
@@ -3132,13 +3149,22 @@ mod tests {
     }
 
     #[test]
-    fn returns_fault_for_serial_endpoint() {
-        let path = unique_socket_path("serial-fault");
+    fn configures_serial_endpoint_over_socket() {
+        let path = unique_socket_path("serial-config");
+        let serial_path = unique_socket_path("serial-output").with_extension("out");
+        let body = format!(
+            r#"{{"serial_out_path":"{}"}}"#,
+            serial_path.to_string_lossy()
+        );
+        let request = format!(
+            "PUT /serial HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
         let server = ApiServer::bind(&path).expect("server should bind");
         let mut client = UnixStream::connect(&path).expect("client should connect");
 
         client
-            .write_all(b"PUT /serial HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}")
+            .write_all(request.as_bytes())
             .expect("client should write request");
         let mut vmm = test_controller();
         server
@@ -3150,11 +3176,111 @@ mod tests {
             .read_to_string(&mut response)
             .expect("client should read response");
 
-        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        assert!(response.contains(r#"{"fault_message":"Serial device is not supported."}"#));
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(response.contains("Content-Length: 0\r\n"));
+        assert_eq!(
+            vmm.serial_config().serial_out_path(),
+            Some(serial_path.as_path())
+        );
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::NotStarted
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_serial_endpoint_without_mutating() {
+        let mut vmm = test_controller();
+        let serial_path = unique_socket_path("serial-original").with_extension("out");
+        let initial_body = format!(
+            r#"{{"serial_out_path":"{}"}}"#,
+            serial_path.to_string_lossy()
+        );
+        let initial_request = format!(
+            "PUT /serial HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{initial_body}",
+            initial_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(initial_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        for (name, body, message) in [
+            (
+                "serial-empty-path",
+                r#"{"serial_out_path":""}"#,
+                "serial output path must not be empty",
+            ),
+            (
+                "serial-control-path",
+                "{\"serial_out_path\":\"/tmp/bad\\npath\"}",
+                "serial output path must not contain control characters",
+            ),
+            (
+                "serial-rate-limiter",
+                r#"{"rate_limiter":{"bandwidth":{"size":1,"refill_time":1}}}"#,
+                "serial output rate limiting is not supported",
+            ),
+        ] {
+            let request = format!(
+                "PUT /serial HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+
+            let response = request_over_socket(&mut vmm, name, &request);
+
+            assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+            assert!(response.contains(&format!(r#"{{"fault_message":"{message}"}}"#)));
+            assert_eq!(
+                vmm.serial_config().serial_out_path(),
+                Some(serial_path.as_path())
+            );
+        }
+    }
+
+    #[test]
+    fn running_state_rejects_serial_endpoint_without_mutating() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let serial_path = unique_socket_path("serial-running-original").with_extension("out");
+        let serial_body = format!(
+            r#"{{"serial_out_path":"{}"}}"#,
+            serial_path.to_string_lossy()
+        );
+        let serial_request = format!(
+            "PUT /serial HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{serial_body}",
+            serial_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(serial_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_request = format!(
+            "PUT /boot-source HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{boot_body}",
+            boot_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "serial-start", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let replacement_body = r#"{"serial_out_path":"/tmp/replacement.out"}"#;
+        let replacement_request = format!(
+            "PUT /serial HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{replacement_body}",
+            replacement_body.len()
+        );
+
+        let response = request_over_socket(&mut vmm, "serial-running", &replacement_request);
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.contains(
+            r#"{"fault_message":"The requested operation is not supported in Running state: PutSerial"}"#
+        ));
+        assert_eq!(
+            vmm.serial_config().serial_out_path(),
+            Some(serial_path.as_path())
         );
     }
 

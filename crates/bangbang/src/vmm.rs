@@ -21,7 +21,9 @@ use bangbang_runtime::network::{
     VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame,
     VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError, validate_network_interface_count,
 };
-use bangbang_runtime::serial::SharedSerialOutputBuffer;
+use bangbang_runtime::serial::{
+    SerialConfigError, SerialOutputFile, SharedSerialOutput, SharedSerialOutputBuffer,
+};
 use bangbang_runtime::startup::{
     Arm64BootNetworkDevice, Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError,
     Arm64BootNetworkPacketIoProvider,
@@ -47,6 +49,8 @@ use bangbang_runtime::block::DriveConfig;
 use bangbang_runtime::boot::BootSourceConfig;
 #[cfg(test)]
 use bangbang_runtime::machine::MachineConfig;
+#[cfg(test)]
+use bangbang_runtime::serial::SerialConfig;
 
 const DEFAULT_BLOCK_MMIO_BASE: GuestAddress = GuestAddress::new(0x5000_0000);
 const DEFAULT_BLOCK_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(1);
@@ -173,6 +177,11 @@ where
         self.controller.boot_source_config()
     }
 
+    #[cfg(test)]
+    pub(crate) const fn serial_config(&self) -> &SerialConfig {
+        self.controller.serial_config()
+    }
+
     pub(crate) fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
         match action {
             VmmAction::InstanceStart => self.start_instance(),
@@ -231,8 +240,21 @@ pub(crate) struct HvfInstanceStartExecutor {
 }
 
 impl HvfInstanceStartExecutor {
+    #[cfg(test)]
     fn boot_session_config(&self) -> HvfArm64BootSessionConfig {
-        default_hvf_boot_session_config(self.serial_output.clone())
+        default_hvf_boot_session_config(SharedSerialOutput::from(self.serial_output.clone()))
+    }
+
+    fn boot_session_config_for_controller(
+        &self,
+        controller: &VmmController,
+    ) -> Result<HvfArm64BootSessionConfig, SerialConfigError> {
+        let serial_output = match controller.serial_config().serial_out_path() {
+            Some(path) => SharedSerialOutput::new(SerialOutputFile::open(path)?),
+            None => SharedSerialOutput::from(self.serial_output.clone()),
+        };
+
+        Ok(default_hvf_boot_session_config(serial_output))
     }
 }
 
@@ -240,13 +262,18 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
     type Session = HvfBootRunLoopSupervisor;
 
     fn start(&mut self, controller: &VmmController) -> Result<Self::Session, BackendError> {
+        let boot_session_config = self
+            .boot_session_config_for_controller(controller)
+            .map_err(|err| {
+                BackendError::Hypervisor(format!("failed to initialize serial output: {err}"))
+            })?;
         let packet_io =
             ProcessNetworkPacketIoProvider::from_controller(controller).map_err(|err| {
                 BackendError::Hypervisor(format!(
                     "failed to build network packet I/O provider: {err}"
                 ))
             })?;
-        let session = OwnedHvfArm64BootSession::new(controller, self.boot_session_config())
+        let session = OwnedHvfArm64BootSession::new(controller, boot_session_config)
             .map_err(|err| BackendError::Hypervisor(err.to_string()))?;
         let session = ProcessHvfBootSession::new(session, packet_io);
         HvfBootRunLoopSupervisor::start(session, default_hvf_boot_run_loop_step_limit())
@@ -908,9 +935,7 @@ fn default_hvf_boot_run_loop_step_limit() -> NonZeroUsize {
     NonZeroUsize::new(DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT).unwrap_or(NonZeroUsize::MIN)
 }
 
-fn default_hvf_boot_session_config(
-    serial_output: SharedSerialOutputBuffer,
-) -> HvfArm64BootSessionConfig {
+fn default_hvf_boot_session_config(serial_output: SharedSerialOutput) -> HvfArm64BootSessionConfig {
     HvfArm64BootSessionConfig::new(
         BlockMmioLayout::new(DEFAULT_BLOCK_MMIO_BASE, DEFAULT_BLOCK_MMIO_REGION_ID),
         NetworkMmioLayout::new(DEFAULT_NETWORK_MMIO_BASE, DEFAULT_NETWORK_MMIO_REGION_ID),
@@ -946,14 +971,15 @@ mod tests {
         PreparedNetworkDevices,
     };
     use bangbang_runtime::serial::{
-        SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialOutput, SharedSerialOutputBuffer,
+        SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialConfigInput, SerialOutput, SharedSerialOutput,
+        SharedSerialOutputBuffer,
     };
     use bangbang_runtime::startup::{
         Arm64BootNetworkDevice, Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError,
         Arm64BootNetworkPacketIoProvider,
     };
     use bangbang_runtime::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE;
-    use bangbang_runtime::{BackendError, InstanceState, VmmAction, VmmActionError};
+    use bangbang_runtime::{BackendError, InstanceState, VmmAction, VmmActionError, VmmController};
 
     use crate::host_network::vmnet::{
         VmnetError, VmnetInterfaceBackend, VmnetInterfaceConfig, VmnetInterfaceDescriptor,
@@ -993,6 +1019,13 @@ mod tests {
         fn path(&self) -> &Path {
             &self.path
         }
+    }
+
+    fn missing_temp_child_path(name: &str) -> PathBuf {
+        let id = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir()
+            .join(format!("bb-vmm-missing-{}-{id}", std::process::id()))
+            .join(name)
     }
 
     impl Drop for TempFilePath {
@@ -1538,6 +1571,97 @@ mod tests {
     }
 
     #[test]
+    fn configured_hvf_boot_session_config_uses_serial_output_file() {
+        let executor = HvfInstanceStartExecutor::default();
+        let serial_file = TempFilePath::create("serial-output");
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutSerial(
+                SerialConfigInput::new()
+                    .with_serial_out_path(serial_file.path().to_string_lossy().into_owned()),
+            ))
+            .expect("serial config should store");
+
+        let config = executor
+            .boot_session_config_for_controller(&controller)
+            .expect("configured serial output should open");
+
+        let mut output = config
+            .serial_device
+            .expect("default HVF boot config should include serial MMIO")
+            .output
+            .clone();
+        output
+            .write_byte(b'S')
+            .expect("serial file output should accept byte");
+        assert_eq!(
+            fs::read(serial_file.path()).expect("serial output should read"),
+            b"S"
+        );
+    }
+
+    #[test]
+    fn configured_hvf_boot_session_config_redacts_serial_output_open_errors() {
+        let executor = HvfInstanceStartExecutor::default();
+        let missing_path = missing_temp_child_path("serial.out");
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutSerial(
+                SerialConfigInput::new()
+                    .with_serial_out_path(missing_path.to_string_lossy().into_owned()),
+            ))
+            .expect("serial config should store");
+
+        let err = executor
+            .boot_session_config_for_controller(&controller)
+            .expect_err("missing serial output parent should fail");
+
+        assert_eq!(
+            err.to_string(),
+            "serial output could not be initialized: NotFound"
+        );
+        assert!(
+            !err.to_string()
+                .contains(&missing_path.to_string_lossy().into_owned())
+        );
+    }
+
+    #[test]
+    fn instance_start_rejects_serial_output_open_failure_without_running() {
+        let missing_path = missing_temp_child_path("serial-start.out");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            "0.1.0",
+            "bangbang",
+            HvfInstanceStartExecutor::default(),
+        );
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::PutSerial(
+            SerialConfigInput::new()
+                .with_serial_out_path(missing_path.to_string_lossy().into_owned()),
+        ))
+        .expect("serial config should store");
+
+        let err = vmm
+            .handle_action(VmmAction::InstanceStart)
+            .expect_err("missing serial output parent should fail startup");
+
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+        assert_eq!(
+            err.to_string(),
+            "failed to start microVM: hypervisor error: failed to initialize serial output: serial output could not be initialized: NotFound"
+        );
+        assert!(
+            !err.to_string()
+                .contains(&missing_path.to_string_lossy().into_owned())
+        );
+    }
+
+    #[test]
     fn default_hvf_boot_session_config_uses_non_overlapping_device_layouts() {
         let root = TempFilePath::create("root");
         let data = TempFilePath::create("data");
@@ -1556,7 +1680,9 @@ mod tests {
             .insert(NetworkInterfaceConfigInput::new("eth1", "eth1", "tap1"))
             .expect("second network should configure");
 
-        let config = default_hvf_boot_session_config(SharedSerialOutputBuffer::default());
+        let config = default_hvf_boot_session_config(SharedSerialOutput::from(
+            SharedSerialOutputBuffer::default(),
+        ));
         let serial_region_id = config
             .serial_device
             .expect("default HVF boot config should include serial MMIO")
@@ -1892,6 +2018,7 @@ mod tests {
             | VmmActionError::MmdsDataStore(_)
             | VmmActionError::MmdsState(_)
             | VmmActionError::NetworkInterfaceConfig(_)
+            | VmmActionError::SerialConfig(_)
             | VmmActionError::VsockConfig(_) => {
                 panic!("vmnet start failure should propagate as hypervisor startup error");
             }

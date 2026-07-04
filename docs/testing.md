@@ -65,6 +65,9 @@ For host filesystem paths, cover missing paths, directories, unsupported file
 types, redacted error messages, cleanup ownership, and failure atomicity. A
 failed operation should not partially mutate accepted configuration, guest
 memory, or host resources.
+For deferred-open paths such as serial output, also cover that parsing stores
+configuration without opening the path, and that startup wiring opens or writes
+through the selected sink with redacted errors.
 
 For guest memory, address, and range logic, cover exact-fit success, one-past
 failure, overflow failure, overlapping ranges, and no-partial-mutation behavior.
