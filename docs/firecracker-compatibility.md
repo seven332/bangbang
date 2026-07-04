@@ -273,17 +273,17 @@ exist.
 | `PUT /boot-source` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /machine-config` | `vcpu_count` | required | Firecracker bounds this to `1..=32`; HVF work must also account for host CPU and thread limits. |
 | `PUT /machine-config` | `mem_size_mib` | required | Drives guest memory allocation and mapping; later work must cover bounds and startup performance. |
-| `PUT /machine-config` | `smt` | optional when `false`; rejected when `true` | Firecracker defaults this to `false` and rejects `true` on aarch64; the initial HVF target should accept explicit no-SMT config without exposing SMT control. |
+| `PUT /machine-config` | `smt` | optional when `false`; rejected when `true` | Firecracker defaults this to `false`; the initial HVF target accepts explicit no-SMT config and currently returns `machine smt is not supported` when SMT is enabled. |
 | `PUT /machine-config` | `cpu_template` | optional when omitted, `null`, or `None`; rejected for known non-`None` templates | Explicit `None` matches Firecracker's deprecated default; known non-default CPU templates currently return `machine cpu_template <template> is not supported` and need a separate HVF compatibility design. |
 | `PUT /machine-config` | `track_dirty_pages` | optional when `false`; rejected when `true` | Explicit `false` matches Firecracker's default; enabling dirty tracking belongs with snapshot support and currently returns `machine track_dirty_pages is not supported`. |
-| `PUT /machine-config` | `huge_pages` | optional when `None`; rejected for `2M` | Explicit `None` matches Firecracker's default; Linux hugetlbfs does not directly apply to the macOS target. |
+| `PUT /machine-config` | `huge_pages` | optional when `None`; rejected for `2M` | Explicit `None` matches Firecracker's default; Linux hugetlbfs does not directly apply to the macOS target and `2M` currently returns `machine huge_pages is not supported`. |
 | `PUT /machine-config` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PATCH /machine-config` | `vcpu_count` | optional | When present, updates the stored vCPU count with the same `1..=32` bounds as `PUT`; omitted fields keep their current values. |
 | `PATCH /machine-config` | `mem_size_mib` | optional | When present, updates the stored memory size and rejects zero; omitted fields keep their current values. |
-| `PATCH /machine-config` | `smt` | optional when `false`; rejected when `true` | Matches the current `PUT` policy for the Apple Silicon target. |
+| `PATCH /machine-config` | `smt` | optional when `false`; rejected when `true` | Matches the current `PUT` policy for the Apple Silicon target and currently returns `machine smt is not supported` when SMT is enabled. |
 | `PATCH /machine-config` | `cpu_template` | optional when omitted or `null`; accepted when `None`; rejected for known non-`None` templates | `null` is treated as omitted. Explicit `None` is accepted; known non-default CPU templates currently return `machine cpu_template <template> is not supported`. |
 | `PATCH /machine-config` | `track_dirty_pages` | optional when `false`; rejected when `true` | Matches the current `PUT` dirty-tracking policy. |
-| `PATCH /machine-config` | `huge_pages` | optional when `None`; rejected for `2M` | Matches the current `PUT` huge-pages policy. |
+| `PATCH /machine-config` | `huge_pages` | optional when `None`; rejected for `2M` | Matches the current `PUT` huge-pages policy and currently returns `machine huge_pages is not supported` for `2M`. |
 | `PATCH /machine-config` | unknown fields or empty patch | rejected | Matches Firecracker's strict request model behavior and avoids silent no-op updates. |
 | `PUT /drives/{drive_id}` | path `drive_id` | required | The API parser captures this value, and the internal model validates it as nonempty alphanumeric or `_`, matching Firecracker's `checked_id` rule. |
 | `PUT /drives/{drive_id}` | body `drive_id` | required | The API parser rejects requests where this does not match the path `drive_id`. |

@@ -1807,6 +1807,64 @@ mod tests {
     }
 
     #[test]
+    fn machine_smt_and_huge_pages_faults_do_not_mutate_vmm_state_over_socket() {
+        let mut vmm = test_controller();
+        let body = r#"{"vcpu_count":2,"mem_size_mib":256}"#;
+        let request = format!(
+            "PUT /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        for (method, socket_name, body, expected_fault) in [
+            (
+                "PUT",
+                "ms-put",
+                r#"{"vcpu_count":4,"mem_size_mib":512,"smt":true}"#,
+                r#"{"fault_message":"machine smt is not supported"}"#,
+            ),
+            (
+                "PATCH",
+                "ms-pat",
+                r#"{"mem_size_mib":512,"smt":true}"#,
+                r#"{"fault_message":"machine smt is not supported"}"#,
+            ),
+            (
+                "PUT",
+                "mh-put",
+                r#"{"vcpu_count":4,"mem_size_mib":512,"huge_pages":"2M"}"#,
+                r#"{"fault_message":"machine huge_pages is not supported"}"#,
+            ),
+            (
+                "PATCH",
+                "mh-pat",
+                r#"{"mem_size_mib":512,"huge_pages":"2M"}"#,
+                r#"{"fault_message":"machine huge_pages is not supported"}"#,
+            ),
+        ] {
+            let request = format!(
+                "{method} /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+
+            let response = request_over_socket(&mut vmm, socket_name, &request);
+
+            assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+            assert!(response.contains(expected_fault), "{method} {body}");
+            assert_eq!(vmm.machine_config().vcpu_count(), 2);
+            assert_eq!(vmm.machine_config().mem_size_mib(), 256);
+            assert!(!vmm.machine_config().smt());
+            assert_eq!(
+                vmm.machine_config().huge_pages(),
+                RuntimeMachineConfigHugePages::None
+            );
+        }
+    }
+
+    #[test]
     fn running_state_rejects_machine_config_patch_without_mutating() {
         let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
         let machine_body = r#"{"vcpu_count":2,"mem_size_mib":256}"#;
