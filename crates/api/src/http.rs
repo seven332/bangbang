@@ -1151,14 +1151,14 @@ pub fn parse_request_with_limit(
         return Err(RequestError::MemoryHotplugUnsupported);
     }
 
-    if matches!(method, "PUT" | "PATCH") && pmem_path_id(path).is_some() {
+    if matches!(method, "PUT" | "PATCH" | "DELETE") && pmem_path_id(path).is_some() {
         return Err(RequestError::PmemUnsupported);
     }
 
-    if method == "PATCH" && drive_path_id(path).is_some() {
+    if matches!(method, "PATCH" | "DELETE") && drive_path_id(path).is_some() {
         return Err(RequestError::DriveUpdateUnsupported);
     }
-    if method == "PATCH" && network_interface_path_id(path).is_some() {
+    if matches!(method, "PATCH" | "DELETE") && network_interface_path_id(path).is_some() {
         return Err(RequestError::NetworkInterfaceUpdateUnsupported);
     }
 
@@ -3302,56 +3302,60 @@ mod tests {
     }
 
     #[test]
-    fn rejects_drive_update_as_unsupported() {
-        let request = request_with_body("PATCH", "/drives/rootfs", r#"{"drive_id":"rootfs"}"#);
-
-        let err = parse_request(&request).expect_err("drive update should be unsupported");
-        assert_eq!(err, RequestError::DriveUpdateUnsupported);
-        assert_eq!(err.fault_message(), "Drive updates are not supported.");
+    fn rejects_drive_update_and_hot_unplug_as_unsupported() {
+        for (route, request) in [
+            (
+                "PATCH /drives/rootfs",
+                request_with_body("PATCH", "/drives/rootfs", r#"{"drive_id":"rootfs"}"#),
+            ),
+            (
+                "DELETE /drives/rootfs",
+                b"DELETE /drives/rootfs HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            ),
+        ] {
+            let err = parse_request(&request).expect_err("drive update should be unsupported");
+            assert_eq!(err, RequestError::DriveUpdateUnsupported, "{route}");
+            assert_eq!(err.fault_message(), "Drive updates are not supported.");
+        }
     }
 
     #[test]
     fn rejects_drive_update_without_parsing_body() {
-        let malformed_body = request_with_body("PATCH", "/drives/rootfs", "not-json");
-        let empty_body =
-            b"PATCH /drives/rootfs HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n";
+        for method in ["PATCH", "DELETE"] {
+            let malformed_body = request_with_body(method, "/drives/rootfs", "not-json");
+            let empty_body = format!(
+                "{method} /drives/rootfs HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+            );
 
-        assert_eq!(
-            parse_request(&malformed_body),
-            Err(RequestError::DriveUpdateUnsupported)
-        );
-        assert_eq!(
-            parse_request(empty_body),
-            Err(RequestError::DriveUpdateUnsupported)
-        );
+            assert_eq!(
+                parse_request(&malformed_body),
+                Err(RequestError::DriveUpdateUnsupported),
+                "{method}"
+            );
+            assert_eq!(
+                parse_request(empty_body.as_bytes()),
+                Err(RequestError::DriveUpdateUnsupported),
+                "{method}"
+            );
+        }
     }
 
     #[test]
     fn rejects_non_exact_drive_update_paths_as_invalid_path_method() {
-        for (route, request) in [
-            ("PATCH /drives", request_with_body("PATCH", "/drives", "{}")),
-            (
-                "PATCH /drives/",
-                request_with_body("PATCH", "/drives/", "{}"),
-            ),
-            (
-                "PATCH /drives/rootfs/extra",
-                request_with_body("PATCH", "/drives/rootfs/extra", "{}"),
-            ),
-            (
-                "PATCH /drives/root-fs",
-                request_with_body("PATCH", "/drives/root-fs", "{}"),
-            ),
-            (
-                "PATCH /drives/rootfs?debug=true",
-                request_with_body("PATCH", "/drives/rootfs?debug=true", "{}"),
-            ),
-        ] {
-            assert_eq!(
-                parse_request(&request),
-                Err(RequestError::InvalidPathMethod),
-                "{route}"
-            );
+        for method in ["PATCH", "DELETE"] {
+            for path in [
+                "/drives",
+                "/drives/",
+                "/drives/rootfs/extra",
+                "/drives/root-fs",
+                "/drives/rootfs?debug=true",
+            ] {
+                assert_eq!(
+                    parse_request(&request_with_body(method, path, "{}")),
+                    Err(RequestError::InvalidPathMethod),
+                    "{method} {path}"
+                );
+            }
         }
     }
 
@@ -3361,10 +3365,6 @@ mod tests {
             (
                 "GET /drives/rootfs",
                 b"GET /drives/rootfs HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
-            ),
-            (
-                "DELETE /drives/rootfs",
-                b"DELETE /drives/rootfs HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
             ),
             (
                 "POST /drives/rootfs",
@@ -3601,66 +3601,72 @@ mod tests {
     }
 
     #[test]
-    fn rejects_network_interface_update_as_unsupported() {
-        let request = request_with_body(
-            "PATCH",
-            "/network-interfaces/eth0",
-            r#"{"iface_id":"eth0"}"#,
-        );
-
-        let err =
-            parse_request(&request).expect_err("network interface update should be unsupported");
-        assert_eq!(err, RequestError::NetworkInterfaceUpdateUnsupported);
-        assert_eq!(
-            err.fault_message(),
-            "Network interface updates are not supported."
-        );
+    fn rejects_network_interface_update_and_hot_unplug_as_unsupported() {
+        for (route, request) in [
+            (
+                "PATCH /network-interfaces/eth0",
+                request_with_body(
+                    "PATCH",
+                    "/network-interfaces/eth0",
+                    r#"{"iface_id":"eth0"}"#,
+                ),
+            ),
+            (
+                "DELETE /network-interfaces/eth0",
+                b"DELETE /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            ),
+        ] {
+            let err = parse_request(&request)
+                .expect_err("network interface update should be unsupported");
+            assert_eq!(
+                err,
+                RequestError::NetworkInterfaceUpdateUnsupported,
+                "{route}"
+            );
+            assert_eq!(
+                err.fault_message(),
+                "Network interface updates are not supported."
+            );
+        }
     }
 
     #[test]
     fn rejects_network_interface_update_without_parsing_body() {
-        let malformed_body = request_with_body("PATCH", "/network-interfaces/eth0", "not-json");
-        let empty_body = b"PATCH /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n";
+        for method in ["PATCH", "DELETE"] {
+            let malformed_body = request_with_body(method, "/network-interfaces/eth0", "not-json");
+            let empty_body = format!(
+                "{method} /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+            );
 
-        assert_eq!(
-            parse_request(&malformed_body),
-            Err(RequestError::NetworkInterfaceUpdateUnsupported)
-        );
-        assert_eq!(
-            parse_request(empty_body),
-            Err(RequestError::NetworkInterfaceUpdateUnsupported)
-        );
+            assert_eq!(
+                parse_request(&malformed_body),
+                Err(RequestError::NetworkInterfaceUpdateUnsupported),
+                "{method}"
+            );
+            assert_eq!(
+                parse_request(empty_body.as_bytes()),
+                Err(RequestError::NetworkInterfaceUpdateUnsupported),
+                "{method}"
+            );
+        }
     }
 
     #[test]
     fn rejects_non_exact_network_interface_update_paths_as_invalid_path_method() {
-        for (route, request) in [
-            (
-                "PATCH /network-interfaces",
-                request_with_body("PATCH", "/network-interfaces", "{}"),
-            ),
-            (
-                "PATCH /network-interfaces/",
-                request_with_body("PATCH", "/network-interfaces/", "{}"),
-            ),
-            (
-                "PATCH /network-interfaces/eth0/extra",
-                request_with_body("PATCH", "/network-interfaces/eth0/extra", "{}"),
-            ),
-            (
-                "PATCH /network-interfaces/eth-0",
-                request_with_body("PATCH", "/network-interfaces/eth-0", "{}"),
-            ),
-            (
-                "PATCH /network-interfaces/eth0?debug=true",
-                request_with_body("PATCH", "/network-interfaces/eth0?debug=true", "{}"),
-            ),
-        ] {
-            assert_eq!(
-                parse_request(&request),
-                Err(RequestError::InvalidPathMethod),
-                "{route}"
-            );
+        for method in ["PATCH", "DELETE"] {
+            for path in [
+                "/network-interfaces",
+                "/network-interfaces/",
+                "/network-interfaces/eth0/extra",
+                "/network-interfaces/eth-0",
+                "/network-interfaces/eth0?debug=true",
+            ] {
+                assert_eq!(
+                    parse_request(&request_with_body(method, path, "{}")),
+                    Err(RequestError::InvalidPathMethod),
+                    "{method} {path}"
+                );
+            }
         }
     }
 
@@ -3670,10 +3676,6 @@ mod tests {
             (
                 "GET /network-interfaces/eth0",
                 b"GET /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
-            ),
-            (
-                "DELETE /network-interfaces/eth0",
-                b"DELETE /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
             ),
             (
                 "POST /network-interfaces/eth0",
@@ -4022,6 +4024,10 @@ mod tests {
                 request_with_body("PATCH", "/pmem/pmem0", r#"{"id":"pmem0"}"#),
             ),
             (
+                "DELETE /pmem/pmem0",
+                b"DELETE /pmem/pmem0 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            ),
+            (
                 "PUT /pmem/pmem_0",
                 request_with_body("PUT", "/pmem/pmem_0", r#"{"id":"pmem_0"}"#),
             ),
@@ -4034,7 +4040,7 @@ mod tests {
 
     #[test]
     fn rejects_pmem_body_methods_without_parsing_body() {
-        for method in ["PUT", "PATCH"] {
+        for method in ["PUT", "PATCH", "DELETE"] {
             let malformed_body = request_with_body(method, "/pmem/pmem0", "not-json");
             let empty_body = format!(
                 "{method} /pmem/pmem0 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
@@ -4055,23 +4061,20 @@ mod tests {
 
     #[test]
     fn rejects_non_exact_pmem_paths_as_invalid_path_method() {
-        for (route, request) in [
-            ("PUT /pmem", request_with_body("PUT", "/pmem", "{}")),
-            ("PUT /pmem/", request_with_body("PUT", "/pmem/", "{}")),
-            (
-                "PUT /pmem/pmem0/extra",
-                request_with_body("PUT", "/pmem/pmem0/extra", "{}"),
-            ),
-            (
-                "PATCH /pmem/pmem-0",
-                request_with_body("PATCH", "/pmem/pmem-0", "{}"),
-            ),
-        ] {
-            assert_eq!(
-                parse_request(&request),
-                Err(RequestError::InvalidPathMethod),
-                "{route}"
-            );
+        for method in ["PUT", "PATCH", "DELETE"] {
+            for path in [
+                "/pmem",
+                "/pmem/",
+                "/pmem/pmem0/extra",
+                "/pmem/pmem-0",
+                "/pmem/pmem0?debug=true",
+            ] {
+                assert_eq!(
+                    parse_request(&request_with_body(method, path, "{}")),
+                    Err(RequestError::InvalidPathMethod),
+                    "{method} {path}"
+                );
+            }
         }
     }
 
@@ -4081,10 +4084,6 @@ mod tests {
             (
                 "GET /pmem/pmem0",
                 b"GET /pmem/pmem0 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
-            ),
-            (
-                "DELETE /pmem/pmem0",
-                b"DELETE /pmem/pmem0 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
             ),
             (
                 "POST /pmem/pmem0",
