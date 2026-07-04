@@ -1087,7 +1087,14 @@ fn vsock_config_response_value(vsock: &VsockConfigResponse) -> serde_json::Value
 }
 
 pub fn parse_request(bytes: &[u8]) -> Result<ApiRequest, RequestError> {
-    if bytes.len() > HTTP_MAX_PAYLOAD_SIZE {
+    parse_request_with_limit(bytes, HTTP_MAX_PAYLOAD_SIZE)
+}
+
+pub fn parse_request_with_limit(
+    bytes: &[u8],
+    max_payload_size: usize,
+) -> Result<ApiRequest, RequestError> {
+    if bytes.len() > max_payload_size {
         return Err(RequestError::PayloadTooLarge);
     }
 
@@ -1100,7 +1107,7 @@ pub fn parse_request(bytes: &[u8]) -> Result<ApiRequest, RequestError> {
         return Err(RequestError::MalformedRequest);
     }
 
-    checked_request_len(header_len, request_body.content_length())?;
+    checked_request_len(header_len, request_body.content_length(), max_payload_size)?;
 
     if body.len() != request_body.content_length() {
         return Err(RequestError::MalformedRequest);
@@ -1509,7 +1516,14 @@ fn require_u64_field(
 }
 
 pub fn request_total_len(bytes: &[u8]) -> Result<Option<usize>, RequestError> {
-    if bytes.len() > HTTP_MAX_PAYLOAD_SIZE {
+    request_total_len_with_limit(bytes, HTTP_MAX_PAYLOAD_SIZE)
+}
+
+pub fn request_total_len_with_limit(
+    bytes: &[u8],
+    max_payload_size: usize,
+) -> Result<Option<usize>, RequestError> {
+    if bytes.len() > max_payload_size {
         return Err(RequestError::PayloadTooLarge);
     }
 
@@ -1531,6 +1545,7 @@ pub fn request_total_len(bytes: &[u8]) -> Result<Option<usize>, RequestError> {
     Ok(Some(checked_request_len(
         header_len,
         body.content_length(),
+        max_payload_size,
     )?))
 }
 
@@ -1640,12 +1655,16 @@ const fn is_http_optional_whitespace(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t')
 }
 
-fn checked_request_len(header_len: usize, content_length: usize) -> Result<usize, RequestError> {
+fn checked_request_len(
+    header_len: usize,
+    content_length: usize,
+    max_payload_size: usize,
+) -> Result<usize, RequestError> {
     let total_len = header_len
         .checked_add(content_length)
         .ok_or(RequestError::PayloadTooLarge)?;
 
-    if total_len > HTTP_MAX_PAYLOAD_SIZE {
+    if total_len > max_payload_size {
         return Err(RequestError::PayloadTooLarge);
     }
 
@@ -1720,6 +1739,35 @@ mod tests {
 
         assert_eq!(parse_request(request), Ok(ApiRequest::GetVersion));
         assert_eq!(request_total_len(request), Ok(Some(request.len())));
+    }
+
+    #[test]
+    fn parses_request_at_custom_payload_limit() {
+        let request = b"GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+        assert_eq!(
+            parse_request_with_limit(request, request.len()),
+            Ok(ApiRequest::GetVersion)
+        );
+        assert_eq!(
+            request_total_len_with_limit(request, request.len()),
+            Ok(Some(request.len()))
+        );
+    }
+
+    #[test]
+    fn rejects_request_over_custom_payload_limit() {
+        let request = b"GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let limit = request.len() - 1;
+
+        assert_eq!(
+            parse_request_with_limit(request, limit),
+            Err(RequestError::PayloadTooLarge)
+        );
+        assert_eq!(
+            request_total_len_with_limit(request, limit),
+            Err(RequestError::PayloadTooLarge)
+        );
     }
 
     #[test]
@@ -3385,6 +3433,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_declared_content_length_over_custom_payload_limit() {
+        let request = b"GET /version HTTP/1.1\r\nContent-Length: 10\r\n\r\n";
+
+        assert_eq!(
+            parse_request_with_limit(request, request.len()),
+            Err(RequestError::PayloadTooLarge)
+        );
+        assert_eq!(
+            request_total_len_with_limit(request, request.len()),
+            Err(RequestError::PayloadTooLarge)
+        );
+    }
+
+    #[test]
     fn rejects_declared_content_length_over_usize() {
         let request =
             b"GET /version HTTP/1.1\r\nContent-Length: 999999999999999999999999999999\r\n\r\n";
@@ -3401,6 +3463,27 @@ mod tests {
         let request = vec![b'a'; HTTP_MAX_PAYLOAD_SIZE + 1];
 
         assert_eq!(parse_request(&request), Err(RequestError::PayloadTooLarge));
+    }
+
+    #[test]
+    fn parses_request_above_default_with_custom_payload_limit() {
+        let module = "a".repeat(HTTP_MAX_PAYLOAD_SIZE);
+        let body = format!(r#"{{"module":"{module}"}}"#);
+        let request = request_with_body("PUT", "/logger", &body);
+
+        assert_eq!(parse_request(&request), Err(RequestError::PayloadTooLarge));
+        assert_eq!(
+            request_total_len_with_limit(&request, request.len()),
+            Ok(Some(request.len()))
+        );
+
+        let parsed = parse_request_with_limit(&request, request.len())
+            .expect("logger request above the default limit should parse");
+
+        let ApiRequest::PutLogger(config) = parsed else {
+            panic!("expected logger request");
+        };
+        assert_eq!(config.module(), Some(module.as_str()));
     }
 
     #[test]

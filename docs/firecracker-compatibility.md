@@ -115,6 +115,7 @@ public run-loop control.
 | Argument | Current behavior | Compatibility notes |
 | --- | --- | --- |
 | `--api-sock <PATH>` | binds the API Unix socket | Firecracker defaults to `/run/firecracker.socket`; bangbang defaults to `/tmp/bangbang.socket` because macOS does not normally provide `/run`. This is an intentional host-platform difference. |
+| `--http-api-max-payload-size <BYTES>` | configures the maximum accepted HTTP API request size | Defaults to Firecracker's `51200` byte limit. The configured value applies to API socket reads and final request parsing. Zero, malformed, duplicate, and equals-syntax values are rejected during argument parsing. |
 | `--id <ID>` | parsed and stored | Defaults to Firecracker's `anonymous-instance`. IDs must be 1 to 64 bytes and contain only ASCII alphanumeric characters or `-`. |
 | `--metrics-path <PATH>` | configures metrics output before API serving | Uses the same per-process metrics sink and redacted host-path error policy as `PUT /metrics`. A later duplicate `PUT /metrics` request fails without replacing this sink. |
 | `--log-path <PATH>` | configures logger output before API serving | Uses the same per-process logger sink and redacted host-path error policy as `PUT /logger`. |
@@ -125,7 +126,7 @@ public run-loop control.
 | `--help`, `-h` | prints help | Help describes the current API socket scope. |
 | `--version`, `-V` | prints version | `-V` is retained from the existing bangbang scaffold. |
 | `--config-file`, `--no-api` | rejected | Deferred until VM configuration models and no-API startup behavior exist. |
-| seccomp, snapshot, MMDS, boot timer, payload-size, and PCI process flags | rejected | These Firecracker options are Linux-specific or tied to later capability work. |
+| seccomp, snapshot, MMDS, boot timer, and PCI process flags | rejected | These Firecracker options are Linux-specific or tied to later capability work. |
 
 bangbang intentionally treats `--id` alphanumeric characters as ASCII only.
 This is stricter than Firecracker `v1.16.0`'s Rust validator, which accepts
@@ -1229,8 +1230,8 @@ VMM action model exist, but this document only defines the initial status/body
 shape.
 
 The initial API implementation uses Firecracker's default `51200` byte HTTP
-request payload limit. The `--http-api-max-payload-size` process argument
-remains rejected until configurable payload limits are introduced explicitly.
+request payload limit unless `--http-api-max-payload-size <BYTES>` configures a
+different per-process API socket request limit.
 The MMDS data store also uses Firecracker's default fixed `51200` byte
 serialized JSON limit for now; `--mmds-size-limit` remains rejected until a
 separate configuration PR adds it.

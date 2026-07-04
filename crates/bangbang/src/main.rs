@@ -12,6 +12,7 @@ pub mod host_network;
 mod vmm;
 
 use api_server::{ApiServer, ApiServerError};
+use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_hvf::HvfBackend;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::{SigId, low_level};
@@ -31,7 +32,6 @@ const UNSUPPORTED_FIRECRACKER_ARGS: &[&str] = &[
     "config-file",
     "describe-snapshot",
     "enable-pci",
-    "http-api-max-payload-size",
     "metadata",
     "mmds-size-limit",
     "no-api",
@@ -69,6 +69,7 @@ fn run() -> Result<(), ProcessError> {
         Command::Run(config) => {
             let StartupConfig {
                 api_sock,
+                http_api_max_payload_size,
                 id,
                 logger_config,
                 metrics_config,
@@ -84,7 +85,9 @@ fn run() -> Result<(), ProcessError> {
             apply_startup_metrics_config(&mut vmm, metrics_config)?;
             apply_startup_logger_config(&mut vmm, logger_config)?;
             let mut shutdown_signal = ShutdownSignal::install()?;
-            let server = ApiServer::bind(&api_sock).map_err(ProcessError::ApiServer)?;
+            let server =
+                ApiServer::bind_with_max_payload_size(&api_sock, http_api_max_payload_size)
+                    .map_err(ProcessError::ApiServer)?;
             println!("status: API server listening; VM execution loop is not implemented yet");
             let shutdown_wakeup = shutdown_signal.wakeup_reader();
             server
@@ -257,6 +260,7 @@ enum Command {
 #[derive(Debug, PartialEq, Eq)]
 struct StartupConfig {
     api_sock: String,
+    http_api_max_payload_size: usize,
     id: String,
     logger_config: Option<LoggerConfigInput>,
     metrics_config: Option<MetricsConfigInput>,
@@ -266,6 +270,7 @@ impl Default for StartupConfig {
     fn default() -> Self {
         Self {
             api_sock: DEFAULT_API_SOCK_PATH.to_string(),
+            http_api_max_payload_size: HTTP_MAX_PAYLOAD_SIZE,
             id: DEFAULT_INSTANCE_ID.to_string(),
             logger_config: None,
             metrics_config: None,
@@ -320,6 +325,7 @@ impl Args {
 
         let mut config = StartupConfig::default();
         let mut api_sock_seen = false;
+        let mut http_api_max_payload_size_seen = false;
         let mut id_seen = false;
         let mut logger_config = LoggerConfigInput::new();
         let mut logger_config_seen = false;
@@ -341,6 +347,15 @@ impl Args {
                     validate_api_sock(&value)?;
                     config.api_sock = value;
                     api_sock_seen = true;
+                    index += 2;
+                }
+                "--http-api-max-payload-size" => {
+                    if http_api_max_payload_size_seen {
+                        return Err("duplicate argument: --http-api-max-payload-size".to_string());
+                    }
+                    let value = take_value(&args, index, "--http-api-max-payload-size")?;
+                    config.http_api_max_payload_size = parse_http_api_max_payload_size(&value)?;
+                    http_api_max_payload_size_seen = true;
                     index += 2;
                 }
                 "--id" => {
@@ -460,6 +475,8 @@ fn help_text() -> String {
             "  bangbang [OPTIONS]\n\n",
             "Options:\n",
             "      --api-sock <PATH>  Unix domain socket path for the API server [default: {}]\n",
+            "      --http-api-max-payload-size <BYTES>\n",
+            "                         Maximum HTTP API request size [default: {}]\n",
             "      --id <ID>          MicroVM unique identifier [default: {}]\n",
             "                         Accepts 1-64 bytes, ASCII alphanumeric or '-'\n",
             "      --log-path <PATH>  Logger output file or FIFO path\n",
@@ -483,6 +500,7 @@ fn help_text() -> String {
         ),
         env!("CARGO_PKG_VERSION"),
         DEFAULT_API_SOCK_PATH,
+        HTTP_MAX_PAYLOAD_SIZE,
         DEFAULT_INSTANCE_ID
     )
 }
@@ -504,6 +522,20 @@ fn validate_api_sock(api_sock: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn parse_http_api_max_payload_size(value: &str) -> Result<usize, String> {
+    let max_payload_size = value.parse::<usize>().map_err(|_| {
+        "invalid --http-api-max-payload-size: value must be a positive integer".to_string()
+    })?;
+
+    if max_payload_size == 0 {
+        return Err(
+            "invalid --http-api-max-payload-size: value must be greater than 0".to_string(),
+        );
+    }
+
+    Ok(max_payload_size)
 }
 
 fn validate_instance_id(id: &str) -> Result<(), String> {
@@ -545,6 +577,7 @@ fn display_arg_name(arg: &str) -> &str {
 fn unsupported_equals_syntax(arg: &str) -> Option<&'static str> {
     [
         ("--api-sock=", "api-sock"),
+        ("--http-api-max-payload-size=", "http-api-max-payload-size"),
         ("--id=", "id"),
         ("--log-path=", "log-path"),
         ("--level=", "level"),
@@ -572,7 +605,8 @@ mod tests {
 
     use super::{
         ApiServerError, Args, Command, DEFAULT_API_SOCK_PATH, DEFAULT_INSTANCE_ID,
-        MAX_INSTANCE_ID_LEN, ProcessError, ProcessExitCode, StartupConfig, parse_process_args,
+        HTTP_MAX_PAYLOAD_SIZE, MAX_INSTANCE_ID_LEN, ProcessError, ProcessExitCode, StartupConfig,
+        parse_process_args,
     };
 
     #[derive(Debug, Clone)]
@@ -705,6 +739,7 @@ mod tests {
         let config = parse_run(&[]).expect("empty args should parse");
 
         assert_eq!(config.api_sock, DEFAULT_API_SOCK_PATH);
+        assert_eq!(config.http_api_max_payload_size, HTTP_MAX_PAYLOAD_SIZE);
         assert_eq!(config.id, DEFAULT_INSTANCE_ID);
         assert_eq!(config.logger_config, None);
         assert_eq!(config.metrics_config, None);
@@ -733,6 +768,7 @@ mod tests {
         assert!(help.contains("minimal action logs"));
         assert!(help.contains("--log-path <PATH>"));
         assert!(help.contains("--metrics-path <PATH>"));
+        assert!(help.contains("--http-api-max-payload-size <BYTES>"));
         assert!(help.contains("--show-level"));
         assert!(help.contains("PUT /actions starts a process-owned HVF boot run-loop worker"));
         assert!(help.contains("across bounded step windows for InstanceStart"));
@@ -780,9 +816,18 @@ mod tests {
             parse_run(&["--api-sock", "/tmp/custom.socket"]).expect("api socket arg should parse");
 
         assert_eq!(config.api_sock, "/tmp/custom.socket");
+        assert_eq!(config.http_api_max_payload_size, HTTP_MAX_PAYLOAD_SIZE);
         assert_eq!(config.id, DEFAULT_INSTANCE_ID);
         assert_eq!(config.logger_config, None);
         assert_eq!(config.metrics_config, None);
+    }
+
+    #[test]
+    fn parse_http_api_max_payload_size_arg() {
+        let config = parse_run(&["--http-api-max-payload-size", "65536"])
+            .expect("payload size arg should parse");
+
+        assert_eq!(config.http_api_max_payload_size, 65_536);
     }
 
     #[test]
@@ -790,6 +835,7 @@ mod tests {
         let config = parse_run(&["--id", "demo-1"]).expect("id arg should parse");
 
         assert_eq!(config.api_sock, DEFAULT_API_SOCK_PATH);
+        assert_eq!(config.http_api_max_payload_size, HTTP_MAX_PAYLOAD_SIZE);
         assert_eq!(config.id, "demo-1");
         assert_eq!(config.logger_config, None);
         assert_eq!(config.metrics_config, None);
@@ -840,12 +886,15 @@ mod tests {
             "/tmp/custom.socket",
             "--id",
             "demo-1",
+            "--http-api-max-payload-size",
+            "65536",
             "--metrics-path",
             "/tmp/bangbang.metrics",
         ])
         .expect("startup args should parse");
 
         assert_eq!(config.api_sock, "/tmp/custom.socket");
+        assert_eq!(config.http_api_max_payload_size, 65_536);
         assert_eq!(config.id, "demo-1");
         assert_eq!(config.logger_config, None);
         assert_eq!(
@@ -866,6 +915,14 @@ mod tests {
         let err = parse(&["--id", "--api-sock"]).expect_err("missing id value should fail");
 
         assert_eq!(err, "missing value for --id");
+    }
+
+    #[test]
+    fn rejects_missing_http_api_max_payload_size_value() {
+        let err = parse(&["--http-api-max-payload-size", "--id"])
+            .expect_err("missing payload size value should fail");
+
+        assert_eq!(err, "missing value for --http-api-max-payload-size");
     }
 
     #[test]
@@ -902,10 +959,53 @@ mod tests {
     }
 
     #[test]
+    fn rejects_duplicate_http_api_max_payload_size() {
+        let err = parse(&[
+            "--http-api-max-payload-size",
+            "65536",
+            "--http-api-max-payload-size",
+            "65537",
+        ])
+        .expect_err("duplicate payload size should fail");
+
+        assert_eq!(err, "duplicate argument: --http-api-max-payload-size");
+    }
+
+    #[test]
     fn rejects_duplicate_id() {
         let err = parse(&["--id", "one", "--id", "two"]).expect_err("duplicate id should fail");
 
         assert_eq!(err, "duplicate argument: --id");
+    }
+
+    #[test]
+    fn rejects_invalid_http_api_max_payload_size() {
+        let err = parse(&["--http-api-max-payload-size", "0"])
+            .expect_err("zero payload size should fail");
+
+        assert_eq!(
+            err,
+            "invalid --http-api-max-payload-size: value must be greater than 0"
+        );
+
+        let err = parse(&["--http-api-max-payload-size", "abc"])
+            .expect_err("non-numeric payload size should fail");
+
+        assert_eq!(
+            err,
+            "invalid --http-api-max-payload-size: value must be a positive integer"
+        );
+
+        let err = parse(&[
+            "--http-api-max-payload-size",
+            "999999999999999999999999999999",
+        ])
+        .expect_err("overflowing payload size should fail");
+
+        assert_eq!(
+            err,
+            "invalid --http-api-max-payload-size: value must be a positive integer"
+        );
     }
 
     #[test]
@@ -1059,6 +1159,14 @@ mod tests {
         assert_eq!(
             err,
             "unsupported argument syntax for --api-sock; use --api-sock <VALUE>"
+        );
+
+        let err =
+            parse(&["--http-api-max-payload-size=65536"]).expect_err("equals syntax should fail");
+
+        assert_eq!(
+            err,
+            "unsupported argument syntax for --http-api-max-payload-size; use --http-api-max-payload-size <VALUE>"
         );
 
         let err = parse(&["--log-path=/tmp/secret.log"]).expect_err("equals syntax should fail");
