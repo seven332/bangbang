@@ -56,7 +56,7 @@ impl RequestError {
             Self::MismatchedInterfaceId => "path iface_id must match body iface_id.",
             Self::MalformedRequest => "Malformed HTTP request.",
             Self::PayloadTooLarge => "HTTP request payload exceeds the configured limit.",
-            Self::SendCtrlAltDelUnsupported => "SendCtrlAltDel does not supported on aarch64.",
+            Self::SendCtrlAltDelUnsupported => "SendCtrlAltDel is not supported on aarch64.",
             Self::SnapshotUnsupported => "Snapshot and restore are not supported.",
         }
     }
@@ -1861,7 +1861,7 @@ mod tests {
         assert_eq!(err, RequestError::SendCtrlAltDelUnsupported);
         assert_eq!(
             err.fault_message(),
-            "SendCtrlAltDel does not supported on aarch64."
+            "SendCtrlAltDel is not supported on aarch64."
         );
     }
 
