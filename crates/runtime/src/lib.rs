@@ -1206,6 +1206,40 @@ mod tests {
     }
 
     #[test]
+    fn controller_with_mmds_data_store_limit_rejects_patch_without_mutating() {
+        let original = serde_json::json!({"latest": {"meta-data": {}}});
+        let limit_bytes = serialized_len(&original);
+        let oversized_patch = serde_json::json!({
+            "latest": {
+                "user-data": "x".repeat(64),
+            },
+        });
+        let mut controller =
+            VmmController::with_mmds_data_store_limit("demo-1", "0.1.0", "bangbang", limit_bytes);
+
+        controller
+            .handle_action(VmmAction::PutMmds(MmdsContentInput::new(original.clone())))
+            .expect("initial exact-limit MMDS put should succeed");
+        let err = controller
+            .handle_action(VmmAction::PatchMmds(MmdsContentInput::new(oversized_patch)))
+            .expect_err("oversized MMDS patch should fail");
+
+        let VmmActionError::MmdsDataStore(MmdsDataStoreError::DataStoreLimitExceeded {
+            limit_bytes: actual_limit_bytes,
+            size_bytes,
+        }) = err
+        else {
+            panic!("expected MMDS data store limit error");
+        };
+        assert_eq!(actual_limit_bytes, limit_bytes);
+        assert!(size_bytes > actual_limit_bytes);
+        assert_eq!(
+            controller.handle_action(VmmAction::GetMmds),
+            Ok(VmmData::MmdsValue(original))
+        );
+    }
+
+    #[test]
     fn oversized_patch_mmds_does_not_mutate_existing_data_store() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         let original = serde_json::json!({"latest": {"meta-data": {}}});
