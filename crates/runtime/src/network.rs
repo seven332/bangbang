@@ -1459,6 +1459,7 @@ impl VirtioNetworkRxQueue {
         if self.event_idx_enabled {
             Ok(VirtqueueNotificationSuppression::EventIdx {
                 used_event: self.available.used_event(memory)?,
+                avail_event: self.available.next_avail(),
             })
         } else {
             Ok(VirtqueueNotificationSuppression::Disabled)
@@ -2115,6 +2116,7 @@ impl VirtioNetworkTxQueue {
         if self.event_idx_enabled {
             Ok(VirtqueueNotificationSuppression::EventIdx {
                 used_event: self.available.used_event(memory)?,
+                avail_event: self.available.next_avail(),
             })
         } else {
             Ok(VirtqueueNotificationSuppression::Disabled)

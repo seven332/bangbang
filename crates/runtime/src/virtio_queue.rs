@@ -508,7 +508,7 @@ impl VirtqueueAvailableRing {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VirtqueueNotificationSuppression {
     Disabled,
-    EventIdx { used_event: u16 },
+    EventIdx { used_event: u16, avail_event: u16 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -609,6 +609,25 @@ impl VirtqueueUsedRing {
             len,
         )?;
 
+        let needs_queue_interrupt = match notification_suppression {
+            VirtqueueNotificationSuppression::Disabled => true,
+            VirtqueueNotificationSuppression::EventIdx {
+                used_event,
+                avail_event,
+            } => {
+                let avail_event_address =
+                    used_ring_avail_event_address(self.used_ring, self.queue_size)?;
+                write_used_ring_u16(
+                    memory,
+                    self.used_ring,
+                    self.queue_size,
+                    avail_event_address,
+                    avail_event,
+                )?;
+                virtqueue_event_idx_needs_notification(old_used, next_used, used_event)
+            }
+        };
+
         // Match Firecracker's ordering point before making a used entry
         // visible by advancing UsedRing.idx.
         fence(Ordering::Release);
@@ -629,12 +648,7 @@ impl VirtqueueUsedRing {
         self.next_used = next_used;
 
         Ok(VirtqueueUsedRingPublication {
-            needs_queue_interrupt: match notification_suppression {
-                VirtqueueNotificationSuppression::Disabled => true,
-                VirtqueueNotificationSuppression::EventIdx { used_event } => {
-                    virtqueue_event_idx_needs_notification(old_used, next_used, used_event)
-                }
-            },
+            needs_queue_interrupt,
         })
     }
 }
@@ -1374,6 +1388,21 @@ fn used_ring_entry_address(
     used_ring_offset_address(used_ring, queue_size, entry_offset)
 }
 
+fn used_ring_avail_event_address(
+    used_ring: GuestAddress,
+    queue_size: u16,
+) -> Result<GuestAddress, VirtqueueUsedRingError> {
+    let avail_event_offset = u64::from(queue_size)
+        .checked_mul(VIRTQUEUE_USED_RING_ELEMENT_SIZE_U64)
+        .and_then(|offset| offset.checked_add(VIRTQUEUE_USED_RING_RING_OFFSET))
+        .ok_or(VirtqueueUsedRingError::UsedRingRangeOverflow {
+            used_ring,
+            queue_size,
+        })?;
+
+    used_ring_offset_address(used_ring, queue_size, avail_event_offset)
+}
+
 fn read_available_ring_u16(
     memory: &GuestMemory,
     available_ring: GuestAddress,
@@ -1670,6 +1699,28 @@ mod tests {
             .expect("used ring entry address should not overflow")
     }
 
+    fn used_ring_avail_event_address(used_ring: GuestAddress, queue_size: u16) -> GuestAddress {
+        used_ring
+            .checked_add(
+                VIRTQUEUE_USED_RING_RING_OFFSET
+                    + u64::from(queue_size) * VIRTQUEUE_USED_RING_ELEMENT_SIZE_U64,
+            )
+            .expect("used ring avail_event address should not overflow")
+    }
+
+    fn write_used_avail_event(
+        memory: &mut GuestMemory,
+        used_ring: GuestAddress,
+        queue_size: u16,
+        value: u16,
+    ) {
+        write_u16(
+            memory,
+            used_ring_avail_event_address(used_ring, queue_size),
+            value,
+        );
+    }
+
     fn indirect_descriptor_options() -> VirtqueueDescriptorChainOptions {
         VirtqueueDescriptorChainOptions::new().with_indirect_descriptors(true)
     }
@@ -1780,7 +1831,10 @@ mod tests {
                 &mut memory,
                 0,
                 0,
-                VirtqueueNotificationSuppression::EventIdx { used_event: 1 },
+                VirtqueueNotificationSuppression::EventIdx {
+                    used_event: 1,
+                    avail_event: 10,
+                },
             )
             .expect("first used element should publish");
         let second = queue
@@ -1788,7 +1842,10 @@ mod tests {
                 &mut memory,
                 1,
                 0,
-                VirtqueueNotificationSuppression::EventIdx { used_event: 1 },
+                VirtqueueNotificationSuppression::EventIdx {
+                    used_event: 1,
+                    avail_event: 11,
+                },
             )
             .expect("second used element should publish");
 
@@ -1798,6 +1855,117 @@ mod tests {
         assert_eq!(
             read_u16_field(&memory, USED.checked_add(2).expect("idx should fit")),
             2
+        );
+        assert_eq!(
+            read_u16_field(&memory, used_ring_avail_event_address(USED, 8)),
+            11
+        );
+    }
+
+    #[test]
+    fn publish_used_element_writes_avail_event_with_event_idx() {
+        let mut memory = guest_memory(0x4000);
+        let mut queue =
+            VirtqueueUsedRing::new(USED, 8).expect("used ring should be valid for publishing");
+
+        let publication = queue
+            .publish_used_element_with_notification(
+                &mut memory,
+                0,
+                16,
+                VirtqueueNotificationSuppression::EventIdx {
+                    used_event: 0,
+                    avail_event: 7,
+                },
+            )
+            .expect("used element with avail_event should publish");
+
+        assert!(publication.needs_queue_interrupt());
+        assert_eq!(queue.next_used(), 1);
+        assert_eq!(
+            read_u16_field(&memory, used_ring_avail_event_address(USED, 8)),
+            7
+        );
+        assert_eq!(
+            read_u16_field(&memory, USED.checked_add(2).expect("idx should fit")),
+            1
+        );
+    }
+
+    #[test]
+    fn publish_used_element_does_not_write_avail_event_when_event_idx_disabled() {
+        let mut memory = guest_memory(0x4000);
+        write_used_avail_event(&mut memory, USED, 8, 0x1234);
+        let mut queue =
+            VirtqueueUsedRing::new(USED, 8).expect("used ring should be valid for publishing");
+
+        let publication = queue
+            .publish_used_element_with_notification(
+                &mut memory,
+                0,
+                16,
+                VirtqueueNotificationSuppression::Disabled,
+            )
+            .expect("disabled event-index used element should publish");
+
+        assert!(publication.needs_queue_interrupt());
+        assert_eq!(queue.next_used(), 1);
+        assert_eq!(
+            read_u16_field(&memory, used_ring_avail_event_address(USED, 8)),
+            0x1234
+        );
+    }
+
+    #[test]
+    fn publish_used_element_rejects_unmapped_avail_event_trailer_without_advancing() {
+        let mut memory = guest_memory(0x4000);
+        let used_ring = GuestAddress::new(0x3fe0);
+        let mut queue = VirtqueueUsedRing::new(used_ring, 4)
+            .expect("used ring address should be valid without memory mapping");
+
+        let err = queue
+            .publish_used_element_with_notification(
+                &mut memory,
+                0,
+                16,
+                VirtqueueNotificationSuppression::EventIdx {
+                    used_event: 0,
+                    avail_event: 1,
+                },
+            )
+            .expect_err("partially unmapped used ring trailer should fail");
+
+        assert!(matches!(err, VirtqueueUsedRingError::UsedRingAccess { .. }));
+        assert_eq!(queue.next_used(), 0);
+    }
+
+    #[test]
+    fn publish_used_element_writes_wrapping_avail_event_with_event_idx() {
+        let mut memory = guest_memory(0x4000);
+        let mut queue = VirtqueueUsedRing::with_next_used(USED, 8, u16::MAX)
+            .expect("used ring should be valid for wrapping publication");
+
+        let publication = queue
+            .publish_used_element_with_notification(
+                &mut memory,
+                0,
+                16,
+                VirtqueueNotificationSuppression::EventIdx {
+                    used_event: u16::MAX,
+                    avail_event: u16::MAX,
+                },
+            )
+            .expect("wrapping used element should publish");
+
+        assert!(publication.needs_queue_interrupt());
+        assert_eq!(queue.next_used(), 0);
+        assert_eq!(
+            read_u16_field(&memory, USED.checked_add(2).expect("idx should fit")),
+            0
+        );
+        assert_eq!(
+            read_u16_field(&memory, used_ring_avail_event_address(USED, 8)),
+            u16::MAX
         );
     }
 
