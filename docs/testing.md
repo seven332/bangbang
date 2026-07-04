@@ -120,6 +120,17 @@ the `bangbang` process boundary:
 cargo test -p bangbang --test process_e2e --all-features --locked
 ```
 
+Build a signed `bangbang` executable artifact for future HVF-backed process e2e
+tests without running it:
+
+```sh
+scripts/build-signed-bangbang.sh --output .tmp/signed-bangbang/bangbang
+```
+
+This requires macOS `codesign` and the `aarch64-apple-darwin` Rust target. The
+command only builds and signs the executable; HVF execution remains the job of
+the signed integration runner.
+
 Hosted macOS CI may use:
 
 ```sh
