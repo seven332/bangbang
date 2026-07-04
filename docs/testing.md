@@ -33,6 +33,14 @@ integration test to pin the intended behavior before changing implementation,
 especially for CLI, API, filesystem, or cross-crate workflows. The final PR
 must leave the new test passing in the documented command set.
 
+Use process-level executable tests when the behavior depends on the real
+`bangbang` binary, process arguments, Unix-socket publication, signal handling,
+or process-owned cleanup but does not enter HVF. These tests live under
+`crates/bangbang/tests/` and run in the normal unsigned workspace test command.
+They should start `env!("CARGO_BIN_EXE_bangbang")`, use unique temporary
+resources, wait on explicit process or socket readiness signals, and shut the
+child down with normal signals when testing owned cleanup.
+
 Use HVF integration tests for behavior that creates HVF VMs, vCPUs, GIC state,
 mapped guest memory, signed test binaries, or guest boot execution. These tests
 live in `crates/hvf/tests/` and must run through
@@ -103,6 +111,13 @@ Run one signed integration test target when the change is narrower:
 ```sh
 scripts/run-integration-tests.sh --test hvf_lifecycle
 scripts/run-integration-tests.sh --test guest_boot
+```
+
+Run only the process-level executable e2e test when the change is limited to
+the `bangbang` process boundary:
+
+```sh
+cargo test -p bangbang --test process_e2e --all-features --locked
 ```
 
 Hosted macOS CI may use:
