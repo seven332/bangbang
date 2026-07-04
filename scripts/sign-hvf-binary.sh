@@ -50,9 +50,9 @@ signed_tmp=""
 
 cleanup() {
   if [[ -n "$signed_tmp" ]]; then
-    rm -f "$signed_tmp"
+    rm -f -- "$signed_tmp"
   fi
-  rm -rf "$tmp_dir"
+  rm -rf -- "$tmp_dir"
 }
 trap cleanup EXIT
 
@@ -68,17 +68,25 @@ cat > "$entitlements" <<'EOF'
 </plist>
 EOF
 
-output_dir="$(dirname "$output")"
-output_name="$(basename "$output")"
+output_dir="$(dirname -- "$output")"
+output_name="$(basename -- "$output")"
 
 if [[ "$output_name" == "." || "$output_name" == "/" ]]; then
   echo "output path must name a file: $output" >&2
   exit 2
 fi
 
-mkdir -p "$output_dir"
-signed_tmp="$(mktemp "$output_dir/.$output_name.signed.XXXXXX")"
-cp -p "$input" "$signed_tmp"
+mkdir -p -- "$output_dir"
+case "$output_dir" in
+  /*)
+    output_tmp_dir="$output_dir"
+    ;;
+  *)
+    output_tmp_dir="./$output_dir"
+    ;;
+esac
+signed_tmp="$(mktemp "$output_tmp_dir/.$output_name.signed.XXXXXX")"
+cp -p -- "$input" "$signed_tmp"
 codesign --force --sign - --entitlements "$entitlements" "$signed_tmp"
-mv -f "$signed_tmp" "$output"
+mv -f -- "$signed_tmp" "$output"
 signed_tmp=""
