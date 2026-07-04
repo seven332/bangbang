@@ -1467,7 +1467,7 @@ fn validate_machine_config_request(body: &MachineConfigRequestBody) -> Result<()
     if body.mem_size_mib == 0 {
         return Err(RequestError::MalformedRequest);
     }
-    if body.smt || body.track_dirty_pages || body.huge_pages != MachineConfigHugePages::None {
+    if body.smt || body.huge_pages != MachineConfigHugePages::None {
         return Err(RequestError::MalformedRequest);
     }
 
@@ -1488,10 +1488,7 @@ fn validate_machine_config_patch_request(
     if body.mem_size_mib == Some(0) {
         return Err(RequestError::MalformedRequest);
     }
-    if body.smt == Some(true)
-        || body.track_dirty_pages == Some(true)
-        || body.huge_pages == Some(MachineConfigHugePages::TwoM)
-    {
+    if body.smt == Some(true) || body.huge_pages == Some(MachineConfigHugePages::TwoM) {
         return Err(RequestError::MalformedRequest);
     }
 
@@ -2348,7 +2345,6 @@ mod tests {
     fn rejects_put_machine_config_unsupported_values() {
         for body in [
             r#"{"vcpu_count":1,"mem_size_mib":128,"smt":true}"#,
-            r#"{"vcpu_count":1,"mem_size_mib":128,"track_dirty_pages":true}"#,
             r#"{"vcpu_count":1,"mem_size_mib":128,"cpu_template":"V1N1"}"#,
             r#"{"vcpu_count":1,"mem_size_mib":128,"huge_pages":"2M"}"#,
         ] {
@@ -2357,6 +2353,23 @@ mod tests {
                 Err(RequestError::MalformedRequest)
             );
         }
+    }
+
+    #[test]
+    fn parses_put_machine_config_with_dirty_page_tracking_enabled() {
+        let body = r#"{
+            "vcpu_count": 1,
+            "mem_size_mib": 128,
+            "track_dirty_pages": true
+        }"#;
+        let request = request_with_body("PUT", "/machine-config", body);
+
+        let parsed = parse_request(&request).expect("machine-config request should parse");
+
+        let ApiRequest::PutMachineConfig(config) = parsed else {
+            panic!("expected machine-config request");
+        };
+        assert!(config.track_dirty_pages());
     }
 
     #[test]
@@ -2472,7 +2485,6 @@ mod tests {
     fn rejects_patch_machine_config_unsupported_values() {
         for body in [
             r#"{"smt":true}"#,
-            r#"{"track_dirty_pages":true}"#,
             r#"{"cpu_template":"V1N1"}"#,
             r#"{"huge_pages":"2M"}"#,
         ] {
@@ -2481,6 +2493,19 @@ mod tests {
                 Err(RequestError::MalformedRequest)
             );
         }
+    }
+
+    #[test]
+    fn parses_patch_machine_config_with_dirty_page_tracking_enabled() {
+        let body = r#"{"track_dirty_pages":true}"#;
+        let request = request_with_body("PATCH", "/machine-config", body);
+
+        let parsed = parse_request(&request).expect("machine-config patch should parse");
+
+        let ApiRequest::PatchMachineConfig(config) = parsed else {
+            panic!("expected machine-config patch request");
+        };
+        assert_eq!(config.track_dirty_pages(), Some(true));
     }
 
     #[test]
