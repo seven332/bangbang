@@ -92,12 +92,14 @@ impl ProcessVmm<HvfInstanceStartExecutor> {
         instance_id: impl Into<String>,
         vmm_version: impl Into<String>,
         app_name: impl Into<String>,
+        mmds_data_store_limit_bytes: usize,
     ) -> Self {
-        Self::with_starter(
+        Self::with_starter_and_mmds_data_store_limit(
             instance_id,
             vmm_version,
             app_name,
             HvfInstanceStartExecutor::default(),
+            mmds_data_store_limit_bytes,
         )
     }
 }
@@ -106,14 +108,36 @@ impl<S> ProcessVmm<S>
 where
     S: InstanceStartExecutor,
 {
+    #[cfg(test)]
     pub(crate) fn with_starter(
         instance_id: impl Into<String>,
         vmm_version: impl Into<String>,
         app_name: impl Into<String>,
         starter: S,
     ) -> Self {
+        Self::with_starter_and_mmds_data_store_limit(
+            instance_id,
+            vmm_version,
+            app_name,
+            starter,
+            bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+        )
+    }
+
+    pub(crate) fn with_starter_and_mmds_data_store_limit(
+        instance_id: impl Into<String>,
+        vmm_version: impl Into<String>,
+        app_name: impl Into<String>,
+        starter: S,
+        mmds_data_store_limit_bytes: usize,
+    ) -> Self {
         Self {
-            controller: VmmController::new(instance_id, vmm_version, app_name),
+            controller: VmmController::with_mmds_data_store_limit(
+                instance_id,
+                vmm_version,
+                app_name,
+                mmds_data_store_limit_bytes,
+            ),
             starter,
             started_session: None,
         }

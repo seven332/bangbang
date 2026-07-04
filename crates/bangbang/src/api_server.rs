@@ -1071,6 +1071,18 @@ mod tests {
         ProcessVmm::with_starter(id, version, "bangbang", TestInstanceStarter::failure())
     }
 
+    fn test_controller_with_mmds_data_store_limit(
+        mmds_data_store_limit_bytes: usize,
+    ) -> ProcessVmm<TestInstanceStarter> {
+        ProcessVmm::with_starter_and_mmds_data_store_limit(
+            "demo-1",
+            VERSION,
+            "bangbang",
+            TestInstanceStarter::failure(),
+            mmds_data_store_limit_bytes,
+        )
+    }
+
     #[test]
     fn handle_empty_maps_logger_write_errors_to_fault() {
         let response = handle_empty(Err(VmmActionError::LoggerWrite(LoggerWriteError::Write(
@@ -2652,6 +2664,89 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(response.contains("Content-Type: application/json\r\n"));
         assert!(response.contains(r#""ami-id":"ami-123""#));
+    }
+
+    #[test]
+    fn serves_put_mmds_above_default_with_configured_mmds_size_limit() {
+        let path = unique_socket_path("mmds-large-limit");
+        let body = format!(r#"{{"data":"{}"}}"#, "x".repeat(HTTP_MAX_PAYLOAD_SIZE));
+        assert!(body.len() > HTTP_MAX_PAYLOAD_SIZE);
+        let request = format!(
+            "PUT /mmds HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let server = ApiServer::bind_with_max_payload_size(&path, request.len())
+            .expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+        let client_handle = thread::spawn(move || {
+            client
+                .write_all(request.as_bytes())
+                .expect("client should write request");
+            let mut response = String::new();
+            client
+                .read_to_string(&mut response)
+                .expect("client should read response");
+            response
+        });
+        let mut vmm = test_controller_with_mmds_data_store_limit(body.len());
+
+        server
+            .serve_next(&mut vmm)
+            .expect("server should handle one request");
+
+        let response = client_handle
+            .join()
+            .expect("client thread should not panic");
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let get_response =
+            handle_request_bytes(b"GET /mmds HTTP/1.1\r\nHost: localhost\r\n\r\n", &mut vmm);
+        assert_eq!(get_response.status(), bangbang_api::http::StatusCode::Ok);
+        assert_eq!(get_response.body(), body);
+    }
+
+    #[test]
+    fn oversized_put_mmds_with_configured_size_limit_does_not_mutate_store() {
+        let original_body = r#"{"latest":{"meta-data":{}}}"#.to_string();
+        let mut vmm = test_controller_with_mmds_data_store_limit(original_body.len());
+        let original_request = format!(
+            "PUT /mmds HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{original_body}",
+            original_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(original_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let path = unique_socket_path("mmds-small-limit");
+        let server = ApiServer::bind_with_max_payload_size(&path, HTTP_MAX_PAYLOAD_SIZE)
+            .expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+        let oversized_body = format!(r#"{{"data":"{}"}}"#, "x".repeat(64));
+        let oversized_request = format!(
+            "PUT /mmds HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{oversized_body}",
+            oversized_body.len()
+        );
+
+        client
+            .write_all(oversized_request.as_bytes())
+            .expect("client should write request");
+        server
+            .serve_next(&mut vmm)
+            .expect("server should handle one request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("client should read response");
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.contains("The MMDS data store size limit was exceeded"));
+
+        let get_response =
+            handle_request_bytes(b"GET /mmds HTTP/1.1\r\nHost: localhost\r\n\r\n", &mut vmm);
+        assert_eq!(get_response.status(), bangbang_api::http::StatusCode::Ok);
+        assert_eq!(get_response.body(), original_body);
     }
 
     #[test]

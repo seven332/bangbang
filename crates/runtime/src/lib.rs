@@ -269,6 +269,20 @@ impl VmmController {
         vmm_version: impl Into<String>,
         app_name: impl Into<String>,
     ) -> Self {
+        Self::with_mmds_data_store_limit(
+            instance_id,
+            vmm_version,
+            app_name,
+            mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+        )
+    }
+
+    pub fn with_mmds_data_store_limit(
+        instance_id: impl Into<String>,
+        vmm_version: impl Into<String>,
+        app_name: impl Into<String>,
+        mmds_data_store_limit_bytes: usize,
+    ) -> Self {
         Self {
             instance_info: InstanceInfo::new(
                 instance_id,
@@ -283,7 +297,9 @@ impl VmmController {
             vsock_config: None,
             logger_state: logger::LoggerState::default(),
             metrics_state: metrics::MetricsState::default(),
-            mmds_state: mmds::MmdsStateHandle::default(),
+            mmds_state: mmds::MmdsStateHandle::new(mmds::MmdsState::new(
+                mmds_data_store_limit_bytes,
+            )),
         }
     }
 
@@ -626,6 +642,10 @@ mod tests {
 
     fn boot_source_input(kernel_image_path: &str) -> BootSourceConfigInput {
         BootSourceConfigInput::new(kernel_image_path)
+    }
+
+    fn serialized_len(value: &serde_json::Value) -> usize {
+        value.to_string().len()
     }
 
     fn mmds_content_input() -> MmdsContentInput {
@@ -1135,6 +1155,84 @@ mod tests {
         };
         assert_eq!(limit_bytes, MMDS_DATA_STORE_LIMIT_BYTES);
         assert!(size_bytes > limit_bytes);
+        assert_eq!(
+            controller.handle_action(VmmAction::GetMmds),
+            Ok(VmmData::MmdsValue(original))
+        );
+    }
+
+    #[test]
+    fn controller_with_mmds_data_store_limit_accepts_exact_limit() {
+        let value = serde_json::json!({"latest": {"meta-data": {"ami-id": "ami-123"}}});
+        let mut controller = VmmController::with_mmds_data_store_limit(
+            "demo-1",
+            "0.1.0",
+            "bangbang",
+            serialized_len(&value),
+        );
+
+        assert_eq!(
+            controller.handle_action(VmmAction::PutMmds(MmdsContentInput::new(value.clone()))),
+            Ok(VmmData::Empty)
+        );
+        assert_eq!(
+            controller.handle_action(VmmAction::GetMmds),
+            Ok(VmmData::MmdsValue(value))
+        );
+    }
+
+    #[test]
+    fn controller_with_mmds_data_store_limit_rejects_one_byte_over_without_initializing() {
+        let value = serde_json::json!({"latest": {"meta-data": {"ami-id": "ami-123"}}});
+        let limit_bytes = serialized_len(&value) - 1;
+        let mut controller =
+            VmmController::with_mmds_data_store_limit("demo-1", "0.1.0", "bangbang", limit_bytes);
+
+        assert_eq!(
+            controller.handle_action(VmmAction::PutMmds(MmdsContentInput::new(value.clone()))),
+            Err(VmmActionError::MmdsDataStore(
+                MmdsDataStoreError::DataStoreLimitExceeded {
+                    limit_bytes,
+                    size_bytes: serialized_len(&value),
+                }
+            ))
+        );
+        assert_eq!(
+            controller.handle_action(VmmAction::GetMmds),
+            Err(VmmActionError::MmdsDataStore(
+                MmdsDataStoreError::NotInitialized
+            ))
+        );
+    }
+
+    #[test]
+    fn controller_with_mmds_data_store_limit_rejects_patch_without_mutating() {
+        let original = serde_json::json!({"latest": {"meta-data": {}}});
+        let limit_bytes = serialized_len(&original);
+        let oversized_patch = serde_json::json!({
+            "latest": {
+                "user-data": "x".repeat(64),
+            },
+        });
+        let mut controller =
+            VmmController::with_mmds_data_store_limit("demo-1", "0.1.0", "bangbang", limit_bytes);
+
+        controller
+            .handle_action(VmmAction::PutMmds(MmdsContentInput::new(original.clone())))
+            .expect("initial exact-limit MMDS put should succeed");
+        let err = controller
+            .handle_action(VmmAction::PatchMmds(MmdsContentInput::new(oversized_patch)))
+            .expect_err("oversized MMDS patch should fail");
+
+        let VmmActionError::MmdsDataStore(MmdsDataStoreError::DataStoreLimitExceeded {
+            limit_bytes: actual_limit_bytes,
+            size_bytes,
+        }) = err
+        else {
+            panic!("expected MMDS data store limit error");
+        };
+        assert_eq!(actual_limit_bytes, limit_bytes);
+        assert!(size_bytes > actual_limit_bytes);
         assert_eq!(
             controller.handle_action(VmmAction::GetMmds),
             Ok(VmmData::MmdsValue(original))
