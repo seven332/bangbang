@@ -20,8 +20,8 @@ use crate::virtio_mmio::{
 };
 use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
-    VirtqueueDescriptorChain, VirtqueueNotificationSuppression, VirtqueueUsedRing,
-    VirtqueueUsedRingError, VirtqueueUsedRingPublication,
+    VirtqueueDescriptorChain, VirtqueueDescriptorChainOptions, VirtqueueNotificationSuppression,
+    VirtqueueUsedRing, VirtqueueUsedRingError, VirtqueueUsedRingPublication,
 };
 
 const MAC_ADDRESS_LEN: usize = 6;
@@ -39,6 +39,7 @@ pub const VIRTIO_NET_MIN_MTU: u16 = 68;
 pub const VIRTIO_NET_MAX_MTU: u16 = u16::MAX;
 pub const VIRTIO_NET_F_MTU: u32 = 3;
 pub const VIRTIO_NET_F_MAC: u32 = 5;
+pub const VIRTIO_RING_FEATURE_INDIRECT_DESC: u32 = 28;
 pub const VIRTIO_RING_FEATURE_EVENT_IDX: u32 = 29;
 pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
 pub const VIRTIO_NET_TX_HEADER_SIZE: u32 = 12;
@@ -269,6 +270,7 @@ impl VirtioNetworkConfigSpace {
 
     pub const fn available_features(self) -> u64 {
         let mut features = virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
+            | virtio_feature_bit(VIRTIO_RING_FEATURE_INDIRECT_DESC)
             | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX);
         if self.guest_mac.is_some() {
             features |= virtio_feature_bit(VIRTIO_NET_F_MAC);
@@ -989,21 +991,37 @@ impl VirtioNetworkDevice {
 
         let event_idx_enabled =
             virtio_feature_enabled(activation.driver_features(), VIRTIO_RING_FEATURE_EVENT_IDX);
+        let indirect_descriptors_enabled = virtio_feature_enabled(
+            activation.driver_features(),
+            VIRTIO_RING_FEATURE_INDIRECT_DESC,
+        );
         let active_rx_queue = active_network_queue_state(activation, VIRTIO_NET_RX_QUEUE_INDEX_U32)
             .and_then(|queue| {
-                VirtioNetworkRxQueue::from_mmio_queue_state_with_event_idx(queue, event_idx_enabled)
-                    .map_err(|source| VirtioNetworkDeviceActivationError::RxQueueBuild {
+                VirtioNetworkRxQueue::from_mmio_queue_state_with_event_idx(
+                    queue,
+                    event_idx_enabled,
+                    indirect_descriptors_enabled,
+                )
+                .map_err(|source| {
+                    VirtioNetworkDeviceActivationError::RxQueueBuild {
                         queue_index: VIRTIO_NET_RX_QUEUE_INDEX_U32,
                         source,
-                    })
+                    }
+                })
             })?;
         let active_tx_queue = active_network_queue_state(activation, VIRTIO_NET_TX_QUEUE_INDEX_U32)
             .and_then(|queue| {
-                VirtioNetworkTxQueue::from_mmio_queue_state_with_event_idx(queue, event_idx_enabled)
-                    .map_err(|source| VirtioNetworkDeviceActivationError::TxQueueBuild {
+                VirtioNetworkTxQueue::from_mmio_queue_state_with_event_idx(
+                    queue,
+                    event_idx_enabled,
+                    indirect_descriptors_enabled,
+                )
+                .map_err(|source| {
+                    VirtioNetworkDeviceActivationError::TxQueueBuild {
                         queue_index: VIRTIO_NET_TX_QUEUE_INDEX_U32,
                         source,
-                    })
+                    }
+                })
             })?;
 
         self.active_rx_queue = Some(active_rx_queue);
@@ -1158,12 +1176,13 @@ impl VirtioNetworkRxQueue {
     pub fn from_mmio_queue_state(
         queue: VirtioMmioQueueState,
     ) -> Result<Self, VirtioNetworkRxQueueBuildError> {
-        Self::from_mmio_queue_state_with_event_idx(queue, false)
+        Self::from_mmio_queue_state_with_event_idx(queue, false, false)
     }
 
     fn from_mmio_queue_state_with_event_idx(
         queue: VirtioMmioQueueState,
         event_idx_enabled: bool,
+        indirect_descriptors_enabled: bool,
     ) -> Result<Self, VirtioNetworkRxQueueBuildError> {
         if !queue.ready() {
             return Err(VirtioNetworkRxQueueBuildError::QueueNotReady);
@@ -1175,6 +1194,10 @@ impl VirtioNetworkRxQueue {
             queue.size(),
         )
         .map_err(|source| VirtioNetworkRxQueueBuildError::AvailableRing { source })?;
+        let available = available.with_descriptor_chain_options(
+            VirtqueueDescriptorChainOptions::new()
+                .with_indirect_descriptors(indirect_descriptors_enabled),
+        );
         let used = VirtqueueUsedRing::new(queue.device_ring(), queue.size())
             .map_err(|source| VirtioNetworkRxQueueBuildError::UsedRing { source })?;
 
@@ -1965,12 +1988,13 @@ impl VirtioNetworkTxQueue {
     pub fn from_mmio_queue_state(
         queue: VirtioMmioQueueState,
     ) -> Result<Self, VirtioNetworkTxQueueBuildError> {
-        Self::from_mmio_queue_state_with_event_idx(queue, false)
+        Self::from_mmio_queue_state_with_event_idx(queue, false, false)
     }
 
     fn from_mmio_queue_state_with_event_idx(
         queue: VirtioMmioQueueState,
         event_idx_enabled: bool,
+        indirect_descriptors_enabled: bool,
     ) -> Result<Self, VirtioNetworkTxQueueBuildError> {
         if !queue.ready() {
             return Err(VirtioNetworkTxQueueBuildError::QueueNotReady);
@@ -1982,6 +2006,10 @@ impl VirtioNetworkTxQueue {
             queue.size(),
         )
         .map_err(|source| VirtioNetworkTxQueueBuildError::AvailableRing { source })?;
+        let available = available.with_descriptor_chain_options(
+            VirtqueueDescriptorChainOptions::new()
+                .with_indirect_descriptors(indirect_descriptors_enabled),
+        );
         let used = VirtqueueUsedRing::new(queue.device_ring(), queue.size())
             .map_err(|source| VirtioNetworkTxQueueBuildError::UsedRing { source })?;
 
@@ -2320,10 +2348,11 @@ impl std::error::Error for VirtioNetworkTxQueueDispatchError {
 }
 
 fn descriptor_chain_head(chain: &VirtqueueDescriptorChain) -> Option<u16> {
-    chain
-        .descriptors()
-        .first()
-        .map(|descriptor| descriptor.index())
+    if chain.is_empty() {
+        None
+    } else {
+        Some(chain.head_index())
+    }
 }
 
 impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioNetworkDevice> {
@@ -3788,12 +3817,13 @@ mod tests {
         VIRTIO_NET_F_MAC, VIRTIO_NET_F_MTU, VIRTIO_NET_MAX_BUFFER_SIZE, VIRTIO_NET_MAX_MTU,
         VIRTIO_NET_MIN_MTU, VIRTIO_NET_QUEUE_COUNT, VIRTIO_NET_QUEUE_SIZE, VIRTIO_NET_QUEUE_SIZES,
         VIRTIO_NET_RX_MIN_BUFFER_SIZE, VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_HEADER_SIZE,
-        VIRTIO_NET_TX_QUEUE_INDEX, VIRTIO_RING_FEATURE_EVENT_IDX, VirtioNetworkConfigSpace,
-        VirtioNetworkDevice, VirtioNetworkDeviceActivationError,
-        VirtioNetworkDeviceNotificationError, VirtioNetworkMmioHandler, VirtioNetworkRxBuffer,
-        VirtioNetworkRxBufferParseError, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
-        VirtioNetworkRxPacketSourceError, VirtioNetworkRxQueueDispatchError, VirtioNetworkTxFrame,
-        VirtioNetworkTxFrameParseError, VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
+        VIRTIO_NET_TX_QUEUE_INDEX, VIRTIO_RING_FEATURE_EVENT_IDX,
+        VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioNetworkConfigSpace, VirtioNetworkDevice,
+        VirtioNetworkDeviceActivationError, VirtioNetworkDeviceNotificationError,
+        VirtioNetworkMmioHandler, VirtioNetworkRxBuffer, VirtioNetworkRxBufferParseError,
+        VirtioNetworkRxPacket, VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError,
+        VirtioNetworkRxQueueDispatchError, VirtioNetworkTxFrame, VirtioNetworkTxFrameParseError,
+        VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
         VirtioNetworkTxQueueDispatchError,
     };
 
@@ -5060,6 +5090,7 @@ mod tests {
             .first()
             .expect("prepared network device should exist");
         let base_features = virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
+            | virtio_feature_bit(VIRTIO_RING_FEATURE_INDIRECT_DESC)
             | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX);
 
         assert_eq!(devices.len(), 1);
@@ -5089,6 +5120,7 @@ mod tests {
         assert_eq!(
             device.config_space().available_features(),
             virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
+                | virtio_feature_bit(VIRTIO_RING_FEATURE_INDIRECT_DESC)
                 | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX)
                 | virtio_feature_bit(VIRTIO_NET_F_MAC)
         );
@@ -5114,6 +5146,7 @@ mod tests {
         assert_eq!(
             device.config_space().available_features(),
             virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
+                | virtio_feature_bit(VIRTIO_RING_FEATURE_INDIRECT_DESC)
                 | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX)
                 | virtio_feature_bit(VIRTIO_NET_F_MTU)
         );
@@ -5459,6 +5492,7 @@ mod tests {
         assert_eq!(VIRTIO_NET_QUEUE_SIZES, [256, 256]);
         assert_eq!(VIRTIO_NET_CONFIG_MAC_SIZE, 6);
         assert_eq!(VIRTIO_NET_F_MAC, 5);
+        assert_eq!(VIRTIO_RING_FEATURE_INDIRECT_DESC, 28);
         assert_eq!(VIRTIO_RING_FEATURE_EVENT_IDX, 29);
         assert_eq!(VIRTIO_FEATURE_VERSION_1, 32);
         assert_eq!(VIRTIO_NET_TX_HEADER_SIZE, 12);
@@ -5944,6 +5978,7 @@ mod tests {
     #[test]
     fn virtio_network_config_space_tracks_configured_features() {
         let base_features = virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
+            | virtio_feature_bit(VIRTIO_RING_FEATURE_INDIRECT_DESC)
             | virtio_feature_bit(VIRTIO_RING_FEATURE_EVENT_IDX);
         let without_mac = VirtioNetworkConfigSpace::new(None, None);
         let with_mac = VirtioNetworkConfigSpace::new(Some(test_guest_mac()), None);

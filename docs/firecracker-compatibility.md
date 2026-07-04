@@ -36,7 +36,8 @@ status/acknowledgement register state, a composed runtime handler that routes
 common register accesses through those state models and exposes drained queue
 notifications, delegated device-configuration accesses, and a `DRIVER_OK`
 activation hook with reset callback, plus virtqueue descriptor-chain validator,
-available-ring read model, used-ring write model, and internal virtio-block
+available-ring read model with negotiated indirect descriptor support,
+used-ring write model, and internal virtio-block
 queue construction, drain, resettable active queue ownership, and active queue
 notification dispatch helper with virtio-mmio queue interrupt-status updates
 for future device handlers, internal boot-resource assembly from stored VM
@@ -63,7 +64,7 @@ delivery, including timer EOI/deactivation-driven unmasking,
 general HVF runner-loop notification scheduling, public serial output streaming,
 serial/backend interrupt wiring beyond the internal boot block and network notification
 and retained serial capture paths,
-device-backed feature negotiation, indirect descriptor support,
+broader device-backed feature negotiation,
 device-backed runner-loop MMIO scheduling, complete device emulation,
 full Firecracker metrics counters, periodic metrics flushing, full logger integration,
 multi-vCPU setup, full PSCI behavior, or successful actions beyond owned `InstanceStart`
@@ -992,10 +993,14 @@ can dispatch registered block-device, virtio-net, and virtio-vsock queue notific
 against caller-supplied guest memory. Internal HVF boot sessions can signal
 needed block, network, and vsock SPI interrupts from those dispatch summaries, but
 future public scheduler and device policy remain deferred. The
-virtqueue model can publish one used-ring completion element with validated
-layout, mapped-memory checks, wrapping, and release ordering. Virtio-block
-queue dispatch, network RX/TX dispatch, and vsock RX/TX dispatch honor
-negotiated used-event interrupt suppression for each published completion,
+shared virtqueue descriptor-chain reader supports direct chains by default and
+negotiated `VIRTIO_RING_F_INDIRECT_DESC` indirect descriptor tables for
+virtio-block, virtio-net, and virtio-vsock RX/TX queues, while preserving the
+main descriptor head for used-ring completions. The virtqueue model can publish
+one used-ring completion element with validated layout, mapped-memory checks,
+wrapping, and release ordering. Virtio-block queue dispatch, network RX/TX
+dispatch, and vsock RX/TX dispatch honor negotiated used-event interrupt
+suppression for each published completion,
 while batching, avail-event kick suppression, and device-backed completion loops
 are still deferred.
 

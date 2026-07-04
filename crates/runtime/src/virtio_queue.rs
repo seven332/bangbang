@@ -14,7 +14,7 @@ pub const VIRTQUEUE_DESC_F_NEXT: u16 = 0x1;
 pub const VIRTQUEUE_DESC_F_WRITE: u16 = 0x2;
 pub const VIRTQUEUE_DESC_F_INDIRECT: u16 = 0x4;
 
-const VIRTQUEUE_DESCRIPTOR_SIZE_U64: u64 = 16;
+const VIRTQUEUE_DESCRIPTOR_SIZE_U64: u64 = VIRTQUEUE_DESCRIPTOR_SIZE as u64;
 const VIRTQUEUE_AVAILABLE_RING_HEADER_SIZE_U64: u64 = 4;
 const VIRTQUEUE_AVAILABLE_RING_ENTRY_SIZE_U64: u64 = 2;
 const VIRTQUEUE_AVAILABLE_RING_USED_EVENT_SIZE_U64: u64 = 2;
@@ -30,6 +30,7 @@ const DESCRIPTOR_LEN_SIZE: usize = 4;
 const DESCRIPTOR_FLAGS_SIZE: usize = 2;
 const U16_FIELD_SIZE: usize = 2;
 const U32_FIELD_SIZE: usize = 4;
+const VIRTQUEUE_DESCRIPTOR_SIZE_U32: u32 = VIRTQUEUE_DESCRIPTOR_SIZE as u32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtqueueDescriptorFlags(u16);
@@ -105,10 +106,15 @@ impl VirtqueueDescriptor {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtqueueDescriptorChain {
+    head_index: u16,
     descriptors: Vec<VirtqueueDescriptor>,
 }
 
 impl VirtqueueDescriptorChain {
+    pub const fn head_index(&self) -> u16 {
+        self.head_index
+    }
+
     pub fn descriptors(&self) -> &[VirtqueueDescriptor] {
         &self.descriptors
     }
@@ -122,11 +128,49 @@ impl VirtqueueDescriptorChain {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VirtqueueDescriptorChainOptions {
+    indirect_descriptors: bool,
+}
+
+impl VirtqueueDescriptorChainOptions {
+    pub const fn new() -> Self {
+        Self {
+            indirect_descriptors: false,
+        }
+    }
+
+    pub const fn with_indirect_descriptors(mut self, enabled: bool) -> Self {
+        self.indirect_descriptors = enabled;
+        self
+    }
+
+    pub const fn indirect_descriptors(self) -> bool {
+        self.indirect_descriptors
+    }
+}
+
 pub fn read_descriptor_chain(
     memory: &GuestMemory,
     descriptor_table: GuestAddress,
     queue_size: u16,
     head_index: u16,
+) -> Result<VirtqueueDescriptorChain, VirtqueueDescriptorChainError> {
+    read_descriptor_chain_with_options(
+        memory,
+        descriptor_table,
+        queue_size,
+        head_index,
+        VirtqueueDescriptorChainOptions::new(),
+    )
+}
+
+pub fn read_descriptor_chain_with_options(
+    memory: &GuestMemory,
+    descriptor_table: GuestAddress,
+    queue_size: u16,
+    head_index: u16,
+    options: VirtqueueDescriptorChainOptions,
 ) -> Result<VirtqueueDescriptorChain, VirtqueueDescriptorChainError> {
     validate_queue_size(queue_size)?;
     validate_descriptor_table_alignment(descriptor_table)?;
@@ -152,10 +196,13 @@ pub fn read_descriptor_chain(
     for _ in 0..queue_size {
         let descriptor = read_descriptor(memory, descriptor_table, queue_size, current_index)?;
         if descriptor.is_indirect() {
-            return Err(
-                VirtqueueDescriptorChainError::UnsupportedIndirectDescriptor {
-                    index: descriptor.index(),
-                },
+            return read_indirect_descriptor_chain(
+                memory,
+                head_index,
+                queue_size,
+                descriptor,
+                options,
+                descriptors,
             );
         }
 
@@ -173,7 +220,12 @@ pub fn read_descriptor_chain(
                 })?;
                 current_index = index;
             }
-            None => return Ok(VirtqueueDescriptorChain { descriptors }),
+            None => {
+                return Ok(VirtqueueDescriptorChain {
+                    head_index,
+                    descriptors,
+                });
+            }
         }
     }
 
@@ -183,12 +235,148 @@ pub fn read_descriptor_chain(
     })
 }
 
+fn read_indirect_descriptor_chain(
+    memory: &GuestMemory,
+    head_index: u16,
+    queue_size: u16,
+    descriptor: VirtqueueDescriptor,
+    options: VirtqueueDescriptorChainOptions,
+    mut descriptors: Vec<VirtqueueDescriptor>,
+) -> Result<VirtqueueDescriptorChain, VirtqueueDescriptorChainError> {
+    if !options.indirect_descriptors() {
+        return Err(
+            VirtqueueDescriptorChainError::UnsupportedIndirectDescriptor {
+                index: descriptor.index(),
+            },
+        );
+    }
+    if descriptor.has_next() {
+        return Err(
+            VirtqueueDescriptorChainError::InvalidIndirectDescriptorWithNext {
+                index: descriptor.index(),
+            },
+        );
+    }
+
+    let indirect_queue_size =
+        validate_indirect_descriptor_table(memory, head_index, descriptor, queue_size)?;
+    let resolved_count = descriptors
+        .len()
+        .checked_add(usize::from(indirect_queue_size))
+        .ok_or(VirtqueueDescriptorChainError::DescriptorChainTooLong {
+            head_index,
+            queue_size,
+        })?;
+    if resolved_count > usize::from(queue_size) {
+        return Err(VirtqueueDescriptorChainError::DescriptorChainTooLong {
+            head_index,
+            queue_size,
+        });
+    }
+
+    let mut current_index = 0;
+    for _ in 0..indirect_queue_size {
+        let indirect_descriptor = read_descriptor(
+            memory,
+            descriptor.address(),
+            indirect_queue_size,
+            current_index,
+        )?;
+        if indirect_descriptor.is_indirect() {
+            return Err(VirtqueueDescriptorChainError::NestedIndirectDescriptor {
+                index: indirect_descriptor.index(),
+            });
+        }
+
+        let next_index = indirect_descriptor.next_index();
+        descriptors.push(indirect_descriptor);
+
+        match next_index {
+            Some(index) => {
+                validate_descriptor_index(index, indirect_queue_size).map_err(|_| {
+                    VirtqueueDescriptorChainError::InvalidNextIndex {
+                        index: current_index,
+                        next_index: index,
+                        queue_size: indirect_queue_size,
+                    }
+                })?;
+                current_index = index;
+            }
+            None => {
+                return Ok(VirtqueueDescriptorChain {
+                    head_index,
+                    descriptors,
+                });
+            }
+        }
+    }
+
+    Err(VirtqueueDescriptorChainError::DescriptorChainTooLong {
+        head_index,
+        queue_size,
+    })
+}
+
+fn validate_indirect_descriptor_table(
+    memory: &GuestMemory,
+    head_index: u16,
+    descriptor: VirtqueueDescriptor,
+    queue_size: u16,
+) -> Result<u16, VirtqueueDescriptorChainError> {
+    let table_len = descriptor.len();
+    if table_len == 0 || !table_len.is_multiple_of(VIRTQUEUE_DESCRIPTOR_SIZE_U32) {
+        return Err(
+            VirtqueueDescriptorChainError::InvalidIndirectDescriptorLength {
+                index: descriptor.index(),
+                len: table_len,
+            },
+        );
+    }
+
+    let table_descriptor_count = table_len / VIRTQUEUE_DESCRIPTOR_SIZE_U32;
+    if table_descriptor_count > u32::from(queue_size) {
+        return Err(VirtqueueDescriptorChainError::DescriptorChainTooLong {
+            head_index,
+            queue_size,
+        });
+    }
+    let table_queue_size = u16::try_from(table_descriptor_count).map_err(|_| {
+        VirtqueueDescriptorChainError::DescriptorChainTooLong {
+            head_index,
+            queue_size,
+        }
+    })?;
+
+    validate_descriptor_table_alignment(descriptor.address())?;
+    let table_range =
+        GuestMemoryRange::new(descriptor.address(), u64::from(table_len)).map_err(|_| {
+            VirtqueueDescriptorChainError::IndirectDescriptorTableRangeOverflow {
+                index: descriptor.index(),
+                descriptor_table: descriptor.address(),
+                len: table_len,
+            }
+        })?;
+    memory
+        .validate_mapped_range(table_range)
+        .map_err(
+            |source| VirtqueueDescriptorChainError::IndirectDescriptorTableAccess {
+                index: descriptor.index(),
+                descriptor_table: descriptor.address(),
+                len: table_len,
+                source,
+            },
+        )?;
+
+    Ok(table_queue_size)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtqueueAvailableRing {
     descriptor_table: GuestAddress,
     available_ring: GuestAddress,
     queue_size: u16,
     next_avail: u16,
+    descriptor_chain_options: VirtqueueDescriptorChainOptions,
 }
 
 impl VirtqueueAvailableRing {
@@ -216,6 +404,7 @@ impl VirtqueueAvailableRing {
             available_ring,
             queue_size,
             next_avail,
+            descriptor_chain_options: VirtqueueDescriptorChainOptions::new(),
         })
     }
 
@@ -233,6 +422,18 @@ impl VirtqueueAvailableRing {
 
     pub const fn next_avail(&self) -> u16 {
         self.next_avail
+    }
+
+    pub const fn descriptor_chain_options(&self) -> VirtqueueDescriptorChainOptions {
+        self.descriptor_chain_options
+    }
+
+    pub const fn with_descriptor_chain_options(
+        mut self,
+        options: VirtqueueDescriptorChainOptions,
+    ) -> Self {
+        self.descriptor_chain_options = options;
+        self
     }
 
     pub fn used_event(&self, memory: &GuestMemory) -> Result<u16, VirtqueueAvailableRingError> {
@@ -289,12 +490,14 @@ impl VirtqueueAvailableRing {
             available_ring_entry_address(self.available_ring, self.queue_size, ring_index)?;
         let head_index =
             read_available_ring_u16(memory, self.available_ring, self.queue_size, head_address)?;
-        let chain =
-            read_descriptor_chain(memory, self.descriptor_table, self.queue_size, head_index)
-                .map_err(|source| VirtqueueAvailableRingError::DescriptorChain {
-                    head_index,
-                    source,
-                })?;
+        let chain = read_descriptor_chain_with_options(
+            memory,
+            self.descriptor_table,
+            self.queue_size,
+            head_index,
+            self.descriptor_chain_options,
+        )
+        .map_err(|source| VirtqueueAvailableRingError::DescriptorChain { head_index, source })?;
 
         self.next_avail = self.next_avail.wrapping_add(1);
 
@@ -676,6 +879,27 @@ pub enum VirtqueueDescriptorChainError {
     UnsupportedIndirectDescriptor {
         index: u16,
     },
+    InvalidIndirectDescriptorWithNext {
+        index: u16,
+    },
+    InvalidIndirectDescriptorLength {
+        index: u16,
+        len: u32,
+    },
+    IndirectDescriptorTableRangeOverflow {
+        index: u16,
+        descriptor_table: GuestAddress,
+        len: u32,
+    },
+    IndirectDescriptorTableAccess {
+        index: u16,
+        descriptor_table: GuestAddress,
+        len: u32,
+        source: GuestMemoryAccessError,
+    },
+    NestedIndirectDescriptor {
+        index: u16,
+    },
     DescriptorChainTooLong {
         head_index: u16,
         queue_size: u16,
@@ -748,7 +972,46 @@ impl fmt::Display for VirtqueueDescriptorChainError {
             Self::UnsupportedIndirectDescriptor { index } => {
                 write!(
                     f,
-                    "virtqueue descriptor {index} uses unsupported indirect descriptors"
+                    "virtqueue descriptor {index} uses indirect descriptors without negotiated support"
+                )
+            }
+            Self::InvalidIndirectDescriptorWithNext { index } => {
+                write!(
+                    f,
+                    "virtqueue descriptor {index} cannot set both indirect and next flags"
+                )
+            }
+            Self::InvalidIndirectDescriptorLength { index, len } => {
+                write!(
+                    f,
+                    "virtqueue descriptor {index} has invalid indirect table length {len}"
+                )
+            }
+            Self::IndirectDescriptorTableRangeOverflow {
+                index,
+                descriptor_table,
+                len,
+            } => {
+                write!(
+                    f,
+                    "virtqueue descriptor {index} indirect table at {descriptor_table} with length {len} overflows address space"
+                )
+            }
+            Self::IndirectDescriptorTableAccess {
+                index,
+                descriptor_table,
+                len,
+                source,
+            } => {
+                write!(
+                    f,
+                    "virtqueue descriptor {index} indirect table at {descriptor_table} with length {len} is not fully mapped: {source}"
+                )
+            }
+            Self::NestedIndirectDescriptor { index } => {
+                write!(
+                    f,
+                    "virtqueue indirect descriptor {index} cannot point to another indirect table"
                 )
             }
             Self::DescriptorChainTooLong {
@@ -774,6 +1037,7 @@ impl std::error::Error for VirtqueueDescriptorChainError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::DescriptorTableAccess { source, .. } => Some(source),
+            Self::IndirectDescriptorTableAccess { source, .. } => Some(source),
             Self::DescriptorRead { source, .. } => Some(source),
             Self::DescriptorChainAllocationFailed { source, .. } => Some(source),
             Self::InvalidQueueSize { .. }
@@ -782,6 +1046,10 @@ impl std::error::Error for VirtqueueDescriptorChainError {
             | Self::DescriptorTableRangeOverflow { .. }
             | Self::InvalidNextIndex { .. }
             | Self::UnsupportedIndirectDescriptor { .. }
+            | Self::InvalidIndirectDescriptorWithNext { .. }
+            | Self::InvalidIndirectDescriptorLength { .. }
+            | Self::IndirectDescriptorTableRangeOverflow { .. }
+            | Self::NestedIndirectDescriptor { .. }
             | Self::DescriptorChainTooLong { .. } => None,
         }
     }
@@ -1256,9 +1524,11 @@ mod tests {
         VIRTQUEUE_DESCRIPTOR_ALIGNMENT, VIRTQUEUE_DESCRIPTOR_SIZE, VIRTQUEUE_DESCRIPTOR_SIZE_U64,
         VIRTQUEUE_USED_RING_ALIGNMENT, VIRTQUEUE_USED_RING_ELEMENT_SIZE_U64,
         VIRTQUEUE_USED_RING_IDX_OFFSET, VIRTQUEUE_USED_RING_RING_OFFSET, VirtqueueAvailableRing,
-        VirtqueueAvailableRingError, VirtqueueDescriptorChainError, VirtqueueDescriptorFlags,
+        VirtqueueAvailableRingError, VirtqueueDescriptorChainError,
+        VirtqueueDescriptorChainOptions, VirtqueueDescriptorFlags,
         VirtqueueNotificationSuppression, VirtqueueUsedRing, VirtqueueUsedRingError,
-        read_descriptor_chain, virtqueue_event_idx_needs_notification,
+        read_descriptor_chain, read_descriptor_chain_with_options,
+        virtqueue_event_idx_needs_notification,
     };
     use crate::memory::{
         GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryLayout, GuestMemoryRange,
@@ -1267,6 +1537,7 @@ mod tests {
     const TABLE: GuestAddress = GuestAddress::new(0x1000);
     const AVAIL: GuestAddress = GuestAddress::new(0x2000);
     const USED: GuestAddress = GuestAddress::new(0x2800);
+    const INDIRECT_TABLE: GuestAddress = GuestAddress::new(0x3000);
 
     fn guest_memory(size: u64) -> GuestMemory {
         let range = GuestMemoryRange::new(GuestAddress::new(0), size)
@@ -1399,6 +1670,10 @@ mod tests {
             .expect("used ring entry address should not overflow")
     }
 
+    fn indirect_descriptor_options() -> VirtqueueDescriptorChainOptions {
+        VirtqueueDescriptorChainOptions::new().with_indirect_descriptors(true)
+    }
+
     #[test]
     fn exposes_virtqueue_descriptor_constants() {
         assert_eq!(VIRTQUEUE_DESCRIPTOR_SIZE, 16);
@@ -1432,6 +1707,10 @@ mod tests {
         assert_eq!(queue.available_ring(), AVAIL);
         assert_eq!(queue.queue_size(), 8);
         assert_eq!(queue.next_avail(), 3);
+        assert!(!queue.descriptor_chain_options().indirect_descriptors());
+
+        let queue = queue.with_descriptor_chain_options(indirect_descriptor_options());
+        assert!(queue.descriptor_chain_options().indirect_descriptors());
     }
 
     #[test]
@@ -1558,6 +1837,46 @@ mod tests {
     }
 
     #[test]
+    fn pops_available_indirect_descriptor_chain_when_negotiated() {
+        let mut memory = guest_memory(0x8000);
+        write_descriptor(
+            &mut memory,
+            TABLE,
+            2,
+            INDIRECT_TABLE.raw_value(),
+            16,
+            VIRTQUEUE_DESC_F_INDIRECT,
+            0,
+        );
+        write_descriptor(
+            &mut memory,
+            INDIRECT_TABLE,
+            0,
+            0x5000,
+            0x40,
+            VIRTQUEUE_DESC_F_WRITE,
+            0,
+        );
+        write_available_index(&mut memory, AVAIL, 1);
+        write_available_head(&mut memory, AVAIL, 0, 2);
+        let mut queue = VirtqueueAvailableRing::new(TABLE, AVAIL, 8)
+            .expect("available ring should be valid")
+            .with_descriptor_chain_options(indirect_descriptor_options());
+
+        let chain = queue
+            .pop_descriptor_chain(&memory)
+            .expect("available indirect descriptor chain should pop")
+            .expect("available ring should contain one head");
+
+        assert_eq!(chain.head_index(), 2);
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain.descriptors()[0].index(), 0);
+        assert_eq!(chain.descriptors()[0].address(), GuestAddress::new(0x5000));
+        assert!(chain.descriptors()[0].is_write_only());
+        assert_eq!(queue.next_avail(), 1);
+    }
+
+    #[test]
     fn does_not_advance_next_avail_when_available_head_is_malformed() {
         let mut memory = guest_memory(0x4000);
         write_available_index(&mut memory, AVAIL, 1);
@@ -1577,6 +1896,44 @@ mod tests {
                     VirtqueueDescriptorChainError::InvalidHeadIndex {
                         head_index: 8,
                         queue_size: 8
+                    }
+                ));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(queue.next_avail(), 0);
+    }
+
+    #[test]
+    fn does_not_advance_next_avail_when_indirect_chain_is_malformed() {
+        let mut memory = guest_memory(0x8000);
+        write_descriptor(
+            &mut memory,
+            TABLE,
+            2,
+            INDIRECT_TABLE.raw_value(),
+            15,
+            VIRTQUEUE_DESC_F_INDIRECT,
+            0,
+        );
+        write_available_index(&mut memory, AVAIL, 1);
+        write_available_head(&mut memory, AVAIL, 0, 2);
+        let mut queue = VirtqueueAvailableRing::new(TABLE, AVAIL, 8)
+            .expect("available ring should be valid")
+            .with_descriptor_chain_options(indirect_descriptor_options());
+
+        let err = queue
+            .pop_descriptor_chain(&memory)
+            .expect_err("malformed indirect chain should fail");
+
+        match err {
+            VirtqueueAvailableRingError::DescriptorChain { head_index, source } => {
+                assert_eq!(head_index, 2);
+                assert!(matches!(
+                    source,
+                    VirtqueueDescriptorChainError::InvalidIndirectDescriptorLength {
+                        index: 2,
+                        len: 15
                     }
                 ));
             }
@@ -2086,6 +2443,94 @@ mod tests {
     }
 
     #[test]
+    fn reads_indirect_descriptor_chain_when_negotiated() {
+        let mut memory = guest_memory(0x8000);
+        write_descriptor(
+            &mut memory,
+            TABLE,
+            2,
+            INDIRECT_TABLE.raw_value(),
+            32,
+            VIRTQUEUE_DESC_F_INDIRECT,
+            0,
+        );
+        write_descriptor(
+            &mut memory,
+            INDIRECT_TABLE,
+            0,
+            0x4000,
+            0x20,
+            VIRTQUEUE_DESC_F_NEXT,
+            1,
+        );
+        write_descriptor(
+            &mut memory,
+            INDIRECT_TABLE,
+            1,
+            0x5000,
+            0x30,
+            VIRTQUEUE_DESC_F_WRITE,
+            0,
+        );
+
+        let chain =
+            read_descriptor_chain_with_options(&memory, TABLE, 8, 2, indirect_descriptor_options())
+                .expect("negotiated indirect descriptor chain should read");
+
+        assert_eq!(chain.head_index(), 2);
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain.descriptors()[0].index(), 0);
+        assert_eq!(chain.descriptors()[0].address(), GuestAddress::new(0x4000));
+        assert_eq!(chain.descriptors()[0].next_index(), Some(1));
+        assert_eq!(chain.descriptors()[1].index(), 1);
+        assert_eq!(chain.descriptors()[1].address(), GuestAddress::new(0x5000));
+        assert!(chain.descriptors()[1].is_write_only());
+    }
+
+    #[test]
+    fn reads_direct_prefix_before_indirect_descriptor_when_negotiated() {
+        let mut memory = guest_memory(0x8000);
+        write_descriptor(
+            &mut memory,
+            TABLE,
+            0,
+            0x4000,
+            0x20,
+            VIRTQUEUE_DESC_F_NEXT,
+            1,
+        );
+        write_descriptor(
+            &mut memory,
+            TABLE,
+            1,
+            INDIRECT_TABLE.raw_value(),
+            16,
+            VIRTQUEUE_DESC_F_INDIRECT,
+            0,
+        );
+        write_descriptor(
+            &mut memory,
+            INDIRECT_TABLE,
+            0,
+            0x5000,
+            0x30,
+            VIRTQUEUE_DESC_F_WRITE,
+            0,
+        );
+
+        let chain =
+            read_descriptor_chain_with_options(&memory, TABLE, 8, 0, indirect_descriptor_options())
+                .expect("direct prefix followed by indirect table should read");
+
+        assert_eq!(chain.head_index(), 0);
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain.descriptors()[0].index(), 0);
+        assert_eq!(chain.descriptors()[0].address(), GuestAddress::new(0x4000));
+        assert_eq!(chain.descriptors()[1].index(), 0);
+        assert_eq!(chain.descriptors()[1].address(), GuestAddress::new(0x5000));
+    }
+
+    #[test]
     fn ignores_next_index_without_next_flag() {
         let mut memory = guest_memory(0x4000);
         write_descriptor(&mut memory, TABLE, 0, 0x2000, 0x20, 0, 8);
@@ -2306,6 +2751,300 @@ mod tests {
         assert!(matches!(
             err,
             VirtqueueDescriptorChainError::UnsupportedIndirectDescriptor { index: 0 }
+        ));
+    }
+
+    #[test]
+    fn rejects_indirect_descriptor_with_next_when_negotiated() {
+        let mut memory = guest_memory(0x8000);
+        write_descriptor(
+            &mut memory,
+            TABLE,
+            2,
+            INDIRECT_TABLE.raw_value(),
+            16,
+            VIRTQUEUE_DESC_F_INDIRECT | VIRTQUEUE_DESC_F_NEXT,
+            3,
+        );
+
+        let err =
+            read_descriptor_chain_with_options(&memory, TABLE, 8, 2, indirect_descriptor_options())
+                .expect_err("indirect descriptor with next should fail");
+
+        assert!(matches!(
+            err,
+            VirtqueueDescriptorChainError::InvalidIndirectDescriptorWithNext { index: 2 }
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_indirect_descriptor_table_lengths() {
+        let mut memory = guest_memory(0x8000);
+        write_descriptor(
+            &mut memory,
+            TABLE,
+            0,
+            INDIRECT_TABLE.raw_value(),
+            0,
+            VIRTQUEUE_DESC_F_INDIRECT,
+            0,
+        );
+
+        let err =
+            read_descriptor_chain_with_options(&memory, TABLE, 8, 0, indirect_descriptor_options())
+                .expect_err("empty indirect table should fail");
+        assert!(matches!(
+            err,
+            VirtqueueDescriptorChainError::InvalidIndirectDescriptorLength { index: 0, len: 0 }
+        ));
+
+        write_descriptor(
+            &mut memory,
+            TABLE,
+            0,
+            INDIRECT_TABLE.raw_value(),
+            15,
+            VIRTQUEUE_DESC_F_INDIRECT,
+            0,
+        );
+
+        let err =
+            read_descriptor_chain_with_options(&memory, TABLE, 8, 0, indirect_descriptor_options())
+                .expect_err("partial descriptor indirect table should fail");
+        assert!(matches!(
+            err,
+            VirtqueueDescriptorChainError::InvalidIndirectDescriptorLength { index: 0, len: 15 }
+        ));
+    }
+
+    #[test]
+    fn rejects_unaligned_indirect_descriptor_table() {
+        let mut memory = guest_memory(0x8000);
+        let table = GuestAddress::new(0x3001);
+        write_descriptor(
+            &mut memory,
+            TABLE,
+            0,
+            table.raw_value(),
+            16,
+            VIRTQUEUE_DESC_F_INDIRECT,
+            0,
+        );
+
+        let err =
+            read_descriptor_chain_with_options(&memory, TABLE, 8, 0, indirect_descriptor_options())
+                .expect_err("unaligned indirect table should fail");
+
+        assert!(matches!(
+            err,
+            VirtqueueDescriptorChainError::UnalignedDescriptorTable {
+                descriptor_table,
+                alignment: VIRTQUEUE_DESCRIPTOR_ALIGNMENT
+            } if descriptor_table == table
+        ));
+    }
+
+    #[test]
+    fn rejects_indirect_descriptor_table_range_overflow() {
+        let mut memory = guest_memory(0x8000);
+        let table = GuestAddress::new(u64::MAX - 15);
+        write_descriptor(
+            &mut memory,
+            TABLE,
+            0,
+            table.raw_value(),
+            32,
+            VIRTQUEUE_DESC_F_INDIRECT,
+            0,
+        );
+
+        let err =
+            read_descriptor_chain_with_options(&memory, TABLE, 8, 0, indirect_descriptor_options())
+                .expect_err("overflowing indirect table range should fail");
+
+        assert!(matches!(
+            err,
+            VirtqueueDescriptorChainError::IndirectDescriptorTableRangeOverflow {
+                index: 0,
+                descriptor_table,
+                len: 32
+            } if descriptor_table == table
+        ));
+    }
+
+    #[test]
+    fn rejects_unmapped_indirect_descriptor_table() {
+        let mut memory = guest_memory(0x4000);
+        let table = GuestAddress::new(0x4000);
+        write_descriptor(
+            &mut memory,
+            TABLE,
+            0,
+            table.raw_value(),
+            16,
+            VIRTQUEUE_DESC_F_INDIRECT,
+            0,
+        );
+
+        let err =
+            read_descriptor_chain_with_options(&memory, TABLE, 8, 0, indirect_descriptor_options())
+                .expect_err("unmapped indirect table should fail");
+
+        assert!(matches!(
+            err,
+            VirtqueueDescriptorChainError::IndirectDescriptorTableAccess {
+                index: 0,
+                descriptor_table,
+                len: 16,
+                source: GuestMemoryAccessError::UnmappedRange { .. }
+            } if descriptor_table == table
+        ));
+    }
+
+    #[test]
+    fn rejects_nested_indirect_descriptor() {
+        let mut memory = guest_memory(0x8000);
+        write_descriptor(
+            &mut memory,
+            TABLE,
+            0,
+            INDIRECT_TABLE.raw_value(),
+            16,
+            VIRTQUEUE_DESC_F_INDIRECT,
+            0,
+        );
+        write_descriptor(
+            &mut memory,
+            INDIRECT_TABLE,
+            0,
+            0x4000,
+            16,
+            VIRTQUEUE_DESC_F_INDIRECT,
+            0,
+        );
+
+        let err =
+            read_descriptor_chain_with_options(&memory, TABLE, 8, 0, indirect_descriptor_options())
+                .expect_err("nested indirect descriptor should fail");
+
+        assert!(matches!(
+            err,
+            VirtqueueDescriptorChainError::NestedIndirectDescriptor { index: 0 }
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_indirect_next_index() {
+        let mut memory = guest_memory(0x8000);
+        write_descriptor(
+            &mut memory,
+            TABLE,
+            0,
+            INDIRECT_TABLE.raw_value(),
+            32,
+            VIRTQUEUE_DESC_F_INDIRECT,
+            0,
+        );
+        write_descriptor(
+            &mut memory,
+            INDIRECT_TABLE,
+            0,
+            0x4000,
+            0x20,
+            VIRTQUEUE_DESC_F_NEXT,
+            2,
+        );
+
+        let err =
+            read_descriptor_chain_with_options(&memory, TABLE, 8, 0, indirect_descriptor_options())
+                .expect_err("invalid indirect next index should fail");
+
+        assert!(matches!(
+            err,
+            VirtqueueDescriptorChainError::InvalidNextIndex {
+                index: 0,
+                next_index: 2,
+                queue_size: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_cyclic_indirect_descriptor_chain() {
+        let mut memory = guest_memory(0x8000);
+        write_descriptor(
+            &mut memory,
+            TABLE,
+            2,
+            INDIRECT_TABLE.raw_value(),
+            32,
+            VIRTQUEUE_DESC_F_INDIRECT,
+            0,
+        );
+        write_descriptor(
+            &mut memory,
+            INDIRECT_TABLE,
+            0,
+            0x4000,
+            0x20,
+            VIRTQUEUE_DESC_F_NEXT,
+            1,
+        );
+        write_descriptor(
+            &mut memory,
+            INDIRECT_TABLE,
+            1,
+            0x5000,
+            0x20,
+            VIRTQUEUE_DESC_F_NEXT,
+            0,
+        );
+
+        let err =
+            read_descriptor_chain_with_options(&memory, TABLE, 4, 2, indirect_descriptor_options())
+                .expect_err("cyclic indirect descriptor chain should fail");
+
+        assert!(matches!(
+            err,
+            VirtqueueDescriptorChainError::DescriptorChainTooLong {
+                head_index: 2,
+                queue_size: 4
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_resolved_indirect_chain_longer_than_queue() {
+        let mut memory = guest_memory(0x8000);
+        write_descriptor(
+            &mut memory,
+            TABLE,
+            0,
+            0x4000,
+            0x20,
+            VIRTQUEUE_DESC_F_NEXT,
+            1,
+        );
+        write_descriptor(
+            &mut memory,
+            TABLE,
+            1,
+            INDIRECT_TABLE.raw_value(),
+            32,
+            VIRTQUEUE_DESC_F_INDIRECT,
+            0,
+        );
+
+        let err =
+            read_descriptor_chain_with_options(&memory, TABLE, 2, 0, indirect_descriptor_options())
+                .expect_err("resolved descriptor chain should not exceed queue size");
+
+        assert!(matches!(
+            err,
+            VirtqueueDescriptorChainError::DescriptorChainTooLong {
+                head_index: 0,
+                queue_size: 2
+            }
         ));
     }
 
