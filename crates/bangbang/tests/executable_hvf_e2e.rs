@@ -18,7 +18,8 @@ mod macos_arm64 {
 
     use crate::support::{
         BangbangProcess, TestDir, assert_clean_shutdown, assert_no_content_response,
-        assert_ok_response, http_get, http_put_json, json_string, path_text,
+        assert_ok_response, assert_response_contains, http_get, http_put_json, json_string,
+        path_text,
     };
 
     const BANGBANG_GUEST_KERNEL_PATH_ENV: &str = "BANGBANG_GUEST_KERNEL_PATH";
@@ -81,6 +82,26 @@ mod macos_arm64 {
             r#"{"action_type":"InstanceStart"}"#,
         );
         assert_no_content_response(&start_response, "PUT /actions InstanceStart");
+
+        let running_instance_info = http_get(&socket_path, "/");
+        assert_ok_response(&running_instance_info, "GET / after InstanceStart");
+        assert_response_contains(
+            &running_instance_info,
+            &format!(r#""id":"{instance_id}""#),
+            "GET / after InstanceStart",
+        );
+        assert_response_contains(
+            &running_instance_info,
+            r#""state":"Running""#,
+            "GET / after InstanceStart",
+        );
+
+        let flush_metrics_response = http_put_json(
+            &socket_path,
+            "/actions",
+            r#"{"action_type":"FlushMetrics"}"#,
+        );
+        assert_no_content_response(&flush_metrics_response, "PUT /actions FlushMetrics");
 
         if let Err(err) =
             wait_for_file_prefix_marker(&backing_path, BLOCK_WRITE_MARKER, GUEST_EXECUTION_TIMEOUT)
