@@ -2804,6 +2804,35 @@ mod tests {
     }
 
     #[test]
+    fn returns_fault_for_cpu_config_endpoint() {
+        let path = unique_socket_path("cpu-fault");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+
+        client
+            .write_all(
+                b"PUT /cpu-config HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
+            )
+            .expect("client should write request");
+        let mut vmm = test_controller();
+        server
+            .serve_next(&mut vmm)
+            .expect("server should handle one request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("client should read response");
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.contains(r#"{"fault_message":"CPU config is not supported."}"#));
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::NotStarted
+        );
+    }
+
+    #[test]
     fn returns_fault_for_send_ctrl_alt_del_action() {
         let path = unique_socket_path("cad-fault");
         let server = ApiServer::bind(&path).expect("server should bind");

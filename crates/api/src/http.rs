@@ -37,6 +37,7 @@ pub enum ApiRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestError {
+    CpuConfigUnsupported,
     GetRequestBody,
     InvalidPathMethod,
     MismatchedDriveId,
@@ -50,6 +51,7 @@ pub enum RequestError {
 impl RequestError {
     pub fn fault_message(&self) -> &'static str {
         match self {
+            Self::CpuConfigUnsupported => "CPU config is not supported.",
             Self::GetRequestBody => "GET request cannot have a body.",
             Self::InvalidPathMethod => "Invalid request method and/or path.",
             Self::MismatchedDriveId => "path drive_id must match body drive_id.",
@@ -1132,6 +1134,9 @@ pub fn parse_request_with_limit(
     }
     if method == "PUT" && path == "/boot-source" {
         return parse_boot_source_request(body);
+    }
+    if method == "PUT" && path == "/cpu-config" {
+        return Err(RequestError::CpuConfigUnsupported);
     }
     if method == "PUT" && path == "/logger" {
         return parse_logger_config_request(body);
@@ -3355,6 +3360,25 @@ mod tests {
         let request = b"GET /unknown HTTP/1.1\r\n\r\n";
 
         assert_eq!(parse_request(request), Err(RequestError::InvalidPathMethod));
+    }
+
+    #[test]
+    fn rejects_cpu_config_as_unsupported() {
+        let request = request_with_body("PUT", "/cpu-config", "{}");
+
+        let err = parse_request(&request).expect_err("cpu-config should be unsupported");
+        assert_eq!(err, RequestError::CpuConfigUnsupported);
+        assert_eq!(err.fault_message(), "CPU config is not supported.");
+    }
+
+    #[test]
+    fn rejects_non_exact_cpu_config_path_as_invalid_path_method() {
+        let request = request_with_body("PUT", "/cpu-config/extra", "{}");
+
+        assert_eq!(
+            parse_request(&request),
+            Err(RequestError::InvalidPathMethod)
+        );
     }
 
     #[test]
