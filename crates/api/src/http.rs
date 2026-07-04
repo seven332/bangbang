@@ -297,6 +297,12 @@ impl MachineConfigPatchRequest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum MachineConfigCpuTemplate {
+    C3,
+    T2,
+    T2S,
+    T2CL,
+    T2A,
+    V1N1,
     None,
 }
 
@@ -2285,6 +2291,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_put_machine_config_with_firecracker_cpu_templates() {
+        for (template, expected) in [
+            ("C3", MachineConfigCpuTemplate::C3),
+            ("T2", MachineConfigCpuTemplate::T2),
+            ("T2S", MachineConfigCpuTemplate::T2S),
+            ("T2CL", MachineConfigCpuTemplate::T2CL),
+            ("T2A", MachineConfigCpuTemplate::T2A),
+            ("V1N1", MachineConfigCpuTemplate::V1N1),
+        ] {
+            let body =
+                format!(r#"{{"vcpu_count":1,"mem_size_mib":128,"cpu_template":"{template}"}}"#);
+            let request = request_with_body("PUT", "/machine-config", &body);
+
+            let parsed = parse_request(&request).expect("CPU template should parse");
+
+            let ApiRequest::PutMachineConfig(config) = parsed else {
+                panic!("expected machine-config request");
+            };
+            assert_eq!(config.cpu_template(), Some(expected), "{template}");
+        }
+    }
+
+    #[test]
     fn rejects_put_machine_config_missing_required_fields() {
         assert_eq!(
             parse_request(&request_with_body(
@@ -2345,7 +2374,6 @@ mod tests {
     fn rejects_put_machine_config_unsupported_values() {
         for body in [
             r#"{"vcpu_count":1,"mem_size_mib":128,"smt":true}"#,
-            r#"{"vcpu_count":1,"mem_size_mib":128,"cpu_template":"V1N1"}"#,
             r#"{"vcpu_count":1,"mem_size_mib":128,"huge_pages":"2M"}"#,
         ] {
             assert_eq!(
@@ -2406,6 +2434,28 @@ mod tests {
         assert_eq!(config.track_dirty_pages(), None);
         assert_eq!(config.huge_pages(), None);
         assert_eq!(request_total_len(&request), Ok(Some(request.len())));
+    }
+
+    #[test]
+    fn parses_patch_machine_config_with_firecracker_cpu_templates() {
+        for (template, expected) in [
+            ("C3", MachineConfigCpuTemplate::C3),
+            ("T2", MachineConfigCpuTemplate::T2),
+            ("T2S", MachineConfigCpuTemplate::T2S),
+            ("T2CL", MachineConfigCpuTemplate::T2CL),
+            ("T2A", MachineConfigCpuTemplate::T2A),
+            ("V1N1", MachineConfigCpuTemplate::V1N1),
+        ] {
+            let body = format!(r#"{{"cpu_template":"{template}"}}"#);
+            let request = request_with_body("PATCH", "/machine-config", &body);
+
+            let parsed = parse_request(&request).expect("CPU template patch should parse");
+
+            let ApiRequest::PatchMachineConfig(config) = parsed else {
+                panic!("expected machine-config patch request");
+            };
+            assert_eq!(config.cpu_template(), Some(expected), "{template}");
+        }
     }
 
     #[test]
@@ -2483,14 +2533,28 @@ mod tests {
 
     #[test]
     fn rejects_patch_machine_config_unsupported_values() {
-        for body in [
-            r#"{"smt":true}"#,
-            r#"{"cpu_template":"V1N1"}"#,
-            r#"{"huge_pages":"2M"}"#,
-        ] {
+        for body in [r#"{"smt":true}"#, r#"{"huge_pages":"2M"}"#] {
             assert_eq!(
                 parse_request(&request_with_body("PATCH", "/machine-config", body)),
                 Err(RequestError::MalformedRequest)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_machine_config_unknown_cpu_template() {
+        for (method, path, body) in [
+            (
+                "PUT",
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":128,"cpu_template":"M7G"}"#,
+            ),
+            ("PATCH", "/machine-config", r#"{"cpu_template":"M7G"}"#),
+        ] {
+            assert_eq!(
+                parse_request(&request_with_body(method, path, body)),
+                Err(RequestError::MalformedRequest),
+                "{method} {path}"
             );
         }
     }

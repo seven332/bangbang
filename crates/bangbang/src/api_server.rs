@@ -697,6 +697,20 @@ fn path_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+fn machine_cpu_template_from_request(
+    cpu_template: bangbang_api::http::MachineConfigCpuTemplate,
+) -> RuntimeMachineConfigCpuTemplate {
+    match cpu_template {
+        bangbang_api::http::MachineConfigCpuTemplate::C3 => RuntimeMachineConfigCpuTemplate::C3,
+        bangbang_api::http::MachineConfigCpuTemplate::T2 => RuntimeMachineConfigCpuTemplate::T2,
+        bangbang_api::http::MachineConfigCpuTemplate::T2S => RuntimeMachineConfigCpuTemplate::T2S,
+        bangbang_api::http::MachineConfigCpuTemplate::T2CL => RuntimeMachineConfigCpuTemplate::T2CL,
+        bangbang_api::http::MachineConfigCpuTemplate::T2A => RuntimeMachineConfigCpuTemplate::T2A,
+        bangbang_api::http::MachineConfigCpuTemplate::V1N1 => RuntimeMachineConfigCpuTemplate::V1N1,
+        bangbang_api::http::MachineConfigCpuTemplate::None => RuntimeMachineConfigCpuTemplate::None,
+    }
+}
+
 fn machine_config_input_from_request(config: &MachineConfigRequest) -> MachineConfigInput {
     let mut input = MachineConfigInput::new(config.vcpu_count(), config.mem_size_mib())
         .with_smt(config.smt())
@@ -707,11 +721,7 @@ fn machine_config_input_from_request(config: &MachineConfigRequest) -> MachineCo
         });
 
     if let Some(cpu_template) = config.cpu_template() {
-        input = input.with_cpu_template(match cpu_template {
-            bangbang_api::http::MachineConfigCpuTemplate::None => {
-                RuntimeMachineConfigCpuTemplate::None
-            }
-        });
+        input = input.with_cpu_template(machine_cpu_template_from_request(cpu_template));
     }
 
     input
@@ -732,11 +742,7 @@ fn machine_config_patch_input_from_request(
         input = input.with_smt(smt);
     }
     if let Some(cpu_template) = config.cpu_template() {
-        input = input.with_cpu_template(match cpu_template {
-            bangbang_api::http::MachineConfigCpuTemplate::None => {
-                RuntimeMachineConfigCpuTemplate::None
-            }
-        });
+        input = input.with_cpu_template(machine_cpu_template_from_request(cpu_template));
     }
     if let Some(track_dirty_pages) = config.track_dirty_pages() {
         input = input.with_track_dirty_pages(track_dirty_pages);
@@ -1752,6 +1758,52 @@ mod tests {
         assert_eq!(vmm.machine_config().vcpu_count(), 2);
         assert_eq!(vmm.machine_config().mem_size_mib(), 256);
         assert!(!vmm.machine_config().track_dirty_pages());
+    }
+
+    #[test]
+    fn machine_cpu_template_faults_do_not_mutate_vmm_state_over_socket() {
+        let mut vmm = test_controller();
+        let body = r#"{"vcpu_count":2,"mem_size_mib":256}"#;
+        let request = format!(
+            "PUT /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let unsupported_put_body = r#"{"vcpu_count":4,"mem_size_mib":512,"cpu_template":"V1N1"}"#;
+        let unsupported_put_request = format!(
+            "PUT /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{unsupported_put_body}",
+            unsupported_put_body.len()
+        );
+
+        let response = request_over_socket(&mut vmm, "mct-put", &unsupported_put_request);
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(
+            response.contains(r#"{"fault_message":"machine cpu_template V1N1 is not supported"}"#)
+        );
+        assert_eq!(vmm.machine_config().vcpu_count(), 2);
+        assert_eq!(vmm.machine_config().mem_size_mib(), 256);
+        assert_eq!(vmm.machine_config().cpu_template(), None);
+
+        let unsupported_patch_body = r#"{"mem_size_mib":512,"cpu_template":"T2A"}"#;
+        let unsupported_patch_request = format!(
+            "PATCH /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{unsupported_patch_body}",
+            unsupported_patch_body.len()
+        );
+
+        let response = request_over_socket(&mut vmm, "mct-patch", &unsupported_patch_request);
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(
+            response.contains(r#"{"fault_message":"machine cpu_template T2A is not supported"}"#)
+        );
+        assert_eq!(vmm.machine_config().vcpu_count(), 2);
+        assert_eq!(vmm.machine_config().mem_size_mib(), 256);
+        assert_eq!(vmm.machine_config().cpu_template(), None);
     }
 
     #[test]
