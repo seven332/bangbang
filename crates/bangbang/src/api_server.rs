@@ -2804,6 +2804,40 @@ mod tests {
     }
 
     #[test]
+    fn returns_fault_for_send_ctrl_alt_del_action() {
+        let path = unique_socket_path("cad-fault");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+        let body = r#"{"action_type":"SendCtrlAltDel"}"#;
+        let request = format!(
+            "PUT /actions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        client
+            .write_all(request.as_bytes())
+            .expect("client should write request");
+        let mut vmm = test_controller();
+        server
+            .serve_next(&mut vmm)
+            .expect("server should handle one request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("client should read response");
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(
+            response.contains(r#"{"fault_message":"SendCtrlAltDel is not supported on aarch64."}"#)
+        );
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::NotStarted
+        );
+    }
+
+    #[test]
     fn configures_machine_config_over_unix_socket() {
         let path = unique_socket_path("machine-config");
         let server = ApiServer::bind(&path).expect("server should bind");
