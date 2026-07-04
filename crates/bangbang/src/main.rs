@@ -39,7 +39,6 @@ const UNSUPPORTED_FIRECRACKER_ARGS: &[&str] = &[
     "describe-snapshot",
     "enable-pci",
     "metadata",
-    "no-api",
     "no-seccomp",
     "parent-cpu-time-us",
     "seccomp-filter",
@@ -81,6 +80,7 @@ fn run() -> Result<(), ProcessError> {
                 logger_config,
                 mmds_size_limit: _,
                 metrics_config,
+                no_api,
             } = config;
 
             println!("bangbang {}", env!("CARGO_PKG_VERSION"));
@@ -99,6 +99,12 @@ fn run() -> Result<(), ProcessError> {
             apply_startup_logger_config(&mut vmm, logger_config)?;
             apply_startup_config_file(&mut vmm, config_file.as_deref())?;
             let mut shutdown_signal = ShutdownSignal::install()?;
+            if no_api {
+                println!("status: VM running without API");
+                shutdown_signal.wait()?;
+                return Ok(());
+            }
+
             let server =
                 ApiServer::bind_with_max_payload_size(&api_sock, http_api_max_payload_size)
                     .map_err(ProcessError::ApiServer)?;
@@ -415,7 +421,7 @@ impl fmt::Display for ProcessError {
             Self::ArgumentParsing(message) => f.write_str(message),
             Self::ConfigFile(err) => write!(f, "config-file error: {err}"),
             Self::SignalHandler(kind) => {
-                write!(f, "failed to register shutdown signal handler: {kind:?}")
+                write!(f, "shutdown signal handling failed: {kind:?}")
             }
             Self::StartupConfiguration(err) => {
                 write!(f, "startup configuration error: {err}")
@@ -511,6 +517,22 @@ impl ShutdownSignal {
     fn wakeup_reader(&mut self) -> &mut UnixStream {
         &mut self.wakeup_reader
     }
+
+    fn wait(&mut self) -> Result<(), ProcessError> {
+        let mut buffer = [0; 64];
+        loop {
+            match self.wakeup_reader.read(&mut buffer) {
+                Ok(0) => {
+                    return Err(ProcessError::SignalHandler(
+                        std::io::ErrorKind::UnexpectedEof,
+                    ));
+                }
+                Ok(_) => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(ProcessError::SignalHandler(err.kind())),
+            }
+        }
+    }
 }
 
 fn register_signal_wakeup(signal: i32, wakeup_writer: &UnixStream) -> Result<SigId, ProcessError> {
@@ -559,6 +581,7 @@ struct StartupConfig {
     logger_config: Option<LoggerConfigInput>,
     mmds_size_limit: Option<usize>,
     metrics_config: Option<MetricsConfigInput>,
+    no_api: bool,
 }
 
 impl Default for StartupConfig {
@@ -571,6 +594,7 @@ impl Default for StartupConfig {
             logger_config: None,
             mmds_size_limit: None,
             metrics_config: None,
+            no_api: false,
         }
     }
 }
@@ -639,6 +663,7 @@ impl Args {
         let mut mmds_size_limit_seen = false;
         let mut metrics_path_seen = false;
         let mut module_seen = false;
+        let mut no_api_seen = false;
         let mut show_level_seen = false;
         let mut show_log_origin_seen = false;
         let mut index = 0;
@@ -716,6 +741,14 @@ impl Args {
                     mmds_size_limit_seen = true;
                     index += 2;
                 }
+                "--no-api" => {
+                    if no_api_seen {
+                        return Err("duplicate argument: --no-api".to_string());
+                    }
+                    config.no_api = true;
+                    no_api_seen = true;
+                    index += 1;
+                }
                 "--metrics-path" => {
                     if metrics_path_seen {
                         return Err("duplicate argument: --metrics-path".to_string());
@@ -754,6 +787,12 @@ impl Args {
                     index += 1;
                 }
                 other => {
+                    if let Some(name) = unsupported_flag_equals_syntax(other) {
+                        return Err(format!(
+                            "unsupported argument syntax for --{name}; use --{name}"
+                        ));
+                    }
+
                     if let Some(name) = unsupported_firecracker_arg(other) {
                         return Err(format!("unsupported Firecracker argument: --{name}"));
                     }
@@ -775,6 +814,10 @@ impl Args {
 
         if logger_config_seen {
             config.logger_config = Some(logger_config);
+        }
+
+        if config.no_api && config.config_file.is_none() {
+            return Err("--no-api requires --config-file".to_string());
         }
 
         Ok(Self {
@@ -812,6 +855,7 @@ fn help_text() -> String {
             "      --mmds-size-limit <BYTES>\n",
             "                         MMDS data store size; defaults to HTTP API limit\n",
             "      --module <MODULE>  Logger module filter stored for future log integration\n",
+            "      --no-api          Start from --config-file without publishing an API socket\n",
             "      --show-level       Include level in minimal logger action lines\n",
             "      --show-log-origin  Include callsite origin in minimal logger action lines\n",
             "  -V, --version          Print version\n",
@@ -824,7 +868,8 @@ fn help_text() -> String {
             "pre-boot PUT /metrics and startup metrics output configuration, ",
             "and pre-boot PUT /logger and startup logger configuration with ",
             "minimal action logs; --config-file can apply the same supported ",
-            "pre-boot configuration and start the VM before API serving; ",
+            "pre-boot configuration and start the VM before API serving, ",
+            "or with --no-api can start without publishing an API socket; ",
             "PATCH /vm parses Paused and Resumed state requests ",
             "as unsupported lifecycle actions; PUT /cpu-config parses custom CPU ",
             "template requests as unsupported CPU configuration actions; ",
@@ -940,6 +985,12 @@ fn unsupported_equals_syntax(arg: &str) -> Option<&'static str> {
     ]
     .into_iter()
     .find_map(|(prefix, name)| arg.starts_with(prefix).then_some(name))
+}
+
+fn unsupported_flag_equals_syntax(arg: &str) -> Option<&'static str> {
+    [("--no-api=", "no-api")]
+        .into_iter()
+        .find_map(|(prefix, name)| arg.starts_with(prefix).then_some(name))
 }
 
 #[cfg(test)]
@@ -1111,6 +1162,7 @@ mod tests {
         assert_eq!(config.id, DEFAULT_INSTANCE_ID);
         assert_eq!(config.logger_config, None);
         assert_eq!(config.metrics_config, None);
+        assert!(!config.no_api);
     }
 
     #[test]
@@ -1142,6 +1194,8 @@ mod tests {
         assert!(help.contains("--metrics-path <PATH>"));
         assert!(help.contains("--http-api-max-payload-size <BYTES>"));
         assert!(help.contains("--mmds-size-limit <BYTES>"));
+        assert!(help.contains("--no-api"));
+        assert!(help.contains("without publishing an API socket"));
         assert!(help.contains("--show-level"));
         assert!(help.contains("PUT /actions starts a process-owned HVF boot run-loop worker"));
         assert!(help.contains("across bounded step windows for InstanceStart"));
@@ -1205,6 +1259,19 @@ mod tests {
             config.config_file,
             Some("/tmp/bangbang-config.json".to_string())
         );
+        assert!(!config.no_api);
+    }
+
+    #[test]
+    fn parse_no_api_config_file_arg() {
+        let config = parse_run(&["--config-file", "/tmp/bangbang-config.json", "--no-api"])
+            .expect("no-api config-file startup should parse");
+
+        assert_eq!(
+            config.config_file,
+            Some("/tmp/bangbang-config.json".to_string())
+        );
+        assert!(config.no_api);
     }
 
     #[test]
@@ -1345,6 +1412,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_no_api_without_config_file() {
+        let err = parse(&["--no-api"]).expect_err("no-api should require config file");
+
+        assert_eq!(err, "--no-api requires --config-file");
+    }
+
+    #[test]
     fn rejects_missing_id_value() {
         let err = parse(&["--id", "--api-sock"]).expect_err("missing id value should fail");
 
@@ -1410,6 +1484,19 @@ mod tests {
         .expect_err("duplicate config-file should fail");
 
         assert_eq!(err, "duplicate argument: --config-file");
+    }
+
+    #[test]
+    fn rejects_duplicate_no_api() {
+        let err = parse(&[
+            "--config-file",
+            "/tmp/bangbang-config.json",
+            "--no-api",
+            "--no-api",
+        ])
+        .expect_err("duplicate no-api should fail");
+
+        assert_eq!(err, "duplicate argument: --no-api");
     }
 
     #[test]
@@ -1630,13 +1717,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_firecracker_no_api_arg() {
-        let err = parse(&["--no-api"]).expect_err("unsupported flag should fail");
-
-        assert_eq!(err, "unsupported Firecracker argument: --no-api");
-    }
-
-    #[test]
     fn rejects_unsupported_firecracker_linux_arg() {
         let err = parse(&["--no-seccomp"]).expect_err("unsupported Linux flag should fail");
 
@@ -1659,6 +1739,13 @@ mod tests {
         assert_eq!(
             err,
             "unsupported argument syntax for --config-file; use --config-file <VALUE>"
+        );
+
+        let err = parse(&["--no-api=true"]).expect_err("equals syntax should fail");
+
+        assert_eq!(
+            err,
+            "unsupported argument syntax for --no-api; use --no-api"
         );
 
         let err =

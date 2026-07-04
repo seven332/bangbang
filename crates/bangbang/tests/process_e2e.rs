@@ -95,6 +95,50 @@ fn executable_config_file_failure_does_not_publish_socket() {
 }
 
 #[test]
+fn executable_no_api_config_file_failure_does_not_publish_socket() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let config_path = test_dir.path().join("vm-config.json");
+    let instance_id = test_dir.instance_id();
+    fs::write(&config_path, "{").expect("malformed config file should be written");
+
+    let output = BangbangProcess::start_with_extra_args_expect_failure(
+        &socket_path,
+        &instance_id,
+        &["--config-file", path_text(&config_path), "--no-api"],
+    );
+
+    assert!(
+        !output.status.success(),
+        "malformed no-api config file should fail startup; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        !socket_path.exists(),
+        "malformed no-api config file should not publish an API socket"
+    );
+    assert!(
+        !output.stdout.contains("status: API server listening"),
+        "no-api failure must not report API readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !output.stdout.contains("status: VM running without API"),
+        "malformed no-api config must not report no-api readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        output
+            .stderr
+            .contains("bangbang: config-file error: malformed config file"),
+        "stderr should describe config-file parse failure without JSON contents; stderr:\n{}",
+        output.stderr
+    );
+}
+
+#[test]
 fn executable_configures_vm_before_start() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");

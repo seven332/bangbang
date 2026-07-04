@@ -18,7 +18,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_BANGBANG_BIN: &str = env!("CARGO_BIN_EXE_bangbang");
 const BANGBANG_PROCESS_E2E_BIN_ENV: &str = "BANGBANG_PROCESS_E2E_BIN";
-const STARTUP_READY_LINE: &str = "status: API server listening";
+const API_STARTUP_READY_LINE: &str = "status: API server listening";
+const NO_API_STARTUP_READY_LINE: &str = "status: VM running without API";
+const STARTUP_READY_LINES: &[&str] = &[API_STARTUP_READY_LINE, NO_API_STARTUP_READY_LINE];
 const HTTP_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -232,7 +234,7 @@ impl BangbangProcess {
             Ok(()) => {
                 let output = self.force_stop_and_collect();
                 panic!(
-                    "bangbang reported API readiness but startup failure was expected; binary: {}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    "bangbang reported startup readiness but startup failure was expected; binary: {}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                     self.binary_path.display(),
                     output.status,
                     output.stdout,
@@ -298,7 +300,7 @@ impl BangbangProcess {
             Err(err) => {
                 let output = self.force_stop_and_collect();
                 panic!(
-                    "bangbang did not report API readiness before timeout: {err:?}; binary: {}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    "bangbang did not report startup readiness before timeout: {err:?}; binary: {}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                     self.binary_path.display(),
                     output.status,
                     output.stdout,
@@ -395,7 +397,10 @@ impl OutputReader {
                 match reader.read_line(&mut line) {
                     Ok(0) => break,
                     Ok(_) => {
-                        if line.contains(STARTUP_READY_LINE) {
+                        if STARTUP_READY_LINES
+                            .iter()
+                            .any(|ready_line| line.contains(ready_line))
+                        {
                             let _ = ready_sender.send(());
                         }
                         output.push_str(&line);
