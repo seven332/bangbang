@@ -256,7 +256,7 @@ compatibility targets.
 | `PUT` | `/serial` | recognized; rejected | Returns a serial-specific unsupported fault. Public serial configuration storage, host output redirection, rate limiting, and integration with the existing internal serial capture path need a dedicated design. |
 | `GET`, `PUT`, `PATCH` | `/hotplug/memory` | recognized; rejected | Returns a memory-hotplug-specific unsupported fault. Real virtio-mem device support, guest memory accounting, and runtime memory update behavior need a dedicated design. |
 | `PATCH` | `/vm` | recognized; rejected | Returns a VM-state-specific unsupported fault. Real pause/resume state rules, VMM actions, and public run-loop control need a dedicated design. |
-| `PATCH` | `/drives/{drive_id}`, `/network-interfaces/{iface_id}` | deferred | Hotplug and runtime update behavior belongs with the relevant device issues. |
+| `PATCH` | `/drives/{drive_id}`, `/network-interfaces/{iface_id}` | recognized; rejected | Returns device-update-specific unsupported faults. Real block-device updates, network-interface updates, runtime mutation, and hotplug behavior need dedicated device designs. |
 | `DELETE` | `/drives/{drive_id}`, `/pmem/{id}`, `/network-interfaces/{iface_id}` | deferred | Firecracker routes these hot-unplug requests in `parsed_request.rs`, but they are not in the `v1.16.0` swagger surface; support needs an explicit compatibility decision. |
 
 ## Initial Field Handling Policy
