@@ -62,18 +62,38 @@ fn executable_serves_api_and_shuts_down_cleanly() {
     assert_response_contains(&vm_config, r#""drives":[]"#, "GET /vm/config");
     assert_response_contains(&vm_config, r#""network-interfaces":[]"#, "GET /vm/config");
 
-    let output = bangbang.terminate();
-    assert!(
-        output.status.success(),
-        "SIGTERM should make bangbang exit successfully; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        output.stdout,
-        output.stderr
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
+fn concurrent_executables_keep_api_sockets_isolated() {
+    let first_dir = TestDir::new();
+    let second_dir = TestDir::new();
+    let first_socket_path = first_dir.path().join("api.socket");
+    let second_socket_path = second_dir.path().join("api.socket");
+    let first_instance_id = first_dir.instance_id();
+    let second_instance_id = second_dir.instance_id();
+
+    let first_bangbang = BangbangProcess::start(&first_socket_path, &first_instance_id);
+    let second_bangbang = BangbangProcess::start(&second_socket_path, &second_instance_id);
+
+    assert_instance_info_matches(
+        &first_socket_path,
+        &first_instance_id,
+        &second_instance_id,
+        "first bangbang",
     );
-    assert!(
-        !socket_path.exists(),
-        "bangbang should remove its owned API socket on normal shutdown"
+    assert_instance_info_matches(
+        &second_socket_path,
+        &second_instance_id,
+        &first_instance_id,
+        "second bangbang",
     );
+
+    let first_output = first_bangbang.terminate();
+    let second_output = second_bangbang.terminate();
+    assert_clean_shutdown(first_output, &first_socket_path, "first bangbang");
+    assert_clean_shutdown(second_output, &second_socket_path, "second bangbang");
 }
 
 fn http_get(socket_path: &Path, path: &str) -> String {
@@ -95,6 +115,39 @@ fn http_get(socket_path: &Path, path: &str) -> String {
         .read_to_string(&mut response)
         .expect("client should read response");
     response
+}
+
+fn assert_instance_info_matches(
+    socket_path: &Path,
+    expected_instance_id: &str,
+    unexpected_instance_id: &str,
+    process_name: &str,
+) {
+    let response = http_get(socket_path, "/");
+    assert_ok_response(&response, process_name);
+    assert_response_contains(
+        &response,
+        &format!(r#""id":"{expected_instance_id}""#),
+        process_name,
+    );
+    assert!(
+        !response.contains(&format!(r#""id":"{unexpected_instance_id}""#)),
+        "{process_name} response should not contain another process id; response:\n{response}"
+    );
+}
+
+fn assert_clean_shutdown(output: CompletedProcess, socket_path: &Path, process_name: &str) {
+    assert!(
+        output.status.success(),
+        "{process_name} SIGTERM should make bangbang exit successfully; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        !socket_path.exists(),
+        "{process_name} should remove its owned API socket on normal shutdown"
+    );
 }
 
 fn assert_ok_response(response: &str, request_name: &str) {
