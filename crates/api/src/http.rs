@@ -13,6 +13,8 @@ const TOKEN_BUCKET_SIZE_FIELD: &str = "size";
 const TOKEN_BUCKET_ONE_TIME_BURST_FIELD: &str = "one_time_burst";
 const TOKEN_BUCKET_REFILL_TIME_FIELD: &str = "refill_time";
 const MAX_MACHINE_CONFIG_VCPUS: u8 = 32;
+const ARM64_KVM_REG_SIZE_MASK: u64 = 0x00f0_0000_0000_0000;
+const ARM64_KVM_REG_SIZE_SHIFT: u32 = 52;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiRequest {
@@ -1423,15 +1425,24 @@ fn validate_kvm_capability(value: &serde_json::Value) -> Result<(), ()> {
 fn validate_arm_register_modifier(value: &serde_json::Value) -> Result<(), ()> {
     let object = exact_object(value, &["addr", "bitmap"])?;
 
-    validate_prefixed_u64(required_field(object, "addr")?)?;
-    validate_bitmap(required_field(object, "bitmap")?, u128::BITS)
+    let register_id = validate_prefixed_u64(required_field(object, "addr")?)?;
+    let register_bits = validate_arm64_register_bits(register_id)?;
+    let bitmap = validate_bitmap(required_field(object, "bitmap")?, u128::BITS)?;
+
+    if let Some(limit) = register_bitmap_limit(register_bits)
+        && (bitmap.value > limit || bitmap.filter > limit)
+    {
+        return Err(());
+    }
+
+    Ok(())
 }
 
 fn validate_vcpu_feature(value: &serde_json::Value) -> Result<(), ()> {
     let object = exact_object(value, &["index", "bitmap"])?;
 
     validate_u32_number(required_field(object, "index")?)?;
-    validate_bitmap(required_field(object, "bitmap")?, u32::BITS)
+    validate_bitmap(required_field(object, "bitmap")?, u32::BITS).map(|_| ())
 }
 
 fn exact_object<'value>(
@@ -1461,7 +1472,7 @@ fn required_field<'value>(
     object.get(field).ok_or(())
 }
 
-fn validate_prefixed_u64(value: &serde_json::Value) -> Result<(), ()> {
+fn validate_prefixed_u64(value: &serde_json::Value) -> Result<u64, ()> {
     let string = value.as_str().ok_or(())?;
     parse_prefixed_integer(string, u64::from_str_radix)
 }
@@ -1469,7 +1480,7 @@ fn validate_prefixed_u64(value: &serde_json::Value) -> Result<(), ()> {
 fn parse_prefixed_integer<T>(
     value: &str,
     parse: impl Fn(&str, u32) -> Result<T, std::num::ParseIntError>,
-) -> Result<(), ()> {
+) -> Result<T, ()> {
     let (digits, radix) = if let Some(binary) = value.strip_prefix("0b") {
         (binary, 2)
     } else if let Some(hex) = value.strip_prefix("0x") {
@@ -1482,7 +1493,7 @@ fn parse_prefixed_integer<T>(
         return Err(());
     }
 
-    parse(digits, radix).map(|_| ()).map_err(|_| ())
+    parse(digits, radix).map_err(|_| ())
 }
 
 fn validate_u32_number(value: &serde_json::Value) -> Result<(), ()> {
@@ -1491,10 +1502,35 @@ fn validate_u32_number(value: &serde_json::Value) -> Result<(), ()> {
     u32::try_from(number).map(|_| ()).map_err(|_| ())
 }
 
-fn validate_bitmap(value: &serde_json::Value, max_bits: u32) -> Result<(), ()> {
+fn validate_arm64_register_bits(register_id: u64) -> Result<u32, ()> {
+    match (register_id & ARM64_KVM_REG_SIZE_MASK) >> ARM64_KVM_REG_SIZE_SHIFT {
+        2 => Ok(32),
+        3 => Ok(64),
+        4 => Ok(128),
+        _ => Err(()),
+    }
+}
+
+fn register_bitmap_limit(register_bits: u32) -> Option<u128> {
+    if register_bits == u128::BITS {
+        None
+    } else {
+        Some((1_u128 << register_bits) - 1)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CpuTemplateBitmap {
+    filter: u128,
+    value: u128,
+}
+
+fn validate_bitmap(value: &serde_json::Value, max_bits: u32) -> Result<CpuTemplateBitmap, ()> {
     let bitmap = value.as_str().ok_or(())?;
     let bitmap = bitmap.strip_prefix("0b").unwrap_or(bitmap);
     let mut bit_count = 0;
+    let mut filter = 0;
+    let mut value = 0;
 
     for byte in bitmap.bytes().rev() {
         if bit_count == max_bits {
@@ -1503,14 +1539,23 @@ fn validate_bitmap(value: &serde_json::Value, max_bits: u32) -> Result<(), ()> {
 
         match byte {
             b'_' => {}
-            b'x' | b'0' | b'1' => {
+            b'x' => {
+                bit_count += 1;
+            }
+            b'0' => {
+                filter |= 1_u128 << bit_count;
+                bit_count += 1;
+            }
+            b'1' => {
+                filter |= 1_u128 << bit_count;
+                value |= 1_u128 << bit_count;
                 bit_count += 1;
             }
             _ => return Err(()),
         }
     }
 
-    Ok(())
+    Ok(CpuTemplateBitmap { filter, value })
 }
 
 fn parse_boot_source_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
@@ -4105,12 +4150,21 @@ mod tests {
             r#"{"reg_modifiers":[{"addr":"0x1"}]}"#,
             r#"{"reg_modifiers":[{"addr":"1","bitmap":"0b1"}]}"#,
             r#"{"reg_modifiers":[{"addr":"0x1","bitmap":"0b2"}]}"#,
+            r#"{"reg_modifiers":[{"addr":"0x0010000000000000","bitmap":"0b1"}]}"#,
             r#"{"vcpu_features":[{"index":4294967296,"bitmap":"0b1"}]}"#,
         ] {
             let request = request_with_body("PUT", "/cpu-config", body);
 
             assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
         }
+
+        let high_bit_body = format!(
+            r#"{{"reg_modifiers":[{{"addr":"0x0030000000000000","bitmap":"0b1{}"}}]}}"#,
+            "0".repeat(64)
+        );
+        let request = request_with_body("PUT", "/cpu-config", &high_bit_body);
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
     }
 
     #[test]
