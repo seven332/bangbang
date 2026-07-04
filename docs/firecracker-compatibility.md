@@ -289,7 +289,7 @@ exist.
 | `PUT /network-interfaces/{iface_id}` | body `iface_id` | required | The API parser rejects requests where this does not match the path `iface_id`. |
 | `PUT /network-interfaces/{iface_id}` | `host_dev_name` | required | The API/VMM path records this value only after rejecting empty values and enforcing the current 16-interface bangbang limit; it does not open, stat, or otherwise touch host networking resources during configuration. `InstanceStart` later accepts only `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>` for vmnet packet I/O startup. |
 | `PUT /network-interfaces/{iface_id}` | `guest_mac` | optional | The internal model accepts six colon-separated two-hex-digit octets, normalizes display to lowercase hex, and rejects duplicate configured MAC addresses across different interface IDs. |
-| `PUT /network-interfaces/{iface_id}` | `mtu` | deferred when configured | The internal model rejects configured MTU values until virtio-net feature negotiation and backend behavior exist. |
+| `PUT /network-interfaces/{iface_id}` | `mtu` | optional | The internal model accepts Firecracker-compatible `68..=65535` values, stores them with the interface config, advertises `VIRTIO_NET_F_MTU`, and exposes the value through virtio-net config space. Host vmnet MTU changes remain out of scope. |
 | `PUT /network-interfaces/{iface_id}` | `rx_rate_limiter`, `tx_rate_limiter` | deferred when configured | The internal model rejects configured network rate limiters until virtio-net rate limiting behavior exists. |
 | `PUT /network-interfaces/{iface_id}` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /vsock` | `vsock_id` | optional and deprecated | Firecracker `v1.16.0` accepts this field but treats it as deprecated. The internal model accepts it when present and rejects empty or control-character values. `GET /vm/config` omits this deprecated field. |
@@ -599,15 +599,19 @@ the same `iface_id`, and rejects duplicate configured guest MAC addresses across
 different interface IDs. Displayed validation errors avoid echoing invalid IDs,
 host device names, and MAC strings.
 
-The internal model rejects configured `mtu`, `rx_rate_limiter`, and
-`tx_rate_limiter` fields as unsupported. bangbang currently limits stored
-network interfaces to 16. Firecracker `v1.16.0` does not publish a separate
-network-interface count limit; this is a macOS/HVF host-resource boundary for
-the current scaffold. Configuration storage does not open host networking
-resources. Stored network interface configs are returned from `GET /vm/config`
-in the `network-interfaces` array. During `InstanceStart`, the process crate
-revalidates the count before opening vmnet resources, maps `host_dev_name`
-values `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>` to vmnet
+The internal model accepts configured `mtu` values in the Firecracker-compatible
+`68..=65535` range, preserves them in stored configs and `GET /vm/config`,
+and exposes them to the guest through `VIRTIO_NET_F_MTU`. The internal model
+still rejects configured `rx_rate_limiter` and `tx_rate_limiter` fields as
+unsupported. bangbang currently limits stored network interfaces to 16.
+Firecracker `v1.16.0` does not publish a separate network-interface count
+limit; this is a macOS/HVF host-resource boundary for the current scaffold.
+Configuration storage does not open host networking resources or change host
+vmnet MTU settings. Stored network interface configs are returned from
+`GET /vm/config` in the `network-interfaces` array. During `InstanceStart`, the
+process crate revalidates the count before opening vmnet resources, maps
+`host_dev_name` values `vmnet:host`, `vmnet:shared`, and
+`vmnet:bridged:<interface>` to vmnet
 host, shared, and bridged configurations, and builds cleanup-owning packet I/O
 for each configured interface. Other nonempty names are still accepted before
 boot but fail startup before `Running` is committed.
@@ -749,7 +753,8 @@ for `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>`. Startup with
 configured network interfaces revalidates the 16-interface limit before opening
 vmnet resources through those supported forms and retains stop-on-drop cleanup.
 Startup without network interfaces still uses a no-op TX sink and an empty RX
-source. These helpers do not advertise MTU, support rate limiters, prove host
+source. These helpers can advertise configured guest-visible MTU values, but
+they do not change host vmnet MTU settings, support rate limiters, prove host
 connectivity, or provide public runtime packet movement.
 
 The runtime crate can prepare owned internal block-device resources from a
