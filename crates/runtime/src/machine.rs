@@ -200,6 +200,11 @@ impl TryFrom<MachineConfigInput> for MachineConfig {
         if input.smt {
             return Err(MachineConfigError::SmtNotSupported);
         }
+        if let Some(cpu_template) = input.cpu_template
+            && cpu_template != MachineConfigCpuTemplate::None
+        {
+            return Err(MachineConfigError::UnsupportedCpuTemplate { cpu_template });
+        }
         if input.track_dirty_pages {
             return Err(MachineConfigError::DirtyPageTrackingNotSupported);
         }
@@ -211,9 +216,7 @@ impl TryFrom<MachineConfigInput> for MachineConfig {
             vcpu_count: input.vcpu_count,
             mem_size_mib: input.mem_size_mib,
             smt: input.smt,
-            cpu_template: match input.cpu_template {
-                Some(MachineConfigCpuTemplate::None) | None => None,
-            },
+            cpu_template: None,
             track_dirty_pages: input.track_dirty_pages,
             huge_pages: input.huge_pages,
         })
@@ -222,7 +225,27 @@ impl TryFrom<MachineConfigInput> for MachineConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MachineConfigCpuTemplate {
+    C3,
+    T2,
+    T2S,
+    T2CL,
+    T2A,
+    V1N1,
     None,
+}
+
+impl fmt::Display for MachineConfigCpuTemplate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::C3 => f.write_str("C3"),
+            Self::T2 => f.write_str("T2"),
+            Self::T2S => f.write_str("T2S"),
+            Self::T2CL => f.write_str("T2CL"),
+            Self::T2A => f.write_str("T2A"),
+            Self::V1N1 => f.write_str("V1N1"),
+            Self::None => f.write_str("None"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -238,6 +261,9 @@ pub enum MachineConfigError {
     InvalidVcpuCount,
     InvalidMemorySize,
     SmtNotSupported,
+    UnsupportedCpuTemplate {
+        cpu_template: MachineConfigCpuTemplate,
+    },
     DirtyPageTrackingNotSupported,
     HugePagesNotSupported,
 }
@@ -251,6 +277,9 @@ impl fmt::Display for MachineConfigError {
             }
             Self::InvalidMemorySize => f.write_str("machine mem_size_mib must not be zero"),
             Self::SmtNotSupported => f.write_str("machine smt is not supported"),
+            Self::UnsupportedCpuTemplate { cpu_template } => {
+                write!(f, "machine cpu_template {cpu_template} is not supported")
+            }
             Self::DirtyPageTrackingNotSupported => {
                 f.write_str("machine track_dirty_pages is not supported")
             }
@@ -309,6 +338,12 @@ mod tests {
             (
                 MachineConfigInput::new(1, 128).with_smt(true),
                 MachineConfigError::SmtNotSupported,
+            ),
+            (
+                MachineConfigInput::new(1, 128).with_cpu_template(MachineConfigCpuTemplate::V1N1),
+                MachineConfigError::UnsupportedCpuTemplate {
+                    cpu_template: MachineConfigCpuTemplate::V1N1,
+                },
             ),
             (
                 MachineConfigInput::new(1, 128).with_track_dirty_pages(true),
@@ -370,6 +405,12 @@ mod tests {
                 MachineConfigError::SmtNotSupported,
             ),
             (
+                MachineConfigPatchInput::new().with_cpu_template(MachineConfigCpuTemplate::T2A),
+                MachineConfigError::UnsupportedCpuTemplate {
+                    cpu_template: MachineConfigCpuTemplate::T2A,
+                },
+            ),
+            (
                 MachineConfigPatchInput::new().with_track_dirty_pages(true),
                 MachineConfigError::DirtyPageTrackingNotSupported,
             ),
@@ -388,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn displays_machine_config_errors_without_user_values() {
+    fn displays_machine_config_errors() {
         assert_eq!(
             MachineConfigError::EmptyPatch.to_string(),
             "machine config patch must update at least one field"
@@ -404,6 +445,13 @@ mod tests {
         assert_eq!(
             MachineConfigError::SmtNotSupported.to_string(),
             "machine smt is not supported"
+        );
+        assert_eq!(
+            MachineConfigError::UnsupportedCpuTemplate {
+                cpu_template: MachineConfigCpuTemplate::V1N1,
+            }
+            .to_string(),
+            "machine cpu_template V1N1 is not supported"
         );
         assert_eq!(
             MachineConfigError::DirtyPageTrackingNotSupported.to_string(),
