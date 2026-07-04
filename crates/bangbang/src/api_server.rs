@@ -3188,6 +3188,10 @@ mod tests {
                 b"PATCH /pmem/pmem0 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 14\r\n\r\n{\"id\":\"pmem0\"}"
                     .as_slice(),
             ),
+            (
+                "delete",
+                b"DELETE /pmem/pmem0 HTTP/1.1\r\nHost: localhost\r\n\r\n".as_slice(),
+            ),
         ] {
             let socket_name = format!("p{method}");
             let path = unique_socket_path(&socket_name);
@@ -3218,17 +3222,33 @@ mod tests {
 
     #[test]
     fn returns_fault_for_device_update_endpoints() {
-        for (name, path, body, fault_message) in [
+        for (name, method, path, body, fault_message) in [
             (
                 "drive",
+                "PATCH",
                 "/drives/rootfs",
                 r#"{"drive_id":"rootfs"}"#,
                 r#"{"fault_message":"Drive updates are not supported."}"#,
             ),
             (
+                "drive-delete",
+                "DELETE",
+                "/drives/rootfs",
+                "",
+                r#"{"fault_message":"Drive updates are not supported."}"#,
+            ),
+            (
                 "net",
+                "PATCH",
                 "/network-interfaces/eth0",
                 r#"{"iface_id":"eth0"}"#,
+                r#"{"fault_message":"Network interface updates are not supported."}"#,
+            ),
+            (
+                "net-delete",
+                "DELETE",
+                "/network-interfaces/eth0",
+                "",
                 r#"{"fault_message":"Network interface updates are not supported."}"#,
             ),
         ] {
@@ -3237,7 +3257,7 @@ mod tests {
             let server = ApiServer::bind(&socket_path).expect("server should bind");
             let mut client = UnixStream::connect(&socket_path).expect("client should connect");
             let request = format!(
-                "PATCH {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+                "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
             );
 
