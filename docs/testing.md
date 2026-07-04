@@ -47,9 +47,10 @@ behind `#[ignore]` in a normal test target. Mark the dedicated target with
 `test = false` in that crate's `Cargo.toml` so `--all-targets` does not run it
 accidentally, then run it explicitly from the signed integration runner.
 
-Use HVF integration tests for behavior that creates HVF VMs, vCPUs, GIC state,
-mapped guest memory, signed test binaries, or guest boot execution. These tests
-live in `crates/hvf/tests/` and must run through
+Use HVF crate integration tests for behavior that creates HVF VMs, vCPUs, GIC
+state, mapped guest memory, signed test binaries, or guest boot execution
+through the `bangbang-hvf` crate. These tests live in `crates/hvf/tests/` and
+must run through
 `scripts/run-integration-tests.sh` so the binaries are signed with the
 `com.apple.security.hypervisor` entitlement. Do not add real HVF tests to the
 unsigned workspace test path.

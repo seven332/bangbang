@@ -32,8 +32,8 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --lock
 ```
 
 On macOS Apple Silicon, also run `scripts/run-integration-tests.sh` for signed
-HVF-backed integration tests under `crates/hvf/tests/`. These tests should not
-be skipped or ignored on hosts that support HVF. Hosted CI may use
+HVF-backed integration targets. These tests should not be skipped or ignored on
+hosts that support HVF. Hosted CI may use
 `scripts/run-integration-tests.sh --allow-unsupported` to validate build/sign
 behavior without executing HVF when the runner does not support it.
 
