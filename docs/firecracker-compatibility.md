@@ -852,8 +852,9 @@ mounts the virtio-block root drive as `/`, and reads `/etc/os-release`; the
 signed `guest_boot` target validates guest-visible `root=/dev/vda ro`
 command-line arguments through captured serial output, and the signed
 executable HVF e2e target validates the same direct-rootfs path through public
-API configuration plus a host-observed scratch block marker. This does not yet
-claim arbitrary distro rootfs boot or default Ubuntu systemd startup.
+API configuration and config-file startup plus a host-observed scratch block
+marker. This does not yet claim arbitrary distro rootfs boot or default Ubuntu
+systemd startup.
 Block hotplug, remaining cache-mode semantics, and rate limiting remain
 deferred.
 It does not provide a public runner control, implement rate limiting, support
