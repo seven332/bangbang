@@ -14,11 +14,11 @@ use bangbang_api::http::{
     ActionRequest, ActionType, ApiRequest, BootSourceRequest, BootSourceResponse,
     DriveCacheType as ApiDriveCacheType, DriveConfigRequest, DriveConfigResponse,
     DriveIoEngine as ApiDriveIoEngine, HttpResponse, LoggerConfigRequest,
-    LoggerLevel as ApiLoggerLevel, MachineConfigRequest, MachineConfigResponse,
-    MetricsConfigRequest, MmdsConfigRequest, MmdsConfigResponse, MmdsContentRequest,
-    MmdsVersion as ApiMmdsVersion, NetworkInterfaceConfigRequest, NetworkInterfaceConfigResponse,
-    RequestError, VmConfigResponse, VsockConfigRequest, VsockConfigResponse, parse_request,
-    request_total_len,
+    LoggerLevel as ApiLoggerLevel, MachineConfigPatchRequest, MachineConfigRequest,
+    MachineConfigResponse, MetricsConfigRequest, MmdsConfigRequest, MmdsConfigResponse,
+    MmdsContentRequest, MmdsVersion as ApiMmdsVersion, NetworkInterfaceConfigRequest,
+    NetworkInterfaceConfigResponse, RequestError, VmConfigResponse, VsockConfigRequest,
+    VsockConfigResponse, parse_request, request_total_len,
 };
 use bangbang_runtime::block::{DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine};
 use bangbang_runtime::boot::{BootSourceConfig, BootSourceConfigInput};
@@ -26,6 +26,7 @@ use bangbang_runtime::logger::{LoggerConfigInput, LoggerLevel};
 use bangbang_runtime::machine::{
     MachineConfig, MachineConfigCpuTemplate as RuntimeMachineConfigCpuTemplate,
     MachineConfigHugePages as RuntimeMachineConfigHugePages, MachineConfigInput,
+    MachineConfigPatchInput,
 };
 use bangbang_runtime::metrics::MetricsConfigInput;
 use bangbang_runtime::mmds::{
@@ -427,6 +428,9 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PutMachineConfig(config) => handle_empty(vmm.handle_action(
             VmmAction::PutMachineConfig(machine_config_input_from_request(config.as_ref())),
         )),
+        ApiRequest::PatchMachineConfig(config) => handle_empty(vmm.handle_action(
+            VmmAction::PatchMachineConfig(machine_config_patch_input_from_request(config.as_ref())),
+        )),
         ApiRequest::PutMetrics(config) => handle_empty(vmm.handle_action(VmmAction::PutMetrics(
             metrics_config_input_from_request(config.as_ref()),
         ))),
@@ -681,6 +685,40 @@ fn machine_config_input_from_request(config: &MachineConfigRequest) -> MachineCo
             bangbang_api::http::MachineConfigCpuTemplate::None => {
                 RuntimeMachineConfigCpuTemplate::None
             }
+        });
+    }
+
+    input
+}
+
+fn machine_config_patch_input_from_request(
+    config: &MachineConfigPatchRequest,
+) -> MachineConfigPatchInput {
+    let mut input = MachineConfigPatchInput::new();
+
+    if let Some(vcpu_count) = config.vcpu_count() {
+        input = input.with_vcpu_count(vcpu_count);
+    }
+    if let Some(mem_size_mib) = config.mem_size_mib() {
+        input = input.with_mem_size_mib(mem_size_mib);
+    }
+    if let Some(smt) = config.smt() {
+        input = input.with_smt(smt);
+    }
+    if let Some(cpu_template) = config.cpu_template() {
+        input = input.with_cpu_template(match cpu_template {
+            bangbang_api::http::MachineConfigCpuTemplate::None => {
+                RuntimeMachineConfigCpuTemplate::None
+            }
+        });
+    }
+    if let Some(track_dirty_pages) = config.track_dirty_pages() {
+        input = input.with_track_dirty_pages(track_dirty_pages);
+    }
+    if let Some(huge_pages) = config.huge_pages() {
+        input = input.with_huge_pages(match huge_pages {
+            bangbang_api::http::MachineConfigHugePages::None => RuntimeMachineConfigHugePages::None,
+            bangbang_api::http::MachineConfigHugePages::TwoM => RuntimeMachineConfigHugePages::TwoM,
         });
     }
 
@@ -1154,13 +1192,38 @@ mod tests {
         assert_eq!(vmm.machine_config().mem_size_mib(), 256);
         assert!(vmm.drive_configs().is_empty());
 
+        let patch_body = r#"{"mem_size_mib":512}"#;
+        let patch_request = format!(
+            "PATCH /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{patch_body}",
+            patch_body.len()
+        );
+
+        let patch_response = handle_request_bytes(patch_request.as_bytes(), &mut vmm);
+
+        assert_eq!(
+            patch_response.status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        assert_eq!(patch_response.body(), "");
+        assert_eq!(vmm.machine_config().vcpu_count(), 2);
+        assert_eq!(vmm.machine_config().mem_size_mib(), 512);
+
         let get_response = handle_request_bytes(
             b"GET /machine-config HTTP/1.1\r\nHost: localhost\r\n\r\n",
             &mut vmm,
         );
 
         assert!(get_response.body().contains(r#""vcpu_count":2"#));
-        assert!(get_response.body().contains(r#""mem_size_mib":256"#));
+        assert!(get_response.body().contains(r#""mem_size_mib":512"#));
+
+        let vm_config_response = handle_request_bytes(
+            b"GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &mut vmm,
+        );
+
+        assert!(vm_config_response.body().contains(r#""machine-config":"#));
+        assert!(vm_config_response.body().contains(r#""vcpu_count":2"#));
+        assert!(vm_config_response.body().contains(r#""mem_size_mib":512"#));
     }
 
     #[test]
@@ -1584,6 +1647,73 @@ mod tests {
         assert_eq!(
             response.body(),
             r#"{"fault_message":"Malformed HTTP request."}"#
+        );
+        assert_eq!(vmm.machine_config().vcpu_count(), 2);
+        assert_eq!(vmm.machine_config().mem_size_mib(), 256);
+
+        let invalid_patch_body = r#"{"mem_size_mib":0}"#;
+        let invalid_patch_request = format!(
+            "PATCH /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{invalid_patch_body}",
+            invalid_patch_body.len()
+        );
+
+        let response = handle_request_bytes(invalid_patch_request.as_bytes(), &mut vmm);
+
+        assert_eq!(
+            response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+        assert_eq!(
+            response.body(),
+            r#"{"fault_message":"Malformed HTTP request."}"#
+        );
+        assert_eq!(vmm.machine_config().vcpu_count(), 2);
+        assert_eq!(vmm.machine_config().mem_size_mib(), 256);
+    }
+
+    #[test]
+    fn running_state_rejects_machine_config_patch_without_mutating() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let machine_body = r#"{"vcpu_count":2,"mem_size_mib":256}"#;
+        let machine_request = format!(
+            "PUT /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{machine_body}",
+            machine_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(machine_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_request = format!(
+            "PUT /boot-source HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{boot_body}",
+            boot_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "mc-patch", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let patch_body = r#"{"mem_size_mib":512}"#;
+        let patch_request = format!(
+            "PATCH /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{patch_body}",
+            patch_body.len()
+        );
+
+        let response = handle_request_bytes(patch_request.as_bytes(), &mut vmm);
+
+        assert_eq!(
+            response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+        assert_eq!(
+            response.body(),
+            r#"{"fault_message":"The requested operation is not supported in Running state: PatchMachineConfig"}"#
+        );
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::Running
         );
         assert_eq!(vmm.machine_config().vcpu_count(), 2);
         assert_eq!(vmm.machine_config().mem_size_mib(), 256);
@@ -2568,6 +2698,31 @@ mod tests {
         assert_eq!(vmm.machine_config().vcpu_count(), 2);
         assert_eq!(vmm.machine_config().mem_size_mib(), 256);
         assert!(vmm.drive_configs().is_empty());
+
+        let mut client = UnixStream::connect(&path).expect("client should connect again");
+        let patch_body = r#"{"mem_size_mib":512}"#;
+        let patch_request = format!(
+            "PATCH /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{patch_body}",
+            patch_body.len()
+        );
+
+        client
+            .write_all(patch_request.as_bytes())
+            .expect("client should write patch request");
+        server
+            .serve_next(&mut vmm)
+            .expect("server should handle one patch request");
+
+        let mut response = String::new();
+        client
+            .read_to_string(&mut response)
+            .expect("client should read patch response");
+
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(response.contains("Content-Length: 0\r\n"));
+        assert!(response.ends_with("\r\n\r\n"));
+        assert_eq!(vmm.machine_config().vcpu_count(), 2);
+        assert_eq!(vmm.machine_config().mem_size_mib(), 512);
     }
 
     #[test]

@@ -26,6 +26,7 @@ pub enum ApiRequest {
     PutDrive(Box<DriveConfigRequest>),
     PutLogger(Box<LoggerConfigRequest>),
     PutMachineConfig(Box<MachineConfigRequest>),
+    PatchMachineConfig(Box<MachineConfigPatchRequest>),
     PutMetrics(Box<MetricsConfigRequest>),
     PutMmds(Box<MmdsContentRequest>),
     PutMmdsConfig(Box<MmdsConfigRequest>),
@@ -238,6 +239,42 @@ impl MachineConfigRequest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineConfigPatchRequest {
+    vcpu_count: Option<u8>,
+    mem_size_mib: Option<u64>,
+    smt: Option<bool>,
+    cpu_template: Option<MachineConfigCpuTemplate>,
+    track_dirty_pages: Option<bool>,
+    huge_pages: Option<MachineConfigHugePages>,
+}
+
+impl MachineConfigPatchRequest {
+    pub const fn vcpu_count(&self) -> Option<u8> {
+        self.vcpu_count
+    }
+
+    pub const fn mem_size_mib(&self) -> Option<u64> {
+        self.mem_size_mib
+    }
+
+    pub const fn smt(&self) -> Option<bool> {
+        self.smt
+    }
+
+    pub const fn cpu_template(&self) -> Option<MachineConfigCpuTemplate> {
+        self.cpu_template
+    }
+
+    pub const fn track_dirty_pages(&self) -> Option<bool> {
+        self.track_dirty_pages
+    }
+
+    pub const fn huge_pages(&self) -> Option<MachineConfigHugePages> {
+        self.huge_pages
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum MachineConfigCpuTemplate {
     None,
@@ -264,6 +301,34 @@ struct MachineConfigRequestBody {
     track_dirty_pages: bool,
     #[serde(default)]
     huge_pages: MachineConfigHugePages,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MachineConfigPatchRequestBody {
+    #[serde(default)]
+    vcpu_count: Option<u8>,
+    #[serde(default)]
+    mem_size_mib: Option<u64>,
+    #[serde(default)]
+    smt: Option<bool>,
+    #[serde(default)]
+    cpu_template: Option<MachineConfigCpuTemplate>,
+    #[serde(default)]
+    track_dirty_pages: Option<bool>,
+    #[serde(default)]
+    huge_pages: Option<MachineConfigHugePages>,
+}
+
+impl MachineConfigPatchRequestBody {
+    const fn is_empty(&self) -> bool {
+        self.vcpu_count.is_none()
+            && self.mem_size_mib.is_none()
+            && self.smt.is_none()
+            && self.cpu_template.is_none()
+            && self.track_dirty_pages.is_none()
+            && self.huge_pages.is_none()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1067,6 +1132,9 @@ pub fn parse_request(bytes: &[u8]) -> Result<ApiRequest, RequestError> {
     if method == "PUT" && path == "/machine-config" {
         return parse_machine_config_request(body);
     }
+    if method == "PATCH" && path == "/machine-config" {
+        return parse_machine_config_patch_request(body);
+    }
     if method == "PUT" && path == "/metrics" {
         return parse_metrics_config_request(body);
     }
@@ -1249,6 +1317,24 @@ fn parse_machine_config_request(body: &[u8]) -> Result<ApiRequest, RequestError>
     )))
 }
 
+fn parse_machine_config_patch_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
+    let body = serde_json::from_slice::<MachineConfigPatchRequestBody>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+
+    validate_machine_config_patch_request(&body)?;
+
+    Ok(ApiRequest::PatchMachineConfig(Box::new(
+        MachineConfigPatchRequest {
+            vcpu_count: body.vcpu_count,
+            mem_size_mib: body.mem_size_mib,
+            smt: body.smt,
+            cpu_template: body.cpu_template,
+            track_dirty_pages: body.track_dirty_pages,
+            huge_pages: body.huge_pages,
+        },
+    )))
+}
+
 fn parse_metrics_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
     let body = serde_json::from_slice::<MetricsConfigRequestBody>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
@@ -1313,6 +1399,30 @@ fn validate_machine_config_request(body: &MachineConfigRequestBody) -> Result<()
         return Err(RequestError::MalformedRequest);
     }
     if body.smt || body.track_dirty_pages || body.huge_pages != MachineConfigHugePages::None {
+        return Err(RequestError::MalformedRequest);
+    }
+
+    Ok(())
+}
+
+fn validate_machine_config_patch_request(
+    body: &MachineConfigPatchRequestBody,
+) -> Result<(), RequestError> {
+    if body.is_empty() {
+        return Err(RequestError::MalformedRequest);
+    }
+    if let Some(vcpu_count) = body.vcpu_count
+        && (vcpu_count == 0 || vcpu_count > MAX_MACHINE_CONFIG_VCPUS)
+    {
+        return Err(RequestError::MalformedRequest);
+    }
+    if body.mem_size_mib == Some(0) {
+        return Err(RequestError::MalformedRequest);
+    }
+    if body.smt == Some(true)
+        || body.track_dirty_pages == Some(true)
+        || body.huge_pages == Some(MachineConfigHugePages::TwoM)
+    {
         return Err(RequestError::MalformedRequest);
     }
 
@@ -1555,6 +1665,7 @@ impl From<ApiRequest> for Endpoint {
             ApiRequest::PutDrive(_) => Self::Drive,
             ApiRequest::PutLogger(_) => Self::Logger,
             ApiRequest::PutMachineConfig(_) => Self::MachineConfig,
+            ApiRequest::PatchMachineConfig(_) => Self::MachineConfig,
             ApiRequest::PutMetrics(_) => Self::Metrics,
             ApiRequest::PutMmds(_) | ApiRequest::PatchMmds(_) | ApiRequest::PutMmdsConfig(_) => {
                 Self::Mmds
@@ -2147,6 +2258,97 @@ mod tests {
         ] {
             assert_eq!(
                 parse_request(&request_with_body("PUT", "/machine-config", body)),
+                Err(RequestError::MalformedRequest)
+            );
+        }
+    }
+
+    #[test]
+    fn parses_patch_machine_config_with_partial_body() {
+        let body = r#"{
+            "mem_size_mib": 512,
+            "cpu_template": "None"
+        }"#;
+        let request = request_with_body("PATCH", "/machine-config", body);
+
+        let parsed = parse_request(&request).expect("machine-config patch should parse");
+
+        let ApiRequest::PatchMachineConfig(config) = parsed else {
+            panic!("expected machine-config patch request");
+        };
+        assert_eq!(config.vcpu_count(), None);
+        assert_eq!(config.mem_size_mib(), Some(512));
+        assert_eq!(config.smt(), None);
+        assert_eq!(config.cpu_template(), Some(MachineConfigCpuTemplate::None));
+        assert_eq!(config.track_dirty_pages(), None);
+        assert_eq!(config.huge_pages(), None);
+        assert_eq!(request_total_len(&request), Ok(Some(request.len())));
+    }
+
+    #[test]
+    fn parses_patch_machine_config_with_accepted_default_values() {
+        let body = r#"{
+            "smt": false,
+            "track_dirty_pages": false,
+            "huge_pages": "None"
+        }"#;
+        let request = request_with_body("PATCH", "/machine-config", body);
+
+        let parsed = parse_request(&request).expect("machine-config patch defaults should parse");
+
+        let ApiRequest::PatchMachineConfig(config) = parsed else {
+            panic!("expected machine-config patch request");
+        };
+        assert_eq!(config.smt(), Some(false));
+        assert_eq!(config.track_dirty_pages(), Some(false));
+        assert_eq!(config.huge_pages(), Some(MachineConfigHugePages::None));
+    }
+
+    #[test]
+    fn rejects_patch_machine_config_empty_body() {
+        for body in [r#"{}"#, r#"{"smt":null}"#] {
+            assert_eq!(
+                parse_request(&request_with_body("PATCH", "/machine-config", body)),
+                Err(RequestError::MalformedRequest)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_patch_machine_config_unknown_field() {
+        let body = r#"{
+            "mem_size_mib": 512,
+            "unknown": true
+        }"#;
+        let request = request_with_body("PATCH", "/machine-config", body);
+
+        assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_patch_machine_config_invalid_numeric_bounds() {
+        for body in [
+            r#"{"vcpu_count":0}"#,
+            r#"{"vcpu_count":33}"#,
+            r#"{"mem_size_mib":0}"#,
+        ] {
+            assert_eq!(
+                parse_request(&request_with_body("PATCH", "/machine-config", body)),
+                Err(RequestError::MalformedRequest)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_patch_machine_config_unsupported_values() {
+        for body in [
+            r#"{"smt":true}"#,
+            r#"{"track_dirty_pages":true}"#,
+            r#"{"cpu_template":"V1N1"}"#,
+            r#"{"huge_pages":"2M"}"#,
+        ] {
+            assert_eq!(
+                parse_request(&request_with_body("PATCH", "/machine-config", body)),
                 Err(RequestError::MalformedRequest)
             );
         }
@@ -3503,6 +3705,15 @@ mod tests {
             r#"{"vcpu_count":1,"mem_size_mib":128}"#,
         ))
         .expect("machine-config request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::MachineConfig);
+
+        let request = parse_request(&request_with_body(
+            "PATCH",
+            "/machine-config",
+            r#"{"mem_size_mib":256}"#,
+        ))
+        .expect("machine-config patch request should parse");
 
         assert_eq!(Endpoint::from(request), Endpoint::MachineConfig);
 

@@ -53,6 +53,91 @@ impl MachineConfigInput {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MachineConfigPatchInput {
+    vcpu_count: Option<u8>,
+    mem_size_mib: Option<u64>,
+    smt: Option<bool>,
+    cpu_template: Option<MachineConfigCpuTemplate>,
+    track_dirty_pages: Option<bool>,
+    huge_pages: Option<MachineConfigHugePages>,
+}
+
+impl MachineConfigPatchInput {
+    pub const fn new() -> Self {
+        Self {
+            vcpu_count: None,
+            mem_size_mib: None,
+            smt: None,
+            cpu_template: None,
+            track_dirty_pages: None,
+            huge_pages: None,
+        }
+    }
+
+    pub const fn with_vcpu_count(mut self, vcpu_count: u8) -> Self {
+        self.vcpu_count = Some(vcpu_count);
+        self
+    }
+
+    pub const fn with_mem_size_mib(mut self, mem_size_mib: u64) -> Self {
+        self.mem_size_mib = Some(mem_size_mib);
+        self
+    }
+
+    pub const fn with_smt(mut self, smt: bool) -> Self {
+        self.smt = Some(smt);
+        self
+    }
+
+    pub const fn with_cpu_template(mut self, cpu_template: MachineConfigCpuTemplate) -> Self {
+        self.cpu_template = Some(cpu_template);
+        self
+    }
+
+    pub const fn with_track_dirty_pages(mut self, track_dirty_pages: bool) -> Self {
+        self.track_dirty_pages = Some(track_dirty_pages);
+        self
+    }
+
+    pub const fn with_huge_pages(mut self, huge_pages: MachineConfigHugePages) -> Self {
+        self.huge_pages = Some(huge_pages);
+        self
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.vcpu_count.is_none()
+            && self.mem_size_mib.is_none()
+            && self.smt.is_none()
+            && self.cpu_template.is_none()
+            && self.track_dirty_pages.is_none()
+            && self.huge_pages.is_none()
+    }
+
+    pub fn apply_to(self, current: MachineConfig) -> Result<MachineConfig, MachineConfigError> {
+        if self.is_empty() {
+            return Err(MachineConfigError::EmptyPatch);
+        }
+
+        let mut input = MachineConfigInput::new(
+            self.vcpu_count.unwrap_or(current.vcpu_count()),
+            self.mem_size_mib.unwrap_or(current.mem_size_mib()),
+        )
+        .with_smt(self.smt.unwrap_or(current.smt()))
+        .with_track_dirty_pages(
+            self.track_dirty_pages
+                .unwrap_or(current.track_dirty_pages()),
+        )
+        .with_huge_pages(self.huge_pages.unwrap_or(current.huge_pages()));
+
+        if let Some(cpu_template) = self.cpu_template.or(current.cpu_template()) {
+            input = input.with_cpu_template(cpu_template);
+        }
+
+        input.validate()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MachineConfig {
     vcpu_count: u8,
@@ -149,6 +234,7 @@ pub enum MachineConfigHugePages {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MachineConfigError {
+    EmptyPatch,
     InvalidVcpuCount,
     InvalidMemorySize,
     SmtNotSupported,
@@ -159,6 +245,7 @@ pub enum MachineConfigError {
 impl fmt::Display for MachineConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::EmptyPatch => f.write_str("machine config patch must update at least one field"),
             Self::InvalidVcpuCount => {
                 write!(f, "machine vcpu_count must be in 1..={MAX_SUPPORTED_VCPUS}")
             }
@@ -240,7 +327,72 @@ mod tests {
     }
 
     #[test]
+    fn applies_machine_config_patch_to_current_config() {
+        let current = MachineConfigInput::new(2, 256)
+            .validate()
+            .expect("current machine config should validate");
+        let patched = MachineConfigPatchInput::new()
+            .with_mem_size_mib(512)
+            .with_cpu_template(MachineConfigCpuTemplate::None)
+            .apply_to(current)
+            .expect("patch should validate");
+
+        assert_eq!(patched.vcpu_count(), 2);
+        assert_eq!(patched.mem_size_mib(), 512);
+        assert!(!patched.smt());
+        assert_eq!(patched.cpu_template(), None);
+        assert!(!patched.track_dirty_pages());
+        assert_eq!(patched.huge_pages(), MachineConfigHugePages::None);
+    }
+
+    #[test]
+    fn rejects_empty_machine_config_patch() {
+        let err = MachineConfigPatchInput::new()
+            .apply_to(MachineConfig::default())
+            .expect_err("empty patch should fail");
+
+        assert_eq!(err, MachineConfigError::EmptyPatch);
+    }
+
+    #[test]
+    fn rejects_invalid_machine_config_patch() {
+        for (patch, expected) in [
+            (
+                MachineConfigPatchInput::new().with_vcpu_count(0),
+                MachineConfigError::InvalidVcpuCount,
+            ),
+            (
+                MachineConfigPatchInput::new().with_mem_size_mib(0),
+                MachineConfigError::InvalidMemorySize,
+            ),
+            (
+                MachineConfigPatchInput::new().with_smt(true),
+                MachineConfigError::SmtNotSupported,
+            ),
+            (
+                MachineConfigPatchInput::new().with_track_dirty_pages(true),
+                MachineConfigError::DirtyPageTrackingNotSupported,
+            ),
+            (
+                MachineConfigPatchInput::new().with_huge_pages(MachineConfigHugePages::TwoM),
+                MachineConfigError::HugePagesNotSupported,
+            ),
+        ] {
+            assert_eq!(
+                patch
+                    .apply_to(MachineConfig::default())
+                    .expect_err("patch should be invalid"),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn displays_machine_config_errors_without_user_values() {
+        assert_eq!(
+            MachineConfigError::EmptyPatch.to_string(),
+            "machine config patch must update at least one field"
+        );
         assert_eq!(
             MachineConfigError::InvalidVcpuCount.to_string(),
             "machine vcpu_count must be in 1..=32"
