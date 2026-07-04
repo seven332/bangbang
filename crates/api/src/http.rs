@@ -3372,6 +3372,22 @@ mod tests {
     }
 
     #[test]
+    fn rejects_cpu_config_as_unsupported_without_parsing_body() {
+        let malformed_body = request_with_body("PUT", "/cpu-config", "not-json");
+        let empty_body =
+            b"PUT /cpu-config HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n";
+
+        assert_eq!(
+            parse_request(&malformed_body),
+            Err(RequestError::CpuConfigUnsupported)
+        );
+        assert_eq!(
+            parse_request(empty_body),
+            Err(RequestError::CpuConfigUnsupported)
+        );
+    }
+
+    #[test]
     fn rejects_non_exact_cpu_config_path_as_invalid_path_method() {
         let request = request_with_body("PUT", "/cpu-config/extra", "{}");
 
