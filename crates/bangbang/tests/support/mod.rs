@@ -190,7 +190,15 @@ pub(crate) struct BangbangProcess {
 
 impl BangbangProcess {
     pub(crate) fn start(socket_path: &Path, instance_id: &str) -> Self {
-        let mut process = Self::spawn(socket_path, instance_id);
+        Self::start_with_extra_args(socket_path, instance_id, &[])
+    }
+
+    pub(crate) fn start_with_extra_args(
+        socket_path: &Path,
+        instance_id: &str,
+        extra_args: &[&str],
+    ) -> Self {
+        let mut process = Self::spawn_with_extra_args(socket_path, instance_id, extra_args);
         process.wait_until_ready();
         process
     }

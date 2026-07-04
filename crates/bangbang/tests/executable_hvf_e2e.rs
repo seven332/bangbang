@@ -181,6 +181,155 @@ mod macos_arm64 {
     }
 
     #[test]
+    fn signed_executable_starts_from_config_file() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let config_path = test_dir.path().join("vm-config.json");
+        let backing_path = test_dir.path().join("data.img");
+        let metrics_path = test_dir.path().join("metrics.out");
+        let logger_path = test_dir.path().join("logger.out");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let initrd_path = env_path(BANGBANG_GUEST_INITRD_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+
+        create_zeroed_block_backing(&backing_path);
+
+        let kernel_path_json = json_string(path_text(&kernel_path));
+        let initrd_path_json = json_string(path_text(&initrd_path));
+        let boot_args_json = json_string(GUEST_BOOT_ARGS);
+        let backing_path_json = json_string(path_text(&backing_path));
+        let metrics_path_json = json_string(path_text(&metrics_path));
+        let logger_path_json = json_string(path_text(&logger_path));
+        let config = format!(
+            r#"{{
+                "machine-config": {{"vcpu_count": 1, "mem_size_mib": 256}},
+                "boot-source": {{
+                    "kernel_image_path": {kernel_path_json},
+                    "initrd_path": {initrd_path_json},
+                    "boot_args": {boot_args_json}
+                }},
+                "drives": [{{
+                    "drive_id": "data",
+                    "path_on_host": {backing_path_json},
+                    "is_root_device": false,
+                    "is_read_only": false
+                }}],
+                "metrics": {{"metrics_path": {metrics_path_json}}},
+                "logger": {{"log_path": {logger_path_json}}}
+            }}"#
+        );
+        fs::write(&config_path, config).expect("config file should be written");
+
+        let mut bangbang = BangbangProcess::start_with_extra_args(
+            &socket_path,
+            &instance_id,
+            &["--config-file", path_text(&config_path)],
+        );
+
+        let running_instance_info = http_get(&socket_path, "/");
+        assert_ok_response(&running_instance_info, "GET / after config-file startup");
+        assert_response_contains(
+            &running_instance_info,
+            &format!(r#""id":"{instance_id}""#),
+            "GET / after config-file startup",
+        );
+        assert_response_contains(
+            &running_instance_info,
+            r#""state":"Running""#,
+            "GET / after config-file startup",
+        );
+
+        let vm_config = http_get(&socket_path, "/vm/config");
+        assert_ok_response(&vm_config, "GET /vm/config after config-file startup");
+        assert_response_contains(
+            &vm_config,
+            r#""vcpu_count":1"#,
+            "GET /vm/config after config-file startup",
+        );
+        assert_response_contains(
+            &vm_config,
+            r#""mem_size_mib":256"#,
+            "GET /vm/config after config-file startup",
+        );
+        assert_response_contains(
+            &vm_config,
+            &format!(r#""kernel_image_path":{kernel_path_json}"#),
+            "GET /vm/config after config-file startup",
+        );
+        assert_response_contains(
+            &vm_config,
+            &format!(r#""initrd_path":{initrd_path_json}"#),
+            "GET /vm/config after config-file startup",
+        );
+        assert_response_contains(
+            &vm_config,
+            &format!(r#""boot_args":{boot_args_json}"#),
+            "GET /vm/config after config-file startup",
+        );
+        assert_response_contains(
+            &vm_config,
+            r#""drive_id":"data""#,
+            "GET /vm/config after config-file startup",
+        );
+        assert_response_contains(
+            &vm_config,
+            &format!(r#""path_on_host":{backing_path_json}"#),
+            "GET /vm/config after config-file startup",
+        );
+
+        let second_start_response = http_put_json(
+            &socket_path,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        );
+        assert_bad_request_response(
+            &second_start_response,
+            "PUT /actions second InstanceStart after config-file startup",
+        );
+        assert_response_contains(
+            &second_start_response,
+            r#"{"fault_message":"The requested operation is not supported in Running state: InstanceStart"}"#,
+            "PUT /actions second InstanceStart after config-file startup",
+        );
+
+        let post_start_machine_response = http_put_json(
+            &socket_path,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        );
+        assert_bad_request_response(
+            &post_start_machine_response,
+            "PUT /machine-config after config-file startup",
+        );
+        assert_response_contains(
+            &post_start_machine_response,
+            r#"{"fault_message":"The requested operation is not supported in Running state: PutMachineConfig"}"#,
+            "PUT /machine-config after config-file startup",
+        );
+
+        let flush_metrics_response = http_put_json(
+            &socket_path,
+            "/actions",
+            r#"{"action_type":"FlushMetrics"}"#,
+        );
+        assert_no_content_response(&flush_metrics_response, "PUT /actions FlushMetrics");
+        assert_metrics_output(&metrics_path);
+        assert_logger_output(&logger_path);
+
+        if let Err(err) =
+            wait_for_file_prefix_marker(&backing_path, BLOCK_WRITE_MARKER, GUEST_EXECUTION_TIMEOUT)
+        {
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "config-file guest did not write block marker through signed bangbang executable: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
+        assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang config file");
+    }
+
+    #[test]
     fn signed_executable_boots_direct_rootfs_and_writes_block_marker() {
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join("api.socket");
