@@ -578,6 +578,8 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PutSerial(config) => handle_empty(vmm.handle_put_request(
             PutApiRequest::serial(serial_config_input_from_request(config.as_ref())),
         )),
+        ApiRequest::PutSnapshotCreate => handle_empty(vmm.handle_action(VmmAction::CreateSnapshot)),
+        ApiRequest::PutSnapshotLoad => handle_empty(vmm.handle_action(VmmAction::LoadSnapshot)),
         ApiRequest::PutVsock(config) => handle_empty(vmm.handle_put_request(PutApiRequest::vsock(
             vsock_config_input_from_request(config.as_ref()),
         ))),
@@ -641,7 +643,9 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         | ApiRequest::PatchNetworkInterface(_)
         | ApiRequest::PatchVmState(_)
         | ApiRequest::PutAction(_)
-        | ApiRequest::PutMmds(_) => None,
+        | ApiRequest::PutMmds(_)
+        | ApiRequest::PutSnapshotCreate
+        | ApiRequest::PutSnapshotLoad => None,
     }
 }
 
@@ -4052,7 +4056,7 @@ mod tests {
                     "/snapshot/create",
                     r#"{"snapshot_path":"vmstate","mem_file_path":"memory"}"#,
                 ),
-                "Snapshot and restore are not supported.",
+                "The requested operation is not supported in Not started state: CreateSnapshot",
             ),
             (
                 "snapshot-load",
@@ -4088,6 +4092,62 @@ mod tests {
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::NotStarted
+        );
+    }
+
+    #[test]
+    fn returns_stateful_faults_for_running_snapshot_endpoints() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_request = format!(
+            "PUT /boot-source HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{boot_body}",
+            boot_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "snap-start", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        for (socket_name, request, fault_message) in [
+            (
+                "snap-cr-run",
+                request_with_body(
+                    "PUT",
+                    "/snapshot/create",
+                    r#"{"snapshot_path":"vmstate","mem_file_path":"memory"}"#,
+                ),
+                "Snapshot and restore are not supported.",
+            ),
+            (
+                "snap-ld-run",
+                request_with_body(
+                    "PUT",
+                    "/snapshot/load",
+                    r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"}}"#,
+                ),
+                "The requested operation is not supported in Running state: LoadSnapshot",
+            ),
+        ] {
+            let response = request_over_socket(&mut vmm, socket_name, &request);
+
+            assert!(
+                response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+                "{socket_name}: {response}"
+            );
+            assert!(
+                response.contains(&format!(r#"{{"fault_message":"{fault_message}"}}"#)),
+                "{socket_name}: {response}"
+            );
+            assert!(
+                !response.contains("vmstate") && !response.contains("memory"),
+                "{socket_name} must not echo snapshot paths: {response}"
+            );
+        }
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::Running
         );
     }
 

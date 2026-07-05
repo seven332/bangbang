@@ -2734,6 +2734,7 @@ mod tests {
             | VmmActionError::NetworkInterfaceConfig(_)
             | VmmActionError::NetworkInterfaceUpdateUnsupported
             | VmmActionError::SerialConfig(_)
+            | VmmActionError::SnapshotUnsupported
             | VmmActionError::VsockConfig(_) => {
                 panic!("vmnet start failure should propagate as hypervisor startup error");
             }

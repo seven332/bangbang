@@ -324,26 +324,24 @@ fn executable_rejects_snapshot_requests_without_mutating() {
     let instance_id = test_dir.instance_id();
     let bangbang = BangbangProcess::start(&socket_path, &instance_id);
 
-    for (path, body, private_values) in [
+    for (path, body, expected_fault, private_values) in [
         (
             "/snapshot/create",
             r#"{"snapshot_path":"secret-create.vmstate","mem_file_path":"secret-create.mem"}"#,
+            r#"{"fault_message":"The requested operation is not supported in Not started state: CreateSnapshot"}"#,
             &["secret-create.vmstate", "secret-create.mem"][..],
         ),
         (
             "/snapshot/load",
             r#"{"snapshot_path":"secret-load.vmstate","mem_backend":{"backend_path":"secret-load.mem","backend_type":"File"}}"#,
+            r#"{"fault_message":"Snapshot and restore are not supported."}"#,
             &["secret-load.vmstate", "secret-load.mem"][..],
         ),
     ] {
         let response = http_put_json(&socket_path, path, body);
 
         assert_bad_request_response(&response, path);
-        assert_response_contains(
-            &response,
-            r#"{"fault_message":"Snapshot and restore are not supported."}"#,
-            path,
-        );
+        assert_response_contains(&response, expected_fault, path);
         for private_value in private_values {
             assert!(
                 !response.contains(private_value),
