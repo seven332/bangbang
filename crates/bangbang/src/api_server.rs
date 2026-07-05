@@ -3500,47 +3500,53 @@ mod tests {
 
     #[test]
     fn returns_fault_for_pmem_endpoints() {
-        for (method, request) in [
+        let mut vmm = test_controller();
+        for (socket_name, request, fault_message) in [
             (
-                "put",
-                b"PUT /pmem/pmem0 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 14\r\n\r\n{\"id\":\"pmem0\"}"
-                    .as_slice(),
+                "p-put",
+                request_with_body(
+                    "PUT",
+                    "/pmem/pmem0",
+                    r#"{"id":"pmem0","path_on_host":"/tmp/pmem.img"}"#,
+                ),
+                "Pmem device is not supported.",
             ),
             (
-                "patch",
-                b"PATCH /pmem/pmem0 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 14\r\n\r\n{\"id\":\"pmem0\"}"
-                    .as_slice(),
+                "p-put-bad",
+                request_with_body("PUT", "/pmem/pmem0", r#"{"id":"pmem0"}"#),
+                "Malformed HTTP request.",
             ),
             (
-                "delete",
-                b"DELETE /pmem/pmem0 HTTP/1.1\r\nHost: localhost\r\n\r\n".as_slice(),
+                "p-patch",
+                request_with_body("PATCH", "/pmem/pmem0", r#"{"id":"pmem0"}"#),
+                "Pmem device is not supported.",
+            ),
+            (
+                "p-patch-mis",
+                request_with_body("PATCH", "/pmem/pmem0", r#"{"id":"other"}"#),
+                "path pmem id must match body id.",
+            ),
+            (
+                "p-del",
+                "DELETE /pmem/pmem0 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
+                "Pmem device is not supported.",
             ),
         ] {
-            let socket_name = format!("p{method}");
-            let path = unique_socket_path(&socket_name);
-            let server = ApiServer::bind(&path).expect("server should bind");
-            let mut client = UnixStream::connect(&path).expect("client should connect");
+            let response = request_over_socket(&mut vmm, socket_name, &request);
 
-            client
-                .write_all(request)
-                .expect("client should write request");
-            let mut vmm = test_controller();
-            server
-                .serve_next(&mut vmm)
-                .expect("server should handle one request");
-
-            let mut response = String::new();
-            client
-                .read_to_string(&mut response)
-                .expect("client should read response");
-
-            assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-            assert!(response.contains(r#"{"fault_message":"Pmem device is not supported."}"#));
-            assert_eq!(
-                vmm.instance_info().state,
-                bangbang_runtime::InstanceState::NotStarted
+            assert!(
+                response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+                "{socket_name}: {response}"
+            );
+            assert!(
+                response.contains(&format!(r#"{{"fault_message":"{fault_message}"}}"#)),
+                "{socket_name}: {response}"
             );
         }
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::NotStarted
+        );
     }
 
     #[test]
