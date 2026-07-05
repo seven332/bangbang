@@ -1509,8 +1509,8 @@ Their eventual support level should follow the endpoint matrix:
 - pmem
 - entropy device configuration
 - serial input, serial rate limiting, public serial streaming, and serial metrics
-- full logger integration, full Firecracker metrics counters, and periodic
-  metrics flush
+- full logger integration, full Firecracker metrics counters, immediate startup
+  metrics flushing, and missed periodic-metrics accounting
 - memory hotplug
 - real pause and resume VM state transitions
 - PATCH and DELETE hotplug/update behavior
