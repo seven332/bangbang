@@ -698,6 +698,42 @@ fn executable_configures_vm_before_start() {
         "GET / after failed PATCH /vm",
     );
 
+    let flush_metrics_response = http_put_json(
+        &socket_path,
+        "/actions",
+        r#"{"action_type":"FlushMetrics"}"#,
+    );
+    assert_bad_request_response(&flush_metrics_response, "PUT /actions FlushMetrics");
+    assert_response_contains(
+        &flush_metrics_response,
+        r#"{"fault_message":"The requested operation is not supported in Not started state: FlushMetrics"}"#,
+        "PUT /actions FlushMetrics",
+    );
+    let instance_info_after_flush_metrics = http_get(&socket_path, "/");
+    assert_response_contains(
+        &instance_info_after_flush_metrics,
+        r#""state":"Not started""#,
+        "GET / after failed PUT /actions FlushMetrics",
+    );
+
+    let send_ctrl_alt_del_response = http_put_json(
+        &socket_path,
+        "/actions",
+        r#"{"action_type":"SendCtrlAltDel"}"#,
+    );
+    assert_bad_request_response(&send_ctrl_alt_del_response, "PUT /actions SendCtrlAltDel");
+    assert_response_contains(
+        &send_ctrl_alt_del_response,
+        r#"{"fault_message":"SendCtrlAltDel is not supported on aarch64."}"#,
+        "PUT /actions SendCtrlAltDel",
+    );
+    let instance_info_after_send_ctrl_alt_del = http_get(&socket_path, "/");
+    assert_response_contains(
+        &instance_info_after_send_ctrl_alt_del,
+        r#""state":"Not started""#,
+        "GET / after failed PUT /actions SendCtrlAltDel",
+    );
+
     assert_response_contains(&vm_config, r#""is_root_device":true"#, "GET /vm/config");
     assert_response_contains(&vm_config, r#""is_read_only":true"#, "GET /vm/config");
     assert_response_contains(&vm_config, r#""partuuid":"0eaa91a0-01""#, "GET /vm/config");
