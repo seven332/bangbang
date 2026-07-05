@@ -301,14 +301,14 @@ exist.
 | `PUT /boot-source` | `boot_args` | optional | Firecracker uses its default kernel command line when omitted. The API/VMM storage path validates the 2048-byte aarch64 limit including the trailing NUL byte and rejects embedded NUL bytes. |
 | `PUT /boot-source` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /machine-config` | `vcpu_count` | required | Firecracker bounds this to `1..=32`; HVF work must also account for host CPU and thread limits. |
-| `PUT /machine-config` | `mem_size_mib` | required | Drives guest memory allocation and mapping; later work must cover bounds and startup performance. |
+| `PUT /machine-config` | `mem_size_mib` | required | Drives guest memory allocation and mapping; accepted range is `1..=1046528` MiB for the current Apple Silicon/aarch64 target. Host free-memory preflight remains deferred. |
 | `PUT /machine-config` | `smt` | optional when `false`; rejected when `true` | Firecracker defaults this to `false`; the initial HVF target accepts explicit no-SMT config and currently returns `machine smt is not supported` when SMT is enabled. |
 | `PUT /machine-config` | `cpu_template` | optional when omitted, `null`, or `None`; rejected for known non-`None` templates | Explicit `None` matches Firecracker's deprecated default; known non-default CPU templates currently return `machine cpu_template <template> is not supported` and need a separate HVF compatibility design. |
 | `PUT /machine-config` | `track_dirty_pages` | optional when `false`; rejected when `true` | Explicit `false` matches Firecracker's default; enabling dirty tracking belongs with snapshot support and currently returns `machine track_dirty_pages is not supported`. |
 | `PUT /machine-config` | `huge_pages` | optional when `None`; rejected for `2M` | Explicit `None` matches Firecracker's default; Linux hugetlbfs does not directly apply to the macOS target and `2M` currently returns `machine huge_pages is not supported`. |
 | `PUT /machine-config` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PATCH /machine-config` | `vcpu_count` | optional | When present, updates the stored vCPU count with the same `1..=32` bounds as `PUT`; omitted fields keep their current values. |
-| `PATCH /machine-config` | `mem_size_mib` | optional | When present, updates the stored memory size and rejects zero; omitted fields keep their current values. |
+| `PATCH /machine-config` | `mem_size_mib` | optional | When present, updates the stored memory size with the same `1..=1046528` MiB target bound as `PUT`; omitted fields keep their current values. |
 | `PATCH /machine-config` | `smt` | optional when `false`; rejected when `true` | Matches the current `PUT` policy for the Apple Silicon target and currently returns `machine smt is not supported` when SMT is enabled. |
 | `PATCH /machine-config` | `cpu_template` | optional when omitted or `null`; accepted when `None`; rejected for known non-`None` templates | `null` is treated as omitted. Explicit `None` is accepted; known non-default CPU templates currently return `machine cpu_template <template> is not supported`. |
 | `PATCH /machine-config` | `track_dirty_pages` | optional when `false`; rejected when `true` | Matches the current `PUT` dirty-tracking policy. |
@@ -543,7 +543,8 @@ The aarch64 layout helper follows Firecracker's `v1.16.0` ARM layout shape:
 - the architectural DRAM maximum is 1022 GiB
 - RAM crossing the 256-512 GiB MMIO64 gap is split around that gap
 - zero requested memory is rejected by the layout helper
-- requests above the architectural maximum are capped inside the layout model
+- requests above the architectural maximum are capped inside the layout model,
+  while public machine configuration rejects them before storage
 
 The allocation model creates one anonymous read/write private host memory
 mapping for each validated guest RAM range and releases the mappings with
@@ -1174,10 +1175,10 @@ runtime notifications and releases it before HVF GIC signaling.
 bangbang now wires `mem_size_mib` into startup preparation, but still does not
 wire device interrupts into public guest execution, emulate devices, provide
 public run-loop control, power on secondary vCPUs, or implement full PSCI CPU
-and system power actions. Later API and startup work still needs to decide
-whether an oversized `mem_size_mib` request should be rejected before layout
-construction or should preserve Firecracker's architecture-helper truncation
-behavior.
+and system power actions. Public machine configuration rejects `mem_size_mib`
+above the current 1022 GiB Apple Silicon/aarch64 DRAM maximum before storage;
+startup keeps its architectural maximum check as a defensive guard. Dynamic
+host-memory availability policy remains deferred.
 
 ## API State and Response Policy
 

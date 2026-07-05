@@ -1198,6 +1198,7 @@ mod tests {
 
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel};
+    use bangbang_runtime::machine::{MAX_MEM_SIZE_MIB, MachineConfigError};
     use bangbang_runtime::metrics::{MetricsConfigError, MetricsConfigInput};
     use bangbang_runtime::mmds::MmdsDataStoreError;
     use bangbang_runtime::serial::SerialConfigError;
@@ -2321,6 +2322,45 @@ mod tests {
         .expect_err("missing boot-source should fail");
 
         assert_eq!(err, super::ConfigFileError::MissingSection("boot-source"));
+    }
+
+    #[test]
+    fn config_file_rejects_oversized_machine_config_before_starting() {
+        let config_path = unique_config_path("oversized-machine-config");
+        let oversized_mem_size_mib = MAX_MEM_SIZE_MIB + 1;
+        let config = format!(
+            r#"{{
+                "machine-config":{{"vcpu_count":1,"mem_size_mib":{oversized_mem_size_mib}}},
+                "boot-source":{{"kernel_image_path":"/tmp/vmlinux"}}
+            }}"#
+        );
+        fs::write(&config_path, config).expect("config file should be written");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        let err = super::apply_startup_config_file(
+            &mut vmm,
+            Some(config_path.to_str().expect("UTF-8 path")),
+        )
+        .expect_err("oversized machine config should fail");
+
+        assert!(matches!(
+            err,
+            ProcessError::ConfigFile(super::ConfigFileError::Apply(
+                bangbang_runtime::VmmActionError::MachineConfig(
+                    MachineConfigError::InvalidMemorySize
+                )
+            ))
+        ));
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+        assert_eq!(vmm.machine_config().mem_size_mib(), 128);
+
+        fs::remove_file(config_path).expect("fixture config should clean up");
     }
 
     #[test]

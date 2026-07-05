@@ -18,6 +18,8 @@ use support::{
     http_put_json, json_string, path_text,
 };
 
+use bangbang_runtime::machine::MAX_MEM_SIZE_MIB;
+
 const BANGBANG_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[test]
@@ -893,6 +895,32 @@ fn executable_serves_and_patches_machine_config() {
         &patched_config,
         r#""track_dirty_pages":false"#,
         "GET /machine-config patched",
+    );
+
+    let oversized_mem_size_mib = MAX_MEM_SIZE_MIB + 1;
+    let oversized_put_response = http_put_json(
+        &socket_path,
+        "/machine-config",
+        &format!(r#"{{"vcpu_count":4,"mem_size_mib":{oversized_mem_size_mib}}}"#),
+    );
+    assert_bad_request_response(&oversized_put_response, "PUT /machine-config oversized");
+    assert_response_contains(
+        &oversized_put_response,
+        &format!(r#"{{"fault_message":"machine mem_size_mib must be in 1..={MAX_MEM_SIZE_MIB}"}}"#),
+        "PUT /machine-config oversized",
+    );
+
+    let oversized_patch_response = http_json(
+        &socket_path,
+        "PATCH",
+        "/machine-config",
+        &format!(r#"{{"mem_size_mib":{oversized_mem_size_mib}}}"#),
+    );
+    assert_bad_request_response(&oversized_patch_response, "PATCH /machine-config oversized");
+    assert_response_contains(
+        &oversized_patch_response,
+        &format!(r#"{{"fault_message":"machine mem_size_mib must be in 1..={MAX_MEM_SIZE_MIB}"}}"#),
+        "PATCH /machine-config oversized",
     );
 
     let invalid_patch_response = http_json(

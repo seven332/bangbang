@@ -674,8 +674,8 @@ mod tests {
         },
         logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel, LoggerWriteError},
         machine::{
-            DEFAULT_MEM_SIZE_MIB, DEFAULT_VCPU_COUNT, MachineConfigError, MachineConfigInput,
-            MachineConfigPatchInput,
+            DEFAULT_MEM_SIZE_MIB, DEFAULT_VCPU_COUNT, MAX_MEM_SIZE_MIB, MachineConfigError,
+            MachineConfigInput, MachineConfigPatchInput,
         },
         metrics::{MetricsConfigError, MetricsConfigInput},
         mmds::{
@@ -2268,6 +2268,20 @@ mod tests {
         assert_eq!(err.to_string(), "machine vcpu_count must be in 1..=32");
         assert_eq!(controller.machine_config().vcpu_count(), 2);
         assert_eq!(controller.machine_config().mem_size_mib(), 256);
+
+        let err = controller
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(
+                4,
+                MAX_MEM_SIZE_MIB + 1,
+            )))
+            .expect_err("oversized machine config should fail");
+
+        assert_eq!(
+            err.to_string(),
+            format!("machine mem_size_mib must be in 1..={MAX_MEM_SIZE_MIB}")
+        );
+        assert_eq!(controller.machine_config().vcpu_count(), 2);
+        assert_eq!(controller.machine_config().mem_size_mib(), 256);
     }
 
     #[test]
@@ -2344,6 +2358,19 @@ mod tests {
             .expect_err("invalid machine config patch should fail");
 
         assert_eq!(err.to_string(), "machine vcpu_count must be in 1..=32");
+        assert_eq!(controller.machine_config().vcpu_count(), 2);
+        assert_eq!(controller.machine_config().mem_size_mib(), 256);
+
+        let err = controller
+            .handle_action(VmmAction::PatchMachineConfig(
+                MachineConfigPatchInput::new().with_mem_size_mib(MAX_MEM_SIZE_MIB + 1),
+            ))
+            .expect_err("oversized machine config patch should fail");
+
+        assert_eq!(
+            err.to_string(),
+            format!("machine mem_size_mib must be in 1..={MAX_MEM_SIZE_MIB}")
+        );
         assert_eq!(controller.machine_config().vcpu_count(), 2);
         assert_eq!(controller.machine_config().mem_size_mib(), 256);
     }
@@ -3153,7 +3180,13 @@ mod tests {
         let err =
             VmmActionError::MachineConfig(super::machine::MachineConfigError::InvalidMemorySize);
 
-        assert_eq!(err.to_string(), "machine mem_size_mib must not be zero");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "machine mem_size_mib must be in 1..={}",
+                super::machine::MAX_MEM_SIZE_MIB
+            )
+        );
         assert!(err.source().is_some());
     }
 
