@@ -163,8 +163,49 @@ mod macos_arm64 {
             );
         }
 
+        let replacement_backing_path = test_dir.path().join("replacement-data.img");
+        let replacement_backing_path_json = json_string(path_text(&replacement_backing_path));
+        let drive_update_body = format!(
+            r#"{{
+                "drive_id":"data",
+                "path_on_host":{replacement_backing_path_json}
+            }}"#
+        );
+        let drive_update_response =
+            http_json(&socket_path, "PATCH", "/drives/data", &drive_update_body);
+        assert_bad_request_response(
+            &drive_update_response,
+            "PATCH /drives/data after InstanceStart",
+        );
+        assert_response_contains(
+            &drive_update_response,
+            r#"{"fault_message":"The requested operation is not supported: UpdateBlockDevice"}"#,
+            "PATCH /drives/data after InstanceStart",
+        );
+
         let vm_config = http_get(&socket_path, "/vm/config");
         assert_ok_response(&vm_config, "GET /vm/config after InstanceStart");
+        assert_response_contains(
+            &vm_config,
+            r#""drive_id":"data""#,
+            "GET /vm/config after InstanceStart",
+        );
+        assert_response_contains(
+            &vm_config,
+            &format!(r#""path_on_host":{backing_path_json}"#),
+            "GET /vm/config after InstanceStart",
+        );
+        assert_eq!(
+            vm_config.matches(r#""drive_id":"#).count(),
+            1,
+            "rejected drive update must not add another drive; response:\n{vm_config}"
+        );
+        assert!(
+            !vm_config.contains(&format!(
+                r#""path_on_host":{replacement_backing_path_json}"#
+            )),
+            "rejected drive update must not mutate the configured drive path; response:\n{vm_config}"
+        );
         assert_response_contains(
             &vm_config,
             r#""guest_cid":3"#,
