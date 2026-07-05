@@ -280,6 +280,13 @@ struct SerialConfigRequestBody {
     rate_limiter: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EntropyDeviceConfigRequestBody {
+    #[serde(default)]
+    rate_limiter: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineConfigRequest {
     vcpu_count: u8,
@@ -1290,7 +1297,7 @@ pub fn parse_request_with_limit(
         return parse_cpu_config_request(body);
     }
     if method == "PUT" && path == "/entropy" {
-        return Err(RequestError::EntropyUnsupported);
+        return parse_entropy_config_request(body);
     }
     if method == "PUT" && path == "/serial" {
         return parse_serial_config_request(body);
@@ -1636,6 +1643,16 @@ fn parse_serial_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> 
         serial_out_path: body.serial_out_path,
         rate_limiter_configured,
     })))
+}
+
+fn parse_entropy_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
+    let body = serde_json::from_slice::<EntropyDeviceConfigRequestBody>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+    if let Some(rate_limiter) = &body.rate_limiter {
+        validate_rate_limiter_config(rate_limiter)?;
+    }
+
+    Err(RequestError::EntropyUnsupported)
 }
 
 fn parse_drive_config_request(
@@ -4283,27 +4300,44 @@ mod tests {
     }
 
     #[test]
-    fn rejects_entropy_as_unsupported() {
-        let request = request_with_body("PUT", "/entropy", "{}");
+    fn rejects_valid_entropy_config_as_unsupported() {
+        for body in [
+            "{}",
+            r#"{"rate_limiter":null}"#,
+            r#"{"rate_limiter":{"bandwidth":{"size":100,"one_time_burst":null,"refill_time":1000}}}"#,
+            r#"{"rate_limiter":{"ops":{"size":100,"one_time_burst":200,"refill_time":1000}}}"#,
+        ] {
+            let request = request_with_body("PUT", "/entropy", body);
 
-        let err = parse_request(&request).expect_err("entropy should be unsupported");
-        assert_eq!(err, RequestError::EntropyUnsupported);
-        assert_eq!(err.fault_message(), "Entropy device is not supported.");
+            let err = parse_request(&request).expect_err("entropy should be unsupported");
+            assert_eq!(err, RequestError::EntropyUnsupported, "{body}");
+            assert_eq!(
+                err.fault_message(),
+                "Entropy device is not supported.",
+                "{body}"
+            );
+        }
     }
 
     #[test]
-    fn rejects_entropy_as_unsupported_without_parsing_body() {
-        let malformed_body = request_with_body("PUT", "/entropy", "not-json");
-        let empty_body = b"PUT /entropy HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n";
+    fn rejects_invalid_entropy_config_before_unsupported() {
+        for body in [
+            "not-json",
+            "",
+            r#"{"unknown":true}"#,
+            r#"{"rate_limiter":"unsupported"}"#,
+            r#"{"rate_limiter":{"bad":{"size":1,"refill_time":1}}}"#,
+            r#"{"rate_limiter":{"bandwidth":{"size":1}}}"#,
+            r#"{"rate_limiter":{"ops":{"refill_time":1}}}"#,
+        ] {
+            let request = request_with_body("PUT", "/entropy", body);
 
-        assert_eq!(
-            parse_request(&malformed_body),
-            Err(RequestError::EntropyUnsupported)
-        );
-        assert_eq!(
-            parse_request(empty_body),
-            Err(RequestError::EntropyUnsupported)
-        );
+            assert_eq!(
+                parse_request(&request),
+                Err(RequestError::MalformedRequest),
+                "{body}"
+            );
+        }
     }
 
     #[test]
