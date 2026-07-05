@@ -43,7 +43,7 @@ use bangbang_runtime::serial::SerialConfigInput;
 use bangbang_runtime::vsock::{VsockConfig, VsockConfigInput};
 use bangbang_runtime::{VmConfiguration, VmmAction, VmmData};
 
-use crate::vmm::{GetApiRequest, VmmRequestHandler};
+use crate::vmm::{GetApiRequest, PutObservabilityApiRequest, VmmRequestHandler};
 
 const READ_CHUNK_SIZE: usize = 4096;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -455,18 +455,18 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
             VmmAction::PutBootSource(boot_source_input_from_request(config.as_ref())),
         )),
         ApiRequest::PutCpuConfig(_) => handle_empty(vmm.handle_action(VmmAction::PutCpuConfig)),
-        ApiRequest::PutLogger(config) => handle_empty(vmm.handle_action(VmmAction::PutLogger(
-            logger_config_input_from_request(config.as_ref()),
-        ))),
+        ApiRequest::PutLogger(config) => handle_empty(vmm.handle_put_observability_request(
+            PutObservabilityApiRequest::logger(logger_config_input_from_request(config.as_ref())),
+        )),
         ApiRequest::PutMachineConfig(config) => handle_empty(vmm.handle_action(
             VmmAction::PutMachineConfig(machine_config_input_from_request(config.as_ref())),
         )),
         ApiRequest::PatchMachineConfig(config) => handle_empty(vmm.handle_action(
             VmmAction::PatchMachineConfig(machine_config_patch_input_from_request(config.as_ref())),
         )),
-        ApiRequest::PutMetrics(config) => handle_empty(vmm.handle_action(VmmAction::PutMetrics(
-            metrics_config_input_from_request(config.as_ref()),
-        ))),
+        ApiRequest::PutMetrics(config) => handle_empty(vmm.handle_put_observability_request(
+            PutObservabilityApiRequest::metrics(metrics_config_input_from_request(config.as_ref())),
+        )),
         ApiRequest::PutMmds(content) => handle_empty(vmm.handle_action(VmmAction::PutMmds(
             mmds_content_input_from_request(content.as_ref()),
         ))),
@@ -490,9 +490,9 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
                 network_interface_config_input_from_request(config.as_ref()),
             )))
         }
-        ApiRequest::PutSerial(config) => handle_empty(vmm.handle_action(VmmAction::PutSerial(
-            serial_config_input_from_request(config.as_ref()),
-        ))),
+        ApiRequest::PutSerial(config) => handle_empty(vmm.handle_put_observability_request(
+            PutObservabilityApiRequest::serial(serial_config_input_from_request(config.as_ref())),
+        )),
         ApiRequest::PutVsock(config) => handle_empty(vmm.handle_action(VmmAction::PutVsock(
             vsock_config_input_from_request(config.as_ref()),
         ))),
@@ -2690,7 +2690,7 @@ mod tests {
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"serial_count\":0,\"serial_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("fixture should clean up");
@@ -2731,7 +2731,7 @@ mod tests {
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"put_api_requests\":{\"actions_count\":3,\"actions_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"put_api_requests\":{\"actions_count\":3,\"actions_fails\":1,\"logger_count\":0,\"logger_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"serial_count\":0,\"serial_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("fixture should clean up");
@@ -2795,10 +2795,114 @@ mod tests {
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"get_api_requests\":{\"instance_info_count\":1,\"machine_cfg_count\":1,\"mmds_count\":1,\"vmm_version_count\":1},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"get_api_requests\":{\"instance_info_count\":1,\"machine_cfg_count\":1,\"mmds_count\":1,\"vmm_version_count\":1},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"serial_count\":0,\"serial_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn configured_metrics_counts_observability_put_api_requests() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let metrics_path = unique_socket_path("metrics-observability").with_extension("metrics");
+        let logger_path = unique_socket_path("logger-observability").with_extension("log");
+        let rejected_logger_path =
+            unique_socket_path("logger-observability-rejected").with_extension("log");
+        let serial_path = unique_socket_path("serial-observability").with_extension("out");
+        let rejected_serial_path =
+            unique_socket_path("serial-observability-rejected").with_extension("out");
+
+        let metrics_body = format!(r#"{{"metrics_path":"{}"}}"#, metrics_path.to_string_lossy());
+        let metrics_request = format!(
+            "PUT /metrics HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{metrics_body}",
+            metrics_body.len()
+        );
+        let metrics_response = request_over_socket(&mut vmm, "o-m1", &metrics_request);
+        assert!(metrics_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let duplicate_metrics_path =
+            unique_socket_path("metrics-observability-duplicate").with_extension("metrics");
+        let duplicate_metrics_body = format!(
+            r#"{{"metrics_path":"{}"}}"#,
+            duplicate_metrics_path.to_string_lossy()
+        );
+        let duplicate_metrics_request = format!(
+            "PUT /metrics HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{duplicate_metrics_body}",
+            duplicate_metrics_body.len()
+        );
+        let duplicate_metrics_response =
+            request_over_socket(&mut vmm, "o-m2", &duplicate_metrics_request);
+        assert!(duplicate_metrics_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(!duplicate_metrics_path.exists());
+
+        let logger_body = format!(r#"{{"log_path":"{}"}}"#, logger_path.to_string_lossy());
+        let logger_request = format!(
+            "PUT /logger HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{logger_body}",
+            logger_body.len()
+        );
+        let logger_response = request_over_socket(&mut vmm, "o-l1", &logger_request);
+        assert!(logger_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(logger_path.exists());
+
+        let serial_body = format!(
+            r#"{{"serial_out_path":"{}"}}"#,
+            serial_path.to_string_lossy()
+        );
+        let serial_request = format!(
+            "PUT /serial HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{serial_body}",
+            serial_body.len()
+        );
+        let serial_response = request_over_socket(&mut vmm, "o-s1", &serial_request);
+        assert!(serial_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(!serial_path.exists());
+
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_request = format!(
+            "PUT /boot-source HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{boot_body}",
+            boot_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "o-a1", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let rejected_logger_body = format!(
+            r#"{{"log_path":"{}"}}"#,
+            rejected_logger_path.to_string_lossy()
+        );
+        let rejected_logger_request = format!(
+            "PUT /logger HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{rejected_logger_body}",
+            rejected_logger_body.len()
+        );
+        let rejected_logger_response =
+            request_over_socket(&mut vmm, "o-l2", &rejected_logger_request);
+        assert!(rejected_logger_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(!rejected_logger_path.exists());
+
+        let rejected_serial_body = format!(
+            r#"{{"serial_out_path":"{}"}}"#,
+            rejected_serial_path.to_string_lossy()
+        );
+        let rejected_serial_request = format!(
+            "PUT /serial HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{rejected_serial_body}",
+            rejected_serial_body.len()
+        );
+        let rejected_serial_response =
+            request_over_socket(&mut vmm, "o-s2", &rejected_serial_request);
+        assert!(rejected_serial_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(!rejected_serial_path.exists());
+
+        let flush_response = put_action_over_socket(&mut vmm, "o-a2", "FlushMetrics");
+        assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert_eq!(
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"logger_count\":2,\"logger_fails\":1,\"metrics_count\":2,\"metrics_fails\":1,\"serial_count\":2,\"serial_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
+        fs::remove_file(logger_path).expect("logger fixture should clean up");
     }
 
     #[test]
@@ -2836,7 +2940,7 @@ mod tests {
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0},\"vmm\":{\"boot_run_loop_status\":\"running\",\"metrics_flush_count\":1}}\n"
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"serial_count\":0,\"serial_fails\":0},\"vmm\":{\"boot_run_loop_status\":\"running\",\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("fixture should clean up");
@@ -2886,7 +2990,7 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&startup_metrics_path)
                 .expect("startup metrics output should be readable"),
-            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"metrics_count\":1,\"metrics_fails\":1,\"serial_count\":0,\"serial_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
         assert!(!api_metrics_path.exists());
 

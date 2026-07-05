@@ -104,6 +104,30 @@ impl MetricsState {
         self.put_api_requests.record_actions_failure();
     }
 
+    pub(crate) fn record_put_metrics_request(&mut self) {
+        self.put_api_requests.record_metrics_request();
+    }
+
+    pub(crate) fn record_put_metrics_failure(&mut self) {
+        self.put_api_requests.record_metrics_failure();
+    }
+
+    pub(crate) fn record_put_logger_request(&mut self) {
+        self.put_api_requests.record_logger_request();
+    }
+
+    pub(crate) fn record_put_logger_failure(&mut self) {
+        self.put_api_requests.record_logger_failure();
+    }
+
+    pub(crate) fn record_put_serial_request(&mut self) {
+        self.put_api_requests.record_serial_request();
+    }
+
+    pub(crate) fn record_put_serial_failure(&mut self) {
+        self.put_api_requests.record_serial_failure();
+    }
+
     pub(crate) fn record_get_instance_info_request(&mut self) {
         self.get_api_requests.record_instance_info_request();
     }
@@ -198,11 +222,24 @@ impl GetApiRequestMetrics {
 struct PutApiRequestMetrics {
     actions_count: u64,
     actions_fails: u64,
+    logger_count: u64,
+    logger_fails: u64,
+    metrics_count: u64,
+    metrics_fails: u64,
+    serial_count: u64,
+    serial_fails: u64,
 }
 
 impl PutApiRequestMetrics {
     const fn is_empty(self) -> bool {
-        self.actions_count == 0 && self.actions_fails == 0
+        self.actions_count == 0
+            && self.actions_fails == 0
+            && self.logger_count == 0
+            && self.logger_fails == 0
+            && self.metrics_count == 0
+            && self.metrics_fails == 0
+            && self.serial_count == 0
+            && self.serial_fails == 0
     }
 
     fn record_actions_request(&mut self) {
@@ -213,12 +250,60 @@ impl PutApiRequestMetrics {
         self.actions_fails = self.actions_fails.saturating_add(1);
     }
 
+    fn record_metrics_request(&mut self) {
+        self.metrics_count = self.metrics_count.saturating_add(1);
+    }
+
+    fn record_metrics_failure(&mut self) {
+        self.metrics_fails = self.metrics_fails.saturating_add(1);
+    }
+
+    fn record_logger_request(&mut self) {
+        self.logger_count = self.logger_count.saturating_add(1);
+    }
+
+    fn record_logger_failure(&mut self) {
+        self.logger_fails = self.logger_fails.saturating_add(1);
+    }
+
+    fn record_serial_request(&mut self) {
+        self.serial_count = self.serial_count.saturating_add(1);
+    }
+
+    fn record_serial_failure(&mut self) {
+        self.serial_fails = self.serial_fails.saturating_add(1);
+    }
+
     const fn actions_count(self) -> u64 {
         self.actions_count
     }
 
     const fn actions_fails(self) -> u64 {
         self.actions_fails
+    }
+
+    const fn logger_count(self) -> u64 {
+        self.logger_count
+    }
+
+    const fn logger_fails(self) -> u64 {
+        self.logger_fails
+    }
+
+    const fn metrics_count(self) -> u64 {
+        self.metrics_count
+    }
+
+    const fn metrics_fails(self) -> u64 {
+        self.metrics_fails
+    }
+
+    const fn serial_count(self) -> u64 {
+        self.serial_count
+    }
+
+    const fn serial_fails(self) -> u64 {
+        self.serial_fails
     }
 }
 
@@ -402,6 +487,30 @@ impl MetricsSink {
                 "actions_fails".to_string(),
                 serde_json::Value::Number(put_api_requests.actions_fails().into()),
             );
+            put_requests.insert(
+                "logger_count".to_string(),
+                serde_json::Value::Number(put_api_requests.logger_count().into()),
+            );
+            put_requests.insert(
+                "logger_fails".to_string(),
+                serde_json::Value::Number(put_api_requests.logger_fails().into()),
+            );
+            put_requests.insert(
+                "metrics_count".to_string(),
+                serde_json::Value::Number(put_api_requests.metrics_count().into()),
+            );
+            put_requests.insert(
+                "metrics_fails".to_string(),
+                serde_json::Value::Number(put_api_requests.metrics_fails().into()),
+            );
+            put_requests.insert(
+                "serial_count".to_string(),
+                serde_json::Value::Number(put_api_requests.serial_count().into()),
+            );
+            put_requests.insert(
+                "serial_fails".to_string(),
+                serde_json::Value::Number(put_api_requests.serial_fails().into()),
+            );
             root.insert(
                 "put_api_requests".to_string(),
                 serde_json::Value::Object(put_requests),
@@ -549,7 +658,33 @@ mod tests {
         let output = fs::read_to_string(&path).expect("metrics output should be readable");
         assert_eq!(
             output,
-            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":1,\"logger_count\":0,\"logger_fails\":0,\"metrics_count\":0,\"metrics_fails\":0,\"serial_count\":0,\"serial_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn writes_put_observability_api_request_metrics_when_recorded() {
+        let path = unique_metrics_path("api-request-observability");
+        let mut state = MetricsState::default();
+
+        state.record_put_metrics_request();
+        state.record_put_metrics_request();
+        state.record_put_metrics_failure();
+        state.record_put_logger_request();
+        state.record_put_logger_failure();
+        state.record_put_serial_request();
+        state.record_put_serial_failure();
+        state
+            .configure(MetricsConfigInput::new(&path))
+            .expect("metrics should configure");
+        assert_eq!(state.flush(), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("metrics output should be readable");
+        assert_eq!(
+            output,
+            "{\"put_api_requests\":{\"actions_count\":0,\"actions_fails\":0,\"logger_count\":1,\"logger_fails\":1,\"metrics_count\":2,\"metrics_fails\":1,\"serial_count\":1,\"serial_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(path).expect("fixture should clean up");

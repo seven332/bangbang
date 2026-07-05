@@ -497,7 +497,10 @@ mod macos_arm64 {
             r#"{"action_type":"FlushMetrics"}"#,
         );
         assert_no_content_response(&flush_metrics_response, "PUT /actions FlushMetrics");
-        assert_metrics_output(&metrics_path, 2, 0);
+        assert_metrics_output(
+            &metrics_path,
+            r#"{"actions_count":2,"actions_fails":0,"logger_count":2,"logger_fails":1,"metrics_count":2,"metrics_fails":1,"serial_count":2,"serial_fails":1}"#,
+        );
         assert_startup_time_metrics_output(&metrics_path);
         assert!(
             !replacement_metrics_path.exists(),
@@ -758,7 +761,10 @@ mod macos_arm64 {
             r#"{"action_type":"FlushMetrics"}"#,
         );
         assert_no_content_response(&flush_metrics_response, "PUT /actions FlushMetrics");
-        assert_metrics_output(&metrics_path, 2, 1);
+        assert_metrics_output(
+            &metrics_path,
+            r#"{"actions_count":2,"actions_fails":1,"logger_count":0,"logger_fails":0,"metrics_count":0,"metrics_fails":0,"serial_count":0,"serial_fails":0}"#,
+        );
         assert_logger_output(&logger_path);
 
         if let Err(err) =
@@ -1120,11 +1126,7 @@ mod macos_arm64 {
             .expect("empty test output file should create");
     }
 
-    fn assert_metrics_output(
-        path: &Path,
-        expected_actions_count: u64,
-        expected_actions_fails: u64,
-    ) {
+    fn assert_metrics_output(path: &Path, expected_put_api_requests: &str) {
         let output = fs::read_to_string(path).unwrap_or_else(|err| {
             panic!(
                 "metrics output {} should be readable: {err}",
@@ -1136,12 +1138,10 @@ mod macos_arm64 {
             output.contains(r#""metrics_flush_count":1"#),
             "metrics output should include first flush count; output:\n{output}"
         );
-        let expected_action_metrics = format!(
-            r#""put_api_requests":{{"actions_count":{expected_actions_count},"actions_fails":{expected_actions_fails}}}"#
-        );
+        let expected_put_metrics = format!(r#""put_api_requests":{expected_put_api_requests}"#);
         assert!(
-            output.contains(&expected_action_metrics),
-            "metrics output should include actions API request counters; output:\n{output}"
+            output.contains(&expected_put_metrics),
+            "metrics output should include expected PUT API request counters; output:\n{output}"
         );
         assert!(
             output.contains(r#""boot_run_loop_status":"running""#)

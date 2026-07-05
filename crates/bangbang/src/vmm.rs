@@ -12,8 +12,9 @@ use bangbang_hvf::{
     HvfVcpuRunnerError, OwnedHvfArm64BootSession,
 };
 use bangbang_runtime::block::BlockMmioLayout;
+use bangbang_runtime::logger::LoggerConfigInput;
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
-use bangbang_runtime::metrics::{BootRunLoopMetricStatus, MetricsDiagnostics};
+use bangbang_runtime::metrics::{BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics};
 use bangbang_runtime::mmds::{MmdsConfig, MmdsStateHandle, MmdsStateLockError};
 use bangbang_runtime::mmio::MmioRegionId;
 use bangbang_runtime::network::{
@@ -22,7 +23,8 @@ use bangbang_runtime::network::{
     VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError, validate_network_interface_count,
 };
 use bangbang_runtime::serial::{
-    SerialConfigError, SerialOutputFile, SharedSerialOutput, SharedSerialOutputBuffer,
+    SerialConfigError, SerialConfigInput, SerialOutputFile, SharedSerialOutput,
+    SharedSerialOutputBuffer,
 };
 use bangbang_runtime::startup::{
     Arm64BootNetworkDevice, Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError,
@@ -105,10 +107,77 @@ impl GetApiRequest {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct PutObservabilityApiRequest {
+    kind: PutObservabilityApiRequestKind,
+    action: VmmAction,
+}
+
+impl PutObservabilityApiRequest {
+    pub(crate) fn metrics(input: MetricsConfigInput) -> Self {
+        Self {
+            kind: PutObservabilityApiRequestKind::Metrics,
+            action: VmmAction::PutMetrics(input),
+        }
+    }
+
+    pub(crate) fn logger(input: LoggerConfigInput) -> Self {
+        Self {
+            kind: PutObservabilityApiRequestKind::Logger,
+            action: VmmAction::PutLogger(input),
+        }
+    }
+
+    pub(crate) fn serial(input: SerialConfigInput) -> Self {
+        Self {
+            kind: PutObservabilityApiRequestKind::Serial,
+            action: VmmAction::PutSerial(input),
+        }
+    }
+
+    fn record_request(&self, controller: &mut VmmController) {
+        self.kind.record_request(controller);
+    }
+
+    fn into_action(self) -> VmmAction {
+        self.action
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PutObservabilityApiRequestKind {
+    Metrics,
+    Logger,
+    Serial,
+}
+
+impl PutObservabilityApiRequestKind {
+    fn record_request(self, controller: &mut VmmController) {
+        match self {
+            Self::Metrics => controller.record_put_metrics_request(),
+            Self::Logger => controller.record_put_logger_request(),
+            Self::Serial => controller.record_put_serial_request(),
+        }
+    }
+
+    fn record_failure(self, controller: &mut VmmController) {
+        match self {
+            Self::Metrics => controller.record_put_metrics_failure(),
+            Self::Logger => controller.record_put_logger_failure(),
+            Self::Serial => controller.record_put_serial_failure(),
+        }
+    }
+}
+
 pub(crate) trait VmmRequestHandler {
     fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError>;
 
     fn handle_get_request(&mut self, request: GetApiRequest) -> Result<VmmData, VmmActionError>;
+
+    fn handle_put_observability_request(
+        &mut self,
+        request: PutObservabilityApiRequest,
+    ) -> Result<VmmData, VmmActionError>;
 
     fn handle_put_action_request(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError>;
 }
@@ -246,6 +315,20 @@ where
         self.handle_action(request.action())
     }
 
+    fn handle_put_observability_request(
+        &mut self,
+        request: PutObservabilityApiRequest,
+    ) -> Result<VmmData, VmmActionError> {
+        let kind = request.kind;
+        request.record_request(&mut self.controller);
+        let action = request.into_action();
+        let result = self.handle_action(action);
+        if result.is_err() {
+            kind.record_failure(&mut self.controller);
+        }
+        result
+    }
+
     fn start_instance(&mut self) -> Result<VmmData, VmmActionError> {
         let controller = &mut self.controller;
         let starter = &mut self.starter;
@@ -298,6 +381,13 @@ where
 
     fn handle_get_request(&mut self, request: GetApiRequest) -> Result<VmmData, VmmActionError> {
         ProcessVmm::handle_get_request(self, request)
+    }
+
+    fn handle_put_observability_request(
+        &mut self,
+        request: PutObservabilityApiRequest,
+    ) -> Result<VmmData, VmmActionError> {
+        ProcessVmm::handle_put_observability_request(self, request)
     }
 }
 
@@ -1029,6 +1119,7 @@ mod tests {
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::fdt::{Arm64FdtRegion, Arm64FdtVirtioMmioDevice};
     use bangbang_runtime::interrupt::GuestInterruptLine;
+    use bangbang_runtime::logger::LoggerConfigInput;
     use bangbang_runtime::metrics::{
         BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics,
     };
@@ -2434,6 +2525,41 @@ mod tests {
         assert_eq!(
             fs::read_to_string(metrics.path()).expect("metrics output should read"),
             "{\"vmm\":{\"boot_run_loop_status\":\"failed\",\"metrics_flush_count\":1,\"parent_cpu_time_us\":3000,\"start_time_us\":1000}}\n"
+        );
+    }
+
+    #[test]
+    fn direct_observability_actions_do_not_record_api_request_metrics() {
+        let metrics = TempFilePath::create("direct-metrics");
+        let logger = TempFilePath::create("direct-logger");
+        let serial = TempFilePath::create("direct-serial");
+        let mut vmm =
+            ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", FakeStarter::success(3));
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            metrics.path(),
+        )))
+        .expect("metrics should configure");
+        vmm.handle_action(VmmAction::PutLogger(
+            LoggerConfigInput::new().with_log_path(logger.path()),
+        ))
+        .expect("logger should configure");
+        vmm.handle_action(VmmAction::PutSerial(
+            SerialConfigInput::new().with_serial_out_path(serial.path().to_string_lossy()),
+        ))
+        .expect("serial should configure");
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        vmm.handle_action(VmmAction::FlushMetrics)
+            .expect("metrics should flush");
+
+        assert_eq!(
+            fs::read_to_string(metrics.path()).expect("metrics output should read"),
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
     }
 
