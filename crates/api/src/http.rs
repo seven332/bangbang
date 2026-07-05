@@ -287,6 +287,30 @@ struct EntropyDeviceConfigRequestBody {
     rate_limiter: Option<serde_json::Value>,
 }
 
+const fn default_memory_hotplug_block_size_mib() -> u64 {
+    2
+}
+
+const fn default_memory_hotplug_slot_size_mib() -> u64 {
+    128
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryHotplugConfigRequestBody {
+    total_size_mib: u64,
+    #[serde(default = "default_memory_hotplug_block_size_mib")]
+    block_size_mib: u64,
+    #[serde(default = "default_memory_hotplug_slot_size_mib")]
+    slot_size_mib: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryHotplugSizeUpdateRequestBody {
+    requested_size_mib: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineConfigRequest {
     vcpu_count: u8,
@@ -1252,8 +1276,14 @@ pub fn parse_request_with_limit(
         return Err(RequestError::BalloonUnsupported);
     }
 
-    if matches!(method, "GET" | "PUT" | "PATCH") && path == "/hotplug/memory" {
+    if method == "GET" && path == "/hotplug/memory" {
         return Err(RequestError::MemoryHotplugUnsupported);
+    }
+    if method == "PUT" && path == "/hotplug/memory" {
+        return parse_memory_hotplug_config_request(body);
+    }
+    if method == "PATCH" && path == "/hotplug/memory" {
+        return parse_memory_hotplug_size_update_request(body);
     }
 
     if matches!(method, "PUT" | "PATCH" | "DELETE") && pmem_path_id(path).is_some() {
@@ -1653,6 +1683,27 @@ fn parse_entropy_config_request(body: &[u8]) -> Result<ApiRequest, RequestError>
     }
 
     Err(RequestError::EntropyUnsupported)
+}
+
+fn parse_memory_hotplug_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
+    let MemoryHotplugConfigRequestBody {
+        total_size_mib,
+        block_size_mib,
+        slot_size_mib,
+    } = serde_json::from_slice::<MemoryHotplugConfigRequestBody>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+    let _ = (total_size_mib, block_size_mib, slot_size_mib);
+
+    Err(RequestError::MemoryHotplugUnsupported)
+}
+
+fn parse_memory_hotplug_size_update_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
+    let MemoryHotplugSizeUpdateRequestBody { requested_size_mib } =
+        serde_json::from_slice::<MemoryHotplugSizeUpdateRequestBody>(body)
+            .map_err(|_| RequestError::MalformedRequest)?;
+    let _ = requested_size_mib;
+
+    Err(RequestError::MemoryHotplugUnsupported)
 }
 
 fn parse_drive_config_request(
@@ -4511,31 +4562,50 @@ mod tests {
         assert_eq!(err, RequestError::MemoryHotplugUnsupported, "GET");
         assert_eq!(err.fault_message(), "Memory hotplug is not supported.");
 
-        for method in ["PUT", "PATCH"] {
-            let request = request_with_body(method, "/hotplug/memory", r#"{"size_mib":128}"#);
+        for (method, body) in [
+            ("PUT", r#"{"total_size_mib":2048}"#),
+            (
+                "PUT",
+                r#"{"total_size_mib":2048,"block_size_mib":2,"slot_size_mib":128}"#,
+            ),
+            ("PATCH", r#"{"requested_size_mib":256}"#),
+        ] {
+            let request = request_with_body(method, "/hotplug/memory", body);
             let err = parse_request(&request).expect_err("memory hotplug should be unsupported");
-            assert_eq!(err, RequestError::MemoryHotplugUnsupported, "{method}");
+            assert_eq!(
+                err,
+                RequestError::MemoryHotplugUnsupported,
+                "{method} {body}"
+            );
             assert_eq!(err.fault_message(), "Memory hotplug is not supported.");
         }
     }
 
     #[test]
-    fn rejects_memory_hotplug_body_methods_without_parsing_body() {
-        for method in ["PUT", "PATCH"] {
-            let malformed_body = request_with_body(method, "/hotplug/memory", "not-json");
-            let empty_body = format!(
-                "{method} /hotplug/memory HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
-            );
+    fn rejects_invalid_memory_hotplug_body_methods_before_unsupported() {
+        for (method, body) in [
+            ("PUT", "not-json"),
+            ("PUT", ""),
+            ("PUT", "{}"),
+            ("PUT", r#"{"size_mib":128}"#),
+            ("PUT", r#"{"total_size_mib":-1}"#),
+            ("PUT", r#"{"total_size_mib":"2048"}"#),
+            ("PUT", r#"{"total_size_mib":2048,"block_size_mib":null}"#),
+            ("PUT", r#"{"total_size_mib":2048,"slot_size_mib":null}"#),
+            ("PATCH", "not-json"),
+            ("PATCH", ""),
+            ("PATCH", "{}"),
+            ("PATCH", r#"{"size_mib":256}"#),
+            ("PATCH", r#"{"requested_size_mib":-1}"#),
+            ("PATCH", r#"{"requested_size_mib":null}"#),
+            ("PATCH", r#"{"requested_size_mib":"256"}"#),
+        ] {
+            let request = request_with_body(method, "/hotplug/memory", body);
 
             assert_eq!(
-                parse_request(&malformed_body),
-                Err(RequestError::MemoryHotplugUnsupported),
-                "{method}"
-            );
-            assert_eq!(
-                parse_request(empty_body.as_bytes()),
-                Err(RequestError::MemoryHotplugUnsupported),
-                "{method}"
+                parse_request(&request),
+                Err(RequestError::MalformedRequest),
+                "{method} {body}"
             );
         }
     }
