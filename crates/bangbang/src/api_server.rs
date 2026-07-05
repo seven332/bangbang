@@ -4039,6 +4039,24 @@ mod tests {
     }
 
     #[test]
+    fn not_started_state_accepts_empty_array_cpu_config_without_mutating() {
+        let mut vmm = test_controller();
+        let body = r#"{"kvm_capabilities":[],"reg_modifiers":[],"vcpu_features":[]}"#;
+        let request = format!(
+            "PUT /cpu-config HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        let response = request_over_socket(&mut vmm, "cpu-cfg-empty-arrays", &request);
+
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::NotStarted
+        );
+    }
+
+    #[test]
     fn not_started_state_rejects_custom_cpu_config_without_mutating() {
         let mut vmm = test_controller();
         let body = r#"{"kvm_capabilities":["1"]}"#;
