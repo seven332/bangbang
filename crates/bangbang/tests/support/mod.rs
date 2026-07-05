@@ -42,7 +42,11 @@ pub(crate) fn http_json(socket_path: &Path, method: &str, path: &str, body: &str
     http_request(socket_path, method, path, Some(body))
 }
 
-fn http_request(socket_path: &Path, method: &str, path: &str, body: Option<&str>) -> String {
+#[allow(
+    dead_code,
+    reason = "shared integration-test support is compiled once per test target"
+)]
+pub(crate) fn http_raw(socket_path: &Path, request: &[u8]) -> String {
     let mut stream = UnixStream::connect(socket_path).expect("client should connect");
     stream
         .set_read_timeout(Some(HTTP_IO_TIMEOUT))
@@ -50,6 +54,18 @@ fn http_request(socket_path: &Path, method: &str, path: &str, body: Option<&str>
     stream
         .set_write_timeout(Some(HTTP_IO_TIMEOUT))
         .expect("client should set write timeout");
+    stream
+        .write_all(request)
+        .expect("client should write request");
+
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("client should read response");
+    response
+}
+
+fn http_request(socket_path: &Path, method: &str, path: &str, body: Option<&str>) -> String {
     let mut request =
         format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
     if let Some(body) = body {
@@ -61,15 +77,7 @@ fn http_request(socket_path: &Path, method: &str, path: &str, body: Option<&str>
         request.push_str("\r\n");
     }
 
-    stream
-        .write_all(request.as_bytes())
-        .expect("client should write request");
-
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .expect("client should read response");
-    response
+    http_raw(socket_path, request.as_bytes())
 }
 
 pub(crate) fn path_text(path: &Path) -> &str {

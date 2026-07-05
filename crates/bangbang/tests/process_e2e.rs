@@ -15,9 +15,10 @@ use std::os::unix::fs::MetadataExt;
 use support::{
     BangbangProcess, TestDir, assert_bad_request_response, assert_clean_shutdown,
     assert_no_content_response, assert_ok_response, assert_response_contains, http_get, http_json,
-    http_no_body, http_put_json, json_string, path_text,
+    http_no_body, http_put_json, http_raw, json_string, path_text,
 };
 
+use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_runtime::machine::MAX_MEM_SIZE_MIB;
 
 const BANGBANG_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -101,6 +102,41 @@ fn executable_accepts_firecracker_startup_time_args() {
             && !vm_config.contains("start_time_cpu_us")
             && !vm_config.contains("parent_cpu_time_us"),
         "GET /vm/config should not expose process startup timing; response:\n{vm_config}"
+    );
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
+fn executable_rejects_api_payload_over_limit_without_stopping() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    let request = format!(
+        "PUT /mmds HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        HTTP_MAX_PAYLOAD_SIZE + 1
+    );
+    assert!(
+        request.len() <= HTTP_MAX_PAYLOAD_SIZE,
+        "fixture should exercise declared payload length rejection, not a large write"
+    );
+
+    let oversized_response = http_raw(&socket_path, request.as_bytes());
+    assert_bad_request_response(&oversized_response, "oversized PUT /mmds");
+    assert_response_contains(
+        &oversized_response,
+        r#"{"fault_message":"HTTP request payload exceeds the configured limit."}"#,
+        "oversized PUT /mmds",
+    );
+
+    let instance_info = http_get(&socket_path, "/");
+    assert_ok_response(&instance_info, "GET / after oversized request");
+    assert_response_contains(
+        &instance_info,
+        r#""state":"Not started""#,
+        "GET / after oversized request",
     );
 
     assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
