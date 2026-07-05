@@ -2734,6 +2734,7 @@ mod tests {
             | VmmActionError::MmdsState(_)
             | VmmActionError::NetworkInterfaceConfig(_)
             | VmmActionError::NetworkInterfaceUpdateUnsupported
+            | VmmActionError::PmemUnsupported
             | VmmActionError::SerialConfig(_)
             | VmmActionError::SnapshotUnsupported
             | VmmActionError::VsockConfig(_) => {

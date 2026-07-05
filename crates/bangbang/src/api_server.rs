@@ -579,6 +579,8 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
             PutApiRequest::serial(serial_config_input_from_request(config.as_ref())),
         )),
         ApiRequest::PutEntropy => handle_empty(vmm.handle_action(VmmAction::PutEntropy)),
+        ApiRequest::PutPmem => handle_empty(vmm.handle_action(VmmAction::PutPmem)),
+        ApiRequest::PatchPmem => handle_empty(vmm.handle_action(VmmAction::PatchPmem)),
         ApiRequest::PutSnapshotCreate => handle_empty(vmm.handle_action(VmmAction::CreateSnapshot)),
         ApiRequest::PutSnapshotLoad => handle_empty(vmm.handle_action(VmmAction::LoadSnapshot)),
         ApiRequest::PutVsock(config) => handle_empty(vmm.handle_put_request(PutApiRequest::vsock(
@@ -642,10 +644,12 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         | ApiRequest::PatchMachineConfig(_)
         | ApiRequest::PatchMmds(_)
         | ApiRequest::PatchNetworkInterface(_)
+        | ApiRequest::PatchPmem
         | ApiRequest::PatchVmState(_)
         | ApiRequest::PutAction(_)
         | ApiRequest::PutEntropy
         | ApiRequest::PutMmds(_)
+        | ApiRequest::PutPmem
         | ApiRequest::PutSnapshotCreate
         | ApiRequest::PutSnapshotLoad => None,
     }
@@ -4716,6 +4720,57 @@ mod tests {
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::NotStarted
+        );
+    }
+
+    #[test]
+    fn running_state_rejects_pmem_endpoints_without_echoing_request_fields() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_request = request_with_body("PUT", "/boot-source", boot_body);
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "pmem-start", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        for (socket_name, request, action) in [
+            (
+                "pmem-put-running",
+                request_with_body(
+                    "PUT",
+                    "/pmem/pmem0",
+                    r#"{"id":"pmem0","path_on_host":"/private/tmp/pmem.img","root_device":true,"read_only":false,"rate_limiter":{"bandwidth":{"size":123456,"one_time_burst":234567,"refill_time":345678}}}"#,
+                ),
+                "PutPmem",
+            ),
+            (
+                "pmem-patch-running",
+                request_with_body(
+                    "PATCH",
+                    "/pmem/pmem0",
+                    r#"{"id":"pmem0","rate_limiter":{"ops":{"size":123456,"one_time_burst":234567,"refill_time":345678}}}"#,
+                ),
+                "PatchPmem",
+            ),
+        ] {
+            let response = request_over_socket(&mut vmm, socket_name, &request);
+
+            assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+            assert!(response.contains(&format!(
+                r#"{{"fault_message":"The requested operation is not supported in Running state: {action}"}}"#
+            )));
+            for private_value in ["/private/tmp/pmem.img", "123456", "234567", "345678"] {
+                assert!(
+                    !response.contains(private_value),
+                    "running-state pmem response must not echo {private_value}: {response}"
+                );
+            }
+        }
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::Running
         );
     }
 
