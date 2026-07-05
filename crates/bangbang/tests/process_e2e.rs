@@ -167,6 +167,52 @@ fn executable_rejects_unsupported_firecracker_process_flags_before_socket_public
 }
 
 #[test]
+fn executable_rejects_snapshot_requests_without_mutating() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    for (path, body, private_values) in [
+        (
+            "/snapshot/create",
+            r#"{"snapshot_path":"secret-create.vmstate","mem_file_path":"secret-create.mem"}"#,
+            &["secret-create.vmstate", "secret-create.mem"][..],
+        ),
+        (
+            "/snapshot/load",
+            r#"{"snapshot_path":"secret-load.vmstate","mem_backend":{"backend_path":"secret-load.mem","backend_type":"File"}}"#,
+            &["secret-load.vmstate", "secret-load.mem"][..],
+        ),
+    ] {
+        let response = http_put_json(&socket_path, path, body);
+
+        assert_bad_request_response(&response, path);
+        assert_response_contains(
+            &response,
+            r#"{"fault_message":"Snapshot and restore are not supported."}"#,
+            path,
+        );
+        for private_value in private_values {
+            assert!(
+                !response.contains(private_value),
+                "{path} must not echo private snapshot path {private_value:?}; response:\n{response}"
+            );
+        }
+    }
+
+    let instance_info = http_get(&socket_path, "/");
+    assert_ok_response(&instance_info, "GET / after rejected snapshots");
+    assert_response_contains(
+        &instance_info,
+        r#""state":"Not started""#,
+        "GET / after rejected snapshots",
+    );
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
 fn executable_config_file_failure_does_not_publish_socket() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
