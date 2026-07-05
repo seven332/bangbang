@@ -62,7 +62,7 @@ impl std::error::Error for VmnetVirtioNetworkPacketIoBuildError {
 }
 
 #[derive(Debug)]
-pub enum MmdsOnlyVirtioNetworkPacketIoBuildError {
+pub(crate) enum MmdsOnlyVirtioNetworkPacketIoBuildError {
     EmptyRxBuffer,
     RxBufferAllocation { len: usize, source: TryReserveError },
 }
@@ -91,7 +91,7 @@ impl std::error::Error for MmdsOnlyVirtioNetworkPacketIoBuildError {
 }
 
 #[derive(Debug)]
-pub enum MmdsOnlyVirtioNetworkPacketIoProviderBuildError {
+pub(crate) enum MmdsOnlyVirtioNetworkPacketIoProviderBuildError {
     DuplicateInterfaceId { iface_id: String },
 }
 
