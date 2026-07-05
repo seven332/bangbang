@@ -712,6 +712,7 @@ fn executable_configures_observability_without_vm_config() {
     let metrics_path = test_dir.path().join("metrics.out");
     let second_metrics_path = test_dir.path().join("metrics-second.out");
     let logger_path = test_dir.path().join("logger.out");
+    let serial_output_path = test_dir.path().join("serial.out");
     let instance_id = test_dir.instance_id();
     let bangbang = BangbangProcess::start(&socket_path, &instance_id);
 
@@ -763,6 +764,15 @@ fn executable_configures_observability_without_vm_config() {
         "PUT /logger should create the configured output file"
     );
 
+    let serial_output_path_json = json_string(path_text(&serial_output_path));
+    let serial_body = format!(r#"{{"serial_out_path":{serial_output_path_json}}}"#);
+    let serial_response = http_put_json(&socket_path, "/serial", &serial_body);
+    assert_no_content_response(&serial_response, "PUT /serial");
+    assert!(
+        !serial_output_path.exists(),
+        "PUT /serial should store the output path without creating it before startup"
+    );
+
     let vm_config = http_get(&socket_path, "/vm/config");
     assert_ok_response(&vm_config, "GET /vm/config after observability config");
     assert_response_contains(
@@ -777,6 +787,10 @@ fn executable_configures_observability_without_vm_config() {
     assert!(
         !vm_config.contains("logger"),
         "GET /vm/config must not include logger observability state; response:\n{vm_config}"
+    );
+    assert!(
+        !vm_config.contains("serial"),
+        "GET /vm/config must not include serial observability state; response:\n{vm_config}"
     );
 
     assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
