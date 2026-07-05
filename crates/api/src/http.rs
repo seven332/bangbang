@@ -4085,6 +4085,7 @@ mod tests {
             r#"{"iface_id":"eth0","unknown":true}"#,
             r#"{"iface_id":"eth0","rx_rate_limiter":"unsupported"}"#,
             r#"{"iface_id":"eth0","rx_rate_limiter":{"ops":{"size":100}}}"#,
+            r#"{"iface_id":"eth0","tx_rate_limiter":{"bandwidth":{"size":100}}}"#,
         ] {
             let request = request_with_body("PATCH", "/network-interfaces/eth0", body);
             assert_eq!(
