@@ -150,8 +150,8 @@ Startup timing arguments are intentionally not exposed in `GET /vm/config` or
 logs because they are process observability data, not guest configuration. When
 metrics are configured and the VM is running, explicit `FlushMetrics` writes
 provided values under the minimal `vmm` metrics object; omitted timing arguments
-remain omitted. Runtime action requests are counted under the root
-`put_api_requests` metrics object for the initial `/actions` subset. Full
+remain omitted. Parsed `/actions` API requests are counted under the root
+`put_api_requests` metrics object for the initial subset. Full
 Firecracker `ProcessTimeReporter` parity remains deferred.
 
 bangbang intentionally treats `--id` alphanumeric characters as ASCII only.

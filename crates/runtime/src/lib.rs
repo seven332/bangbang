@@ -397,19 +397,6 @@ impl VmmController {
         Ok(VmmData::Empty)
     }
 
-    pub fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
-        if matches!(action, VmmAction::InstanceStart | VmmAction::FlushMetrics) {
-            self.record_put_actions_request();
-            let result = self.handle_action_inner(action);
-            if result.is_err() {
-                self.record_put_actions_failure();
-            }
-            return result;
-        }
-
-        self.handle_action_inner(action)
-    }
-
     pub fn record_put_actions_request(&mut self) {
         self.metrics_state.record_put_actions_request();
     }
@@ -418,7 +405,7 @@ impl VmmController {
         self.metrics_state.record_put_actions_failure();
     }
 
-    fn handle_action_inner(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
+    pub fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
         let action_name = action.name();
         match action {
             VmmAction::GetVmmVersion => {
@@ -1960,10 +1947,7 @@ mod tests {
 
         assert_eq!(controller.instance_info().state, InstanceState::Running);
         let output = fs::read_to_string(&path).expect("metrics output should be readable");
-        assert_eq!(
-            output,
-            "{\"put_api_requests\":{\"actions_count\":1,\"actions_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        assert_eq!(output, "{\"vmm\":{\"metrics_flush_count\":1}}\n");
         fs::remove_file(path).expect("fixture should clean up");
     }
 
@@ -2021,10 +2005,7 @@ mod tests {
             .expect("flush should still use original metrics sink");
         let first_output =
             fs::read_to_string(&first_path).expect("first metrics output should be readable");
-        assert_eq!(
-            first_output,
-            "{\"put_api_requests\":{\"actions_count\":1,\"actions_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
-        );
+        assert_eq!(first_output, "{\"vmm\":{\"metrics_flush_count\":1}}\n");
         assert!(!second_path.exists());
         fs::remove_file(first_path).expect("fixture should clean up");
     }

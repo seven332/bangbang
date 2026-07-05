@@ -447,7 +447,7 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::GetMmds => handle_mmds(vmm.handle_action(VmmAction::GetMmds)),
         ApiRequest::GetVmConfig => handle_vm_config(vmm.handle_action(VmmAction::GetVmConfig)),
         ApiRequest::PutAction(action) => {
-            handle_empty(vmm.handle_action(action_from_request(action.as_ref())))
+            handle_empty(vmm.handle_put_action_request(action_from_request(action.as_ref())))
         }
         ApiRequest::PutBootSource(config) => handle_empty(vmm.handle_action(
             VmmAction::PutBootSource(boot_source_input_from_request(config.as_ref())),

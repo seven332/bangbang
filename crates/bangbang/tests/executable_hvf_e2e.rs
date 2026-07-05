@@ -758,7 +758,7 @@ mod macos_arm64 {
             r#"{"action_type":"FlushMetrics"}"#,
         );
         assert_no_content_response(&flush_metrics_response, "PUT /actions FlushMetrics");
-        assert_metrics_output(&metrics_path, 3, 1);
+        assert_metrics_output(&metrics_path, 2, 1);
         assert_logger_output(&logger_path);
 
         if let Err(err) =

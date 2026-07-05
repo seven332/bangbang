@@ -79,6 +79,8 @@ impl ProcessSessionDiagnostics for () {}
 
 pub(crate) trait VmmRequestHandler {
     fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError>;
+
+    fn handle_put_action_request(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError>;
 }
 
 #[derive(Debug)]
@@ -194,18 +196,15 @@ where
 
     pub(crate) fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
         match action {
-            VmmAction::InstanceStart => self.handle_put_actions_api_request(Self::start_instance),
-            VmmAction::FlushMetrics => self.handle_put_actions_api_request(Self::flush_metrics),
+            VmmAction::InstanceStart => self.start_instance(),
+            VmmAction::FlushMetrics => self.flush_metrics(),
             action => self.controller.handle_action(action),
         }
     }
 
-    fn handle_put_actions_api_request(
-        &mut self,
-        handler: impl FnOnce(&mut Self) -> Result<VmmData, VmmActionError>,
-    ) -> Result<VmmData, VmmActionError> {
+    fn handle_put_action_request(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
         self.controller.record_put_actions_request();
-        let result = handler(self);
+        let result = self.handle_action(action);
         if result.is_err() {
             self.controller.record_put_actions_failure();
         }
@@ -256,6 +255,10 @@ where
 {
     fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
         ProcessVmm::handle_action(self, action)
+    }
+
+    fn handle_put_action_request(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
+        ProcessVmm::handle_put_action_request(self, action)
     }
 }
 
@@ -2391,7 +2394,7 @@ mod tests {
         assert_eq!(vmm.starter.calls, 1);
         assert_eq!(
             fs::read_to_string(metrics.path()).expect("metrics output should read"),
-            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0},\"vmm\":{\"boot_run_loop_status\":\"failed\",\"metrics_flush_count\":1,\"parent_cpu_time_us\":3000,\"start_time_us\":1000}}\n"
+            "{\"vmm\":{\"boot_run_loop_status\":\"failed\",\"metrics_flush_count\":1,\"parent_cpu_time_us\":3000,\"start_time_us\":1000}}\n"
         );
     }
 
