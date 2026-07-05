@@ -213,6 +213,66 @@ fn executable_rejects_snapshot_requests_without_mutating() {
 }
 
 #[test]
+fn executable_rejects_remaining_device_requests_without_mutating() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    for (path, body, fault_message, private_values) in [
+        (
+            "/balloon",
+            r#"{"amount_mib":64,"deflate_on_oom":true}"#,
+            "Balloon device is not supported.",
+            &[][..],
+        ),
+        (
+            "/pmem/pmem0",
+            r#"{"id":"pmem0","path_on_host":"secret-pmem.img"}"#,
+            "Pmem device is not supported.",
+            &["secret-pmem.img"][..],
+        ),
+        (
+            "/entropy",
+            "{}",
+            "Entropy device is not supported.",
+            &[][..],
+        ),
+        (
+            "/hotplug/memory",
+            r#"{"total_size_mib":2048}"#,
+            "Memory hotplug is not supported.",
+            &[][..],
+        ),
+    ] {
+        let response = http_put_json(&socket_path, path, body);
+
+        assert_bad_request_response(&response, path);
+        assert_response_contains(
+            &response,
+            &format!(r#"{{"fault_message":"{fault_message}"}}"#),
+            path,
+        );
+        for private_value in private_values {
+            assert!(
+                !response.contains(private_value),
+                "{path} must not echo private device path {private_value:?}; response:\n{response}"
+            );
+        }
+    }
+
+    let instance_info = http_get(&socket_path, "/");
+    assert_ok_response(&instance_info, "GET / after rejected remaining devices");
+    assert_response_contains(
+        &instance_info,
+        r#""state":"Not started""#,
+        "GET / after rejected remaining devices",
+    );
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
 fn executable_config_file_failure_does_not_publish_socket() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
