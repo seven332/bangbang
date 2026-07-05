@@ -50,6 +50,7 @@ pub enum RequestError {
     InvalidPathMethod,
     MismatchedDriveId,
     MismatchedInterfaceId,
+    MismatchedPmemId,
     MalformedRequest,
     MemoryHotplugUnsupported,
     NetworkInterfaceUpdateUnsupported,
@@ -69,6 +70,7 @@ impl RequestError {
             Self::InvalidPathMethod => "Invalid request method and/or path.",
             Self::MismatchedDriveId => "path drive_id must match body drive_id.",
             Self::MismatchedInterfaceId => "path iface_id must match body iface_id.",
+            Self::MismatchedPmemId => "path pmem id must match body id.",
             Self::MalformedRequest => "Malformed HTTP request.",
             Self::MemoryHotplugUnsupported => "Memory hotplug is not supported.",
             Self::NetworkInterfaceUpdateUnsupported => {
@@ -894,6 +896,27 @@ struct DrivePatchRequestBody {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct PmemConfigRequestBody {
+    id: String,
+    path_on_host: String,
+    #[serde(default)]
+    root_device: bool,
+    #[serde(default)]
+    read_only: bool,
+    #[serde(default)]
+    rate_limiter: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PmemPatchRequestBody {
+    id: String,
+    #[serde(default)]
+    rate_limiter: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NetworkInterfaceConfigRequestBody {
     iface_id: String,
     host_dev_name: String,
@@ -1286,7 +1309,17 @@ pub fn parse_request_with_limit(
         return parse_memory_hotplug_size_update_request(body);
     }
 
-    if matches!(method, "PUT" | "PATCH" | "DELETE") && pmem_path_id(path).is_some() {
+    if method == "PUT"
+        && let Some(path_pmem_id) = pmem_path_id(path)
+    {
+        return parse_pmem_config_request(path_pmem_id, body);
+    }
+    if method == "PATCH"
+        && let Some(path_pmem_id) = pmem_path_id(path)
+    {
+        return parse_pmem_patch_request(path_pmem_id, body);
+    }
+    if method == "DELETE" && pmem_path_id(path).is_some() {
         return Err(RequestError::PmemUnsupported);
     }
 
@@ -1753,6 +1786,42 @@ fn parse_drive_patch_request(path_drive_id: &str, body: &[u8]) -> Result<ApiRequ
         body_drive_id: body.drive_id,
         path_on_host: body.path_on_host,
     })))
+}
+
+fn parse_pmem_config_request(path_pmem_id: &str, body: &[u8]) -> Result<ApiRequest, RequestError> {
+    let body = serde_json::from_slice::<PmemConfigRequestBody>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+    if let Some(rate_limiter) = &body.rate_limiter {
+        validate_rate_limiter_config(rate_limiter)?;
+    }
+    if path_pmem_id != body.id {
+        return Err(RequestError::MismatchedPmemId);
+    }
+    let PmemConfigRequestBody {
+        id,
+        path_on_host,
+        root_device,
+        read_only,
+        rate_limiter,
+    } = body;
+    let _ = (id, path_on_host, root_device, read_only, rate_limiter);
+
+    Err(RequestError::PmemUnsupported)
+}
+
+fn parse_pmem_patch_request(path_pmem_id: &str, body: &[u8]) -> Result<ApiRequest, RequestError> {
+    let body = serde_json::from_slice::<PmemPatchRequestBody>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+    if let Some(rate_limiter) = &body.rate_limiter {
+        validate_rate_limiter_config(rate_limiter)?;
+    }
+    if path_pmem_id != body.id {
+        return Err(RequestError::MismatchedPmemId);
+    }
+    let PmemPatchRequestBody { id, rate_limiter } = body;
+    let _ = (id, rate_limiter);
+
+    Err(RequestError::PmemUnsupported)
 }
 
 fn parse_network_interface_config_request(
@@ -4644,23 +4713,51 @@ mod tests {
     }
 
     #[test]
-    fn rejects_pmem_methods_as_unsupported() {
+    fn rejects_valid_pmem_body_methods_as_unsupported() {
         for (route, request) in [
             (
                 "PUT /pmem/pmem0",
-                request_with_body("PUT", "/pmem/pmem0", r#"{"id":"pmem0"}"#),
+                request_with_body(
+                    "PUT",
+                    "/pmem/pmem0",
+                    r#"{"id":"pmem0","path_on_host":"/tmp/pmem.img"}"#,
+                ),
+            ),
+            (
+                "PUT /pmem/pmem_0",
+                request_with_body(
+                    "PUT",
+                    "/pmem/pmem_0",
+                    r#"{"id":"pmem_0","path_on_host":"/tmp/pmem.img","root_device":true,"read_only":false,"rate_limiter":{"bandwidth":{"size":100,"one_time_burst":null,"refill_time":1000}}}"#,
+                ),
+            ),
+            (
+                "PUT /pmem/pmem1 empty rate limiter",
+                request_with_body(
+                    "PUT",
+                    "/pmem/pmem1",
+                    r#"{"id":"pmem1","path_on_host":"/tmp/pmem.img","rate_limiter":{}}"#,
+                ),
             ),
             (
                 "PATCH /pmem/pmem0",
                 request_with_body("PATCH", "/pmem/pmem0", r#"{"id":"pmem0"}"#),
             ),
             (
-                "DELETE /pmem/pmem0",
-                b"DELETE /pmem/pmem0 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+                "PATCH /pmem/pmem0 empty rate limiter",
+                request_with_body(
+                    "PATCH",
+                    "/pmem/pmem0",
+                    r#"{"id":"pmem0","rate_limiter":{}}"#,
+                ),
             ),
             (
-                "PUT /pmem/pmem_0",
-                request_with_body("PUT", "/pmem/pmem_0", r#"{"id":"pmem_0"}"#),
+                "PATCH /pmem/pmem0 rate limiter",
+                request_with_body(
+                    "PATCH",
+                    "/pmem/pmem0",
+                    r#"{"id":"pmem0","rate_limiter":{"ops":{"size":100,"one_time_burst":200,"refill_time":1000}}}"#,
+                ),
             ),
         ] {
             let err = parse_request(&request).expect_err("pmem should be unsupported");
@@ -4670,24 +4767,76 @@ mod tests {
     }
 
     #[test]
-    fn rejects_pmem_body_methods_without_parsing_body() {
-        for method in ["PUT", "PATCH", "DELETE"] {
-            let malformed_body = request_with_body(method, "/pmem/pmem0", "not-json");
-            let empty_body = format!(
-                "{method} /pmem/pmem0 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
-            );
+    fn rejects_invalid_pmem_body_methods_before_unsupported() {
+        for (method, body) in [
+            ("PUT", "not-json"),
+            ("PUT", ""),
+            ("PUT", "{}"),
+            ("PUT", r#"{"id":"pmem0"}"#),
+            ("PUT", r#"{"id":3,"path_on_host":"/tmp/pmem.img"}"#),
+            ("PUT", r#"{"id":"pmem0","path_on_host":3}"#),
+            (
+                "PUT",
+                r#"{"id":"pmem0","path_on_host":"/tmp/pmem.img","unknown":true}"#,
+            ),
+            (
+                "PUT",
+                r#"{"id":"pmem0","path_on_host":"/tmp/pmem.img","root_device":null}"#,
+            ),
+            (
+                "PUT",
+                r#"{"id":"pmem0","path_on_host":"/tmp/pmem.img","read_only":"false"}"#,
+            ),
+            (
+                "PUT",
+                r#"{"id":"pmem0","path_on_host":"/tmp/pmem.img","rate_limiter":"bad"}"#,
+            ),
+            (
+                "PUT",
+                r#"{"id":"pmem0","path_on_host":"/tmp/pmem.img","rate_limiter":{"bandwidth":{"size":1}}}"#,
+            ),
+            ("PATCH", "not-json"),
+            ("PATCH", ""),
+            ("PATCH", "{}"),
+            ("PATCH", r#"{"id":3}"#),
+            ("PATCH", r#"{"id":"pmem0","unknown":true}"#),
+            ("PATCH", r#"{"id":"pmem0","rate_limiter":"bad"}"#),
+            (
+                "PATCH",
+                r#"{"id":"pmem0","rate_limiter":{"ops":{"refill_time":1}}}"#,
+            ),
+        ] {
+            let request = request_with_body(method, "/pmem/pmem0", body);
 
             assert_eq!(
-                parse_request(&malformed_body),
-                Err(RequestError::PmemUnsupported),
-                "{method}"
-            );
-            assert_eq!(
-                parse_request(empty_body.as_bytes()),
-                Err(RequestError::PmemUnsupported),
-                "{method}"
+                parse_request(&request),
+                Err(RequestError::MalformedRequest),
+                "{method} {body}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_mismatched_pmem_ids_before_unsupported() {
+        for (method, body) in [
+            ("PUT", r#"{"id":"other","path_on_host":"/tmp/pmem.img"}"#),
+            ("PATCH", r#"{"id":"other"}"#),
+        ] {
+            let request = request_with_body(method, "/pmem/pmem0", body);
+
+            let err = parse_request(&request).expect_err("mismatched pmem id should fail");
+            assert_eq!(err, RequestError::MismatchedPmemId, "{method}");
+            assert_eq!(err.fault_message(), "path pmem id must match body id.");
+        }
+    }
+
+    #[test]
+    fn rejects_pmem_delete_as_unsupported() {
+        let request = b"DELETE /pmem/pmem0 HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+        let err = parse_request(request).expect_err("pmem delete should be unsupported");
+        assert_eq!(err, RequestError::PmemUnsupported);
+        assert_eq!(err.fault_message(), "Pmem device is not supported.");
     }
 
     #[test]
