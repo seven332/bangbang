@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_api::http::{
-    ActionRequest, ActionType, ApiRequest, BootSourceRequest, BootSourceResponse,
+    ActionRequest, ActionType, ApiRequest, BootSourceRequest, BootSourceResponse, CpuConfigRequest,
     DriveCacheType as ApiDriveCacheType, DriveConfigRequest, DriveConfigResponse,
     DriveIoEngine as ApiDriveIoEngine, DrivePatchRequest, HttpResponse, LoggerConfigRequest,
     LoggerLevel as ApiLoggerLevel, MachineConfigPatchRequest, MachineConfigRequest,
@@ -26,6 +26,7 @@ use bangbang_runtime::block::{
     DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine, DriveUpdateInput,
 };
 use bangbang_runtime::boot::{BootSourceConfig, BootSourceConfigInput};
+use bangbang_runtime::cpu::CpuConfigInput;
 use bangbang_runtime::logger::{LoggerConfigInput, LoggerLevel};
 use bangbang_runtime::machine::{
     MachineConfig, MachineConfigCpuTemplate as RuntimeMachineConfigCpuTemplate,
@@ -531,9 +532,9 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PutBootSource(config) => handle_empty(vmm.handle_put_request(
             PutApiRequest::boot_source(boot_source_input_from_request(config.as_ref())),
         )),
-        ApiRequest::PutCpuConfig(_) => {
-            handle_empty(vmm.handle_put_request(PutApiRequest::cpu_config()))
-        }
+        ApiRequest::PutCpuConfig(config) => handle_empty(vmm.handle_put_request(
+            PutApiRequest::cpu_config(cpu_config_input_from_request(config.as_ref())),
+        )),
         ApiRequest::PutLogger(config) => handle_empty(vmm.handle_put_request(
             PutApiRequest::logger(logger_config_input_from_request(config.as_ref())),
         )),
@@ -597,7 +598,9 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         ApiRequest::PutBootSource(config) => Some(VmmAction::PutBootSource(
             boot_source_input_from_request(config.as_ref()),
         )),
-        ApiRequest::PutCpuConfig(_) => Some(VmmAction::PutCpuConfig),
+        ApiRequest::PutCpuConfig(config) => Some(VmmAction::PutCpuConfig(
+            cpu_config_input_from_request(config.as_ref()),
+        )),
         ApiRequest::PutDrive(config) => Some(VmmAction::PutDrive(drive_config_input_from_request(
             config.as_ref(),
         ))),
@@ -647,6 +650,10 @@ fn boot_source_input_from_request(config: &BootSourceRequest) -> BootSourceConfi
     }
 
     input
+}
+
+fn cpu_config_input_from_request(config: &CpuConfigRequest) -> CpuConfigInput {
+    CpuConfigInput::new(config.custom_template_configured())
 }
 
 fn handle_vmm_version(result: Result<VmmData, bangbang_runtime::VmmActionError>) -> HttpResponse {
@@ -3258,6 +3265,15 @@ mod tests {
         );
         assert_eq!(
             cpu_response.status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let custom_cpu_response = handle_request_bytes(
+            request_with_body("PUT", "/cpu-config", r#"{"kvm_capabilities":["1"]}"#).as_bytes(),
+            &mut vmm,
+        );
+        assert_eq!(
+            custom_cpu_response.status(),
             bangbang_api::http::StatusCode::BadRequest
         );
 
@@ -3373,7 +3389,7 @@ mod tests {
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":2,\"boot_source_fails\":1,\"cpu_cfg_count\":1,\"cpu_cfg_fails\":1,\"drive_count\":2,\"drive_fails\":1,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":2,\"network_fails\":1,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":2,\"vsock_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":2,\"boot_source_fails\":1,\"cpu_cfg_count\":2,\"cpu_cfg_fails\":1,\"drive_count\":2,\"drive_fails\":1,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":2,\"network_fails\":1,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":2,\"vsock_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         assert!(!drive_path.exists());
@@ -4009,11 +4025,47 @@ mod tests {
     }
 
     #[test]
-    fn not_started_state_rejects_cpu_config_without_mutating() {
+    fn not_started_state_accepts_noop_cpu_config_without_mutating() {
         let mut vmm = test_controller();
         let request = "PUT /cpu-config HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}";
 
         let response = request_over_socket(&mut vmm, "cpu-cfg-ns", request);
+
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::NotStarted
+        );
+    }
+
+    #[test]
+    fn not_started_state_accepts_empty_array_cpu_config_without_mutating() {
+        let mut vmm = test_controller();
+        let body = r#"{"kvm_capabilities":[],"reg_modifiers":[],"vcpu_features":[]}"#;
+        let request = format!(
+            "PUT /cpu-config HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        let response = request_over_socket(&mut vmm, "cpu-cfg-empty-arrays", &request);
+
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::NotStarted
+        );
+    }
+
+    #[test]
+    fn not_started_state_rejects_custom_cpu_config_without_mutating() {
+        let mut vmm = test_controller();
+        let body = r#"{"kvm_capabilities":["1"]}"#;
+        let request = format!(
+            "PUT /cpu-config HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        let response = request_over_socket(&mut vmm, "cpu-cfg-custom", &request);
 
         assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
         assert!(response.contains(

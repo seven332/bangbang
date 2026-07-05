@@ -938,17 +938,21 @@ fn executable_configures_vm_before_start() {
     );
 
     let cpu_config_response = http_put_json(&socket_path, "/cpu-config", "{}");
-    assert_bad_request_response(&cpu_config_response, "PUT /cpu-config");
+    assert_no_content_response(&cpu_config_response, "PUT /cpu-config empty");
+
+    let custom_cpu_config_response =
+        http_put_json(&socket_path, "/cpu-config", r#"{"kvm_capabilities":["1"]}"#);
+    assert_bad_request_response(&custom_cpu_config_response, "PUT /cpu-config custom");
     assert_response_contains(
-        &cpu_config_response,
+        &custom_cpu_config_response,
         r#"{"fault_message":"The requested operation is not supported: PutCpuConfig"}"#,
-        "PUT /cpu-config",
+        "PUT /cpu-config custom",
     );
     let instance_info_after_cpu_config = http_get(&socket_path, "/");
     assert_response_contains(
         &instance_info_after_cpu_config,
         r#""state":"Not started""#,
-        "GET / after failed PUT /cpu-config",
+        "GET / after custom PUT /cpu-config",
     );
 
     let vm_state_response = http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#);

@@ -123,7 +123,15 @@ enum ActionTypeBody {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CpuConfigRequest;
+pub struct CpuConfigRequest {
+    custom_template_configured: bool,
+}
+
+impl CpuConfigRequest {
+    pub const fn custom_template_configured(&self) -> bool {
+        self.custom_template_configured
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmStateUpdateRequest {
@@ -1591,12 +1599,15 @@ fn parse_vm_state_update_request(body: &[u8]) -> Result<ApiRequest, RequestError
 fn parse_cpu_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
     let value = serde_json::from_slice::<serde_json::Value>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
-    validate_cpu_config_value(&value).map_err(|()| RequestError::MalformedRequest)?;
+    let custom_template_configured =
+        validate_cpu_config_value(&value).map_err(|()| RequestError::MalformedRequest)?;
 
-    Ok(ApiRequest::PutCpuConfig(Box::new(CpuConfigRequest)))
+    Ok(ApiRequest::PutCpuConfig(Box::new(CpuConfigRequest {
+        custom_template_configured,
+    })))
 }
 
-fn validate_cpu_config_value(value: &serde_json::Value) -> Result<(), ()> {
+fn validate_cpu_config_value(value: &serde_json::Value) -> Result<bool, ()> {
     let object = value.as_object().ok_or(())?;
 
     for key in object.keys() {
@@ -1608,30 +1619,34 @@ fn validate_cpu_config_value(value: &serde_json::Value) -> Result<(), ()> {
         }
     }
 
+    let mut custom_template_configured = false;
     if let Some(kvm_capabilities) = object.get("kvm_capabilities") {
-        validate_cpu_config_array(kvm_capabilities, validate_kvm_capability)?;
+        custom_template_configured |=
+            validate_cpu_config_array(kvm_capabilities, validate_kvm_capability)?;
     }
     if let Some(reg_modifiers) = object.get("reg_modifiers") {
-        validate_cpu_config_array(reg_modifiers, validate_arm_register_modifier)?;
+        custom_template_configured |=
+            validate_cpu_config_array(reg_modifiers, validate_arm_register_modifier)?;
     }
     if let Some(vcpu_features) = object.get("vcpu_features") {
-        validate_cpu_config_array(vcpu_features, validate_vcpu_feature)?;
+        custom_template_configured |=
+            validate_cpu_config_array(vcpu_features, validate_vcpu_feature)?;
     }
 
-    Ok(())
+    Ok(custom_template_configured)
 }
 
 fn validate_cpu_config_array(
     value: &serde_json::Value,
     mut validate_item: impl FnMut(&serde_json::Value) -> Result<(), ()>,
-) -> Result<(), ()> {
+) -> Result<bool, ()> {
     let values = value.as_array().ok_or(())?;
 
     for item in values {
         validate_item(item)?;
     }
 
-    Ok(())
+    Ok(!values.is_empty())
 }
 
 fn validate_kvm_capability(value: &serde_json::Value) -> Result<(), ()> {
@@ -4617,9 +4632,26 @@ mod tests {
 
         let parsed = parse_request(&request).expect("empty cpu-config should parse");
 
-        let ApiRequest::PutCpuConfig(_) = parsed else {
+        let ApiRequest::PutCpuConfig(config) = parsed else {
             panic!("expected cpu-config request");
         };
+        assert!(!config.custom_template_configured());
+    }
+
+    #[test]
+    fn parses_empty_array_cpu_config_request_as_noop() {
+        let request = request_with_body(
+            "PUT",
+            "/cpu-config",
+            r#"{"kvm_capabilities":[],"reg_modifiers":[],"vcpu_features":[]}"#,
+        );
+
+        let parsed = parse_request(&request).expect("empty cpu-config arrays should parse");
+
+        let ApiRequest::PutCpuConfig(config) = parsed else {
+            panic!("expected cpu-config request");
+        };
+        assert!(!config.custom_template_configured());
     }
 
     #[test]
@@ -4643,9 +4675,10 @@ mod tests {
 
         let parsed = parse_request(&request).expect("cpu-config should parse");
 
-        let ApiRequest::PutCpuConfig(_) = parsed else {
+        let ApiRequest::PutCpuConfig(config) = parsed else {
             panic!("expected cpu-config request");
         };
+        assert!(config.custom_template_configured());
     }
 
     #[test]

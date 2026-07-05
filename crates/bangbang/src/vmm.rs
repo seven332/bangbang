@@ -17,6 +17,7 @@ use bangbang_hvf::{
 };
 use bangbang_runtime::block::{BlockMmioLayout, DriveConfigInput, DriveUpdateInput};
 use bangbang_runtime::boot::BootSourceConfigInput;
+use bangbang_runtime::cpu::CpuConfigInput;
 use bangbang_runtime::logger::LoggerConfigInput;
 use bangbang_runtime::machine::{MachineConfigInput, MachineConfigPatchInput};
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
@@ -170,10 +171,10 @@ impl PutApiRequest {
         }
     }
 
-    pub(crate) fn cpu_config() -> Self {
+    pub(crate) fn cpu_config(input: CpuConfigInput) -> Self {
         Self {
             kind: PutApiRequestKind::CpuConfig,
-            action: VmmAction::PutCpuConfig,
+            action: VmmAction::PutCpuConfig(input),
         }
     }
 
@@ -1535,6 +1536,7 @@ mod tests {
         DriveConfigInput, DriveConfigs, DriveUpdateInput, PreparedBlockDevices,
     };
     use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::cpu::CpuConfigInput;
     use bangbang_runtime::fdt::{Arm64FdtRegion, Arm64FdtVirtioMmioDevice};
     use bangbang_runtime::interrupt::GuestInterruptLine;
     use bangbang_runtime::logger::LoggerConfigInput;
@@ -3186,7 +3188,9 @@ mod tests {
         )))
         .expect("vsock should configure");
         assert_eq!(
-            vmm.handle_action(VmmAction::PutCpuConfig),
+            vmm.handle_action(VmmAction::PutCpuConfig(
+                CpuConfigInput::with_custom_template()
+            )),
             Err(VmmActionError::UnsupportedAction("PutCpuConfig"))
         );
         assert_eq!(

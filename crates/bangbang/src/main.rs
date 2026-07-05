@@ -1197,8 +1197,8 @@ fn help_text() -> String {
             "pre-boot configuration and start the VM before API serving, ",
             "or with --no-api can start without publishing an API socket; ",
             "PATCH /vm parses Paused and Resumed state requests ",
-            "as unsupported lifecycle actions; PUT /cpu-config parses custom CPU ",
-            "template requests as unsupported CPU configuration actions; ",
+            "as unsupported lifecycle actions; PUT /cpu-config accepts empty ",
+            "CPU config as no-op and rejects custom CPU templates; ",
             "PUT /actions starts a process-owned ",
             "HVF boot run-loop worker across bounded step windows for InstanceStart, ",
             "but public run-loop control is not implemented yet."
@@ -1742,7 +1742,7 @@ mod tests {
         assert!(help.contains("minimal action logs"));
         assert!(help.contains("--config-file can apply the same supported pre-boot configuration"));
         assert!(help.contains("PATCH /vm parses Paused and Resumed state requests"));
-        assert!(help.contains("PUT /cpu-config parses custom CPU template requests"));
+        assert!(help.contains("PUT /cpu-config accepts empty CPU config as no-op"));
         assert!(help.contains("--log-path <PATH>"));
         assert!(help.contains("--metrics-path <PATH>"));
         assert!(help.contains("--http-api-max-payload-size <BYTES>"));
@@ -2900,7 +2900,7 @@ mod tests {
         let config_path = unique_config_path("cpu-config");
         fs::write(
             &config_path,
-            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"cpu-config":{}}"#,
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"cpu-config":{"kvm_capabilities":["1"]}}"#,
         )
         .expect("config file should be written");
         let mut vmm = ProcessVmm::with_starter(
@@ -2924,6 +2924,30 @@ mod tests {
         ));
         assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
         assert!(!vmm.has_started_session());
+
+        fs::remove_file(config_path).expect("fixture config should clean up");
+    }
+
+    #[test]
+    fn config_file_noop_cpu_config_starts_instance() {
+        let config_path = unique_config_path("noop-cpu-config");
+        fs::write(
+            &config_path,
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"cpu-config":{}}"#,
+        )
+        .expect("config file should be written");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        super::apply_startup_config_file(&mut vmm, Some(config_path.to_str().expect("UTF-8 path")))
+            .expect("empty cpu-config should not block config-file startup");
+
+        assert_eq!(vmm.instance_info().state, InstanceState::Running);
+        assert!(vmm.has_started_session());
 
         fs::remove_file(config_path).expect("fixture config should clean up");
     }
