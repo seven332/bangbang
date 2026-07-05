@@ -76,6 +76,8 @@ pub enum VmmAction {
     LoadSnapshot,
     FlushMetrics,
     PutEntropy,
+    PutPmem,
+    PatchPmem,
     PutBootSource(boot::BootSourceConfigInput),
     PutCpuConfig(cpu::CpuConfigInput),
     PutLogger(logger::LoggerConfigInput),
@@ -108,6 +110,8 @@ impl VmmAction {
             Self::LoadSnapshot => "LoadSnapshot",
             Self::FlushMetrics => "FlushMetrics",
             Self::PutEntropy => "PutEntropy",
+            Self::PutPmem => "PutPmem",
+            Self::PatchPmem => "PatchPmem",
             Self::PutBootSource(_) => "PutBootSource",
             Self::PutCpuConfig(_) => "PutCpuConfig",
             Self::PutLogger(_) => "PutLogger",
@@ -213,6 +217,7 @@ pub enum VmmActionError {
     MmdsState(mmds::MmdsStateLockError),
     NetworkInterfaceConfig(network::NetworkInterfaceConfigError),
     NetworkInterfaceUpdateUnsupported,
+    PmemUnsupported,
     SerialConfig(serial::SerialConfigError),
     SnapshotUnsupported,
     VsockConfig(vsock::VsockConfigError),
@@ -249,6 +254,7 @@ impl fmt::Display for VmmActionError {
             Self::NetworkInterfaceUpdateUnsupported => {
                 f.write_str("Network interface updates are not supported.")
             }
+            Self::PmemUnsupported => f.write_str("Pmem device is not supported."),
             Self::SerialConfig(err) => write!(f, "{err}"),
             Self::SnapshotUnsupported => f.write_str("Snapshot and restore are not supported."),
             Self::VsockConfig(err) => write!(f, "{err}"),
@@ -276,6 +282,7 @@ impl std::error::Error for VmmActionError {
             Self::EntropyUnsupported
             | Self::MissingBootSource
             | Self::NetworkInterfaceUpdateUnsupported
+            | Self::PmemUnsupported
             | Self::SnapshotUnsupported
             | Self::UnsupportedAction(_)
             | Self::UnsupportedState { .. } => None,
@@ -627,6 +634,26 @@ impl VmmController {
                 }
 
                 Err(VmmActionError::EntropyUnsupported)
+            }
+            VmmAction::PutPmem => {
+                if self.instance_info.state != InstanceState::NotStarted {
+                    return Err(VmmActionError::UnsupportedState {
+                        action: action_name,
+                        state: self.instance_info.state,
+                    });
+                }
+
+                Err(VmmActionError::PmemUnsupported)
+            }
+            VmmAction::PatchPmem => {
+                if self.instance_info.state == InstanceState::NotStarted {
+                    return Err(VmmActionError::UnsupportedState {
+                        action: action_name,
+                        state: self.instance_info.state,
+                    });
+                }
+
+                Err(VmmActionError::PmemUnsupported)
             }
             VmmAction::PutBootSource(config) => {
                 if self.instance_info.state != InstanceState::NotStarted {
@@ -1217,6 +1244,8 @@ mod tests {
         assert_eq!(VmmAction::LoadSnapshot.name(), "LoadSnapshot");
         assert_eq!(VmmAction::FlushMetrics.name(), "FlushMetrics");
         assert_eq!(VmmAction::PutEntropy.name(), "PutEntropy");
+        assert_eq!(VmmAction::PutPmem.name(), "PutPmem");
+        assert_eq!(VmmAction::PatchPmem.name(), "PatchPmem");
         assert_eq!(
             VmmAction::PutCpuConfig(CpuConfigInput::noop()).name(),
             "PutCpuConfig"
@@ -1452,6 +1481,96 @@ mod tests {
                     state,
                 }
             );
+            assert_eq!(controller.instance_info().state, state);
+            assert!(controller.boot_source_config().is_some());
+            assert!(controller.drive_configs().is_empty());
+            assert!(controller.network_interface_configs().is_empty());
+        }
+    }
+
+    #[test]
+    fn put_pmem_reaches_pmem_fault_before_start_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PutPmem)
+            .expect_err("pmem should remain unsupported");
+
+        assert_eq!(err, VmmActionError::PmemUnsupported);
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert!(controller.boot_source_config().is_some());
+        assert!(controller.drive_configs().is_empty());
+        assert!(controller.network_interface_configs().is_empty());
+    }
+
+    #[test]
+    fn patch_pmem_rejects_not_started_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PatchPmem)
+            .expect_err("pmem patch should be post-boot-only");
+
+        assert_eq!(
+            err,
+            VmmActionError::UnsupportedState {
+                action: VmmAction::PatchPmem.name(),
+                state: InstanceState::NotStarted,
+            }
+        );
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert!(controller.boot_source_config().is_some());
+        assert!(controller.drive_configs().is_empty());
+        assert!(controller.network_interface_configs().is_empty());
+    }
+
+    #[test]
+    fn put_pmem_rejects_running_or_paused_without_mutating() {
+        for state in [InstanceState::Running, InstanceState::Paused] {
+            let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+            controller
+                .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+                .expect("boot source config should be stored");
+            controller.instance_info.state = state;
+
+            let err = controller
+                .handle_action(VmmAction::PutPmem)
+                .expect_err("pmem put should be pre-boot-only");
+
+            assert_eq!(
+                err,
+                VmmActionError::UnsupportedState {
+                    action: VmmAction::PutPmem.name(),
+                    state,
+                }
+            );
+            assert_eq!(controller.instance_info().state, state);
+            assert!(controller.boot_source_config().is_some());
+            assert!(controller.drive_configs().is_empty());
+            assert!(controller.network_interface_configs().is_empty());
+        }
+    }
+
+    #[test]
+    fn patch_pmem_reaches_pmem_fault_after_start_without_mutating() {
+        for state in [InstanceState::Running, InstanceState::Paused] {
+            let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+            controller
+                .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+                .expect("boot source config should be stored");
+            controller.instance_info.state = state;
+
+            let err = controller
+                .handle_action(VmmAction::PatchPmem)
+                .expect_err("pmem should remain unsupported");
+
+            assert_eq!(err, VmmActionError::PmemUnsupported);
             assert_eq!(controller.instance_info().state, state);
             assert!(controller.boot_source_config().is_some());
             assert!(controller.drive_configs().is_empty());
@@ -3734,6 +3853,14 @@ mod tests {
         let err = VmmActionError::EntropyUnsupported;
 
         assert_eq!(err.to_string(), "Entropy device is not supported.");
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn displays_pmem_unsupported_error() {
+        let err = VmmActionError::PmemUnsupported;
+
+        assert_eq!(err.to_string(), "Pmem device is not supported.");
         assert!(err.source().is_none());
     }
 

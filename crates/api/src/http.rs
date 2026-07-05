@@ -38,6 +38,8 @@ pub enum ApiRequest {
     PutMmdsConfig(Box<MmdsConfigRequest>),
     PutNetworkInterface(Box<NetworkInterfaceConfigRequest>),
     PatchNetworkInterface(Box<NetworkInterfacePatchRequest>),
+    PutPmem,
+    PatchPmem,
     PutSerial(Box<SerialConfigRequest>),
     PutSnapshotCreate,
     PutSnapshotLoad,
@@ -2065,7 +2067,7 @@ fn parse_pmem_config_request(path_pmem_id: &str, body: &[u8]) -> Result<ApiReque
     } = body;
     let _ = (id, path_on_host, root_device, read_only, rate_limiter);
 
-    Err(RequestError::PmemUnsupported)
+    Ok(ApiRequest::PutPmem)
 }
 
 fn parse_pmem_patch_request(path_pmem_id: &str, body: &[u8]) -> Result<ApiRequest, RequestError> {
@@ -2080,7 +2082,7 @@ fn parse_pmem_patch_request(path_pmem_id: &str, body: &[u8]) -> Result<ApiReques
     let PmemPatchRequestBody { id, rate_limiter } = body;
     let _ = (id, rate_limiter);
 
-    Err(RequestError::PmemUnsupported)
+    Ok(ApiRequest::PatchPmem)
 }
 
 fn parse_network_interface_config_request(
@@ -2521,6 +2523,7 @@ impl From<ApiRequest> for Endpoint {
             ApiRequest::PutNetworkInterface(_) | ApiRequest::PatchNetworkInterface(_) => {
                 Self::NetworkInterface
             }
+            ApiRequest::PutPmem | ApiRequest::PatchPmem => Self::Pmem,
             ApiRequest::PutSerial(_) => Self::Serial,
             ApiRequest::PutSnapshotCreate | ApiRequest::PutSnapshotLoad => Self::Snapshot,
             ApiRequest::PutVsock(_) => Self::Vsock,
@@ -5190,7 +5193,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_valid_pmem_body_methods_as_unsupported() {
+    fn parses_valid_pmem_body_methods() {
         for (route, request) in [
             (
                 "PUT /pmem/pmem0",
@@ -5253,9 +5256,11 @@ mod tests {
                 ),
             ),
         ] {
-            let err = parse_request(&request).expect_err("pmem should be unsupported");
-            assert_eq!(err, RequestError::PmemUnsupported, "{route}");
-            assert_eq!(err.fault_message(), "Pmem device is not supported.");
+            let parsed = parse_request(&request).expect("pmem request should parse");
+            match (route.starts_with("PUT"), parsed) {
+                (true, ApiRequest::PutPmem) | (false, ApiRequest::PatchPmem) => {}
+                (_, other) => panic!("unexpected pmem request for {route}: {other:?}"),
+            }
         }
     }
 
@@ -6170,6 +6175,24 @@ mod tests {
         .expect("network interface patch request should parse");
 
         assert_eq!(Endpoint::from(request), Endpoint::NetworkInterface);
+
+        let request = parse_request(&request_with_body(
+            "PUT",
+            "/pmem/pmem0",
+            r#"{"id":"pmem0","path_on_host":"/tmp/pmem.img"}"#,
+        ))
+        .expect("pmem request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::Pmem);
+
+        let request = parse_request(&request_with_body(
+            "PATCH",
+            "/pmem/pmem0",
+            r#"{"id":"pmem0"}"#,
+        ))
+        .expect("pmem patch request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::Pmem);
 
         let request = parse_request(&request_with_body(
             "PUT",

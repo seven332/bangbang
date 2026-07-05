@@ -14,6 +14,7 @@ pub enum Endpoint {
     Mmds,
     Drive,
     NetworkInterface,
+    Pmem,
     Serial,
     Snapshot,
     Vsock,
