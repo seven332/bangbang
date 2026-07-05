@@ -22,6 +22,7 @@ pub enum ApiRequest {
     GetBalloon,
     GetBalloonStats,
     GetBalloonHintingStatus,
+    GetMemoryHotplug,
     GetMachineConfig,
     GetMmds,
     GetVmConfig,
@@ -32,10 +33,12 @@ pub enum ApiRequest {
     PutCpuConfig(Box<CpuConfigRequest>),
     PutDrive(Box<DriveConfigRequest>),
     PutEntropy,
+    PutMemoryHotplug,
     PatchBalloon,
     PatchBalloonStats,
     PatchBalloonHintingStart,
     PatchBalloonHintingStop,
+    PatchMemoryHotplug,
     PatchDrive(Box<DrivePatchRequest>),
     PatchVmState(Box<VmStateUpdateRequest>),
     PutLogger(Box<LoggerConfigRequest>),
@@ -65,7 +68,6 @@ pub enum RequestError {
     MismatchedInterfaceId,
     MismatchedPmemId,
     MalformedRequest,
-    MemoryHotplugUnsupported,
     NetworkInterfaceUpdateUnsupported,
     PayloadTooLarge,
     PmemUnsupported,
@@ -83,7 +85,6 @@ impl RequestError {
             Self::MismatchedInterfaceId => "path iface_id must match body iface_id.",
             Self::MismatchedPmemId => "path pmem id must match body id.",
             Self::MalformedRequest => "Malformed HTTP request.",
-            Self::MemoryHotplugUnsupported => "Memory hotplug is not supported.",
             Self::NetworkInterfaceUpdateUnsupported => {
                 "Network interface updates are not supported."
             }
@@ -1449,7 +1450,7 @@ pub fn parse_request_with_limit(
     }
 
     if method == "GET" && path == "/hotplug/memory" {
-        return Err(RequestError::MemoryHotplugUnsupported);
+        return Ok(ApiRequest::GetMemoryHotplug);
     }
     if method == "PUT" && path == "/hotplug/memory" {
         return parse_memory_hotplug_config_request(body);
@@ -1996,7 +1997,7 @@ fn parse_memory_hotplug_config_request(body: &[u8]) -> Result<ApiRequest, Reques
         .map_err(|_| RequestError::MalformedRequest)?;
     let _ = (total_size_mib, block_size_mib, slot_size_mib);
 
-    Err(RequestError::MemoryHotplugUnsupported)
+    Ok(ApiRequest::PutMemoryHotplug)
 }
 
 fn parse_memory_hotplug_size_update_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
@@ -2005,7 +2006,7 @@ fn parse_memory_hotplug_size_update_request(body: &[u8]) -> Result<ApiRequest, R
             .map_err(|_| RequestError::MalformedRequest)?;
     let _ = requested_size_mib;
 
-    Err(RequestError::MemoryHotplugUnsupported)
+    Ok(ApiRequest::PatchMemoryHotplug)
 }
 
 fn parse_drive_config_request(
@@ -2515,6 +2516,9 @@ impl From<ApiRequest> for Endpoint {
             ApiRequest::GetMmds => Self::Mmds,
             ApiRequest::GetVmConfig => Self::VmConfig,
             ApiRequest::GetVersion => Self::Version,
+            ApiRequest::GetMemoryHotplug
+            | ApiRequest::PutMemoryHotplug
+            | ApiRequest::PatchMemoryHotplug => Self::MemoryHotplug,
             ApiRequest::GetBalloon
             | ApiRequest::GetBalloonStats
             | ApiRequest::GetBalloonHintingStatus
@@ -5139,33 +5143,38 @@ mod tests {
     }
 
     #[test]
-    fn rejects_memory_hotplug_methods_as_unsupported() {
+    fn parses_memory_hotplug_methods_after_schema_validation() {
         let get_request = b"GET /hotplug/memory HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        let err = parse_request(get_request).expect_err("memory hotplug should be unsupported");
-        assert_eq!(err, RequestError::MemoryHotplugUnsupported, "GET");
-        assert_eq!(err.fault_message(), "Memory hotplug is not supported.");
+        assert_eq!(
+            parse_request(get_request),
+            Ok(ApiRequest::GetMemoryHotplug),
+            "GET"
+        );
 
-        for (method, body) in [
-            ("PUT", r#"{"total_size_mib":2048}"#),
+        for (method, body, expected) in [
+            (
+                "PUT",
+                r#"{"total_size_mib":2048}"#,
+                ApiRequest::PutMemoryHotplug,
+            ),
             (
                 "PUT",
                 r#"{"total_size_mib":2048,"block_size_mib":2,"slot_size_mib":128}"#,
+                ApiRequest::PutMemoryHotplug,
             ),
-            ("PATCH", r#"{"requested_size_mib":256}"#),
+            (
+                "PATCH",
+                r#"{"requested_size_mib":256}"#,
+                ApiRequest::PatchMemoryHotplug,
+            ),
         ] {
             let request = request_with_body(method, "/hotplug/memory", body);
-            let err = parse_request(&request).expect_err("memory hotplug should be unsupported");
-            assert_eq!(
-                err,
-                RequestError::MemoryHotplugUnsupported,
-                "{method} {body}"
-            );
-            assert_eq!(err.fault_message(), "Memory hotplug is not supported.");
+            assert_eq!(parse_request(&request), Ok(expected), "{method} {body}");
         }
     }
 
     #[test]
-    fn rejects_invalid_memory_hotplug_body_methods_before_unsupported() {
+    fn rejects_invalid_memory_hotplug_body_methods_before_vmm_dispatch() {
         for (method, body) in [
             ("PUT", "not-json"),
             ("PUT", ""),
@@ -6137,6 +6146,29 @@ mod tests {
             .expect("entropy request should parse");
 
         assert_eq!(Endpoint::from(request), Endpoint::Entropy);
+
+        assert_eq!(
+            Endpoint::from(ApiRequest::GetMemoryHotplug),
+            Endpoint::MemoryHotplug
+        );
+
+        let request = parse_request(&request_with_body(
+            "PUT",
+            "/hotplug/memory",
+            r#"{"total_size_mib":2048}"#,
+        ))
+        .expect("memory hotplug request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::MemoryHotplug);
+
+        let request = parse_request(&request_with_body(
+            "PATCH",
+            "/hotplug/memory",
+            r#"{"requested_size_mib":1024}"#,
+        ))
+        .expect("memory hotplug patch request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::MemoryHotplug);
 
         let request = parse_request(&request_with_body("PUT", "/logger", "{}"))
             .expect("logger request should parse");

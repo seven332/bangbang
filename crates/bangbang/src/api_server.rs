@@ -594,6 +594,15 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PatchBalloonHintingStop => {
             handle_empty(vmm.handle_action(VmmAction::PatchBalloonHintingStop))
         }
+        ApiRequest::GetMemoryHotplug => {
+            handle_empty(vmm.handle_action(VmmAction::GetMemoryHotplug))
+        }
+        ApiRequest::PutMemoryHotplug => {
+            handle_empty(vmm.handle_action(VmmAction::PutMemoryHotplug))
+        }
+        ApiRequest::PatchMemoryHotplug => {
+            handle_empty(vmm.handle_action(VmmAction::PatchMemoryHotplug))
+        }
         ApiRequest::PutEntropy => handle_empty(vmm.handle_action(VmmAction::PutEntropy)),
         ApiRequest::PutPmem => handle_empty(vmm.handle_action(VmmAction::PutPmem)),
         ApiRequest::PatchPmem => handle_empty(vmm.handle_action(VmmAction::PatchPmem)),
@@ -656,6 +665,7 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         | ApiRequest::GetBalloonStats
         | ApiRequest::GetBalloonHintingStatus
         | ApiRequest::GetMachineConfig
+        | ApiRequest::GetMemoryHotplug
         | ApiRequest::GetMmds
         | ApiRequest::GetVmConfig
         | ApiRequest::GetVersion
@@ -666,12 +676,14 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         | ApiRequest::PatchDrive(_)
         | ApiRequest::PatchMachineConfig(_)
         | ApiRequest::PatchMmds(_)
+        | ApiRequest::PatchMemoryHotplug
         | ApiRequest::PatchNetworkInterface(_)
         | ApiRequest::PatchPmem
         | ApiRequest::PatchVmState(_)
         | ApiRequest::PutAction(_)
         | ApiRequest::PutBalloon
         | ApiRequest::PutEntropy
+        | ApiRequest::PutMemoryHotplug
         | ApiRequest::PutMmds(_)
         | ApiRequest::PutPmem
         | ApiRequest::PutSnapshotCreate
@@ -4739,7 +4751,7 @@ mod tests {
             (
                 "mh-get",
                 "GET /hotplug/memory HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
-                "Memory hotplug is not supported.",
+                "The requested operation is not supported in Not started state: GetMemoryHotplug",
             ),
             (
                 "mh-put",
@@ -4754,7 +4766,7 @@ mod tests {
             (
                 "mh-patch",
                 request_with_body("PATCH", "/hotplug/memory", r#"{"requested_size_mib":256}"#),
-                "Memory hotplug is not supported.",
+                "The requested operation is not supported in Not started state: PatchMemoryHotplug",
             ),
             (
                 "mh-patch-bad",
@@ -4776,6 +4788,58 @@ mod tests {
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::NotStarted
+        );
+    }
+
+    #[test]
+    fn running_state_rejects_memory_hotplug_endpoints_without_echoing_request_fields() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_request = request_with_body("PUT", "/boot-source", boot_body);
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "mh-start", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        for (socket_name, request, fault_message) in [
+            (
+                "mhgr",
+                "GET /hotplug/memory HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
+                "Memory hotplug is not supported.",
+            ),
+            (
+                "mhpr",
+                request_with_body(
+                    "PUT",
+                    "/hotplug/memory",
+                    r#"{"total_size_mib":222222222,"block_size_mib":2,"slot_size_mib":128}"#,
+                ),
+                "The requested operation is not supported in Running state: PutMemoryHotplug",
+            ),
+            (
+                "mhpar",
+                request_with_body(
+                    "PATCH",
+                    "/hotplug/memory",
+                    r#"{"requested_size_mib":222222222}"#,
+                ),
+                "Memory hotplug is not supported.",
+            ),
+        ] {
+            let response = request_over_socket(&mut vmm, socket_name, &request);
+
+            assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+            assert!(response.contains(&format!(r#"{{"fault_message":"{fault_message}"}}"#)));
+            assert!(
+                !response.contains("222222222"),
+                "memory hotplug response must not echo request sizes: {response}"
+            );
+        }
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::Running
         );
     }
 
