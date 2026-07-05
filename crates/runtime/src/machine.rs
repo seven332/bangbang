@@ -1,10 +1,15 @@
 //! Backend-neutral machine configuration model.
 
+use crate::memory::aarch64;
+
 use std::fmt;
+
+const MIB: u64 = 1024 * 1024;
 
 pub const DEFAULT_VCPU_COUNT: u8 = 1;
 pub const DEFAULT_MEM_SIZE_MIB: u64 = 128;
 pub const MAX_SUPPORTED_VCPUS: u8 = 32;
+pub const MAX_MEM_SIZE_MIB: u64 = aarch64::DRAM_MEM_MAX_SIZE / MIB;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MachineConfigInput {
@@ -172,6 +177,18 @@ impl MachineConfig {
     pub const fn huge_pages(self) -> MachineConfigHugePages {
         self.huge_pages
     }
+
+    #[cfg(test)]
+    pub(crate) const fn new_unchecked_for_tests(vcpu_count: u8, mem_size_mib: u64) -> Self {
+        Self {
+            vcpu_count,
+            mem_size_mib,
+            smt: false,
+            cpu_template: None,
+            track_dirty_pages: false,
+            huge_pages: MachineConfigHugePages::None,
+        }
+    }
 }
 
 impl Default for MachineConfig {
@@ -194,7 +211,7 @@ impl TryFrom<MachineConfigInput> for MachineConfig {
         if input.vcpu_count == 0 || input.vcpu_count > MAX_SUPPORTED_VCPUS {
             return Err(MachineConfigError::InvalidVcpuCount);
         }
-        if input.mem_size_mib == 0 {
+        if input.mem_size_mib == 0 || input.mem_size_mib > MAX_MEM_SIZE_MIB {
             return Err(MachineConfigError::InvalidMemorySize);
         }
         if input.smt {
@@ -275,7 +292,9 @@ impl fmt::Display for MachineConfigError {
             Self::InvalidVcpuCount => {
                 write!(f, "machine vcpu_count must be in 1..={MAX_SUPPORTED_VCPUS}")
             }
-            Self::InvalidMemorySize => f.write_str("machine mem_size_mib must not be zero"),
+            Self::InvalidMemorySize => {
+                write!(f, "machine mem_size_mib must be in 1..={MAX_MEM_SIZE_MIB}")
+            }
             Self::SmtNotSupported => f.write_str("machine smt is not supported"),
             Self::UnsupportedCpuTemplate { cpu_template } => {
                 write!(f, "machine cpu_template {cpu_template} is not supported")
@@ -321,6 +340,15 @@ mod tests {
     }
 
     #[test]
+    fn accepts_maximum_machine_memory_size() {
+        let config = MachineConfigInput::new(1, MAX_MEM_SIZE_MIB)
+            .validate()
+            .expect("maximum memory size should validate");
+
+        assert_eq!(config.mem_size_mib(), MAX_MEM_SIZE_MIB);
+    }
+
+    #[test]
     fn rejects_invalid_machine_config_input() {
         for (input, expected) in [
             (
@@ -333,6 +361,14 @@ mod tests {
             ),
             (
                 MachineConfigInput::new(1, 0),
+                MachineConfigError::InvalidMemorySize,
+            ),
+            (
+                MachineConfigInput::new(1, MAX_MEM_SIZE_MIB + 1),
+                MachineConfigError::InvalidMemorySize,
+            ),
+            (
+                MachineConfigInput::new(1, u64::MAX),
                 MachineConfigError::InvalidMemorySize,
             ),
             (
@@ -401,6 +437,10 @@ mod tests {
                 MachineConfigError::InvalidMemorySize,
             ),
             (
+                MachineConfigPatchInput::new().with_mem_size_mib(MAX_MEM_SIZE_MIB + 1),
+                MachineConfigError::InvalidMemorySize,
+            ),
+            (
                 MachineConfigPatchInput::new().with_smt(true),
                 MachineConfigError::SmtNotSupported,
             ),
@@ -440,7 +480,7 @@ mod tests {
         );
         assert_eq!(
             MachineConfigError::InvalidMemorySize.to_string(),
-            "machine mem_size_mib must not be zero"
+            format!("machine mem_size_mib must be in 1..={MAX_MEM_SIZE_MIB}")
         );
         assert_eq!(
             MachineConfigError::SmtNotSupported.to_string(),

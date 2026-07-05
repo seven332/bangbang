@@ -1072,6 +1072,7 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use bangbang_runtime::logger::{LoggerConfigInput, LoggerWriteError};
+    use bangbang_runtime::machine::MAX_MEM_SIZE_MIB;
     use bangbang_runtime::metrics::{
         BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics,
     };
@@ -1805,6 +1806,30 @@ mod tests {
         assert_eq!(vmm.machine_config().mem_size_mib(), 256);
         assert!(!vmm.machine_config().track_dirty_pages());
 
+        let oversized_mem_size_mib = MAX_MEM_SIZE_MIB + 1;
+        let oversized_body =
+            format!(r#"{{"vcpu_count":4,"mem_size_mib":{oversized_mem_size_mib}}}"#);
+        let oversized_request = format!(
+            "PUT /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{oversized_body}",
+            oversized_body.len()
+        );
+
+        let response = handle_request_bytes(oversized_request.as_bytes(), &mut vmm);
+
+        assert_eq!(
+            response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+        assert_eq!(
+            response.body(),
+            format!(
+                r#"{{"fault_message":"machine mem_size_mib must be in 1..={MAX_MEM_SIZE_MIB}"}}"#
+            )
+        );
+        assert_eq!(vmm.machine_config().vcpu_count(), 2);
+        assert_eq!(vmm.machine_config().mem_size_mib(), 256);
+        assert!(!vmm.machine_config().track_dirty_pages());
+
         let invalid_patch_body = r#"{"mem_size_mib":0}"#;
         let invalid_patch_request = format!(
             "PATCH /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{invalid_patch_body}",
@@ -1820,6 +1845,28 @@ mod tests {
         assert_eq!(
             response.body(),
             r#"{"fault_message":"Malformed HTTP request."}"#
+        );
+        assert_eq!(vmm.machine_config().vcpu_count(), 2);
+        assert_eq!(vmm.machine_config().mem_size_mib(), 256);
+        assert!(!vmm.machine_config().track_dirty_pages());
+
+        let oversized_patch_body = format!(r#"{{"mem_size_mib":{oversized_mem_size_mib}}}"#);
+        let oversized_patch_request = format!(
+            "PATCH /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{oversized_patch_body}",
+            oversized_patch_body.len()
+        );
+
+        let response = handle_request_bytes(oversized_patch_request.as_bytes(), &mut vmm);
+
+        assert_eq!(
+            response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+        assert_eq!(
+            response.body(),
+            format!(
+                r#"{{"fault_message":"machine mem_size_mib must be in 1..={MAX_MEM_SIZE_MIB}"}}"#
+            )
         );
         assert_eq!(vmm.machine_config().vcpu_count(), 2);
         assert_eq!(vmm.machine_config().mem_size_mib(), 256);

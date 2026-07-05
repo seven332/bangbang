@@ -1340,7 +1340,7 @@ mod tests {
     };
     use crate::fdt::{Arm64FdtError, Arm64FdtGic, Arm64FdtRegion, Arm64FdtTimerInterrupts};
     use crate::interrupt::{DeviceInterruptKind, GuestInterruptLine};
-    use crate::machine::MachineConfigInput;
+    use crate::machine::{MachineConfig, MachineConfigInput};
     use crate::memory::{GuestAddress, aarch64};
     use crate::mmio::{
         MmioAccessBytes, MmioBusError, MmioDispatchOutcome, MmioDispatcher, MmioOperation,
@@ -4785,15 +4785,11 @@ mod tests {
     }
 
     #[test]
-    fn oversized_memory_fails_before_boot_source_load() {
+    fn memory_size_bytes_rejects_oversized_unchecked_config() {
         let mem_size_mib = aarch64::DRAM_MEM_MAX_SIZE / MIB + 1;
-        let controller = controller_with_kernel_and_memory(
-            &missing_path("oversized-memory-kernel"),
-            mem_size_mib,
-        );
+        let config = MachineConfig::new_unchecked_for_tests(1, mem_size_mib);
 
-        let err = Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
-            .expect_err("oversized memory should fail");
+        let err = super::memory_size_bytes(config).expect_err("oversized memory should fail");
 
         assert!(matches!(
             err,
