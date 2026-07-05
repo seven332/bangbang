@@ -4588,12 +4588,16 @@ mod tests {
             ("PUT", ""),
             ("PUT", "{}"),
             ("PUT", r#"{"size_mib":128}"#),
+            ("PUT", r#"{"total_size_mib":-1}"#),
             ("PUT", r#"{"total_size_mib":"2048"}"#),
             ("PUT", r#"{"total_size_mib":2048,"block_size_mib":null}"#),
+            ("PUT", r#"{"total_size_mib":2048,"slot_size_mib":null}"#),
             ("PATCH", "not-json"),
             ("PATCH", ""),
             ("PATCH", "{}"),
             ("PATCH", r#"{"size_mib":256}"#),
+            ("PATCH", r#"{"requested_size_mib":-1}"#),
+            ("PATCH", r#"{"requested_size_mib":null}"#),
             ("PATCH", r#"{"requested_size_mib":"256"}"#),
         ] {
             let request = request_with_body(method, "/hotplug/memory", body);
