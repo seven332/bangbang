@@ -200,6 +200,34 @@ mod macos_arm64 {
             "GET / after rejected PUT /cpu-config",
         );
 
+        let replacement_put_backing_path = test_dir.path().join("replacement-put-data.img");
+        let replacement_put_backing_path_json =
+            json_string(path_text(&replacement_put_backing_path));
+        let drive_put_body = format!(
+            r#"{{
+                "drive_id":"replacement",
+                "path_on_host":{replacement_put_backing_path_json},
+                "is_root_device":false,
+                "is_read_only":false
+            }}"#
+        );
+        let drive_put_response =
+            http_put_json(&socket_path, "/drives/replacement", &drive_put_body);
+        assert_bad_request_response(
+            &drive_put_response,
+            "PUT /drives/replacement after InstanceStart",
+        );
+        assert_response_contains(
+            &drive_put_response,
+            r#"{"fault_message":"The requested operation is not supported in Running state: PutDrive"}"#,
+            "PUT /drives/replacement after InstanceStart",
+        );
+        assert!(
+            !replacement_put_backing_path.exists(),
+            "rejected drive PUT must not create or use replacement backing path {}",
+            replacement_put_backing_path.display()
+        );
+
         let replacement_backing_path = test_dir.path().join("replacement-data.img");
         let replacement_backing_path_json = json_string(path_text(&replacement_backing_path));
         let drive_update_body = format!(
@@ -379,6 +407,16 @@ mod macos_arm64 {
                 r#""path_on_host":{replacement_backing_path_json}"#
             )),
             "rejected drive update must not mutate the configured drive path; response:\n{vm_config}"
+        );
+        assert!(
+            !vm_config.contains(r#""drive_id":"replacement""#),
+            "rejected drive PUT must not add replacement drive; response:\n{vm_config}"
+        );
+        assert!(
+            !vm_config.contains(&format!(
+                r#""path_on_host":{replacement_put_backing_path_json}"#
+            )),
+            "rejected drive PUT must not store replacement backing path; response:\n{vm_config}"
         );
         assert_response_contains(
             &vm_config,
