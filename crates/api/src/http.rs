@@ -38,6 +38,8 @@ pub enum ApiRequest {
     PutNetworkInterface(Box<NetworkInterfaceConfigRequest>),
     PatchNetworkInterface(Box<NetworkInterfacePatchRequest>),
     PutSerial(Box<SerialConfigRequest>),
+    PutSnapshotCreate,
+    PutSnapshotLoad,
     PutVsock(Box<VsockConfigRequest>),
     PatchMmds(Box<MmdsContentRequest>),
 }
@@ -58,7 +60,6 @@ pub enum RequestError {
     PayloadTooLarge,
     PmemUnsupported,
     SendCtrlAltDelUnsupported,
-    SnapshotUnsupported,
 }
 
 impl RequestError {
@@ -80,7 +81,6 @@ impl RequestError {
             Self::PayloadTooLarge => "HTTP request payload exceeds the configured limit.",
             Self::PmemUnsupported => "Pmem device is not supported.",
             Self::SendCtrlAltDelUnsupported => "SendCtrlAltDel is not supported on aarch64.",
-            Self::SnapshotUnsupported => "Snapshot and restore are not supported.",
         }
     }
 }
@@ -1926,7 +1926,7 @@ fn parse_snapshot_create_request(body: &[u8]) -> Result<ApiRequest, RequestError
         .map_err(|_| RequestError::MalformedRequest)?;
     let _ = (snapshot_type, snapshot_path, mem_file_path);
 
-    Err(RequestError::SnapshotUnsupported)
+    Ok(ApiRequest::PutSnapshotCreate)
 }
 
 fn parse_snapshot_load_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
@@ -1975,7 +1975,7 @@ fn parse_snapshot_load_request(body: &[u8]) -> Result<ApiRequest, RequestError> 
         let _ = uds_path;
     }
 
-    Err(RequestError::SnapshotUnsupported)
+    Ok(ApiRequest::PutSnapshotLoad)
 }
 
 fn parse_memory_hotplug_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
@@ -2522,6 +2522,7 @@ impl From<ApiRequest> for Endpoint {
                 Self::NetworkInterface
             }
             ApiRequest::PutSerial(_) => Self::Serial,
+            ApiRequest::PutSnapshotCreate | ApiRequest::PutSnapshotLoad => Self::Snapshot,
             ApiRequest::PutVsock(_) => Self::Vsock,
         }
     }
@@ -5536,7 +5537,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_valid_snapshot_create_as_unsupported() {
+    fn parses_valid_snapshot_create_requests() {
         for body in [
             r#"{"snapshot_path":"vmstate","mem_file_path":"memory"}"#,
             r#"{"snapshot_type":"Full","snapshot_path":"vmstate","mem_file_path":"memory"}"#,
@@ -5544,11 +5545,9 @@ mod tests {
         ] {
             let request = request_with_body("PUT", "/snapshot/create", body);
 
-            let err = parse_request(&request).expect_err("snapshot create should be unsupported");
-            assert_eq!(err, RequestError::SnapshotUnsupported, "{body}");
             assert_eq!(
-                err.fault_message(),
-                "Snapshot and restore are not supported.",
+                parse_request(&request),
+                Ok(ApiRequest::PutSnapshotCreate),
                 "{body}"
             );
         }
@@ -5581,7 +5580,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_valid_snapshot_load_as_unsupported() {
+    fn parses_valid_snapshot_load_requests() {
         for body in [
             r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"}}"#,
             r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"Uffd"},"enable_diff_snapshots":true,"track_dirty_pages":true,"resume_vm":true,"clock_realtime":true}"#,
@@ -5591,11 +5590,9 @@ mod tests {
         ] {
             let request = request_with_body("PUT", "/snapshot/load", body);
 
-            let err = parse_request(&request).expect_err("snapshot load should be unsupported");
-            assert_eq!(err, RequestError::SnapshotUnsupported, "{body}");
             assert_eq!(
-                err.fault_message(),
-                "Snapshot and restore are not supported.",
+                parse_request(&request),
+                Ok(ApiRequest::PutSnapshotLoad),
                 "{body}"
             );
         }
@@ -6179,5 +6176,23 @@ mod tests {
         .expect("vsock request should parse");
 
         assert_eq!(Endpoint::from(request), Endpoint::Vsock);
+
+        let request = parse_request(&request_with_body(
+            "PUT",
+            "/snapshot/create",
+            r#"{"snapshot_path":"vmstate","mem_file_path":"memory"}"#,
+        ))
+        .expect("snapshot create request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::Snapshot);
+
+        let request = parse_request(&request_with_body(
+            "PUT",
+            "/snapshot/load",
+            r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"}}"#,
+        ))
+        .expect("snapshot load request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::Snapshot);
     }
 }

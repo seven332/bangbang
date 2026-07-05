@@ -14,5 +14,6 @@ pub enum Endpoint {
     Drive,
     NetworkInterface,
     Serial,
+    Snapshot,
     Vsock,
 }
