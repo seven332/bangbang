@@ -878,6 +878,16 @@ struct NetworkInterfaceConfigRequestBody {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct NetworkInterfacePatchRequestBody {
+    iface_id: String,
+    #[serde(default)]
+    rx_rate_limiter: Option<serde_json::Value>,
+    #[serde(default)]
+    tx_rate_limiter: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct VsockConfigRequestBody {
     #[serde(default)]
     vsock_id: Option<String>,
@@ -1251,7 +1261,12 @@ pub fn parse_request_with_limit(
     if method == "DELETE" && drive_path_id(path).is_some() {
         return Err(RequestError::DriveUpdateUnsupported);
     }
-    if matches!(method, "PATCH" | "DELETE") && network_interface_path_id(path).is_some() {
+    if method == "PATCH"
+        && let Some(path_iface_id) = network_interface_path_id(path)
+    {
+        return parse_network_interface_patch_request(path_iface_id, body);
+    }
+    if method == "DELETE" && network_interface_path_id(path).is_some() {
         return Err(RequestError::NetworkInterfaceUpdateUnsupported);
     }
 
@@ -1707,6 +1722,25 @@ fn parse_network_interface_config_request(
             tx_rate_limiter_configured,
         },
     )))
+}
+
+fn parse_network_interface_patch_request(
+    path_iface_id: &str,
+    body: &[u8],
+) -> Result<ApiRequest, RequestError> {
+    let body = serde_json::from_slice::<NetworkInterfacePatchRequestBody>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+    if path_iface_id != body.iface_id {
+        return Err(RequestError::MismatchedInterfaceId);
+    }
+    for rate_limiter in [&body.rx_rate_limiter, &body.tx_rate_limiter]
+        .into_iter()
+        .flatten()
+    {
+        validate_rate_limiter_config(rate_limiter)?;
+    }
+
+    Err(RequestError::NetworkInterfaceUpdateUnsupported)
 }
 
 fn parse_machine_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
@@ -4019,23 +4053,73 @@ mod tests {
     }
 
     #[test]
-    fn rejects_network_interface_update_and_hot_unplug_as_unsupported() {
+    fn rejects_valid_network_interface_patch_as_unsupported() {
+        for body in [
+            r#"{"iface_id":"eth0"}"#,
+            r#"{"iface_id":"eth0","rx_rate_limiter":null,"tx_rate_limiter":null}"#,
+            r#"{"iface_id":"eth0","rx_rate_limiter":{"bandwidth":{"size":100,"one_time_burst":null,"refill_time":1000}}}"#,
+            r#"{"iface_id":"eth0","tx_rate_limiter":{"ops":{"size":100,"one_time_burst":200,"refill_time":1000}}}"#,
+        ] {
+            let request = request_with_body("PATCH", "/network-interfaces/eth0", body);
+            let err = parse_request(&request)
+                .expect_err("network interface update should be unsupported");
+            assert_eq!(
+                err,
+                RequestError::NetworkInterfaceUpdateUnsupported,
+                "{body}"
+            );
+            assert_eq!(
+                err.fault_message(),
+                "Network interface updates are not supported.",
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_network_interface_patch_before_unsupported() {
+        for body in [
+            "not-json",
+            "",
+            "{}",
+            r#"{"iface_id":"eth0","unknown":true}"#,
+            r#"{"iface_id":"eth0","rx_rate_limiter":"unsupported"}"#,
+            r#"{"iface_id":"eth0","rx_rate_limiter":{"ops":{"size":100}}}"#,
+            r#"{"iface_id":"eth0","tx_rate_limiter":{"bandwidth":{"size":100}}}"#,
+        ] {
+            let request = request_with_body("PATCH", "/network-interfaces/eth0", body);
+            assert_eq!(
+                parse_request(&request),
+                Err(RequestError::MalformedRequest),
+                "{body}"
+            );
+        }
+
+        let request = request_with_body(
+            "PATCH",
+            "/network-interfaces/eth0",
+            r#"{"iface_id":"eth1"}"#,
+        );
+        assert_eq!(
+            parse_request(&request),
+            Err(RequestError::MismatchedInterfaceId)
+        );
+    }
+
+    #[test]
+    fn rejects_network_interface_delete_without_parsing_body() {
         for (route, request) in [
-            (
-                "PATCH /network-interfaces/eth0",
-                request_with_body(
-                    "PATCH",
-                    "/network-interfaces/eth0",
-                    r#"{"iface_id":"eth0"}"#,
-                ),
-            ),
             (
                 "DELETE /network-interfaces/eth0",
                 b"DELETE /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
             ),
+            (
+                "DELETE /network-interfaces/eth0 malformed body",
+                request_with_body("DELETE", "/network-interfaces/eth0", "not-json"),
+            ),
         ] {
             let err = parse_request(&request)
-                .expect_err("network interface update should be unsupported");
+                .expect_err("network interface delete should be unsupported");
             assert_eq!(
                 err,
                 RequestError::NetworkInterfaceUpdateUnsupported,
@@ -4044,27 +4128,6 @@ mod tests {
             assert_eq!(
                 err.fault_message(),
                 "Network interface updates are not supported."
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_network_interface_update_without_parsing_body() {
-        for method in ["PATCH", "DELETE"] {
-            let malformed_body = request_with_body(method, "/network-interfaces/eth0", "not-json");
-            let empty_body = format!(
-                "{method} /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
-            );
-
-            assert_eq!(
-                parse_request(&malformed_body),
-                Err(RequestError::NetworkInterfaceUpdateUnsupported),
-                "{method}"
-            );
-            assert_eq!(
-                parse_request(empty_body.as_bytes()),
-                Err(RequestError::NetworkInterfaceUpdateUnsupported),
-                "{method}"
             );
         }
     }
