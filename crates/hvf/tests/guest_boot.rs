@@ -667,6 +667,8 @@ impl GuestBootRunDiagnostics {
             bangbang_hvf::HvfVcpuRunStepOutcome::Hvc { .. } => {
                 self.hvc_steps += 1;
             }
+            bangbang_hvf::HvfVcpuRunStepOutcome::GuestShutdown { .. }
+            | bangbang_hvf::HvfVcpuRunStepOutcome::GuestReset { .. } => {}
             bangbang_hvf::HvfVcpuRunStepOutcome::Sys64 { .. } => {
                 self.sys64_steps += 1;
             }
@@ -891,6 +893,8 @@ fn run_loop_completed_steps(outcome: &bangbang_hvf::HvfArm64BootRunLoopOutcome) 
         bangbang_hvf::HvfArm64BootRunLoopOutcome::StepLimitReached { steps }
         | bangbang_hvf::HvfArm64BootRunLoopOutcome::Stopped { steps }
         | bangbang_hvf::HvfArm64BootRunLoopOutcome::Canceled { steps }
+        | bangbang_hvf::HvfArm64BootRunLoopOutcome::GuestShutdown { steps }
+        | bangbang_hvf::HvfArm64BootRunLoopOutcome::GuestReset { steps }
         | bangbang_hvf::HvfArm64BootRunLoopOutcome::Unknown { steps, .. } => *steps,
     }
 }
@@ -1116,11 +1120,23 @@ mod tests {
             3
         );
         assert_eq!(
-            run_loop_completed_steps(&bangbang_hvf::HvfArm64BootRunLoopOutcome::Unknown {
-                steps: 4,
-                reason: 99
+            run_loop_completed_steps(&bangbang_hvf::HvfArm64BootRunLoopOutcome::GuestShutdown {
+                steps: 4
             }),
             4
+        );
+        assert_eq!(
+            run_loop_completed_steps(&bangbang_hvf::HvfArm64BootRunLoopOutcome::GuestReset {
+                steps: 5
+            }),
+            5
+        );
+        assert_eq!(
+            run_loop_completed_steps(&bangbang_hvf::HvfArm64BootRunLoopOutcome::Unknown {
+                steps: 6,
+                reason: 99
+            }),
+            6
         );
     }
 

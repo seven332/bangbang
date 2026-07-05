@@ -15,7 +15,7 @@ use crate::exit::{
 use crate::gic::{HvfGicError, HvfGicPpiPendingWriter, validate_gic_ppi_pending_intid};
 use crate::mmio::HvfMmioDispatchError;
 use crate::psci::{
-    PsciCall, call_uses_arg0, handle_call as handle_psci_call, not_supported_result,
+    PsciCall, PsciCallAction, call_uses_arg0, handle_call as handle_psci_call, not_supported_result,
 };
 use crate::vcpu::{HvfArm64BootRegisters, HvfRegister, HvfSystemRegister, HvfVcpuOwner};
 
@@ -64,6 +64,16 @@ pub enum HvfVcpuRunnerError {
 pub enum HvfVcpuRunStepOutcome {
     Canceled,
     Hvc {
+        exit: HvfHvcExit,
+        function_id: u64,
+        return_value: u64,
+    },
+    GuestShutdown {
+        exit: HvfHvcExit,
+        function_id: u64,
+        return_value: u64,
+    },
+    GuestReset {
         exit: HvfHvcExit,
         function_id: u64,
         return_value: u64,
@@ -1564,11 +1574,23 @@ fn handle_hvc_on_runner_thread(
     vcpu.write_register(HvfRegister::X0, return_value)
         .map_err(HvfVcpuRunnerError::Backend)?;
 
-    Ok(HvfVcpuRunStepOutcome::Hvc {
-        exit,
-        function_id,
-        return_value,
-    })
+    match result.action() {
+        PsciCallAction::Return => Ok(HvfVcpuRunStepOutcome::Hvc {
+            exit,
+            function_id,
+            return_value,
+        }),
+        PsciCallAction::SystemOff => Ok(HvfVcpuRunStepOutcome::GuestShutdown {
+            exit,
+            function_id,
+            return_value,
+        }),
+        PsciCallAction::SystemReset => Ok(HvfVcpuRunStepOutcome::GuestReset {
+            exit,
+            function_id,
+            return_value,
+        }),
+    }
 }
 
 fn dispatch_mmio_access_on_runner_thread(
@@ -1657,6 +1679,8 @@ mod tests {
     const ESR_ISS_SF: u64 = 1 << 15;
     const PSCI_VERSION: u64 = 0x8400_0000;
     const PSCI_CPU_ON: u64 = 0x8400_0003;
+    const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
+    const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
     const PSCI_FEATURES: u64 = 0x8400_000a;
     const PSCI_VERSION_0_2: u64 = 0x0000_0002;
     const PSCI_RET_SUCCESS: u64 = 0;
@@ -4492,6 +4516,56 @@ mod tests {
             register_write_receiver
                 .recv()
                 .expect("PSCI_FEATURES should write X0"),
+            (HvfRegister::X0, PSCI_RET_SUCCESS)
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn run_once_and_handle_mmio_returns_guest_shutdown_for_psci_system_off() {
+        let (runner, register_write_receiver) = start_psci_run_step_recording_runner_with_x1(
+            PSCI_SYSTEM_OFF,
+            Err(BackendError::InvalidState("X1 should not be read")),
+        );
+
+        assert_eq!(
+            runner.run_once_and_handle_mmio(shared_dispatcher()),
+            Ok(HvfVcpuRunStepOutcome::GuestShutdown {
+                exit: hvc_exit(0),
+                function_id: PSCI_SYSTEM_OFF,
+                return_value: PSCI_RET_SUCCESS,
+            })
+        );
+        assert_eq!(
+            register_write_receiver
+                .recv()
+                .expect("PSCI_SYSTEM_OFF should write X0"),
+            (HvfRegister::X0, PSCI_RET_SUCCESS)
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
+    fn run_once_and_handle_mmio_returns_guest_reset_for_psci_system_reset() {
+        let (runner, register_write_receiver) = start_psci_run_step_recording_runner_with_x1(
+            PSCI_SYSTEM_RESET,
+            Err(BackendError::InvalidState("X1 should not be read")),
+        );
+
+        assert_eq!(
+            runner.run_once_and_handle_mmio(shared_dispatcher()),
+            Ok(HvfVcpuRunStepOutcome::GuestReset {
+                exit: hvc_exit(0),
+                function_id: PSCI_SYSTEM_RESET,
+                return_value: PSCI_RET_SUCCESS,
+            })
+        );
+        assert_eq!(
+            register_write_receiver
+                .recv()
+                .expect("PSCI_SYSTEM_RESET should write X0"),
             (HvfRegister::X0, PSCI_RET_SUCCESS)
         );
 

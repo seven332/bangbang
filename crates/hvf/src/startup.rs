@@ -176,6 +176,8 @@ pub enum HvfArm64BootRunLoopOutcome {
     StepLimitReached { steps: usize },
     Stopped { steps: usize },
     Canceled { steps: usize },
+    GuestShutdown { steps: usize },
+    GuestReset { steps: usize },
     Unknown { steps: usize, reason: u32 },
 }
 
@@ -1370,6 +1372,12 @@ fn run_boot_session_loop_with_observer(
             HvfVcpuRunStepOutcome::Unknown { reason } => {
                 return Ok(HvfArm64BootRunLoopOutcome::Unknown { steps, reason });
             }
+            HvfVcpuRunStepOutcome::GuestShutdown { .. } => {
+                return Ok(HvfArm64BootRunLoopOutcome::GuestShutdown { steps });
+            }
+            HvfVcpuRunStepOutcome::GuestReset { .. } => {
+                return Ok(HvfArm64BootRunLoopOutcome::GuestReset { steps });
+            }
             HvfVcpuRunStepOutcome::Hvc { .. } | HvfVcpuRunStepOutcome::Sys64 { .. } => {
                 if stop_token.is_stop_requested() {
                     return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
@@ -2144,7 +2152,10 @@ mod tests {
         | VIRTIO_DEVICE_STATUS_FEATURES_OK;
     const DRIVER_OK_STATUS: u32 = QUEUE_CONFIG_STATUS | VIRTIO_DEVICE_STATUS_DRIVER_OK;
     const PSCI_VERSION: u64 = 0x8400_0000;
+    const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
+    const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
     const PSCI_VERSION_0_2: u64 = 0x0000_0002;
+    const PSCI_RET_SUCCESS: u64 = 0;
     const TEST_NETWORK_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_4000);
 
     struct TempFile {
@@ -2604,6 +2615,22 @@ mod tests {
             exit: hvc_exit(0),
             function_id: PSCI_VERSION,
             return_value: PSCI_VERSION_0_2,
+        }
+    }
+
+    fn guest_shutdown_run_step_outcome() -> HvfVcpuRunStepOutcome {
+        HvfVcpuRunStepOutcome::GuestShutdown {
+            exit: hvc_exit(0),
+            function_id: PSCI_SYSTEM_OFF,
+            return_value: PSCI_RET_SUCCESS,
+        }
+    }
+
+    fn guest_reset_run_step_outcome() -> HvfVcpuRunStepOutcome {
+        HvfVcpuRunStepOutcome::GuestReset {
+            exit: hvc_exit(0),
+            function_id: PSCI_SYSTEM_RESET,
+            return_value: PSCI_RET_SUCCESS,
         }
     }
 
@@ -4902,6 +4929,34 @@ mod tests {
             HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 2 }
         );
         assert_eq!(session.events, ["run", "run"]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_returns_guest_shutdown_as_terminal_outcome() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session =
+            RecordingBootSessionRunLoopSession::new([guest_shutdown_run_step_outcome()]);
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(2))
+            .expect("guest shutdown loop should succeed");
+
+        assert_eq!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::GuestShutdown { steps: 1 }
+        );
+        assert_eq!(session.events, ["run"]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_returns_guest_reset_as_terminal_outcome() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([guest_reset_run_step_outcome()]);
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(2))
+            .expect("guest reset loop should succeed");
+
+        assert_eq!(outcome, HvfArm64BootRunLoopOutcome::GuestReset { steps: 1 });
+        assert_eq!(session.events, ["run"]);
     }
 
     #[test]
