@@ -390,11 +390,19 @@ impl VmmController {
     {
         self.preflight_instance_start()?;
         executor(self).map_err(VmmActionError::InstanceStart)?;
-        self.logger_state
-            .log_action(VmmAction::InstanceStart.name())
-            .map_err(VmmActionError::LoggerWrite)?;
+        self.log_action(VmmAction::InstanceStart.name())?;
         self.instance_info.state = InstanceState::Running;
         Ok(VmmData::Empty)
+    }
+
+    #[track_caller]
+    fn log_action(&mut self, action: &str) -> Result<(), VmmActionError> {
+        if let Err(err) = self.logger_state.log_action(action) {
+            self.metrics_state.record_missed_log();
+            return Err(VmmActionError::LoggerWrite(err));
+        }
+
+        Ok(())
     }
 
     pub fn record_put_actions_request(&mut self) {
@@ -755,9 +763,7 @@ impl VmmController {
         self.metrics_state
             .flush_with_diagnostics(diagnostics)
             .map_err(VmmActionError::MetricsFlush)?;
-        self.logger_state
-            .log_action(VmmAction::FlushMetrics.name())
-            .map_err(VmmActionError::LoggerWrite)?;
+        self.log_action(VmmAction::FlushMetrics.name())?;
         Ok(VmmData::Empty)
     }
 
@@ -813,6 +819,7 @@ mod tests {
     use std::cell::Cell;
     use std::error::Error as _;
     use std::fs;
+    use std::io::{Error, ErrorKind, Write};
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -892,6 +899,19 @@ mod tests {
             "bangbang-runtime-logger-test-{}-{nanos}-{name}",
             std::process::id()
         ))
+    }
+
+    #[derive(Debug)]
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(Error::from(ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -1882,6 +1902,41 @@ mod tests {
     }
 
     #[test]
+    fn start_instance_logger_write_failure_reports_missed_log_count_in_metrics() {
+        let metrics_path = unique_metrics_path("start-missed-log");
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+                &metrics_path,
+            )))
+            .expect("metrics config should be stored");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller.logger_state.configure_test_writer(FailingWriter);
+
+        let err = controller
+            .commit_instance_start()
+            .expect_err("logger write should fail startup commit");
+
+        assert_eq!(
+            err,
+            VmmActionError::LoggerWrite(LoggerWriteError::Write(ErrorKind::BrokenPipe))
+        );
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert_eq!(
+            controller.flush_startup_metrics_with_diagnostics(&MetricsDiagnostics::default()),
+            Ok(true)
+        );
+        assert_eq!(
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
+            "{\"logger\":{\"missed_log_count\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
+    }
+
+    #[test]
     fn start_instance_with_executor_failure_does_not_write_logger_action() {
         let path = unique_logger_path("start-action-failure");
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
@@ -2065,6 +2120,43 @@ mod tests {
             "action=InstanceStart\naction=FlushMetrics\n"
         );
         fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn flush_metrics_logger_write_failure_reports_missed_log_count_in_metrics() {
+        let metrics_path = unique_metrics_path("flush-missed-log");
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+                &metrics_path,
+            )))
+            .expect("metrics config should be stored");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller
+            .commit_instance_start()
+            .expect("start commit should set running state");
+        controller.logger_state.configure_test_writer(FailingWriter);
+
+        let err = controller
+            .handle_action(VmmAction::FlushMetrics)
+            .expect_err("flush metrics action logger write should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::LoggerWrite(LoggerWriteError::Write(ErrorKind::BrokenPipe))
+        );
+        assert_eq!(
+            controller.flush_periodic_metrics_with_diagnostics(&MetricsDiagnostics::default()),
+            Ok(true)
+        );
+        assert_eq!(
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"logger\":{\"missed_log_count\":1},\"vmm\":{\"metrics_flush_count\":2}}\n"
+        );
+
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }
 
     #[test]

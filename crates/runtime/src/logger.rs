@@ -294,6 +294,11 @@ impl LoggerState {
     pub const fn is_configured(&self) -> bool {
         self.sink.is_some()
     }
+
+    #[cfg(test)]
+    pub(crate) fn configure_test_writer(&mut self, writer: impl Write + Send + 'static) {
+        self.sink = Some(LoggerSink::from_writer(writer));
+    }
 }
 
 struct LoggerSink {
