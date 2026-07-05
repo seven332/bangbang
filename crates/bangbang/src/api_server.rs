@@ -43,7 +43,7 @@ use bangbang_runtime::serial::SerialConfigInput;
 use bangbang_runtime::vsock::{VsockConfig, VsockConfigInput};
 use bangbang_runtime::{VmConfiguration, VmmAction, VmmData};
 
-use crate::vmm::{GetApiRequest, PutObservabilityApiRequest, VmmRequestHandler};
+use crate::vmm::{GetApiRequest, PutApiRequest, VmmRequestHandler};
 
 const READ_CHUNK_SIZE: usize = 4096;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -451,21 +451,23 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PutAction(action) => {
             handle_empty(vmm.handle_put_action_request(action_from_request(action.as_ref())))
         }
-        ApiRequest::PutBootSource(config) => handle_empty(vmm.handle_action(
-            VmmAction::PutBootSource(boot_source_input_from_request(config.as_ref())),
+        ApiRequest::PutBootSource(config) => handle_empty(vmm.handle_put_request(
+            PutApiRequest::boot_source(boot_source_input_from_request(config.as_ref())),
         )),
-        ApiRequest::PutCpuConfig(_) => handle_empty(vmm.handle_action(VmmAction::PutCpuConfig)),
-        ApiRequest::PutLogger(config) => handle_empty(vmm.handle_put_observability_request(
-            PutObservabilityApiRequest::logger(logger_config_input_from_request(config.as_ref())),
+        ApiRequest::PutCpuConfig(_) => {
+            handle_empty(vmm.handle_put_request(PutApiRequest::cpu_config()))
+        }
+        ApiRequest::PutLogger(config) => handle_empty(vmm.handle_put_request(
+            PutApiRequest::logger(logger_config_input_from_request(config.as_ref())),
         )),
-        ApiRequest::PutMachineConfig(config) => handle_empty(vmm.handle_action(
-            VmmAction::PutMachineConfig(machine_config_input_from_request(config.as_ref())),
+        ApiRequest::PutMachineConfig(config) => handle_empty(vmm.handle_put_request(
+            PutApiRequest::machine_config(machine_config_input_from_request(config.as_ref())),
         )),
         ApiRequest::PatchMachineConfig(config) => handle_empty(vmm.handle_action(
             VmmAction::PatchMachineConfig(machine_config_patch_input_from_request(config.as_ref())),
         )),
-        ApiRequest::PutMetrics(config) => handle_empty(vmm.handle_put_observability_request(
-            PutObservabilityApiRequest::metrics(metrics_config_input_from_request(config.as_ref())),
+        ApiRequest::PutMetrics(config) => handle_empty(vmm.handle_put_request(
+            PutApiRequest::metrics(metrics_config_input_from_request(config.as_ref())),
         )),
         ApiRequest::PutMmds(content) => handle_empty(vmm.handle_action(VmmAction::PutMmds(
             mmds_content_input_from_request(content.as_ref()),
@@ -476,7 +478,7 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PutMmdsConfig(config) => handle_empty(vmm.handle_action(
             VmmAction::PutMmdsConfig(mmds_config_input_from_request(config.as_ref())),
         )),
-        ApiRequest::PutDrive(config) => handle_empty(vmm.handle_action(VmmAction::PutDrive(
+        ApiRequest::PutDrive(config) => handle_empty(vmm.handle_put_request(PutApiRequest::drive(
             drive_config_input_from_request(config.as_ref()),
         ))),
         ApiRequest::PatchDrive(config) => handle_empty(vmm.handle_action(
@@ -485,15 +487,13 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PatchVmState(update) => {
             handle_empty(vmm.handle_action(vm_state_action_from_request(update.as_ref())))
         }
-        ApiRequest::PutNetworkInterface(config) => {
-            handle_empty(vmm.handle_action(VmmAction::PutNetworkInterface(
-                network_interface_config_input_from_request(config.as_ref()),
-            )))
-        }
-        ApiRequest::PutSerial(config) => handle_empty(vmm.handle_put_observability_request(
-            PutObservabilityApiRequest::serial(serial_config_input_from_request(config.as_ref())),
+        ApiRequest::PutNetworkInterface(config) => handle_empty(vmm.handle_put_request(
+            PutApiRequest::network(network_interface_config_input_from_request(config.as_ref())),
         )),
-        ApiRequest::PutVsock(config) => handle_empty(vmm.handle_action(VmmAction::PutVsock(
+        ApiRequest::PutSerial(config) => handle_empty(vmm.handle_put_request(
+            PutApiRequest::serial(serial_config_input_from_request(config.as_ref())),
+        )),
+        ApiRequest::PutVsock(config) => handle_empty(vmm.handle_put_request(PutApiRequest::vsock(
             vsock_config_input_from_request(config.as_ref()),
         ))),
     }
@@ -2690,7 +2690,7 @@ mod tests {
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"serial_count\":0,\"serial_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"network_count\":0,\"network_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("fixture should clean up");
@@ -2731,7 +2731,7 @@ mod tests {
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"put_api_requests\":{\"actions_count\":3,\"actions_fails\":1,\"logger_count\":0,\"logger_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"serial_count\":0,\"serial_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"put_api_requests\":{\"actions_count\":3,\"actions_fails\":1,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"network_count\":0,\"network_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("fixture should clean up");
@@ -2795,7 +2795,7 @@ mod tests {
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"get_api_requests\":{\"instance_info_count\":1,\"machine_cfg_count\":1,\"mmds_count\":1,\"vmm_version_count\":1},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"serial_count\":0,\"serial_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"get_api_requests\":{\"instance_info_count\":1,\"machine_cfg_count\":1,\"mmds_count\":1,\"vmm_version_count\":1},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"network_count\":0,\"network_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("fixture should clean up");
@@ -2898,11 +2898,168 @@ mod tests {
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"logger_count\":2,\"logger_fails\":1,\"metrics_count\":2,\"metrics_fails\":1,\"serial_count\":2,\"serial_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":2,\"logger_fails\":1,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":2,\"metrics_fails\":1,\"network_count\":0,\"network_fails\":0,\"serial_count\":2,\"serial_fails\":1,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
         fs::remove_file(logger_path).expect("logger fixture should clean up");
+    }
+
+    #[test]
+    fn configured_metrics_counts_core_config_put_api_requests() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let metrics_path = unique_socket_path("metrics-core-config").with_extension("metrics");
+        let drive_path = unique_socket_path("core-drive").with_extension("img");
+        let replacement_drive_path =
+            unique_socket_path("core-drive-rejected").with_extension("img");
+        let vsock_path = unique_socket_path("core-vsock").with_extension("sock");
+        let replacement_vsock_path =
+            unique_socket_path("core-vsock-rejected").with_extension("sock");
+
+        let metrics_body = format!(r#"{{"metrics_path":"{}"}}"#, metrics_path.to_string_lossy());
+        let metrics_request = request_with_body("PUT", "/metrics", &metrics_body);
+        assert_eq!(
+            handle_request_bytes(metrics_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let machine_request = request_with_body(
+            "PUT",
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        );
+        assert_eq!(
+            handle_request_bytes(machine_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let cpu_response = handle_request_bytes(
+            request_with_body("PUT", "/cpu-config", "{}").as_bytes(),
+            &mut vmm,
+        );
+        assert_eq!(
+            cpu_response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_request = request_with_body("PUT", "/boot-source", boot_body);
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let drive_body = format!(
+            r#"{{"drive_id":"data","path_on_host":"{}","is_root_device":false,"is_read_only":false}}"#,
+            drive_path.to_string_lossy()
+        );
+        let drive_request = request_with_body("PUT", "/drives/data", &drive_body);
+        assert_eq!(
+            handle_request_bytes(drive_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let network_body =
+            r#"{"iface_id":"eth0","host_dev_name":"vmnet:shared","guest_mac":"12:34:56:78:9a:bc"}"#;
+        let network_request = request_with_body("PUT", "/network-interfaces/eth0", network_body);
+        assert_eq!(
+            handle_request_bytes(network_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let vsock_body = format!(
+            r#"{{"guest_cid":3,"uds_path":"{}"}}"#,
+            vsock_path.to_string_lossy()
+        );
+        let vsock_request = request_with_body("PUT", "/vsock", &vsock_body);
+        assert_eq!(
+            handle_request_bytes(vsock_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let start_response = put_action_over_socket(&mut vmm, "core-a1", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let machine_after_start_response = handle_request_bytes(
+            request_with_body(
+                "PUT",
+                "/machine-config",
+                r#"{"vcpu_count":2,"mem_size_mib":512}"#,
+            )
+            .as_bytes(),
+            &mut vmm,
+        );
+        assert_eq!(
+            machine_after_start_response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+
+        let boot_after_start_response = handle_request_bytes(
+            request_with_body(
+                "PUT",
+                "/boot-source",
+                r#"{"kernel_image_path":"/tmp/replacement-vmlinux"}"#,
+            )
+            .as_bytes(),
+            &mut vmm,
+        );
+        assert_eq!(
+            boot_after_start_response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+
+        let rejected_drive_body = format!(
+            r#"{{"drive_id":"replacement","path_on_host":"{}","is_root_device":false,"is_read_only":false}}"#,
+            replacement_drive_path.to_string_lossy()
+        );
+        let drive_after_start_response = handle_request_bytes(
+            request_with_body("PUT", "/drives/replacement", &rejected_drive_body).as_bytes(),
+            &mut vmm,
+        );
+        assert_eq!(
+            drive_after_start_response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+        assert!(!replacement_drive_path.exists());
+
+        let network_after_start_response = handle_request_bytes(
+            request_with_body(
+                "PUT",
+                "/network-interfaces/eth1",
+                r#"{"iface_id":"eth1","host_dev_name":"vmnet:shared"}"#,
+            )
+            .as_bytes(),
+            &mut vmm,
+        );
+        assert_eq!(
+            network_after_start_response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+
+        let rejected_vsock_body = format!(
+            r#"{{"guest_cid":4,"uds_path":"{}"}}"#,
+            replacement_vsock_path.to_string_lossy()
+        );
+        let vsock_after_start_response = handle_request_bytes(
+            request_with_body("PUT", "/vsock", &rejected_vsock_body).as_bytes(),
+            &mut vmm,
+        );
+        assert_eq!(
+            vsock_after_start_response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+        assert!(!replacement_vsock_path.exists());
+
+        let flush_response = put_action_over_socket(&mut vmm, "core-a2", "FlushMetrics");
+        assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert_eq!(
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":2,\"boot_source_fails\":1,\"cpu_cfg_count\":1,\"cpu_cfg_fails\":1,\"drive_count\":2,\"drive_fails\":1,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"metrics_count\":1,\"metrics_fails\":0,\"network_count\":2,\"network_fails\":1,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":2,\"vsock_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+
+        assert!(!drive_path.exists());
+        assert!(!vsock_path.exists());
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }
 
     #[test]
@@ -2940,7 +3097,7 @@ mod tests {
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"serial_count\":0,\"serial_fails\":0},\"vmm\":{\"boot_run_loop_status\":\"running\",\"metrics_flush_count\":1}}\n"
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"network_count\":0,\"network_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"boot_run_loop_status\":\"running\",\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("fixture should clean up");
@@ -2990,7 +3147,7 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&startup_metrics_path)
                 .expect("startup metrics output should be readable"),
-            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"metrics_count\":1,\"metrics_fails\":1,\"serial_count\":0,\"serial_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":1,\"network_count\":0,\"network_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
         assert!(!api_metrics_path.exists());
 

@@ -104,6 +104,30 @@ impl MetricsState {
         self.put_api_requests.record_actions_failure();
     }
 
+    pub(crate) fn record_put_boot_source_request(&mut self) {
+        self.put_api_requests.record_boot_source_request();
+    }
+
+    pub(crate) fn record_put_boot_source_failure(&mut self) {
+        self.put_api_requests.record_boot_source_failure();
+    }
+
+    pub(crate) fn record_put_cpu_config_request(&mut self) {
+        self.put_api_requests.record_cpu_config_request();
+    }
+
+    pub(crate) fn record_put_cpu_config_failure(&mut self) {
+        self.put_api_requests.record_cpu_config_failure();
+    }
+
+    pub(crate) fn record_put_drive_request(&mut self) {
+        self.put_api_requests.record_drive_request();
+    }
+
+    pub(crate) fn record_put_drive_failure(&mut self) {
+        self.put_api_requests.record_drive_failure();
+    }
+
     pub(crate) fn record_put_metrics_request(&mut self) {
         self.put_api_requests.record_metrics_request();
     }
@@ -120,12 +144,36 @@ impl MetricsState {
         self.put_api_requests.record_logger_failure();
     }
 
+    pub(crate) fn record_put_machine_config_request(&mut self) {
+        self.put_api_requests.record_machine_config_request();
+    }
+
+    pub(crate) fn record_put_machine_config_failure(&mut self) {
+        self.put_api_requests.record_machine_config_failure();
+    }
+
+    pub(crate) fn record_put_network_request(&mut self) {
+        self.put_api_requests.record_network_request();
+    }
+
+    pub(crate) fn record_put_network_failure(&mut self) {
+        self.put_api_requests.record_network_failure();
+    }
+
     pub(crate) fn record_put_serial_request(&mut self) {
         self.put_api_requests.record_serial_request();
     }
 
     pub(crate) fn record_put_serial_failure(&mut self) {
         self.put_api_requests.record_serial_failure();
+    }
+
+    pub(crate) fn record_put_vsock_request(&mut self) {
+        self.put_api_requests.record_vsock_request();
+    }
+
+    pub(crate) fn record_put_vsock_failure(&mut self) {
+        self.put_api_requests.record_vsock_failure();
     }
 
     pub(crate) fn record_get_instance_info_request(&mut self) {
@@ -222,24 +270,48 @@ impl GetApiRequestMetrics {
 struct PutApiRequestMetrics {
     actions_count: u64,
     actions_fails: u64,
+    boot_source_count: u64,
+    boot_source_fails: u64,
+    cpu_cfg_count: u64,
+    cpu_cfg_fails: u64,
+    drive_count: u64,
+    drive_fails: u64,
     logger_count: u64,
     logger_fails: u64,
+    machine_cfg_count: u64,
+    machine_cfg_fails: u64,
     metrics_count: u64,
     metrics_fails: u64,
+    network_count: u64,
+    network_fails: u64,
     serial_count: u64,
     serial_fails: u64,
+    vsock_count: u64,
+    vsock_fails: u64,
 }
 
 impl PutApiRequestMetrics {
     const fn is_empty(self) -> bool {
         self.actions_count == 0
             && self.actions_fails == 0
+            && self.boot_source_count == 0
+            && self.boot_source_fails == 0
+            && self.cpu_cfg_count == 0
+            && self.cpu_cfg_fails == 0
+            && self.drive_count == 0
+            && self.drive_fails == 0
             && self.logger_count == 0
             && self.logger_fails == 0
+            && self.machine_cfg_count == 0
+            && self.machine_cfg_fails == 0
             && self.metrics_count == 0
             && self.metrics_fails == 0
+            && self.network_count == 0
+            && self.network_fails == 0
             && self.serial_count == 0
             && self.serial_fails == 0
+            && self.vsock_count == 0
+            && self.vsock_fails == 0
     }
 
     fn record_actions_request(&mut self) {
@@ -248,6 +320,30 @@ impl PutApiRequestMetrics {
 
     fn record_actions_failure(&mut self) {
         self.actions_fails = self.actions_fails.saturating_add(1);
+    }
+
+    fn record_boot_source_request(&mut self) {
+        self.boot_source_count = self.boot_source_count.saturating_add(1);
+    }
+
+    fn record_boot_source_failure(&mut self) {
+        self.boot_source_fails = self.boot_source_fails.saturating_add(1);
+    }
+
+    fn record_cpu_config_request(&mut self) {
+        self.cpu_cfg_count = self.cpu_cfg_count.saturating_add(1);
+    }
+
+    fn record_cpu_config_failure(&mut self) {
+        self.cpu_cfg_fails = self.cpu_cfg_fails.saturating_add(1);
+    }
+
+    fn record_drive_request(&mut self) {
+        self.drive_count = self.drive_count.saturating_add(1);
+    }
+
+    fn record_drive_failure(&mut self) {
+        self.drive_fails = self.drive_fails.saturating_add(1);
     }
 
     fn record_metrics_request(&mut self) {
@@ -266,12 +362,36 @@ impl PutApiRequestMetrics {
         self.logger_fails = self.logger_fails.saturating_add(1);
     }
 
+    fn record_machine_config_request(&mut self) {
+        self.machine_cfg_count = self.machine_cfg_count.saturating_add(1);
+    }
+
+    fn record_machine_config_failure(&mut self) {
+        self.machine_cfg_fails = self.machine_cfg_fails.saturating_add(1);
+    }
+
+    fn record_network_request(&mut self) {
+        self.network_count = self.network_count.saturating_add(1);
+    }
+
+    fn record_network_failure(&mut self) {
+        self.network_fails = self.network_fails.saturating_add(1);
+    }
+
     fn record_serial_request(&mut self) {
         self.serial_count = self.serial_count.saturating_add(1);
     }
 
     fn record_serial_failure(&mut self) {
         self.serial_fails = self.serial_fails.saturating_add(1);
+    }
+
+    fn record_vsock_request(&mut self) {
+        self.vsock_count = self.vsock_count.saturating_add(1);
+    }
+
+    fn record_vsock_failure(&mut self) {
+        self.vsock_fails = self.vsock_fails.saturating_add(1);
     }
 
     const fn actions_count(self) -> u64 {
@@ -282,12 +402,44 @@ impl PutApiRequestMetrics {
         self.actions_fails
     }
 
+    const fn boot_source_count(self) -> u64 {
+        self.boot_source_count
+    }
+
+    const fn boot_source_fails(self) -> u64 {
+        self.boot_source_fails
+    }
+
+    const fn cpu_cfg_count(self) -> u64 {
+        self.cpu_cfg_count
+    }
+
+    const fn cpu_cfg_fails(self) -> u64 {
+        self.cpu_cfg_fails
+    }
+
+    const fn drive_count(self) -> u64 {
+        self.drive_count
+    }
+
+    const fn drive_fails(self) -> u64 {
+        self.drive_fails
+    }
+
     const fn logger_count(self) -> u64 {
         self.logger_count
     }
 
     const fn logger_fails(self) -> u64 {
         self.logger_fails
+    }
+
+    const fn machine_cfg_count(self) -> u64 {
+        self.machine_cfg_count
+    }
+
+    const fn machine_cfg_fails(self) -> u64 {
+        self.machine_cfg_fails
     }
 
     const fn metrics_count(self) -> u64 {
@@ -298,12 +450,28 @@ impl PutApiRequestMetrics {
         self.metrics_fails
     }
 
+    const fn network_count(self) -> u64 {
+        self.network_count
+    }
+
+    const fn network_fails(self) -> u64 {
+        self.network_fails
+    }
+
     const fn serial_count(self) -> u64 {
         self.serial_count
     }
 
     const fn serial_fails(self) -> u64 {
         self.serial_fails
+    }
+
+    const fn vsock_count(self) -> u64 {
+        self.vsock_count
+    }
+
+    const fn vsock_fails(self) -> u64 {
+        self.vsock_fails
     }
 }
 
@@ -488,12 +656,44 @@ impl MetricsSink {
                 serde_json::Value::Number(put_api_requests.actions_fails().into()),
             );
             put_requests.insert(
+                "boot_source_count".to_string(),
+                serde_json::Value::Number(put_api_requests.boot_source_count().into()),
+            );
+            put_requests.insert(
+                "boot_source_fails".to_string(),
+                serde_json::Value::Number(put_api_requests.boot_source_fails().into()),
+            );
+            put_requests.insert(
+                "cpu_cfg_count".to_string(),
+                serde_json::Value::Number(put_api_requests.cpu_cfg_count().into()),
+            );
+            put_requests.insert(
+                "cpu_cfg_fails".to_string(),
+                serde_json::Value::Number(put_api_requests.cpu_cfg_fails().into()),
+            );
+            put_requests.insert(
+                "drive_count".to_string(),
+                serde_json::Value::Number(put_api_requests.drive_count().into()),
+            );
+            put_requests.insert(
+                "drive_fails".to_string(),
+                serde_json::Value::Number(put_api_requests.drive_fails().into()),
+            );
+            put_requests.insert(
                 "logger_count".to_string(),
                 serde_json::Value::Number(put_api_requests.logger_count().into()),
             );
             put_requests.insert(
                 "logger_fails".to_string(),
                 serde_json::Value::Number(put_api_requests.logger_fails().into()),
+            );
+            put_requests.insert(
+                "machine_cfg_count".to_string(),
+                serde_json::Value::Number(put_api_requests.machine_cfg_count().into()),
+            );
+            put_requests.insert(
+                "machine_cfg_fails".to_string(),
+                serde_json::Value::Number(put_api_requests.machine_cfg_fails().into()),
             );
             put_requests.insert(
                 "metrics_count".to_string(),
@@ -504,12 +704,28 @@ impl MetricsSink {
                 serde_json::Value::Number(put_api_requests.metrics_fails().into()),
             );
             put_requests.insert(
+                "network_count".to_string(),
+                serde_json::Value::Number(put_api_requests.network_count().into()),
+            );
+            put_requests.insert(
+                "network_fails".to_string(),
+                serde_json::Value::Number(put_api_requests.network_fails().into()),
+            );
+            put_requests.insert(
                 "serial_count".to_string(),
                 serde_json::Value::Number(put_api_requests.serial_count().into()),
             );
             put_requests.insert(
                 "serial_fails".to_string(),
                 serde_json::Value::Number(put_api_requests.serial_fails().into()),
+            );
+            put_requests.insert(
+                "vsock_count".to_string(),
+                serde_json::Value::Number(put_api_requests.vsock_count().into()),
+            );
+            put_requests.insert(
+                "vsock_fails".to_string(),
+                serde_json::Value::Number(put_api_requests.vsock_fails().into()),
             );
             root.insert(
                 "put_api_requests".to_string(),
@@ -658,7 +874,40 @@ mod tests {
         let output = fs::read_to_string(&path).expect("metrics output should be readable");
         assert_eq!(
             output,
-            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":1,\"logger_count\":0,\"logger_fails\":0,\"metrics_count\":0,\"metrics_fails\":0,\"serial_count\":0,\"serial_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":1,\"boot_source_count\":0,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":0,\"metrics_fails\":0,\"network_count\":0,\"network_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn writes_put_core_config_api_request_metrics_when_recorded() {
+        let path = unique_metrics_path("api-request-core-config");
+        let mut state = MetricsState::default();
+
+        state.record_put_boot_source_request();
+        state.record_put_boot_source_request();
+        state.record_put_boot_source_failure();
+        state.record_put_cpu_config_request();
+        state.record_put_cpu_config_failure();
+        state.record_put_drive_request();
+        state.record_put_drive_failure();
+        state.record_put_machine_config_request();
+        state.record_put_machine_config_request();
+        state.record_put_machine_config_failure();
+        state.record_put_network_request();
+        state.record_put_network_failure();
+        state.record_put_vsock_request();
+        state.record_put_vsock_failure();
+        state
+            .configure(MetricsConfigInput::new(&path))
+            .expect("metrics should configure");
+        assert_eq!(state.flush(), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("metrics output should be readable");
+        assert_eq!(
+            output,
+            "{\"put_api_requests\":{\"actions_count\":0,\"actions_fails\":0,\"boot_source_count\":2,\"boot_source_fails\":1,\"cpu_cfg_count\":1,\"cpu_cfg_fails\":1,\"drive_count\":1,\"drive_fails\":1,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"metrics_count\":0,\"metrics_fails\":0,\"network_count\":1,\"network_fails\":1,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":1,\"vsock_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(path).expect("fixture should clean up");
@@ -684,7 +933,7 @@ mod tests {
         let output = fs::read_to_string(&path).expect("metrics output should be readable");
         assert_eq!(
             output,
-            "{\"put_api_requests\":{\"actions_count\":0,\"actions_fails\":0,\"logger_count\":1,\"logger_fails\":1,\"metrics_count\":2,\"metrics_fails\":1,\"serial_count\":1,\"serial_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"put_api_requests\":{\"actions_count\":0,\"actions_fails\":0,\"boot_source_count\":0,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":1,\"logger_fails\":1,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":2,\"metrics_fails\":1,\"network_count\":0,\"network_fails\":0,\"serial_count\":1,\"serial_fails\":1,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(path).expect("fixture should clean up");
