@@ -1671,6 +1671,84 @@ fn executable_configures_network_and_mmds() {
 }
 
 #[test]
+fn executable_rejects_invalid_mmds_config_without_mutating() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    let network_response = http_put_json(
+        &socket_path,
+        "/network-interfaces/eth0",
+        r#"{"iface_id":"eth0","host_dev_name":"vmnet:shared","guest_mac":"12:34:56:78:9A:BC","mtu":1500}"#,
+    );
+    assert_no_content_response(&network_response, "PUT /network-interfaces/eth0");
+
+    let mmds_config_response = http_put_json(
+        &socket_path,
+        "/mmds/config",
+        r#"{"network_interfaces":["eth0"],"version":"V2","ipv4_address":"169.254.169.254","imds_compat":true}"#,
+    );
+    assert_no_content_response(&mmds_config_response, "PUT /mmds/config");
+
+    let assert_original_mmds_config = |context: &str, rejected_interface: Option<&str>| {
+        let vm_config = http_get(&socket_path, "/vm/config");
+        assert_ok_response(&vm_config, context);
+        assert_response_contains(&vm_config, r#""iface_id":"eth0""#, context);
+        assert_response_contains(&vm_config, r#""host_dev_name":"vmnet:shared""#, context);
+        assert_response_contains(&vm_config, r#""guest_mac":"12:34:56:78:9a:bc""#, context);
+        assert_response_contains(&vm_config, r#""mtu":1500"#, context);
+        assert_response_contains(&vm_config, r#""mmds-config":"#, context);
+        assert_response_contains(&vm_config, r#""network_interfaces":["eth0"]"#, context);
+        assert_response_contains(&vm_config, r#""version":"V2""#, context);
+        assert_response_contains(&vm_config, r#""ipv4_address":"169.254.169.254""#, context);
+        assert_response_contains(&vm_config, r#""imds_compat":true"#, context);
+        assert!(
+            !vm_config.contains(r#""network_interfaces":[]"#),
+            "{context} must not replace MMDS config with an empty interface list; response:\n{vm_config}"
+        );
+
+        if let Some(rejected_interface) = rejected_interface {
+            assert!(
+                !vm_config.contains(&format!(r#""{rejected_interface}""#)),
+                "{context} must not store rejected MMDS interface {rejected_interface}; response:\n{vm_config}"
+            );
+        }
+    };
+
+    let unknown_interface_response = http_put_json(
+        &socket_path,
+        "/mmds/config",
+        r#"{"network_interfaces":["eth1"],"version":"V1","ipv4_address":"169.254.169.253","imds_compat":false}"#,
+    );
+    assert_bad_request_response(&unknown_interface_response, "PUT /mmds/config with eth1");
+    assert_response_contains(
+        &unknown_interface_response,
+        r#"{"fault_message":"MMDS network interface id is not configured: eth1"}"#,
+        "PUT /mmds/config with eth1",
+    );
+    assert_original_mmds_config("GET /vm/config after unknown MMDS interface", Some("eth1"));
+
+    let empty_interface_list_response = http_put_json(
+        &socket_path,
+        "/mmds/config",
+        r#"{"network_interfaces":[],"version":"V1","ipv4_address":"169.254.169.253","imds_compat":false}"#,
+    );
+    assert_bad_request_response(
+        &empty_interface_list_response,
+        "PUT /mmds/config with empty interface list",
+    );
+    assert_response_contains(
+        &empty_interface_list_response,
+        r#"{"fault_message":"MMDS network_interfaces must not be empty"}"#,
+        "PUT /mmds/config with empty interface list",
+    );
+    assert_original_mmds_config("GET /vm/config after empty MMDS interface list", None);
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
 fn executable_configures_vsock() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
