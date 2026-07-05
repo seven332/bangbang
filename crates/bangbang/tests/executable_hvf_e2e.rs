@@ -20,7 +20,7 @@ mod macos_arm64 {
     use crate::support::{
         BangbangProcess, TestDir, assert_bad_request_response, assert_clean_shutdown,
         assert_no_content_response, assert_ok_response, assert_response_contains, http_get,
-        http_put_json, json_string, path_text,
+        http_json, http_put_json, json_string, path_text,
     };
 
     const BANGBANG_GUEST_KERNEL_PATH_ENV: &str = "BANGBANG_GUEST_KERNEL_PATH";
@@ -140,6 +140,28 @@ mod macos_arm64 {
             r#""state":"Running""#,
             "GET / after InstanceStart",
         );
+
+        for (requested_state, action_name) in [("Paused", "Pause"), ("Resumed", "Resume")] {
+            let context = format!("PATCH /vm {requested_state} after InstanceStart");
+            let body = format!(r#"{{"state":"{requested_state}"}}"#);
+            let response = http_json(&socket_path, "PATCH", "/vm", &body);
+            assert_bad_request_response(&response, &context);
+            assert_response_contains(
+                &response,
+                &format!(
+                    r#"{{"fault_message":"The requested operation is not supported: {action_name}"}}"#
+                ),
+                &context,
+            );
+
+            let instance_info_after_patch = http_get(&socket_path, "/");
+            assert_ok_response(&instance_info_after_patch, "GET / after rejected PATCH /vm");
+            assert_response_contains(
+                &instance_info_after_patch,
+                r#""state":"Running""#,
+                "GET / after rejected PATCH /vm",
+            );
+        }
 
         let vm_config = http_get(&socket_path, "/vm/config");
         assert_ok_response(&vm_config, "GET /vm/config after InstanceStart");
