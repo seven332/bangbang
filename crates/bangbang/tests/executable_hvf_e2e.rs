@@ -354,6 +354,41 @@ mod macos_arm64 {
             "PUT /mmds/config after InstanceStart",
         );
 
+        let put_mmds_response = http_put_json(
+            &socket_path,
+            "/mmds",
+            r#"{"latest":{"meta-data":{"ami-id":"ami-bangbang","remove-me":"yes"},"user-data":"before"}}"#,
+        );
+        assert_no_content_response(&put_mmds_response, "PUT /mmds after InstanceStart");
+        let patch_mmds_response = http_json(
+            &socket_path,
+            "PATCH",
+            "/mmds",
+            r#"{"latest":{"dynamic":{"instance-identity":"document"},"meta-data":{"ami-id":"ami-updated","remove-me":null}}}"#,
+        );
+        assert_no_content_response(&patch_mmds_response, "PATCH /mmds after InstanceStart");
+        let mmds_data = http_get(&socket_path, "/mmds");
+        assert_ok_response(&mmds_data, "GET /mmds after runtime patch");
+        assert_response_contains(
+            &mmds_data,
+            r#""ami-id":"ami-updated""#,
+            "GET /mmds after runtime patch",
+        );
+        assert_response_contains(
+            &mmds_data,
+            r#""user-data":"before""#,
+            "GET /mmds after runtime patch",
+        );
+        assert_response_contains(
+            &mmds_data,
+            r#""instance-identity":"document""#,
+            "GET /mmds after runtime patch",
+        );
+        assert!(
+            !mmds_data.contains("remove-me"),
+            "PATCH /mmds should remove null-valued fields; response:\n{mmds_data}"
+        );
+
         let vm_config = http_get(&socket_path, "/vm/config");
         assert_ok_response(&vm_config, "GET /vm/config after InstanceStart");
         assert_response_contains(
