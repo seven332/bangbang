@@ -1020,6 +1020,16 @@ fn executable_configures_network_and_mmds() {
         r#""host_dev_name":"vmnet:shared""#,
         "GET /vm/config after rejected network updates",
     );
+    assert_response_contains(
+        &vm_config_after_network_updates,
+        r#""guest_mac":"12:34:56:78:9a:bc""#,
+        "GET /vm/config after rejected network updates",
+    );
+    assert_response_contains(
+        &vm_config_after_network_updates,
+        r#""mtu":1500"#,
+        "GET /vm/config after rejected network updates",
+    );
     assert!(
         !vm_config_after_network_updates.contains(r#""iface_id":"eth1""#),
         "rejected network updates must not add a new interface; response:\n{vm_config_after_network_updates}"
