@@ -4599,6 +4599,32 @@ mod tests {
     }
 
     #[test]
+    fn run_once_and_handle_mmio_rejects_nonzero_hvc_immediate_without_guest_shutdown() {
+        let (runner, register_write_receiver) = start_psci_run_step_recording_runner_with_exit(
+            PSCI_SYSTEM_OFF,
+            Err(BackendError::InvalidState("X1 should not be read")),
+            1,
+        );
+
+        assert_eq!(
+            runner.run_once_and_handle_mmio(shared_dispatcher()),
+            Ok(HvfVcpuRunStepOutcome::Hvc {
+                exit: hvc_exit(1),
+                function_id: PSCI_SYSTEM_OFF,
+                return_value: PSCI_RET_NOT_SUPPORTED,
+            })
+        );
+        assert_eq!(
+            register_write_receiver
+                .recv()
+                .expect("nonzero HVC immediate should still write X0"),
+            (HvfRegister::X0, PSCI_RET_NOT_SUPPORTED)
+        );
+
+        runner.shutdown().expect("runner should shut down");
+    }
+
+    #[test]
     fn run_once_and_handle_mmio_returns_not_supported_for_unsupported_psci_hvc() {
         let (runner, register_write_receiver) = start_psci_run_step_recording_runner_with_x1(
             PSCI_CPU_ON,
