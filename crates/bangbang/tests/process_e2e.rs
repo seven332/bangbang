@@ -139,6 +139,83 @@ fn executable_no_api_config_file_failure_does_not_publish_socket() {
 }
 
 #[test]
+fn executable_metadata_startup_initializes_mmds() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let metadata_path = test_dir.path().join("metadata.json");
+    let instance_id = test_dir.instance_id();
+    fs::write(
+        &metadata_path,
+        r#"{"latest":{"meta-data":{"ami-id":"ami-bangbang"},"user-data":"from-startup"}}"#,
+    )
+    .expect("metadata file should be written");
+    let bangbang = BangbangProcess::start_with_extra_args(
+        &socket_path,
+        &instance_id,
+        &["--metadata", path_text(&metadata_path)],
+    );
+
+    let mmds_data = http_get(&socket_path, "/mmds");
+    assert_ok_response(&mmds_data, "GET /mmds after --metadata");
+    assert_response_contains(
+        &mmds_data,
+        r#""ami-id":"ami-bangbang""#,
+        "GET /mmds after --metadata",
+    );
+    assert_response_contains(
+        &mmds_data,
+        r#""user-data":"from-startup""#,
+        "GET /mmds after --metadata",
+    );
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
+fn executable_metadata_failure_does_not_publish_socket() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let metadata_path = write_malformed_metadata_file(&test_dir);
+    let instance_id = test_dir.instance_id();
+
+    let output = BangbangProcess::start_with_extra_args_expect_failure(
+        &socket_path,
+        &instance_id,
+        &["--metadata", path_text(&metadata_path)],
+    );
+
+    assert_metadata_failure(&output, &socket_path, "metadata startup failure");
+}
+
+#[test]
+fn executable_no_api_metadata_failure_does_not_publish_socket() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let metadata_path = write_malformed_metadata_file(&test_dir);
+    let config_path = test_dir.path().join("vm-config.json");
+    let instance_id = test_dir.instance_id();
+    fs::write(
+        &config_path,
+        r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"}}"#,
+    )
+    .expect("config file should be written");
+
+    let output = BangbangProcess::start_with_extra_args_expect_failure(
+        &socket_path,
+        &instance_id,
+        &[
+            "--metadata",
+            path_text(&metadata_path),
+            "--config-file",
+            path_text(&config_path),
+            "--no-api",
+        ],
+    );
+
+    assert_metadata_failure(&output, &socket_path, "no-api metadata startup failure");
+}
+
+#[test]
 fn executable_config_file_rejected_drive_socket_does_not_publish_socket() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
@@ -928,6 +1005,59 @@ fn write_rejected_serial_rate_limiter_config(
     fs::write(&config_path, config).expect("config file should be written");
 
     (config_path, serial_output_path)
+}
+
+fn write_malformed_metadata_file(test_dir: &TestDir) -> std::path::PathBuf {
+    let metadata_path = test_dir.path().join("metadata.json");
+    fs::write(&metadata_path, r#"{"secret":"private-metadata-secret""#)
+        .expect("malformed metadata file should be written");
+
+    metadata_path
+}
+
+fn assert_metadata_failure(
+    output: &support::CompletedProcess,
+    socket_path: &std::path::Path,
+    case_name: &str,
+) {
+    assert!(
+        !output.status.success(),
+        "{case_name} should fail startup; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        !socket_path.exists(),
+        "{case_name} should fail before API socket publication"
+    );
+    assert!(
+        !output.stdout.contains("status: API server listening"),
+        "{case_name} must not report API readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !output.stdout.contains("status: VM running without API"),
+        "{case_name} must not report no-api readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        output
+            .stderr
+            .contains("bangbang: metadata error: malformed metadata file"),
+        "{case_name} stderr should describe metadata parse failure; stderr:\n{}",
+        output.stderr
+    );
+    assert!(
+        !output.stdout.contains("private-metadata-secret"),
+        "{case_name} stdout must not echo metadata contents; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !output.stderr.contains("private-metadata-secret"),
+        "{case_name} stderr must not echo metadata contents; stderr:\n{}",
+        output.stderr
+    );
 }
 
 fn assert_rejected_drive_socket_config_failure(

@@ -24,21 +24,20 @@ use vmm::ProcessVmm;
 
 use bangbang_runtime::logger::{LoggerConfigInput, LoggerLevel};
 use bangbang_runtime::metrics::MetricsConfigInput;
+use bangbang_runtime::mmds::MmdsContentInput;
 use bangbang_runtime::{VmmAction, VmmActionError};
 
 const DEFAULT_API_SOCK_PATH: &str = "/tmp/bangbang.socket";
 const DEFAULT_INSTANCE_ID: &str = "anonymous-instance";
 const APP_NAME: &str = "bangbang";
 const CONFIG_FILE_MAX_BYTES: usize = 1024 * 1024;
-const CONFIG_FILE_MAX_BYTES_U64: u64 = CONFIG_FILE_MAX_BYTES as u64;
-const CONFIG_FILE_READ_LIMIT_BYTES: u64 = CONFIG_FILE_MAX_BYTES_U64 + 1;
+const METADATA_FILE_MAX_BYTES: usize = CONFIG_FILE_MAX_BYTES;
 const MIN_INSTANCE_ID_LEN: usize = 1;
 const MAX_INSTANCE_ID_LEN: usize = 64;
 const UNSUPPORTED_FIRECRACKER_ARGS: &[&str] = &[
     "boot-timer",
     "describe-snapshot",
     "enable-pci",
-    "metadata",
     "no-seccomp",
     "parent-cpu-time-us",
     "seccomp-filter",
@@ -71,6 +70,7 @@ fn run() -> Result<(), ProcessError> {
             return Ok(());
         }
         Command::Run(config) => {
+            let config = *config;
             let effective_mmds_size_limit = config.effective_mmds_size_limit();
             let StartupConfig {
                 api_sock,
@@ -79,6 +79,7 @@ fn run() -> Result<(), ProcessError> {
                 id,
                 logger_config,
                 mmds_size_limit: _,
+                metadata,
                 metrics_config,
                 no_api,
             } = config;
@@ -97,6 +98,7 @@ fn run() -> Result<(), ProcessError> {
             );
             apply_startup_metrics_config(&mut vmm, metrics_config)?;
             apply_startup_logger_config(&mut vmm, logger_config)?;
+            apply_startup_metadata(&mut vmm, metadata.as_deref())?;
             apply_startup_config_file(&mut vmm, config_file.as_deref())?;
             let mut shutdown_signal = ShutdownSignal::install()?;
             if no_api {
@@ -144,32 +146,13 @@ where
 }
 
 fn config_file_actions(config_file: &str) -> Result<Vec<VmmAction>, ConfigFileError> {
-    // Keep special files such as FIFOs from hanging startup before file-type validation.
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(config_file)
-        .map_err(|err| ConfigFileError::Read(err.kind()))?;
-    let metadata = file
-        .metadata()
-        .map_err(|err| ConfigFileError::Read(err.kind()))?;
-    if !metadata.file_type().is_file() {
-        return Err(ConfigFileError::NotRegular);
-    }
-    if metadata.len() > CONFIG_FILE_MAX_BYTES_U64 {
-        return Err(ConfigFileError::TooLarge);
-    }
-
-    // Re-check through a capped reader in case the file grows after metadata validation.
-    let mut contents = Vec::new();
-    file.take(CONFIG_FILE_READ_LIMIT_BYTES)
-        .read_to_end(&mut contents)
-        .map_err(|err| ConfigFileError::Read(err.kind()))?;
-    if contents.len() > CONFIG_FILE_MAX_BYTES {
-        return Err(ConfigFileError::TooLarge);
-    }
-    let contents = String::from_utf8(contents)
-        .map_err(|_| ConfigFileError::Read(std::io::ErrorKind::InvalidData))?;
+    let contents = read_limited_regular_utf8_file(config_file, CONFIG_FILE_MAX_BYTES).map_err(
+        |err| match err {
+            StartupFileReadError::Read(kind) => ConfigFileError::Read(kind),
+            StartupFileReadError::NotRegular => ConfigFileError::NotRegular,
+            StartupFileReadError::TooLarge => ConfigFileError::TooLarge,
+        },
+    )?;
     config_file_actions_from_str(&contents)
 }
 
@@ -379,6 +362,74 @@ where
     Ok(())
 }
 
+fn apply_startup_metadata<S>(
+    vmm: &mut ProcessVmm<S>,
+    metadata: Option<&str>,
+) -> Result<(), ProcessError>
+where
+    S: vmm::InstanceStartExecutor,
+{
+    let Some(metadata) = metadata else {
+        return Ok(());
+    };
+    let input = metadata_content_input(metadata).map_err(ProcessError::Metadata)?;
+
+    vmm.handle_action(VmmAction::PutMmds(input))
+        .map(|_| ())
+        .map_err(MetadataFileError::Apply)
+        .map_err(ProcessError::Metadata)
+}
+
+fn metadata_content_input(metadata_file: &str) -> Result<MmdsContentInput, MetadataFileError> {
+    let contents =
+        read_limited_regular_utf8_file(metadata_file, METADATA_FILE_MAX_BYTES).map_err(|err| {
+            match err {
+                StartupFileReadError::Read(kind) => MetadataFileError::Read(kind),
+                StartupFileReadError::NotRegular => MetadataFileError::NotRegular,
+                StartupFileReadError::TooLarge => MetadataFileError::TooLarge,
+            }
+        })?;
+    let value = serde_json::from_str::<serde_json::Value>(&contents)
+        .map_err(|_| MetadataFileError::Malformed)?;
+
+    Ok(MmdsContentInput::new(value))
+}
+
+fn read_limited_regular_utf8_file(
+    path: &str,
+    max_bytes: usize,
+) -> Result<String, StartupFileReadError> {
+    let max_bytes_u64 = max_bytes as u64;
+
+    // Keep special files such as FIFOs from hanging startup before file-type validation.
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|err| StartupFileReadError::Read(err.kind()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|err| StartupFileReadError::Read(err.kind()))?;
+    if !metadata.file_type().is_file() {
+        return Err(StartupFileReadError::NotRegular);
+    }
+    if metadata.len() > max_bytes_u64 {
+        return Err(StartupFileReadError::TooLarge);
+    }
+
+    // Re-check through a capped reader in case the file grows after metadata validation.
+    let mut contents = Vec::new();
+    file.take(max_bytes_u64 + 1)
+        .read_to_end(&mut contents)
+        .map_err(|err| StartupFileReadError::Read(err.kind()))?;
+    if contents.len() > max_bytes {
+        return Err(StartupFileReadError::TooLarge);
+    }
+
+    String::from_utf8(contents)
+        .map_err(|_| StartupFileReadError::Read(std::io::ErrorKind::InvalidData))
+}
+
 fn parse_process_args<I>(args: I) -> Result<Args, ProcessError>
 where
     I: IntoIterator<Item = OsString>,
@@ -407,6 +458,7 @@ enum ProcessError {
     ApiServer(ApiServerError),
     ArgumentParsing(String),
     ConfigFile(ConfigFileError),
+    Metadata(MetadataFileError),
     SignalHandler(std::io::ErrorKind),
     StartupConfiguration(VmmActionError),
 }
@@ -417,6 +469,7 @@ impl ProcessError {
             Self::ApiServer(_) => ProcessExitCode::ProcessFailure,
             Self::ArgumentParsing(_) => ProcessExitCode::ArgumentParsing,
             Self::ConfigFile(_) => ProcessExitCode::ProcessFailure,
+            Self::Metadata(_) => ProcessExitCode::ProcessFailure,
             Self::SignalHandler(_) => ProcessExitCode::ProcessFailure,
             Self::StartupConfiguration(_) => ProcessExitCode::ProcessFailure,
         }
@@ -429,6 +482,7 @@ impl fmt::Display for ProcessError {
             Self::ApiServer(err) => write!(f, "API server error: {err}"),
             Self::ArgumentParsing(message) => f.write_str(message),
             Self::ConfigFile(err) => write!(f, "config-file error: {err}"),
+            Self::Metadata(err) => write!(f, "metadata error: {err}"),
             Self::SignalHandler(kind) => {
                 write!(f, "shutdown signal handling failed: {kind:?}")
             }
@@ -440,6 +494,13 @@ impl fmt::Display for ProcessError {
 }
 
 impl std::error::Error for ProcessError {}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StartupFileReadError {
+    Read(std::io::ErrorKind),
+    NotRegular,
+    TooLarge,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum ConfigFileError {
@@ -497,6 +558,32 @@ impl fmt::Display for ConfigFileError {
 }
 
 impl std::error::Error for ConfigFileError {}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MetadataFileError {
+    Read(std::io::ErrorKind),
+    NotRegular,
+    TooLarge,
+    Malformed,
+    Apply(VmmActionError),
+}
+
+impl fmt::Display for MetadataFileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(kind) => write!(f, "failed to read metadata file: {kind:?}"),
+            Self::NotRegular => f.write_str("metadata file must be a regular file"),
+            Self::TooLarge => write!(
+                f,
+                "metadata file exceeds {METADATA_FILE_MAX_BYTES} byte size limit"
+            ),
+            Self::Malformed => f.write_str("malformed metadata file"),
+            Self::Apply(err) => write!(f, "failed to apply metadata: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for MetadataFileError {}
 
 #[derive(Debug)]
 struct ShutdownSignal {
@@ -578,7 +665,7 @@ struct Args {
 enum Command {
     Help,
     Version,
-    Run(StartupConfig),
+    Run(Box<StartupConfig>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -589,6 +676,7 @@ struct StartupConfig {
     id: String,
     logger_config: Option<LoggerConfigInput>,
     mmds_size_limit: Option<usize>,
+    metadata: Option<String>,
     metrics_config: Option<MetricsConfigInput>,
     no_api: bool,
 }
@@ -602,6 +690,7 @@ impl Default for StartupConfig {
             id: DEFAULT_INSTANCE_ID.to_string(),
             logger_config: None,
             mmds_size_limit: None,
+            metadata: None,
             metrics_config: None,
             no_api: false,
         }
@@ -670,6 +759,7 @@ impl Args {
         let mut log_path_seen = false;
         let mut level_seen = false;
         let mut mmds_size_limit_seen = false;
+        let mut metadata_seen = false;
         let mut metrics_path_seen = false;
         let mut module_seen = false;
         let mut no_api_seen = false;
@@ -748,6 +838,16 @@ impl Args {
                     let value = take_value(&args, index, "--mmds-size-limit")?;
                     config.mmds_size_limit = Some(parse_mmds_size_limit(&value)?);
                     mmds_size_limit_seen = true;
+                    index += 2;
+                }
+                "--metadata" => {
+                    if metadata_seen {
+                        return Err("duplicate argument: --metadata".to_string());
+                    }
+                    let value = take_value(&args, index, "--metadata")?;
+                    validate_metadata_path(&value)?;
+                    config.metadata = Some(value);
+                    metadata_seen = true;
                     index += 2;
                 }
                 "--no-api" => {
@@ -830,7 +930,7 @@ impl Args {
         }
 
         Ok(Self {
-            command: Command::Run(config),
+            command: Command::Run(Box::new(config)),
         })
     }
 }
@@ -863,6 +963,7 @@ fn help_text() -> String {
             "      --metrics-path <PATH>  Metrics output file or FIFO path\n",
             "      --mmds-size-limit <BYTES>\n",
             "                         MMDS data store size; defaults to HTTP API limit\n",
+            "      --metadata <PATH>  JSON metadata file used to initialize MMDS at startup\n",
             "      --module <MODULE>  Logger module filter stored for future log integration\n",
             "      --no-api          Start from --config-file without publishing an API socket\n",
             "      --show-level       Include level in minimal logger action lines\n",
@@ -917,12 +1018,22 @@ fn parse_http_api_max_payload_size(value: &str) -> Result<usize, String> {
 }
 
 fn validate_config_file_path(config_file: &str) -> Result<(), String> {
-    if config_file.is_empty() {
-        return Err("invalid --config-file: path must not be empty".to_string());
+    validate_startup_file_path(config_file, "config-file")
+}
+
+fn validate_metadata_path(metadata: &str) -> Result<(), String> {
+    validate_startup_file_path(metadata, "metadata")
+}
+
+fn validate_startup_file_path(path: &str, name: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err(format!("invalid --{name}: path must not be empty"));
     }
 
-    if config_file.chars().any(char::is_control) {
-        return Err("invalid --config-file: path must not contain control characters".to_string());
+    if path.chars().any(char::is_control) {
+        return Err(format!(
+            "invalid --{name}: path must not contain control characters"
+        ));
     }
 
     Ok(())
@@ -988,6 +1099,7 @@ fn unsupported_equals_syntax(arg: &str) -> Option<&'static str> {
         ("--id=", "id"),
         ("--log-path=", "log-path"),
         ("--level=", "level"),
+        ("--metadata=", "metadata"),
         ("--metrics-path=", "metrics-path"),
         ("--mmds-size-limit=", "mmds-size-limit"),
         ("--module=", "module"),
@@ -1013,8 +1125,9 @@ mod tests {
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel};
     use bangbang_runtime::metrics::{MetricsConfigError, MetricsConfigInput};
+    use bangbang_runtime::mmds::MmdsDataStoreError;
     use bangbang_runtime::serial::SerialConfigError;
-    use bangbang_runtime::{BackendError, InstanceState, VmmAction};
+    use bangbang_runtime::{BackendError, InstanceState, VmmAction, VmmData};
 
     use crate::vmm::{InstanceStartExecutor, ProcessVmm};
 
@@ -1044,7 +1157,7 @@ mod tests {
 
     fn parse_run(args: &[&str]) -> Result<StartupConfig, String> {
         match parse(args)?.command {
-            Command::Run(config) => Ok(config),
+            Command::Run(config) => Ok(*config),
             command => Err(format!("expected run command, got {command:?}")),
         }
     }
@@ -1183,6 +1296,7 @@ mod tests {
         assert_eq!(config.id, DEFAULT_INSTANCE_ID);
         assert_eq!(config.logger_config, None);
         assert_eq!(config.metrics_config, None);
+        assert_eq!(config.metadata, None);
         assert!(!config.no_api);
     }
 
@@ -1215,6 +1329,7 @@ mod tests {
         assert!(help.contains("--metrics-path <PATH>"));
         assert!(help.contains("--http-api-max-payload-size <BYTES>"));
         assert!(help.contains("--mmds-size-limit <BYTES>"));
+        assert!(help.contains("--metadata <PATH>"));
         assert!(help.contains("--no-api"));
         assert!(help.contains("without publishing an API socket"));
         assert!(help.contains("--show-level"));
@@ -1313,6 +1428,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_metadata_arg() {
+        let config = parse_run(&["--metadata", "/tmp/mmds.json"])
+            .expect("metadata startup arg should parse");
+
+        assert_eq!(config.metadata, Some("/tmp/mmds.json".to_string()));
+    }
+
+    #[test]
     fn mmds_size_limit_inherits_http_api_max_payload_size_when_omitted() {
         let config = parse_run(&["--http-api-max-payload-size", "65536"])
             .expect("HTTP payload size should parse");
@@ -1398,6 +1521,8 @@ mod tests {
             "65536",
             "--mmds-size-limit",
             "4096",
+            "--metadata",
+            "/tmp/mmds.json",
             "--metrics-path",
             "/tmp/bangbang.metrics",
         ])
@@ -1410,6 +1535,7 @@ mod tests {
         );
         assert_eq!(config.http_api_max_payload_size, 65_536);
         assert_eq!(config.mmds_size_limit, Some(4096));
+        assert_eq!(config.metadata, Some("/tmp/mmds.json".to_string()));
         assert_eq!(config.id, "demo-1");
         assert_eq!(config.logger_config, None);
         assert_eq!(
@@ -1459,6 +1585,13 @@ mod tests {
         let err = parse(&["--mmds-size-limit", "--id"]).expect_err("missing MMDS size should fail");
 
         assert_eq!(err, "missing value for --mmds-size-limit");
+    }
+
+    #[test]
+    fn rejects_missing_metadata_value() {
+        let err = parse(&["--metadata", "--id"]).expect_err("missing metadata path should fail");
+
+        assert_eq!(err, "missing value for --metadata");
     }
 
     #[test]
@@ -1539,6 +1672,14 @@ mod tests {
             .expect_err("duplicate MMDS size should fail");
 
         assert_eq!(err, "duplicate argument: --mmds-size-limit");
+    }
+
+    #[test]
+    fn rejects_duplicate_metadata() {
+        let err = parse(&["--metadata", "/tmp/one.json", "--metadata", "/tmp/two.json"])
+            .expect_err("duplicate metadata path should fail");
+
+        assert_eq!(err, "duplicate argument: --metadata");
     }
 
     #[test]
@@ -1679,6 +1820,24 @@ mod tests {
     }
 
     #[test]
+    fn rejects_empty_metadata_path() {
+        let err = parse(&["--metadata", ""]).expect_err("empty metadata path should fail");
+
+        assert_eq!(err, "invalid --metadata: path must not be empty");
+    }
+
+    #[test]
+    fn rejects_metadata_path_with_control_character() {
+        let err = parse(&["--metadata", "/tmp/mmds\n.json"])
+            .expect_err("metadata path with control character should fail");
+
+        assert_eq!(
+            err,
+            "invalid --metadata: path must not contain control characters"
+        );
+    }
+
+    #[test]
     fn rejects_empty_id() {
         let err = parse(&["--id", ""]).expect_err("empty id should fail");
 
@@ -1811,6 +1970,13 @@ mod tests {
         assert_eq!(
             err,
             "unsupported argument syntax for --mmds-size-limit; use --mmds-size-limit <VALUE>"
+        );
+
+        let err = parse(&["--metadata=/tmp/mmds.json"]).expect_err("equals syntax should fail");
+
+        assert_eq!(
+            err,
+            "unsupported argument syntax for --metadata; use --metadata <VALUE>"
         );
     }
 
@@ -1958,7 +2124,7 @@ mod tests {
     fn config_file_rejects_oversized_file_before_reading() {
         let config_path = unique_config_path("oversized");
         let file = fs::File::create(&config_path).expect("fixture file should be created");
-        file.set_len(super::CONFIG_FILE_MAX_BYTES_U64 + 1)
+        file.set_len(super::CONFIG_FILE_MAX_BYTES as u64 + 1)
             .expect("fixture file should be sized");
 
         let err = super::config_file_actions(config_path.to_str().expect("UTF-8 path"))
@@ -2125,6 +2291,189 @@ mod tests {
         );
 
         fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn applies_startup_metadata_before_actions() {
+        let path = unique_config_path("metadata");
+        fs::write(
+            &path,
+            r#"{"latest":{"meta-data":{"ami-id":"ami-bangbang"},"user-data":"hello"}}"#,
+        )
+        .expect("metadata file should be written");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        super::apply_startup_metadata(&mut vmm, Some(path.to_str().expect("UTF-8 path")))
+            .expect("startup metadata should apply");
+
+        assert_eq!(
+            vmm.handle_action(VmmAction::GetMmds),
+            Ok(VmmData::MmdsValue(serde_json::json!({
+                "latest": {
+                    "meta-data": {
+                        "ami-id": "ami-bangbang"
+                    },
+                    "user-data": "hello"
+                }
+            })))
+        );
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+
+        fs::remove_file(path).expect("fixture metadata should clean up");
+    }
+
+    #[test]
+    fn metadata_file_rejects_non_regular_file() {
+        let metadata_path = unique_config_path("metadata-directory");
+        fs::create_dir(&metadata_path).expect("fixture directory should be created");
+
+        let err = super::metadata_content_input(metadata_path.to_str().expect("UTF-8 path"))
+            .expect_err("metadata directory should fail before reading");
+
+        assert_eq!(err, super::MetadataFileError::NotRegular);
+
+        fs::remove_dir(metadata_path).expect("fixture directory should clean up");
+    }
+
+    #[test]
+    fn metadata_file_rejects_oversized_file_before_parsing() {
+        let metadata_path = unique_config_path("metadata-oversized-file");
+        let file = fs::File::create(&metadata_path).expect("fixture file should be created");
+        file.set_len(super::METADATA_FILE_MAX_BYTES as u64 + 1)
+            .expect("fixture file should be sized");
+
+        let err = super::metadata_content_input(metadata_path.to_str().expect("UTF-8 path"))
+            .expect_err("oversized metadata file should fail before parsing");
+
+        assert_eq!(err, super::MetadataFileError::TooLarge);
+
+        fs::remove_file(metadata_path).expect("fixture file should clean up");
+    }
+
+    #[test]
+    fn metadata_file_accepts_exact_size_limit() {
+        let metadata_path = unique_config_path("metadata-exact-size");
+        let mut metadata = r#"{"latest":{"user-data":"hello"}}"#.to_string();
+        metadata.extend(std::iter::repeat_n(
+            ' ',
+            super::METADATA_FILE_MAX_BYTES - metadata.len(),
+        ));
+        fs::write(&metadata_path, metadata).expect("fixture file should be written");
+
+        let input = super::metadata_content_input(metadata_path.to_str().expect("UTF-8 path"))
+            .expect("exact limit metadata file should parse");
+
+        assert_eq!(
+            input.into_value(),
+            serde_json::json!({
+                "latest": {
+                    "user-data": "hello"
+                }
+            })
+        );
+
+        fs::remove_file(metadata_path).expect("fixture file should clean up");
+    }
+
+    #[test]
+    fn metadata_file_rejects_invalid_utf8() {
+        let metadata_path = unique_config_path("metadata-invalid-utf8");
+        fs::write(&metadata_path, [0xff]).expect("fixture file should be written");
+
+        let err = super::metadata_content_input(metadata_path.to_str().expect("UTF-8 path"))
+            .expect_err("invalid UTF-8 metadata file should fail");
+
+        assert_eq!(
+            err,
+            super::MetadataFileError::Read(std::io::ErrorKind::InvalidData)
+        );
+
+        fs::remove_file(metadata_path).expect("fixture file should clean up");
+    }
+
+    #[test]
+    fn startup_metadata_errors_do_not_start_instance() {
+        let malformed_path = unique_config_path("metadata-malformed");
+        fs::write(&malformed_path, "{").expect("malformed metadata file should be written");
+        let non_object_path = unique_config_path("metadata-non-object");
+        fs::write(&non_object_path, r#"["not","object"]"#)
+            .expect("non-object metadata file should be written");
+        let oversized_path = unique_config_path("metadata-oversized");
+        let oversized_value = "x".repeat(128);
+        fs::write(
+            &oversized_path,
+            format!(r#"{{"latest":{{"user-data":"{oversized_value}"}}}}"#),
+        )
+        .expect("oversized metadata file should be written");
+
+        let cases = [
+            (
+                &malformed_path,
+                bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+                "malformed",
+            ),
+            (
+                &non_object_path,
+                bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+                "non-object",
+            ),
+            (&oversized_path, 32, "oversized"),
+        ];
+        for (path, limit, case_name) in cases {
+            let mut vmm = ProcessVmm::with_starter_and_mmds_data_store_limit(
+                "demo-1",
+                env!("CARGO_PKG_VERSION"),
+                "bangbang",
+                TestInstanceStarter,
+                limit,
+            );
+            let err =
+                super::apply_startup_metadata(&mut vmm, Some(path.to_str().expect("UTF-8 path")))
+                    .expect_err("metadata error should fail startup metadata application");
+
+            match case_name {
+                "malformed" => assert_eq!(
+                    err,
+                    ProcessError::Metadata(super::MetadataFileError::Malformed)
+                ),
+                "non-object" => assert_eq!(
+                    err,
+                    ProcessError::Metadata(super::MetadataFileError::Apply(
+                        bangbang_runtime::VmmActionError::MmdsDataStore(
+                            MmdsDataStoreError::InvalidObject,
+                        ),
+                    ))
+                ),
+                "oversized" => {
+                    let ProcessError::Metadata(super::MetadataFileError::Apply(
+                        bangbang_runtime::VmmActionError::MmdsDataStore(
+                            MmdsDataStoreError::DataStoreLimitExceeded {
+                                limit_bytes,
+                                size_bytes,
+                            },
+                        ),
+                    )) = err
+                    else {
+                        panic!("expected oversized metadata error, got {err:?}");
+                    };
+                    assert_eq!(limit_bytes, 32);
+                    assert!(size_bytes > limit_bytes);
+                }
+                _ => panic!("unexpected metadata test case: {case_name}"),
+            }
+            assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+            assert!(!vmm.has_started_session());
+        }
+
+        fs::remove_file(malformed_path).expect("malformed fixture should clean up");
+        fs::remove_file(non_object_path).expect("non-object fixture should clean up");
+        fs::remove_file(oversized_path).expect("oversized fixture should clean up");
     }
 
     #[test]

@@ -131,11 +131,12 @@ control yet.
 | `--show-level` | enables level prefix for minimal action logs | Writes `level=Info` before minimal `InstanceStart` and `FlushMetrics` action lines. |
 | `--show-log-origin` | enables origin field for minimal action logs | Writes `origin=<file>:<line>` before minimal `InstanceStart` and `FlushMetrics` action names. Full Firecracker logger integration remains deferred. |
 | `--mmds-size-limit <BYTES>` | configures the maximum serialized MMDS data-store size | When omitted, follows the effective HTTP API payload limit like Firecracker; with default HTTP settings this is `51200` bytes. Zero, malformed, duplicate, and equals-syntax values are rejected during argument parsing. |
+| `--metadata <PATH>` | initializes MMDS data before API serving or no-api readiness | Reads a readable regular UTF-8 JSON metadata file up to 1 MiB and applies it through the same runtime validation and serialized data-store limit as `PUT /mmds`. Malformed, non-object, oversized, duplicate, empty-path, control-character, missing-value, and equals-syntax inputs fail before readiness. |
 | `--config-file <PATH>` | startup implemented for supported subset | Reads a Firecracker-shaped JSON configuration from a readable regular file up to 1 MiB, applies supported sections through the same validation path as matching API requests, and starts the VM with `InstanceStart`. In API-enabled mode, the API socket is published only after successful startup. Malformed, oversized, unknown, unsupported, or invalid sections fail before socket publication or no-api readiness. |
 | `--help`, `-h` | prints help | Help describes the current API socket scope. |
 | `--version`, `-V` | prints version | `-V` is retained from the existing bangbang scaffold. |
 | `--no-api` | config-file startup without API socket | Requires `--config-file`. Starts the supported config-file subset without binding or publishing the configured API socket, then waits for handled `SIGINT` or `SIGTERM`. Runtime control, guest-initiated shutdown, and no-api exit-code parity remain deferred. |
-| seccomp, snapshot, metadata, boot timer, and PCI process flags | rejected | These Firecracker options are Linux-specific or tied to later capability work. |
+| seccomp, snapshot, boot timer, and PCI process flags | rejected | These Firecracker options are Linux-specific or tied to later capability work. |
 
 bangbang intentionally treats `--id` alphanumeric characters as ASCII only.
 This is stricter than Firecracker `v1.16.0`'s Rust validator, which accepts
@@ -152,8 +153,8 @@ compatibility decision expands the CLI parser.
 `PUT /cpu-config` and still fails as an unsupported CPU configuration action.
 Known unsupported sections such as `balloon`, `entropy`, `memory-hotplug`, and
 `pmem` fail before the API socket is published or before no-api readiness is
-reported. The config-file path does not load MMDS data; Firecracker's separate
-metadata startup argument remains unsupported.
+reported. The config-file path does not load MMDS data; use Firecracker's
+separate `--metadata <PATH>` startup argument for startup MMDS data.
 
 CLI values are untrusted input. Current validation rejects invalid IDs, empty
 socket paths, and socket paths containing control characters. API startup also
@@ -1277,7 +1278,9 @@ different per-process API socket request limit.
 The MMDS data store uses the effective `--mmds-size-limit <BYTES>` value as its
 serialized JSON limit. When that argument is omitted, the limit follows the
 effective HTTP API payload limit like Firecracker; with default HTTP settings
-this remains `51200` bytes.
+this remains `51200` bytes. Startup `--metadata <PATH>` initializes the same
+data store before API serving or no-api readiness and is subject to the same
+serialized JSON limit after its file is parsed.
 Internal MMDS guest GET response modeling checks the configured MMDS v2 token
 requirement before reading metadata. Once a request is permitted to read
 metadata, it follows the same uninitialized data policy: before `PUT /mmds`, it
