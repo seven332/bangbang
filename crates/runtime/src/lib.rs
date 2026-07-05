@@ -405,6 +405,30 @@ impl VmmController {
         self.metrics_state.record_put_actions_failure();
     }
 
+    pub fn record_put_boot_source_request(&mut self) {
+        self.metrics_state.record_put_boot_source_request();
+    }
+
+    pub fn record_put_boot_source_failure(&mut self) {
+        self.metrics_state.record_put_boot_source_failure();
+    }
+
+    pub fn record_put_cpu_config_request(&mut self) {
+        self.metrics_state.record_put_cpu_config_request();
+    }
+
+    pub fn record_put_cpu_config_failure(&mut self) {
+        self.metrics_state.record_put_cpu_config_failure();
+    }
+
+    pub fn record_put_drive_request(&mut self) {
+        self.metrics_state.record_put_drive_request();
+    }
+
+    pub fn record_put_drive_failure(&mut self) {
+        self.metrics_state.record_put_drive_failure();
+    }
+
     pub fn record_put_metrics_request(&mut self) {
         self.metrics_state.record_put_metrics_request();
     }
@@ -421,12 +445,36 @@ impl VmmController {
         self.metrics_state.record_put_logger_failure();
     }
 
+    pub fn record_put_machine_config_request(&mut self) {
+        self.metrics_state.record_put_machine_config_request();
+    }
+
+    pub fn record_put_machine_config_failure(&mut self) {
+        self.metrics_state.record_put_machine_config_failure();
+    }
+
+    pub fn record_put_network_request(&mut self) {
+        self.metrics_state.record_put_network_request();
+    }
+
+    pub fn record_put_network_failure(&mut self) {
+        self.metrics_state.record_put_network_failure();
+    }
+
     pub fn record_put_serial_request(&mut self) {
         self.metrics_state.record_put_serial_request();
     }
 
     pub fn record_put_serial_failure(&mut self) {
         self.metrics_state.record_put_serial_failure();
+    }
+
+    pub fn record_put_vsock_request(&mut self) {
+        self.metrics_state.record_put_vsock_request();
+    }
+
+    pub fn record_put_vsock_failure(&mut self) {
+        self.metrics_state.record_put_vsock_failure();
     }
 
     pub fn record_get_instance_info_request(&mut self) {

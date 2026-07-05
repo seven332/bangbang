@@ -11,16 +11,19 @@ use bangbang_hvf::{
     HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
     HvfVcpuRunnerError, OwnedHvfArm64BootSession,
 };
-use bangbang_runtime::block::BlockMmioLayout;
+use bangbang_runtime::block::{BlockMmioLayout, DriveConfigInput};
+use bangbang_runtime::boot::BootSourceConfigInput;
 use bangbang_runtime::logger::LoggerConfigInput;
+use bangbang_runtime::machine::MachineConfigInput;
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
 use bangbang_runtime::metrics::{BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics};
 use bangbang_runtime::mmds::{MmdsConfig, MmdsStateHandle, MmdsStateLockError};
 use bangbang_runtime::mmio::MmioRegionId;
 use bangbang_runtime::network::{
-    NetworkInterfaceConfig, NetworkInterfaceConfigError, NetworkMmioLayout, VirtioNetworkRxPacket,
-    VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame,
-    VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError, validate_network_interface_count,
+    NetworkInterfaceConfig, NetworkInterfaceConfigError, NetworkInterfaceConfigInput,
+    NetworkMmioLayout, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
+    VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame, VirtioNetworkTxPacketSink,
+    VirtioNetworkTxPacketSinkError, validate_network_interface_count,
 };
 use bangbang_runtime::serial::{
     SerialConfigError, SerialConfigInput, SerialOutputFile, SharedSerialOutput,
@@ -30,7 +33,7 @@ use bangbang_runtime::startup::{
     Arm64BootNetworkDevice, Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError,
     Arm64BootNetworkPacketIoProvider,
 };
-use bangbang_runtime::vsock::VsockMmioLayout;
+use bangbang_runtime::vsock::{VsockConfigInput, VsockMmioLayout};
 use bangbang_runtime::{BackendError, VmmAction, VmmActionError, VmmController, VmmData};
 
 use crate::host_network::virtio_vmnet::{
@@ -108,30 +111,72 @@ impl GetApiRequest {
 }
 
 #[derive(Debug)]
-pub(crate) struct PutObservabilityApiRequest {
-    kind: PutObservabilityApiRequestKind,
+pub(crate) struct PutApiRequest {
+    kind: PutApiRequestKind,
     action: VmmAction,
 }
 
-impl PutObservabilityApiRequest {
+impl PutApiRequest {
+    pub(crate) fn boot_source(input: BootSourceConfigInput) -> Self {
+        Self {
+            kind: PutApiRequestKind::BootSource,
+            action: VmmAction::PutBootSource(input),
+        }
+    }
+
+    pub(crate) fn cpu_config() -> Self {
+        Self {
+            kind: PutApiRequestKind::CpuConfig,
+            action: VmmAction::PutCpuConfig,
+        }
+    }
+
+    pub(crate) fn drive(input: DriveConfigInput) -> Self {
+        Self {
+            kind: PutApiRequestKind::Drive,
+            action: VmmAction::PutDrive(input),
+        }
+    }
+
     pub(crate) fn metrics(input: MetricsConfigInput) -> Self {
         Self {
-            kind: PutObservabilityApiRequestKind::Metrics,
+            kind: PutApiRequestKind::Metrics,
             action: VmmAction::PutMetrics(input),
         }
     }
 
     pub(crate) fn logger(input: LoggerConfigInput) -> Self {
         Self {
-            kind: PutObservabilityApiRequestKind::Logger,
+            kind: PutApiRequestKind::Logger,
             action: VmmAction::PutLogger(input),
+        }
+    }
+
+    pub(crate) fn machine_config(input: MachineConfigInput) -> Self {
+        Self {
+            kind: PutApiRequestKind::MachineConfig,
+            action: VmmAction::PutMachineConfig(input),
+        }
+    }
+
+    pub(crate) fn network(input: NetworkInterfaceConfigInput) -> Self {
+        Self {
+            kind: PutApiRequestKind::Network,
+            action: VmmAction::PutNetworkInterface(input),
         }
     }
 
     pub(crate) fn serial(input: SerialConfigInput) -> Self {
         Self {
-            kind: PutObservabilityApiRequestKind::Serial,
+            kind: PutApiRequestKind::Serial,
             action: VmmAction::PutSerial(input),
+        }
+    }
+
+    pub(crate) fn vsock(input: VsockConfigInput) -> Self {
+        Self {
+            kind: PutApiRequestKind::Vsock,
+            action: VmmAction::PutVsock(input),
         }
     }
 
@@ -145,26 +190,44 @@ impl PutObservabilityApiRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PutObservabilityApiRequestKind {
+enum PutApiRequestKind {
+    BootSource,
+    CpuConfig,
+    Drive,
     Metrics,
     Logger,
+    MachineConfig,
+    Network,
     Serial,
+    Vsock,
 }
 
-impl PutObservabilityApiRequestKind {
+impl PutApiRequestKind {
     fn record_request(self, controller: &mut VmmController) {
         match self {
+            Self::BootSource => controller.record_put_boot_source_request(),
+            Self::CpuConfig => controller.record_put_cpu_config_request(),
+            Self::Drive => controller.record_put_drive_request(),
             Self::Metrics => controller.record_put_metrics_request(),
             Self::Logger => controller.record_put_logger_request(),
+            Self::MachineConfig => controller.record_put_machine_config_request(),
+            Self::Network => controller.record_put_network_request(),
             Self::Serial => controller.record_put_serial_request(),
+            Self::Vsock => controller.record_put_vsock_request(),
         }
     }
 
     fn record_failure(self, controller: &mut VmmController) {
         match self {
+            Self::BootSource => controller.record_put_boot_source_failure(),
+            Self::CpuConfig => controller.record_put_cpu_config_failure(),
+            Self::Drive => controller.record_put_drive_failure(),
             Self::Metrics => controller.record_put_metrics_failure(),
             Self::Logger => controller.record_put_logger_failure(),
+            Self::MachineConfig => controller.record_put_machine_config_failure(),
+            Self::Network => controller.record_put_network_failure(),
             Self::Serial => controller.record_put_serial_failure(),
+            Self::Vsock => controller.record_put_vsock_failure(),
         }
     }
 }
@@ -174,10 +237,7 @@ pub(crate) trait VmmRequestHandler {
 
     fn handle_get_request(&mut self, request: GetApiRequest) -> Result<VmmData, VmmActionError>;
 
-    fn handle_put_observability_request(
-        &mut self,
-        request: PutObservabilityApiRequest,
-    ) -> Result<VmmData, VmmActionError>;
+    fn handle_put_request(&mut self, request: PutApiRequest) -> Result<VmmData, VmmActionError>;
 
     fn handle_put_action_request(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError>;
 }
@@ -315,10 +375,7 @@ where
         self.handle_action(request.action())
     }
 
-    fn handle_put_observability_request(
-        &mut self,
-        request: PutObservabilityApiRequest,
-    ) -> Result<VmmData, VmmActionError> {
+    fn handle_put_request(&mut self, request: PutApiRequest) -> Result<VmmData, VmmActionError> {
         let kind = request.kind;
         request.record_request(&mut self.controller);
         let action = request.into_action();
@@ -383,11 +440,8 @@ where
         ProcessVmm::handle_get_request(self, request)
     }
 
-    fn handle_put_observability_request(
-        &mut self,
-        request: PutObservabilityApiRequest,
-    ) -> Result<VmmData, VmmActionError> {
-        ProcessVmm::handle_put_observability_request(self, request)
+    fn handle_put_request(&mut self, request: PutApiRequest) -> Result<VmmData, VmmActionError> {
+        ProcessVmm::handle_put_request(self, request)
     }
 }
 
@@ -1120,6 +1174,7 @@ mod tests {
     use bangbang_runtime::fdt::{Arm64FdtRegion, Arm64FdtVirtioMmioDevice};
     use bangbang_runtime::interrupt::GuestInterruptLine;
     use bangbang_runtime::logger::LoggerConfigInput;
+    use bangbang_runtime::machine::MachineConfigInput;
     use bangbang_runtime::metrics::{
         BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics,
     };
@@ -1139,6 +1194,7 @@ mod tests {
         Arm64BootNetworkPacketIoProvider,
     };
     use bangbang_runtime::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE;
+    use bangbang_runtime::vsock::VsockConfigInput;
     use bangbang_runtime::{BackendError, InstanceState, VmmAction, VmmActionError, VmmController};
 
     use crate::host_network::vmnet::{
@@ -2529,16 +2585,20 @@ mod tests {
     }
 
     #[test]
-    fn direct_observability_actions_do_not_record_api_request_metrics() {
+    fn direct_put_actions_do_not_record_api_request_metrics() {
         let metrics = TempFilePath::create("direct-metrics");
         let logger = TempFilePath::create("direct-logger");
         let serial = TempFilePath::create("direct-serial");
+        let drive = TempFilePath::create("direct-drive");
+        let vsock = TempFilePath::create("direct-vsock");
         let mut vmm =
             ProcessVmm::with_starter("demo-1", "0.1.0", "bangbang", FakeStarter::success(3));
         vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
             metrics.path(),
         )))
         .expect("metrics should configure");
+        vmm.handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 256)))
+            .expect("machine config should configure");
         vmm.handle_action(VmmAction::PutLogger(
             LoggerConfigInput::new().with_log_path(logger.path()),
         ))
@@ -2547,6 +2607,26 @@ mod tests {
             SerialConfigInput::new().with_serial_out_path(serial.path().to_string_lossy()),
         ))
         .expect("serial should configure");
+        vmm.handle_action(VmmAction::PutDrive(DriveConfigInput::new(
+            "data",
+            "data",
+            drive.path(),
+            false,
+        )))
+        .expect("drive should configure");
+        vmm.handle_action(VmmAction::PutNetworkInterface(
+            NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared"),
+        ))
+        .expect("network interface should configure");
+        vmm.handle_action(VmmAction::PutVsock(VsockConfigInput::new(
+            3,
+            vsock.path().to_string_lossy(),
+        )))
+        .expect("vsock should configure");
+        assert_eq!(
+            vmm.handle_action(VmmAction::PutCpuConfig),
+            Err(VmmActionError::UnsupportedAction("PutCpuConfig"))
+        );
         vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
             "/tmp/vmlinux",
         )))
