@@ -5,6 +5,7 @@ pub enum Endpoint {
     VmState,
     VmConfig,
     Actions,
+    Balloon,
     BootSource,
     CpuConfig,
     Entropy,

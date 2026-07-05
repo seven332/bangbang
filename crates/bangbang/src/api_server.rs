@@ -578,6 +578,22 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PutSerial(config) => handle_empty(vmm.handle_put_request(
             PutApiRequest::serial(serial_config_input_from_request(config.as_ref())),
         )),
+        ApiRequest::GetBalloon => handle_empty(vmm.handle_action(VmmAction::GetBalloon)),
+        ApiRequest::GetBalloonStats => handle_empty(vmm.handle_action(VmmAction::GetBalloonStats)),
+        ApiRequest::GetBalloonHintingStatus => {
+            handle_empty(vmm.handle_action(VmmAction::GetBalloonHintingStatus))
+        }
+        ApiRequest::PutBalloon => handle_empty(vmm.handle_action(VmmAction::PutBalloon)),
+        ApiRequest::PatchBalloon => handle_empty(vmm.handle_action(VmmAction::PatchBalloon)),
+        ApiRequest::PatchBalloonStats => {
+            handle_empty(vmm.handle_action(VmmAction::PatchBalloonStats))
+        }
+        ApiRequest::PatchBalloonHintingStart => {
+            handle_empty(vmm.handle_action(VmmAction::PatchBalloonHintingStart))
+        }
+        ApiRequest::PatchBalloonHintingStop => {
+            handle_empty(vmm.handle_action(VmmAction::PatchBalloonHintingStop))
+        }
         ApiRequest::PutEntropy => handle_empty(vmm.handle_action(VmmAction::PutEntropy)),
         ApiRequest::PutPmem => handle_empty(vmm.handle_action(VmmAction::PutPmem)),
         ApiRequest::PatchPmem => handle_empty(vmm.handle_action(VmmAction::PatchPmem)),
@@ -636,10 +652,17 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
             config.as_ref(),
         ))),
         ApiRequest::GetInstanceInfo
+        | ApiRequest::GetBalloon
+        | ApiRequest::GetBalloonStats
+        | ApiRequest::GetBalloonHintingStatus
         | ApiRequest::GetMachineConfig
         | ApiRequest::GetMmds
         | ApiRequest::GetVmConfig
         | ApiRequest::GetVersion
+        | ApiRequest::PatchBalloon
+        | ApiRequest::PatchBalloonStats
+        | ApiRequest::PatchBalloonHintingStart
+        | ApiRequest::PatchBalloonHintingStop
         | ApiRequest::PatchDrive(_)
         | ApiRequest::PatchMachineConfig(_)
         | ApiRequest::PatchMmds(_)
@@ -647,6 +670,7 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         | ApiRequest::PatchPmem
         | ApiRequest::PatchVmState(_)
         | ApiRequest::PutAction(_)
+        | ApiRequest::PutBalloon
         | ApiRequest::PutEntropy
         | ApiRequest::PutMmds(_)
         | ApiRequest::PutPmem
@@ -4351,12 +4375,12 @@ mod tests {
             (
                 "b-stats-get",
                 "GET /balloon/statistics HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
-                "Balloon device is not supported.",
+                "The requested operation is not supported in Not started state: GetBalloonStats",
             ),
             (
                 "b-hint-status",
                 "GET /balloon/hinting/status HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
-                "Balloon device is not supported.",
+                "The requested operation is not supported in Not started state: GetBalloonHintingStatus",
             ),
             (
                 "b-put",
@@ -4375,7 +4399,7 @@ mod tests {
             (
                 "b-patch",
                 request_with_body("PATCH", "/balloon", r#"{"amount_mib":32}"#),
-                "Balloon device is not supported.",
+                "The requested operation is not supported in Not started state: PatchBalloon",
             ),
             (
                 "b-stats-patch",
@@ -4384,7 +4408,7 @@ mod tests {
                     "/balloon/statistics",
                     r#"{"stats_polling_interval_s":1}"#,
                 ),
-                "Balloon device is not supported.",
+                "The requested operation is not supported in Not started state: PatchBalloonStats",
             ),
             (
                 "b-hint-start",
@@ -4393,7 +4417,7 @@ mod tests {
                     "/balloon/hinting/start",
                     r#"{"acknowledge_on_stop":false}"#,
                 ),
-                "Balloon device is not supported.",
+                "The requested operation is not supported in Not started state: PatchBalloonHintingStart",
             ),
             (
                 "b-hint-start-bad",
@@ -4407,7 +4431,7 @@ mod tests {
             (
                 "b-hint-stop",
                 request_with_body("PATCH", "/balloon/hinting/stop", "not-json"),
-                "Balloon device is not supported.",
+                "The requested operation is not supported in Not started state: PatchBalloonHintingStop",
             ),
         ] {
             let response = request_over_socket(&mut vmm, socket_name, &request);
@@ -4424,6 +4448,89 @@ mod tests {
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::NotStarted
+        );
+    }
+
+    #[test]
+    fn running_state_rejects_balloon_endpoints_without_echoing_request_fields() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_request = request_with_body("PUT", "/boot-source", boot_body);
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "balloon-start", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        for (socket_name, request, fault_message) in [
+            (
+                "bgr",
+                "GET /balloon HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
+                "Balloon device is not supported.",
+            ),
+            (
+                "bpr",
+                request_with_body(
+                    "PUT",
+                    "/balloon",
+                    r#"{"amount_mib":222222222,"deflate_on_oom":true,"stats_polling_interval_s":333}"#,
+                ),
+                "The requested operation is not supported in Running state: PutBalloon",
+            ),
+            (
+                "bpar",
+                request_with_body("PATCH", "/balloon", r#"{"amount_mib":222222222}"#),
+                "Balloon device is not supported.",
+            ),
+            (
+                "bsgr",
+                "GET /balloon/statistics HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
+                "Balloon device is not supported.",
+            ),
+            (
+                "bspr",
+                request_with_body(
+                    "PATCH",
+                    "/balloon/statistics",
+                    r#"{"stats_polling_interval_s":333}"#,
+                ),
+                "Balloon device is not supported.",
+            ),
+            (
+                "bhsr",
+                "GET /balloon/hinting/status HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
+                "Balloon device is not supported.",
+            ),
+            (
+                "bhsar",
+                request_with_body(
+                    "PATCH",
+                    "/balloon/hinting/start",
+                    r#"{"acknowledge_on_stop":false}"#,
+                ),
+                "Balloon device is not supported.",
+            ),
+            (
+                "bhsor",
+                request_with_body("PATCH", "/balloon/hinting/stop", "not-json"),
+                "Balloon device is not supported.",
+            ),
+        ] {
+            let response = request_over_socket(&mut vmm, socket_name, &request);
+
+            assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+            assert!(response.contains(&format!(r#"{{"fault_message":"{fault_message}"}}"#)));
+            for private_value in ["222222222", "333"] {
+                assert!(
+                    !response.contains(private_value),
+                    "running-state balloon response must not echo {private_value}: {response}"
+                );
+            }
+        }
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::Running
         );
     }
 

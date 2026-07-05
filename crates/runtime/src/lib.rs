@@ -75,6 +75,14 @@ pub enum VmmAction {
     CreateSnapshot,
     LoadSnapshot,
     FlushMetrics,
+    GetBalloon,
+    GetBalloonStats,
+    GetBalloonHintingStatus,
+    PutBalloon,
+    PatchBalloon,
+    PatchBalloonStats,
+    PatchBalloonHintingStart,
+    PatchBalloonHintingStop,
     PutEntropy,
     PutPmem,
     PatchPmem,
@@ -109,6 +117,14 @@ impl VmmAction {
             Self::CreateSnapshot => "CreateSnapshot",
             Self::LoadSnapshot => "LoadSnapshot",
             Self::FlushMetrics => "FlushMetrics",
+            Self::GetBalloon => "GetBalloon",
+            Self::GetBalloonStats => "GetBalloonStats",
+            Self::GetBalloonHintingStatus => "GetBalloonHintingStatus",
+            Self::PutBalloon => "PutBalloon",
+            Self::PatchBalloon => "PatchBalloon",
+            Self::PatchBalloonStats => "PatchBalloonStats",
+            Self::PatchBalloonHintingStart => "PatchBalloonHintingStart",
+            Self::PatchBalloonHintingStop => "PatchBalloonHintingStop",
             Self::PutEntropy => "PutEntropy",
             Self::PutPmem => "PutPmem",
             Self::PatchPmem => "PatchPmem",
@@ -202,6 +218,7 @@ pub enum VmmActionError {
         action: &'static str,
         state: InstanceState,
     },
+    BalloonUnsupported,
     EntropyUnsupported,
     MissingBootSource,
     InstanceStart(BackendError),
@@ -235,6 +252,7 @@ impl fmt::Display for VmmActionError {
                     "The requested operation is not supported in {state} state: {action}"
                 )
             }
+            Self::BalloonUnsupported => f.write_str("Balloon device is not supported."),
             Self::EntropyUnsupported => f.write_str("Entropy device is not supported."),
             Self::MissingBootSource => {
                 f.write_str("boot source must be configured before InstanceStart")
@@ -279,7 +297,8 @@ impl std::error::Error for VmmActionError {
             Self::NetworkInterfaceConfig(err) => Some(err),
             Self::SerialConfig(err) => Some(err),
             Self::VsockConfig(err) => Some(err),
-            Self::EntropyUnsupported
+            Self::BalloonUnsupported
+            | Self::EntropyUnsupported
             | Self::MissingBootSource
             | Self::NetworkInterfaceUpdateUnsupported
             | Self::PmemUnsupported
@@ -624,6 +643,32 @@ impl VmmController {
             }
             VmmAction::FlushMetrics => {
                 self.flush_metrics_with_diagnostics(&metrics::MetricsDiagnostics::default())
+            }
+            VmmAction::GetBalloon => Err(VmmActionError::BalloonUnsupported),
+            VmmAction::PutBalloon => {
+                if self.instance_info.state != InstanceState::NotStarted {
+                    return Err(VmmActionError::UnsupportedState {
+                        action: action_name,
+                        state: self.instance_info.state,
+                    });
+                }
+
+                Err(VmmActionError::BalloonUnsupported)
+            }
+            VmmAction::GetBalloonStats
+            | VmmAction::GetBalloonHintingStatus
+            | VmmAction::PatchBalloon
+            | VmmAction::PatchBalloonStats
+            | VmmAction::PatchBalloonHintingStart
+            | VmmAction::PatchBalloonHintingStop => {
+                if self.instance_info.state == InstanceState::NotStarted {
+                    return Err(VmmActionError::UnsupportedState {
+                        action: action_name,
+                        state: self.instance_info.state,
+                    });
+                }
+
+                Err(VmmActionError::BalloonUnsupported)
             }
             VmmAction::PutEntropy => {
                 if self.instance_info.state != InstanceState::NotStarted {
@@ -1243,6 +1288,23 @@ mod tests {
         assert_eq!(VmmAction::CreateSnapshot.name(), "CreateSnapshot");
         assert_eq!(VmmAction::LoadSnapshot.name(), "LoadSnapshot");
         assert_eq!(VmmAction::FlushMetrics.name(), "FlushMetrics");
+        assert_eq!(VmmAction::GetBalloon.name(), "GetBalloon");
+        assert_eq!(VmmAction::GetBalloonStats.name(), "GetBalloonStats");
+        assert_eq!(
+            VmmAction::GetBalloonHintingStatus.name(),
+            "GetBalloonHintingStatus"
+        );
+        assert_eq!(VmmAction::PutBalloon.name(), "PutBalloon");
+        assert_eq!(VmmAction::PatchBalloon.name(), "PatchBalloon");
+        assert_eq!(VmmAction::PatchBalloonStats.name(), "PatchBalloonStats");
+        assert_eq!(
+            VmmAction::PatchBalloonHintingStart.name(),
+            "PatchBalloonHintingStart"
+        );
+        assert_eq!(
+            VmmAction::PatchBalloonHintingStop.name(),
+            "PatchBalloonHintingStop"
+        );
         assert_eq!(VmmAction::PutEntropy.name(), "PutEntropy");
         assert_eq!(VmmAction::PutPmem.name(), "PutPmem");
         assert_eq!(VmmAction::PatchPmem.name(), "PatchPmem");
@@ -1440,6 +1502,139 @@ mod tests {
             );
             assert_eq!(controller.instance_info().state, state);
             assert!(controller.boot_source_config().is_some());
+        }
+    }
+
+    #[test]
+    fn get_balloon_reaches_balloon_fault_without_mutating() {
+        for state in [
+            InstanceState::NotStarted,
+            InstanceState::Running,
+            InstanceState::Paused,
+        ] {
+            let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+            controller
+                .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+                .expect("boot source config should be stored");
+            controller.instance_info.state = state;
+
+            let err = controller
+                .handle_action(VmmAction::GetBalloon)
+                .expect_err("balloon should remain unsupported");
+
+            assert_eq!(err, VmmActionError::BalloonUnsupported);
+            assert_eq!(controller.instance_info().state, state);
+            assert!(controller.boot_source_config().is_some());
+            assert!(controller.drive_configs().is_empty());
+            assert!(controller.network_interface_configs().is_empty());
+        }
+    }
+
+    #[test]
+    fn put_balloon_reaches_balloon_fault_before_start_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PutBalloon)
+            .expect_err("balloon should remain unsupported");
+
+        assert_eq!(err, VmmActionError::BalloonUnsupported);
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert!(controller.boot_source_config().is_some());
+        assert!(controller.drive_configs().is_empty());
+        assert!(controller.network_interface_configs().is_empty());
+    }
+
+    #[test]
+    fn put_balloon_rejects_running_or_paused_without_mutating() {
+        for state in [InstanceState::Running, InstanceState::Paused] {
+            let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+            controller
+                .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+                .expect("boot source config should be stored");
+            controller.instance_info.state = state;
+
+            let err = controller
+                .handle_action(VmmAction::PutBalloon)
+                .expect_err("balloon put should be pre-boot-only");
+
+            assert_eq!(
+                err,
+                VmmActionError::UnsupportedState {
+                    action: VmmAction::PutBalloon.name(),
+                    state,
+                }
+            );
+            assert_eq!(controller.instance_info().state, state);
+            assert!(controller.boot_source_config().is_some());
+            assert!(controller.drive_configs().is_empty());
+            assert!(controller.network_interface_configs().is_empty());
+        }
+    }
+
+    #[test]
+    fn postboot_balloon_actions_reject_not_started_without_mutating() {
+        for action in [
+            VmmAction::GetBalloonStats,
+            VmmAction::GetBalloonHintingStatus,
+            VmmAction::PatchBalloon,
+            VmmAction::PatchBalloonStats,
+            VmmAction::PatchBalloonHintingStart,
+            VmmAction::PatchBalloonHintingStop,
+        ] {
+            let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+            controller
+                .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+                .expect("boot source config should be stored");
+
+            let err = controller
+                .handle_action(action.clone())
+                .expect_err("balloon action should be post-boot-only");
+
+            assert_eq!(
+                err,
+                VmmActionError::UnsupportedState {
+                    action: action.name(),
+                    state: InstanceState::NotStarted,
+                }
+            );
+            assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+            assert!(controller.boot_source_config().is_some());
+            assert!(controller.drive_configs().is_empty());
+            assert!(controller.network_interface_configs().is_empty());
+        }
+    }
+
+    #[test]
+    fn postboot_balloon_actions_reach_balloon_fault_after_start_without_mutating() {
+        for state in [InstanceState::Running, InstanceState::Paused] {
+            for action in [
+                VmmAction::GetBalloonStats,
+                VmmAction::GetBalloonHintingStatus,
+                VmmAction::PatchBalloon,
+                VmmAction::PatchBalloonStats,
+                VmmAction::PatchBalloonHintingStart,
+                VmmAction::PatchBalloonHintingStop,
+            ] {
+                let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+                controller
+                    .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+                    .expect("boot source config should be stored");
+                controller.instance_info.state = state;
+
+                let err = controller
+                    .handle_action(action)
+                    .expect_err("balloon should remain unsupported");
+
+                assert_eq!(err, VmmActionError::BalloonUnsupported);
+                assert_eq!(controller.instance_info().state, state);
+                assert!(controller.boot_source_config().is_some());
+                assert!(controller.drive_configs().is_empty());
+                assert!(controller.network_interface_configs().is_empty());
+            }
         }
     }
 
@@ -3845,6 +4040,14 @@ mod tests {
         let err = VmmActionError::SnapshotUnsupported;
 
         assert_eq!(err.to_string(), "Snapshot and restore are not supported.");
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn displays_balloon_unsupported_error() {
+        let err = VmmActionError::BalloonUnsupported;
+
+        assert_eq!(err.to_string(), "Balloon device is not supported.");
         assert!(err.source().is_none());
     }
 

@@ -431,22 +431,43 @@ fn executable_rejects_remaining_device_requests_without_mutating() {
         "PATCH /hotplug/memory",
     );
 
-    for path in ["/balloon", "/balloon/statistics", "/balloon/hinting/status"] {
+    let balloon_get_response = http_get(&socket_path, "/balloon");
+    assert_bad_request_response(&balloon_get_response, "GET /balloon");
+    assert_response_contains(
+        &balloon_get_response,
+        r#"{"fault_message":"Balloon device is not supported."}"#,
+        "GET /balloon",
+    );
+
+    for (path, action) in [
+        ("/balloon/statistics", "GetBalloonStats"),
+        ("/balloon/hinting/status", "GetBalloonHintingStatus"),
+    ] {
         let request_name = format!("GET {path}");
         let response = http_get(&socket_path, path);
 
         assert_bad_request_response(&response, &request_name);
         assert_response_contains(
             &response,
-            r#"{"fault_message":"Balloon device is not supported."}"#,
+            &format!(
+                r#"{{"fault_message":"The requested operation is not supported in Not started state: {action}"}}"#
+            ),
             &request_name,
         );
     }
 
-    for (path, body) in [
-        ("/balloon", r#"{"amount_mib":32}"#),
-        ("/balloon/statistics", r#"{"stats_polling_interval_s":1}"#),
-        ("/balloon/hinting/start", r#"{"acknowledge_on_stop":false}"#),
+    for (path, body, action) in [
+        ("/balloon", r#"{"amount_mib":32}"#, "PatchBalloon"),
+        (
+            "/balloon/statistics",
+            r#"{"stats_polling_interval_s":1}"#,
+            "PatchBalloonStats",
+        ),
+        (
+            "/balloon/hinting/start",
+            r#"{"acknowledge_on_stop":false}"#,
+            "PatchBalloonHintingStart",
+        ),
     ] {
         let request_name = format!("PATCH {path}");
         let response = http_json(&socket_path, "PATCH", path, body);
@@ -454,7 +475,9 @@ fn executable_rejects_remaining_device_requests_without_mutating() {
         assert_bad_request_response(&response, &request_name);
         assert_response_contains(
             &response,
-            r#"{"fault_message":"Balloon device is not supported."}"#,
+            &format!(
+                r#"{{"fault_message":"The requested operation is not supported in Not started state: {action}"}}"#
+            ),
             &request_name,
         );
     }
@@ -467,7 +490,7 @@ fn executable_rejects_remaining_device_requests_without_mutating() {
     );
     assert_response_contains(
         &balloon_hinting_stop_response,
-        r#"{"fault_message":"Balloon device is not supported."}"#,
+        r#"{"fault_message":"The requested operation is not supported in Not started state: PatchBalloonHintingStop"}"#,
         "PATCH /balloon/hinting/stop",
     );
 

@@ -2720,6 +2720,7 @@ mod tests {
             )
             | VmmActionError::UnsupportedAction(_)
             | VmmActionError::UnsupportedState { .. }
+            | VmmActionError::BalloonUnsupported
             | VmmActionError::EntropyUnsupported
             | VmmActionError::MissingBootSource
             | VmmActionError::BootSourceConfig(_)
