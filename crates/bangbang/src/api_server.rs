@@ -1219,6 +1219,13 @@ mod tests {
         response
     }
 
+    fn request_with_body(method: &str, path: &str, body: &str) -> String {
+        format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
     fn put_action_over_socket(
         vmm: &mut impl VmmRequestHandler,
         socket_name: &str,
@@ -3446,47 +3453,49 @@ mod tests {
 
     #[test]
     fn returns_fault_for_memory_hotplug_endpoints() {
-        for (method, request) in [
+        let mut vmm = test_controller();
+        for (socket_name, request, fault_message) in [
             (
-                "get",
-                b"GET /hotplug/memory HTTP/1.1\r\nHost: localhost\r\n\r\n".as_slice(),
+                "mh-get",
+                "GET /hotplug/memory HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
+                "Memory hotplug is not supported.",
             ),
             (
-                "put",
-                b"PUT /hotplug/memory HTTP/1.1\r\nHost: localhost\r\nContent-Length: 16\r\n\r\n{\"size_mib\":128}"
-                    .as_slice(),
+                "mh-put",
+                request_with_body("PUT", "/hotplug/memory", r#"{"total_size_mib":2048}"#),
+                "Memory hotplug is not supported.",
             ),
             (
-                "patch",
-                b"PATCH /hotplug/memory HTTP/1.1\r\nHost: localhost\r\nContent-Length: 16\r\n\r\n{\"size_mib\":256}"
-                    .as_slice(),
+                "mh-put-bad",
+                request_with_body("PUT", "/hotplug/memory", r#"{"size_mib":2048}"#),
+                "Malformed HTTP request.",
+            ),
+            (
+                "mh-patch",
+                request_with_body("PATCH", "/hotplug/memory", r#"{"requested_size_mib":256}"#),
+                "Memory hotplug is not supported.",
+            ),
+            (
+                "mh-patch-bad",
+                request_with_body("PATCH", "/hotplug/memory", "not-json"),
+                "Malformed HTTP request.",
             ),
         ] {
-            let socket_name = format!("mh-{method}");
-            let path = unique_socket_path(&socket_name);
-            let server = ApiServer::bind(&path).expect("server should bind");
-            let mut client = UnixStream::connect(&path).expect("client should connect");
+            let response = request_over_socket(&mut vmm, socket_name, &request);
 
-            client
-                .write_all(request)
-                .expect("client should write request");
-            let mut vmm = test_controller();
-            server
-                .serve_next(&mut vmm)
-                .expect("server should handle one request");
-
-            let mut response = String::new();
-            client
-                .read_to_string(&mut response)
-                .expect("client should read response");
-
-            assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-            assert!(response.contains(r#"{"fault_message":"Memory hotplug is not supported."}"#));
-            assert_eq!(
-                vmm.instance_info().state,
-                bangbang_runtime::InstanceState::NotStarted
+            assert!(
+                response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+                "{socket_name}: {response}"
+            );
+            assert!(
+                response.contains(&format!(r#"{{"fault_message":"{fault_message}"}}"#)),
+                "{socket_name}: {response}"
             );
         }
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::NotStarted
+        );
     }
 
     #[test]
