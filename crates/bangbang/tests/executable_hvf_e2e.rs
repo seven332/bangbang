@@ -308,6 +308,24 @@ mod macos_arm64 {
             "PUT /network-interfaces/eth0 after InstanceStart",
         );
 
+        let mmds_config_update_body = r#"{
+            "network_interfaces":["eth0"],
+            "version":"V2",
+            "ipv4_address":"169.254.169.254",
+            "imds_compat":true
+        }"#;
+        let mmds_config_update_response =
+            http_put_json(&socket_path, "/mmds/config", mmds_config_update_body);
+        assert_bad_request_response(
+            &mmds_config_update_response,
+            "PUT /mmds/config after InstanceStart",
+        );
+        assert_response_contains(
+            &mmds_config_update_response,
+            r#"{"fault_message":"The requested operation is not supported in Running state: PutMmdsConfig"}"#,
+            "PUT /mmds/config after InstanceStart",
+        );
+
         let vm_config = http_get(&socket_path, "/vm/config");
         assert_ok_response(&vm_config, "GET /vm/config after InstanceStart");
         assert_response_contains(
@@ -384,6 +402,14 @@ mod macos_arm64 {
         assert!(
             !vm_config.contains(r#""iface_id":"eth0""#),
             "rejected network update must not add an interface; response:\n{vm_config}"
+        );
+        assert!(
+            !vm_config.contains(r#""mmds-config":"#),
+            "rejected MMDS config update must not add MMDS config; response:\n{vm_config}"
+        );
+        assert!(
+            !vm_config.contains(r#""network_interfaces":["eth0"]"#),
+            "rejected MMDS config update must not store interface bindings; response:\n{vm_config}"
         );
         UnixStream::connect(&uds_path).unwrap_or_else(|err| {
             panic!(
