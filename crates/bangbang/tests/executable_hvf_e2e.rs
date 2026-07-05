@@ -36,8 +36,16 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_VSOCK_PORT: u32 = 5005;
     const DIRECT_ROOTFS_HOST_VSOCK_READY_MARKER: &[u8] = b"BANGBANG_VSOCK_HOST_CONNECT_READY";
     const DIRECT_ROOTFS_HOST_VSOCK_MARKER: &[u8] = b"BANGBANG_VSOCK_HOST_CONNECT_OK";
-    const DIRECT_ROOTFS_HOST_VSOCK_GUEST_GREETING: &[u8] = b"BANGBANG_VSOCK_GUEST_GREETING";
-    const DIRECT_ROOTFS_HOST_VSOCK_HOST_REPLY: &[u8] = b"BANGBANG_VSOCK_HOST_REPLY";
+    const DIRECT_ROOTFS_HOST_VSOCK_EXCHANGES: &[(&[u8], &[u8])] = &[
+        (
+            b"BANGBANG_VSOCK_GUEST_STREAM_ONE",
+            b"BANGBANG_VSOCK_HOST_STREAM_ONE",
+        ),
+        (
+            b"BANGBANG_VSOCK_GUEST_STREAM_TWO",
+            b"BANGBANG_VSOCK_HOST_STREAM_TWO",
+        ),
+    ];
     const DIRECT_ROOTFS_HOST_VSOCK_PORT: u32 = 5006;
     const GUEST_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/init";
     const GUEST_POWEROFF_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/poweroff-init";
@@ -1342,27 +1350,32 @@ mod macos_arm64 {
                 output.status, output.stdout, output.stderr
             );
         }
-        let mut guest_greeting = vec![0; DIRECT_ROOTFS_HOST_VSOCK_GUEST_GREETING.len()];
-        if let Err(err) = host_stream.read_exact(&mut guest_greeting) {
-            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
-            let output = bangbang.force_stop_and_collect();
-            panic!(
-                "host side did not receive guest greeting over host-initiated vsock: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-                output.status, output.stdout, output.stderr
+        for (exchange_index, &(guest_payload, host_payload)) in
+            DIRECT_ROOTFS_HOST_VSOCK_EXCHANGES.iter().enumerate()
+        {
+            let exchange_number = exchange_index + 1;
+            let mut received_guest_payload = vec![0; guest_payload.len()];
+            if let Err(err) = host_stream.read_exact(&mut received_guest_payload) {
+                let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+                let output = bangbang.force_stop_and_collect();
+                panic!(
+                    "host side did not receive guest payload {exchange_number} over host-initiated vsock: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status, output.stdout, output.stderr
+                );
+            }
+            assert_eq!(
+                received_guest_payload, guest_payload,
+                "host side should receive deterministic guest payload {exchange_number}"
             );
-        }
-        assert_eq!(
-            guest_greeting, DIRECT_ROOTFS_HOST_VSOCK_GUEST_GREETING,
-            "host side should receive the deterministic guest greeting"
-        );
 
-        if let Err(err) = host_stream.write_all(DIRECT_ROOTFS_HOST_VSOCK_HOST_REPLY) {
-            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
-            let output = bangbang.force_stop_and_collect();
-            panic!(
-                "host side did not write host-initiated vsock reply: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-                output.status, output.stdout, output.stderr
-            );
+            if let Err(err) = host_stream.write_all(host_payload) {
+                let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+                let output = bangbang.force_stop_and_collect();
+                panic!(
+                    "host side did not write host-initiated vsock reply {exchange_number}: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status, output.stdout, output.stderr
+                );
+            }
         }
 
         if let Err(err) = wait_for_file_prefix_marker(
