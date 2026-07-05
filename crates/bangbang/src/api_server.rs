@@ -43,7 +43,7 @@ use bangbang_runtime::serial::SerialConfigInput;
 use bangbang_runtime::vsock::{VsockConfig, VsockConfigInput};
 use bangbang_runtime::{VmConfiguration, VmmAction, VmmData};
 
-use crate::vmm::{GetApiRequest, PutApiRequest, VmmRequestHandler};
+use crate::vmm::{GetApiRequest, PatchApiRequest, PutApiRequest, VmmRequestHandler};
 
 const READ_CHUNK_SIZE: usize = 4096;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -463,26 +463,28 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PutMachineConfig(config) => handle_empty(vmm.handle_put_request(
             PutApiRequest::machine_config(machine_config_input_from_request(config.as_ref())),
         )),
-        ApiRequest::PatchMachineConfig(config) => handle_empty(vmm.handle_action(
-            VmmAction::PatchMachineConfig(machine_config_patch_input_from_request(config.as_ref())),
-        )),
+        ApiRequest::PatchMachineConfig(config) => {
+            handle_empty(vmm.handle_patch_request(PatchApiRequest::machine_config(
+                machine_config_patch_input_from_request(config.as_ref()),
+            )))
+        }
         ApiRequest::PutMetrics(config) => handle_empty(vmm.handle_put_request(
             PutApiRequest::metrics(metrics_config_input_from_request(config.as_ref())),
         )),
         ApiRequest::PutMmds(content) => handle_empty(vmm.handle_put_request(PutApiRequest::mmds(
             mmds_content_input_from_request(content.as_ref()),
         ))),
-        ApiRequest::PatchMmds(content) => handle_empty(vmm.handle_action(VmmAction::PatchMmds(
-            mmds_content_input_from_request(content.as_ref()),
-        ))),
+        ApiRequest::PatchMmds(content) => handle_empty(vmm.handle_patch_request(
+            PatchApiRequest::mmds(mmds_content_input_from_request(content.as_ref())),
+        )),
         ApiRequest::PutMmdsConfig(config) => handle_empty(vmm.handle_put_request(
             PutApiRequest::mmds_config(mmds_config_input_from_request(config.as_ref())),
         )),
         ApiRequest::PutDrive(config) => handle_empty(vmm.handle_put_request(PutApiRequest::drive(
             drive_config_input_from_request(config.as_ref()),
         ))),
-        ApiRequest::PatchDrive(config) => handle_empty(vmm.handle_action(
-            VmmAction::UpdateBlockDevice(drive_update_input_from_request(config.as_ref())),
+        ApiRequest::PatchDrive(config) => handle_empty(vmm.handle_patch_request(
+            PatchApiRequest::drive(drive_update_input_from_request(config.as_ref())),
         )),
         ApiRequest::PatchVmState(update) => {
             handle_empty(vmm.handle_action(vm_state_action_from_request(update.as_ref())))
@@ -3152,7 +3154,103 @@ mod tests {
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":4,\"mmds_fails\":2,\"network_count\":1,\"network_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"patch_api_requests\":{\"drive_count\":0,\"drive_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":1,\"mmds_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":4,\"mmds_fails\":2,\"network_count\":1,\"network_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
+    }
+
+    #[test]
+    fn configured_metrics_counts_patch_api_requests() {
+        let original_mmds_body = r#"{"latest":{"meta-data":{}}}"#;
+        let mut vmm = test_controller_with_starter_and_mmds_data_store_limit(
+            TestInstanceStarter::success(),
+            original_mmds_body.len(),
+        );
+        vmm.handle_action(VmmAction::PutDrive(DriveConfigInput::new(
+            "rootfs",
+            "rootfs",
+            "/tmp/rootfs.ext4",
+            true,
+        )))
+        .expect("initial drive should configure");
+        vmm.handle_action(VmmAction::PutMmds(MmdsContentInput::new(
+            serde_json::json!({"latest": {"meta-data": {}}}),
+        )))
+        .expect("MMDS data should configure");
+        let metrics_path = unique_socket_path("metrics-patch").with_extension("metrics");
+
+        let metrics_body = format!(r#"{{"metrics_path":"{}"}}"#, metrics_path.to_string_lossy());
+        let metrics_request = request_with_body("PUT", "/metrics", &metrics_body);
+        assert_eq!(
+            handle_request_bytes(metrics_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let machine_patch_request =
+            request_with_body("PATCH", "/machine-config", r#"{"vcpu_count":2}"#);
+        assert_eq!(
+            handle_request_bytes(machine_patch_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let mmds_patch_request = request_with_body("PATCH", "/mmds", original_mmds_body);
+        assert_eq!(
+            handle_request_bytes(mmds_patch_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let oversized_mmds_patch_body = r#"{"latest":{"meta-data":{"ami-id":"ami-oversized"}}}"#;
+        assert_eq!(
+            handle_request_bytes(
+                request_with_body("PATCH", "/mmds", oversized_mmds_patch_body).as_bytes(),
+                &mut vmm,
+            )
+            .status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+
+        let drive_patch_body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "/tmp/replaced.ext4"
+        }"#;
+        assert_eq!(
+            handle_request_bytes(
+                request_with_body("PATCH", "/drives/rootfs", drive_patch_body).as_bytes(),
+                &mut vmm,
+            )
+            .status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+        assert_eq!(
+            handle_request_bytes(
+                request_with_body("PATCH", "/vm", r#"{"state":"Paused"}"#).as_bytes(),
+                &mut vmm,
+            )
+            .status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+
+        let boot_request = request_with_body(
+            "PUT",
+            "/boot-source",
+            r#"{"kernel_image_path":"/tmp/vmlinux"}"#,
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "patch-a1", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        assert_eq!(
+            handle_request_bytes(machine_patch_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+
+        let flush_response = put_action_over_socket(&mut vmm, "patch-a2", "FlushMetrics");
+        assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert_eq!(
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
+            "{\"patch_api_requests\":{\"drive_count\":1,\"drive_fails\":1,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"mmds_count\":2,\"mmds_fails\":1},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");

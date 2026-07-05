@@ -159,9 +159,9 @@ Configured metrics output records a minimal JSON line for successful runtime
 process-owned boot worker exists. When startup timing CLI values are provided,
 the same line includes `start_time_us`, `start_time_cpu_us`, and
 `parent_cpu_time_us`. The current Firecracker-shaped API request metrics subset
-also reports selected GET counters under `get_api_requests` and parsed core
+also reports selected GET counters under `get_api_requests`, parsed core
 configuration, MMDS, observability, and `/actions` counters under
-`put_api_requests`.
+`put_api_requests`, and selected PATCH counters under `patch_api_requests`.
 
 Configure logger output before boot:
 

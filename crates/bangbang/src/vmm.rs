@@ -11,10 +11,10 @@ use bangbang_hvf::{
     HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
     HvfVcpuRunnerError, OwnedHvfArm64BootSession,
 };
-use bangbang_runtime::block::{BlockMmioLayout, DriveConfigInput};
+use bangbang_runtime::block::{BlockMmioLayout, DriveConfigInput, DriveUpdateInput};
 use bangbang_runtime::boot::BootSourceConfigInput;
 use bangbang_runtime::logger::LoggerConfigInput;
-use bangbang_runtime::machine::MachineConfigInput;
+use bangbang_runtime::machine::{MachineConfigInput, MachineConfigPatchInput};
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
 use bangbang_runtime::metrics::{BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics};
 use bangbang_runtime::mmds::{
@@ -251,10 +251,75 @@ impl PutApiRequestKind {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct PatchApiRequest {
+    kind: PatchApiRequestKind,
+    action: VmmAction,
+}
+
+impl PatchApiRequest {
+    pub(crate) fn drive(input: DriveUpdateInput) -> Self {
+        Self {
+            kind: PatchApiRequestKind::Drive,
+            action: VmmAction::UpdateBlockDevice(input),
+        }
+    }
+
+    pub(crate) fn machine_config(input: MachineConfigPatchInput) -> Self {
+        Self {
+            kind: PatchApiRequestKind::MachineConfig,
+            action: VmmAction::PatchMachineConfig(input),
+        }
+    }
+
+    pub(crate) fn mmds(input: MmdsContentInput) -> Self {
+        Self {
+            kind: PatchApiRequestKind::Mmds,
+            action: VmmAction::PatchMmds(input),
+        }
+    }
+
+    fn record_request(&self, controller: &mut VmmController) {
+        self.kind.record_request(controller);
+    }
+
+    fn into_action(self) -> VmmAction {
+        self.action
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatchApiRequestKind {
+    Drive,
+    MachineConfig,
+    Mmds,
+}
+
+impl PatchApiRequestKind {
+    fn record_request(self, controller: &mut VmmController) {
+        match self {
+            Self::Drive => controller.record_patch_drive_request(),
+            Self::MachineConfig => controller.record_patch_machine_config_request(),
+            Self::Mmds => controller.record_patch_mmds_request(),
+        }
+    }
+
+    fn record_failure(self, controller: &mut VmmController) {
+        match self {
+            Self::Drive => controller.record_patch_drive_failure(),
+            Self::MachineConfig => controller.record_patch_machine_config_failure(),
+            Self::Mmds => controller.record_patch_mmds_failure(),
+        }
+    }
+}
+
 pub(crate) trait VmmRequestHandler {
     fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError>;
 
     fn handle_get_request(&mut self, request: GetApiRequest) -> Result<VmmData, VmmActionError>;
+
+    fn handle_patch_request(&mut self, request: PatchApiRequest)
+    -> Result<VmmData, VmmActionError>;
 
     fn handle_put_request(&mut self, request: PutApiRequest) -> Result<VmmData, VmmActionError>;
 
@@ -394,6 +459,20 @@ where
         self.handle_action(request.action())
     }
 
+    fn handle_patch_request(
+        &mut self,
+        request: PatchApiRequest,
+    ) -> Result<VmmData, VmmActionError> {
+        let kind = request.kind;
+        request.record_request(&mut self.controller);
+        let action = request.into_action();
+        let result = self.handle_action(action);
+        if result.is_err() {
+            kind.record_failure(&mut self.controller);
+        }
+        result
+    }
+
     fn handle_put_request(&mut self, request: PutApiRequest) -> Result<VmmData, VmmActionError> {
         let kind = request.kind;
         request.record_request(&mut self.controller);
@@ -457,6 +536,13 @@ where
 
     fn handle_get_request(&mut self, request: GetApiRequest) -> Result<VmmData, VmmActionError> {
         ProcessVmm::handle_get_request(self, request)
+    }
+
+    fn handle_patch_request(
+        &mut self,
+        request: PatchApiRequest,
+    ) -> Result<VmmData, VmmActionError> {
+        ProcessVmm::handle_patch_request(self, request)
     }
 
     fn handle_put_request(&mut self, request: PutApiRequest) -> Result<VmmData, VmmActionError> {
@@ -1188,12 +1274,14 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
 
-    use bangbang_runtime::block::{DriveConfigInput, DriveConfigs, PreparedBlockDevices};
+    use bangbang_runtime::block::{
+        DriveConfigInput, DriveConfigs, DriveUpdateInput, PreparedBlockDevices,
+    };
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::fdt::{Arm64FdtRegion, Arm64FdtVirtioMmioDevice};
     use bangbang_runtime::interrupt::GuestInterruptLine;
     use bangbang_runtime::logger::LoggerConfigInput;
-    use bangbang_runtime::machine::MachineConfigInput;
+    use bangbang_runtime::machine::{MachineConfigInput, MachineConfigPatchInput};
     use bangbang_runtime::metrics::{
         BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics,
     };
@@ -2604,7 +2692,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_put_actions_do_not_record_api_request_metrics() {
+    fn direct_actions_do_not_record_api_request_metrics() {
         let metrics = TempFilePath::create("direct-metrics");
         let logger = TempFilePath::create("direct-logger");
         let serial = TempFilePath::create("direct-serial");
@@ -2618,6 +2706,10 @@ mod tests {
         .expect("metrics should configure");
         vmm.handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 256)))
             .expect("machine config should configure");
+        vmm.handle_action(VmmAction::PatchMachineConfig(
+            MachineConfigPatchInput::new().with_mem_size_mib(512),
+        ))
+        .expect("machine config patch should configure");
         vmm.handle_action(VmmAction::PutLogger(
             LoggerConfigInput::new().with_log_path(logger.path()),
         ))
@@ -2645,6 +2737,10 @@ mod tests {
             serde_json::json!({"latest": {"meta-data": {}}}),
         )))
         .expect("MMDS data should configure");
+        vmm.handle_action(VmmAction::PatchMmds(MmdsContentInput::new(
+            serde_json::json!({"latest": {"meta-data": {}}}),
+        )))
+        .expect("MMDS data patch should configure");
         vmm.handle_action(VmmAction::PutVsock(VsockConfigInput::new(
             3,
             vsock.path().to_string_lossy(),
@@ -2653,6 +2749,15 @@ mod tests {
         assert_eq!(
             vmm.handle_action(VmmAction::PutCpuConfig),
             Err(VmmActionError::UnsupportedAction("PutCpuConfig"))
+        );
+        assert_eq!(
+            vmm.handle_action(VmmAction::UpdateBlockDevice(DriveUpdateInput::new(
+                "data", "data", None,
+            ))),
+            Err(VmmActionError::UnsupportedState {
+                action: "UpdateBlockDevice",
+                state: InstanceState::NotStarted,
+            })
         );
         vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
             "/tmp/vmlinux",

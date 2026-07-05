@@ -500,6 +500,9 @@ mod macos_arm64 {
         assert_metrics_output(
             &metrics_path,
             r#"{"actions_count":2,"actions_fails":0,"boot_source_count":2,"boot_source_fails":1,"cpu_cfg_count":1,"cpu_cfg_fails":1,"drive_count":2,"drive_fails":1,"logger_count":2,"logger_fails":1,"machine_cfg_count":1,"machine_cfg_fails":0,"metrics_count":2,"metrics_fails":1,"mmds_count":2,"mmds_fails":1,"network_count":1,"network_fails":1,"serial_count":2,"serial_fails":1,"vsock_count":2,"vsock_fails":1}"#,
+            Some(
+                r#"{"drive_count":1,"drive_fails":1,"machine_cfg_count":0,"machine_cfg_fails":0,"mmds_count":1,"mmds_fails":0}"#,
+            ),
         );
         assert_startup_time_metrics_output(&metrics_path);
         assert!(
@@ -764,6 +767,7 @@ mod macos_arm64 {
         assert_metrics_output(
             &metrics_path,
             r#"{"actions_count":2,"actions_fails":1,"boot_source_count":0,"boot_source_fails":0,"cpu_cfg_count":0,"cpu_cfg_fails":0,"drive_count":0,"drive_fails":0,"logger_count":0,"logger_fails":0,"machine_cfg_count":1,"machine_cfg_fails":1,"metrics_count":0,"metrics_fails":0,"mmds_count":0,"mmds_fails":0,"network_count":0,"network_fails":0,"serial_count":0,"serial_fails":0,"vsock_count":0,"vsock_fails":0}"#,
+            None,
         );
         assert_logger_output(&logger_path);
 
@@ -1126,7 +1130,11 @@ mod macos_arm64 {
             .expect("empty test output file should create");
     }
 
-    fn assert_metrics_output(path: &Path, expected_put_api_requests: &str) {
+    fn assert_metrics_output(
+        path: &Path,
+        expected_put_api_requests: &str,
+        expected_patch_api_requests: Option<&str>,
+    ) {
         let output = fs::read_to_string(path).unwrap_or_else(|err| {
             panic!(
                 "metrics output {} should be readable: {err}",
@@ -1143,6 +1151,19 @@ mod macos_arm64 {
             output.contains(&expected_put_metrics),
             "metrics output should include expected PUT API request counters; output:\n{output}"
         );
+        if let Some(expected_patch_api_requests) = expected_patch_api_requests {
+            let expected_patch_metrics =
+                format!(r#""patch_api_requests":{expected_patch_api_requests}"#);
+            assert!(
+                output.contains(&expected_patch_metrics),
+                "metrics output should include expected PATCH API request counters; output:\n{output}"
+            );
+        } else {
+            assert!(
+                !output.contains(r#""patch_api_requests":"#),
+                "metrics output should not include PATCH API request counters; output:\n{output}"
+            );
+        }
         assert!(
             output.contains(r#""boot_run_loop_status":"running""#)
                 || output.contains(r#""boot_run_loop_status":"exited""#),
