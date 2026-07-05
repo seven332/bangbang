@@ -15,7 +15,7 @@ use std::os::unix::fs::MetadataExt;
 use support::{
     BangbangProcess, TestDir, assert_bad_request_response, assert_clean_shutdown,
     assert_no_content_response, assert_ok_response, assert_response_contains, http_get, http_json,
-    http_put_json, json_string, path_text,
+    http_no_body, http_put_json, json_string, path_text,
 };
 
 use bangbang_runtime::machine::MAX_MEM_SIZE_MIB;
@@ -565,6 +565,14 @@ fn executable_configures_vm_before_start() {
         "PATCH /drives/rootfs",
     );
 
+    let drive_delete_response = http_no_body(&socket_path, "DELETE", "/drives/rootfs");
+    assert_bad_request_response(&drive_delete_response, "DELETE /drives/rootfs");
+    assert_response_contains(
+        &drive_delete_response,
+        r#"{"fault_message":"Drive updates are not supported."}"#,
+        "DELETE /drives/rootfs",
+    );
+
     let vm_config = http_get(&socket_path, "/vm/config");
     assert_ok_response(&vm_config, "GET /vm/config");
     assert_response_contains(&vm_config, r#""machine-config":"#, "GET /vm/config");
@@ -590,7 +598,7 @@ fn executable_configures_vm_before_start() {
     );
     assert!(
         !vm_config.contains(&format!(r#""path_on_host":{replaced_rootfs_path_json}"#)),
-        "failed PATCH /drives/rootfs must not mutate drive path; response:\n{vm_config}"
+        "failed PATCH or DELETE /drives/rootfs must not mutate drive path; response:\n{vm_config}"
     );
 
     let cpu_config_response = http_put_json(&socket_path, "/cpu-config", "{}");

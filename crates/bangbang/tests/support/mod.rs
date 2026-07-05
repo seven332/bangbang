@@ -27,7 +27,11 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn http_get(socket_path: &Path, path: &str) -> String {
-    http_request(socket_path, "GET", path, None)
+    http_no_body(socket_path, "GET", path)
+}
+
+pub(crate) fn http_no_body(socket_path: &Path, method: &str, path: &str) -> String {
+    http_request(socket_path, method, path, None)
 }
 
 pub(crate) fn http_put_json(socket_path: &Path, path: &str, body: &str) -> String {
