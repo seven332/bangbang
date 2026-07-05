@@ -2329,6 +2329,75 @@ mod tests {
     }
 
     #[test]
+    fn metadata_file_rejects_non_regular_file() {
+        let metadata_path = unique_config_path("metadata-directory");
+        fs::create_dir(&metadata_path).expect("fixture directory should be created");
+
+        let err = super::metadata_content_input(metadata_path.to_str().expect("UTF-8 path"))
+            .expect_err("metadata directory should fail before reading");
+
+        assert_eq!(err, super::MetadataFileError::NotRegular);
+
+        fs::remove_dir(metadata_path).expect("fixture directory should clean up");
+    }
+
+    #[test]
+    fn metadata_file_rejects_oversized_file_before_parsing() {
+        let metadata_path = unique_config_path("metadata-oversized-file");
+        let file = fs::File::create(&metadata_path).expect("fixture file should be created");
+        file.set_len(super::METADATA_FILE_MAX_BYTES as u64 + 1)
+            .expect("fixture file should be sized");
+
+        let err = super::metadata_content_input(metadata_path.to_str().expect("UTF-8 path"))
+            .expect_err("oversized metadata file should fail before parsing");
+
+        assert_eq!(err, super::MetadataFileError::TooLarge);
+
+        fs::remove_file(metadata_path).expect("fixture file should clean up");
+    }
+
+    #[test]
+    fn metadata_file_accepts_exact_size_limit() {
+        let metadata_path = unique_config_path("metadata-exact-size");
+        let mut metadata = r#"{"latest":{"user-data":"hello"}}"#.to_string();
+        metadata.extend(std::iter::repeat_n(
+            ' ',
+            super::METADATA_FILE_MAX_BYTES - metadata.len(),
+        ));
+        fs::write(&metadata_path, metadata).expect("fixture file should be written");
+
+        let input = super::metadata_content_input(metadata_path.to_str().expect("UTF-8 path"))
+            .expect("exact limit metadata file should parse");
+
+        assert_eq!(
+            input.into_value(),
+            serde_json::json!({
+                "latest": {
+                    "user-data": "hello"
+                }
+            })
+        );
+
+        fs::remove_file(metadata_path).expect("fixture file should clean up");
+    }
+
+    #[test]
+    fn metadata_file_rejects_invalid_utf8() {
+        let metadata_path = unique_config_path("metadata-invalid-utf8");
+        fs::write(&metadata_path, [0xff]).expect("fixture file should be written");
+
+        let err = super::metadata_content_input(metadata_path.to_str().expect("UTF-8 path"))
+            .expect_err("invalid UTF-8 metadata file should fail");
+
+        assert_eq!(
+            err,
+            super::MetadataFileError::Read(std::io::ErrorKind::InvalidData)
+        );
+
+        fs::remove_file(metadata_path).expect("fixture file should clean up");
+    }
+
+    #[test]
     fn startup_metadata_errors_do_not_start_instance() {
         let malformed_path = unique_config_path("metadata-malformed");
         fs::write(&malformed_path, "{").expect("malformed metadata file should be written");
