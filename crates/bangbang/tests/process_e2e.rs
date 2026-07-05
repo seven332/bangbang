@@ -143,6 +143,35 @@ fn executable_rejects_api_payload_over_limit_without_stopping() {
 }
 
 #[test]
+fn executable_rejects_malformed_http_request_without_stopping() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    let malformed_response = http_raw(
+        &socket_path,
+        b"GET /version HTTP/1.1\r\nHost: localhost\r\nContent-Length: +0\r\nConnection: close\r\n\r\n",
+    );
+    assert_bad_request_response(&malformed_response, "malformed GET /version");
+    assert_response_contains(
+        &malformed_response,
+        r#"{"fault_message":"Malformed HTTP request."}"#,
+        "malformed GET /version",
+    );
+
+    let instance_info = http_get(&socket_path, "/");
+    assert_ok_response(&instance_info, "GET / after malformed request");
+    assert_response_contains(
+        &instance_info,
+        r#""state":"Not started""#,
+        "GET / after malformed request",
+    );
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
 fn executable_rejects_invalid_api_routes_without_stopping() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
