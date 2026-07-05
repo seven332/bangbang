@@ -598,7 +598,7 @@ fn executable_configures_vm_before_start() {
     );
     assert!(
         !vm_config.contains(&format!(r#""path_on_host":{replaced_rootfs_path_json}"#)),
-        "failed PATCH /drives/rootfs must not mutate drive path; response:\n{vm_config}"
+        "failed PATCH or DELETE /drives/rootfs must not mutate drive path; response:\n{vm_config}"
     );
 
     let cpu_config_response = http_put_json(&socket_path, "/cpu-config", "{}");
