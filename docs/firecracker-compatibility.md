@@ -87,6 +87,11 @@ socket, host-path, HVF entitlement, guest-data, and multi-process boundaries, an
 also records Linux Firecracker hardening features that are not implemented by the
 current macOS/HVF scaffold.
 
+The concise support-status and test-layer summary is maintained in
+[Firecracker Validation Matrix](firecracker-validation-matrix.md). This document
+remains the detailed source for endpoint behavior, field policy, compatibility
+rationale, and platform limits.
+
 The intended public control plane is Firecracker-style HTTP over a Unix domain
 socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
 `GET /machine-config`, pre-boot `PUT /machine-config`, pre-boot
@@ -1536,6 +1541,9 @@ surface:
   boot and executable HVF e2e tests, and fails when the host cannot run HVF
   tests unless CI explicitly uses `--allow-unsupported` after build/sign
   validation
+
+Changes that alter support status or validation coverage should also update
+[Firecracker Validation Matrix](firecracker-validation-matrix.md).
 
 ## Security and Performance Scope
 

@@ -9,6 +9,7 @@ truth for detailed capability status, compatibility limits, security boundaries,
 and test rules:
 
 - [Firecracker Compatibility Scope](docs/firecracker-compatibility.md)
+- [Firecracker Validation Matrix](docs/firecracker-validation-matrix.md)
 - [macOS Host Security Model](docs/security.md)
 - [Testing Guide](docs/testing.md)
 - [Pull Request Review Guidelines](docs/review-guidelines.md)
@@ -184,7 +185,8 @@ curl --unix-socket /tmp/bangbang.socket \
 
 See [Firecracker Compatibility Scope](docs/firecracker-compatibility.md) for
 the full endpoint matrix, implemented behavior, and deferred Firecracker
-features.
+features. See [Firecracker Validation Matrix](docs/firecracker-validation-matrix.md)
+for the support status and validation layer summary.
 
 ## Build And Test
 
