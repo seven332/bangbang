@@ -61,6 +61,40 @@ fn executable_serves_api_and_shuts_down_cleanly() {
 }
 
 #[test]
+fn executable_accepts_firecracker_startup_time_args() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start_with_extra_args(
+        &socket_path,
+        &instance_id,
+        &[
+            "--start-time-us",
+            "1000",
+            "--start-time-cpu-us",
+            "2000",
+            "--parent-cpu-time-us",
+            "3000",
+        ],
+    );
+
+    let instance_info = http_get(&socket_path, "/");
+    assert_ok_response(&instance_info, "GET / with startup time args");
+    assert_response_contains(
+        &instance_info,
+        &format!(r#""id":"{instance_id}""#),
+        "GET / with startup time args",
+    );
+    assert_response_contains(
+        &instance_info,
+        r#""state":"Not started""#,
+        "GET / with startup time args",
+    );
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
 fn executable_config_file_failure_does_not_publish_socket() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
