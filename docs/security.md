@@ -208,10 +208,11 @@ generic no-ops.
 
 The current serial device is a TX-only MMIO output path. By default, guest
 serial bytes go to a bounded internal capture buffer; when `/serial` configures
-`serial_out_path`, startup opens that host path and routes guest TX bytes there.
-Treat serial output as untrusted guest data. Reviews for serial-output changes
-must preserve explicit host-observation behavior, bounded buffering or writes,
-path redaction, and per-process ownership.
+`serial_out_path`, startup opens that host path with nonblocking output
+semantics and routes guest TX bytes there. Treat serial output as untrusted
+guest data. Reviews for serial-output changes must preserve explicit
+host-observation behavior, bounded internal buffering where used, path
+redaction, and per-process ownership.
 
 Block devices can expose host file contents to the guest and can write to the
 backing file when configured read-write. Operators should use dedicated disk
