@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -130,8 +130,17 @@ impl ApiServer {
             .map_err(|err| ApiServerError::Connection(err.kind()))?;
 
         loop {
-            wait_for_listener_or_shutdown(&self.listener, shutdown_wakeup)?;
+            wait_for_listener_or_shutdown(
+                &self.listener,
+                shutdown_wakeup,
+                vmm.process_exit_wakeup_fd(),
+            )?;
             if drain_shutdown_wakeup(shutdown_wakeup)? {
+                return Ok(());
+            }
+            vmm.drain_process_exit_wakeup()
+                .map_err(ApiServerError::Connection)?;
+            if vmm.process_exit_status().should_exit_successfully() {
                 return Ok(());
             }
 
@@ -170,6 +179,7 @@ fn is_transient_accept_error(kind: std::io::ErrorKind) -> bool {
 fn wait_for_listener_or_shutdown(
     listener: &UnixListener,
     shutdown_wakeup: &UnixStream,
+    process_exit_wakeup_fd: Option<RawFd>,
 ) -> Result<(), ApiServerError> {
     let mut poll_fds = [
         libc::pollfd {
@@ -182,15 +192,28 @@ fn wait_for_listener_or_shutdown(
             events: libc::POLLIN,
             revents: 0,
         },
+        libc::pollfd {
+            fd: process_exit_wakeup_fd.unwrap_or(-1),
+            events: libc::POLLIN,
+            revents: 0,
+        },
     ];
+    let poll_fd_count = if process_exit_wakeup_fd.is_some() {
+        poll_fds.len()
+    } else {
+        poll_fds.len() - 1
+    };
+    let poll_fds = poll_fds
+        .get_mut(..poll_fd_count)
+        .ok_or(ApiServerError::Connection(std::io::ErrorKind::InvalidInput))?;
 
     loop {
-        for poll_fd in &mut poll_fds {
+        for poll_fd in poll_fds.iter_mut() {
             poll_fd.revents = 0;
         }
 
-        // SAFETY: `poll_fds` points to two initialized `pollfd` values and
-        // remains valid for the duration of the call. The timeout is infinite.
+        // SAFETY: `poll_fds` points to initialized `pollfd` values and remains
+        // valid for the duration of the call. The timeout is infinite.
         let result = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as _, -1) };
         if result > 0 {
             return Ok(());
@@ -1070,8 +1093,9 @@ fn read_request_until_with_limit(
 mod tests {
     use std::env;
     use std::io::{Read, Write};
+    use std::os::unix::io::{AsRawFd, RawFd};
     use std::os::unix::net::UnixStream;
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1082,7 +1106,9 @@ mod tests {
     };
     use bangbang_runtime::{BackendError, VmmActionError};
 
-    use crate::vmm::{InstanceStartExecutor, ProcessSessionDiagnostics, ProcessVmm};
+    use crate::vmm::{
+        InstanceStartExecutor, ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm,
+    };
 
     use super::*;
 
@@ -1096,18 +1122,28 @@ mod tests {
     #[derive(Debug, Clone)]
     struct TestSession {
         boot_run_loop_status: Option<BootRunLoopMetricStatus>,
+        process_exit_signal: Option<TestProcessExitSignal>,
     }
 
     impl TestSession {
         const fn without_boot_run_loop_status() -> Self {
             Self {
                 boot_run_loop_status: None,
+                process_exit_signal: None,
             }
         }
 
         const fn with_boot_run_loop_status(status: BootRunLoopMetricStatus) -> Self {
             Self {
                 boot_run_loop_status: Some(status),
+                process_exit_signal: None,
+            }
+        }
+
+        fn with_process_exit_signal(signal: TestProcessExitSignal) -> Self {
+            Self {
+                boot_run_loop_status: None,
+                process_exit_signal: Some(signal),
             }
         }
     }
@@ -1117,6 +1153,94 @@ mod tests {
             self.boot_run_loop_status
                 .map(|status| MetricsDiagnostics::new().with_boot_run_loop_status(status))
                 .unwrap_or_default()
+        }
+
+        fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
+            self.process_exit_signal
+                .as_ref()
+                .map(TestProcessExitSignal::wakeup_fd)
+        }
+
+        fn drain_process_exit_wakeup(&mut self) -> Result<(), std::io::ErrorKind> {
+            if let Some(signal) = self.process_exit_signal.as_mut() {
+                signal.drain()?;
+            }
+
+            Ok(())
+        }
+
+        fn process_exit_status(&self) -> ProcessSessionExitStatus {
+            self.process_exit_signal
+                .as_ref()
+                .map(TestProcessExitSignal::status)
+                .unwrap_or_default()
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct TestProcessExitSignal {
+        reader: Arc<Mutex<UnixStream>>,
+        writer: Arc<Mutex<UnixStream>>,
+        reader_fd: RawFd,
+        status: Arc<Mutex<ProcessSessionExitStatus>>,
+    }
+
+    impl TestProcessExitSignal {
+        fn new() -> Self {
+            let (reader, writer) =
+                UnixStream::pair().expect("test process-exit signal should be created");
+            reader
+                .set_nonblocking(true)
+                .expect("test process-exit reader should be nonblocking");
+            let reader_fd = reader.as_raw_fd();
+
+            Self {
+                reader: Arc::new(Mutex::new(reader)),
+                writer: Arc::new(Mutex::new(writer)),
+                reader_fd,
+                status: Arc::new(Mutex::new(ProcessSessionExitStatus::Running)),
+            }
+        }
+
+        const fn wakeup_fd(&self) -> RawFd {
+            self.reader_fd
+        }
+
+        fn status(&self) -> ProcessSessionExitStatus {
+            *self
+                .status
+                .lock()
+                .expect("test process-exit status should lock")
+        }
+
+        fn trigger(&self, status: ProcessSessionExitStatus) {
+            *self
+                .status
+                .lock()
+                .expect("test process-exit status should lock") = status;
+            self.writer
+                .lock()
+                .expect("test process-exit writer should lock")
+                .write_all(&[1])
+                .expect("test process-exit signal should write");
+        }
+
+        fn drain(&mut self) -> Result<(), std::io::ErrorKind> {
+            let mut reader = self
+                .reader
+                .lock()
+                .expect("test process-exit reader should lock");
+            let mut buffer = [0; 64];
+
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => return Ok(()),
+                    Ok(_) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(err) => return Err(err.kind()),
+                }
+            }
         }
     }
 
@@ -1130,6 +1254,12 @@ mod tests {
         const fn success_with_boot_run_loop_status(status: BootRunLoopMetricStatus) -> Self {
             Self {
                 result: Ok(TestSession::with_boot_run_loop_status(status)),
+            }
+        }
+
+        fn success_with_process_exit_signal(signal: TestProcessExitSignal) -> Self {
+            Self {
+                result: Ok(TestSession::with_process_exit_signal(signal)),
             }
         }
 
@@ -5041,6 +5171,34 @@ mod tests {
         shutdown_writer
             .write_all(b"x")
             .expect("shutdown wakeup should be written");
+
+        assert_eq!(
+            handle.join().expect("server thread should not panic"),
+            Ok(())
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn run_until_cleans_idle_socket_after_guest_shutdown() {
+        let path = unique_socket_path("idle-guest-shutdown");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let (mut shutdown_reader, _shutdown_writer) =
+            UnixStream::pair().expect("shutdown stream pair should be created");
+        let process_exit_signal = TestProcessExitSignal::new();
+        let process_exit_trigger = process_exit_signal.clone();
+        let mut vmm = test_controller_with_starter(
+            TestInstanceStarter::success_with_process_exit_signal(process_exit_signal),
+        );
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("instance should start");
+        let handle = thread::spawn(move || server.run_until(&mut vmm, &mut shutdown_reader));
+
+        process_exit_trigger.trigger(ProcessSessionExitStatus::GuestShutdown);
 
         assert_eq!(
             handle.join().expect("server thread should not panic"),

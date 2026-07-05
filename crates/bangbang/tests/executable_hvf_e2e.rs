@@ -31,6 +31,7 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_MMDS_MARKER: &[u8] = b"BANGBANG_MMDS_GUEST_FETCH_OK";
     const DIRECT_ROOTFS_MMDS_V2_MARKER: &[u8] = b"BANGBANG_MMDS_V2_GUEST_FETCH_OK";
     const GUEST_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/init";
+    const GUEST_POWEROFF_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/poweroff-init";
     const DIRECT_ROOTFS_BOOT_ARGS: &str =
         "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init";
     const DIRECT_ROOTFS_MMDS_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-fetch=1";
@@ -1245,12 +1246,96 @@ mod macos_arm64 {
         );
     }
 
+    #[test]
+    fn signed_executable_exits_after_guest_shutdown_from_config_file() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let config_path = test_dir.path().join("vm-config.json");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let initrd_path = env_path(BANGBANG_GUEST_INITRD_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+
+        write_poweroff_config(&config_path, &kernel_path, &initrd_path);
+
+        let bangbang = BangbangProcess::start_with_extra_args(
+            &socket_path,
+            &instance_id,
+            &["--config-file", path_text(&config_path)],
+        );
+        let output = bangbang.wait_for_exit();
+
+        assert!(
+            output.status.success(),
+            "guest SYSTEM_OFF should make API-enabled bangbang exit successfully; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            output.stdout,
+            output.stderr
+        );
+        assert!(
+            !socket_path.exists(),
+            "guest SYSTEM_OFF should clean up the owned API socket"
+        );
+    }
+
+    #[test]
+    fn signed_executable_exits_after_guest_shutdown_from_no_api_config_file() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let config_path = test_dir.path().join("vm-config.json");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let initrd_path = env_path(BANGBANG_GUEST_INITRD_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+
+        write_poweroff_config(&config_path, &kernel_path, &initrd_path);
+
+        let bangbang = BangbangProcess::start_with_extra_args(
+            &socket_path,
+            &instance_id,
+            &["--config-file", path_text(&config_path), "--no-api"],
+        );
+        assert!(
+            !socket_path.exists(),
+            "guest shutdown no-api startup must not publish an API socket"
+        );
+
+        let output = bangbang.wait_for_exit();
+
+        assert!(
+            output.status.success(),
+            "guest SYSTEM_OFF should make no-api bangbang exit successfully; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            output.stdout,
+            output.stderr
+        );
+        assert!(
+            !socket_path.exists(),
+            "guest shutdown no-api path must leave the API socket absent"
+        );
+    }
+
     fn env_path(name: &str) -> PathBuf {
         match std::env::var_os(name) {
             Some(value) if value.is_empty() => panic!("{name} must not be empty"),
             Some(value) => PathBuf::from(value),
             None => panic!("{name} must be set"),
         }
+    }
+
+    fn write_poweroff_config(config_path: &Path, kernel_path: &Path, initrd_path: &Path) {
+        let kernel_path_json = json_string(path_text(kernel_path));
+        let initrd_path_json = json_string(path_text(initrd_path));
+        let boot_args_json = json_string(GUEST_POWEROFF_BOOT_ARGS);
+        let config = format!(
+            r#"{{
+                "machine-config": {{"vcpu_count": 1, "mem_size_mib": 256}},
+                "boot-source": {{
+                    "kernel_image_path": {kernel_path_json},
+                    "initrd_path": {initrd_path_json},
+                    "boot_args": {boot_args_json}
+                }}
+            }}"#
+        );
+        fs::write(config_path, config).expect("guest shutdown config file should be written");
     }
 
     fn create_zeroed_block_backing(path: &Path) {

@@ -4,7 +4,7 @@ use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::IntoRawFd;
+use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 
@@ -103,7 +103,7 @@ fn run() -> Result<(), ProcessError> {
             let mut shutdown_signal = ShutdownSignal::install()?;
             if no_api {
                 println!("status: VM running without API");
-                shutdown_signal.wait()?;
+                wait_for_no_api_shutdown(&mut shutdown_signal, &mut vmm)?;
                 return Ok(());
             }
 
@@ -119,6 +119,31 @@ fn run() -> Result<(), ProcessError> {
     }
 
     Ok(())
+}
+
+fn wait_for_no_api_shutdown<S>(
+    shutdown_signal: &mut ShutdownSignal,
+    vmm: &mut ProcessVmm<S>,
+) -> Result<(), ProcessError>
+where
+    S: vmm::InstanceStartExecutor,
+{
+    shutdown_signal.set_nonblocking()?;
+
+    loop {
+        wait_for_shutdown_or_process_exit(
+            shutdown_signal.wakeup_fd(),
+            vmm.process_exit_wakeup_fd(),
+        )?;
+        if shutdown_signal.drain_wakeup()? {
+            return Ok(());
+        }
+        vmm.drain_process_exit_wakeup()
+            .map_err(ProcessError::ProcessExitNotification)?;
+        if vmm.process_exit_status().should_exit_successfully() {
+            return Ok(());
+        }
+    }
 }
 
 fn apply_startup_config_file<S>(
@@ -459,6 +484,7 @@ enum ProcessError {
     ArgumentParsing(String),
     ConfigFile(ConfigFileError),
     Metadata(MetadataFileError),
+    ProcessExitNotification(std::io::ErrorKind),
     SignalHandler(std::io::ErrorKind),
     StartupConfiguration(VmmActionError),
 }
@@ -470,6 +496,7 @@ impl ProcessError {
             Self::ArgumentParsing(_) => ProcessExitCode::ArgumentParsing,
             Self::ConfigFile(_) => ProcessExitCode::ProcessFailure,
             Self::Metadata(_) => ProcessExitCode::ProcessFailure,
+            Self::ProcessExitNotification(_) => ProcessExitCode::ProcessFailure,
             Self::SignalHandler(_) => ProcessExitCode::ProcessFailure,
             Self::StartupConfiguration(_) => ProcessExitCode::ProcessFailure,
         }
@@ -483,6 +510,9 @@ impl fmt::Display for ProcessError {
             Self::ArgumentParsing(message) => f.write_str(message),
             Self::ConfigFile(err) => write!(f, "config-file error: {err}"),
             Self::Metadata(err) => write!(f, "metadata error: {err}"),
+            Self::ProcessExitNotification(kind) => {
+                write!(f, "process exit notification failed: {kind:?}")
+            }
             Self::SignalHandler(kind) => {
                 write!(f, "shutdown signal handling failed: {kind:?}")
             }
@@ -614,8 +644,20 @@ impl ShutdownSignal {
         &mut self.wakeup_reader
     }
 
-    fn wait(&mut self) -> Result<(), ProcessError> {
+    fn wakeup_fd(&self) -> RawFd {
+        self.wakeup_reader.as_raw_fd()
+    }
+
+    fn set_nonblocking(&self) -> Result<(), ProcessError> {
+        self.wakeup_reader
+            .set_nonblocking(true)
+            .map_err(|err| ProcessError::SignalHandler(err.kind()))
+    }
+
+    fn drain_wakeup(&mut self) -> Result<bool, ProcessError> {
+        let mut drained = false;
         let mut buffer = [0; 64];
+
         loop {
             match self.wakeup_reader.read(&mut buffer) {
                 Ok(0) => {
@@ -623,10 +665,57 @@ impl ShutdownSignal {
                         std::io::ErrorKind::UnexpectedEof,
                     ));
                 }
-                Ok(_) => return Ok(()),
+                Ok(_) => drained = true,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(drained),
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(err) => return Err(ProcessError::SignalHandler(err.kind())),
             }
+        }
+    }
+}
+
+fn wait_for_shutdown_or_process_exit(
+    shutdown_wakeup_fd: RawFd,
+    process_exit_wakeup_fd: Option<RawFd>,
+) -> Result<(), ProcessError> {
+    let mut poll_fds = [
+        libc::pollfd {
+            fd: shutdown_wakeup_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: process_exit_wakeup_fd.unwrap_or(-1),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    let poll_fd_count = if process_exit_wakeup_fd.is_some() {
+        poll_fds.len()
+    } else {
+        poll_fds.len() - 1
+    };
+    let poll_fds = poll_fds
+        .get_mut(..poll_fd_count)
+        .ok_or(ProcessError::SignalHandler(
+            std::io::ErrorKind::InvalidInput,
+        ))?;
+
+    loop {
+        for poll_fd in poll_fds.iter_mut() {
+            poll_fd.revents = 0;
+        }
+
+        // SAFETY: `poll_fds` points to initialized `pollfd` values and remains
+        // valid for the duration of the call. The timeout is infinite.
+        let result = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as _, -1) };
+        if result > 0 {
+            return Ok(());
+        }
+
+        let kind = std::io::Error::last_os_error().kind();
+        if kind != std::io::ErrorKind::Interrupted {
+            return Err(ProcessError::SignalHandler(kind));
         }
     }
 }
@@ -1192,8 +1281,12 @@ fn unsupported_flag_equals_syntax(arg: &str) -> Option<&'static str> {
 mod tests {
     use std::ffi::OsString;
     use std::fs;
+    use std::io::{Read, Write};
     use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::io::{AsRawFd, RawFd};
+    use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use bangbang_runtime::boot::BootSourceConfigInput;
@@ -1204,7 +1297,9 @@ mod tests {
     use bangbang_runtime::serial::SerialConfigError;
     use bangbang_runtime::{BackendError, InstanceState, VmmAction, VmmData};
 
-    use crate::vmm::{InstanceStartExecutor, ProcessVmm};
+    use crate::vmm::{
+        InstanceStartExecutor, ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm,
+    };
 
     use super::{
         ApiServerError, Args, Command, DEFAULT_API_SOCK_PATH, DEFAULT_INSTANCE_ID,
@@ -1223,6 +1318,110 @@ mod tests {
             _controller: &bangbang_runtime::VmmController,
         ) -> Result<Self::Session, BackendError> {
             Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ProcessExitTestStarter {
+        signal: TestProcessExitSignal,
+    }
+
+    impl InstanceStartExecutor for ProcessExitTestStarter {
+        type Session = TestProcessExitSession;
+
+        fn start(
+            &mut self,
+            _controller: &bangbang_runtime::VmmController,
+        ) -> Result<Self::Session, BackendError> {
+            Ok(TestProcessExitSession {
+                signal: self.signal.clone(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestProcessExitSession {
+        signal: TestProcessExitSignal,
+    }
+
+    impl ProcessSessionDiagnostics for TestProcessExitSession {
+        fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
+            Some(self.signal.wakeup_fd())
+        }
+
+        fn drain_process_exit_wakeup(&mut self) -> Result<(), std::io::ErrorKind> {
+            self.signal.drain()
+        }
+
+        fn process_exit_status(&self) -> ProcessSessionExitStatus {
+            self.signal.status()
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct TestProcessExitSignal {
+        reader: Arc<Mutex<UnixStream>>,
+        writer: Arc<Mutex<UnixStream>>,
+        reader_fd: RawFd,
+        status: Arc<Mutex<ProcessSessionExitStatus>>,
+    }
+
+    impl TestProcessExitSignal {
+        fn new() -> Self {
+            let (reader, writer) =
+                UnixStream::pair().expect("test process-exit signal should be created");
+            reader
+                .set_nonblocking(true)
+                .expect("test process-exit reader should be nonblocking");
+            let reader_fd = reader.as_raw_fd();
+
+            Self {
+                reader: Arc::new(Mutex::new(reader)),
+                writer: Arc::new(Mutex::new(writer)),
+                reader_fd,
+                status: Arc::new(Mutex::new(ProcessSessionExitStatus::Running)),
+            }
+        }
+
+        const fn wakeup_fd(&self) -> RawFd {
+            self.reader_fd
+        }
+
+        fn status(&self) -> ProcessSessionExitStatus {
+            *self
+                .status
+                .lock()
+                .expect("test process-exit status should lock")
+        }
+
+        fn trigger(&self, status: ProcessSessionExitStatus) {
+            *self
+                .status
+                .lock()
+                .expect("test process-exit status should lock") = status;
+            self.writer
+                .lock()
+                .expect("test process-exit writer should lock")
+                .write_all(&[1])
+                .expect("test process-exit signal should write");
+        }
+
+        fn drain(&mut self) -> Result<(), std::io::ErrorKind> {
+            let mut reader = self
+                .reader
+                .lock()
+                .expect("test process-exit reader should lock");
+            let mut buffer = [0; 64];
+
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof),
+                    Ok(_) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(err) => return Err(err.kind()),
+                }
+            }
         }
     }
 
@@ -1257,6 +1456,10 @@ mod tests {
             "bangbang-main-test-{}-{nanos}-{name}.metrics",
             std::process::id()
         ))
+    }
+
+    fn test_shutdown_signal() -> super::ShutdownSignal {
+        super::ShutdownSignal::install().expect("test shutdown signal should install")
     }
 
     fn unique_serial_path(name: &str) -> PathBuf {
@@ -2322,6 +2525,32 @@ mod tests {
         .expect_err("missing boot-source should fail");
 
         assert_eq!(err, super::ConfigFileError::MissingSection("boot-source"));
+    }
+
+    #[test]
+    fn no_api_wait_returns_after_guest_shutdown_notification() {
+        let process_exit_signal = TestProcessExitSignal::new();
+        let process_exit_trigger = process_exit_signal.clone();
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            ProcessExitTestStarter {
+                signal: process_exit_signal,
+            },
+        );
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("instance should start");
+        let mut shutdown_signal = test_shutdown_signal();
+
+        process_exit_trigger.trigger(ProcessSessionExitStatus::GuestShutdown);
+
+        super::wait_for_no_api_shutdown(&mut shutdown_signal, &mut vmm)
+            .expect("guest shutdown should stop no-api wait successfully");
     }
 
     #[test]

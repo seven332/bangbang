@@ -330,6 +330,17 @@ impl BangbangProcess {
         dead_code,
         reason = "shared integration-test support is compiled once per test target"
     )]
+    pub(crate) fn wait_for_exit(mut self) -> CompletedProcess {
+        let child = self.child.take().expect("child should still be owned");
+        let status = wait_for_child_exit(child, SHUTDOWN_TIMEOUT);
+
+        self.collect_output(status)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "shared integration-test support is compiled once per test target"
+    )]
     pub(crate) fn interrupt(mut self) -> CompletedProcess {
         self.stop_with_signal(libc::SIGINT, "SIGINT")
     }
