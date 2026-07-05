@@ -1102,6 +1102,29 @@ mod tests {
     }
 
     #[test]
+    fn repeated_failed_flushes_accumulate_missed_metrics() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+
+        output.fail_next_write();
+        assert_eq!(
+            state.flush(),
+            Err(MetricsFlushError::Write(ErrorKind::BrokenPipe))
+        );
+        output.fail_next_write();
+        assert_eq!(
+            state.flush(),
+            Err(MetricsFlushError::Write(ErrorKind::BrokenPipe))
+        );
+        assert_eq!(state.flush(), Ok(true));
+
+        assert_eq!(
+            output.lines(),
+            [r#"{"logger":{"missed_metrics_count":2},"vmm":{"metrics_flush_count":1}}"#]
+        );
+    }
+
+    #[test]
     fn writes_boot_run_loop_diagnostics_when_provided() {
         let path = unique_metrics_path("diagnostics");
         let mut state = MetricsState::default();
