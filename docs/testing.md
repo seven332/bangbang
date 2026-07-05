@@ -284,7 +284,7 @@ artifacts and is not a substitute for a production rootfs build process.
 The signed `guest_boot` and executable HVF e2e targets also validate a
 deterministic direct-rootfs boot. For those scenarios,
 `scripts/run-integration-tests.sh` prepares
-`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v16.ext4`
+`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v17.ext4`
 after confirming the host can execute HVF. The generated image is an ext4 copy
 of the pinned Firecracker rootfs with a test-specific
 `/bangbang-direct-rootfs-init` script added before image creation. The test
@@ -321,16 +321,21 @@ accepts the host's Firecracker-style `CONNECT <PORT>` request through the main
 multiple ordered deterministic guest and host payloads over the same stream, and
 writes `BANGBANG_VSOCK_HOST_CONNECT_OK` only after every payload matches. The
 signed e2e also verifies the retained host stream reports EOF after the guest
-closes the accepted AF_VSOCK stream. These checks prove the kernel mounted the
-virtio-block root drive as `/`, give
+closes the accepted AF_VSOCK stream. With `bangbang.vsock-host-multistream=1`,
+Python binds two guest AF_VSOCK listeners on distinct ports, reports ready only
+after both listeners are active, accepts two host `CONNECT <PORT>` streams
+through the main `uds_path`, sends distinct guest payloads on both streams,
+waits for distinct host replies, and writes
+`BANGBANG_VSOCK_HOST_MULTISTREAM_OK` only after both streams complete. These
+checks prove the kernel mounted the virtio-block root drive as `/`, give
 executable-boundary MMDS fetch coverage through the process-local MMDS-only
 packet path, and cover guest-initiated plus host-initiated virtio-vsock
 connection exchange through the signed executable, including narrow
-multi-payload stream cases in both directions and guest-initiated multi-stream
-retention. They do not claim that bangbang can boot an arbitrary distro image
-through its default init, that full networking compatibility is complete, or
-that host-initiated multi-stream, full vsock throughput, graceful half-close
-behavior, and credit accounting are complete.
+multi-payload stream cases and multi-stream retention in both directions. They
+do not claim that bangbang can boot an arbitrary distro image through its
+default init, that full networking compatibility is complete, or that full
+vsock throughput, graceful half-close behavior, and credit accounting are
+complete.
 
 bangbang appends Firecracker-style root-drive command-line arguments during
 startup resource assembly when a configured drive has `is_root_device=true`.
