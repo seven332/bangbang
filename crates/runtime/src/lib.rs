@@ -397,6 +397,14 @@ impl VmmController {
         Ok(VmmData::Empty)
     }
 
+    pub fn record_put_actions_request(&mut self) {
+        self.metrics_state.record_put_actions_request();
+    }
+
+    pub fn record_put_actions_failure(&mut self) {
+        self.metrics_state.record_put_actions_failure();
+    }
+
     pub fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
         let action_name = action.name();
         match action {

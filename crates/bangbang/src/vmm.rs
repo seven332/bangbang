@@ -79,6 +79,8 @@ impl ProcessSessionDiagnostics for () {}
 
 pub(crate) trait VmmRequestHandler {
     fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError>;
+
+    fn handle_put_action_request(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError>;
 }
 
 #[derive(Debug)]
@@ -200,6 +202,15 @@ where
         }
     }
 
+    fn handle_put_action_request(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
+        self.controller.record_put_actions_request();
+        let result = self.handle_action(action);
+        if result.is_err() {
+            self.controller.record_put_actions_failure();
+        }
+        result
+    }
+
     fn start_instance(&mut self) -> Result<VmmData, VmmActionError> {
         let controller = &mut self.controller;
         let starter = &mut self.starter;
@@ -244,6 +255,10 @@ where
 {
     fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
         ProcessVmm::handle_action(self, action)
+    }
+
+    fn handle_put_action_request(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
+        ProcessVmm::handle_put_action_request(self, action)
     }
 }
 

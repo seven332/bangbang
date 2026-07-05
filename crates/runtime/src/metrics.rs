@@ -76,6 +76,7 @@ impl std::error::Error for MetricsFlushError {}
 pub struct MetricsState {
     sink: Option<MetricsSink>,
     flush_count: u64,
+    put_api_requests: PutApiRequestMetrics,
 }
 
 impl MetricsState {
@@ -94,6 +95,14 @@ impl MetricsState {
         self.flush_with_diagnostics(&MetricsDiagnostics::default())
     }
 
+    pub(crate) fn record_put_actions_request(&mut self) {
+        self.put_api_requests.record_actions_request();
+    }
+
+    pub(crate) fn record_put_actions_failure(&mut self) {
+        self.put_api_requests.record_actions_failure();
+    }
+
     pub fn flush_with_diagnostics(
         &mut self,
         diagnostics: &MetricsDiagnostics,
@@ -102,7 +111,7 @@ impl MetricsState {
             return Ok(false);
         };
         let next_flush_count = self.flush_count.saturating_add(1);
-        sink.write_minimal_metrics(next_flush_count, diagnostics)?;
+        sink.write_minimal_metrics(next_flush_count, diagnostics, self.put_api_requests)?;
         self.flush_count = next_flush_count;
 
         Ok(true)
@@ -111,6 +120,34 @@ impl MetricsState {
     #[cfg(test)]
     pub const fn is_configured(&self) -> bool {
         self.sink.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PutApiRequestMetrics {
+    actions_count: u64,
+    actions_fails: u64,
+}
+
+impl PutApiRequestMetrics {
+    const fn is_empty(self) -> bool {
+        self.actions_count == 0 && self.actions_fails == 0
+    }
+
+    fn record_actions_request(&mut self) {
+        self.actions_count = self.actions_count.saturating_add(1);
+    }
+
+    fn record_actions_failure(&mut self) {
+        self.actions_fails = self.actions_fails.saturating_add(1);
+    }
+
+    const fn actions_count(self) -> u64 {
+        self.actions_count
+    }
+
+    const fn actions_fails(self) -> u64 {
+        self.actions_fails
     }
 }
 
@@ -227,6 +264,7 @@ impl MetricsSink {
         &mut self,
         flush_count: u64,
         diagnostics: &MetricsDiagnostics,
+        put_api_requests: PutApiRequestMetrics,
     ) -> Result<(), MetricsFlushError> {
         let mut vmm = serde_json::Map::new();
         if let Some(status) = diagnostics.boot_run_loop_status() {
@@ -259,6 +297,21 @@ impl MetricsSink {
         }
 
         let mut root = serde_json::Map::new();
+        if !put_api_requests.is_empty() {
+            let mut put_requests = serde_json::Map::new();
+            put_requests.insert(
+                "actions_count".to_string(),
+                serde_json::Value::Number(put_api_requests.actions_count().into()),
+            );
+            put_requests.insert(
+                "actions_fails".to_string(),
+                serde_json::Value::Number(put_api_requests.actions_fails().into()),
+            );
+            root.insert(
+                "put_api_requests".to_string(),
+                serde_json::Value::Object(put_requests),
+            );
+        }
         root.insert("vmm".to_string(), serde_json::Value::Object(vmm));
 
         writeln!(self.writer, "{}", serde_json::Value::Object(root))
@@ -380,6 +433,28 @@ mod tests {
         assert_eq!(
             output,
             "{\"vmm\":{\"metrics_flush_count\":1,\"parent_cpu_time_us\":3000,\"start_time_cpu_us\":2000,\"start_time_us\":1000}}\n"
+        );
+
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn writes_put_actions_api_request_metrics_when_recorded() {
+        let path = unique_metrics_path("api-request-actions");
+        let mut state = MetricsState::default();
+
+        state.record_put_actions_request();
+        state.record_put_actions_request();
+        state.record_put_actions_failure();
+        state
+            .configure(MetricsConfigInput::new(&path))
+            .expect("metrics should configure");
+        assert_eq!(state.flush(), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("metrics output should be readable");
+        assert_eq!(
+            output,
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(path).expect("fixture should clean up");
