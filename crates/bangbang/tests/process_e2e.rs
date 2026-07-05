@@ -1647,6 +1647,90 @@ fn executable_rejects_invalid_machine_config_put_without_mutating() {
 }
 
 #[test]
+fn executable_rejects_unsupported_machine_config_options_without_mutating() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    let put_response = http_put_json(
+        &socket_path,
+        "/machine-config",
+        r#"{"vcpu_count":2,"mem_size_mib":256}"#,
+    );
+    assert_no_content_response(&put_response, "PUT /machine-config original");
+
+    for (request_name, method, body, expected_fault) in [
+        (
+            "PUT /machine-config cpu_template",
+            "PUT",
+            r#"{"vcpu_count":4,"mem_size_mib":512,"cpu_template":"V1N1"}"#,
+            r#"{"fault_message":"machine cpu_template V1N1 is not supported"}"#,
+        ),
+        (
+            "PATCH /machine-config cpu_template",
+            "PATCH",
+            r#"{"mem_size_mib":512,"cpu_template":"T2A"}"#,
+            r#"{"fault_message":"machine cpu_template T2A is not supported"}"#,
+        ),
+        (
+            "PUT /machine-config smt",
+            "PUT",
+            r#"{"vcpu_count":4,"mem_size_mib":512,"smt":true}"#,
+            r#"{"fault_message":"machine smt is not supported"}"#,
+        ),
+        (
+            "PATCH /machine-config smt",
+            "PATCH",
+            r#"{"mem_size_mib":512,"smt":true}"#,
+            r#"{"fault_message":"machine smt is not supported"}"#,
+        ),
+        (
+            "PUT /machine-config huge_pages",
+            "PUT",
+            r#"{"vcpu_count":4,"mem_size_mib":512,"huge_pages":"2M"}"#,
+            r#"{"fault_message":"machine huge_pages is not supported"}"#,
+        ),
+        (
+            "PATCH /machine-config huge_pages",
+            "PATCH",
+            r#"{"mem_size_mib":512,"huge_pages":"2M"}"#,
+            r#"{"fault_message":"machine huge_pages is not supported"}"#,
+        ),
+    ] {
+        let response = if method == "PUT" {
+            http_put_json(&socket_path, "/machine-config", body)
+        } else {
+            http_json(&socket_path, method, "/machine-config", body)
+        };
+        assert_bad_request_response(&response, request_name);
+        assert_response_contains(&response, expected_fault, request_name);
+
+        let machine_config = http_get(&socket_path, "/machine-config");
+        let config_context = format!("GET /machine-config after {request_name}");
+        assert_ok_response(&machine_config, &config_context);
+        assert_response_contains(&machine_config, r#""vcpu_count":2"#, &config_context);
+        assert_response_contains(&machine_config, r#""mem_size_mib":256"#, &config_context);
+        assert_response_contains(&machine_config, r#""smt":false"#, &config_context);
+        assert_response_contains(
+            &machine_config,
+            r#""track_dirty_pages":false"#,
+            &config_context,
+        );
+        assert_response_contains(&machine_config, r#""huge_pages":"None""#, &config_context);
+        assert!(
+            !machine_config.contains(r#""vcpu_count":4"#)
+                && !machine_config.contains(r#""mem_size_mib":512"#)
+                && !machine_config.contains(r#""smt":true"#)
+                && !machine_config.contains(r#""huge_pages":"2M""#),
+            "{request_name} must not mutate stored machine config; response:\n{machine_config}"
+        );
+    }
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
 fn executable_fails_when_api_socket_path_exists_without_removing_it() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
