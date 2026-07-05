@@ -3557,7 +3557,7 @@ mod tests {
         );
         let network_patch_response = request_over_socket(
             &mut vmm,
-            "patch-network",
+            "pn",
             &request_with_body(
                 "PATCH",
                 "/network-interfaces/eth0",
@@ -3573,6 +3573,28 @@ mod tests {
                 .contains(r#"{"fault_message":"Network interface updates are not supported."}"#),
             "network patch should keep the existing unsupported fault body; response:\n{network_patch_response}"
         );
+        for (socket_name, body, fault_message) in [
+            (
+                "pn-mis",
+                r#"{"iface_id":"eth1"}"#,
+                "path iface_id must match body iface_id.",
+            ),
+            ("pn-bad", "not-json", "Malformed HTTP request."),
+        ] {
+            let response = request_over_socket(
+                &mut vmm,
+                socket_name,
+                &request_with_body("PATCH", "/network-interfaces/eth0", body),
+            );
+            assert!(
+                response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+                "{socket_name} should fail through the API socket; response:\n{response}"
+            );
+            assert!(
+                response.contains(&format!(r#"{{"fault_message":"{fault_message}"}}"#)),
+                "{socket_name} should return the parser fault before VMM metrics; response:\n{response}"
+            );
+        }
         let vm_config_after_network_patch = handle_request_bytes(
             b"GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
             &mut vmm,
