@@ -12,8 +12,8 @@ mod support;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod macos_arm64 {
     use std::fs;
-    use std::io::Read;
-    use std::os::unix::net::UnixStream;
+    use std::io::{Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
@@ -30,6 +30,10 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_BLOCK_MARKER: &[u8] = b"BANGBANG_DIRECT_ROOTFS_BLOCK_OK";
     const DIRECT_ROOTFS_MMDS_MARKER: &[u8] = b"BANGBANG_MMDS_GUEST_FETCH_OK";
     const DIRECT_ROOTFS_MMDS_V2_MARKER: &[u8] = b"BANGBANG_MMDS_V2_GUEST_FETCH_OK";
+    const DIRECT_ROOTFS_VSOCK_MARKER: &[u8] = b"BANGBANG_VSOCK_GUEST_CONNECT_OK";
+    const DIRECT_ROOTFS_VSOCK_GUEST_PAYLOAD: &[u8] = b"BANGBANG_VSOCK_GUEST_PAYLOAD";
+    const DIRECT_ROOTFS_VSOCK_HOST_REPLY: &[u8] = b"BANGBANG_VSOCK_HOST_REPLY";
+    const DIRECT_ROOTFS_VSOCK_PORT: u32 = 5005;
     const GUEST_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/init";
     const GUEST_POWEROFF_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/poweroff-init";
     const GUEST_RESET_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/reboot-init";
@@ -37,6 +41,7 @@ mod macos_arm64 {
         "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init";
     const DIRECT_ROOTFS_MMDS_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-fetch=1";
     const DIRECT_ROOTFS_MMDS_V2_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-v2-fetch=1";
+    const DIRECT_ROOTFS_VSOCK_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-guest-connect=1";
     const GUEST_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
 
     #[derive(Clone, Copy)]
@@ -1015,6 +1020,179 @@ mod macos_arm64 {
         });
     }
 
+    #[test]
+    fn signed_executable_handles_guest_initiated_vsock_from_direct_rootfs() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let data_backing_path = test_dir.path().join("data.img");
+        let uds_path = test_dir.path().join("guest-vsock.sock");
+        let host_port_path = vsock_port_path(&uds_path, DIRECT_ROOTFS_VSOCK_PORT);
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+
+        create_zeroed_block_backing(&data_backing_path);
+        let host_listener = UnixListener::bind(&host_port_path).unwrap_or_else(|err| {
+            panic!(
+                "host vsock port listener {} should bind before guest startup: {err}",
+                host_port_path.display()
+            )
+        });
+        host_listener
+            .set_nonblocking(true)
+            .expect("host vsock port listener should be nonblocking");
+
+        let mut bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+        let machine_response = http_put_json(
+            &socket_path,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        );
+        assert_no_content_response(&machine_response, "PUT /machine-config guest vsock");
+
+        let kernel_path_json = json_string(path_text(&kernel_path));
+        let boot_args_json = json_string(DIRECT_ROOTFS_VSOCK_BOOT_ARGS);
+        let boot_body = format!(
+            r#"{{
+                "kernel_image_path":{kernel_path_json},
+                "boot_args":{boot_args_json}
+            }}"#
+        );
+        let boot_response = http_put_json(&socket_path, "/boot-source", &boot_body);
+        assert_no_content_response(&boot_response, "PUT /boot-source guest vsock");
+
+        let rootfs_path_json = json_string(path_text(&rootfs_path));
+        let rootfs_body = format!(
+            r#"{{
+                "drive_id":"rootfs",
+                "path_on_host":{rootfs_path_json},
+                "is_root_device":true,
+                "is_read_only":true
+            }}"#
+        );
+        let rootfs_response = http_put_json(&socket_path, "/drives/rootfs", &rootfs_body);
+        assert_no_content_response(&rootfs_response, "PUT /drives/rootfs guest vsock");
+
+        let data_backing_path_json = json_string(path_text(&data_backing_path));
+        let data_drive_body = format!(
+            r#"{{
+                "drive_id":"data",
+                "path_on_host":{data_backing_path_json},
+                "is_root_device":false,
+                "is_read_only":false
+            }}"#
+        );
+        let data_drive_response = http_put_json(&socket_path, "/drives/data", &data_drive_body);
+        assert_no_content_response(&data_drive_response, "PUT /drives/data guest vsock");
+
+        let uds_path_json = json_string(path_text(&uds_path));
+        let vsock_body = format!(r#"{{"guest_cid":3,"uds_path":{uds_path_json}}}"#);
+        let vsock_response = http_put_json(&socket_path, "/vsock", &vsock_body);
+        assert_no_content_response(&vsock_response, "PUT /vsock guest vsock");
+        assert!(
+            !uds_path.exists(),
+            "PUT /vsock should not bind the main vsock listener before startup"
+        );
+
+        let start_response = http_put_json(
+            &socket_path,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        );
+        assert_no_content_response(&start_response, "PUT /actions InstanceStart guest vsock");
+
+        let running_instance_info = http_get(&socket_path, "/");
+        assert_ok_response(&running_instance_info, "GET / after guest vsock start");
+        assert_response_contains(
+            &running_instance_info,
+            r#""state":"Running""#,
+            "GET / after guest vsock start",
+        );
+
+        let mut host_stream = match wait_for_unix_listener_accept(
+            &host_listener,
+            &host_port_path,
+            GUEST_EXECUTION_TIMEOUT,
+        ) {
+            Ok(stream) => stream,
+            Err(err) => {
+                let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+                let output = bangbang.force_stop_and_collect();
+                panic!(
+                    "guest did not initiate vsock connection to host listener {}: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    host_port_path.display(),
+                    output.status,
+                    output.stdout,
+                    output.stderr
+                );
+            }
+        };
+        drop(host_listener);
+        fs::remove_file(&host_port_path).unwrap_or_else(|err| {
+            panic!(
+                "host vsock port listener path {} should be removed after accept: {err}",
+                host_port_path.display()
+            )
+        });
+
+        host_stream
+            .set_nonblocking(false)
+            .expect("host vsock stream should switch back to blocking mode");
+        host_stream
+            .set_read_timeout(Some(GUEST_EXECUTION_TIMEOUT))
+            .expect("host vsock stream read timeout should set");
+        host_stream
+            .set_write_timeout(Some(GUEST_EXECUTION_TIMEOUT))
+            .expect("host vsock stream write timeout should set");
+
+        let mut guest_payload = vec![0; DIRECT_ROOTFS_VSOCK_GUEST_PAYLOAD.len()];
+        if let Err(err) = host_stream.read_exact(&mut guest_payload) {
+            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "host side did not receive guest vsock payload: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+        assert_eq!(
+            guest_payload, DIRECT_ROOTFS_VSOCK_GUEST_PAYLOAD,
+            "host side should receive the deterministic guest vsock payload"
+        );
+
+        if let Err(err) = host_stream.write_all(DIRECT_ROOTFS_VSOCK_HOST_REPLY) {
+            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "host side did not write guest vsock reply: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
+        if let Err(err) = wait_for_file_prefix_marker(
+            &data_backing_path,
+            DIRECT_ROOTFS_VSOCK_MARKER,
+            GUEST_EXECUTION_TIMEOUT,
+        ) {
+            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "direct rootfs guest did not complete guest-initiated vsock through signed bangbang executable: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
+        assert_clean_shutdown(
+            bangbang.terminate(),
+            &socket_path,
+            "bangbang direct rootfs guest vsock",
+        );
+        assert!(
+            !uds_path.exists(),
+            "bangbang shutdown should remove its owned main vsock listener path"
+        );
+    }
+
     fn run_direct_rootfs_mmds_guest_fetch_test(case: DirectRootfsMmdsFetchCase<'_>) {
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join("api.socket");
@@ -1409,6 +1587,12 @@ mod macos_arm64 {
         }
     }
 
+    fn vsock_port_path(uds_path: &Path, port: u32) -> PathBuf {
+        let mut path = uds_path.as_os_str().to_os_string();
+        path.push(format!("_{port}"));
+        PathBuf::from(path)
+    }
+
     fn write_guest_stop_config(
         config_path: &Path,
         kernel_path: &Path,
@@ -1612,6 +1796,57 @@ mod macos_arm64 {
         }
     }
 
+    fn wait_for_unix_listener_accept(
+        listener: &UnixListener,
+        path: &Path,
+        timeout: Duration,
+    ) -> Result<UnixStream, String> {
+        listener.set_nonblocking(true).map_err(|err| {
+            format!(
+                "failed to set listener {} nonblocking before accept wait: {err}",
+                path.display()
+            )
+        })?;
+        if let Some(stream) = try_accept_unix_listener(listener, path)? {
+            return Ok(stream);
+        }
+
+        let kqueue = Kqueue::new()?;
+        kqueue.watch_reads(listener)?;
+        let started_at = Instant::now();
+
+        loop {
+            if let Some(stream) = try_accept_unix_listener(listener, path)? {
+                return Ok(stream);
+            }
+
+            let Some(remaining) = timeout.checked_sub(started_at.elapsed()) else {
+                return Err(format!(
+                    "timed out after {:?} waiting for Unix listener {} to accept",
+                    timeout,
+                    path.display()
+                ));
+            };
+
+            kqueue.wait_for_read(remaining)?;
+        }
+    }
+
+    fn try_accept_unix_listener(
+        listener: &UnixListener,
+        path: &Path,
+    ) -> Result<Option<UnixStream>, String> {
+        match listener.accept() {
+            Ok((stream, _addr)) => Ok(Some(stream)),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => Ok(None),
+            Err(err) => Err(format!(
+                "failed to accept Unix listener {}: {err}",
+                path.display()
+            )),
+        }
+    }
+
     fn file_starts_with_marker(path: &Path, marker: &[u8]) -> Result<bool, String> {
         let mut file = fs::File::open(path)
             .map_err(|err| format!("failed to open block backing {}: {err}", path.display()))?;
@@ -1664,13 +1899,34 @@ mod macos_arm64 {
         fn watch_writes(&self, file: &fs::File) -> Result<(), String> {
             use std::os::fd::AsRawFd;
 
-            let ident = libc::uintptr_t::try_from(file.as_raw_fd())
-                .map_err(|_| "watched file descriptor did not fit uintptr_t".to_string())?;
+            self.register_event(
+                file.as_raw_fd(),
+                libc::EVFILT_VNODE,
+                libc::NOTE_WRITE | libc::NOTE_EXTEND,
+                "file write",
+            )
+        }
+
+        fn watch_reads(&self, listener: &UnixListener) -> Result<(), String> {
+            use std::os::fd::AsRawFd;
+
+            self.register_event(listener.as_raw_fd(), libc::EVFILT_READ, 0, "listener read")
+        }
+
+        fn register_event(
+            &self,
+            raw_fd: libc::c_int,
+            filter: i16,
+            fflags: u32,
+            context: &str,
+        ) -> Result<(), String> {
+            let ident = libc::uintptr_t::try_from(raw_fd)
+                .map_err(|_| format!("watched {context} descriptor did not fit uintptr_t"))?;
             let change = libc::kevent {
                 ident,
-                filter: libc::EVFILT_VNODE,
+                filter,
                 flags: libc::EV_ADD | libc::EV_CLEAR,
-                fflags: libc::NOTE_WRITE | libc::NOTE_EXTEND,
+                fflags,
                 data: 0,
                 udata: std::ptr::null_mut(),
             };
@@ -1691,13 +1947,21 @@ mod macos_arm64 {
                 Ok(())
             } else {
                 Err(format!(
-                    "failed to register file kqueue watch: {}",
+                    "failed to register {context} kqueue watch: {}",
                     std::io::Error::last_os_error()
                 ))
             }
         }
 
         fn wait_for_write(&self, timeout: Duration) -> Result<(), String> {
+            self.wait_for_event(timeout, "file write")
+        }
+
+        fn wait_for_read(&self, timeout: Duration) -> Result<(), String> {
+            self.wait_for_event(timeout, "listener read")
+        }
+
+        fn wait_for_event(&self, timeout: Duration, context: &str) -> Result<(), String> {
             let timeout = duration_to_timespec(timeout)?;
             let mut event = libc::kevent {
                 ident: 0,
@@ -1719,12 +1983,12 @@ mod macos_arm64 {
                     return Ok(());
                 }
                 if result == 0 {
-                    return Err("timed out waiting for file write event".to_string());
+                    return Err(format!("timed out waiting for {context} event"));
                 }
 
                 let err = std::io::Error::last_os_error();
                 if err.kind() != std::io::ErrorKind::Interrupted {
-                    return Err(format!("failed while waiting for file write: {err}"));
+                    return Err(format!("failed while waiting for {context}: {err}"));
                 }
             }
         }
