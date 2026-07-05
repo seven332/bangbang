@@ -183,6 +183,24 @@ mod macos_arm64 {
             "PATCH /drives/data after InstanceStart",
         );
 
+        let replacement_serial_output_path = test_dir.path().join("replacement-serial.out");
+        let replacement_serial_output_path_json =
+            json_string(path_text(&replacement_serial_output_path));
+        let serial_update_body =
+            format!(r#"{{"serial_out_path":{replacement_serial_output_path_json}}}"#);
+        let serial_update_response = http_put_json(&socket_path, "/serial", &serial_update_body);
+        assert_bad_request_response(&serial_update_response, "PUT /serial after InstanceStart");
+        assert_response_contains(
+            &serial_update_response,
+            r#"{"fault_message":"The requested operation is not supported in Running state: PutSerial"}"#,
+            "PUT /serial after InstanceStart",
+        );
+        assert!(
+            !replacement_serial_output_path.exists(),
+            "rejected serial update must not create or use replacement output path {}",
+            replacement_serial_output_path.display()
+        );
+
         let vm_config = http_get(&socket_path, "/vm/config");
         assert_ok_response(&vm_config, "GET /vm/config after InstanceStart");
         assert_response_contains(
