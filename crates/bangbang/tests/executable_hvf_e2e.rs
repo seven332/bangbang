@@ -1209,6 +1209,15 @@ mod macos_arm64 {
             );
         }
 
+        if let Err(err) = read_unix_stream_eof(&mut host_stream, &host_port_path) {
+            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "host side did not observe guest vsock EOF after guest close: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
         assert_clean_shutdown(
             bangbang.terminate(),
             &socket_path,
@@ -2104,6 +2113,21 @@ mod macos_arm64 {
             .map_err(|err| format!("CONNECT OK response has invalid local port: {err}"))?;
 
         Ok(())
+    }
+
+    fn read_unix_stream_eof(stream: &mut UnixStream, path: &Path) -> Result<(), String> {
+        let mut byte = [0; 1];
+        match stream.read(&mut byte) {
+            Ok(0) => Ok(()),
+            Ok(read) => Err(format!(
+                "expected EOF from Unix stream {}, read {read} byte(s)",
+                path.display()
+            )),
+            Err(err) => Err(format!(
+                "failed to read EOF from Unix stream {}: {err}",
+                path.display()
+            )),
+        }
     }
 
     fn file_starts_with_marker(path: &Path, marker: &[u8]) -> Result<bool, String> {
