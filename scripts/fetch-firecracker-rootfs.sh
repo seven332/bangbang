@@ -114,7 +114,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v16"
+direct_boot_variant="direct-boot-v17"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -768,6 +768,132 @@ finally:
 PY
 }
 
+fetch_multi_host_vsock_marker() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    emit_line BANGBANG_VSOCK_HOST_MULTISTREAM_FAIL_NO_PYTHON
+    write_vdb_marker BANGBANG_VSOCK_HOST_MULTISTREAM_FAIL
+    return
+  fi
+
+  python3 - <<'PY' 2>/dev/null || true
+import socket
+import sys
+
+CID_ANY = getattr(socket, "VMADDR_CID_ANY", -1)
+STREAMS = (
+    (
+        5009,
+        b"BANGBANG_VSOCK_HOST_MULTI_GUEST_ONE",
+        b"BANGBANG_VSOCK_HOST_MULTI_HOST_ONE",
+    ),
+    (
+        5010,
+        b"BANGBANG_VSOCK_HOST_MULTI_GUEST_TWO",
+        b"BANGBANG_VSOCK_HOST_MULTI_HOST_TWO",
+    ),
+)
+READY_MARKER = b"BANGBANG_VSOCK_HOST_MULTISTREAM_READY"
+SUCCESS_MARKER = b"BANGBANG_VSOCK_HOST_MULTISTREAM_OK"
+FAIL_MARKER = b"BANGBANG_VSOCK_HOST_MULTISTREAM_FAIL"
+SOCKET_TIMEOUT = 10.0
+
+
+def marker_text(marker):
+    return marker.decode("ascii")
+
+
+def write_marker(marker):
+    try:
+        with open("/dev/vdb", "wb", buffering=0) as drive:
+            drive.write(marker.ljust(512, b" "))
+    except OSError:
+        pass
+
+
+def fail(reason):
+    marker = FAIL_MARKER + b"_" + reason.encode("ascii")
+    write_marker(marker)
+    print(marker_text(marker))
+    sys.exit(1)
+
+
+def recv_exact(stream, size):
+    data = b""
+    while len(data) < size:
+        try:
+            chunk = stream.recv(size - len(data))
+        except OSError:
+            fail("RECV")
+        if not chunk:
+            fail("EOF")
+        data += chunk
+    return data
+
+
+if not hasattr(socket, "AF_VSOCK"):
+    fail("NO_AF_VSOCK")
+
+listeners = []
+connections = []
+try:
+    for port, guest_payload, host_payload in STREAMS:
+        try:
+            server = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+        except OSError:
+            fail(f"SOCKET_{port}")
+
+        try:
+            server.settimeout(SOCKET_TIMEOUT)
+            server.bind((CID_ANY, port))
+            server.listen(1)
+        except OSError:
+            server.close()
+            fail(f"LISTEN_{port}")
+
+        listeners.append((port, server, guest_payload, host_payload))
+
+    write_marker(READY_MARKER)
+    print(marker_text(READY_MARKER))
+
+    for port, server, guest_payload, host_payload in listeners:
+        try:
+            connection, _addr = server.accept()
+        except OSError:
+            fail(f"ACCEPT_{port}")
+
+        try:
+            connection.settimeout(SOCKET_TIMEOUT)
+        except OSError:
+            connection.close()
+            fail(f"TIMEOUT_{port}")
+
+        connections.append((port, connection, guest_payload, host_payload))
+
+    for index, (_port, connection, guest_payload, _host_payload) in enumerate(
+        connections, start=1
+    ):
+        try:
+            connection.sendall(guest_payload)
+        except OSError:
+            fail(f"SEND_{index}")
+
+    for index, (_port, connection, _guest_payload, host_payload) in enumerate(
+        connections, start=1
+    ):
+        payload = recv_exact(connection, len(host_payload))
+        if payload != host_payload:
+            fail(f"PAYLOAD_{index}")
+
+    write_marker(SUCCESS_MARKER)
+    print(marker_text(SUCCESS_MARKER))
+finally:
+    for _port, connection, _guest_payload, _host_payload in connections:
+        connection.close()
+    for _port, server, _guest_payload, _host_payload in listeners:
+        server.close()
+PY
+}
+
 cmdline=
 emit_line BANGBANG_DIRECT_ROOTFS_BOOT_BEGIN
 if [ -r /etc/os-release ]; then
@@ -799,6 +925,8 @@ elif cmdline_has bangbang.vsock-guest-multistream=1; then
   fetch_multi_vsock_marker
 elif cmdline_has bangbang.vsock-host-connect=1; then
   fetch_host_vsock_marker
+elif cmdline_has bangbang.vsock-host-multistream=1; then
+  fetch_multi_host_vsock_marker
 else
   write_vdb_marker BANGBANG_DIRECT_ROOTFS_BLOCK_OK
 fi
