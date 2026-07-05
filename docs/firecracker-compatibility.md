@@ -974,8 +974,9 @@ arm64 HVC exception exits and handles `HVC #0` as a minimal PSCI 0.2 responder
 for early single-vCPU boot probing. The responder returns `PSCI_VERSION`,
 reports feature support only for the implemented minimal calls, returns
 `MIGRATE_INFO_TYPE` as the PSCI value for a trusted OS that is MP-capable or
-not present, where migration is not required, and writes `NOT_SUPPORTED` to X0
-for other PSCI calls or HVC immediates.
+not present, where migration is not required, and translates `SYSTEM_OFF` and
+`SYSTEM_RESET` into guest-requested terminal boot run-loop outcomes. It writes
+`NOT_SUPPORTED` to X0 for other PSCI calls or HVC immediates.
 Early boot also traps the guest's `OSDLR_EL1` and `OSLAR_EL1` OS lock
 system-register accesses through the AArch64 SYS64 exception class (`0x18`),
 not through SMC/SMCCC. The HVF runner handles only those observed
@@ -1247,9 +1248,10 @@ bounded internal
 boot-session run-loop pump now composes that one-step path with boot block,
 virtio-net, and virtio-vsock notification dispatch between successful MMIO steps and virtual
 timer PPI assertion after virtual timer exits. It stops explicitly on a step limit,
-stop-token request, canceled run exit, unknown run exit, dispatch error, or
-timer handler error. This remains internal runner-loop plumbing, not the future
-public guest scheduler. An owned internal session handle preserves the same
+stop-token request, canceled run exit, PSCI `SYSTEM_OFF` or `SYSTEM_RESET`
+guest request, unknown run exit, dispatch error, or timer handler error. This
+remains internal runner-loop plumbing, not the future public guest scheduler.
+An owned internal session handle preserves the same
 session operations while avoiding a self-referential backend/session owner in
 process-level state.
 The boot session can also dispatch pending boot block, virtio-net, and
@@ -1263,10 +1265,11 @@ runtime notifications and releases it before HVF GIC signaling.
 bangbang now wires `mem_size_mib` into startup preparation, but still does not
 wire device interrupts into public guest execution, emulate devices, provide
 public run-loop control, power on secondary vCPUs, or implement full PSCI CPU
-and system power actions. Public machine configuration rejects `mem_size_mib`
-above the current 1022 GiB Apple Silicon/aarch64 DRAM maximum before storage;
-startup keeps its architectural maximum check as a defensive guard. Dynamic
-host-memory availability policy remains deferred.
+control and process exit-code parity for guest system power actions. Public
+machine configuration rejects `mem_size_mib` above the current 1022 GiB Apple
+Silicon/aarch64 DRAM maximum before storage; startup keeps its architectural
+maximum check as a defensive guard. Dynamic host-memory availability policy
+remains deferred.
 
 ## API State and Response Policy
 
