@@ -307,7 +307,9 @@ the same init script uses the rootfs-provided Python `AF_VSOCK` support to
 connect to host CID 2 on the test port, exchange multiple ordered deterministic
 guest and host payloads with a host Unix listener at the Firecracker-style
 `uds_path_<PORT>` path, and write `BANGBANG_VSOCK_GUEST_CONNECT_OK` only after
-every reply matches. When the boot args include
+every reply matches. The signed e2e also verifies the retained host stream
+reports EOF after the guest closes the AF_VSOCK stream. When the boot args
+include
 `bangbang.vsock-host-connect=1`, Python instead binds and listens on the test
 AF_VSOCK port, writes
 `BANGBANG_VSOCK_HOST_CONNECT_READY` only after the guest listener is ready,
