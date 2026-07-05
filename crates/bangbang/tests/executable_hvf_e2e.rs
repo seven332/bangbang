@@ -201,6 +201,22 @@ mod macos_arm64 {
             replacement_serial_output_path.display()
         );
 
+        let replacement_logger_path = test_dir.path().join("replacement-logger.out");
+        let replacement_logger_path_json = json_string(path_text(&replacement_logger_path));
+        let logger_update_body = format!(r#"{{"log_path":{replacement_logger_path_json}}}"#);
+        let logger_update_response = http_put_json(&socket_path, "/logger", &logger_update_body);
+        assert_bad_request_response(&logger_update_response, "PUT /logger after InstanceStart");
+        assert_response_contains(
+            &logger_update_response,
+            r#"{"fault_message":"The requested operation is not supported in Running state: PutLogger"}"#,
+            "PUT /logger after InstanceStart",
+        );
+        assert!(
+            !replacement_logger_path.exists(),
+            "rejected logger update must not create or use replacement output path {}",
+            replacement_logger_path.display()
+        );
+
         let vm_config = http_get(&socket_path, "/vm/config");
         assert_ok_response(&vm_config, "GET /vm/config after InstanceStart");
         assert_response_contains(
@@ -250,6 +266,11 @@ mod macos_arm64 {
         assert_metrics_output(&metrics_path);
         assert_startup_time_metrics_output(&metrics_path);
         assert_logger_output(&logger_path);
+        assert!(
+            !replacement_logger_path.exists(),
+            "rejected logger update must not write later action records to replacement output path {}",
+            replacement_logger_path.display()
+        );
 
         let second_start_response = http_put_json(
             &socket_path,
