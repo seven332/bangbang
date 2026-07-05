@@ -1584,6 +1584,69 @@ fn executable_serves_and_patches_machine_config() {
 }
 
 #[test]
+fn executable_rejects_invalid_machine_config_put_without_mutating() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    let put_response = http_put_json(
+        &socket_path,
+        "/machine-config",
+        r#"{"vcpu_count":2,"mem_size_mib":256}"#,
+    );
+    assert_no_content_response(&put_response, "PUT /machine-config original");
+
+    let invalid_put_response = http_put_json(
+        &socket_path,
+        "/machine-config",
+        r#"{"vcpu_count":4,"mem_size_mib":512,"track_dirty_pages":true}"#,
+    );
+    assert_bad_request_response(&invalid_put_response, "PUT /machine-config invalid");
+    assert_response_contains(
+        &invalid_put_response,
+        r#"{"fault_message":"machine track_dirty_pages is not supported"}"#,
+        "PUT /machine-config invalid",
+    );
+
+    let machine_config = http_get(&socket_path, "/machine-config");
+    assert_ok_response(&machine_config, "GET /machine-config after invalid PUT");
+    assert_response_contains(
+        &machine_config,
+        r#""vcpu_count":2"#,
+        "GET /machine-config after invalid PUT",
+    );
+    assert_response_contains(
+        &machine_config,
+        r#""mem_size_mib":256"#,
+        "GET /machine-config after invalid PUT",
+    );
+    assert_response_contains(
+        &machine_config,
+        r#""smt":false"#,
+        "GET /machine-config after invalid PUT",
+    );
+    assert_response_contains(
+        &machine_config,
+        r#""track_dirty_pages":false"#,
+        "GET /machine-config after invalid PUT",
+    );
+    assert_response_contains(
+        &machine_config,
+        r#""huge_pages":"None""#,
+        "GET /machine-config after invalid PUT",
+    );
+    assert!(
+        !machine_config.contains(r#""vcpu_count":4"#)
+            && !machine_config.contains(r#""mem_size_mib":512"#)
+            && !machine_config.contains(r#""track_dirty_pages":true"#),
+        "invalid PUT /machine-config must not mutate stored machine config; response:\n{machine_config}"
+    );
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
 fn executable_fails_when_api_socket_path_exists_without_removing_it() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
