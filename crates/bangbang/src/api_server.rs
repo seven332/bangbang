@@ -578,6 +578,7 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PutSerial(config) => handle_empty(vmm.handle_put_request(
             PutApiRequest::serial(serial_config_input_from_request(config.as_ref())),
         )),
+        ApiRequest::PutEntropy => handle_empty(vmm.handle_action(VmmAction::PutEntropy)),
         ApiRequest::PutSnapshotCreate => handle_empty(vmm.handle_action(VmmAction::CreateSnapshot)),
         ApiRequest::PutSnapshotLoad => handle_empty(vmm.handle_action(VmmAction::LoadSnapshot)),
         ApiRequest::PutVsock(config) => handle_empty(vmm.handle_put_request(PutApiRequest::vsock(
@@ -643,6 +644,7 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         | ApiRequest::PatchNetworkInterface(_)
         | ApiRequest::PatchVmState(_)
         | ApiRequest::PutAction(_)
+        | ApiRequest::PutEntropy
         | ApiRequest::PutMmds(_)
         | ApiRequest::PutSnapshotCreate
         | ApiRequest::PutSnapshotLoad => None,
@@ -4251,13 +4253,20 @@ mod tests {
     #[test]
     fn returns_fault_for_entropy_endpoint() {
         let mut vmm = test_controller();
-        for (socket_name, body, fault_message) in [
-            ("ent-ok", "{}", "Entropy device is not supported."),
-            ("ent-bad", "not-json", "Malformed HTTP request."),
+        for (socket_name, body, fault_message, private_values) in [
+            ("ent-ok", "{}", "Entropy device is not supported.", &[][..]),
             (
                 "ent-rl",
+                r#"{"rate_limiter":{"bandwidth":{"size":123456789,"one_time_burst":987654321,"refill_time":777}}}"#,
+                "Entropy device is not supported.",
+                &["123456789", "987654321", "777"][..],
+            ),
+            ("ent-bad", "not-json", "Malformed HTTP request.", &[][..]),
+            (
+                "ent-bad-rl",
                 r#"{"rate_limiter":{"bandwidth":{"size":1}}}"#,
                 "Malformed HTTP request.",
+                &[][..],
             ),
         ] {
             let request = format!(
@@ -4275,10 +4284,54 @@ mod tests {
                 response.contains(&format!(r#"{{"fault_message":"{fault_message}"}}"#)),
                 "{socket_name}: {response}"
             );
+            for private_value in private_values {
+                assert!(
+                    !response.contains(private_value),
+                    "{socket_name} must not echo private entropy config value {private_value}: {response}"
+                );
+            }
         }
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::NotStarted
+        );
+    }
+
+    #[test]
+    fn running_state_rejects_entropy_endpoint_without_mutating() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_request = format!(
+            "PUT /boot-source HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{boot_body}",
+            boot_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "ent-start", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let body = r#"{"rate_limiter":{"ops":{"size":222222222,"one_time_burst":333333333,"refill_time":444}}}"#;
+        let request = format!(
+            "PUT /entropy HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        let response = request_over_socket(&mut vmm, "ent-run", &request);
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.contains(
+            r#"{"fault_message":"The requested operation is not supported in Running state: PutEntropy"}"#
+        ));
+        for private_value in ["222222222", "333333333", "444"] {
+            assert!(
+                !response.contains(private_value),
+                "running-state entropy response must not echo {private_value}: {response}"
+            );
+        }
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::Running
         );
     }
 
