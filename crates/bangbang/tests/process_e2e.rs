@@ -143,6 +143,21 @@ fn executable_rejects_api_payload_over_limit_without_stopping() {
 }
 
 #[test]
+fn executable_handles_sigint_shutdown_cleanly() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    assert!(
+        socket_path.exists(),
+        "bangbang should publish the configured API socket before SIGINT"
+    );
+
+    assert_clean_shutdown(bangbang.interrupt(), &socket_path, "bangbang SIGINT");
+}
+
+#[test]
 fn executable_rejects_unsupported_firecracker_process_flags_before_socket_publication() {
     for (name, args, private_value) in [
         ("boot-timer", &["--boot-timer"][..], None),
