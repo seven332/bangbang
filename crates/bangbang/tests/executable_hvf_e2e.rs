@@ -1413,6 +1413,15 @@ mod macos_arm64 {
             );
         }
 
+        if let Err(err) = read_unix_stream_eof(&mut host_stream, &uds_path) {
+            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "host side did not observe host-initiated vsock EOF after guest close: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
         drop(host_stream);
         assert_clean_shutdown(
             bangbang.terminate(),

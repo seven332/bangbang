@@ -315,8 +315,10 @@ the test AF_VSOCK port, writes
 accepts the host's Firecracker-style `CONNECT <PORT>` request through the main
 `uds_path` after the host consumes the `OK <local_port>` response, exchanges
 multiple ordered deterministic guest and host payloads over the same stream, and
-writes `BANGBANG_VSOCK_HOST_CONNECT_OK` only after every payload matches. These
-checks prove the kernel mounted the virtio-block root drive as `/`, give
+writes `BANGBANG_VSOCK_HOST_CONNECT_OK` only after every payload matches. The
+signed e2e also verifies the retained host stream reports EOF after the guest
+closes the accepted AF_VSOCK stream. These checks prove the kernel mounted the
+virtio-block root drive as `/`, give
 executable-boundary MMDS fetch coverage through the process-local MMDS-only
 packet path, and cover guest-initiated plus host-initiated virtio-vsock
 connection exchange through the signed executable, including narrow
