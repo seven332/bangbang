@@ -165,6 +165,8 @@ the same metrics output includes `start_time_us`, `start_time_cpu_us`, and
 also reports selected GET counters under `get_api_requests`, parsed core
 configuration, MMDS, observability, and `/actions` counters under
 `put_api_requests`, and selected PATCH counters under `patch_api_requests`.
+After a metrics write failure, later successful metrics output includes the
+minimal Firecracker-shaped `logger.missed_metrics_count` counter.
 
 Configure logger output before boot:
 

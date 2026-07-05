@@ -77,6 +77,7 @@ pub struct MetricsState {
     sink: Option<MetricsSink>,
     flush_count: u64,
     get_api_requests: GetApiRequestMetrics,
+    logger_metrics: LoggerMetrics,
     patch_api_requests: PatchApiRequestMetrics,
     put_api_requests: PutApiRequestMetrics,
 }
@@ -233,16 +234,28 @@ impl MetricsState {
             return Ok(false);
         };
         let next_flush_count = self.flush_count.saturating_add(1);
-        sink.write_minimal_metrics(
+        if let Err(err) = sink.write_minimal_metrics(
             next_flush_count,
             diagnostics,
             self.get_api_requests,
+            self.logger_metrics,
             self.patch_api_requests,
             self.put_api_requests,
-        )?;
+        ) {
+            self.logger_metrics.record_missed_metrics();
+            return Err(err);
+        }
         self.flush_count = next_flush_count;
 
         Ok(true)
+    }
+
+    #[cfg(test)]
+    fn with_test_output(output: impl MetricsOutput + 'static) -> Self {
+        Self {
+            sink: Some(MetricsSink::new(Box::new(output))),
+            ..Self::default()
+        }
     }
 
     #[cfg(test)]
@@ -257,6 +270,25 @@ struct GetApiRequestMetrics {
     vmm_version_count: u64,
     machine_cfg_count: u64,
     mmds_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LoggerMetrics {
+    missed_metrics_count: u64,
+}
+
+impl LoggerMetrics {
+    const fn is_empty(self) -> bool {
+        self.missed_metrics_count == 0
+    }
+
+    fn record_missed_metrics(&mut self) {
+        self.missed_metrics_count = self.missed_metrics_count.saturating_add(1);
+    }
+
+    const fn missed_metrics_count(self) -> u64 {
+        self.missed_metrics_count
+    }
 }
 
 impl GetApiRequestMetrics {
@@ -689,7 +721,25 @@ impl BootRunLoopMetricStatus {
 
 #[derive(Debug)]
 struct MetricsSink {
+    output: Box<dyn MetricsOutput>,
+}
+
+trait MetricsOutput: fmt::Debug + Send {
+    fn write_json_line(&mut self, line: &serde_json::Value) -> Result<(), MetricsFlushError>;
+}
+
+#[derive(Debug)]
+struct FileMetricsOutput {
     writer: LineWriter<File>,
+}
+
+impl MetricsOutput for FileMetricsOutput {
+    fn write_json_line(&mut self, line: &serde_json::Value) -> Result<(), MetricsFlushError> {
+        writeln!(self.writer, "{line}").map_err(|err| MetricsFlushError::Write(err.kind()))?;
+        self.writer
+            .flush()
+            .map_err(|err| MetricsFlushError::Write(err.kind()))
+    }
 }
 
 impl MetricsSink {
@@ -702,9 +752,13 @@ impl MetricsSink {
             .open(config.metrics_path())
             .map_err(|err| MetricsConfigError::OpenFile(err.kind()))?;
 
-        Ok(Self {
+        Ok(Self::new(Box::new(FileMetricsOutput {
             writer: LineWriter::new(file),
-        })
+        })))
+    }
+
+    fn new(output: Box<dyn MetricsOutput>) -> Self {
+        Self { output }
     }
 
     fn write_minimal_metrics(
@@ -712,6 +766,7 @@ impl MetricsSink {
         flush_count: u64,
         diagnostics: &MetricsDiagnostics,
         get_api_requests: GetApiRequestMetrics,
+        logger_metrics: LoggerMetrics,
         patch_api_requests: PatchApiRequestMetrics,
         put_api_requests: PutApiRequestMetrics,
     ) -> Result<(), MetricsFlushError> {
@@ -768,6 +823,14 @@ impl MetricsSink {
                 "get_api_requests".to_string(),
                 serde_json::Value::Object(get_requests),
             );
+        }
+        if !logger_metrics.is_empty() {
+            let mut logger = serde_json::Map::new();
+            logger.insert(
+                "missed_metrics_count".to_string(),
+                serde_json::Value::Number(logger_metrics.missed_metrics_count().into()),
+            );
+            root.insert("logger".to_string(), serde_json::Value::Object(logger));
         }
         if !patch_api_requests.is_empty() {
             let mut patch_requests = serde_json::Map::new();
@@ -897,24 +960,23 @@ impl MetricsSink {
         }
         root.insert("vmm".to_string(), serde_json::Value::Object(vmm));
 
-        writeln!(self.writer, "{}", serde_json::Value::Object(root))
-            .map_err(|err| MetricsFlushError::Write(err.kind()))?;
-        self.writer
-            .flush()
-            .map_err(|err| MetricsFlushError::Write(err.kind()))
+        self.output
+            .write_json_line(&serde_json::Value::Object(root))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::ErrorKind;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         BootRunLoopMetricStatus, MetricsConfigError, MetricsConfigInput, MetricsDiagnostics,
-        MetricsFlushError, MetricsState,
+        MetricsFlushError, MetricsOutput, MetricsState,
     };
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -929,6 +991,50 @@ mod tests {
             "bangbang-metrics-test-{}-{nanos}-{id}-{name}",
             std::process::id()
         ))
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct TestMetricsOutput {
+        state: Arc<Mutex<TestMetricsOutputState>>,
+    }
+
+    impl TestMetricsOutput {
+        fn fail_next_write(&self) {
+            self.state
+                .lock()
+                .expect("test metrics output lock should not be poisoned")
+                .fail_next_write = true;
+        }
+
+        fn lines(&self) -> Vec<String> {
+            self.state
+                .lock()
+                .expect("test metrics output lock should not be poisoned")
+                .lines
+                .clone()
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct TestMetricsOutputState {
+        fail_next_write: bool,
+        lines: Vec<String>,
+    }
+
+    impl MetricsOutput for TestMetricsOutput {
+        fn write_json_line(&mut self, line: &serde_json::Value) -> Result<(), MetricsFlushError> {
+            let mut state = self
+                .state
+                .lock()
+                .expect("test metrics output lock should not be poisoned");
+            if state.fail_next_write {
+                state.fail_next_write = false;
+                return Err(MetricsFlushError::Write(ErrorKind::BrokenPipe));
+            }
+
+            state.lines.push(line.to_string());
+            Ok(())
+        }
     }
 
     #[test]
@@ -975,6 +1081,47 @@ mod tests {
         );
 
         fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn failed_flush_records_missed_metrics_without_incrementing_flush_count() {
+        let output = TestMetricsOutput::default();
+        output.fail_next_write();
+        let mut state = MetricsState::with_test_output(output.clone());
+
+        assert_eq!(
+            state.flush(),
+            Err(MetricsFlushError::Write(ErrorKind::BrokenPipe))
+        );
+        assert_eq!(state.flush(), Ok(true));
+
+        assert_eq!(
+            output.lines(),
+            [r#"{"logger":{"missed_metrics_count":1},"vmm":{"metrics_flush_count":1}}"#]
+        );
+    }
+
+    #[test]
+    fn repeated_failed_flushes_accumulate_missed_metrics() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+
+        output.fail_next_write();
+        assert_eq!(
+            state.flush(),
+            Err(MetricsFlushError::Write(ErrorKind::BrokenPipe))
+        );
+        output.fail_next_write();
+        assert_eq!(
+            state.flush(),
+            Err(MetricsFlushError::Write(ErrorKind::BrokenPipe))
+        );
+        assert_eq!(state.flush(), Ok(true));
+
+        assert_eq!(
+            output.lines(),
+            [r#"{"logger":{"missed_metrics_count":2},"vmm":{"metrics_flush_count":1}}"#]
+        );
     }
 
     #[test]
