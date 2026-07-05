@@ -564,9 +564,10 @@ and full event payload dispatch remain deferred. Event queue notifications are
 accepted as no-op dispatch metadata.
 Signed executable validation currently covers narrow guest-initiated and
 host-initiated multi-payload exchanges through Firecracker-style vsock paths,
-plus guest-initiated and host-initiated EOF cleanup after guest close; it does
-not cover throughput-oriented streaming, multiple simultaneous streams,
-graceful half-close behavior, or full credit accounting.
+guest-initiated multi-stream exchange, plus guest-initiated and host-initiated
+EOF cleanup after guest close; it does not cover throughput-oriented streaming,
+host-initiated multiple simultaneous streams, graceful half-close behavior, or
+full credit accounting.
 `SendCtrlAltDel` is rejected at parse time for the first aarch64 target.
 
 Future implementation PRs should derive unit or golden tests from these tables.
@@ -1508,9 +1509,10 @@ Their eventual support level should follow the endpoint matrix:
 - virtio-vsock socket lifecycle beyond connection setup, forceful guest
   reset/full-shutdown cleanup, current narrow signed guest-initiated and
   host-initiated EOF cleanup, and signed guest-initiated and host-initiated
-  multi-payload exchanges; full graceful half-close state tracking, full
-  virtio-vsock credit accounting, CID routing beyond current host/guest checks,
-  multiple simultaneous streams, and full event payload dispatch.
+  multi-payload exchanges, plus signed guest-initiated multi-stream exchange;
+  full graceful half-close state tracking, full virtio-vsock credit accounting,
+  CID routing beyond current host/guest checks, host-initiated multiple
+  simultaneous streams, and full event payload dispatch.
   Implemented vsock scope is limited
   to no-op event notifications, pre-boot `/vsock` configuration storage,
   startup FDT attachment,
