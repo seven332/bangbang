@@ -76,6 +76,7 @@ impl std::error::Error for MetricsFlushError {}
 pub struct MetricsState {
     sink: Option<MetricsSink>,
     flush_count: u64,
+    get_api_requests: GetApiRequestMetrics,
     put_api_requests: PutApiRequestMetrics,
 }
 
@@ -103,6 +104,22 @@ impl MetricsState {
         self.put_api_requests.record_actions_failure();
     }
 
+    pub(crate) fn record_get_instance_info_request(&mut self) {
+        self.get_api_requests.record_instance_info_request();
+    }
+
+    pub(crate) fn record_get_vmm_version_request(&mut self) {
+        self.get_api_requests.record_vmm_version_request();
+    }
+
+    pub(crate) fn record_get_machine_config_request(&mut self) {
+        self.get_api_requests.record_machine_config_request();
+    }
+
+    pub(crate) fn record_get_mmds_request(&mut self) {
+        self.get_api_requests.record_mmds_request();
+    }
+
     pub fn flush_with_diagnostics(
         &mut self,
         diagnostics: &MetricsDiagnostics,
@@ -111,7 +128,12 @@ impl MetricsState {
             return Ok(false);
         };
         let next_flush_count = self.flush_count.saturating_add(1);
-        sink.write_minimal_metrics(next_flush_count, diagnostics, self.put_api_requests)?;
+        sink.write_minimal_metrics(
+            next_flush_count,
+            diagnostics,
+            self.get_api_requests,
+            self.put_api_requests,
+        )?;
         self.flush_count = next_flush_count;
 
         Ok(true)
@@ -120,6 +142,55 @@ impl MetricsState {
     #[cfg(test)]
     pub const fn is_configured(&self) -> bool {
         self.sink.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct GetApiRequestMetrics {
+    instance_info_count: u64,
+    vmm_version_count: u64,
+    machine_cfg_count: u64,
+    mmds_count: u64,
+}
+
+impl GetApiRequestMetrics {
+    const fn is_empty(self) -> bool {
+        self.instance_info_count == 0
+            && self.vmm_version_count == 0
+            && self.machine_cfg_count == 0
+            && self.mmds_count == 0
+    }
+
+    fn record_instance_info_request(&mut self) {
+        self.instance_info_count = self.instance_info_count.saturating_add(1);
+    }
+
+    fn record_vmm_version_request(&mut self) {
+        self.vmm_version_count = self.vmm_version_count.saturating_add(1);
+    }
+
+    fn record_machine_config_request(&mut self) {
+        self.machine_cfg_count = self.machine_cfg_count.saturating_add(1);
+    }
+
+    fn record_mmds_request(&mut self) {
+        self.mmds_count = self.mmds_count.saturating_add(1);
+    }
+
+    const fn instance_info_count(self) -> u64 {
+        self.instance_info_count
+    }
+
+    const fn vmm_version_count(self) -> u64 {
+        self.vmm_version_count
+    }
+
+    const fn machine_cfg_count(self) -> u64 {
+        self.machine_cfg_count
+    }
+
+    const fn mmds_count(self) -> u64 {
+        self.mmds_count
     }
 }
 
@@ -264,6 +335,7 @@ impl MetricsSink {
         &mut self,
         flush_count: u64,
         diagnostics: &MetricsDiagnostics,
+        get_api_requests: GetApiRequestMetrics,
         put_api_requests: PutApiRequestMetrics,
     ) -> Result<(), MetricsFlushError> {
         let mut vmm = serde_json::Map::new();
@@ -297,6 +369,29 @@ impl MetricsSink {
         }
 
         let mut root = serde_json::Map::new();
+        if !get_api_requests.is_empty() {
+            let mut get_requests = serde_json::Map::new();
+            get_requests.insert(
+                "instance_info_count".to_string(),
+                serde_json::Value::Number(get_api_requests.instance_info_count().into()),
+            );
+            get_requests.insert(
+                "machine_cfg_count".to_string(),
+                serde_json::Value::Number(get_api_requests.machine_cfg_count().into()),
+            );
+            get_requests.insert(
+                "mmds_count".to_string(),
+                serde_json::Value::Number(get_api_requests.mmds_count().into()),
+            );
+            get_requests.insert(
+                "vmm_version_count".to_string(),
+                serde_json::Value::Number(get_api_requests.vmm_version_count().into()),
+            );
+            root.insert(
+                "get_api_requests".to_string(),
+                serde_json::Value::Object(get_requests),
+            );
+        }
         if !put_api_requests.is_empty() {
             let mut put_requests = serde_json::Map::new();
             put_requests.insert(
@@ -455,6 +550,30 @@ mod tests {
         assert_eq!(
             output,
             "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn writes_get_api_request_metrics_when_recorded() {
+        let path = unique_metrics_path("api-request-get");
+        let mut state = MetricsState::default();
+
+        state.record_get_instance_info_request();
+        state.record_get_vmm_version_request();
+        state.record_get_machine_config_request();
+        state.record_get_mmds_request();
+        state.record_get_mmds_request();
+        state
+            .configure(MetricsConfigInput::new(&path))
+            .expect("metrics should configure");
+        assert_eq!(state.flush(), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("metrics output should be readable");
+        assert_eq!(
+            output,
+            "{\"get_api_requests\":{\"instance_info_count\":1,\"machine_cfg_count\":1,\"mmds_count\":2,\"vmm_version_count\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(path).expect("fixture should clean up");

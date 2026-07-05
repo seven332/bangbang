@@ -405,6 +405,22 @@ impl VmmController {
         self.metrics_state.record_put_actions_failure();
     }
 
+    pub fn record_get_instance_info_request(&mut self) {
+        self.metrics_state.record_get_instance_info_request();
+    }
+
+    pub fn record_get_vmm_version_request(&mut self) {
+        self.metrics_state.record_get_vmm_version_request();
+    }
+
+    pub fn record_get_machine_config_request(&mut self) {
+        self.metrics_state.record_get_machine_config_request();
+    }
+
+    pub fn record_get_mmds_request(&mut self) {
+        self.metrics_state.record_get_mmds_request();
+    }
+
     pub fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
         let action_name = action.name();
         match action {

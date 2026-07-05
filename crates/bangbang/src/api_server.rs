@@ -43,7 +43,7 @@ use bangbang_runtime::serial::SerialConfigInput;
 use bangbang_runtime::vsock::{VsockConfig, VsockConfigInput};
 use bangbang_runtime::{VmConfiguration, VmmAction, VmmData};
 
-use crate::vmm::VmmRequestHandler;
+use crate::vmm::{GetApiRequest, VmmRequestHandler};
 
 const READ_CHUNK_SIZE: usize = 4096;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -438,13 +438,15 @@ fn handle_request_bytes_with_limit(
 fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> HttpResponse {
     match request {
         ApiRequest::GetInstanceInfo => {
-            handle_instance_info(vmm.handle_action(VmmAction::GetVmInstanceInfo))
+            handle_instance_info(vmm.handle_get_request(GetApiRequest::InstanceInfo))
         }
-        ApiRequest::GetVersion => handle_vmm_version(vmm.handle_action(VmmAction::GetVmmVersion)),
+        ApiRequest::GetVersion => {
+            handle_vmm_version(vmm.handle_get_request(GetApiRequest::VmmVersion))
+        }
         ApiRequest::GetMachineConfig => {
-            handle_machine_config(vmm.handle_action(VmmAction::GetMachineConfig))
+            handle_machine_config(vmm.handle_get_request(GetApiRequest::MachineConfig))
         }
-        ApiRequest::GetMmds => handle_mmds(vmm.handle_action(VmmAction::GetMmds)),
+        ApiRequest::GetMmds => handle_mmds(vmm.handle_get_request(GetApiRequest::Mmds)),
         ApiRequest::GetVmConfig => handle_vm_config(vmm.handle_action(VmmAction::GetVmConfig)),
         ApiRequest::PutAction(action) => {
             handle_empty(vmm.handle_put_action_request(action_from_request(action.as_ref())))
@@ -2730,6 +2732,70 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
             "{\"put_api_requests\":{\"actions_count\":3,\"actions_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+
+        fs::remove_file(metrics_path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn configured_metrics_counts_get_api_requests() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let metrics_path = unique_socket_path("metrics-get").with_extension("metrics");
+        let metrics_body = format!(r#"{{"metrics_path":"{}"}}"#, metrics_path.to_string_lossy());
+        let metrics_request = format!(
+            "PUT /metrics HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{metrics_body}",
+            metrics_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(metrics_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let instance_response =
+            request_over_socket(&mut vmm, "g-i", "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(instance_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        let version_response = request_over_socket(
+            &mut vmm,
+            "g-v",
+            "GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(version_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        let machine_response = request_over_socket(
+            &mut vmm,
+            "g-m",
+            "GET /machine-config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(machine_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        let mmds_response = request_over_socket(
+            &mut vmm,
+            "g-d",
+            "GET /mmds HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(mmds_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        let vm_config_response = request_over_socket(
+            &mut vmm,
+            "g-c",
+            "GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(vm_config_response.starts_with("HTTP/1.1 200 OK\r\n"));
+
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_request = format!(
+            "PUT /boot-source HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{boot_body}",
+            boot_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "g-s", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let flush_response = put_action_over_socket(&mut vmm, "g-f", "FlushMetrics");
+
+        assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert_eq!(
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
+            "{\"get_api_requests\":{\"instance_info_count\":1,\"machine_cfg_count\":1,\"mmds_count\":1,\"vmm_version_count\":1},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("fixture should clean up");

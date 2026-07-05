@@ -77,8 +77,38 @@ pub(crate) trait ProcessSessionDiagnostics {
 
 impl ProcessSessionDiagnostics for () {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GetApiRequest {
+    InstanceInfo,
+    VmmVersion,
+    MachineConfig,
+    Mmds,
+}
+
+impl GetApiRequest {
+    const fn action(self) -> VmmAction {
+        match self {
+            Self::InstanceInfo => VmmAction::GetVmInstanceInfo,
+            Self::VmmVersion => VmmAction::GetVmmVersion,
+            Self::MachineConfig => VmmAction::GetMachineConfig,
+            Self::Mmds => VmmAction::GetMmds,
+        }
+    }
+
+    fn record(self, controller: &mut VmmController) {
+        match self {
+            Self::InstanceInfo => controller.record_get_instance_info_request(),
+            Self::VmmVersion => controller.record_get_vmm_version_request(),
+            Self::MachineConfig => controller.record_get_machine_config_request(),
+            Self::Mmds => controller.record_get_mmds_request(),
+        }
+    }
+}
+
 pub(crate) trait VmmRequestHandler {
     fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError>;
+
+    fn handle_get_request(&mut self, request: GetApiRequest) -> Result<VmmData, VmmActionError>;
 
     fn handle_put_action_request(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError>;
 }
@@ -211,6 +241,11 @@ where
         result
     }
 
+    fn handle_get_request(&mut self, request: GetApiRequest) -> Result<VmmData, VmmActionError> {
+        request.record(&mut self.controller);
+        self.handle_action(request.action())
+    }
+
     fn start_instance(&mut self) -> Result<VmmData, VmmActionError> {
         let controller = &mut self.controller;
         let starter = &mut self.starter;
@@ -259,6 +294,10 @@ where
 
     fn handle_put_action_request(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
         ProcessVmm::handle_put_action_request(self, action)
+    }
+
+    fn handle_get_request(&mut self, request: GetApiRequest) -> Result<VmmData, VmmActionError> {
+        ProcessVmm::handle_get_request(self, request)
     }
 }
 
