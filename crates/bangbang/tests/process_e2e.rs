@@ -109,6 +109,43 @@ fn executable_accepts_firecracker_startup_time_args() {
 }
 
 #[test]
+fn executable_startup_metrics_path_writes_initial_metrics() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let metrics_path = test_dir.path().join("startup.metrics");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start_with_extra_args(
+        &socket_path,
+        &instance_id,
+        &[
+            "--metrics-path",
+            path_text(&metrics_path),
+            "--start-time-us",
+            "1000",
+            "--start-time-cpu-us",
+            "2000",
+            "--parent-cpu-time-us",
+            "3000",
+        ],
+    );
+
+    assert_eq!(
+        fs::read_to_string(&metrics_path).expect("startup metrics should be readable"),
+        "{\"vmm\":{\"metrics_flush_count\":1,\"parent_cpu_time_us\":3000,\"start_time_cpu_us\":2000,\"start_time_us\":1000}}\n"
+    );
+
+    let instance_info = http_get(&socket_path, "/");
+    assert_ok_response(&instance_info, "GET / after startup metrics");
+    assert_response_contains(
+        &instance_info,
+        r#""state":"Not started""#,
+        "GET / after startup metrics",
+    );
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
 fn executable_rejects_api_payload_over_limit_without_stopping() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");

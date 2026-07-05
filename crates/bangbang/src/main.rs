@@ -185,9 +185,16 @@ where
     let actions = config_file_actions(config_file).map_err(ProcessError::ConfigFile)?;
 
     for action in actions {
+        let flush_startup_metrics = matches!(action, VmmAction::PutMetrics(_));
         vmm.handle_action(action)
             .map_err(ConfigFileError::Apply)
             .map_err(ProcessError::ConfigFile)?;
+        if flush_startup_metrics {
+            vmm.flush_startup_metrics()
+                .map(|_| ())
+                .map_err(ConfigFileError::Apply)
+                .map_err(ProcessError::ConfigFile)?;
+        }
     }
 
     vmm.handle_action(VmmAction::InstanceStart)
@@ -390,6 +397,9 @@ where
 {
     if let Some(metrics_config) = metrics_config {
         vmm.handle_action(VmmAction::PutMetrics(metrics_config))
+            .map(|_| ())
+            .map_err(ProcessError::StartupConfiguration)?;
+        vmm.flush_startup_metrics()
             .map(|_| ())
             .map_err(ProcessError::StartupConfiguration)?;
     }
@@ -1344,7 +1354,7 @@ mod tests {
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel};
     use bangbang_runtime::machine::{MAX_MEM_SIZE_MIB, MachineConfigError};
-    use bangbang_runtime::metrics::{MetricsConfigError, MetricsConfigInput};
+    use bangbang_runtime::metrics::{MetricsConfigError, MetricsConfigInput, MetricsDiagnostics};
     use bangbang_runtime::mmds::MmdsDataStoreError;
     use bangbang_runtime::serial::SerialConfigError;
     use bangbang_runtime::{BackendError, InstanceState, VmmAction, VmmActionError, VmmData};
@@ -2634,7 +2644,7 @@ mod tests {
             .expect("flush metrics should succeed");
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"vmm\":{\"metrics_flush_count\":2}}\n"
         );
         assert_eq!(
             fs::read_to_string(&logger_path).expect("logger output should be readable"),
@@ -3084,6 +3094,12 @@ mod tests {
 
         super::apply_startup_metrics_config(&mut vmm, Some(MetricsConfigInput::new(&path)))
             .expect("startup metrics config should apply");
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+        assert_eq!(
+            fs::read_to_string(&path).expect("startup metrics output should be readable"),
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
         vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
             "/tmp/vmlinux",
         )))
@@ -3095,7 +3111,35 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(&path).expect("metrics output should be readable"),
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n{\"vmm\":{\"metrics_flush_count\":2}}\n"
+        );
+
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn applies_startup_metrics_config_with_startup_time_diagnostics() {
+        let path = unique_metrics_path("startup-time");
+        let diagnostics = MetricsDiagnostics::new()
+            .with_start_time_us(1000)
+            .with_start_time_cpu_us(2000)
+            .with_parent_cpu_time_us(3000);
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        )
+        .with_process_metrics_diagnostics(diagnostics);
+
+        super::apply_startup_metrics_config(&mut vmm, Some(MetricsConfigInput::new(&path)))
+            .expect("startup metrics config should apply");
+
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+        assert_eq!(
+            fs::read_to_string(&path).expect("startup metrics output should be readable"),
+            "{\"vmm\":{\"metrics_flush_count\":1,\"parent_cpu_time_us\":3000,\"start_time_cpu_us\":2000,\"start_time_us\":1000}}\n"
         );
 
         fs::remove_file(path).expect("fixture should clean up");

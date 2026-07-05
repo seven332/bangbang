@@ -574,6 +574,13 @@ where
         self.controller.flush_metrics_with_diagnostics(&diagnostics)
     }
 
+    pub(crate) fn flush_startup_metrics(&mut self) -> Result<bool, VmmActionError> {
+        let diagnostics = self.metrics_diagnostics();
+
+        self.controller
+            .flush_startup_metrics_with_diagnostics(&diagnostics)
+    }
+
     fn flush_periodic_metrics(&mut self) -> Result<bool, VmmActionError> {
         let diagnostics = self.metrics_diagnostics();
 
