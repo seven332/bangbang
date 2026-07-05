@@ -152,6 +152,14 @@ impl MetricsState {
         self.put_api_requests.record_machine_config_failure();
     }
 
+    pub(crate) fn record_put_mmds_request(&mut self) {
+        self.put_api_requests.record_mmds_request();
+    }
+
+    pub(crate) fn record_put_mmds_failure(&mut self) {
+        self.put_api_requests.record_mmds_failure();
+    }
+
     pub(crate) fn record_put_network_request(&mut self) {
         self.put_api_requests.record_network_request();
     }
@@ -282,6 +290,8 @@ struct PutApiRequestMetrics {
     machine_cfg_fails: u64,
     metrics_count: u64,
     metrics_fails: u64,
+    mmds_count: u64,
+    mmds_fails: u64,
     network_count: u64,
     network_fails: u64,
     serial_count: u64,
@@ -306,6 +316,8 @@ impl PutApiRequestMetrics {
             && self.machine_cfg_fails == 0
             && self.metrics_count == 0
             && self.metrics_fails == 0
+            && self.mmds_count == 0
+            && self.mmds_fails == 0
             && self.network_count == 0
             && self.network_fails == 0
             && self.serial_count == 0
@@ -368,6 +380,14 @@ impl PutApiRequestMetrics {
 
     fn record_machine_config_failure(&mut self) {
         self.machine_cfg_fails = self.machine_cfg_fails.saturating_add(1);
+    }
+
+    fn record_mmds_request(&mut self) {
+        self.mmds_count = self.mmds_count.saturating_add(1);
+    }
+
+    fn record_mmds_failure(&mut self) {
+        self.mmds_fails = self.mmds_fails.saturating_add(1);
     }
 
     fn record_network_request(&mut self) {
@@ -448,6 +468,14 @@ impl PutApiRequestMetrics {
 
     const fn metrics_fails(self) -> u64 {
         self.metrics_fails
+    }
+
+    const fn mmds_count(self) -> u64 {
+        self.mmds_count
+    }
+
+    const fn mmds_fails(self) -> u64 {
+        self.mmds_fails
     }
 
     const fn network_count(self) -> u64 {
@@ -704,6 +732,14 @@ impl MetricsSink {
                 serde_json::Value::Number(put_api_requests.metrics_fails().into()),
             );
             put_requests.insert(
+                "mmds_count".to_string(),
+                serde_json::Value::Number(put_api_requests.mmds_count().into()),
+            );
+            put_requests.insert(
+                "mmds_fails".to_string(),
+                serde_json::Value::Number(put_api_requests.mmds_fails().into()),
+            );
+            put_requests.insert(
                 "network_count".to_string(),
                 serde_json::Value::Number(put_api_requests.network_count().into()),
             );
@@ -874,7 +910,7 @@ mod tests {
         let output = fs::read_to_string(&path).expect("metrics output should be readable");
         assert_eq!(
             output,
-            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":1,\"boot_source_count\":0,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":0,\"metrics_fails\":0,\"network_count\":0,\"network_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":1,\"boot_source_count\":0,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":0,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(path).expect("fixture should clean up");
@@ -907,7 +943,29 @@ mod tests {
         let output = fs::read_to_string(&path).expect("metrics output should be readable");
         assert_eq!(
             output,
-            "{\"put_api_requests\":{\"actions_count\":0,\"actions_fails\":0,\"boot_source_count\":2,\"boot_source_fails\":1,\"cpu_cfg_count\":1,\"cpu_cfg_fails\":1,\"drive_count\":1,\"drive_fails\":1,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"metrics_count\":0,\"metrics_fails\":0,\"network_count\":1,\"network_fails\":1,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":1,\"vsock_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"put_api_requests\":{\"actions_count\":0,\"actions_fails\":0,\"boot_source_count\":2,\"boot_source_fails\":1,\"cpu_cfg_count\":1,\"cpu_cfg_fails\":1,\"drive_count\":1,\"drive_fails\":1,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"metrics_count\":0,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":1,\"network_fails\":1,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":1,\"vsock_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn writes_put_mmds_api_request_metrics_when_recorded() {
+        let path = unique_metrics_path("api-request-mmds");
+        let mut state = MetricsState::default();
+
+        state.record_put_mmds_request();
+        state.record_put_mmds_request();
+        state.record_put_mmds_failure();
+        state
+            .configure(MetricsConfigInput::new(&path))
+            .expect("metrics should configure");
+        assert_eq!(state.flush(), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("metrics output should be readable");
+        assert_eq!(
+            output,
+            "{\"put_api_requests\":{\"actions_count\":0,\"actions_fails\":0,\"boot_source_count\":0,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":0,\"metrics_fails\":0,\"mmds_count\":2,\"mmds_fails\":1,\"network_count\":0,\"network_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(path).expect("fixture should clean up");
@@ -933,7 +991,7 @@ mod tests {
         let output = fs::read_to_string(&path).expect("metrics output should be readable");
         assert_eq!(
             output,
-            "{\"put_api_requests\":{\"actions_count\":0,\"actions_fails\":0,\"boot_source_count\":0,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":1,\"logger_fails\":1,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":2,\"metrics_fails\":1,\"network_count\":0,\"network_fails\":0,\"serial_count\":1,\"serial_fails\":1,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"put_api_requests\":{\"actions_count\":0,\"actions_fails\":0,\"boot_source_count\":0,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":1,\"logger_fails\":1,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":2,\"metrics_fails\":1,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"serial_count\":1,\"serial_fails\":1,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(path).expect("fixture should clean up");

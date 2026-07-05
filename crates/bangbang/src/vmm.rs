@@ -17,7 +17,9 @@ use bangbang_runtime::logger::LoggerConfigInput;
 use bangbang_runtime::machine::MachineConfigInput;
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
 use bangbang_runtime::metrics::{BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics};
-use bangbang_runtime::mmds::{MmdsConfig, MmdsStateHandle, MmdsStateLockError};
+use bangbang_runtime::mmds::{
+    MmdsConfig, MmdsConfigInput, MmdsContentInput, MmdsStateHandle, MmdsStateLockError,
+};
 use bangbang_runtime::mmio::MmioRegionId;
 use bangbang_runtime::network::{
     NetworkInterfaceConfig, NetworkInterfaceConfigError, NetworkInterfaceConfigInput,
@@ -159,6 +161,20 @@ impl PutApiRequest {
         }
     }
 
+    pub(crate) fn mmds(input: MmdsContentInput) -> Self {
+        Self {
+            kind: PutApiRequestKind::Mmds,
+            action: VmmAction::PutMmds(input),
+        }
+    }
+
+    pub(crate) fn mmds_config(input: MmdsConfigInput) -> Self {
+        Self {
+            kind: PutApiRequestKind::Mmds,
+            action: VmmAction::PutMmdsConfig(input),
+        }
+    }
+
     pub(crate) fn network(input: NetworkInterfaceConfigInput) -> Self {
         Self {
             kind: PutApiRequestKind::Network,
@@ -197,6 +213,7 @@ enum PutApiRequestKind {
     Metrics,
     Logger,
     MachineConfig,
+    Mmds,
     Network,
     Serial,
     Vsock,
@@ -211,6 +228,7 @@ impl PutApiRequestKind {
             Self::Metrics => controller.record_put_metrics_request(),
             Self::Logger => controller.record_put_logger_request(),
             Self::MachineConfig => controller.record_put_machine_config_request(),
+            Self::Mmds => controller.record_put_mmds_request(),
             Self::Network => controller.record_put_network_request(),
             Self::Serial => controller.record_put_serial_request(),
             Self::Vsock => controller.record_put_vsock_request(),
@@ -225,6 +243,7 @@ impl PutApiRequestKind {
             Self::Metrics => controller.record_put_metrics_failure(),
             Self::Logger => controller.record_put_logger_failure(),
             Self::MachineConfig => controller.record_put_machine_config_failure(),
+            Self::Mmds => controller.record_put_mmds_failure(),
             Self::Network => controller.record_put_network_failure(),
             Self::Serial => controller.record_put_serial_failure(),
             Self::Vsock => controller.record_put_vsock_failure(),
@@ -1178,7 +1197,7 @@ mod tests {
     use bangbang_runtime::metrics::{
         BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics,
     };
-    use bangbang_runtime::mmds::{MmdsConfigInput, MmdsStateHandle};
+    use bangbang_runtime::mmds::{MmdsConfigInput, MmdsContentInput, MmdsStateHandle};
     use bangbang_runtime::mmio::MmioRegion;
     use bangbang_runtime::network::{
         MAX_NETWORK_INTERFACE_COUNT, NetworkInterfaceConfig, NetworkInterfaceConfigError,
@@ -2618,6 +2637,14 @@ mod tests {
             NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared"),
         ))
         .expect("network interface should configure");
+        vmm.handle_action(VmmAction::PutMmdsConfig(MmdsConfigInput::new(vec![
+            "eth0".to_string(),
+        ])))
+        .expect("MMDS config should configure");
+        vmm.handle_action(VmmAction::PutMmds(MmdsContentInput::new(
+            serde_json::json!({"latest": {"meta-data": {}}}),
+        )))
+        .expect("MMDS data should configure");
         vmm.handle_action(VmmAction::PutVsock(VsockConfigInput::new(
             3,
             vsock.path().to_string_lossy(),

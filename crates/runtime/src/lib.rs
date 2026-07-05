@@ -453,6 +453,14 @@ impl VmmController {
         self.metrics_state.record_put_machine_config_failure();
     }
 
+    pub fn record_put_mmds_request(&mut self) {
+        self.metrics_state.record_put_mmds_request();
+    }
+
+    pub fn record_put_mmds_failure(&mut self) {
+        self.metrics_state.record_put_mmds_failure();
+    }
+
     pub fn record_put_network_request(&mut self) {
         self.metrics_state.record_put_network_request();
     }
