@@ -4740,6 +4740,14 @@ mod tests {
                 ),
             ),
             (
+                "PUT /pmem/pmem2 null rate limiter",
+                request_with_body(
+                    "PUT",
+                    "/pmem/pmem2",
+                    r#"{"id":"pmem2","path_on_host":"/tmp/pmem.img","rate_limiter":null}"#,
+                ),
+            ),
+            (
                 "PATCH /pmem/pmem0",
                 request_with_body("PATCH", "/pmem/pmem0", r#"{"id":"pmem0"}"#),
             ),
@@ -4749,6 +4757,14 @@ mod tests {
                     "PATCH",
                     "/pmem/pmem0",
                     r#"{"id":"pmem0","rate_limiter":{}}"#,
+                ),
+            ),
+            (
+                "PATCH /pmem/pmem0 null rate limiter",
+                request_with_body(
+                    "PATCH",
+                    "/pmem/pmem0",
+                    r#"{"id":"pmem0","rate_limiter":null}"#,
                 ),
             ),
             (
