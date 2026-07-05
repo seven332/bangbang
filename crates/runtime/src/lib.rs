@@ -75,6 +75,7 @@ pub enum VmmAction {
     CreateSnapshot,
     LoadSnapshot,
     FlushMetrics,
+    PutEntropy,
     PutBootSource(boot::BootSourceConfigInput),
     PutCpuConfig(cpu::CpuConfigInput),
     PutLogger(logger::LoggerConfigInput),
@@ -106,6 +107,7 @@ impl VmmAction {
             Self::CreateSnapshot => "CreateSnapshot",
             Self::LoadSnapshot => "LoadSnapshot",
             Self::FlushMetrics => "FlushMetrics",
+            Self::PutEntropy => "PutEntropy",
             Self::PutBootSource(_) => "PutBootSource",
             Self::PutCpuConfig(_) => "PutCpuConfig",
             Self::PutLogger(_) => "PutLogger",
@@ -196,6 +198,7 @@ pub enum VmmActionError {
         action: &'static str,
         state: InstanceState,
     },
+    EntropyUnsupported,
     MissingBootSource,
     InstanceStart(BackendError),
     BootSourceConfig(boot::BootSourceConfigError),
@@ -227,6 +230,7 @@ impl fmt::Display for VmmActionError {
                     "The requested operation is not supported in {state} state: {action}"
                 )
             }
+            Self::EntropyUnsupported => f.write_str("Entropy device is not supported."),
             Self::MissingBootSource => {
                 f.write_str("boot source must be configured before InstanceStart")
             }
@@ -269,7 +273,8 @@ impl std::error::Error for VmmActionError {
             Self::NetworkInterfaceConfig(err) => Some(err),
             Self::SerialConfig(err) => Some(err),
             Self::VsockConfig(err) => Some(err),
-            Self::MissingBootSource
+            Self::EntropyUnsupported
+            | Self::MissingBootSource
             | Self::NetworkInterfaceUpdateUnsupported
             | Self::SnapshotUnsupported
             | Self::UnsupportedAction(_)
@@ -612,6 +617,16 @@ impl VmmController {
             }
             VmmAction::FlushMetrics => {
                 self.flush_metrics_with_diagnostics(&metrics::MetricsDiagnostics::default())
+            }
+            VmmAction::PutEntropy => {
+                if self.instance_info.state != InstanceState::NotStarted {
+                    return Err(VmmActionError::UnsupportedState {
+                        action: action_name,
+                        state: self.instance_info.state,
+                    });
+                }
+
+                Err(VmmActionError::EntropyUnsupported)
             }
             VmmAction::PutBootSource(config) => {
                 if self.instance_info.state != InstanceState::NotStarted {
@@ -1201,6 +1216,7 @@ mod tests {
         assert_eq!(VmmAction::CreateSnapshot.name(), "CreateSnapshot");
         assert_eq!(VmmAction::LoadSnapshot.name(), "LoadSnapshot");
         assert_eq!(VmmAction::FlushMetrics.name(), "FlushMetrics");
+        assert_eq!(VmmAction::PutEntropy.name(), "PutEntropy");
         assert_eq!(
             VmmAction::PutCpuConfig(CpuConfigInput::noop()).name(),
             "PutCpuConfig"
@@ -1395,6 +1411,51 @@ mod tests {
             );
             assert_eq!(controller.instance_info().state, state);
             assert!(controller.boot_source_config().is_some());
+        }
+    }
+
+    #[test]
+    fn put_entropy_reaches_entropy_fault_before_start_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PutEntropy)
+            .expect_err("entropy should remain unsupported");
+
+        assert_eq!(err, VmmActionError::EntropyUnsupported);
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert!(controller.boot_source_config().is_some());
+        assert!(controller.drive_configs().is_empty());
+        assert!(controller.network_interface_configs().is_empty());
+    }
+
+    #[test]
+    fn put_entropy_rejects_running_or_paused_without_mutating() {
+        for state in [InstanceState::Running, InstanceState::Paused] {
+            let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+            controller
+                .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+                .expect("boot source config should be stored");
+            controller.instance_info.state = state;
+
+            let err = controller
+                .handle_action(VmmAction::PutEntropy)
+                .expect_err("entropy should be pre-boot-only");
+
+            assert_eq!(
+                err,
+                VmmActionError::UnsupportedState {
+                    action: VmmAction::PutEntropy.name(),
+                    state,
+                }
+            );
+            assert_eq!(controller.instance_info().state, state);
+            assert!(controller.boot_source_config().is_some());
+            assert!(controller.drive_configs().is_empty());
+            assert!(controller.network_interface_configs().is_empty());
         }
     }
 
@@ -3665,6 +3726,14 @@ mod tests {
         let err = VmmActionError::SnapshotUnsupported;
 
         assert_eq!(err.to_string(), "Snapshot and restore are not supported.");
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn displays_entropy_unsupported_error() {
+        let err = VmmActionError::EntropyUnsupported;
+
+        assert_eq!(err.to_string(), "Entropy device is not supported.");
         assert!(err.source().is_none());
     }
 

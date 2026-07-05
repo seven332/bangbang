@@ -27,6 +27,7 @@ pub enum ApiRequest {
     PutBootSource(Box<BootSourceRequest>),
     PutCpuConfig(Box<CpuConfigRequest>),
     PutDrive(Box<DriveConfigRequest>),
+    PutEntropy,
     PatchDrive(Box<DrivePatchRequest>),
     PatchVmState(Box<VmStateUpdateRequest>),
     PutLogger(Box<LoggerConfigRequest>),
@@ -48,7 +49,6 @@ pub enum ApiRequest {
 pub enum RequestError {
     BalloonUnsupported,
     DriveUpdateUnsupported,
-    EntropyUnsupported,
     GetRequestBody,
     InvalidPathMethod,
     MismatchedDriveId,
@@ -67,7 +67,6 @@ impl RequestError {
         match self {
             Self::BalloonUnsupported => "Balloon device is not supported.",
             Self::DriveUpdateUnsupported => "Drive updates are not supported.",
-            Self::EntropyUnsupported => "Entropy device is not supported.",
             Self::GetRequestBody => "GET request cannot have a body.",
             Self::InvalidPathMethod => "Invalid request method and/or path.",
             Self::MismatchedDriveId => "path drive_id must match body drive_id.",
@@ -1861,7 +1860,7 @@ fn parse_entropy_config_request(body: &[u8]) -> Result<ApiRequest, RequestError>
         validate_rate_limiter_config(rate_limiter)?;
     }
 
-    Err(RequestError::EntropyUnsupported)
+    Ok(ApiRequest::PutEntropy)
 }
 
 fn parse_balloon_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
@@ -2510,6 +2509,7 @@ impl From<ApiRequest> for Endpoint {
             ApiRequest::PutAction(_) => Self::Actions,
             ApiRequest::PutBootSource(_) => Self::BootSource,
             ApiRequest::PutCpuConfig(_) => Self::CpuConfig,
+            ApiRequest::PutEntropy => Self::Entropy,
             ApiRequest::PutDrive(_) | ApiRequest::PatchDrive(_) => Self::Drive,
             ApiRequest::PutLogger(_) => Self::Logger,
             ApiRequest::PutMachineConfig(_) => Self::MachineConfig,
@@ -4745,7 +4745,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_valid_entropy_config_as_unsupported() {
+    fn parses_valid_entropy_config() {
         for body in [
             "{}",
             r#"{"rate_limiter":null}"#,
@@ -4755,11 +4755,9 @@ mod tests {
         ] {
             let request = request_with_body("PUT", "/entropy", body);
 
-            let err = parse_request(&request).expect_err("entropy should be unsupported");
-            assert_eq!(err, RequestError::EntropyUnsupported, "{body}");
             assert_eq!(
-                err.fault_message(),
-                "Entropy device is not supported.",
+                parse_request(&request),
+                Ok(ApiRequest::PutEntropy),
                 "{body}"
             );
         }
@@ -6071,6 +6069,11 @@ mod tests {
             .expect("cpu-config request should parse");
 
         assert_eq!(Endpoint::from(request), Endpoint::CpuConfig);
+
+        let request = parse_request(&request_with_body("PUT", "/entropy", "{}"))
+            .expect("entropy request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::Entropy);
 
         let request = parse_request(&request_with_body("PUT", "/logger", "{}"))
             .expect("logger request should parse");

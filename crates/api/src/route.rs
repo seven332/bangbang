@@ -7,6 +7,7 @@ pub enum Endpoint {
     Actions,
     BootSource,
     CpuConfig,
+    Entropy,
     Logger,
     MachineConfig,
     Metrics,
