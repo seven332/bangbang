@@ -62,6 +62,52 @@ impl std::error::Error for VmnetVirtioNetworkPacketIoBuildError {
 }
 
 #[derive(Debug)]
+pub(crate) enum MmdsOnlyVirtioNetworkPacketIoBuildError {
+    EmptyRxBuffer,
+    RxBufferAllocation { len: usize, source: TryReserveError },
+}
+
+impl fmt::Display for MmdsOnlyVirtioNetworkPacketIoBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyRxBuffer => f.write_str("MMDS-only virtio-net RX buffer must not be empty"),
+            Self::RxBufferAllocation { len, source } => {
+                write!(
+                    f,
+                    "failed to reserve MMDS-only virtio-net RX buffer of {len} bytes: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for MmdsOnlyVirtioNetworkPacketIoBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::RxBufferAllocation { source, .. } => Some(source),
+            Self::EmptyRxBuffer => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum MmdsOnlyVirtioNetworkPacketIoProviderBuildError {
+    DuplicateInterfaceId { iface_id: String },
+}
+
+impl fmt::Display for MmdsOnlyVirtioNetworkPacketIoProviderBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateInterfaceId { iface_id } => {
+                write!(f, "duplicate MMDS-only network interface id {iface_id}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MmdsOnlyVirtioNetworkPacketIoProviderBuildError {}
+
+#[derive(Debug)]
 pub(crate) struct MmdsPacketDetour {
     mmds_state: MmdsStateHandle,
     mmds_ipv4_address: Ipv4Addr,
@@ -843,6 +889,72 @@ where
 }
 
 #[derive(Debug)]
+pub(crate) struct MmdsOnlyVirtioNetworkPacketIoProvider {
+    entries: Vec<MmdsOnlyVirtioNetworkPacketIoProviderEntry>,
+}
+
+impl MmdsOnlyVirtioNetworkPacketIoProvider {
+    pub(crate) fn new(
+        entries: Vec<MmdsOnlyVirtioNetworkPacketIoProviderEntry>,
+    ) -> Result<Self, MmdsOnlyVirtioNetworkPacketIoProviderBuildError> {
+        for (index, entry) in entries.iter().enumerate() {
+            if entries
+                .iter()
+                .skip(index + 1)
+                .any(|candidate| candidate.iface_id == entry.iface_id)
+            {
+                return Err(
+                    MmdsOnlyVirtioNetworkPacketIoProviderBuildError::DuplicateInterfaceId {
+                        iface_id: entry.iface_id.clone(),
+                    },
+                );
+            }
+        }
+
+        Ok(Self { entries })
+    }
+}
+
+impl Arm64BootNetworkPacketIoProvider for MmdsOnlyVirtioNetworkPacketIoProvider {
+    fn packet_io(
+        &mut self,
+        device: &Arm64BootNetworkDevice,
+    ) -> Result<Arm64BootNetworkPacketIo<'_>, Arm64BootNetworkPacketIoError> {
+        let iface_id = device.registration.iface_id();
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.iface_id == iface_id)
+        else {
+            return Err(Arm64BootNetworkPacketIoError::new(format!(
+                "missing MMDS-only packet I/O for interface {iface_id}"
+            )));
+        };
+
+        let MmdsOnlyVirtioNetworkPacketIo { tx_sink, rx_source } = &mut entry.packet_io;
+        Ok(Arm64BootNetworkPacketIo::new(tx_sink, rx_source))
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct MmdsOnlyVirtioNetworkPacketIoProviderEntry {
+    iface_id: String,
+    packet_io: MmdsOnlyVirtioNetworkPacketIo,
+}
+
+impl MmdsOnlyVirtioNetworkPacketIoProviderEntry {
+    pub(crate) fn new(
+        iface_id: impl Into<String>,
+        packet_io: MmdsOnlyVirtioNetworkPacketIo,
+    ) -> Self {
+        Self {
+            iface_id: iface_id.into(),
+            packet_io,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct VmnetVirtioNetworkPacketIoState<B>
 where
     B: VmnetPacketIoBackend,
@@ -1021,6 +1133,116 @@ where
             && let Some(mmds_response_queue) = &self.mmds_response_queue
         {
             let _ = mmds_response_queue.pop_front();
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct MmdsOnlyVirtioNetworkPacketIo {
+    tx_sink: MmdsOnlyVirtioNetworkTxPacketSink,
+    rx_source: MmdsOnlyVirtioNetworkRxPacketSource,
+}
+
+impl MmdsOnlyVirtioNetworkPacketIo {
+    pub(crate) fn new(
+        mmds_detour: MmdsPacketDetour,
+    ) -> Result<Self, MmdsOnlyVirtioNetworkPacketIoBuildError> {
+        let response_queue = mmds_detour.response_queue();
+        Ok(Self {
+            tx_sink: MmdsOnlyVirtioNetworkTxPacketSink { mmds_detour },
+            rx_source: MmdsOnlyVirtioNetworkRxPacketSource::new(
+                response_queue,
+                DEFAULT_VMNET_VIRTIO_NETWORK_RX_BUFFER_LEN,
+            )?,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct MmdsOnlyVirtioNetworkTxPacketSink {
+    mmds_detour: MmdsPacketDetour,
+}
+
+impl VirtioNetworkTxPacketSink for MmdsOnlyVirtioNetworkTxPacketSink {
+    fn transmit_frame(
+        &mut self,
+        memory: &GuestMemory,
+        frame: &VirtioNetworkTxFrame,
+    ) -> Result<(), VirtioNetworkTxPacketSinkError> {
+        let packet = copy_tx_frame_payload(memory, frame).map_err(tx_error)?;
+        self.mmds_detour
+            .detour_packet(&packet)
+            .map(|_| ())
+            .map_err(tx_mmds_detour_error)
+    }
+}
+
+#[derive(Debug)]
+struct MmdsOnlyVirtioNetworkRxPacketSource {
+    response_queue: MmdsResponseQueue,
+    read_buffer: Vec<u8>,
+    cached_len: Option<usize>,
+}
+
+impl MmdsOnlyVirtioNetworkRxPacketSource {
+    fn new(
+        response_queue: MmdsResponseQueue,
+        rx_buffer_len: usize,
+    ) -> Result<Self, MmdsOnlyVirtioNetworkPacketIoBuildError> {
+        if rx_buffer_len == 0 {
+            return Err(MmdsOnlyVirtioNetworkPacketIoBuildError::EmptyRxBuffer);
+        }
+
+        let mut read_buffer = Vec::new();
+        read_buffer
+            .try_reserve_exact(rx_buffer_len)
+            .map_err(
+                |source| MmdsOnlyVirtioNetworkPacketIoBuildError::RxBufferAllocation {
+                    len: rx_buffer_len,
+                    source,
+                },
+            )?;
+        read_buffer.resize(rx_buffer_len, 0);
+
+        Ok(Self {
+            response_queue,
+            read_buffer,
+            cached_len: None,
+        })
+    }
+
+    fn cached_packet(&self) -> Option<VirtioNetworkRxPacket<'_>> {
+        let len = self.cached_len?;
+        self.read_buffer.get(..len).map(VirtioNetworkRxPacket::new)
+    }
+}
+
+impl VirtioNetworkRxPacketSource for MmdsOnlyVirtioNetworkRxPacketSource {
+    fn retry_after_tx_hint(&self) -> bool {
+        self.cached_len.is_some() || self.response_queue.may_have_response()
+    }
+
+    fn peek_packet(
+        &mut self,
+    ) -> Result<Option<VirtioNetworkRxPacket<'_>>, VirtioNetworkRxPacketSourceError> {
+        if self.cached_len.is_some() {
+            return Ok(self.cached_packet());
+        }
+
+        if let Some(len) = self
+            .response_queue
+            .copy_front_into(&mut self.read_buffer)
+            .map_err(rx_mmds_response_queue_error)?
+        {
+            self.cached_len = Some(len);
+        }
+
+        Ok(self.cached_packet())
+    }
+
+    fn consume_packet(&mut self) {
+        if self.cached_len.take().is_some() {
+            let _ = self.response_queue.pop_front();
         }
     }
 }
@@ -1236,10 +1458,13 @@ mod tests {
     };
 
     use super::{
-        MmdsPacketDetour, MmdsResponseQueue, VmnetPacketIoBackend, VmnetPacketIoError,
-        VmnetReadPacket, VmnetVirtioNetworkPacketIo, VmnetVirtioNetworkPacketIoBuildError,
-        VmnetVirtioNetworkPacketIoProvider, VmnetVirtioNetworkPacketIoProviderBuildError,
-        VmnetVirtioNetworkPacketIoProviderEntry, VmnetWritePacket,
+        MmdsOnlyVirtioNetworkPacketIo, MmdsOnlyVirtioNetworkPacketIoProvider,
+        MmdsOnlyVirtioNetworkPacketIoProviderBuildError,
+        MmdsOnlyVirtioNetworkPacketIoProviderEntry, MmdsPacketDetour, MmdsResponseQueue,
+        VmnetPacketIoBackend, VmnetPacketIoError, VmnetReadPacket, VmnetVirtioNetworkPacketIo,
+        VmnetVirtioNetworkPacketIoBuildError, VmnetVirtioNetworkPacketIoProvider,
+        VmnetVirtioNetworkPacketIoProviderBuildError, VmnetVirtioNetworkPacketIoProviderEntry,
+        VmnetWritePacket,
     };
     use crate::host_network::vmnet::{VmnetOperation, VmnetPacketCountExpectation};
 
@@ -1746,6 +1971,14 @@ mod tests {
             .expect("packet I/O with MMDS detour should build")
     }
 
+    fn mmds_only_packet_io(
+        mmds_state: MmdsStateHandle,
+        response_queue: MmdsResponseQueue,
+    ) -> MmdsOnlyVirtioNetworkPacketIo {
+        let detour = MmdsPacketDetour::new(mmds_state, DEFAULT_MMDS_IPV4_ADDRESS, response_queue);
+        MmdsOnlyVirtioNetworkPacketIo::new(detour).expect("MMDS-only packet I/O should build")
+    }
+
     fn push_mmds_response(response_queue: &MmdsResponseQueue, response: &[u8]) {
         response_queue
             .push_with(|| Ok(response.to_vec()))
@@ -1777,6 +2010,16 @@ mod tests {
         VmnetVirtioNetworkPacketIoProviderEntry::new(
             iface_id,
             packet_io_with_mmds_detour(backend, mmds_state, response_queue),
+        )
+    }
+
+    fn mmds_only_provider_entry(
+        iface_id: &str,
+        response_queue: MmdsResponseQueue,
+    ) -> MmdsOnlyVirtioNetworkPacketIoProviderEntry {
+        MmdsOnlyVirtioNetworkPacketIoProviderEntry::new(
+            iface_id,
+            mmds_only_packet_io(MmdsStateHandle::default(), response_queue),
         )
     }
 
@@ -1979,6 +2222,46 @@ mod tests {
         drop(state);
 
         packet_io.rx_source().consume_packet();
+        assert!(
+            response_queue
+                .responses()
+                .expect("MMDS response queue should read")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mmds_only_packet_io_delivers_detoured_mmds_response_through_rx_source() {
+        let payload = b"GET /meta-data/hostname HTTP/1.1\r\nAccept: application/json\r\n\r\n";
+        let packet = mmds_tcp_packet(payload);
+        let mut memory = tx_memory();
+        let frame = tx_frame(&mut memory, &[(&packet, PAYLOAD_ADDRESS)]);
+        let response_queue = MmdsResponseQueue::with_capacity(2);
+        let mut packet_io = mmds_only_packet_io(MmdsStateHandle::default(), response_queue.clone());
+
+        assert!(!packet_io.rx_source.retry_after_tx_hint());
+        packet_io
+            .tx_sink
+            .transmit_frame(&memory, &frame)
+            .expect("MMDS-only TX should detour");
+        assert!(packet_io.rx_source.retry_after_tx_hint());
+        let response = packet_io
+            .rx_source
+            .peek_packet()
+            .expect("MMDS-only response RX should succeed")
+            .expect("MMDS-only response should be present");
+
+        assert!(
+            std::str::from_utf8(mmds_response_frame_tcp_payload(response.bytes()))
+                .expect("response should be UTF-8")
+                .starts_with("HTTP/1.1 400 Bad Request")
+        );
+        assert_eq!(
+            mmds_response_body(response.bytes()),
+            b"The MMDS data store is not initialized."
+        );
+
+        packet_io.rx_source.consume_packet();
         assert!(
             response_queue
                 .responses()
@@ -4374,6 +4657,42 @@ mod tests {
         assert_eq!(
             error.message(),
             "missing vmnet packet I/O for interface eth1"
+        );
+    }
+
+    #[test]
+    fn mmds_only_provider_rejects_duplicate_interface_ids() {
+        let response_queue = MmdsResponseQueue::with_capacity(1);
+        let error = MmdsOnlyVirtioNetworkPacketIoProvider::new(vec![
+            mmds_only_provider_entry("eth0", response_queue.clone()),
+            mmds_only_provider_entry("eth0", response_queue),
+        ])
+        .expect_err("duplicate MMDS-only interface ids should fail");
+
+        assert!(matches!(
+            error,
+            MmdsOnlyVirtioNetworkPacketIoProviderBuildError::DuplicateInterfaceId { ref iface_id }
+                if iface_id == "eth0"
+        ));
+    }
+
+    #[test]
+    fn mmds_only_provider_reports_missing_interface_id() {
+        let mut provider =
+            MmdsOnlyVirtioNetworkPacketIoProvider::new(vec![mmds_only_provider_entry(
+                "eth0",
+                MmdsResponseQueue::with_capacity(1),
+            )])
+            .expect("MMDS-only provider should build");
+        let device = network_device("eth1");
+
+        let error = provider
+            .packet_io(&device)
+            .expect_err("missing MMDS-only provider entry should fail");
+
+        assert_eq!(
+            error.message(),
+            "missing MMDS-only packet I/O for interface eth1"
         );
     }
 
