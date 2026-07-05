@@ -5180,8 +5180,8 @@ mod tests {
     }
 
     #[test]
-    fn run_until_cleans_idle_socket_after_guest_shutdown() {
-        let path = unique_socket_path("idle-guest-shutdown");
+    fn run_until_cleans_idle_socket_after_guest_requested_stop() {
+        let path = unique_socket_path("idle-guest-requested-stop");
         let server = ApiServer::bind(&path).expect("server should bind");
         let (mut shutdown_reader, _shutdown_writer) =
             UnixStream::pair().expect("shutdown stream pair should be created");
@@ -5198,7 +5198,7 @@ mod tests {
             .expect("instance should start");
         let handle = thread::spawn(move || server.run_until(&mut vmm, &mut shutdown_reader));
 
-        process_exit_trigger.trigger(ProcessSessionExitStatus::GuestShutdown);
+        process_exit_trigger.trigger(ProcessSessionExitStatus::GuestRequestedStop);
 
         assert_eq!(
             handle.join().expect("server thread should not panic"),

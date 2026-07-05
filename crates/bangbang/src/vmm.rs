@@ -107,13 +107,13 @@ impl ProcessSessionDiagnostics for () {}
 pub(crate) enum ProcessSessionExitStatus {
     #[default]
     Running,
-    GuestShutdown,
+    GuestRequestedStop,
     Terminal,
 }
 
 impl ProcessSessionExitStatus {
     pub(crate) const fn should_exit_successfully(self) -> bool {
-        matches!(self, Self::GuestShutdown)
+        matches!(self, Self::GuestRequestedStop)
     }
 }
 
@@ -1238,7 +1238,9 @@ trait BootRunLoopProcessExit {
 impl BootRunLoopProcessExit for HvfArm64BootRunLoopOutcome {
     fn process_exit_status(&self) -> ProcessSessionExitStatus {
         match self {
-            Self::GuestShutdown { .. } => ProcessSessionExitStatus::GuestShutdown,
+            Self::GuestShutdown { .. } | Self::GuestReset { .. } => {
+                ProcessSessionExitStatus::GuestRequestedStop
+            }
             _ => ProcessSessionExitStatus::Terminal,
         }
     }
@@ -1674,9 +1676,34 @@ mod tests {
         fn process_exit_status(&self) -> super::ProcessSessionExitStatus {
             match self {
                 Self::StepLimitReached => super::ProcessSessionExitStatus::Running,
-                Self::Terminal => super::ProcessSessionExitStatus::GuestShutdown,
+                Self::Terminal => super::ProcessSessionExitStatus::GuestRequestedStop,
             }
         }
+    }
+
+    #[test]
+    fn hvf_guest_power_outcomes_request_process_stop() {
+        assert_eq!(
+            super::BootRunLoopProcessExit::process_exit_status(
+                &super::HvfArm64BootRunLoopOutcome::GuestShutdown { steps: 1 },
+            ),
+            super::ProcessSessionExitStatus::GuestRequestedStop
+        );
+        assert_eq!(
+            super::BootRunLoopProcessExit::process_exit_status(
+                &super::HvfArm64BootRunLoopOutcome::GuestReset { steps: 1 },
+            ),
+            super::ProcessSessionExitStatus::GuestRequestedStop
+        );
+        assert_eq!(
+            super::BootRunLoopProcessExit::process_exit_status(
+                &super::HvfArm64BootRunLoopOutcome::Unknown {
+                    steps: 1,
+                    reason: 1,
+                },
+            ),
+            super::ProcessSessionExitStatus::Terminal
+        );
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2779,7 +2806,7 @@ mod tests {
         );
         assert_eq!(
             supervisor.process_exit_status(),
-            super::ProcessSessionExitStatus::GuestShutdown
+            super::ProcessSessionExitStatus::GuestRequestedStop
         );
         assert!(supervisor.process_exit_wakeup_fd().is_some());
         supervisor

@@ -2528,7 +2528,7 @@ mod tests {
     }
 
     #[test]
-    fn no_api_wait_returns_after_guest_shutdown_notification() {
+    fn no_api_wait_returns_after_guest_requested_stop_notification() {
         let process_exit_signal = TestProcessExitSignal::new();
         let process_exit_trigger = process_exit_signal.clone();
         let mut vmm = ProcessVmm::with_starter(
@@ -2547,10 +2547,10 @@ mod tests {
             .expect("instance should start");
         let mut shutdown_signal = test_shutdown_signal();
 
-        process_exit_trigger.trigger(ProcessSessionExitStatus::GuestShutdown);
+        process_exit_trigger.trigger(ProcessSessionExitStatus::GuestRequestedStop);
 
         super::wait_for_no_api_shutdown(&mut shutdown_signal, &mut vmm)
-            .expect("guest shutdown should stop no-api wait successfully");
+            .expect("guest-requested stop should stop no-api wait successfully");
     }
 
     #[test]

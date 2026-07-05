@@ -50,6 +50,7 @@ LINUX_AARCH64_SYSCALL_EXIT = 93
 LINUX_AARCH64_SYSCALL_REBOOT = 142
 LINUX_REBOOT_MAGIC1 = 0xFEE1DEAD
 LINUX_REBOOT_MAGIC2 = 0x28121969
+LINUX_REBOOT_CMD_RESTART = 0x01234567
 LINUX_REBOOT_CMD_POWER_OFF = 0x4321FEDC
 # The tiny init has no UART drain loop, so keep serial writes within the FIFO depth.
 GUEST_SERIAL_WRITE_CHUNK_SIZE = 16
@@ -426,12 +427,12 @@ def build_guest_init_elf() -> bytes:
     return build_guest_elf(code, data)
 
 
-def build_poweroff_init_elf() -> bytes:
+def build_reboot_syscall_init_elf(command: int) -> bytes:
     code = b"".join(
         (
             mov_imm_64(0, LINUX_REBOOT_MAGIC1),
             mov_imm_64(1, LINUX_REBOOT_MAGIC2),
-            mov_imm_64(2, LINUX_REBOOT_CMD_POWER_OFF),
+            mov_imm_64(2, command),
             movz_64(3, 0),
             movz_64(8, LINUX_AARCH64_SYSCALL_REBOOT),
             svc_0(),
@@ -439,6 +440,14 @@ def build_poweroff_init_elf() -> bytes:
         )
     )
     return build_guest_elf(code, b"")
+
+
+def build_poweroff_init_elf() -> bytes:
+    return build_reboot_syscall_init_elf(LINUX_REBOOT_CMD_POWER_OFF)
+
+
+def build_reboot_init_elf() -> bytes:
+    return build_reboot_syscall_init_elf(LINUX_REBOOT_CMD_RESTART)
 
 
 def pad4(data: bytes) -> bytes:
@@ -509,6 +518,7 @@ def cpio_entry(
 def build_initrd() -> bytes:
     guest_init = build_guest_init_elf()
     poweroff_init = build_poweroff_init_elf()
+    reboot_init = build_reboot_init_elf()
     archive = b"".join(
         (
             cpio_entry(name="dev", ino=1, mode=S_IFDIR | 0o755, nlink=2),
@@ -528,7 +538,13 @@ def build_initrd() -> bytes:
                 mode=S_IFREG | 0o755,
                 data=poweroff_init,
             ),
-            cpio_entry(name="TRAILER!!!", ino=7, mode=0, nlink=1),
+            cpio_entry(
+                name="reboot-init",
+                ino=7,
+                mode=S_IFREG | 0o755,
+                data=reboot_init,
+            ),
+            cpio_entry(name="TRAILER!!!", ino=8, mode=0, nlink=1),
         )
     )
     return pad512(archive)
@@ -613,6 +629,33 @@ def file_type(mode: object) -> int:
     return int(mode) & S_IFMT
 
 
+def validate_reboot_init_entry(
+    entries: dict[str, dict[str, object]],
+    *,
+    name: str,
+    command: int,
+    command_description: str,
+) -> None:
+    entry = required_entry(entries, name)
+    if file_type(entry["mode"]) != S_IFREG:
+        raise RuntimeError(f"guest initrd {name} entry is not a regular file")
+    payload = bytes(entry["payload"])
+    if not payload.startswith(b"\x7fELF"):
+        raise RuntimeError(f"guest initrd {name} payload is not an ELF file")
+    if mov_imm_64(0, LINUX_REBOOT_MAGIC1) not in payload:
+        raise RuntimeError(f"guest initrd {name} payload does not load reboot magic1")
+    if mov_imm_64(1, LINUX_REBOOT_MAGIC2) not in payload:
+        raise RuntimeError(f"guest initrd {name} payload does not load reboot magic2")
+    if mov_imm_64(2, command) not in payload:
+        raise RuntimeError(
+            f"guest initrd {name} payload does not load {command_description} command"
+        )
+    if movz_64(8, LINUX_AARCH64_SYSCALL_REBOOT) not in payload:
+        raise RuntimeError(f"guest initrd {name} payload does not load reboot syscall")
+    if svc_0() not in payload:
+        raise RuntimeError(f"guest initrd {name} payload does not contain SVC #0")
+
+
 def validate_initrd(data: bytes) -> None:
     if not data:
         raise RuntimeError("guest initrd is empty")
@@ -629,6 +672,7 @@ def validate_initrd(data: bytes) -> None:
         "dev/console",
         "init",
         "poweroff-init",
+        "reboot-init",
         CPIO_TRAILER,
     ]
     if names != expected_names:
@@ -688,22 +732,18 @@ def validate_initrd(data: bytes) -> None:
                 f"guest initrd init payload does not contain {guest_path!r}"
             )
 
-    poweroff_init = required_entry(entries, "poweroff-init")
-    if file_type(poweroff_init["mode"]) != S_IFREG:
-        raise RuntimeError("guest initrd poweroff-init entry is not a regular file")
-    poweroff_payload = bytes(poweroff_init["payload"])
-    if not poweroff_payload.startswith(b"\x7fELF"):
-        raise RuntimeError("guest initrd poweroff-init payload is not an ELF file")
-    if mov_imm_64(0, LINUX_REBOOT_MAGIC1) not in poweroff_payload:
-        raise RuntimeError("guest initrd poweroff-init payload does not load reboot magic1")
-    if mov_imm_64(1, LINUX_REBOOT_MAGIC2) not in poweroff_payload:
-        raise RuntimeError("guest initrd poweroff-init payload does not load reboot magic2")
-    if mov_imm_64(2, LINUX_REBOOT_CMD_POWER_OFF) not in poweroff_payload:
-        raise RuntimeError("guest initrd poweroff-init payload does not load poweroff command")
-    if movz_64(8, LINUX_AARCH64_SYSCALL_REBOOT) not in poweroff_payload:
-        raise RuntimeError("guest initrd poweroff-init payload does not load reboot syscall")
-    if svc_0() not in poweroff_payload:
-        raise RuntimeError("guest initrd poweroff-init payload does not contain SVC #0")
+    validate_reboot_init_entry(
+        entries,
+        name="poweroff-init",
+        command=LINUX_REBOOT_CMD_POWER_OFF,
+        command_description="poweroff",
+    )
+    validate_reboot_init_entry(
+        entries,
+        name="reboot-init",
+        command=LINUX_REBOOT_CMD_RESTART,
+        command_description="restart",
+    )
 
 
 def default_output_path() -> Path:
