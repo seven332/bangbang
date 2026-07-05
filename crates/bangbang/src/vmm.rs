@@ -369,6 +369,10 @@ pub(crate) trait VmmRequestHandler {
 
     fn handle_put_action_request(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError>;
 
+    fn handle_periodic_metrics_flush(&mut self) -> Result<bool, VmmActionError> {
+        Ok(false)
+    }
+
     fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
         None
     }
@@ -565,16 +569,26 @@ where
     }
 
     fn flush_metrics(&mut self) -> Result<VmmData, VmmActionError> {
+        let diagnostics = self.metrics_diagnostics();
+
+        self.controller.flush_metrics_with_diagnostics(&diagnostics)
+    }
+
+    fn flush_periodic_metrics(&mut self) -> Result<bool, VmmActionError> {
+        let diagnostics = self.metrics_diagnostics();
+
+        self.controller
+            .flush_periodic_metrics_with_diagnostics(&diagnostics)
+    }
+
+    fn metrics_diagnostics(&self) -> MetricsDiagnostics {
         let session_diagnostics = self
             .started_session
             .as_ref()
             .map(ProcessSessionDiagnostics::metrics_diagnostics)
             .unwrap_or_default();
-        let diagnostics = self
-            .process_metrics_diagnostics
-            .merged_with(session_diagnostics);
-
-        self.controller.flush_metrics_with_diagnostics(&diagnostics)
+        self.process_metrics_diagnostics
+            .merged_with(session_diagnostics)
     }
 
     pub(crate) fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
@@ -609,6 +623,10 @@ where
 
     fn handle_put_action_request(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
         ProcessVmm::handle_put_action_request(self, action)
+    }
+
+    fn handle_periodic_metrics_flush(&mut self) -> Result<bool, VmmActionError> {
+        ProcessVmm::flush_periodic_metrics(self)
     }
 
     fn handle_get_request(&mut self, request: GetApiRequest) -> Result<VmmData, VmmActionError> {
@@ -3060,6 +3078,48 @@ mod tests {
         assert_eq!(
             fs::read_to_string(metrics.path()).expect("metrics output should read"),
             "{\"vmm\":{\"boot_run_loop_status\":\"failed\",\"metrics_flush_count\":1,\"parent_cpu_time_us\":3000,\"start_time_us\":1000}}\n"
+        );
+    }
+
+    #[test]
+    fn periodic_metrics_flush_includes_diagnostics_without_logger_action() {
+        let metrics = TempFilePath::create("periodic-metrics");
+        let logger = TempFilePath::create("periodic-logger");
+        let process_diagnostics = MetricsDiagnostics::new()
+            .with_start_time_us(1000)
+            .with_parent_cpu_time_us(3000);
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            "0.1.0",
+            "bangbang",
+            DiagnosticStarter::new(BootRunLoopMetricStatus::Failed),
+        )
+        .with_process_metrics_diagnostics(process_diagnostics);
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            metrics.path(),
+        )))
+        .expect("metrics should configure");
+        vmm.handle_action(VmmAction::PutLogger(
+            LoggerConfigInput::new().with_log_path(logger.path()),
+        ))
+        .expect("logger should configure");
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        assert_eq!(vmm.flush_periodic_metrics(), Ok(true));
+
+        assert_eq!(vmm.starter.calls, 1);
+        assert_eq!(
+            fs::read_to_string(metrics.path()).expect("metrics output should read"),
+            "{\"vmm\":{\"boot_run_loop_status\":\"failed\",\"metrics_flush_count\":1,\"parent_cpu_time_us\":3000,\"start_time_us\":1000}}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(logger.path()).expect("logger output should read"),
+            "action=InstanceStart\n"
         );
     }
 

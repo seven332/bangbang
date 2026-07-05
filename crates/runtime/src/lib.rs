@@ -760,6 +760,19 @@ impl VmmController {
             .map_err(VmmActionError::LoggerWrite)?;
         Ok(VmmData::Empty)
     }
+
+    pub fn flush_periodic_metrics_with_diagnostics(
+        &mut self,
+        diagnostics: &metrics::MetricsDiagnostics,
+    ) -> Result<bool, VmmActionError> {
+        if self.instance_info.state != InstanceState::Running {
+            return Ok(false);
+        }
+
+        self.metrics_state
+            .flush_with_diagnostics(diagnostics)
+            .map_err(VmmActionError::MetricsFlush)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -805,7 +818,7 @@ mod tests {
             DEFAULT_MEM_SIZE_MIB, DEFAULT_VCPU_COUNT, MAX_MEM_SIZE_MIB, MachineConfigError,
             MachineConfigInput, MachineConfigPatchInput,
         },
-        metrics::{MetricsConfigError, MetricsConfigInput},
+        metrics::{MetricsConfigError, MetricsConfigInput, MetricsDiagnostics},
         mmds::{
             MMDS_DATA_STORE_LIMIT_BYTES, MmdsConfigError, MmdsConfigInput, MmdsContentInput,
             MmdsDataStoreError, MmdsVersion,
@@ -2095,6 +2108,65 @@ mod tests {
             ""
         );
         fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn periodic_metrics_before_start_with_configuration_does_not_write() {
+        let path = unique_metrics_path("periodic-preboot");
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(&path)))
+            .expect("metrics config should be stored");
+
+        assert_eq!(
+            controller.flush_periodic_metrics_with_diagnostics(&MetricsDiagnostics::default()),
+            Ok(false)
+        );
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("metrics output should be readable"),
+            ""
+        );
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn periodic_metrics_after_start_writes_without_logger_action() {
+        let metrics_path = unique_metrics_path("periodic-running");
+        let logger_path = unique_logger_path("periodic-no-action");
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+                &metrics_path,
+            )))
+            .expect("metrics config should be stored");
+        controller
+            .handle_action(VmmAction::PutLogger(
+                LoggerConfigInput::new().with_log_path(&logger_path),
+            ))
+            .expect("logger config should be stored");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller
+            .commit_instance_start()
+            .expect("start commit should set running state");
+
+        assert_eq!(
+            controller.flush_periodic_metrics_with_diagnostics(&MetricsDiagnostics::default()),
+            Ok(true)
+        );
+
+        assert_eq!(
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&logger_path).expect("logger output should be readable"),
+            "action=InstanceStart\n"
+        );
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
+        fs::remove_file(logger_path).expect("logger fixture should clean up");
     }
 
     #[test]

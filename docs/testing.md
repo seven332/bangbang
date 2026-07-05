@@ -76,6 +76,10 @@ For process, socket, and multi-bangbang behavior, cover unique resource names,
 stale socket handling, shutdown cleanup, replacement races, and concurrent runs
 where practical.
 
+For periodic process behavior, test scheduler and timeout paths directly. Do
+not wait for real production intervals such as the 60-second metrics flush
+period.
+
 For HVF and FFI code, cover resource creation and destruction, platform gating,
 error translation, unsupported exits or registers, cancellation, and cleanup
 after partial setup failure.
