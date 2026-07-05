@@ -692,6 +692,71 @@ fn executable_configures_network_and_mmds() {
     );
     assert_response_contains(&vm_config, r#""imds_compat":true"#, "GET /vm/config");
 
+    let network_patch_response = http_json(
+        &socket_path,
+        "PATCH",
+        "/network-interfaces/eth0",
+        r#"{"iface_id":"eth0","rx_rate_limiter":null}"#,
+    );
+    assert_bad_request_response(&network_patch_response, "PATCH /network-interfaces/eth0");
+    assert_response_contains(
+        &network_patch_response,
+        r#"{"fault_message":"Network interface updates are not supported."}"#,
+        "PATCH /network-interfaces/eth0",
+    );
+
+    let mismatched_network_patch_response = http_json(
+        &socket_path,
+        "PATCH",
+        "/network-interfaces/eth0",
+        r#"{"iface_id":"eth1"}"#,
+    );
+    assert_bad_request_response(
+        &mismatched_network_patch_response,
+        "mismatched PATCH /network-interfaces/eth0",
+    );
+    assert_response_contains(
+        &mismatched_network_patch_response,
+        r#"{"fault_message":"path iface_id must match body iface_id."}"#,
+        "mismatched PATCH /network-interfaces/eth0",
+    );
+
+    let malformed_network_patch_response = http_json(
+        &socket_path,
+        "PATCH",
+        "/network-interfaces/eth0",
+        "not-json",
+    );
+    assert_bad_request_response(
+        &malformed_network_patch_response,
+        "malformed PATCH /network-interfaces/eth0",
+    );
+    assert_response_contains(
+        &malformed_network_patch_response,
+        r#"{"fault_message":"Malformed HTTP request."}"#,
+        "malformed PATCH /network-interfaces/eth0",
+    );
+
+    let vm_config_after_network_patch = http_get(&socket_path, "/vm/config");
+    assert_ok_response(
+        &vm_config_after_network_patch,
+        "GET /vm/config after rejected network PATCH",
+    );
+    assert_response_contains(
+        &vm_config_after_network_patch,
+        r#""iface_id":"eth0""#,
+        "GET /vm/config after rejected network PATCH",
+    );
+    assert_response_contains(
+        &vm_config_after_network_patch,
+        r#""host_dev_name":"vmnet:shared""#,
+        "GET /vm/config after rejected network PATCH",
+    );
+    assert!(
+        !vm_config_after_network_patch.contains(r#""iface_id":"eth1""#),
+        "rejected network PATCH must not add a new interface; response:\n{vm_config_after_network_patch}"
+    );
+
     let put_mmds_response = http_put_json(
         &socket_path,
         "/mmds",
