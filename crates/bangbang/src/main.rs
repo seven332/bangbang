@@ -1619,6 +1619,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_max_startup_time_args() {
+        let max_value = u64::MAX.to_string();
+        let config = parse_run(&[
+            "--start-time-us",
+            &max_value,
+            "--start-time-cpu-us",
+            &max_value,
+            "--parent-cpu-time-us",
+            &max_value,
+        ])
+        .expect("maximum startup timing args should parse");
+
+        assert_eq!(
+            config.startup_time,
+            StartupTimeConfig {
+                start_time_us: Some(u64::MAX),
+                start_time_cpu_us: Some(u64::MAX),
+                parent_cpu_time_us: Some(u64::MAX),
+            }
+        );
+    }
+
+    #[test]
     fn parse_startup_args_together() {
         let config = parse_run(&[
             "--api-sock",
