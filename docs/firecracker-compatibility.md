@@ -562,11 +562,10 @@ reset/full-shutdown cleanup, full graceful half-close state tracking, full
 virtio-vsock credit accounting, CID routing beyond current host/guest checks,
 and full event payload dispatch remain deferred. Event queue notifications are
 accepted as no-op dispatch metadata.
-Signed executable validation currently covers guest-initiated connection
-exchange and a narrow host-initiated multi-payload exchange through the
-Firecracker-style main `uds_path`; it does not cover throughput-oriented
-streaming, multiple simultaneous streams, graceful half-close behavior, or full
-credit accounting.
+Signed executable validation currently covers narrow guest-initiated and
+host-initiated multi-payload exchanges through Firecracker-style vsock paths; it
+does not cover throughput-oriented streaming, multiple simultaneous streams,
+graceful half-close behavior, or full credit accounting.
 `SendCtrlAltDel` is rejected at parse time for the first aarch64 target.
 
 Future implementation PRs should derive unit or golden tests from these tables.
@@ -1506,10 +1505,11 @@ Their eventual support level should follow the endpoint matrix:
   TX/RX notification dispatch metadata helpers, and startup-time vmnet packet
   I/O selection for supported `host_dev_name` forms
 - virtio-vsock socket lifecycle beyond connection setup, forceful guest
-  reset/full-shutdown cleanup, and the current narrow signed host-initiated
-  multi-payload exchange; full graceful half-close state tracking, full
-  virtio-vsock credit accounting, CID routing beyond current host/guest checks,
-  multiple simultaneous streams, and full event payload dispatch.
+  reset/full-shutdown cleanup, and the current narrow signed guest-initiated and
+  host-initiated multi-payload exchanges; full graceful half-close state
+  tracking, full virtio-vsock credit accounting, CID routing beyond current
+  host/guest checks, multiple simultaneous streams, and full event payload
+  dispatch.
   Implemented vsock scope is limited
   to no-op event notifications, pre-boot `/vsock` configuration storage,
   startup FDT attachment,

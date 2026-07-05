@@ -31,8 +31,16 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_MMDS_MARKER: &[u8] = b"BANGBANG_MMDS_GUEST_FETCH_OK";
     const DIRECT_ROOTFS_MMDS_V2_MARKER: &[u8] = b"BANGBANG_MMDS_V2_GUEST_FETCH_OK";
     const DIRECT_ROOTFS_VSOCK_MARKER: &[u8] = b"BANGBANG_VSOCK_GUEST_CONNECT_OK";
-    const DIRECT_ROOTFS_VSOCK_GUEST_PAYLOAD: &[u8] = b"BANGBANG_VSOCK_GUEST_PAYLOAD";
-    const DIRECT_ROOTFS_VSOCK_HOST_REPLY: &[u8] = b"BANGBANG_VSOCK_HOST_REPLY";
+    const DIRECT_ROOTFS_VSOCK_EXCHANGES: &[(&[u8], &[u8])] = &[
+        (
+            b"BANGBANG_VSOCK_GUEST_STREAM_ONE",
+            b"BANGBANG_VSOCK_HOST_STREAM_ONE",
+        ),
+        (
+            b"BANGBANG_VSOCK_GUEST_STREAM_TWO",
+            b"BANGBANG_VSOCK_HOST_STREAM_TWO",
+        ),
+    ];
     const DIRECT_ROOTFS_VSOCK_PORT: u32 = 5005;
     const DIRECT_ROOTFS_HOST_VSOCK_READY_MARKER: &[u8] = b"BANGBANG_VSOCK_HOST_CONNECT_READY";
     const DIRECT_ROOTFS_HOST_VSOCK_MARKER: &[u8] = b"BANGBANG_VSOCK_HOST_CONNECT_OK";
@@ -1160,27 +1168,32 @@ mod macos_arm64 {
             .set_write_timeout(Some(GUEST_EXECUTION_TIMEOUT))
             .expect("host vsock stream write timeout should set");
 
-        let mut guest_payload = vec![0; DIRECT_ROOTFS_VSOCK_GUEST_PAYLOAD.len()];
-        if let Err(err) = host_stream.read_exact(&mut guest_payload) {
-            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
-            let output = bangbang.force_stop_and_collect();
-            panic!(
-                "host side did not receive guest vsock payload: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-                output.status, output.stdout, output.stderr
+        for (exchange_index, &(guest_payload, host_payload)) in
+            DIRECT_ROOTFS_VSOCK_EXCHANGES.iter().enumerate()
+        {
+            let exchange_number = exchange_index + 1;
+            let mut received_guest_payload = vec![0; guest_payload.len()];
+            if let Err(err) = host_stream.read_exact(&mut received_guest_payload) {
+                let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+                let output = bangbang.force_stop_and_collect();
+                panic!(
+                    "host side did not receive guest vsock payload {exchange_number}: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status, output.stdout, output.stderr
+                );
+            }
+            assert_eq!(
+                received_guest_payload, guest_payload,
+                "host side should receive deterministic guest vsock payload {exchange_number}"
             );
-        }
-        assert_eq!(
-            guest_payload, DIRECT_ROOTFS_VSOCK_GUEST_PAYLOAD,
-            "host side should receive the deterministic guest vsock payload"
-        );
 
-        if let Err(err) = host_stream.write_all(DIRECT_ROOTFS_VSOCK_HOST_REPLY) {
-            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
-            let output = bangbang.force_stop_and_collect();
-            panic!(
-                "host side did not write guest vsock reply: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
-                output.status, output.stdout, output.stderr
-            );
+            if let Err(err) = host_stream.write_all(host_payload) {
+                let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+                let output = bangbang.force_stop_and_collect();
+                panic!(
+                    "host side did not write guest vsock reply {exchange_number}: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status, output.stdout, output.stderr
+                );
+            }
         }
 
         if let Err(err) = wait_for_file_prefix_marker(
