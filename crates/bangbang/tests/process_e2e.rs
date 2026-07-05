@@ -23,6 +23,7 @@ use bangbang_runtime::machine::MAX_MEM_SIZE_MIB;
 
 const BANGBANG_VERSION: &str = env!("CARGO_PKG_VERSION");
 const ARGUMENT_PARSING_EXIT_CODE: i32 = 153;
+const MULTI_VCPU_STARTUP_ERROR: &str = "HVF arm64 boot session supports exactly 1 vCPU, got 2";
 
 #[test]
 fn executable_serves_api_and_shuts_down_cleanly() {
@@ -529,6 +530,122 @@ fn executable_no_api_config_file_failure_does_not_publish_socket() {
             .contains("bangbang: config-file error: malformed config file"),
         "stderr should describe config-file parse failure without JSON contents; stderr:\n{}",
         output.stderr
+    );
+}
+
+#[test]
+fn executable_rejects_multi_vcpu_instance_start_without_stopping() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let kernel_path = test_dir.path().join("private-vmlinux");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    let machine_response = http_put_json(
+        &socket_path,
+        "/machine-config",
+        r#"{"vcpu_count":2,"mem_size_mib":256}"#,
+    );
+    assert_no_content_response(&machine_response, "PUT /machine-config multi-vCPU");
+
+    let kernel_path_text = path_text(&kernel_path);
+    let kernel_path_json = json_string(kernel_path_text);
+    let boot_body = format!(r#"{{"kernel_image_path":{kernel_path_json}}}"#);
+    let boot_response = http_put_json(&socket_path, "/boot-source", &boot_body);
+    assert_no_content_response(&boot_response, "PUT /boot-source multi-vCPU");
+
+    let start_response = http_put_json(
+        &socket_path,
+        "/actions",
+        r#"{"action_type":"InstanceStart"}"#,
+    );
+    assert_bad_request_response(&start_response, "PUT /actions multi-vCPU start");
+    assert_response_contains(
+        &start_response,
+        MULTI_VCPU_STARTUP_ERROR,
+        "PUT /actions multi-vCPU start",
+    );
+    assert!(
+        !start_response.contains(kernel_path_text),
+        "multi-vCPU startup rejection should not echo the private kernel path; response:\n{start_response}"
+    );
+    assert!(
+        !kernel_path.exists(),
+        "multi-vCPU startup rejection should happen before touching the kernel path"
+    );
+
+    let instance_info = http_get(&socket_path, "/");
+    assert_ok_response(&instance_info, "GET / after rejected multi-vCPU start");
+    assert_response_contains(
+        &instance_info,
+        r#""state":"Not started""#,
+        "GET / after rejected multi-vCPU start",
+    );
+
+    let machine_config = http_get(&socket_path, "/machine-config");
+    assert_ok_response(
+        &machine_config,
+        "GET /machine-config after rejected multi-vCPU start",
+    );
+    assert_response_contains(
+        &machine_config,
+        r#""vcpu_count":2"#,
+        "GET /machine-config after rejected multi-vCPU start",
+    );
+
+    let output = bangbang.terminate();
+    assert!(
+        !output.stdout.contains(kernel_path_text),
+        "multi-vCPU startup rejection should not write the private kernel path to stdout; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !output.stderr.contains(kernel_path_text),
+        "multi-vCPU startup rejection should not write the private kernel path to stderr; stderr:\n{}",
+        output.stderr
+    );
+    assert_clean_shutdown(output, &socket_path, "bangbang");
+}
+
+#[test]
+fn executable_config_file_multi_vcpu_startup_failure_does_not_publish_socket() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let (config_path, kernel_path) = write_multi_vcpu_startup_config(&test_dir);
+    let instance_id = test_dir.instance_id();
+
+    let output = BangbangProcess::start_with_extra_args_expect_failure(
+        &socket_path,
+        &instance_id,
+        &["--config-file", path_text(&config_path)],
+    );
+
+    assert_multi_vcpu_startup_failure(
+        &output,
+        &socket_path,
+        &kernel_path,
+        "config-file multi-vCPU startup failure",
+    );
+}
+
+#[test]
+fn executable_no_api_config_file_multi_vcpu_startup_failure_does_not_publish_socket() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let (config_path, kernel_path) = write_multi_vcpu_startup_config(&test_dir);
+    let instance_id = test_dir.instance_id();
+
+    let output = BangbangProcess::start_with_extra_args_expect_failure(
+        &socket_path,
+        &instance_id,
+        &["--config-file", path_text(&config_path), "--no-api"],
+    );
+
+    assert_multi_vcpu_startup_failure(
+        &output,
+        &socket_path,
+        &kernel_path,
+        "no-api config-file multi-vCPU startup failure",
     );
 }
 
@@ -2217,6 +2334,21 @@ fn write_rejected_serial_rate_limiter_config(
     (config_path, serial_output_path)
 }
 
+fn write_multi_vcpu_startup_config(test_dir: &TestDir) -> (std::path::PathBuf, std::path::PathBuf) {
+    let config_path = test_dir.path().join("vm-config.json");
+    let kernel_path = test_dir.path().join("private-vmlinux");
+    let kernel_path_json = json_string(path_text(&kernel_path));
+    let config = format!(
+        r#"{{
+            "machine-config": {{"vcpu_count": 2, "mem_size_mib": 256}},
+            "boot-source": {{"kernel_image_path": {kernel_path_json}}}
+        }}"#
+    );
+    fs::write(&config_path, config).expect("multi-vCPU config file should be written");
+
+    (config_path, kernel_path)
+}
+
 fn write_malformed_metadata_file(test_dir: &TestDir) -> std::path::PathBuf {
     let metadata_path = test_dir.path().join("metadata.json");
     fs::write(&metadata_path, r#"{"secret":"private-metadata-secret""#)
@@ -2267,6 +2399,62 @@ fn assert_metadata_failure(
         !output.stderr.contains("private-metadata-secret"),
         "{case_name} stderr must not echo metadata contents; stderr:\n{}",
         output.stderr
+    );
+}
+
+fn assert_multi_vcpu_startup_failure(
+    output: &support::CompletedProcess,
+    socket_path: &std::path::Path,
+    kernel_path: &std::path::Path,
+    case_name: &str,
+) {
+    assert!(
+        !output.status.success(),
+        "{case_name} should fail startup; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        !socket_path.exists(),
+        "{case_name} should fail before API socket publication"
+    );
+    assert!(
+        !output.stdout.contains("status: API server listening"),
+        "{case_name} must not report API readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !output.stdout.contains("status: VM running without API"),
+        "{case_name} must not report no-api readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        output
+            .stderr
+            .contains("bangbang: config-file error: failed to apply config-file action: failed to start microVM"),
+        "{case_name} stderr should describe startup action failure; stderr:\n{}",
+        output.stderr
+    );
+    assert!(
+        output.stderr.contains(MULTI_VCPU_STARTUP_ERROR),
+        "{case_name} stderr should describe the HVF single-vCPU startup limit; stderr:\n{}",
+        output.stderr
+    );
+    let kernel_path_text = path_text(kernel_path);
+    assert!(
+        !output.stdout.contains(kernel_path_text),
+        "{case_name} stdout must not echo private kernel path; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !output.stderr.contains(kernel_path_text),
+        "{case_name} stderr must not echo private kernel path; stderr:\n{}",
+        output.stderr
+    );
+    assert!(
+        !kernel_path.exists(),
+        "{case_name} should fail before touching the kernel path"
     );
 }
 
