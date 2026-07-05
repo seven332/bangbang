@@ -163,6 +163,25 @@ mod macos_arm64 {
             );
         }
 
+        let replacement_kernel_path = test_dir.path().join("replacement-vmlinux");
+        let replacement_kernel_path_json = json_string(path_text(&replacement_kernel_path));
+        let boot_update_body = format!(r#"{{"kernel_image_path":{replacement_kernel_path_json}}}"#);
+        let boot_update_response = http_put_json(&socket_path, "/boot-source", &boot_update_body);
+        assert_bad_request_response(
+            &boot_update_response,
+            "PUT /boot-source after InstanceStart",
+        );
+        assert_response_contains(
+            &boot_update_response,
+            r#"{"fault_message":"The requested operation is not supported in Running state: PutBootSource"}"#,
+            "PUT /boot-source after InstanceStart",
+        );
+        assert!(
+            !replacement_kernel_path.exists(),
+            "rejected boot-source update must not create or use replacement kernel path {}",
+            replacement_kernel_path.display()
+        );
+
         let replacement_backing_path = test_dir.path().join("replacement-data.img");
         let replacement_backing_path_json = json_string(path_text(&replacement_backing_path));
         let drive_update_body = format!(
@@ -273,6 +292,27 @@ mod macos_arm64 {
 
         let vm_config = http_get(&socket_path, "/vm/config");
         assert_ok_response(&vm_config, "GET /vm/config after InstanceStart");
+        assert_response_contains(
+            &vm_config,
+            &format!(r#""kernel_image_path":{kernel_path_json}"#),
+            "GET /vm/config after InstanceStart",
+        );
+        assert_response_contains(
+            &vm_config,
+            &format!(r#""initrd_path":{initrd_path_json}"#),
+            "GET /vm/config after InstanceStart",
+        );
+        assert_response_contains(
+            &vm_config,
+            &format!(r#""boot_args":{boot_args_json}"#),
+            "GET /vm/config after InstanceStart",
+        );
+        assert!(
+            !vm_config.contains(&format!(
+                r#""kernel_image_path":{replacement_kernel_path_json}"#
+            )),
+            "rejected boot-source update must not mutate the configured kernel path; response:\n{vm_config}"
+        );
         assert_response_contains(
             &vm_config,
             r#""drive_id":"data""#,
