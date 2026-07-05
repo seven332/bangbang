@@ -114,7 +114,7 @@ pub(crate) fn assert_clean_shutdown(
 ) {
     assert!(
         output.status.success(),
-        "{process_name} SIGTERM should make bangbang exit successfully; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+        "{process_name} shutdown signal should make bangbang exit successfully; status: {:?}\nstdout:\n{}\nstderr:\n{}",
         output.status,
         output.stdout,
         output.stderr
@@ -323,8 +323,22 @@ impl BangbangProcess {
     }
 
     pub(crate) fn terminate(mut self) -> CompletedProcess {
+        self.stop_with_signal(libc::SIGTERM, "SIGTERM")
+    }
+
+    #[allow(
+        dead_code,
+        reason = "shared integration-test support is compiled once per test target"
+    )]
+    pub(crate) fn interrupt(mut self) -> CompletedProcess {
+        self.stop_with_signal(libc::SIGINT, "SIGINT")
+    }
+
+    fn stop_with_signal(&mut self, signal: i32, signal_name: &str) -> CompletedProcess {
         let child = self.child.as_ref().expect("child should still be running");
-        send_signal(child.id(), libc::SIGTERM).expect("SIGTERM should be delivered");
+        if let Err(err) = send_signal(child.id(), signal) {
+            panic!("{signal_name} should be delivered: {err}");
+        }
         let child = self.child.take().expect("child should still be owned");
         let status = wait_for_child_exit(child, SHUTDOWN_TIMEOUT);
 
