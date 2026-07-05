@@ -1044,6 +1044,151 @@ fn executable_configures_writeback_drive_cache_type() {
 }
 
 #[test]
+fn executable_rejects_invalid_drive_configs_without_mutating() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let data_drive_path = test_dir.path().join("data.img");
+    let root_drive_path = test_dir.path().join("rootfs.img");
+    let mismatched_drive_path = test_dir.path().join("mismatched.img");
+    let second_root_drive_path = test_dir.path().join("second-root.img");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    let data_drive_path_json = json_string(path_text(&data_drive_path));
+    let data_drive_body = format!(
+        r#"{{
+            "drive_id":"data",
+            "path_on_host":{data_drive_path_json},
+            "is_root_device":false,
+            "is_read_only":false
+        }}"#
+    );
+    let data_response = http_put_json(&socket_path, "/drives/data", &data_drive_body);
+    assert_no_content_response(&data_response, "PUT /drives/data");
+
+    let assert_accepted_drives =
+        |context: &str, root_drive_path_json: Option<&str>, rejected: &[(&str, Option<&str>)]| {
+            let vm_config = http_get(&socket_path, "/vm/config");
+            assert_ok_response(&vm_config, context);
+            assert_response_contains(&vm_config, r#""drive_id":"data""#, context);
+            assert_response_contains(
+                &vm_config,
+                &format!(r#""path_on_host":{data_drive_path_json}"#),
+                context,
+            );
+
+            let expected_drive_count = if let Some(root_drive_path_json) = root_drive_path_json {
+                assert_response_contains(&vm_config, r#""drive_id":"rootfs""#, context);
+                assert_response_contains(
+                    &vm_config,
+                    &format!(r#""path_on_host":{root_drive_path_json}"#),
+                    context,
+                );
+                2
+            } else {
+                1
+            };
+            assert_eq!(
+                vm_config.matches(r#""drive_id":"#).count(),
+                expected_drive_count,
+                "{context} must keep only accepted drives; response:\n{vm_config}"
+            );
+
+            for (drive_id, path_on_host) in rejected {
+                assert!(
+                    !vm_config.contains(&format!(r#""drive_id":"{drive_id}""#)),
+                    "{context} must not store rejected drive {drive_id}; response:\n{vm_config}"
+                );
+                if let Some(path_on_host) = path_on_host {
+                    assert!(
+                        !vm_config.contains(&format!(r#""path_on_host":{path_on_host}"#)),
+                        "{context} must not store rejected drive path; response:\n{vm_config}"
+                    );
+                }
+            }
+        };
+
+    let mismatched_drive_path_text = path_text(&mismatched_drive_path);
+    let mismatched_drive_path_json = json_string(mismatched_drive_path_text);
+    let mismatched_body = format!(
+        r#"{{
+            "drive_id":"mismatched_body",
+            "path_on_host":{mismatched_drive_path_json},
+            "is_root_device":false
+        }}"#
+    );
+    let mismatched_response =
+        http_put_json(&socket_path, "/drives/mismatched_path", &mismatched_body);
+    assert_bad_request_response(&mismatched_response, "PUT /drives/mismatched_path");
+    assert_response_contains(
+        &mismatched_response,
+        r#"{"fault_message":"path drive_id must match body drive_id."}"#,
+        "PUT /drives/mismatched_path",
+    );
+    assert!(
+        !mismatched_response.contains("mismatched_body")
+            && !mismatched_response.contains(mismatched_drive_path_text),
+        "mismatched drive response must not echo rejected values; response:\n{mismatched_response}"
+    );
+    assert_accepted_drives(
+        "GET /vm/config after mismatched drive_id",
+        None,
+        &[("mismatched_body", Some(&mismatched_drive_path_json))],
+    );
+
+    let empty_path_body = r#"{"drive_id":"empty_path","path_on_host":"","is_root_device":false}"#;
+    let empty_path_response = http_put_json(&socket_path, "/drives/empty_path", empty_path_body);
+    assert_bad_request_response(&empty_path_response, "PUT /drives/empty_path");
+    assert_response_contains(
+        &empty_path_response,
+        r#"{"fault_message":"drive path_on_host must not be empty"}"#,
+        "PUT /drives/empty_path",
+    );
+    assert_accepted_drives(
+        "GET /vm/config after empty drive path",
+        None,
+        &[("empty_path", None)],
+    );
+
+    let root_drive_path_json = json_string(path_text(&root_drive_path));
+    let root_drive_body = format!(
+        r#"{{
+            "drive_id":"rootfs",
+            "path_on_host":{root_drive_path_json},
+            "is_root_device":true,
+            "is_read_only":true
+        }}"#
+    );
+    let root_response = http_put_json(&socket_path, "/drives/rootfs", &root_drive_body);
+    assert_no_content_response(&root_response, "PUT /drives/rootfs");
+
+    let second_root_drive_path_json = json_string(path_text(&second_root_drive_path));
+    let second_root_body = format!(
+        r#"{{
+            "drive_id":"second_root",
+            "path_on_host":{second_root_drive_path_json},
+            "is_root_device":true,
+            "is_read_only":true
+        }}"#
+    );
+    let second_root_response =
+        http_put_json(&socket_path, "/drives/second_root", &second_root_body);
+    assert_bad_request_response(&second_root_response, "PUT /drives/second_root");
+    assert_response_contains(
+        &second_root_response,
+        r#"{"fault_message":"a root drive is already configured"}"#,
+        "PUT /drives/second_root",
+    );
+    assert_accepted_drives(
+        "GET /vm/config after rejected second root drive",
+        Some(&root_drive_path_json),
+        &[("second_root", Some(&second_root_drive_path_json))],
+    );
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
 fn executable_rejects_unsupported_drive_options_without_mutating() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
