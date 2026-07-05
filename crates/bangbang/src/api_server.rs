@@ -4693,7 +4693,7 @@ mod tests {
             (
                 "p-patch",
                 request_with_body("PATCH", "/pmem/pmem0", r#"{"id":"pmem0"}"#),
-                "Pmem device is not supported.",
+                "The requested operation is not supported in Not started state: PatchPmem",
             ),
             (
                 "p-patch-mis",
@@ -4735,7 +4735,7 @@ mod tests {
         let start_response = put_action_over_socket(&mut vmm, "pmem-start", "InstanceStart");
         assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
 
-        for (socket_name, request, action) in [
+        for (socket_name, request, fault_message) in [
             (
                 "pmem-put-running",
                 request_with_body(
@@ -4743,7 +4743,7 @@ mod tests {
                     "/pmem/pmem0",
                     r#"{"id":"pmem0","path_on_host":"/private/tmp/pmem.img","root_device":true,"read_only":false,"rate_limiter":{"bandwidth":{"size":123456,"one_time_burst":234567,"refill_time":345678}}}"#,
                 ),
-                "PutPmem",
+                "The requested operation is not supported in Running state: PutPmem",
             ),
             (
                 "pmem-patch-running",
@@ -4752,15 +4752,13 @@ mod tests {
                     "/pmem/pmem0",
                     r#"{"id":"pmem0","rate_limiter":{"ops":{"size":123456,"one_time_burst":234567,"refill_time":345678}}}"#,
                 ),
-                "PatchPmem",
+                "Pmem device is not supported.",
             ),
         ] {
             let response = request_over_socket(&mut vmm, socket_name, &request);
 
             assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-            assert!(response.contains(&format!(
-                r#"{{"fault_message":"The requested operation is not supported in Running state: {action}"}}"#
-            )));
+            assert!(response.contains(&format!(r#"{{"fault_message":"{fault_message}"}}"#)));
             for private_value in ["/private/tmp/pmem.img", "123456", "234567", "345678"] {
                 assert!(
                     !response.contains(private_value),

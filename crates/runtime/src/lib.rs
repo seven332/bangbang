@@ -635,8 +635,18 @@ impl VmmController {
 
                 Err(VmmActionError::EntropyUnsupported)
             }
-            VmmAction::PutPmem | VmmAction::PatchPmem => {
+            VmmAction::PutPmem => {
                 if self.instance_info.state != InstanceState::NotStarted {
+                    return Err(VmmActionError::UnsupportedState {
+                        action: action_name,
+                        state: self.instance_info.state,
+                    });
+                }
+
+                Err(VmmActionError::PmemUnsupported)
+            }
+            VmmAction::PatchPmem => {
+                if self.instance_info.state == InstanceState::NotStarted {
                     return Err(VmmActionError::UnsupportedState {
                         action: action_name,
                         state: self.instance_info.state,
@@ -1479,19 +1489,68 @@ mod tests {
     }
 
     #[test]
-    fn pmem_actions_reach_pmem_fault_before_start_without_mutating() {
-        for action in [VmmAction::PutPmem, VmmAction::PatchPmem] {
+    fn put_pmem_reaches_pmem_fault_before_start_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PutPmem)
+            .expect_err("pmem should remain unsupported");
+
+        assert_eq!(err, VmmActionError::PmemUnsupported);
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert!(controller.boot_source_config().is_some());
+        assert!(controller.drive_configs().is_empty());
+        assert!(controller.network_interface_configs().is_empty());
+    }
+
+    #[test]
+    fn patch_pmem_rejects_not_started_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PatchPmem)
+            .expect_err("pmem patch should be post-boot-only");
+
+        assert_eq!(
+            err,
+            VmmActionError::UnsupportedState {
+                action: VmmAction::PatchPmem.name(),
+                state: InstanceState::NotStarted,
+            }
+        );
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert!(controller.boot_source_config().is_some());
+        assert!(controller.drive_configs().is_empty());
+        assert!(controller.network_interface_configs().is_empty());
+    }
+
+    #[test]
+    fn put_pmem_rejects_running_or_paused_without_mutating() {
+        for state in [InstanceState::Running, InstanceState::Paused] {
             let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
             controller
                 .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
                 .expect("boot source config should be stored");
+            controller.instance_info.state = state;
 
             let err = controller
-                .handle_action(action.clone())
-                .expect_err("pmem should remain unsupported");
+                .handle_action(VmmAction::PutPmem)
+                .expect_err("pmem put should be pre-boot-only");
 
-            assert_eq!(err, VmmActionError::PmemUnsupported);
-            assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+            assert_eq!(
+                err,
+                VmmActionError::UnsupportedState {
+                    action: VmmAction::PutPmem.name(),
+                    state,
+                }
+            );
+            assert_eq!(controller.instance_info().state, state);
             assert!(controller.boot_source_config().is_some());
             assert!(controller.drive_configs().is_empty());
             assert!(controller.network_interface_configs().is_empty());
@@ -1499,31 +1558,23 @@ mod tests {
     }
 
     #[test]
-    fn pmem_actions_reject_running_or_paused_without_mutating() {
+    fn patch_pmem_reaches_pmem_fault_after_start_without_mutating() {
         for state in [InstanceState::Running, InstanceState::Paused] {
-            for action in [VmmAction::PutPmem, VmmAction::PatchPmem] {
-                let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
-                controller
-                    .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
-                    .expect("boot source config should be stored");
-                controller.instance_info.state = state;
+            let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+            controller
+                .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+                .expect("boot source config should be stored");
+            controller.instance_info.state = state;
 
-                let err = controller
-                    .handle_action(action.clone())
-                    .expect_err("pmem should be pre-boot-only");
+            let err = controller
+                .handle_action(VmmAction::PatchPmem)
+                .expect_err("pmem should remain unsupported");
 
-                assert_eq!(
-                    err,
-                    VmmActionError::UnsupportedState {
-                        action: action.name(),
-                        state,
-                    }
-                );
-                assert_eq!(controller.instance_info().state, state);
-                assert!(controller.boot_source_config().is_some());
-                assert!(controller.drive_configs().is_empty());
-                assert!(controller.network_interface_configs().is_empty());
-            }
+            assert_eq!(err, VmmActionError::PmemUnsupported);
+            assert_eq!(controller.instance_info().state, state);
+            assert!(controller.boot_source_config().is_some());
+            assert!(controller.drive_configs().is_empty());
+            assert!(controller.network_interface_configs().is_empty());
         }
     }
 
