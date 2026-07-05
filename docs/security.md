@@ -36,6 +36,42 @@ bangbang currently rejects Linux-specific Firecracker process options rather
 than silently accepting them. There is no macOS sandbox profile, resource broker,
 launcher process, or Firecracker-jailer replacement yet.
 
+## Platform-Limit Taxonomy
+
+Use this taxonomy with the status vocabulary in
+[Firecracker Validation Matrix](firecracker-validation-matrix.md) when a PR
+changes Firecracker-facing behavior or security posture:
+
+- Linux-only hardening: Firecracker behavior that depends on jailer, seccomp,
+  namespaces, cgroups, chroot, or post-setup privilege dropping is
+  `platform-limited` until bangbang has a macOS replacement. Matching CLI flags
+  or API inputs should be rejected or documented as unsupported instead of
+  accepted as no-ops.
+- macOS/HVF host-facility limits: behavior blocked by Hypervisor.framework,
+  code-signing, entitlement, vmnet, filesystem, or other host APIs is
+  `platform-limited` only when the missing macOS/HVF facility is the blocker.
+  Record the concrete macOS/HVF reason and any required external launcher,
+  entitlement, or operator setup.
+- Validation-environment limits: CI or developer hosts that cannot execute HVF
+  change the validation layer, not the support status, unless the same limit
+  applies to real macOS hosts. Use explicit compile/sign-only validation such as
+  `--allow-unsupported` for those runners.
+- Implementation deferrals: behavior that is feasible on macOS/HVF but not
+  built yet is `deferred` or `partial`, not `platform-limited`. Keep a related
+  issue for the missing implementation, tests, and documentation.
+- Recognized unsupported shapes: parsed Firecracker endpoints, flags, or fields
+  that intentionally return a Firecracker-shaped fault without mutating state
+  are `recognized unsupported`. Add parser/state tests and process e2e coverage
+  when the public process boundary is affected.
+- Operator-owned policy: socket-directory permissions, restrictive umask,
+  host-path ownership, and current resource-sharing rules are deployment
+  assumptions until a launcher or resource broker exists. Document the
+  assumption and test that one `bangbang` process does not clean up resources it
+  no longer owns.
+
+When a capability moves between these categories, update the compatibility docs,
+validation matrix, tests, and related issue links in the same PR.
+
 ## API Socket Handling
 
 The API socket is a local control interface with no protocol-level
