@@ -89,6 +89,7 @@ where
     controller: VmmController,
     starter: S,
     started_session: Option<S::Session>,
+    process_metrics_diagnostics: MetricsDiagnostics,
 }
 
 impl ProcessVmm<HvfInstanceStartExecutor> {
@@ -144,7 +145,16 @@ where
             ),
             starter,
             started_session: None,
+            process_metrics_diagnostics: MetricsDiagnostics::default(),
         }
+    }
+
+    pub(crate) fn with_process_metrics_diagnostics(
+        mut self,
+        diagnostics: MetricsDiagnostics,
+    ) -> Self {
+        self.process_metrics_diagnostics = diagnostics;
+        self
     }
 
     #[cfg(test)]
@@ -215,11 +225,14 @@ where
     }
 
     fn flush_metrics(&mut self) -> Result<VmmData, VmmActionError> {
-        let diagnostics = self
+        let session_diagnostics = self
             .started_session
             .as_ref()
             .map(ProcessSessionDiagnostics::metrics_diagnostics)
             .unwrap_or_default();
+        let diagnostics = self
+            .process_metrics_diagnostics
+            .merged_with(session_diagnostics);
 
         self.controller.flush_metrics_with_diagnostics(&diagnostics)
     }
@@ -962,7 +975,9 @@ mod tests {
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::fdt::{Arm64FdtRegion, Arm64FdtVirtioMmioDevice};
     use bangbang_runtime::interrupt::GuestInterruptLine;
-    use bangbang_runtime::metrics::{BootRunLoopMetricStatus, MetricsConfigInput};
+    use bangbang_runtime::metrics::{
+        BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics,
+    };
     use bangbang_runtime::mmds::{MmdsConfigInput, MmdsStateHandle};
     use bangbang_runtime::mmio::MmioRegion;
     use bangbang_runtime::network::{
@@ -2337,12 +2352,16 @@ mod tests {
     #[test]
     fn flush_metrics_includes_started_session_diagnostics() {
         let metrics = TempFilePath::create("metrics");
+        let process_diagnostics = MetricsDiagnostics::new()
+            .with_start_time_us(1000)
+            .with_parent_cpu_time_us(3000);
         let mut vmm = ProcessVmm::with_starter(
             "demo-1",
             "0.1.0",
             "bangbang",
             DiagnosticStarter::new(BootRunLoopMetricStatus::Failed),
-        );
+        )
+        .with_process_metrics_diagnostics(process_diagnostics);
         vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
             metrics.path(),
         )))
@@ -2360,7 +2379,7 @@ mod tests {
         assert_eq!(vmm.starter.calls, 1);
         assert_eq!(
             fs::read_to_string(metrics.path()).expect("metrics output should read"),
-            "{\"vmm\":{\"boot_run_loop_status\":\"failed\",\"metrics_flush_count\":1}}\n"
+            "{\"vmm\":{\"boot_run_loop_status\":\"failed\",\"metrics_flush_count\":1,\"parent_cpu_time_us\":3000,\"start_time_us\":1000}}\n"
         );
     }
 

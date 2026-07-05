@@ -41,8 +41,7 @@ cargo run -p bangbang -- --api-sock /tmp/bangbang.socket --id demo-1
   `anonymous-instance`.
 - `--start-time-us <MICROS>`, `--start-time-cpu-us <MICROS>`, and
   `--parent-cpu-time-us <MICROS>` accept Firecracker launcher timing values for
-  future metrics integration; the current minimal metrics output does not report
-  them yet.
+  minimal metrics output after successful startup and explicit `FlushMetrics`.
 - `--metrics-path <PATH>` configures the same per-process metrics sink as
   `PUT /metrics` before the API socket is served.
 - `--mmds-size-limit <BYTES>` sets the maximum serialized MMDS data-store size.
@@ -155,7 +154,9 @@ curl --unix-socket /tmp/bangbang.socket \
 Configured metrics output records a minimal JSON line for successful runtime
 `FlushMetrics` actions. After `InstanceStart`, the line also includes a
 `boot_run_loop_status` summary such as `running`, `exited`, or `failed` when a
-process-owned boot worker exists.
+process-owned boot worker exists. When startup timing CLI values are provided,
+the same line includes `start_time_us`, `start_time_cpu_us`, and
+`parent_cpu_time_us`.
 
 Configure logger output before boot:
 
