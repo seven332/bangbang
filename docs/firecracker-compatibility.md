@@ -103,7 +103,7 @@ recognized `PATCH /drives/{drive_id}` requests already map through a minimal int
 action/data boundary. Validation rejects malformed boot-source, drive update,
 VM state update, and actions requests before VMM state mutation.
 Successful `InstanceStart` startup, the `Running` transition, and an internal boot run-loop worker across bounded step windows are implemented with configured or default internal serial MMIO
-output and retained internal active, terminal-outcome, or error worker status. `FlushMetrics` is implemented as a runtime-only minimal JSON-line flush through per-process metrics state, and includes a terse `boot_run_loop_status` summary when a process-owned boot worker exists plus initial Firecracker-shaped GET, core configuration PUT, MMDS PUT, selected PATCH, observability PUT, and `/actions` API request counters. `PUT /logger` is implemented as pre-boot per-process observability configuration with minimal successful `InstanceStart` and `FlushMetrics` action-event output; public run-loop control, public serial
+output and retained internal active, terminal-outcome, or error worker status. Process-owned API-enabled and no-api runs can exit successfully after a guest PSCI `SYSTEM_OFF` terminal outcome. `FlushMetrics` is implemented as a runtime-only minimal JSON-line flush through per-process metrics state, and includes a terse `boot_run_loop_status` summary when a process-owned boot worker exists plus initial Firecracker-shaped GET, core configuration PUT, MMDS PUT, selected PATCH, observability PUT, and `/actions` API request counters. `PUT /logger` is implemented as pre-boot per-process observability configuration with minimal successful `InstanceStart` and `FlushMetrics` action-event output; public run-loop control, public serial
 streaming, full Firecracker metrics counters, periodic flush, and full logger integration remain deferred.
 
 ## Process Startup CLI
@@ -122,8 +122,8 @@ state/configuration faults. The process can also read `--config-file` for the
 supported startup subset, start the VM before serving the API socket, and then
 keep the API socket available for runtime requests. With `--no-api`, the same
 supported config-file startup path runs without publishing an API socket and
-exits on handled `SIGINT` or `SIGTERM`. It does not provide public run-loop
-control yet.
+exits on handled `SIGINT`, handled `SIGTERM`, or guest PSCI `SYSTEM_OFF`. It
+does not provide public run-loop control yet.
 
 | Argument | Current behavior | Compatibility notes |
 | --- | --- | --- |
@@ -144,7 +144,7 @@ control yet.
 | `--config-file <PATH>` | startup implemented for supported subset | Reads a Firecracker-shaped JSON configuration from a readable regular file up to 1 MiB, applies supported sections through the same validation path as matching API requests, and starts the VM with `InstanceStart`. In API-enabled mode, the API socket is published only after successful startup. Malformed, oversized, unknown, unsupported, or invalid sections fail before socket publication or no-api readiness. |
 | `--help`, `-h` | prints help | Help describes the current API socket scope. |
 | `--version`, `-V` | prints version | `-V` is retained from the existing bangbang scaffold. |
-| `--no-api` | config-file startup without API socket | Requires `--config-file`. Starts the supported config-file subset without binding or publishing the configured API socket, then waits for handled `SIGINT` or `SIGTERM`. Runtime control, guest-initiated shutdown, and no-api exit-code parity remain deferred. |
+| `--no-api` | config-file startup without API socket | Requires `--config-file`. Starts the supported config-file subset without binding or publishing the configured API socket, then waits for handled `SIGINT`, handled `SIGTERM`, or guest PSCI `SYSTEM_OFF`. Runtime control and reset/error exit-code parity remain deferred. |
 | seccomp, snapshot, boot timer, and PCI process flags | rejected | These Firecracker options are Linux-specific or tied to later capability work. |
 
 Startup timing arguments are intentionally not exposed in `GET /vm/config` or
@@ -199,7 +199,7 @@ The current executable uses a small process exit status contract:
 
 | Exit status | Current meaning | Compatibility notes |
 | --- | --- | --- |
-| `0` | Help or version completed successfully, the API server exited without error, or no-api mode handled `SIGINT`/`SIGTERM` shutdown. | Matches Firecracker's success status. |
+| `0` | Help or version completed successfully, the API server exited without error, no-api mode handled `SIGINT`/`SIGTERM` shutdown, or a process-owned VM exited after guest PSCI `SYSTEM_OFF`. | Matches Firecracker's success status. |
 | `153` | Startup argument parsing failed before process configuration began. | Matches Firecracker's `ArgParsing` exit code. |
 | `1` | Process failure, including config-file startup, startup metrics/logger configuration, API socket bind, signal handler registration, no-api signal wait failure, or API accept failure. | Used for non-argument process failures before more specific Firecracker-compatible process errors exist. Per-connection read/write errors do not terminate the API server. |
 
@@ -1251,6 +1251,8 @@ timer PPI assertion after virtual timer exits. It stops explicitly on a step lim
 stop-token request, canceled run exit, PSCI `SYSTEM_OFF` or `SYSTEM_RESET`
 guest request, unknown run exit, dispatch error, or timer handler error. This
 remains internal runner-loop plumbing, not the future public guest scheduler.
+For process-owned API-enabled and no-api runs, PSCI `SYSTEM_OFF` wakes the
+process supervisor and lets the process exit successfully.
 An owned internal session handle preserves the same
 session operations while avoiding a self-referential backend/session owner in
 process-level state.
@@ -1265,7 +1267,7 @@ runtime notifications and releases it before HVF GIC signaling.
 bangbang now wires `mem_size_mib` into startup preparation, but still does not
 wire device interrupts into public guest execution, emulate devices, provide
 public run-loop control, power on secondary vCPUs, or implement full PSCI CPU
-control and process exit-code parity for guest system power actions. Public
+control and process exit-code parity for guest reset or error power actions. Public
 machine configuration rejects `mem_size_mib` above the current 1022 GiB Apple
 Silicon/aarch64 DRAM maximum before storage; startup keeps its architectural
 maximum check as a defensive guard. Dynamic host-memory availability policy
@@ -1354,7 +1356,7 @@ The first API implementation should model the same broad stages as Firecracker:
 | `PUT /metrics` | implemented; `204` empty response on successful output initialization | unsupported after start; `400` `fault_message` | Metrics output is process observability state, not guest configuration. Duplicate initialization fails. |
 | `PUT /logger` | implemented; `204` empty response on successful pre-boot configuration | unsupported after start; `400` `fault_message` | Logger output is process observability state, not guest configuration. Repeated pre-boot requests update provided fields; minimal successful action logging supports configured level and origin fields, but full log routing remains deferred. |
 | `PUT /serial` | implemented; `204` empty response on successful pre-boot output configuration or clear request | unsupported after start; `400` `fault_message` | Serial output is process observability state, not guest configuration. Valid `serial_out_path` values are stored without opening host resources during the request; startup opens the path and routes guest TX serial bytes to it. Empty/control-character paths and configured rate limiters are rejected without mutating previous serial output configuration. |
-| `PUT /actions` with `InstanceStart` | process-routed; `204` after successful owned HVF startup with internal boot run-loop worker across bounded step windows or `400` preflight/preparation/logger-output fault | unsupported after start; `400` `fault_message` | Commits `Running` only after the owned HVF boot-session worker with configured serial output or default internal serial capture is retained and configured action logging succeeds. The worker keeps internal active, terminal-outcome, or error status; public run-loop control and public serial streaming remain deferred. |
+| `PUT /actions` with `InstanceStart` | process-routed; `204` after successful owned HVF startup with internal boot run-loop worker across bounded step windows or `400` preflight/preparation/logger-output fault | unsupported after start; `400` `fault_message` | Commits `Running` only after the owned HVF boot-session worker with configured serial output or default internal serial capture is retained and configured action logging succeeds. The worker keeps internal active, terminal-outcome, or error status; guest PSCI `SYSTEM_OFF` can terminate the owning process successfully. Public run-loop control, guest reset/error exit-code parity, and public serial streaming remain deferred. |
 | `PUT /actions` with `FlushMetrics` | VMM-routed; `400` unsupported-state `fault_message` | implemented; `204` empty response or `400` logger/metrics output fault | Firecracker treats this as runtime-only. bangbang writes one minimal JSON line when metrics output was configured, including selected API request counters and `boot_run_loop_status` as `running`, `exited`, or `failed` when a process-owned boot worker exists, writes one minimal action line when logger output is configured and enabled, and otherwise succeeds without writing. |
 | `PUT /actions` with `SendCtrlAltDel` | intentionally unsupported; parser returns `400` `fault_message` | intentionally unsupported; `400` `fault_message` | Firecracker rejects this on aarch64; bangbang's first target is Apple Silicon. |
 | Non-initial endpoints from the endpoint matrix | `400` `fault_message` until their capability exists | `400` `fault_message` until their capability exists | Covers planned later and deferred endpoints; a later capability PR may define more specific state behavior. |

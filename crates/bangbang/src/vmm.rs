@@ -1,6 +1,10 @@
 use std::fmt;
+use std::io::Read;
+use std::io::Write as _;
 use std::net::Ipv4Addr;
 use std::num::NonZeroUsize;
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::net::UnixStream;
 #[cfg(test)]
 use std::sync::Condvar;
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
@@ -83,9 +87,35 @@ pub(crate) trait ProcessSessionDiagnostics {
     fn metrics_diagnostics(&self) -> MetricsDiagnostics {
         MetricsDiagnostics::default()
     }
+
+    fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
+        None
+    }
+
+    fn drain_process_exit_wakeup(&mut self) -> Result<(), std::io::ErrorKind> {
+        Ok(())
+    }
+
+    fn process_exit_status(&self) -> ProcessSessionExitStatus {
+        ProcessSessionExitStatus::Running
+    }
 }
 
 impl ProcessSessionDiagnostics for () {}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ProcessSessionExitStatus {
+    #[default]
+    Running,
+    GuestShutdown,
+    Terminal,
+}
+
+impl ProcessSessionExitStatus {
+    pub(crate) const fn should_exit_successfully(self) -> bool {
+        matches!(self, Self::GuestShutdown)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GetApiRequest {
@@ -327,6 +357,18 @@ pub(crate) trait VmmRequestHandler {
     fn handle_put_request(&mut self, request: PutApiRequest) -> Result<VmmData, VmmActionError>;
 
     fn handle_put_action_request(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError>;
+
+    fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
+        None
+    }
+
+    fn drain_process_exit_wakeup(&mut self) -> Result<(), std::io::ErrorKind> {
+        Ok(())
+    }
+
+    fn process_exit_status(&self) -> ProcessSessionExitStatus {
+        ProcessSessionExitStatus::Running
+    }
 }
 
 #[derive(Debug)]
@@ -523,6 +565,27 @@ where
 
         self.controller.flush_metrics_with_diagnostics(&diagnostics)
     }
+
+    pub(crate) fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
+        self.started_session
+            .as_ref()
+            .and_then(ProcessSessionDiagnostics::process_exit_wakeup_fd)
+    }
+
+    pub(crate) fn drain_process_exit_wakeup(&mut self) -> Result<(), std::io::ErrorKind> {
+        if let Some(session) = self.started_session.as_mut() {
+            session.drain_process_exit_wakeup()?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn process_exit_status(&self) -> ProcessSessionExitStatus {
+        self.started_session
+            .as_ref()
+            .map(ProcessSessionDiagnostics::process_exit_status)
+            .unwrap_or_default()
+    }
 }
 
 impl<S> VmmRequestHandler for ProcessVmm<S>
@@ -550,6 +613,18 @@ where
 
     fn handle_put_request(&mut self, request: PutApiRequest) -> Result<VmmData, VmmActionError> {
         ProcessVmm::handle_put_request(self, request)
+    }
+
+    fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
+        ProcessVmm::process_exit_wakeup_fd(self)
+    }
+
+    fn drain_process_exit_wakeup(&mut self) -> Result<(), std::io::ErrorKind> {
+        ProcessVmm::drain_process_exit_wakeup(self)
+    }
+
+    fn process_exit_status(&self) -> ProcessSessionExitStatus {
+        ProcessVmm::process_exit_status(self)
     }
 }
 
@@ -1156,6 +1231,19 @@ pub(crate) enum BootRunLoopWorkerStatus<O> {
     Failed(String),
 }
 
+trait BootRunLoopProcessExit {
+    fn process_exit_status(&self) -> ProcessSessionExitStatus;
+}
+
+impl BootRunLoopProcessExit for HvfArm64BootRunLoopOutcome {
+    fn process_exit_status(&self) -> ProcessSessionExitStatus {
+        match self {
+            Self::GuestShutdown { .. } => ProcessSessionExitStatus::GuestShutdown,
+            _ => ProcessSessionExitStatus::Terminal,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct BootRunLoopWorkerStatusCell<O> {
     status: Mutex<BootRunLoopWorkerStatus<O>>,
@@ -1223,6 +1311,7 @@ where
 {
     control: S::Control,
     status: Arc<BootRunLoopWorkerStatusCell<S::Outcome>>,
+    terminal_wakeup_reader: UnixStream,
     session_release_sender: Option<mpsc::Sender<()>>,
     worker: Option<JoinHandle<Result<S::Outcome, S::Error>>>,
 }
@@ -1236,6 +1325,19 @@ where
         let stop_token = control.stop_token();
         let status = Arc::new(BootRunLoopWorkerStatusCell::new());
         let worker_status = Arc::clone(&status);
+        let (terminal_wakeup_reader, mut terminal_wakeup_writer) =
+            UnixStream::pair().map_err(|err| {
+                BackendError::Hypervisor(format!(
+                    "failed to create HVF boot run loop wakeup stream: {err}"
+                ))
+            })?;
+        terminal_wakeup_reader
+            .set_nonblocking(true)
+            .map_err(|err| {
+                BackendError::Hypervisor(format!(
+                    "failed to configure HVF boot run loop wakeup stream: {err}"
+                ))
+            })?;
         let (session_release_sender, session_release_receiver) = mpsc::channel();
         let worker = thread::Builder::new()
             .name(HVF_BOOT_RUN_LOOP_THREAD_NAME.to_owned())
@@ -1245,10 +1347,12 @@ where
                         Ok(outcome) if S::should_continue_after_outcome(&outcome) => continue,
                         Ok(outcome) => {
                             worker_status.record(BootRunLoopWorkerStatus::Exited(outcome.clone()));
+                            let _ = terminal_wakeup_writer.write_all(&[1]);
                             break Ok(outcome);
                         }
                         Err(err) => {
                             worker_status.record(BootRunLoopWorkerStatus::Failed(err.to_string()));
+                            let _ = terminal_wakeup_writer.write_all(&[1]);
                             break Err(err);
                         }
                     }
@@ -1263,6 +1367,7 @@ where
         Ok(Self {
             control,
             status,
+            terminal_wakeup_reader,
             session_release_sender: Some(session_release_sender),
             worker: Some(worker),
         })
@@ -1305,9 +1410,37 @@ where
 impl<S> ProcessSessionDiagnostics for BootRunLoopSupervisor<S>
 where
     S: BootRunLoopSession,
+    S::Outcome: BootRunLoopProcessExit,
 {
     fn metrics_diagnostics(&self) -> MetricsDiagnostics {
         MetricsDiagnostics::new().with_boot_run_loop_status(self.metric_status())
+    }
+
+    fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
+        Some(self.terminal_wakeup_reader.as_raw_fd())
+    }
+
+    fn drain_process_exit_wakeup(&mut self) -> Result<(), std::io::ErrorKind> {
+        let mut buffer = [0; 64];
+
+        loop {
+            match self.terminal_wakeup_reader.read(&mut buffer) {
+                Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof),
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err.kind()),
+            }
+        }
+    }
+
+    fn process_exit_status(&self) -> ProcessSessionExitStatus {
+        let current = self.status.lock_status();
+        match &*current {
+            BootRunLoopWorkerStatus::Running => ProcessSessionExitStatus::Running,
+            BootRunLoopWorkerStatus::Exited(outcome) => outcome.process_exit_status(),
+            BootRunLoopWorkerStatus::Failed(_) => ProcessSessionExitStatus::Terminal,
+        }
     }
 }
 
@@ -1535,6 +1668,15 @@ mod tests {
     enum FakeRunLoopOutcome {
         StepLimitReached,
         Terminal,
+    }
+
+    impl super::BootRunLoopProcessExit for FakeRunLoopOutcome {
+        fn process_exit_status(&self) -> super::ProcessSessionExitStatus {
+            match self {
+                Self::StepLimitReached => super::ProcessSessionExitStatus::Running,
+                Self::Terminal => super::ProcessSessionExitStatus::GuestShutdown,
+            }
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2617,7 +2759,7 @@ mod tests {
             FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
                 .with_wait_for_stop(false);
 
-        let supervisor =
+        let mut supervisor =
             BootRunLoopSupervisor::start(session, NonZeroUsize::new(3).expect("non-zero limit"))
                 .expect("supervisor should start");
 
@@ -2635,6 +2777,17 @@ mod tests {
             supervisor.metrics_diagnostics().boot_run_loop_status(),
             Some(BootRunLoopMetricStatus::Exited)
         );
+        assert_eq!(
+            supervisor.process_exit_status(),
+            super::ProcessSessionExitStatus::GuestShutdown
+        );
+        assert!(supervisor.process_exit_wakeup_fd().is_some());
+        supervisor
+            .drain_process_exit_wakeup()
+            .expect("terminal wakeup should drain");
+        supervisor
+            .drain_process_exit_wakeup()
+            .expect("terminal wakeup drain should be idempotent");
         assert_eq!(control.request_stop_count(), 0);
         assert_eq!(drop_count.load(Ordering::SeqCst), 0);
 
@@ -2759,7 +2912,7 @@ mod tests {
                 .with_wait_for_stop(false)
                 .with_outcomes([Err(FakeRunLoopError)]);
 
-        let supervisor =
+        let mut supervisor =
             BootRunLoopSupervisor::start(session, NonZeroUsize::new(19).expect("non-zero limit"))
                 .expect("supervisor should start");
 
@@ -2777,6 +2930,13 @@ mod tests {
             supervisor.metrics_diagnostics().boot_run_loop_status(),
             Some(BootRunLoopMetricStatus::Failed)
         );
+        assert_eq!(
+            supervisor.process_exit_status(),
+            super::ProcessSessionExitStatus::Terminal
+        );
+        supervisor
+            .drain_process_exit_wakeup()
+            .expect("error wakeup should drain");
         assert_eq!(control.request_stop_count(), 0);
         assert_eq!(drop_count.load(Ordering::SeqCst), 0);
 

@@ -180,6 +180,10 @@ The API-request, API-enabled config-file, and no-api config-file scenarios
 verify vsock listener binding during startup and owned vsock listener cleanup
 on shutdown. The API-request and API-enabled config-file scenarios verify
 metrics and logger outputs after runtime `FlushMetrics`. The
+config-file guest-shutdown scenarios boot the tiny initrd's `/poweroff-init`,
+which invokes the Linux poweroff syscall so the kernel issues PSCI
+`SYSTEM_OFF`, and verify that API-enabled and no-api `bangbang` processes exit
+successfully. The
 direct-rootfs scenarios boot the generated ext4 rootfs without an initrd and
 write `BANGBANG_DIRECT_ROOTFS_BLOCK_OK` through a second writable drive. This
 verifies the public process/API/config-file/HVF path, including public serial
