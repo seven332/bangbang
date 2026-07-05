@@ -855,6 +855,62 @@ fn executable_configures_vm_before_start() {
 }
 
 #[test]
+fn executable_rejects_invalid_boot_source_without_mutating() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let original_kernel_path = test_dir.path().join("original-vmlinux");
+    let rejected_kernel_path = test_dir.path().join("private-vmlinux");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    let original_kernel_path_json = json_string(path_text(&original_kernel_path));
+    let original_boot_args = "console=hvc0 reboot=k panic=1";
+    let original_boot_args_json = json_string(original_boot_args);
+    let original_body = format!(
+        r#"{{"kernel_image_path":{original_kernel_path_json},"boot_args":{original_boot_args_json}}}"#
+    );
+    let original_response = http_put_json(&socket_path, "/boot-source", &original_body);
+    assert_no_content_response(&original_response, "PUT /boot-source original");
+
+    let rejected_kernel_path_text = path_text(&rejected_kernel_path);
+    let rejected_kernel_path_json = json_string(rejected_kernel_path_text);
+    let rejected_body = format!(
+        r#"{{"kernel_image_path":{rejected_kernel_path_json},"boot_args":"secret\u0000debug"}}"#
+    );
+    let rejected_response = http_put_json(&socket_path, "/boot-source", &rejected_body);
+    assert_bad_request_response(&rejected_response, "PUT /boot-source invalid");
+    assert_response_contains(
+        &rejected_response,
+        r#"{"fault_message":"kernel command line is invalid: contains a NUL byte"}"#,
+        "PUT /boot-source invalid",
+    );
+    assert!(
+        !rejected_response.contains("secret")
+            && !rejected_response.contains(rejected_kernel_path_text),
+        "invalid boot-source response should not echo private request values; response:\n{rejected_response}"
+    );
+
+    let vm_config = http_get(&socket_path, "/vm/config");
+    assert_ok_response(&vm_config, "GET /vm/config after invalid boot-source");
+    assert_response_contains(
+        &vm_config,
+        &format!(r#""kernel_image_path":{original_kernel_path_json}"#),
+        "GET /vm/config after invalid boot-source",
+    );
+    assert_response_contains(
+        &vm_config,
+        &format!(r#""boot_args":{original_boot_args_json}"#),
+        "GET /vm/config after invalid boot-source",
+    );
+    assert!(
+        !vm_config.contains(rejected_kernel_path_text) && !vm_config.contains("secret"),
+        "GET /vm/config should retain the original boot-source after invalid update; response:\n{vm_config}"
+    );
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
 fn executable_configures_observability_without_vm_config() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
