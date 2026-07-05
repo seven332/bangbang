@@ -1681,6 +1681,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn hvf_guest_power_outcomes_request_process_stop() {
+        assert_eq!(
+            super::BootRunLoopProcessExit::process_exit_status(
+                &super::HvfArm64BootRunLoopOutcome::GuestShutdown { steps: 1 },
+            ),
+            super::ProcessSessionExitStatus::GuestRequestedStop
+        );
+        assert_eq!(
+            super::BootRunLoopProcessExit::process_exit_status(
+                &super::HvfArm64BootRunLoopOutcome::GuestReset { steps: 1 },
+            ),
+            super::ProcessSessionExitStatus::GuestRequestedStop
+        );
+        assert_eq!(
+            super::BootRunLoopProcessExit::process_exit_status(
+                &super::HvfArm64BootRunLoopOutcome::Unknown {
+                    steps: 1,
+                    reason: 1,
+                },
+            ),
+            super::ProcessSessionExitStatus::Terminal
+        );
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct FakeRunLoopError;
 
