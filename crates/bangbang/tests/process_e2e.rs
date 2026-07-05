@@ -637,6 +637,83 @@ fn executable_configures_vm_before_start() {
 }
 
 #[test]
+fn executable_configures_observability_without_vm_config() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let metrics_path = test_dir.path().join("metrics.out");
+    let second_metrics_path = test_dir.path().join("metrics-second.out");
+    let logger_path = test_dir.path().join("logger.out");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    let metrics_path_json = json_string(path_text(&metrics_path));
+    let metrics_body = format!(r#"{{"metrics_path":{metrics_path_json}}}"#);
+    let metrics_response = http_put_json(&socket_path, "/metrics", &metrics_body);
+    assert_no_content_response(&metrics_response, "PUT /metrics");
+    assert!(
+        metrics_path.exists(),
+        "PUT /metrics should create the configured output file"
+    );
+
+    let second_metrics_path_json = json_string(path_text(&second_metrics_path));
+    let second_metrics_body = format!(r#"{{"metrics_path":{second_metrics_path_json}}}"#);
+    let second_metrics_response = http_put_json(&socket_path, "/metrics", &second_metrics_body);
+    assert_bad_request_response(&second_metrics_response, "second PUT /metrics");
+    assert_response_contains(
+        &second_metrics_response,
+        r#"{"fault_message":"metrics system is already initialized"}"#,
+        "second PUT /metrics",
+    );
+    assert!(
+        !second_metrics_response.contains(path_text(&second_metrics_path)),
+        "duplicate PUT /metrics must not echo the rejected output path; response:\n{second_metrics_response}"
+    );
+    assert!(
+        metrics_path.exists(),
+        "duplicate PUT /metrics must keep the original output file"
+    );
+    assert!(
+        !second_metrics_path.exists(),
+        "duplicate PUT /metrics must not create the second output file"
+    );
+
+    let logger_path_json = json_string(path_text(&logger_path));
+    let logger_body = format!(
+        r#"{{
+            "log_path":{logger_path_json},
+            "level":"Warning",
+            "show_level":true,
+            "show_log_origin":true,
+            "module":"api_server"
+        }}"#
+    );
+    let logger_response = http_put_json(&socket_path, "/logger", &logger_body);
+    assert_no_content_response(&logger_response, "PUT /logger");
+    assert!(
+        logger_path.exists(),
+        "PUT /logger should create the configured output file"
+    );
+
+    let vm_config = http_get(&socket_path, "/vm/config");
+    assert_ok_response(&vm_config, "GET /vm/config after observability config");
+    assert_response_contains(
+        &vm_config,
+        r#""machine-config":"#,
+        "GET /vm/config after observability config",
+    );
+    assert!(
+        !vm_config.contains("metrics"),
+        "GET /vm/config must not include metrics observability state; response:\n{vm_config}"
+    );
+    assert!(
+        !vm_config.contains("logger"),
+        "GET /vm/config must not include logger observability state; response:\n{vm_config}"
+    );
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
 fn executable_configures_writeback_drive_cache_type() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
