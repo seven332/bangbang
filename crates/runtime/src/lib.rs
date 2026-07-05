@@ -405,6 +405,30 @@ impl VmmController {
         self.metrics_state.record_put_actions_failure();
     }
 
+    pub fn record_put_metrics_request(&mut self) {
+        self.metrics_state.record_put_metrics_request();
+    }
+
+    pub fn record_put_metrics_failure(&mut self) {
+        self.metrics_state.record_put_metrics_failure();
+    }
+
+    pub fn record_put_logger_request(&mut self) {
+        self.metrics_state.record_put_logger_request();
+    }
+
+    pub fn record_put_logger_failure(&mut self) {
+        self.metrics_state.record_put_logger_failure();
+    }
+
+    pub fn record_put_serial_request(&mut self) {
+        self.metrics_state.record_put_serial_request();
+    }
+
+    pub fn record_put_serial_failure(&mut self) {
+        self.metrics_state.record_put_serial_failure();
+    }
+
     pub fn record_get_instance_info_request(&mut self) {
         self.metrics_state.record_get_instance_info_request();
     }
