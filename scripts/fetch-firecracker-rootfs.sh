@@ -114,7 +114,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v10"
+direct_boot_variant="direct-boot-v11"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -489,6 +489,80 @@ fetch_mmds_v2_marker() {
   fi
 }
 
+fetch_vsock_marker() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    emit_line BANGBANG_VSOCK_GUEST_CONNECT_FAIL_NO_PYTHON
+    write_vdb_marker BANGBANG_VSOCK_GUEST_CONNECT_FAIL
+    return
+  fi
+
+  vsock_result=$(
+    python3 - <<'PY' 2>/dev/null || true
+import socket
+import sys
+
+HOST_CID = getattr(socket, "VMADDR_CID_HOST", 2)
+PORT = 5005
+GUEST_PAYLOAD = b"BANGBANG_VSOCK_GUEST_PAYLOAD"
+HOST_REPLY = b"BANGBANG_VSOCK_HOST_REPLY"
+
+
+def fail(reason):
+    print(f"BANGBANG_VSOCK_GUEST_CONNECT_FAIL_{reason}")
+    sys.exit(1)
+
+
+if not hasattr(socket, "AF_VSOCK"):
+    fail("NO_AF_VSOCK")
+
+try:
+    stream = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+except OSError:
+    fail("SOCKET")
+
+try:
+    stream.settimeout(5.0)
+    try:
+        stream.connect((HOST_CID, PORT))
+    except OSError:
+        fail("CONNECT")
+
+    try:
+        stream.sendall(GUEST_PAYLOAD)
+    except OSError:
+        fail("SEND")
+
+    reply = b""
+    while len(reply) < len(HOST_REPLY):
+        try:
+            chunk = stream.recv(len(HOST_REPLY) - len(reply))
+        except OSError:
+            fail("RECV")
+        if not chunk:
+            fail("EOF")
+        reply += chunk
+
+    if reply != HOST_REPLY:
+        fail("REPLY")
+
+    print("BANGBANG_VSOCK_GUEST_CONNECT_OK")
+finally:
+    stream.close()
+PY
+  )
+
+  if [ "$vsock_result" = BANGBANG_VSOCK_GUEST_CONNECT_OK ]; then
+    emit_line BANGBANG_VSOCK_GUEST_CONNECT_OK
+    write_vdb_marker BANGBANG_VSOCK_GUEST_CONNECT_OK
+  elif [ -n "$vsock_result" ]; then
+    emit_line "$vsock_result"
+    write_vdb_marker BANGBANG_VSOCK_GUEST_CONNECT_FAIL
+  else
+    emit_line BANGBANG_VSOCK_GUEST_CONNECT_FAIL_EMPTY
+    write_vdb_marker BANGBANG_VSOCK_GUEST_CONNECT_FAIL
+  fi
+}
+
 cmdline=
 emit_line BANGBANG_DIRECT_ROOTFS_BOOT_BEGIN
 if [ -r /etc/os-release ]; then
@@ -514,6 +588,8 @@ if cmdline_has bangbang.mmds-v2-fetch=1; then
   fetch_mmds_v2_marker
 elif cmdline_has bangbang.mmds-fetch=1; then
   fetch_mmds_marker
+elif cmdline_has bangbang.vsock-guest-connect=1; then
+  fetch_vsock_marker
 else
   write_vdb_marker BANGBANG_DIRECT_ROOTFS_BLOCK_OK
 fi
