@@ -114,7 +114,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v13"
+direct_boot_variant="direct-boot-v14"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -576,8 +576,10 @@ import sys
 
 CID_ANY = getattr(socket, "VMADDR_CID_ANY", -1)
 PORT = 5006
-GUEST_GREETING = b"BANGBANG_VSOCK_GUEST_GREETING"
-HOST_REPLY = b"BANGBANG_VSOCK_HOST_REPLY"
+PAYLOAD_PAIRS = (
+    (b"BANGBANG_VSOCK_GUEST_STREAM_ONE", b"BANGBANG_VSOCK_HOST_STREAM_ONE"),
+    (b"BANGBANG_VSOCK_GUEST_STREAM_TWO", b"BANGBANG_VSOCK_HOST_STREAM_TWO"),
+)
 READY_MARKER = b"BANGBANG_VSOCK_HOST_CONNECT_READY"
 SUCCESS_MARKER = b"BANGBANG_VSOCK_HOST_CONNECT_OK"
 FAIL_MARKER = b"BANGBANG_VSOCK_HOST_CONNECT_FAIL"
@@ -646,13 +648,14 @@ try:
 
     try:
         connection.settimeout(SOCKET_TIMEOUT)
-        try:
-            connection.sendall(GUEST_GREETING)
-        except OSError:
-            fail("SEND")
-        payload = recv_exact(connection, len(HOST_REPLY))
-        if payload != HOST_REPLY:
-            fail("PAYLOAD")
+        for index, (guest_payload, host_payload) in enumerate(PAYLOAD_PAIRS, start=1):
+            try:
+                connection.sendall(guest_payload)
+            except OSError:
+                fail(f"SEND_{index}")
+            payload = recv_exact(connection, len(host_payload))
+            if payload != host_payload:
+                fail(f"PAYLOAD_{index}")
     finally:
         connection.close()
 
