@@ -194,6 +194,14 @@ impl MetricsState {
         self.patch_api_requests.record_drive_failure();
     }
 
+    pub(crate) fn record_patch_network_request(&mut self) {
+        self.patch_api_requests.record_network_request();
+    }
+
+    pub(crate) fn record_patch_network_failure(&mut self) {
+        self.patch_api_requests.record_network_failure();
+    }
+
     pub(crate) fn record_patch_machine_config_request(&mut self) {
         self.patch_api_requests.record_machine_config_request();
     }
@@ -349,6 +357,8 @@ impl GetApiRequestMetrics {
 struct PatchApiRequestMetrics {
     drive_count: u64,
     drive_fails: u64,
+    network_count: u64,
+    network_fails: u64,
     machine_cfg_count: u64,
     machine_cfg_fails: u64,
     mmds_count: u64,
@@ -359,6 +369,8 @@ impl PatchApiRequestMetrics {
     const fn is_empty(self) -> bool {
         self.drive_count == 0
             && self.drive_fails == 0
+            && self.network_count == 0
+            && self.network_fails == 0
             && self.machine_cfg_count == 0
             && self.machine_cfg_fails == 0
             && self.mmds_count == 0
@@ -371,6 +383,14 @@ impl PatchApiRequestMetrics {
 
     fn record_drive_failure(&mut self) {
         self.drive_fails = self.drive_fails.saturating_add(1);
+    }
+
+    fn record_network_request(&mut self) {
+        self.network_count = self.network_count.saturating_add(1);
+    }
+
+    fn record_network_failure(&mut self) {
+        self.network_fails = self.network_fails.saturating_add(1);
     }
 
     fn record_machine_config_request(&mut self) {
@@ -395,6 +415,14 @@ impl PatchApiRequestMetrics {
 
     const fn drive_fails(self) -> u64 {
         self.drive_fails
+    }
+
+    const fn network_count(self) -> u64 {
+        self.network_count
+    }
+
+    const fn network_fails(self) -> u64 {
+        self.network_fails
     }
 
     const fn machine_cfg_count(self) -> u64 {
@@ -864,6 +892,14 @@ impl MetricsSink {
                 serde_json::Value::Number(patch_api_requests.drive_fails().into()),
             );
             patch_requests.insert(
+                "network_count".to_string(),
+                serde_json::Value::Number(patch_api_requests.network_count().into()),
+            );
+            patch_requests.insert(
+                "network_fails".to_string(),
+                serde_json::Value::Number(patch_api_requests.network_fails().into()),
+            );
+            patch_requests.insert(
                 "machine_cfg_count".to_string(),
                 serde_json::Value::Number(patch_api_requests.machine_cfg_count().into()),
             );
@@ -1239,6 +1275,8 @@ mod tests {
 
         state.record_patch_drive_request();
         state.record_patch_drive_failure();
+        state.record_patch_network_request();
+        state.record_patch_network_failure();
         state.record_patch_machine_config_request();
         state.record_patch_machine_config_request();
         state.record_patch_machine_config_failure();
@@ -1252,7 +1290,7 @@ mod tests {
         let output = fs::read_to_string(&path).expect("metrics output should be readable");
         assert_eq!(
             output,
-            "{\"patch_api_requests\":{\"drive_count\":1,\"drive_fails\":1,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"mmds_count\":1,\"mmds_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"patch_api_requests\":{\"drive_count\":1,\"drive_fails\":1,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"mmds_count\":1,\"mmds_fails\":1,\"network_count\":1,\"network_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(path).expect("fixture should clean up");

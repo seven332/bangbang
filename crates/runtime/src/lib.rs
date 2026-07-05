@@ -86,6 +86,7 @@ pub enum VmmAction {
     PutDrive(block::DriveConfigInput),
     UpdateBlockDevice(block::DriveUpdateInput),
     PutNetworkInterface(network::NetworkInterfaceConfigInput),
+    UpdateNetworkInterface(network::NetworkInterfaceUpdateInput),
     PutVsock(vsock::VsockConfigInput),
 }
 
@@ -114,6 +115,7 @@ impl VmmAction {
             Self::PutDrive(_) => "PutDrive",
             Self::UpdateBlockDevice(_) => "UpdateBlockDevice",
             Self::PutNetworkInterface(_) => "PutNetworkInterface",
+            Self::UpdateNetworkInterface(_) => "UpdateNetworkInterface",
             Self::PutVsock(_) => "PutVsock",
         }
     }
@@ -203,6 +205,7 @@ pub enum VmmActionError {
     MmdsDataStore(mmds::MmdsDataStoreError),
     MmdsState(mmds::MmdsStateLockError),
     NetworkInterfaceConfig(network::NetworkInterfaceConfigError),
+    NetworkInterfaceUpdateUnsupported,
     SerialConfig(serial::SerialConfigError),
     VsockConfig(vsock::VsockConfigError),
 }
@@ -234,6 +237,9 @@ impl fmt::Display for VmmActionError {
             Self::MmdsDataStore(err) => write!(f, "{err}"),
             Self::MmdsState(err) => write!(f, "{err}"),
             Self::NetworkInterfaceConfig(err) => write!(f, "{err}"),
+            Self::NetworkInterfaceUpdateUnsupported => {
+                f.write_str("Network interface updates are not supported.")
+            }
             Self::SerialConfig(err) => write!(f, "{err}"),
             Self::VsockConfig(err) => write!(f, "{err}"),
         }
@@ -258,6 +264,7 @@ impl std::error::Error for VmmActionError {
             Self::SerialConfig(err) => Some(err),
             Self::VsockConfig(err) => Some(err),
             Self::MissingBootSource
+            | Self::NetworkInterfaceUpdateUnsupported
             | Self::UnsupportedAction(_)
             | Self::UnsupportedState { .. } => None,
         }
@@ -502,6 +509,14 @@ impl VmmController {
         self.metrics_state.record_patch_drive_failure();
     }
 
+    pub fn record_patch_network_request(&mut self) {
+        self.metrics_state.record_patch_network_request();
+    }
+
+    pub fn record_patch_network_failure(&mut self) {
+        self.metrics_state.record_patch_network_failure();
+    }
+
     pub fn record_patch_machine_config_request(&mut self) {
         self.metrics_state.record_patch_machine_config_request();
     }
@@ -738,6 +753,9 @@ impl VmmController {
 
                 Ok(VmmData::Empty)
             }
+            VmmAction::UpdateNetworkInterface(_) => {
+                Err(VmmActionError::NetworkInterfaceUpdateUnsupported)
+            }
             VmmAction::PutVsock(config) => {
                 if self.instance_info.state != InstanceState::NotStarted {
                     return Err(VmmActionError::UnsupportedState {
@@ -847,7 +865,7 @@ mod tests {
         },
         network::{
             GuestMacAddress, MAX_NETWORK_INTERFACE_COUNT, NetworkInterfaceConfigError,
-            NetworkInterfaceConfigInput,
+            NetworkInterfaceConfigInput, NetworkInterfaceUpdateInput,
         },
         serial::{SerialConfigError, SerialConfigInput},
         vsock::{MIN_GUEST_CID, VsockConfigError, VsockConfigInput},
@@ -1166,6 +1184,11 @@ mod tests {
         assert_eq!(
             VmmAction::PutNetworkInterface(network_input("eth0", "tap0")).name(),
             "PutNetworkInterface"
+        );
+        assert_eq!(
+            VmmAction::UpdateNetworkInterface(NetworkInterfaceUpdateInput::new("eth0", "eth0"))
+                .name(),
+            "UpdateNetworkInterface"
         );
         assert_eq!(
             VmmAction::PutVsock(vsock_input(3, "./v.sock")).name(),
@@ -3248,6 +3271,38 @@ mod tests {
             }
         );
         assert!(controller.network_interface_configs().is_empty());
+    }
+
+    #[test]
+    fn update_network_interface_is_unsupported_without_mutating() {
+        for state in [InstanceState::NotStarted, InstanceState::Running] {
+            let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+            controller
+                .handle_action(VmmAction::PutNetworkInterface(network_input(
+                    "eth0", "tap0",
+                )))
+                .expect("initial network interface config should be stored");
+            controller.instance_info.state = state;
+
+            let err = controller
+                .handle_action(VmmAction::UpdateNetworkInterface(
+                    NetworkInterfaceUpdateInput::new("eth0", "eth0"),
+                ))
+                .expect_err("network update should remain unsupported");
+
+            assert_eq!(err, VmmActionError::NetworkInterfaceUpdateUnsupported);
+            assert_eq!(
+                err.to_string(),
+                "Network interface updates are not supported."
+            );
+            assert_eq!(controller.instance_info().state, state);
+            assert_eq!(controller.network_interface_configs().len(), 1);
+            assert_eq!(controller.network_interface_configs()[0].iface_id(), "eth0");
+            assert_eq!(
+                controller.network_interface_configs()[0].host_dev_name(),
+                "tap0"
+            );
+        }
     }
 
     #[test]

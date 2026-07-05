@@ -161,11 +161,12 @@ omitted timing arguments remain omitted. Parsed `GET /`,
 `GET /mmds` API requests are counted under `get_api_requests`; parsed
 core configuration PUTs, `PUT /mmds`, `PUT /mmds/config`, `PUT /metrics`,
 `PUT /logger`, `PUT /serial`, and `/actions` API requests are counted under
-`put_api_requests`; parsed `PATCH /machine-config`, `PATCH /mmds`, and
-`PATCH /drives/{drive_id}` requests routed through VMM control are counted
-under `patch_api_requests`. Direct config-file and startup initialization paths
-are not API requests and are not included in these counters. `PATCH /vm` remains
-outside `patch_api_requests` because Firecracker does not expose a matching
+`put_api_requests`; parsed `PATCH /machine-config`, `PATCH /mmds`,
+`PATCH /drives/{drive_id}`, and `PATCH /network-interfaces/{iface_id}`
+requests routed through VMM control are counted under `patch_api_requests`.
+Direct config-file and startup initialization paths are not API requests and
+are not included in these counters. `PATCH /vm` remains outside
+`patch_api_requests` because Firecracker does not expose a matching
 `PatchRequestsMetrics` field for VM state changes. Full Firecracker
 `ProcessTimeReporter` parity remains deferred.
 
@@ -487,11 +488,12 @@ GET API requests, plus selected `put_api_requests` counters for parsed core
 configuration PUTs, `PUT /mmds`, `PUT /mmds/config`, `PUT /metrics`,
 `PUT /logger`, `PUT /serial`, and `/actions` requests routed through VMM
 control, plus selected `patch_api_requests` counters for parsed
-`PATCH /machine-config`, `PATCH /mmds`, and `PATCH /drives/{drive_id}` requests
-routed through VMM control. Remaining-device counters, remaining PATCH counters,
-and parser-level malformed-request counters remain deferred. Public run-loop control, guest boot
-output, public runner loop scheduling, full Firecracker metrics counters,
-and full logger integration remain deferred. Metrics write failures increment
+`PATCH /machine-config`, `PATCH /mmds`, `PATCH /drives/{drive_id}`, and
+`PATCH /network-interfaces/{iface_id}` requests routed through VMM control.
+Remaining-device counters, remaining PATCH counters, and parser-level
+malformed-request counters remain deferred. Public run-loop control, guest boot
+output, public runner loop scheduling, full Firecracker metrics counters, and
+full logger integration remain deferred. Metrics write failures increment
 `logger.missed_metrics_count`; logger action write failures increment
 `logger.missed_log_count`; broader logger metrics remain deferred.
 The process startup path and API/VMM state path implement the logger field
