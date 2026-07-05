@@ -20,7 +20,7 @@ use bangbang_api::http::{RequestError, parse_request_with_limit};
 use bangbang_hvf::HvfBackend;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::{SigId, low_level};
-use vmm::ProcessVmm;
+use vmm::{ProcessSessionExitDecision, ProcessVmm};
 
 use bangbang_runtime::logger::{LoggerConfigInput, LoggerLevel};
 use bangbang_runtime::metrics::{MetricsConfigInput, MetricsDiagnostics};
@@ -140,8 +140,12 @@ where
         }
         vmm.drain_process_exit_wakeup()
             .map_err(ProcessError::ProcessExitNotification)?;
-        if vmm.process_exit_status().should_exit_successfully() {
-            return Ok(());
+        match vmm.process_exit_status().decision() {
+            ProcessSessionExitDecision::Continue => {}
+            ProcessSessionExitDecision::ExitSuccessfully => return Ok(()),
+            ProcessSessionExitDecision::ExitWithFailure => {
+                return Err(ProcessError::ProcessSessionTerminal);
+            }
         }
     }
 }
@@ -485,6 +489,7 @@ enum ProcessError {
     ConfigFile(ConfigFileError),
     Metadata(MetadataFileError),
     ProcessExitNotification(std::io::ErrorKind),
+    ProcessSessionTerminal,
     SignalHandler(std::io::ErrorKind),
     StartupConfiguration(VmmActionError),
 }
@@ -497,6 +502,7 @@ impl ProcessError {
             Self::ConfigFile(_) => ProcessExitCode::ProcessFailure,
             Self::Metadata(_) => ProcessExitCode::ProcessFailure,
             Self::ProcessExitNotification(_) => ProcessExitCode::ProcessFailure,
+            Self::ProcessSessionTerminal => ProcessExitCode::ProcessFailure,
             Self::SignalHandler(_) => ProcessExitCode::ProcessFailure,
             Self::StartupConfiguration(_) => ProcessExitCode::ProcessFailure,
         }
@@ -512,6 +518,9 @@ impl fmt::Display for ProcessError {
             Self::Metadata(err) => write!(f, "metadata error: {err}"),
             Self::ProcessExitNotification(kind) => {
                 write!(f, "process exit notification failed: {kind:?}")
+            }
+            Self::ProcessSessionTerminal => {
+                f.write_str("process-owned boot run loop exited with failure")
             }
             Self::SignalHandler(kind) => {
                 write!(f, "shutdown signal handling failed: {kind:?}")
@@ -2551,6 +2560,34 @@ mod tests {
 
         super::wait_for_no_api_shutdown(&mut shutdown_signal, &mut vmm)
             .expect("guest-requested stop should stop no-api wait successfully");
+    }
+
+    #[test]
+    fn no_api_wait_fails_after_process_terminal_notification() {
+        let process_exit_signal = TestProcessExitSignal::new();
+        let process_exit_trigger = process_exit_signal.clone();
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            ProcessExitTestStarter {
+                signal: process_exit_signal,
+            },
+        );
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("instance should start");
+        let mut shutdown_signal = test_shutdown_signal();
+
+        process_exit_trigger.trigger(ProcessSessionExitStatus::Terminal);
+
+        assert_eq!(
+            super::wait_for_no_api_shutdown(&mut shutdown_signal, &mut vmm),
+            Err(super::ProcessError::ProcessSessionTerminal)
+        );
     }
 
     #[test]

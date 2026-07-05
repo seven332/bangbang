@@ -111,9 +111,20 @@ pub(crate) enum ProcessSessionExitStatus {
     Terminal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessSessionExitDecision {
+    Continue,
+    ExitSuccessfully,
+    ExitWithFailure,
+}
+
 impl ProcessSessionExitStatus {
-    pub(crate) const fn should_exit_successfully(self) -> bool {
-        matches!(self, Self::GuestRequestedStop)
+    pub(crate) const fn decision(self) -> ProcessSessionExitDecision {
+        match self {
+            Self::Running => ProcessSessionExitDecision::Continue,
+            Self::GuestRequestedStop => ProcessSessionExitDecision::ExitSuccessfully,
+            Self::Terminal => ProcessSessionExitDecision::ExitWithFailure,
+        }
     }
 }
 
@@ -1679,6 +1690,22 @@ mod tests {
                 Self::Terminal => super::ProcessSessionExitStatus::GuestRequestedStop,
             }
         }
+    }
+
+    #[test]
+    fn process_exit_status_maps_to_process_decision() {
+        assert_eq!(
+            super::ProcessSessionExitStatus::Running.decision(),
+            super::ProcessSessionExitDecision::Continue
+        );
+        assert_eq!(
+            super::ProcessSessionExitStatus::GuestRequestedStop.decision(),
+            super::ProcessSessionExitDecision::ExitSuccessfully
+        );
+        assert_eq!(
+            super::ProcessSessionExitStatus::Terminal.decision(),
+            super::ProcessSessionExitDecision::ExitWithFailure
+        );
     }
 
     #[test]
