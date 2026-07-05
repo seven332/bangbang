@@ -21,6 +21,7 @@ use support::{
 use bangbang_runtime::machine::MAX_MEM_SIZE_MIB;
 
 const BANGBANG_VERSION: &str = env!("CARGO_PKG_VERSION");
+const ARGUMENT_PARSING_EXIT_CODE: i32 = 153;
 
 #[test]
 fn executable_serves_api_and_shuts_down_cleanly() {
@@ -103,6 +104,66 @@ fn executable_accepts_firecracker_startup_time_args() {
     );
 
     assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
+fn executable_rejects_unsupported_firecracker_process_flags_before_socket_publication() {
+    for (name, args, private_value) in [
+        ("boot-timer", &["--boot-timer"][..], None),
+        (
+            "describe-snapshot",
+            &["--describe-snapshot", "secret-snapshot.vmstate"],
+            Some("secret-snapshot.vmstate"),
+        ),
+        ("enable-pci", &["--enable-pci"], None),
+        ("no-seccomp", &["--no-seccomp"], None),
+        (
+            "seccomp-filter",
+            &["--seccomp-filter", "secret-seccomp.bpf"],
+            Some("secret-seccomp.bpf"),
+        ),
+        ("snapshot-version", &["--snapshot-version"], None),
+    ] {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join(format!("{name}.socket"));
+        let instance_id = test_dir.instance_id();
+
+        let output =
+            BangbangProcess::start_with_extra_args_expect_failure(&socket_path, &instance_id, args);
+
+        assert_eq!(
+            output.status.code(),
+            Some(ARGUMENT_PARSING_EXIT_CODE),
+            "unsupported --{name} should fail with the argument parsing exit code; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            output.stdout,
+            output.stderr
+        );
+        assert!(
+            output.stderr.contains(&format!(
+                "bangbang: unsupported Firecracker argument: --{name}"
+            )),
+            "unsupported --{name} should report a Firecracker argument rejection; stderr:\n{}",
+            output.stderr
+        );
+        assert!(
+            !output.stdout.contains("status: API server listening"),
+            "unsupported --{name} must not report API readiness; stdout:\n{}",
+            output.stdout
+        );
+        if let Some(private_value) = private_value {
+            assert!(
+                !output.stdout.contains(private_value) && !output.stderr.contains(private_value),
+                "unsupported --{name} failure must not echo private argument value {private_value:?}; stdout:\n{}\nstderr:\n{}",
+                output.stdout,
+                output.stderr
+            );
+        }
+        assert!(
+            !socket_path.exists(),
+            "unsupported --{name} must fail before publishing the API socket"
+        );
+    }
 }
 
 #[test]
