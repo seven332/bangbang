@@ -1394,6 +1394,9 @@ pub fn parse_request_with_limit(
     if method == "GET" && request_body.has_content() {
         return Err(RequestError::GetRequestBody);
     }
+    if method == "DELETE" && request_body.has_content() {
+        return Err(RequestError::MalformedRequest);
+    }
 
     if is_balloon_endpoint_without_body_parsing(method, path) {
         return Err(RequestError::BalloonUnsupported);
@@ -2498,6 +2501,10 @@ mod tests {
             body.len()
         )
         .into_bytes()
+    }
+
+    fn request_without_body(method: &str, path: &str) -> Vec<u8> {
+        format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").into_bytes()
     }
 
     #[test]
@@ -4146,12 +4153,40 @@ mod tests {
     }
 
     #[test]
-    fn rejects_drive_hot_unplug_as_unsupported_without_parsing_body() {
+    fn rejects_drive_hot_unplug_as_unsupported_without_body() {
         let request = b"DELETE /drives/rootfs HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec();
 
         let err = parse_request(&request).expect_err("drive hot-unplug should be unsupported");
         assert_eq!(err, RequestError::DriveUpdateUnsupported);
         assert_eq!(err.fault_message(), "Drive updates are not supported.");
+    }
+
+    #[test]
+    fn rejects_delete_request_bodies_before_hot_unplug_routing() {
+        for (route, request) in [
+            (
+                "DELETE /drives/rootfs",
+                request_with_body("DELETE", "/drives/rootfs", "{}"),
+            ),
+            (
+                "DELETE /network-interfaces/eth0",
+                request_with_body("DELETE", "/network-interfaces/eth0", "not-json"),
+            ),
+            (
+                "DELETE /pmem/pmem0",
+                request_with_body("DELETE", "/pmem/pmem0", "{}"),
+            ),
+            (
+                "DELETE /unknown",
+                request_with_body("DELETE", "/unknown", "{}"),
+            ),
+        ] {
+            assert_eq!(
+                parse_request(&request),
+                Err(RequestError::MalformedRequest),
+                "{route}"
+            );
+        }
     }
 
     #[test]
@@ -4164,8 +4199,14 @@ mod tests {
                 "/drives/root-fs",
                 "/drives/rootfs?debug=true",
             ] {
+                let request = if method == "DELETE" {
+                    request_without_body(method, path)
+                } else {
+                    request_with_body(method, path, "{}")
+                };
+
                 assert_eq!(
-                    parse_request(&request_with_body(method, path, "{}")),
+                    parse_request(&request),
                     Err(RequestError::InvalidPathMethod),
                     "{method} {path}"
                 );
@@ -4469,29 +4510,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_network_interface_delete_without_parsing_body() {
-        for (route, request) in [
-            (
-                "DELETE /network-interfaces/eth0",
-                b"DELETE /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
-            ),
-            (
-                "DELETE /network-interfaces/eth0 malformed body",
-                request_with_body("DELETE", "/network-interfaces/eth0", "not-json"),
-            ),
-        ] {
-            let err = parse_request(&request)
-                .expect_err("network interface delete should be unsupported");
-            assert_eq!(
-                err,
-                RequestError::NetworkInterfaceUpdateUnsupported,
-                "{route}"
-            );
-            assert_eq!(
-                err.fault_message(),
-                "Network interface updates are not supported."
-            );
-        }
+    fn rejects_network_interface_delete_as_unsupported_without_body() {
+        let request = b"DELETE /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+        let err =
+            parse_request(request).expect_err("network interface delete should be unsupported");
+        assert_eq!(err, RequestError::NetworkInterfaceUpdateUnsupported);
+        assert_eq!(
+            err.fault_message(),
+            "Network interface updates are not supported."
+        );
     }
 
     #[test]
@@ -4504,8 +4532,14 @@ mod tests {
                 "/network-interfaces/eth-0",
                 "/network-interfaces/eth0?debug=true",
             ] {
+                let request = if method == "DELETE" {
+                    request_without_body(method, path)
+                } else {
+                    request_with_body(method, path, "{}")
+                };
+
                 assert_eq!(
-                    parse_request(&request_with_body(method, path, "{}")),
+                    parse_request(&request),
                     Err(RequestError::InvalidPathMethod),
                     "{method} {path}"
                 );
@@ -5244,8 +5278,14 @@ mod tests {
                 "/pmem/pmem-0",
                 "/pmem/pmem0?debug=true",
             ] {
+                let request = if method == "DELETE" {
+                    request_without_body(method, path)
+                } else {
+                    request_with_body(method, path, "{}")
+                };
+
                 assert_eq!(
-                    parse_request(&request_with_body(method, path, "{}")),
+                    parse_request(&request),
                     Err(RequestError::InvalidPathMethod),
                     "{method} {path}"
                 );
