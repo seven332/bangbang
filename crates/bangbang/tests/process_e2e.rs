@@ -414,7 +414,7 @@ fn executable_rejects_remaining_device_requests_without_mutating() {
     assert_bad_request_response(&memory_hotplug_get_response, "GET /hotplug/memory");
     assert_response_contains(
         &memory_hotplug_get_response,
-        r#"{"fault_message":"Memory hotplug is not supported."}"#,
+        r#"{"fault_message":"The requested operation is not supported in Not started state: GetMemoryHotplug"}"#,
         "GET /hotplug/memory",
     );
 
@@ -427,7 +427,7 @@ fn executable_rejects_remaining_device_requests_without_mutating() {
     assert_bad_request_response(&memory_hotplug_patch_response, "PATCH /hotplug/memory");
     assert_response_contains(
         &memory_hotplug_patch_response,
-        r#"{"fault_message":"Memory hotplug is not supported."}"#,
+        r#"{"fault_message":"The requested operation is not supported in Not started state: PatchMemoryHotplug"}"#,
         "PATCH /hotplug/memory",
     );
 

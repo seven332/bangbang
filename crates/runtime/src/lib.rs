@@ -83,6 +83,9 @@ pub enum VmmAction {
     PatchBalloonStats,
     PatchBalloonHintingStart,
     PatchBalloonHintingStop,
+    GetMemoryHotplug,
+    PutMemoryHotplug,
+    PatchMemoryHotplug,
     PutEntropy,
     PutPmem,
     PatchPmem,
@@ -125,6 +128,9 @@ impl VmmAction {
             Self::PatchBalloonStats => "PatchBalloonStats",
             Self::PatchBalloonHintingStart => "PatchBalloonHintingStart",
             Self::PatchBalloonHintingStop => "PatchBalloonHintingStop",
+            Self::GetMemoryHotplug => "GetMemoryHotplug",
+            Self::PutMemoryHotplug => "PutMemoryHotplug",
+            Self::PatchMemoryHotplug => "PatchMemoryHotplug",
             Self::PutEntropy => "PutEntropy",
             Self::PutPmem => "PutPmem",
             Self::PatchPmem => "PatchPmem",
@@ -234,6 +240,7 @@ pub enum VmmActionError {
     MmdsState(mmds::MmdsStateLockError),
     NetworkInterfaceConfig(network::NetworkInterfaceConfigError),
     NetworkInterfaceUpdateUnsupported,
+    MemoryHotplugUnsupported,
     PmemUnsupported,
     SerialConfig(serial::SerialConfigError),
     SnapshotUnsupported,
@@ -272,6 +279,7 @@ impl fmt::Display for VmmActionError {
             Self::NetworkInterfaceUpdateUnsupported => {
                 f.write_str("Network interface updates are not supported.")
             }
+            Self::MemoryHotplugUnsupported => f.write_str("Memory hotplug is not supported."),
             Self::PmemUnsupported => f.write_str("Pmem device is not supported."),
             Self::SerialConfig(err) => write!(f, "{err}"),
             Self::SnapshotUnsupported => f.write_str("Snapshot and restore are not supported."),
@@ -301,6 +309,7 @@ impl std::error::Error for VmmActionError {
             | Self::EntropyUnsupported
             | Self::MissingBootSource
             | Self::NetworkInterfaceUpdateUnsupported
+            | Self::MemoryHotplugUnsupported
             | Self::PmemUnsupported
             | Self::SnapshotUnsupported
             | Self::UnsupportedAction(_)
@@ -679,6 +688,26 @@ impl VmmController {
                 }
 
                 Err(VmmActionError::EntropyUnsupported)
+            }
+            VmmAction::PutMemoryHotplug => {
+                if self.instance_info.state != InstanceState::NotStarted {
+                    return Err(VmmActionError::UnsupportedState {
+                        action: action_name,
+                        state: self.instance_info.state,
+                    });
+                }
+
+                Err(VmmActionError::MemoryHotplugUnsupported)
+            }
+            VmmAction::GetMemoryHotplug | VmmAction::PatchMemoryHotplug => {
+                if self.instance_info.state == InstanceState::NotStarted {
+                    return Err(VmmActionError::UnsupportedState {
+                        action: action_name,
+                        state: self.instance_info.state,
+                    });
+                }
+
+                Err(VmmActionError::MemoryHotplugUnsupported)
             }
             VmmAction::PutPmem => {
                 if self.instance_info.state != InstanceState::NotStarted {
@@ -1305,6 +1334,9 @@ mod tests {
             VmmAction::PatchBalloonHintingStop.name(),
             "PatchBalloonHintingStop"
         );
+        assert_eq!(VmmAction::GetMemoryHotplug.name(), "GetMemoryHotplug");
+        assert_eq!(VmmAction::PutMemoryHotplug.name(), "PutMemoryHotplug");
+        assert_eq!(VmmAction::PatchMemoryHotplug.name(), "PatchMemoryHotplug");
         assert_eq!(VmmAction::PutEntropy.name(), "PutEntropy");
         assert_eq!(VmmAction::PutPmem.name(), "PutPmem");
         assert_eq!(VmmAction::PatchPmem.name(), "PatchPmem");
@@ -1680,6 +1712,100 @@ mod tests {
             assert!(controller.boot_source_config().is_some());
             assert!(controller.drive_configs().is_empty());
             assert!(controller.network_interface_configs().is_empty());
+        }
+    }
+
+    #[test]
+    fn put_memory_hotplug_reaches_memory_hotplug_fault_before_start_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PutMemoryHotplug)
+            .expect_err("memory hotplug should remain unsupported");
+
+        assert_eq!(err, VmmActionError::MemoryHotplugUnsupported);
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert!(controller.boot_source_config().is_some());
+        assert!(controller.drive_configs().is_empty());
+        assert!(controller.network_interface_configs().is_empty());
+    }
+
+    #[test]
+    fn put_memory_hotplug_rejects_running_or_paused_without_mutating() {
+        for state in [InstanceState::Running, InstanceState::Paused] {
+            let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+            controller
+                .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+                .expect("boot source config should be stored");
+            controller.instance_info.state = state;
+
+            let err = controller
+                .handle_action(VmmAction::PutMemoryHotplug)
+                .expect_err("memory hotplug put should be pre-boot-only");
+
+            assert_eq!(
+                err,
+                VmmActionError::UnsupportedState {
+                    action: VmmAction::PutMemoryHotplug.name(),
+                    state,
+                }
+            );
+            assert_eq!(controller.instance_info().state, state);
+            assert!(controller.boot_source_config().is_some());
+            assert!(controller.drive_configs().is_empty());
+            assert!(controller.network_interface_configs().is_empty());
+        }
+    }
+
+    #[test]
+    fn postboot_memory_hotplug_actions_reject_not_started_without_mutating() {
+        for action in [VmmAction::GetMemoryHotplug, VmmAction::PatchMemoryHotplug] {
+            let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+            controller
+                .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+                .expect("boot source config should be stored");
+
+            let err = controller
+                .handle_action(action.clone())
+                .expect_err("memory hotplug action should be post-boot-only");
+
+            assert_eq!(
+                err,
+                VmmActionError::UnsupportedState {
+                    action: action.name(),
+                    state: InstanceState::NotStarted,
+                }
+            );
+            assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+            assert!(controller.boot_source_config().is_some());
+            assert!(controller.drive_configs().is_empty());
+            assert!(controller.network_interface_configs().is_empty());
+        }
+    }
+
+    #[test]
+    fn postboot_memory_hotplug_actions_reach_memory_hotplug_fault_after_start_without_mutating() {
+        for state in [InstanceState::Running, InstanceState::Paused] {
+            for action in [VmmAction::GetMemoryHotplug, VmmAction::PatchMemoryHotplug] {
+                let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+                controller
+                    .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+                    .expect("boot source config should be stored");
+                controller.instance_info.state = state;
+
+                let err = controller
+                    .handle_action(action)
+                    .expect_err("memory hotplug should remain unsupported");
+
+                assert_eq!(err, VmmActionError::MemoryHotplugUnsupported);
+                assert_eq!(controller.instance_info().state, state);
+                assert!(controller.boot_source_config().is_some());
+                assert!(controller.drive_configs().is_empty());
+                assert!(controller.network_interface_configs().is_empty());
+            }
         }
     }
 
@@ -4056,6 +4182,14 @@ mod tests {
         let err = VmmActionError::EntropyUnsupported;
 
         assert_eq!(err.to_string(), "Entropy device is not supported.");
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn displays_memory_hotplug_unsupported_error() {
+        let err = VmmActionError::MemoryHotplugUnsupported;
+
+        assert_eq!(err.to_string(), "Memory hotplug is not supported.");
         assert!(err.source().is_none());
     }
 

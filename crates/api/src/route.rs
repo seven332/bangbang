@@ -11,6 +11,7 @@ pub enum Endpoint {
     Entropy,
     Logger,
     MachineConfig,
+    MemoryHotplug,
     Metrics,
     Mmds,
     Drive,
