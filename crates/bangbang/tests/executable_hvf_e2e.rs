@@ -250,6 +250,27 @@ mod macos_arm64 {
             replacement_vsock_path.display()
         );
 
+        let network_update_body = r#"{
+            "iface_id":"eth0",
+            "host_dev_name":"vmnet:shared",
+            "guest_mac":"12:34:56:78:9a:bc",
+            "mtu":1500
+        }"#;
+        let network_update_response = http_put_json(
+            &socket_path,
+            "/network-interfaces/eth0",
+            network_update_body,
+        );
+        assert_bad_request_response(
+            &network_update_response,
+            "PUT /network-interfaces/eth0 after InstanceStart",
+        );
+        assert_response_contains(
+            &network_update_response,
+            r#"{"fault_message":"The requested operation is not supported in Running state: PutNetworkInterface"}"#,
+            "PUT /network-interfaces/eth0 after InstanceStart",
+        );
+
         let vm_config = http_get(&socket_path, "/vm/config");
         assert_ok_response(&vm_config, "GET /vm/config after InstanceStart");
         assert_response_contains(
@@ -286,6 +307,15 @@ mod macos_arm64 {
         assert!(
             !vm_config.contains(&format!(r#""uds_path":{replacement_vsock_path_json}"#)),
             "rejected vsock update must not mutate the configured socket path; response:\n{vm_config}"
+        );
+        assert_response_contains(
+            &vm_config,
+            r#""network-interfaces":[]"#,
+            "GET /vm/config after InstanceStart",
+        );
+        assert!(
+            !vm_config.contains(r#""iface_id":"eth0""#),
+            "rejected network update must not add an interface; response:\n{vm_config}"
         );
         UnixStream::connect(&uds_path).unwrap_or_else(|err| {
             panic!(
