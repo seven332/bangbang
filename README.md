@@ -42,8 +42,8 @@ cargo run -p bangbang -- --api-sock /tmp/bangbang.socket --id demo-1
   `anonymous-instance`.
 - `--start-time-us <MICROS>`, `--start-time-cpu-us <MICROS>`, and
   `--parent-cpu-time-us <MICROS>` accept Firecracker launcher timing values for
-  configured minimal metrics output after successful startup, explicit
-  `FlushMetrics`, and periodic runtime metrics flushes.
+  configured minimal startup metrics output, explicit `FlushMetrics`, and
+  periodic runtime metrics flushes.
 - `--metrics-path <PATH>` configures the same per-process metrics sink as
   `PUT /metrics` before the API socket is served.
 - `--mmds-size-limit <BYTES>` sets the maximum serialized MMDS data-store size.
@@ -154,12 +154,13 @@ curl --unix-socket /tmp/bangbang.socket \
   -d '{"metrics_path":"/tmp/bangbang.metrics"}'
 ```
 
-Configured metrics output records a minimal JSON line for explicit runtime
-`FlushMetrics` actions and for periodic runtime metrics flushes every 60
-seconds while the VM is running. After `InstanceStart`, the line also includes a
+Configured metrics output records an initial minimal JSON line when startup
+metrics are configured successfully. It also records explicit runtime
+`FlushMetrics` actions and periodic runtime metrics flushes every 60 seconds
+while the VM is running. After `InstanceStart`, the line also includes a
 `boot_run_loop_status` summary such as `running`, `exited`, or `failed` when a
 process-owned boot worker exists. When startup timing CLI values are provided,
-the same line includes `start_time_us`, `start_time_cpu_us`, and
+the same metrics output includes `start_time_us`, `start_time_cpu_us`, and
 `parent_cpu_time_us`. The current Firecracker-shaped API request metrics subset
 also reports selected GET counters under `get_api_requests`, parsed core
 configuration, MMDS, observability, and `/actions` counters under
