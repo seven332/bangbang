@@ -309,9 +309,8 @@ guest and host payloads with a host Unix listener at the Firecracker-style
 `uds_path_<PORT>` path, and write `BANGBANG_VSOCK_GUEST_CONNECT_OK` only after
 every reply matches. The signed e2e also verifies the retained host stream
 reports EOF after the guest closes the AF_VSOCK stream. When the boot args
-include
-`bangbang.vsock-host-connect=1`, Python instead binds and listens on the test
-AF_VSOCK port, writes
+include `bangbang.vsock-host-connect=1`, Python instead binds and listens on
+the test AF_VSOCK port, writes
 `BANGBANG_VSOCK_HOST_CONNECT_READY` only after the guest listener is ready,
 accepts the host's Firecracker-style `CONNECT <PORT>` request through the main
 `uds_path` after the host consumes the `OK <local_port>` response, exchanges
