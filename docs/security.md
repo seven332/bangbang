@@ -244,7 +244,11 @@ that source reports a queued response. It also has a process-local
 opaque token authority with a default `1024`-entry active-token store and can
 model process-local guest `PUT /latest/api/token` exchanges that return
 generated tokens. When MMDS v2 is configured, process-local guest GET handling
-requires a valid generated token before returning metadata. The runtime can
+requires a valid generated token before returning metadata. The signed
+executable e2e coverage includes a direct-rootfs v2 token flow that requests a
+guest token and uses it for metadata access, while the guest init script emits
+only static success or failure markers and must not log generated tokens or
+metadata values. The runtime can
 classify ARP requests for the configured MMDS IPv4 address and raw
 Ethernet/IPv4/TCP guest packet bytes as MMDS candidates only when they target
 the configured MMDS IPv4 address and TCP port `80`; malformed, truncated,

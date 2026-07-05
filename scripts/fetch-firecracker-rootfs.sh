@@ -114,7 +114,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v8"
+direct_boot_variant="direct-boot-v9"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -381,34 +381,41 @@ first_network_iface() {
   return 1
 }
 
-fetch_mmds_marker() {
+prepare_mmds_network() {
   if ! command -v ip >/dev/null 2>&1; then
-    emit_line BANGBANG_MMDS_FETCH_FAIL_NO_IP
-    write_vdb_marker BANGBANG_MMDS_FETCH_FAIL
-    return
+    emit_line "${1}_NO_IP"
+    write_vdb_marker "$2"
+    return 1
   fi
 
   if ! command -v curl >/dev/null 2>&1; then
-    emit_line BANGBANG_MMDS_FETCH_FAIL_NO_CURL
-    write_vdb_marker BANGBANG_MMDS_FETCH_FAIL
-    return
+    emit_line "${1}_NO_CURL"
+    write_vdb_marker "$2"
+    return 1
   fi
 
   mmds_iface=$(first_network_iface || true)
   if [ -z "$mmds_iface" ]; then
-    emit_line BANGBANG_MMDS_FETCH_FAIL_NO_IFACE
-    write_vdb_marker BANGBANG_MMDS_FETCH_FAIL
-    return
+    emit_line "${1}_NO_IFACE"
+    write_vdb_marker "$2"
+    return 1
   fi
 
   if ! ip link set dev "$mmds_iface" up 2>/dev/null; then
-    emit_line BANGBANG_MMDS_FETCH_FAIL_LINK
-    write_vdb_marker BANGBANG_MMDS_FETCH_FAIL
-    return
+    emit_line "${1}_LINK"
+    write_vdb_marker "$2"
+    return 1
   fi
 
   ip addr add 169.254.100.2/16 dev "$mmds_iface" 2>/dev/null || true
   ip route replace 169.254.0.0/16 dev "$mmds_iface" src 169.254.100.2 2>/dev/null || true
+  return 0
+}
+
+fetch_mmds_marker() {
+  if ! prepare_mmds_network BANGBANG_MMDS_FETCH_FAIL BANGBANG_MMDS_FETCH_FAIL; then
+    return
+  fi
 
   mmds_value=$(
     curl \
@@ -427,6 +434,51 @@ fetch_mmds_marker() {
   else
     emit_line BANGBANG_MMDS_FETCH_FAIL_RESPONSE
     write_vdb_marker BANGBANG_MMDS_FETCH_FAIL
+  fi
+}
+
+fetch_mmds_v2_marker() {
+  if ! prepare_mmds_network BANGBANG_MMDS_V2_FETCH_FAIL BANGBANG_MMDS_V2_FETCH_FAIL; then
+    return
+  fi
+
+  mmds_token=$(
+    curl \
+      --fail \
+      --silent \
+      --show-error \
+      --connect-timeout 2 \
+      --max-time 5 \
+      -X PUT \
+      -H 'X-metadata-token-ttl-seconds: 60' \
+      http://169.254.169.254/latest/api/token \
+      2>/dev/null || true
+  )
+
+  if [ "${#mmds_token}" -ne 64 ]; then
+    emit_line BANGBANG_MMDS_V2_FETCH_FAIL_TOKEN
+    write_vdb_marker BANGBANG_MMDS_V2_FETCH_FAIL
+    return
+  fi
+
+  mmds_value=$(
+    curl \
+      --fail \
+      --silent \
+      --show-error \
+      --connect-timeout 2 \
+      --max-time 5 \
+      -H "X-metadata-token: $mmds_token" \
+      http://169.254.169.254/meta-data/bangbang-marker \
+      2>/dev/null || true
+  )
+
+  if [ "$mmds_value" = BANGBANG_MMDS_GUEST_VALUE ]; then
+    emit_line BANGBANG_MMDS_V2_FETCH_OK
+    write_vdb_marker BANGBANG_MMDS_V2_GUEST_FETCH_OK
+  else
+    emit_line BANGBANG_MMDS_V2_FETCH_FAIL_RESPONSE
+    write_vdb_marker BANGBANG_MMDS_V2_FETCH_FAIL
   fi
 }
 
@@ -451,7 +503,9 @@ if [ -r /proc/cmdline ]; then
   emit_line "$cmdline"
   emit_line BANGBANG_CMDLINE_END
 fi
-if cmdline_has bangbang.mmds-fetch=1; then
+if cmdline_has bangbang.mmds-v2-fetch=1; then
+  fetch_mmds_v2_marker
+elif cmdline_has bangbang.mmds-fetch=1; then
   fetch_mmds_marker
 else
   write_vdb_marker BANGBANG_DIRECT_ROOTFS_BLOCK_OK
