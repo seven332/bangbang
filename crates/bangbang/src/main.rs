@@ -39,11 +39,8 @@ const UNSUPPORTED_FIRECRACKER_ARGS: &[&str] = &[
     "describe-snapshot",
     "enable-pci",
     "no-seccomp",
-    "parent-cpu-time-us",
     "seccomp-filter",
     "snapshot-version",
-    "start-time-cpu-us",
-    "start-time-us",
 ];
 
 fn main() -> ExitCode {
@@ -82,7 +79,15 @@ fn run() -> Result<(), ProcessError> {
                 metadata,
                 metrics_config,
                 no_api,
+                startup_time,
             } = config;
+            // Accepted for Firecracker-compatible launchers; reporting is deferred
+            // until full process startup metrics are implemented.
+            let StartupTimeConfig {
+                start_time_us: _,
+                start_time_cpu_us: _,
+                parent_cpu_time_us: _,
+            } = startup_time;
 
             println!("bangbang {}", env!("CARGO_PKG_VERSION"));
             println!(
@@ -679,6 +684,14 @@ struct StartupConfig {
     metadata: Option<String>,
     metrics_config: Option<MetricsConfigInput>,
     no_api: bool,
+    startup_time: StartupTimeConfig,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StartupTimeConfig {
+    start_time_us: Option<u64>,
+    start_time_cpu_us: Option<u64>,
+    parent_cpu_time_us: Option<u64>,
 }
 
 impl Default for StartupConfig {
@@ -693,6 +706,7 @@ impl Default for StartupConfig {
             metadata: None,
             metrics_config: None,
             no_api: false,
+            startup_time: StartupTimeConfig::default(),
         }
     }
 }
@@ -763,8 +777,11 @@ impl Args {
         let mut metrics_path_seen = false;
         let mut module_seen = false;
         let mut no_api_seen = false;
+        let mut parent_cpu_time_us_seen = false;
         let mut show_level_seen = false;
         let mut show_log_origin_seen = false;
+        let mut start_time_cpu_us_seen = false;
+        let mut start_time_us_seen = false;
         let mut index = 0;
 
         while let Some(arg) = args.get(index) {
@@ -858,6 +875,16 @@ impl Args {
                     no_api_seen = true;
                     index += 1;
                 }
+                "--parent-cpu-time-us" => {
+                    if parent_cpu_time_us_seen {
+                        return Err("duplicate argument: --parent-cpu-time-us".to_string());
+                    }
+                    let value = take_value(&args, index, "--parent-cpu-time-us")?;
+                    config.startup_time.parent_cpu_time_us =
+                        Some(parse_startup_time_us(&value, "parent-cpu-time-us")?);
+                    parent_cpu_time_us_seen = true;
+                    index += 2;
+                }
                 "--metrics-path" => {
                     if metrics_path_seen {
                         return Err("duplicate argument: --metrics-path".to_string());
@@ -894,6 +921,26 @@ impl Args {
                     logger_config_seen = true;
                     show_log_origin_seen = true;
                     index += 1;
+                }
+                "--start-time-cpu-us" => {
+                    if start_time_cpu_us_seen {
+                        return Err("duplicate argument: --start-time-cpu-us".to_string());
+                    }
+                    let value = take_value(&args, index, "--start-time-cpu-us")?;
+                    config.startup_time.start_time_cpu_us =
+                        Some(parse_startup_time_us(&value, "start-time-cpu-us")?);
+                    start_time_cpu_us_seen = true;
+                    index += 2;
+                }
+                "--start-time-us" => {
+                    if start_time_us_seen {
+                        return Err("duplicate argument: --start-time-us".to_string());
+                    }
+                    let value = take_value(&args, index, "--start-time-us")?;
+                    config.startup_time.start_time_us =
+                        Some(parse_startup_time_us(&value, "start-time-us")?);
+                    start_time_us_seen = true;
+                    index += 2;
                 }
                 other => {
                     if let Some(name) = unsupported_flag_equals_syntax(other) {
@@ -968,6 +1015,12 @@ fn help_text() -> String {
             "      --no-api          Start from --config-file without publishing an API socket\n",
             "      --show-level       Include level in minimal logger action lines\n",
             "      --show-log-origin  Include callsite origin in minimal logger action lines\n",
+            "      --start-time-us <MICROS>\n",
+            "                         Process start wall-clock time for future metrics\n",
+            "      --start-time-cpu-us <MICROS>\n",
+            "                         Process start CPU time for future metrics\n",
+            "      --parent-cpu-time-us <MICROS>\n",
+            "                         Parent process CPU time for future metrics\n",
             "  -V, --version          Print version\n",
             "  -h, --help             Print help\n\n",
             "Current scope:\n",
@@ -1043,6 +1096,12 @@ fn parse_mmds_size_limit(value: &str) -> Result<usize, String> {
     parse_positive_usize_arg(value, "mmds-size-limit")
 }
 
+fn parse_startup_time_us(value: &str, name: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("invalid --{name}: value must be a non-negative integer"))
+}
+
 fn parse_positive_usize_arg(value: &str, name: &str) -> Result<usize, String> {
     let parsed = value
         .parse::<usize>()
@@ -1103,6 +1162,9 @@ fn unsupported_equals_syntax(arg: &str) -> Option<&'static str> {
         ("--metrics-path=", "metrics-path"),
         ("--mmds-size-limit=", "mmds-size-limit"),
         ("--module=", "module"),
+        ("--parent-cpu-time-us=", "parent-cpu-time-us"),
+        ("--start-time-cpu-us=", "start-time-cpu-us"),
+        ("--start-time-us=", "start-time-us"),
     ]
     .into_iter()
     .find_map(|(prefix, name)| arg.starts_with(prefix).then_some(name))
@@ -1134,7 +1196,7 @@ mod tests {
     use super::{
         ApiServerError, Args, Command, DEFAULT_API_SOCK_PATH, DEFAULT_INSTANCE_ID,
         HTTP_MAX_PAYLOAD_SIZE, MAX_INSTANCE_ID_LEN, ProcessError, ProcessExitCode, StartupConfig,
-        parse_process_args,
+        StartupTimeConfig, parse_process_args,
     };
 
     #[derive(Debug, Clone)]
@@ -1298,6 +1360,7 @@ mod tests {
         assert_eq!(config.metrics_config, None);
         assert_eq!(config.metadata, None);
         assert!(!config.no_api);
+        assert_eq!(config.startup_time, StartupTimeConfig::default());
     }
 
     #[test]
@@ -1333,6 +1396,9 @@ mod tests {
         assert!(help.contains("--no-api"));
         assert!(help.contains("without publishing an API socket"));
         assert!(help.contains("--show-level"));
+        assert!(help.contains("--start-time-us <MICROS>"));
+        assert!(help.contains("--start-time-cpu-us <MICROS>"));
+        assert!(help.contains("--parent-cpu-time-us <MICROS>"));
         assert!(help.contains("PUT /actions starts a process-owned HVF boot run-loop worker"));
         assert!(help.contains("across bounded step windows for InstanceStart"));
         assert!(help.contains("public run-loop control is not implemented yet"));
@@ -1509,6 +1575,73 @@ mod tests {
     }
 
     #[test]
+    fn parse_startup_time_args() {
+        let config = parse_run(&[
+            "--start-time-us",
+            "1000",
+            "--start-time-cpu-us",
+            "2000",
+            "--parent-cpu-time-us",
+            "3000",
+        ])
+        .expect("startup timing args should parse");
+
+        assert_eq!(
+            config.startup_time,
+            StartupTimeConfig {
+                start_time_us: Some(1000),
+                start_time_cpu_us: Some(2000),
+                parent_cpu_time_us: Some(3000),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_zero_startup_time_args() {
+        let config = parse_run(&[
+            "--start-time-us",
+            "0",
+            "--start-time-cpu-us",
+            "0",
+            "--parent-cpu-time-us",
+            "0",
+        ])
+        .expect("zero startup timing args should parse");
+
+        assert_eq!(
+            config.startup_time,
+            StartupTimeConfig {
+                start_time_us: Some(0),
+                start_time_cpu_us: Some(0),
+                parent_cpu_time_us: Some(0),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_max_startup_time_args() {
+        let max_value = u64::MAX.to_string();
+        let config = parse_run(&[
+            "--start-time-us",
+            &max_value,
+            "--start-time-cpu-us",
+            &max_value,
+            "--parent-cpu-time-us",
+            &max_value,
+        ])
+        .expect("maximum startup timing args should parse");
+
+        assert_eq!(
+            config.startup_time,
+            StartupTimeConfig {
+                start_time_us: Some(u64::MAX),
+                start_time_cpu_us: Some(u64::MAX),
+                parent_cpu_time_us: Some(u64::MAX),
+            }
+        );
+    }
+
+    #[test]
     fn parse_startup_args_together() {
         let config = parse_run(&[
             "--api-sock",
@@ -1525,6 +1658,12 @@ mod tests {
             "/tmp/mmds.json",
             "--metrics-path",
             "/tmp/bangbang.metrics",
+            "--start-time-us",
+            "1000",
+            "--start-time-cpu-us",
+            "2000",
+            "--parent-cpu-time-us",
+            "3000",
         ])
         .expect("startup args should parse");
 
@@ -1541,6 +1680,14 @@ mod tests {
         assert_eq!(
             config.metrics_config,
             Some(MetricsConfigInput::new("/tmp/bangbang.metrics"))
+        );
+        assert_eq!(
+            config.startup_time,
+            StartupTimeConfig {
+                start_time_us: Some(1000),
+                start_time_cpu_us: Some(2000),
+                parent_cpu_time_us: Some(3000),
+            }
         );
     }
 
@@ -1612,6 +1759,23 @@ mod tests {
             parse(&["--metrics-path", "--id"]).expect_err("missing metrics path value should fail");
 
         assert_eq!(err, "missing value for --metrics-path");
+    }
+
+    #[test]
+    fn rejects_missing_startup_time_values() {
+        let err = parse(&["--start-time-us", "--id"]).expect_err("missing start time should fail");
+
+        assert_eq!(err, "missing value for --start-time-us");
+
+        let err = parse(&["--start-time-cpu-us", "--id"])
+            .expect_err("missing start CPU time should fail");
+
+        assert_eq!(err, "missing value for --start-time-cpu-us");
+
+        let err = parse(&["--parent-cpu-time-us", "--id"])
+            .expect_err("missing parent CPU time should fail");
+
+        assert_eq!(err, "missing value for --parent-cpu-time-us");
     }
 
     #[test]
@@ -1781,6 +1945,50 @@ mod tests {
         .expect_err("duplicate metrics-path arg should fail");
 
         assert_eq!(err, "duplicate argument: --metrics-path");
+    }
+
+    #[test]
+    fn rejects_duplicate_startup_time_args() {
+        let err = parse(&["--start-time-us", "1", "--start-time-us", "2"])
+            .expect_err("duplicate start time should fail");
+
+        assert_eq!(err, "duplicate argument: --start-time-us");
+
+        let err = parse(&["--start-time-cpu-us", "1", "--start-time-cpu-us", "2"])
+            .expect_err("duplicate start CPU time should fail");
+
+        assert_eq!(err, "duplicate argument: --start-time-cpu-us");
+
+        let err = parse(&["--parent-cpu-time-us", "1", "--parent-cpu-time-us", "2"])
+            .expect_err("duplicate parent CPU time should fail");
+
+        assert_eq!(err, "duplicate argument: --parent-cpu-time-us");
+    }
+
+    #[test]
+    fn rejects_invalid_startup_time_args() {
+        let err = parse(&["--start-time-us", "-1"]).expect_err("negative start time should fail");
+
+        assert_eq!(
+            err,
+            "invalid --start-time-us: value must be a non-negative integer"
+        );
+
+        let err = parse(&["--start-time-cpu-us", "abc"])
+            .expect_err("non-numeric start CPU time should fail");
+
+        assert_eq!(
+            err,
+            "invalid --start-time-cpu-us: value must be a non-negative integer"
+        );
+
+        let err = parse(&["--parent-cpu-time-us", "999999999999999999999999999999"])
+            .expect_err("overflowing parent CPU time should fail");
+
+        assert_eq!(
+            err,
+            "invalid --parent-cpu-time-us: value must be a non-negative integer"
+        );
     }
 
     #[test]
@@ -1977,6 +2185,27 @@ mod tests {
         assert_eq!(
             err,
             "unsupported argument syntax for --metadata; use --metadata <VALUE>"
+        );
+
+        let err = parse(&["--start-time-us=1000"]).expect_err("equals syntax should fail");
+
+        assert_eq!(
+            err,
+            "unsupported argument syntax for --start-time-us; use --start-time-us <VALUE>"
+        );
+
+        let err = parse(&["--start-time-cpu-us=2000"]).expect_err("equals syntax should fail");
+
+        assert_eq!(
+            err,
+            "unsupported argument syntax for --start-time-cpu-us; use --start-time-cpu-us <VALUE>"
+        );
+
+        let err = parse(&["--parent-cpu-time-us=3000"]).expect_err("equals syntax should fail");
+
+        assert_eq!(
+            err,
+            "unsupported argument syntax for --parent-cpu-time-us; use --parent-cpu-time-us <VALUE>"
         );
     }
 

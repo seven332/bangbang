@@ -124,6 +124,9 @@ control yet.
 | `--api-sock <PATH>` | binds the API Unix socket | Firecracker defaults to `/run/firecracker.socket`; bangbang defaults to `/tmp/bangbang.socket` because macOS does not normally provide `/run`. This is an intentional host-platform difference. |
 | `--http-api-max-payload-size <BYTES>` | configures the maximum accepted HTTP API request size | Defaults to Firecracker's `51200` byte limit. The configured value applies to API socket reads and final request parsing. Zero, malformed, duplicate, and equals-syntax values are rejected during argument parsing. |
 | `--id <ID>` | parsed and stored | Defaults to Firecracker's `anonymous-instance`. IDs must be 1 to 64 bytes and contain only ASCII alphanumeric characters or `-`. |
+| `--start-time-us <MICROS>` | parsed and stored for future metrics | Accepts non-negative `u64` microsecond values passed by Firecracker-style launchers. Full `ProcessTimeReporter` integration and metrics output remain deferred. |
+| `--start-time-cpu-us <MICROS>` | parsed and stored for future metrics | Accepts non-negative `u64` microsecond values passed by Firecracker-style launchers. Full `ProcessTimeReporter` integration and metrics output remain deferred. |
+| `--parent-cpu-time-us <MICROS>` | parsed and stored for future metrics | Accepts non-negative `u64` microsecond values passed by Firecracker-style launchers. Full `ProcessTimeReporter` integration and metrics output remain deferred. |
 | `--metrics-path <PATH>` | configures metrics output before API serving | Uses the same per-process metrics sink and redacted host-path error policy as `PUT /metrics`. A later duplicate `PUT /metrics` request fails without replacing this sink. |
 | `--log-path <PATH>` | configures logger output before API serving | Uses the same per-process logger sink and redacted host-path error policy as `PUT /logger`. |
 | `--level <LEVEL>` | configures logger level before API serving | Accepts the existing logger levels `Off`, `Trace`, `Debug`, `Info`, `Warn`, `Warning`, and `Error`; minimal action logs are emitted only when the configured level allows `Info`. |
@@ -137,6 +140,10 @@ control yet.
 | `--version`, `-V` | prints version | `-V` is retained from the existing bangbang scaffold. |
 | `--no-api` | config-file startup without API socket | Requires `--config-file`. Starts the supported config-file subset without binding or publishing the configured API socket, then waits for handled `SIGINT` or `SIGTERM`. Runtime control, guest-initiated shutdown, and no-api exit-code parity remain deferred. |
 | seccomp, snapshot, boot timer, and PCI process flags | rejected | These Firecracker options are Linux-specific or tied to later capability work. |
+
+Startup timing arguments are intentionally retained without being exposed in
+`GET /vm/config`, logs, or the current minimal metrics output. They reserve the
+Firecracker-compatible process input shape for a later metrics parity change.
 
 bangbang intentionally treats `--id` alphanumeric characters as ASCII only.
 This is stricter than Firecracker `v1.16.0`'s Rust validator, which accepts

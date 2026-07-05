@@ -39,6 +39,10 @@ cargo run -p bangbang -- --api-sock /tmp/bangbang.socket --id demo-1
   request size. The default is `51200` bytes.
 - `--id <ID>` records the microVM identifier. The default is
   `anonymous-instance`.
+- `--start-time-us <MICROS>`, `--start-time-cpu-us <MICROS>`, and
+  `--parent-cpu-time-us <MICROS>` accept Firecracker launcher timing values for
+  future metrics integration; the current minimal metrics output does not report
+  them yet.
 - `--metrics-path <PATH>` configures the same per-process metrics sink as
   `PUT /metrics` before the API socket is served.
 - `--mmds-size-limit <BYTES>` sets the maximum serialized MMDS data-store size.
