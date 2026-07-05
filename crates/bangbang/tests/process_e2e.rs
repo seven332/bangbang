@@ -261,6 +261,46 @@ fn executable_rejects_remaining_device_requests_without_mutating() {
         }
     }
 
+    for path in ["/balloon", "/balloon/statistics", "/balloon/hinting/status"] {
+        let request_name = format!("GET {path}");
+        let response = http_get(&socket_path, path);
+
+        assert_bad_request_response(&response, &request_name);
+        assert_response_contains(
+            &response,
+            r#"{"fault_message":"Balloon device is not supported."}"#,
+            &request_name,
+        );
+    }
+
+    for (path, body) in [
+        ("/balloon", r#"{"amount_mib":32}"#),
+        ("/balloon/statistics", r#"{"stats_polling_interval_s":1}"#),
+        ("/balloon/hinting/start", r#"{"acknowledge_on_stop":false}"#),
+    ] {
+        let request_name = format!("PATCH {path}");
+        let response = http_json(&socket_path, "PATCH", path, body);
+
+        assert_bad_request_response(&response, &request_name);
+        assert_response_contains(
+            &response,
+            r#"{"fault_message":"Balloon device is not supported."}"#,
+            &request_name,
+        );
+    }
+
+    let balloon_hinting_stop_response =
+        http_no_body(&socket_path, "PATCH", "/balloon/hinting/stop");
+    assert_bad_request_response(
+        &balloon_hinting_stop_response,
+        "PATCH /balloon/hinting/stop",
+    );
+    assert_response_contains(
+        &balloon_hinting_stop_response,
+        r#"{"fault_message":"Balloon device is not supported."}"#,
+        "PATCH /balloon/hinting/stop",
+    );
+
     let pmem_delete_response = http_no_body(&socket_path, "DELETE", "/pmem/pmem0");
     assert_bad_request_response(&pmem_delete_response, "DELETE /pmem/pmem0");
     assert_response_contains(
