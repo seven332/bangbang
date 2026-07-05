@@ -291,13 +291,14 @@ of the pinned Firecracker rootfs with a test-specific
 boots without the tiny initrd, attaches that ext4 image as a read-only root
 drive, and passes `init=/bangbang-direct-rootfs-init`. The `guest_boot` target
 expects deterministic serial markers plus Ubuntu os-release content from
-`/etc/os-release`; the executable HVF e2e target observes
-`BANGBANG_DIRECT_ROOTFS_BLOCK_OK` in a second writable scratch drive because it
-does not expose public serial output. When the boot args also include
-`bangbang.mmds-fetch=1`, the same init script configures the first non-loopback
-guest interface with a link-local address, runs a bounded `curl` request for
-`/meta-data/bangbang-marker`, and writes `BANGBANG_MMDS_GUEST_FETCH_OK` to the
-scratch drive only after the expected MMDS value is returned. With
+`/etc/os-release`; the direct-rootfs executable HVF e2e scenarios observe
+`BANGBANG_DIRECT_ROOTFS_BLOCK_OK` in a second writable scratch drive because
+those scenarios do not configure a public serial output path. When the boot
+args also include `bangbang.mmds-fetch=1`, the same init script configures the
+first non-loopback guest interface with a link-local address, runs a bounded
+`curl` request for `/meta-data/bangbang-marker`, and writes
+`BANGBANG_MMDS_GUEST_FETCH_OK` to the scratch drive only after the expected
+MMDS value is returned. With
 `bangbang.mmds-v2-fetch=1`, it first requests a v2 token from
 `/latest/api/token`, then fetches the same marker with the token header and
 writes `BANGBANG_MMDS_V2_GUEST_FETCH_OK`. The init script emits only static
