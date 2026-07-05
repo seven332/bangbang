@@ -284,7 +284,7 @@ artifacts and is not a substitute for a production rootfs build process.
 The signed `guest_boot` and executable HVF e2e targets also validate a
 deterministic direct-rootfs boot. For those scenarios,
 `scripts/run-integration-tests.sh` prepares
-`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v14.ext4`
+`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v15.ext4`
 after confirming the host can execute HVF. The generated image is an ext4 copy
 of the pinned Firecracker rootfs with a test-specific
 `/bangbang-direct-rootfs-init` script added before image creation. The test
@@ -304,11 +304,12 @@ writes `BANGBANG_MMDS_V2_GUEST_FETCH_OK`. The init script emits only static
 success or failure markers for this path; it must not print generated tokens or
 metadata values. When the boot args include `bangbang.vsock-guest-connect=1`,
 the same init script uses the rootfs-provided Python `AF_VSOCK` support to
-connect to host CID 2 on the test port, exchange deterministic payload bytes
-with a host Unix listener at the Firecracker-style `uds_path_<PORT>` path, and
-write `BANGBANG_VSOCK_GUEST_CONNECT_OK` only after the reply matches. When the
-boot args include `bangbang.vsock-host-connect=1`, Python instead binds and
-listens on the test AF_VSOCK port, writes
+connect to host CID 2 on the test port, exchange multiple ordered deterministic
+guest and host payloads with a host Unix listener at the Firecracker-style
+`uds_path_<PORT>` path, and write `BANGBANG_VSOCK_GUEST_CONNECT_OK` only after
+every reply matches. When the boot args include
+`bangbang.vsock-host-connect=1`, Python instead binds and listens on the test
+AF_VSOCK port, writes
 `BANGBANG_VSOCK_HOST_CONNECT_READY` only after the guest listener is ready,
 accepts the host's Firecracker-style `CONNECT <PORT>` request through the main
 `uds_path` after the host consumes the `OK <local_port>` response, exchanges
@@ -317,11 +318,11 @@ writes `BANGBANG_VSOCK_HOST_CONNECT_OK` only after every payload matches. These
 checks prove the kernel mounted the virtio-block root drive as `/`, give
 executable-boundary MMDS fetch coverage through the process-local MMDS-only
 packet path, and cover guest-initiated plus host-initiated virtio-vsock
-connection exchange through the signed executable, including a narrow
-multi-payload host-initiated stream case. They do not claim that bangbang can
-boot an arbitrary distro image through its default init, that full networking
-compatibility is complete, or that full vsock throughput, graceful half-close
-behavior, and credit accounting are complete.
+connection exchange through the signed executable, including narrow
+multi-payload stream cases in both directions. They do not claim that bangbang
+can boot an arbitrary distro image through its default init, that full
+networking compatibility is complete, or that full vsock throughput, graceful
+half-close behavior, and credit accounting are complete.
 
 bangbang appends Firecracker-style root-drive command-line arguments during
 startup resource assembly when a configured drive has `is_root_device=true`.

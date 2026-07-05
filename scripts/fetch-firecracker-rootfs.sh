@@ -114,7 +114,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v14"
+direct_boot_variant="direct-boot-v15"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -503,13 +503,28 @@ import sys
 
 HOST_CID = getattr(socket, "VMADDR_CID_HOST", 2)
 PORT = 5005
-GUEST_PAYLOAD = b"BANGBANG_VSOCK_GUEST_PAYLOAD"
-HOST_REPLY = b"BANGBANG_VSOCK_HOST_REPLY"
+PAYLOAD_PAIRS = (
+    (b"BANGBANG_VSOCK_GUEST_STREAM_ONE", b"BANGBANG_VSOCK_HOST_STREAM_ONE"),
+    (b"BANGBANG_VSOCK_GUEST_STREAM_TWO", b"BANGBANG_VSOCK_HOST_STREAM_TWO"),
+)
 
 
 def fail(reason):
     print(f"BANGBANG_VSOCK_GUEST_CONNECT_FAIL_{reason}")
     sys.exit(1)
+
+
+def recv_exact(stream, size):
+    data = b""
+    while len(data) < size:
+        try:
+            chunk = stream.recv(size - len(data))
+        except OSError:
+            fail("RECV")
+        if not chunk:
+            fail("EOF")
+        data += chunk
+    return data
 
 
 if not hasattr(socket, "AF_VSOCK"):
@@ -527,23 +542,15 @@ try:
     except OSError:
         fail("CONNECT")
 
-    try:
-        stream.sendall(GUEST_PAYLOAD)
-    except OSError:
-        fail("SEND")
-
-    reply = b""
-    while len(reply) < len(HOST_REPLY):
+    for index, (guest_payload, host_reply) in enumerate(PAYLOAD_PAIRS, start=1):
         try:
-            chunk = stream.recv(len(HOST_REPLY) - len(reply))
+            stream.sendall(guest_payload)
         except OSError:
-            fail("RECV")
-        if not chunk:
-            fail("EOF")
-        reply += chunk
+            fail(f"SEND_{index}")
 
-    if reply != HOST_REPLY:
-        fail("REPLY")
+        reply = recv_exact(stream, len(host_reply))
+        if reply != host_reply:
+            fail(f"REPLY_{index}")
 
     print("BANGBANG_VSOCK_GUEST_CONNECT_OK")
 finally:
