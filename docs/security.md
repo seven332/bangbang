@@ -206,10 +206,12 @@ explicit. The current HVF runner emulates only the early-boot `OSDLR_EL1` and
 unsupported trapped system registers fail closed instead of being treated as
 generic no-ops.
 
-The current serial device is an internal TX-only MMIO output path with bounded
-capture. Public serial output streaming is not implemented. Treat serial output
-as guest data; future public exposure must document whether the host is expected
-to observe it and how it is bounded.
+The current serial device is a TX-only MMIO output path. By default, guest
+serial bytes go to a bounded internal capture buffer; when `/serial` configures
+`serial_out_path`, startup opens that host path and routes guest TX bytes there.
+Treat serial output as untrusted guest data. Reviews for serial-output changes
+must preserve explicit host-observation behavior, bounded buffering or writes,
+path redaction, and per-process ownership.
 
 Block devices can expose host file contents to the guest and can write to the
 backing file when configured read-write. Operators should use dedicated disk
@@ -410,7 +412,7 @@ The current scaffold does not implement:
   checks, dispatch real event payloads, track graceful half-close state, or
   implement full virtio-vsock credit accounting.
 - complete production logging or metrics policy
-- public run-loop control or public serial streaming policy
+- public run-loop control or serial input, rate-limiting, and streaming policy
 
 These are future security design and implementation topics. PRs that add new
 host-facing resources should update this document and include resource-specific
