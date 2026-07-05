@@ -233,6 +233,23 @@ mod macos_arm64 {
             replacement_logger_path.display()
         );
 
+        let replacement_vsock_path = test_dir.path().join("replacement-vsock.sock");
+        let replacement_vsock_path_json = json_string(path_text(&replacement_vsock_path));
+        let vsock_update_body =
+            format!(r#"{{"guest_cid":4,"uds_path":{replacement_vsock_path_json}}}"#);
+        let vsock_update_response = http_put_json(&socket_path, "/vsock", &vsock_update_body);
+        assert_bad_request_response(&vsock_update_response, "PUT /vsock after InstanceStart");
+        assert_response_contains(
+            &vsock_update_response,
+            r#"{"fault_message":"The requested operation is not supported in Running state: PutVsock"}"#,
+            "PUT /vsock after InstanceStart",
+        );
+        assert!(
+            !replacement_vsock_path.exists(),
+            "rejected vsock update must not create or bind replacement socket path {}",
+            replacement_vsock_path.display()
+        );
+
         let vm_config = http_get(&socket_path, "/vm/config");
         assert_ok_response(&vm_config, "GET /vm/config after InstanceStart");
         assert_response_contains(
@@ -265,6 +282,10 @@ mod macos_arm64 {
             &vm_config,
             &format!(r#""uds_path":{uds_path_json}"#),
             "GET /vm/config after InstanceStart",
+        );
+        assert!(
+            !vm_config.contains(&format!(r#""uds_path":{replacement_vsock_path_json}"#)),
+            "rejected vsock update must not mutate the configured socket path; response:\n{vm_config}"
         );
         UnixStream::connect(&uds_path).unwrap_or_else(|err| {
             panic!(
@@ -346,6 +367,11 @@ mod macos_arm64 {
         assert!(
             !uds_path.exists(),
             "bangbang shutdown should remove its owned vsock listener path"
+        );
+        assert!(
+            !replacement_vsock_path.exists(),
+            "rejected vsock update must not leave replacement socket path {}",
+            replacement_vsock_path.display()
         );
     }
 
