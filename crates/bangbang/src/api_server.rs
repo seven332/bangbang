@@ -18,9 +18,9 @@ use bangbang_api::http::{
     LoggerLevel as ApiLoggerLevel, MachineConfigPatchRequest, MachineConfigRequest,
     MachineConfigResponse, MetricsConfigRequest, MmdsConfigRequest, MmdsConfigResponse,
     MmdsContentRequest, MmdsVersion as ApiMmdsVersion, NetworkInterfaceConfigRequest,
-    NetworkInterfaceConfigResponse, RequestError, SerialConfigRequest, VmConfigResponse,
-    VmStateUpdate, VmStateUpdateRequest, VsockConfigRequest, VsockConfigResponse,
-    parse_request_with_limit, request_total_len_with_limit,
+    NetworkInterfaceConfigResponse, NetworkInterfacePatchRequest, RequestError,
+    SerialConfigRequest, VmConfigResponse, VmStateUpdate, VmStateUpdateRequest, VsockConfigRequest,
+    VsockConfigResponse, parse_request_with_limit, request_total_len_with_limit,
 };
 use bangbang_runtime::block::{
     DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine, DriveUpdateInput,
@@ -39,7 +39,9 @@ use bangbang_runtime::mmds::{
 };
 #[cfg(test)]
 use bangbang_runtime::network::MAX_NETWORK_INTERFACE_COUNT;
-use bangbang_runtime::network::{NetworkInterfaceConfig, NetworkInterfaceConfigInput};
+use bangbang_runtime::network::{
+    NetworkInterfaceConfig, NetworkInterfaceConfigInput, NetworkInterfaceUpdateInput,
+};
 use bangbang_runtime::serial::SerialConfigInput;
 use bangbang_runtime::vsock::{VsockConfig, VsockConfigInput};
 use bangbang_runtime::{VmConfiguration, VmmAction, VmmActionError, VmmData};
@@ -570,6 +572,9 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PutNetworkInterface(config) => handle_empty(vmm.handle_put_request(
             PutApiRequest::network(network_interface_config_input_from_request(config.as_ref())),
         )),
+        ApiRequest::PatchNetworkInterface(config) => handle_empty(vmm.handle_patch_request(
+            PatchApiRequest::network(network_interface_update_input_from_request(config.as_ref())),
+        )),
         ApiRequest::PutSerial(config) => handle_empty(vmm.handle_put_request(
             PutApiRequest::serial(serial_config_input_from_request(config.as_ref())),
         )),
@@ -633,6 +638,7 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         | ApiRequest::PatchDrive(_)
         | ApiRequest::PatchMachineConfig(_)
         | ApiRequest::PatchMmds(_)
+        | ApiRequest::PatchNetworkInterface(_)
         | ApiRequest::PatchVmState(_)
         | ApiRequest::PutAction(_)
         | ApiRequest::PutMmds(_) => None,
@@ -1043,6 +1049,12 @@ fn network_interface_config_input_from_request(
     }
 
     input
+}
+
+fn network_interface_update_input_from_request(
+    config: &NetworkInterfacePatchRequest,
+) -> NetworkInterfaceUpdateInput {
+    NetworkInterfaceUpdateInput::new(config.path_iface_id(), config.body_iface_id())
 }
 
 fn serial_config_input_from_request(config: &SerialConfigRequest) -> SerialConfigInput {
@@ -3477,7 +3489,7 @@ mod tests {
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"patch_api_requests\":{\"drive_count\":0,\"drive_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":1,\"mmds_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":4,\"mmds_fails\":2,\"network_count\":1,\"network_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"patch_api_requests\":{\"drive_count\":0,\"drive_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":1,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":4,\"mmds_fails\":2,\"network_count\":1,\"network_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
@@ -3545,6 +3557,34 @@ mod tests {
         );
         assert_eq!(
             handle_request_bytes(
+                request_with_body(
+                    "PATCH",
+                    "/network-interfaces/eth0",
+                    r#"{"iface_id":"eth0"}"#
+                )
+                .as_bytes(),
+                &mut vmm,
+            )
+            .status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+        let vm_config_after_network_patch = handle_request_bytes(
+            b"GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &mut vmm,
+        );
+        assert_eq!(
+            vm_config_after_network_patch.status(),
+            bangbang_api::http::StatusCode::Ok
+        );
+        assert!(
+            vm_config_after_network_patch
+                .body()
+                .contains(r#""network-interfaces":[]"#),
+            "rejected network PATCH must not add network interface config; response:\n{}",
+            vm_config_after_network_patch.body()
+        );
+        assert_eq!(
+            handle_request_bytes(
                 request_with_body("PATCH", "/vm", r#"{"state":"Paused"}"#).as_bytes(),
                 &mut vmm,
             )
@@ -3573,7 +3613,7 @@ mod tests {
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"patch_api_requests\":{\"drive_count\":1,\"drive_fails\":1,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"mmds_count\":2,\"mmds_fails\":1},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"patch_api_requests\":{\"drive_count\":1,\"drive_fails\":1,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"mmds_count\":2,\"mmds_fails\":1,\"network_count\":1,\"network_fails\":1},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");

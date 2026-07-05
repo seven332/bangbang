@@ -28,9 +28,9 @@ use bangbang_runtime::mmds::{
 use bangbang_runtime::mmio::MmioRegionId;
 use bangbang_runtime::network::{
     NetworkInterfaceConfig, NetworkInterfaceConfigError, NetworkInterfaceConfigInput,
-    NetworkMmioLayout, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
-    VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame, VirtioNetworkTxPacketSink,
-    VirtioNetworkTxPacketSinkError, validate_network_interface_count,
+    NetworkInterfaceUpdateInput, NetworkMmioLayout, VirtioNetworkRxPacket,
+    VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame,
+    VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError, validate_network_interface_count,
 };
 use bangbang_runtime::serial::{
     SerialConfigError, SerialConfigInput, SerialOutputFile, SharedSerialOutput,
@@ -324,6 +324,13 @@ impl PatchApiRequest {
         }
     }
 
+    pub(crate) fn network(input: NetworkInterfaceUpdateInput) -> Self {
+        Self {
+            kind: PatchApiRequestKind::Network,
+            action: VmmAction::UpdateNetworkInterface(input),
+        }
+    }
+
     fn record_request(&self, controller: &mut VmmController) {
         self.kind.record_request(controller);
     }
@@ -338,6 +345,7 @@ enum PatchApiRequestKind {
     Drive,
     MachineConfig,
     Mmds,
+    Network,
 }
 
 impl PatchApiRequestKind {
@@ -346,6 +354,7 @@ impl PatchApiRequestKind {
             Self::Drive => controller.record_patch_drive_request(),
             Self::MachineConfig => controller.record_patch_machine_config_request(),
             Self::Mmds => controller.record_patch_mmds_request(),
+            Self::Network => controller.record_patch_network_request(),
         }
     }
 
@@ -354,6 +363,7 @@ impl PatchApiRequestKind {
             Self::Drive => controller.record_patch_drive_failure(),
             Self::MachineConfig => controller.record_patch_machine_config_failure(),
             Self::Mmds => controller.record_patch_mmds_failure(),
+            Self::Network => controller.record_patch_network_failure(),
         }
     }
 }
@@ -2722,6 +2732,7 @@ mod tests {
             | VmmActionError::MmdsDataStore(_)
             | VmmActionError::MmdsState(_)
             | VmmActionError::NetworkInterfaceConfig(_)
+            | VmmActionError::NetworkInterfaceUpdateUnsupported
             | VmmActionError::SerialConfig(_)
             | VmmActionError::VsockConfig(_) => {
                 panic!("vmnet start failure should propagate as hypervisor startup error");

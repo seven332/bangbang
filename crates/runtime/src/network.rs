@@ -64,6 +64,12 @@ pub struct NetworkInterfaceConfigInput {
     tx_rate_limiter_configured: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkInterfaceUpdateInput {
+    path_iface_id: String,
+    body_iface_id: String,
+}
+
 impl NetworkInterfaceConfigInput {
     pub fn new(
         path_iface_id: impl Into<String>,
@@ -131,6 +137,23 @@ impl NetworkInterfaceConfigInput {
 
     pub fn validate(self) -> Result<NetworkInterfaceConfig, NetworkInterfaceConfigError> {
         NetworkInterfaceConfig::try_from(self)
+    }
+}
+
+impl NetworkInterfaceUpdateInput {
+    pub fn new(path_iface_id: impl Into<String>, body_iface_id: impl Into<String>) -> Self {
+        Self {
+            path_iface_id: path_iface_id.into(),
+            body_iface_id: body_iface_id.into(),
+        }
+    }
+
+    pub fn path_iface_id(&self) -> &str {
+        &self.path_iface_id
+    }
+
+    pub fn body_iface_id(&self) -> &str {
+        &self.body_iface_id
     }
 }
 
