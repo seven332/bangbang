@@ -485,6 +485,30 @@ impl VmmController {
         self.metrics_state.record_put_vsock_failure();
     }
 
+    pub fn record_patch_drive_request(&mut self) {
+        self.metrics_state.record_patch_drive_request();
+    }
+
+    pub fn record_patch_drive_failure(&mut self) {
+        self.metrics_state.record_patch_drive_failure();
+    }
+
+    pub fn record_patch_machine_config_request(&mut self) {
+        self.metrics_state.record_patch_machine_config_request();
+    }
+
+    pub fn record_patch_machine_config_failure(&mut self) {
+        self.metrics_state.record_patch_machine_config_failure();
+    }
+
+    pub fn record_patch_mmds_request(&mut self) {
+        self.metrics_state.record_patch_mmds_request();
+    }
+
+    pub fn record_patch_mmds_failure(&mut self) {
+        self.metrics_state.record_patch_mmds_failure();
+    }
+
     pub fn record_get_instance_info_request(&mut self) {
         self.metrics_state.record_get_instance_info_request();
     }

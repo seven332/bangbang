@@ -77,6 +77,7 @@ pub struct MetricsState {
     sink: Option<MetricsSink>,
     flush_count: u64,
     get_api_requests: GetApiRequestMetrics,
+    patch_api_requests: PatchApiRequestMetrics,
     put_api_requests: PutApiRequestMetrics,
 }
 
@@ -184,6 +185,30 @@ impl MetricsState {
         self.put_api_requests.record_vsock_failure();
     }
 
+    pub(crate) fn record_patch_drive_request(&mut self) {
+        self.patch_api_requests.record_drive_request();
+    }
+
+    pub(crate) fn record_patch_drive_failure(&mut self) {
+        self.patch_api_requests.record_drive_failure();
+    }
+
+    pub(crate) fn record_patch_machine_config_request(&mut self) {
+        self.patch_api_requests.record_machine_config_request();
+    }
+
+    pub(crate) fn record_patch_machine_config_failure(&mut self) {
+        self.patch_api_requests.record_machine_config_failure();
+    }
+
+    pub(crate) fn record_patch_mmds_request(&mut self) {
+        self.patch_api_requests.record_mmds_request();
+    }
+
+    pub(crate) fn record_patch_mmds_failure(&mut self) {
+        self.patch_api_requests.record_mmds_failure();
+    }
+
     pub(crate) fn record_get_instance_info_request(&mut self) {
         self.get_api_requests.record_instance_info_request();
     }
@@ -212,6 +237,7 @@ impl MetricsState {
             next_flush_count,
             diagnostics,
             self.get_api_requests,
+            self.patch_api_requests,
             self.put_api_requests,
         )?;
         self.flush_count = next_flush_count;
@@ -271,6 +297,75 @@ impl GetApiRequestMetrics {
 
     const fn mmds_count(self) -> u64 {
         self.mmds_count
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PatchApiRequestMetrics {
+    drive_count: u64,
+    drive_fails: u64,
+    machine_cfg_count: u64,
+    machine_cfg_fails: u64,
+    mmds_count: u64,
+    mmds_fails: u64,
+}
+
+impl PatchApiRequestMetrics {
+    const fn is_empty(self) -> bool {
+        self.drive_count == 0
+            && self.drive_fails == 0
+            && self.machine_cfg_count == 0
+            && self.machine_cfg_fails == 0
+            && self.mmds_count == 0
+            && self.mmds_fails == 0
+    }
+
+    fn record_drive_request(&mut self) {
+        self.drive_count = self.drive_count.saturating_add(1);
+    }
+
+    fn record_drive_failure(&mut self) {
+        self.drive_fails = self.drive_fails.saturating_add(1);
+    }
+
+    fn record_machine_config_request(&mut self) {
+        self.machine_cfg_count = self.machine_cfg_count.saturating_add(1);
+    }
+
+    fn record_machine_config_failure(&mut self) {
+        self.machine_cfg_fails = self.machine_cfg_fails.saturating_add(1);
+    }
+
+    fn record_mmds_request(&mut self) {
+        self.mmds_count = self.mmds_count.saturating_add(1);
+    }
+
+    fn record_mmds_failure(&mut self) {
+        self.mmds_fails = self.mmds_fails.saturating_add(1);
+    }
+
+    const fn drive_count(self) -> u64 {
+        self.drive_count
+    }
+
+    const fn drive_fails(self) -> u64 {
+        self.drive_fails
+    }
+
+    const fn machine_cfg_count(self) -> u64 {
+        self.machine_cfg_count
+    }
+
+    const fn machine_cfg_fails(self) -> u64 {
+        self.machine_cfg_fails
+    }
+
+    const fn mmds_count(self) -> u64 {
+        self.mmds_count
+    }
+
+    const fn mmds_fails(self) -> u64 {
+        self.mmds_fails
     }
 }
 
@@ -617,6 +712,7 @@ impl MetricsSink {
         flush_count: u64,
         diagnostics: &MetricsDiagnostics,
         get_api_requests: GetApiRequestMetrics,
+        patch_api_requests: PatchApiRequestMetrics,
         put_api_requests: PutApiRequestMetrics,
     ) -> Result<(), MetricsFlushError> {
         let mut vmm = serde_json::Map::new();
@@ -671,6 +767,37 @@ impl MetricsSink {
             root.insert(
                 "get_api_requests".to_string(),
                 serde_json::Value::Object(get_requests),
+            );
+        }
+        if !patch_api_requests.is_empty() {
+            let mut patch_requests = serde_json::Map::new();
+            patch_requests.insert(
+                "drive_count".to_string(),
+                serde_json::Value::Number(patch_api_requests.drive_count().into()),
+            );
+            patch_requests.insert(
+                "drive_fails".to_string(),
+                serde_json::Value::Number(patch_api_requests.drive_fails().into()),
+            );
+            patch_requests.insert(
+                "machine_cfg_count".to_string(),
+                serde_json::Value::Number(patch_api_requests.machine_cfg_count().into()),
+            );
+            patch_requests.insert(
+                "machine_cfg_fails".to_string(),
+                serde_json::Value::Number(patch_api_requests.machine_cfg_fails().into()),
+            );
+            patch_requests.insert(
+                "mmds_count".to_string(),
+                serde_json::Value::Number(patch_api_requests.mmds_count().into()),
+            );
+            patch_requests.insert(
+                "mmds_fails".to_string(),
+                serde_json::Value::Number(patch_api_requests.mmds_fails().into()),
+            );
+            root.insert(
+                "patch_api_requests".to_string(),
+                serde_json::Value::Object(patch_requests),
             );
         }
         if !put_api_requests.is_empty() {
@@ -911,6 +1038,32 @@ mod tests {
         assert_eq!(
             output,
             "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":1,\"boot_source_count\":0,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":0,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn writes_patch_api_request_metrics_when_recorded() {
+        let path = unique_metrics_path("api-request-patch");
+        let mut state = MetricsState::default();
+
+        state.record_patch_drive_request();
+        state.record_patch_drive_failure();
+        state.record_patch_machine_config_request();
+        state.record_patch_machine_config_request();
+        state.record_patch_machine_config_failure();
+        state.record_patch_mmds_request();
+        state.record_patch_mmds_failure();
+        state
+            .configure(MetricsConfigInput::new(&path))
+            .expect("metrics should configure");
+        assert_eq!(state.flush(), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("metrics output should be readable");
+        assert_eq!(
+            output,
+            "{\"patch_api_requests\":{\"drive_count\":1,\"drive_fails\":1,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"mmds_count\":1,\"mmds_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(path).expect("fixture should clean up");
