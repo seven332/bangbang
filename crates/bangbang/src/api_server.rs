@@ -1710,7 +1710,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_mmds_config_request_does_not_reach_runtime() {
+    fn empty_mmds_config_network_interface_list_reaches_runtime_without_mutating() {
         let mut vmm = test_controller();
         let body = r#"{"network_interfaces":[]}"#;
         let request = format!(
@@ -1726,12 +1726,21 @@ mod tests {
         );
         assert_eq!(
             response.body(),
-            r#"{"fault_message":"Malformed HTTP request."}"#
+            r#"{"fault_message":"MMDS network_interfaces must not be empty"}"#
         );
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::NotStarted
         );
+        let vm_config_response = handle_request_bytes(
+            b"GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &mut vmm,
+        );
+        assert_eq!(
+            vm_config_response.status(),
+            bangbang_api::http::StatusCode::Ok
+        );
+        assert!(!vm_config_response.body().contains(r#""mmds-config":"#));
         assert!(vmm.boot_source_config().is_none());
         assert!(vmm.drive_configs().is_empty());
     }

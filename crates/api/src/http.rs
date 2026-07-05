@@ -2228,11 +2228,10 @@ fn validate_machine_config_patch_request(
 }
 
 fn validate_mmds_config_request(body: &MmdsConfigRequestBody) -> Result<(), RequestError> {
-    if body.network_interfaces.is_empty()
-        || body
-            .network_interfaces
-            .iter()
-            .any(|iface_id| iface_id.trim().is_empty())
+    if body
+        .network_interfaces
+        .iter()
+        .any(|iface_id| iface_id.trim().is_empty())
     {
         return Err(RequestError::MalformedRequest);
     }
@@ -3482,6 +3481,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_put_mmds_config_with_empty_network_interfaces() {
+        let request = request_with_body("PUT", "/mmds/config", r#"{"network_interfaces":[]}"#);
+
+        let parsed = parse_request(&request).expect("empty MMDS interface list should parse");
+
+        let ApiRequest::PutMmdsConfig(config) = parsed else {
+            panic!("expected MMDS config request");
+        };
+        assert!(config.network_interfaces().is_empty());
+        assert_eq!(config.version(), MmdsVersion::V1);
+        assert_eq!(config.ipv4_address(), None);
+        assert!(!config.imds_compat());
+    }
+
+    #[test]
     fn parses_put_mmds_config_with_complete_body() {
         let body = r#"{
             "network_interfaces": ["eth0", "mgmt0"],
@@ -3556,7 +3570,6 @@ mod tests {
     fn rejects_put_mmds_config_invalid_body() {
         for body in [
             "{}",
-            r#"{"network_interfaces":[]}"#,
             r#"{"network_interfaces":["eth0",""]}"#,
             r#"{"network_interfaces":["eth0","   "]}"#,
             r#"{"network_interfaces":["eth0"],"version":"V3"}"#,
