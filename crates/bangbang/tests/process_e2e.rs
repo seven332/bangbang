@@ -261,6 +261,14 @@ fn executable_rejects_remaining_device_requests_without_mutating() {
         }
     }
 
+    let pmem_delete_response = http_no_body(&socket_path, "DELETE", "/pmem/pmem0");
+    assert_bad_request_response(&pmem_delete_response, "DELETE /pmem/pmem0");
+    assert_response_contains(
+        &pmem_delete_response,
+        r#"{"fault_message":"Pmem device is not supported."}"#,
+        "DELETE /pmem/pmem0",
+    );
+
     let instance_info = http_get(&socket_path, "/");
     assert_ok_response(&instance_info, "GET / after rejected remaining devices");
     assert_response_contains(
