@@ -997,24 +997,32 @@ fn executable_configures_network_and_mmds() {
         "malformed PATCH /network-interfaces/eth0",
     );
 
-    let vm_config_after_network_patch = http_get(&socket_path, "/vm/config");
+    let network_delete_response = http_no_body(&socket_path, "DELETE", "/network-interfaces/eth0");
+    assert_bad_request_response(&network_delete_response, "DELETE /network-interfaces/eth0");
+    assert_response_contains(
+        &network_delete_response,
+        r#"{"fault_message":"Network interface updates are not supported."}"#,
+        "DELETE /network-interfaces/eth0",
+    );
+
+    let vm_config_after_network_updates = http_get(&socket_path, "/vm/config");
     assert_ok_response(
-        &vm_config_after_network_patch,
-        "GET /vm/config after rejected network PATCH",
+        &vm_config_after_network_updates,
+        "GET /vm/config after rejected network updates",
     );
     assert_response_contains(
-        &vm_config_after_network_patch,
+        &vm_config_after_network_updates,
         r#""iface_id":"eth0""#,
-        "GET /vm/config after rejected network PATCH",
+        "GET /vm/config after rejected network updates",
     );
     assert_response_contains(
-        &vm_config_after_network_patch,
+        &vm_config_after_network_updates,
         r#""host_dev_name":"vmnet:shared""#,
-        "GET /vm/config after rejected network PATCH",
+        "GET /vm/config after rejected network updates",
     );
     assert!(
-        !vm_config_after_network_patch.contains(r#""iface_id":"eth1""#),
-        "rejected network PATCH must not add a new interface; response:\n{vm_config_after_network_patch}"
+        !vm_config_after_network_updates.contains(r#""iface_id":"eth1""#),
+        "rejected network updates must not add a new interface; response:\n{vm_config_after_network_updates}"
     );
 
     let put_mmds_response = http_put_json(
