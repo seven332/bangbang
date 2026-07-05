@@ -930,6 +930,71 @@ const fn default_balloon_acknowledge_on_stop() -> bool {
 }
 
 #[derive(Debug, Deserialize)]
+enum SnapshotTypeRequestBody {
+    Full,
+    Diff,
+}
+
+const fn default_snapshot_type_request_body() -> SnapshotTypeRequestBody {
+    SnapshotTypeRequestBody::Full
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotCreateRequestBody {
+    #[serde(default = "default_snapshot_type_request_body")]
+    snapshot_type: SnapshotTypeRequestBody,
+    snapshot_path: String,
+    mem_file_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+enum SnapshotMemBackendTypeRequestBody {
+    File,
+    Uffd,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotMemBackendRequestBody {
+    backend_path: String,
+    backend_type: SnapshotMemBackendTypeRequestBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct SnapshotNetworkOverrideRequestBody {
+    iface_id: String,
+    host_dev_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SnapshotVsockOverrideRequestBody {
+    uds_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotLoadRequestBody {
+    snapshot_path: String,
+    #[serde(default)]
+    mem_file_path: Option<String>,
+    #[serde(default)]
+    mem_backend: Option<SnapshotMemBackendRequestBody>,
+    #[serde(default)]
+    enable_diff_snapshots: bool,
+    #[serde(default)]
+    track_dirty_pages: bool,
+    #[serde(default)]
+    resume_vm: bool,
+    #[serde(default)]
+    network_overrides: Vec<SnapshotNetworkOverrideRequestBody>,
+    #[serde(default)]
+    vsock_override: Option<SnapshotVsockOverrideRequestBody>,
+    #[serde(default)]
+    clock_realtime: bool,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PmemConfigRequestBody {
     id: String,
@@ -1439,8 +1504,11 @@ pub fn parse_request_with_limit(
     if method == "PUT" && path == "/vsock" {
         return parse_vsock_config_request(body);
     }
-    if method == "PUT" && (path == "/snapshot/create" || path == "/snapshot/load") {
-        return Err(RequestError::SnapshotUnsupported);
+    if method == "PUT" && path == "/snapshot/create" {
+        return parse_snapshot_create_request(body);
+    }
+    if method == "PUT" && path == "/snapshot/load" {
+        return parse_snapshot_load_request(body);
     }
 
     match (method, path) {
@@ -1812,6 +1880,67 @@ fn parse_balloon_hinting_start_request(body: &[u8]) -> Result<ApiRequest, Reques
     let _ = acknowledge_on_stop;
 
     Err(RequestError::BalloonUnsupported)
+}
+
+fn parse_snapshot_create_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
+    let SnapshotCreateRequestBody {
+        snapshot_type,
+        snapshot_path,
+        mem_file_path,
+    } = serde_json::from_slice::<SnapshotCreateRequestBody>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+    let _ = (snapshot_type, snapshot_path, mem_file_path);
+
+    Err(RequestError::SnapshotUnsupported)
+}
+
+fn parse_snapshot_load_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
+    let SnapshotLoadRequestBody {
+        snapshot_path,
+        mem_file_path,
+        mem_backend,
+        enable_diff_snapshots,
+        track_dirty_pages,
+        resume_vm,
+        network_overrides,
+        vsock_override,
+        clock_realtime,
+    } = serde_json::from_slice::<SnapshotLoadRequestBody>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+
+    if mem_file_path.is_some() == mem_backend.is_some() {
+        return Err(RequestError::MalformedRequest);
+    }
+
+    let _ = (
+        snapshot_path,
+        mem_file_path,
+        enable_diff_snapshots,
+        track_dirty_pages,
+        resume_vm,
+        clock_realtime,
+    );
+
+    if let Some(mem_backend) = mem_backend {
+        let SnapshotMemBackendRequestBody {
+            backend_path,
+            backend_type,
+        } = mem_backend;
+        let _ = (backend_path, backend_type);
+    }
+    for network_override in network_overrides {
+        let SnapshotNetworkOverrideRequestBody {
+            iface_id,
+            host_dev_name,
+        } = network_override;
+        let _ = (iface_id, host_dev_name);
+    }
+    if let Some(vsock_override) = vsock_override {
+        let SnapshotVsockOverrideRequestBody { uds_path } = vsock_override;
+        let _ = uds_path;
+    }
+
+    Err(RequestError::SnapshotUnsupported)
 }
 
 fn parse_memory_hotplug_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
@@ -5302,24 +5431,128 @@ mod tests {
     }
 
     #[test]
-    fn rejects_snapshot_create_as_unsupported() {
-        let request = request_with_body("PUT", "/snapshot/create", "{}");
+    fn rejects_valid_snapshot_create_as_unsupported() {
+        for body in [
+            r#"{"snapshot_path":"vmstate","mem_file_path":"memory"}"#,
+            r#"{"snapshot_type":"Full","snapshot_path":"vmstate","mem_file_path":"memory"}"#,
+            r#"{"snapshot_type":"Diff","snapshot_path":"vmstate","mem_file_path":"memory"}"#,
+        ] {
+            let request = request_with_body("PUT", "/snapshot/create", body);
 
-        let err = parse_request(&request).expect_err("snapshot create should be unsupported");
-        assert_eq!(err, RequestError::SnapshotUnsupported);
-        assert_eq!(
-            err.fault_message(),
-            "Snapshot and restore are not supported."
-        );
+            let err = parse_request(&request).expect_err("snapshot create should be unsupported");
+            assert_eq!(err, RequestError::SnapshotUnsupported, "{body}");
+            assert_eq!(
+                err.fault_message(),
+                "Snapshot and restore are not supported.",
+                "{body}"
+            );
+        }
     }
 
     #[test]
-    fn rejects_snapshot_load_as_unsupported() {
-        let request = request_with_body("PUT", "/snapshot/load", "{}");
+    fn rejects_invalid_snapshot_create_before_unsupported() {
+        for body in [
+            "not-json",
+            "",
+            "null",
+            "[]",
+            "{}",
+            r#"{"snapshot_path":"vmstate"}"#,
+            r#"{"mem_file_path":"memory"}"#,
+            r#"{"snapshot_type":"Incremental","snapshot_path":"vmstate","mem_file_path":"memory"}"#,
+            r#"{"snapshot_type":true,"snapshot_path":"vmstate","mem_file_path":"memory"}"#,
+            r#"{"snapshot_path":42,"mem_file_path":"memory"}"#,
+            r#"{"snapshot_path":"vmstate","mem_file_path":42}"#,
+            r#"{"snapshot_path":"vmstate","mem_file_path":"memory","unknown":true}"#,
+        ] {
+            let request = request_with_body("PUT", "/snapshot/create", body);
+
+            assert_eq!(
+                parse_request(&request),
+                Err(RequestError::MalformedRequest),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_valid_snapshot_load_as_unsupported() {
+        for body in [
+            r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"}}"#,
+            r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"Uffd"},"enable_diff_snapshots":true,"track_dirty_pages":true,"resume_vm":true,"clock_realtime":true}"#,
+            r#"{"snapshot_path":"vmstate","mem_file_path":"memory","resume_vm":true}"#,
+            r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"},"network_overrides":[{"iface_id":"eth0","host_dev_name":"tap0"}],"vsock_override":{"uds_path":"/tmp/v.sock"}}"#,
+            r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"},"network_overrides":[{"iface_id":"eth0","host_dev_name":"tap0","unknown":true}],"vsock_override":{"uds_path":"/tmp/v.sock","unknown":true}}"#,
+        ] {
+            let request = request_with_body("PUT", "/snapshot/load", body);
+
+            let err = parse_request(&request).expect_err("snapshot load should be unsupported");
+            assert_eq!(err, RequestError::SnapshotUnsupported, "{body}");
+            assert_eq!(
+                err.fault_message(),
+                "Snapshot and restore are not supported.",
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_snapshot_load_before_unsupported() {
+        for body in [
+            "not-json",
+            "",
+            "null",
+            "[]",
+            "{}",
+            r#"{"snapshot_path":"vmstate"}"#,
+            r#"{"mem_backend":{"backend_path":"memory","backend_type":"File"}}"#,
+            r#"{"snapshot_path":"vmstate","mem_file_path":"memory","mem_backend":{"backend_path":"memory","backend_type":"File"}}"#,
+            r#"{"snapshot_path":"vmstate","mem_backend":null}"#,
+            r#"{"snapshot_path":"vmstate","mem_file_path":42}"#,
+            r#"{"snapshot_path":42,"mem_file_path":"memory"}"#,
+            r#"{"snapshot_path":"vmstate","mem_backend":{"backend_type":"File"}}"#,
+            r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory"}}"#,
+            r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"Shared"}}"#,
+            r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File","unknown":true}}"#,
+            r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"},"enable_diff_snapshots":"true"}"#,
+            r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"},"track_dirty_pages":"true"}"#,
+            r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"},"resume_vm":"true"}"#,
+            r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"},"clock_realtime":"true"}"#,
+            r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"},"network_overrides":"eth0"}"#,
+            r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"},"network_overrides":[{"iface_id":"eth0"}]}"#,
+            r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"},"vsock_override":{}}"#,
+            r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"},"unknown":true}"#,
+        ] {
+            let request = request_with_body("PUT", "/snapshot/load", body);
+
+            assert_eq!(
+                parse_request(&request),
+                Err(RequestError::MalformedRequest),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_exact_snapshot_paths_as_invalid_path_method() {
+        for (method, path) in [
+            ("PUT", "/snapshot"),
+            ("PUT", "/snapshot/create/extra"),
+            ("PUT", "/snapshot/load/extra"),
+            ("PATCH", "/snapshot/load"),
+        ] {
+            let request = request_with_body(method, path, "{}");
+
+            assert_eq!(
+                parse_request(&request),
+                Err(RequestError::InvalidPathMethod),
+                "{method} {path}"
+            );
+        }
 
         assert_eq!(
-            parse_request(&request),
-            Err(RequestError::SnapshotUnsupported)
+            parse_request(b"GET /snapshot/create HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+            Err(RequestError::InvalidPathMethod)
         );
     }
 

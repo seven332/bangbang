@@ -3055,29 +3055,48 @@ mod tests {
 
     #[test]
     fn returns_fault_for_snapshot_endpoint() {
-        let path = unique_socket_path("snapshot-fault");
-        let server = ApiServer::bind(&path).expect("server should bind");
-        let mut client = UnixStream::connect(&path).expect("client should connect");
-
-        client
-            .write_all(
-                b"PUT /snapshot/create HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
-            )
-            .expect("client should write request");
         let mut vmm = test_controller();
-        server
-            .serve_next(&mut vmm)
-            .expect("server should handle one request");
+        for (socket_name, request, fault_message) in [
+            (
+                "snapshot-create",
+                request_with_body(
+                    "PUT",
+                    "/snapshot/create",
+                    r#"{"snapshot_path":"vmstate","mem_file_path":"memory"}"#,
+                ),
+                "Snapshot and restore are not supported.",
+            ),
+            (
+                "snapshot-load",
+                request_with_body(
+                    "PUT",
+                    "/snapshot/load",
+                    r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"}}"#,
+                ),
+                "Snapshot and restore are not supported.",
+            ),
+            (
+                "snapshot-create-bad",
+                request_with_body("PUT", "/snapshot/create", "{}"),
+                "Malformed HTTP request.",
+            ),
+            (
+                "snapshot-load-bad",
+                request_with_body("PUT", "/snapshot/load", r#"{"snapshot_path":"vmstate"}"#),
+                "Malformed HTTP request.",
+            ),
+        ] {
+            let response = request_over_socket(&mut vmm, socket_name, &request);
 
-        let mut response = String::new();
-        client
-            .read_to_string(&mut response)
-            .expect("client should read response");
-
-        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        assert!(
-            response.contains(r#"{"fault_message":"Snapshot and restore are not supported."}"#)
-        );
+            assert!(
+                response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+                "{socket_name}: {response}"
+            );
+            assert!(
+                response.contains(&format!(r#"{{"fault_message":"{fault_message}"}}"#)),
+                "{socket_name}: {response}"
+            );
+        }
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::NotStarted
