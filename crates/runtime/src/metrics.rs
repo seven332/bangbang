@@ -95,11 +95,11 @@ impl MetricsState {
         self.flush_with_diagnostics(&MetricsDiagnostics::default())
     }
 
-    pub fn record_put_actions_request(&mut self) {
+    pub(crate) fn record_put_actions_request(&mut self) {
         self.put_api_requests.record_actions_request();
     }
 
-    pub fn record_put_actions_failure(&mut self) {
+    pub(crate) fn record_put_actions_failure(&mut self) {
         self.put_api_requests.record_actions_failure();
     }
 
@@ -124,7 +124,7 @@ impl MetricsState {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PutApiRequestMetrics {
+struct PutApiRequestMetrics {
     actions_count: u64,
     actions_fails: u64,
 }
@@ -142,11 +142,11 @@ impl PutApiRequestMetrics {
         self.actions_fails = self.actions_fails.saturating_add(1);
     }
 
-    pub const fn actions_count(self) -> u64 {
+    const fn actions_count(self) -> u64 {
         self.actions_count
     }
 
-    pub const fn actions_fails(self) -> u64 {
+    const fn actions_fails(self) -> u64 {
         self.actions_fails
     }
 }
