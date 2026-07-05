@@ -182,6 +182,24 @@ mod macos_arm64 {
             replacement_kernel_path.display()
         );
 
+        let cpu_config_response = http_put_json(&socket_path, "/cpu-config", "{}");
+        assert_bad_request_response(&cpu_config_response, "PUT /cpu-config after InstanceStart");
+        assert_response_contains(
+            &cpu_config_response,
+            r#"{"fault_message":"The requested operation is not supported in Running state: PutCpuConfig"}"#,
+            "PUT /cpu-config after InstanceStart",
+        );
+        let instance_info_after_cpu_config = http_get(&socket_path, "/");
+        assert_ok_response(
+            &instance_info_after_cpu_config,
+            "GET / after rejected PUT /cpu-config",
+        );
+        assert_response_contains(
+            &instance_info_after_cpu_config,
+            r#""state":"Running""#,
+            "GET / after rejected PUT /cpu-config",
+        );
+
         let replacement_backing_path = test_dir.path().join("replacement-data.img");
         let replacement_backing_path_json = json_string(path_text(&replacement_backing_path));
         let drive_update_body = format!(
@@ -312,6 +330,16 @@ mod macos_arm64 {
                 r#""kernel_image_path":{replacement_kernel_path_json}"#
             )),
             "rejected boot-source update must not mutate the configured kernel path; response:\n{vm_config}"
+        );
+        assert_response_contains(
+            &vm_config,
+            r#""vcpu_count":1"#,
+            "GET /vm/config after InstanceStart",
+        );
+        assert_response_contains(
+            &vm_config,
+            r#""mem_size_mib":256"#,
+            "GET /vm/config after InstanceStart",
         );
         assert_response_contains(
             &vm_config,
