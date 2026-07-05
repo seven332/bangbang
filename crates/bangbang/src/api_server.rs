@@ -3140,25 +3140,32 @@ mod tests {
 
     #[test]
     fn returns_fault_for_entropy_endpoint() {
-        let path = unique_socket_path("entropy-fault");
-        let server = ApiServer::bind(&path).expect("server should bind");
-        let mut client = UnixStream::connect(&path).expect("client should connect");
-
-        client
-            .write_all(b"PUT /entropy HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}")
-            .expect("client should write request");
         let mut vmm = test_controller();
-        server
-            .serve_next(&mut vmm)
-            .expect("server should handle one request");
+        for (socket_name, body, fault_message) in [
+            ("ent-ok", "{}", "Entropy device is not supported."),
+            ("ent-bad", "not-json", "Malformed HTTP request."),
+            (
+                "ent-rl",
+                r#"{"rate_limiter":{"bandwidth":{"size":1}}}"#,
+                "Malformed HTTP request.",
+            ),
+        ] {
+            let request = format!(
+                "PUT /entropy HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
 
-        let mut response = String::new();
-        client
-            .read_to_string(&mut response)
-            .expect("client should read response");
+            let response = request_over_socket(&mut vmm, socket_name, &request);
 
-        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        assert!(response.contains(r#"{"fault_message":"Entropy device is not supported."}"#));
+            assert!(
+                response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+                "{socket_name}: {response}"
+            );
+            assert!(
+                response.contains(&format!(r#"{{"fault_message":"{fault_message}"}}"#)),
+                "{socket_name}: {response}"
+            );
+        }
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::NotStarted
