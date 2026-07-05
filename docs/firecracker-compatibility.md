@@ -102,7 +102,7 @@ socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
 action/data boundary. Validation rejects malformed boot-source, drive update,
 VM state update, and actions requests before VMM state mutation.
 Successful `InstanceStart` startup, the `Running` transition, and an internal boot run-loop worker across bounded step windows are implemented with configured or default internal serial MMIO
-output and retained internal active, terminal-outcome, or error worker status. `FlushMetrics` is implemented as a runtime-only minimal JSON-line flush through per-process metrics state, and includes a terse `boot_run_loop_status` summary when a process-owned boot worker exists. `PUT /logger` is implemented as pre-boot per-process observability configuration with minimal successful `InstanceStart` and `FlushMetrics` action-event output; public run-loop control, public serial
+output and retained internal active, terminal-outcome, or error worker status. `FlushMetrics` is implemented as a runtime-only minimal JSON-line flush through per-process metrics state, and includes a terse `boot_run_loop_status` summary when a process-owned boot worker exists plus initial Firecracker-shaped `/actions` API request counters. `PUT /logger` is implemented as pre-boot per-process observability configuration with minimal successful `InstanceStart` and `FlushMetrics` action-event output; public run-loop control, public serial
 streaming, full Firecracker metrics counters, periodic flush, and full logger integration remain deferred.
 
 ## Process Startup CLI
@@ -150,7 +150,9 @@ Startup timing arguments are intentionally not exposed in `GET /vm/config` or
 logs because they are process observability data, not guest configuration. When
 metrics are configured and the VM is running, explicit `FlushMetrics` writes
 provided values under the minimal `vmm` metrics object; omitted timing arguments
-remain omitted. Full Firecracker `ProcessTimeReporter` parity remains deferred.
+remain omitted. Runtime action requests are counted under the root
+`put_api_requests` metrics object for the initial `/actions` subset. Full
+Firecracker `ProcessTimeReporter` parity remains deferred.
 
 bangbang intentionally treats `--id` alphanumeric characters as ASCII only.
 This is stricter than Firecracker `v1.16.0`'s Rust validator, which accepts
@@ -270,8 +272,8 @@ compatibility targets.
 | `PATCH` | `/machine-config` | supported target; implemented | Applies pre-boot partial updates to the stored machine configuration, preserving omitted fields and rejecting invalid updates without mutation. |
 | `PUT` | `/boot-source` | supported target; implemented | Stores guest kernel path, optional initrd path, and optional boot arguments before boot; host files are opened during startup preparation. |
 | `PUT` | `/drives/{drive_id}` | supported target; implemented | Stores initial virtio-block device configuration before boot; backing files are opened during startup preparation. |
-| `PUT` | `/metrics` | supported target; minimal subset implemented | Stores process metrics output before boot, opens the configured file/FIFO path with nonblocking output semantics, and omits metrics from `GET /vm/config` because it is not guest configuration. Duplicate initialization returns a fault. Minimal output can include startup timing CLI values when they were provided. |
-| `PUT` | `/actions` | supported target; internal startup execution and minimal metrics flush implemented | Parses `InstanceStart` and `FlushMetrics` request bodies and routes them through the process VMM owner. `InstanceStart` validates stored boot-source and state preflight, prepares an owned HVF boot session with the configured serial output path or the default internal serial MMIO console on success, starts a process-owned internal boot run-loop worker across bounded step windows, writes one minimal action log line when logger output is configured and enabled, and commits `Running` only after the worker handle and action log are retained. `FlushMetrics` is rejected before startup and returns `204 No Content` after startup; configured metrics output receives one minimal JSON line with flush count, optional startup timing fields, and optional boot-run-loop status, configured logger output receives one minimal action log line when enabled, and unconfigured metrics/logger output is a no-op success. |
+| `PUT` | `/metrics` | supported target; minimal subset implemented | Stores process metrics output before boot, opens the configured file/FIFO path with nonblocking output semantics, and omits metrics from `GET /vm/config` because it is not guest configuration. Duplicate initialization returns a fault. Minimal output can include startup timing CLI values and initial `/actions` API request counters. |
+| `PUT` | `/actions` | supported target; internal startup execution and minimal metrics flush implemented | Parses `InstanceStart` and `FlushMetrics` request bodies and routes them through the process VMM owner. `InstanceStart` validates stored boot-source and state preflight, prepares an owned HVF boot session with the configured serial output path or the default internal serial MMIO console on success, starts a process-owned internal boot run-loop worker across bounded step windows, writes one minimal action log line when logger output is configured and enabled, and commits `Running` only after the worker handle and action log are retained. `FlushMetrics` is rejected before startup and returns `204 No Content` after startup; configured metrics output receives one minimal JSON line with flush count, `put_api_requests.actions_count`, `put_api_requests.actions_fails`, optional startup timing fields, and optional boot-run-loop status, configured logger output receives one minimal action log line when enabled, and unconfigured metrics/logger output is a no-op success. |
 | `PUT` | `/actions` with `SendCtrlAltDel` | intentionally unsupported; parser rejected | Firecracker gates this action on x86 keyboard behavior; the first bangbang target is Apple Silicon. |
 | `PUT` | `/logger` | supported target; minimal subset implemented | Stores process logger configuration before boot, opens `log_path` with nonblocking output semantics when provided, accepts optional Firecracker-shaped level/show/module fields, and omits logger state from `GET /vm/config` because it is not guest configuration. Successful `InstanceStart` and `FlushMetrics` append deterministic `action=...` lines when the configured level allows `Info`; full internal log routing remains deferred. |
 | `PUT` | `/serial` | supported target; output path subset implemented | Stores Firecracker-shaped pre-boot serial output configuration with optional `serial_out_path`; `{}` and `"serial_out_path": null` clear the configured public output path. `InstanceStart` opens the configured file/FIFO path with nonblocking output semantics and routes guest TX serial MMIO bytes to it. Serial input/stdin, configured `rate_limiter`, metrics, and public streaming remain deferred. |
@@ -411,7 +413,7 @@ exist.
 | `PATCH /hotplug/memory` | `requested_size_mib` | required; unsupported after parser validation | Required Firecracker-shaped target hotpluggable-memory size. The parser accepts syntactically valid unsigned integer values before returning the memory-hotplug unsupported fault. Real resize behavior remains deferred. |
 | `PATCH /hotplug/memory` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /actions` | `action_type=InstanceStart` | process-routed; internal startup execution across bounded step windows implemented | Validates stored boot-source and state preflight first, then attempts owned HVF boot-session preparation with configured serial output or the default internal serial MMIO console and starts the process-owned internal boot run-loop worker across bounded step windows. Success returns `204 No Content`, writes one minimal logger action line when configured and enabled, and commits `Running`; preparation, worker-start, or logger-output failures return a fault without mutating state. Public run-loop control and public serial streaming remain deferred. |
-| `PUT /actions` | `action_type=FlushMetrics` | runtime-only; minimal execution implemented | Rejected before startup. After startup, returns `204 No Content`; if metrics output was configured, appends one minimal JSON line, and if logger output was configured and enabled, appends one minimal action line. Full Firecracker counters, periodic flush, and full logger integration remain deferred. |
+| `PUT /actions` | `action_type=FlushMetrics` | runtime-only; minimal execution implemented | Rejected before startup. After startup, returns `204 No Content`; if metrics output was configured, appends one minimal JSON line with `metrics_flush_count` and the initial `put_api_requests.actions_count` / `actions_fails` counters, and if logger output was configured and enabled, appends one minimal action line. Full Firecracker counters, periodic flush, and full logger integration remain deferred. |
 | `PUT /actions` | `action_type=SendCtrlAltDel` | intentionally unsupported; parser rejected | Firecracker gates this on x86 keyboard behavior; the first target is Apple Silicon. |
 | `PUT /actions` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 
@@ -457,8 +459,11 @@ initialize the metrics sink before the API socket is served. Duplicate
 initialization fails without replacing the original sink. `FlushMetrics` is
 runtime-only: it fails before startup, succeeds without writing when the sink is
 unconfigured, and writes one minimal JSON line when `--metrics-path` or
-`PUT /metrics` configured an output path. Public run-loop control, guest boot
-output, public runner loop scheduling, full Firecracker metrics counters,
+`PUT /metrics` configured an output path. The line includes initial
+Firecracker-shaped `put_api_requests.actions_count` and `actions_fails`
+counters for parsed `/actions` requests routed through VMM control. Public
+run-loop control, guest boot output, public runner loop scheduling, full
+Firecracker metrics counters,
 periodic metrics flush, and full logger integration remain deferred.
 The process startup path and API/VMM state path implement the logger field
 policy above as pre-boot-only per-process observability configuration. Startup

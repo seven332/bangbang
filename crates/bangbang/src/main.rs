@@ -2302,7 +2302,7 @@ mod tests {
             .expect("flush metrics should succeed");
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
         assert_eq!(
             fs::read_to_string(&logger_path).expect("logger output should be readable"),
@@ -2582,7 +2582,7 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(&path).expect("metrics output should be readable"),
-            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(path).expect("fixture should clean up");
