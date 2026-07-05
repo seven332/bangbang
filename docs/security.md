@@ -125,8 +125,8 @@ is resource-specific:
   successful streams in a bounded guest-initiated connection table, and deliver
   guest-visible `VSOCK_OP_RESPONSE` headers. Connect, duplicate, or retention
   failures deliver guest-visible `VSOCK_OP_RST` headers and retain no stream.
-  Established guest-initiated connections can forward bounded guest
-  `VSOCK_OP_RW` payload bytes to the retained host stream, keep a bounded
+  Established host-initiated or guest-initiated connections can forward bounded
+  guest `VSOCK_OP_RW` payload bytes to the retained host stream, keep a bounded
   four-packet per-connection guest-to-host retry queue for partial or
   would-block nonblocking writes, and retry pending bytes on later notification
   dispatch before accepting more guest `RW` data for the same connection.
@@ -384,13 +384,14 @@ The current scaffold does not implement:
   guest-initiated connection table, and deliver guest-visible
   `VSOCK_OP_RESPONSE` headers; connect or retention failures deliver
   guest-visible `VSOCK_OP_RST` headers and retain no stream. Established
-  guest-initiated connections can forward bounded guest `VSOCK_OP_RW` payload
-  bytes to retained host streams, keep a bounded four-packet per-connection
-  guest-to-host retry queue for partial or would-block nonblocking writes, and
-  retry pending bytes on later notification dispatch before accepting more guest
-  `RW` data for the same connection. Queue overflow or terminal write failures
-  drop the retained stream before queuing a guest-visible reset. Established
-  host-initiated and guest-initiated connections can retain a bounded
+  host-initiated or guest-initiated connections can forward bounded guest
+  `VSOCK_OP_RW` payload bytes to retained host streams, keep a bounded
+  four-packet per-connection guest-to-host retry queue for partial or
+  would-block nonblocking writes, and retry pending bytes on later notification
+  dispatch before accepting more guest `RW` data for the same connection. Queue
+  overflow or terminal write failures drop the retained stream before queuing a
+  guest-visible reset. Established host-initiated and guest-initiated
+  connections can retain a bounded
   four-packet per-connection backlog of host `VSOCK_OP_RW` payloads and deliver
   one queued payload at a time into validated guest RX buffers,
   guest `VSOCK_OP_RST` packets drop matching retained host-initiated or

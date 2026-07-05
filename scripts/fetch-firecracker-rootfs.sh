@@ -114,7 +114,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v11"
+direct_boot_variant="direct-boot-v13"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -563,6 +563,106 @@ PY
   fi
 }
 
+fetch_host_vsock_marker() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    emit_line BANGBANG_VSOCK_HOST_CONNECT_FAIL_NO_PYTHON
+    write_vdb_marker BANGBANG_VSOCK_HOST_CONNECT_FAIL
+    return
+  fi
+
+  python3 - <<'PY' 2>/dev/null || true
+import socket
+import sys
+
+CID_ANY = getattr(socket, "VMADDR_CID_ANY", -1)
+PORT = 5006
+GUEST_GREETING = b"BANGBANG_VSOCK_GUEST_GREETING"
+HOST_REPLY = b"BANGBANG_VSOCK_HOST_REPLY"
+READY_MARKER = b"BANGBANG_VSOCK_HOST_CONNECT_READY"
+SUCCESS_MARKER = b"BANGBANG_VSOCK_HOST_CONNECT_OK"
+FAIL_MARKER = b"BANGBANG_VSOCK_HOST_CONNECT_FAIL"
+SOCKET_TIMEOUT = 10.0
+
+
+def marker_text(marker):
+    return marker.decode("ascii")
+
+
+def write_marker(marker):
+    try:
+        with open("/dev/vdb", "wb", buffering=0) as drive:
+            drive.write(marker.ljust(512, b" "))
+    except OSError:
+        pass
+
+
+def fail(reason):
+    marker = FAIL_MARKER + b"_" + reason.encode("ascii")
+    write_marker(marker)
+    print(marker_text(marker))
+    sys.exit(1)
+
+
+def recv_exact(stream, size):
+    data = b""
+    while len(data) < size:
+        try:
+            chunk = stream.recv(size - len(data))
+        except OSError:
+            fail("RECV")
+        if not chunk:
+            fail("EOF")
+        data += chunk
+    return data
+
+
+if not hasattr(socket, "AF_VSOCK"):
+    fail("NO_AF_VSOCK")
+
+try:
+    server = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+except OSError:
+    fail("SOCKET")
+
+try:
+    server.settimeout(SOCKET_TIMEOUT)
+    try:
+        server.bind((CID_ANY, PORT))
+    except OSError:
+        fail("BIND")
+
+    try:
+        server.listen(1)
+    except OSError:
+        fail("LISTEN")
+
+    write_marker(READY_MARKER)
+    print(marker_text(READY_MARKER))
+
+    try:
+        connection, _addr = server.accept()
+    except OSError:
+        fail("ACCEPT")
+
+    try:
+        connection.settimeout(SOCKET_TIMEOUT)
+        try:
+            connection.sendall(GUEST_GREETING)
+        except OSError:
+            fail("SEND")
+        payload = recv_exact(connection, len(HOST_REPLY))
+        if payload != HOST_REPLY:
+            fail("PAYLOAD")
+    finally:
+        connection.close()
+
+    write_marker(SUCCESS_MARKER)
+    print(marker_text(SUCCESS_MARKER))
+finally:
+    server.close()
+PY
+}
+
 cmdline=
 emit_line BANGBANG_DIRECT_ROOTFS_BOOT_BEGIN
 if [ -r /etc/os-release ]; then
@@ -590,6 +690,8 @@ elif cmdline_has bangbang.mmds-fetch=1; then
   fetch_mmds_marker
 elif cmdline_has bangbang.vsock-guest-connect=1; then
   fetch_vsock_marker
+elif cmdline_has bangbang.vsock-host-connect=1; then
+  fetch_host_vsock_marker
 else
   write_vdb_marker BANGBANG_DIRECT_ROOTFS_BLOCK_OK
 fi

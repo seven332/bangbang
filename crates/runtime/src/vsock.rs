@@ -725,6 +725,7 @@ pub struct VsockHostConnection {
     request_packet_pending: bool,
     host_ack_sent: bool,
     pending_credit_update_packet: bool,
+    pending_guest_rw_writes: VsockGuestRwPendingWrites,
     pending_host_rw_payloads: VecDeque<Vec<u8>>,
 }
 
@@ -735,6 +736,7 @@ impl VsockHostConnection {
             request_packet_pending: true,
             host_ack_sent: false,
             pending_credit_update_packet: false,
+            pending_guest_rw_writes: VsockGuestRwPendingWrites::new(),
             pending_host_rw_payloads: VecDeque::new(),
         }
     }
@@ -768,6 +770,21 @@ impl VsockHostConnection {
         !self.request_packet_pending
             && self.host_ack_sent
             && self.pending_host_rw_payloads.len() < VSOCK_HOST_RW_PENDING_PACKET_LIMIT
+    }
+
+    fn write_guest_rw_payload(&mut self, payload: Vec<u8>) -> Result<(), VsockGuestRwForwardError> {
+        let mut stream = self.accepted.stream();
+        self.pending_guest_rw_writes
+            .write_or_queue(&mut stream, payload)
+    }
+
+    fn flush_pending_guest_rw_writes(&mut self) -> Result<(), VsockGuestRwForwardError> {
+        let mut stream = self.accepted.stream();
+        self.pending_guest_rw_writes.flush(&mut stream)
+    }
+
+    fn has_pending_guest_rw_writes(&self) -> bool {
+        !self.pending_guest_rw_writes.is_empty()
     }
 
     fn acknowledge_guest_response(
@@ -1495,6 +1512,104 @@ impl VsockHostConnectionTable {
         reset_headers
     }
 
+    fn flush_pending_guest_rw_writes(&mut self, guest_cid: u32) -> Vec<VirtioVsockPacketHeader> {
+        let keys = self.connections.keys().copied().collect::<Vec<_>>();
+        let mut reset_headers = Vec::new();
+
+        for key in keys {
+            let Some(connection) = self.connections.get_mut(&key) else {
+                continue;
+            };
+            if !connection.has_pending_guest_rw_writes() {
+                continue;
+            }
+
+            if connection.flush_pending_guest_rw_writes().is_err() {
+                let removed = self.remove(key);
+                debug_assert!(removed);
+                reset_headers.push(host_connection_reset_packet_header(key, guest_cid));
+            }
+        }
+
+        reset_headers
+    }
+
+    fn forward_guest_rw_packet(
+        &mut self,
+        memory: &GuestMemory,
+        packet: &VirtioVsockTxPacket,
+        guest_cid: u32,
+    ) -> Option<VsockGuestRwOutcome> {
+        let header = packet.header();
+        if header.operation() != VIRTIO_VSOCK_OP_RW {
+            return None;
+        }
+        if header.packet_type() != VIRTIO_VSOCK_PACKET_TYPE_STREAM {
+            return Some(VsockGuestRwOutcome::Ignored {
+                reason: VsockGuestRwIgnoreReason::UnsupportedPacketType,
+            });
+        }
+        if header.src_cid() != u64::from(guest_cid) {
+            return Some(VsockGuestRwOutcome::Ignored {
+                reason: VsockGuestRwIgnoreReason::WrongSourceCid,
+            });
+        }
+        if header.dst_cid() != VIRTIO_VSOCK_HOST_CID {
+            return Some(VsockGuestRwOutcome::Ignored {
+                reason: VsockGuestRwIgnoreReason::WrongDestinationCid,
+            });
+        }
+
+        let Ok(local_port) = VsockHostLocalPort::try_from_raw(header.dst_port()) else {
+            return None;
+        };
+        let key = VsockHostConnectionKey::new(local_port, header.src_port());
+        let connection = self.connections.get(&key)?;
+        if !connection.is_established() {
+            let removed = self.remove(key);
+            debug_assert!(removed);
+            return Some(VsockGuestRwOutcome::Dropped {
+                key: VsockGuestRwConnectionKey::Host(key),
+                source: VsockGuestRwForwardError::ResponseStillPending,
+            });
+        }
+
+        let payload = match read_vsock_tx_payload_bytes(memory, packet) {
+            Ok(payload) => payload,
+            Err(source) => {
+                let removed = self.remove(key);
+                debug_assert!(removed);
+                return Some(VsockGuestRwOutcome::Dropped {
+                    key: VsockGuestRwConnectionKey::Host(key),
+                    source,
+                });
+            }
+        };
+
+        let Some(connection) = self.connections.get_mut(&key) else {
+            return Some(VsockGuestRwOutcome::Dropped {
+                key: VsockGuestRwConnectionKey::Host(key),
+                source: VsockGuestRwForwardError::MissingConnection,
+            });
+        };
+        let payload_len = payload.len();
+        let result = connection.write_guest_rw_payload(payload);
+        match result {
+            Ok(()) => Some(VsockGuestRwOutcome::Forwarded {
+                key: VsockGuestRwConnectionKey::Host(key),
+                bytes: payload_len,
+            }),
+            Err(source) => {
+                let removed = self.remove(key);
+                debug_assert!(removed);
+                Some(VsockGuestRwOutcome::Dropped {
+                    key: VsockGuestRwConnectionKey::Host(key),
+                    source,
+                })
+            }
+        }
+    }
+
     fn acknowledge_guest_response_packet(
         &mut self,
         packet: &VirtioVsockTxPacket,
@@ -1755,16 +1870,22 @@ enum VsockGuestCreditError {
 #[derive(Debug)]
 enum VsockGuestRwOutcome {
     Forwarded {
-        key: VsockGuestConnectionKey,
+        key: VsockGuestRwConnectionKey,
         bytes: usize,
     },
     Ignored {
         reason: VsockGuestRwIgnoreReason,
     },
     Dropped {
-        key: VsockGuestConnectionKey,
+        key: VsockGuestRwConnectionKey,
         source: VsockGuestRwForwardError,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VsockGuestRwConnectionKey {
+    Host(VsockHostConnectionKey),
+    Guest(VsockGuestConnectionKey),
 }
 
 impl VsockGuestRwOutcome {
@@ -2454,7 +2575,7 @@ impl VsockGuestConnectionTable {
         let key = VsockGuestConnectionKey::new(header.dst_port(), header.src_port());
         let Some(connection) = self.connections.get(&key) else {
             return Some(VsockGuestRwOutcome::Dropped {
-                key,
+                key: VsockGuestRwConnectionKey::Guest(key),
                 source: VsockGuestRwForwardError::MissingConnection,
             });
         };
@@ -2462,7 +2583,7 @@ impl VsockGuestConnectionTable {
             let removed = self.remove(key);
             debug_assert!(removed);
             return Some(VsockGuestRwOutcome::Dropped {
-                key,
+                key: VsockGuestRwConnectionKey::Guest(key),
                 source: VsockGuestRwForwardError::ResponseStillPending,
             });
         }
@@ -2472,13 +2593,16 @@ impl VsockGuestConnectionTable {
             Err(source) => {
                 let removed = self.remove(key);
                 debug_assert!(removed);
-                return Some(VsockGuestRwOutcome::Dropped { key, source });
+                return Some(VsockGuestRwOutcome::Dropped {
+                    key: VsockGuestRwConnectionKey::Guest(key),
+                    source,
+                });
             }
         };
 
         let Some(connection) = self.connections.get_mut(&key) else {
             return Some(VsockGuestRwOutcome::Dropped {
-                key,
+                key: VsockGuestRwConnectionKey::Guest(key),
                 source: VsockGuestRwForwardError::MissingConnection,
             });
         };
@@ -2486,13 +2610,16 @@ impl VsockGuestConnectionTable {
         let result = connection.write_guest_rw_payload(payload);
         match result {
             Ok(()) => Some(VsockGuestRwOutcome::Forwarded {
-                key,
+                key: VsockGuestRwConnectionKey::Guest(key),
                 bytes: payload_len,
             }),
             Err(source) => {
                 let removed = self.remove(key);
                 debug_assert!(removed);
-                Some(VsockGuestRwOutcome::Dropped { key, source })
+                Some(VsockGuestRwOutcome::Dropped {
+                    key: VsockGuestRwConnectionKey::Guest(key),
+                    source,
+                })
             }
         }
     }
@@ -5425,9 +5552,13 @@ impl VirtioVsockDevice {
     }
 
     fn flush_pending_guest_rw_writes(&mut self) {
-        let reset_headers = self
+        let mut reset_headers = self
             .guest_connections
             .flush_pending_guest_rw_writes(self.guest_cid);
+        reset_headers.extend(
+            self.host_connections
+                .flush_pending_guest_rw_writes(self.guest_cid),
+        );
 
         for header in reset_headers {
             let _ = self.queue_guest_reset_packet(header);
@@ -5801,9 +5932,13 @@ impl VirtioVsockDevice {
                 continue;
             }
 
-            let rw_outcome =
-                self.guest_connections
-                    .forward_guest_rw_packet(memory, packet, self.guest_cid);
+            let rw_outcome = self
+                .host_connections
+                .forward_guest_rw_packet(memory, packet, self.guest_cid)
+                .or_else(|| {
+                    self.guest_connections
+                        .forward_guest_rw_packet(memory, packet, self.guest_cid)
+                });
             if let Some(outcome) = rw_outcome.as_ref() {
                 rw_dispatch.record(outcome);
             }
@@ -13919,6 +14054,51 @@ mod tests {
         assert_stream_closed(
             &mut accepted,
             "dropping handler should close forwarded guest stream",
+        );
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_forward_host_connection_guest_rw_payload_to_host_stream() {
+        let (mut memory, mut handler, mut client, key) =
+            established_host_connection_for_test("host-rw-guest", 4000);
+        let payload = b"payload";
+        let packet = guest_rw_tx_packet(42, key.local_port().raw(), 4000).header();
+
+        write_vsock_tx_packet_with_payload(
+            &mut memory,
+            1,
+            TEST_VSOCK_SECOND_HEADER,
+            packet,
+            payload,
+        );
+        append_vsock_tx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+
+        let notification = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("host connection guest RW should forward to host stream");
+
+        assert_empty_guest_response_dispatch(notification.guest_response_dispatch());
+        assert_empty_guest_request_dispatch(notification.guest_request_dispatch());
+        assert_eq!(notification.guest_rw_dispatch().rw_packets(), 1);
+        assert_eq!(notification.guest_rw_dispatch().forwarded_packets(), 1);
+        assert_eq!(
+            notification.guest_rw_dispatch().forwarded_bytes(),
+            payload.len()
+        );
+        assert_eq!(notification.guest_rw_dispatch().ignored_packets(), 0);
+        assert_eq!(notification.guest_rw_dispatch().dropped_connections(), 0);
+        assert_empty_guest_reset_dispatch(notification.guest_reset_dispatch());
+        assert!(notification.rx_queue_dispatch().is_none());
+        assert_eq!(read_vsock_tx_used_index(&memory), 2);
+        assert_eq!(read_vsock_tx_used_element(&memory, 1), (1, 0));
+        assert_host_payload(&mut client, payload);
+        assert!(handler.activation_handler().has_host_connection(key));
+
+        drop(handler);
+        assert_stream_closed(
+            &mut client,
+            "dropping handler should close forwarded host connection stream",
         );
     }
 
