@@ -3593,6 +3593,13 @@ mod tests {
                 r#"{"fault_message":"Drive updates are not supported."}"#,
             ),
             (
+                "drive-delete-body",
+                "DELETE",
+                "/drives/rootfs",
+                "{}",
+                r#"{"fault_message":"Malformed HTTP request."}"#,
+            ),
+            (
                 "net",
                 "PATCH",
                 "/network-interfaces/eth0",
