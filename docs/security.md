@@ -154,6 +154,9 @@ is resource-specific:
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink. The `--metrics-path` startup CLI flag uses the same
   sink and host-path error redaction rules before the API socket is served.
+  Runtime `FlushMetrics` and periodic runtime metrics flushes every 60 seconds
+  can append minimal host observability lines to this sink while the VM is
+  running.
 - `/logger` opens `log_path` during pre-boot configuration when that field is
   present and keeps a per-process logger sink. Successful `InstanceStart` and
   `FlushMetrics` can append minimal action-event lines to that sink when the
@@ -219,10 +222,10 @@ file `sync_all()` path.
 Metrics and logger outputs are host observability state, not guest
 configuration, and are intentionally omitted from `GET /vm/config`. Current
 logger action events are host VMM events only and do not expose guest serial
-output. Current metrics can expose only a terse boot run-loop status summary
-without worker error strings or serial bytes. Future full logging and metrics
-support must avoid leaking host paths or unexpected guest data in error
-messages.
+output. Current explicit and periodic metrics lines can expose only a terse boot
+run-loop status summary without worker error strings or serial bytes. Future
+full logging and metrics support must avoid leaking host paths or unexpected
+guest data in error messages.
 
 MMDS control-plane contents are process-local in-memory JSON state configured
 through the unauthenticated local API socket. Treat metadata as sensitive host

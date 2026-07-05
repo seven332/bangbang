@@ -7,20 +7,23 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
+use std::time::Instant;
 
 mod api_server;
 #[doc(hidden)]
 #[cfg(target_os = "macos")]
 pub mod host_network;
+mod periodic_metrics;
 mod vmm;
 
 use api_server::{ApiServer, ApiServerError, config_vmm_action_from_api_request};
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_api::http::{RequestError, parse_request_with_limit};
 use bangbang_hvf::HvfBackend;
+use periodic_metrics::PeriodicMetricsScheduler;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::{SigId, low_level};
-use vmm::{ProcessSessionExitDecision, ProcessVmm};
+use vmm::{ProcessSessionExitDecision, ProcessVmm, VmmRequestHandler};
 
 use bangbang_runtime::logger::{LoggerConfigInput, LoggerLevel};
 use bangbang_runtime::metrics::{MetricsConfigInput, MetricsDiagnostics};
@@ -121,20 +124,39 @@ fn run() -> Result<(), ProcessError> {
     Ok(())
 }
 
-fn wait_for_no_api_shutdown<S>(
+fn wait_for_no_api_shutdown(
     shutdown_signal: &mut ShutdownSignal,
-    vmm: &mut ProcessVmm<S>,
-) -> Result<(), ProcessError>
-where
-    S: vmm::InstanceStartExecutor,
-{
+    vmm: &mut impl VmmRequestHandler,
+) -> Result<(), ProcessError> {
+    wait_for_no_api_shutdown_with_periodic_metrics_scheduler(
+        shutdown_signal,
+        vmm,
+        PeriodicMetricsScheduler::new(Instant::now()),
+    )
+}
+
+fn wait_for_no_api_shutdown_with_periodic_metrics_scheduler(
+    shutdown_signal: &mut ShutdownSignal,
+    vmm: &mut impl VmmRequestHandler,
+    mut metrics_scheduler: PeriodicMetricsScheduler,
+) -> Result<(), ProcessError> {
     shutdown_signal.set_nonblocking()?;
 
     loop {
-        wait_for_shutdown_or_process_exit(
+        let now = Instant::now();
+        match wait_for_shutdown_or_process_exit(
             shutdown_signal.wakeup_fd(),
             vmm.process_exit_wakeup_fd(),
-        )?;
+            Some(metrics_scheduler.poll_timeout_ms(now)),
+        )? {
+            ProcessWaitResult::Ready => {}
+            ProcessWaitResult::TimedOut => {
+                vmm.handle_periodic_metrics_flush()
+                    .map_err(ProcessError::PeriodicMetricsFlush)?;
+                metrics_scheduler.schedule_next(Instant::now());
+                continue;
+            }
+        }
         if shutdown_signal.drain_wakeup()? {
             return Ok(());
         }
@@ -488,6 +510,7 @@ enum ProcessError {
     ArgumentParsing(String),
     ConfigFile(ConfigFileError),
     Metadata(MetadataFileError),
+    PeriodicMetricsFlush(VmmActionError),
     ProcessExitNotification(std::io::ErrorKind),
     ProcessSessionTerminal,
     SignalHandler(std::io::ErrorKind),
@@ -501,6 +524,7 @@ impl ProcessError {
             Self::ArgumentParsing(_) => ProcessExitCode::ArgumentParsing,
             Self::ConfigFile(_) => ProcessExitCode::ProcessFailure,
             Self::Metadata(_) => ProcessExitCode::ProcessFailure,
+            Self::PeriodicMetricsFlush(_) => ProcessExitCode::ProcessFailure,
             Self::ProcessExitNotification(_) => ProcessExitCode::ProcessFailure,
             Self::ProcessSessionTerminal => ProcessExitCode::ProcessFailure,
             Self::SignalHandler(_) => ProcessExitCode::ProcessFailure,
@@ -516,6 +540,9 @@ impl fmt::Display for ProcessError {
             Self::ArgumentParsing(message) => f.write_str(message),
             Self::ConfigFile(err) => write!(f, "config-file error: {err}"),
             Self::Metadata(err) => write!(f, "metadata error: {err}"),
+            Self::PeriodicMetricsFlush(err) => {
+                write!(f, "failed to flush periodic metrics: {err}")
+            }
             Self::ProcessExitNotification(kind) => {
                 write!(f, "process exit notification failed: {kind:?}")
             }
@@ -686,7 +713,8 @@ impl ShutdownSignal {
 fn wait_for_shutdown_or_process_exit(
     shutdown_wakeup_fd: RawFd,
     process_exit_wakeup_fd: Option<RawFd>,
-) -> Result<(), ProcessError> {
+    timeout_ms: Option<i32>,
+) -> Result<ProcessWaitResult, ProcessError> {
     let mut poll_fds = [
         libc::pollfd {
             fd: shutdown_wakeup_fd,
@@ -716,10 +744,19 @@ fn wait_for_shutdown_or_process_exit(
         }
 
         // SAFETY: `poll_fds` points to initialized `pollfd` values and remains
-        // valid for the duration of the call. The timeout is infinite.
-        let result = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as _, -1) };
+        // valid for the duration of the call.
+        let result = unsafe {
+            libc::poll(
+                poll_fds.as_mut_ptr(),
+                poll_fds.len() as _,
+                timeout_ms.unwrap_or(-1),
+            )
+        };
         if result > 0 {
-            return Ok(());
+            return Ok(ProcessWaitResult::Ready);
+        }
+        if result == 0 {
+            return Ok(ProcessWaitResult::TimedOut);
         }
 
         let kind = std::io::Error::last_os_error().kind();
@@ -727,6 +764,12 @@ fn wait_for_shutdown_or_process_exit(
             return Err(ProcessError::SignalHandler(kind));
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessWaitResult {
+    Ready,
+    TimedOut,
 }
 
 fn register_signal_wakeup(signal: i32, wakeup_writer: &UnixStream) -> Result<SigId, ProcessError> {
@@ -1296,7 +1339,7 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel};
@@ -1304,10 +1347,11 @@ mod tests {
     use bangbang_runtime::metrics::{MetricsConfigError, MetricsConfigInput};
     use bangbang_runtime::mmds::MmdsDataStoreError;
     use bangbang_runtime::serial::SerialConfigError;
-    use bangbang_runtime::{BackendError, InstanceState, VmmAction, VmmData};
+    use bangbang_runtime::{BackendError, InstanceState, VmmAction, VmmActionError, VmmData};
 
     use crate::vmm::{
-        InstanceStartExecutor, ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm,
+        GetApiRequest, InstanceStartExecutor, PatchApiRequest, ProcessSessionDiagnostics,
+        ProcessSessionExitStatus, ProcessVmm, PutApiRequest, VmmRequestHandler,
     };
 
     use super::{
@@ -1431,6 +1475,82 @@ mod tests {
                     Err(err) => return Err(err.kind()),
                 }
             }
+        }
+    }
+
+    struct ProcessExitAfterPeriodicFlush<S>
+    where
+        S: InstanceStartExecutor,
+    {
+        inner: ProcessVmm<S>,
+        process_exit_trigger: TestProcessExitSignal,
+    }
+
+    impl<S> ProcessExitAfterPeriodicFlush<S>
+    where
+        S: InstanceStartExecutor,
+    {
+        fn new(inner: ProcessVmm<S>, process_exit_trigger: TestProcessExitSignal) -> Self {
+            Self {
+                inner,
+                process_exit_trigger,
+            }
+        }
+    }
+
+    impl<S> VmmRequestHandler for ProcessExitAfterPeriodicFlush<S>
+    where
+        S: InstanceStartExecutor,
+    {
+        fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
+            self.inner.handle_action(action)
+        }
+
+        fn handle_get_request(
+            &mut self,
+            request: GetApiRequest,
+        ) -> Result<VmmData, VmmActionError> {
+            self.inner.handle_get_request(request)
+        }
+
+        fn handle_patch_request(
+            &mut self,
+            request: PatchApiRequest,
+        ) -> Result<VmmData, VmmActionError> {
+            self.inner.handle_patch_request(request)
+        }
+
+        fn handle_put_request(
+            &mut self,
+            request: PutApiRequest,
+        ) -> Result<VmmData, VmmActionError> {
+            self.inner.handle_put_request(request)
+        }
+
+        fn handle_put_action_request(
+            &mut self,
+            action: VmmAction,
+        ) -> Result<VmmData, VmmActionError> {
+            self.inner.handle_put_action_request(action)
+        }
+
+        fn handle_periodic_metrics_flush(&mut self) -> Result<bool, VmmActionError> {
+            let result = self.inner.handle_periodic_metrics_flush();
+            self.process_exit_trigger
+                .trigger(ProcessSessionExitStatus::GuestRequestedStop);
+            result
+        }
+
+        fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
+            self.inner.process_exit_wakeup_fd()
+        }
+
+        fn drain_process_exit_wakeup(&mut self) -> Result<(), std::io::ErrorKind> {
+            self.inner.drain_process_exit_wakeup()
+        }
+
+        fn process_exit_status(&self) -> ProcessSessionExitStatus {
+            self.inner.process_exit_status()
         }
     }
 
@@ -2587,6 +2707,57 @@ mod tests {
         assert_eq!(
             super::wait_for_no_api_shutdown(&mut shutdown_signal, &mut vmm),
             Err(super::ProcessError::ProcessSessionTerminal)
+        );
+    }
+
+    #[test]
+    fn no_api_wait_periodic_metrics_timeout_flushes_after_start_without_sleeping() {
+        let metrics_path = unique_metrics_path("no-api-periodic");
+        let process_exit_signal = TestProcessExitSignal::new();
+        let process_exit_trigger = process_exit_signal.clone();
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            ProcessExitTestStarter {
+                signal: process_exit_signal,
+            },
+        );
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            &metrics_path,
+        )))
+        .expect("metrics should configure");
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("instance should start");
+        let mut vmm = ProcessExitAfterPeriodicFlush::new(vmm, process_exit_trigger);
+        let mut shutdown_signal = test_shutdown_signal();
+
+        assert_eq!(
+            super::wait_for_no_api_shutdown_with_periodic_metrics_scheduler(
+                &mut shutdown_signal,
+                &mut vmm,
+                super::PeriodicMetricsScheduler::due_now(Instant::now()),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+        fs::remove_file(metrics_path).expect("fixture metrics should clean up");
+    }
+
+    #[test]
+    fn no_api_wait_helper_reports_periodic_metrics_timeout_without_sleeping() {
+        let shutdown_signal = test_shutdown_signal();
+
+        assert_eq!(
+            super::wait_for_shutdown_or_process_exit(shutdown_signal.wakeup_fd(), None, Some(0)),
+            Ok(super::ProcessWaitResult::TimedOut)
         );
     }
 

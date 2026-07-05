@@ -41,8 +41,9 @@ use bangbang_runtime::network::MAX_NETWORK_INTERFACE_COUNT;
 use bangbang_runtime::network::{NetworkInterfaceConfig, NetworkInterfaceConfigInput};
 use bangbang_runtime::serial::SerialConfigInput;
 use bangbang_runtime::vsock::{VsockConfig, VsockConfigInput};
-use bangbang_runtime::{VmConfiguration, VmmAction, VmmData};
+use bangbang_runtime::{VmConfiguration, VmmAction, VmmActionError, VmmData};
 
+use crate::periodic_metrics::PeriodicMetricsScheduler;
 use crate::vmm::{
     GetApiRequest, PatchApiRequest, ProcessSessionExitDecision, PutApiRequest, VmmRequestHandler,
 };
@@ -56,6 +57,7 @@ pub(crate) enum ApiServerError {
     Accept(std::io::ErrorKind),
     Bind(std::io::ErrorKind),
     Connection(std::io::ErrorKind),
+    PeriodicMetricsFlush(VmmActionError),
     ProcessSessionTerminal,
     SocketMetadata(std::io::ErrorKind),
     SocketPathCheck(std::io::ErrorKind),
@@ -70,6 +72,9 @@ impl std::fmt::Display for ApiServerError {
             Self::Accept(kind) => write!(f, "failed to accept API connection: {kind:?}"),
             Self::Bind(kind) => write!(f, "failed to bind API socket: {kind:?}"),
             Self::Connection(kind) => write!(f, "API connection I/O failed: {kind:?}"),
+            Self::PeriodicMetricsFlush(err) => {
+                write!(f, "failed to flush periodic metrics: {err}")
+            }
             Self::ProcessSessionTerminal => {
                 f.write_str("process-owned boot run loop exited with failure")
             }
@@ -128,6 +133,19 @@ impl ApiServer {
         vmm: &mut impl VmmRequestHandler,
         shutdown_wakeup: &mut UnixStream,
     ) -> Result<(), ApiServerError> {
+        self.run_until_with_periodic_metrics_scheduler(
+            vmm,
+            shutdown_wakeup,
+            PeriodicMetricsScheduler::new(Instant::now()),
+        )
+    }
+
+    fn run_until_with_periodic_metrics_scheduler(
+        &self,
+        vmm: &mut impl VmmRequestHandler,
+        shutdown_wakeup: &mut UnixStream,
+        mut metrics_scheduler: PeriodicMetricsScheduler,
+    ) -> Result<(), ApiServerError> {
         self.listener
             .set_nonblocking(true)
             .map_err(|err| ApiServerError::Accept(err.kind()))?;
@@ -136,11 +154,21 @@ impl ApiServer {
             .map_err(|err| ApiServerError::Connection(err.kind()))?;
 
         loop {
-            wait_for_listener_or_shutdown(
+            let now = Instant::now();
+            match wait_for_listener_or_shutdown(
                 &self.listener,
                 shutdown_wakeup,
                 vmm.process_exit_wakeup_fd(),
-            )?;
+                Some(metrics_scheduler.poll_timeout_ms(now)),
+            )? {
+                ApiServerWaitResult::Ready => {}
+                ApiServerWaitResult::TimedOut => {
+                    vmm.handle_periodic_metrics_flush()
+                        .map_err(ApiServerError::PeriodicMetricsFlush)?;
+                    metrics_scheduler.schedule_next(Instant::now());
+                    continue;
+                }
+            }
             if drain_shutdown_wakeup(shutdown_wakeup)? {
                 return Ok(());
             }
@@ -177,6 +205,12 @@ impl ApiServer {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiServerWaitResult {
+    Ready,
+    TimedOut,
+}
+
 fn is_transient_accept_error(kind: std::io::ErrorKind) -> bool {
     matches!(
         kind,
@@ -190,7 +224,8 @@ fn wait_for_listener_or_shutdown(
     listener: &UnixListener,
     shutdown_wakeup: &UnixStream,
     process_exit_wakeup_fd: Option<RawFd>,
-) -> Result<(), ApiServerError> {
+    timeout_ms: Option<i32>,
+) -> Result<ApiServerWaitResult, ApiServerError> {
     let mut poll_fds = [
         libc::pollfd {
             fd: listener.as_raw_fd(),
@@ -223,10 +258,19 @@ fn wait_for_listener_or_shutdown(
         }
 
         // SAFETY: `poll_fds` points to initialized `pollfd` values and remains
-        // valid for the duration of the call. The timeout is infinite.
-        let result = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as _, -1) };
+        // valid for the duration of the call.
+        let result = unsafe {
+            libc::poll(
+                poll_fds.as_mut_ptr(),
+                poll_fds.len() as _,
+                timeout_ms.unwrap_or(-1),
+            )
+        };
         if result > 0 {
-            return Ok(());
+            return Ok(ApiServerWaitResult::Ready);
+        }
+        if result == 0 {
+            return Ok(ApiServerWaitResult::TimedOut);
         }
 
         let kind = std::io::Error::last_os_error().kind();
@@ -1392,6 +1436,85 @@ mod tests {
         );
 
         request_over_socket(vmm, socket_name, &request)
+    }
+
+    struct ShutdownAfterPeriodicFlush<S>
+    where
+        S: InstanceStartExecutor,
+    {
+        inner: ProcessVmm<S>,
+        shutdown_writer: UnixStream,
+    }
+
+    impl<S> ShutdownAfterPeriodicFlush<S>
+    where
+        S: InstanceStartExecutor,
+    {
+        fn new(inner: ProcessVmm<S>, shutdown_writer: &UnixStream) -> Self {
+            Self {
+                inner,
+                shutdown_writer: shutdown_writer
+                    .try_clone()
+                    .expect("shutdown writer should clone"),
+            }
+        }
+    }
+
+    impl<S> VmmRequestHandler for ShutdownAfterPeriodicFlush<S>
+    where
+        S: InstanceStartExecutor,
+    {
+        fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
+            self.inner.handle_action(action)
+        }
+
+        fn handle_get_request(
+            &mut self,
+            request: GetApiRequest,
+        ) -> Result<VmmData, VmmActionError> {
+            self.inner.handle_get_request(request)
+        }
+
+        fn handle_patch_request(
+            &mut self,
+            request: PatchApiRequest,
+        ) -> Result<VmmData, VmmActionError> {
+            self.inner.handle_patch_request(request)
+        }
+
+        fn handle_put_request(
+            &mut self,
+            request: PutApiRequest,
+        ) -> Result<VmmData, VmmActionError> {
+            self.inner.handle_put_request(request)
+        }
+
+        fn handle_put_action_request(
+            &mut self,
+            action: VmmAction,
+        ) -> Result<VmmData, VmmActionError> {
+            self.inner.handle_put_action_request(action)
+        }
+
+        fn handle_periodic_metrics_flush(&mut self) -> Result<bool, VmmActionError> {
+            let result = self.inner.handle_periodic_metrics_flush();
+            self.shutdown_writer
+                .write_all(b"x")
+                .expect("periodic flush test should signal shutdown");
+            result
+        }
+
+        fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
+            self.inner.process_exit_wakeup_fd()
+        }
+
+        fn drain_process_exit_wakeup(&mut self) -> Result<(), std::io::ErrorKind> {
+            self.inner.drain_process_exit_wakeup()
+        }
+
+        fn process_exit_status(&self) -> ProcessSessionExitStatus {
+            self.inner.process_exit_status()
+        }
     }
 
     fn unique_temp_dir(name: &str) -> PathBuf {
@@ -5230,6 +5353,104 @@ mod tests {
             handle.join().expect("server thread should not panic"),
             Ok(())
         );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn run_until_periodic_metrics_timeout_flushes_after_start() {
+        let path = unique_socket_path("periodic-metrics");
+        let metrics_path = unique_socket_path("periodic-metrics-output").with_extension("metrics");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let (mut shutdown_reader, shutdown_writer) =
+            UnixStream::pair().expect("shutdown stream pair should be created");
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            &metrics_path,
+        )))
+        .expect("metrics should configure");
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("instance should start");
+        let mut vmm = ShutdownAfterPeriodicFlush::new(vmm, &shutdown_writer);
+
+        assert_eq!(
+            server.run_until_with_periodic_metrics_scheduler(
+                &mut vmm,
+                &mut shutdown_reader,
+                PeriodicMetricsScheduler::due_now(Instant::now()),
+            ),
+            Ok(())
+        );
+
+        assert_eq!(
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+        fs::remove_file(metrics_path).expect("fixture should clean up");
+        drop(server);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn run_until_periodic_metrics_timeout_before_start_does_not_write() {
+        let path = unique_socket_path("periodic-pre-start");
+        let metrics_path =
+            unique_socket_path("periodic-pre-start-output").with_extension("metrics");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let (mut shutdown_reader, shutdown_writer) =
+            UnixStream::pair().expect("shutdown stream pair should be created");
+        let mut vmm = test_controller();
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            &metrics_path,
+        )))
+        .expect("metrics should configure");
+        let mut vmm = ShutdownAfterPeriodicFlush::new(vmm, &shutdown_writer);
+
+        assert_eq!(
+            server.run_until_with_periodic_metrics_scheduler(
+                &mut vmm,
+                &mut shutdown_reader,
+                PeriodicMetricsScheduler::due_now(Instant::now()),
+            ),
+            Ok(())
+        );
+
+        assert_eq!(
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
+            ""
+        );
+        fs::remove_file(metrics_path).expect("fixture should clean up");
+        drop(server);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn run_until_periodic_metrics_timeout_without_configuration_is_noop() {
+        let path = unique_socket_path("periodic-unconfigured");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let (mut shutdown_reader, shutdown_writer) =
+            UnixStream::pair().expect("shutdown stream pair should be created");
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("instance should start");
+        let mut vmm = ShutdownAfterPeriodicFlush::new(vmm, &shutdown_writer);
+
+        assert_eq!(
+            server.run_until_with_periodic_metrics_scheduler(
+                &mut vmm,
+                &mut shutdown_reader,
+                PeriodicMetricsScheduler::due_now(Instant::now()),
+            ),
+            Ok(())
+        );
+        drop(server);
         assert!(!path.exists());
     }
 
