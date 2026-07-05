@@ -4599,8 +4599,20 @@ mod tests {
                 ),
             ),
             (
+                "PUT /balloon max numeric fields",
+                request_with_body(
+                    "PUT",
+                    "/balloon",
+                    r#"{"amount_mib":4294967295,"deflate_on_oom":true,"stats_polling_interval_s":65535}"#,
+                ),
+            ),
+            (
                 "PATCH /balloon",
                 request_with_body("PATCH", "/balloon", r#"{"amount_mib":32}"#),
+            ),
+            (
+                "PATCH /balloon max amount",
+                request_with_body("PATCH", "/balloon", r#"{"amount_mib":4294967295}"#),
             ),
             (
                 "PATCH /balloon/statistics",
@@ -4608,6 +4620,14 @@ mod tests {
                     "PATCH",
                     "/balloon/statistics",
                     r#"{"stats_polling_interval_s":1}"#,
+                ),
+            ),
+            (
+                "PATCH /balloon/statistics max interval",
+                request_with_body(
+                    "PATCH",
+                    "/balloon/statistics",
+                    r#"{"stats_polling_interval_s":65535}"#,
                 ),
             ),
             (
@@ -4637,6 +4657,10 @@ mod tests {
                     "/balloon/hinting/start",
                     r#"{"acknowledge_on_stop":false,"unknown":true}"#,
                 ),
+            ),
+            (
+                "PATCH /balloon/hinting/start only unknown field",
+                request_with_body("PATCH", "/balloon/hinting/start", r#"{"unknown":true}"#),
             ),
             (
                 "PATCH /balloon/hinting/stop",
