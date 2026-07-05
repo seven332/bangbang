@@ -665,6 +665,14 @@ fn executable_configures_observability_without_vm_config() {
         "second PUT /metrics",
     );
     assert!(
+        !second_metrics_response.contains(path_text(&second_metrics_path)),
+        "duplicate PUT /metrics must not echo the rejected output path; response:\n{second_metrics_response}"
+    );
+    assert!(
+        metrics_path.exists(),
+        "duplicate PUT /metrics must keep the original output file"
+    );
+    assert!(
         !second_metrics_path.exists(),
         "duplicate PUT /metrics must not create the second output file"
     );
