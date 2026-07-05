@@ -4304,6 +4304,7 @@ mod tests {
         for body in [
             "{}",
             r#"{"rate_limiter":null}"#,
+            r#"{"rate_limiter":{}}"#,
             r#"{"rate_limiter":{"bandwidth":{"size":100,"one_time_burst":null,"refill_time":1000}}}"#,
             r#"{"rate_limiter":{"ops":{"size":100,"one_time_burst":200,"refill_time":1000}}}"#,
         ] {
