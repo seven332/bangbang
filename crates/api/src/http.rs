@@ -4643,6 +4643,10 @@ mod tests {
                 request_with_body("PATCH", "/balloon/hinting/start", "{}"),
             ),
             (
+                "PATCH /balloon/hinting/start empty sequence",
+                request_with_body("PATCH", "/balloon/hinting/start", "[]"),
+            ),
+            (
                 "PATCH /balloon/hinting/start explicit",
                 request_with_body(
                     "PATCH",
@@ -4680,6 +4684,8 @@ mod tests {
         for (method, path, body) in [
             ("PUT", "/balloon", "not-json"),
             ("PUT", "/balloon", ""),
+            ("PUT", "/balloon", "null"),
+            ("PUT", "/balloon", "[]"),
             ("PUT", "/balloon", "{}"),
             ("PUT", "/balloon", r#"{"amount_mib":64}"#),
             ("PUT", "/balloon", r#"{"deflate_on_oom":true}"#),
@@ -4720,6 +4726,8 @@ mod tests {
             ),
             ("PATCH", "/balloon", "not-json"),
             ("PATCH", "/balloon", ""),
+            ("PATCH", "/balloon", "null"),
+            ("PATCH", "/balloon", "[]"),
             ("PATCH", "/balloon", "{}"),
             ("PATCH", "/balloon", r#"{"amount_mib":"32"}"#),
             ("PATCH", "/balloon", r#"{"amount_mib":-1}"#),
@@ -4727,6 +4735,8 @@ mod tests {
             ("PATCH", "/balloon", r#"{"amount_mib":32,"unknown":true}"#),
             ("PATCH", "/balloon/statistics", "not-json"),
             ("PATCH", "/balloon/statistics", ""),
+            ("PATCH", "/balloon/statistics", "null"),
+            ("PATCH", "/balloon/statistics", "[]"),
             ("PATCH", "/balloon/statistics", "{}"),
             (
                 "PATCH",
@@ -4749,6 +4759,7 @@ mod tests {
                 r#"{"stats_polling_interval_s":1,"unknown":true}"#,
             ),
             ("PATCH", "/balloon/hinting/start", "not-json"),
+            ("PATCH", "/balloon/hinting/start", "null"),
             (
                 "PATCH",
                 "/balloon/hinting/start",

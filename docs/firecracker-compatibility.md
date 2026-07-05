@@ -327,7 +327,7 @@ exist.
 | `PATCH /balloon` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PATCH /balloon/statistics` | `stats_polling_interval_s` | required; unsupported after parser validation | Parsed as an unsigned 16-bit Firecracker-shaped polling interval before returning the balloon unsupported fault. Real statistics polling remains deferred. |
 | `PATCH /balloon/statistics` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
-| `PATCH /balloon/hinting/start` | body | optional when absent or empty | Missing or empty bodies use Firecracker's default hinting start command before returning the balloon unsupported fault. |
+| `PATCH /balloon/hinting/start` | body | optional when absent or empty | Missing or empty bodies use Firecracker's default hinting start command before returning the balloon unsupported fault. An empty JSON array is also accepted as a default command, matching the current Firecracker Serde parser behavior. |
 | `PATCH /balloon/hinting/start` | `acknowledge_on_stop` | optional | Missing values follow Firecracker's default `true` command shape. Real free-page hinting remains deferred. |
 | `PATCH /balloon/hinting/start` | unknown fields | accepted by parser | Matches Firecracker's current hinting start command parser, which ignores unknown fields while preserving typed validation for `acknowledge_on_stop`. |
 | `PUT /drives/{drive_id}` | path `drive_id` | required | The API parser captures this value, and the internal model validates it as nonempty alphanumeric or `_`, matching Firecracker's `checked_id` rule. |
