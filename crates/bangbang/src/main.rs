@@ -1121,7 +1121,7 @@ fn help_text() -> String {
             "      --mmds-size-limit <BYTES>\n",
             "                         MMDS data store size; defaults to HTTP API limit\n",
             "      --metadata <PATH>  JSON metadata file used to initialize MMDS at startup\n",
-            "      --module <MODULE>  Logger module filter stored for future log integration\n",
+            "      --module <MODULE>  Logger module prefix filter for minimal action logs\n",
             "      --no-api          Start from --config-file without publishing an API socket\n",
             "      --show-level       Include level in minimal logger action lines\n",
             "      --show-log-origin  Include callsite origin in minimal logger action lines\n",
@@ -2823,6 +2823,82 @@ mod tests {
         );
 
         fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn applies_startup_logger_module_filter_before_actions() {
+        let matching_path = unique_logger_path("module-filter-match");
+        let matching_config = parse_run(&[
+            "--log-path",
+            matching_path
+                .to_str()
+                .expect("fixture logger path should be UTF-8"),
+            "--module",
+            "bangbang_runtime",
+        ])
+        .expect("matching startup logger args should parse");
+        let mut matching_vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        super::apply_startup_logger_config(&mut matching_vmm, matching_config.logger_config)
+            .expect("matching startup logger config should apply");
+        matching_vmm
+            .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+                "/tmp/vmlinux",
+            )))
+            .expect("boot source should configure");
+        matching_vmm
+            .handle_action(VmmAction::InstanceStart)
+            .expect("instance start should succeed");
+        matching_vmm
+            .handle_action(VmmAction::FlushMetrics)
+            .expect("flush metrics should succeed");
+        assert_eq!(
+            fs::read_to_string(&matching_path).expect("matching logger output should be readable"),
+            "action=InstanceStart\naction=FlushMetrics\n"
+        );
+
+        let filtered_path = unique_logger_path("module-filter-miss");
+        let filtered_config = parse_run(&[
+            "--log-path",
+            filtered_path
+                .to_str()
+                .expect("fixture logger path should be UTF-8"),
+            "--module",
+            "api_server",
+        ])
+        .expect("filtered startup logger args should parse");
+        let mut filtered_vmm = ProcessVmm::with_starter(
+            "demo-2",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        super::apply_startup_logger_config(&mut filtered_vmm, filtered_config.logger_config)
+            .expect("filtered startup logger config should apply");
+        filtered_vmm
+            .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+                "/tmp/vmlinux",
+            )))
+            .expect("boot source should configure");
+        filtered_vmm
+            .handle_action(VmmAction::InstanceStart)
+            .expect("instance start should succeed");
+        filtered_vmm
+            .handle_action(VmmAction::FlushMetrics)
+            .expect("flush metrics should succeed");
+        assert_eq!(
+            fs::read_to_string(&filtered_path).expect("filtered logger output should be readable"),
+            ""
+        );
+
+        fs::remove_file(matching_path).expect("matching fixture should clean up");
+        fs::remove_file(filtered_path).expect("filtered fixture should clean up");
     }
 
     #[test]
