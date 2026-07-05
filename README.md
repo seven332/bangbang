@@ -51,7 +51,8 @@ cargo run -p bangbang -- --api-sock /tmp/bangbang.socket --id demo-1
   `51200` bytes.
 - `--log-path <PATH>`, `--level <LEVEL>`, `--module <MODULE>`,
   `--show-level`, and `--show-log-origin` configure the same per-process
-  logger state as `PUT /logger` before the API socket is served.
+  logger state as `PUT /logger` before the API socket is served. The current
+  minimal action logs use module path `bangbang_runtime::vmm_action`.
 - `--no-api` requires `--config-file <PATH>`, starts from that configuration
   without publishing an API socket, and exits cleanly on `SIGINT` or `SIGTERM`.
 - `--help`, `-h`, `--version`, and `-V` are supported.
@@ -169,12 +170,14 @@ Configure logger output before boot:
 curl --unix-socket /tmp/bangbang.socket \
   -X PUT http://localhost/logger \
   -H 'Content-Type: application/json' \
-  -d '{"log_path":"/tmp/bangbang.log","level":"Info","show_level":true,"show_log_origin":true}'
+  -d '{"log_path":"/tmp/bangbang.log","level":"Info","module":"bangbang_runtime","show_level":true,"show_log_origin":true}'
 ```
 
 Configured logger output records minimal successful `InstanceStart` and
 `FlushMetrics` action events. `show_level` adds `level=Info`, and
 `show_log_origin` adds the runtime action callsite as `origin=<file>:<line>`.
+`module` filters these minimal action logs by prefix against
+`bangbang_runtime::vmm_action`.
 Full internal log routing remains deferred.
 
 Submit an `InstanceStart` action:

@@ -6,6 +6,8 @@ use std::panic::Location;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+const MINIMAL_ACTION_LOG_MODULE: &str = "bangbang_runtime::vmm_action";
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LoggerLevel {
     Off,
@@ -248,6 +250,10 @@ impl LoggerState {
             return Ok(false);
         }
 
+        if !self.module_allows(MINIMAL_ACTION_LOG_MODULE) {
+            return Ok(false);
+        }
+
         let Some(sink) = &mut self.sink else {
             return Ok(false);
         };
@@ -276,6 +282,12 @@ impl LoggerState {
 
     pub fn module(&self) -> Option<&str> {
         self.module.as_deref()
+    }
+
+    fn module_allows(&self, module_path: &str) -> bool {
+        self.module
+            .as_deref()
+            .is_none_or(|filter| module_path.starts_with(filter))
     }
 
     #[cfg(test)]
@@ -355,7 +367,7 @@ mod tests {
 
     use super::{
         LoggerConfigError, LoggerConfigInput, LoggerLevel, LoggerSink, LoggerState,
-        LoggerWriteError,
+        LoggerWriteError, MINIMAL_ACTION_LOG_MODULE,
     };
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -608,6 +620,54 @@ mod tests {
 
         let output = fs::read_to_string(&path).expect("logger output should be readable");
         assert_eq!(output, "action=FlushMetrics\n");
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn log_action_respects_module_filter_and_reconfiguration() {
+        let path = unique_logger_path("module-filtered-actions");
+        let mut state = LoggerState::default();
+        state
+            .configure(
+                LoggerConfigInput::new()
+                    .with_log_path(&path)
+                    .with_module("bangbang_runtime"),
+            )
+            .expect("logger should configure");
+
+        assert_eq!(state.log_action("InstanceStart"), Ok(true));
+
+        state
+            .configure(LoggerConfigInput::new().with_module(MINIMAL_ACTION_LOG_MODULE))
+            .expect("logger should update module filter");
+        assert_eq!(state.log_action("FlushMetrics"), Ok(true));
+
+        state
+            .configure(LoggerConfigInput::new().with_module("api_server"))
+            .expect("logger should update module filter");
+        assert_eq!(state.log_action("Suppressed"), Ok(false));
+
+        let output = fs::read_to_string(&path).expect("logger output should be readable");
+        assert_eq!(output, "action=InstanceStart\naction=FlushMetrics\n");
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn log_action_treats_empty_module_filter_as_match_all() {
+        let path = unique_logger_path("empty-module-filter");
+        let mut state = LoggerState::default();
+        state
+            .configure(
+                LoggerConfigInput::new()
+                    .with_log_path(&path)
+                    .with_module(""),
+            )
+            .expect("logger should configure");
+
+        assert_eq!(state.log_action("InstanceStart"), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("logger output should be readable");
+        assert_eq!(output, "action=InstanceStart\n");
         fs::remove_file(path).expect("fixture should clean up");
     }
 
