@@ -1746,6 +1746,33 @@ mod tests {
     }
 
     #[test]
+    fn empty_mmds_config_network_interface_list_faults_over_unix_socket() {
+        let mut vmm = test_controller();
+        let body = r#"{"network_interfaces":[]}"#;
+        let request = format!(
+            "PUT /mmds/config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        let response = request_over_socket(&mut vmm, "mmds-empty", &request);
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.contains("Content-Type: application/json\r\n"));
+        assert!(
+            response.contains(r#"{"fault_message":"MMDS network_interfaces must not be empty"}"#)
+        );
+        let vm_config_response = handle_request_bytes(
+            b"GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &mut vmm,
+        );
+        assert_eq!(
+            vm_config_response.status(),
+            bangbang_api::http::StatusCode::Ok
+        );
+        assert!(!vm_config_response.body().contains(r#""mmds-config":"#));
+    }
+
+    #[test]
     fn mmds_config_after_start_returns_state_fault() {
         let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
         let boot_body = r#"{"kernel_image_path":"/tmp/vmlinux"}"#;
