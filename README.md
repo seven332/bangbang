@@ -41,7 +41,8 @@ cargo run -p bangbang -- --api-sock /tmp/bangbang.socket --id demo-1
   `anonymous-instance`.
 - `--start-time-us <MICROS>`, `--start-time-cpu-us <MICROS>`, and
   `--parent-cpu-time-us <MICROS>` accept Firecracker launcher timing values for
-  minimal metrics output after successful startup and explicit `FlushMetrics`.
+  configured minimal metrics output after successful startup and explicit
+  `FlushMetrics`.
 - `--metrics-path <PATH>` configures the same per-process metrics sink as
   `PUT /metrics` before the API socket is served.
 - `--mmds-size-limit <BYTES>` sets the maximum serialized MMDS data-store size.
