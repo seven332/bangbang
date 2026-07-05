@@ -201,6 +201,22 @@ mod macos_arm64 {
             replacement_serial_output_path.display()
         );
 
+        let replacement_metrics_path = test_dir.path().join("replacement-metrics.out");
+        let replacement_metrics_path_json = json_string(path_text(&replacement_metrics_path));
+        let metrics_update_body = format!(r#"{{"metrics_path":{replacement_metrics_path_json}}}"#);
+        let metrics_update_response = http_put_json(&socket_path, "/metrics", &metrics_update_body);
+        assert_bad_request_response(&metrics_update_response, "PUT /metrics after InstanceStart");
+        assert_response_contains(
+            &metrics_update_response,
+            r#"{"fault_message":"The requested operation is not supported in Running state: PutMetrics"}"#,
+            "PUT /metrics after InstanceStart",
+        );
+        assert!(
+            !replacement_metrics_path.exists(),
+            "rejected metrics update must not create or use replacement output path {}",
+            replacement_metrics_path.display()
+        );
+
         let replacement_logger_path = test_dir.path().join("replacement-logger.out");
         let replacement_logger_path_json = json_string(path_text(&replacement_logger_path));
         let logger_update_body = format!(r#"{{"log_path":{replacement_logger_path_json}}}"#);
@@ -265,6 +281,11 @@ mod macos_arm64 {
         assert_no_content_response(&flush_metrics_response, "PUT /actions FlushMetrics");
         assert_metrics_output(&metrics_path);
         assert_startup_time_metrics_output(&metrics_path);
+        assert!(
+            !replacement_metrics_path.exists(),
+            "rejected metrics update must not write later metrics output to replacement path {}",
+            replacement_metrics_path.display()
+        );
         assert_logger_output(&logger_path);
         assert!(
             !replacement_logger_path.exists(),
