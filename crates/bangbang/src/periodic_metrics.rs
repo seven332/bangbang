@@ -41,7 +41,8 @@ impl PeriodicMetricsScheduler {
         }
 
         let remaining = self.next_deadline.duration_since(now);
-        let millis = remaining.as_millis();
+        let millis =
+            remaining.as_millis() + u128::from(!remaining.subsec_nanos().is_multiple_of(1_000_000));
         if millis == 0 {
             1
         } else if millis > i32::MAX as u128 {
@@ -85,6 +86,17 @@ mod tests {
         let scheduler = PeriodicMetricsScheduler::with_period(now, Duration::from_nanos(1));
 
         assert_eq!(scheduler.poll_timeout_ms(now), 1);
+    }
+
+    #[test]
+    fn scheduler_rounds_partial_millisecond_timeout_up() {
+        let now = Instant::now();
+        let scheduler = PeriodicMetricsScheduler::with_period(
+            now,
+            Duration::from_millis(1) + Duration::from_nanos(1),
+        );
+
+        assert_eq!(scheduler.poll_timeout_ms(now), 2);
     }
 
     #[test]
