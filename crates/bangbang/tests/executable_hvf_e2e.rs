@@ -42,6 +42,19 @@ mod macos_arm64 {
         ),
     ];
     const DIRECT_ROOTFS_VSOCK_PORT: u32 = 5005;
+    const DIRECT_ROOTFS_VSOCK_MULTISTREAM_MARKER: &[u8] = b"BANGBANG_VSOCK_GUEST_MULTISTREAM_OK";
+    const DIRECT_ROOTFS_VSOCK_MULTISTREAM_EXCHANGES: &[(u32, &[u8], &[u8])] = &[
+        (
+            5007,
+            b"BANGBANG_VSOCK_GUEST_MULTI_ONE",
+            b"BANGBANG_VSOCK_HOST_MULTI_ONE",
+        ),
+        (
+            5008,
+            b"BANGBANG_VSOCK_GUEST_MULTI_TWO",
+            b"BANGBANG_VSOCK_HOST_MULTI_TWO",
+        ),
+    ];
     const DIRECT_ROOTFS_HOST_VSOCK_READY_MARKER: &[u8] = b"BANGBANG_VSOCK_HOST_CONNECT_READY";
     const DIRECT_ROOTFS_HOST_VSOCK_MARKER: &[u8] = b"BANGBANG_VSOCK_HOST_CONNECT_OK";
     const DIRECT_ROOTFS_HOST_VSOCK_EXCHANGES: &[(&[u8], &[u8])] = &[
@@ -63,6 +76,7 @@ mod macos_arm64 {
     const DIRECT_ROOTFS_MMDS_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-fetch=1";
     const DIRECT_ROOTFS_MMDS_V2_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-v2-fetch=1";
     const DIRECT_ROOTFS_VSOCK_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-guest-connect=1";
+    const DIRECT_ROOTFS_VSOCK_MULTISTREAM_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-guest-multistream=1";
     const DIRECT_ROOTFS_HOST_VSOCK_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-host-connect=1";
     const GUEST_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -1222,6 +1236,242 @@ mod macos_arm64 {
             bangbang.terminate(),
             &socket_path,
             "bangbang direct rootfs guest vsock",
+        );
+        assert!(
+            !uds_path.exists(),
+            "bangbang shutdown should remove its owned main vsock listener path"
+        );
+    }
+
+    #[test]
+    fn signed_executable_handles_guest_initiated_vsock_multistream_from_direct_rootfs() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let data_backing_path = test_dir.path().join("data.img");
+        let uds_path = test_dir.path().join("gms.sock");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+
+        create_zeroed_block_backing(&data_backing_path);
+
+        let mut host_listeners = Vec::new();
+        for &(port, _, _) in DIRECT_ROOTFS_VSOCK_MULTISTREAM_EXCHANGES {
+            let host_port_path = vsock_port_path(&uds_path, port);
+            let host_listener = UnixListener::bind(&host_port_path).unwrap_or_else(|err| {
+                panic!(
+                    "host vsock multistream port listener {} should bind before guest startup: {err}",
+                    host_port_path.display()
+                )
+            });
+            host_listener
+                .set_nonblocking(true)
+                .expect("host vsock multistream port listener should be nonblocking");
+            host_listeners.push((port, host_port_path, host_listener));
+        }
+
+        let mut bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+        let machine_response = http_put_json(
+            &socket_path,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        );
+        assert_no_content_response(
+            &machine_response,
+            "PUT /machine-config guest multistream vsock",
+        );
+
+        let kernel_path_json = json_string(path_text(&kernel_path));
+        let boot_args_json = json_string(DIRECT_ROOTFS_VSOCK_MULTISTREAM_BOOT_ARGS);
+        let boot_body = format!(
+            r#"{{
+                "kernel_image_path":{kernel_path_json},
+                "boot_args":{boot_args_json}
+            }}"#
+        );
+        let boot_response = http_put_json(&socket_path, "/boot-source", &boot_body);
+        assert_no_content_response(&boot_response, "PUT /boot-source guest multistream vsock");
+
+        let rootfs_path_json = json_string(path_text(&rootfs_path));
+        let rootfs_body = format!(
+            r#"{{
+                "drive_id":"rootfs",
+                "path_on_host":{rootfs_path_json},
+                "is_root_device":true,
+                "is_read_only":true
+            }}"#
+        );
+        let rootfs_response = http_put_json(&socket_path, "/drives/rootfs", &rootfs_body);
+        assert_no_content_response(
+            &rootfs_response,
+            "PUT /drives/rootfs guest multistream vsock",
+        );
+
+        let data_backing_path_json = json_string(path_text(&data_backing_path));
+        let data_drive_body = format!(
+            r#"{{
+                "drive_id":"data",
+                "path_on_host":{data_backing_path_json},
+                "is_root_device":false,
+                "is_read_only":false
+            }}"#
+        );
+        let data_drive_response = http_put_json(&socket_path, "/drives/data", &data_drive_body);
+        assert_no_content_response(
+            &data_drive_response,
+            "PUT /drives/data guest multistream vsock",
+        );
+
+        let uds_path_json = json_string(path_text(&uds_path));
+        let vsock_body = format!(r#"{{"guest_cid":3,"uds_path":{uds_path_json}}}"#);
+        let vsock_response = http_put_json(&socket_path, "/vsock", &vsock_body);
+        assert_no_content_response(&vsock_response, "PUT /vsock guest multistream vsock");
+        assert!(
+            !uds_path.exists(),
+            "PUT /vsock should not bind the main vsock listener before startup"
+        );
+
+        let start_response = http_put_json(
+            &socket_path,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        );
+        assert_no_content_response(
+            &start_response,
+            "PUT /actions InstanceStart guest multistream vsock",
+        );
+
+        let running_instance_info = http_get(&socket_path, "/");
+        assert_ok_response(
+            &running_instance_info,
+            "GET / after guest multistream vsock start",
+        );
+        assert_response_contains(
+            &running_instance_info,
+            r#""state":"Running""#,
+            "GET / after guest multistream vsock start",
+        );
+
+        let mut host_streams = Vec::new();
+        for (port, host_port_path, host_listener) in host_listeners {
+            let host_stream = match wait_for_unix_listener_accept(
+                &host_listener,
+                &host_port_path,
+                GUEST_EXECUTION_TIMEOUT,
+            ) {
+                Ok(stream) => stream,
+                Err(err) => {
+                    let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+                    let output = bangbang.force_stop_and_collect();
+                    panic!(
+                        "guest did not initiate multistream vsock connection for port {port} to host listener {}: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                        host_port_path.display(),
+                        output.status,
+                        output.stdout,
+                        output.stderr
+                    );
+                }
+            };
+            drop(host_listener);
+            fs::remove_file(&host_port_path).unwrap_or_else(|err| {
+                panic!(
+                    "host vsock multistream port listener path {} should be removed after accept: {err}",
+                    host_port_path.display()
+                )
+            });
+
+            host_stream
+                .set_nonblocking(false)
+                .expect("host vsock multistream stream should switch back to blocking mode");
+            host_stream
+                .set_read_timeout(Some(GUEST_EXECUTION_TIMEOUT))
+                .expect("host vsock multistream stream read timeout should set");
+            host_stream
+                .set_write_timeout(Some(GUEST_EXECUTION_TIMEOUT))
+                .expect("host vsock multistream stream write timeout should set");
+            host_streams.push((port, host_port_path, host_stream));
+        }
+
+        for (
+            stream_index,
+            ((port, _host_port_path, host_stream), &(expected_port, guest_payload, _)),
+        ) in host_streams
+            .iter_mut()
+            .zip(DIRECT_ROOTFS_VSOCK_MULTISTREAM_EXCHANGES.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                *port, expected_port,
+                "host vsock multistream stream order should match port {expected_port}"
+            );
+            let stream_number = stream_index + 1;
+            let mut received_guest_payload = vec![0; guest_payload.len()];
+            if let Err(err) = host_stream.read_exact(&mut received_guest_payload) {
+                let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+                let output = bangbang.force_stop_and_collect();
+                panic!(
+                    "host side did not receive guest multistream payload {stream_number} for port {expected_port}: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status, output.stdout, output.stderr
+                );
+            }
+            assert_eq!(
+                received_guest_payload, guest_payload,
+                "host side should receive isolated guest multistream payload {stream_number}"
+            );
+        }
+
+        for (
+            stream_index,
+            ((port, _host_port_path, host_stream), &(expected_port, _, host_payload)),
+        ) in host_streams
+            .iter_mut()
+            .zip(DIRECT_ROOTFS_VSOCK_MULTISTREAM_EXCHANGES.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                *port, expected_port,
+                "host vsock multistream reply stream order should match port {expected_port}"
+            );
+            let stream_number = stream_index + 1;
+            if let Err(err) = host_stream.write_all(host_payload) {
+                let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+                let output = bangbang.force_stop_and_collect();
+                panic!(
+                    "host side did not write guest multistream reply {stream_number} for port {expected_port}: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status, output.stdout, output.stderr
+                );
+            }
+        }
+
+        if let Err(err) = wait_for_file_prefix_marker(
+            &data_backing_path,
+            DIRECT_ROOTFS_VSOCK_MULTISTREAM_MARKER,
+            GUEST_EXECUTION_TIMEOUT,
+        ) {
+            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "direct rootfs guest did not complete guest-initiated vsock multistream through signed bangbang executable: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
+        for (port, host_port_path, host_stream) in &mut host_streams {
+            if let Err(err) = read_unix_stream_eof(host_stream, host_port_path) {
+                let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+                let output = bangbang.force_stop_and_collect();
+                panic!(
+                    "host side did not observe guest multistream EOF for port {port} after guest close: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status, output.stdout, output.stderr
+                );
+            }
+        }
+
+        assert_clean_shutdown(
+            bangbang.terminate(),
+            &socket_path,
+            "bangbang direct rootfs guest multistream vsock",
         );
         assert!(
             !uds_path.exists(),
