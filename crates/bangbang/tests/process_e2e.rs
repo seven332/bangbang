@@ -1324,6 +1324,152 @@ fn executable_rejects_unsupported_drive_options_without_mutating() {
 }
 
 #[test]
+fn executable_rejects_invalid_network_interfaces_without_mutating() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    let network_response = http_put_json(
+        &socket_path,
+        "/network-interfaces/eth0",
+        r#"{"iface_id":"eth0","host_dev_name":"vmnet:shared","guest_mac":"12:34:56:78:9a:bc","mtu":1500}"#,
+    );
+    assert_no_content_response(&network_response, "PUT /network-interfaces/eth0");
+
+    let assert_only_eth0 = |context: &str, rejected: &[(&str, Option<&str>, Option<&str>)]| {
+        let vm_config = http_get(&socket_path, "/vm/config");
+        assert_ok_response(&vm_config, context);
+        assert_response_contains(&vm_config, r#""iface_id":"eth0""#, context);
+        assert_response_contains(&vm_config, r#""host_dev_name":"vmnet:shared""#, context);
+        assert_response_contains(&vm_config, r#""guest_mac":"12:34:56:78:9a:bc""#, context);
+        assert_response_contains(&vm_config, r#""mtu":1500"#, context);
+        assert_eq!(
+            vm_config.matches(r#""iface_id":"#).count(),
+            1,
+            "{context} must keep only the accepted network interface; response:\n{vm_config}"
+        );
+
+        for (iface_id, host_dev_name, guest_mac) in rejected {
+            assert!(
+                !vm_config.contains(&format!(r#""iface_id":"{iface_id}""#)),
+                "{context} must not store rejected interface {iface_id}; response:\n{vm_config}"
+            );
+            if let Some(host_dev_name) = host_dev_name {
+                assert!(
+                    !vm_config.contains(&format!(r#""host_dev_name":"{host_dev_name}""#)),
+                    "{context} must not store rejected host device; response:\n{vm_config}"
+                );
+            }
+            if let Some(guest_mac) = guest_mac {
+                assert!(
+                    !vm_config.contains(&format!(r#""guest_mac":"{guest_mac}""#)),
+                    "{context} must not store rejected guest MAC; response:\n{vm_config}"
+                );
+            }
+        }
+    };
+
+    let mismatched_response = http_put_json(
+        &socket_path,
+        "/network-interfaces/mismatched_path",
+        r#"{"iface_id":"mismatched_body","host_dev_name":"vmnet:mismatched","guest_mac":"02:00:00:00:00:01"}"#,
+    );
+    assert_bad_request_response(
+        &mismatched_response,
+        "PUT /network-interfaces/mismatched_path",
+    );
+    assert_response_contains(
+        &mismatched_response,
+        r#"{"fault_message":"path iface_id must match body iface_id."}"#,
+        "PUT /network-interfaces/mismatched_path",
+    );
+    assert_only_eth0(
+        "GET /vm/config after mismatched network iface_id",
+        &[(
+            "mismatched_body",
+            Some("vmnet:mismatched"),
+            Some("02:00:00:00:00:01"),
+        )],
+    );
+
+    let empty_host_response = http_put_json(
+        &socket_path,
+        "/network-interfaces/empty_host",
+        r#"{"iface_id":"empty_host","host_dev_name":"","guest_mac":"02:00:00:00:00:02"}"#,
+    );
+    assert_bad_request_response(&empty_host_response, "PUT /network-interfaces/empty_host");
+    assert_response_contains(
+        &empty_host_response,
+        r#"{"fault_message":"network host_dev_name must not be empty"}"#,
+        "PUT /network-interfaces/empty_host",
+    );
+    assert_only_eth0(
+        "GET /vm/config after empty network host_dev_name",
+        &[("empty_host", None, Some("02:00:00:00:00:02"))],
+    );
+
+    let rx_rate_limiter_response = http_put_json(
+        &socket_path,
+        "/network-interfaces/rx_limited",
+        r#"{"iface_id":"rx_limited","host_dev_name":"vmnet:rx","guest_mac":"02:00:00:00:00:03","rx_rate_limiter":{"bandwidth":{"size":1000,"one_time_burst":1000,"refill_time":100}}}"#,
+    );
+    assert_bad_request_response(
+        &rx_rate_limiter_response,
+        "PUT /network-interfaces/rx_limited",
+    );
+    assert_response_contains(
+        &rx_rate_limiter_response,
+        r#"{"fault_message":"network rx_rate_limiter is not supported"}"#,
+        "PUT /network-interfaces/rx_limited",
+    );
+    assert_only_eth0(
+        "GET /vm/config after rejected rx rate limiter",
+        &[("rx_limited", Some("vmnet:rx"), Some("02:00:00:00:00:03"))],
+    );
+
+    let tx_rate_limiter_response = http_put_json(
+        &socket_path,
+        "/network-interfaces/tx_limited",
+        r#"{"iface_id":"tx_limited","host_dev_name":"vmnet:tx","guest_mac":"02:00:00:00:00:04","tx_rate_limiter":{"ops":{"size":100,"one_time_burst":100,"refill_time":1000}}}"#,
+    );
+    assert_bad_request_response(
+        &tx_rate_limiter_response,
+        "PUT /network-interfaces/tx_limited",
+    );
+    assert_response_contains(
+        &tx_rate_limiter_response,
+        r#"{"fault_message":"network tx_rate_limiter is not supported"}"#,
+        "PUT /network-interfaces/tx_limited",
+    );
+    assert_only_eth0(
+        "GET /vm/config after rejected tx rate limiter",
+        &[("tx_limited", Some("vmnet:tx"), Some("02:00:00:00:00:04"))],
+    );
+
+    let duplicate_mac_response = http_put_json(
+        &socket_path,
+        "/network-interfaces/duplicate_mac",
+        r#"{"iface_id":"duplicate_mac","host_dev_name":"vmnet:duplicate","guest_mac":"12:34:56:78:9a:bc"}"#,
+    );
+    assert_bad_request_response(
+        &duplicate_mac_response,
+        "PUT /network-interfaces/duplicate_mac",
+    );
+    assert_response_contains(
+        &duplicate_mac_response,
+        r#"{"fault_message":"network guest_mac is already in use"}"#,
+        "PUT /network-interfaces/duplicate_mac",
+    );
+    assert_only_eth0(
+        "GET /vm/config after duplicate network guest_mac",
+        &[("duplicate_mac", Some("vmnet:duplicate"), None)],
+    );
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
 fn executable_configures_network_and_mmds() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
