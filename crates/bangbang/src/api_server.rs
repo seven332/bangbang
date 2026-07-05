@@ -3555,18 +3555,23 @@ mod tests {
             .status(),
             bangbang_api::http::StatusCode::BadRequest
         );
-        assert_eq!(
-            handle_request_bytes(
-                request_with_body(
-                    "PATCH",
-                    "/network-interfaces/eth0",
-                    r#"{"iface_id":"eth0"}"#
-                )
-                .as_bytes(),
-                &mut vmm,
-            )
-            .status(),
-            bangbang_api::http::StatusCode::BadRequest
+        let network_patch_response = request_over_socket(
+            &mut vmm,
+            "patch-network",
+            &request_with_body(
+                "PATCH",
+                "/network-interfaces/eth0",
+                r#"{"iface_id":"eth0"}"#,
+            ),
+        );
+        assert!(
+            network_patch_response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "network patch should fail through the API socket; response:\n{network_patch_response}"
+        );
+        assert!(
+            network_patch_response
+                .contains(r#"{"fault_message":"Network interface updates are not supported."}"#),
+            "network patch should keep the existing unsupported fault body; response:\n{network_patch_response}"
         );
         let vm_config_after_network_patch = handle_request_bytes(
             b"GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
