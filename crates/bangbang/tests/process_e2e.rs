@@ -593,7 +593,18 @@ fn executable_rejects_multi_vcpu_instance_start_without_stopping() {
         "GET /machine-config after rejected multi-vCPU start",
     );
 
-    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+    let output = bangbang.terminate();
+    assert!(
+        !output.stdout.contains(kernel_path_text),
+        "multi-vCPU startup rejection should not write the private kernel path to stdout; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !output.stderr.contains(kernel_path_text),
+        "multi-vCPU startup rejection should not write the private kernel path to stderr; stderr:\n{}",
+        output.stderr
+    );
+    assert_clean_shutdown(output, &socket_path, "bangbang");
 }
 
 #[test]
