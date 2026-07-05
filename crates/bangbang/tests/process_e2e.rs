@@ -108,19 +108,21 @@ fn executable_accepts_firecracker_startup_time_args() {
 
 #[test]
 fn executable_rejects_unsupported_firecracker_process_flags_before_socket_publication() {
-    for (name, args) in [
-        ("boot-timer", &["--boot-timer"][..]),
+    for (name, args, private_value) in [
+        ("boot-timer", &["--boot-timer"][..], None),
         (
             "describe-snapshot",
             &["--describe-snapshot", "secret-snapshot.vmstate"],
+            Some("secret-snapshot.vmstate"),
         ),
-        ("enable-pci", &["--enable-pci"]),
-        ("no-seccomp", &["--no-seccomp"]),
+        ("enable-pci", &["--enable-pci"], None),
+        ("no-seccomp", &["--no-seccomp"], None),
         (
             "seccomp-filter",
             &["--seccomp-filter", "secret-seccomp.bpf"],
+            Some("secret-seccomp.bpf"),
         ),
-        ("snapshot-version", &["--snapshot-version"]),
+        ("snapshot-version", &["--snapshot-version"], None),
     ] {
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join(format!("{name}.socket"));
@@ -149,6 +151,14 @@ fn executable_rejects_unsupported_firecracker_process_flags_before_socket_public
             "unsupported --{name} must not report API readiness; stdout:\n{}",
             output.stdout
         );
+        if let Some(private_value) = private_value {
+            assert!(
+                !output.stdout.contains(private_value) && !output.stderr.contains(private_value),
+                "unsupported --{name} failure must not echo private argument value {private_value:?}; stdout:\n{}\nstderr:\n{}",
+                output.stdout,
+                output.stderr
+            );
+        }
         assert!(
             !socket_path.exists(),
             "unsupported --{name} must fail before publishing the API socket"
