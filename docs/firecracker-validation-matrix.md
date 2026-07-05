@@ -1,0 +1,52 @@
+# Firecracker Validation Matrix
+
+This matrix summarizes bangbang's current Firecracker-facing compatibility
+coverage. Detailed endpoint behavior, field policy, platform limits, and
+compatibility rationale remain in
+[Firecracker Compatibility Scope](firecracker-compatibility.md).
+
+## Status Vocabulary
+
+- `implemented`: the public behavior exists for the documented subset.
+- `partial`: an initial subset works, but important Firecracker behavior is
+  still tracked by the related issue.
+- `recognized unsupported`: the API shape is parsed or recognized before
+  returning a Firecracker-shaped fault.
+- `deferred`: the behavior needs a larger capability or backend design.
+- `platform-limited`: the Firecracker feature depends on Linux-specific
+  mechanisms or a host facility that does not map directly to macOS/HVF.
+
+## Validation Layers
+
+- `unit`: crate-local Rust tests for parsers, state, error formatting, and
+  backend-neutral helpers.
+- `api socket`: in-process API server tests over a real Unix socket.
+- `process e2e`: unsigned executable tests in `crates/bangbang/tests/`.
+- `signed process`: `scripts/run-signed-process-tests.sh`.
+- `signed HVF`: `scripts/run-integration-tests.sh` targets that create HVF
+  resources or boot guests.
+- `docs`: compatibility, security, testing, or review documentation.
+
+## Matrix
+
+| Area | Current status | Primary validation | Related issue | Notes |
+| --- | --- | --- | --- | --- |
+| Process CLI and API socket | partial | unit, api socket, process e2e, signed process | #536, #545 | Firecracker-shaped startup args, API socket binding, config-file startup, no-api mode, payload limits, and cleanup are covered for the current subset. Linux jailer/seccomp behavior is platform-limited. |
+| Instance/version/config reads | implemented | unit, api socket, process e2e | #536 | `GET /`, `GET /version`, `GET /vm/config`, and `GET /machine-config` expose accumulated supported state for the current subset. Unsupported config sections are omitted until modeled. |
+| Machine and boot configuration | partial | unit, api socket, process e2e, signed HVF | #538 | Pre-boot machine config, boot source, kernel/initrd loading, FDT generation, and direct-rootfs boot paths are covered. Multi-vCPU and broader CPU feature behavior remain deferred. |
+| Drives and virtio-block | partial | unit, api socket, process e2e, signed HVF | #539 | Initial drives, cache policy handling, block read/write, root-drive boot args, and basic guest-visible block behavior are covered. Runtime update/hotplug remains deferred. |
+| Network and MMDS | partial | unit, api socket, process e2e, signed HVF | #540 | Initial network config, vmnet mode selection, process-local MMDS, and internal guest-visible MMDS packet handling are covered. Public packet movement, rate limiting, and runtime updates remain deferred. |
+| Virtio-vsock | partial | unit, api socket, process e2e, signed HVF | #541 | Initial config, startup listener ownership, connection setup, bounded buffering, reset/shutdown cleanup, and executable startup paths are covered. Full streaming semantics and credit accounting remain deferred. |
+| Observability: logger, metrics, serial | partial | unit, api socket, process e2e, signed process, signed HVF | #542 | Minimal logger, metrics, startup timing, flush metrics, and serial output paths are covered. Full Firecracker counters, periodic flush, and full log routing remain deferred. |
+| VM lifecycle and run-loop control | partial | unit, api socket, process e2e, signed HVF | #537 | `InstanceStart`, Running transition, retained boot worker status, and unsupported pause/resume request routing are covered. Public pause/resume and guest shutdown state handling remain deferred. |
+| Snapshots and restore | recognized unsupported | unit, api socket | #543 | Snapshot create/load request shapes are parsed and rejected with the snapshot fault. Real memory, vCPU, and device-state persistence remains deferred. |
+| Remaining Firecracker devices | recognized unsupported | unit, api socket | #544 | Balloon, pmem, entropy, and memory hotplug request shapes are recognized or parsed before returning device-specific unsupported faults. Device implementation needs separate designs. |
+| macOS isolation and platform limits | partial | docs, process e2e | #545 | Security docs cover current socket, host-path, entitlement, and multi-process boundaries. macOS sandboxing, launcher/resource broker, and stricter host-path policy need follow-up work. |
+| Validation matrix maintenance | implemented | docs | #546 | Future capability PRs should update this matrix when support status or validation layers change. Full upstream Firecracker test-suite mapping remains deferred. |
+
+## Update Rule
+
+When a PR changes Firecracker-facing behavior, update this matrix if it changes
+support status, adds or removes a validation layer, or moves work between
+implemented, partial, deferred, recognized unsupported, or platform-limited
+states.
