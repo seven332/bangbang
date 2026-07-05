@@ -143,6 +143,39 @@ fn executable_rejects_api_payload_over_limit_without_stopping() {
 }
 
 #[test]
+fn executable_rejects_invalid_api_routes_without_stopping() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    for (request_name, response) in [
+        ("GET /unknown", http_get(&socket_path, "/unknown")),
+        (
+            "POST /version",
+            http_no_body(&socket_path, "POST", "/version"),
+        ),
+    ] {
+        assert_bad_request_response(&response, request_name);
+        assert_response_contains(
+            &response,
+            r#"{"fault_message":"Invalid request method and/or path."}"#,
+            request_name,
+        );
+    }
+
+    let instance_info = http_get(&socket_path, "/");
+    assert_ok_response(&instance_info, "GET / after invalid API routes");
+    assert_response_contains(
+        &instance_info,
+        r#""state":"Not started""#,
+        "GET / after invalid API routes",
+    );
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
+}
+
+#[test]
 fn executable_handles_sigint_shutdown_cleanly() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
