@@ -261,6 +261,27 @@ fn executable_rejects_remaining_device_requests_without_mutating() {
         }
     }
 
+    let memory_hotplug_get_response = http_get(&socket_path, "/hotplug/memory");
+    assert_bad_request_response(&memory_hotplug_get_response, "GET /hotplug/memory");
+    assert_response_contains(
+        &memory_hotplug_get_response,
+        r#"{"fault_message":"Memory hotplug is not supported."}"#,
+        "GET /hotplug/memory",
+    );
+
+    let memory_hotplug_patch_response = http_json(
+        &socket_path,
+        "PATCH",
+        "/hotplug/memory",
+        r#"{"requested_size_mib":256}"#,
+    );
+    assert_bad_request_response(&memory_hotplug_patch_response, "PATCH /hotplug/memory");
+    assert_response_contains(
+        &memory_hotplug_patch_response,
+        r#"{"fault_message":"Memory hotplug is not supported."}"#,
+        "PATCH /hotplug/memory",
+    );
+
     for path in ["/balloon", "/balloon/statistics", "/balloon/hinting/status"] {
         let request_name = format!("GET {path}");
         let response = http_get(&socket_path, path);
