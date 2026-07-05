@@ -2301,16 +2301,60 @@ fn executable_fails_when_api_socket_path_exists_without_removing_it() {
 }
 
 #[test]
-fn concurrent_executables_keep_api_sockets_isolated() {
+fn concurrent_executables_keep_api_resources_isolated() {
     let first_dir = TestDir::new();
     let second_dir = TestDir::new();
     let first_socket_path = first_dir.path().join("api.socket");
     let second_socket_path = second_dir.path().join("api.socket");
+    let first_metadata_path = first_dir.path().join("metadata.json");
+    let second_metadata_path = second_dir.path().join("metadata.json");
+    let first_metrics_path = first_dir.path().join("startup.metrics");
+    let second_metrics_path = second_dir.path().join("startup.metrics");
     let first_instance_id = first_dir.instance_id();
     let second_instance_id = second_dir.instance_id();
+    fs::write(
+        &first_metadata_path,
+        r#"{"latest":{"meta-data":{"ami-id":"ami-first"},"user-data":"first-user-data"}}"#,
+    )
+    .expect("first metadata file should be written");
+    fs::write(
+        &second_metadata_path,
+        r#"{"latest":{"meta-data":{"ami-id":"ami-second"},"user-data":"second-user-data"}}"#,
+    )
+    .expect("second metadata file should be written");
 
-    let first_bangbang = BangbangProcess::start(&first_socket_path, &first_instance_id);
-    let second_bangbang = BangbangProcess::start(&second_socket_path, &second_instance_id);
+    let first_bangbang = BangbangProcess::start_with_extra_args(
+        &first_socket_path,
+        &first_instance_id,
+        &[
+            "--metadata",
+            path_text(&first_metadata_path),
+            "--metrics-path",
+            path_text(&first_metrics_path),
+            "--start-time-us",
+            "1100",
+            "--start-time-cpu-us",
+            "1200",
+            "--parent-cpu-time-us",
+            "1300",
+        ],
+    );
+    let second_bangbang = BangbangProcess::start_with_extra_args(
+        &second_socket_path,
+        &second_instance_id,
+        &[
+            "--metadata",
+            path_text(&second_metadata_path),
+            "--metrics-path",
+            path_text(&second_metrics_path),
+            "--start-time-us",
+            "2100",
+            "--start-time-cpu-us",
+            "2200",
+            "--parent-cpu-time-us",
+            "2300",
+        ],
+    );
 
     assert_instance_info_matches(
         &first_socket_path,
@@ -2322,6 +2366,50 @@ fn concurrent_executables_keep_api_sockets_isolated() {
         &second_socket_path,
         &second_instance_id,
         &first_instance_id,
+        "second bangbang",
+    );
+    assert_mmds_data_matches(
+        &first_socket_path,
+        "ami-first",
+        "first-user-data",
+        "ami-second",
+        "second-user-data",
+        "first bangbang",
+    );
+    assert_mmds_data_matches(
+        &second_socket_path,
+        "ami-second",
+        "second-user-data",
+        "ami-first",
+        "first-user-data",
+        "second bangbang",
+    );
+    assert_startup_metrics_match(
+        &first_metrics_path,
+        &[
+            r#""start_time_us":1100"#,
+            r#""start_time_cpu_us":1200"#,
+            r#""parent_cpu_time_us":1300"#,
+        ],
+        &[
+            r#""start_time_us":2100"#,
+            r#""start_time_cpu_us":2200"#,
+            r#""parent_cpu_time_us":2300"#,
+        ],
+        "first bangbang",
+    );
+    assert_startup_metrics_match(
+        &second_metrics_path,
+        &[
+            r#""start_time_us":2100"#,
+            r#""start_time_cpu_us":2200"#,
+            r#""parent_cpu_time_us":2300"#,
+        ],
+        &[
+            r#""start_time_us":1100"#,
+            r#""start_time_cpu_us":1200"#,
+            r#""parent_cpu_time_us":1300"#,
+        ],
         "second bangbang",
     );
 
@@ -2618,4 +2706,58 @@ fn assert_instance_info_matches(
         !response.contains(&format!(r#""id":"{unexpected_instance_id}""#)),
         "{process_name} response should not contain another process id; response:\n{response}"
     );
+}
+
+fn assert_mmds_data_matches(
+    socket_path: &std::path::Path,
+    expected_ami_id: &str,
+    expected_user_data: &str,
+    unexpected_ami_id: &str,
+    unexpected_user_data: &str,
+    process_name: &str,
+) {
+    let request_name = format!("GET /mmds for {process_name}");
+    let response = http_get(socket_path, "/mmds");
+    assert_ok_response(&response, &request_name);
+    assert_response_contains(
+        &response,
+        &format!(r#""ami-id":"{expected_ami_id}""#),
+        &request_name,
+    );
+    assert_response_contains(
+        &response,
+        &format!(r#""user-data":"{expected_user_data}""#),
+        &request_name,
+    );
+    assert!(
+        !response.contains(&format!(r#""ami-id":"{unexpected_ami_id}""#))
+            && !response.contains(&format!(r#""user-data":"{unexpected_user_data}""#)),
+        "{request_name} response should not contain another process MMDS data; response:\n{response}"
+    );
+}
+
+fn assert_startup_metrics_match(
+    metrics_path: &std::path::Path,
+    expected_fragments: &[&str],
+    unexpected_fragments: &[&str],
+    process_name: &str,
+) {
+    let output = fs::read_to_string(metrics_path).unwrap_or_else(|err| {
+        panic!(
+            "{process_name} metrics output {} should be readable: {err}",
+            metrics_path.display()
+        )
+    });
+    for expected in expected_fragments {
+        assert!(
+            output.contains(expected),
+            "{process_name} metrics output should contain {expected:?}; output:\n{output}"
+        );
+    }
+    for unexpected in unexpected_fragments {
+        assert!(
+            !output.contains(unexpected),
+            "{process_name} metrics output should not contain another process value {unexpected:?}; output:\n{output}"
+        );
+    }
 }
