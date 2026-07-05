@@ -160,7 +160,8 @@ process-owned boot worker exists. When startup timing CLI values are provided,
 the same line includes `start_time_us`, `start_time_cpu_us`, and
 `parent_cpu_time_us`. The current Firecracker-shaped API request metrics subset
 also reports selected GET counters under `get_api_requests` and parsed core
-configuration, observability, and `/actions` counters under `put_api_requests`.
+configuration, MMDS, observability, and `/actions` counters under
+`put_api_requests`.
 
 Configure logger output before boot:
 
