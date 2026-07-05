@@ -19,15 +19,23 @@ const ARM64_KVM_REG_SIZE_SHIFT: u32 = 52;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiRequest {
     GetInstanceInfo,
+    GetBalloon,
+    GetBalloonStats,
+    GetBalloonHintingStatus,
     GetMachineConfig,
     GetMmds,
     GetVmConfig,
     GetVersion,
     PutAction(Box<ActionRequest>),
+    PutBalloon,
     PutBootSource(Box<BootSourceRequest>),
     PutCpuConfig(Box<CpuConfigRequest>),
     PutDrive(Box<DriveConfigRequest>),
     PutEntropy,
+    PatchBalloon,
+    PatchBalloonStats,
+    PatchBalloonHintingStart,
+    PatchBalloonHintingStop,
     PatchDrive(Box<DrivePatchRequest>),
     PatchVmState(Box<VmStateUpdateRequest>),
     PutLogger(Box<LoggerConfigRequest>),
@@ -1424,8 +1432,8 @@ pub fn parse_request_with_limit(
         return Err(RequestError::MalformedRequest);
     }
 
-    if is_balloon_endpoint_without_body_parsing(method, path) {
-        return Err(RequestError::BalloonUnsupported);
+    if let Some(request) = balloon_request_without_body_parsing(method, path) {
+        return Ok(request);
     }
     if method == "PUT" && path == "/balloon" {
         return parse_balloon_config_request(body);
@@ -1550,14 +1558,14 @@ pub fn parse_request_with_limit(
     }
 }
 
-fn is_balloon_endpoint_without_body_parsing(method: &str, path: &str) -> bool {
-    matches!(
-        (method, path),
-        ("GET", "/balloon")
-            | ("GET", "/balloon/statistics")
-            | ("GET", "/balloon/hinting/status")
-            | ("PATCH", "/balloon/hinting/stop")
-    )
+fn balloon_request_without_body_parsing(method: &str, path: &str) -> Option<ApiRequest> {
+    match (method, path) {
+        ("GET", "/balloon") => Some(ApiRequest::GetBalloon),
+        ("GET", "/balloon/statistics") => Some(ApiRequest::GetBalloonStats),
+        ("GET", "/balloon/hinting/status") => Some(ApiRequest::GetBalloonHintingStatus),
+        ("PATCH", "/balloon/hinting/stop") => Some(ApiRequest::PatchBalloonHintingStop),
+        _ => None,
+    }
 }
 
 fn drive_path_id(path: &str) -> Option<&str> {
@@ -1882,7 +1890,7 @@ fn parse_balloon_config_request(body: &[u8]) -> Result<ApiRequest, RequestError>
         free_page_reporting,
     );
 
-    Err(RequestError::BalloonUnsupported)
+    Ok(ApiRequest::PutBalloon)
 }
 
 fn parse_balloon_update_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
@@ -1891,7 +1899,7 @@ fn parse_balloon_update_request(body: &[u8]) -> Result<ApiRequest, RequestError>
             .map_err(|_| RequestError::MalformedRequest)?;
     let _ = amount_mib;
 
-    Err(RequestError::BalloonUnsupported)
+    Ok(ApiRequest::PatchBalloon)
 }
 
 fn parse_balloon_stats_update_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
@@ -1901,12 +1909,12 @@ fn parse_balloon_stats_update_request(body: &[u8]) -> Result<ApiRequest, Request
         .map_err(|_| RequestError::MalformedRequest)?;
     let _ = stats_polling_interval_s;
 
-    Err(RequestError::BalloonUnsupported)
+    Ok(ApiRequest::PatchBalloonStats)
 }
 
 fn parse_balloon_hinting_start_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
     if body.is_empty() {
-        return Err(RequestError::BalloonUnsupported);
+        return Ok(ApiRequest::PatchBalloonHintingStart);
     }
 
     let BalloonHintingStartRequestBody {
@@ -1915,7 +1923,7 @@ fn parse_balloon_hinting_start_request(body: &[u8]) -> Result<ApiRequest, Reques
         .map_err(|_| RequestError::MalformedRequest)?;
     let _ = acknowledge_on_stop;
 
-    Err(RequestError::BalloonUnsupported)
+    Ok(ApiRequest::PatchBalloonHintingStart)
 }
 
 fn parse_snapshot_create_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
@@ -2507,6 +2515,14 @@ impl From<ApiRequest> for Endpoint {
             ApiRequest::GetMmds => Self::Mmds,
             ApiRequest::GetVmConfig => Self::VmConfig,
             ApiRequest::GetVersion => Self::Version,
+            ApiRequest::GetBalloon
+            | ApiRequest::GetBalloonStats
+            | ApiRequest::GetBalloonHintingStatus
+            | ApiRequest::PutBalloon
+            | ApiRequest::PatchBalloon
+            | ApiRequest::PatchBalloonStats
+            | ApiRequest::PatchBalloonHintingStart
+            | ApiRequest::PatchBalloonHintingStop => Self::Balloon,
             ApiRequest::PatchVmState(_) => Self::VmState,
             ApiRequest::PutAction(_) => Self::Actions,
             ApiRequest::PutBootSource(_) => Self::BootSource,
@@ -4798,19 +4814,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_valid_balloon_methods_as_unsupported() {
+    fn parses_valid_balloon_methods() {
         let requests = [
             (
                 "GET /balloon",
                 b"GET /balloon HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+                ApiRequest::GetBalloon,
             ),
             (
                 "GET /balloon/statistics",
                 b"GET /balloon/statistics HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+                ApiRequest::GetBalloonStats,
             ),
             (
                 "GET /balloon/hinting/status",
                 b"GET /balloon/hinting/status HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+                ApiRequest::GetBalloonHintingStatus,
             ),
             (
                 "PUT /balloon",
@@ -4819,6 +4838,7 @@ mod tests {
                     "/balloon",
                     r#"{"amount_mib":64,"deflate_on_oom":true}"#,
                 ),
+                ApiRequest::PutBalloon,
             ),
             (
                 "PUT /balloon optional fields",
@@ -4827,6 +4847,7 @@ mod tests {
                     "/balloon",
                     r#"{"amount_mib":64,"deflate_on_oom":false,"stats_polling_interval_s":1,"free_page_hinting":true,"free_page_reporting":false}"#,
                 ),
+                ApiRequest::PutBalloon,
             ),
             (
                 "PUT /balloon max numeric fields",
@@ -4835,14 +4856,17 @@ mod tests {
                     "/balloon",
                     r#"{"amount_mib":4294967295,"deflate_on_oom":true,"stats_polling_interval_s":65535}"#,
                 ),
+                ApiRequest::PutBalloon,
             ),
             (
                 "PATCH /balloon",
                 request_with_body("PATCH", "/balloon", r#"{"amount_mib":32}"#),
+                ApiRequest::PatchBalloon,
             ),
             (
                 "PATCH /balloon max amount",
                 request_with_body("PATCH", "/balloon", r#"{"amount_mib":4294967295}"#),
+                ApiRequest::PatchBalloon,
             ),
             (
                 "PATCH /balloon/statistics",
@@ -4851,6 +4875,7 @@ mod tests {
                     "/balloon/statistics",
                     r#"{"stats_polling_interval_s":1}"#,
                 ),
+                ApiRequest::PatchBalloonStats,
             ),
             (
                 "PATCH /balloon/statistics max interval",
@@ -4859,22 +4884,27 @@ mod tests {
                     "/balloon/statistics",
                     r#"{"stats_polling_interval_s":65535}"#,
                 ),
+                ApiRequest::PatchBalloonStats,
             ),
             (
                 "PATCH /balloon/hinting/start without body",
                 b"PATCH /balloon/hinting/start HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+                ApiRequest::PatchBalloonHintingStart,
             ),
             (
                 "PATCH /balloon/hinting/start empty body",
                 request_with_body("PATCH", "/balloon/hinting/start", ""),
+                ApiRequest::PatchBalloonHintingStart,
             ),
             (
                 "PATCH /balloon/hinting/start",
                 request_with_body("PATCH", "/balloon/hinting/start", "{}"),
+                ApiRequest::PatchBalloonHintingStart,
             ),
             (
                 "PATCH /balloon/hinting/start empty sequence",
                 request_with_body("PATCH", "/balloon/hinting/start", "[]"),
+                ApiRequest::PatchBalloonHintingStart,
             ),
             (
                 "PATCH /balloon/hinting/start explicit",
@@ -4883,6 +4913,7 @@ mod tests {
                     "/balloon/hinting/start",
                     r#"{"acknowledge_on_stop":false}"#,
                 ),
+                ApiRequest::PatchBalloonHintingStart,
             ),
             (
                 "PATCH /balloon/hinting/start unknown field",
@@ -4891,21 +4922,23 @@ mod tests {
                     "/balloon/hinting/start",
                     r#"{"acknowledge_on_stop":false,"unknown":true}"#,
                 ),
+                ApiRequest::PatchBalloonHintingStart,
             ),
             (
                 "PATCH /balloon/hinting/start only unknown field",
                 request_with_body("PATCH", "/balloon/hinting/start", r#"{"unknown":true}"#),
+                ApiRequest::PatchBalloonHintingStart,
             ),
             (
                 "PATCH /balloon/hinting/stop",
                 b"PATCH /balloon/hinting/stop HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+                ApiRequest::PatchBalloonHintingStop,
             ),
         ];
 
-        for (route, request) in requests {
-            let err = parse_request(&request).expect_err("balloon should be unsupported");
-            assert_eq!(err, RequestError::BalloonUnsupported, "{route}");
-            assert_eq!(err.fault_message(), "Balloon device is not supported.");
+        for (route, request, expected) in requests {
+            let parsed = parse_request(&request).expect("balloon request should parse");
+            assert_eq!(parsed, expected, "{route}");
         }
     }
 
@@ -5007,14 +5040,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_balloon_hinting_stop_without_parsing_body() {
+    fn parses_balloon_hinting_stop_without_parsing_body() {
         for request in [
             request_with_body("PATCH", "/balloon/hinting/stop", "not-json"),
             request_with_body("PATCH", "/balloon/hinting/stop", ""),
         ] {
-            let err = parse_request(&request).expect_err("balloon should be unsupported");
-            assert_eq!(err, RequestError::BalloonUnsupported);
-            assert_eq!(err.fault_message(), "Balloon device is not supported.");
+            assert_eq!(
+                parse_request(&request),
+                Ok(ApiRequest::PatchBalloonHintingStop)
+            );
         }
     }
 
@@ -6074,6 +6108,30 @@ mod tests {
             .expect("cpu-config request should parse");
 
         assert_eq!(Endpoint::from(request), Endpoint::CpuConfig);
+
+        assert_eq!(Endpoint::from(ApiRequest::GetBalloon), Endpoint::Balloon);
+        assert_eq!(
+            Endpoint::from(ApiRequest::GetBalloonStats),
+            Endpoint::Balloon
+        );
+        assert_eq!(
+            Endpoint::from(ApiRequest::GetBalloonHintingStatus),
+            Endpoint::Balloon
+        );
+
+        let request = parse_request(&request_with_body(
+            "PUT",
+            "/balloon",
+            r#"{"amount_mib":64,"deflate_on_oom":true}"#,
+        ))
+        .expect("balloon request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::Balloon);
+
+        let request = parse_request(&request_with_body("PATCH", "/balloon/hinting/start", "{}"))
+            .expect("balloon hinting request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::Balloon);
 
         let request = parse_request(&request_with_body("PUT", "/entropy", "{}"))
             .expect("entropy request should parse");
