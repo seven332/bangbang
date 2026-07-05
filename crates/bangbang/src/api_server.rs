@@ -43,7 +43,9 @@ use bangbang_runtime::serial::SerialConfigInput;
 use bangbang_runtime::vsock::{VsockConfig, VsockConfigInput};
 use bangbang_runtime::{VmConfiguration, VmmAction, VmmData};
 
-use crate::vmm::{GetApiRequest, PatchApiRequest, PutApiRequest, VmmRequestHandler};
+use crate::vmm::{
+    GetApiRequest, PatchApiRequest, ProcessSessionExitDecision, PutApiRequest, VmmRequestHandler,
+};
 
 const READ_CHUNK_SIZE: usize = 4096;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -54,6 +56,7 @@ pub(crate) enum ApiServerError {
     Accept(std::io::ErrorKind),
     Bind(std::io::ErrorKind),
     Connection(std::io::ErrorKind),
+    ProcessSessionTerminal,
     SocketMetadata(std::io::ErrorKind),
     SocketPathCheck(std::io::ErrorKind),
     SocketPathChanged,
@@ -67,6 +70,9 @@ impl std::fmt::Display for ApiServerError {
             Self::Accept(kind) => write!(f, "failed to accept API connection: {kind:?}"),
             Self::Bind(kind) => write!(f, "failed to bind API socket: {kind:?}"),
             Self::Connection(kind) => write!(f, "API connection I/O failed: {kind:?}"),
+            Self::ProcessSessionTerminal => {
+                f.write_str("process-owned boot run loop exited with failure")
+            }
             Self::SocketMetadata(kind) => {
                 write!(f, "failed to inspect bound API socket: {kind:?}")
             }
@@ -140,8 +146,12 @@ impl ApiServer {
             }
             vmm.drain_process_exit_wakeup()
                 .map_err(ApiServerError::Connection)?;
-            if vmm.process_exit_status().should_exit_successfully() {
-                return Ok(());
+            match vmm.process_exit_status().decision() {
+                ProcessSessionExitDecision::Continue => {}
+                ProcessSessionExitDecision::ExitSuccessfully => return Ok(()),
+                ProcessSessionExitDecision::ExitWithFailure => {
+                    return Err(ApiServerError::ProcessSessionTerminal);
+                }
             }
 
             match self.serve_next(vmm) {
@@ -5203,6 +5213,34 @@ mod tests {
         assert_eq!(
             handle.join().expect("server thread should not panic"),
             Ok(())
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn run_until_fails_and_cleans_idle_socket_after_process_terminal_status() {
+        let path = unique_socket_path("idle-process-terminal");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let (mut shutdown_reader, _shutdown_writer) =
+            UnixStream::pair().expect("shutdown stream pair should be created");
+        let process_exit_signal = TestProcessExitSignal::new();
+        let process_exit_trigger = process_exit_signal.clone();
+        let mut vmm = test_controller_with_starter(
+            TestInstanceStarter::success_with_process_exit_signal(process_exit_signal),
+        );
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("instance should start");
+        let handle = thread::spawn(move || server.run_until(&mut vmm, &mut shutdown_reader));
+
+        process_exit_trigger.trigger(ProcessSessionExitStatus::Terminal);
+
+        assert_eq!(
+            handle.join().expect("server thread should not panic"),
+            Err(ApiServerError::ProcessSessionTerminal)
         );
         assert!(!path.exists());
     }

@@ -103,7 +103,7 @@ recognized `PATCH /drives/{drive_id}` requests already map through a minimal int
 action/data boundary. Validation rejects malformed boot-source, drive update,
 VM state update, and actions requests before VMM state mutation.
 Successful `InstanceStart` startup, the `Running` transition, and an internal boot run-loop worker across bounded step windows are implemented with configured or default internal serial MMIO
-output and retained internal active, terminal-outcome, or error worker status. Process-owned API-enabled and no-api runs can exit successfully after guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET` terminal outcomes. `FlushMetrics` is implemented as a runtime-only minimal JSON-line flush through per-process metrics state, and includes a terse `boot_run_loop_status` summary when a process-owned boot worker exists plus initial Firecracker-shaped GET, core configuration PUT, MMDS PUT, selected PATCH, observability PUT, and `/actions` API request counters. `PUT /logger` is implemented as pre-boot per-process observability configuration with minimal successful `InstanceStart` and `FlushMetrics` action-event output; public run-loop control, public serial
+output and retained internal active, terminal-outcome, or error worker status. Process-owned API-enabled and no-api runs can exit successfully after guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET` terminal outcomes, and fail the process on non-success terminal worker states. `FlushMetrics` is implemented as a runtime-only minimal JSON-line flush through per-process metrics state, and includes a terse `boot_run_loop_status` summary when a process-owned boot worker exists plus initial Firecracker-shaped GET, core configuration PUT, MMDS PUT, selected PATCH, observability PUT, and `/actions` API request counters. `PUT /logger` is implemented as pre-boot per-process observability configuration with minimal successful `InstanceStart` and `FlushMetrics` action-event output; public run-loop control, public serial
 streaming, full Firecracker metrics counters, periodic flush, and full logger integration remain deferred.
 
 ## Process Startup CLI
@@ -201,7 +201,7 @@ The current executable uses a small process exit status contract:
 | --- | --- | --- |
 | `0` | Help or version completed successfully, the API server exited without error, no-api mode handled `SIGINT`/`SIGTERM` shutdown, or a process-owned VM exited after guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET`. | Matches Firecracker's success status. |
 | `153` | Startup argument parsing failed before process configuration began. | Matches Firecracker's `ArgParsing` exit code. |
-| `1` | Process failure, including config-file startup, startup metrics/logger configuration, API socket bind, signal handler registration, no-api signal wait failure, or API accept failure. | Used for non-argument process failures before more specific Firecracker-compatible process errors exist. Per-connection read/write errors do not terminate the API server. |
+| `1` | Process failure, including config-file startup, startup metrics/logger configuration, API socket bind, signal handler registration, no-api signal wait failure, API accept failure, or a process-owned boot worker non-success terminal state. | Used for non-argument process failures before more specific Firecracker-compatible process errors exist. Per-connection read/write errors do not terminate the API server. |
 
 Firecracker also defines bad-configuration and signal-specific exit codes.
 bangbang does not expose those until the corresponding configuration loading,
@@ -1253,7 +1253,8 @@ guest request, unknown run exit, dispatch error, or timer handler error. This
 remains internal runner-loop plumbing, not the future public guest scheduler.
 For process-owned API-enabled and no-api runs, PSCI `SYSTEM_OFF` and
 `SYSTEM_RESET` wake the process supervisor and let the process exit
-successfully.
+successfully. Non-success terminal worker states wake the same supervisor path
+and fail the process with the current coarse process-failure exit status.
 An owned internal session handle preserves the same
 session operations while avoiding a self-referential backend/session owner in
 process-level state.
