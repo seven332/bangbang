@@ -246,7 +246,7 @@ impl MetricsState {
             self.patch_api_requests,
             self.put_api_requests,
         ) {
-            self.logger_metrics.record_missed_metrics();
+            self.logger_metrics.record_metrics_failure();
             return Err(err);
         }
         self.flush_count = next_flush_count;
@@ -278,21 +278,27 @@ struct GetApiRequestMetrics {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct LoggerMetrics {
+    metrics_fails: u64,
     missed_log_count: u64,
     missed_metrics_count: u64,
 }
 
 impl LoggerMetrics {
     const fn is_empty(self) -> bool {
-        self.missed_log_count == 0 && self.missed_metrics_count == 0
+        self.metrics_fails == 0 && self.missed_log_count == 0 && self.missed_metrics_count == 0
     }
 
     fn record_missed_log(&mut self) {
         self.missed_log_count = self.missed_log_count.saturating_add(1);
     }
 
-    fn record_missed_metrics(&mut self) {
+    fn record_metrics_failure(&mut self) {
+        self.metrics_fails = self.metrics_fails.saturating_add(1);
         self.missed_metrics_count = self.missed_metrics_count.saturating_add(1);
+    }
+
+    const fn metrics_fails(self) -> u64 {
+        self.metrics_fails
     }
 
     const fn missed_log_count(self) -> u64 {
@@ -839,6 +845,12 @@ impl MetricsSink {
         }
         if !logger_metrics.is_empty() {
             let mut logger = serde_json::Map::new();
+            if logger_metrics.metrics_fails() != 0 {
+                logger.insert(
+                    "metrics_fails".to_string(),
+                    serde_json::Value::Number(logger_metrics.metrics_fails().into()),
+                );
+            }
             if logger_metrics.missed_log_count() != 0 {
                 logger.insert(
                     "missed_log_count".to_string(),
@@ -1105,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_flush_records_missed_metrics_without_incrementing_flush_count() {
+    fn failed_flush_records_logger_metrics_failure_without_incrementing_flush_count() {
         let output = TestMetricsOutput::default();
         output.fail_next_write();
         let mut state = MetricsState::with_test_output(output.clone());
@@ -1118,12 +1130,14 @@ mod tests {
 
         assert_eq!(
             output.lines(),
-            [r#"{"logger":{"missed_metrics_count":1},"vmm":{"metrics_flush_count":1}}"#]
+            [
+                r#"{"logger":{"metrics_fails":1,"missed_metrics_count":1},"vmm":{"metrics_flush_count":1}}"#
+            ]
         );
     }
 
     #[test]
-    fn repeated_failed_flushes_accumulate_missed_metrics() {
+    fn repeated_failed_flushes_accumulate_logger_metrics_failures() {
         let output = TestMetricsOutput::default();
         let mut state = MetricsState::with_test_output(output.clone());
 
@@ -1141,7 +1155,9 @@ mod tests {
 
         assert_eq!(
             output.lines(),
-            [r#"{"logger":{"missed_metrics_count":2},"vmm":{"metrics_flush_count":1}}"#]
+            [
+                r#"{"logger":{"metrics_fails":2,"missed_metrics_count":2},"vmm":{"metrics_flush_count":1}}"#
+            ]
         );
     }
 
@@ -1161,7 +1177,7 @@ mod tests {
         assert_eq!(
             output.lines(),
             [
-                r#"{"logger":{"missed_log_count":1,"missed_metrics_count":1},"vmm":{"metrics_flush_count":1}}"#
+                r#"{"logger":{"metrics_fails":1,"missed_log_count":1,"missed_metrics_count":1},"vmm":{"metrics_flush_count":1}}"#
             ]
         );
     }
