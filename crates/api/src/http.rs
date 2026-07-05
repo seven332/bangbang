@@ -896,6 +896,41 @@ struct DrivePatchRequestBody {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct BalloonConfigRequestBody {
+    amount_mib: u32,
+    deflate_on_oom: bool,
+    #[serde(default)]
+    stats_polling_interval_s: u16,
+    #[serde(default)]
+    free_page_hinting: bool,
+    #[serde(default)]
+    free_page_reporting: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BalloonUpdateRequestBody {
+    amount_mib: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BalloonStatsUpdateRequestBody {
+    stats_polling_interval_s: u16,
+}
+
+#[derive(Debug, Deserialize)]
+struct BalloonHintingStartRequestBody {
+    #[serde(default = "default_balloon_acknowledge_on_stop")]
+    acknowledge_on_stop: bool,
+}
+
+const fn default_balloon_acknowledge_on_stop() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PmemConfigRequestBody {
     id: String,
     path_on_host: String,
@@ -1295,8 +1330,20 @@ pub fn parse_request_with_limit(
         return Err(RequestError::GetRequestBody);
     }
 
-    if is_balloon_endpoint(method, path) {
+    if is_balloon_endpoint_without_body_parsing(method, path) {
         return Err(RequestError::BalloonUnsupported);
+    }
+    if method == "PUT" && path == "/balloon" {
+        return parse_balloon_config_request(body);
+    }
+    if method == "PATCH" && path == "/balloon" {
+        return parse_balloon_update_request(body);
+    }
+    if method == "PATCH" && path == "/balloon/statistics" {
+        return parse_balloon_stats_update_request(body);
+    }
+    if method == "PATCH" && path == "/balloon/hinting/start" {
+        return parse_balloon_hinting_start_request(body);
     }
 
     if method == "GET" && path == "/hotplug/memory" {
@@ -1406,16 +1453,12 @@ pub fn parse_request_with_limit(
     }
 }
 
-fn is_balloon_endpoint(method: &str, path: &str) -> bool {
+fn is_balloon_endpoint_without_body_parsing(method: &str, path: &str) -> bool {
     matches!(
         (method, path),
         ("GET", "/balloon")
             | ("GET", "/balloon/statistics")
             | ("GET", "/balloon/hinting/status")
-            | ("PUT", "/balloon")
-            | ("PATCH", "/balloon")
-            | ("PATCH", "/balloon/statistics")
-            | ("PATCH", "/balloon/hinting/start")
             | ("PATCH", "/balloon/hinting/stop")
     )
 }
@@ -1716,6 +1759,59 @@ fn parse_entropy_config_request(body: &[u8]) -> Result<ApiRequest, RequestError>
     }
 
     Err(RequestError::EntropyUnsupported)
+}
+
+fn parse_balloon_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
+    let BalloonConfigRequestBody {
+        amount_mib,
+        deflate_on_oom,
+        stats_polling_interval_s,
+        free_page_hinting,
+        free_page_reporting,
+    } = serde_json::from_slice::<BalloonConfigRequestBody>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+    let _ = (
+        amount_mib,
+        deflate_on_oom,
+        stats_polling_interval_s,
+        free_page_hinting,
+        free_page_reporting,
+    );
+
+    Err(RequestError::BalloonUnsupported)
+}
+
+fn parse_balloon_update_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
+    let BalloonUpdateRequestBody { amount_mib } =
+        serde_json::from_slice::<BalloonUpdateRequestBody>(body)
+            .map_err(|_| RequestError::MalformedRequest)?;
+    let _ = amount_mib;
+
+    Err(RequestError::BalloonUnsupported)
+}
+
+fn parse_balloon_stats_update_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
+    let BalloonStatsUpdateRequestBody {
+        stats_polling_interval_s,
+    } = serde_json::from_slice::<BalloonStatsUpdateRequestBody>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+    let _ = stats_polling_interval_s;
+
+    Err(RequestError::BalloonUnsupported)
+}
+
+fn parse_balloon_hinting_start_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
+    if body.is_empty() {
+        return Err(RequestError::BalloonUnsupported);
+    }
+
+    let BalloonHintingStartRequestBody {
+        acknowledge_on_stop,
+    } = serde_json::from_slice::<BalloonHintingStartRequestBody>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+    let _ = acknowledge_on_stop;
+
+    Err(RequestError::BalloonUnsupported)
 }
 
 fn parse_memory_hotplug_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
@@ -4472,7 +4568,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_balloon_methods_as_unsupported() {
+    fn rejects_valid_balloon_methods_as_unsupported() {
         let requests = [
             (
                 "GET /balloon",
@@ -4486,18 +4582,89 @@ mod tests {
                 "GET /balloon/hinting/status",
                 b"GET /balloon/hinting/status HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
             ),
-            ("PUT /balloon", request_with_body("PUT", "/balloon", "{}")),
+            (
+                "PUT /balloon",
+                request_with_body(
+                    "PUT",
+                    "/balloon",
+                    r#"{"amount_mib":64,"deflate_on_oom":true}"#,
+                ),
+            ),
+            (
+                "PUT /balloon optional fields",
+                request_with_body(
+                    "PUT",
+                    "/balloon",
+                    r#"{"amount_mib":64,"deflate_on_oom":false,"stats_polling_interval_s":1,"free_page_hinting":true,"free_page_reporting":false}"#,
+                ),
+            ),
+            (
+                "PUT /balloon max numeric fields",
+                request_with_body(
+                    "PUT",
+                    "/balloon",
+                    r#"{"amount_mib":4294967295,"deflate_on_oom":true,"stats_polling_interval_s":65535}"#,
+                ),
+            ),
             (
                 "PATCH /balloon",
-                request_with_body("PATCH", "/balloon", "{}"),
+                request_with_body("PATCH", "/balloon", r#"{"amount_mib":32}"#),
+            ),
+            (
+                "PATCH /balloon max amount",
+                request_with_body("PATCH", "/balloon", r#"{"amount_mib":4294967295}"#),
             ),
             (
                 "PATCH /balloon/statistics",
-                request_with_body("PATCH", "/balloon/statistics", "{}"),
+                request_with_body(
+                    "PATCH",
+                    "/balloon/statistics",
+                    r#"{"stats_polling_interval_s":1}"#,
+                ),
+            ),
+            (
+                "PATCH /balloon/statistics max interval",
+                request_with_body(
+                    "PATCH",
+                    "/balloon/statistics",
+                    r#"{"stats_polling_interval_s":65535}"#,
+                ),
+            ),
+            (
+                "PATCH /balloon/hinting/start without body",
+                b"PATCH /balloon/hinting/start HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            ),
+            (
+                "PATCH /balloon/hinting/start empty body",
+                request_with_body("PATCH", "/balloon/hinting/start", ""),
             ),
             (
                 "PATCH /balloon/hinting/start",
                 request_with_body("PATCH", "/balloon/hinting/start", "{}"),
+            ),
+            (
+                "PATCH /balloon/hinting/start empty sequence",
+                request_with_body("PATCH", "/balloon/hinting/start", "[]"),
+            ),
+            (
+                "PATCH /balloon/hinting/start explicit",
+                request_with_body(
+                    "PATCH",
+                    "/balloon/hinting/start",
+                    r#"{"acknowledge_on_stop":false}"#,
+                ),
+            ),
+            (
+                "PATCH /balloon/hinting/start unknown field",
+                request_with_body(
+                    "PATCH",
+                    "/balloon/hinting/start",
+                    r#"{"acknowledge_on_stop":false,"unknown":true}"#,
+                ),
+            ),
+            (
+                "PATCH /balloon/hinting/start only unknown field",
+                request_with_body("PATCH", "/balloon/hinting/start", r#"{"unknown":true}"#),
             ),
             (
                 "PATCH /balloon/hinting/stop",
@@ -4513,28 +4680,111 @@ mod tests {
     }
 
     #[test]
-    fn rejects_balloon_body_methods_without_parsing_body() {
-        for (method, path) in [
-            ("PUT", "/balloon"),
-            ("PATCH", "/balloon"),
-            ("PATCH", "/balloon/statistics"),
-            ("PATCH", "/balloon/hinting/start"),
-            ("PATCH", "/balloon/hinting/stop"),
+    fn rejects_invalid_balloon_body_methods_before_unsupported() {
+        for (method, path, body) in [
+            ("PUT", "/balloon", "not-json"),
+            ("PUT", "/balloon", ""),
+            ("PUT", "/balloon", "null"),
+            ("PUT", "/balloon", "[]"),
+            ("PUT", "/balloon", "{}"),
+            ("PUT", "/balloon", r#"{"amount_mib":64}"#),
+            ("PUT", "/balloon", r#"{"deflate_on_oom":true}"#),
+            (
+                "PUT",
+                "/balloon",
+                r#"{"amount_mib":"64","deflate_on_oom":true}"#,
+            ),
+            (
+                "PUT",
+                "/balloon",
+                r#"{"amount_mib":-1,"deflate_on_oom":true}"#,
+            ),
+            (
+                "PUT",
+                "/balloon",
+                r#"{"amount_mib":4294967296,"deflate_on_oom":true}"#,
+            ),
+            (
+                "PUT",
+                "/balloon",
+                r#"{"amount_mib":64,"deflate_on_oom":"true"}"#,
+            ),
+            (
+                "PUT",
+                "/balloon",
+                r#"{"amount_mib":64,"deflate_on_oom":true,"stats_polling_interval_s":65536}"#,
+            ),
+            (
+                "PUT",
+                "/balloon",
+                r#"{"amount_mib":64,"deflate_on_oom":true,"free_page_hinting":null}"#,
+            ),
+            (
+                "PUT",
+                "/balloon",
+                r#"{"amount_mib":64,"deflate_on_oom":true,"unknown":true}"#,
+            ),
+            ("PATCH", "/balloon", "not-json"),
+            ("PATCH", "/balloon", ""),
+            ("PATCH", "/balloon", "null"),
+            ("PATCH", "/balloon", "[]"),
+            ("PATCH", "/balloon", "{}"),
+            ("PATCH", "/balloon", r#"{"amount_mib":"32"}"#),
+            ("PATCH", "/balloon", r#"{"amount_mib":-1}"#),
+            ("PATCH", "/balloon", r#"{"amount_mib":4294967296}"#),
+            ("PATCH", "/balloon", r#"{"amount_mib":32,"unknown":true}"#),
+            ("PATCH", "/balloon/statistics", "not-json"),
+            ("PATCH", "/balloon/statistics", ""),
+            ("PATCH", "/balloon/statistics", "null"),
+            ("PATCH", "/balloon/statistics", "[]"),
+            ("PATCH", "/balloon/statistics", "{}"),
+            (
+                "PATCH",
+                "/balloon/statistics",
+                r#"{"stats_polling_interval_s":"1"}"#,
+            ),
+            (
+                "PATCH",
+                "/balloon/statistics",
+                r#"{"stats_polling_interval_s":-1}"#,
+            ),
+            (
+                "PATCH",
+                "/balloon/statistics",
+                r#"{"stats_polling_interval_s":65536}"#,
+            ),
+            (
+                "PATCH",
+                "/balloon/statistics",
+                r#"{"stats_polling_interval_s":1,"unknown":true}"#,
+            ),
+            ("PATCH", "/balloon/hinting/start", "not-json"),
+            ("PATCH", "/balloon/hinting/start", "null"),
+            (
+                "PATCH",
+                "/balloon/hinting/start",
+                r#"{"acknowledge_on_stop":"false"}"#,
+            ),
         ] {
-            let malformed_body = request_with_body(method, path, "not-json");
-            let empty_body =
-                format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+            let request = request_with_body(method, path, body);
 
             assert_eq!(
-                parse_request(&malformed_body),
-                Err(RequestError::BalloonUnsupported),
-                "{method} {path}"
+                parse_request(&request),
+                Err(RequestError::MalformedRequest),
+                "{method} {path} {body}"
             );
-            assert_eq!(
-                parse_request(empty_body.as_bytes()),
-                Err(RequestError::BalloonUnsupported),
-                "{method} {path}"
-            );
+        }
+    }
+
+    #[test]
+    fn rejects_balloon_hinting_stop_without_parsing_body() {
+        for request in [
+            request_with_body("PATCH", "/balloon/hinting/stop", "not-json"),
+            request_with_body("PATCH", "/balloon/hinting/stop", ""),
+        ] {
+            let err = parse_request(&request).expect_err("balloon should be unsupported");
+            assert_eq!(err, RequestError::BalloonUnsupported);
+            assert_eq!(err.fault_message(), "Balloon device is not supported.");
         }
     }
 

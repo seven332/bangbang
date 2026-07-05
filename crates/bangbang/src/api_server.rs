@@ -3181,76 +3181,90 @@ mod tests {
 
     #[test]
     fn returns_fault_for_balloon_endpoints() {
-        for (index, (route, request)) in [
+        let mut vmm = test_controller();
+        for (socket_name, request, fault_message) in [
             (
-                "GET /balloon",
-                b"GET /balloon HTTP/1.1\r\nHost: localhost\r\n\r\n".as_slice(),
+                "b-get",
+                "GET /balloon HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
+                "Balloon device is not supported.",
             ),
             (
-                "GET /balloon/statistics",
-                b"GET /balloon/statistics HTTP/1.1\r\nHost: localhost\r\n\r\n".as_slice(),
+                "b-stats-get",
+                "GET /balloon/statistics HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
+                "Balloon device is not supported.",
             ),
             (
-                "GET /balloon/hinting/status",
-                b"GET /balloon/hinting/status HTTP/1.1\r\nHost: localhost\r\n\r\n".as_slice(),
+                "b-hint-status",
+                "GET /balloon/hinting/status HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
+                "Balloon device is not supported.",
             ),
             (
-                "PUT /balloon",
-                b"PUT /balloon HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}"
-                    .as_slice(),
+                "b-put",
+                request_with_body(
+                    "PUT",
+                    "/balloon",
+                    r#"{"amount_mib":64,"deflate_on_oom":true}"#,
+                ),
+                "Balloon device is not supported.",
             ),
             (
-                "PATCH /balloon",
-                b"PATCH /balloon HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}"
-                    .as_slice(),
+                "b-put-bad",
+                request_with_body("PUT", "/balloon", "{}"),
+                "Malformed HTTP request.",
             ),
             (
-                "PATCH /balloon/statistics",
-                b"PATCH /balloon/statistics HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}"
-                    .as_slice(),
+                "b-patch",
+                request_with_body("PATCH", "/balloon", r#"{"amount_mib":32}"#),
+                "Balloon device is not supported.",
             ),
             (
-                "PATCH /balloon/hinting/start",
-                b"PATCH /balloon/hinting/start HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}"
-                    .as_slice(),
+                "b-stats-patch",
+                request_with_body(
+                    "PATCH",
+                    "/balloon/statistics",
+                    r#"{"stats_polling_interval_s":1}"#,
+                ),
+                "Balloon device is not supported.",
             ),
             (
-                "PATCH /balloon/hinting/stop",
-                b"PATCH /balloon/hinting/stop HTTP/1.1\r\nHost: localhost\r\n\r\n".as_slice(),
+                "b-hint-start",
+                request_with_body(
+                    "PATCH",
+                    "/balloon/hinting/start",
+                    r#"{"acknowledge_on_stop":false}"#,
+                ),
+                "Balloon device is not supported.",
             ),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let socket_name = format!("b{index}");
-            let path = unique_socket_path(&socket_name);
-            let server = ApiServer::bind(&path).expect("server should bind");
-            let mut client = UnixStream::connect(&path).expect("client should connect");
+            (
+                "b-hint-start-bad",
+                request_with_body(
+                    "PATCH",
+                    "/balloon/hinting/start",
+                    r#"{"acknowledge_on_stop":"false"}"#,
+                ),
+                "Malformed HTTP request.",
+            ),
+            (
+                "b-hint-stop",
+                request_with_body("PATCH", "/balloon/hinting/stop", "not-json"),
+                "Balloon device is not supported.",
+            ),
+        ] {
+            let response = request_over_socket(&mut vmm, socket_name, &request);
 
-            client
-                .write_all(request)
-                .expect("client should write request");
-            let mut vmm = test_controller();
-            server
-                .serve_next(&mut vmm)
-                .expect("server should handle one request");
-
-            let mut response = String::new();
-            client
-                .read_to_string(&mut response)
-                .expect("client should read response");
-
-            assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{route}");
             assert!(
-                response.contains(r#"{"fault_message":"Balloon device is not supported."}"#),
-                "{route}"
+                response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+                "{socket_name}: {response}"
             );
-            assert_eq!(
-                vmm.instance_info().state,
-                bangbang_runtime::InstanceState::NotStarted,
-                "{route}"
+            assert!(
+                response.contains(&format!(r#"{{"fault_message":"{fault_message}"}}"#)),
+                "{socket_name}: {response}"
             );
         }
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::NotStarted
+        );
     }
 
     #[test]
