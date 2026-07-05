@@ -91,6 +91,15 @@ fn executable_accepts_firecracker_startup_time_args() {
         "GET / with startup time args",
     );
 
+    let vm_config = http_get(&socket_path, "/vm/config");
+    assert_ok_response(&vm_config, "GET /vm/config with startup time args");
+    assert!(
+        !vm_config.contains("start_time_us")
+            && !vm_config.contains("start_time_cpu_us")
+            && !vm_config.contains("parent_cpu_time_us"),
+        "GET /vm/config should not expose process startup timing; response:\n{vm_config}"
+    );
+
     assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
 }
 

@@ -49,7 +49,18 @@ mod macos_arm64 {
         create_zeroed_block_backing(&backing_path);
         create_empty_file(&serial_output_path);
 
-        let mut bangbang = BangbangProcess::start(&socket_path, &instance_id);
+        let mut bangbang = BangbangProcess::start_with_extra_args(
+            &socket_path,
+            &instance_id,
+            &[
+                "--start-time-us",
+                "1000",
+                "--start-time-cpu-us",
+                "2000",
+                "--parent-cpu-time-us",
+                "3000",
+            ],
+        );
 
         let instance_info = http_get(&socket_path, "/");
         assert_ok_response(&instance_info, "GET / before InstanceStart");
@@ -156,6 +167,7 @@ mod macos_arm64 {
         );
         assert_no_content_response(&flush_metrics_response, "PUT /actions FlushMetrics");
         assert_metrics_output(&metrics_path);
+        assert_startup_time_metrics_output(&metrics_path);
         assert_logger_output(&logger_path);
 
         let second_start_response = http_put_json(
@@ -752,6 +764,28 @@ mod macos_arm64 {
         assert!(
             !output.contains(r#""boot_run_loop_status":"failed""#),
             "metrics output should not report failed boot run-loop status; output:\n{output}"
+        );
+    }
+
+    fn assert_startup_time_metrics_output(path: &Path) {
+        let output = fs::read_to_string(path).unwrap_or_else(|err| {
+            panic!(
+                "metrics output {} should be readable: {err}",
+                path.display()
+            )
+        });
+
+        assert!(
+            output.contains(r#""start_time_us":1000"#),
+            "metrics output should include start_time_us; output:\n{output}"
+        );
+        assert!(
+            output.contains(r#""start_time_cpu_us":2000"#),
+            "metrics output should include start_time_cpu_us; output:\n{output}"
+        );
+        assert!(
+            output.contains(r#""parent_cpu_time_us":3000"#),
+            "metrics output should include parent_cpu_time_us; output:\n{output}"
         );
     }
 

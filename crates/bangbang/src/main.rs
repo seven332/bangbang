@@ -23,7 +23,7 @@ use signal_hook::{SigId, low_level};
 use vmm::ProcessVmm;
 
 use bangbang_runtime::logger::{LoggerConfigInput, LoggerLevel};
-use bangbang_runtime::metrics::MetricsConfigInput;
+use bangbang_runtime::metrics::{MetricsConfigInput, MetricsDiagnostics};
 use bangbang_runtime::mmds::MmdsContentInput;
 use bangbang_runtime::{VmmAction, VmmActionError};
 
@@ -81,13 +81,7 @@ fn run() -> Result<(), ProcessError> {
                 no_api,
                 startup_time,
             } = config;
-            // Accepted for Firecracker-compatible launchers; reporting is deferred
-            // until full process startup metrics are implemented.
-            let StartupTimeConfig {
-                start_time_us: _,
-                start_time_cpu_us: _,
-                parent_cpu_time_us: _,
-            } = startup_time;
+            let process_metrics_diagnostics = startup_time.metrics_diagnostics();
 
             println!("bangbang {}", env!("CARGO_PKG_VERSION"));
             println!(
@@ -100,7 +94,8 @@ fn run() -> Result<(), ProcessError> {
                 env!("CARGO_PKG_VERSION"),
                 APP_NAME,
                 effective_mmds_size_limit,
-            );
+            )
+            .with_process_metrics_diagnostics(process_metrics_diagnostics);
             apply_startup_metrics_config(&mut vmm, metrics_config)?;
             apply_startup_logger_config(&mut vmm, logger_config)?;
             apply_startup_metadata(&mut vmm, metadata.as_deref())?;
@@ -692,6 +687,23 @@ struct StartupTimeConfig {
     start_time_us: Option<u64>,
     start_time_cpu_us: Option<u64>,
     parent_cpu_time_us: Option<u64>,
+}
+
+impl StartupTimeConfig {
+    fn metrics_diagnostics(self) -> MetricsDiagnostics {
+        let mut diagnostics = MetricsDiagnostics::new();
+        if let Some(start_time_us) = self.start_time_us {
+            diagnostics = diagnostics.with_start_time_us(start_time_us);
+        }
+        if let Some(start_time_cpu_us) = self.start_time_cpu_us {
+            diagnostics = diagnostics.with_start_time_cpu_us(start_time_cpu_us);
+        }
+        if let Some(parent_cpu_time_us) = self.parent_cpu_time_us {
+            diagnostics = diagnostics.with_parent_cpu_time_us(parent_cpu_time_us);
+        }
+
+        diagnostics
+    }
 }
 
 impl Default for StartupConfig {
@@ -1639,6 +1651,20 @@ mod tests {
                 parent_cpu_time_us: Some(u64::MAX),
             }
         );
+    }
+
+    #[test]
+    fn startup_time_config_builds_metrics_diagnostics() {
+        let diagnostics = StartupTimeConfig {
+            start_time_us: Some(1000),
+            start_time_cpu_us: None,
+            parent_cpu_time_us: Some(3000),
+        }
+        .metrics_diagnostics();
+
+        assert_eq!(diagnostics.start_time_us(), Some(1000));
+        assert_eq!(diagnostics.start_time_cpu_us(), None);
+        assert_eq!(diagnostics.parent_cpu_time_us(), Some(3000));
     }
 
     #[test]

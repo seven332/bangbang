@@ -117,12 +117,18 @@ impl MetricsState {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MetricsDiagnostics {
     boot_run_loop_status: Option<BootRunLoopMetricStatus>,
+    start_time_us: Option<u64>,
+    start_time_cpu_us: Option<u64>,
+    parent_cpu_time_us: Option<u64>,
 }
 
 impl MetricsDiagnostics {
     pub const fn new() -> Self {
         Self {
             boot_run_loop_status: None,
+            start_time_us: None,
+            start_time_cpu_us: None,
+            parent_cpu_time_us: None,
         }
     }
 
@@ -131,8 +137,52 @@ impl MetricsDiagnostics {
         self
     }
 
+    pub const fn with_start_time_us(mut self, start_time_us: u64) -> Self {
+        self.start_time_us = Some(start_time_us);
+        self
+    }
+
+    pub const fn with_start_time_cpu_us(mut self, start_time_cpu_us: u64) -> Self {
+        self.start_time_cpu_us = Some(start_time_cpu_us);
+        self
+    }
+
+    pub const fn with_parent_cpu_time_us(mut self, parent_cpu_time_us: u64) -> Self {
+        self.parent_cpu_time_us = Some(parent_cpu_time_us);
+        self
+    }
+
+    pub const fn merged_with(mut self, other: Self) -> Self {
+        if other.boot_run_loop_status.is_some() {
+            self.boot_run_loop_status = other.boot_run_loop_status;
+        }
+        if other.start_time_us.is_some() {
+            self.start_time_us = other.start_time_us;
+        }
+        if other.start_time_cpu_us.is_some() {
+            self.start_time_cpu_us = other.start_time_cpu_us;
+        }
+        if other.parent_cpu_time_us.is_some() {
+            self.parent_cpu_time_us = other.parent_cpu_time_us;
+        }
+
+        self
+    }
+
     pub const fn boot_run_loop_status(&self) -> Option<BootRunLoopMetricStatus> {
         self.boot_run_loop_status
+    }
+
+    pub const fn start_time_us(&self) -> Option<u64> {
+        self.start_time_us
+    }
+
+    pub const fn start_time_cpu_us(&self) -> Option<u64> {
+        self.start_time_cpu_us
+    }
+
+    pub const fn parent_cpu_time_us(&self) -> Option<u64> {
+        self.parent_cpu_time_us
     }
 }
 
@@ -189,6 +239,24 @@ impl MetricsSink {
             "metrics_flush_count".to_string(),
             serde_json::Value::Number(flush_count.into()),
         );
+        if let Some(value) = diagnostics.parent_cpu_time_us() {
+            vmm.insert(
+                "parent_cpu_time_us".to_string(),
+                serde_json::Value::Number(value.into()),
+            );
+        }
+        if let Some(value) = diagnostics.start_time_cpu_us() {
+            vmm.insert(
+                "start_time_cpu_us".to_string(),
+                serde_json::Value::Number(value.into()),
+            );
+        }
+        if let Some(value) = diagnostics.start_time_us() {
+            vmm.insert(
+                "start_time_us".to_string(),
+                serde_json::Value::Number(value.into()),
+            );
+        }
 
         let mut root = serde_json::Map::new();
         root.insert("vmm".to_string(), serde_json::Value::Object(vmm));
@@ -292,6 +360,49 @@ mod tests {
         );
 
         fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn writes_startup_time_diagnostics_when_provided() {
+        let path = unique_metrics_path("startup-time");
+        let mut state = MetricsState::default();
+        let diagnostics = MetricsDiagnostics::new()
+            .with_start_time_us(1000)
+            .with_start_time_cpu_us(2000)
+            .with_parent_cpu_time_us(3000);
+
+        state
+            .configure(MetricsConfigInput::new(&path))
+            .expect("metrics should configure");
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("metrics output should be readable");
+        assert_eq!(
+            output,
+            "{\"vmm\":{\"metrics_flush_count\":1,\"parent_cpu_time_us\":3000,\"start_time_cpu_us\":2000,\"start_time_us\":1000}}\n"
+        );
+
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn merges_independent_diagnostics() {
+        let base = MetricsDiagnostics::new()
+            .with_start_time_us(1000)
+            .with_start_time_cpu_us(2000);
+        let session = MetricsDiagnostics::new()
+            .with_boot_run_loop_status(BootRunLoopMetricStatus::Running)
+            .with_parent_cpu_time_us(3000);
+
+        let diagnostics = base.merged_with(session);
+
+        assert_eq!(
+            diagnostics.boot_run_loop_status(),
+            Some(BootRunLoopMetricStatus::Running)
+        );
+        assert_eq!(diagnostics.start_time_us(), Some(1000));
+        assert_eq!(diagnostics.start_time_cpu_us(), Some(2000));
+        assert_eq!(diagnostics.parent_cpu_time_us(), Some(3000));
     }
 
     #[test]
