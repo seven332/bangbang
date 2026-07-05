@@ -266,6 +266,11 @@ mod macos_arm64 {
         assert_metrics_output(&metrics_path);
         assert_startup_time_metrics_output(&metrics_path);
         assert_logger_output(&logger_path);
+        assert!(
+            !replacement_logger_path.exists(),
+            "rejected logger update must not write later action records to replacement output path {}",
+            replacement_logger_path.display()
+        );
 
         let second_start_response = http_put_json(
             &socket_path,
