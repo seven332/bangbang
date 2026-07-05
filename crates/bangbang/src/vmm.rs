@@ -39,9 +39,12 @@ use bangbang_runtime::vsock::{VsockConfigInput, VsockMmioLayout};
 use bangbang_runtime::{BackendError, VmmAction, VmmActionError, VmmController, VmmData};
 
 use crate::host_network::virtio_vmnet::{
-    MmdsPacketDetour, MmdsResponseQueue, VmnetVirtioNetworkPacketIo,
-    VmnetVirtioNetworkPacketIoBuildError, VmnetVirtioNetworkPacketIoProvider,
-    VmnetVirtioNetworkPacketIoProviderBuildError, VmnetVirtioNetworkPacketIoProviderEntry,
+    MmdsOnlyVirtioNetworkPacketIo, MmdsOnlyVirtioNetworkPacketIoBuildError,
+    MmdsOnlyVirtioNetworkPacketIoProvider, MmdsOnlyVirtioNetworkPacketIoProviderBuildError,
+    MmdsOnlyVirtioNetworkPacketIoProviderEntry, MmdsPacketDetour, MmdsResponseQueue,
+    VmnetVirtioNetworkPacketIo, VmnetVirtioNetworkPacketIoBuildError,
+    VmnetVirtioNetworkPacketIoProvider, VmnetVirtioNetworkPacketIoProviderBuildError,
+    VmnetVirtioNetworkPacketIoProviderEntry,
 };
 use crate::host_network::vmnet::{
     StartedVmnetPacketIoBackend, SystemVmnetInterfaceBackend, VmnetHostDeviceNameConfigError,
@@ -649,6 +652,7 @@ type SystemProcessVmnetPacketIoProvider =
 #[derive(Debug)]
 pub(crate) enum ProcessNetworkPacketIoProvider {
     Noop(NoopProcessNetworkPacketIoProvider),
+    MmdsOnly(MmdsOnlyVirtioNetworkPacketIoProvider),
     Vmnet(SystemProcessVmnetPacketIoProvider),
 }
 
@@ -686,6 +690,13 @@ impl ProcessNetworkPacketIoProvider {
 
         if configs.is_empty() {
             return Ok(Self::Noop(NoopProcessNetworkPacketIoProvider::default()));
+        }
+
+        if let Some(mmds_detour) = mmds_detour
+            && mmds_detour.covers_all_interfaces(configs)
+        {
+            return process_mmds_only_packet_io_provider_from_configs(configs, mmds_detour)
+                .map(Self::MmdsOnly);
         }
 
         let mut factory = SystemProcessVmnetPacketIoBackendFactory;
@@ -729,6 +740,18 @@ impl ProcessMmdsPacketDetourConfig {
             MmdsResponseQueue::default(),
         ))
     }
+
+    fn covers_all_interfaces(&self, configs: &[NetworkInterfaceConfig]) -> bool {
+        configs
+            .iter()
+            .all(|config| self.interface_is_configured(config.iface_id()))
+    }
+
+    fn interface_is_configured(&self, iface_id: &str) -> bool {
+        self.network_interfaces
+            .iter()
+            .any(|configured_iface_id| configured_iface_id == iface_id)
+    }
 }
 
 impl Arm64BootNetworkPacketIoProvider for ProcessNetworkPacketIoProvider {
@@ -738,6 +761,7 @@ impl Arm64BootNetworkPacketIoProvider for ProcessNetworkPacketIoProvider {
     ) -> Result<Arm64BootNetworkPacketIo<'_>, Arm64BootNetworkPacketIoError> {
         match self {
             Self::Noop(provider) => provider.packet_io(device),
+            Self::MmdsOnly(provider) => provider.packet_io(device),
             Self::Vmnet(provider) => provider.packet_io(device),
         }
     }
@@ -762,6 +786,16 @@ enum ProcessNetworkPacketIoProviderBuildError {
     PacketIoBuild {
         iface_id: String,
         source: VmnetVirtioNetworkPacketIoBuildError,
+    },
+    MmdsOnlyPacketIoBuild {
+        iface_id: String,
+        source: MmdsOnlyVirtioNetworkPacketIoBuildError,
+    },
+    MissingMmdsDetour {
+        iface_id: String,
+    },
+    MmdsOnlyProviderBuild {
+        source: MmdsOnlyVirtioNetworkPacketIoProviderBuildError,
     },
     ProviderBuild {
         source: VmnetVirtioNetworkPacketIoProviderBuildError,
@@ -795,6 +829,18 @@ impl fmt::Display for ProcessNetworkPacketIoProviderBuildError {
                     "failed to build vmnet packet I/O for interface {iface_id}: {source}"
                 )
             }
+            Self::MmdsOnlyPacketIoBuild { iface_id, source } => {
+                write!(
+                    f,
+                    "failed to build MMDS-only packet I/O for interface {iface_id}: {source}"
+                )
+            }
+            Self::MissingMmdsDetour { iface_id } => {
+                write!(f, "missing MMDS packet detour for interface {iface_id}")
+            }
+            Self::MmdsOnlyProviderBuild { source } => {
+                write!(f, "failed to build MMDS-only packet I/O provider: {source}")
+            }
             Self::ProviderBuild { source } => {
                 write!(f, "failed to build vmnet packet I/O provider: {source}")
             }
@@ -810,6 +856,9 @@ impl std::error::Error for ProcessNetworkPacketIoProviderBuildError {
             Self::HostDeviceName { source, .. } => Some(source),
             Self::Start { source, .. } => Some(source),
             Self::PacketIoBuild { source, .. } => Some(source),
+            Self::MmdsOnlyPacketIoBuild { source, .. } => Some(source),
+            Self::MissingMmdsDetour { .. } => None,
+            Self::MmdsOnlyProviderBuild { source } => Some(source),
             Self::ProviderBuild { source } => Some(source),
         }
     }
@@ -901,6 +950,43 @@ where
 
     VmnetVirtioNetworkPacketIoProvider::new(entries)
         .map_err(|source| ProcessNetworkPacketIoProviderBuildError::ProviderBuild { source })
+}
+
+fn process_mmds_only_packet_io_provider_from_configs(
+    configs: &[NetworkInterfaceConfig],
+    mmds_detour: &ProcessMmdsPacketDetourConfig,
+) -> Result<MmdsOnlyVirtioNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError> {
+    let mut entries = Vec::new();
+
+    for config in configs {
+        let iface_id = config.iface_id();
+        VmnetInterfaceConfig::from_host_dev_name(config.host_dev_name()).map_err(|source| {
+            ProcessNetworkPacketIoProviderBuildError::HostDeviceName {
+                iface_id: iface_id.to_string(),
+                source,
+            }
+        })?;
+        let Some(detour) = mmds_detour.detour_for_interface(iface_id) else {
+            return Err(
+                ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour {
+                    iface_id: iface_id.to_string(),
+                },
+            );
+        };
+        let packet_io = MmdsOnlyVirtioNetworkPacketIo::new(detour).map_err(|source| {
+            ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild {
+                iface_id: iface_id.to_string(),
+                source,
+            }
+        })?;
+        entries.push(MmdsOnlyVirtioNetworkPacketIoProviderEntry::new(
+            iface_id, packet_io,
+        ));
+    }
+
+    MmdsOnlyVirtioNetworkPacketIoProvider::new(entries).map_err(|source| {
+        ProcessNetworkPacketIoProviderBuildError::MmdsOnlyProviderBuild { source }
+    })
 }
 
 #[derive(Debug, Default)]
@@ -2113,8 +2199,9 @@ mod tests {
 
         match &provider {
             ProcessNetworkPacketIoProvider::Noop(_) => {}
-            ProcessNetworkPacketIoProvider::Vmnet(_) => {
-                panic!("empty network configs should not build a vmnet provider");
+            ProcessNetworkPacketIoProvider::MmdsOnly(_)
+            | ProcessNetworkPacketIoProvider::Vmnet(_) => {
+                panic!("empty network configs should not build a network provider");
             }
         }
         provider
@@ -2207,6 +2294,68 @@ mod tests {
     }
 
     #[test]
+    fn process_network_packet_io_provider_uses_mmds_only_for_all_mmds_interfaces() {
+        let configs = network_configs([("eth0", "vmnet:shared"), ("eth1", "vmnet:shared")]);
+        let mmds_config = MmdsConfigInput::new(vec!["eth0".to_string(), "eth1".to_string()])
+            .validate(&configs)
+            .expect("MMDS config should validate");
+        let detour_config = ProcessMmdsPacketDetourConfig::from_mmds_config(
+            MmdsStateHandle::default(),
+            &mmds_config,
+        );
+
+        let mut provider = ProcessNetworkPacketIoProvider::from_network_configs_and_mmds_detour(
+            &configs,
+            Some(&detour_config),
+        )
+        .expect("all-MMDS network configs should build an MMDS-only provider");
+
+        match &provider {
+            ProcessNetworkPacketIoProvider::MmdsOnly(_) => {}
+            ProcessNetworkPacketIoProvider::Noop(_) | ProcessNetworkPacketIoProvider::Vmnet(_) => {
+                panic!("all-MMDS network configs should not open vmnet resources");
+            }
+        }
+        provider
+            .packet_io(&test_boot_network_device())
+            .expect("MMDS-only provider should return packet I/O for configured device");
+    }
+
+    #[test]
+    fn process_network_packet_io_provider_validates_host_dev_name_for_mmds_only() {
+        let configs = network_configs([("eth0", "tap0")]);
+        let mmds_config = MmdsConfigInput::new(vec!["eth0".to_string()])
+            .validate(&configs)
+            .expect("MMDS config should validate");
+        let detour_config = ProcessMmdsPacketDetourConfig::from_mmds_config(
+            MmdsStateHandle::default(),
+            &mmds_config,
+        );
+
+        let error = ProcessNetworkPacketIoProvider::from_network_configs_and_mmds_detour(
+            &configs,
+            Some(&detour_config),
+        )
+        .expect_err("MMDS-only provider should still validate host_dev_name syntax");
+
+        match error {
+            ProcessNetworkPacketIoProviderBuildError::HostDeviceName { iface_id, .. } => {
+                assert_eq!(iface_id, "eth0");
+            }
+            ProcessNetworkPacketIoProviderBuildError::NetworkInterfaceCount { .. }
+            | ProcessNetworkPacketIoProviderBuildError::MmdsState { .. }
+            | ProcessNetworkPacketIoProviderBuildError::Start { .. }
+            | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
+            | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { .. }
+            | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour { .. }
+            | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyProviderBuild { .. }
+            | ProcessNetworkPacketIoProviderBuildError::ProviderBuild { .. } => {
+                panic!("unsupported host_dev_name should be reported as config failure");
+            }
+        }
+    }
+
+    #[test]
     fn process_vmnet_packet_io_provider_rejects_over_limit_before_backend() {
         let configs = validated_network_configs(MAX_NETWORK_INTERFACE_COUNT + 1);
         let mut factory = RecordingVmnetPacketIoBackendFactory::default();
@@ -2228,6 +2377,9 @@ mod tests {
             | ProcessNetworkPacketIoProviderBuildError::MmdsState { .. }
             | ProcessNetworkPacketIoProviderBuildError::Start { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
+            | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { .. }
+            | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour { .. }
+            | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyProviderBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::ProviderBuild { .. } => {
                 panic!("over-limit configs should fail before vmnet backend start");
             }
@@ -2251,6 +2403,9 @@ mod tests {
             | ProcessNetworkPacketIoProviderBuildError::MmdsState { .. }
             | ProcessNetworkPacketIoProviderBuildError::Start { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
+            | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { .. }
+            | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour { .. }
+            | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyProviderBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::ProviderBuild { .. } => {
                 panic!("unsupported host_dev_name should fail before vmnet backend start");
             }
@@ -2274,6 +2429,9 @@ mod tests {
             | ProcessNetworkPacketIoProviderBuildError::MmdsState { .. }
             | ProcessNetworkPacketIoProviderBuildError::Start { .. }
             | ProcessNetworkPacketIoProviderBuildError::PacketIoBuild { .. }
+            | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyPacketIoBuild { .. }
+            | ProcessNetworkPacketIoProviderBuildError::MissingMmdsDetour { .. }
+            | ProcessNetworkPacketIoProviderBuildError::MmdsOnlyProviderBuild { .. }
             | ProcessNetworkPacketIoProviderBuildError::ProviderBuild { .. } => {
                 panic!("unsupported host_dev_name should be reported as config failure");
             }

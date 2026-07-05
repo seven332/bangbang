@@ -278,7 +278,10 @@ SYN-ACK context, minimal FIN close context, minimal RST context, or the first
 TCP request fragment context, retains those frames in bounded per-interface
 queues, delivers queued frames through the matching virtio-net RX source with a
 bounded post-TX RX retry, and does not forward handled request payloads to
-vmnet. This still does
+vmnet. When every configured network interface is listed in MMDS config,
+startup can use a process-local MMDS-only packet path that reuses the same
+detour and response-queue logic, drops non-MMDS TX frames, and does not open
+vmnet resources. This still does
 not manage a full ARP cache, emit gratuitous ARP, implement ARP
 timeouts/retries, validate broader TCP ACK numbers beyond the narrow ACK-only
 and non-empty payload SYN-ACK acknowledgement paths, reassemble out-of-order TCP
@@ -336,14 +339,17 @@ The current scaffold does not implement:
   synthesize deterministic ARP replies, MMDS SYN-ACK frames, minimal MMDS RST
   frames, and MMDS TCP response frames, retain bounded per-interface MMDS
   response queues, and expose queued responses through virtio-net RX with
-  bounded post-TX retry, plus an internal provider that can select prebuilt
-  adapters by configured interface ID and an internal `host_dev_name` mapping for
+  bounded post-TX retry, plus an MMDS-only adapter that can reuse those queues
+  without opening vmnet when every configured interface is listed in MMDS
+  config, plus internal providers that can select prebuilt adapters by
+  configured interface ID and an internal `host_dev_name` mapping for
   `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>`. The current
   model stores at most 16 configured network interfaces. Startup revalidates
-  that limit before opening vmnet resources, opens them only when configured
-  interfaces use the supported names, keeps no-network startup on a no-op TX
-  sink plus empty RX source, and still lacks a macOS sandbox, host resource
-  broker, connectivity policy, and live vmnet integration proof. The current
+  that limit before selecting packet I/O, opens vmnet resources only for
+  non-MMDS-only startup when configured interfaces use the supported names,
+  keeps no-network startup on a no-op TX sink plus empty RX source, and still
+  lacks a macOS sandbox, host resource broker, connectivity policy, and live
+  vmnet integration proof. The current
   vsock API path validates and stores `guest_cid` plus `uds_path` before boot.
   The runtime crate has an internal virtio-vsock prepared resource, MMIO
   registration helper, config-space, packet header model, TX descriptor packet

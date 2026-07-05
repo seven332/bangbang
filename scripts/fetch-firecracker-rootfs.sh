@@ -14,9 +14,10 @@ Options:
                    Only valid with --format ext4.
   --direct-boot-init
                    Add a deterministic bangbang direct-rootfs boot init script
-                   to the generated ext4 image. The init emits serial markers
-                   and writes an optional /dev/vdb marker when that drive
-                   exists. Only valid with --format ext4.
+                   to the generated ext4 image. The init emits serial markers,
+                   writes an optional /dev/vdb marker when that drive exists,
+                   and can fetch MMDS when requested by boot args. Only valid
+                   with --format ext4.
   -h, --help       Show this help.
 
 Environment:
@@ -113,7 +114,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v6"
+direct_boot_variant="direct-boot-v8"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -350,6 +351,86 @@ mount_if_directory() {
   fi
 }
 
+cmdline_has() {
+  case " $cmdline " in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+write_vdb_marker() {
+  marker=$1
+  if [ -b /dev/vdb ]; then
+    printf '%-512s' "$marker" >/dev/vdb 2>/dev/null || true
+  fi
+}
+
+first_network_iface() {
+  for iface_path in /sys/class/net/*; do
+    if [ ! -d "$iface_path" ]; then
+      continue
+    fi
+
+    iface=${iface_path##*/}
+    if [ "$iface" != lo ]; then
+      printf '%s\n' "$iface"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+fetch_mmds_marker() {
+  if ! command -v ip >/dev/null 2>&1; then
+    emit_line BANGBANG_MMDS_FETCH_FAIL_NO_IP
+    write_vdb_marker BANGBANG_MMDS_FETCH_FAIL
+    return
+  fi
+
+  if ! command -v curl >/dev/null 2>&1; then
+    emit_line BANGBANG_MMDS_FETCH_FAIL_NO_CURL
+    write_vdb_marker BANGBANG_MMDS_FETCH_FAIL
+    return
+  fi
+
+  mmds_iface=$(first_network_iface || true)
+  if [ -z "$mmds_iface" ]; then
+    emit_line BANGBANG_MMDS_FETCH_FAIL_NO_IFACE
+    write_vdb_marker BANGBANG_MMDS_FETCH_FAIL
+    return
+  fi
+
+  if ! ip link set dev "$mmds_iface" up 2>/dev/null; then
+    emit_line BANGBANG_MMDS_FETCH_FAIL_LINK
+    write_vdb_marker BANGBANG_MMDS_FETCH_FAIL
+    return
+  fi
+
+  ip addr add 169.254.100.2/16 dev "$mmds_iface" 2>/dev/null || true
+  ip route replace 169.254.0.0/16 dev "$mmds_iface" src 169.254.100.2 2>/dev/null || true
+
+  mmds_value=$(
+    curl \
+      --fail \
+      --silent \
+      --show-error \
+      --connect-timeout 2 \
+      --max-time 5 \
+      http://169.254.169.254/meta-data/bangbang-marker \
+      2>/dev/null || true
+  )
+
+  if [ "$mmds_value" = BANGBANG_MMDS_GUEST_VALUE ]; then
+    emit_line BANGBANG_MMDS_FETCH_OK
+    write_vdb_marker BANGBANG_MMDS_GUEST_FETCH_OK
+  else
+    emit_line BANGBANG_MMDS_FETCH_FAIL_RESPONSE
+    write_vdb_marker BANGBANG_MMDS_FETCH_FAIL
+  fi
+}
+
+cmdline=
 emit_line BANGBANG_DIRECT_ROOTFS_BOOT_BEGIN
 if [ -r /etc/os-release ]; then
   id_line=$(grep -m 1 '^ID=' /etc/os-release 2>/dev/null || true)
@@ -363,14 +444,17 @@ if [ -r /etc/os-release ]; then
 fi
 mount_if_directory proc proc /proc
 mount_if_directory devtmpfs devtmpfs /dev
+mount_if_directory sysfs sysfs /sys
 if [ -r /proc/cmdline ]; then
   emit_line BANGBANG_CMDLINE_BEGIN
   cmdline=$(cat /proc/cmdline 2>/dev/null || true)
   emit_line "$cmdline"
   emit_line BANGBANG_CMDLINE_END
 fi
-if [ -b /dev/vdb ]; then
-  printf '%-512s' BANGBANG_DIRECT_ROOTFS_BLOCK_OK >/dev/vdb 2>/dev/null || true
+if cmdline_has bangbang.mmds-fetch=1; then
+  fetch_mmds_marker
+else
+  write_vdb_marker BANGBANG_DIRECT_ROOTFS_BLOCK_OK
 fi
 emit_line BANGBANG_DIRECT_ROOTFS_BOOT_OK
 exec sleep 3600

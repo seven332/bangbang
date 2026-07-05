@@ -28,9 +28,11 @@ mod macos_arm64 {
     const BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV: &str = "BANGBANG_GUEST_EXT4_ROOTFS_PATH";
     const BLOCK_WRITE_MARKER: &[u8] = b"BANGBANG_BLOCK_WRITE_OK";
     const DIRECT_ROOTFS_BLOCK_MARKER: &[u8] = b"BANGBANG_DIRECT_ROOTFS_BLOCK_OK";
+    const DIRECT_ROOTFS_MMDS_MARKER: &[u8] = b"BANGBANG_MMDS_GUEST_FETCH_OK";
     const GUEST_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/init";
     const DIRECT_ROOTFS_BOOT_ARGS: &str =
         "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init";
+    const DIRECT_ROOTFS_MMDS_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-fetch=1";
     const GUEST_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
 
     #[test]
@@ -982,6 +984,123 @@ mod macos_arm64 {
     }
 
     #[test]
+    fn signed_executable_serves_mmds_to_direct_rootfs_guest() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let data_backing_path = test_dir.path().join("data.img");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+
+        create_zeroed_block_backing(&data_backing_path);
+
+        let mut bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+        let machine_response = http_put_json(
+            &socket_path,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        );
+        assert_no_content_response(&machine_response, "PUT /machine-config MMDS guest fetch");
+
+        let network_response = http_put_json(
+            &socket_path,
+            "/network-interfaces/eth0",
+            r#"{"iface_id":"eth0","host_dev_name":"vmnet:shared","guest_mac":"06:00:00:00:00:01"}"#,
+        );
+        assert_no_content_response(&network_response, "PUT /network-interfaces/eth0");
+
+        let mmds_config_response = http_put_json(
+            &socket_path,
+            "/mmds/config",
+            r#"{"network_interfaces":["eth0"],"version":"V1","ipv4_address":"169.254.169.254"}"#,
+        );
+        assert_no_content_response(&mmds_config_response, "PUT /mmds/config");
+
+        let mmds_response = http_put_json(
+            &socket_path,
+            "/mmds",
+            r#"{"meta-data":{"bangbang-marker":"BANGBANG_MMDS_GUEST_VALUE"}}"#,
+        );
+        assert_no_content_response(&mmds_response, "PUT /mmds");
+
+        let kernel_path_json = json_string(path_text(&kernel_path));
+        let boot_args_json = json_string(DIRECT_ROOTFS_MMDS_BOOT_ARGS);
+        let boot_body = format!(
+            r#"{{
+                "kernel_image_path":{kernel_path_json},
+                "boot_args":{boot_args_json}
+            }}"#
+        );
+        let boot_response = http_put_json(&socket_path, "/boot-source", &boot_body);
+        assert_no_content_response(&boot_response, "PUT /boot-source MMDS guest fetch");
+
+        let rootfs_path_json = json_string(path_text(&rootfs_path));
+        let rootfs_body = format!(
+            r#"{{
+                "drive_id":"rootfs",
+                "path_on_host":{rootfs_path_json},
+                "is_root_device":true,
+                "is_read_only":true
+            }}"#
+        );
+        let rootfs_response = http_put_json(&socket_path, "/drives/rootfs", &rootfs_body);
+        assert_no_content_response(&rootfs_response, "PUT /drives/rootfs MMDS guest fetch");
+
+        let data_backing_path_json = json_string(path_text(&data_backing_path));
+        let data_drive_body = format!(
+            r#"{{
+                "drive_id":"data",
+                "path_on_host":{data_backing_path_json},
+                "is_root_device":false,
+                "is_read_only":false
+            }}"#
+        );
+        let data_drive_response = http_put_json(&socket_path, "/drives/data", &data_drive_body);
+        assert_no_content_response(&data_drive_response, "PUT /drives/data MMDS guest fetch");
+
+        let start_response = http_put_json(
+            &socket_path,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        );
+        assert_no_content_response(
+            &start_response,
+            "PUT /actions InstanceStart MMDS guest fetch",
+        );
+
+        let running_instance_info = http_get(&socket_path, "/");
+        assert_ok_response(
+            &running_instance_info,
+            "GET / after MMDS guest fetch InstanceStart",
+        );
+        assert_response_contains(
+            &running_instance_info,
+            r#""state":"Running""#,
+            "GET / after MMDS guest fetch InstanceStart",
+        );
+
+        if let Err(err) = wait_for_file_prefix_marker(
+            &data_backing_path,
+            DIRECT_ROOTFS_MMDS_MARKER,
+            GUEST_EXECUTION_TIMEOUT,
+        ) {
+            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "direct rootfs guest did not fetch MMDS through signed bangbang executable: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
+        assert_clean_shutdown(
+            bangbang.terminate(),
+            &socket_path,
+            "bangbang direct rootfs MMDS guest fetch",
+        );
+    }
+
+    #[test]
     fn signed_executable_starts_from_config_file_with_direct_rootfs() {
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join("api.socket");
@@ -1313,6 +1432,13 @@ mod macos_arm64 {
             .map_err(|err| format!("failed to read serial output {}: {err}", path.display()))?;
 
         Ok(bytes.windows(marker.len()).any(|window| window == marker))
+    }
+
+    fn file_prefix_lossy(path: &Path, len: usize) -> String {
+        match fs::read(path) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes[..bytes.len().min(len)]).into_owned(),
+            Err(err) => format!("failed to read {}: {err}", path.display()),
+        }
     }
 
     #[derive(Debug)]
