@@ -502,6 +502,36 @@ mod macos_arm64 {
             r#"{"fault_message":"The requested operation is not supported in Running state: PutMachineConfig"}"#,
             "PUT /machine-config after InstanceStart",
         );
+        let post_start_machine_patch_response = http_json(
+            &socket_path,
+            "PATCH",
+            "/machine-config",
+            r#"{"mem_size_mib":512}"#,
+        );
+        assert_bad_request_response(
+            &post_start_machine_patch_response,
+            "PATCH /machine-config after InstanceStart",
+        );
+        assert_response_contains(
+            &post_start_machine_patch_response,
+            r#"{"fault_message":"The requested operation is not supported in Running state: PatchMachineConfig"}"#,
+            "PATCH /machine-config after InstanceStart",
+        );
+        let machine_config_after_patch = http_get(&socket_path, "/machine-config");
+        assert_ok_response(
+            &machine_config_after_patch,
+            "GET /machine-config after rejected PATCH /machine-config",
+        );
+        assert_response_contains(
+            &machine_config_after_patch,
+            r#""vcpu_count":1"#,
+            "GET /machine-config after rejected PATCH /machine-config",
+        );
+        assert_response_contains(
+            &machine_config_after_patch,
+            r#""mem_size_mib":256"#,
+            "GET /machine-config after rejected PATCH /machine-config",
+        );
 
         if let Err(err) =
             wait_for_file_prefix_marker(&backing_path, BLOCK_WRITE_MARKER, GUEST_EXECUTION_TIMEOUT)
