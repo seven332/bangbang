@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use bangbang_runtime::block::BlockMmioLayout;
-use bangbang_runtime::entropy::EntropyMmioLayout;
+use bangbang_runtime::entropy::{EntropyMmioLayout, VirtioRngOsEntropySource};
 use bangbang_runtime::fdt::Arm64FdtError;
 use bangbang_runtime::interrupt::{
     DeviceInterruptKind, DeviceInterruptTriggerError, GuestInterruptLine, InterruptSink,
@@ -21,11 +21,10 @@ use bangbang_runtime::startup::{
     Arm64BootBlockNotificationDispatches,
     Arm64BootEntropyDeviceConfig as RuntimeArm64BootEntropyDeviceConfig,
     Arm64BootEntropyNotificationDispatch, Arm64BootEntropyNotificationDispatchError,
-    Arm64BootEntropyNotificationDispatches, Arm64BootEntropySourceError,
-    Arm64BootEntropySourceProvider, Arm64BootNetworkNotificationDispatch,
-    Arm64BootNetworkNotificationDispatchError, Arm64BootNetworkNotificationDispatches,
-    Arm64BootNetworkPacketIoProvider, Arm64BootResourceConfig, Arm64BootResourceError,
-    Arm64BootResources, Arm64BootRuntimeResources,
+    Arm64BootEntropyNotificationDispatches, Arm64BootEntropySourceProvider,
+    Arm64BootNetworkNotificationDispatch, Arm64BootNetworkNotificationDispatchError,
+    Arm64BootNetworkNotificationDispatches, Arm64BootNetworkPacketIoProvider,
+    Arm64BootResourceConfig, Arm64BootResourceError, Arm64BootResources, Arm64BootRuntimeResources,
     Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig,
     Arm64BootVsockNotificationDispatch, Arm64BootVsockNotificationDispatchError,
     Arm64BootVsockNotificationDispatches,
@@ -137,6 +136,7 @@ pub struct HvfArm64BootSession<'vm> {
     backend: &'vm mut HvfBackend,
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
+    entropy_source: VirtioRngOsEntropySource,
     gic: HvfGicMetadata,
     primary_mpidr: u64,
     block_interrupt_lines: Vec<GuestInterruptLine>,
@@ -153,6 +153,7 @@ pub struct OwnedHvfArm64BootSession {
     backend: HvfBackend,
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
+    entropy_source: VirtioRngOsEntropySource,
     gic: HvfGicMetadata,
     primary_mpidr: u64,
     block_interrupt_lines: Vec<GuestInterruptLine>,
@@ -544,24 +545,13 @@ impl HvfArm64BootSession<'_> {
         HvfArm64BootEntropyNotificationDispatches,
         HvfArm64BootEntropyNotificationDispatchError,
     > {
-        let dispatches = {
-            let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
-                HvfArm64BootEntropyNotificationDispatchError::MapGuestMemory { source }
-            })?;
-            let mut mmio_dispatcher =
-                lock_boot_mmio_dispatcher(&self.mmio_dispatcher).map_err(|source| {
-                    HvfArm64BootEntropyNotificationDispatchError::MmioDispatcher { source }
-                })?;
-
-            dispatch_entropy_runtime_notifications_with_source(
-                memory,
-                &mut self.runtime_resources,
-                &mut mmio_dispatcher,
-                entropy_source,
-            )?
-        };
-
-        collect_or_signal_entropy_queue_interrupts(dispatches, &self.gic)
+        dispatch_entropy_queue_notifications_and_signal_interrupts_with_source(
+            self.backend,
+            &self.mmio_dispatcher,
+            &mut self.runtime_resources,
+            &self.gic,
+            entropy_source,
+        )
     }
 }
 
@@ -591,6 +581,7 @@ impl OwnedHvfArm64BootSession {
             backend,
             mmio_dispatcher: prepared.mmio_dispatcher,
             runtime_resources: prepared.runtime_resources,
+            entropy_source: VirtioRngOsEntropySource::new(),
             gic: prepared.gic,
             primary_mpidr: prepared.primary_mpidr,
             block_interrupt_lines: prepared.block_interrupt_lines,
@@ -827,24 +818,13 @@ impl OwnedHvfArm64BootSession {
         HvfArm64BootEntropyNotificationDispatches,
         HvfArm64BootEntropyNotificationDispatchError,
     > {
-        let dispatches = {
-            let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
-                HvfArm64BootEntropyNotificationDispatchError::MapGuestMemory { source }
-            })?;
-            let mut mmio_dispatcher =
-                lock_boot_mmio_dispatcher(&self.mmio_dispatcher).map_err(|source| {
-                    HvfArm64BootEntropyNotificationDispatchError::MmioDispatcher { source }
-                })?;
-
-            dispatch_entropy_runtime_notifications_with_source(
-                memory,
-                &mut self.runtime_resources,
-                &mut mmio_dispatcher,
-                entropy_source,
-            )?
-        };
-
-        collect_or_signal_entropy_queue_interrupts(dispatches, &self.gic)
+        dispatch_entropy_queue_notifications_and_signal_interrupts_with_source(
+            &mut self.backend,
+            &self.mmio_dispatcher,
+            &mut self.runtime_resources,
+            &self.gic,
+            entropy_source,
+        )
     }
 }
 
@@ -887,8 +867,13 @@ impl BootSessionRunLoopSession for OwnedHvfArm64BootSession {
         HvfArm64BootEntropyNotificationDispatches,
         HvfArm64BootEntropyNotificationDispatchError,
     > {
-        let mut entropy_source = UnsupportedEntropySourceProvider;
-        self.dispatch_entropy_queue_notifications_and_signal_interrupts(&mut entropy_source)
+        dispatch_entropy_queue_notifications_and_signal_interrupts_with_source(
+            &mut self.backend,
+            &self.mmio_dispatcher,
+            &mut self.runtime_resources,
+            &self.gic,
+            &mut self.entropy_source,
+        )
     }
 }
 
@@ -959,9 +944,13 @@ where
         HvfArm64BootEntropyNotificationDispatches,
         HvfArm64BootEntropyNotificationDispatchError,
     > {
-        let mut entropy_source = UnsupportedEntropySourceProvider;
-        self.session
-            .dispatch_entropy_queue_notifications_and_signal_interrupts(&mut entropy_source)
+        dispatch_entropy_queue_notifications_and_signal_interrupts_with_source(
+            &mut self.session.backend,
+            &self.session.mmio_dispatcher,
+            &mut self.session.runtime_resources,
+            &self.session.gic,
+            &mut self.session.entropy_source,
+        )
     }
 }
 
@@ -1547,21 +1536,6 @@ trait BootSessionRunLoopSession {
     >;
 }
 
-#[derive(Debug)]
-struct UnsupportedEntropySourceProvider;
-
-impl Arm64BootEntropySourceProvider for UnsupportedEntropySourceProvider {
-    fn entropy_source(
-        &mut self,
-        _device: &bangbang_runtime::startup::Arm64BootEntropyDevice,
-    ) -> Result<bangbang_runtime::startup::Arm64BootEntropySource<'_>, Arm64BootEntropySourceError>
-    {
-        Err(Arm64BootEntropySourceError::new(
-            "HVF boot-session entropy source is not configured",
-        ))
-    }
-}
-
 impl BootSessionRunLoopSession for HvfArm64BootSession<'_> {
     fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
         self.run_once_and_handle_mmio()
@@ -1601,8 +1575,13 @@ impl BootSessionRunLoopSession for HvfArm64BootSession<'_> {
         HvfArm64BootEntropyNotificationDispatches,
         HvfArm64BootEntropyNotificationDispatchError,
     > {
-        let mut entropy_source = UnsupportedEntropySourceProvider;
-        self.dispatch_entropy_queue_notifications_and_signal_interrupts(&mut entropy_source)
+        dispatch_entropy_queue_notifications_and_signal_interrupts_with_source(
+            self.backend,
+            &self.mmio_dispatcher,
+            &mut self.runtime_resources,
+            &self.gic,
+            &mut self.entropy_source,
+        )
     }
 }
 
@@ -1874,6 +1853,33 @@ fn dispatch_vsock_runtime_notifications(
         .map_err(
             |source| HvfArm64BootVsockNotificationDispatchError::DispatchNotifications { source },
         )
+}
+
+fn dispatch_entropy_queue_notifications_and_signal_interrupts_with_source(
+    backend: &mut HvfBackend,
+    dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    runtime_resources: &mut Arm64BootRuntimeResources,
+    gic: &HvfGicMetadata,
+    entropy_source: &mut impl Arm64BootEntropySourceProvider,
+) -> Result<HvfArm64BootEntropyNotificationDispatches, HvfArm64BootEntropyNotificationDispatchError>
+{
+    let dispatches = {
+        let memory = backend.mapped_guest_memory_mut().map_err(|source| {
+            HvfArm64BootEntropyNotificationDispatchError::MapGuestMemory { source }
+        })?;
+        let mut mmio_dispatcher = lock_boot_mmio_dispatcher(dispatcher).map_err(|source| {
+            HvfArm64BootEntropyNotificationDispatchError::MmioDispatcher { source }
+        })?;
+
+        dispatch_entropy_runtime_notifications_with_source(
+            memory,
+            runtime_resources,
+            &mut mmio_dispatcher,
+            entropy_source,
+        )?
+    };
+
+    collect_or_signal_entropy_queue_interrupts(dispatches, gic)
 }
 
 fn dispatch_entropy_runtime_notifications_with_source(
@@ -2240,6 +2246,7 @@ impl HvfBackend {
             backend: self,
             mmio_dispatcher: prepared.mmio_dispatcher,
             runtime_resources: prepared.runtime_resources,
+            entropy_source: VirtioRngOsEntropySource::new(),
             gic: prepared.gic,
             primary_mpidr: prepared.primary_mpidr,
             block_interrupt_lines: prepared.block_interrupt_lines,
