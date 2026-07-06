@@ -754,8 +754,8 @@ fn record_deprecated_api_usage(request: &ApiRequest, vmm: &mut impl VmmRequestHa
 
 fn request_uses_deprecated_api(request: &ApiRequest) -> bool {
     match request {
-        ApiRequest::PutMachineConfig(config) => config.cpu_template_field_present(),
-        ApiRequest::PatchMachineConfig(config) => config.cpu_template_field_present(),
+        ApiRequest::PutMachineConfig(config) => config.cpu_template().is_some(),
+        ApiRequest::PatchMachineConfig(config) => config.cpu_template().is_some(),
         ApiRequest::PutMmdsConfig(config) => config.version() == ApiMmdsVersion::V1,
         ApiRequest::PutSnapshotLoad(config) => config.deprecated_fields_used(),
         ApiRequest::PutVsock(config) => config.vsock_id().is_some(),
@@ -4378,6 +4378,46 @@ mod tests {
     }
 
     #[test]
+    fn deprecated_api_usage_tracks_machine_cpu_template_values() {
+        for (method, body, expected) in [
+            ("PUT", r#"{"vcpu_count":1,"mem_size_mib":256}"#, false),
+            (
+                "PUT",
+                r#"{"vcpu_count":1,"mem_size_mib":256,"cpu_template":null}"#,
+                false,
+            ),
+            (
+                "PUT",
+                r#"{"vcpu_count":1,"mem_size_mib":256,"cpu_template":"None"}"#,
+                true,
+            ),
+            (
+                "PUT",
+                r#"{"vcpu_count":1,"mem_size_mib":256,"cpu_template":"V1N1"}"#,
+                true,
+            ),
+            ("PATCH", r#"{"mem_size_mib":256}"#, false),
+            (
+                "PATCH",
+                r#"{"mem_size_mib":256,"cpu_template":null}"#,
+                false,
+            ),
+            ("PATCH", r#"{"cpu_template":"None"}"#, true),
+            ("PATCH", r#"{"cpu_template":"T2A"}"#, true),
+        ] {
+            let request = request_with_body(method, "/machine-config", body);
+            let parsed = parse_request_with_limit(request.as_bytes(), HTTP_MAX_PAYLOAD_SIZE)
+                .expect("machine config request should parse");
+
+            assert_eq!(
+                request_uses_deprecated_api(&parsed),
+                expected,
+                "{method} {body}"
+            );
+        }
+    }
+
+    #[test]
     fn configured_metrics_counts_deprecated_api_requests() {
         let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
         let metrics_path = unique_socket_path("metrics-deprecated-api").with_extension("metrics");
@@ -4407,6 +4447,25 @@ mod tests {
         assert_eq!(
             handle_request_bytes(machine_patch_request.as_bytes(), &mut vmm).status(),
             bangbang_api::http::StatusCode::NoContent
+        );
+
+        let machine_none_request = request_with_body(
+            "PUT",
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256,"cpu_template":"None"}"#,
+        );
+        assert_eq!(
+            handle_request_bytes(machine_none_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let unsupported_machine_patch_response = handle_request_bytes(
+            request_with_body("PATCH", "/machine-config", r#"{"cpu_template":"T2A"}"#).as_bytes(),
+            &mut vmm,
+        );
+        assert_eq!(
+            unsupported_machine_patch_response.status(),
+            bangbang_api::http::StatusCode::BadRequest
         );
 
         let mmds_config_response = handle_request_bytes(
@@ -4490,7 +4549,7 @@ mod tests {
             fs::read_to_string(&metrics_path).expect("metrics output should be readable");
         assert_eq!(
             metrics_output,
-            "{\"deprecated_api\":{\"deprecated_http_api_calls\":5},\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":1,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":1,\"mmds_fails\":1,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":1,\"vsock_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"deprecated_api\":{\"deprecated_http_api_calls\":5},\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":3,\"machine_cfg_fails\":1,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":1,\"mmds_fails\":1,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":1,\"vsock_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
         assert!(!metrics_output.contains("vsock-secret"));
         assert!(!metrics_output.contains("deprecated-vsock-secret"));
