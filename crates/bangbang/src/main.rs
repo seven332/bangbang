@@ -949,86 +949,87 @@ impl Args {
 
         while let Some(arg) = args.get(index) {
             match arg.as_str() {
-                "--api-sock" => {
+                value_arg if is_value_arg(value_arg, "--api-sock") => {
                     if api_sock_seen {
                         return Err("duplicate argument: --api-sock".to_string());
                     }
-                    let value = take_value(&args, index, "--api-sock")?;
+                    let (value, consumed) = take_value_arg(&args, index, "--api-sock")?;
                     validate_api_sock(&value)?;
                     config.api_sock = value;
                     api_sock_seen = true;
-                    index += 2;
+                    index += consumed;
                 }
-                "--config-file" => {
+                value_arg if is_value_arg(value_arg, "--config-file") => {
                     if config_file_seen {
                         return Err("duplicate argument: --config-file".to_string());
                     }
-                    let value = take_value(&args, index, "--config-file")?;
+                    let (value, consumed) = take_value_arg(&args, index, "--config-file")?;
                     validate_config_file_path(&value)?;
                     config.config_file = Some(value);
                     config_file_seen = true;
-                    index += 2;
+                    index += consumed;
                 }
-                "--http-api-max-payload-size" => {
+                value_arg if is_value_arg(value_arg, "--http-api-max-payload-size") => {
                     if http_api_max_payload_size_seen {
                         return Err("duplicate argument: --http-api-max-payload-size".to_string());
                     }
-                    let value = take_value(&args, index, "--http-api-max-payload-size")?;
+                    let (value, consumed) =
+                        take_value_arg(&args, index, "--http-api-max-payload-size")?;
                     config.http_api_max_payload_size = parse_http_api_max_payload_size(&value)?;
                     http_api_max_payload_size_seen = true;
-                    index += 2;
+                    index += consumed;
                 }
-                "--id" => {
+                value_arg if is_value_arg(value_arg, "--id") => {
                     if id_seen {
                         return Err("duplicate argument: --id".to_string());
                     }
-                    let value = take_value(&args, index, "--id")?;
+                    let (value, consumed) = take_value_arg(&args, index, "--id")?;
                     validate_instance_id(&value)?;
                     config.id = value;
                     id_seen = true;
-                    index += 2;
+                    index += consumed;
                 }
-                "--log-path" => {
+                value_arg if is_value_arg(value_arg, "--log-path") => {
                     if log_path_seen {
                         return Err("duplicate argument: --log-path".to_string());
                     }
-                    let value = take_value(&args, index, "--log-path")?;
+                    let (value, consumed) = take_value_arg(&args, index, "--log-path")?;
                     logger_config = logger_config.with_log_path(value);
                     logger_config_seen = true;
                     log_path_seen = true;
-                    index += 2;
+                    index += consumed;
                 }
-                "--level" => {
+                value_arg if is_value_arg(value_arg, "--level") => {
                     if level_seen {
                         return Err("duplicate argument: --level".to_string());
                     }
-                    let value = take_value(&args, index, "--level")?;
+                    let (value, consumed) = take_value_arg(&args, index, "--level")?;
                     let level = value
                         .parse::<LoggerLevel>()
                         .map_err(|err| format!("invalid --level: {err}"))?;
                     logger_config = logger_config.with_level(level);
                     logger_config_seen = true;
                     level_seen = true;
-                    index += 2;
+                    index += consumed;
                 }
-                "--mmds-size-limit" => {
+                value_arg if is_value_arg(value_arg, "--mmds-size-limit") => {
                     if mmds_size_limit_seen {
                         return Err("duplicate argument: --mmds-size-limit".to_string());
                     }
-                    let value = take_value(&args, index, "--mmds-size-limit")?;
+                    let (value, consumed) = take_value_arg(&args, index, "--mmds-size-limit")?;
                     config.mmds_size_limit = Some(parse_mmds_size_limit(&value)?);
                     mmds_size_limit_seen = true;
-                    index += 2;
+                    index += consumed;
                 }
-                "--metadata" => {
+                value_arg if is_value_arg(value_arg, "--metadata") => {
                     if metadata_seen {
                         return Err("duplicate argument: --metadata".to_string());
                     }
-                    let value = take_value(&args, index, "--metadata")?;
+                    let (value, consumed) = take_value_arg(&args, index, "--metadata")?;
                     validate_metadata_path(&value)?;
                     config.metadata = Some(value);
                     metadata_seen = true;
-                    index += 2;
+                    index += consumed;
                 }
                 "--no-api" => {
                     if no_api_seen {
@@ -1038,34 +1039,34 @@ impl Args {
                     no_api_seen = true;
                     index += 1;
                 }
-                "--parent-cpu-time-us" => {
+                value_arg if is_value_arg(value_arg, "--parent-cpu-time-us") => {
                     if parent_cpu_time_us_seen {
                         return Err("duplicate argument: --parent-cpu-time-us".to_string());
                     }
-                    let value = take_value(&args, index, "--parent-cpu-time-us")?;
+                    let (value, consumed) = take_value_arg(&args, index, "--parent-cpu-time-us")?;
                     config.startup_time.parent_cpu_time_us =
                         Some(parse_startup_time_us(&value, "parent-cpu-time-us")?);
                     parent_cpu_time_us_seen = true;
-                    index += 2;
+                    index += consumed;
                 }
-                "--metrics-path" => {
+                value_arg if is_value_arg(value_arg, "--metrics-path") => {
                     if metrics_path_seen {
                         return Err("duplicate argument: --metrics-path".to_string());
                     }
-                    let value = take_value(&args, index, "--metrics-path")?;
+                    let (value, consumed) = take_value_arg(&args, index, "--metrics-path")?;
                     config.metrics_config = Some(MetricsConfigInput::new(value));
                     metrics_path_seen = true;
-                    index += 2;
+                    index += consumed;
                 }
-                "--module" => {
+                value_arg if is_value_arg(value_arg, "--module") => {
                     if module_seen {
                         return Err("duplicate argument: --module".to_string());
                     }
-                    let value = take_value(&args, index, "--module")?;
+                    let (value, consumed) = take_value_arg(&args, index, "--module")?;
                     logger_config = logger_config.with_module(value);
                     logger_config_seen = true;
                     module_seen = true;
-                    index += 2;
+                    index += consumed;
                 }
                 "--show-level" => {
                     if show_level_seen {
@@ -1085,25 +1086,25 @@ impl Args {
                     show_log_origin_seen = true;
                     index += 1;
                 }
-                "--start-time-cpu-us" => {
+                value_arg if is_value_arg(value_arg, "--start-time-cpu-us") => {
                     if start_time_cpu_us_seen {
                         return Err("duplicate argument: --start-time-cpu-us".to_string());
                     }
-                    let value = take_value(&args, index, "--start-time-cpu-us")?;
+                    let (value, consumed) = take_value_arg(&args, index, "--start-time-cpu-us")?;
                     config.startup_time.start_time_cpu_us =
                         Some(parse_startup_time_us(&value, "start-time-cpu-us")?);
                     start_time_cpu_us_seen = true;
-                    index += 2;
+                    index += consumed;
                 }
-                "--start-time-us" => {
+                value_arg if is_value_arg(value_arg, "--start-time-us") => {
                     if start_time_us_seen {
                         return Err("duplicate argument: --start-time-us".to_string());
                     }
-                    let value = take_value(&args, index, "--start-time-us")?;
+                    let (value, consumed) = take_value_arg(&args, index, "--start-time-us")?;
                     config.startup_time.start_time_us =
                         Some(parse_startup_time_us(&value, "start-time-us")?);
                     start_time_us_seen = true;
-                    index += 2;
+                    index += consumed;
                 }
                 other => {
                     if let Some(name) = unsupported_flag_equals_syntax(other) {
@@ -1114,12 +1115,6 @@ impl Args {
 
                     if let Some(name) = unsupported_firecracker_arg(other) {
                         return Err(format!("unsupported Firecracker argument: --{name}"));
-                    }
-
-                    if let Some(name) = unsupported_equals_syntax(other) {
-                        return Err(format!(
-                            "unsupported argument syntax for --{name}; use --{name} <VALUE>"
-                        ));
                     }
 
                     if other.starts_with('-') {
@@ -1160,6 +1155,8 @@ fn help_text() -> String {
             "bangbang {}\n\n",
             "Usage:\n",
             "  bangbang [OPTIONS]\n\n",
+            "Value-taking long options accept either --name value or --name=value.\n",
+            "Value-less flags reject attached values.\n\n",
             "Options:\n",
             "      --api-sock <PATH>  Unix domain socket path for the API server [default: {}]\n",
             "      --config-file <PATH>\n",
@@ -1215,6 +1212,25 @@ fn take_value(args: &[String], index: usize, name: &str) -> Result<String, Strin
         .filter(|value| !value.starts_with("--"))
         .cloned()
         .ok_or_else(|| format!("missing value for {name}"))
+}
+
+fn take_value_arg(args: &[String], index: usize, name: &str) -> Result<(String, usize), String> {
+    let arg = args
+        .get(index)
+        .ok_or_else(|| format!("missing value for {name}"))?;
+    if let Some(value) = inline_value(arg, name) {
+        return Ok((value.to_string(), 1));
+    }
+
+    take_value(args, index, name).map(|value| (value, 2))
+}
+
+fn is_value_arg(arg: &str, name: &str) -> bool {
+    arg == name || inline_value(arg, name).is_some()
+}
+
+fn inline_value<'arg>(arg: &'arg str, name: &str) -> Option<&'arg str> {
+    arg.strip_prefix(name)?.strip_prefix('=')
 }
 
 fn validate_api_sock(api_sock: &str) -> Result<(), String> {
@@ -1313,30 +1329,16 @@ fn display_arg_name(arg: &str) -> &str {
     arg.split_once('=').map_or(arg, |(name, _)| name)
 }
 
-fn unsupported_equals_syntax(arg: &str) -> Option<&'static str> {
+fn unsupported_flag_equals_syntax(arg: &str) -> Option<&'static str> {
     [
-        ("--api-sock=", "api-sock"),
-        ("--config-file=", "config-file"),
-        ("--http-api-max-payload-size=", "http-api-max-payload-size"),
-        ("--id=", "id"),
-        ("--log-path=", "log-path"),
-        ("--level=", "level"),
-        ("--metadata=", "metadata"),
-        ("--metrics-path=", "metrics-path"),
-        ("--mmds-size-limit=", "mmds-size-limit"),
-        ("--module=", "module"),
-        ("--parent-cpu-time-us=", "parent-cpu-time-us"),
-        ("--start-time-cpu-us=", "start-time-cpu-us"),
-        ("--start-time-us=", "start-time-us"),
+        ("--help=", "help"),
+        ("--no-api=", "no-api"),
+        ("--show-level=", "show-level"),
+        ("--show-log-origin=", "show-log-origin"),
+        ("--version=", "version"),
     ]
     .into_iter()
     .find_map(|(prefix, name)| arg.starts_with(prefix).then_some(name))
-}
-
-fn unsupported_flag_equals_syntax(arg: &str) -> Option<&'static str> {
-    [("--no-api=", "no-api")]
-        .into_iter()
-        .find_map(|(prefix, name)| arg.starts_with(prefix).then_some(name))
 }
 
 #[cfg(test)]
@@ -1734,6 +1736,10 @@ mod tests {
         let help = super::help_text();
 
         assert!(help.contains("Serves GET /, GET /version"));
+        assert!(
+            help.contains("Value-taking long options accept either --name value or --name=value")
+        );
+        assert!(help.contains("Value-less flags reject attached values"));
         assert!(help.contains("GET /vm/config"));
         assert!(help.contains("--config-file <PATH>"));
         assert!(help.contains("GET /machine-config"));
@@ -2065,6 +2071,69 @@ mod tests {
     }
 
     #[test]
+    fn parse_startup_args_with_equals_syntax() {
+        let config = parse_run(&[
+            "--api-sock=/tmp/custom.socket",
+            "--config-file=/tmp/bangbang-config.json",
+            "--id=demo-1",
+            "--http-api-max-payload-size=65536",
+            "--mmds-size-limit=4096",
+            "--metadata=/tmp/mmds.json",
+            "--metrics-path=/tmp/bangbang.metrics",
+            "--start-time-us=1000",
+            "--start-time-cpu-us=2000",
+            "--parent-cpu-time-us=3000",
+        ])
+        .expect("startup args should parse with equals syntax");
+
+        assert_eq!(config.api_sock, "/tmp/custom.socket");
+        assert_eq!(
+            config.config_file,
+            Some("/tmp/bangbang-config.json".to_string())
+        );
+        assert_eq!(config.http_api_max_payload_size, 65_536);
+        assert_eq!(config.mmds_size_limit, Some(4096));
+        assert_eq!(config.metadata, Some("/tmp/mmds.json".to_string()));
+        assert_eq!(config.id, "demo-1");
+        assert_eq!(
+            config.metrics_config,
+            Some(MetricsConfigInput::new("/tmp/bangbang.metrics"))
+        );
+        assert_eq!(
+            config.startup_time,
+            StartupTimeConfig {
+                start_time_us: Some(1000),
+                start_time_cpu_us: Some(2000),
+                parent_cpu_time_us: Some(3000),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_observability_args_with_equals_syntax() {
+        let config = parse_run(&[
+            "--log-path=/tmp/bangbang.log",
+            "--level=Warning",
+            "--module=api_server",
+            "--show-level",
+            "--show-log-origin",
+        ])
+        .expect("logger startup args should parse with equals syntax");
+
+        assert_eq!(
+            config.logger_config,
+            Some(
+                LoggerConfigInput::new()
+                    .with_log_path("/tmp/bangbang.log")
+                    .with_level(LoggerLevel::Warn)
+                    .with_module("api_server")
+                    .with_show_level(true)
+                    .with_show_log_origin(true)
+            )
+        );
+    }
+
+    #[test]
     fn rejects_missing_api_sock_value() {
         let err = parse(&["--api-sock"]).expect_err("missing api socket value should fail");
 
@@ -2224,6 +2293,22 @@ mod tests {
         let err = parse(&["--id", "one", "--id", "two"]).expect_err("duplicate id should fail");
 
         assert_eq!(err, "duplicate argument: --id");
+    }
+
+    #[test]
+    fn rejects_duplicate_mixed_equals_and_separate_args() {
+        let err = parse(&["--id", "one", "--id=two"]).expect_err("duplicate id should fail");
+
+        assert_eq!(err, "duplicate argument: --id");
+
+        let err = parse(&[
+            "--api-sock=/tmp/one.socket",
+            "--api-sock",
+            "/tmp/two.socket",
+        ])
+        .expect_err("duplicate api socket should fail");
+
+        assert_eq!(err, "duplicate argument: --api-sock");
     }
 
     #[test]
@@ -2485,100 +2570,59 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_equals_syntax_for_supported_arg() {
-        let err =
-            parse(&["--api-sock=/tmp/bangbang.socket"]).expect_err("equals syntax should fail");
+    fn rejects_empty_equals_values_through_existing_validation() {
+        let err = parse(&["--api-sock="]).expect_err("empty api socket should fail");
+
+        assert_eq!(err, "invalid --api-sock: path must not be empty");
+
+        let err = parse(&["--id="]).expect_err("empty id should fail");
 
         assert_eq!(
             err,
-            "unsupported argument syntax for --api-sock; use --api-sock <VALUE>"
+            "invalid --id: invalid length 0; length must be between 1 and 64"
         );
 
         let err =
-            parse(&["--config-file=/tmp/secret.json"]).expect_err("equals syntax should fail");
+            parse(&["--http-api-max-payload-size="]).expect_err("empty payload size should fail");
 
         assert_eq!(
             err,
-            "unsupported argument syntax for --config-file; use --config-file <VALUE>"
+            "invalid --http-api-max-payload-size: value must be a positive integer"
         );
+    }
 
-        let err = parse(&["--no-api=true"]).expect_err("equals syntax should fail");
+    #[test]
+    fn rejects_equals_syntax_for_supported_flags() {
+        let err = parse(&["--no-api=true"]).expect_err("flag with value should fail");
 
         assert_eq!(
             err,
             "unsupported argument syntax for --no-api; use --no-api"
         );
 
-        let err =
-            parse(&["--http-api-max-payload-size=65536"]).expect_err("equals syntax should fail");
+        let err = parse(&["--show-level=true"]).expect_err("flag with value should fail");
 
         assert_eq!(
             err,
-            "unsupported argument syntax for --http-api-max-payload-size; use --http-api-max-payload-size <VALUE>"
+            "unsupported argument syntax for --show-level; use --show-level"
         );
 
-        let err = parse(&["--log-path=/tmp/secret.log"]).expect_err("equals syntax should fail");
+        let err = parse(&["--show-log-origin=true"]).expect_err("flag with value should fail");
 
         assert_eq!(
             err,
-            "unsupported argument syntax for --log-path; use --log-path <VALUE>"
+            "unsupported argument syntax for --show-log-origin; use --show-log-origin"
         );
 
-        let err = parse(&["--level=Info"]).expect_err("equals syntax should fail");
+        let err = parse(&["--help=true"]).expect_err("help flag with value should fail");
+
+        assert_eq!(err, "unsupported argument syntax for --help; use --help");
+
+        let err = parse(&["--version=true"]).expect_err("version flag with value should fail");
 
         assert_eq!(
             err,
-            "unsupported argument syntax for --level; use --level <VALUE>"
-        );
-
-        let err = parse(&["--module=api_server"]).expect_err("equals syntax should fail");
-
-        assert_eq!(
-            err,
-            "unsupported argument syntax for --module; use --module <VALUE>"
-        );
-
-        let err =
-            parse(&["--metrics-path=/tmp/secret.metrics"]).expect_err("equals syntax should fail");
-
-        assert_eq!(
-            err,
-            "unsupported argument syntax for --metrics-path; use --metrics-path <VALUE>"
-        );
-
-        let err = parse(&["--mmds-size-limit=65536"]).expect_err("equals syntax should fail");
-
-        assert_eq!(
-            err,
-            "unsupported argument syntax for --mmds-size-limit; use --mmds-size-limit <VALUE>"
-        );
-
-        let err = parse(&["--metadata=/tmp/mmds.json"]).expect_err("equals syntax should fail");
-
-        assert_eq!(
-            err,
-            "unsupported argument syntax for --metadata; use --metadata <VALUE>"
-        );
-
-        let err = parse(&["--start-time-us=1000"]).expect_err("equals syntax should fail");
-
-        assert_eq!(
-            err,
-            "unsupported argument syntax for --start-time-us; use --start-time-us <VALUE>"
-        );
-
-        let err = parse(&["--start-time-cpu-us=2000"]).expect_err("equals syntax should fail");
-
-        assert_eq!(
-            err,
-            "unsupported argument syntax for --start-time-cpu-us; use --start-time-cpu-us <VALUE>"
-        );
-
-        let err = parse(&["--parent-cpu-time-us=3000"]).expect_err("equals syntax should fail");
-
-        assert_eq!(
-            err,
-            "unsupported argument syntax for --parent-cpu-time-us; use --parent-cpu-time-us <VALUE>"
+            "unsupported argument syntax for --version; use --version"
         );
     }
 

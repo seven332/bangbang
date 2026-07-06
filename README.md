@@ -31,6 +31,9 @@ Run the VMM process skeleton and API server:
 cargo run -p bangbang -- --api-sock /tmp/bangbang.socket --id demo-1
 ```
 
+Supported value-taking options accept either `--name value` or `--name=value`.
+Value-less flags, such as `--no-api`, do not accept an attached value.
+
 - `--api-sock <PATH>` sets the Unix socket path. The default is
   `/tmp/bangbang.socket`.
 - `--config-file <PATH>` reads a Firecracker-shaped JSON configuration for the
