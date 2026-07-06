@@ -464,13 +464,13 @@ is one Firecracker-shaped virtio-rng device configured before startup, attached
 as a virtio-mmio device in the arm64 FDT, backed by host randomness, and
 validated through the signed executable process/HVF path by a guest read from
 the RNG device. The follow-up split should keep PRs independently mergeable:
-first add the API/runtime configuration model while preserving unsupported
-rate-limiter behavior, then add the backend-neutral virtio-rng queue handler,
-then wire startup, MMIO layout, FDT, interrupts, reset/cleanup, and finally add
-signed executable e2e and metrics/security docs. Entropy device metrics and
-real rate limiting remain deferred until their producers exist. `PUT /entropy`
-must continue to return unsupported until a later PR exposes guest-visible
-entropy behavior.
+first define the API/runtime configuration boundary without enabling a
+successful `PUT /entropy` path, then add the backend-neutral virtio-rng queue
+handler, then wire startup, MMIO layout, FDT, interrupts, reset/cleanup, and
+finally add signed executable e2e and metrics/security docs. Entropy device
+metrics and real rate limiting remain deferred until their producers exist.
+`PUT /entropy` must continue to return unsupported until a later PR exposes
+guest-visible entropy behavior.
 
 The API and VMM state path also route valid snapshot requests through explicit
 actions before returning unsupported faults. `PUT /snapshot/create` fails as an
