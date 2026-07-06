@@ -501,9 +501,10 @@ without side effects. It includes the stored/default `machine-config`, includes
 for configured virtio-block drives plus a `network-interfaces` array for stored
 network interface configs. It includes `vsock` only after `PUT /vsock` stores a
 valid configuration. It includes `mmds-config` after successful MMDS
-configuration storage. Firecracker sections without stored configuration
-models, including balloon, entropy, snapshots, and hotplug, are omitted until
-those models exist.
+configuration storage. It includes `entropy` as an empty object after
+successful `PUT /entropy` configuration. Firecracker sections without stored
+configuration models, including balloon, snapshots, and hotplug, are omitted
+until those models exist.
 Metrics and logger output configuration are also omitted because they are
 process observability state rather than guest configuration.
 
