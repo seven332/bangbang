@@ -266,7 +266,7 @@ before changing this reference.
 The current scaffold implements `GET /`, `GET /version`, `GET /vm/config`,
 `GET /machine-config`, pre-boot `PUT /machine-config` configuration storage, pre-boot
 `PUT /boot-source`, `PUT /drives/{drive_id}`,
-`PUT /network-interfaces/{iface_id}`, `PUT /vsock`, `PUT /metrics`, and `PUT /logger` configuration
+`PUT /network-interfaces/{iface_id}`, `PUT /vsock`, `PUT /entropy`, `PUT /metrics`, and `PUT /logger` configuration
 storage over HTTP on a Unix domain socket, plus runtime `FlushMetrics` and
 periodic runtime metrics flushes after successful startup. The support levels below describe compatibility targets for
 future API work:
@@ -323,7 +323,7 @@ compatibility targets.
 | `PATCH` | `/balloon/hinting/stop` | recognized; VMM-routed unsupported | Routes through the VMM state/action policy without parsing the request body, matching Firecracker's stop-command parser behavior. Hinting stop is treated as post-boot-only and currently returns the balloon-specific unsupported fault after startup. Real free-page hinting and reporting need a dedicated design. |
 | `GET` | `/balloon/hinting/status` | recognized; VMM-routed unsupported | Routes through the VMM state/action policy. Hinting status is treated as post-boot-only and currently returns the balloon-specific unsupported fault after startup. Real free-page hinting state tracking needs a dedicated design. |
 | `PUT`, `PATCH` | `/pmem/{id}` | recognized; VMM-routed unsupported | Parses Firecracker-shaped pmem config and update request bodies, rejects malformed, invalid, or mismatched path/body IDs first, and then routes valid requests through the VMM state/action policy. `PUT` is treated as pre-boot-only and reaches the pmem-specific unsupported fault before startup. `PATCH` is treated as post-boot-only and reaches the pmem-specific unsupported fault after startup. Requests made in the wrong lifecycle state return the normal unsupported-state fault. Real pmem device configuration, guest attachment, rate limiting, and runtime update behavior need a dedicated device design. |
-| `PUT` | `/entropy` | recognized; VMM-routed unsupported | Parses Firecracker-shaped entropy config requests, rejects malformed or invalid bodies first, and then routes valid bodies through the VMM state/action policy. Pre-boot requests without a configured rate limiter currently return the entropy-specific unsupported fault. Configured rate limiters are validated and then rejected with the entropy rate-limiter unsupported fault. Post-start requests follow the pre-boot-only unsupported-state policy. The internal virtio-rng queue, activation, notification, MMIO registration, startup resource, and FDT attachment layers exist, but real public configuration storage, rate limiting, host randomness ownership, guest-visible dispatch, and signed e2e remain deferred. |
+| `PUT` | `/entropy` | supported target; configuration storage and startup attachment implemented | Stores one Firecracker-shaped virtio-rng entropy configuration before boot when `rate_limiter` is omitted or `null`. `GET /vm/config` includes `"entropy": {}` after configuration, and `InstanceStart` attaches the existing HVF virtio-rng MMIO/FDT device backed by the session-owned host OS randomness source. Configured rate limiters are validated and then rejected with the entropy rate-limiter unsupported fault without mutating stored entropy configuration. Post-start requests follow the pre-boot-only unsupported-state policy. Config-file `entropy` (#815), real rate limiting, entropy metrics, and signed executable guest entropy e2e remain deferred. |
 | `GET`, `PUT`, `PATCH` | `/hotplug/memory` | recognized; VMM-routed unsupported | Parses Firecracker-shaped `PUT` and `PATCH` memory hotplug request bodies, rejects malformed or schema-invalid bodies first, and then routes valid requests through the VMM state/action policy. `PUT` is treated as pre-boot-only and reaches the memory-hotplug-specific unsupported fault before startup. `GET` and `PATCH` are treated as post-boot-only and reach the memory-hotplug-specific unsupported fault after startup. Requests made in the wrong lifecycle state return the normal unsupported-state fault. Real virtio-mem device support, guest memory accounting, semantic config validation, and runtime memory update behavior need a dedicated design. |
 | `PATCH` | `/vm` | recognized; rejected | Parses the Firecracker-shaped VM state request with required `state` values `Paused` and `Resumed`, then routes valid requests through `Pause` or `Resume` VMM actions. Requests before startup fail as unsupported in `Not started` state, and runtime requests fail as unsupported actions without mutating VM state. Real pause/resume state transitions and public run-loop control remain deferred. |
 | `PATCH` | `/drives/{drive_id}` | recognized; rejected | Parses the Firecracker-shaped block-device update request with required `drive_id`, optional `path_on_host`, and optional `rate_limiter`, then routes valid updates through `UpdateBlockDevice`. Pre-boot requests fail as post-boot-only operations and runtime requests fail as unsupported actions without mutating stored drive configuration. Configured rate limiters remain unsupported until block update behavior exists. |
@@ -436,7 +436,7 @@ exist.
 | `PUT /serial` | `serial_out_path` | optional | Host path to the serial output file or FIFO. The runtime stores it before boot, startup opens it as per-process observability output, and API-facing open errors redact path details. Omit the field or set it to `null` to clear the configured public output path. |
 | `PUT /serial` | `rate_limiter` | unsupported when configured | Missing or `null` values are accepted; configured values return a fault without mutating previous serial output configuration. |
 | `PUT /serial` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
-| `PUT /entropy` | `rate_limiter` | optional; unsupported when validly configured | Missing or `null` values are accepted before the VMM returns the entropy unsupported fault. Configured Firecracker-shaped rate limiter objects are validated and then rejected as `entropy rate_limiter is not supported`; request values are never echoed in faults. Real virtio-rng rate limiting remains deferred. |
+| `PUT /entropy` | `rate_limiter` | optional; unsupported when validly configured | Missing or `null` values are accepted and store the supported empty entropy configuration. Configured Firecracker-shaped rate limiter objects are validated and then rejected as `entropy rate_limiter is not supported` without mutating previous entropy configuration; request values are never echoed in faults. Real virtio-rng rate limiting remains deferred. |
 | `PUT /entropy` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /hotplug/memory` | `total_size_mib` | required; unsupported after VMM routing | Required Firecracker-shaped hotpluggable-memory total size. The parser accepts syntactically valid unsigned integer values, then the API server routes the request through the pre-boot-only memory-hotplug action before returning the unsupported fault. Real virtio-mem semantic validation and storage remain deferred. |
 | `PUT /hotplug/memory` | `block_size_mib` | optional; unsupported after VMM routing | Missing values use Firecracker's parser default shape. Present values must be unsigned integers. Real block-size semantic validation remains deferred with virtio-mem support. |
@@ -459,30 +459,18 @@ success; invalid updates leave the stored configuration unchanged.
 values are applied during `InstanceStart` startup.
 
 Entropy support is tracked by #797 and needs to move as one guest-visible
-capability instead of only accepting configuration. The target supported subset
-is one Firecracker-shaped virtio-rng device configured before startup, attached
-as a virtio-mmio device in the arm64 FDT, backed by host randomness, and
-validated through the signed executable process/HVF path by a guest read from
-the RNG device. The current API/runtime boundary preserves whether a
-Firecracker-shaped `rate_limiter` was configured while keeping successful
-`PUT /entropy` behavior unsupported. A backend-neutral virtio-rng queue handler
-and runtime MMIO activation/notification layer can now fill writable guest
-descriptor chains from an injected entropy source under unit tests, including
-malformed-buffer, source-failure, reset, and queue-interrupt completion paths.
-An internal virtio-rng MMIO registration helper can now build the single-queue
-MMIO handler, register it in a fresh or existing dispatcher, and return
-deterministic region metadata. The internal arm64 startup resource path can
-optionally consume that layout, attach one virtio-rng MMIO device to the shared
-boot dispatcher, preserve runtime metadata, and emit one FDT virtio-mmio node.
-The internal startup runtime and HVF boot-loop helpers can now dispatch
-virtio-rng queue notifications from an injected entropy source or the
-session-owned host OS randomness source, preserve dispatch and signal errors,
-and signal the configured queue interrupt under unit tests. Remaining follow-up
-PRs should wire public API configuration storage, signed executable e2e, and
-metrics/security docs.
-Entropy device metrics and real rate limiting remain deferred until their
-producers exist. `PUT /entropy` must continue to return unsupported until a
-later PR exposes guest-visible entropy behavior.
+capability, not only a configuration endpoint. The current supported subset is
+one Firecracker-shaped virtio-rng device configured before startup with no
+rate limiter, attached as a virtio-mmio device in the arm64 FDT, backed by host
+OS randomness, and dispatched from the HVF boot loop. A backend-neutral
+virtio-rng queue handler and runtime MMIO activation/notification layer can fill
+writable guest descriptor chains from an injected entropy source under unit
+tests, including malformed-buffer, source-failure, reset, and queue-interrupt
+completion paths. The public API can now store the empty entropy configuration,
+include it in `GET /vm/config` as `"entropy": {}`, and pass it into
+`InstanceStart` so the existing HVF startup path attaches the device. Config-file
+`entropy` (#815), signed executable guest entropy e2e, metrics, security docs,
+and real rate limiting remain deferred.
 
 The API and VMM state path also route valid snapshot requests through explicit
 actions before returning unsupported faults. `PUT /snapshot/create` fails as an
@@ -513,9 +501,10 @@ without side effects. It includes the stored/default `machine-config`, includes
 for configured virtio-block drives plus a `network-interfaces` array for stored
 network interface configs. It includes `vsock` only after `PUT /vsock` stores a
 valid configuration. It includes `mmds-config` after successful MMDS
-configuration storage. Firecracker sections without stored configuration
-models, including balloon, entropy, snapshots, and hotplug, are omitted until
-those models exist.
+configuration storage. It includes `entropy` as an empty object after
+successful `PUT /entropy` configuration. Firecracker sections without stored
+configuration models, including balloon, snapshots, and hotplug, are omitted
+until those models exist.
 Metrics and logger output configuration are also omitted because they are
 process observability state rather than guest configuration.
 
@@ -559,8 +548,8 @@ records `balloon_count` extension fields for parsed balloon GET, PUT, and PATCH
 routes, plus `balloon_fails` extension fields for parsed balloon PUT and PATCH
 failures, because Firecracker does not expose matching request metrics. It does
 not emit entropy request-counter fields; Firecracker does not define
-`put_api_requests.entropy_count` or `entropy_fails`, and bangbang keeps entropy
-work under the unsupported virtio-rng device surface until that device exists.
+`put_api_requests.entropy_count` or `entropy_fails`. Entropy device runtime
+metrics remain deferred until their producers exist.
 Parsed deprecated HTTP API usage is counted under
 `deprecated_api.deprecated_http_api_calls` for the supported deprecated fields
 above; malformed parser failures remain outside the counter.
@@ -1441,7 +1430,7 @@ The first API implementation should model the same broad stages as Firecracker:
 | --- | --- | --- | --- |
 | `GET /` | implemented; `200` JSON | implemented; `200` JSON | Response state reflects the current microVM state. |
 | `GET /version` | implemented; `200` JSON | implemented; `200` JSON | Body uses Firecracker's `firecracker_version` field shape. |
-| `GET /vm/config` | implemented; `200` JSON | implemented; `200` JSON | Returns the accumulated supported configuration subset, including `mmds-config` after successful MMDS config storage. Startup applies the supported boot subset to an owned HVF session and internal boot run-loop worker across bounded step windows. |
+| `GET /vm/config` | implemented; `200` JSON | implemented; `200` JSON | Returns the accumulated supported configuration subset, including `mmds-config` after successful MMDS config storage and `entropy` after successful entropy configuration. Startup applies the supported boot subset to an owned HVF session and internal boot run-loop worker across bounded step windows. |
 | `GET /machine-config` | implemented; `200` JSON | supported target; `200` JSON | Returns the stored/default machine configuration. |
 | `PUT /machine-config` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Pre-boot-only configuration. Stored values are applied during startup preparation. |
 | `PATCH /machine-config` | implemented; `204` empty response on successful partial config update | unsupported after start; `400` `fault_message` | Pre-boot-only partial configuration. Omitted fields preserve current stored values; invalid updates leave stored values unchanged. |
@@ -1459,6 +1448,7 @@ The first API implementation should model the same broad stages as Firecracker:
 | `PUT /metrics` | implemented; `204` empty response on successful output initialization | unsupported after start; `400` `fault_message` | Metrics output is process observability state, not guest configuration. Duplicate initialization fails. When configured, startup CLI/config-file metrics paths can write one initial metrics line, and runtime `FlushMetrics` plus periodic runtime flushes every 60 seconds while the VM is running append later minimal metrics lines. |
 | `PUT /logger` | implemented; `204` empty response on successful pre-boot configuration | unsupported after start; `400` `fault_message` | Logger output is process observability state, not guest configuration. Repeated pre-boot requests update provided fields; minimal successful action logging supports configured level, origin, and module-prefix fields, but full log routing remains deferred. |
 | `PUT /serial` | implemented; `204` empty response on successful pre-boot output configuration or clear request | unsupported after start; `400` `fault_message` | Serial output is process observability state, not guest configuration. Valid `serial_out_path` values are stored without opening host resources during the request; startup opens the path and routes guest TX serial bytes to it. Empty/control-character paths and configured rate limiters are rejected without mutating previous serial output configuration. |
+| `PUT /entropy` | implemented; `204` empty response on successful no-rate-limiter configuration | unsupported after start; `400` `fault_message` | Stores the supported empty virtio-rng configuration before startup. `GET /vm/config` then includes `"entropy": {}`, and `InstanceStart` attaches the existing HVF virtio-rng MMIO/FDT device backed by the session-owned host OS randomness source. Configured rate limiters are rejected without mutating previous entropy configuration. |
 | `PUT /actions` with `InstanceStart` | process-routed; `204` after successful owned HVF startup with internal boot run-loop worker across bounded step windows or `400` preflight/preparation/logger-output fault | unsupported after start; `400` `fault_message` | Commits `Running` only after the owned HVF boot-session worker with configured serial output or default internal serial capture is retained and any emitted action logging succeeds. The worker keeps internal active, terminal-outcome, or error status; guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET` can terminate the owning process successfully. Public run-loop control, reboot-in-place, error exit-code parity, and public serial streaming remain deferred. |
 | `PUT /actions` with `FlushMetrics` | VMM-routed; `400` unsupported-state `fault_message` | implemented; `204` empty response or `400` logger/metrics output fault | Firecracker treats this as runtime-only. bangbang writes one minimal JSON line when metrics output was configured, including selected API request counters, `logger.missed_metrics_count` after a previous metrics write failure, `logger.missed_log_count` after a previous logger action write failure, and `boot_run_loop_status` as `running`, `exited`, or `failed` when a process-owned boot worker exists, writes one minimal action line when logger output is configured and allowed by level/module filters, and otherwise succeeds without writing. Periodic metrics flushes reuse the same metrics payload every 60 seconds while running, but are not `/actions` requests and do not write logger action lines. |
 | `PUT /actions` with `SendCtrlAltDel` | intentionally unsupported; parser returns `400` `fault_message` | intentionally unsupported; `400` `fault_message` | Firecracker rejects this on aarch64; bangbang's first target is Apple Silicon. |
@@ -1603,7 +1593,9 @@ Their eventual support level should follow the endpoint matrix:
 - full MMDS TCP routing, stream reassembly, and retransmission policy
 - balloon devices and balloon statistics
 - pmem
-- entropy device configuration
+- entropy config-file support, rate limiting, runtime metrics, security docs,
+  and signed guest-visible e2e coverage beyond the current public API storage
+  and startup attachment path
 - serial input, serial rate limiting, public serial streaming, and serial metrics
 - full logger integration, full Firecracker metrics counters beyond the minimal
   `logger.missed_metrics_count` and `logger.missed_log_count`

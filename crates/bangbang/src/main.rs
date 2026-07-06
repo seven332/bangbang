@@ -2872,7 +2872,7 @@ mod tests {
     }
 
     #[test]
-    fn config_file_rejects_unsupported_section_before_apply() {
+    fn config_file_rejects_entropy_section_until_config_file_support_exists() {
         let err = super::config_file_actions_from_str(
             r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"entropy":{}}"#,
         )

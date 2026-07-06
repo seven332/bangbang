@@ -15,8 +15,8 @@ use bangbang_api::http::{
     ActionRequest, ActionType, ApiRequest, BootSourceRequest, BootSourceResponse, CpuConfigRequest,
     DriveCacheType as ApiDriveCacheType, DriveConfigRequest, DriveConfigResponse,
     DriveIoEngine as ApiDriveIoEngine, DrivePatchRequest, EntropyConfigRequest,
-    HotUnplugDeviceKind as ApiHotUnplugDeviceKind, HotUnplugDeviceRequest, HttpResponse,
-    LoggerConfigRequest, LoggerLevel as ApiLoggerLevel, MachineConfigPatchRequest,
+    EntropyConfigResponse, HotUnplugDeviceKind as ApiHotUnplugDeviceKind, HotUnplugDeviceRequest,
+    HttpResponse, LoggerConfigRequest, LoggerLevel as ApiLoggerLevel, MachineConfigPatchRequest,
     MachineConfigRequest, MachineConfigResponse, MetricsConfigRequest, MmdsConfigRequest,
     MmdsConfigResponse, MmdsContentRequest, MmdsVersion as ApiMmdsVersion,
     NetworkInterfaceConfigRequest, NetworkInterfaceConfigResponse, NetworkInterfacePatchRequest,
@@ -930,7 +930,16 @@ fn vm_config_response_from_runtime(config: &VmConfiguration) -> VmConfigResponse
         config
             .vsock_config()
             .map(vsock_config_response_from_runtime),
+        config
+            .entropy_config()
+            .map(entropy_config_response_from_runtime),
     )
+}
+
+fn entropy_config_response_from_runtime(
+    _config: bangbang_runtime::entropy::EntropyConfig,
+) -> EntropyConfigResponse {
+    EntropyConfigResponse::new()
 }
 
 fn machine_config_response_from_runtime(config: MachineConfig) -> MachineConfigResponse {
@@ -4845,10 +4854,56 @@ mod tests {
     }
 
     #[test]
-    fn returns_fault_for_entropy_endpoint() {
+    fn stores_entropy_endpoint_without_rate_limiter() {
         let mut vmm = test_controller();
+        for (socket_name, body) in [
+            ("ent-empty", "{}"),
+            ("ent-null-rl", r#"{"rate_limiter":null}"#),
+        ] {
+            let request = format!(
+                "PUT /entropy HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+
+            let response = request_over_socket(&mut vmm, socket_name, &request);
+
+            assert!(
+                response.starts_with("HTTP/1.1 204 No Content\r\n"),
+                "{socket_name}: {response}"
+            );
+            let data = vmm
+                .handle_action(VmmAction::GetVmConfig)
+                .expect("VM config should be returned");
+            let VmmData::VmConfiguration(config) = data else {
+                panic!("expected VM config");
+            };
+            assert!(config.entropy_config().is_some(), "{socket_name}");
+            let vm_config_response = handle_request_bytes(
+                b"GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                &mut vmm,
+            );
+            assert_eq!(
+                vm_config_response.status(),
+                bangbang_api::http::StatusCode::Ok
+            );
+            assert!(
+                vm_config_response.body().contains(r#""entropy":{}"#),
+                "{socket_name}: {}",
+                vm_config_response.body()
+            );
+        }
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::NotStarted
+        );
+    }
+
+    #[test]
+    fn returns_fault_for_invalid_entropy_endpoint_without_mutating() {
+        let mut vmm = test_controller();
+        vmm.handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
+            .expect("initial entropy config should store");
         for (socket_name, body, fault_message, private_values) in [
-            ("ent-ok", "{}", "Entropy device is not supported.", &[][..]),
             (
                 "ent-rl",
                 r#"{"rate_limiter":{"bandwidth":{"size":123456789,"one_time_burst":987654321,"refill_time":777}}}"#,
@@ -4884,6 +4939,13 @@ mod tests {
                     "{socket_name} must not echo private entropy config value {private_value}: {response}"
                 );
             }
+            let data = vmm
+                .handle_action(VmmAction::GetVmConfig)
+                .expect("VM config should be returned");
+            let VmmData::VmConfiguration(config) = data else {
+                panic!("expected VM config");
+            };
+            assert!(config.entropy_config().is_some(), "{socket_name}");
         }
         assert_eq!(
             vmm.instance_info().state,
@@ -4903,6 +4965,8 @@ mod tests {
             handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
             bangbang_api::http::StatusCode::NoContent
         );
+        vmm.handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
+            .expect("initial entropy config should store");
         let start_response = put_action_over_socket(&mut vmm, "ent-start", "InstanceStart");
         assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         let body = r#"{"rate_limiter":{"ops":{"size":222222222,"one_time_burst":333333333,"refill_time":444}}}"#;
@@ -4927,6 +4991,13 @@ mod tests {
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::Running
         );
+        let data = vmm
+            .handle_action(VmmAction::GetVmConfig)
+            .expect("VM config should be returned");
+        let VmmData::VmConfiguration(config) = data else {
+            panic!("expected VM config");
+        };
+        assert!(config.entropy_config().is_some());
     }
 
     #[test]

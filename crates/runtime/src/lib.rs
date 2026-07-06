@@ -204,6 +204,7 @@ pub struct VmConfiguration {
     network_interface_configs: Vec<network::NetworkInterfaceConfig>,
     mmds_config: Option<mmds::MmdsConfig>,
     vsock_config: Option<vsock::VsockConfig>,
+    entropy_config: Option<entropy::EntropyConfig>,
 }
 
 impl VmConfiguration {
@@ -214,6 +215,7 @@ impl VmConfiguration {
         network_interface_configs: Vec<network::NetworkInterfaceConfig>,
         mmds_config: Option<mmds::MmdsConfig>,
         vsock_config: Option<vsock::VsockConfig>,
+        entropy_config: Option<entropy::EntropyConfig>,
     ) -> Self {
         Self {
             machine_config,
@@ -222,6 +224,7 @@ impl VmConfiguration {
             network_interface_configs,
             mmds_config,
             vsock_config,
+            entropy_config,
         }
     }
 
@@ -247,6 +250,10 @@ impl VmConfiguration {
 
     pub fn vsock_config(&self) -> Option<&vsock::VsockConfig> {
         self.vsock_config.as_ref()
+    }
+
+    pub const fn entropy_config(&self) -> Option<entropy::EntropyConfig> {
+        self.entropy_config
     }
 }
 
@@ -365,6 +372,7 @@ pub struct VmmController {
     drive_configs: block::DriveConfigs,
     network_interface_configs: network::NetworkInterfaceConfigs,
     vsock_config: Option<vsock::VsockConfig>,
+    entropy_config: Option<entropy::EntropyConfig>,
     serial_config: serial::SerialConfig,
     logger_state: logger::LoggerState,
     metrics_state: metrics::MetricsState,
@@ -403,6 +411,7 @@ impl VmmController {
             drive_configs: block::DriveConfigs::new(),
             network_interface_configs: network::NetworkInterfaceConfigs::new(),
             vsock_config: None,
+            entropy_config: None,
             serial_config: serial::SerialConfig::default(),
             logger_state: logger::LoggerState::default(),
             metrics_state: metrics::MetricsState::default(),
@@ -426,6 +435,10 @@ impl VmmController {
 
     pub fn vsock_config(&self) -> Option<&vsock::VsockConfig> {
         self.vsock_config.as_ref()
+    }
+
+    pub const fn entropy_config(&self) -> Option<entropy::EntropyConfig> {
+        self.entropy_config
     }
 
     pub const fn serial_config(&self) -> &serial::SerialConfig {
@@ -456,6 +469,7 @@ impl VmmController {
             self.network_interface_configs.as_slice().to_vec(),
             self.mmds_config()?,
             self.vsock_config.clone(),
+            self.entropy_config,
         ))
     }
 
@@ -791,7 +805,8 @@ impl VmmController {
                     ));
                 }
 
-                Err(VmmActionError::EntropyUnsupported)
+                self.entropy_config = Some(entropy::EntropyConfig::new());
+                Ok(VmmData::Empty)
             }
             VmmAction::PutMemoryHotplug => {
                 if self.instance_info.state != InstanceState::NotStarted {
@@ -1124,7 +1139,7 @@ mod tests {
             BootCommandLineError, BootPayloadKind, BootSourceConfigError, BootSourceConfigInput,
         },
         cpu::CpuConfigInput,
-        entropy::{EntropyConfigError, EntropyConfigInput},
+        entropy::{EntropyConfig, EntropyConfigError, EntropyConfigInput},
         logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel, LoggerWriteError},
         machine::{
             DEFAULT_MEM_SIZE_MIB, DEFAULT_VCPU_COUNT, MAX_MEM_SIZE_MIB, MachineConfigError,
@@ -1347,11 +1362,13 @@ mod tests {
         assert!(config.network_interface_configs().is_empty());
         assert_eq!(config.mmds_config(), None);
         assert_eq!(config.vsock_config(), None);
+        assert_eq!(config.entropy_config(), None);
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
         assert!(controller.boot_source_config().is_none());
         assert!(controller.drive_configs().is_empty());
         assert!(controller.network_interface_configs().is_empty());
         assert!(controller.vsock_config().is_none());
+        assert_eq!(controller.entropy_config(), None);
         assert_eq!(controller.serial_config().serial_out_path(), None);
     }
 
@@ -1392,6 +1409,9 @@ mod tests {
                 vsock_input(3, "./v.sock").with_vsock_id("vsock0"),
             ))
             .expect("vsock config should be stored");
+        controller
+            .handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
+            .expect("entropy config should be stored");
 
         let data = controller
             .handle_action(VmmAction::GetVmConfig)
@@ -1446,6 +1466,7 @@ mod tests {
         assert_eq!(vsock.vsock_id(), Some("vsock0"));
         assert_eq!(vsock.guest_cid(), 3);
         assert_eq!(vsock.uds_path(), Path::new("./v.sock"));
+        assert_eq!(config.entropy_config(), Some(EntropyConfig::new()));
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
     }
 
@@ -1473,6 +1494,7 @@ mod tests {
         assert!(config.network_interface_configs().is_empty());
         assert_eq!(config.mmds_config(), None);
         assert_eq!(config.vsock_config(), None);
+        assert_eq!(config.entropy_config(), None);
     }
 
     #[test]
@@ -1849,19 +1871,20 @@ mod tests {
     }
 
     #[test]
-    fn put_entropy_reaches_entropy_fault_before_start_without_mutating() {
+    fn put_entropy_stores_config_before_start() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         controller
             .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
             .expect("boot source config should be stored");
 
-        let err = controller
+        let data = controller
             .handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
-            .expect_err("entropy should remain unsupported");
+            .expect("entropy config should be stored");
 
-        assert_eq!(err, VmmActionError::EntropyUnsupported);
+        assert_eq!(data, VmmData::Empty);
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
         assert!(controller.boot_source_config().is_some());
+        assert_eq!(controller.entropy_config(), Some(EntropyConfig::new()));
         assert!(controller.drive_configs().is_empty());
         assert!(controller.network_interface_configs().is_empty());
     }
@@ -1872,6 +1895,9 @@ mod tests {
         controller
             .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
             .expect("boot source config should be stored");
+        controller
+            .handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
+            .expect("initial entropy config should be stored");
 
         let err = controller
             .handle_action(VmmAction::PutEntropy(
@@ -1885,6 +1911,7 @@ mod tests {
         );
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
         assert!(controller.boot_source_config().is_some());
+        assert_eq!(controller.entropy_config(), Some(EntropyConfig::new()));
         assert!(controller.drive_configs().is_empty());
         assert!(controller.network_interface_configs().is_empty());
     }
@@ -1896,6 +1923,9 @@ mod tests {
             controller
                 .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
                 .expect("boot source config should be stored");
+            controller
+                .handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
+                .expect("initial entropy config should be stored");
             controller.instance_info.state = state;
 
             let err = controller
@@ -1913,6 +1943,7 @@ mod tests {
             );
             assert_eq!(controller.instance_info().state, state);
             assert!(controller.boot_source_config().is_some());
+            assert_eq!(controller.entropy_config(), Some(EntropyConfig::new()));
             assert!(controller.drive_configs().is_empty());
             assert!(controller.network_interface_configs().is_empty());
         }
