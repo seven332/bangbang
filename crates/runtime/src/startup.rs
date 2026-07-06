@@ -1074,18 +1074,14 @@ pub fn update_block_device_backing_for_devices(
     mmio_dispatcher: &mut MmioDispatcher,
     config: &DriveConfig,
 ) -> Result<(), DriveUpdateError> {
+    let region_id = block_device_region_id(block_devices, config)?;
     let backing =
         BlockFileBacking::open(config).map_err(|source| DriveUpdateError::OpenBacking {
             drive_id: config.drive_id().to_string(),
             message: source.to_string(),
         })?;
 
-    update_block_device_backing_for_devices_with_opened(
-        block_devices,
-        mmio_dispatcher,
-        config,
-        backing,
-    )
+    update_block_device_backing_for_region_with_opened(mmio_dispatcher, region_id, config, backing)
 }
 
 pub fn update_block_device_backing_for_devices_with_opened(
@@ -1094,6 +1090,15 @@ pub fn update_block_device_backing_for_devices_with_opened(
     config: &DriveConfig,
     backing: BlockFileBacking,
 ) -> Result<(), DriveUpdateError> {
+    let region_id = block_device_region_id(block_devices, config)?;
+
+    update_block_device_backing_for_region_with_opened(mmio_dispatcher, region_id, config, backing)
+}
+
+fn block_device_region_id(
+    block_devices: &[Arm64BootBlockDevice],
+    config: &DriveConfig,
+) -> Result<MmioRegionId, DriveUpdateError> {
     let Some(device) = block_devices
         .iter()
         .find(|device| device.registration.drive_id() == config.drive_id())
@@ -1102,7 +1107,16 @@ pub fn update_block_device_backing_for_devices_with_opened(
             drive_id: config.drive_id().to_string(),
         });
     };
-    let region_id = device.registration.region_id();
+
+    Ok(device.registration.region_id())
+}
+
+fn update_block_device_backing_for_region_with_opened(
+    mmio_dispatcher: &mut MmioDispatcher,
+    region_id: MmioRegionId,
+    config: &DriveConfig,
+    backing: BlockFileBacking,
+) -> Result<(), DriveUpdateError> {
     let handler = mmio_dispatcher
         .handler_mut::<VirtioBlockMmioHandler>(region_id)
         .map_err(|source| DriveUpdateError::HandlerLookup {
