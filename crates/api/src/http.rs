@@ -1001,6 +1001,8 @@ impl NetworkInterfaceConfigRequest {
 pub struct NetworkInterfacePatchRequest {
     path_iface_id: String,
     body_iface_id: String,
+    rx_rate_limiter_configured: bool,
+    tx_rate_limiter_configured: bool,
 }
 
 impl NetworkInterfacePatchRequest {
@@ -1010,6 +1012,14 @@ impl NetworkInterfacePatchRequest {
 
     pub fn body_iface_id(&self) -> &str {
         &self.body_iface_id
+    }
+
+    pub const fn rx_rate_limiter_configured(&self) -> bool {
+        self.rx_rate_limiter_configured
+    }
+
+    pub const fn tx_rate_limiter_configured(&self) -> bool {
+        self.tx_rate_limiter_configured
     }
 }
 
@@ -2569,17 +2579,27 @@ fn parse_network_interface_patch_request(
     if path_iface_id != body.iface_id {
         return Err(RequestError::MismatchedInterfaceId);
     }
-    for rate_limiter in [&body.rx_rate_limiter, &body.tx_rate_limiter]
-        .into_iter()
-        .flatten()
-    {
-        validate_rate_limiter_config(rate_limiter.as_value())?;
-    }
+    let rx_rate_limiter_configured = match &body.rx_rate_limiter {
+        Some(rate_limiter) => {
+            validate_rate_limiter_config(rate_limiter.as_value())?;
+            true
+        }
+        None => false,
+    };
+    let tx_rate_limiter_configured = match &body.tx_rate_limiter {
+        Some(rate_limiter) => {
+            validate_rate_limiter_config(rate_limiter.as_value())?;
+            true
+        }
+        None => false,
+    };
 
     Ok(ApiRequest::PatchNetworkInterface(Box::new(
         NetworkInterfacePatchRequest {
             path_iface_id: path_iface_id.to_string(),
             body_iface_id: body.iface_id,
+            rx_rate_limiter_configured,
+            tx_rate_limiter_configured,
         },
     )))
 }
@@ -5173,11 +5193,23 @@ mod tests {
 
     #[test]
     fn parses_valid_network_interface_patch() {
-        for body in [
-            r#"{"iface_id":"eth0"}"#,
-            r#"{"iface_id":"eth0","rx_rate_limiter":null,"tx_rate_limiter":null}"#,
-            r#"{"iface_id":"eth0","rx_rate_limiter":{"bandwidth":{"size":100,"one_time_burst":null,"refill_time":1000}}}"#,
-            r#"{"iface_id":"eth0","tx_rate_limiter":{"ops":{"size":100,"one_time_burst":200,"refill_time":1000}}}"#,
+        for (body, rx_rate_limiter_configured, tx_rate_limiter_configured) in [
+            (r#"{"iface_id":"eth0"}"#, false, false),
+            (
+                r#"{"iface_id":"eth0","rx_rate_limiter":null,"tx_rate_limiter":null}"#,
+                false,
+                false,
+            ),
+            (
+                r#"{"iface_id":"eth0","rx_rate_limiter":{"bandwidth":{"size":100,"one_time_burst":null,"refill_time":1000}}}"#,
+                true,
+                false,
+            ),
+            (
+                r#"{"iface_id":"eth0","tx_rate_limiter":{"ops":{"size":100,"one_time_burst":200,"refill_time":1000}}}"#,
+                false,
+                true,
+            ),
         ] {
             let request = request_with_body("PATCH", "/network-interfaces/eth0", body);
             let parsed = parse_request(&request).expect("network interface patch should parse");
@@ -5187,6 +5219,16 @@ mod tests {
             };
             assert_eq!(config.path_iface_id(), "eth0", "{body}");
             assert_eq!(config.body_iface_id(), "eth0", "{body}");
+            assert_eq!(
+                config.rx_rate_limiter_configured(),
+                rx_rate_limiter_configured,
+                "{body}"
+            );
+            assert_eq!(
+                config.tx_rate_limiter_configured(),
+                tx_rate_limiter_configured,
+                "{body}"
+            );
         }
     }
 
