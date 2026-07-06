@@ -196,6 +196,10 @@ target also includes direct-rootfs MMDS v1 and v2 token-flow scenarios that
 configure a `vmnet:shared` network interface, configure MMDS for that
 interface, fetch a deterministic MMDS value from the guest through
 `169.254.169.254`, and write host-observable markers to unique scratch drives.
+It also includes a direct-rootfs entropy scenario that configures `/entropy`,
+checks that the guest selected `virtio_rng` as the current hardware RNG, reads
+from `/dev/hwrng`, and writes a host-observable marker only after a non-empty
+read succeeds.
 Because every configured network interface is bound to MMDS in these scenarios,
 startup uses the process-local MMDS-only packet path and does not require
 external vmnet packet movement.
@@ -284,7 +288,7 @@ artifacts and is not a substitute for a production rootfs build process.
 The signed `guest_boot` and executable HVF e2e targets also validate a
 deterministic direct-rootfs boot. For those scenarios,
 `scripts/run-integration-tests.sh` prepares
-`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v17.ext4`
+`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v18.ext4`
 after confirming the host can execute HVF. The generated image is an ext4 copy
 of the pinned Firecracker rootfs with a test-specific
 `/bangbang-direct-rootfs-init` script added before image creation. The test
@@ -303,7 +307,11 @@ MMDS value is returned. With
 `/latest/api/token`, then fetches the same marker with the token header and
 writes `BANGBANG_MMDS_V2_GUEST_FETCH_OK`. The init script emits only static
 success or failure markers for this path; it must not print generated tokens or
-metadata values. When the boot args include `bangbang.vsock-guest-connect=1`,
+metadata values. When the boot args include `bangbang.entropy-read=1`, the same
+init script checks `/sys/class/misc/hw_random/rng_current` for `virtio_rng`,
+reads bytes from `/dev/hwrng`, and writes
+`BANGBANG_ENTROPY_GUEST_READ_OK` only after the read returns non-empty data.
+When the boot args include `bangbang.vsock-guest-connect=1`,
 the same init script uses the rootfs-provided Python `AF_VSOCK` support to
 connect to host CID 2 on the test port, exchange multiple ordered deterministic
 guest and host payloads with a host Unix listener at the Firecracker-style
@@ -330,7 +338,8 @@ waits for distinct host replies, and writes
 `BANGBANG_VSOCK_HOST_MULTISTREAM_OK` only after both streams complete. These
 checks prove the kernel mounted the virtio-block root drive as `/`, give
 executable-boundary MMDS fetch coverage through the process-local MMDS-only
-packet path, and cover guest-initiated plus host-initiated virtio-vsock
+packet path, prove guest-visible virtio-rng reads through `/dev/hwrng`, and
+cover guest-initiated plus host-initiated virtio-vsock
 connection exchange through the signed executable, including narrow
 multi-payload stream cases and multi-stream retention in both directions. They
 do not claim that bangbang can boot an arbitrary distro image through its

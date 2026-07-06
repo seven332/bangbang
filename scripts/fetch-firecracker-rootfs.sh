@@ -114,7 +114,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v17"
+direct_boot_variant="direct-boot-v18"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -435,6 +435,47 @@ fetch_mmds_marker() {
     emit_line BANGBANG_MMDS_FETCH_FAIL_RESPONSE
     write_vdb_marker BANGBANG_MMDS_FETCH_FAIL
   fi
+}
+
+read_entropy_marker() {
+  if [ ! -c /dev/hwrng ]; then
+    emit_line BANGBANG_ENTROPY_GUEST_READ_FAIL_NO_HWRNG
+    write_vdb_marker BANGBANG_ENTROPY_GUEST_READ_FAIL
+    return
+  fi
+
+  if [ ! -r /sys/class/misc/hw_random/rng_current ]; then
+    emit_line BANGBANG_ENTROPY_GUEST_READ_FAIL_NO_RNG_CURRENT
+    write_vdb_marker BANGBANG_ENTROPY_GUEST_READ_FAIL
+    return
+  fi
+
+  rng_current=$(cat /sys/class/misc/hw_random/rng_current 2>/dev/null || true)
+  case "$rng_current" in
+    virtio_rng*) ;;
+    *)
+      emit_line BANGBANG_ENTROPY_GUEST_READ_FAIL_NOT_VIRTIO_RNG
+      write_vdb_marker BANGBANG_ENTROPY_GUEST_READ_FAIL
+      return
+      ;;
+  esac
+
+  entropy_result=$(dd if=/dev/hwrng bs=32 count=1 2>/dev/null | wc -c 2>/dev/null || true)
+  entropy_bytes=${entropy_result##* }
+  case "$entropy_bytes" in
+    "" | *[!0123456789]*)
+      emit_line BANGBANG_ENTROPY_GUEST_READ_FAIL_BAD_COUNT
+      write_vdb_marker BANGBANG_ENTROPY_GUEST_READ_FAIL
+      ;;
+    0)
+      emit_line BANGBANG_ENTROPY_GUEST_READ_FAIL_EMPTY
+      write_vdb_marker BANGBANG_ENTROPY_GUEST_READ_FAIL
+      ;;
+    *)
+      emit_line BANGBANG_ENTROPY_GUEST_READ_OK
+      write_vdb_marker BANGBANG_ENTROPY_GUEST_READ_OK
+      ;;
+  esac
 }
 
 fetch_mmds_v2_marker() {
@@ -915,7 +956,9 @@ if [ -r /proc/cmdline ]; then
   emit_line "$cmdline"
   emit_line BANGBANG_CMDLINE_END
 fi
-if cmdline_has bangbang.mmds-v2-fetch=1; then
+if cmdline_has bangbang.entropy-read=1; then
+  read_entropy_marker
+elif cmdline_has bangbang.mmds-v2-fetch=1; then
   fetch_mmds_v2_marker
 elif cmdline_has bangbang.mmds-fetch=1; then
   fetch_mmds_marker
