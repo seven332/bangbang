@@ -377,12 +377,6 @@ fn executable_handles_remaining_device_requests_without_mutating() {
 
     for (path, body, fault_message, private_values) in [
         (
-            "/balloon",
-            r#"{"amount_mib":64,"deflate_on_oom":true}"#,
-            "Balloon device is not supported.",
-            &[][..],
-        ),
-        (
             "/pmem/pmem0",
             r#"{"id":"pmem0","path_on_host":"secret-pmem.img"}"#,
             "Pmem device is not supported.",
@@ -478,6 +472,42 @@ fn executable_handles_remaining_device_requests_without_mutating() {
         "GET /balloon",
     );
 
+    let balloon_put_response = http_put_json(
+        &socket_path,
+        "/balloon",
+        r#"{"amount_mib":64,"deflate_on_oom":true,"stats_polling_interval_s":60,"free_page_hinting":true,"free_page_reporting":false}"#,
+    );
+    assert_no_content_response(&balloon_put_response, "PUT /balloon");
+
+    let configured_balloon_get_response = http_get(&socket_path, "/balloon");
+    assert_ok_response(&configured_balloon_get_response, "GET /balloon configured");
+    for expected in [
+        r#""amount_mib":64"#,
+        r#""deflate_on_oom":true"#,
+        r#""stats_polling_interval_s":60"#,
+        r#""free_page_hinting":true"#,
+        r#""free_page_reporting":false"#,
+    ] {
+        assert_response_contains(
+            &configured_balloon_get_response,
+            expected,
+            "GET /balloon configured",
+        );
+    }
+
+    let balloon_vm_config = http_get(&socket_path, "/vm/config");
+    assert_ok_response(&balloon_vm_config, "GET /vm/config after PUT /balloon");
+    assert_response_contains(
+        &balloon_vm_config,
+        r#""balloon":"#,
+        "GET /vm/config after PUT /balloon",
+    );
+    assert_response_contains(
+        &balloon_vm_config,
+        r#""amount_mib":64"#,
+        "GET /vm/config after PUT /balloon",
+    );
+
     for (path, action) in [
         ("/balloon/statistics", "GetBalloonStats"),
         ("/balloon/hinting/status", "GetBalloonHintingStatus"),
@@ -539,6 +569,27 @@ fn executable_handles_remaining_device_requests_without_mutating() {
         &pmem_delete_response,
         r#"{"fault_message":"The requested operation is not supported in Not started state: HotUnplugDevice"}"#,
         "DELETE /pmem/pmem0",
+    );
+
+    let boot_source_response = http_put_json(
+        &socket_path,
+        "/boot-source",
+        r#"{"kernel_image_path":"/tmp/nonexistent-vmlinux"}"#,
+    );
+    assert_no_content_response(
+        &boot_source_response,
+        "PUT /boot-source before balloon start",
+    );
+    let start_response = http_put_json(
+        &socket_path,
+        "/actions",
+        r#"{"action_type":"InstanceStart"}"#,
+    );
+    assert_bad_request_response(&start_response, "PUT /actions InstanceStart with balloon");
+    assert_response_contains(
+        &start_response,
+        r#"{"fault_message":"Balloon device is not supported."}"#,
+        "PUT /actions InstanceStart with balloon",
     );
 
     let instance_info = http_get(&socket_path, "/");

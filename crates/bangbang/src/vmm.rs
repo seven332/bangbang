@@ -15,6 +15,7 @@ use bangbang_hvf::{
     HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig,
     HvfArm64BootSessionConfig, HvfVcpuRunnerError, OwnedHvfArm64BootSession,
 };
+use bangbang_runtime::balloon::BalloonConfigInput;
 use bangbang_runtime::block::{
     BlockFileBacking, BlockMmioLayout, DriveConfig, DriveConfigInput, DriveUpdateError,
     DriveUpdateInput,
@@ -231,10 +232,10 @@ pub(crate) struct PutApiRequest {
 }
 
 impl PutApiRequest {
-    pub(crate) const fn balloon() -> Self {
+    pub(crate) const fn balloon(input: BalloonConfigInput) -> Self {
         Self {
             kind: PutApiRequestKind::Balloon,
-            action: VmmAction::PutBalloon,
+            action: VmmAction::PutBalloon(input),
         }
     }
 

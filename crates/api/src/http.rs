@@ -29,7 +29,7 @@ pub enum ApiRequest {
     GetVmConfig,
     GetVersion,
     PutAction(Box<ActionRequest>),
-    PutBalloon,
+    PutBalloon(Box<BalloonConfigRequest>),
     PutBootSource(Box<BootSourceRequest>),
     PutCpuConfig(Box<CpuConfigRequest>),
     PutDrive(Box<DriveConfigRequest>),
@@ -509,6 +509,37 @@ pub struct EntropyConfigRequest {
 impl EntropyConfigRequest {
     pub const fn rate_limiter_configured(&self) -> bool {
         self.rate_limiter_configured
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BalloonConfigRequest {
+    amount_mib: u32,
+    deflate_on_oom: bool,
+    stats_polling_interval_s: u16,
+    free_page_hinting: bool,
+    free_page_reporting: bool,
+}
+
+impl BalloonConfigRequest {
+    pub const fn amount_mib(self) -> u32 {
+        self.amount_mib
+    }
+
+    pub const fn deflate_on_oom(self) -> bool {
+        self.deflate_on_oom
+    }
+
+    pub const fn stats_polling_interval_s(self) -> u16 {
+        self.stats_polling_interval_s
+    }
+
+    pub const fn free_page_hinting(self) -> bool {
+        self.free_page_hinting
+    }
+
+    pub const fn free_page_reporting(self) -> bool {
+        self.free_page_reporting
     }
 }
 
@@ -1144,6 +1175,7 @@ pub struct VmConfigResponse {
     mmds_config: Option<MmdsConfigResponse>,
     vsock: Option<VsockConfigResponse>,
     entropy: Option<EntropyConfigResponse>,
+    balloon: Option<BalloonConfigResponse>,
 }
 
 impl VmConfigResponse {
@@ -1164,6 +1196,39 @@ impl VmConfigResponse {
             mmds_config,
             vsock,
             entropy,
+            balloon: None,
+        }
+    }
+
+    pub const fn with_balloon(mut self, balloon: Option<BalloonConfigResponse>) -> Self {
+        self.balloon = balloon;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BalloonConfigResponse {
+    amount_mib: u32,
+    deflate_on_oom: bool,
+    stats_polling_interval_s: u16,
+    free_page_hinting: bool,
+    free_page_reporting: bool,
+}
+
+impl BalloonConfigResponse {
+    pub const fn new(
+        amount_mib: u32,
+        deflate_on_oom: bool,
+        stats_polling_interval_s: u16,
+        free_page_hinting: bool,
+        free_page_reporting: bool,
+    ) -> Self {
+        Self {
+            amount_mib,
+            deflate_on_oom,
+            stats_polling_interval_s,
+            free_page_hinting,
+            free_page_reporting,
         }
     }
 }
@@ -1528,6 +1593,12 @@ impl HttpResponse {
 
     pub fn vm_config(config: &VmConfigResponse) -> Self {
         let mut body = serde_json::Map::new();
+        if let Some(balloon) = &config.balloon {
+            body.insert(
+                "balloon".to_string(),
+                balloon_config_response_value(balloon),
+            );
+        }
         if let Some(boot_source) = &config.boot_source {
             body.insert(
                 "boot-source".to_string(),
@@ -1584,6 +1655,13 @@ impl HttpResponse {
         Self {
             status: StatusCode::Ok,
             body: value.to_string(),
+        }
+    }
+
+    pub fn balloon_config(config: BalloonConfigResponse) -> Self {
+        Self {
+            status: StatusCode::Ok,
+            body: balloon_config_response_value(&config).to_string(),
         }
     }
 
@@ -1728,6 +1806,16 @@ fn network_interface_config_response_value(
 
 fn entropy_config_response_value(_entropy: &EntropyConfigResponse) -> serde_json::Value {
     serde_json::Value::Object(serde_json::Map::new())
+}
+
+fn balloon_config_response_value(balloon: &BalloonConfigResponse) -> serde_json::Value {
+    serde_json::json!({
+        "amount_mib": balloon.amount_mib,
+        "deflate_on_oom": balloon.deflate_on_oom,
+        "free_page_hinting": balloon.free_page_hinting,
+        "free_page_reporting": balloon.free_page_reporting,
+        "stats_polling_interval_s": balloon.stats_polling_interval_s,
+    })
 }
 
 fn mmds_config_response_value(config: &MmdsConfigResponse) -> serde_json::Value {
@@ -2217,15 +2305,14 @@ fn parse_balloon_config_request(body: &[u8]) -> Result<ApiRequest, RequestError>
         free_page_reporting,
     } = serde_json::from_slice::<BalloonConfigRequestBody>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
-    let _ = (
+
+    Ok(ApiRequest::PutBalloon(Box::new(BalloonConfigRequest {
         amount_mib,
         deflate_on_oom,
         stats_polling_interval_s,
         free_page_hinting,
         free_page_reporting,
-    );
-
-    Ok(ApiRequest::PutBalloon)
+    })))
 }
 
 fn parse_balloon_update_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
@@ -2864,7 +2951,7 @@ impl From<ApiRequest> for Endpoint {
             ApiRequest::GetBalloon
             | ApiRequest::GetBalloonStats
             | ApiRequest::GetBalloonHintingStatus
-            | ApiRequest::PutBalloon
+            | ApiRequest::PutBalloon(_)
             | ApiRequest::PatchBalloon
             | ApiRequest::PatchBalloonStats
             | ApiRequest::PatchBalloonHintingStart
@@ -5436,7 +5523,13 @@ mod tests {
                     "/balloon",
                     r#"{"amount_mib":64,"deflate_on_oom":true}"#,
                 ),
-                ApiRequest::PutBalloon,
+                ApiRequest::PutBalloon(Box::new(BalloonConfigRequest {
+                    amount_mib: 64,
+                    deflate_on_oom: true,
+                    stats_polling_interval_s: 0,
+                    free_page_hinting: false,
+                    free_page_reporting: false,
+                })),
             ),
             (
                 "PUT /balloon optional fields",
@@ -5445,7 +5538,13 @@ mod tests {
                     "/balloon",
                     r#"{"amount_mib":64,"deflate_on_oom":false,"stats_polling_interval_s":1,"free_page_hinting":true,"free_page_reporting":false}"#,
                 ),
-                ApiRequest::PutBalloon,
+                ApiRequest::PutBalloon(Box::new(BalloonConfigRequest {
+                    amount_mib: 64,
+                    deflate_on_oom: false,
+                    stats_polling_interval_s: 1,
+                    free_page_hinting: true,
+                    free_page_reporting: false,
+                })),
             ),
             (
                 "PUT /balloon max numeric fields",
@@ -5454,7 +5553,13 @@ mod tests {
                     "/balloon",
                     r#"{"amount_mib":4294967295,"deflate_on_oom":true,"stats_polling_interval_s":65535}"#,
                 ),
-                ApiRequest::PutBalloon,
+                ApiRequest::PutBalloon(Box::new(BalloonConfigRequest {
+                    amount_mib: 4_294_967_295,
+                    deflate_on_oom: true,
+                    stats_polling_interval_s: 65_535,
+                    free_page_hinting: false,
+                    free_page_reporting: false,
+                })),
             ),
             (
                 "PATCH /balloon",
@@ -6524,6 +6629,7 @@ mod tests {
             })
         );
         assert_eq!(body.get("boot-source"), None);
+        assert_eq!(body.get("balloon"), None);
         assert_eq!(body.get("logger"), None);
         assert_eq!(body.get("mmds-config"), None);
         assert_eq!(body.get("entropy"), None);
@@ -6544,15 +6650,19 @@ mod tests {
         let mmds_config = MmdsConfigResponse::new(vec!["eth0".to_string()], "V2", true)
             .with_ipv4_address("169.254.169.254");
         let vsock = VsockConfigResponse::new(3, "./v.sock");
-        let response = HttpResponse::vm_config(&VmConfigResponse::new(
-            MachineConfigResponse::new(2, 256, false, false, "None"),
-            Some(boot_source),
-            vec![drive],
-            vec![network_interface],
-            Some(mmds_config),
-            Some(vsock),
-            Some(EntropyConfigResponse::new()),
-        ));
+        let balloon = BalloonConfigResponse::new(128, true, 60, true, false);
+        let response = HttpResponse::vm_config(
+            &VmConfigResponse::new(
+                MachineConfigResponse::new(2, 256, false, false, "None"),
+                Some(boot_source),
+                vec![drive],
+                vec![network_interface],
+                Some(mmds_config),
+                Some(vsock),
+                Some(EntropyConfigResponse::new()),
+            )
+            .with_balloon(Some(balloon)),
+        );
         let body: serde_json::Value =
             serde_json::from_str(response.body()).expect("body should be JSON");
 
@@ -6564,6 +6674,13 @@ mod tests {
                     "boot_args": "console=hvc0 reboot=k panic=1",
                     "initrd_path": "/tmp/initrd.img",
                     "kernel_image_path": "/tmp/vmlinux",
+                },
+                "balloon": {
+                    "amount_mib": 128,
+                    "deflate_on_oom": true,
+                    "free_page_hinting": true,
+                    "free_page_reporting": false,
+                    "stats_polling_interval_s": 60,
                 },
                 "drives": [
                     {
