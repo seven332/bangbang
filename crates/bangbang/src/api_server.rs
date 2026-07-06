@@ -13,18 +13,19 @@ use std::time::{Duration, Instant};
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_api::http::{
     ActionRequest, ActionType, ApiRequest, ApiRequestMetricEndpoint, ApiRequestMetricPatchEndpoint,
-    ApiRequestMetricPutEndpoint, BootSourceRequest, BootSourceResponse, CpuConfigRequest,
-    DriveCacheType as ApiDriveCacheType, DriveConfigRequest, DriveConfigResponse,
-    DriveIoEngine as ApiDriveIoEngine, DrivePatchRequest, EntropyConfigRequest,
-    EntropyConfigResponse, HotUnplugDeviceKind as ApiHotUnplugDeviceKind, HotUnplugDeviceRequest,
-    HttpResponse, LoggerConfigRequest, LoggerLevel as ApiLoggerLevel, MachineConfigPatchRequest,
-    MachineConfigRequest, MachineConfigResponse, MetricsConfigRequest, MmdsConfigRequest,
-    MmdsConfigResponse, MmdsContentRequest, MmdsVersion as ApiMmdsVersion,
+    ApiRequestMetricPutEndpoint, BalloonConfigRequest, BalloonConfigResponse, BootSourceRequest,
+    BootSourceResponse, CpuConfigRequest, DriveCacheType as ApiDriveCacheType, DriveConfigRequest,
+    DriveConfigResponse, DriveIoEngine as ApiDriveIoEngine, DrivePatchRequest,
+    EntropyConfigRequest, EntropyConfigResponse, HotUnplugDeviceKind as ApiHotUnplugDeviceKind,
+    HotUnplugDeviceRequest, HttpResponse, LoggerConfigRequest, LoggerLevel as ApiLoggerLevel,
+    MachineConfigPatchRequest, MachineConfigRequest, MachineConfigResponse, MetricsConfigRequest,
+    MmdsConfigRequest, MmdsConfigResponse, MmdsContentRequest, MmdsVersion as ApiMmdsVersion,
     NetworkInterfaceConfigRequest, NetworkInterfaceConfigResponse, NetworkInterfacePatchRequest,
     RequestError, SerialConfigRequest, VmConfigResponse, VmStateUpdate, VmStateUpdateRequest,
     VsockConfigRequest, VsockConfigResponse, api_request_metric_endpoint, parse_request_with_limit,
     request_total_len_with_limit,
 };
+use bangbang_runtime::balloon::{BalloonConfig, BalloonConfigInput};
 use bangbang_runtime::block::{
     DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine, DriveUpdateInput,
 };
@@ -706,14 +707,16 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PutSerial(config) => handle_empty(vmm.handle_put_request(
             PutApiRequest::serial(serial_config_input_from_request(config.as_ref())),
         )),
-        ApiRequest::GetBalloon => handle_empty(vmm.handle_get_request(GetApiRequest::Balloon)),
+        ApiRequest::GetBalloon => handle_balloon(vmm.handle_get_request(GetApiRequest::Balloon)),
         ApiRequest::GetBalloonStats => {
             handle_empty(vmm.handle_get_request(GetApiRequest::BalloonStats))
         }
         ApiRequest::GetBalloonHintingStatus => {
             handle_empty(vmm.handle_get_request(GetApiRequest::BalloonHintingStatus))
         }
-        ApiRequest::PutBalloon => handle_empty(vmm.handle_put_request(PutApiRequest::balloon())),
+        ApiRequest::PutBalloon(config) => handle_empty(vmm.handle_put_request(
+            PutApiRequest::balloon(balloon_config_input_from_request(*config)),
+        )),
         ApiRequest::PatchBalloon => {
             handle_empty(vmm.handle_patch_request(PatchApiRequest::balloon()))
         }
@@ -782,7 +785,7 @@ fn request_uses_deprecated_api(request: &ApiRequest) -> bool {
         | ApiRequest::PatchPmem
         | ApiRequest::PatchVmState(_)
         | ApiRequest::PutAction(_)
-        | ApiRequest::PutBalloon
+        | ApiRequest::PutBalloon(_)
         | ApiRequest::PutBootSource(_)
         | ApiRequest::PutCpuConfig(_)
         | ApiRequest::PutDrive(_)
@@ -841,6 +844,9 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         ApiRequest::PutEntropy(config) => Some(VmmAction::PutEntropy(
             entropy_config_input_from_request(config.as_ref()),
         )),
+        ApiRequest::PutBalloon(config) => Some(VmmAction::PutBalloon(
+            balloon_config_input_from_request(*config),
+        )),
         ApiRequest::PutLogger(config) => Some(VmmAction::PutLogger(
             logger_config_input_from_request(config.as_ref()),
         )),
@@ -884,7 +890,6 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         | ApiRequest::PatchPmem
         | ApiRequest::PatchVmState(_)
         | ApiRequest::PutAction(_)
-        | ApiRequest::PutBalloon
         | ApiRequest::PutMemoryHotplug
         | ApiRequest::PutMmds(_)
         | ApiRequest::PutPmem
@@ -916,6 +921,7 @@ fn handle_vmm_version(result: Result<VmmData, bangbang_runtime::VmmActionError>)
         Ok(
             VmmData::Empty
             | VmmData::InstanceInformation(_)
+            | VmmData::BalloonConfiguration(_)
             | VmmData::MachineConfiguration(_)
             | VmmData::MmdsValue(_)
             | VmmData::VmConfiguration(_),
@@ -933,6 +939,7 @@ fn handle_instance_info(result: Result<VmmData, bangbang_runtime::VmmActionError
         Ok(
             VmmData::Empty
             | VmmData::VmmVersion(_)
+            | VmmData::BalloonConfiguration(_)
             | VmmData::MachineConfiguration(_)
             | VmmData::MmdsValue(_)
             | VmmData::VmConfiguration(_),
@@ -956,9 +963,27 @@ fn handle_machine_config(
             VmmData::Empty
             | VmmData::VmmVersion(_)
             | VmmData::InstanceInformation(_)
+            | VmmData::BalloonConfiguration(_)
             | VmmData::MmdsValue(_)
             | VmmData::VmConfiguration(_),
         ) => HttpResponse::fault("machine config request returned unexpected VMM data."),
+        Err(err) => HttpResponse::fault(&err.to_string()),
+    }
+}
+
+fn handle_balloon(result: Result<VmmData, bangbang_runtime::VmmActionError>) -> HttpResponse {
+    match result {
+        Ok(VmmData::BalloonConfiguration(config)) => {
+            HttpResponse::balloon_config(balloon_config_response_from_runtime(config))
+        }
+        Ok(
+            VmmData::Empty
+            | VmmData::VmmVersion(_)
+            | VmmData::InstanceInformation(_)
+            | VmmData::MachineConfiguration(_)
+            | VmmData::MmdsValue(_)
+            | VmmData::VmConfiguration(_),
+        ) => HttpResponse::fault("balloon request returned unexpected VMM data."),
         Err(err) => HttpResponse::fault(&err.to_string()),
     }
 }
@@ -972,6 +997,7 @@ fn handle_vm_config(result: Result<VmmData, bangbang_runtime::VmmActionError>) -
             VmmData::Empty
             | VmmData::VmmVersion(_)
             | VmmData::InstanceInformation(_)
+            | VmmData::BalloonConfiguration(_)
             | VmmData::MachineConfiguration(_)
             | VmmData::MmdsValue(_),
         ) => HttpResponse::fault("VM config request returned unexpected VMM data."),
@@ -986,6 +1012,7 @@ fn handle_mmds(result: Result<VmmData, bangbang_runtime::VmmActionError>) -> Htt
             VmmData::Empty
             | VmmData::VmmVersion(_)
             | VmmData::InstanceInformation(_)
+            | VmmData::BalloonConfiguration(_)
             | VmmData::MachineConfiguration(_)
             | VmmData::VmConfiguration(_),
         ) => HttpResponse::fault("MMDS request returned unexpected VMM data."),
@@ -999,6 +1026,7 @@ fn handle_empty(result: Result<VmmData, bangbang_runtime::VmmActionError>) -> Ht
         Ok(
             VmmData::InstanceInformation(_)
             | VmmData::VmmVersion(_)
+            | VmmData::BalloonConfiguration(_)
             | VmmData::MachineConfiguration(_)
             | VmmData::MmdsValue(_)
             | VmmData::VmConfiguration(_),
@@ -1030,6 +1058,21 @@ fn vm_config_response_from_runtime(config: &VmConfiguration) -> VmConfigResponse
         config
             .entropy_config()
             .map(entropy_config_response_from_runtime),
+    )
+    .with_balloon(
+        config
+            .balloon_config()
+            .map(balloon_config_response_from_runtime),
+    )
+}
+
+fn balloon_config_response_from_runtime(config: BalloonConfig) -> BalloonConfigResponse {
+    BalloonConfigResponse::new(
+        config.amount_mib(),
+        config.deflate_on_oom(),
+        config.stats_polling_interval_s(),
+        config.free_page_hinting(),
+        config.free_page_reporting(),
     )
 }
 
@@ -1341,6 +1384,13 @@ fn entropy_config_input_from_request(config: &EntropyConfigRequest) -> EntropyCo
     }
 
     input
+}
+
+fn balloon_config_input_from_request(config: BalloonConfigRequest) -> BalloonConfigInput {
+    BalloonConfigInput::new(config.amount_mib(), config.deflate_on_oom())
+        .with_stats_polling_interval_s(config.stats_polling_interval_s())
+        .with_free_page_hinting(config.free_page_hinting())
+        .with_free_page_reporting(config.free_page_reporting())
 }
 
 fn vsock_config_input_from_request(config: &VsockConfigRequest) -> VsockConfigInput {
@@ -3479,17 +3529,6 @@ mod tests {
             assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
         }
 
-        let valid_put_response = request_over_socket(
-            &mut vmm,
-            "bp",
-            &request_with_body(
-                "PUT",
-                "/balloon",
-                r#"{"amount_mib":64,"deflate_on_oom":true}"#,
-            ),
-        );
-        assert!(valid_put_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-
         let malformed_put_response =
             request_over_socket(&mut vmm, "bpm", &request_with_body("PUT", "/balloon", "{}"));
         assert!(malformed_put_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
@@ -3532,6 +3571,18 @@ mod tests {
         );
         let start_response = put_action_over_socket(&mut vmm, "bs", "InstanceStart");
         assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let running_put_response = request_over_socket(
+            &mut vmm,
+            "bp",
+            &request_with_body(
+                "PUT",
+                "/balloon",
+                r#"{"amount_mib":64,"deflate_on_oom":true}"#,
+            ),
+        );
+        assert!(running_put_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+
         let flush_response = put_action_over_socket(&mut vmm, "bf", "FlushMetrics");
 
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
@@ -5494,7 +5545,7 @@ mod tests {
     }
 
     #[test]
-    fn returns_fault_for_balloon_endpoints() {
+    fn stores_and_returns_balloon_config_over_socket() {
         let mut vmm = test_controller();
         for (socket_name, request, fault_message) in [
             (
@@ -5511,15 +5562,6 @@ mod tests {
                 "b-hint-status",
                 "GET /balloon/hinting/status HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
                 "The requested operation is not supported in Not started state: GetBalloonHintingStatus",
-            ),
-            (
-                "b-put",
-                request_with_body(
-                    "PUT",
-                    "/balloon",
-                    r#"{"amount_mib":64,"deflate_on_oom":true}"#,
-                ),
-                "Balloon device is not supported.",
             ),
             (
                 "b-put-bad",
@@ -5575,6 +5617,52 @@ mod tests {
                 "{socket_name}: {response}"
             );
         }
+
+        let put_response = request_over_socket(
+            &mut vmm,
+            "b-put",
+            &request_with_body(
+                "PUT",
+                "/balloon",
+                r#"{"amount_mib":64,"deflate_on_oom":true,"stats_polling_interval_s":60,"free_page_hinting":true,"free_page_reporting":false}"#,
+            ),
+        );
+        assert!(put_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let get_response = request_over_socket(
+            &mut vmm,
+            "b-get-configured",
+            "GET /balloon HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(get_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(get_response.contains(r#""amount_mib":64"#));
+        assert!(get_response.contains(r#""deflate_on_oom":true"#));
+        assert!(get_response.contains(r#""stats_polling_interval_s":60"#));
+        assert!(get_response.contains(r#""free_page_hinting":true"#));
+        assert!(get_response.contains(r#""free_page_reporting":false"#));
+
+        let vm_config_response = request_over_socket(
+            &mut vmm,
+            "b-vm-config",
+            "GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(vm_config_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(vm_config_response.contains(r#""balloon":"#));
+        assert!(vm_config_response.contains(r#""amount_mib":64"#));
+
+        let boot_response = request_over_socket(
+            &mut vmm,
+            "b-boot",
+            &request_with_body(
+                "PUT",
+                "/boot-source",
+                r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#,
+            ),
+        );
+        assert!(boot_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let start_response = put_action_over_socket(&mut vmm, "b-start", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(start_response.contains(r#"{"fault_message":"Balloon device is not supported."}"#));
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::NotStarted

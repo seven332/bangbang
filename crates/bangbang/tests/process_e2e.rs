@@ -377,12 +377,6 @@ fn executable_handles_remaining_device_requests_without_mutating() {
 
     for (path, body, fault_message, private_values) in [
         (
-            "/balloon",
-            r#"{"amount_mib":64,"deflate_on_oom":true}"#,
-            "Balloon device is not supported.",
-            &[][..],
-        ),
-        (
             "/pmem/pmem0",
             r#"{"id":"pmem0","path_on_host":"secret-pmem.img"}"#,
             "Pmem device is not supported.",
@@ -478,6 +472,42 @@ fn executable_handles_remaining_device_requests_without_mutating() {
         "GET /balloon",
     );
 
+    let balloon_put_response = http_put_json(
+        &socket_path,
+        "/balloon",
+        r#"{"amount_mib":64,"deflate_on_oom":true,"stats_polling_interval_s":60,"free_page_hinting":true,"free_page_reporting":false}"#,
+    );
+    assert_no_content_response(&balloon_put_response, "PUT /balloon");
+
+    let configured_balloon_get_response = http_get(&socket_path, "/balloon");
+    assert_ok_response(&configured_balloon_get_response, "GET /balloon configured");
+    for expected in [
+        r#""amount_mib":64"#,
+        r#""deflate_on_oom":true"#,
+        r#""stats_polling_interval_s":60"#,
+        r#""free_page_hinting":true"#,
+        r#""free_page_reporting":false"#,
+    ] {
+        assert_response_contains(
+            &configured_balloon_get_response,
+            expected,
+            "GET /balloon configured",
+        );
+    }
+
+    let balloon_vm_config = http_get(&socket_path, "/vm/config");
+    assert_ok_response(&balloon_vm_config, "GET /vm/config after PUT /balloon");
+    assert_response_contains(
+        &balloon_vm_config,
+        r#""balloon":"#,
+        "GET /vm/config after PUT /balloon",
+    );
+    assert_response_contains(
+        &balloon_vm_config,
+        r#""amount_mib":64"#,
+        "GET /vm/config after PUT /balloon",
+    );
+
     for (path, action) in [
         ("/balloon/statistics", "GetBalloonStats"),
         ("/balloon/hinting/status", "GetBalloonHintingStatus"),
@@ -539,6 +569,27 @@ fn executable_handles_remaining_device_requests_without_mutating() {
         &pmem_delete_response,
         r#"{"fault_message":"The requested operation is not supported in Not started state: HotUnplugDevice"}"#,
         "DELETE /pmem/pmem0",
+    );
+
+    let boot_source_response = http_put_json(
+        &socket_path,
+        "/boot-source",
+        r#"{"kernel_image_path":"/tmp/nonexistent-vmlinux"}"#,
+    );
+    assert_no_content_response(
+        &boot_source_response,
+        "PUT /boot-source before balloon start",
+    );
+    let start_response = http_put_json(
+        &socket_path,
+        "/actions",
+        r#"{"action_type":"InstanceStart"}"#,
+    );
+    assert_bad_request_response(&start_response, "PUT /actions InstanceStart with balloon");
+    assert_response_contains(
+        &start_response,
+        r#"{"fault_message":"Balloon device is not supported."}"#,
+        "PUT /actions InstanceStart with balloon",
     );
 
     let instance_info = http_get(&socket_path, "/");
@@ -713,6 +764,46 @@ fn executable_no_api_config_file_rejected_entropy_rate_limiter_does_not_publish_
         &output,
         &socket_path,
         "no-api config-file rejected entropy rate limiter",
+    );
+}
+
+#[test]
+fn executable_config_file_balloon_startup_failure_does_not_publish_socket() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let config_path = write_balloon_startup_config(&test_dir);
+    let instance_id = test_dir.instance_id();
+
+    let output = BangbangProcess::start_with_extra_args_expect_failure(
+        &socket_path,
+        &instance_id,
+        &["--config-file", path_text(&config_path)],
+    );
+
+    assert_balloon_config_startup_failure(
+        &output,
+        &socket_path,
+        "config-file balloon startup failure",
+    );
+}
+
+#[test]
+fn executable_no_api_config_file_balloon_startup_failure_does_not_publish_socket() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let config_path = write_balloon_startup_config(&test_dir);
+    let instance_id = test_dir.instance_id();
+
+    let output = BangbangProcess::start_with_extra_args_expect_failure(
+        &socket_path,
+        &instance_id,
+        &["--config-file", path_text(&config_path), "--no-api"],
+    );
+
+    assert_balloon_config_startup_failure(
+        &output,
+        &socket_path,
+        "no-api config-file balloon startup failure",
     );
 }
 
@@ -2614,6 +2705,20 @@ fn write_rejected_entropy_rate_limiter_config(test_dir: &TestDir) -> std::path::
     config_path
 }
 
+fn write_balloon_startup_config(test_dir: &TestDir) -> std::path::PathBuf {
+    let config_path = test_dir.path().join("vm-config.json");
+    fs::write(
+        &config_path,
+        r#"{
+            "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
+            "balloon":{"amount_mib":64,"deflate_on_oom":true}
+        }"#,
+    )
+    .expect("config file should be written");
+
+    config_path
+}
+
 fn write_multi_vcpu_startup_config(test_dir: &TestDir) -> (std::path::PathBuf, std::path::PathBuf) {
     let config_path = test_dir.path().join("vm-config.json");
     let kernel_path = test_dir.path().join("private-vmlinux");
@@ -2678,6 +2783,41 @@ fn assert_metadata_failure(
     assert!(
         !output.stderr.contains("private-metadata-secret"),
         "{case_name} stderr must not echo metadata contents; stderr:\n{}",
+        output.stderr
+    );
+}
+
+fn assert_balloon_config_startup_failure(
+    output: &support::CompletedProcess,
+    socket_path: &std::path::Path,
+    case_name: &str,
+) {
+    assert!(
+        !output.status.success(),
+        "{case_name} should fail startup; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        !socket_path.exists(),
+        "{case_name} should fail before API socket publication"
+    );
+    assert!(
+        !output.stdout.contains("status: API server listening"),
+        "{case_name} must not report API readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !output.stdout.contains("status: VM running without API"),
+        "{case_name} must not report no-api readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        output.stderr.contains(
+            "bangbang: config-file error: failed to apply config-file action: Balloon device is not supported."
+        ),
+        "{case_name} stderr should describe balloon startup rejection; stderr:\n{}",
         output.stderr
     );
 }

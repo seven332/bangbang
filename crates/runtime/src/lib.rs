@@ -1,5 +1,6 @@
 //! Backend-neutral VM runtime boundary.
 
+pub mod balloon;
 pub mod block;
 pub mod boot;
 pub mod cpu;
@@ -79,7 +80,7 @@ pub enum VmmAction {
     GetBalloon,
     GetBalloonStats,
     GetBalloonHintingStatus,
-    PutBalloon,
+    PutBalloon(balloon::BalloonConfigInput),
     PatchBalloon,
     PatchBalloonStats,
     PatchBalloonHintingStart,
@@ -155,7 +156,7 @@ impl VmmAction {
             Self::GetBalloon => "GetBalloon",
             Self::GetBalloonStats => "GetBalloonStats",
             Self::GetBalloonHintingStatus => "GetBalloonHintingStatus",
-            Self::PutBalloon => "PutBalloon",
+            Self::PutBalloon(_) => "PutBalloon",
             Self::PatchBalloon => "PatchBalloon",
             Self::PatchBalloonStats => "PatchBalloonStats",
             Self::PatchBalloonHintingStart => "PatchBalloonHintingStart",
@@ -192,6 +193,7 @@ pub enum VmmData {
     VmmVersion(String),
     InstanceInformation(InstanceInfo),
     MachineConfiguration(machine::MachineConfig),
+    BalloonConfiguration(balloon::BalloonConfig),
     MmdsValue(serde_json::Value),
     VmConfiguration(VmConfiguration),
 }
@@ -205,6 +207,7 @@ pub struct VmConfiguration {
     mmds_config: Option<mmds::MmdsConfig>,
     vsock_config: Option<vsock::VsockConfig>,
     entropy_config: Option<entropy::EntropyConfig>,
+    balloon_config: Option<balloon::BalloonConfig>,
 }
 
 impl VmConfiguration {
@@ -225,7 +228,16 @@ impl VmConfiguration {
             mmds_config,
             vsock_config,
             entropy_config,
+            balloon_config: None,
         }
+    }
+
+    pub const fn with_balloon_config(
+        mut self,
+        balloon_config: Option<balloon::BalloonConfig>,
+    ) -> Self {
+        self.balloon_config = balloon_config;
+        self
     }
 
     pub const fn machine_config(&self) -> machine::MachineConfig {
@@ -254,6 +266,10 @@ impl VmConfiguration {
 
     pub const fn entropy_config(&self) -> Option<entropy::EntropyConfig> {
         self.entropy_config
+    }
+
+    pub const fn balloon_config(&self) -> Option<balloon::BalloonConfig> {
+        self.balloon_config
     }
 }
 
@@ -376,6 +392,7 @@ pub struct VmmController {
     network_interface_configs: network::NetworkInterfaceConfigs,
     vsock_config: Option<vsock::VsockConfig>,
     entropy_config: Option<entropy::EntropyConfig>,
+    balloon_config: Option<balloon::BalloonConfig>,
     serial_config: serial::SerialConfig,
     logger_state: logger::LoggerState,
     metrics_state: metrics::MetricsState,
@@ -415,6 +432,7 @@ impl VmmController {
             network_interface_configs: network::NetworkInterfaceConfigs::new(),
             vsock_config: None,
             entropy_config: None,
+            balloon_config: None,
             serial_config: serial::SerialConfig::default(),
             logger_state: logger::LoggerState::default(),
             metrics_state: metrics::MetricsState::default(),
@@ -442,6 +460,10 @@ impl VmmController {
 
     pub const fn entropy_config(&self) -> Option<entropy::EntropyConfig> {
         self.entropy_config
+    }
+
+    pub const fn balloon_config(&self) -> Option<balloon::BalloonConfig> {
+        self.balloon_config
     }
 
     pub const fn serial_config(&self) -> &serial::SerialConfig {
@@ -473,7 +495,8 @@ impl VmmController {
             self.mmds_config()?,
             self.vsock_config.clone(),
             self.entropy_config,
-        ))
+        )
+        .with_balloon_config(self.balloon_config))
     }
 
     pub fn updated_drive_config(
@@ -504,6 +527,10 @@ impl VmmController {
 
         if self.boot_source_config.is_none() {
             return Err(VmmActionError::MissingBootSource);
+        }
+
+        if self.balloon_config.is_some() {
+            return Err(VmmActionError::BalloonUnsupported);
         }
 
         Ok(())
@@ -786,8 +813,11 @@ impl VmmController {
             VmmAction::FlushMetrics => {
                 self.flush_metrics_with_diagnostics(&metrics::MetricsDiagnostics::default())
             }
-            VmmAction::GetBalloon => Err(VmmActionError::BalloonUnsupported),
-            VmmAction::PutBalloon => {
+            VmmAction::GetBalloon => self
+                .balloon_config
+                .map(VmmData::BalloonConfiguration)
+                .ok_or(VmmActionError::BalloonUnsupported),
+            VmmAction::PutBalloon(config) => {
                 if self.instance_info.state != InstanceState::NotStarted {
                     return Err(VmmActionError::UnsupportedState {
                         action: action_name,
@@ -795,7 +825,8 @@ impl VmmController {
                     });
                 }
 
-                Err(VmmActionError::BalloonUnsupported)
+                self.balloon_config = Some(config.into());
+                Ok(VmmData::Empty)
             }
             VmmAction::GetBalloonStats
             | VmmAction::GetBalloonHintingStatus
@@ -1154,6 +1185,7 @@ mod tests {
     use super::{
         BackendError, HotUnplugDeviceInput, HotUnplugDeviceKind, InstanceState, VmmAction,
         VmmActionError, VmmController, VmmData,
+        balloon::{BalloonConfig, BalloonConfigInput},
         block::{DriveConfigError, DriveConfigInput, DriveUpdateInput},
         boot::{
             BootCommandLineError, BootPayloadKind, BootSourceConfigError, BootSourceConfigInput,
@@ -1192,6 +1224,13 @@ mod tests {
 
     fn serial_input(serial_out_path: &str) -> SerialConfigInput {
         SerialConfigInput::new().with_serial_out_path(serial_out_path)
+    }
+
+    fn balloon_input(amount_mib: u32, deflate_on_oom: bool) -> BalloonConfigInput {
+        BalloonConfigInput::new(amount_mib, deflate_on_oom)
+            .with_stats_polling_interval_s(60)
+            .with_free_page_hinting(true)
+            .with_free_page_reporting(false)
     }
 
     fn boot_source_input(kernel_image_path: &str) -> BootSourceConfigInput {
@@ -1383,12 +1422,14 @@ mod tests {
         assert_eq!(config.mmds_config(), None);
         assert_eq!(config.vsock_config(), None);
         assert_eq!(config.entropy_config(), None);
+        assert_eq!(config.balloon_config(), None);
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
         assert!(controller.boot_source_config().is_none());
         assert!(controller.drive_configs().is_empty());
         assert!(controller.network_interface_configs().is_empty());
         assert!(controller.vsock_config().is_none());
         assert_eq!(controller.entropy_config(), None);
+        assert_eq!(controller.balloon_config(), None);
         assert_eq!(controller.serial_config().serial_out_path(), None);
     }
 
@@ -1432,6 +1473,9 @@ mod tests {
         controller
             .handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
             .expect("entropy config should be stored");
+        controller
+            .handle_action(VmmAction::PutBalloon(balloon_input(64, true)))
+            .expect("balloon config should be stored");
 
         let data = controller
             .handle_action(VmmAction::GetVmConfig)
@@ -1487,6 +1531,10 @@ mod tests {
         assert_eq!(vsock.guest_cid(), 3);
         assert_eq!(vsock.uds_path(), Path::new("./v.sock"));
         assert_eq!(config.entropy_config(), Some(EntropyConfig::new()));
+        assert_eq!(
+            config.balloon_config(),
+            Some(BalloonConfig::from(balloon_input(64, true)))
+        );
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
     }
 
@@ -1515,6 +1563,7 @@ mod tests {
         assert_eq!(config.mmds_config(), None);
         assert_eq!(config.vsock_config(), None);
         assert_eq!(config.entropy_config(), None);
+        assert_eq!(config.balloon_config(), None);
     }
 
     #[test]
@@ -1532,7 +1581,10 @@ mod tests {
             VmmAction::GetBalloonHintingStatus.name(),
             "GetBalloonHintingStatus"
         );
-        assert_eq!(VmmAction::PutBalloon.name(), "PutBalloon");
+        assert_eq!(
+            VmmAction::PutBalloon(balloon_input(64, true)).name(),
+            "PutBalloon"
+        );
         assert_eq!(VmmAction::PatchBalloon.name(), "PatchBalloon");
         assert_eq!(VmmAction::PatchBalloonStats.name(), "PatchBalloonStats");
         assert_eq!(
@@ -1758,7 +1810,7 @@ mod tests {
     }
 
     #[test]
-    fn get_balloon_reaches_balloon_fault_without_mutating() {
+    fn get_balloon_without_config_reaches_balloon_fault_without_mutating() {
         for state in [
             InstanceState::NotStarted,
             InstanceState::Running,
@@ -1779,25 +1831,57 @@ mod tests {
             assert!(controller.boot_source_config().is_some());
             assert!(controller.drive_configs().is_empty());
             assert!(controller.network_interface_configs().is_empty());
+            assert_eq!(controller.balloon_config(), None);
         }
     }
 
     #[test]
-    fn put_balloon_reaches_balloon_fault_before_start_without_mutating() {
+    fn put_balloon_stores_and_replaces_config_before_start() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         controller
             .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
             .expect("boot source config should be stored");
 
-        let err = controller
-            .handle_action(VmmAction::PutBalloon)
-            .expect_err("balloon should remain unsupported");
+        let data = controller
+            .handle_action(VmmAction::PutBalloon(balloon_input(64, true)))
+            .expect("balloon should store before start");
 
-        assert_eq!(err, VmmActionError::BalloonUnsupported);
+        assert_eq!(data, VmmData::Empty);
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
         assert!(controller.boot_source_config().is_some());
         assert!(controller.drive_configs().is_empty());
         assert!(controller.network_interface_configs().is_empty());
+        assert_eq!(
+            controller.balloon_config(),
+            Some(BalloonConfig::from(balloon_input(64, true)))
+        );
+
+        controller
+            .handle_action(VmmAction::PutBalloon(balloon_input(128, false)))
+            .expect("balloon config should be replaceable before start");
+
+        assert_eq!(
+            controller.balloon_config(),
+            Some(BalloonConfig::from(balloon_input(128, false)))
+        );
+    }
+
+    #[test]
+    fn get_balloon_returns_stored_config() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBalloon(balloon_input(64, true)))
+            .expect("balloon config should be stored");
+
+        let data = controller
+            .handle_action(VmmAction::GetBalloon)
+            .expect("stored balloon should be returned");
+
+        assert_eq!(
+            data,
+            VmmData::BalloonConfiguration(BalloonConfig::from(balloon_input(64, true)))
+        );
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
     }
 
     #[test]
@@ -1807,16 +1891,19 @@ mod tests {
             controller
                 .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
                 .expect("boot source config should be stored");
+            controller
+                .handle_action(VmmAction::PutBalloon(balloon_input(64, true)))
+                .expect("initial balloon config should be stored");
             controller.instance_info.state = state;
 
             let err = controller
-                .handle_action(VmmAction::PutBalloon)
+                .handle_action(VmmAction::PutBalloon(balloon_input(128, false)))
                 .expect_err("balloon put should be pre-boot-only");
 
             assert_eq!(
                 err,
                 VmmActionError::UnsupportedState {
-                    action: VmmAction::PutBalloon.name(),
+                    action: VmmAction::PutBalloon(balloon_input(0, false)).name(),
                     state,
                 }
             );
@@ -1824,6 +1911,10 @@ mod tests {
             assert!(controller.boot_source_config().is_some());
             assert!(controller.drive_configs().is_empty());
             assert!(controller.network_interface_configs().is_empty());
+            assert_eq!(
+                controller.balloon_config(),
+                Some(BalloonConfig::from(balloon_input(64, true)))
+            );
         }
     }
 
@@ -2715,6 +2806,29 @@ mod tests {
     }
 
     #[test]
+    fn instance_start_preflight_rejects_configured_balloon_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller
+            .handle_action(VmmAction::PutBalloon(balloon_input(64, true)))
+            .expect("balloon config should be stored");
+
+        let err = controller
+            .preflight_instance_start()
+            .expect_err("configured balloon should fail preflight");
+
+        assert_eq!(err, VmmActionError::BalloonUnsupported);
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert!(controller.boot_source_config().is_some());
+        assert_eq!(
+            controller.balloon_config(),
+            Some(BalloonConfig::from(balloon_input(64, true)))
+        );
+    }
+
+    #[test]
     fn instance_start_preflight_rejects_running_state() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         controller
@@ -2943,6 +3057,33 @@ mod tests {
         assert!(!called.get());
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
         assert!(controller.boot_source_config().is_none());
+    }
+
+    #[test]
+    fn start_instance_with_configured_balloon_does_not_invoke_executor() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller
+            .handle_action(VmmAction::PutBalloon(balloon_input(64, true)))
+            .expect("balloon config should be stored");
+        let called = Cell::new(false);
+
+        let err = controller
+            .start_instance_with(|_| {
+                called.set(true);
+                Ok(())
+            })
+            .expect_err("configured balloon should fail before executor");
+
+        assert_eq!(err, VmmActionError::BalloonUnsupported);
+        assert!(!called.get());
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert_eq!(
+            controller.balloon_config(),
+            Some(BalloonConfig::from(balloon_input(64, true)))
+        );
     }
 
     #[test]
