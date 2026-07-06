@@ -3742,7 +3742,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_metrics_counts_core_parser_failures() {
+    fn configured_metrics_counts_identifiable_parser_failures() {
         let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
         let metrics_path = unique_socket_path("metrics-core-parser").with_extension("metrics");
 
