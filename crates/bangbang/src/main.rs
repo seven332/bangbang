@@ -22,6 +22,7 @@ use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_api::http::{RequestError, parse_request_with_limit};
 use bangbang_hvf::HvfBackend;
 use periodic_metrics::PeriodicMetricsScheduler;
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::{SigId, low_level};
 use vmm::{ProcessSessionExitDecision, ProcessVmm, VmmRequestHandler};
@@ -218,8 +219,7 @@ fn config_file_actions(config_file: &str) -> Result<Vec<VmmAction>, ConfigFileEr
 }
 
 fn config_file_actions_from_str(contents: &str) -> Result<Vec<VmmAction>, ConfigFileError> {
-    let value = serde_json::from_str::<serde_json::Value>(contents)
-        .map_err(|_| ConfigFileError::Malformed)?;
+    let value = parse_config_file_json_value(contents)?;
     let object = value.as_object().ok_or(ConfigFileError::Malformed)?;
 
     validate_config_file_sections(object)?;
@@ -339,6 +339,115 @@ fn config_file_actions_from_str(contents: &str) -> Result<Vec<VmmAction>, Config
                 .ok_or(ConfigFileError::UnsupportedRequest { section })
         })
         .collect()
+}
+
+fn parse_config_file_json_value(contents: &str) -> Result<serde_json::Value, ConfigFileError> {
+    let ConfigFileJsonValue(value) = serde_json::from_str::<ConfigFileJsonValue>(contents)
+        .map_err(|_| ConfigFileError::Malformed)?;
+    Ok(value)
+}
+
+#[derive(Debug)]
+struct ConfigFileJsonValue(serde_json::Value);
+
+impl<'de> serde::Deserialize<'de> for ConfigFileJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer
+            .deserialize_any(ConfigFileJsonValueVisitor)
+            .map(Self)
+    }
+}
+
+#[derive(Debug)]
+struct ConfigFileJsonValueVisitor;
+
+impl<'de> Visitor<'de> for ConfigFileJsonValueVisitor {
+    type Value = serde_json::Value;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Number(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Number(value.into()))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| E::custom("invalid JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(serde_json::Value::String(value.to_string()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::String(value))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        serde::Deserialize::deserialize(deserializer).map(|ConfigFileJsonValue(value)| value)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+
+        while let Some(ConfigFileJsonValue(value)) = sequence.next_element()? {
+            values.push(value);
+        }
+
+        Ok(serde_json::Value::Array(values))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut object = serde_json::Map::new();
+
+        while let Some(key) = map.next_key::<String>()? {
+            if object.contains_key(&key) {
+                return Err(de::Error::custom("duplicate object key"));
+            }
+
+            let ConfigFileJsonValue(value) = map.next_value()?;
+            object.insert(key, value);
+        }
+
+        Ok(serde_json::Value::Object(object))
+    }
 }
 
 fn validate_config_file_sections(
@@ -3031,6 +3140,65 @@ mod tests {
             err,
             super::ConfigFileError::UnknownSection("unknown".to_string())
         );
+    }
+
+    #[test]
+    fn config_file_rejects_duplicate_top_level_supported_section() {
+        let err = super::config_file_actions_from_str(
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"boot-source":{"kernel_image_path":"/tmp/vmlinux-2"}}"#,
+        )
+        .expect_err("duplicate top-level supported section should fail");
+
+        assert_eq!(err, super::ConfigFileError::Malformed);
+    }
+
+    #[test]
+    fn config_file_rejects_duplicate_top_level_recognized_unsupported_section() {
+        let err = super::config_file_actions_from_str(
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"balloon":{},"balloon":{}}"#,
+        )
+        .expect_err("duplicate top-level recognized unsupported section should fail");
+
+        assert_eq!(err, super::ConfigFileError::Malformed);
+    }
+
+    #[test]
+    fn config_file_rejects_duplicate_nested_section_field() {
+        let err = super::config_file_actions_from_str(
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux","kernel_image_path":"/tmp/vmlinux-2"}}"#,
+        )
+        .expect_err("duplicate nested section field should fail");
+
+        assert_eq!(err, super::ConfigFileError::Malformed);
+    }
+
+    #[test]
+    fn config_file_rejects_escaped_duplicate_object_key() {
+        let err = super::config_file_actions_from_str(
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"\u0062oot-source":{"kernel_image_path":"/tmp/vmlinux-2"}}"#,
+        )
+        .expect_err("escaped duplicate object key should fail");
+
+        assert_eq!(err, super::ConfigFileError::Malformed);
+    }
+
+    #[test]
+    fn config_file_rejects_duplicate_array_item_field() {
+        let err = super::config_file_actions_from_str(
+            r#"{
+                "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
+                "drives":[{
+                    "drive_id":"rootfs",
+                    "drive_id":"data",
+                    "path_on_host":"/tmp/rootfs.ext4",
+                    "is_root_device":true,
+                    "is_read_only":true
+                }]
+            }"#,
+        )
+        .expect_err("duplicate array item field should fail");
+
+        assert_eq!(err, super::ConfigFileError::Malformed);
     }
 
     #[test]
