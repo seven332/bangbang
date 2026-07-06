@@ -469,7 +469,10 @@ Firecracker-shaped `rate_limiter` was configured while keeping successful
 and runtime MMIO activation/notification layer can now fill writable guest
 descriptor chains from an injected entropy source under unit tests, including
 malformed-buffer, source-failure, reset, and queue-interrupt completion paths.
-Remaining follow-up PRs should wire startup MMIO layout, FDT attachment, real
+An internal virtio-rng MMIO registration helper can now build the single-queue
+MMIO handler, register it in a fresh or existing dispatcher, and return
+deterministic region metadata for later startup/FDT assembly. Remaining
+follow-up PRs should wire startup MMIO layout consumption, FDT attachment, real
 host randomness ownership, signed executable e2e, and metrics/security docs.
 Entropy device metrics and real rate limiting remain deferred until their
 producers exist. `PUT /entropy` must continue to return unsupported until a

@@ -3,11 +3,14 @@ use std::fmt;
 
 use crate::interrupt::DeviceInterruptKind;
 use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError};
-use crate::mmio::MmioHandlerError;
+use crate::mmio::{
+    MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandlerError, MmioRegion, MmioRegionId,
+};
 use crate::virtio_mmio::{
-    UnsupportedVirtioMmioDeviceConfig, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
-    VirtioMmioDeviceActivationHandler, VirtioMmioQueueRegisterError, VirtioMmioQueueState,
-    VirtioMmioRegisterHandler,
+    UnsupportedVirtioMmioDeviceConfig, VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation,
+    VirtioMmioDeviceActivationError, VirtioMmioDeviceActivationHandler,
+    VirtioMmioQueueRegisterError, VirtioMmioQueueState, VirtioMmioRegisterHandler,
+    VirtioMmioRegisterHandlerError,
 };
 use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
@@ -71,6 +74,236 @@ impl fmt::Display for EntropyConfigError {
 }
 
 impl std::error::Error for EntropyConfigError {}
+
+#[derive(Debug, Default)]
+pub struct PreparedEntropyDevice {
+    device: VirtioRngDevice,
+}
+
+impl PreparedEntropyDevice {
+    pub const fn new() -> Self {
+        Self {
+            device: VirtioRngDevice::new(),
+        }
+    }
+
+    pub const fn device(&self) -> &VirtioRngDevice {
+        &self.device
+    }
+
+    pub fn into_device(self) -> VirtioRngDevice {
+        self.device
+    }
+
+    pub fn register_mmio(
+        self,
+        layout: EntropyMmioLayout,
+    ) -> Result<EntropyMmioDevice, EntropyMmioRegistrationError> {
+        EntropyMmioDevice::from_prepared(self, layout)
+    }
+
+    pub fn register_mmio_with_dispatcher(
+        self,
+        layout: EntropyMmioLayout,
+        dispatcher: MmioDispatcher,
+    ) -> Result<EntropyMmioDevice, EntropyMmioRegistrationError> {
+        EntropyMmioDevice::from_prepared_with_dispatcher(self, layout, dispatcher)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntropyMmioLayout {
+    address: GuestAddress,
+    region_id: MmioRegionId,
+}
+
+impl EntropyMmioLayout {
+    pub const fn new(address: GuestAddress, region_id: MmioRegionId) -> Self {
+        Self { address, region_id }
+    }
+
+    pub const fn address(self) -> GuestAddress {
+        self.address
+    }
+
+    pub const fn region_id(self) -> MmioRegionId {
+        self.region_id
+    }
+
+    fn region(self) -> Result<MmioRegion, EntropyMmioRegistrationError> {
+        MmioRegion::new(self.region_id, self.address, VIRTIO_MMIO_DEVICE_WINDOW_SIZE).map_err(
+            |source| EntropyMmioRegistrationError::InvalidRegion {
+                region_id: self.region_id,
+                address: self.address,
+                source,
+            },
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntropyMmioDeviceRegistration {
+    region: MmioRegion,
+}
+
+impl EntropyMmioDeviceRegistration {
+    pub const fn region(&self) -> MmioRegion {
+        self.region
+    }
+
+    pub const fn region_id(&self) -> MmioRegionId {
+        self.region.id()
+    }
+
+    pub const fn address(&self) -> GuestAddress {
+        self.region.range().start()
+    }
+}
+
+#[derive(Debug)]
+pub struct EntropyMmioDevice {
+    dispatcher: MmioDispatcher,
+    registration: EntropyMmioDeviceRegistration,
+}
+
+impl EntropyMmioDevice {
+    pub fn from_prepared(
+        prepared: PreparedEntropyDevice,
+        layout: EntropyMmioLayout,
+    ) -> Result<Self, EntropyMmioRegistrationError> {
+        Self::from_prepared_with_dispatcher(prepared, layout, MmioDispatcher::new())
+    }
+
+    pub fn from_prepared_with_dispatcher(
+        prepared: PreparedEntropyDevice,
+        layout: EntropyMmioLayout,
+        dispatcher: MmioDispatcher,
+    ) -> Result<Self, EntropyMmioRegistrationError> {
+        let region = layout.region()?;
+        let handler = VirtioRngMmioHandler::with_activation(
+            VIRTIO_RNG_DEVICE_ID,
+            0,
+            &VIRTIO_RNG_QUEUE_SIZES,
+            prepared.into_device(),
+        )
+        .map_err(|source| EntropyMmioRegistrationError::BuildHandler {
+            region_id: layout.region_id(),
+            source,
+        })?;
+        let mut dispatcher = dispatcher;
+        let inserted_region = dispatcher
+            .insert_region(
+                layout.region_id(),
+                layout.address(),
+                VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+            )
+            .map_err(|source| EntropyMmioRegistrationError::InsertRegion {
+                region_id: layout.region_id(),
+                address: layout.address(),
+                source,
+            })?;
+        dispatcher
+            .register_handler(layout.region_id(), handler)
+            .map_err(|source| EntropyMmioRegistrationError::RegisterHandler {
+                region_id: layout.region_id(),
+                source,
+            })?;
+        debug_assert_eq!(inserted_region, region);
+
+        Ok(Self {
+            dispatcher,
+            registration: EntropyMmioDeviceRegistration { region },
+        })
+    }
+
+    pub fn dispatcher(&self) -> &MmioDispatcher {
+        &self.dispatcher
+    }
+
+    pub fn dispatcher_mut(&mut self) -> &mut MmioDispatcher {
+        &mut self.dispatcher
+    }
+
+    pub const fn registration(&self) -> &EntropyMmioDeviceRegistration {
+        &self.registration
+    }
+
+    pub fn into_parts(self) -> (MmioDispatcher, EntropyMmioDeviceRegistration) {
+        (self.dispatcher, self.registration)
+    }
+}
+
+#[derive(Debug)]
+pub enum EntropyMmioRegistrationError {
+    InvalidRegion {
+        region_id: MmioRegionId,
+        address: GuestAddress,
+        source: GuestMemoryError,
+    },
+    BuildHandler {
+        region_id: MmioRegionId,
+        source: VirtioMmioRegisterHandlerError,
+    },
+    InsertRegion {
+        region_id: MmioRegionId,
+        address: GuestAddress,
+        source: MmioBusError,
+    },
+    RegisterHandler {
+        region_id: MmioRegionId,
+        source: MmioDispatchError,
+    },
+}
+
+impl fmt::Display for EntropyMmioRegistrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRegion {
+                region_id,
+                address,
+                source,
+            } => {
+                write!(
+                    f,
+                    "invalid entropy MMIO region id={region_id} at {address}: {source}"
+                )
+            }
+            Self::BuildHandler { region_id, source } => {
+                write!(
+                    f,
+                    "failed to build entropy MMIO handler for region id={region_id}: {source}"
+                )
+            }
+            Self::InsertRegion {
+                region_id,
+                address,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to insert entropy MMIO region id={region_id} at {address}: {source}"
+                )
+            }
+            Self::RegisterHandler { region_id, source } => {
+                write!(
+                    f,
+                    "failed to register entropy MMIO handler for region id={region_id}: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for EntropyMmioRegistrationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidRegion { source, .. } => Some(source),
+            Self::BuildHandler { source, .. } => Some(source),
+            Self::InsertRegion { source, .. } => Some(source),
+            Self::RegisterHandler { source, .. } => Some(source),
+        }
+    }
+}
 
 pub trait VirtioRngEntropySource {
     fn fill_entropy(&mut self, destination: &mut [u8]) -> Result<(), VirtioRngEntropySourceError>;
@@ -1100,13 +1333,17 @@ mod tests {
     use std::error::Error as _;
 
     use crate::interrupt::DeviceInterruptKind;
-    use crate::memory::{GuestMemoryLayout, GuestMemoryRange};
+    use crate::memory::{GuestMemoryError, GuestMemoryLayout, GuestMemoryRange};
+    use crate::mmio::{
+        MmioAccess, MmioAccessBytes, MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandler,
+        MmioHandlerError, MmioHandlerLookupError, MmioRegionId,
+    };
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
         VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
-        VIRTIO_DEVICE_STATUS_INIT, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
-        VirtioMmioDeviceActivationHandler, VirtioMmioDeviceRegisters, VirtioMmioQueueRegisters,
-        VirtioMmioRegister,
+        VIRTIO_DEVICE_STATUS_INIT, VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation,
+        VirtioMmioDeviceActivationError, VirtioMmioDeviceActivationHandler,
+        VirtioMmioDeviceRegisters, VirtioMmioQueueRegisters, VirtioMmioRegister,
     };
     use crate::virtio_queue::{
         VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
@@ -1114,7 +1351,8 @@ mod tests {
     };
 
     use super::{
-        GuestAddress, GuestMemory, VIRTIO_RNG_DEVICE_ID, VIRTIO_RNG_MAX_REQUEST_BYTES,
+        EntropyMmioLayout, EntropyMmioRegistrationError, GuestAddress, GuestMemory,
+        PreparedEntropyDevice, VIRTIO_RNG_DEVICE_ID, VIRTIO_RNG_MAX_REQUEST_BYTES,
         VIRTIO_RNG_QUEUE_SIZES, VirtioRngBufferParseError, VirtioRngDevice,
         VirtioRngDeviceActivationError, VirtioRngDeviceNotificationError, VirtioRngEntropySource,
         VirtioRngEntropySourceError, VirtioRngMmioHandler, VirtioRngQueue,
@@ -1126,6 +1364,7 @@ mod tests {
     const TEST_USED_RING: GuestAddress = GuestAddress::new(0x6000);
     const TEST_DATA: GuestAddress = GuestAddress::new(0x8000);
     const TEST_SECOND_DATA: GuestAddress = GuestAddress::new(0xa000);
+    const TEST_MMIO_BASE: GuestAddress = GuestAddress::new(0x1_0000);
     const TEST_QUEUE_SIZE: u16 = 8;
     const TEST_MEMORY_SIZE: u64 = 0x4_0000;
     const TEST_AVAILABLE_RING_IDX_OFFSET: u64 = 2;
@@ -1138,6 +1377,23 @@ mod tests {
         | VIRTIO_DEVICE_STATUS_DRIVER
         | VIRTIO_DEVICE_STATUS_FEATURES_OK;
     const DRIVER_OK_STATUS: u32 = QUEUE_CONFIG_STATUS | VIRTIO_DEVICE_STATUS_DRIVER_OK;
+
+    #[derive(Debug)]
+    struct OtherMmioHandler;
+
+    impl MmioHandler for OtherMmioHandler {
+        fn read(&mut self, _access: MmioAccess) -> Result<MmioAccessBytes, MmioHandlerError> {
+            MmioAccessBytes::zeroed(1).map_err(|source| MmioHandlerError::new(source.to_string()))
+        }
+
+        fn write(
+            &mut self,
+            _access: MmioAccess,
+            _data: MmioAccessBytes,
+        ) -> Result<(), MmioHandlerError> {
+            Ok(())
+        }
+    }
 
     #[derive(Debug, Default)]
     struct TestEntropySource {
@@ -1227,6 +1483,14 @@ mod tests {
             VirtioRngDevice::new(),
         )
         .expect("virtio-rng MMIO handler should build")
+    }
+
+    fn entropy_mmio_layout() -> EntropyMmioLayout {
+        entropy_mmio_layout_at(TEST_MMIO_BASE, 7)
+    }
+
+    fn entropy_mmio_layout_at(address: GuestAddress, region_id: u64) -> EntropyMmioLayout {
+        EntropyMmioLayout::new(address, MmioRegionId::new(region_id))
     }
 
     fn configure_rng_mmio_handler_queue(
@@ -1469,6 +1733,178 @@ mod tests {
             .read_slice(&mut bytes, address)
             .expect("guest bytes should read");
         bytes
+    }
+
+    #[test]
+    fn prepared_entropy_device_registers_mmio_handler_in_fresh_dispatcher() {
+        let layout = entropy_mmio_layout();
+
+        let device = PreparedEntropyDevice::new()
+            .register_mmio(layout)
+            .expect("entropy MMIO registration should succeed");
+        let registration = *device.registration();
+
+        assert_eq!(registration.region_id(), layout.region_id());
+        assert_eq!(registration.address(), layout.address());
+        assert_eq!(
+            registration.region().range().size(),
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE
+        );
+        assert_eq!(device.dispatcher().regions(), &[registration.region()]);
+
+        let (mut dispatcher, registration) = device.into_parts();
+        dispatcher
+            .handler_mut::<VirtioRngMmioHandler>(registration.region_id())
+            .expect("registered entropy handler should have the expected type");
+    }
+
+    #[test]
+    fn prepared_entropy_device_registers_mmio_handler_in_existing_dispatcher() {
+        let mut dispatcher = MmioDispatcher::new();
+        let existing_region = dispatcher
+            .insert_region(MmioRegionId::new(1), GuestAddress::new(0x8000), 0x1000)
+            .expect("existing region should insert");
+        let layout = entropy_mmio_layout_at(GuestAddress::new(0x1_0000), 2);
+
+        let device = PreparedEntropyDevice::new()
+            .register_mmio_with_dispatcher(layout, dispatcher)
+            .expect("entropy MMIO registration should succeed");
+
+        assert_eq!(
+            device.dispatcher().regions(),
+            &[existing_region, device.registration().region()]
+        );
+    }
+
+    #[test]
+    fn prepared_entropy_device_rejects_invalid_mmio_region() {
+        let layout = entropy_mmio_layout_at(GuestAddress::new(u64::MAX), 3);
+
+        let error = PreparedEntropyDevice::new()
+            .register_mmio(layout)
+            .expect_err("overflowing MMIO region should fail");
+
+        match error {
+            EntropyMmioRegistrationError::InvalidRegion {
+                region_id,
+                address,
+                source,
+            } => {
+                assert_eq!(region_id, layout.region_id());
+                assert_eq!(address, layout.address());
+                assert!(matches!(source, GuestMemoryError::AddressOverflow { .. }));
+            }
+            source => panic!("unexpected error: {source}"),
+        }
+    }
+
+    #[test]
+    fn prepared_entropy_device_rejects_overlapping_mmio_region() {
+        let layout = entropy_mmio_layout();
+        let mut dispatcher = MmioDispatcher::new();
+        dispatcher
+            .insert_region(
+                MmioRegionId::new(1),
+                layout.address(),
+                VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+            )
+            .expect("existing region should insert");
+
+        let error = PreparedEntropyDevice::new()
+            .register_mmio_with_dispatcher(layout, dispatcher)
+            .expect_err("overlapping region should fail");
+
+        assert!(matches!(
+            error,
+            EntropyMmioRegistrationError::InsertRegion {
+                source: MmioBusError::OverlappingRegion { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn prepared_entropy_device_rejects_duplicate_mmio_handler() {
+        let layout = entropy_mmio_layout();
+        let mut dispatcher = MmioDispatcher::new();
+        dispatcher
+            .register_handler(layout.region_id(), OtherMmioHandler)
+            .expect("existing handler should register");
+
+        let error = PreparedEntropyDevice::new()
+            .register_mmio_with_dispatcher(layout, dispatcher)
+            .expect_err("duplicate handler should fail");
+
+        assert!(matches!(
+            error,
+            EntropyMmioRegistrationError::RegisterHandler {
+                region_id,
+                source: MmioDispatchError::DuplicateHandler { .. },
+            } if region_id == layout.region_id()
+        ));
+    }
+
+    #[test]
+    fn prepared_entropy_device_preserves_typed_handler_lookup() {
+        let layout = entropy_mmio_layout();
+        let device = PreparedEntropyDevice::new()
+            .register_mmio(layout)
+            .expect("entropy MMIO registration should succeed");
+        let (mut dispatcher, registration) = device.into_parts();
+
+        let error = dispatcher
+            .handler_mut::<OtherMmioHandler>(registration.region_id())
+            .expect_err("wrong handler type lookup should fail");
+
+        assert_eq!(
+            error,
+            MmioHandlerLookupError::UnexpectedHandlerType {
+                region_id: registration.region_id(),
+                expected: std::any::type_name::<OtherMmioHandler>(),
+            }
+        );
+    }
+
+    #[test]
+    fn prepared_entropy_device_registrations_are_independent() {
+        let first = PreparedEntropyDevice::new()
+            .register_mmio(entropy_mmio_layout_at(GuestAddress::new(0x1_0000), 10))
+            .expect("first entropy MMIO registration should succeed");
+        let second = PreparedEntropyDevice::new()
+            .register_mmio(entropy_mmio_layout_at(GuestAddress::new(0x2_0000), 11))
+            .expect("second entropy MMIO registration should succeed");
+        let (mut first_dispatcher, first_registration) = first.into_parts();
+        let (mut second_dispatcher, second_registration) = second.into_parts();
+
+        let first_handler = first_dispatcher
+            .handler_mut::<VirtioRngMmioHandler>(first_registration.region_id())
+            .expect("first entropy handler should exist");
+        configure_rng_mmio_handler_queue(first_handler, TEST_USED_RING);
+        activate_rng_mmio_handler(first_handler);
+
+        let second_handler = second_dispatcher
+            .handler_mut::<VirtioRngMmioHandler>(second_registration.region_id())
+            .expect("second entropy handler should exist");
+        assert!(!second_handler.activation_handler().is_activated());
+        assert_ne!(
+            first_registration.region_id(),
+            second_registration.region_id()
+        );
+        assert_ne!(first_registration.address(), second_registration.address());
+    }
+
+    #[test]
+    fn displays_entropy_mmio_registration_errors_and_preserves_sources() {
+        let error = PreparedEntropyDevice::new()
+            .register_mmio(entropy_mmio_layout_at(GuestAddress::new(u64::MAX), 12))
+            .expect_err("overflowing MMIO region should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid entropy MMIO region id=12")
+        );
+        assert!(error.source().is_some());
     }
 
     #[test]
