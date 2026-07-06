@@ -369,7 +369,7 @@ pub struct MachineConfigRequest {
     mem_size_mib: u64,
     smt: bool,
     cpu_template: Option<MachineConfigCpuTemplate>,
-    cpu_template_configured: bool,
+    cpu_template_field_present: bool,
     track_dirty_pages: bool,
     huge_pages: MachineConfigHugePages,
 }
@@ -391,8 +391,8 @@ impl MachineConfigRequest {
         self.cpu_template
     }
 
-    pub const fn cpu_template_configured(&self) -> bool {
-        self.cpu_template_configured
+    pub const fn cpu_template_field_present(&self) -> bool {
+        self.cpu_template_field_present
     }
 
     pub const fn track_dirty_pages(&self) -> bool {
@@ -410,7 +410,7 @@ pub struct MachineConfigPatchRequest {
     mem_size_mib: Option<u64>,
     smt: Option<bool>,
     cpu_template: Option<MachineConfigCpuTemplate>,
-    cpu_template_configured: bool,
+    cpu_template_field_present: bool,
     track_dirty_pages: Option<bool>,
     huge_pages: Option<MachineConfigHugePages>,
 }
@@ -432,8 +432,8 @@ impl MachineConfigPatchRequest {
         self.cpu_template
     }
 
-    pub const fn cpu_template_configured(&self) -> bool {
-        self.cpu_template_configured
+    pub const fn cpu_template_field_present(&self) -> bool {
+        self.cpu_template_field_present
     }
 
     pub const fn track_dirty_pages(&self) -> Option<bool> {
@@ -2239,7 +2239,7 @@ fn json_object_contains_key(value: &serde_json::Value, key: &str) -> bool {
 fn parse_machine_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
     let value = serde_json::from_slice::<serde_json::Value>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
-    let cpu_template_configured = json_object_contains_key(&value, "cpu_template");
+    let cpu_template_field_present = json_object_contains_key(&value, "cpu_template");
     let body = serde_json::from_value::<MachineConfigRequestBody>(value)
         .map_err(|_| RequestError::MalformedRequest)?;
 
@@ -2251,7 +2251,7 @@ fn parse_machine_config_request(body: &[u8]) -> Result<ApiRequest, RequestError>
             mem_size_mib: body.mem_size_mib,
             smt: body.smt,
             cpu_template: body.cpu_template,
-            cpu_template_configured,
+            cpu_template_field_present,
             track_dirty_pages: body.track_dirty_pages,
             huge_pages: body.huge_pages,
         },
@@ -2261,7 +2261,7 @@ fn parse_machine_config_request(body: &[u8]) -> Result<ApiRequest, RequestError>
 fn parse_machine_config_patch_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
     let value = serde_json::from_slice::<serde_json::Value>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
-    let cpu_template_configured = json_object_contains_key(&value, "cpu_template");
+    let cpu_template_field_present = json_object_contains_key(&value, "cpu_template");
     let body = serde_json::from_value::<MachineConfigPatchRequestBody>(value)
         .map_err(|_| RequestError::MalformedRequest)?;
 
@@ -2273,7 +2273,7 @@ fn parse_machine_config_patch_request(body: &[u8]) -> Result<ApiRequest, Request
             mem_size_mib: body.mem_size_mib,
             smt: body.smt,
             cpu_template: body.cpu_template,
-            cpu_template_configured,
+            cpu_template_field_present,
             track_dirty_pages: body.track_dirty_pages,
             huge_pages: body.huge_pages,
         },
@@ -3134,7 +3134,7 @@ mod tests {
         assert_eq!(config.mem_size_mib(), 128);
         assert!(!config.smt());
         assert_eq!(config.cpu_template(), None);
-        assert!(!config.cpu_template_configured());
+        assert!(!config.cpu_template_field_present());
         assert!(!config.track_dirty_pages());
         assert_eq!(config.huge_pages(), MachineConfigHugePages::None);
         assert_eq!(request_total_len(&request), Ok(Some(request.len())));
@@ -3160,7 +3160,7 @@ mod tests {
         assert_eq!(config.vcpu_count(), 32);
         assert_eq!(config.mem_size_mib(), 1024);
         assert_eq!(config.cpu_template(), Some(MachineConfigCpuTemplate::None));
-        assert!(config.cpu_template_configured());
+        assert!(config.cpu_template_field_present());
         assert_eq!(config.huge_pages(), MachineConfigHugePages::None);
     }
 
@@ -3179,7 +3179,7 @@ mod tests {
             panic!("expected machine-config request");
         };
         assert_eq!(config.cpu_template(), None);
-        assert!(config.cpu_template_configured());
+        assert!(config.cpu_template_field_present());
     }
 
     #[test]
@@ -3202,7 +3202,7 @@ mod tests {
                 panic!("expected machine-config request");
             };
             assert_eq!(config.cpu_template(), Some(expected), "{template}");
-            assert!(config.cpu_template_configured(), "{template}");
+            assert!(config.cpu_template_field_present(), "{template}");
         }
     }
 
@@ -3336,7 +3336,7 @@ mod tests {
         assert_eq!(config.mem_size_mib(), Some(512));
         assert_eq!(config.smt(), None);
         assert_eq!(config.cpu_template(), Some(MachineConfigCpuTemplate::None));
-        assert!(config.cpu_template_configured());
+        assert!(config.cpu_template_field_present());
         assert_eq!(config.track_dirty_pages(), None);
         assert_eq!(config.huge_pages(), None);
         assert_eq!(request_total_len(&request), Ok(Some(request.len())));
@@ -3361,7 +3361,7 @@ mod tests {
                 panic!("expected machine-config patch request");
             };
             assert_eq!(config.cpu_template(), Some(expected), "{template}");
-            assert!(config.cpu_template_configured(), "{template}");
+            assert!(config.cpu_template_field_present(), "{template}");
         }
     }
 
@@ -3401,7 +3401,7 @@ mod tests {
         assert_eq!(config.vcpu_count(), Some(2));
         assert_eq!(config.smt(), None);
         assert_eq!(config.cpu_template(), None);
-        assert!(config.cpu_template_configured());
+        assert!(config.cpu_template_field_present());
     }
 
     #[test]

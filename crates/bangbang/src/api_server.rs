@@ -632,8 +632,8 @@ fn record_deprecated_api_usage(request: &ApiRequest, vmm: &mut impl VmmRequestHa
 
 fn request_uses_deprecated_api(request: &ApiRequest) -> bool {
     match request {
-        ApiRequest::PutMachineConfig(config) => config.cpu_template_configured(),
-        ApiRequest::PatchMachineConfig(config) => config.cpu_template_configured(),
+        ApiRequest::PutMachineConfig(config) => config.cpu_template_field_present(),
+        ApiRequest::PatchMachineConfig(config) => config.cpu_template_field_present(),
         ApiRequest::PutMmdsConfig(config) => config.version() == ApiMmdsVersion::V1,
         ApiRequest::PutSnapshotLoad(config) => config.deprecated_fields_used(),
         ApiRequest::PutVsock(config) => config.vsock_id().is_some(),
