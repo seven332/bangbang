@@ -742,10 +742,9 @@ impl VmmController {
             VmmAction::GetMachineConfig => Ok(VmmData::MachineConfiguration(self.machine_config)),
             VmmAction::GetMmds => self
                 .mmds_state
-                .with(mmds::MmdsState::get_data)
-                .map_err(VmmActionError::MmdsState)?
+                .with(mmds::MmdsState::get_data_or_null)
                 .map(VmmData::MmdsValue)
-                .map_err(VmmActionError::MmdsDataStore),
+                .map_err(VmmActionError::MmdsState),
             VmmAction::GetVmConfig => self
                 .vm_config()
                 .map(VmmData::VmConfiguration)
@@ -1169,7 +1168,7 @@ mod tests {
         metrics::{MetricsConfigError, MetricsConfigInput, MetricsDiagnostics},
         mmds::{
             MMDS_DATA_STORE_LIMIT_BYTES, MmdsConfigError, MmdsConfigInput, MmdsContentInput,
-            MmdsDataStoreError, MmdsVersion,
+            MmdsDataStoreError, MmdsState, MmdsVersion,
         },
         network::{
             GuestMacAddress, MAX_NETWORK_INTERFACE_COUNT, NetworkInterfaceConfigError,
@@ -2283,16 +2282,12 @@ mod tests {
     }
 
     #[test]
-    fn get_mmds_requires_initialized_data_store_without_mutating() {
+    fn get_mmds_returns_null_before_initialization_without_mutating() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
 
-        let err = controller
-            .handle_action(VmmAction::GetMmds)
-            .expect_err("uninitialized MMDS data store should fail");
-
         assert_eq!(
-            err,
-            VmmActionError::MmdsDataStore(MmdsDataStoreError::NotInitialized)
+            controller.handle_action(VmmAction::GetMmds),
+            Ok(VmmData::MmdsValue(serde_json::Value::Null))
         );
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
         assert_eq!(controller.machine_config().vcpu_count(), DEFAULT_VCPU_COUNT);
@@ -2385,10 +2380,12 @@ mod tests {
             VmmActionError::MmdsDataStore(MmdsDataStoreError::NotInitialized)
         );
         assert_eq!(
+            controller.mmds_state.with(MmdsState::get_data),
+            Ok(Err(MmdsDataStoreError::NotInitialized))
+        );
+        assert_eq!(
             controller.handle_action(VmmAction::GetMmds),
-            Err(VmmActionError::MmdsDataStore(
-                MmdsDataStoreError::NotInitialized
-            ))
+            Ok(VmmData::MmdsValue(serde_json::Value::Null))
         );
     }
 
@@ -2406,9 +2403,7 @@ mod tests {
         );
         assert_eq!(
             controller.handle_action(VmmAction::GetMmds),
-            Err(VmmActionError::MmdsDataStore(
-                MmdsDataStoreError::NotInitialized
-            ))
+            Ok(VmmData::MmdsValue(serde_json::Value::Null))
         );
     }
 
@@ -2500,9 +2495,11 @@ mod tests {
         );
         assert_eq!(
             controller.handle_action(VmmAction::GetMmds),
-            Err(VmmActionError::MmdsDataStore(
-                MmdsDataStoreError::NotInitialized
-            ))
+            Ok(VmmData::MmdsValue(serde_json::Value::Null))
+        );
+        assert_eq!(
+            controller.mmds_state.with(MmdsState::get_data),
+            Ok(Err(MmdsDataStoreError::NotInitialized))
         );
     }
 

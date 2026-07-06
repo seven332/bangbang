@@ -2169,14 +2169,8 @@ mod tests {
         let get_response =
             handle_request_bytes(b"GET /mmds HTTP/1.1\r\nHost: localhost\r\n\r\n", &mut vmm);
 
-        assert_eq!(
-            get_response.status(),
-            bangbang_api::http::StatusCode::BadRequest
-        );
-        assert_eq!(
-            get_response.body(),
-            r#"{"fault_message":"The MMDS data store is not initialized."}"#
-        );
+        assert_eq!(get_response.status(), bangbang_api::http::StatusCode::Ok);
+        assert_eq!(get_response.body(), "null");
 
         let network_body = r#"{"iface_id":"eth0","host_dev_name":"tap0"}"#;
         let network_request = format!(
@@ -2294,10 +2288,8 @@ mod tests {
         );
         let get_response =
             handle_request_bytes(b"GET /mmds HTTP/1.1\r\nHost: localhost\r\n\r\n", &mut vmm);
-        assert_eq!(
-            get_response.body(),
-            r#"{"fault_message":"The MMDS data store is not initialized."}"#
-        );
+        assert_eq!(get_response.status(), bangbang_api::http::StatusCode::Ok);
+        assert_eq!(get_response.body(), "null");
     }
 
     #[test]
@@ -3427,7 +3419,8 @@ mod tests {
             "g-d",
             "GET /mmds HTTP/1.1\r\nHost: localhost\r\n\r\n",
         );
-        assert!(mmds_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(mmds_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(mmds_response.ends_with("\r\n\r\nnull"));
         let vm_config_response = request_over_socket(
             &mut vmm,
             "g-c",
