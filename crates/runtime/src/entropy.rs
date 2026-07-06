@@ -1,4 +1,20 @@
+use std::collections::TryReserveError;
 use std::fmt;
+
+use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError};
+use crate::virtio_mmio::VirtioMmioQueueState;
+use crate::virtio_queue::{
+    VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
+    VirtqueueDescriptorChain, VirtqueueNotificationSuppression, VirtqueueUsedRing,
+    VirtqueueUsedRingError, VirtqueueUsedRingPublication,
+};
+
+pub const VIRTIO_RNG_DEVICE_ID: u32 = 4;
+pub const VIRTIO_RNG_QUEUE_INDEX: u16 = 0;
+pub const VIRTIO_RNG_QUEUE_COUNT: usize = 1;
+pub const VIRTIO_RNG_MAX_REQUEST_BYTES: usize = 64 * 1024;
+
+const VIRTIO_RNG_MAX_REQUEST_BYTES_U64: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntropyConfigInput {
@@ -42,3 +58,1527 @@ impl fmt::Display for EntropyConfigError {
 }
 
 impl std::error::Error for EntropyConfigError {}
+
+pub trait VirtioRngEntropySource {
+    fn fill_entropy(&mut self, destination: &mut [u8]) -> Result<(), VirtioRngEntropySourceError>;
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VirtioRngEntropySourceError;
+
+impl VirtioRngEntropySourceError {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl fmt::Display for VirtioRngEntropySourceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("virtio-rng entropy source failed")
+    }
+}
+
+impl std::error::Error for VirtioRngEntropySourceError {}
+
+#[derive(Debug)]
+pub enum VirtioRngQueueBuildError {
+    QueueNotReady,
+    AvailableRing { source: VirtqueueAvailableRingError },
+    UsedRing { source: VirtqueueUsedRingError },
+}
+
+impl fmt::Display for VirtioRngQueueBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::QueueNotReady => f.write_str("virtio-rng queue is not ready"),
+            Self::AvailableRing { source } => {
+                write!(
+                    f,
+                    "failed to build virtio-rng available ring from queue state: {source}"
+                )
+            }
+            Self::UsedRing { source } => {
+                write!(
+                    f,
+                    "failed to build virtio-rng used ring from queue state: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioRngQueueBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AvailableRing { source } => Some(source),
+            Self::UsedRing { source } => Some(source),
+            Self::QueueNotReady => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioRngQueue {
+    available: VirtqueueAvailableRing,
+    used: VirtqueueUsedRing,
+}
+
+impl VirtioRngQueue {
+    pub const fn new(available: VirtqueueAvailableRing, used: VirtqueueUsedRing) -> Self {
+        Self { available, used }
+    }
+
+    pub fn from_mmio_queue_state(
+        queue: &VirtioMmioQueueState,
+    ) -> Result<Self, VirtioRngQueueBuildError> {
+        if !queue.ready() {
+            return Err(VirtioRngQueueBuildError::QueueNotReady);
+        }
+
+        let available = VirtqueueAvailableRing::new(
+            queue.descriptor_table(),
+            queue.driver_ring(),
+            queue.size(),
+        )
+        .map_err(|source| VirtioRngQueueBuildError::AvailableRing { source })?;
+        let used = VirtqueueUsedRing::new(queue.device_ring(), queue.size())
+            .map_err(|source| VirtioRngQueueBuildError::UsedRing { source })?;
+
+        Ok(Self { available, used })
+    }
+
+    pub const fn available_ring(&self) -> &VirtqueueAvailableRing {
+        &self.available
+    }
+
+    pub const fn used_ring(&self) -> &VirtqueueUsedRing {
+        &self.used
+    }
+
+    pub fn dispatch_with_source(
+        &mut self,
+        memory: &mut GuestMemory,
+        entropy_source: &mut (impl VirtioRngEntropySource + ?Sized),
+    ) -> Result<VirtioRngQueueDispatch, VirtioRngQueueDispatchError> {
+        let mut dispatch = VirtioRngQueueDispatch::default();
+        let mut entropy_buffer = Vec::new();
+
+        while let Some(chain) = match self.available.pop_descriptor_chain(memory) {
+            Ok(chain) => chain,
+            Err(source) => {
+                return Err(VirtioRngQueueDispatchError::AvailableRing {
+                    completed_dispatch: Box::new(dispatch),
+                    source,
+                });
+            }
+        } {
+            let descriptor_head = match descriptor_chain_head(&chain) {
+                Some(descriptor_head) => descriptor_head,
+                None => {
+                    return Err(VirtioRngQueueDispatchError::EmptyDescriptorChain {
+                        completed_dispatch: Box::new(dispatch),
+                    });
+                }
+            };
+
+            let (bytes_written_to_guest, outcome) = match VirtioRngBuffer::parse(memory, &chain) {
+                Ok(buffer) => {
+                    match fill_entropy_buffer(memory, &buffer, entropy_source, &mut entropy_buffer)
+                    {
+                        Ok(bytes_written_to_guest) => (
+                            bytes_written_to_guest,
+                            VirtioRngQueueDispatchOutcome::Filled {
+                                bytes_written_to_guest,
+                            },
+                        ),
+                        Err(VirtioRngFillError::EntropyBufferAllocation {
+                            requested_len,
+                            source,
+                        }) => {
+                            return Err(VirtioRngQueueDispatchError::EntropyBufferAllocation {
+                                completed_dispatch: Box::new(dispatch),
+                                requested_len,
+                                source,
+                            });
+                        }
+                        Err(VirtioRngFillError::CompletedLengthTooLarge { len }) => {
+                            return Err(VirtioRngQueueDispatchError::CompletedLengthTooLarge {
+                                completed_dispatch: Box::new(dispatch),
+                                len,
+                            });
+                        }
+                        Err(VirtioRngFillError::Source(source)) => {
+                            (0, VirtioRngQueueDispatchOutcome::SourceError(source))
+                        }
+                        Err(VirtioRngFillError::BufferWrite(source)) => {
+                            return Err(VirtioRngQueueDispatchError::BufferWrite {
+                                completed_dispatch: Box::new(dispatch),
+                                descriptor_head,
+                                source,
+                            });
+                        }
+                    }
+                }
+                Err(source) => (0, VirtioRngQueueDispatchOutcome::BufferParseError(source)),
+            };
+
+            let publication = match self.used.publish_used_element_with_notification(
+                memory,
+                descriptor_head,
+                bytes_written_to_guest,
+                VirtqueueNotificationSuppression::Disabled,
+            ) {
+                Ok(publication) => publication,
+                Err(source) => {
+                    return Err(VirtioRngQueueDispatchError::UsedRing {
+                        completed_dispatch: Box::new(dispatch),
+                        descriptor_head,
+                        bytes_written_to_guest,
+                        source,
+                    });
+                }
+            };
+
+            dispatch.record(outcome, publication);
+        }
+
+        Ok(dispatch)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct VirtioRngQueueDispatch {
+    processed_requests: usize,
+    successful_requests: usize,
+    buffer_parse_failures: usize,
+    source_failures: usize,
+    bytes_written_to_guest: u64,
+    first_buffer_parse_failure: Option<VirtioRngBufferParseError>,
+    first_source_failure: Option<VirtioRngEntropySourceError>,
+    needs_queue_interrupt: bool,
+}
+
+impl VirtioRngQueueDispatch {
+    pub const fn processed_requests(&self) -> usize {
+        self.processed_requests
+    }
+
+    pub const fn successful_requests(&self) -> usize {
+        self.successful_requests
+    }
+
+    pub const fn buffer_parse_failures(&self) -> usize {
+        self.buffer_parse_failures
+    }
+
+    pub const fn source_failures(&self) -> usize {
+        self.source_failures
+    }
+
+    pub const fn bytes_written_to_guest(&self) -> u64 {
+        self.bytes_written_to_guest
+    }
+
+    pub const fn first_buffer_parse_failure(&self) -> Option<&VirtioRngBufferParseError> {
+        self.first_buffer_parse_failure.as_ref()
+    }
+
+    pub const fn first_source_failure(&self) -> Option<VirtioRngEntropySourceError> {
+        self.first_source_failure
+    }
+
+    pub const fn needs_queue_interrupt(&self) -> bool {
+        self.needs_queue_interrupt
+    }
+
+    fn record(
+        &mut self,
+        outcome: VirtioRngQueueDispatchOutcome,
+        publication: VirtqueueUsedRingPublication,
+    ) {
+        self.processed_requests += 1;
+        self.needs_queue_interrupt |= publication.needs_queue_interrupt();
+        match outcome {
+            VirtioRngQueueDispatchOutcome::Filled {
+                bytes_written_to_guest,
+            } => {
+                self.successful_requests += 1;
+                self.bytes_written_to_guest += u64::from(bytes_written_to_guest);
+            }
+            VirtioRngQueueDispatchOutcome::BufferParseError(source) => {
+                self.buffer_parse_failures += 1;
+                if self.first_buffer_parse_failure.is_none() {
+                    self.first_buffer_parse_failure = Some(source);
+                }
+            }
+            VirtioRngQueueDispatchOutcome::SourceError(source) => {
+                self.source_failures += 1;
+                if self.first_source_failure.is_none() {
+                    self.first_source_failure = Some(source);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum VirtioRngQueueDispatchOutcome {
+    Filled { bytes_written_to_guest: u32 },
+    BufferParseError(VirtioRngBufferParseError),
+    SourceError(VirtioRngEntropySourceError),
+}
+
+#[derive(Debug)]
+pub enum VirtioRngQueueDispatchError {
+    EntropyBufferAllocation {
+        completed_dispatch: Box<VirtioRngQueueDispatch>,
+        requested_len: usize,
+        source: TryReserveError,
+    },
+    CompletedLengthTooLarge {
+        completed_dispatch: Box<VirtioRngQueueDispatch>,
+        len: usize,
+    },
+    AvailableRing {
+        completed_dispatch: Box<VirtioRngQueueDispatch>,
+        source: VirtqueueAvailableRingError,
+    },
+    EmptyDescriptorChain {
+        completed_dispatch: Box<VirtioRngQueueDispatch>,
+    },
+    UsedRing {
+        completed_dispatch: Box<VirtioRngQueueDispatch>,
+        descriptor_head: u16,
+        bytes_written_to_guest: u32,
+        source: VirtqueueUsedRingError,
+    },
+    BufferWrite {
+        completed_dispatch: Box<VirtioRngQueueDispatch>,
+        descriptor_head: u16,
+        source: VirtioRngBufferWriteError,
+    },
+}
+
+impl VirtioRngQueueDispatchError {
+    pub const fn completed_dispatch(&self) -> &VirtioRngQueueDispatch {
+        match self {
+            Self::EntropyBufferAllocation {
+                completed_dispatch, ..
+            }
+            | Self::CompletedLengthTooLarge {
+                completed_dispatch, ..
+            }
+            | Self::AvailableRing {
+                completed_dispatch, ..
+            }
+            | Self::EmptyDescriptorChain {
+                completed_dispatch, ..
+            }
+            | Self::UsedRing {
+                completed_dispatch, ..
+            }
+            | Self::BufferWrite {
+                completed_dispatch, ..
+            } => completed_dispatch,
+        }
+    }
+}
+
+impl fmt::Display for VirtioRngQueueDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EntropyBufferAllocation {
+                requested_len,
+                source,
+                ..
+            } => {
+                write!(
+                    f,
+                    "failed to reserve {requested_len} bytes for virtio-rng entropy: {source}"
+                )
+            }
+            Self::CompletedLengthTooLarge { len, .. } => {
+                write!(
+                    f,
+                    "virtio-rng completed entropy length {len} exceeds used-ring length field"
+                )
+            }
+            Self::AvailableRing { source, .. } => {
+                write!(
+                    f,
+                    "failed to pop virtio-rng available descriptor chain: {source}"
+                )
+            }
+            Self::EmptyDescriptorChain { .. } => {
+                f.write_str("virtio-rng queue produced an empty descriptor chain")
+            }
+            Self::UsedRing {
+                descriptor_head,
+                bytes_written_to_guest,
+                source,
+                ..
+            } => {
+                write!(
+                    f,
+                    "failed to publish virtio-rng used descriptor head {descriptor_head} with length {bytes_written_to_guest}: {source}"
+                )
+            }
+            Self::BufferWrite {
+                descriptor_head,
+                source,
+                ..
+            } => {
+                write!(
+                    f,
+                    "failed to write virtio-rng entropy into descriptor head {descriptor_head}: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioRngQueueDispatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::EntropyBufferAllocation { source, .. } => Some(source),
+            Self::AvailableRing { source, .. } => Some(source),
+            Self::UsedRing { source, .. } => Some(source),
+            Self::BufferWrite { source, .. } => Some(source),
+            Self::CompletedLengthTooLarge { .. } | Self::EmptyDescriptorChain { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct VirtioRngBuffer {
+    len: u64,
+    segments: Vec<VirtioRngBufferSegment>,
+}
+
+impl VirtioRngBuffer {
+    fn parse(
+        memory: &GuestMemory,
+        chain: &VirtqueueDescriptorChain,
+    ) -> Result<Self, VirtioRngBufferParseError> {
+        let mut segments = Vec::new();
+        segments.try_reserve_exact(chain.len()).map_err(|source| {
+            VirtioRngBufferParseError::BufferSegmentsAllocationFailed {
+                descriptor_count: chain.len(),
+                source,
+            }
+        })?;
+
+        let mut len = 0_u64;
+        for descriptor in chain.descriptors() {
+            let segment = VirtioRngBufferSegment::parse(memory, *descriptor)?;
+            len = len.checked_add(segment.len()).ok_or(
+                VirtioRngBufferParseError::BufferLengthOverflow {
+                    current: len,
+                    len: descriptor.len(),
+                },
+            )?;
+            segments.push(segment);
+        }
+
+        Ok(Self { len, segments })
+    }
+
+    const fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+#[derive(Debug)]
+struct VirtioRngBufferSegment {
+    descriptor_index: u16,
+    address: GuestAddress,
+    len: u32,
+}
+
+impl VirtioRngBufferSegment {
+    fn parse(
+        memory: &GuestMemory,
+        descriptor: VirtqueueDescriptor,
+    ) -> Result<Self, VirtioRngBufferParseError> {
+        if !descriptor.is_write_only() {
+            return Err(VirtioRngBufferParseError::BufferDescriptorReadOnly {
+                index: descriptor.index(),
+            });
+        }
+        if descriptor.is_empty() {
+            return Err(VirtioRngBufferParseError::BufferDescriptorEmpty {
+                index: descriptor.index(),
+            });
+        }
+
+        let range =
+            crate::memory::GuestMemoryRange::new(descriptor.address(), u64::from(descriptor.len()))
+                .map_err(|source| VirtioRngBufferParseError::BufferDescriptorRange {
+                    index: descriptor.index(),
+                    address: descriptor.address(),
+                    len: descriptor.len(),
+                    source,
+                })?;
+        memory.validate_mapped_range(range).map_err(|source| {
+            VirtioRngBufferParseError::BufferDescriptorAccess {
+                index: descriptor.index(),
+                address: descriptor.address(),
+                len: descriptor.len(),
+                source,
+            }
+        })?;
+
+        Ok(Self {
+            descriptor_index: descriptor.index(),
+            address: descriptor.address(),
+            len: descriptor.len(),
+        })
+    }
+
+    fn len(&self) -> u64 {
+        u64::from(self.len)
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioRngBufferParseError {
+    BufferDescriptorReadOnly {
+        index: u16,
+    },
+    BufferDescriptorEmpty {
+        index: u16,
+    },
+    BufferDescriptorRange {
+        index: u16,
+        address: GuestAddress,
+        len: u32,
+        source: GuestMemoryError,
+    },
+    BufferDescriptorAccess {
+        index: u16,
+        address: GuestAddress,
+        len: u32,
+        source: GuestMemoryAccessError,
+    },
+    BufferLengthOverflow {
+        current: u64,
+        len: u32,
+    },
+    BufferSegmentsAllocationFailed {
+        descriptor_count: usize,
+        source: TryReserveError,
+    },
+}
+
+impl fmt::Display for VirtioRngBufferParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BufferDescriptorReadOnly { index } => {
+                write!(f, "virtio-rng buffer descriptor {index} is read-only")
+            }
+            Self::BufferDescriptorEmpty { index } => {
+                write!(f, "virtio-rng buffer descriptor {index} is empty")
+            }
+            Self::BufferDescriptorRange {
+                index,
+                address,
+                len,
+                source,
+            } => {
+                write!(
+                    f,
+                    "virtio-rng buffer descriptor {index} at {address} with length {len} is invalid: {source}"
+                )
+            }
+            Self::BufferDescriptorAccess {
+                index,
+                address,
+                len,
+                source,
+            } => {
+                write!(
+                    f,
+                    "virtio-rng buffer descriptor {index} at {address} with length {len} is not fully mapped: {source}"
+                )
+            }
+            Self::BufferLengthOverflow { current, len } => {
+                write!(
+                    f,
+                    "virtio-rng buffer length {current} overflows when adding descriptor length {len}"
+                )
+            }
+            Self::BufferSegmentsAllocationFailed {
+                descriptor_count,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to reserve virtio-rng buffer metadata for {descriptor_count} descriptors: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioRngBufferParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BufferDescriptorRange { source, .. } => Some(source),
+            Self::BufferDescriptorAccess { source, .. } => Some(source),
+            Self::BufferSegmentsAllocationFailed { source, .. } => Some(source),
+            Self::BufferDescriptorReadOnly { .. }
+            | Self::BufferDescriptorEmpty { .. }
+            | Self::BufferLengthOverflow { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioRngBufferWriteError {
+    SegmentWrite {
+        descriptor_index: u16,
+        address: GuestAddress,
+        len: usize,
+        source: GuestMemoryAccessError,
+    },
+    IncompleteBufferWrite {
+        remaining_bytes: usize,
+    },
+}
+
+impl fmt::Display for VirtioRngBufferWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SegmentWrite {
+                descriptor_index,
+                address,
+                len,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to write {len} bytes into virtio-rng buffer descriptor {descriptor_index} at {address}: {source}"
+                )
+            }
+            Self::IncompleteBufferWrite { remaining_bytes } => {
+                write!(
+                    f,
+                    "virtio-rng buffer write finished with {remaining_bytes} entropy bytes remaining"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioRngBufferWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SegmentWrite { source, .. } => Some(source),
+            Self::IncompleteBufferWrite { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum VirtioRngFillError {
+    EntropyBufferAllocation {
+        requested_len: usize,
+        source: TryReserveError,
+    },
+    CompletedLengthTooLarge {
+        len: usize,
+    },
+    Source(VirtioRngEntropySourceError),
+    BufferWrite(VirtioRngBufferWriteError),
+}
+
+fn fill_entropy_buffer(
+    memory: &mut GuestMemory,
+    buffer: &VirtioRngBuffer,
+    entropy_source: &mut (impl VirtioRngEntropySource + ?Sized),
+    entropy_buffer: &mut Vec<u8>,
+) -> Result<u32, VirtioRngFillError> {
+    let requested_len = entropy_request_len(buffer.len())?;
+    if entropy_buffer.capacity() < requested_len {
+        entropy_buffer
+            .try_reserve_exact(requested_len - entropy_buffer.capacity())
+            .map_err(|source| VirtioRngFillError::EntropyBufferAllocation {
+                requested_len,
+                source,
+            })?;
+    }
+    entropy_buffer.clear();
+    entropy_buffer.resize(requested_len, 0);
+
+    entropy_source
+        .fill_entropy(entropy_buffer)
+        .map_err(VirtioRngFillError::Source)?;
+    write_entropy_to_buffer(memory, buffer, entropy_buffer)
+        .map_err(VirtioRngFillError::BufferWrite)?;
+
+    u32::try_from(requested_len)
+        .map_err(|_| VirtioRngFillError::CompletedLengthTooLarge { len: requested_len })
+}
+
+fn entropy_request_len(buffer_len: u64) -> Result<usize, VirtioRngFillError> {
+    if buffer_len > VIRTIO_RNG_MAX_REQUEST_BYTES_U64 {
+        return Ok(VIRTIO_RNG_MAX_REQUEST_BYTES);
+    }
+
+    usize::try_from(buffer_len)
+        .map_err(|_| VirtioRngFillError::CompletedLengthTooLarge { len: usize::MAX })
+}
+
+fn write_entropy_to_buffer(
+    memory: &mut GuestMemory,
+    buffer: &VirtioRngBuffer,
+    entropy: &[u8],
+) -> Result<(), VirtioRngBufferWriteError> {
+    let mut remaining = entropy;
+    for segment in &buffer.segments {
+        if remaining.is_empty() {
+            break;
+        }
+
+        let write_len = match usize::try_from(segment.len) {
+            Ok(segment_len) => segment_len.min(remaining.len()),
+            Err(_) => remaining.len(),
+        };
+        let (source_segment, next_remaining) = remaining.split_at(write_len);
+        memory
+            .write_slice(source_segment, segment.address)
+            .map_err(|source| VirtioRngBufferWriteError::SegmentWrite {
+                descriptor_index: segment.descriptor_index,
+                address: segment.address,
+                len: write_len,
+                source,
+            })?;
+        remaining = next_remaining;
+    }
+
+    if remaining.is_empty() {
+        Ok(())
+    } else {
+        Err(VirtioRngBufferWriteError::IncompleteBufferWrite {
+            remaining_bytes: remaining.len(),
+        })
+    }
+}
+
+fn descriptor_chain_head(chain: &VirtqueueDescriptorChain) -> Option<u16> {
+    chain
+        .descriptors()
+        .first()
+        .copied()
+        .map(VirtqueueDescriptor::index)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as _;
+
+    use crate::memory::{GuestMemoryLayout, GuestMemoryRange};
+    use crate::virtio_mmio::{
+        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
+        VIRTIO_DEVICE_STATUS_FEATURES_OK, VirtioMmioQueueRegisters, VirtioMmioRegister,
+    };
+    use crate::virtio_queue::{
+        VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
+        VirtqueueAvailableRing, VirtqueueUsedRing,
+    };
+
+    use super::{
+        GuestAddress, GuestMemory, VIRTIO_RNG_MAX_REQUEST_BYTES, VirtioRngBufferParseError,
+        VirtioRngEntropySource, VirtioRngEntropySourceError, VirtioRngQueue,
+        VirtioRngQueueBuildError, VirtioRngQueueDispatchError,
+    };
+
+    const TEST_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x1000);
+    const TEST_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x5000);
+    const TEST_USED_RING: GuestAddress = GuestAddress::new(0x6000);
+    const TEST_DATA: GuestAddress = GuestAddress::new(0x8000);
+    const TEST_SECOND_DATA: GuestAddress = GuestAddress::new(0xa000);
+    const TEST_QUEUE_SIZE: u16 = 8;
+    const TEST_MEMORY_SIZE: u64 = 0x4_0000;
+    const TEST_AVAILABLE_RING_IDX_OFFSET: u64 = 2;
+    const TEST_AVAILABLE_RING_RING_OFFSET: u64 = 4;
+    const TEST_AVAILABLE_RING_ENTRY_SIZE: u64 = 2;
+    const TEST_USED_RING_IDX_OFFSET: u64 = 2;
+    const TEST_USED_RING_RING_OFFSET: u64 = 4;
+    const TEST_USED_RING_ELEMENT_SIZE: u64 = 8;
+    const QUEUE_CONFIG_STATUS: u32 = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+        | VIRTIO_DEVICE_STATUS_DRIVER
+        | VIRTIO_DEVICE_STATUS_FEATURES_OK;
+
+    #[derive(Debug, Default)]
+    struct TestEntropySource {
+        calls: Vec<usize>,
+        next_byte: u8,
+        fail: bool,
+    }
+
+    impl TestEntropySource {
+        fn failing() -> Self {
+            Self {
+                calls: Vec::new(),
+                next_byte: 0,
+                fail: true,
+            }
+        }
+
+        fn calls(&self) -> &[usize] {
+            &self.calls
+        }
+    }
+
+    impl VirtioRngEntropySource for TestEntropySource {
+        fn fill_entropy(
+            &mut self,
+            destination: &mut [u8],
+        ) -> Result<(), VirtioRngEntropySourceError> {
+            self.calls.push(destination.len());
+            if self.fail {
+                return Err(VirtioRngEntropySourceError::new());
+            }
+
+            for byte in destination {
+                *byte = self.next_byte;
+                self.next_byte = self.next_byte.wrapping_add(1);
+            }
+
+            Ok(())
+        }
+    }
+
+    fn memory() -> GuestMemory {
+        let layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(GuestAddress::new(0), TEST_MEMORY_SIZE)
+                .expect("guest memory range should be valid"),
+        ])
+        .expect("guest memory layout should be valid");
+        GuestMemory::allocate(&layout).expect("guest memory should allocate")
+    }
+
+    fn rng_queue() -> VirtioRngQueue {
+        let available = VirtqueueAvailableRing::new(
+            TEST_DESCRIPTOR_TABLE,
+            TEST_AVAILABLE_RING,
+            TEST_QUEUE_SIZE,
+        )
+        .expect("available ring should build");
+        let used = VirtqueueUsedRing::new(TEST_USED_RING, TEST_QUEUE_SIZE)
+            .expect("used ring should build");
+        VirtioRngQueue::new(available, used)
+    }
+
+    fn guest_address_low(address: GuestAddress) -> u32 {
+        u32::try_from(address.raw_value()).expect("test address should fit in queue low register")
+    }
+
+    fn configured_mmio_queue(size: u16, ready: bool) -> VirtioMmioQueueRegisters {
+        configured_mmio_queue_with_device_ring(size, guest_address_low(TEST_USED_RING), 0, ready)
+    }
+
+    fn configured_mmio_queue_with_device_ring(
+        size: u16,
+        device_ring_low: u32,
+        device_ring_high: u32,
+        ready: bool,
+    ) -> VirtioMmioQueueRegisters {
+        let mut queues =
+            VirtioMmioQueueRegisters::new(&[TEST_QUEUE_SIZE]).expect("queue table should build");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueNum,
+                u32::from(size),
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("queue size should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDescLow,
+                guest_address_low(TEST_DESCRIPTOR_TABLE),
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("queue descriptor table should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDriverLow,
+                guest_address_low(TEST_AVAILABLE_RING),
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("queue driver ring should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDeviceLow,
+                device_ring_low,
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("queue device ring should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueDeviceHigh,
+                device_ring_high,
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("queue device ring high should write");
+
+        if ready {
+            queues
+                .write_register(VirtioMmioRegister::QueueReady, 1, QUEUE_CONFIG_STATUS)
+                .expect("queue ready should write");
+        }
+
+        queues
+    }
+
+    fn descriptor_address(index: u16) -> GuestAddress {
+        TEST_DESCRIPTOR_TABLE
+            .checked_add(
+                u64::from(index)
+                    * u64::try_from(VIRTQUEUE_DESCRIPTOR_SIZE)
+                        .expect("descriptor size should fit u64"),
+            )
+            .expect("descriptor address should not overflow")
+    }
+
+    fn write_descriptor(
+        memory: &mut GuestMemory,
+        index: u16,
+        address: GuestAddress,
+        len: u32,
+        flags: u16,
+        next: u16,
+    ) {
+        let descriptor = descriptor_address(index);
+        write_u64(memory, descriptor, address.raw_value());
+        write_u32(
+            memory,
+            descriptor
+                .checked_add(8)
+                .expect("descriptor len address should not overflow"),
+            len,
+        );
+        write_u16(
+            memory,
+            descriptor
+                .checked_add(12)
+                .expect("descriptor flags address should not overflow"),
+            flags,
+        );
+        write_u16(
+            memory,
+            descriptor
+                .checked_add(14)
+                .expect("descriptor next address should not overflow"),
+            next,
+        );
+    }
+
+    fn queue_head(memory: &mut GuestMemory, ring_index: u16, head: u16) {
+        let address = TEST_AVAILABLE_RING
+            .checked_add(
+                TEST_AVAILABLE_RING_RING_OFFSET
+                    + u64::from(ring_index) * TEST_AVAILABLE_RING_ENTRY_SIZE,
+            )
+            .expect("available ring entry address should not overflow");
+        write_u16(memory, address, head);
+    }
+
+    fn set_available_index(memory: &mut GuestMemory, index: u16) {
+        write_u16(
+            memory,
+            TEST_AVAILABLE_RING
+                .checked_add(TEST_AVAILABLE_RING_IDX_OFFSET)
+                .expect("available index address should not overflow"),
+            index,
+        );
+    }
+
+    fn used_ring_entry_address(ring_index: u16) -> GuestAddress {
+        TEST_USED_RING
+            .checked_add(
+                TEST_USED_RING_RING_OFFSET + u64::from(ring_index) * TEST_USED_RING_ELEMENT_SIZE,
+            )
+            .expect("used ring entry address should not overflow")
+    }
+
+    fn read_used_index(memory: &GuestMemory) -> u16 {
+        read_u16(
+            memory,
+            TEST_USED_RING
+                .checked_add(TEST_USED_RING_IDX_OFFSET)
+                .expect("used index address should not overflow"),
+        )
+    }
+
+    fn read_used_id(memory: &GuestMemory, ring_index: u16) -> u32 {
+        read_u32(memory, used_ring_entry_address(ring_index))
+    }
+
+    fn read_used_len(memory: &GuestMemory, ring_index: u16) -> u32 {
+        read_u32(
+            memory,
+            used_ring_entry_address(ring_index)
+                .checked_add(4)
+                .expect("used len address should not overflow"),
+        )
+    }
+
+    fn write_u64(memory: &mut GuestMemory, address: GuestAddress, value: u64) {
+        memory
+            .write_slice(&value.to_le_bytes(), address)
+            .expect("u64 should write");
+    }
+
+    fn write_u32(memory: &mut GuestMemory, address: GuestAddress, value: u32) {
+        memory
+            .write_slice(&value.to_le_bytes(), address)
+            .expect("u32 should write");
+    }
+
+    fn write_u16(memory: &mut GuestMemory, address: GuestAddress, value: u16) {
+        memory
+            .write_slice(&value.to_le_bytes(), address)
+            .expect("u16 should write");
+    }
+
+    fn read_u32(memory: &GuestMemory, address: GuestAddress) -> u32 {
+        let mut bytes = [0; 4];
+        memory
+            .read_slice(&mut bytes, address)
+            .expect("u32 should read");
+        u32::from_le_bytes(bytes)
+    }
+
+    fn read_u16(memory: &GuestMemory, address: GuestAddress) -> u16 {
+        let mut bytes = [0; 2];
+        memory
+            .read_slice(&mut bytes, address)
+            .expect("u16 should read");
+        u16::from_le_bytes(bytes)
+    }
+
+    fn read_guest_bytes(memory: &GuestMemory, address: GuestAddress, len: usize) -> Vec<u8> {
+        let mut bytes = vec![0; len];
+        memory
+            .read_slice(&mut bytes, address)
+            .expect("guest bytes should read");
+        bytes
+    }
+
+    #[test]
+    fn rng_queue_from_mmio_queue_state_uses_configured_queue_metadata() {
+        let queues = configured_mmio_queue(4, true);
+
+        let queue = VirtioRngQueue::from_mmio_queue_state(
+            queues.queue(0).expect("queue state should exist"),
+        )
+        .expect("rng queue should build from ready mmio queue state");
+
+        assert_eq!(
+            queue.available_ring().descriptor_table(),
+            TEST_DESCRIPTOR_TABLE
+        );
+        assert_eq!(queue.available_ring().available_ring(), TEST_AVAILABLE_RING);
+        assert_eq!(queue.available_ring().queue_size(), 4);
+        assert_eq!(queue.available_ring().next_avail(), 0);
+        assert_eq!(queue.used_ring().used_ring(), TEST_USED_RING);
+        assert_eq!(queue.used_ring().queue_size(), 4);
+        assert_eq!(queue.used_ring().next_used(), 0);
+    }
+
+    #[test]
+    fn rng_queue_from_mmio_queue_state_rejects_not_ready_queue() {
+        let queues = configured_mmio_queue(TEST_QUEUE_SIZE, false);
+
+        let error = VirtioRngQueue::from_mmio_queue_state(
+            queues.queue(0).expect("queue state should exist"),
+        )
+        .expect_err("not-ready queue should not build");
+
+        assert!(matches!(error, VirtioRngQueueBuildError::QueueNotReady));
+        assert_eq!(error.to_string(), "virtio-rng queue is not ready");
+        assert!(error.source().is_none());
+    }
+
+    #[test]
+    fn rng_queue_from_mmio_queue_state_wraps_available_ring_error() {
+        let mut queues =
+            VirtioMmioQueueRegisters::new(&[TEST_QUEUE_SIZE]).expect("queue table should build");
+        queues
+            .write_register(VirtioMmioRegister::QueueReady, 1, QUEUE_CONFIG_STATUS)
+            .expect("queue ready should write");
+
+        let error = VirtioRngQueue::from_mmio_queue_state(
+            queues.queue(0).expect("queue state should exist"),
+        )
+        .expect_err("zero-size queue should not build");
+
+        assert!(matches!(
+            error,
+            VirtioRngQueueBuildError::AvailableRing { .. }
+        ));
+        assert_eq!(
+            error
+                .source()
+                .expect("source should be preserved")
+                .to_string(),
+            "virtqueue size 0 must be a nonzero power of two"
+        );
+    }
+
+    #[test]
+    fn rng_queue_from_mmio_queue_state_wraps_used_ring_error() {
+        let queues =
+            configured_mmio_queue_with_device_ring(TEST_QUEUE_SIZE, u32::MAX - 3, u32::MAX, true);
+
+        let error = VirtioRngQueue::from_mmio_queue_state(
+            queues.queue(0).expect("queue state should exist"),
+        )
+        .expect_err("overflowing used ring should not build");
+
+        assert!(matches!(error, VirtioRngQueueBuildError::UsedRing { .. }));
+        assert_eq!(
+            error
+                .source()
+                .expect("source should be preserved")
+                .to_string(),
+            "virtqueue used ring address 0xfffffffffffffffc with queue size 8 overflows address space"
+        );
+    }
+
+    #[test]
+    fn rng_queue_dispatch_fills_single_writable_descriptor() {
+        let mut memory = memory();
+        write_descriptor(&mut memory, 0, TEST_DATA, 8, VIRTQUEUE_DESC_F_WRITE, 0);
+        queue_head(&mut memory, 0, 0);
+        set_available_index(&mut memory, 1);
+
+        let mut source = TestEntropySource::default();
+        let mut queue = rng_queue();
+        let dispatch = queue
+            .dispatch_with_source(&mut memory, &mut source)
+            .expect("rng queue dispatch should succeed");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_requests(), 1);
+        assert_eq!(dispatch.buffer_parse_failures(), 0);
+        assert_eq!(dispatch.source_failures(), 0);
+        assert_eq!(dispatch.bytes_written_to_guest(), 8);
+        assert!(dispatch.needs_queue_interrupt());
+        assert_eq!(source.calls(), &[8]);
+        assert_eq!(
+            read_guest_bytes(&memory, TEST_DATA, 8),
+            vec![0, 1, 2, 3, 4, 5, 6, 7]
+        );
+        assert_eq!(read_used_index(&memory), 1);
+        assert_eq!(read_used_id(&memory, 0), 0);
+        assert_eq!(read_used_len(&memory, 0), 8);
+    }
+
+    #[test]
+    fn rng_queue_dispatch_empty_available_ring_is_noop() {
+        let mut memory = memory();
+        let mut source = TestEntropySource::default();
+        let mut queue = rng_queue();
+
+        let dispatch = queue
+            .dispatch_with_source(&mut memory, &mut source)
+            .expect("empty rng queue dispatch should succeed");
+
+        assert_eq!(dispatch.processed_requests(), 0);
+        assert_eq!(dispatch.successful_requests(), 0);
+        assert_eq!(dispatch.bytes_written_to_guest(), 0);
+        assert!(!dispatch.needs_queue_interrupt());
+        assert!(source.calls().is_empty());
+        assert_eq!(read_used_index(&memory), 0);
+    }
+
+    #[test]
+    fn rng_queue_dispatch_fills_split_descriptor_chain() {
+        let mut memory = memory();
+        write_descriptor(
+            &mut memory,
+            0,
+            TEST_DATA,
+            4,
+            VIRTQUEUE_DESC_F_WRITE | VIRTQUEUE_DESC_F_NEXT,
+            1,
+        );
+        write_descriptor(
+            &mut memory,
+            1,
+            TEST_SECOND_DATA,
+            4,
+            VIRTQUEUE_DESC_F_WRITE,
+            0,
+        );
+        queue_head(&mut memory, 0, 0);
+        set_available_index(&mut memory, 1);
+
+        let mut source = TestEntropySource::default();
+        let mut queue = rng_queue();
+        let dispatch = queue
+            .dispatch_with_source(&mut memory, &mut source)
+            .expect("rng queue dispatch should succeed");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_requests(), 1);
+        assert_eq!(dispatch.bytes_written_to_guest(), 8);
+        assert_eq!(source.calls(), &[8]);
+        assert_eq!(read_guest_bytes(&memory, TEST_DATA, 4), vec![0, 1, 2, 3]);
+        assert_eq!(
+            read_guest_bytes(&memory, TEST_SECOND_DATA, 4),
+            vec![4, 5, 6, 7]
+        );
+        assert_eq!(read_used_len(&memory, 0), 8);
+    }
+
+    #[test]
+    fn rng_queue_dispatch_writes_overlapping_descriptors_sequentially() {
+        let mut memory = memory();
+        write_descriptor(
+            &mut memory,
+            0,
+            TEST_DATA,
+            4,
+            VIRTQUEUE_DESC_F_WRITE | VIRTQUEUE_DESC_F_NEXT,
+            1,
+        );
+        write_descriptor(
+            &mut memory,
+            1,
+            TEST_DATA
+                .checked_add(2)
+                .expect("overlapping descriptor address should not overflow"),
+            4,
+            VIRTQUEUE_DESC_F_WRITE,
+            0,
+        );
+        queue_head(&mut memory, 0, 0);
+        set_available_index(&mut memory, 1);
+
+        let mut source = TestEntropySource::default();
+        let mut queue = rng_queue();
+        let dispatch = queue
+            .dispatch_with_source(&mut memory, &mut source)
+            .expect("rng queue dispatch should succeed");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_requests(), 1);
+        assert_eq!(dispatch.bytes_written_to_guest(), 8);
+        assert_eq!(source.calls(), &[8]);
+        assert_eq!(
+            read_guest_bytes(&memory, TEST_DATA, 6),
+            vec![0, 1, 4, 5, 6, 7]
+        );
+        assert_eq!(read_used_len(&memory, 0), 8);
+    }
+
+    #[test]
+    fn rng_queue_dispatch_processes_multiple_requests() {
+        let mut memory = memory();
+        write_descriptor(&mut memory, 0, TEST_DATA, 4, VIRTQUEUE_DESC_F_WRITE, 0);
+        write_descriptor(
+            &mut memory,
+            1,
+            TEST_SECOND_DATA,
+            4,
+            VIRTQUEUE_DESC_F_WRITE,
+            0,
+        );
+        queue_head(&mut memory, 0, 0);
+        queue_head(&mut memory, 1, 1);
+        set_available_index(&mut memory, 2);
+
+        let mut source = TestEntropySource::default();
+        let mut queue = rng_queue();
+        let dispatch = queue
+            .dispatch_with_source(&mut memory, &mut source)
+            .expect("rng queue dispatch should succeed");
+
+        assert_eq!(dispatch.processed_requests(), 2);
+        assert_eq!(dispatch.successful_requests(), 2);
+        assert_eq!(dispatch.bytes_written_to_guest(), 8);
+        assert_eq!(source.calls(), &[4, 4]);
+        assert_eq!(read_guest_bytes(&memory, TEST_DATA, 4), vec![0, 1, 2, 3]);
+        assert_eq!(
+            read_guest_bytes(&memory, TEST_SECOND_DATA, 4),
+            vec![4, 5, 6, 7]
+        );
+        assert_eq!(read_used_index(&memory), 2);
+        assert_eq!(read_used_id(&memory, 0), 0);
+        assert_eq!(read_used_len(&memory, 0), 4);
+        assert_eq!(read_used_id(&memory, 1), 1);
+        assert_eq!(read_used_len(&memory, 1), 4);
+    }
+
+    #[test]
+    fn rng_queue_dispatch_preserves_ring_state_across_dispatch_calls() {
+        let mut memory = memory();
+        write_descriptor(&mut memory, 0, TEST_DATA, 4, VIRTQUEUE_DESC_F_WRITE, 0);
+        queue_head(&mut memory, 0, 0);
+        set_available_index(&mut memory, 1);
+
+        let mut source = TestEntropySource::default();
+        let mut queue = rng_queue();
+        let first = queue
+            .dispatch_with_source(&mut memory, &mut source)
+            .expect("first rng queue dispatch should succeed");
+
+        write_descriptor(
+            &mut memory,
+            1,
+            TEST_SECOND_DATA,
+            4,
+            VIRTQUEUE_DESC_F_WRITE,
+            0,
+        );
+        queue_head(&mut memory, 1, 1);
+        set_available_index(&mut memory, 2);
+        let second = queue
+            .dispatch_with_source(&mut memory, &mut source)
+            .expect("second rng queue dispatch should succeed");
+
+        assert_eq!(first.processed_requests(), 1);
+        assert_eq!(second.processed_requests(), 1);
+        assert_eq!(source.calls(), &[4, 4]);
+        assert_eq!(read_guest_bytes(&memory, TEST_DATA, 4), vec![0, 1, 2, 3]);
+        assert_eq!(
+            read_guest_bytes(&memory, TEST_SECOND_DATA, 4),
+            vec![4, 5, 6, 7]
+        );
+        assert_eq!(read_used_index(&memory), 2);
+        assert_eq!(read_used_id(&memory, 0), 0);
+        assert_eq!(read_used_id(&memory, 1), 1);
+    }
+
+    #[test]
+    fn rng_queue_dispatch_caps_single_request_to_sixty_four_kib() {
+        let mut memory = memory();
+        let requested_len =
+            u32::try_from(VIRTIO_RNG_MAX_REQUEST_BYTES + 4096).expect("test len should fit u32");
+        write_descriptor(
+            &mut memory,
+            0,
+            TEST_DATA,
+            requested_len,
+            VIRTQUEUE_DESC_F_WRITE,
+            0,
+        );
+        queue_head(&mut memory, 0, 0);
+        set_available_index(&mut memory, 1);
+
+        let mut source = TestEntropySource::default();
+        let mut queue = rng_queue();
+        let dispatch = queue
+            .dispatch_with_source(&mut memory, &mut source)
+            .expect("rng queue dispatch should succeed");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_requests(), 1);
+        assert_eq!(
+            dispatch.bytes_written_to_guest(),
+            u64::try_from(VIRTIO_RNG_MAX_REQUEST_BYTES).expect("max request should fit u64")
+        );
+        assert_eq!(source.calls(), &[VIRTIO_RNG_MAX_REQUEST_BYTES]);
+        assert_eq!(
+            read_used_len(&memory, 0),
+            u32::try_from(VIRTIO_RNG_MAX_REQUEST_BYTES).expect("max request should fit u32")
+        );
+        assert_eq!(read_guest_bytes(&memory, TEST_DATA, 4), vec![0, 1, 2, 3]);
+        assert_eq!(
+            read_guest_bytes(
+                &memory,
+                TEST_DATA
+                    .checked_add(
+                        u64::try_from(VIRTIO_RNG_MAX_REQUEST_BYTES)
+                            .expect("max request should fit u64")
+                    )
+                    .expect("post-cap byte address should not overflow"),
+                1,
+            ),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn rng_queue_dispatch_completes_read_only_descriptor_with_zero_len() {
+        let mut memory = memory();
+        write_descriptor(&mut memory, 0, TEST_DATA, 8, 0, 0);
+        queue_head(&mut memory, 0, 0);
+        set_available_index(&mut memory, 1);
+
+        let mut source = TestEntropySource::default();
+        let mut queue = rng_queue();
+        let dispatch = queue
+            .dispatch_with_source(&mut memory, &mut source)
+            .expect("rng queue dispatch should complete invalid descriptor");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_requests(), 0);
+        assert_eq!(dispatch.buffer_parse_failures(), 1);
+        assert_eq!(dispatch.bytes_written_to_guest(), 0);
+        assert!(source.calls().is_empty());
+        assert!(matches!(
+            dispatch.first_buffer_parse_failure(),
+            Some(VirtioRngBufferParseError::BufferDescriptorReadOnly { index: 0 })
+        ));
+        assert_eq!(read_used_index(&memory), 1);
+        assert_eq!(read_used_id(&memory, 0), 0);
+        assert_eq!(read_used_len(&memory, 0), 0);
+    }
+
+    #[test]
+    fn rng_queue_dispatch_completes_empty_descriptor_with_zero_len() {
+        let mut memory = memory();
+        write_descriptor(&mut memory, 0, TEST_DATA, 0, VIRTQUEUE_DESC_F_WRITE, 0);
+        queue_head(&mut memory, 0, 0);
+        set_available_index(&mut memory, 1);
+
+        let mut source = TestEntropySource::default();
+        let mut queue = rng_queue();
+        let dispatch = queue
+            .dispatch_with_source(&mut memory, &mut source)
+            .expect("rng queue dispatch should complete invalid descriptor");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_requests(), 0);
+        assert_eq!(dispatch.buffer_parse_failures(), 1);
+        assert_eq!(dispatch.bytes_written_to_guest(), 0);
+        assert!(source.calls().is_empty());
+        assert!(matches!(
+            dispatch.first_buffer_parse_failure(),
+            Some(VirtioRngBufferParseError::BufferDescriptorEmpty { index: 0 })
+        ));
+        assert_eq!(read_used_len(&memory, 0), 0);
+    }
+
+    #[test]
+    fn rng_queue_dispatch_validates_unmapped_descriptor_before_entropy_source() {
+        let mut memory = memory();
+        write_descriptor(
+            &mut memory,
+            0,
+            GuestAddress::new(TEST_MEMORY_SIZE),
+            8,
+            VIRTQUEUE_DESC_F_WRITE,
+            0,
+        );
+        queue_head(&mut memory, 0, 0);
+        set_available_index(&mut memory, 1);
+
+        let mut source = TestEntropySource::default();
+        let mut queue = rng_queue();
+        let dispatch = queue
+            .dispatch_with_source(&mut memory, &mut source)
+            .expect("rng queue dispatch should complete invalid descriptor");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_requests(), 0);
+        assert_eq!(dispatch.buffer_parse_failures(), 1);
+        assert!(source.calls().is_empty());
+        assert!(matches!(
+            dispatch.first_buffer_parse_failure(),
+            Some(VirtioRngBufferParseError::BufferDescriptorAccess { index: 0, .. })
+        ));
+        assert_eq!(read_used_len(&memory, 0), 0);
+    }
+
+    #[test]
+    fn rng_queue_dispatch_validates_range_overflow_before_entropy_source() {
+        let mut memory = memory();
+        write_descriptor(
+            &mut memory,
+            0,
+            GuestAddress::new(u64::MAX),
+            1,
+            VIRTQUEUE_DESC_F_WRITE,
+            0,
+        );
+        queue_head(&mut memory, 0, 0);
+        set_available_index(&mut memory, 1);
+
+        let mut source = TestEntropySource::default();
+        let mut queue = rng_queue();
+        let dispatch = queue
+            .dispatch_with_source(&mut memory, &mut source)
+            .expect("rng queue dispatch should complete invalid descriptor");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_requests(), 0);
+        assert_eq!(dispatch.buffer_parse_failures(), 1);
+        assert!(source.calls().is_empty());
+        assert!(matches!(
+            dispatch.first_buffer_parse_failure(),
+            Some(VirtioRngBufferParseError::BufferDescriptorRange { index: 0, .. })
+        ));
+        assert_eq!(read_used_len(&memory, 0), 0);
+    }
+
+    #[test]
+    fn rng_queue_dispatch_records_source_failure_with_zero_len() {
+        let mut memory = memory();
+        write_descriptor(&mut memory, 0, TEST_DATA, 8, VIRTQUEUE_DESC_F_WRITE, 0);
+        queue_head(&mut memory, 0, 0);
+        set_available_index(&mut memory, 1);
+
+        let mut source = TestEntropySource::failing();
+        let mut queue = rng_queue();
+        let dispatch = queue
+            .dispatch_with_source(&mut memory, &mut source)
+            .expect("rng queue dispatch should complete source failure");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_requests(), 0);
+        assert_eq!(dispatch.source_failures(), 1);
+        assert_eq!(
+            dispatch.first_source_failure(),
+            Some(VirtioRngEntropySourceError)
+        );
+        assert_eq!(source.calls(), &[8]);
+        assert_eq!(read_guest_bytes(&memory, TEST_DATA, 8), vec![0; 8]);
+        assert_eq!(read_used_index(&memory), 1);
+        assert_eq!(read_used_len(&memory, 0), 0);
+    }
+
+    #[test]
+    fn rng_queue_dispatch_returns_used_ring_error_with_completed_dispatch() {
+        let mut memory = memory();
+        write_descriptor(&mut memory, 0, TEST_DATA, 8, VIRTQUEUE_DESC_F_WRITE, 0);
+        queue_head(&mut memory, 0, 0);
+        set_available_index(&mut memory, 1);
+
+        let available = VirtqueueAvailableRing::new(
+            TEST_DESCRIPTOR_TABLE,
+            TEST_AVAILABLE_RING,
+            TEST_QUEUE_SIZE,
+        )
+        .expect("available ring should build");
+        let used = VirtqueueUsedRing::new(GuestAddress::new(TEST_MEMORY_SIZE), TEST_QUEUE_SIZE)
+            .expect("used ring metadata should build");
+        let mut queue = VirtioRngQueue::new(available, used);
+        let mut source = TestEntropySource::default();
+
+        let error = queue
+            .dispatch_with_source(&mut memory, &mut source)
+            .expect_err("unmapped used ring should fail");
+
+        match &error {
+            VirtioRngQueueDispatchError::UsedRing {
+                descriptor_head,
+                bytes_written_to_guest,
+                source,
+                ..
+            } => {
+                assert_eq!(*descriptor_head, 0);
+                assert_eq!(*bytes_written_to_guest, 8);
+                assert!(source.to_string().contains("is not fully mapped"));
+            }
+            other => panic!("expected used ring error, got {other:?}"),
+        }
+        assert_eq!(error.completed_dispatch().processed_requests(), 0);
+        assert_eq!(source.calls(), &[8]);
+    }
+}
