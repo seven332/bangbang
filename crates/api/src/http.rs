@@ -54,7 +54,7 @@ pub enum ApiRequest {
     PatchPmem,
     PutSerial(Box<SerialConfigRequest>),
     PutSnapshotCreate,
-    PutSnapshotLoad,
+    PutSnapshotLoad(SnapshotLoadRequest),
     PutVsock(Box<VsockConfigRequest>),
     PatchMmds(Box<MmdsContentRequest>),
 }
@@ -369,6 +369,7 @@ pub struct MachineConfigRequest {
     mem_size_mib: u64,
     smt: bool,
     cpu_template: Option<MachineConfigCpuTemplate>,
+    cpu_template_field_present: bool,
     track_dirty_pages: bool,
     huge_pages: MachineConfigHugePages,
 }
@@ -390,6 +391,10 @@ impl MachineConfigRequest {
         self.cpu_template
     }
 
+    pub const fn cpu_template_field_present(&self) -> bool {
+        self.cpu_template_field_present
+    }
+
     pub const fn track_dirty_pages(&self) -> bool {
         self.track_dirty_pages
     }
@@ -405,6 +410,7 @@ pub struct MachineConfigPatchRequest {
     mem_size_mib: Option<u64>,
     smt: Option<bool>,
     cpu_template: Option<MachineConfigCpuTemplate>,
+    cpu_template_field_present: bool,
     track_dirty_pages: Option<bool>,
     huge_pages: Option<MachineConfigHugePages>,
 }
@@ -424,6 +430,10 @@ impl MachineConfigPatchRequest {
 
     pub const fn cpu_template(&self) -> Option<MachineConfigCpuTemplate> {
         self.cpu_template
+    }
+
+    pub const fn cpu_template_field_present(&self) -> bool {
+        self.cpu_template_field_present
     }
 
     pub const fn track_dirty_pages(&self) -> Option<bool> {
@@ -1012,6 +1022,23 @@ struct SnapshotCreateRequestBody {
     snapshot_type: SnapshotTypeRequestBody,
     snapshot_path: String,
     mem_file_path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotLoadRequest {
+    deprecated_fields_used: bool,
+}
+
+impl SnapshotLoadRequest {
+    const fn new(deprecated_fields_used: bool) -> Self {
+        Self {
+            deprecated_fields_used,
+        }
+    }
+
+    pub const fn deprecated_fields_used(&self) -> bool {
+        self.deprecated_fields_used
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1983,6 +2010,10 @@ fn parse_snapshot_create_request(body: &[u8]) -> Result<ApiRequest, RequestError
 }
 
 fn parse_snapshot_load_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
+    let value = serde_json::from_slice::<serde_json::Value>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+    let enable_diff_snapshots_field_present =
+        json_object_contains_key(&value, "enable_diff_snapshots");
     let SnapshotLoadRequestBody {
         snapshot_path,
         mem_file_path,
@@ -1993,12 +2024,14 @@ fn parse_snapshot_load_request(body: &[u8]) -> Result<ApiRequest, RequestError> 
         network_overrides,
         vsock_override,
         clock_realtime,
-    } = serde_json::from_slice::<SnapshotLoadRequestBody>(body)
+    } = serde_json::from_value::<SnapshotLoadRequestBody>(value)
         .map_err(|_| RequestError::MalformedRequest)?;
 
     if mem_file_path.is_some() == mem_backend.is_some() {
         return Err(RequestError::MalformedRequest);
     }
+
+    let deprecated_fields_used = mem_file_path.is_some() || enable_diff_snapshots_field_present;
 
     let _ = (
         snapshot_path,
@@ -2028,7 +2061,9 @@ fn parse_snapshot_load_request(body: &[u8]) -> Result<ApiRequest, RequestError> 
         let _ = uds_path;
     }
 
-    Ok(ApiRequest::PutSnapshotLoad)
+    Ok(ApiRequest::PutSnapshotLoad(SnapshotLoadRequest::new(
+        deprecated_fields_used,
+    )))
 }
 
 fn parse_memory_hotplug_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
@@ -2198,8 +2233,18 @@ fn parse_network_interface_patch_request(
     )))
 }
 
+fn json_object_contains_key(value: &serde_json::Value, key: &str) -> bool {
+    match value.as_object() {
+        Some(object) => object.contains_key(key),
+        None => false,
+    }
+}
+
 fn parse_machine_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
-    let body = serde_json::from_slice::<MachineConfigRequestBody>(body)
+    let value = serde_json::from_slice::<serde_json::Value>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+    let cpu_template_field_present = json_object_contains_key(&value, "cpu_template");
+    let body = serde_json::from_value::<MachineConfigRequestBody>(value)
         .map_err(|_| RequestError::MalformedRequest)?;
 
     validate_machine_config_request(&body)?;
@@ -2210,6 +2255,7 @@ fn parse_machine_config_request(body: &[u8]) -> Result<ApiRequest, RequestError>
             mem_size_mib: body.mem_size_mib,
             smt: body.smt,
             cpu_template: body.cpu_template,
+            cpu_template_field_present,
             track_dirty_pages: body.track_dirty_pages,
             huge_pages: body.huge_pages,
         },
@@ -2217,7 +2263,10 @@ fn parse_machine_config_request(body: &[u8]) -> Result<ApiRequest, RequestError>
 }
 
 fn parse_machine_config_patch_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
-    let body = serde_json::from_slice::<MachineConfigPatchRequestBody>(body)
+    let value = serde_json::from_slice::<serde_json::Value>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+    let cpu_template_field_present = json_object_contains_key(&value, "cpu_template");
+    let body = serde_json::from_value::<MachineConfigPatchRequestBody>(value)
         .map_err(|_| RequestError::MalformedRequest)?;
 
     validate_machine_config_patch_request(&body)?;
@@ -2228,6 +2277,7 @@ fn parse_machine_config_patch_request(body: &[u8]) -> Result<ApiRequest, Request
             mem_size_mib: body.mem_size_mib,
             smt: body.smt,
             cpu_template: body.cpu_template,
+            cpu_template_field_present,
             track_dirty_pages: body.track_dirty_pages,
             huge_pages: body.huge_pages,
         },
@@ -2593,7 +2643,7 @@ impl From<ApiRequest> for Endpoint {
             }
             ApiRequest::PutPmem | ApiRequest::PatchPmem => Self::Pmem,
             ApiRequest::PutSerial(_) => Self::Serial,
-            ApiRequest::PutSnapshotCreate | ApiRequest::PutSnapshotLoad => Self::Snapshot,
+            ApiRequest::PutSnapshotCreate | ApiRequest::PutSnapshotLoad(_) => Self::Snapshot,
             ApiRequest::PutVsock(_) => Self::Vsock,
         }
     }
@@ -3088,6 +3138,7 @@ mod tests {
         assert_eq!(config.mem_size_mib(), 128);
         assert!(!config.smt());
         assert_eq!(config.cpu_template(), None);
+        assert!(!config.cpu_template_field_present());
         assert!(!config.track_dirty_pages());
         assert_eq!(config.huge_pages(), MachineConfigHugePages::None);
         assert_eq!(request_total_len(&request), Ok(Some(request.len())));
@@ -3113,6 +3164,7 @@ mod tests {
         assert_eq!(config.vcpu_count(), 32);
         assert_eq!(config.mem_size_mib(), 1024);
         assert_eq!(config.cpu_template(), Some(MachineConfigCpuTemplate::None));
+        assert!(config.cpu_template_field_present());
         assert_eq!(config.huge_pages(), MachineConfigHugePages::None);
     }
 
@@ -3131,6 +3183,7 @@ mod tests {
             panic!("expected machine-config request");
         };
         assert_eq!(config.cpu_template(), None);
+        assert!(config.cpu_template_field_present());
     }
 
     #[test]
@@ -3153,6 +3206,7 @@ mod tests {
                 panic!("expected machine-config request");
             };
             assert_eq!(config.cpu_template(), Some(expected), "{template}");
+            assert!(config.cpu_template_field_present(), "{template}");
         }
     }
 
@@ -3286,6 +3340,7 @@ mod tests {
         assert_eq!(config.mem_size_mib(), Some(512));
         assert_eq!(config.smt(), None);
         assert_eq!(config.cpu_template(), Some(MachineConfigCpuTemplate::None));
+        assert!(config.cpu_template_field_present());
         assert_eq!(config.track_dirty_pages(), None);
         assert_eq!(config.huge_pages(), None);
         assert_eq!(request_total_len(&request), Ok(Some(request.len())));
@@ -3310,6 +3365,7 @@ mod tests {
                 panic!("expected machine-config patch request");
             };
             assert_eq!(config.cpu_template(), Some(expected), "{template}");
+            assert!(config.cpu_template_field_present(), "{template}");
         }
     }
 
@@ -3349,11 +3405,12 @@ mod tests {
         assert_eq!(config.vcpu_count(), Some(2));
         assert_eq!(config.smt(), None);
         assert_eq!(config.cpu_template(), None);
+        assert!(config.cpu_template_field_present());
     }
 
     #[test]
     fn rejects_patch_machine_config_empty_body() {
-        for body in [r#"{}"#, r#"{"smt":null}"#] {
+        for body in [r#"{}"#, r#"{"smt":null}"#, r#"{"cpu_template":null}"#] {
             assert_eq!(
                 parse_request(&request_with_body("PATCH", "/machine-config", body)),
                 Err(RequestError::MalformedRequest)
@@ -5680,18 +5737,39 @@ mod tests {
 
     #[test]
     fn parses_valid_snapshot_load_requests() {
-        for body in [
-            r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"}}"#,
-            r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"Uffd"},"enable_diff_snapshots":true,"track_dirty_pages":true,"resume_vm":true,"clock_realtime":true}"#,
-            r#"{"snapshot_path":"vmstate","mem_file_path":"memory","resume_vm":true}"#,
-            r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"},"network_overrides":[{"iface_id":"eth0","host_dev_name":"tap0"}],"vsock_override":{"uds_path":"/tmp/v.sock"}}"#,
-            r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"},"network_overrides":[{"iface_id":"eth0","host_dev_name":"tap0","unknown":true}],"vsock_override":{"uds_path":"/tmp/v.sock","unknown":true}}"#,
+        for (body, deprecated_fields_used) in [
+            (
+                r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"}}"#,
+                false,
+            ),
+            (
+                r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"Uffd"},"enable_diff_snapshots":true,"track_dirty_pages":true,"resume_vm":true,"clock_realtime":true}"#,
+                true,
+            ),
+            (
+                r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"},"enable_diff_snapshots":false}"#,
+                true,
+            ),
+            (
+                r#"{"snapshot_path":"vmstate","mem_file_path":"memory","resume_vm":true}"#,
+                true,
+            ),
+            (
+                r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"},"network_overrides":[{"iface_id":"eth0","host_dev_name":"tap0"}],"vsock_override":{"uds_path":"/tmp/v.sock"}}"#,
+                false,
+            ),
+            (
+                r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"},"network_overrides":[{"iface_id":"eth0","host_dev_name":"tap0","unknown":true}],"vsock_override":{"uds_path":"/tmp/v.sock","unknown":true}}"#,
+                false,
+            ),
         ] {
             let request = request_with_body("PUT", "/snapshot/load", body);
 
             assert_eq!(
                 parse_request(&request),
-                Ok(ApiRequest::PutSnapshotLoad),
+                Ok(ApiRequest::PutSnapshotLoad(SnapshotLoadRequest::new(
+                    deprecated_fields_used
+                ))),
                 "{body}"
             );
         }

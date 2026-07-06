@@ -74,6 +74,7 @@ impl std::error::Error for MetricsFlushError {}
 
 #[derive(Debug, Default)]
 pub struct MetricsState {
+    deprecated_api: DeprecatedApiMetrics,
     sink: Option<MetricsSink>,
     flush_count: u64,
     get_api_requests: GetApiRequestMetrics,
@@ -96,6 +97,10 @@ impl MetricsState {
 
     pub fn flush(&mut self) -> Result<bool, MetricsFlushError> {
         self.flush_with_diagnostics(&MetricsDiagnostics::default())
+    }
+
+    pub(crate) fn record_deprecated_api_call(&mut self) {
+        self.deprecated_api.record_deprecated_http_api_call();
     }
 
     pub(crate) fn record_put_actions_request(&mut self) {
@@ -282,14 +287,16 @@ impl MetricsState {
             return Ok(false);
         };
         let next_flush_count = self.flush_count.saturating_add(1);
-        if let Err(err) = sink.write_minimal_metrics(
-            next_flush_count,
+        let snapshot = MinimalMetricsSnapshot {
+            flush_count: next_flush_count,
             diagnostics,
-            self.get_api_requests,
-            self.logger_metrics,
-            self.patch_api_requests,
-            self.put_api_requests,
-        ) {
+            deprecated_api: self.deprecated_api,
+            get_api_requests: self.get_api_requests,
+            logger_metrics: self.logger_metrics,
+            patch_api_requests: self.patch_api_requests,
+            put_api_requests: self.put_api_requests,
+        };
+        if let Err(err) = sink.write_minimal_metrics(snapshot) {
             self.logger_metrics.record_missed_metrics();
             return Err(err);
         }
@@ -309,6 +316,25 @@ impl MetricsState {
     #[cfg(test)]
     pub const fn is_configured(&self) -> bool {
         self.sink.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DeprecatedApiMetrics {
+    deprecated_http_api_calls: u64,
+}
+
+impl DeprecatedApiMetrics {
+    const fn is_empty(self) -> bool {
+        self.deprecated_http_api_calls == 0
+    }
+
+    fn record_deprecated_http_api_call(&mut self) {
+        self.deprecated_http_api_calls = self.deprecated_http_api_calls.saturating_add(1);
+    }
+
+    const fn deprecated_http_api_calls(self) -> u64 {
+        self.deprecated_http_api_calls
     }
 }
 
@@ -900,6 +926,17 @@ struct FileMetricsOutput {
     writer: LineWriter<File>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MinimalMetricsSnapshot<'a> {
+    flush_count: u64,
+    diagnostics: &'a MetricsDiagnostics,
+    deprecated_api: DeprecatedApiMetrics,
+    get_api_requests: GetApiRequestMetrics,
+    logger_metrics: LoggerMetrics,
+    patch_api_requests: PatchApiRequestMetrics,
+    put_api_requests: PutApiRequestMetrics,
+}
+
 impl MetricsOutput for FileMetricsOutput {
     fn write_json_line(&mut self, line: &serde_json::Value) -> Result<(), MetricsFlushError> {
         writeln!(self.writer, "{line}").map_err(|err| MetricsFlushError::Write(err.kind()))?;
@@ -930,13 +967,17 @@ impl MetricsSink {
 
     fn write_minimal_metrics(
         &mut self,
-        flush_count: u64,
-        diagnostics: &MetricsDiagnostics,
-        get_api_requests: GetApiRequestMetrics,
-        logger_metrics: LoggerMetrics,
-        patch_api_requests: PatchApiRequestMetrics,
-        put_api_requests: PutApiRequestMetrics,
+        snapshot: MinimalMetricsSnapshot<'_>,
     ) -> Result<(), MetricsFlushError> {
+        let MinimalMetricsSnapshot {
+            flush_count,
+            diagnostics,
+            deprecated_api,
+            get_api_requests,
+            logger_metrics,
+            patch_api_requests,
+            put_api_requests,
+        } = snapshot;
         let mut vmm = serde_json::Map::new();
         if let Some(status) = diagnostics.boot_run_loop_status() {
             vmm.insert(
@@ -968,6 +1009,17 @@ impl MetricsSink {
         }
 
         let mut root = serde_json::Map::new();
+        if !deprecated_api.is_empty() {
+            let mut deprecated = serde_json::Map::new();
+            deprecated.insert(
+                "deprecated_http_api_calls".to_string(),
+                serde_json::Value::Number(deprecated_api.deprecated_http_api_calls().into()),
+            );
+            root.insert(
+                "deprecated_api".to_string(),
+                serde_json::Value::Object(deprecated),
+            );
+        }
         if !get_api_requests.is_empty() {
             let mut get_requests = serde_json::Map::new();
             get_requests.insert(
@@ -1557,6 +1609,27 @@ mod tests {
         assert_eq!(
             output,
             "{\"get_api_requests\":{\"hotplug_memory_count\":1,\"instance_info_count\":0,\"machine_cfg_count\":0,\"mmds_count\":0,\"vmm_version_count\":0},\"patch_api_requests\":{\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":1,\"hotplug_memory_fails\":1,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":0,\"actions_fails\":0,\"boot_source_count\":0,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":2,\"hotplug_memory_fails\":1,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":0,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn writes_deprecated_api_metrics_when_recorded() {
+        let path = unique_metrics_path("deprecated-api");
+        let mut state = MetricsState::default();
+
+        state.record_deprecated_api_call();
+        state.record_deprecated_api_call();
+        state
+            .configure(MetricsConfigInput::new(&path))
+            .expect("metrics should configure");
+        assert_eq!(state.flush(), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("metrics output should be readable");
+        assert_eq!(
+            output,
+            "{\"deprecated_api\":{\"deprecated_http_api_calls\":2},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(path).expect("fixture should clean up");

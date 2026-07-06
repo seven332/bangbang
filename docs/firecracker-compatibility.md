@@ -108,7 +108,7 @@ recognized `PATCH /drives/{drive_id}` requests already map through a minimal int
 action/data boundary. Validation rejects malformed boot-source, drive update,
 VM state update, and actions requests before VMM state mutation.
 Successful `InstanceStart` startup, the `Running` transition, and an internal boot run-loop worker across bounded step windows are implemented with configured or default internal serial MMIO
-output and retained internal active, terminal-outcome, or error worker status. Process-owned API-enabled and no-api runs can exit successfully after guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET` terminal outcomes, and fail the process on non-success terminal worker states. Startup CLI and config-file metrics paths write one initial minimal metrics line when the metrics sink is configured. `FlushMetrics` is implemented as a runtime-only minimal JSON-line flush through per-process metrics state, and includes a terse `boot_run_loop_status` summary when a process-owned boot worker exists plus initial Firecracker-shaped GET, core configuration PUT, MMDS PUT, selected PATCH, observability PUT, `/actions` API request counters, `logger.missed_metrics_count` after a previous metrics write failure, and `logger.missed_log_count` after a previous logger action write failure. API-enabled and no-api runtime loops also flush the same minimal metrics output every 60 seconds while the VM is running. `PUT /logger` is implemented as pre-boot per-process observability configuration with minimal successful `InstanceStart` and `FlushMetrics` action-event output; public run-loop control, public serial
+output and retained internal active, terminal-outcome, or error worker status. Process-owned API-enabled and no-api runs can exit successfully after guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET` terminal outcomes, and fail the process on non-success terminal worker states. Startup CLI and config-file metrics paths write one initial minimal metrics line when the metrics sink is configured. `FlushMetrics` is implemented as a runtime-only minimal JSON-line flush through per-process metrics state, and includes a terse `boot_run_loop_status` summary when a process-owned boot worker exists plus initial Firecracker-shaped GET, core configuration PUT, MMDS PUT, selected PATCH, observability PUT, `/actions` API request counters, selected deprecated HTTP API usage, `logger.missed_metrics_count` after a previous metrics write failure, and `logger.missed_log_count` after a previous logger action write failure. API-enabled and no-api runtime loops also flush the same minimal metrics output every 60 seconds while the VM is running. `PUT /logger` is implemented as pre-boot per-process observability configuration with minimal successful `InstanceStart` and `FlushMetrics` action-event output; public run-loop control, public serial
 streaming, full Firecracker metrics counters, and full logger integration remain deferred.
 
 ## Process Startup CLI
@@ -167,6 +167,11 @@ requests are counted under `put_api_requests`; parsed `PATCH /machine-config`,
 `PATCH /network-interfaces/{iface_id}`, `PATCH /hotplug/memory`, and
 `PATCH /pmem/{pmem_id}` requests
 routed through VMM control are counted under `patch_api_requests`.
+Parsed deprecated HTTP API usage is counted under
+`deprecated_api.deprecated_http_api_calls` for supported machine
+`cpu_template`, MMDS V1 config, deprecated `vsock_id`, and snapshot-load
+`mem_file_path` or `enable_diff_snapshots` request forms. Malformed parser
+failures are not counted.
 Direct config-file and startup initialization paths are not API requests and
 are not included in these counters. `PATCH /vm` remains outside
 `patch_api_requests` because Firecracker does not expose a matching
@@ -502,6 +507,9 @@ through VMM control, plus selected `patch_api_requests` counters for parsed
 `PATCH /machine-config`, `PATCH /mmds`, `PATCH /drives/{drive_id}`,
 `PATCH /network-interfaces/{iface_id}`, `PATCH /hotplug/memory`, and
 `PATCH /pmem/{pmem_id}` requests routed through VMM control.
+Parsed deprecated HTTP API usage is counted under
+`deprecated_api.deprecated_http_api_calls` for the supported deprecated fields
+above; malformed parser failures remain outside the counter.
 Device runtime counters, remaining API request counters, and parser-level
 malformed-request counters remain deferred. Public run-loop control, guest boot
 output, public runner loop scheduling, full Firecracker metrics counters, and

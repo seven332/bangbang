@@ -1544,6 +1544,10 @@ mod tests {
             self.inner.handle_put_action_request(action)
         }
 
+        fn record_deprecated_api_call(&mut self) {
+            self.inner.record_deprecated_api_call();
+        }
+
         fn handle_periodic_metrics_flush(&mut self) -> Result<bool, VmmActionError> {
             let result = self.inner.handle_periodic_metrics_flush();
             self.process_exit_trigger
