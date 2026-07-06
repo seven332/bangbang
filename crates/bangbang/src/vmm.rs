@@ -131,12 +131,20 @@ impl BootRunLoopBlockDeviceUpdater {
         }
     }
 
-    fn update_block_device(&self, config: &DriveConfig) -> Result<(), DriveUpdateError> {
-        let backing =
-            BlockFileBacking::open(config).map_err(|source| DriveUpdateError::OpenBacking {
-                drive_id: config.drive_id().to_string(),
-                message: source.to_string(),
-            })?;
+    fn open_block_device_backing(
+        config: &DriveConfig,
+    ) -> Result<BlockFileBacking, DriveUpdateError> {
+        BlockFileBacking::open(config).map_err(|source| DriveUpdateError::OpenBacking {
+            drive_id: config.drive_id().to_string(),
+            message: source.to_string(),
+        })
+    }
+
+    fn update_block_device_with_opened(
+        &self,
+        config: &DriveConfig,
+        backing: BlockFileBacking,
+    ) -> Result<(), DriveUpdateError> {
         let mut dispatcher = self
             .mmio_dispatcher
             .lock()
@@ -1612,6 +1620,20 @@ where
     }
 }
 
+fn drive_update_error_from_boot_run_loop_command<C>(
+    err: BootRunLoopCommandError<C, DriveUpdateError>,
+) -> DriveUpdateError
+where
+    C: fmt::Display,
+{
+    match err {
+        BootRunLoopCommandError::Command { source } => source,
+        other => DriveUpdateError::ActiveSessionCommand {
+            message: other.to_string(),
+        },
+    }
+}
+
 pub(crate) struct BootRunLoopCommandHandle<S>
 where
     S: BootRunLoopSession,
@@ -1822,13 +1844,6 @@ where
         self.command_handle.clone()
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "boot run-loop commands are introduced before #828 drive update migration"
-        )
-    )]
     pub(crate) fn run_command<R, E>(
         &self,
         command: impl FnOnce(&mut S) -> Result<R, E> + Send + 'static,
@@ -1888,7 +1903,18 @@ where
             return Err(DriveUpdateError::ActiveSessionUnavailable);
         };
 
-        updater.update_block_device(config)
+        if !matches!(self.status(), BootRunLoopWorkerStatus::Running) {
+            return Err(DriveUpdateError::ActiveSessionUnavailable);
+        }
+
+        // Keep host file open/stat work on the caller side; only the active
+        // handler mutation runs on the boot run-loop worker.
+        let backing = BootRunLoopBlockDeviceUpdater::open_block_device_backing(config)?;
+        let updater = updater.clone();
+        let config = config.clone();
+
+        self.run_command(move |_| updater.update_block_device_with_opened(&config, backing))
+            .map_err(drive_update_error_from_boot_run_loop_command)
     }
 
     fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
@@ -1963,15 +1989,15 @@ fn default_hvf_boot_session_config(serial_output: SharedSerialOutput) -> HvfArm6
 mod tests {
     use std::collections::VecDeque;
     use std::fmt;
-    use std::fs::{self, File, remove_file};
+    use std::fs::{self, remove_file};
     use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
 
     use bangbang_runtime::block::{
-        DriveConfig, DriveConfigInput, DriveConfigs, DriveUpdateError, DriveUpdateInput,
-        PreparedBlockDevices,
+        BlockMmioLayout, DriveConfig, DriveConfigInput, DriveConfigs, DriveUpdateError,
+        DriveUpdateInput, PreparedBlockDevices,
     };
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::cpu::CpuConfigInput;
@@ -1995,8 +2021,8 @@ mod tests {
         SharedSerialOutputBuffer,
     };
     use bangbang_runtime::startup::{
-        Arm64BootNetworkDevice, Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError,
-        Arm64BootNetworkPacketIoProvider,
+        Arm64BootBlockDevice, Arm64BootNetworkDevice, Arm64BootNetworkPacketIo,
+        Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
     };
     use bangbang_runtime::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE;
     use bangbang_runtime::vsock::VsockConfigInput;
@@ -2009,8 +2035,9 @@ mod tests {
     };
 
     use super::{
-        BootRunLoopControl, BootRunLoopSession, BootRunLoopSupervisor, BootRunLoopWorkerStatus,
-        DEFAULT_ENTROPY_MMIO_BASE, DEFAULT_ENTROPY_MMIO_REGION_ID,
+        BootRunLoopBlockDeviceUpdater, BootRunLoopControl, BootRunLoopSession,
+        BootRunLoopSupervisor, BootRunLoopWorkerStatus, DEFAULT_BLOCK_MMIO_BASE,
+        DEFAULT_BLOCK_MMIO_REGION_ID, DEFAULT_ENTROPY_MMIO_BASE, DEFAULT_ENTROPY_MMIO_REGION_ID,
         DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT, DEFAULT_NETWORK_MMIO_BASE,
         DEFAULT_NETWORK_MMIO_REGION_ID, DEFAULT_SERIAL_MMIO_BASE, DEFAULT_SERIAL_MMIO_REGION_ID,
         DEFAULT_VSOCK_MMIO_BASE, DEFAULT_VSOCK_MMIO_REGION_ID, EmptyProcessNetworkRxPacketSource,
@@ -2031,10 +2058,14 @@ mod tests {
 
     impl TempFilePath {
         fn create(name: &str) -> Self {
+            Self::create_with_bytes(name, b"")
+        }
+
+        fn create_with_bytes(name: &str, bytes: &[u8]) -> Self {
             let id = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
             let path =
                 std::env::temp_dir().join(format!("bb-vmm-{}-{id}-{name}", std::process::id()));
-            File::create(&path).expect("test backing file should be created");
+            fs::write(&path, bytes).expect("test backing file should be written");
             Self { path }
         }
 
@@ -2048,6 +2079,61 @@ mod tests {
         std::env::temp_dir()
             .join(format!("bb-vmm-missing-{}-{id}", std::process::id()))
             .join(name)
+    }
+
+    fn drive_config(drive_id: &str, path: &Path) -> DriveConfig {
+        DriveConfigInput::new(drive_id, drive_id, path, false)
+            .validate()
+            .expect("drive config should validate")
+    }
+
+    fn block_device_updater_fixture(
+        drive_id: &str,
+        backing_path: &Path,
+    ) -> (BootRunLoopBlockDeviceUpdater, DriveConfig) {
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new(
+                drive_id,
+                drive_id,
+                backing_path,
+                false,
+            ))
+            .expect("drive config should insert");
+        let config = configs
+            .as_slice()
+            .first()
+            .expect("fixture drive should exist")
+            .clone();
+        let devices = PreparedBlockDevices::from_configs(&configs)
+            .expect("prepared block devices should build")
+            .register_mmio(BlockMmioLayout::new(
+                DEFAULT_BLOCK_MMIO_BASE,
+                DEFAULT_BLOCK_MMIO_REGION_ID,
+            ))
+            .expect("block MMIO devices should register");
+        let (dispatcher, registrations) = devices.into_parts();
+        let block_devices = registrations
+            .into_iter()
+            .map(|registration| {
+                let range = registration.region().range();
+                Arm64BootBlockDevice {
+                    registration,
+                    fdt_device: Arm64FdtVirtioMmioDevice {
+                        region: Arm64FdtRegion {
+                            base: range.start().raw_value(),
+                            size: range.size(),
+                        },
+                        interrupt_line: GuestInterruptLine::new(32)
+                            .expect("test interrupt line should validate"),
+                    },
+                }
+            })
+            .collect();
+        let dispatcher = Arc::new(Mutex::new(dispatcher));
+        let updater = BootRunLoopBlockDeviceUpdater::new(block_devices, Arc::clone(&dispatcher));
+
+        (updater, config)
     }
 
     impl Drop for TempFilePath {
@@ -2377,6 +2463,7 @@ mod tests {
         run_count: Arc<AtomicU64>,
         max_steps_sender: mpsc::Sender<usize>,
         outcomes: Arc<Mutex<VecDeque<Result<FakeRunLoopOutcome, FakeRunLoopError>>>>,
+        block_device_updater: Option<BootRunLoopBlockDeviceUpdater>,
         wait_for_stop: bool,
         wait_for_wakeup: bool,
         wait_for_stop_sequence: Arc<Mutex<VecDeque<bool>>>,
@@ -2396,6 +2483,7 @@ mod tests {
                 outcomes: Arc::new(Mutex::new(VecDeque::from([Ok(
                     FakeRunLoopOutcome::Terminal,
                 )]))),
+                block_device_updater: None,
                 wait_for_stop: true,
                 wait_for_wakeup: false,
                 wait_for_stop_sequence: Arc::default(),
@@ -2411,6 +2499,11 @@ mod tests {
             outcomes: impl IntoIterator<Item = Result<FakeRunLoopOutcome, FakeRunLoopError>>,
         ) -> Self {
             self.outcomes = Arc::new(Mutex::new(outcomes.into_iter().collect()));
+            self
+        }
+
+        fn with_block_device_updater(mut self, updater: BootRunLoopBlockDeviceUpdater) -> Self {
+            self.block_device_updater = Some(updater);
             self
         }
 
@@ -2446,6 +2539,10 @@ mod tests {
 
         fn run_loop_control(&self) -> Self::Control {
             self.control.clone()
+        }
+
+        fn block_device_updater(&self) -> Option<BootRunLoopBlockDeviceUpdater> {
+            self.block_device_updater.clone()
         }
 
         fn run_loop(
@@ -3827,6 +3924,186 @@ mod tests {
         drop(supervisor);
 
         assert_eq!(control.request_stop_count(), 2);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_updates_drive_backing_on_worker_after_wakeup() {
+        let original = TempFilePath::create_with_bytes("run-loop-drive-original", &[0x11; 512]);
+        let replacement =
+            TempFilePath::create_with_bytes("run-loop-drive-replacement", &[0x22; 1024]);
+        let (updater, _original_config) = block_device_updater_fixture("data", original.path());
+        let replacement_config = drive_config("data", replacement.path());
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_block_device_updater(updater)
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true)
+                .with_outcomes([
+                    Ok(FakeRunLoopOutcome::Wakeup),
+                    Ok(FakeRunLoopOutcome::Terminal),
+                ]);
+
+        let mut supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(43).expect("non-zero limit"))
+                .expect("supervisor should start");
+
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            43
+        );
+        supervisor
+            .update_block_device(&replacement_config)
+            .expect("drive update should run on worker");
+
+        assert_eq!(control.request_wakeup_count(), 1);
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_propagates_drive_update_command_error() {
+        let original =
+            TempFilePath::create_with_bytes("run-loop-drive-error-original", &[0x11; 512]);
+        let replacement =
+            TempFilePath::create_with_bytes("run-loop-drive-error-replacement", &[0x22; 1024]);
+        let (updater, _original_config) = block_device_updater_fixture("data", original.path());
+        let replacement_config = drive_config("missing", replacement.path());
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_block_device_updater(updater)
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true)
+                .with_outcomes([
+                    Ok(FakeRunLoopOutcome::Wakeup),
+                    Ok(FakeRunLoopOutcome::Terminal),
+                ]);
+
+        let mut supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(47).expect("non-zero limit"))
+                .expect("supervisor should start");
+
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            47
+        );
+
+        let error = supervisor
+            .update_block_device(&replacement_config)
+            .expect_err("unknown active drive should fail");
+
+        assert_eq!(
+            error,
+            DriveUpdateError::UnknownDrive {
+                drive_id: "missing".to_string()
+            }
+        );
+        assert_eq!(control.request_wakeup_count(), 1);
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_maps_full_drive_update_command_queue() {
+        let original =
+            TempFilePath::create_with_bytes("run-loop-drive-queue-original", &[0x11; 512]);
+        let replacement =
+            TempFilePath::create_with_bytes("run-loop-drive-queue-replacement", &[0x22; 1024]);
+        let (updater, _original_config) = block_device_updater_fixture("data", original.path());
+        let replacement_config = drive_config("data", replacement.path());
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_block_device_updater(updater);
+
+        let mut supervisor = BootRunLoopSupervisor::start_with_command_queue_capacity(
+            session,
+            NonZeroUsize::new(53).expect("non-zero limit"),
+            0,
+        )
+        .expect("supervisor should start");
+
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            53
+        );
+
+        let error = supervisor
+            .update_block_device(&replacement_config)
+            .expect_err("full queue should fail");
+
+        assert_eq!(
+            error,
+            DriveUpdateError::ActiveSessionCommand {
+                message: "boot run loop command queue is full".to_string()
+            }
+        );
+        assert_eq!(control.request_wakeup_count(), 0);
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_open_backing_failure_does_not_queue_drive_update() {
+        let original =
+            TempFilePath::create_with_bytes("run-loop-drive-open-original", &[0x11; 512]);
+        let missing = missing_temp_child_path("run-loop-drive-open-missing");
+        let (updater, _original_config) = block_device_updater_fixture("data", original.path());
+        let missing_config = drive_config("data", &missing);
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_block_device_updater(updater);
+
+        let mut supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(59).expect("non-zero limit"))
+                .expect("supervisor should start");
+
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            59
+        );
+
+        let error = supervisor
+            .update_block_device(&missing_config)
+            .expect_err("missing backing should fail before queueing command");
+
+        assert!(matches!(
+            error,
+            DriveUpdateError::OpenBacking { drive_id, .. } if drive_id == "data"
+        ));
+        assert_eq!(control.request_wakeup_count(), 0);
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
         assert_eq!(drop_count.load(Ordering::SeqCst), 1);
     }
 
