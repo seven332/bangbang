@@ -611,4 +611,14 @@ mod tests {
         assert_eq!(queues[3].kind(), VirtioBalloonQueueKind::FreePageReporting);
         assert_eq!(queues[3].index(), VIRTIO_BALLOON_STATS_QUEUE_INDEX + 1);
     }
+
+    #[test]
+    fn reporting_queue_compacts_when_hinting_and_statistics_are_disabled() {
+        let device = prepared(balloon_config(64, false, 0, false, true));
+        let queues: Vec<_> = device.queue_layout().iter().collect();
+
+        assert_eq!(queues.len(), VIRTIO_BALLOON_MIN_QUEUE_COUNT + 1);
+        assert_eq!(queues[2].kind(), VirtioBalloonQueueKind::FreePageReporting);
+        assert_eq!(queues[2].index(), VIRTIO_BALLOON_STATS_QUEUE_INDEX);
+    }
 }
