@@ -1104,8 +1104,8 @@ mod tests {
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
         VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
-        VirtioMmioDeviceActivation, VirtioMmioDeviceRegisters, VirtioMmioQueueRegisters,
-        VirtioMmioRegister,
+        VIRTIO_DEVICE_STATUS_INIT, VirtioMmioDeviceActivation, VirtioMmioDeviceRegisters,
+        VirtioMmioQueueRegisters, VirtioMmioRegister,
     };
     use crate::virtio_queue::{
         VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
@@ -1689,6 +1689,27 @@ mod tests {
                 .pending_status()
                 .contains(DeviceInterruptKind::Queue)
         );
+    }
+
+    #[test]
+    fn rng_mmio_handler_reset_clears_active_queue_and_pending_notification() {
+        let mut handler = rng_mmio_handler();
+        configure_rng_mmio_handler_queue(&mut handler, TEST_USED_RING);
+        activate_rng_mmio_handler(&mut handler);
+        notify_rng_queue(&mut handler, 0);
+
+        assert!(handler.is_device_activated());
+        assert!(handler.activation_handler().is_activated());
+        assert_eq!(handler.pending_queue_notifications(), vec![0]);
+
+        handler
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_INIT)
+            .expect("reset status should write");
+
+        assert!(!handler.is_device_activated());
+        assert!(!handler.activation_handler().is_activated());
+        assert!(handler.pending_queue_notifications().is_empty());
+        assert!(handler.interrupt_registers().pending_status().is_empty());
     }
 
     #[test]
