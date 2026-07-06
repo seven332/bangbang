@@ -49,6 +49,7 @@ pub enum ApiRequest {
     PutMmdsConfig(Box<MmdsConfigRequest>),
     PutNetworkInterface(Box<NetworkInterfaceConfigRequest>),
     PatchNetworkInterface(Box<NetworkInterfacePatchRequest>),
+    HotUnplugDevice(Box<HotUnplugDeviceRequest>),
     PutPmem,
     PatchPmem,
     PutSerial(Box<SerialConfigRequest>),
@@ -111,6 +112,36 @@ pub struct ActionRequest {
 impl ActionRequest {
     pub const fn action_type(&self) -> ActionType {
         self.action_type
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotUnplugDeviceKind {
+    Drive,
+    NetworkInterface,
+    Pmem,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotUnplugDeviceRequest {
+    kind: HotUnplugDeviceKind,
+    id: String,
+}
+
+impl HotUnplugDeviceRequest {
+    pub fn new(kind: HotUnplugDeviceKind, id: impl Into<String>) -> Self {
+        Self {
+            kind,
+            id: id.into(),
+        }
+    }
+
+    pub const fn kind(&self) -> HotUnplugDeviceKind {
+        self.kind
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
     }
 }
 
@@ -1469,8 +1500,12 @@ pub fn parse_request_with_limit(
     {
         return parse_pmem_patch_request(path_pmem_id, body);
     }
-    if method == "DELETE" && pmem_path_id(path).is_some() {
-        return Err(RequestError::PmemUnsupported);
+    if method == "DELETE"
+        && let Some(path_pmem_id) = pmem_path_id(path)
+    {
+        return Ok(ApiRequest::HotUnplugDevice(Box::new(
+            HotUnplugDeviceRequest::new(HotUnplugDeviceKind::Pmem, path_pmem_id),
+        )));
     }
 
     if method == "PATCH"
@@ -1478,16 +1513,24 @@ pub fn parse_request_with_limit(
     {
         return parse_drive_patch_request(path_drive_id, body);
     }
-    if method == "DELETE" && drive_path_id(path).is_some() {
-        return Err(RequestError::DriveUpdateUnsupported);
+    if method == "DELETE"
+        && let Some(path_drive_id) = drive_path_id(path)
+    {
+        return Ok(ApiRequest::HotUnplugDevice(Box::new(
+            HotUnplugDeviceRequest::new(HotUnplugDeviceKind::Drive, path_drive_id),
+        )));
     }
     if method == "PATCH"
         && let Some(path_iface_id) = network_interface_path_id(path)
     {
         return parse_network_interface_patch_request(path_iface_id, body);
     }
-    if method == "DELETE" && network_interface_path_id(path).is_some() {
-        return Err(RequestError::NetworkInterfaceUpdateUnsupported);
+    if method == "DELETE"
+        && let Some(path_iface_id) = network_interface_path_id(path)
+    {
+        return Ok(ApiRequest::HotUnplugDevice(Box::new(
+            HotUnplugDeviceRequest::new(HotUnplugDeviceKind::NetworkInterface, path_iface_id),
+        )));
     }
 
     if method == "PUT"
@@ -2533,6 +2576,11 @@ impl From<ApiRequest> for Endpoint {
             ApiRequest::PutCpuConfig(_) => Self::CpuConfig,
             ApiRequest::PutEntropy => Self::Entropy,
             ApiRequest::PutDrive(_) | ApiRequest::PatchDrive(_) => Self::Drive,
+            ApiRequest::HotUnplugDevice(request) => match request.kind() {
+                HotUnplugDeviceKind::Drive => Self::Drive,
+                HotUnplugDeviceKind::NetworkInterface => Self::NetworkInterface,
+                HotUnplugDeviceKind::Pmem => Self::Pmem,
+            },
             ApiRequest::PutLogger(_) => Self::Logger,
             ApiRequest::PutMachineConfig(_) => Self::MachineConfig,
             ApiRequest::PatchMachineConfig(_) => Self::MachineConfig,
@@ -4229,12 +4277,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_drive_hot_unplug_as_unsupported_without_body() {
+    fn parses_drive_hot_unplug_without_body() {
         let request = b"DELETE /drives/rootfs HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec();
+        let parsed = parse_request(&request).expect("drive hot-unplug should parse");
 
-        let err = parse_request(&request).expect_err("drive hot-unplug should be unsupported");
-        assert_eq!(err, RequestError::DriveUpdateUnsupported);
-        assert_eq!(err.fault_message(), "Drive updates are not supported.");
+        let ApiRequest::HotUnplugDevice(request) = parsed else {
+            panic!("expected hot-unplug request");
+        };
+        assert_eq!(request.kind(), HotUnplugDeviceKind::Drive);
+        assert_eq!(request.id(), "rootfs");
     }
 
     #[test]
@@ -4581,16 +4632,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_network_interface_delete_as_unsupported_without_body() {
+    fn parses_network_interface_delete_without_body() {
         let request = b"DELETE /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let parsed = parse_request(request).expect("network interface delete should parse");
 
-        let err =
-            parse_request(request).expect_err("network interface delete should be unsupported");
-        assert_eq!(err, RequestError::NetworkInterfaceUpdateUnsupported);
-        assert_eq!(
-            err.fault_message(),
-            "Network interface updates are not supported."
-        );
+        let ApiRequest::HotUnplugDevice(request) = parsed else {
+            panic!("expected hot-unplug request");
+        };
+        assert_eq!(request.kind(), HotUnplugDeviceKind::NetworkInterface);
+        assert_eq!(request.id(), "eth0");
     }
 
     #[test]
@@ -5372,12 +5422,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_pmem_delete_as_unsupported() {
+    fn parses_pmem_delete_without_body() {
         let request = b"DELETE /pmem/pmem0 HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let parsed = parse_request(request).expect("pmem delete should parse");
 
-        let err = parse_request(request).expect_err("pmem delete should be unsupported");
-        assert_eq!(err, RequestError::PmemUnsupported);
-        assert_eq!(err.fault_message(), "Pmem device is not supported.");
+        let ApiRequest::HotUnplugDevice(request) = parsed else {
+            panic!("expected hot-unplug request");
+        };
+        assert_eq!(request.kind(), HotUnplugDeviceKind::Pmem);
+        assert_eq!(request.id(), "pmem0");
     }
 
     #[test]
@@ -6197,6 +6250,11 @@ mod tests {
 
         assert_eq!(Endpoint::from(request), Endpoint::Drive);
 
+        let request = parse_request(b"DELETE /drives/rootfs HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("drive delete request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::Drive);
+
         let request = parse_request(&request_with_body(
             "PUT",
             "/machine-config",
@@ -6266,6 +6324,12 @@ mod tests {
 
         assert_eq!(Endpoint::from(request), Endpoint::NetworkInterface);
 
+        let request =
+            parse_request(b"DELETE /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .expect("network interface delete request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::NetworkInterface);
+
         let request = parse_request(&request_with_body(
             "PUT",
             "/pmem/pmem0",
@@ -6281,6 +6345,11 @@ mod tests {
             r#"{"id":"pmem0"}"#,
         ))
         .expect("pmem patch request should parse");
+
+        assert_eq!(Endpoint::from(request), Endpoint::Pmem);
+
+        let request = parse_request(b"DELETE /pmem/pmem0 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("pmem delete request should parse");
 
         assert_eq!(Endpoint::from(request), Endpoint::Pmem);
 

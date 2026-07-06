@@ -14,13 +14,15 @@ use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_api::http::{
     ActionRequest, ActionType, ApiRequest, BootSourceRequest, BootSourceResponse, CpuConfigRequest,
     DriveCacheType as ApiDriveCacheType, DriveConfigRequest, DriveConfigResponse,
-    DriveIoEngine as ApiDriveIoEngine, DrivePatchRequest, HttpResponse, LoggerConfigRequest,
-    LoggerLevel as ApiLoggerLevel, MachineConfigPatchRequest, MachineConfigRequest,
-    MachineConfigResponse, MetricsConfigRequest, MmdsConfigRequest, MmdsConfigResponse,
-    MmdsContentRequest, MmdsVersion as ApiMmdsVersion, NetworkInterfaceConfigRequest,
-    NetworkInterfaceConfigResponse, NetworkInterfacePatchRequest, RequestError,
-    SerialConfigRequest, VmConfigResponse, VmStateUpdate, VmStateUpdateRequest, VsockConfigRequest,
-    VsockConfigResponse, parse_request_with_limit, request_total_len_with_limit,
+    DriveIoEngine as ApiDriveIoEngine, DrivePatchRequest,
+    HotUnplugDeviceKind as ApiHotUnplugDeviceKind, HotUnplugDeviceRequest, HttpResponse,
+    LoggerConfigRequest, LoggerLevel as ApiLoggerLevel, MachineConfigPatchRequest,
+    MachineConfigRequest, MachineConfigResponse, MetricsConfigRequest, MmdsConfigRequest,
+    MmdsConfigResponse, MmdsContentRequest, MmdsVersion as ApiMmdsVersion,
+    NetworkInterfaceConfigRequest, NetworkInterfaceConfigResponse, NetworkInterfacePatchRequest,
+    RequestError, SerialConfigRequest, VmConfigResponse, VmStateUpdate, VmStateUpdateRequest,
+    VsockConfigRequest, VsockConfigResponse, parse_request_with_limit,
+    request_total_len_with_limit,
 };
 use bangbang_runtime::block::{
     DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine, DriveUpdateInput,
@@ -44,7 +46,10 @@ use bangbang_runtime::network::{
 };
 use bangbang_runtime::serial::SerialConfigInput;
 use bangbang_runtime::vsock::{VsockConfig, VsockConfigInput};
-use bangbang_runtime::{VmConfiguration, VmmAction, VmmActionError, VmmData};
+use bangbang_runtime::{
+    HotUnplugDeviceInput, HotUnplugDeviceKind as RuntimeHotUnplugDeviceKind, VmConfiguration,
+    VmmAction, VmmActionError, VmmData,
+};
 
 use crate::periodic_metrics::PeriodicMetricsScheduler;
 use crate::vmm::{
@@ -575,6 +580,9 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PatchNetworkInterface(config) => handle_empty(vmm.handle_patch_request(
             PatchApiRequest::network(network_interface_update_input_from_request(config.as_ref())),
         )),
+        ApiRequest::HotUnplugDevice(request) => {
+            handle_empty(vmm.handle_action(hot_unplug_action_from_request(request.as_ref())))
+        }
         ApiRequest::PutSerial(config) => handle_empty(vmm.handle_put_request(
             PutApiRequest::serial(serial_config_input_from_request(config.as_ref())),
         )),
@@ -628,6 +636,21 @@ fn vm_state_action_from_request(update: &VmStateUpdateRequest) -> VmmAction {
     }
 }
 
+fn hot_unplug_action_from_request(request: &HotUnplugDeviceRequest) -> VmmAction {
+    VmmAction::HotUnplugDevice(HotUnplugDeviceInput::new(
+        hot_unplug_kind_from_request(request.kind()),
+        request.id(),
+    ))
+}
+
+fn hot_unplug_kind_from_request(kind: ApiHotUnplugDeviceKind) -> RuntimeHotUnplugDeviceKind {
+    match kind {
+        ApiHotUnplugDeviceKind::Drive => RuntimeHotUnplugDeviceKind::Drive,
+        ApiHotUnplugDeviceKind::NetworkInterface => RuntimeHotUnplugDeviceKind::NetworkInterface,
+        ApiHotUnplugDeviceKind::Pmem => RuntimeHotUnplugDeviceKind::Pmem,
+    }
+}
+
 pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<VmmAction> {
     match request {
         ApiRequest::PutBootSource(config) => Some(VmmAction::PutBootSource(
@@ -669,6 +692,7 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         | ApiRequest::GetMmds
         | ApiRequest::GetVmConfig
         | ApiRequest::GetVersion
+        | ApiRequest::HotUnplugDevice(_)
         | ApiRequest::PatchBalloon
         | ApiRequest::PatchBalloonStats
         | ApiRequest::PatchBalloonHintingStart
@@ -4906,7 +4930,7 @@ mod tests {
             (
                 "p-del",
                 "DELETE /pmem/pmem0 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
-                "Pmem device is not supported.",
+                "The requested operation is not supported in Not started state: HotUnplugDevice",
             ),
         ] {
             let response = request_over_socket(&mut vmm, socket_name, &request);
@@ -4976,6 +5000,59 @@ mod tests {
     }
 
     #[test]
+    fn running_state_rejects_hot_unplug_endpoints_without_echoing_ids() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_request = request_with_body("PUT", "/boot-source", boot_body);
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "hot-unplug-start", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        for (socket_name, request, fault_message, private_value) in [
+            (
+                "drive-delete-running",
+                "DELETE /drives/rootfs HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "Drive updates are not supported.",
+                "rootfs",
+            ),
+            (
+                "net-delete-running",
+                "DELETE /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "Network interface updates are not supported.",
+                "eth0",
+            ),
+            (
+                "pmem-delete-running",
+                "DELETE /pmem/pmem0 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "Pmem device is not supported.",
+                "pmem0",
+            ),
+        ] {
+            let response = request_over_socket(&mut vmm, socket_name, request);
+
+            assert!(
+                response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+                "{socket_name}: {response}"
+            );
+            assert!(
+                response.contains(&format!(r#"{{"fault_message":"{fault_message}"}}"#)),
+                "{socket_name}: {response}"
+            );
+            assert!(
+                !response.contains(private_value),
+                "running hot-unplug response must not echo {private_value}: {response}"
+            );
+        }
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::Running
+        );
+    }
+
+    #[test]
     fn returns_fault_for_device_update_endpoints() {
         for (name, method, path, body, fault_message) in [
             (
@@ -4983,7 +5060,7 @@ mod tests {
                 "DELETE",
                 "/drives/rootfs",
                 "",
-                r#"{"fault_message":"Drive updates are not supported."}"#,
+                r#"{"fault_message":"The requested operation is not supported in Not started state: HotUnplugDevice"}"#,
             ),
             (
                 "drive-delete-body",
@@ -5004,7 +5081,14 @@ mod tests {
                 "DELETE",
                 "/network-interfaces/eth0",
                 "",
-                r#"{"fault_message":"Network interface updates are not supported."}"#,
+                r#"{"fault_message":"The requested operation is not supported in Not started state: HotUnplugDevice"}"#,
+            ),
+            (
+                "pmem-delete",
+                "DELETE",
+                "/pmem/pmem0",
+                "",
+                r#"{"fault_message":"The requested operation is not supported in Not started state: HotUnplugDevice"}"#,
             ),
         ] {
             let socket_name = format!("du-{name}");
