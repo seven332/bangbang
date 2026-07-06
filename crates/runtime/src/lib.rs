@@ -101,9 +101,40 @@ pub enum VmmAction {
     PutSerial(serial::SerialConfigInput),
     PutDrive(block::DriveConfigInput),
     UpdateBlockDevice(block::DriveUpdateInput),
+    HotUnplugDevice(HotUnplugDeviceInput),
     PutNetworkInterface(network::NetworkInterfaceConfigInput),
     UpdateNetworkInterface(network::NetworkInterfaceUpdateInput),
     PutVsock(vsock::VsockConfigInput),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotUnplugDeviceKind {
+    Drive,
+    NetworkInterface,
+    Pmem,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotUnplugDeviceInput {
+    kind: HotUnplugDeviceKind,
+    id: String,
+}
+
+impl HotUnplugDeviceInput {
+    pub fn new(kind: HotUnplugDeviceKind, id: impl Into<String>) -> Self {
+        Self {
+            kind,
+            id: id.into(),
+        }
+    }
+
+    pub const fn kind(&self) -> HotUnplugDeviceKind {
+        self.kind
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
 }
 
 impl VmmAction {
@@ -146,6 +177,7 @@ impl VmmAction {
             Self::PutSerial(_) => "PutSerial",
             Self::PutDrive(_) => "PutDrive",
             Self::UpdateBlockDevice(_) => "UpdateBlockDevice",
+            Self::HotUnplugDevice(_) => "HotUnplugDevice",
             Self::PutNetworkInterface(_) => "PutNetworkInterface",
             Self::UpdateNetworkInterface(_) => "UpdateNetworkInterface",
             Self::PutVsock(_) => "PutVsock",
@@ -230,6 +262,7 @@ pub enum VmmActionError {
     InstanceStart(BackendError),
     BootSourceConfig(boot::BootSourceConfigError),
     DriveConfig(block::DriveConfigError),
+    DriveUpdateUnsupported,
     LoggerConfig(logger::LoggerConfigError),
     LoggerWrite(logger::LoggerWriteError),
     MachineConfig(machine::MachineConfigError),
@@ -267,6 +300,7 @@ impl fmt::Display for VmmActionError {
             Self::InstanceStart(err) => write!(f, "failed to start microVM: {err}"),
             Self::BootSourceConfig(err) => write!(f, "{err}"),
             Self::DriveConfig(err) => write!(f, "{err}"),
+            Self::DriveUpdateUnsupported => f.write_str("Drive updates are not supported."),
             Self::LoggerConfig(err) => write!(f, "{err}"),
             Self::LoggerWrite(err) => write!(f, "{err}"),
             Self::MachineConfig(err) => write!(f, "{err}"),
@@ -306,6 +340,7 @@ impl std::error::Error for VmmActionError {
             Self::SerialConfig(err) => Some(err),
             Self::VsockConfig(err) => Some(err),
             Self::BalloonUnsupported
+            | Self::DriveUpdateUnsupported
             | Self::EntropyUnsupported
             | Self::MissingBootSource
             | Self::NetworkInterfaceUpdateUnsupported
@@ -882,6 +917,22 @@ impl VmmController {
 
                 Err(VmmActionError::UnsupportedAction(action_name))
             }
+            VmmAction::HotUnplugDevice(input) => {
+                if self.instance_info.state == InstanceState::NotStarted {
+                    return Err(VmmActionError::UnsupportedState {
+                        action: action_name,
+                        state: self.instance_info.state,
+                    });
+                }
+
+                match input.kind() {
+                    HotUnplugDeviceKind::Drive => Err(VmmActionError::DriveUpdateUnsupported),
+                    HotUnplugDeviceKind::NetworkInterface => {
+                        Err(VmmActionError::NetworkInterfaceUpdateUnsupported)
+                    }
+                    HotUnplugDeviceKind::Pmem => Err(VmmActionError::PmemUnsupported),
+                }
+            }
             VmmAction::PutNetworkInterface(config) => {
                 if self.instance_info.state != InstanceState::NotStarted {
                     return Err(VmmActionError::UnsupportedState {
@@ -997,7 +1048,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        BackendError, InstanceState, VmmAction, VmmActionError, VmmController, VmmData,
+        BackendError, HotUnplugDeviceInput, HotUnplugDeviceKind, InstanceState, VmmAction,
+        VmmActionError, VmmController, VmmData,
         block::{DriveConfigError, DriveConfigInput, DriveUpdateInput},
         boot::{
             BootCommandLineError, BootPayloadKind, BootSourceConfigError, BootSourceConfigInput,
@@ -1039,6 +1091,44 @@ mod tests {
 
     fn boot_source_input(kernel_image_path: &str) -> BootSourceConfigInput {
         BootSourceConfigInput::new(kernel_image_path)
+    }
+
+    fn hot_unplug_controller() -> VmmController {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller
+            .handle_action(VmmAction::PutDrive(drive_input(
+                "rootfs",
+                "/tmp/rootfs.ext4",
+                true,
+            )))
+            .expect("initial drive config should be stored");
+        controller
+            .handle_action(VmmAction::PutNetworkInterface(network_input(
+                "eth0", "tap0",
+            )))
+            .expect("initial network interface config should be stored");
+
+        controller
+    }
+
+    fn assert_hot_unplug_config_unchanged(controller: &VmmController, state: InstanceState) {
+        assert_eq!(controller.instance_info().state, state);
+        assert!(controller.boot_source_config().is_some());
+        assert_eq!(controller.drive_configs().len(), 1);
+        assert_eq!(controller.drive_configs()[0].drive_id(), "rootfs");
+        assert_eq!(
+            controller.drive_configs()[0].path_on_host(),
+            Path::new("/tmp/rootfs.ext4")
+        );
+        assert_eq!(controller.network_interface_configs().len(), 1);
+        assert_eq!(controller.network_interface_configs()[0].iface_id(), "eth0");
+        assert_eq!(
+            controller.network_interface_configs()[0].host_dev_name(),
+            "tap0"
+        );
     }
 
     fn serialized_len(value: &serde_json::Value) -> usize {
@@ -1364,6 +1454,14 @@ mod tests {
             VmmAction::UpdateNetworkInterface(NetworkInterfaceUpdateInput::new("eth0", "eth0"))
                 .name(),
             "UpdateNetworkInterface"
+        );
+        assert_eq!(
+            VmmAction::HotUnplugDevice(HotUnplugDeviceInput::new(
+                HotUnplugDeviceKind::NetworkInterface,
+                "eth0"
+            ))
+            .name(),
+            "HotUnplugDevice"
         );
         assert_eq!(
             VmmAction::PutVsock(vsock_input(3, "./v.sock")).name(),
@@ -1812,6 +1910,62 @@ mod tests {
                 assert!(controller.boot_source_config().is_some());
                 assert!(controller.drive_configs().is_empty());
                 assert!(controller.network_interface_configs().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn hot_unplug_rejects_not_started_without_mutating() {
+        for (kind, id) in [
+            (HotUnplugDeviceKind::Drive, "rootfs"),
+            (HotUnplugDeviceKind::NetworkInterface, "eth0"),
+            (HotUnplugDeviceKind::Pmem, "pmem0"),
+        ] {
+            let mut controller = hot_unplug_controller();
+
+            let err = controller
+                .handle_action(VmmAction::HotUnplugDevice(HotUnplugDeviceInput::new(
+                    kind, id,
+                )))
+                .expect_err("hot-unplug should be post-boot-only");
+
+            assert_eq!(
+                err,
+                VmmActionError::UnsupportedState {
+                    action: "HotUnplugDevice",
+                    state: InstanceState::NotStarted,
+                }
+            );
+            assert_hot_unplug_config_unchanged(&controller, InstanceState::NotStarted);
+        }
+    }
+
+    #[test]
+    fn hot_unplug_reaches_device_fault_after_start_without_mutating() {
+        for state in [InstanceState::Running, InstanceState::Paused] {
+            for (kind, id) in [
+                (HotUnplugDeviceKind::Drive, "rootfs"),
+                (HotUnplugDeviceKind::NetworkInterface, "eth0"),
+                (HotUnplugDeviceKind::Pmem, "pmem0"),
+            ] {
+                let mut controller = hot_unplug_controller();
+                controller.instance_info.state = state;
+
+                let err = controller
+                    .handle_action(VmmAction::HotUnplugDevice(HotUnplugDeviceInput::new(
+                        kind, id,
+                    )))
+                    .expect_err("hot-unplug should remain unsupported");
+
+                let expected = match kind {
+                    HotUnplugDeviceKind::Drive => VmmActionError::DriveUpdateUnsupported,
+                    HotUnplugDeviceKind::NetworkInterface => {
+                        VmmActionError::NetworkInterfaceUpdateUnsupported
+                    }
+                    HotUnplugDeviceKind::Pmem => VmmActionError::PmemUnsupported,
+                };
+                assert_eq!(err, expected);
+                assert_hot_unplug_config_unchanged(&controller, state);
             }
         }
     }
@@ -4224,6 +4378,14 @@ mod tests {
         let err = VmmActionError::EntropyUnsupported;
 
         assert_eq!(err.to_string(), "Entropy device is not supported.");
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn displays_drive_update_unsupported_error() {
+        let err = VmmActionError::DriveUpdateUnsupported;
+
+        assert_eq!(err.to_string(), "Drive updates are not supported.");
         assert!(err.source().is_none());
     }
 

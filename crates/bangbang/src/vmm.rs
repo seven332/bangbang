@@ -2725,6 +2725,7 @@ mod tests {
             | VmmActionError::MissingBootSource
             | VmmActionError::BootSourceConfig(_)
             | VmmActionError::DriveConfig(_)
+            | VmmActionError::DriveUpdateUnsupported
             | VmmActionError::LoggerConfig(_)
             | VmmActionError::LoggerWrite(_)
             | VmmActionError::MachineConfig(_)

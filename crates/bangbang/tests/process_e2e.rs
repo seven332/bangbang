@@ -498,7 +498,7 @@ fn executable_rejects_remaining_device_requests_without_mutating() {
     assert_bad_request_response(&pmem_delete_response, "DELETE /pmem/pmem0");
     assert_response_contains(
         &pmem_delete_response,
-        r#"{"fault_message":"Pmem device is not supported."}"#,
+        r#"{"fault_message":"The requested operation is not supported in Not started state: HotUnplugDevice"}"#,
         "DELETE /pmem/pmem0",
     );
 
@@ -926,7 +926,7 @@ fn executable_configures_vm_before_start() {
     assert_bad_request_response(&drive_delete_response, "DELETE /drives/rootfs");
     assert_response_contains(
         &drive_delete_response,
-        r#"{"fault_message":"Drive updates are not supported."}"#,
+        r#"{"fault_message":"The requested operation is not supported in Not started state: HotUnplugDevice"}"#,
         "DELETE /drives/rootfs",
     );
 
@@ -1751,7 +1751,7 @@ fn executable_configures_network_and_mmds() {
     assert_bad_request_response(&network_delete_response, "DELETE /network-interfaces/eth0");
     assert_response_contains(
         &network_delete_response,
-        r#"{"fault_message":"Network interface updates are not supported."}"#,
+        r#"{"fault_message":"The requested operation is not supported in Not started state: HotUnplugDevice"}"#,
         "DELETE /network-interfaces/eth0",
     );
 
