@@ -2,6 +2,7 @@
 
 use std::collections::TryReserveError;
 use std::fmt;
+use std::os::fd::RawFd;
 
 use crate::VmmController;
 use crate::block::{
@@ -134,6 +135,34 @@ pub struct Arm64BootRuntimeResources {
     pub network_devices: Vec<Arm64BootNetworkDevice>,
     pub vsock_device: Option<Arm64BootVsockDevice>,
     pub entropy_device: Option<Arm64BootEntropyDevice>,
+}
+
+#[derive(Debug)]
+pub enum Arm64BootVsockWakeupFdsError {
+    HandlerLookup { source: MmioHandlerLookupError },
+    ResultAllocation { source: TryReserveError },
+}
+
+impl fmt::Display for Arm64BootVsockWakeupFdsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HandlerLookup { source } => {
+                write!(f, "failed to find boot vsock MMIO handler: {source}")
+            }
+            Self::ResultAllocation { source } => {
+                write!(f, "failed to allocate boot vsock wakeup fd list: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Arm64BootVsockWakeupFdsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::HandlerLookup { source } => Some(source),
+            Self::ResultAllocation { source } => Some(source),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -813,6 +842,25 @@ pub struct Arm64BootSerialDevice {
 }
 
 impl Arm64BootRuntimeResources {
+    pub fn vsock_host_read_wakeup_fds(
+        &self,
+        mmio_dispatcher: &mut MmioDispatcher,
+    ) -> Result<Vec<RawFd>, Arm64BootVsockWakeupFdsError> {
+        let Some(device) = self.vsock_device.as_ref() else {
+            return Ok(Vec::new());
+        };
+
+        let region_id = device.registration.region_id();
+        let handler = mmio_dispatcher
+            .handler_mut::<VirtioVsockMmioHandler>(region_id)
+            .map_err(|source| Arm64BootVsockWakeupFdsError::HandlerLookup { source })?;
+
+        handler
+            .activation_handler()
+            .host_read_wakeup_fds()
+            .map_err(|source| Arm64BootVsockWakeupFdsError::ResultAllocation { source })
+    }
+
     pub fn dispatch_block_queue_notifications(
         &mut self,
         memory: &mut GuestMemory,
