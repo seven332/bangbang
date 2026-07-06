@@ -178,8 +178,10 @@ Direct config-file and startup initialization paths are not API requests and
 are not included in these counters. `PATCH /vm` remains outside
 `patch_api_requests` because Firecracker does not expose a matching
 `PatchRequestsMetrics` field for VM state changes. The balloon API request
-fields are bangbang-specific extension counters; Firecracker exposes balloon
-device metrics but no matching balloon API request metric fields. Full Firecracker
+fields are bangbang-specific extension counters: GET, PUT, and PATCH balloon
+routes report `balloon_count`, and PUT/PATCH failures also report
+`balloon_fails`. Firecracker exposes balloon device metrics but no matching
+balloon API request metric fields. Full Firecracker
 `ProcessTimeReporter` parity remains deferred.
 
 bangbang intentionally treats `--id` alphanumeric characters as ASCII only.
@@ -510,9 +512,9 @@ through VMM control, plus selected `patch_api_requests` counters for parsed
 `PATCH /machine-config`, `PATCH /mmds`, `PATCH /drives/{drive_id}`,
 `PATCH /network-interfaces/{iface_id}`, `PATCH /hotplug/memory`, and
 `PATCH /pmem/{pmem_id}` requests routed through VMM control. bangbang also
-records `balloon_count` and `balloon_fails` extension fields for parsed balloon
-GET, PUT, and PATCH routes because Firecracker does not expose matching request
-metrics.
+records `balloon_count` extension fields for parsed balloon GET, PUT, and PATCH
+routes, plus `balloon_fails` extension fields for parsed balloon PUT and PATCH
+failures, because Firecracker does not expose matching request metrics.
 Parsed deprecated HTTP API usage is counted under
 `deprecated_api.deprecated_http_api_calls` for the supported deprecated fields
 above; malformed parser failures remain outside the counter.

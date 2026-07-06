@@ -169,9 +169,10 @@ also reports selected GET counters under `get_api_requests`; parsed core
 configuration, MMDS, observability, memory hotplug, pmem, and `/actions`
 counters under `put_api_requests`; and selected PATCH counters including memory
 hotplug and pmem under `patch_api_requests`. bangbang also records
-bangbang-specific `balloon_count` and `balloon_fails` API request counters for
-parsed balloon routes because Firecracker does not expose matching balloon API
-request metric fields. Parsed deprecated HTTP API
+bangbang-specific `balloon_count` API request counters for parsed balloon GET,
+PUT, and PATCH routes, plus `balloon_fails` counters for parsed balloon PUT and
+PATCH failures, because Firecracker does not expose matching balloon API request
+metric fields. Parsed deprecated HTTP API
 usage is counted under `deprecated_api.deprecated_http_api_calls` for supported
 deprecated machine `cpu_template`, MMDS V1 config, `vsock_id`, and snapshot-load
 field forms.
