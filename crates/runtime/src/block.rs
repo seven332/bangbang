@@ -3154,8 +3154,8 @@ fn validate_drive_update_id(source: DriveIdSource, drive_id: &str) -> Result<(),
     }
 
     if !drive_id
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        .chars()
+        .all(|character| character == '_' || character.is_alphanumeric())
     {
         return Err(DriveUpdateError::InvalidDriveId {
             source,
@@ -4309,6 +4309,11 @@ mod tests {
 
     #[test]
     fn drive_update_input_validates_ids_and_empty_path() {
+        let unicode_update = DriveUpdateInput::new("数据_1", "数据_1", None)
+            .validate()
+            .expect("drive update ID validation should match initial config validation");
+        assert_eq!(unicode_update.drive_id(), "数据_1");
+
         assert_eq!(
             DriveUpdateInput::new("", "", None).validate(),
             Err(DriveUpdateError::EmptyDriveId {
