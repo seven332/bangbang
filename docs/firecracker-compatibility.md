@@ -465,6 +465,22 @@ the instance is started. `PUT /snapshot/load` reaches the snapshot unsupported
 fault before startup and fails as an unsupported state after startup. Malformed
 or schema-invalid snapshot bodies are still rejected by the parser first.
 
+Snapshot support needs a dedicated macOS/HVF design before either request can
+move beyond recognized unsupported behavior. Firecracker's implementation saves
+microVM state, KVM VM state, vCPU state, and device-manager state, writes a
+separate guest-memory image, can load memory from a file or Linux userfaultfd,
+can enable KVM dirty-page tracking for diff snapshots, and can apply
+network/vsock restore overrides before optionally resuming the VM. bangbang must
+first define HVF equivalents for paused run-loop ownership, guest-memory file
+persistence, HVF vCPU and VM state capture/restore, device-state serialization,
+host-path redaction and ownership, and failure handling that leaves the process
+in a known terminal or recoverable state. These are implementation deferrals
+until a concrete macOS/HVF limitation is proven; unknown HVF feasibility should
+not be reported as a platform limit by default. The first supported subset also
+needs an explicit snapshot format decision: Firecracker file-format
+compatibility, a bangbang-native format behind Firecracker-shaped API requests,
+or a documented unsupported boundary.
+
 `GET /vm/config` returns the accumulated supported VM configuration subset
 without side effects. It includes the stored/default `machine-config`, includes
 `boot-source` only after it is configured, and always includes a `drives` array
