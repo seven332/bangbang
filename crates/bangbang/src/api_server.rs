@@ -603,13 +603,13 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
             handle_empty(vmm.handle_action(VmmAction::PatchBalloonHintingStop))
         }
         ApiRequest::GetMemoryHotplug => {
-            handle_empty(vmm.handle_action(VmmAction::GetMemoryHotplug))
+            handle_empty(vmm.handle_get_request(GetApiRequest::HotplugMemory))
         }
         ApiRequest::PutMemoryHotplug => {
-            handle_empty(vmm.handle_action(VmmAction::PutMemoryHotplug))
+            handle_empty(vmm.handle_put_request(PutApiRequest::memory_hotplug()))
         }
         ApiRequest::PatchMemoryHotplug => {
-            handle_empty(vmm.handle_action(VmmAction::PatchMemoryHotplug))
+            handle_empty(vmm.handle_patch_request(PatchApiRequest::memory_hotplug()))
         }
         ApiRequest::PutEntropy => handle_empty(vmm.handle_action(VmmAction::PutEntropy)),
         ApiRequest::PutPmem => handle_empty(vmm.handle_put_request(PutApiRequest::pmem())),
@@ -3098,7 +3098,7 @@ mod tests {
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("fixture should clean up");
@@ -3139,7 +3139,7 @@ mod tests {
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"put_api_requests\":{\"actions_count\":3,\"actions_fails\":1,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"put_api_requests\":{\"actions_count\":3,\"actions_fails\":1,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("fixture should clean up");
@@ -3203,7 +3203,7 @@ mod tests {
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"get_api_requests\":{\"instance_info_count\":1,\"machine_cfg_count\":1,\"mmds_count\":1,\"vmm_version_count\":1},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"get_api_requests\":{\"hotplug_memory_count\":0,\"instance_info_count\":1,\"machine_cfg_count\":1,\"mmds_count\":1,\"vmm_version_count\":1},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("fixture should clean up");
@@ -3306,7 +3306,7 @@ mod tests {
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":2,\"logger_fails\":1,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":2,\"metrics_fails\":1,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":2,\"serial_fails\":1,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":2,\"logger_fails\":1,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":2,\"metrics_fails\":1,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":2,\"serial_fails\":1,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
@@ -3471,7 +3471,7 @@ mod tests {
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":2,\"boot_source_fails\":1,\"cpu_cfg_count\":2,\"cpu_cfg_fails\":1,\"drive_count\":2,\"drive_fails\":1,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":2,\"network_fails\":1,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":2,\"vsock_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":2,\"boot_source_fails\":1,\"cpu_cfg_count\":2,\"cpu_cfg_fails\":1,\"drive_count\":2,\"drive_fails\":1,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":2,\"network_fails\":1,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":2,\"vsock_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         assert!(!drive_path.exists());
@@ -3559,7 +3559,7 @@ mod tests {
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"patch_api_requests\":{\"drive_count\":0,\"drive_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":1,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":4,\"mmds_fails\":2,\"network_count\":1,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"patch_api_requests\":{\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":1,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":4,\"mmds_fails\":2,\"network_count\":1,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
@@ -3635,10 +3635,99 @@ mod tests {
             fs::read_to_string(&metrics_path).expect("metrics output should be readable");
         assert_eq!(
             metrics_output,
-            "{\"patch_api_requests\":{\"drive_count\":0,\"drive_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":1,\"pmem_fails\":1},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":1,\"pmem_fails\":1,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"patch_api_requests\":{\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":1,\"pmem_fails\":1},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":1,\"pmem_fails\":1,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
         assert!(!metrics_output.contains("pmem0"));
         assert!(!metrics_output.contains("/private/tmp/pmem.img"));
+
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
+    }
+
+    #[test]
+    fn configured_metrics_counts_memory_hotplug_api_requests() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let metrics_path = unique_socket_path("metrics-memory-hotplug").with_extension("metrics");
+
+        let metrics_body = format!(r#"{{"metrics_path":"{}"}}"#, metrics_path.to_string_lossy());
+        let metrics_request = request_with_body("PUT", "/metrics", &metrics_body);
+        assert_eq!(
+            handle_request_bytes(metrics_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let valid_get_response = request_over_socket(
+            &mut vmm,
+            "mh-m-get",
+            "GET /hotplug/memory HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(valid_get_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(valid_get_response.contains(
+            r#"{"fault_message":"The requested operation is not supported in Not started state: GetMemoryHotplug"}"#
+        ));
+
+        let valid_put_body =
+            r#"{"total_size_mib":222222222,"block_size_mib":2,"slot_size_mib":128}"#;
+        let valid_put_response = request_over_socket(
+            &mut vmm,
+            "mh-m-put",
+            &request_with_body("PUT", "/hotplug/memory", valid_put_body),
+        );
+        assert!(valid_put_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(
+            valid_put_response.contains(r#"{"fault_message":"Memory hotplug is not supported."}"#)
+        );
+
+        let malformed_put_response = request_over_socket(
+            &mut vmm,
+            "mh-m-put-bad",
+            &request_with_body("PUT", "/hotplug/memory", r#"{"size_mib":2048}"#),
+        );
+        assert!(malformed_put_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(malformed_put_response.contains(r#"{"fault_message":"Malformed HTTP request."}"#));
+
+        let valid_patch_body = r#"{"requested_size_mib":333333333}"#;
+        let valid_patch_response = request_over_socket(
+            &mut vmm,
+            "mh-m-pat",
+            &request_with_body("PATCH", "/hotplug/memory", valid_patch_body),
+        );
+        assert!(valid_patch_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(valid_patch_response.contains(
+            r#"{"fault_message":"The requested operation is not supported in Not started state: PatchMemoryHotplug"}"#
+        ));
+
+        let malformed_patch_response = request_over_socket(
+            &mut vmm,
+            "mh-m-pat-bad",
+            &request_with_body("PATCH", "/hotplug/memory", "not-json"),
+        );
+        assert!(malformed_patch_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(
+            malformed_patch_response.contains(r#"{"fault_message":"Malformed HTTP request."}"#)
+        );
+
+        let boot_request = request_with_body(
+            "PUT",
+            "/boot-source",
+            r#"{"kernel_image_path":"/tmp/vmlinux"}"#,
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "mh-m-a1", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let flush_response = put_action_over_socket(&mut vmm, "mh-m-a2", "FlushMetrics");
+        assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let metrics_output =
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable");
+        assert_eq!(
+            metrics_output,
+            "{\"get_api_requests\":{\"hotplug_memory_count\":1,\"instance_info_count\":0,\"machine_cfg_count\":0,\"mmds_count\":0,\"vmm_version_count\":0},\"patch_api_requests\":{\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":1,\"hotplug_memory_fails\":1,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":1,\"hotplug_memory_fails\":1,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+        assert!(!metrics_output.contains("222222222"));
+        assert!(!metrics_output.contains("333333333"));
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }
@@ -3820,7 +3909,7 @@ mod tests {
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"patch_api_requests\":{\"drive_count\":1,\"drive_fails\":1,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"mmds_count\":2,\"mmds_fails\":1,\"network_count\":2,\"network_fails\":2,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"patch_api_requests\":{\"drive_count\":1,\"drive_fails\":1,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"mmds_count\":2,\"mmds_fails\":1,\"network_count\":2,\"network_fails\":2,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
@@ -3861,7 +3950,7 @@ mod tests {
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"boot_run_loop_status\":\"running\",\"metrics_flush_count\":1}}\n"
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"boot_run_loop_status\":\"running\",\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("fixture should clean up");
@@ -3911,7 +4000,7 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&startup_metrics_path)
                 .expect("startup metrics output should be readable"),
-            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":1,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":1,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
         assert!(!api_metrics_path.exists());
 
