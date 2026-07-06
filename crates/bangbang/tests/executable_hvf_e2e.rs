@@ -119,6 +119,7 @@ mod macos_arm64 {
         let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
         let initrd_path = env_path(BANGBANG_GUEST_INITRD_PATH_ENV);
         let instance_id = test_dir.instance_id();
+        let future_start_time = u64::MAX.to_string();
 
         create_zeroed_block_backing(&backing_path);
         create_empty_file(&serial_output_path);
@@ -128,9 +129,9 @@ mod macos_arm64 {
             &instance_id,
             &[
                 "--start-time-us",
-                "1000",
+                future_start_time.as_str(),
                 "--start-time-cpu-us",
-                "2000",
+                future_start_time.as_str(),
                 "--parent-cpu-time-us",
                 "3000",
             ],
@@ -2639,11 +2640,11 @@ mod macos_arm64 {
         });
 
         assert!(
-            output.contains(r#""process_startup_time_us":1000"#),
+            output.contains(r#""process_startup_time_us":0"#),
             "metrics output should include process_startup_time_us; output:\n{output}"
         );
         assert!(
-            output.contains(r#""process_startup_time_cpu_us":5000"#),
+            output.contains(r#""process_startup_time_cpu_us":3000"#),
             "metrics output should include process_startup_time_cpu_us; output:\n{output}"
         );
         assert!(

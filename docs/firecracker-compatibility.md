@@ -135,9 +135,9 @@ exits on handled `SIGINT`, handled `SIGTERM`, or guest PSCI `SYSTEM_OFF` or
 | `--api-sock <PATH>` | binds the API Unix socket | Firecracker defaults to `/run/firecracker.socket`; bangbang defaults to `/tmp/bangbang.socket` because macOS does not normally provide `/run`. This is an intentional host-platform difference. |
 | `--http-api-max-payload-size <BYTES>` | configures the maximum accepted HTTP API request size | Defaults to Firecracker's `51200` byte limit. The configured value applies to API socket reads and final request parsing. Zero, malformed, and duplicate values are rejected during argument parsing. |
 | `--id <ID>` | parsed and stored | Defaults to Firecracker's `anonymous-instance`. IDs must be 1 to 64 bytes and contain only ASCII alphanumeric characters or `-`. |
-| `--start-time-us <MICROS>` | parsed and reported in minimal metrics | Accepts non-negative `u64` microsecond values passed by Firecracker-style launchers. When provided, startup, explicit runtime `FlushMetrics`, and periodic runtime metrics output include `api_server.process_startup_time_us`. Full `ProcessTimeReporter` parity remains deferred. |
-| `--start-time-cpu-us <MICROS>` | parsed and reported in minimal metrics | Accepts non-negative `u64` microsecond values passed by Firecracker-style launchers. When provided, startup, explicit runtime `FlushMetrics`, and periodic runtime metrics output include `api_server.process_startup_time_cpu_us`. Full `ProcessTimeReporter` parity remains deferred. |
-| `--parent-cpu-time-us <MICROS>` | parsed and reported in minimal metrics | Accepts non-negative `u64` microsecond values passed by Firecracker-style launchers. When `--start-time-cpu-us` is also provided, startup, explicit runtime `FlushMetrics`, and periodic runtime metrics output add this value into `api_server.process_startup_time_cpu_us`; it is not serialized separately. Full `ProcessTimeReporter` parity remains deferred. |
+| `--start-time-us <MICROS>` | parsed and reported in minimal metrics | Accepts non-negative `u64` microsecond values passed by Firecracker-style launchers. When provided, startup, explicit runtime `FlushMetrics`, and periodic runtime metrics output include `api_server.process_startup_time_us` as the sampled monotonic clock minus this value, saturating at zero for future timestamps. |
+| `--start-time-cpu-us <MICROS>` | parsed and reported in minimal metrics | Accepts non-negative `u64` microsecond values passed by Firecracker-style launchers. When provided, startup, explicit runtime `FlushMetrics`, and periodic runtime metrics output include `api_server.process_startup_time_cpu_us` as the sampled process CPU clock minus this value, saturating at zero for future timestamps before adding optional parent CPU time. |
+| `--parent-cpu-time-us <MICROS>` | parsed and reported in minimal metrics | Accepts non-negative `u64` microsecond values passed by Firecracker-style launchers. When `--start-time-cpu-us` is also provided, startup, explicit runtime `FlushMetrics`, and periodic runtime metrics output add this value into `api_server.process_startup_time_cpu_us`; it is not serialized separately. |
 | `--metrics-path <PATH>` | configures metrics output before API serving | Uses the same per-process metrics sink and redacted host-path error policy as `PUT /metrics`. A later duplicate `PUT /metrics` request fails without replacing this sink. |
 | `--log-path <PATH>` | configures logger output before API serving | Uses the same per-process logger sink and redacted host-path error policy as `PUT /logger`. |
 | `--level <LEVEL>` | configures logger level before API serving | Accepts the existing logger levels `Off`, `Trace`, `Debug`, `Info`, `Warn`, `Warning`, and `Error`; minimal action logs are emitted only when the configured level allows `Info`. |
@@ -181,8 +181,9 @@ are not included in these counters. `PATCH /vm` remains outside
 fields are bangbang-specific extension counters: GET, PUT, and PATCH balloon
 routes report `balloon_count`, and PUT/PATCH failures also report
 `balloon_fails`. Firecracker exposes balloon device metrics but no matching
-balloon API request metric fields. Full Firecracker
-`ProcessTimeReporter` parity remains deferred.
+balloon API request metric fields. The startup timing fields from
+Firecracker's `ProcessTimeReporter` are implemented; the broader full
+Firecracker metrics set remains deferred.
 
 bangbang intentionally treats `--id` alphanumeric characters as ASCII only.
 This is stricter than Firecracker `v1.16.0`'s Rust validator, which accepts
