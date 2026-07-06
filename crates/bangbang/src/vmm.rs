@@ -423,6 +423,8 @@ pub(crate) trait VmmRequestHandler {
 
     fn handle_put_action_request(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError>;
 
+    fn record_deprecated_api_call(&mut self);
+
     fn handle_periodic_metrics_flush(&mut self) -> Result<bool, VmmActionError> {
         Ok(false)
     }
@@ -598,6 +600,10 @@ where
         result
     }
 
+    fn record_deprecated_api_call(&mut self) {
+        self.controller.record_deprecated_api_call();
+    }
+
     fn start_instance(&mut self) -> Result<VmmData, VmmActionError> {
         let controller = &mut self.controller;
         let starter = &mut self.starter;
@@ -703,6 +709,10 @@ where
 
     fn handle_put_request(&mut self, request: PutApiRequest) -> Result<VmmData, VmmActionError> {
         ProcessVmm::handle_put_request(self, request)
+    }
+
+    fn record_deprecated_api_call(&mut self) {
+        ProcessVmm::record_deprecated_api_call(self);
     }
 
     fn process_exit_wakeup_fd(&self) -> Option<RawFd> {

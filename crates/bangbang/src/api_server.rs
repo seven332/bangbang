@@ -521,6 +521,8 @@ fn handle_request_bytes_with_limit(
 }
 
 fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> HttpResponse {
+    record_deprecated_api_usage(&request, vmm);
+
     match request {
         ApiRequest::GetInstanceInfo => {
             handle_instance_info(vmm.handle_get_request(GetApiRequest::InstanceInfo))
@@ -615,10 +617,60 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PutPmem => handle_empty(vmm.handle_put_request(PutApiRequest::pmem())),
         ApiRequest::PatchPmem => handle_empty(vmm.handle_patch_request(PatchApiRequest::pmem())),
         ApiRequest::PutSnapshotCreate => handle_empty(vmm.handle_action(VmmAction::CreateSnapshot)),
-        ApiRequest::PutSnapshotLoad => handle_empty(vmm.handle_action(VmmAction::LoadSnapshot)),
+        ApiRequest::PutSnapshotLoad(_) => handle_empty(vmm.handle_action(VmmAction::LoadSnapshot)),
         ApiRequest::PutVsock(config) => handle_empty(vmm.handle_put_request(PutApiRequest::vsock(
             vsock_config_input_from_request(config.as_ref()),
         ))),
+    }
+}
+
+fn record_deprecated_api_usage(request: &ApiRequest, vmm: &mut impl VmmRequestHandler) {
+    if request_uses_deprecated_api(request) {
+        vmm.record_deprecated_api_call();
+    }
+}
+
+fn request_uses_deprecated_api(request: &ApiRequest) -> bool {
+    match request {
+        ApiRequest::PutMachineConfig(config) => config.cpu_template_configured(),
+        ApiRequest::PatchMachineConfig(config) => config.cpu_template_configured(),
+        ApiRequest::PutMmdsConfig(config) => config.version() == ApiMmdsVersion::V1,
+        ApiRequest::PutSnapshotLoad(config) => config.deprecated_fields_used(),
+        ApiRequest::PutVsock(config) => config.vsock_id().is_some(),
+        ApiRequest::GetInstanceInfo
+        | ApiRequest::GetBalloon
+        | ApiRequest::GetBalloonStats
+        | ApiRequest::GetBalloonHintingStatus
+        | ApiRequest::GetMachineConfig
+        | ApiRequest::GetMemoryHotplug
+        | ApiRequest::GetMmds
+        | ApiRequest::GetVmConfig
+        | ApiRequest::GetVersion
+        | ApiRequest::HotUnplugDevice(_)
+        | ApiRequest::PatchBalloon
+        | ApiRequest::PatchBalloonStats
+        | ApiRequest::PatchBalloonHintingStart
+        | ApiRequest::PatchBalloonHintingStop
+        | ApiRequest::PatchDrive(_)
+        | ApiRequest::PatchMemoryHotplug
+        | ApiRequest::PatchMmds(_)
+        | ApiRequest::PatchNetworkInterface(_)
+        | ApiRequest::PatchPmem
+        | ApiRequest::PatchVmState(_)
+        | ApiRequest::PutAction(_)
+        | ApiRequest::PutBalloon
+        | ApiRequest::PutBootSource(_)
+        | ApiRequest::PutCpuConfig(_)
+        | ApiRequest::PutDrive(_)
+        | ApiRequest::PutEntropy
+        | ApiRequest::PutLogger(_)
+        | ApiRequest::PutMemoryHotplug
+        | ApiRequest::PutMetrics(_)
+        | ApiRequest::PutMmds(_)
+        | ApiRequest::PutNetworkInterface(_)
+        | ApiRequest::PutPmem
+        | ApiRequest::PutSerial(_)
+        | ApiRequest::PutSnapshotCreate => false,
     }
 }
 
@@ -711,7 +763,7 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         | ApiRequest::PutMmds(_)
         | ApiRequest::PutPmem
         | ApiRequest::PutSnapshotCreate
-        | ApiRequest::PutSnapshotLoad => None,
+        | ApiRequest::PutSnapshotLoad(_) => None,
     }
 }
 
@@ -1583,6 +1635,10 @@ mod tests {
             action: VmmAction,
         ) -> Result<VmmData, VmmActionError> {
             self.inner.handle_put_action_request(action)
+        }
+
+        fn record_deprecated_api_call(&mut self) {
+            self.inner.record_deprecated_api_call();
         }
 
         fn handle_periodic_metrics_flush(&mut self) -> Result<bool, VmmActionError> {
@@ -3739,6 +3795,119 @@ mod tests {
         );
         assert!(!metrics_output.contains("222222222"));
         assert!(!metrics_output.contains("333333333"));
+
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
+    }
+
+    #[test]
+    fn configured_metrics_counts_deprecated_api_requests() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let metrics_path = unique_socket_path("metrics-deprecated-api").with_extension("metrics");
+
+        let metrics_body = format!(r#"{{"metrics_path":"{}"}}"#, metrics_path.to_string_lossy());
+        let metrics_request = request_with_body("PUT", "/metrics", &metrics_body);
+        assert_eq!(
+            handle_request_bytes(metrics_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let machine_request = request_with_body(
+            "PUT",
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256,"cpu_template":null}"#,
+        );
+        assert_eq!(
+            handle_request_bytes(machine_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let machine_patch_request = request_with_body(
+            "PATCH",
+            "/machine-config",
+            r#"{"mem_size_mib":256,"cpu_template":null}"#,
+        );
+        assert_eq!(
+            handle_request_bytes(machine_patch_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let mmds_config_response = handle_request_bytes(
+            request_with_body("PUT", "/mmds/config", r#"{"network_interfaces":[]}"#).as_bytes(),
+            &mut vmm,
+        );
+        assert_eq!(
+            mmds_config_response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+
+        let vsock_body = r#"{"vsock_id":"vsock-secret","guest_cid":2,"uds_path":"/private/tmp/deprecated-vsock-secret.sock"}"#;
+        let vsock_response = handle_request_bytes(
+            request_with_body("PUT", "/vsock", vsock_body).as_bytes(),
+            &mut vmm,
+        );
+        assert_eq!(
+            vsock_response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+
+        let snapshot_load_body = r#"{"snapshot_path":"/private/tmp/deprecated-vmstate","mem_file_path":"/private/tmp/deprecated-memory"}"#;
+        let snapshot_load_response = handle_request_bytes(
+            request_with_body("PUT", "/snapshot/load", snapshot_load_body).as_bytes(),
+            &mut vmm,
+        );
+        assert_eq!(
+            snapshot_load_response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+
+        let malformed_machine_response = handle_request_bytes(
+            request_with_body(
+                "PUT",
+                "/machine-config",
+                r#"{"vcpu_count":1,"mem_size_mib":256,"cpu_template":"unknown-template"}"#,
+            )
+            .as_bytes(),
+            &mut vmm,
+        );
+        assert_eq!(
+            malformed_machine_response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+
+        let malformed_snapshot_load_body = r#"{"snapshot_path":"vmstate","mem_file_path":"memory","mem_backend":{"backend_path":"memory","backend_type":"File"}}"#;
+        let malformed_snapshot_load_response = handle_request_bytes(
+            request_with_body("PUT", "/snapshot/load", malformed_snapshot_load_body).as_bytes(),
+            &mut vmm,
+        );
+        assert_eq!(
+            malformed_snapshot_load_response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+
+        let boot_request = request_with_body(
+            "PUT",
+            "/boot-source",
+            r#"{"kernel_image_path":"/tmp/vmlinux"}"#,
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "deprecated-a1", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let flush_response = put_action_over_socket(&mut vmm, "deprecated-a2", "FlushMetrics");
+        assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let metrics_output =
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable");
+        assert_eq!(
+            metrics_output,
+            "{\"deprecated_api\":{\"deprecated_http_api_calls\":5},\"patch_api_requests\":{\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":1,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":1,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":1,\"mmds_fails\":1,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":1,\"vsock_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+        assert!(!metrics_output.contains("vsock-secret"));
+        assert!(!metrics_output.contains("deprecated-vsock-secret"));
+        assert!(!metrics_output.contains("deprecated-vmstate"));
+        assert!(!metrics_output.contains("deprecated-memory"));
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }

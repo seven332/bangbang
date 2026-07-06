@@ -599,6 +599,10 @@ impl VmmController {
         self.metrics_state.record_put_vsock_failure();
     }
 
+    pub fn record_deprecated_api_call(&mut self) {
+        self.metrics_state.record_deprecated_api_call();
+    }
+
     pub fn record_patch_drive_request(&mut self) {
         self.metrics_state.record_patch_drive_request();
     }
