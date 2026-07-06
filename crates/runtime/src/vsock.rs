@@ -1,11 +1,11 @@
 //! Backend-neutral vsock configuration model.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque, hash_map::Entry};
+use std::collections::{BTreeSet, HashMap, HashSet, TryReserveError, VecDeque, hash_map::Entry};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read as _, Write as _};
 use std::mem;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -1470,6 +1470,22 @@ impl VsockHostConnectionTable {
             .any(VsockHostConnection::can_poll_host_rw_payload)
     }
 
+    fn pollable_host_rw_payload_fd_count(&self) -> usize {
+        self.connections
+            .values()
+            .filter(|connection| connection.can_poll_host_rw_payload())
+            .count()
+    }
+
+    fn push_pollable_host_rw_payload_fds(&self, fds: &mut Vec<RawFd>) {
+        fds.extend(
+            self.connections
+                .values()
+                .filter(|connection| connection.can_poll_host_rw_payload())
+                .map(|connection| connection.stream().as_raw_fd()),
+        );
+    }
+
     fn pending_host_rw_packet(
         &self,
         key: VsockHostConnectionKey,
@@ -2479,6 +2495,22 @@ impl VsockGuestConnectionTable {
         self.connections
             .values()
             .any(VsockGuestConnection::can_poll_host_rw_payload)
+    }
+
+    fn pollable_host_rw_payload_fd_count(&self) -> usize {
+        self.connections
+            .values()
+            .filter(|connection| connection.can_poll_host_rw_payload())
+            .count()
+    }
+
+    fn push_pollable_host_rw_payload_fds(&self, fds: &mut Vec<RawFd>) {
+        fds.extend(
+            self.connections
+                .values()
+                .filter(|connection| connection.can_poll_host_rw_payload())
+                .map(|connection| connection.stream().as_raw_fd()),
+        );
     }
 
     fn pending_host_rw_packet(
@@ -5242,6 +5274,44 @@ impl VirtioVsockDevice {
         self.active_event_queue.as_ref()
     }
 
+    pub fn host_read_wakeup_fds(&self) -> Result<Vec<RawFd>, TryReserveError> {
+        let mut fds = Vec::new();
+        if !self.is_activated() {
+            return Ok(fds);
+        }
+
+        let retained_host_connections = self
+            .host_connections
+            .len()
+            .saturating_add(self.pending_host_connections.len());
+        let listener_fd_count = usize::from(
+            self.host_socket_owner.is_some()
+                && retained_host_connections < self.host_connection_limit,
+        );
+        let capacity = listener_fd_count
+            .saturating_add(self.pending_host_connections.len())
+            .saturating_add(self.host_connections.pollable_host_rw_payload_fd_count())
+            .saturating_add(self.guest_connections.pollable_host_rw_payload_fd_count());
+        fds.try_reserve_exact(capacity)?;
+
+        if listener_fd_count != 0
+            && let Some(owner) = self.host_socket_owner.as_ref()
+        {
+            fds.push(owner.listener.as_raw_fd());
+        }
+        fds.extend(
+            self.pending_host_connections
+                .iter()
+                .map(|connection| connection.stream().as_raw_fd()),
+        );
+        self.host_connections
+            .push_pollable_host_rw_payload_fds(&mut fds);
+        self.guest_connections
+            .push_pollable_host_rw_payload_fds(&mut fds);
+
+        Ok(fds)
+    }
+
     /// Accepts one pending host connection from the owned listener.
     ///
     /// Returns `Ok(None)` when this call did not produce an accepted stream,
@@ -5577,21 +5647,24 @@ impl VirtioVsockDevice {
     fn poll_host_request_connections(&mut self) -> VirtioVsockHostRequestDispatch {
         let mut dispatch = VirtioVsockHostRequestDispatch::new();
 
-        let retained_connections = self
+        let mut retained_connections = self
             .host_connections
             .len()
             .saturating_add(self.pending_host_connections.len());
-        if retained_connections < self.host_connection_limit
-            && let Some(host_socket_owner) = self.host_socket_owner.as_ref()
-        {
+        while retained_connections < self.host_connection_limit {
+            let Some(host_socket_owner) = self.host_socket_owner.as_ref() else {
+                break;
+            };
             match host_socket_owner.accept_host_connection() {
                 Ok(Some(accepted)) => {
                     self.pending_host_connections.push_back(accepted);
                     dispatch.accepted_connections += 1;
+                    retained_connections = retained_connections.saturating_add(1);
                 }
-                Ok(None) => {}
+                Ok(None) => break,
                 Err(_) => {
                     dispatch.dropped_connections += 1;
+                    break;
                 }
             }
         }
@@ -7313,6 +7386,7 @@ mod tests {
     use std::fs;
     use std::io;
     use std::io::{Read as _, Write as _};
+    use std::os::fd::AsRawFd as _;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::Path;
     use std::path::PathBuf;
@@ -7457,6 +7531,15 @@ mod tests {
 
     fn prepared_vsock_device(guest_cid: u32, uds_path: impl Into<String>) -> PreparedVsockDevice {
         PreparedVsockDevice::from_config(&valid_vsock_config(guest_cid, uds_path))
+    }
+
+    fn activate_vsock_device(device: &mut VirtioVsockDevice) {
+        let registers = vsock_device_registers();
+        let queues = configured_vsock_queue_registers(Some(4), true);
+
+        device
+            .activate_vsock(VirtioMmioDeviceActivation::new(&registers, &queues))
+            .expect("vsock device should activate");
     }
 
     fn unique_socket_path(name: &str) -> PathBuf {
@@ -10513,6 +10596,37 @@ mod tests {
     }
 
     #[test]
+    fn virtio_vsock_host_request_poll_drains_pending_listener_connections() {
+        let (mut device, path) = host_socket_device(42, "poll-drain");
+        let mut clients = Vec::new();
+        for port in [4000, 4001, 4002] {
+            let mut client = UnixStream::connect(&path).expect("client should connect");
+            let request = format!("CONNECT {port}\n");
+            client
+                .write_all(request.as_bytes())
+                .expect("CONNECT should write");
+            clients.push(client);
+        }
+
+        let dispatch = device.poll_host_request_connections();
+        let mut peer_ports = device
+            .host_connections
+            .connections
+            .keys()
+            .map(|key| key.peer_port())
+            .collect::<Vec<_>>();
+        peer_ports.sort_unstable();
+
+        assert_eq!(dispatch.accepted_connections(), 3);
+        assert_eq!(dispatch.completed_requests(), 3);
+        assert_eq!(dispatch.dropped_connections(), 0);
+        assert_eq!(dispatch.pending_connections(), 0);
+        assert_eq!(device.pending_host_connection_count(), 0);
+        assert_eq!(peer_ports, [4000, 4001, 4002]);
+        assert_eq!(clients.len(), 3);
+    }
+
+    #[test]
     fn virtio_vsock_host_request_poll_retains_partial_connect_handshake() {
         let (mut device, path) = host_socket_device(42, "poll-partial");
         let mut client = UnixStream::connect(&path).expect("client should connect");
@@ -12426,6 +12540,81 @@ mod tests {
                 .queue_state(),
             event_queue
         );
+    }
+
+    #[test]
+    fn virtio_vsock_device_host_read_wakeup_fds_are_empty_before_activation() {
+        let (device, _path) = host_socket_device(MIN_GUEST_CID, "wakeup-inactive");
+
+        let fds = device
+            .host_read_wakeup_fds()
+            .expect("wakeup fd collection should succeed");
+
+        assert!(fds.is_empty());
+    }
+
+    #[test]
+    fn virtio_vsock_device_host_read_wakeup_fds_include_active_listener() {
+        let (mut device, _path) = host_socket_device(MIN_GUEST_CID, "wakeup-listen");
+        activate_vsock_device(&mut device);
+
+        let fds = device
+            .host_read_wakeup_fds()
+            .expect("wakeup fd collection should succeed");
+        let listener_fd = device
+            .host_socket_owner
+            .as_ref()
+            .expect("host socket should be attached")
+            .listener
+            .as_raw_fd();
+
+        assert_eq!(fds, [listener_fd]);
+    }
+
+    #[test]
+    fn virtio_vsock_device_host_read_wakeup_fds_include_pending_host_handshake_stream() {
+        let (accepted, _client) = accepted_host_connection("wakeup-handshake");
+        let accepted_fd = accepted.stream().as_raw_fd();
+        let mut device = VirtioVsockDevice::with_guest_cid(MIN_GUEST_CID);
+        activate_vsock_device(&mut device);
+        device.pending_host_connections.push_back(accepted);
+
+        let fds = device
+            .host_read_wakeup_fds()
+            .expect("wakeup fd collection should succeed");
+
+        assert_eq!(fds, [accepted_fd]);
+    }
+
+    #[test]
+    fn virtio_vsock_device_host_read_wakeup_fds_include_established_host_rw_stream() {
+        let request =
+            VsockHostConnectRequest::parse(b"CONNECT 5006\n").expect("request should parse");
+        let (accepted, _client) = accepted_host_connection("wakeup-host-rw");
+        let accepted_fd = accepted.stream().as_raw_fd();
+        let mut device = VirtioVsockDevice::with_guest_cid(MIN_GUEST_CID);
+        activate_vsock_device(&mut device);
+        let key = device
+            .insert_accepted_host_connection(accepted, request)
+            .expect("host connection should insert");
+        let header = device
+            .host_connections
+            .take_pending_request_packet_header(key, MIN_GUEST_CID)
+            .expect("pending request header should exist");
+        assert_eq!(header.operation(), VIRTIO_VSOCK_OP_REQUEST);
+        device
+            .host_connections
+            .connections
+            .get_mut(&key)
+            .expect("host connection should exist")
+            .acknowledge_guest_response(key)
+            .expect("host response should acknowledge");
+
+        let fds = device
+            .host_read_wakeup_fds()
+            .expect("wakeup fd collection should succeed");
+
+        assert_eq!(fds, [accepted_fd]);
     }
 
     #[test]

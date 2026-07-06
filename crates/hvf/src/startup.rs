@@ -2,9 +2,13 @@
 
 use std::collections::TryReserveError;
 use std::fmt;
+use std::io::{self, Write as _};
 use std::num::NonZeroUsize;
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::thread::{self, JoinHandle};
 
 use bangbang_runtime::block::BlockMmioLayout;
 use bangbang_runtime::entropy::{EntropyMmioLayout, VirtioRngOsEntropySource};
@@ -27,7 +31,7 @@ use bangbang_runtime::startup::{
     Arm64BootResourceConfig, Arm64BootResourceError, Arm64BootResources, Arm64BootRuntimeResources,
     Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig,
     Arm64BootVsockNotificationDispatch, Arm64BootVsockNotificationDispatchError,
-    Arm64BootVsockNotificationDispatches,
+    Arm64BootVsockNotificationDispatches, Arm64BootVsockWakeupFdsError,
 };
 use bangbang_runtime::vsock::VsockMmioLayout;
 use bangbang_runtime::{BackendError, VmBackend, VmmController};
@@ -44,6 +48,9 @@ use crate::runner::{
 use crate::vcpu::HvfArm64BootRegisters;
 
 const SINGLE_VCPU_COUNT: u8 = 1;
+const VSOCK_WAKEUP_MONITOR_THREAD_NAME: &str = "bangbang-hvf-vsock-wakeup";
+const VSOCK_WAKEUP_MONITOR_STOP_BYTE: [u8; 1] = [0];
+const POLL_FOREVER: libc::c_int = -1;
 
 #[derive(Debug, Clone)]
 pub struct HvfArm64BootSessionConfig {
@@ -136,6 +143,7 @@ pub struct HvfArm64BootSession<'vm> {
     backend: &'vm mut HvfBackend,
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
+    run_loop_wakeup: HvfArm64BootRunLoopWakeupToken,
     entropy_source: VirtioRngOsEntropySource,
     gic: HvfGicMetadata,
     primary_mpidr: u64,
@@ -153,6 +161,7 @@ pub struct OwnedHvfArm64BootSession {
     backend: HvfBackend,
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
+    run_loop_wakeup: HvfArm64BootRunLoopWakeupToken,
     entropy_source: VirtioRngOsEntropySource,
     gic: HvfGicMetadata,
     primary_mpidr: u64,
@@ -180,6 +189,21 @@ impl HvfArm64BootRunLoopStopToken {
 
     pub fn is_stop_requested(&self) -> bool {
         self.stop_requested.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct HvfArm64BootRunLoopWakeupToken {
+    wakeup_requested: Arc<AtomicBool>,
+}
+
+impl HvfArm64BootRunLoopWakeupToken {
+    fn request_wakeup(&self) {
+        self.wakeup_requested.store(true, Ordering::Relaxed);
+    }
+
+    fn take_wakeup_request(&self) -> bool {
+        self.wakeup_requested.swap(false, Ordering::Relaxed)
     }
 }
 
@@ -219,9 +243,17 @@ pub enum HvfArm64BootRunLoopOutcome {
 
 #[derive(Debug)]
 pub enum HvfArm64BootRunLoopError {
+    StartVsockWakeupMonitor {
+        steps_completed: usize,
+        source: Box<HvfArm64BootRunLoopWakeupMonitorError>,
+    },
     RunStep {
         steps_completed: usize,
         source: Box<HvfVcpuRunnerError>,
+    },
+    StopVsockWakeupMonitor {
+        steps_completed: usize,
+        source: Box<HvfArm64BootRunLoopWakeupMonitorError>,
     },
     DispatchBlockNotifications {
         steps_completed: usize,
@@ -248,12 +280,26 @@ pub enum HvfArm64BootRunLoopError {
 impl fmt::Display for HvfArm64BootRunLoopError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::StartVsockWakeupMonitor {
+                steps_completed,
+                source,
+            } => write!(
+                f,
+                "failed to start HVF boot-session vsock wakeup monitor after {steps_completed} completed steps: {source}"
+            ),
             Self::RunStep {
                 steps_completed,
                 source,
             } => write!(
                 f,
                 "failed to run HVF boot-session vCPU step after {steps_completed} completed steps: {source}"
+            ),
+            Self::StopVsockWakeupMonitor {
+                steps_completed,
+                source,
+            } => write!(
+                f,
+                "failed to stop HVF boot-session vsock wakeup monitor after {steps_completed} completed steps: {source}"
             ),
             Self::DispatchBlockNotifications {
                 steps_completed,
@@ -297,12 +343,93 @@ impl fmt::Display for HvfArm64BootRunLoopError {
 impl std::error::Error for HvfArm64BootRunLoopError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::StartVsockWakeupMonitor { source, .. } => Some(source.as_ref()),
             Self::RunStep { source, .. } => Some(source.as_ref()),
+            Self::StopVsockWakeupMonitor { source, .. } => Some(source.as_ref()),
             Self::DispatchBlockNotifications { source, .. } => Some(source.as_ref()),
             Self::DispatchNetworkNotifications { source, .. } => Some(source.as_ref()),
             Self::DispatchVsockNotifications { source, .. } => Some(source.as_ref()),
             Self::DispatchEntropyNotifications { source, .. } => Some(source.as_ref()),
             Self::HandleVirtualTimer { source, .. } => Some(source.as_ref()),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum HvfArm64BootRunLoopWakeupMonitorError {
+    MmioDispatcher {
+        source: HvfArm64BootMmioDispatcherError,
+    },
+    CollectVsockWakeupFds {
+        source: Arm64BootVsockWakeupFdsError,
+    },
+    PollFdAllocation {
+        source: TryReserveError,
+    },
+    TooManyPollFds {
+        count: usize,
+    },
+    CreateStopPipe {
+        source: io::ErrorKind,
+    },
+    ThreadSpawn {
+        source: io::Error,
+    },
+    StopSignal {
+        source: io::ErrorKind,
+    },
+    ThreadPanicked,
+}
+
+impl fmt::Display for HvfArm64BootRunLoopWakeupMonitorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MmioDispatcher { source } => {
+                write!(
+                    f,
+                    "failed to lock HVF boot-session MMIO dispatcher: {source}"
+                )
+            }
+            Self::CollectVsockWakeupFds { source } => {
+                write!(f, "failed to collect boot vsock wakeup fds: {source}")
+            }
+            Self::PollFdAllocation { source } => {
+                write!(
+                    f,
+                    "failed to allocate boot vsock wakeup poll fd list: {source}"
+                )
+            }
+            Self::TooManyPollFds { count } => {
+                write!(f, "too many boot vsock wakeup poll fds: {count}")
+            }
+            Self::CreateStopPipe { source } => {
+                write!(f, "failed to create boot vsock wakeup stop pipe: {source}")
+            }
+            Self::ThreadSpawn { source } => {
+                write!(f, "failed to spawn boot vsock wakeup monitor: {source}")
+            }
+            Self::StopSignal { source } => {
+                write!(
+                    f,
+                    "failed to signal boot vsock wakeup monitor stop: {source}"
+                )
+            }
+            Self::ThreadPanicked => f.write_str("boot vsock wakeup monitor thread panicked"),
+        }
+    }
+}
+
+impl std::error::Error for HvfArm64BootRunLoopWakeupMonitorError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CollectVsockWakeupFds { source } => Some(source),
+            Self::PollFdAllocation { source } => Some(source),
+            Self::ThreadSpawn { source } => Some(source),
+            Self::MmioDispatcher { .. }
+            | Self::TooManyPollFds { .. }
+            | Self::CreateStopPipe { .. }
+            | Self::StopSignal { .. }
+            | Self::ThreadPanicked => None,
         }
     }
 }
@@ -581,6 +708,7 @@ impl OwnedHvfArm64BootSession {
             backend,
             mmio_dispatcher: prepared.mmio_dispatcher,
             runtime_resources: prepared.runtime_resources,
+            run_loop_wakeup: prepared.run_loop_wakeup,
             entropy_source: VirtioRngOsEntropySource::new(),
             gic: prepared.gic,
             primary_mpidr: prepared.primary_mpidr,
@@ -829,6 +957,21 @@ impl OwnedHvfArm64BootSession {
 }
 
 impl BootSessionRunLoopSession for OwnedHvfArm64BootSession {
+    fn start_run_loop_vsock_wakeup_monitor(
+        &mut self,
+    ) -> Result<HvfArm64BootRunLoopWakeupMonitor, HvfArm64BootRunLoopWakeupMonitorError> {
+        start_run_loop_vsock_wakeup_monitor(
+            &self.runtime_resources,
+            &self.mmio_dispatcher,
+            self.run_cancel_handle(),
+            self.run_loop_wakeup.clone(),
+        )
+    }
+
+    fn take_run_loop_wakeup_request(&mut self) -> bool {
+        self.run_loop_wakeup.take_wakeup_request()
+    }
+
     fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
         self.run_once_and_handle_mmio()
     }
@@ -901,6 +1044,16 @@ impl<P> BootSessionRunLoopSession for NetworkPacketIoBootSessionRunLoopSession<'
 where
     P: Arm64BootNetworkPacketIoProvider,
 {
+    fn start_run_loop_vsock_wakeup_monitor(
+        &mut self,
+    ) -> Result<HvfArm64BootRunLoopWakeupMonitor, HvfArm64BootRunLoopWakeupMonitorError> {
+        self.session.start_run_loop_vsock_wakeup_monitor()
+    }
+
+    fn take_run_loop_wakeup_request(&mut self) -> bool {
+        self.session.take_run_loop_wakeup_request()
+    }
+
     fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
         self.session.run_once_and_handle_mmio()
     }
@@ -1508,7 +1661,40 @@ fn run_boot_session_vcpu_step(
     runner.run_once_and_handle_mmio(Arc::clone(dispatcher))
 }
 
+fn start_run_loop_vsock_wakeup_monitor(
+    runtime_resources: &Arm64BootRuntimeResources,
+    dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    cancel_handle: HvfVcpuRunCancelHandle,
+    wakeup_token: HvfArm64BootRunLoopWakeupToken,
+) -> Result<HvfArm64BootRunLoopWakeupMonitor, HvfArm64BootRunLoopWakeupMonitorError> {
+    if runtime_resources.vsock_device.is_none() {
+        return Ok(HvfArm64BootRunLoopWakeupMonitor::inactive());
+    }
+
+    let fds = {
+        let mut mmio_dispatcher = lock_boot_mmio_dispatcher(dispatcher)
+            .map_err(|source| HvfArm64BootRunLoopWakeupMonitorError::MmioDispatcher { source })?;
+        runtime_resources
+            .vsock_host_read_wakeup_fds(&mut mmio_dispatcher)
+            .map_err(
+                |source| HvfArm64BootRunLoopWakeupMonitorError::CollectVsockWakeupFds { source },
+            )?
+    };
+
+    HvfArm64BootRunLoopWakeupMonitor::start(fds, cancel_handle, wakeup_token)
+}
+
 trait BootSessionRunLoopSession {
+    fn start_run_loop_vsock_wakeup_monitor(
+        &mut self,
+    ) -> Result<HvfArm64BootRunLoopWakeupMonitor, HvfArm64BootRunLoopWakeupMonitorError> {
+        Ok(HvfArm64BootRunLoopWakeupMonitor::inactive())
+    }
+
+    fn take_run_loop_wakeup_request(&mut self) -> bool {
+        false
+    }
+
     fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError>;
 
     fn handle_run_loop_virtual_timer(&mut self) -> Result<(), HvfVcpuRunnerError>;
@@ -1537,6 +1723,21 @@ trait BootSessionRunLoopSession {
 }
 
 impl BootSessionRunLoopSession for HvfArm64BootSession<'_> {
+    fn start_run_loop_vsock_wakeup_monitor(
+        &mut self,
+    ) -> Result<HvfArm64BootRunLoopWakeupMonitor, HvfArm64BootRunLoopWakeupMonitorError> {
+        start_run_loop_vsock_wakeup_monitor(
+            &self.runtime_resources,
+            &self.mmio_dispatcher,
+            self.run_cancel_handle(),
+            self.run_loop_wakeup.clone(),
+        )
+    }
+
+    fn take_run_loop_wakeup_request(&mut self) -> bool {
+        self.run_loop_wakeup.take_wakeup_request()
+    }
+
     fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
         self.run_once_and_handle_mmio()
     }
@@ -1593,6 +1794,22 @@ fn run_boot_session_loop(
     run_boot_session_loop_with_observer(session, stop_token, max_steps, |_| {})
 }
 
+fn dispatch_run_loop_vsock_notifications_for_step(
+    session: &mut impl BootSessionRunLoopSession,
+    steps_completed: usize,
+) -> Result<(), HvfArm64BootRunLoopError> {
+    session
+        .dispatch_run_loop_vsock_notifications()
+        .map_err(
+            |source| HvfArm64BootRunLoopError::DispatchVsockNotifications {
+                steps_completed,
+                source: Box::new(source),
+            },
+        )?;
+
+    Ok(())
+}
+
 fn run_boot_session_loop_with_observer(
     session: &mut impl BootSessionRunLoopSession,
     stop_token: &HvfArm64BootRunLoopStopToken,
@@ -1607,13 +1824,36 @@ fn run_boot_session_loop_with_observer(
             return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
         }
 
-        let outcome =
-            session
-                .run_loop_vcpu_step()
-                .map_err(|source| HvfArm64BootRunLoopError::RunStep {
+        let monitor = session
+            .start_run_loop_vsock_wakeup_monitor()
+            .map_err(|source| HvfArm64BootRunLoopError::StartVsockWakeupMonitor {
+                steps_completed: steps,
+                source: Box::new(source),
+            })?;
+        let outcome_result = session.run_loop_vcpu_step();
+        let finish_result = monitor.finish();
+        let monitor_wakeup_requested = match &outcome_result {
+            Ok(_) => finish_result.map_err(|source| {
+                HvfArm64BootRunLoopError::StopVsockWakeupMonitor {
+                    steps_completed: steps.saturating_add(1),
+                    source: Box::new(source),
+                }
+            })?,
+            Err(_) => finish_result.map_err(|source| {
+                HvfArm64BootRunLoopError::StopVsockWakeupMonitor {
                     steps_completed: steps,
                     source: Box::new(source),
-                })?;
+                }
+            })?,
+        };
+        let outcome = outcome_result.map_err(|source| HvfArm64BootRunLoopError::RunStep {
+            steps_completed: steps,
+            source: Box::new(source),
+        })?;
+        let canceled = matches!(outcome, HvfVcpuRunStepOutcome::Canceled);
+        if !canceled && !monitor_wakeup_requested {
+            let _ = session.take_run_loop_wakeup_request();
+        }
         observe_step(&outcome);
         steps += 1;
 
@@ -1621,6 +1861,18 @@ fn run_boot_session_loop_with_observer(
             HvfVcpuRunStepOutcome::Canceled => {
                 if stop_token.is_stop_requested() {
                     return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+                }
+                let wakeup_requested =
+                    session.take_run_loop_wakeup_request() || monitor_wakeup_requested;
+                if wakeup_requested {
+                    dispatch_run_loop_vsock_notifications_for_step(session, steps)?;
+                    if stop_token.is_stop_requested() {
+                        return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+                    }
+                    if steps == max_steps {
+                        return Ok(HvfArm64BootRunLoopOutcome::StepLimitReached { steps });
+                    }
+                    continue;
                 }
                 return Ok(HvfArm64BootRunLoopOutcome::Canceled { steps });
             }
@@ -1631,6 +1883,10 @@ fn run_boot_session_loop_with_observer(
                         source: Box::new(source),
                     }
                 })?;
+                if stop_token.is_stop_requested() {
+                    return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+                }
+                dispatch_run_loop_vsock_notifications_for_step(session, steps)?;
                 if stop_token.is_stop_requested() {
                     return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
                 }
@@ -1648,6 +1904,10 @@ fn run_boot_session_loop_with_observer(
                 return Ok(HvfArm64BootRunLoopOutcome::GuestReset { steps });
             }
             HvfVcpuRunStepOutcome::Hvc { .. } | HvfVcpuRunStepOutcome::Sys64 { .. } => {
+                if stop_token.is_stop_requested() {
+                    return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+                }
+                dispatch_run_loop_vsock_notifications_for_step(session, steps)?;
                 if stop_token.is_stop_requested() {
                     return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
                 }
@@ -1678,14 +1938,7 @@ fn run_boot_session_loop_with_observer(
                 if stop_token.is_stop_requested() {
                     return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
                 }
-                session
-                    .dispatch_run_loop_vsock_notifications()
-                    .map_err(
-                        |source| HvfArm64BootRunLoopError::DispatchVsockNotifications {
-                            steps_completed: steps,
-                            source: Box::new(source),
-                        },
-                    )?;
+                dispatch_run_loop_vsock_notifications_for_step(session, steps)?;
                 if stop_token.is_stop_requested() {
                     return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
                 }
@@ -1706,6 +1959,169 @@ fn run_boot_session_loop_with_observer(
             }
         }
     }
+}
+
+struct HvfArm64BootRunLoopWakeupMonitor {
+    stop_writer: Option<UnixStream>,
+    thread: Option<JoinHandle<bool>>,
+    completed_wakeup: bool,
+}
+
+impl HvfArm64BootRunLoopWakeupMonitor {
+    const fn inactive() -> Self {
+        Self {
+            stop_writer: None,
+            thread: None,
+            completed_wakeup: false,
+        }
+    }
+
+    #[cfg(test)]
+    const fn completed_for_test(completed_wakeup: bool) -> Self {
+        Self {
+            stop_writer: None,
+            thread: None,
+            completed_wakeup,
+        }
+    }
+
+    fn start(
+        mut fds: Vec<RawFd>,
+        cancel_handle: HvfVcpuRunCancelHandle,
+        wakeup_token: HvfArm64BootRunLoopWakeupToken,
+    ) -> Result<Self, HvfArm64BootRunLoopWakeupMonitorError> {
+        fds.sort_unstable();
+        fds.dedup();
+        if fds.is_empty() {
+            return Ok(Self::inactive());
+        }
+
+        let (stop_reader, stop_writer) =
+            UnixStream::pair().map_err(|source| Self::create_stop_pipe_error(source.kind()))?;
+        let mut pollfds = vsock_wakeup_pollfds(fds, stop_reader.as_raw_fd())?;
+        let pollfd_count = libc::nfds_t::try_from(pollfds.len()).map_err(|_| {
+            HvfArm64BootRunLoopWakeupMonitorError::TooManyPollFds {
+                count: pollfds.len(),
+            }
+        })?;
+        let thread = thread::Builder::new()
+            .name(VSOCK_WAKEUP_MONITOR_THREAD_NAME.to_owned())
+            .spawn(move || {
+                run_vsock_wakeup_monitor(
+                    &mut pollfds,
+                    pollfd_count,
+                    stop_reader,
+                    cancel_handle,
+                    wakeup_token,
+                )
+            })
+            .map_err(|source| HvfArm64BootRunLoopWakeupMonitorError::ThreadSpawn { source })?;
+
+        Ok(Self {
+            stop_writer: Some(stop_writer),
+            thread: Some(thread),
+            completed_wakeup: false,
+        })
+    }
+
+    fn finish(mut self) -> Result<bool, HvfArm64BootRunLoopWakeupMonitorError> {
+        if let Some(mut stop_writer) = self.stop_writer.take() {
+            match stop_writer.write_all(&VSOCK_WAKEUP_MONITOR_STOP_BYTE) {
+                Ok(()) => {}
+                Err(source)
+                    if matches!(
+                        source.kind(),
+                        io::ErrorKind::BrokenPipe | io::ErrorKind::NotConnected
+                    ) => {}
+                Err(source) => {
+                    return Err(HvfArm64BootRunLoopWakeupMonitorError::StopSignal {
+                        source: source.kind(),
+                    });
+                }
+            }
+        }
+
+        let Some(thread) = self.thread.take() else {
+            return Ok(self.completed_wakeup);
+        };
+
+        thread
+            .join()
+            .map_err(|_| HvfArm64BootRunLoopWakeupMonitorError::ThreadPanicked)
+    }
+
+    const fn create_stop_pipe_error(
+        source: io::ErrorKind,
+    ) -> HvfArm64BootRunLoopWakeupMonitorError {
+        HvfArm64BootRunLoopWakeupMonitorError::CreateStopPipe { source }
+    }
+}
+
+fn vsock_wakeup_pollfds(
+    fds: Vec<RawFd>,
+    stop_fd: RawFd,
+) -> Result<Vec<libc::pollfd>, HvfArm64BootRunLoopWakeupMonitorError> {
+    let mut pollfds = Vec::new();
+    pollfds
+        .try_reserve_exact(fds.len().saturating_add(1))
+        .map_err(|source| HvfArm64BootRunLoopWakeupMonitorError::PollFdAllocation { source })?;
+    pollfds.push(libc::pollfd {
+        fd: stop_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    });
+    pollfds.extend(fds.into_iter().map(|fd| libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    }));
+
+    Ok(pollfds)
+}
+
+fn run_vsock_wakeup_monitor(
+    pollfds: &mut [libc::pollfd],
+    pollfd_count: libc::nfds_t,
+    _stop_reader: UnixStream,
+    cancel_handle: HvfVcpuRunCancelHandle,
+    wakeup_token: HvfArm64BootRunLoopWakeupToken,
+) -> bool {
+    loop {
+        for pollfd in pollfds.iter_mut() {
+            pollfd.revents = 0;
+        }
+
+        // SAFETY: `pollfds` is a valid mutable slice for `pollfd_count` entries
+        // and remains alive for the duration of this blocking `poll` call.
+        let poll_result = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfd_count, POLL_FOREVER) };
+        if poll_result < 0 {
+            let source = io::Error::last_os_error();
+            if source.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+
+        let Some(stop_pollfd) = pollfds.first() else {
+            return false;
+        };
+        if pollfd_has_wakeup_event(stop_pollfd.revents) {
+            return false;
+        }
+        if pollfds
+            .iter()
+            .skip(1)
+            .any(|pollfd| pollfd_has_wakeup_event(pollfd.revents))
+        {
+            wakeup_token.request_wakeup();
+            let _ = cancel_handle.cancel();
+            return true;
+        }
+    }
+}
+
+const fn pollfd_has_wakeup_event(revents: libc::c_short) -> bool {
+    revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
 }
 
 fn lock_boot_mmio_dispatcher(
@@ -2204,6 +2620,7 @@ struct PreparedHvfArm64BootSession<'vm> {
     runner: HvfVcpuRunner<'vm>,
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
+    run_loop_wakeup: HvfArm64BootRunLoopWakeupToken,
     gic: HvfGicMetadata,
     primary_mpidr: u64,
     block_interrupt_lines: Vec<GuestInterruptLine>,
@@ -2246,6 +2663,7 @@ impl HvfBackend {
             backend: self,
             mmio_dispatcher: prepared.mmio_dispatcher,
             runtime_resources: prepared.runtime_resources,
+            run_loop_wakeup: prepared.run_loop_wakeup,
             entropy_source: VirtioRngOsEntropySource::new(),
             gic: prepared.gic,
             primary_mpidr: prepared.primary_mpidr,
@@ -2331,6 +2749,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
         runner,
         mmio_dispatcher: Arc::new(Mutex::new(parts.mmio_dispatcher)),
         runtime_resources: parts.runtime,
+        run_loop_wakeup: HvfArm64BootRunLoopWakeupToken::default(),
         gic,
         primary_mpidr,
         block_interrupt_lines: interrupt_lines.block,
@@ -2860,6 +3279,7 @@ mod tests {
                 HvfArm64BootBlockNotificationDispatchError,
             >,
         >,
+        monitor_wakeup_results: VecDeque<bool>,
         network_dispatch_results: VecDeque<
             Result<
                 super::HvfArm64BootNetworkNotificationDispatches,
@@ -2886,6 +3306,7 @@ mod tests {
         request_stop_on_vsock_dispatch: Option<HvfArm64BootRunLoopStopToken>,
         request_stop_on_entropy_dispatch: Option<HvfArm64BootRunLoopStopToken>,
         request_stop_on_timer: Option<HvfArm64BootRunLoopStopToken>,
+        wakeup_requested: bool,
     }
 
     impl RecordingBootSessionRunLoopSession {
@@ -2893,6 +3314,7 @@ mod tests {
             Self {
                 run_results: run_results.into_iter().map(Ok).collect(),
                 dispatch_results: VecDeque::new(),
+                monitor_wakeup_results: VecDeque::new(),
                 network_dispatch_results: VecDeque::new(),
                 vsock_dispatch_results: VecDeque::new(),
                 entropy_dispatch_results: VecDeque::new(),
@@ -2904,6 +3326,7 @@ mod tests {
                 request_stop_on_vsock_dispatch: None,
                 request_stop_on_entropy_dispatch: None,
                 request_stop_on_timer: None,
+                wakeup_requested: false,
             }
         }
 
@@ -2911,6 +3334,7 @@ mod tests {
             Self {
                 run_results: VecDeque::from([Err(source)]),
                 dispatch_results: VecDeque::new(),
+                monitor_wakeup_results: VecDeque::new(),
                 network_dispatch_results: VecDeque::new(),
                 vsock_dispatch_results: VecDeque::new(),
                 entropy_dispatch_results: VecDeque::new(),
@@ -2922,11 +3346,16 @@ mod tests {
                 request_stop_on_vsock_dispatch: None,
                 request_stop_on_entropy_dispatch: None,
                 request_stop_on_timer: None,
+                wakeup_requested: false,
             }
         }
 
         fn push_dispatch_error(&mut self, source: HvfArm64BootBlockNotificationDispatchError) {
             self.dispatch_results.push_back(Err(source));
+        }
+
+        fn push_monitor_wakeup(&mut self) {
+            self.monitor_wakeup_results.push_back(true);
         }
 
         fn push_network_dispatch_error(
@@ -2977,9 +3406,35 @@ mod tests {
         fn request_stop_on_timer(&mut self, stop_token: HvfArm64BootRunLoopStopToken) {
             self.request_stop_on_timer = Some(stop_token);
         }
+
+        const fn request_run_loop_wakeup(&mut self) {
+            self.wakeup_requested = true;
+        }
     }
 
     impl super::BootSessionRunLoopSession for RecordingBootSessionRunLoopSession {
+        fn start_run_loop_vsock_wakeup_monitor(
+            &mut self,
+        ) -> Result<
+            super::HvfArm64BootRunLoopWakeupMonitor,
+            super::HvfArm64BootRunLoopWakeupMonitorError,
+        > {
+            let completed_wakeup = self.monitor_wakeup_results.pop_front().unwrap_or(false);
+            if completed_wakeup {
+                self.wakeup_requested = true;
+            }
+
+            Ok(super::HvfArm64BootRunLoopWakeupMonitor::completed_for_test(
+                completed_wakeup,
+            ))
+        }
+
+        fn take_run_loop_wakeup_request(&mut self) -> bool {
+            let wakeup_requested = self.wakeup_requested;
+            self.wakeup_requested = false;
+            wakeup_requested
+        }
+
         fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
             self.events.push("run");
             if let Some(stop_token) = self.request_stop_on_run.take() {
@@ -5762,7 +6217,10 @@ mod tests {
             outcome,
             HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 2 }
         );
-        assert_eq!(session.events, ["run", "run"]);
+        assert_eq!(
+            session.events,
+            ["run", "vsock-dispatch", "run", "vsock-dispatch"]
+        );
     }
 
     #[test]
@@ -5808,7 +6266,10 @@ mod tests {
             outcome,
             HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 2 }
         );
-        assert_eq!(session.events, ["run", "run"]);
+        assert_eq!(
+            session.events,
+            ["run", "vsock-dispatch", "run", "vsock-dispatch"]
+        );
     }
 
     #[test]
@@ -5847,9 +6308,12 @@ mod tests {
             session.events,
             [
                 "run",
+                "vsock-dispatch",
                 "run",
+                "vsock-dispatch",
                 "run",
                 "timer",
+                "vsock-dispatch",
                 "run",
                 "dispatch",
                 "network-dispatch",
@@ -5899,6 +6363,19 @@ mod tests {
             session.events,
             ["run", "dispatch", "network-dispatch", "vsock-dispatch"]
         );
+    }
+
+    #[test]
+    fn boot_session_run_loop_reports_stop_after_non_mmio_vsock_dispatch() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([hvc_run_step_outcome()]);
+        session.request_stop_on_vsock_dispatch(stop_token.clone());
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("stop after non-MMIO vsock dispatch should succeed");
+
+        assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Stopped { steps: 1 });
+        assert_eq!(session.events, ["run", "vsock-dispatch"]);
     }
 
     #[test]
@@ -5961,6 +6438,45 @@ mod tests {
 
         assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Canceled { steps: 1 });
         assert_eq!(session.events, ["run"]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_dispatches_vsock_after_wakeup_cancel() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session =
+            RecordingBootSessionRunLoopSession::new([HvfVcpuRunStepOutcome::Canceled]);
+        session.request_run_loop_wakeup();
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("wakeup cancel loop should succeed");
+
+        assert_eq!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 1 }
+        );
+        assert_eq!(session.events, ["run", "vsock-dispatch"]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_keeps_wakeup_for_delayed_cancel_after_non_canceled_step() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([
+            hvc_run_step_outcome(),
+            HvfVcpuRunStepOutcome::Canceled,
+        ]);
+        session.push_monitor_wakeup();
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(2))
+            .expect("delayed wakeup cancel loop should succeed");
+
+        assert_eq!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 2 }
+        );
+        assert_eq!(
+            session.events,
+            ["run", "vsock-dispatch", "run", "vsock-dispatch"]
+        );
     }
 
     #[test]
@@ -6074,6 +6590,35 @@ mod tests {
     }
 
     #[test]
+    fn boot_session_run_loop_preserves_vsock_notification_error_after_non_mmio_step() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([hvc_run_step_outcome()]);
+        session.push_vsock_dispatch_error(
+            HvfArm64BootVsockNotificationDispatchError::MmioDispatcher {
+                source: HvfArm64BootMmioDispatcherError::Busy,
+            },
+        );
+
+        let err = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect_err("non-MMIO vsock notification error should stop loop");
+
+        match err {
+            super::HvfArm64BootRunLoopError::DispatchVsockNotifications {
+                steps_completed,
+                source,
+            } => {
+                assert_eq!(steps_completed, 1);
+                assert_eq!(
+                    source.to_string(),
+                    "failed to lock HVF boot-session MMIO dispatcher: HVF boot-session MMIO dispatcher lock is busy"
+                );
+            }
+            other => panic!("expected vsock notification error, got {other:?}"),
+        }
+        assert_eq!(session.events, ["run", "vsock-dispatch"]);
+    }
+
+    #[test]
     fn boot_session_run_loop_preserves_entropy_notification_error_after_mmio_step() {
         let stop_token = HvfArm64BootRunLoopStopToken::new();
         let mut session = RecordingBootSessionRunLoopSession::new([mmio_run_step_outcome()]);
@@ -6126,7 +6671,17 @@ mod tests {
             outcome,
             HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 2 }
         );
-        assert_eq!(session.events, ["run", "timer", "run", "timer"]);
+        assert_eq!(
+            session.events,
+            [
+                "run",
+                "timer",
+                "vsock-dispatch",
+                "run",
+                "timer",
+                "vsock-dispatch",
+            ]
+        );
     }
 
     #[test]
