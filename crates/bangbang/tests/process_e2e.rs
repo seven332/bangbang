@@ -626,6 +626,46 @@ fn executable_no_api_config_file_failure_does_not_publish_socket() {
 }
 
 #[test]
+fn executable_config_file_rejected_entropy_rate_limiter_does_not_publish_socket() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let config_path = write_rejected_entropy_rate_limiter_config(&test_dir);
+    let instance_id = test_dir.instance_id();
+
+    let output = BangbangProcess::start_with_extra_args_expect_failure(
+        &socket_path,
+        &instance_id,
+        &["--config-file", path_text(&config_path)],
+    );
+
+    assert_rejected_entropy_config_failure(
+        &output,
+        &socket_path,
+        "config-file rejected entropy rate limiter",
+    );
+}
+
+#[test]
+fn executable_no_api_config_file_rejected_entropy_rate_limiter_does_not_publish_socket() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let config_path = write_rejected_entropy_rate_limiter_config(&test_dir);
+    let instance_id = test_dir.instance_id();
+
+    let output = BangbangProcess::start_with_extra_args_expect_failure(
+        &socket_path,
+        &instance_id,
+        &["--config-file", path_text(&config_path), "--no-api"],
+    );
+
+    assert_rejected_entropy_config_failure(
+        &output,
+        &socket_path,
+        "no-api config-file rejected entropy rate limiter",
+    );
+}
+
+#[test]
 fn executable_rejects_multi_vcpu_instance_start_without_stopping() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
@@ -2518,6 +2558,20 @@ fn write_rejected_serial_rate_limiter_config(
     (config_path, serial_output_path)
 }
 
+fn write_rejected_entropy_rate_limiter_config(test_dir: &TestDir) -> std::path::PathBuf {
+    let config_path = test_dir.path().join("vm-config.json");
+    fs::write(
+        &config_path,
+        r#"{
+            "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
+            "entropy":{"rate_limiter":{"bandwidth":{"size":123456789,"one_time_burst":987654321,"refill_time":777}}}
+        }"#,
+    )
+    .expect("config file should be written");
+
+    config_path
+}
+
 fn write_multi_vcpu_startup_config(test_dir: &TestDir) -> (std::path::PathBuf, std::path::PathBuf) {
     let config_path = test_dir.path().join("vm-config.json");
     let kernel_path = test_dir.path().join("private-vmlinux");
@@ -2742,6 +2796,49 @@ fn assert_rejected_serial_config_failure(
         !serial_output_path.exists(),
         "{case_name} must not create rejected serial output path"
     );
+}
+
+fn assert_rejected_entropy_config_failure(
+    output: &support::CompletedProcess,
+    socket_path: &std::path::Path,
+    case_name: &str,
+) {
+    assert!(
+        !output.status.success(),
+        "{case_name} should fail startup; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        !socket_path.exists(),
+        "{case_name} should fail before API socket publication"
+    );
+    assert!(
+        !output.stdout.contains("status: API server listening"),
+        "{case_name} must not report API readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !output.stdout.contains("status: VM running without API"),
+        "{case_name} must not report no-api readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        output.stderr.contains(
+            "bangbang: config-file error: failed to apply config-file action: entropy rate_limiter is not supported"
+        ),
+        "{case_name} stderr should describe config-file entropy rejection; stderr:\n{}",
+        output.stderr
+    );
+    for private_value in ["123456789", "987654321", "777"] {
+        assert!(
+            !output.stdout.contains(private_value) && !output.stderr.contains(private_value),
+            "{case_name} must not echo private config value {private_value}; stdout:\n{}\nstderr:\n{}",
+            output.stdout,
+            output.stderr
+        );
+    }
 }
 
 fn assert_instance_info_matches(

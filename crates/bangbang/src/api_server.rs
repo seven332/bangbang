@@ -743,6 +743,9 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         ApiRequest::PutDrive(config) => Some(VmmAction::PutDrive(drive_config_input_from_request(
             config.as_ref(),
         ))),
+        ApiRequest::PutEntropy(config) => Some(VmmAction::PutEntropy(
+            entropy_config_input_from_request(config.as_ref()),
+        )),
         ApiRequest::PutLogger(config) => Some(VmmAction::PutLogger(
             logger_config_input_from_request(config.as_ref()),
         )),
@@ -787,7 +790,6 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         | ApiRequest::PatchVmState(_)
         | ApiRequest::PutAction(_)
         | ApiRequest::PutBalloon
-        | ApiRequest::PutEntropy(_)
         | ApiRequest::PutMemoryHotplug
         | ApiRequest::PutMmds(_)
         | ApiRequest::PutPmem

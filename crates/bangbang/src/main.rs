@@ -284,6 +284,15 @@ fn config_file_actions_from_str(contents: &str) -> Result<Vec<VmmAction>, Config
         )?);
     }
 
+    if let Some(entropy) = object.get("entropy") {
+        requests.push(config_section_request(
+            "entropy",
+            "PUT",
+            "/entropy".to_string(),
+            entropy,
+        )?);
+    }
+
     if let Some(cpu_config) = object.get("cpu-config") {
         requests.push(config_section_request(
             "cpu-config",
@@ -335,8 +344,8 @@ fn validate_config_file_sections(
     for section in object.keys() {
         match section.as_str() {
             "boot-source" | "cpu-config" | "drives" | "logger" | "machine-config" | "metrics"
-            | "mmds-config" | "network-interfaces" | "serial" | "vsock" => {}
-            "balloon" | "entropy" | "memory-hotplug" | "pmem" => {
+            | "mmds-config" | "network-interfaces" | "serial" | "vsock" | "entropy" => {}
+            "balloon" | "memory-hotplug" | "pmem" => {
                 return Err(ConfigFileError::UnsupportedSection(section.clone()));
             }
             _ => return Err(ConfigFileError::UnknownSection(section.clone())),
@@ -2663,7 +2672,8 @@ mod tests {
                 }}],
                 "metrics": {{"metrics_path": {metrics_path_json}}},
                 "logger": {{"log_path": {logger_path_json}, "show_level": true}},
-                "serial": {{"serial_out_path": {serial_path_json}}}
+                "serial": {{"serial_out_path": {serial_path_json}}},
+                "entropy": {{}}
             }}"#
         );
         fs::write(&config_path, config).expect("config file should be written");
@@ -2687,6 +2697,13 @@ mod tests {
             vmm.serial_config().serial_out_path(),
             Some(serial_path.as_path())
         );
+        let data = vmm
+            .handle_action(VmmAction::GetVmConfig)
+            .expect("VM config should be returned");
+        let VmmData::VmConfiguration(config) = data else {
+            panic!("expected VM config");
+        };
+        assert!(config.entropy_config().is_some());
 
         vmm.handle_action(VmmAction::FlushMetrics)
             .expect("flush metrics should succeed");
@@ -2872,16 +2889,98 @@ mod tests {
     }
 
     #[test]
-    fn config_file_rejects_entropy_section_until_config_file_support_exists() {
-        let err = super::config_file_actions_from_str(
+    fn config_file_accepts_entropy_section() {
+        let actions = super::config_file_actions_from_str(
             r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"entropy":{}}"#,
         )
-        .expect_err("unsupported config section should fail");
+        .expect("entropy config section should parse");
+
+        assert_eq!(
+            actions,
+            [
+                VmmAction::PutBootSource(BootSourceConfigInput::new("/tmp/vmlinux")),
+                VmmAction::PutEntropy(bangbang_runtime::entropy::EntropyConfigInput::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn config_file_accepts_entropy_null_rate_limiter() {
+        let actions = super::config_file_actions_from_str(
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"entropy":{"rate_limiter":null}}"#,
+        )
+        .expect("entropy config section should accept null rate limiter");
+
+        assert_eq!(
+            actions,
+            [
+                VmmAction::PutBootSource(BootSourceConfigInput::new("/tmp/vmlinux")),
+                VmmAction::PutEntropy(bangbang_runtime::entropy::EntropyConfigInput::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn config_file_rejects_malformed_entropy_section() {
+        for config in [
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"entropy":"bad"}"#,
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"entropy":{"unknown":true}}"#,
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"entropy":{"rate_limiter":"bad"}}"#,
+        ] {
+            let err = super::config_file_actions_from_str(config)
+                .expect_err("malformed entropy section should fail");
+
+            assert_eq!(
+                err,
+                super::ConfigFileError::Request {
+                    section: "entropy",
+                    source: super::RequestError::MalformedRequest
+                },
+                "{config}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_file_entropy_rate_limiter_fails_before_starting() {
+        let config_path = unique_config_path("entropy-rate-limiter");
+        let config = r#"{
+            "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
+            "entropy":{"rate_limiter":{"bandwidth":{"size":123456789,"one_time_burst":987654321,"refill_time":777}}}
+        }"#;
+        fs::write(&config_path, config).expect("config file should be written");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        let err = super::apply_startup_config_file(
+            &mut vmm,
+            Some(config_path.to_str().expect("UTF-8 path")),
+        )
+        .expect_err("configured entropy rate limiter should fail");
 
         assert_eq!(
             err,
-            super::ConfigFileError::UnsupportedSection("entropy".to_string())
+            ProcessError::ConfigFile(super::ConfigFileError::Apply(
+                bangbang_runtime::VmmActionError::EntropyConfig(
+                    bangbang_runtime::entropy::EntropyConfigError::UnsupportedRateLimiter
+                )
+            ))
         );
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+        let data = vmm
+            .handle_action(VmmAction::GetVmConfig)
+            .expect("VM config should be returned");
+        let VmmData::VmConfiguration(config) = data else {
+            panic!("expected VM config");
+        };
+        assert_eq!(config.entropy_config(), None);
+
+        fs::remove_file(config_path).expect("fixture config should clean up");
     }
 
     #[test]

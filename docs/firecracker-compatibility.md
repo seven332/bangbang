@@ -194,15 +194,18 @@ Supported value-taking startup arguments accept both Firecracker-style
 
 `--config-file` currently accepts the supported Firecracker-shaped sections
 `machine-config`, `boot-source`, `drives`, `network-interfaces`,
-`mmds-config`, `vsock`, `metrics`, `logger`, `serial`, and `cpu-config`. The
-`cpu-config` section is parsed through the same request model as
-`PUT /cpu-config`: empty/no-op custom template bodies are accepted before
+`mmds-config`, `vsock`, `entropy`, `metrics`, `logger`, `serial`, and
+`cpu-config`. The `cpu-config` section is parsed through the same request model
+as `PUT /cpu-config`: empty/no-op custom template bodies are accepted before
 startup, while non-empty custom CPU templates still fail as unsupported CPU
-configuration actions.
-Known unsupported sections such as `balloon`, `entropy`, `memory-hotplug`, and
-`pmem` fail before the API socket is published or before no-api readiness is
-reported. The config-file path does not load MMDS data; use Firecracker's
-separate `--metadata <PATH>` startup argument for startup MMDS data.
+configuration actions. The `entropy` section is parsed through `PUT /entropy`:
+empty bodies and `rate_limiter: null` are accepted, while configured rate
+limiters fail before the API socket is published or before no-api readiness is
+reported.
+Known unsupported sections such as `balloon`, `memory-hotplug`, and `pmem` fail
+before the API socket is published or before no-api readiness is reported. The
+config-file path does not load MMDS data; use Firecracker's separate
+`--metadata <PATH>` startup argument for startup MMDS data.
 
 CLI values are untrusted input. Current validation rejects invalid IDs, empty
 socket paths, and socket paths containing control characters. API startup also
@@ -323,7 +326,7 @@ compatibility targets.
 | `PATCH` | `/balloon/hinting/stop` | recognized; VMM-routed unsupported | Routes through the VMM state/action policy without parsing the request body, matching Firecracker's stop-command parser behavior. Hinting stop is treated as post-boot-only and currently returns the balloon-specific unsupported fault after startup. Real free-page hinting and reporting need a dedicated design. |
 | `GET` | `/balloon/hinting/status` | recognized; VMM-routed unsupported | Routes through the VMM state/action policy. Hinting status is treated as post-boot-only and currently returns the balloon-specific unsupported fault after startup. Real free-page hinting state tracking needs a dedicated design. |
 | `PUT`, `PATCH` | `/pmem/{id}` | recognized; VMM-routed unsupported | Parses Firecracker-shaped pmem config and update request bodies, rejects malformed, invalid, or mismatched path/body IDs first, and then routes valid requests through the VMM state/action policy. `PUT` is treated as pre-boot-only and reaches the pmem-specific unsupported fault before startup. `PATCH` is treated as post-boot-only and reaches the pmem-specific unsupported fault after startup. Requests made in the wrong lifecycle state return the normal unsupported-state fault. Real pmem device configuration, guest attachment, rate limiting, and runtime update behavior need a dedicated device design. |
-| `PUT` | `/entropy` | supported target; configuration storage and startup attachment implemented | Stores one Firecracker-shaped virtio-rng entropy configuration before boot when `rate_limiter` is omitted or `null`. `GET /vm/config` includes `"entropy": {}` after configuration, and `InstanceStart` attaches the existing HVF virtio-rng MMIO/FDT device backed by the session-owned host OS randomness source. Configured rate limiters are validated and then rejected with the entropy rate-limiter unsupported fault without mutating stored entropy configuration. Post-start requests follow the pre-boot-only unsupported-state policy. Config-file `entropy` (#815), real rate limiting, entropy metrics, and signed executable guest entropy e2e remain deferred. |
+| `PUT` | `/entropy` | supported target; configuration storage and startup attachment implemented | Stores one Firecracker-shaped virtio-rng entropy configuration before boot when `rate_limiter` is omitted or `null`. `GET /vm/config` includes `"entropy": {}` after API or config-file configuration, and `InstanceStart` attaches the existing HVF virtio-rng MMIO/FDT device backed by the session-owned host OS randomness source. Configured rate limiters are validated and then rejected with the entropy rate-limiter unsupported fault without mutating stored entropy configuration. Post-start requests follow the pre-boot-only unsupported-state policy. Real rate limiting, entropy metrics, and signed executable guest entropy e2e remain deferred. |
 | `GET`, `PUT`, `PATCH` | `/hotplug/memory` | recognized; VMM-routed unsupported | Parses Firecracker-shaped `PUT` and `PATCH` memory hotplug request bodies, rejects malformed or schema-invalid bodies first, and then routes valid requests through the VMM state/action policy. `PUT` is treated as pre-boot-only and reaches the memory-hotplug-specific unsupported fault before startup. `GET` and `PATCH` are treated as post-boot-only and reach the memory-hotplug-specific unsupported fault after startup. Requests made in the wrong lifecycle state return the normal unsupported-state fault. Real virtio-mem device support, guest memory accounting, semantic config validation, and runtime memory update behavior need a dedicated design. |
 | `PATCH` | `/vm` | recognized; rejected | Parses the Firecracker-shaped VM state request with required `state` values `Paused` and `Resumed`, then routes valid requests through `Pause` or `Resume` VMM actions. Requests before startup fail as unsupported in `Not started` state, and runtime requests fail as unsupported actions without mutating VM state. Real pause/resume state transitions and public run-loop control remain deferred. |
 | `PATCH` | `/drives/{drive_id}` | recognized; rejected | Parses the Firecracker-shaped block-device update request with required `drive_id`, optional `path_on_host`, and optional `rate_limiter`, then routes valid updates through `UpdateBlockDevice`. Pre-boot requests fail as post-boot-only operations and runtime requests fail as unsupported actions without mutating stored drive configuration. Configured rate limiters remain unsupported until block update behavior exists. |
@@ -468,9 +471,11 @@ writable guest descriptor chains from an injected entropy source under unit
 tests, including malformed-buffer, source-failure, reset, and queue-interrupt
 completion paths. The public API can now store the empty entropy configuration,
 include it in `GET /vm/config` as `"entropy": {}`, and pass it into
-`InstanceStart` so the existing HVF startup path attaches the device. Config-file
-`entropy` (#815), signed executable guest entropy e2e, metrics, security docs,
-and real rate limiting remain deferred.
+`InstanceStart` so the existing HVF startup path attaches the device. The
+config-file startup path accepts the same no-rate-limiter entropy configuration
+and rejects configured rate limiters before publishing readiness. Signed
+executable guest entropy e2e, metrics, security docs, and real rate limiting
+remain deferred.
 
 The API and VMM state path also route valid snapshot requests through explicit
 actions before returning unsupported faults. `PUT /snapshot/create` fails as an
@@ -1593,8 +1598,8 @@ Their eventual support level should follow the endpoint matrix:
 - full MMDS TCP routing, stream reassembly, and retransmission policy
 - balloon devices and balloon statistics
 - pmem
-- entropy config-file support, rate limiting, runtime metrics, security docs,
-  and signed guest-visible e2e coverage beyond the current public API storage
+- entropy rate limiting, runtime metrics, security docs, and signed
+  guest-visible e2e coverage beyond the current public API/config-file storage
   and startup attachment path
 - serial input, serial rate limiting, public serial streaming, and serial metrics
 - full logger integration, full Firecracker metrics counters beyond the minimal
