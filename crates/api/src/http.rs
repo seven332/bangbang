@@ -2174,7 +2174,7 @@ fn parse_serial_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> 
         .map_err(|_| RequestError::MalformedRequest)?;
     let rate_limiter_configured = match &body.rate_limiter {
         Some(rate_limiter) => {
-            validate_rate_limiter_config(rate_limiter.as_value())?;
+            validate_token_bucket(rate_limiter.as_value())?;
             true
         }
         None => false,
@@ -6058,7 +6058,7 @@ mod tests {
         let request = request_with_body(
             "PUT",
             "/serial",
-            r#"{"rate_limiter":{"bandwidth":{"size":1,"refill_time":1}}}"#,
+            r#"{"rate_limiter":{"size":1,"one_time_burst":null,"refill_time":1}}"#,
         );
 
         let parsed = parse_request(&request).expect("serial config should parse");
@@ -6075,9 +6075,14 @@ mod tests {
         for body in [
             r#"{"rate_limiter":"unsupported"}"#,
             r#"{"rate_limiter":{"bad":{"size":1,"refill_time":1}}}"#,
+            r#"{"rate_limiter":{"size":1}}"#,
+            r#"{"rate_limiter":{"refill_time":1}}"#,
+            r#"{"rate_limiter":{"size":"1","refill_time":1}}"#,
+            r#"{"rate_limiter":{"size":1,"refill_time":"1"}}"#,
+            r#"{"rate_limiter":{"size":1,"one_time_burst":"1","refill_time":1}}"#,
             r#"{"rate_limiter":{"bandwidth":{"size":1}}}"#,
             r#"{"rate_limiter":{"ops":null,"ops":null}}"#,
-            r#"{"rate_limiter":{"bandwidth":{"size":1,"refill_time":1,"refill_time":2}}}"#,
+            r#"{"rate_limiter":{"size":1,"refill_time":1,"refill_time":2}}"#,
         ] {
             let request = request_with_body("PUT", "/serial", body);
 

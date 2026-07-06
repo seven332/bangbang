@@ -2591,7 +2591,7 @@ fn write_rejected_serial_rate_limiter_config(
             "boot-source": {{"kernel_image_path": "/tmp/vmlinux"}},
             "serial": {{
                 "serial_out_path": {serial_output_path_json},
-                "rate_limiter": {{"bandwidth": {{"size": 1, "refill_time": 1}}}}
+                "rate_limiter": {{"size": 1, "refill_time": 1}}
             }}
         }}"#
     );
