@@ -1571,6 +1571,49 @@ mod tests {
     }
 
     #[test]
+    fn writes_api_server_cpu_time_without_parent_cpu_time() {
+        let path = unique_metrics_path("startup-cpu-only");
+        let mut state = MetricsState::default();
+        let diagnostics = MetricsDiagnostics::new().with_start_time_cpu_us(2000);
+
+        state
+            .configure(MetricsConfigInput::new(&path))
+            .expect("metrics should configure");
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("metrics output should be readable");
+        assert_eq!(
+            output,
+            "{\"api_server\":{\"process_startup_time_cpu_us\":2000},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn writes_zero_startup_time_diagnostics_when_provided() {
+        let path = unique_metrics_path("startup-zero");
+        let mut state = MetricsState::default();
+        let diagnostics = MetricsDiagnostics::new()
+            .with_start_time_us(0)
+            .with_start_time_cpu_us(0)
+            .with_parent_cpu_time_us(0);
+
+        state
+            .configure(MetricsConfigInput::new(&path))
+            .expect("metrics should configure");
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("metrics output should be readable");
+        assert_eq!(
+            output,
+            "{\"api_server\":{\"process_startup_time_cpu_us\":0,\"process_startup_time_us\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
     fn startup_cpu_time_diagnostics_saturate_when_parent_time_overflows() {
         let path = unique_metrics_path("startup-time-saturates");
         let mut state = MetricsState::default();
