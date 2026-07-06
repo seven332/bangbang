@@ -1,6 +1,7 @@
 use std::fmt;
 use std::net::Ipv4Addr;
 
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 use crate::HTTP_MAX_PAYLOAD_SIZE;
@@ -511,14 +512,124 @@ struct SerialConfigRequestBody {
     #[serde(default)]
     serial_out_path: Option<String>,
     #[serde(default)]
-    rate_limiter: Option<serde_json::Value>,
+    rate_limiter: Option<JsonValueWithoutDuplicateObjectKeys>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EntropyDeviceConfigRequestBody {
     #[serde(default)]
-    rate_limiter: Option<serde_json::Value>,
+    rate_limiter: Option<JsonValueWithoutDuplicateObjectKeys>,
+}
+
+#[derive(Debug)]
+struct JsonValueWithoutDuplicateObjectKeys(serde_json::Value);
+
+impl JsonValueWithoutDuplicateObjectKeys {
+    const fn as_value(&self) -> &serde_json::Value {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for JsonValueWithoutDuplicateObjectKeys {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer
+            .deserialize_any(JsonValueWithoutDuplicateObjectKeysVisitor)
+            .map(Self)
+    }
+}
+
+#[derive(Debug)]
+struct JsonValueWithoutDuplicateObjectKeysVisitor;
+
+impl<'de> Visitor<'de> for JsonValueWithoutDuplicateObjectKeysVisitor {
+    type Value = serde_json::Value;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Number(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Number(value.into()))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| E::custom("invalid JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(serde_json::Value::String(value.to_string()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::String(value))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Deserialize::deserialize(deserializer)
+            .map(|JsonValueWithoutDuplicateObjectKeys(value)| value)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+
+        while let Some(JsonValueWithoutDuplicateObjectKeys(value)) = sequence.next_element()? {
+            values.push(value);
+        }
+
+        Ok(serde_json::Value::Array(values))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut object = serde_json::Map::new();
+
+        while let Some(key) = map.next_key::<String>()? {
+            if object.contains_key(&key) {
+                return Err(de::Error::custom("duplicate object key"));
+            }
+
+            let JsonValueWithoutDuplicateObjectKeys(value) = map.next_value()?;
+            object.insert(key, value);
+        }
+
+        Ok(serde_json::Value::Object(object))
+    }
 }
 
 const fn default_memory_hotplug_block_size_mib() -> u64 {
@@ -1144,7 +1255,7 @@ struct DriveConfigRequestBody {
     #[serde(default, rename = "io_engine")]
     io_engine: Option<DriveIoEngine>,
     #[serde(default)]
-    rate_limiter: Option<serde_json::Value>,
+    rate_limiter: Option<JsonValueWithoutDuplicateObjectKeys>,
     #[serde(default)]
     socket: Option<String>,
 }
@@ -1156,7 +1267,7 @@ struct DrivePatchRequestBody {
     #[serde(default)]
     path_on_host: Option<String>,
     #[serde(default)]
-    rate_limiter: Option<serde_json::Value>,
+    rate_limiter: Option<JsonValueWithoutDuplicateObjectKeys>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1286,7 +1397,7 @@ struct PmemConfigRequestBody {
     #[serde(default)]
     read_only: bool,
     #[serde(default)]
-    rate_limiter: Option<serde_json::Value>,
+    rate_limiter: Option<JsonValueWithoutDuplicateObjectKeys>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1294,7 +1405,7 @@ struct PmemConfigRequestBody {
 struct PmemPatchRequestBody {
     id: String,
     #[serde(default)]
-    rate_limiter: Option<serde_json::Value>,
+    rate_limiter: Option<JsonValueWithoutDuplicateObjectKeys>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1307,9 +1418,9 @@ struct NetworkInterfaceConfigRequestBody {
     #[serde(default)]
     mtu: Option<u16>,
     #[serde(default)]
-    rx_rate_limiter: Option<serde_json::Value>,
+    rx_rate_limiter: Option<JsonValueWithoutDuplicateObjectKeys>,
     #[serde(default)]
-    tx_rate_limiter: Option<serde_json::Value>,
+    tx_rate_limiter: Option<JsonValueWithoutDuplicateObjectKeys>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1317,9 +1428,9 @@ struct NetworkInterfaceConfigRequestBody {
 struct NetworkInterfacePatchRequestBody {
     iface_id: String,
     #[serde(default)]
-    rx_rate_limiter: Option<serde_json::Value>,
+    rx_rate_limiter: Option<JsonValueWithoutDuplicateObjectKeys>,
     #[serde(default)]
-    tx_rate_limiter: Option<serde_json::Value>,
+    tx_rate_limiter: Option<JsonValueWithoutDuplicateObjectKeys>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2063,7 +2174,7 @@ fn parse_serial_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> 
         .map_err(|_| RequestError::MalformedRequest)?;
     let rate_limiter_configured = match &body.rate_limiter {
         Some(rate_limiter) => {
-            validate_rate_limiter_config(rate_limiter)?;
+            validate_rate_limiter_config(rate_limiter.as_value())?;
             true
         }
         None => false,
@@ -2080,7 +2191,7 @@ fn parse_entropy_config_request(body: &[u8]) -> Result<ApiRequest, RequestError>
         .map_err(|_| RequestError::MalformedRequest)?;
     let rate_limiter_configured = match &body.rate_limiter {
         Some(rate_limiter) => {
-            validate_rate_limiter_config(rate_limiter)?;
+            validate_rate_limiter_config(rate_limiter.as_value())?;
             true
         }
         None => false,
@@ -2241,7 +2352,7 @@ fn parse_drive_config_request(
     }
     let rate_limiter_configured = match &body.rate_limiter {
         Some(rate_limiter) => {
-            validate_rate_limiter_config(rate_limiter)?;
+            validate_rate_limiter_config(rate_limiter.as_value())?;
             true
         }
         None => false,
@@ -2269,7 +2380,7 @@ fn parse_drive_patch_request(path_drive_id: &str, body: &[u8]) -> Result<ApiRequ
     }
     let rate_limiter_configured = match &body.rate_limiter {
         Some(rate_limiter) => {
-            validate_rate_limiter_config(rate_limiter)?;
+            validate_rate_limiter_config(rate_limiter.as_value())?;
             true
         }
         None => false,
@@ -2287,7 +2398,7 @@ fn parse_pmem_config_request(path_pmem_id: &str, body: &[u8]) -> Result<ApiReque
     let body = serde_json::from_slice::<PmemConfigRequestBody>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
     if let Some(rate_limiter) = &body.rate_limiter {
-        validate_rate_limiter_config(rate_limiter)?;
+        validate_rate_limiter_config(rate_limiter.as_value())?;
     }
     if path_pmem_id != body.id {
         return Err(RequestError::MismatchedPmemId);
@@ -2308,7 +2419,7 @@ fn parse_pmem_patch_request(path_pmem_id: &str, body: &[u8]) -> Result<ApiReques
     let body = serde_json::from_slice::<PmemPatchRequestBody>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
     if let Some(rate_limiter) = &body.rate_limiter {
-        validate_rate_limiter_config(rate_limiter)?;
+        validate_rate_limiter_config(rate_limiter.as_value())?;
     }
     if path_pmem_id != body.id {
         return Err(RequestError::MismatchedPmemId);
@@ -2330,14 +2441,14 @@ fn parse_network_interface_config_request(
     }
     let rx_rate_limiter_configured = match &body.rx_rate_limiter {
         Some(rate_limiter) => {
-            validate_rate_limiter_config(rate_limiter)?;
+            validate_rate_limiter_config(rate_limiter.as_value())?;
             true
         }
         None => false,
     };
     let tx_rate_limiter_configured = match &body.tx_rate_limiter {
         Some(rate_limiter) => {
-            validate_rate_limiter_config(rate_limiter)?;
+            validate_rate_limiter_config(rate_limiter.as_value())?;
             true
         }
         None => false,
@@ -2369,7 +2480,7 @@ fn parse_network_interface_patch_request(
         .into_iter()
         .flatten()
     {
-        validate_rate_limiter_config(rate_limiter)?;
+        validate_rate_limiter_config(rate_limiter.as_value())?;
     }
 
     Ok(ApiRequest::PatchNetworkInterface(Box::new(
@@ -4410,6 +4521,41 @@ mod tests {
     }
 
     #[test]
+    fn rejects_put_drive_duplicate_rate_limiter_fields() {
+        for body in [
+            r#"{
+                "drive_id": "rootfs",
+                "path_on_host": "/tmp/rootfs.ext4",
+                "is_root_device": true,
+                "rate_limiter": {
+                    "ops": null,
+                    "ops": null
+                }
+            }"#,
+            r#"{
+                "drive_id": "rootfs",
+                "path_on_host": "/tmp/rootfs.ext4",
+                "is_root_device": true,
+                "rate_limiter": {
+                    "ops": {
+                        "size": 100,
+                        "size": 200,
+                        "refill_time": 1000
+                    }
+                }
+            }"#,
+        ] {
+            let request = request_with_body("PUT", "/drives/rootfs", body);
+
+            assert_eq!(
+                parse_request(&request),
+                Err(RequestError::MalformedRequest),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
     fn parses_put_drive_with_null_rate_limiter_buckets() {
         let body = r#"{
             "drive_id": "rootfs",
@@ -4719,6 +4865,40 @@ mod tests {
         assert_eq!(config.mtu(), Some(1500));
         assert!(config.rx_rate_limiter_configured());
         assert!(config.tx_rate_limiter_configured());
+    }
+
+    #[test]
+    fn rejects_put_network_interface_duplicate_rate_limiter_fields() {
+        for body in [
+            r#"{
+                "iface_id": "eth0",
+                "host_dev_name": "tap0",
+                "rx_rate_limiter": {
+                    "bandwidth": null,
+                    "bandwidth": null
+                }
+            }"#,
+            r#"{
+                "iface_id": "eth0",
+                "host_dev_name": "tap0",
+                "tx_rate_limiter": {
+                    "bandwidth": {
+                        "size": 1024,
+                        "one_time_burst": null,
+                        "refill_time": 1000,
+                        "refill_time": 2000
+                    }
+                }
+            }"#,
+        ] {
+            let request = request_with_body("PUT", "/network-interfaces/eth0", body);
+
+            assert_eq!(
+                parse_request(&request),
+                Err(RequestError::MalformedRequest),
+                "{body}"
+            );
+        }
     }
 
     #[test]
@@ -5186,6 +5366,8 @@ mod tests {
             r#"{"rate_limiter":{"bad":{"size":1,"refill_time":1}}}"#,
             r#"{"rate_limiter":{"bandwidth":{"size":1}}}"#,
             r#"{"rate_limiter":{"ops":{"refill_time":1}}}"#,
+            r#"{"rate_limiter":{"ops":null,"ops":null}}"#,
+            r#"{"rate_limiter":{"bandwidth":{"size":1,"refill_time":1,"refill_time":2}}}"#,
         ] {
             let request = request_with_body("PUT", "/entropy", body);
 
@@ -5726,6 +5908,10 @@ mod tests {
                 "PUT",
                 r#"{"id":"pmem0","path_on_host":"/tmp/pmem.img","rate_limiter":{"bandwidth":{"size":1}}}"#,
             ),
+            (
+                "PUT",
+                r#"{"id":"pmem0","path_on_host":"/tmp/pmem.img","rate_limiter":{"ops":null,"ops":null}}"#,
+            ),
             ("PATCH", "not-json"),
             ("PATCH", ""),
             ("PATCH", "{}"),
@@ -5735,6 +5921,10 @@ mod tests {
             (
                 "PATCH",
                 r#"{"id":"pmem0","rate_limiter":{"ops":{"refill_time":1}}}"#,
+            ),
+            (
+                "PATCH",
+                r#"{"id":"pmem0","rate_limiter":{"bandwidth":{"size":1,"refill_time":1,"refill_time":2}}}"#,
             ),
         ] {
             let request = request_with_body(method, "/pmem/pmem0", body);
@@ -5886,6 +6076,8 @@ mod tests {
             r#"{"rate_limiter":"unsupported"}"#,
             r#"{"rate_limiter":{"bad":{"size":1,"refill_time":1}}}"#,
             r#"{"rate_limiter":{"bandwidth":{"size":1}}}"#,
+            r#"{"rate_limiter":{"ops":null,"ops":null}}"#,
+            r#"{"rate_limiter":{"bandwidth":{"size":1,"refill_time":1,"refill_time":2}}}"#,
         ] {
             let request = request_with_body("PUT", "/serial", body);
 
