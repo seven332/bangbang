@@ -222,6 +222,13 @@ explicit. The current HVF runner emulates only the early-boot `OSDLR_EL1` and
 unsupported trapped system registers fail closed instead of being treated as
 generic no-ops.
 
+The current virtio-balloon foundation is runtime-only metadata derived from
+stored control-plane configuration. It does not expose a guest-visible device,
+map guest memory, or process guest descriptors. Future balloon attachment must
+treat PFNs, statistics descriptors, free-page hinting commands, and reporting
+queue data as untrusted guest input before changing host memory accounting or
+reclaim behavior.
+
 The current serial device is a TX-only MMIO output path. By default, guest
 serial bytes go to a bounded internal capture buffer; when `/serial` configures
 `serial_out_path`, startup opens that host path with nonblocking output
