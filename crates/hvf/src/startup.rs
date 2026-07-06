@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 use bangbang_runtime::block::BlockMmioLayout;
+use bangbang_runtime::entropy::EntropyMmioLayout;
 use bangbang_runtime::fdt::Arm64FdtError;
 use bangbang_runtime::interrupt::{
     DeviceInterruptKind, DeviceInterruptTriggerError, GuestInterruptLine, InterruptSink,
@@ -17,10 +18,11 @@ use bangbang_runtime::network::NetworkMmioLayout;
 use bangbang_runtime::serial::SharedSerialOutput;
 use bangbang_runtime::startup::{
     Arm64BootBlockNotificationDispatch, Arm64BootBlockNotificationDispatchError,
-    Arm64BootBlockNotificationDispatches, Arm64BootNetworkNotificationDispatch,
-    Arm64BootNetworkNotificationDispatchError, Arm64BootNetworkNotificationDispatches,
-    Arm64BootNetworkPacketIoProvider, Arm64BootResourceConfig, Arm64BootResourceError,
-    Arm64BootResources, Arm64BootRuntimeResources,
+    Arm64BootBlockNotificationDispatches,
+    Arm64BootEntropyDeviceConfig as RuntimeArm64BootEntropyDeviceConfig,
+    Arm64BootNetworkNotificationDispatch, Arm64BootNetworkNotificationDispatchError,
+    Arm64BootNetworkNotificationDispatches, Arm64BootNetworkPacketIoProvider,
+    Arm64BootResourceConfig, Arm64BootResourceError, Arm64BootResources, Arm64BootRuntimeResources,
     Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig,
     Arm64BootVsockNotificationDispatch, Arm64BootVsockNotificationDispatchError,
     Arm64BootVsockNotificationDispatches,
@@ -46,6 +48,7 @@ pub struct HvfArm64BootSessionConfig {
     pub block_mmio_layout: BlockMmioLayout,
     pub network_mmio_layout: NetworkMmioLayout,
     pub vsock_mmio_layout: VsockMmioLayout,
+    pub entropy_device: Option<HvfArm64BootEntropyDeviceConfig>,
     pub serial_device: Option<HvfArm64BootSerialDeviceConfig>,
 }
 
@@ -59,13 +62,40 @@ impl HvfArm64BootSessionConfig {
             block_mmio_layout,
             network_mmio_layout,
             vsock_mmio_layout,
+            entropy_device: None,
             serial_device: None,
         }
+    }
+
+    pub const fn with_entropy_device(
+        mut self,
+        entropy_device: HvfArm64BootEntropyDeviceConfig,
+    ) -> Self {
+        self.entropy_device = Some(entropy_device);
+        self
     }
 
     pub fn with_serial_device(mut self, serial_device: HvfArm64BootSerialDeviceConfig) -> Self {
         self.serial_device = Some(serial_device);
         self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HvfArm64BootEntropyDeviceConfig {
+    pub mmio_layout: EntropyMmioLayout,
+}
+
+impl HvfArm64BootEntropyDeviceConfig {
+    pub const fn new(mmio_layout: EntropyMmioLayout) -> Self {
+        Self { mmio_layout }
+    }
+
+    const fn into_runtime(
+        self,
+        interrupt_line: GuestInterruptLine,
+    ) -> RuntimeArm64BootEntropyDeviceConfig {
+        RuntimeArm64BootEntropyDeviceConfig::new(self.mmio_layout, interrupt_line)
     }
 }
 
@@ -109,6 +139,7 @@ pub struct HvfArm64BootSession<'vm> {
     block_interrupt_lines: Vec<GuestInterruptLine>,
     network_interrupt_lines: Vec<GuestInterruptLine>,
     vsock_interrupt_line: Option<GuestInterruptLine>,
+    entropy_interrupt_line: Option<GuestInterruptLine>,
     serial_interrupt_line: Option<GuestInterruptLine>,
     boot_registers: HvfArm64BootRegisters,
 }
@@ -124,6 +155,7 @@ pub struct OwnedHvfArm64BootSession {
     block_interrupt_lines: Vec<GuestInterruptLine>,
     network_interrupt_lines: Vec<GuestInterruptLine>,
     vsock_interrupt_line: Option<GuestInterruptLine>,
+    entropy_interrupt_line: Option<GuestInterruptLine>,
     serial_interrupt_line: Option<GuestInterruptLine>,
     boot_registers: HvfArm64BootRegisters,
 }
@@ -319,6 +351,10 @@ impl HvfArm64BootSession<'_> {
 
     pub const fn vsock_interrupt_line(&self) -> Option<GuestInterruptLine> {
         self.vsock_interrupt_line
+    }
+
+    pub const fn entropy_interrupt_line(&self) -> Option<GuestInterruptLine> {
+        self.entropy_interrupt_line
     }
 
     pub const fn serial_interrupt_line(&self) -> Option<GuestInterruptLine> {
@@ -518,6 +554,7 @@ impl OwnedHvfArm64BootSession {
             block_interrupt_lines: prepared.block_interrupt_lines,
             network_interrupt_lines: prepared.network_interrupt_lines,
             vsock_interrupt_line: prepared.vsock_interrupt_line,
+            entropy_interrupt_line: prepared.entropy_interrupt_line,
             serial_interrupt_line: prepared.serial_interrupt_line,
             boot_registers: prepared.boot_registers,
         })
@@ -582,6 +619,10 @@ impl OwnedHvfArm64BootSession {
 
     pub const fn vsock_interrupt_line(&self) -> Option<GuestInterruptLine> {
         self.vsock_interrupt_line
+    }
+
+    pub const fn entropy_interrupt_line(&self) -> Option<GuestInterruptLine> {
+        self.entropy_interrupt_line
     }
 
     pub const fn serial_interrupt_line(&self) -> Option<GuestInterruptLine> {
@@ -1772,6 +1813,7 @@ pub enum HvfArm64BootInterruptLinePurpose {
     BlockDevice,
     NetworkDevice,
     VsockDevice,
+    EntropyDevice,
     SerialDevice,
 }
 
@@ -1781,6 +1823,7 @@ impl fmt::Display for HvfArm64BootInterruptLinePurpose {
             Self::BlockDevice => f.write_str("block device"),
             Self::NetworkDevice => f.write_str("network device"),
             Self::VsockDevice => f.write_str("vsock device"),
+            Self::EntropyDevice => f.write_str("entropy device"),
             Self::SerialDevice => f.write_str("serial device"),
         }
     }
@@ -1824,6 +1867,7 @@ struct PreparedHvfArm64BootSession<'vm> {
     block_interrupt_lines: Vec<GuestInterruptLine>,
     network_interrupt_lines: Vec<GuestInterruptLine>,
     vsock_interrupt_line: Option<GuestInterruptLine>,
+    entropy_interrupt_line: Option<GuestInterruptLine>,
     serial_interrupt_line: Option<GuestInterruptLine>,
     boot_registers: HvfArm64BootRegisters,
 }
@@ -1833,6 +1877,7 @@ struct HvfArm64BootInterruptLines {
     block: Vec<GuestInterruptLine>,
     network: Vec<GuestInterruptLine>,
     vsock: Option<GuestInterruptLine>,
+    entropy: Option<GuestInterruptLine>,
     serial: Option<GuestInterruptLine>,
 }
 
@@ -1864,6 +1909,7 @@ impl HvfBackend {
             block_interrupt_lines: prepared.block_interrupt_lines,
             network_interrupt_lines: prepared.network_interrupt_lines,
             vsock_interrupt_line: prepared.vsock_interrupt_line,
+            entropy_interrupt_line: prepared.entropy_interrupt_line,
             serial_interrupt_line: prepared.serial_interrupt_line,
             boot_registers: prepared.boot_registers,
         })
@@ -1890,6 +1936,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
         controller.drive_configs().len(),
         controller.network_interface_configs().len(),
         controller.vsock_config().is_some(),
+        config.entropy_device.is_some(),
         config.serial_device.is_some(),
     )?;
 
@@ -1903,6 +1950,10 @@ fn prepare_arm64_boot_session_parts<'vm>(
         .serial_device
         .zip(interrupt_lines.serial)
         .map(|(serial, interrupt_line)| serial.into_runtime(interrupt_line));
+    let runtime_entropy = config
+        .entropy_device
+        .zip(interrupt_lines.entropy)
+        .map(|(entropy, interrupt_line)| entropy.into_runtime(interrupt_line));
     let resources = Arm64BootResources::assemble_from_controller(
         controller,
         Arm64BootResourceConfig {
@@ -1916,6 +1967,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
             network_interrupt_lines: &interrupt_lines.network,
             vsock_mmio_layout: config.vsock_mmio_layout,
             vsock_interrupt_line: interrupt_lines.vsock,
+            entropy_device: runtime_entropy,
         },
     )
     .map_err(|source| HvfArm64BootSessionError::AssembleResources { source })?;
@@ -1941,6 +1993,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
         block_interrupt_lines: interrupt_lines.block,
         network_interrupt_lines: interrupt_lines.network,
         vsock_interrupt_line: interrupt_lines.vsock,
+        entropy_interrupt_line: interrupt_lines.entropy,
         serial_interrupt_line: interrupt_lines.serial,
         boot_registers,
     })
@@ -1960,6 +2013,7 @@ fn allocate_interrupt_lines(
     block_device_count: usize,
     network_device_count: usize,
     vsock_configured: bool,
+    entropy_configured: bool,
     serial_configured: bool,
 ) -> Result<HvfArm64BootInterruptLines, HvfArm64BootSessionError> {
     let mut allocator = HvfGicInterruptLineAllocator::from_metadata(gic).map_err(|source| {
@@ -2007,6 +2061,17 @@ fn allocate_interrupt_lines(
         None
     };
 
+    let entropy = if entropy_configured {
+        Some(allocator.allocate().map_err(|source| {
+            HvfArm64BootSessionError::AllocateInterruptLine {
+                purpose: HvfArm64BootInterruptLinePurpose::EntropyDevice,
+                source,
+            }
+        })?)
+    } else {
+        None
+    };
+
     let serial = if serial_configured {
         Some(allocator.allocate().map_err(|source| {
             HvfArm64BootSessionError::AllocateInterruptLine {
@@ -2022,6 +2087,7 @@ fn allocate_interrupt_lines(
         block,
         network,
         vsock,
+        entropy,
         serial,
     })
 }
@@ -2045,6 +2111,7 @@ mod tests {
         VIRTIO_BLOCK_STATUS_OK, VIRTIO_BLOCK_STATUS_SIZE,
     };
     use bangbang_runtime::boot::BootSourceConfigInput;
+    use bangbang_runtime::entropy::EntropyMmioLayout;
     use bangbang_runtime::fdt::{Arm64FdtGic, Arm64FdtRegion, Arm64FdtTimerInterrupts};
     use bangbang_runtime::interrupt::{
         DeviceInterruptKind, GuestInterruptLine, InterruptSignalError, InterruptSink,
@@ -2082,13 +2149,13 @@ mod tests {
     };
 
     use super::{
-        HvfArm64BootBlockNotificationDispatchError, HvfArm64BootInterruptLinePurpose,
-        HvfArm64BootMmioDispatcherError, HvfArm64BootNetworkNotificationDispatchError,
-        HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig,
-        HvfArm64BootSessionConfig, HvfArm64BootSessionError,
-        HvfArm64BootVsockNotificationDispatchError, allocate_interrupt_lines,
-        collect_block_notification_dispatches, collect_network_notification_dispatches,
-        collect_vsock_notification_dispatches,
+        HvfArm64BootBlockNotificationDispatchError, HvfArm64BootEntropyDeviceConfig,
+        HvfArm64BootInterruptLinePurpose, HvfArm64BootMmioDispatcherError,
+        HvfArm64BootNetworkNotificationDispatchError, HvfArm64BootRunLoopOutcome,
+        HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
+        HvfArm64BootSessionError, HvfArm64BootVsockNotificationDispatchError,
+        allocate_interrupt_lines, collect_block_notification_dispatches,
+        collect_network_notification_dispatches, collect_vsock_notification_dispatches,
         dispatch_network_runtime_notifications_with_packet_io, lock_boot_mmio_dispatcher,
         run_boot_session_loop, run_boot_session_vcpu_step, signal_block_queue_interrupts,
         signal_network_queue_interrupts, signal_vsock_queue_interrupts, validate_single_vcpu,
@@ -2876,6 +2943,7 @@ mod tests {
                 MmioRegionId::new(90),
             ),
             vsock_interrupt_line: vsock_line,
+            entropy_device: None,
         }
     }
 
@@ -5440,6 +5508,23 @@ mod tests {
     }
 
     #[test]
+    fn session_config_stores_entropy_device() {
+        let entropy = HvfArm64BootEntropyDeviceConfig::new(EntropyMmioLayout::new(
+            GuestAddress::new(0x8000_0000),
+            MmioRegionId::new(3000),
+        ));
+        let config = HvfArm64BootSessionConfig::new(
+            BlockMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1)),
+            NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
+            VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+        )
+        .with_entropy_device(entropy);
+
+        assert_eq!(config.entropy_device, Some(entropy));
+        assert!(config.serial_device.is_none());
+    }
+
+    #[test]
     fn single_vcpu_validation_accepts_default_controller() {
         let controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
 
@@ -5457,30 +5542,32 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_lines_allocate_blocks_before_network_before_serial() {
-        let lines = allocate_interrupt_lines(&gic_with_spi_range(32, 6), 2, 2, true, true)
+    fn interrupt_lines_allocate_blocks_before_network_before_vsock_entropy_and_serial() {
+        let lines = allocate_interrupt_lines(&gic_with_spi_range(32, 7), 2, 2, true, true, true)
             .expect("interrupt lines should allocate");
 
         assert_eq!(line_values(&lines.block), vec![32, 33]);
         assert_eq!(line_values(&lines.network), vec![34, 35]);
         assert_eq!(lines.vsock.map(|line| line.raw_value()), Some(36));
-        assert_eq!(lines.serial.map(|line| line.raw_value()), Some(37));
+        assert_eq!(lines.entropy.map(|line| line.raw_value()), Some(37));
+        assert_eq!(lines.serial.map(|line| line.raw_value()), Some(38));
     }
 
     #[test]
     fn interrupt_lines_allocate_none_for_absent_serial() {
-        let lines = allocate_interrupt_lines(&gic_with_spi_range(40, 3), 2, 1, false, false)
+        let lines = allocate_interrupt_lines(&gic_with_spi_range(40, 3), 2, 1, false, false, false)
             .expect("interrupt lines should allocate");
 
         assert_eq!(line_values(&lines.block), vec![40, 41]);
         assert_eq!(line_values(&lines.network), vec![42]);
         assert_eq!(lines.vsock, None);
+        assert_eq!(lines.entropy, None);
         assert_eq!(lines.serial, None);
     }
 
     #[test]
     fn interrupt_lines_report_vsock_exhaustion_with_purpose() {
-        let err = allocate_interrupt_lines(&gic_with_spi_range(32, 2), 1, 1, true, false)
+        let err = allocate_interrupt_lines(&gic_with_spi_range(32, 2), 1, 1, true, false, false)
             .expect_err("vsock allocation should exhaust range");
 
         assert!(matches!(
@@ -5493,8 +5580,22 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_lines_report_entropy_exhaustion_with_purpose() {
+        let err = allocate_interrupt_lines(&gic_with_spi_range(32, 3), 1, 1, true, true, false)
+            .expect_err("entropy allocation should exhaust range");
+
+        assert!(matches!(
+            err,
+            HvfArm64BootSessionError::AllocateInterruptLine {
+                purpose: HvfArm64BootInterruptLinePurpose::EntropyDevice,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn interrupt_lines_report_serial_exhaustion_with_purpose() {
-        let err = allocate_interrupt_lines(&gic_with_spi_range(32, 3), 1, 1, true, true)
+        let err = allocate_interrupt_lines(&gic_with_spi_range(32, 3), 1, 1, true, false, true)
             .expect_err("serial allocation should exhaust range");
 
         assert!(matches!(
@@ -5508,7 +5609,7 @@ mod tests {
 
     #[test]
     fn interrupt_lines_report_network_exhaustion_with_purpose() {
-        let err = allocate_interrupt_lines(&gic_with_spi_range(32, 1), 1, 1, false, false)
+        let err = allocate_interrupt_lines(&gic_with_spi_range(32, 1), 1, 1, false, false, false)
             .expect_err("network allocation should exhaust range");
 
         assert!(matches!(
@@ -5522,7 +5623,7 @@ mod tests {
 
     #[test]
     fn interrupt_lines_reject_invalid_gic_range() {
-        let err = allocate_interrupt_lines(&gic_with_spi_range(31, 1), 0, 0, false, false)
+        let err = allocate_interrupt_lines(&gic_with_spi_range(31, 1), 0, 0, false, false, false)
             .expect_err("invalid SPI range should fail");
 
         assert!(matches!(
