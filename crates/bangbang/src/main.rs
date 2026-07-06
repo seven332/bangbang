@@ -1155,6 +1155,8 @@ fn help_text() -> String {
             "bangbang {}\n\n",
             "Usage:\n",
             "  bangbang [OPTIONS]\n\n",
+            "Value-taking long options accept either --name value or --name=value.\n",
+            "Value-less flags reject attached values.\n\n",
             "Options:\n",
             "      --api-sock <PATH>  Unix domain socket path for the API server [default: {}]\n",
             "      --config-file <PATH>\n",
@@ -1734,6 +1736,10 @@ mod tests {
         let help = super::help_text();
 
         assert!(help.contains("Serves GET /, GET /version"));
+        assert!(
+            help.contains("Value-taking long options accept either --name value or --name=value")
+        );
+        assert!(help.contains("Value-less flags reject attached values"));
         assert!(help.contains("GET /vm/config"));
         assert!(help.contains("--config-file <PATH>"));
         assert!(help.contains("GET /machine-config"));
