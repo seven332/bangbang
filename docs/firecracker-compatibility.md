@@ -514,7 +514,10 @@ through VMM control, plus selected `patch_api_requests` counters for parsed
 `PATCH /pmem/{pmem_id}` requests routed through VMM control. bangbang also
 records `balloon_count` extension fields for parsed balloon GET, PUT, and PATCH
 routes, plus `balloon_fails` extension fields for parsed balloon PUT and PATCH
-failures, because Firecracker does not expose matching request metrics.
+failures, because Firecracker does not expose matching request metrics. It does
+not emit entropy request-counter fields; Firecracker does not define
+`put_api_requests.entropy_count` or `entropy_fails`, and bangbang keeps entropy
+work under the unsupported virtio-rng device surface until that device exists.
 Parsed deprecated HTTP API usage is counted under
 `deprecated_api.deprecated_http_api_calls` for the supported deprecated fields
 above; malformed parser failures remain outside the counter.
