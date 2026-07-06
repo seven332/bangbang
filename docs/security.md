@@ -145,20 +145,22 @@ is resource-specific:
   `VSOCK_OP_RW` payloads and deliver one queued payload at a time
   into validated guest RX buffers. Guest `VSOCK_OP_RST` packets drop matching
   retained host-initiated or guest-initiated streams without queuing guest-visible
-  RX output. Full guest `VSOCK_OP_SHUTDOWN` packets drop matching retained
-  streams, release the host local port when applicable, and queue a
-  guest-visible `VSOCK_OP_RST`. Valid guest `VSOCK_OP_CREDIT_UPDATE` packets
-  for established retained streams are consumed without queuing a reset, and
-  valid guest `VSOCK_OP_CREDIT_REQUEST` packets queue zero-payload guest-visible
-  `VSOCK_OP_CREDIT_UPDATE` headers on the existing RX path. Host-stream EOF or
-  read failures drop the retained stream and queue a guest-visible
-  `VSOCK_OP_RST`.
+  RX output. Partial guest `VSOCK_OP_SHUTDOWN` packets record receive/send
+  closure state, suppress later data movement in the closed direction, and keep
+  the retained stream until both directions are closed. Full guest
+  `VSOCK_OP_SHUTDOWN` packets drop matching retained streams, release the host
+  local port when applicable, and queue a guest-visible `VSOCK_OP_RST`. Valid
+  guest `VSOCK_OP_CREDIT_UPDATE` packets for established retained streams are
+  consumed without queuing a reset, and valid guest `VSOCK_OP_CREDIT_REQUEST`
+  packets queue zero-payload guest-visible `VSOCK_OP_CREDIT_UPDATE` headers on
+  the existing RX path. Host-stream EOF or read failures drop the retained
+  stream and queue a guest-visible `VSOCK_OP_RST`.
   Startup also binds a nonblocking host Unix listener at `uds_path`,
   records the listener socket device and inode, and removes the path on normal
   shutdown only when it still refers to the socket created by this process. It
   does not route CIDs beyond current host/guest checks, dispatch real event
-  payloads, track graceful half-close state, or implement full virtio-vsock
-  credit accounting yet.
+  payloads, implement Firecracker's full graceful-shutdown timeout/kill-queue
+  behavior, or implement full virtio-vsock credit accounting yet.
 - `/metrics` opens the output path during pre-boot configuration and keeps a
   per-process metrics sink. The `--metrics-path` startup CLI flag uses the same
   sink and host-path error redaction rules before the API socket is served.
@@ -406,11 +408,13 @@ The current scaffold does not implement:
   four-packet per-connection backlog of host `VSOCK_OP_RW` payloads and deliver
   one queued payload at a time into validated guest RX buffers,
   guest `VSOCK_OP_RST` packets drop matching retained host-initiated or
-  guest-initiated streams without queuing guest-visible RX output, and
-  full guest `VSOCK_OP_SHUTDOWN` packets drop matching retained streams before
-  queuing a guest-visible reset. Valid guest `VSOCK_OP_CREDIT_UPDATE` packets
-  for established retained streams are consumed without queuing a reset, and
-  valid guest `VSOCK_OP_CREDIT_REQUEST` packets queue zero-payload guest-visible
+  guest-initiated streams without queuing guest-visible RX output, partial guest
+  `VSOCK_OP_SHUTDOWN` packets record receive/send closure state and suppress
+  later data movement in the closed direction, and full guest
+  `VSOCK_OP_SHUTDOWN` packets drop matching retained streams before queuing a
+  guest-visible reset. Valid guest `VSOCK_OP_CREDIT_UPDATE` packets for
+  established retained streams are consumed without queuing a reset, and valid
+  guest `VSOCK_OP_CREDIT_REQUEST` packets queue zero-payload guest-visible
   `VSOCK_OP_CREDIT_UPDATE` headers on the existing RX path. Host-stream EOF or
   read failures drop the retained stream before queuing a guest-visible reset.
   Startup preparation
@@ -418,8 +422,9 @@ The current scaffold does not implement:
   while the path still matches the created socket inode. It can accept event
   queue notifications as no-op
   dispatch metadata, but it still does not route CIDs beyond current host/guest
-  checks, dispatch real event payloads, track graceful half-close state, or
-  implement full virtio-vsock credit accounting.
+  checks, dispatch real event payloads, implement Firecracker's full
+  graceful-shutdown timeout/kill-queue behavior, or implement full virtio-vsock
+  credit accounting.
 - complete production logging or metrics policy
 - public run-loop control or serial input, rate-limiting, and streaming policy
 
