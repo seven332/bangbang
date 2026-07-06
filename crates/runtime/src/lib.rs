@@ -3,6 +3,7 @@
 pub mod block;
 pub mod boot;
 pub mod cpu;
+pub mod entropy;
 pub mod fdt;
 pub mod interrupt;
 pub mod logger;
@@ -86,7 +87,7 @@ pub enum VmmAction {
     GetMemoryHotplug,
     PutMemoryHotplug,
     PatchMemoryHotplug,
-    PutEntropy,
+    PutEntropy(entropy::EntropyConfigInput),
     PutPmem,
     PatchPmem,
     PutBootSource(boot::BootSourceConfigInput),
@@ -162,7 +163,7 @@ impl VmmAction {
             Self::GetMemoryHotplug => "GetMemoryHotplug",
             Self::PutMemoryHotplug => "PutMemoryHotplug",
             Self::PatchMemoryHotplug => "PatchMemoryHotplug",
-            Self::PutEntropy => "PutEntropy",
+            Self::PutEntropy(_) => "PutEntropy",
             Self::PutPmem => "PutPmem",
             Self::PatchPmem => "PatchPmem",
             Self::PutBootSource(_) => "PutBootSource",
@@ -263,6 +264,7 @@ pub enum VmmActionError {
     BootSourceConfig(boot::BootSourceConfigError),
     DriveConfig(block::DriveConfigError),
     DriveUpdateUnsupported,
+    EntropyConfig(entropy::EntropyConfigError),
     LoggerConfig(logger::LoggerConfigError),
     LoggerWrite(logger::LoggerWriteError),
     MachineConfig(machine::MachineConfigError),
@@ -301,6 +303,7 @@ impl fmt::Display for VmmActionError {
             Self::BootSourceConfig(err) => write!(f, "{err}"),
             Self::DriveConfig(err) => write!(f, "{err}"),
             Self::DriveUpdateUnsupported => f.write_str("Drive updates are not supported."),
+            Self::EntropyConfig(err) => write!(f, "{err}"),
             Self::LoggerConfig(err) => write!(f, "{err}"),
             Self::LoggerWrite(err) => write!(f, "{err}"),
             Self::MachineConfig(err) => write!(f, "{err}"),
@@ -328,6 +331,7 @@ impl std::error::Error for VmmActionError {
             Self::InstanceStart(err) => Some(err),
             Self::BootSourceConfig(err) => Some(err),
             Self::DriveConfig(err) => Some(err),
+            Self::EntropyConfig(err) => Some(err),
             Self::LoggerConfig(err) => Some(err),
             Self::LoggerWrite(err) => Some(err),
             Self::MachineConfig(err) => Some(err),
@@ -774,12 +778,17 @@ impl VmmController {
 
                 Err(VmmActionError::BalloonUnsupported)
             }
-            VmmAction::PutEntropy => {
+            VmmAction::PutEntropy(config) => {
                 if self.instance_info.state != InstanceState::NotStarted {
                     return Err(VmmActionError::UnsupportedState {
                         action: action_name,
                         state: self.instance_info.state,
                     });
+                }
+                if config.rate_limiter_configured() {
+                    return Err(VmmActionError::EntropyConfig(
+                        entropy::EntropyConfigError::UnsupportedRateLimiter,
+                    ));
                 }
 
                 Err(VmmActionError::EntropyUnsupported)
@@ -1115,6 +1124,7 @@ mod tests {
             BootCommandLineError, BootPayloadKind, BootSourceConfigError, BootSourceConfigInput,
         },
         cpu::CpuConfigInput,
+        entropy::{EntropyConfigError, EntropyConfigInput},
         logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel, LoggerWriteError},
         machine::{
             DEFAULT_MEM_SIZE_MIB, DEFAULT_VCPU_COUNT, MAX_MEM_SIZE_MIB, MachineConfigError,
@@ -1494,7 +1504,10 @@ mod tests {
         assert_eq!(VmmAction::GetMemoryHotplug.name(), "GetMemoryHotplug");
         assert_eq!(VmmAction::PutMemoryHotplug.name(), "PutMemoryHotplug");
         assert_eq!(VmmAction::PatchMemoryHotplug.name(), "PatchMemoryHotplug");
-        assert_eq!(VmmAction::PutEntropy.name(), "PutEntropy");
+        assert_eq!(
+            VmmAction::PutEntropy(EntropyConfigInput::new()).name(),
+            "PutEntropy"
+        );
         assert_eq!(VmmAction::PutPmem.name(), "PutPmem");
         assert_eq!(VmmAction::PatchPmem.name(), "PatchPmem");
         assert_eq!(
@@ -1843,10 +1856,33 @@ mod tests {
             .expect("boot source config should be stored");
 
         let err = controller
-            .handle_action(VmmAction::PutEntropy)
+            .handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
             .expect_err("entropy should remain unsupported");
 
         assert_eq!(err, VmmActionError::EntropyUnsupported);
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert!(controller.boot_source_config().is_some());
+        assert!(controller.drive_configs().is_empty());
+        assert!(controller.network_interface_configs().is_empty());
+    }
+
+    #[test]
+    fn put_entropy_rejects_rate_limiter_before_start_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PutEntropy(
+                EntropyConfigInput::new().with_rate_limiter_configured(),
+            ))
+            .expect_err("entropy rate limiter should remain unsupported");
+
+        assert_eq!(
+            err,
+            VmmActionError::EntropyConfig(EntropyConfigError::UnsupportedRateLimiter)
+        );
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
         assert!(controller.boot_source_config().is_some());
         assert!(controller.drive_configs().is_empty());
@@ -1863,13 +1899,15 @@ mod tests {
             controller.instance_info.state = state;
 
             let err = controller
-                .handle_action(VmmAction::PutEntropy)
+                .handle_action(VmmAction::PutEntropy(
+                    EntropyConfigInput::new().with_rate_limiter_configured(),
+                ))
                 .expect_err("entropy should be pre-boot-only");
 
             assert_eq!(
                 err,
                 VmmActionError::UnsupportedState {
-                    action: VmmAction::PutEntropy.name(),
+                    action: VmmAction::PutEntropy(EntropyConfigInput::new()).name(),
                     state,
                 }
             );
@@ -4439,6 +4477,14 @@ mod tests {
 
         assert_eq!(err.to_string(), "Entropy device is not supported.");
         assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn displays_entropy_config_error() {
+        let err = VmmActionError::EntropyConfig(EntropyConfigError::UnsupportedRateLimiter);
+
+        assert_eq!(err.to_string(), "entropy rate_limiter is not supported");
+        assert!(err.source().is_some());
     }
 
     #[test]

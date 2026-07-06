@@ -323,7 +323,7 @@ compatibility targets.
 | `PATCH` | `/balloon/hinting/stop` | recognized; VMM-routed unsupported | Routes through the VMM state/action policy without parsing the request body, matching Firecracker's stop-command parser behavior. Hinting stop is treated as post-boot-only and currently returns the balloon-specific unsupported fault after startup. Real free-page hinting and reporting need a dedicated design. |
 | `GET` | `/balloon/hinting/status` | recognized; VMM-routed unsupported | Routes through the VMM state/action policy. Hinting status is treated as post-boot-only and currently returns the balloon-specific unsupported fault after startup. Real free-page hinting state tracking needs a dedicated design. |
 | `PUT`, `PATCH` | `/pmem/{id}` | recognized; VMM-routed unsupported | Parses Firecracker-shaped pmem config and update request bodies, rejects malformed, invalid, or mismatched path/body IDs first, and then routes valid requests through the VMM state/action policy. `PUT` is treated as pre-boot-only and reaches the pmem-specific unsupported fault before startup. `PATCH` is treated as post-boot-only and reaches the pmem-specific unsupported fault after startup. Requests made in the wrong lifecycle state return the normal unsupported-state fault. Real pmem device configuration, guest attachment, rate limiting, and runtime update behavior need a dedicated device design. |
-| `PUT` | `/entropy` | recognized; VMM-routed unsupported | Parses Firecracker-shaped entropy config requests, rejects malformed or invalid bodies first, and then routes valid bodies through the VMM state/action policy. Pre-boot requests currently return the entropy-specific unsupported fault, while post-start requests follow the pre-boot-only unsupported-state policy. Real virtio-rng configuration storage, rate limiting, guest randomness wiring, and startup resource attachment need a dedicated device design. |
+| `PUT` | `/entropy` | recognized; VMM-routed unsupported | Parses Firecracker-shaped entropy config requests, rejects malformed or invalid bodies first, and then routes valid bodies through the VMM state/action policy. Pre-boot requests without a configured rate limiter currently return the entropy-specific unsupported fault. Configured rate limiters are validated and then rejected with the entropy rate-limiter unsupported fault. Post-start requests follow the pre-boot-only unsupported-state policy. Real virtio-rng configuration storage, rate limiting, guest randomness wiring, and startup resource attachment need a dedicated device design. |
 | `GET`, `PUT`, `PATCH` | `/hotplug/memory` | recognized; VMM-routed unsupported | Parses Firecracker-shaped `PUT` and `PATCH` memory hotplug request bodies, rejects malformed or schema-invalid bodies first, and then routes valid requests through the VMM state/action policy. `PUT` is treated as pre-boot-only and reaches the memory-hotplug-specific unsupported fault before startup. `GET` and `PATCH` are treated as post-boot-only and reach the memory-hotplug-specific unsupported fault after startup. Requests made in the wrong lifecycle state return the normal unsupported-state fault. Real virtio-mem device support, guest memory accounting, semantic config validation, and runtime memory update behavior need a dedicated design. |
 | `PATCH` | `/vm` | recognized; rejected | Parses the Firecracker-shaped VM state request with required `state` values `Paused` and `Resumed`, then routes valid requests through `Pause` or `Resume` VMM actions. Requests before startup fail as unsupported in `Not started` state, and runtime requests fail as unsupported actions without mutating VM state. Real pause/resume state transitions and public run-loop control remain deferred. |
 | `PATCH` | `/drives/{drive_id}` | recognized; rejected | Parses the Firecracker-shaped block-device update request with required `drive_id`, optional `path_on_host`, and optional `rate_limiter`, then routes valid updates through `UpdateBlockDevice`. Pre-boot requests fail as post-boot-only operations and runtime requests fail as unsupported actions without mutating stored drive configuration. Configured rate limiters remain unsupported until block update behavior exists. |
@@ -436,7 +436,7 @@ exist.
 | `PUT /serial` | `serial_out_path` | optional | Host path to the serial output file or FIFO. The runtime stores it before boot, startup opens it as per-process observability output, and API-facing open errors redact path details. Omit the field or set it to `null` to clear the configured public output path. |
 | `PUT /serial` | `rate_limiter` | unsupported when configured | Missing or `null` values are accepted; configured values return a fault without mutating previous serial output configuration. |
 | `PUT /serial` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
-| `PUT /entropy` | `rate_limiter` | optional; unsupported when validly configured | Missing or `null` values are accepted before the VMM returns the entropy unsupported fault. Configured Firecracker-shaped rate limiter objects are validated, discarded, and never echoed in faults. Real virtio-rng rate limiting remains deferred. |
+| `PUT /entropy` | `rate_limiter` | optional; unsupported when validly configured | Missing or `null` values are accepted before the VMM returns the entropy unsupported fault. Configured Firecracker-shaped rate limiter objects are validated and then rejected as `entropy rate_limiter is not supported`; request values are never echoed in faults. Real virtio-rng rate limiting remains deferred. |
 | `PUT /entropy` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /hotplug/memory` | `total_size_mib` | required; unsupported after VMM routing | Required Firecracker-shaped hotpluggable-memory total size. The parser accepts syntactically valid unsigned integer values, then the API server routes the request through the pre-boot-only memory-hotplug action before returning the unsupported fault. Real virtio-mem semantic validation and storage remain deferred. |
 | `PUT /hotplug/memory` | `block_size_mib` | optional; unsupported after VMM routing | Missing values use Firecracker's parser default shape. Present values must be unsigned integers. Real block-size semantic validation remains deferred with virtio-mem support. |
@@ -463,14 +463,14 @@ capability instead of only accepting configuration. The target supported subset
 is one Firecracker-shaped virtio-rng device configured before startup, attached
 as a virtio-mmio device in the arm64 FDT, backed by host randomness, and
 validated through the signed executable process/HVF path by a guest read from
-the RNG device. The follow-up split should keep PRs independently mergeable:
-first define the API/runtime configuration boundary without enabling a
-successful `PUT /entropy` path, then add the backend-neutral virtio-rng queue
-handler, then wire startup, MMIO layout, FDT, interrupts, reset/cleanup, and
-finally add signed executable e2e and metrics/security docs. Entropy device
-metrics and real rate limiting remain deferred until their producers exist.
-`PUT /entropy` must continue to return unsupported until a later PR exposes
-guest-visible entropy behavior.
+the RNG device. The current API/runtime boundary preserves whether a
+Firecracker-shaped `rate_limiter` was configured while keeping successful
+`PUT /entropy` behavior unsupported. Remaining follow-up PRs should add the
+backend-neutral virtio-rng queue handler, then wire startup, MMIO layout, FDT,
+interrupts, reset/cleanup, and finally add signed executable e2e and
+metrics/security docs. Entropy device metrics and real rate limiting remain
+deferred until their producers exist. `PUT /entropy` must continue to return
+unsupported until a later PR exposes guest-visible entropy behavior.
 
 The API and VMM state path also route valid snapshot requests through explicit
 actions before returning unsupported faults. `PUT /snapshot/create` fails as an
