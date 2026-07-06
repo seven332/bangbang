@@ -1430,7 +1430,7 @@ The first API implementation should model the same broad stages as Firecracker:
 | --- | --- | --- | --- |
 | `GET /` | implemented; `200` JSON | implemented; `200` JSON | Response state reflects the current microVM state. |
 | `GET /version` | implemented; `200` JSON | implemented; `200` JSON | Body uses Firecracker's `firecracker_version` field shape. |
-| `GET /vm/config` | implemented; `200` JSON | implemented; `200` JSON | Returns the accumulated supported configuration subset, including `mmds-config` after successful MMDS config storage. Startup applies the supported boot subset to an owned HVF session and internal boot run-loop worker across bounded step windows. |
+| `GET /vm/config` | implemented; `200` JSON | implemented; `200` JSON | Returns the accumulated supported configuration subset, including `mmds-config` after successful MMDS config storage and `entropy` after successful entropy configuration. Startup applies the supported boot subset to an owned HVF session and internal boot run-loop worker across bounded step windows. |
 | `GET /machine-config` | implemented; `200` JSON | supported target; `200` JSON | Returns the stored/default machine configuration. |
 | `PUT /machine-config` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Pre-boot-only configuration. Stored values are applied during startup preparation. |
 | `PATCH /machine-config` | implemented; `204` empty response on successful partial config update | unsupported after start; `400` `fault_message` | Pre-boot-only partial configuration. Omitted fields preserve current stored values; invalid updates leave stored values unchanged. |
