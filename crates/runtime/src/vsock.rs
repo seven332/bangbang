@@ -12572,6 +12572,29 @@ mod tests {
     }
 
     #[test]
+    fn virtio_vsock_device_host_read_wakeup_fds_omit_listener_at_host_connection_limit() {
+        let (accepted, _client) = accepted_host_connection("wakeup-limit");
+        let accepted_fd = accepted.stream().as_raw_fd();
+        let (mut device, _path) = host_socket_device(MIN_GUEST_CID, "wakeup-full");
+        activate_vsock_device(&mut device);
+        device.set_host_connection_limit(1);
+        let listener_fd = device
+            .host_socket_owner
+            .as_ref()
+            .expect("host socket should be attached")
+            .listener
+            .as_raw_fd();
+        device.pending_host_connections.push_back(accepted);
+
+        let fds = device
+            .host_read_wakeup_fds()
+            .expect("wakeup fd collection should succeed");
+
+        assert_eq!(fds, [accepted_fd]);
+        assert!(!fds.contains(&listener_fd));
+    }
+
+    #[test]
     fn virtio_vsock_device_host_read_wakeup_fds_include_pending_host_handshake_stream() {
         let (accepted, _client) = accepted_host_connection("wakeup-handshake");
         let accepted_fd = accepted.stream().as_raw_fd();
