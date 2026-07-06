@@ -3169,7 +3169,7 @@ mod tests {
     #[test]
     fn config_file_rejects_duplicate_top_level_recognized_unsupported_section() {
         let err = super::config_file_actions_from_str(
-            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"balloon":{},"balloon":{}}"#,
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"memory-hotplug":{},"memory-hotplug":{}}"#,
         )
         .expect_err("duplicate top-level recognized unsupported section should fail");
 
