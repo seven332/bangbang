@@ -4378,6 +4378,46 @@ mod tests {
     }
 
     #[test]
+    fn deprecated_api_usage_tracks_machine_cpu_template_values() {
+        for (method, body, expected) in [
+            ("PUT", r#"{"vcpu_count":1,"mem_size_mib":256}"#, false),
+            (
+                "PUT",
+                r#"{"vcpu_count":1,"mem_size_mib":256,"cpu_template":null}"#,
+                false,
+            ),
+            (
+                "PUT",
+                r#"{"vcpu_count":1,"mem_size_mib":256,"cpu_template":"None"}"#,
+                true,
+            ),
+            (
+                "PUT",
+                r#"{"vcpu_count":1,"mem_size_mib":256,"cpu_template":"V1N1"}"#,
+                true,
+            ),
+            ("PATCH", r#"{"mem_size_mib":256}"#, false),
+            (
+                "PATCH",
+                r#"{"mem_size_mib":256,"cpu_template":null}"#,
+                false,
+            ),
+            ("PATCH", r#"{"cpu_template":"None"}"#, true),
+            ("PATCH", r#"{"cpu_template":"T2A"}"#, true),
+        ] {
+            let request = request_with_body(method, "/machine-config", body);
+            let parsed = parse_request_with_limit(request.as_bytes(), HTTP_MAX_PAYLOAD_SIZE)
+                .expect("machine config request should parse");
+
+            assert_eq!(
+                request_uses_deprecated_api(&parsed),
+                expected,
+                "{method} {body}"
+            );
+        }
+    }
+
+    #[test]
     fn configured_metrics_counts_deprecated_api_requests() {
         let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
         let metrics_path = unique_socket_path("metrics-deprecated-api").with_extension("metrics");
