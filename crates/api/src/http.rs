@@ -2140,8 +2140,6 @@ fn parse_snapshot_create_request(body: &[u8]) -> Result<ApiRequest, RequestError
 }
 
 fn parse_snapshot_load_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
-    let value = serde_json::from_slice::<serde_json::Value>(body)
-        .map_err(|_| RequestError::MalformedRequest)?;
     let SnapshotLoadRequestBody {
         snapshot_path,
         mem_file_path,
@@ -2152,7 +2150,7 @@ fn parse_snapshot_load_request(body: &[u8]) -> Result<ApiRequest, RequestError> 
         network_overrides,
         vsock_override,
         clock_realtime,
-    } = serde_json::from_value::<SnapshotLoadRequestBody>(value)
+    } = serde_json::from_slice::<SnapshotLoadRequestBody>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
 
     if mem_file_path.is_some() == mem_backend.is_some() {
