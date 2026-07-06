@@ -73,6 +73,7 @@ pub struct DriveUpdateInput {
     path_drive_id: String,
     body_drive_id: String,
     path_on_host: Option<PathBuf>,
+    rate_limiter_configured: bool,
 }
 
 impl DriveUpdateInput {
@@ -85,6 +86,7 @@ impl DriveUpdateInput {
             path_drive_id: path_drive_id.into(),
             body_drive_id: body_drive_id.into(),
             path_on_host,
+            rate_limiter_configured: false,
         }
     }
 
@@ -98,6 +100,15 @@ impl DriveUpdateInput {
 
     pub fn path_on_host(&self) -> Option<&Path> {
         self.path_on_host.as_deref()
+    }
+
+    pub const fn rate_limiter_configured(&self) -> bool {
+        self.rate_limiter_configured
+    }
+
+    pub const fn with_rate_limiter_configured(mut self) -> Self {
+        self.rate_limiter_configured = true;
+        self
     }
 
     pub fn validate(self) -> Result<DriveUpdate, DriveUpdateError> {
@@ -414,6 +425,10 @@ impl TryFrom<DriveUpdateInput> for DriveUpdate {
             return Err(DriveUpdateError::EmptyPathOnHost);
         }
 
+        if input.rate_limiter_configured {
+            return Err(DriveUpdateError::UnsupportedRateLimiter);
+        }
+
         Ok(Self {
             drive_id: input.path_drive_id,
             path_on_host: input.path_on_host,
@@ -504,6 +519,7 @@ pub enum DriveUpdateError {
         body_drive_id: String,
     },
     EmptyPathOnHost,
+    UnsupportedRateLimiter,
     UnknownDrive {
         drive_id: String,
     },
@@ -559,6 +575,7 @@ impl fmt::Display for DriveUpdateError {
             }
             Self::MismatchedDriveId { .. } => f.write_str("path drive_id must match body drive_id"),
             Self::EmptyPathOnHost => f.write_str("drive path_on_host must not be empty"),
+            Self::UnsupportedRateLimiter => f.write_str("drive rate_limiter is not supported"),
             Self::UnknownDrive { drive_id } => {
                 write!(f, "drive {drive_id} is not configured")
             }
@@ -4358,6 +4375,14 @@ mod tests {
         assert_eq!(
             DriveUpdateInput::new("rootfs", "rootfs", Some(PathBuf::new())).validate(),
             Err(DriveUpdateError::EmptyPathOnHost)
+        );
+
+        let rate_limited_update =
+            DriveUpdateInput::new("rootfs", "rootfs", None).with_rate_limiter_configured();
+        assert!(rate_limited_update.rate_limiter_configured());
+        assert_eq!(
+            rate_limited_update.validate(),
+            Err(DriveUpdateError::UnsupportedRateLimiter)
         );
     }
 
