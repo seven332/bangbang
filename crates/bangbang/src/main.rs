@@ -2613,6 +2613,17 @@ mod tests {
             err,
             "unsupported argument syntax for --show-log-origin; use --show-log-origin"
         );
+
+        let err = parse(&["--help=true"]).expect_err("help flag with value should fail");
+
+        assert_eq!(err, "unsupported argument syntax for --help; use --help");
+
+        let err = parse(&["--version=true"]).expect_err("version flag with value should fail");
+
+        assert_eq!(
+            err,
+            "unsupported argument syntax for --version; use --version"
+        );
     }
 
     #[test]
