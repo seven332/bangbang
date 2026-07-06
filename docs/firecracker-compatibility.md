@@ -465,8 +465,10 @@ as a virtio-mmio device in the arm64 FDT, backed by host randomness, and
 validated through the signed executable process/HVF path by a guest read from
 the RNG device. The current API/runtime boundary preserves whether a
 Firecracker-shaped `rate_limiter` was configured while keeping successful
-`PUT /entropy` behavior unsupported. Remaining follow-up PRs should add the
-backend-neutral virtio-rng queue handler, then wire startup, MMIO layout, FDT,
+`PUT /entropy` behavior unsupported. A backend-neutral virtio-rng queue handler
+can now fill writable guest descriptor chains from an injected entropy source
+under unit tests, including malformed-buffer and source-failure completion
+paths. Remaining follow-up PRs should wire startup, MMIO layout, FDT,
 interrupts, reset/cleanup, and finally add signed executable e2e and
 metrics/security docs. Entropy device metrics and real rate limiting remain
 deferred until their producers exist. `PUT /entropy` must continue to return
