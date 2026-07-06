@@ -17111,6 +17111,79 @@ mod tests {
     }
 
     #[test]
+    fn virtio_vsock_notifications_receive_shutdown_suppresses_host_connection_host_rw() {
+        let (mut memory, mut handler, mut client, key) =
+            established_host_connection_for_test("host-receive-shutdown-rw", 4000);
+        let queued_payload = b"queued-before-shutdown";
+        let after_shutdown_payload = b"after-receive-shutdown";
+        let receive_only_shutdown = guest_shutdown_tx_packet(42, key.local_port().raw(), 4000)
+            .header()
+            .with_flags(VIRTIO_VSOCK_FLAGS_SHUTDOWN_RCV);
+
+        client
+            .write_all(queued_payload)
+            .expect("host payload before receive shutdown should write");
+        let queued = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("host payload should queue without an RX buffer");
+        assert_eq!(
+            queued
+                .rx_queue_dispatch()
+                .expect("queued host payload should attempt RX dispatch")
+                .delivered_host_rw_packets(),
+            0
+        );
+
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_SECOND_HEADER, receive_only_shutdown);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::readable(
+                TEST_VSOCK_SECOND_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        append_vsock_tx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+        let shutdown = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("partial receive shutdown should be recorded");
+        assert_eq!(
+            shutdown
+                .guest_shutdown_dispatch()
+                .updated_host_connections(),
+            1
+        );
+        assert!(handler.activation_handler().has_host_connection(key));
+
+        client
+            .write_all(after_shutdown_payload)
+            .expect("host stream should remain open after receive shutdown");
+        write_vsock_rx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_SECOND_BUFFER,
+                vsock_packet_len_with_payload(queued_payload),
+                None,
+            ),
+        );
+        append_vsock_rx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+        let retry = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("receive-closed connection should not deliver host RW");
+        let rx = retry
+            .rx_queue_dispatch()
+            .expect("RX notification should produce an empty dispatch");
+        assert_eq!(rx.processed_buffers(), 0);
+        assert_eq!(rx.delivered_host_rw_packets(), 0);
+        assert_eq!(read_vsock_rx_used_index(&memory), 1);
+        assert!(handler.activation_handler().has_host_connection(key));
+    }
+
+    #[test]
     fn virtio_vsock_notifications_suppress_host_connection_guest_rw_after_send_shutdown() {
         let (mut memory, mut handler, mut client, key) =
             established_host_connection_for_test("host-send-shutdown", 4000);
@@ -17408,6 +17481,80 @@ mod tests {
         accepted
             .write_all(b"still-open")
             .expect("partial guest SHUTDOWN should keep guest stream open");
+    }
+
+    #[test]
+    fn virtio_vsock_notifications_receive_shutdown_suppresses_guest_connection_host_rw() {
+        let (mut memory, mut handler, mut accepted) =
+            established_guest_connection_for_test("guest-receive-shutdown-rw", 52, 4000);
+        let key = VsockGuestConnectionKey::new(52, 4000);
+        let queued_payload = b"queued-before-shutdown";
+        let after_shutdown_payload = b"after-receive-shutdown";
+        let receive_only_shutdown = guest_shutdown_tx_packet(42, 52, 4000)
+            .header()
+            .with_flags(VIRTIO_VSOCK_FLAGS_SHUTDOWN_RCV);
+
+        accepted
+            .write_all(queued_payload)
+            .expect("host payload before receive shutdown should write");
+        let queued = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("host payload should queue without an RX buffer");
+        assert_eq!(
+            queued
+                .rx_queue_dispatch()
+                .expect("queued host payload should attempt RX dispatch")
+                .delivered_host_rw_packets(),
+            0
+        );
+
+        write_vsock_packet_header(&mut memory, TEST_VSOCK_SECOND_HEADER, receive_only_shutdown);
+        write_vsock_tx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::readable(
+                TEST_VSOCK_SECOND_HEADER,
+                VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32,
+                None,
+            ),
+        );
+        append_vsock_tx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_TX_QUEUE_INDEX);
+        let shutdown = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("partial receive shutdown should be recorded");
+        assert_eq!(
+            shutdown
+                .guest_shutdown_dispatch()
+                .updated_guest_connections(),
+            1
+        );
+        assert!(handler.activation_handler().has_guest_connection(key));
+
+        accepted
+            .write_all(after_shutdown_payload)
+            .expect("host stream should remain open after receive shutdown");
+        write_vsock_rx_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::writable(
+                TEST_VSOCK_RX_SECOND_BUFFER,
+                vsock_packet_len_with_payload(queued_payload),
+                None,
+            ),
+        );
+        append_vsock_rx_available_head(&mut memory, 1, 1, 2);
+        notify_vsock_queue(&mut handler, VIRTIO_VSOCK_RX_QUEUE_INDEX);
+        let retry = handler
+            .dispatch_vsock_queue_notifications(&mut memory)
+            .expect("receive-closed connection should not deliver host RW");
+        let rx = retry
+            .rx_queue_dispatch()
+            .expect("RX notification should produce an empty dispatch");
+        assert_eq!(rx.processed_buffers(), 0);
+        assert_eq!(rx.delivered_host_rw_packets(), 0);
+        assert_eq!(read_vsock_rx_used_index(&memory), 1);
+        assert!(handler.activation_handler().has_guest_connection(key));
     }
 
     #[test]
