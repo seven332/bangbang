@@ -309,6 +309,21 @@ pub trait VirtioRngEntropySource {
     fn fill_entropy(&mut self, destination: &mut [u8]) -> Result<(), VirtioRngEntropySourceError>;
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioRngOsEntropySource;
+
+impl VirtioRngOsEntropySource {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl VirtioRngEntropySource for VirtioRngOsEntropySource {
+    fn fill_entropy(&mut self, destination: &mut [u8]) -> Result<(), VirtioRngEntropySourceError> {
+        getrandom::fill(destination).map_err(|_| VirtioRngEntropySourceError::new())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VirtioRngEntropySourceError;
 
@@ -1355,8 +1370,8 @@ mod tests {
         PreparedEntropyDevice, VIRTIO_RNG_DEVICE_ID, VIRTIO_RNG_MAX_REQUEST_BYTES,
         VIRTIO_RNG_QUEUE_SIZES, VirtioRngBufferParseError, VirtioRngDevice,
         VirtioRngDeviceActivationError, VirtioRngDeviceNotificationError, VirtioRngEntropySource,
-        VirtioRngEntropySourceError, VirtioRngMmioHandler, VirtioRngQueue,
-        VirtioRngQueueBuildError, VirtioRngQueueDispatchError,
+        VirtioRngEntropySourceError, VirtioRngMmioHandler, VirtioRngOsEntropySource,
+        VirtioRngQueue, VirtioRngQueueBuildError, VirtioRngQueueDispatchError,
     };
 
     const TEST_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x1000);
@@ -1433,6 +1448,30 @@ mod tests {
 
             Ok(())
         }
+    }
+
+    #[test]
+    fn os_entropy_source_accepts_empty_destination() {
+        let mut source = VirtioRngOsEntropySource::new();
+        let mut bytes = [];
+
+        source
+            .fill_entropy(&mut bytes)
+            .expect("OS entropy source should accept empty requests");
+
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn os_entropy_source_accepts_non_empty_destination() {
+        let mut source = VirtioRngOsEntropySource::new();
+        let mut bytes = [0_u8; 32];
+
+        source
+            .fill_entropy(&mut bytes)
+            .expect("OS entropy source should fill non-empty requests");
+
+        assert_eq!(bytes.len(), 32);
     }
 
     fn memory() -> GuestMemory {
