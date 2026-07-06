@@ -3269,6 +3269,27 @@ mod tests {
     }
 
     #[test]
+    fn config_file_rejects_malformed_balloon_section() {
+        for config in [
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"balloon":"bad"}"#,
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"balloon":{"amount_mib":64}}"#,
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"balloon":{"amount_mib":64,"deflate_on_oom":true,"unknown":true}}"#,
+        ] {
+            let err = super::config_file_actions_from_str(config)
+                .expect_err("malformed balloon section should fail");
+
+            assert_eq!(
+                err,
+                super::ConfigFileError::Request {
+                    section: "balloon",
+                    source: super::RequestError::MalformedRequest
+                },
+                "{config}"
+            );
+        }
+    }
+
+    #[test]
     fn config_file_rejects_malformed_entropy_section() {
         for config in [
             r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"entropy":"bad"}"#,
