@@ -60,6 +60,15 @@ impl Default for EntropyConfigInput {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EntropyConfig;
+
+impl EntropyConfig {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntropyConfigError {
     UnsupportedRateLimiter,

@@ -865,6 +865,7 @@ pub struct VmConfigResponse {
     network_interfaces: Vec<NetworkInterfaceConfigResponse>,
     mmds_config: Option<MmdsConfigResponse>,
     vsock: Option<VsockConfigResponse>,
+    entropy: Option<EntropyConfigResponse>,
 }
 
 impl VmConfigResponse {
@@ -875,6 +876,7 @@ impl VmConfigResponse {
         network_interfaces: Vec<NetworkInterfaceConfigResponse>,
         mmds_config: Option<MmdsConfigResponse>,
         vsock: Option<VsockConfigResponse>,
+        entropy: Option<EntropyConfigResponse>,
     ) -> Self {
         Self {
             machine_config,
@@ -883,7 +885,17 @@ impl VmConfigResponse {
             network_interfaces,
             mmds_config,
             vsock,
+            entropy,
         }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EntropyConfigResponse;
+
+impl EntropyConfigResponse {
+    pub const fn new() -> Self {
+        Self
     }
 }
 
@@ -1249,6 +1261,12 @@ impl HttpResponse {
                     .collect(),
             ),
         );
+        if let Some(entropy) = &config.entropy {
+            body.insert(
+                "entropy".to_string(),
+                entropy_config_response_value(entropy),
+            );
+        }
         body.insert(
             "machine-config".to_string(),
             machine_config_response_value(&config.machine_config),
@@ -1423,6 +1441,10 @@ fn network_interface_config_response_value(
     );
 
     serde_json::Value::Object(body)
+}
+
+fn entropy_config_response_value(_entropy: &EntropyConfigResponse) -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
 }
 
 fn mmds_config_response_value(config: &MmdsConfigResponse) -> serde_json::Value {
@@ -6027,6 +6049,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            None,
         ));
         let body: serde_json::Value =
             serde_json::from_str(response.body()).expect("body should be JSON");
@@ -6049,6 +6072,7 @@ mod tests {
         assert_eq!(body.get("boot-source"), None);
         assert_eq!(body.get("logger"), None);
         assert_eq!(body.get("mmds-config"), None);
+        assert_eq!(body.get("entropy"), None);
         assert_eq!(body.get("vsock"), None);
     }
 
@@ -6073,6 +6097,7 @@ mod tests {
             vec![network_interface],
             Some(mmds_config),
             Some(vsock),
+            Some(EntropyConfigResponse::new()),
         ));
         let body: serde_json::Value =
             serde_json::from_str(response.body()).expect("body should be JSON");
@@ -6097,6 +6122,7 @@ mod tests {
                         "path_on_host": "/tmp/rootfs.ext4",
                     },
                 ],
+                "entropy": {},
                 "machine-config": {
                     "huge_pages": "None",
                     "mem_size_mib": 256,
@@ -6143,6 +6169,7 @@ mod tests {
             vec![NetworkInterfaceConfigResponse::new("eth0", "tap0")],
             None,
             Some(VsockConfigResponse::new(3, "./v.sock")),
+            None,
         ));
         let body: serde_json::Value =
             serde_json::from_str(response.body()).expect("body should be JSON");

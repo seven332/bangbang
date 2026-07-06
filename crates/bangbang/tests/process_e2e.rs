@@ -364,7 +364,7 @@ fn executable_rejects_snapshot_requests_without_mutating() {
 }
 
 #[test]
-fn executable_rejects_remaining_device_requests_without_mutating() {
+fn executable_handles_remaining_device_requests_without_mutating() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
     let instance_id = test_dir.instance_id();
@@ -382,12 +382,6 @@ fn executable_rejects_remaining_device_requests_without_mutating() {
             r#"{"id":"pmem0","path_on_host":"secret-pmem.img"}"#,
             "Pmem device is not supported.",
             &["secret-pmem.img"][..],
-        ),
-        (
-            "/entropy",
-            "{}",
-            "Entropy device is not supported.",
-            &[][..],
         ),
         (
             "/hotplug/memory",
@@ -411,6 +405,44 @@ fn executable_rejects_remaining_device_requests_without_mutating() {
             );
         }
     }
+
+    let entropy_response = http_put_json(&socket_path, "/entropy", "{}");
+    assert_no_content_response(&entropy_response, "PUT /entropy");
+    let entropy_vm_config = http_get(&socket_path, "/vm/config");
+    assert_ok_response(&entropy_vm_config, "GET /vm/config after PUT /entropy");
+    assert_response_contains(
+        &entropy_vm_config,
+        r#""entropy":{}"#,
+        "GET /vm/config after PUT /entropy",
+    );
+
+    let entropy_rate_limiter_response = http_put_json(
+        &socket_path,
+        "/entropy",
+        r#"{"rate_limiter":{"bandwidth":{"size":123456789,"one_time_burst":987654321,"refill_time":777}}}"#,
+    );
+    assert_bad_request_response(&entropy_rate_limiter_response, "PUT /entropy rate_limiter");
+    assert_response_contains(
+        &entropy_rate_limiter_response,
+        r#"{"fault_message":"entropy rate_limiter is not supported"}"#,
+        "PUT /entropy rate_limiter",
+    );
+    for private_value in ["123456789", "987654321", "777"] {
+        assert!(
+            !entropy_rate_limiter_response.contains(private_value),
+            "PUT /entropy rate_limiter must not echo private config value {private_value:?}; response:\n{entropy_rate_limiter_response}"
+        );
+    }
+    let entropy_vm_config_after_fault = http_get(&socket_path, "/vm/config");
+    assert_ok_response(
+        &entropy_vm_config_after_fault,
+        "GET /vm/config after rejected PUT /entropy rate_limiter",
+    );
+    assert_response_contains(
+        &entropy_vm_config_after_fault,
+        r#""entropy":{}"#,
+        "GET /vm/config after rejected PUT /entropy rate_limiter",
+    );
 
     let memory_hotplug_get_response = http_get(&socket_path, "/hotplug/memory");
     assert_bad_request_response(&memory_hotplug_get_response, "GET /hotplug/memory");

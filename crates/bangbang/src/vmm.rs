@@ -11,13 +11,14 @@ use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
 
 use bangbang_hvf::{
-    HvfArm64BootRunLoopControl, HvfArm64BootRunLoopError, HvfArm64BootRunLoopOutcome,
-    HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
-    HvfVcpuRunnerError, OwnedHvfArm64BootSession,
+    HvfArm64BootEntropyDeviceConfig, HvfArm64BootRunLoopControl, HvfArm64BootRunLoopError,
+    HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig,
+    HvfArm64BootSessionConfig, HvfVcpuRunnerError, OwnedHvfArm64BootSession,
 };
 use bangbang_runtime::block::{BlockMmioLayout, DriveConfigInput, DriveUpdateInput};
 use bangbang_runtime::boot::BootSourceConfigInput;
 use bangbang_runtime::cpu::CpuConfigInput;
+use bangbang_runtime::entropy::EntropyMmioLayout;
 use bangbang_runtime::logger::LoggerConfigInput;
 use bangbang_runtime::machine::{MachineConfigInput, MachineConfigPatchInput};
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
@@ -75,6 +76,8 @@ const DEFAULT_VSOCK_MMIO_BASE: GuestAddress = GuestAddress::new(0x7000_0000);
 const DEFAULT_VSOCK_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(2000);
 const DEFAULT_SERIAL_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_0000);
 const DEFAULT_SERIAL_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(0);
+const DEFAULT_ENTROPY_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_7000);
+const DEFAULT_ENTROPY_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(3000);
 const DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT: usize = 1024;
 const HVF_BOOT_RUN_LOOP_THREAD_NAME: &str = "bangbang-hvf-boot-loop";
 
@@ -798,7 +801,14 @@ impl HvfInstanceStartExecutor {
             None => SharedSerialOutput::from(self.serial_output.clone()),
         };
 
-        Ok(default_hvf_boot_session_config(serial_output))
+        let mut config = default_hvf_boot_session_config(serial_output);
+        if controller.entropy_config().is_some() {
+            config = config.with_entropy_device(HvfArm64BootEntropyDeviceConfig::new(
+                EntropyMmioLayout::new(DEFAULT_ENTROPY_MMIO_BASE, DEFAULT_ENTROPY_MMIO_REGION_ID),
+            ));
+        }
+
+        Ok(config)
     }
 }
 
@@ -1650,6 +1660,7 @@ mod tests {
     };
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::cpu::CpuConfigInput;
+    use bangbang_runtime::entropy::EntropyConfigInput;
     use bangbang_runtime::fdt::{Arm64FdtRegion, Arm64FdtVirtioMmioDevice};
     use bangbang_runtime::interrupt::GuestInterruptLine;
     use bangbang_runtime::logger::LoggerConfigInput;
@@ -1684,6 +1695,7 @@ mod tests {
 
     use super::{
         BootRunLoopControl, BootRunLoopSession, BootRunLoopSupervisor, BootRunLoopWorkerStatus,
+        DEFAULT_ENTROPY_MMIO_BASE, DEFAULT_ENTROPY_MMIO_REGION_ID,
         DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT, DEFAULT_NETWORK_MMIO_BASE,
         DEFAULT_NETWORK_MMIO_REGION_ID, DEFAULT_SERIAL_MMIO_BASE, DEFAULT_SERIAL_MMIO_REGION_ID,
         DEFAULT_VSOCK_MMIO_BASE, DEFAULT_VSOCK_MMIO_REGION_ID, EmptyProcessNetworkRxPacketSource,
@@ -2299,6 +2311,7 @@ mod tests {
 
         let config = executor.boot_session_config();
 
+        assert_eq!(config.entropy_device, None);
         let serial = config
             .serial_device
             .expect("default HVF boot config should include serial MMIO");
@@ -2312,6 +2325,28 @@ mod tests {
         assert_eq!(
             retained_output.bytes().expect("serial output should read"),
             b"B"
+        );
+    }
+
+    #[test]
+    fn configured_hvf_boot_session_config_includes_entropy_device() {
+        let executor = HvfInstanceStartExecutor::default();
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
+            .expect("entropy config should store");
+
+        let config = executor
+            .boot_session_config_for_controller(&controller)
+            .expect("configured entropy should build boot config");
+
+        let entropy = config
+            .entropy_device
+            .expect("configured entropy should add HVF boot entropy device");
+        assert_eq!(entropy.mmio_layout.address(), DEFAULT_ENTROPY_MMIO_BASE);
+        assert_eq!(
+            entropy.mmio_layout.region_id(),
+            DEFAULT_ENTROPY_MMIO_REGION_ID
         );
     }
 
