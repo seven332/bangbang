@@ -146,7 +146,8 @@ is resource-specific:
   into validated guest RX buffers. Guest `VSOCK_OP_RST` packets drop matching
   retained host-initiated or guest-initiated streams without queuing guest-visible
   RX output. Partial guest `VSOCK_OP_SHUTDOWN` packets record receive/send
-  closure state, suppress later data movement in the closed direction, and keep
+  closure state, suppress later data movement in the closed direction, apply TX
+  shutdown control before same-window RX host-payload delivery, and keep
   the retained stream until both directions are closed. Full guest
   `VSOCK_OP_SHUTDOWN` packets drop matching retained streams, release the host
   local port when applicable, and queue a guest-visible `VSOCK_OP_RST`. Valid
@@ -409,8 +410,9 @@ The current scaffold does not implement:
   one queued payload at a time into validated guest RX buffers,
   guest `VSOCK_OP_RST` packets drop matching retained host-initiated or
   guest-initiated streams without queuing guest-visible RX output, partial guest
-  `VSOCK_OP_SHUTDOWN` packets record receive/send closure state and suppress
-  later data movement in the closed direction, and full guest
+  `VSOCK_OP_SHUTDOWN` packets record receive/send closure state, suppress
+  later data movement in the closed direction, and apply TX shutdown control
+  before same-window RX host-payload delivery, while full guest
   `VSOCK_OP_SHUTDOWN` packets drop matching retained streams before queuing a
   guest-visible reset. Valid guest `VSOCK_OP_CREDIT_UPDATE` packets for
   established retained streams are consumed without queuing a reset, and valid

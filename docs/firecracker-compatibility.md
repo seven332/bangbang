@@ -622,7 +622,9 @@ established host-initiated and guest-initiated connections can retain a bounded
 four-packet per-connection backlog of host `VSOCK_OP_RW` payloads and deliver
 one queued payload at a time into guest RX buffers; guest `VSOCK_OP_RST`
 packets drop matching retained host-initiated or guest-initiated connections
-without queuing guest-visible RX output; full guest `VSOCK_OP_SHUTDOWN`
+without queuing guest-visible RX output; partial guest `VSOCK_OP_SHUTDOWN`
+packets record receive/send closure state and apply TX shutdown control before
+same-window RX host-payload delivery, while full guest `VSOCK_OP_SHUTDOWN`
 packets drop matching retained connections and queue guest-visible
 `VSOCK_OP_RST` headers; valid guest `VSOCK_OP_CREDIT_UPDATE` packets for
 established retained streams are consumed without a reset, and valid guest
@@ -923,7 +925,9 @@ established host-initiated and guest-initiated connections can retain a bounded
 four-packet per-connection backlog of host `VSOCK_OP_RW` payloads and deliver
 one queued payload at a time into guest RX buffers; guest `VSOCK_OP_RST`
 packets drop matching retained host-initiated or guest-initiated connections
-without queuing guest-visible RX output; full guest `VSOCK_OP_SHUTDOWN`
+without queuing guest-visible RX output; partial guest `VSOCK_OP_SHUTDOWN`
+packets record receive/send closure state and apply TX shutdown control before
+same-window RX host-payload delivery, while full guest `VSOCK_OP_SHUTDOWN`
 packets drop matching retained connections and queue guest-visible
 `VSOCK_OP_RST` headers; valid guest `VSOCK_OP_CREDIT_UPDATE` packets for
 established retained streams are consumed without a reset, and valid guest
