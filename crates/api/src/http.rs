@@ -4551,7 +4551,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_network_interface_patch_before_unsupported() {
+    fn rejects_invalid_network_interface_patch_before_vmm_dispatch() {
         for body in [
             "not-json",
             "",
