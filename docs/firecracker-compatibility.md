@@ -466,13 +466,14 @@ validated through the signed executable process/HVF path by a guest read from
 the RNG device. The current API/runtime boundary preserves whether a
 Firecracker-shaped `rate_limiter` was configured while keeping successful
 `PUT /entropy` behavior unsupported. A backend-neutral virtio-rng queue handler
-can now fill writable guest descriptor chains from an injected entropy source
-under unit tests, including malformed-buffer and source-failure completion
-paths. Remaining follow-up PRs should wire startup, MMIO layout, FDT,
-interrupts, reset/cleanup, and finally add signed executable e2e and
-metrics/security docs. Entropy device metrics and real rate limiting remain
-deferred until their producers exist. `PUT /entropy` must continue to return
-unsupported until a later PR exposes guest-visible entropy behavior.
+and runtime MMIO activation/notification layer can now fill writable guest
+descriptor chains from an injected entropy source under unit tests, including
+malformed-buffer, source-failure, reset, and queue-interrupt completion paths.
+Remaining follow-up PRs should wire startup MMIO layout, FDT attachment, real
+host randomness ownership, signed executable e2e, and metrics/security docs.
+Entropy device metrics and real rate limiting remain deferred until their
+producers exist. `PUT /entropy` must continue to return unsupported until a
+later PR exposes guest-visible entropy behavior.
 
 The API and VMM state path also route valid snapshot requests through explicit
 actions before returning unsupported faults. `PUT /snapshot/create` fails as an
