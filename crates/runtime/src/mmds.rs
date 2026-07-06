@@ -1714,6 +1714,10 @@ impl MmdsState {
             .ok_or(MmdsDataStoreError::NotInitialized)
     }
 
+    pub fn get_data_or_null(&self) -> Value {
+        self.value.as_ref().cloned().unwrap_or(Value::Null)
+    }
+
     pub fn query_data(
         &self,
         path: &str,
@@ -4079,6 +4083,14 @@ mod tests {
             .expect("exact-limit MMDS value should be accepted");
 
         assert_eq!(state.get_data(), Ok(value));
+    }
+
+    #[test]
+    fn get_data_or_null_returns_public_default_without_initializing() {
+        let state = MmdsState::default();
+
+        assert_eq!(state.get_data_or_null(), Value::Null);
+        assert_eq!(state.get_data(), Err(MmdsDataStoreError::NotInitialized));
     }
 
     #[test]
