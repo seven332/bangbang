@@ -516,6 +516,9 @@ pub enum DriveUpdateError {
         region_id: MmioRegionId,
         message: String,
     },
+    ActiveSessionCommand {
+        message: String,
+    },
     ActiveSessionUnavailable,
     MmioDispatcherUnavailable,
 }
@@ -570,6 +573,9 @@ impl fmt::Display for DriveUpdateError {
                 f,
                 "failed to find active drive {drive_id} handler for MMIO region {region_id}: {message}"
             ),
+            Self::ActiveSessionCommand { message } => {
+                write!(f, "active drive update command failed: {message}")
+            }
             Self::ActiveSessionUnavailable => {
                 f.write_str("active drive update session is unavailable")
             }
@@ -4352,6 +4358,18 @@ mod tests {
         assert_eq!(
             DriveUpdateInput::new("rootfs", "rootfs", Some(PathBuf::new())).validate(),
             Err(DriveUpdateError::EmptyPathOnHost)
+        );
+    }
+
+    #[test]
+    fn drive_update_error_displays_active_session_command_failure() {
+        let err = DriveUpdateError::ActiveSessionCommand {
+            message: "boot run loop command queue is full".to_string(),
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "active drive update command failed: boot run loop command queue is full"
         );
     }
 
