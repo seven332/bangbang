@@ -1649,6 +1649,10 @@ mod tests {
             self.inner.record_api_request_parse_failure(request);
         }
 
+        fn record_put_actions_request(&mut self) {
+            self.inner.record_put_actions_request();
+        }
+
         fn handle_put_action_request(
             &mut self,
             action: VmmAction,
