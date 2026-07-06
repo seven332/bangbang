@@ -103,19 +103,89 @@ impl fmt::Display for RequestError {
 impl std::error::Error for RequestError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObservabilityPutEndpoint {
-    Logger,
-    Metrics,
-    Serial,
+pub enum ApiRequestMetricEndpoint {
+    Patch(ApiRequestMetricPatchEndpoint),
+    Put(ApiRequestMetricPutEndpoint),
 }
 
-pub fn observability_put_endpoint(bytes: &[u8]) -> Option<ObservabilityPutEndpoint> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiRequestMetricPutEndpoint {
+    Actions,
+    BootSource,
+    CpuConfig,
+    Drive,
+    HotplugMemory,
+    Logger,
+    MachineConfig,
+    Metrics,
+    Mmds,
+    Network,
+    Pmem,
+    Serial,
+    Vsock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiRequestMetricPatchEndpoint {
+    Drive,
+    HotplugMemory,
+    MachineConfig,
+    Mmds,
+    Network,
+    Pmem,
+}
+
+pub fn api_request_metric_endpoint(bytes: &[u8]) -> Option<ApiRequestMetricEndpoint> {
     let (method, path, _, _) = parse_request_head(bytes).ok()?;
 
-    match (method, path) {
-        ("PUT", "/logger") => Some(ObservabilityPutEndpoint::Logger),
-        ("PUT", "/metrics") => Some(ObservabilityPutEndpoint::Metrics),
-        ("PUT", "/serial") => Some(ObservabilityPutEndpoint::Serial),
+    match method {
+        "PATCH" => patch_api_request_metric_endpoint(path).map(ApiRequestMetricEndpoint::Patch),
+        "PUT" => put_api_request_metric_endpoint(path).map(ApiRequestMetricEndpoint::Put),
+        _ => None,
+    }
+}
+
+fn put_api_request_metric_endpoint(path: &str) -> Option<ApiRequestMetricPutEndpoint> {
+    if drive_path_id(path).is_some() {
+        return Some(ApiRequestMetricPutEndpoint::Drive);
+    }
+    if network_interface_path_id(path).is_some() {
+        return Some(ApiRequestMetricPutEndpoint::Network);
+    }
+    if pmem_path_id(path).is_some() {
+        return Some(ApiRequestMetricPutEndpoint::Pmem);
+    }
+
+    match path {
+        "/actions" => Some(ApiRequestMetricPutEndpoint::Actions),
+        "/boot-source" => Some(ApiRequestMetricPutEndpoint::BootSource),
+        "/cpu-config" => Some(ApiRequestMetricPutEndpoint::CpuConfig),
+        "/hotplug/memory" => Some(ApiRequestMetricPutEndpoint::HotplugMemory),
+        "/logger" => Some(ApiRequestMetricPutEndpoint::Logger),
+        "/machine-config" => Some(ApiRequestMetricPutEndpoint::MachineConfig),
+        "/metrics" => Some(ApiRequestMetricPutEndpoint::Metrics),
+        "/mmds" | "/mmds/config" => Some(ApiRequestMetricPutEndpoint::Mmds),
+        "/serial" => Some(ApiRequestMetricPutEndpoint::Serial),
+        "/vsock" => Some(ApiRequestMetricPutEndpoint::Vsock),
+        _ => None,
+    }
+}
+
+fn patch_api_request_metric_endpoint(path: &str) -> Option<ApiRequestMetricPatchEndpoint> {
+    if drive_path_id(path).is_some() {
+        return Some(ApiRequestMetricPatchEndpoint::Drive);
+    }
+    if network_interface_path_id(path).is_some() {
+        return Some(ApiRequestMetricPatchEndpoint::Network);
+    }
+    if pmem_path_id(path).is_some() {
+        return Some(ApiRequestMetricPatchEndpoint::Pmem);
+    }
+
+    match path {
+        "/hotplug/memory" => Some(ApiRequestMetricPatchEndpoint::HotplugMemory),
+        "/machine-config" => Some(ApiRequestMetricPatchEndpoint::MachineConfig),
+        "/mmds" => Some(ApiRequestMetricPatchEndpoint::Mmds),
         _ => None,
     }
 }
@@ -2732,39 +2802,83 @@ mod tests {
     }
 
     #[test]
-    fn identifies_observability_put_endpoints_from_request_head() {
-        assert_eq!(
-            observability_put_endpoint(&request_with_body("PUT", "/metrics", "{")),
-            Some(ObservabilityPutEndpoint::Metrics)
-        );
-        assert_eq!(
-            observability_put_endpoint(&request_with_body("PUT", "/logger", "{")),
-            Some(ObservabilityPutEndpoint::Logger)
-        );
-        assert_eq!(
-            observability_put_endpoint(&request_with_body("PUT", "/serial", "{")),
-            Some(ObservabilityPutEndpoint::Serial)
-        );
+    fn identifies_put_api_request_metric_endpoints_from_request_head() {
+        for (path, endpoint) in [
+            ("/actions", ApiRequestMetricPutEndpoint::Actions),
+            ("/boot-source", ApiRequestMetricPutEndpoint::BootSource),
+            ("/cpu-config", ApiRequestMetricPutEndpoint::CpuConfig),
+            ("/drives/rootfs", ApiRequestMetricPutEndpoint::Drive),
+            (
+                "/hotplug/memory",
+                ApiRequestMetricPutEndpoint::HotplugMemory,
+            ),
+            ("/logger", ApiRequestMetricPutEndpoint::Logger),
+            (
+                "/machine-config",
+                ApiRequestMetricPutEndpoint::MachineConfig,
+            ),
+            ("/metrics", ApiRequestMetricPutEndpoint::Metrics),
+            ("/mmds", ApiRequestMetricPutEndpoint::Mmds),
+            ("/mmds/config", ApiRequestMetricPutEndpoint::Mmds),
+            (
+                "/network-interfaces/eth0",
+                ApiRequestMetricPutEndpoint::Network,
+            ),
+            ("/pmem/pmem0", ApiRequestMetricPutEndpoint::Pmem),
+            ("/serial", ApiRequestMetricPutEndpoint::Serial),
+            ("/vsock", ApiRequestMetricPutEndpoint::Vsock),
+        ] {
+            assert_eq!(
+                api_request_metric_endpoint(&request_with_body("PUT", path, "{")),
+                Some(ApiRequestMetricEndpoint::Put(endpoint)),
+                "PUT {path}"
+            );
+        }
     }
 
     #[test]
-    fn ignores_non_observability_put_endpoint_requests() {
-        assert_eq!(
-            observability_put_endpoint(&request_with_body("GET", "/metrics", "{}")),
-            None
-        );
-        assert_eq!(
-            observability_put_endpoint(&request_with_body("PUT", "/metrics/extra", "{}")),
-            None
-        );
-        assert_eq!(
-            observability_put_endpoint(&request_with_body("PUT", "/boot-source", "{}")),
-            None
-        );
-        assert_eq!(
-            observability_put_endpoint(b"PUT /metrics HTTP/1.1\r\nHost: localhost\r\n"),
-            None
-        );
+    fn identifies_patch_api_request_metric_endpoints_from_request_head() {
+        for (path, endpoint) in [
+            ("/drives/rootfs", ApiRequestMetricPatchEndpoint::Drive),
+            (
+                "/hotplug/memory",
+                ApiRequestMetricPatchEndpoint::HotplugMemory,
+            ),
+            (
+                "/machine-config",
+                ApiRequestMetricPatchEndpoint::MachineConfig,
+            ),
+            ("/mmds", ApiRequestMetricPatchEndpoint::Mmds),
+            (
+                "/network-interfaces/eth0",
+                ApiRequestMetricPatchEndpoint::Network,
+            ),
+            ("/pmem/pmem0", ApiRequestMetricPatchEndpoint::Pmem),
+        ] {
+            assert_eq!(
+                api_request_metric_endpoint(&request_with_body("PATCH", path, "{")),
+                Some(ApiRequestMetricEndpoint::Patch(endpoint)),
+                "PATCH {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_requests_without_matching_api_request_metric_endpoint() {
+        for request in [
+            request_with_body("GET", "/metrics", "{}"),
+            request_with_body("DELETE", "/drives/rootfs", "{}"),
+            request_with_body("PUT", "/entropy", "{}"),
+            request_with_body("PUT", "/balloon", "{}"),
+            request_with_body("PATCH", "/vm", "{}"),
+            request_with_body("PATCH", "/balloon", "{}"),
+            request_with_body("PUT", "/metrics/extra", "{}"),
+            request_with_body("PUT", "/drives/rootfs/extra", "{}"),
+            request_with_body("PUT", "/drives/rootfs?debug=true", "{}"),
+            b"PUT /metrics HTTP/1.1\r\nHost: localhost\r\n".to_vec(),
+        ] {
+            assert_eq!(api_request_metric_endpoint(&request), None);
+        }
     }
 
     #[test]

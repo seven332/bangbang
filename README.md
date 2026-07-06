@@ -175,10 +175,12 @@ component saturates at zero. The current
 Firecracker-shaped API request metrics subset also reports selected GET counters
 under `get_api_requests`; parsed core
 configuration, MMDS, observability, memory hotplug, pmem, and `/actions`
-counters under `put_api_requests`; malformed `PUT /metrics`, `PUT /logger`,
-and `PUT /serial` parser failures in the matching `put_api_requests` count/fail
-counters; and selected PATCH counters including memory hotplug and pmem under
-`patch_api_requests`. bangbang also records
+counters under `put_api_requests`; parser failures, including malformed bodies
+and path/body ID mismatches, for those PUT endpoints with matching
+Firecracker-style fields in the matching
+`put_api_requests` count/fail counters; and selected PATCH counters including
+memory hotplug and pmem under `patch_api_requests`, including parser failures
+for those PATCH endpoints. bangbang also records
 bangbang-specific `balloon_count` API request counters for parsed balloon GET,
 PUT, and PATCH routes, plus `balloon_fails` counters for parsed balloon PUT and
 PATCH failures, because Firecracker does not expose matching balloon API request

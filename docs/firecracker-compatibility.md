@@ -172,8 +172,11 @@ VMM control are counted under `patch_api_requests`.
 Parsed deprecated HTTP API usage is counted under
 `deprecated_api.deprecated_http_api_calls` for supported machine
 `cpu_template`, MMDS V1 config, deprecated `vsock_id`, and snapshot-load
-`mem_file_path` or `enable_diff_snapshots` request forms. Malformed parser
-failures are not counted.
+`mem_file_path` or `enable_diff_snapshots` request forms. Parser failures,
+including malformed bodies and path/body ID mismatches, for the PUT and PATCH
+endpoints above with matching Firecracker-shaped request metric fields are
+counted in the same count/fail counters when the endpoint is identifiable from
+the request line.
 Direct config-file and startup initialization paths are not API requests and
 are not included in these counters. `PATCH /vm` remains outside
 `patch_api_requests` because Firecracker does not expose a matching
@@ -549,24 +552,26 @@ events. The line includes initial Firecracker-shaped GET API counters for
 `put_api_requests` counters for parsed core configuration PUTs, `PUT /mmds`,
 `PUT /mmds/config`, `PUT /metrics`, `PUT /logger`, `PUT /serial`,
 `PUT /hotplug/memory`, `PUT /pmem/{pmem_id}`, and `/actions` requests routed
-through VMM control, malformed parser failures for `PUT /metrics`,
-`PUT /logger`, and `PUT /serial` in the matching `put_api_requests` count/fail
-counters, plus selected `patch_api_requests` counters for parsed
+through VMM control, parser failures for those endpoints in the matching
+`put_api_requests` count/fail counters, plus selected
+`patch_api_requests` counters for parsed
 `PATCH /machine-config`, `PATCH /mmds`, `PATCH /drives/{drive_id}`,
 `PATCH /network-interfaces/{iface_id}`, `PATCH /hotplug/memory`, and
-`PATCH /pmem/{pmem_id}` requests routed through VMM control. bangbang also
-records `balloon_count` extension fields for parsed balloon GET, PUT, and PATCH
-routes, plus `balloon_fails` extension fields for parsed balloon PUT and PATCH
+`PATCH /pmem/{pmem_id}` requests routed through VMM control and parser failures
+for those PATCH endpoints. bangbang also records
+`balloon_count` extension fields for parsed balloon GET, PUT, and PATCH routes,
+plus `balloon_fails` extension fields for parsed balloon PUT and PATCH
 failures, because Firecracker does not expose matching request metrics. It does
-not emit entropy request-counter fields; Firecracker does not define
+not count malformed balloon parser failures in those extension fields. It also
+does not emit entropy request-counter fields; Firecracker does not define
 `put_api_requests.entropy_count` or `entropy_fails`. Entropy device runtime
 metrics remain deferred until their producers exist.
 Parsed deprecated HTTP API usage is counted under
 `deprecated_api.deprecated_http_api_calls` for the supported deprecated fields
 above; malformed parser failures remain outside the deprecated counter.
 Device runtime counters, remaining API request counters, and parser-level
-malformed-request counters beyond the observability PUT endpoints remain
-deferred. Public run-loop control, guest boot
+malformed-request counters for endpoints without Firecracker-shaped request
+metric fields remain deferred. Public run-loop control, guest boot
 output, public runner loop scheduling, full Firecracker metrics counters, and
 full logger integration remain deferred. Metrics write failures increment
 `logger.missed_metrics_count`; logger action write failures increment

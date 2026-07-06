@@ -1467,7 +1467,7 @@ mod tests {
     use bangbang_runtime::{BackendError, InstanceState, VmmAction, VmmActionError, VmmData};
 
     use crate::vmm::{
-        GetApiRequest, InstanceStartExecutor, ObservabilityPutRequest, PatchApiRequest,
+        ApiRequestMetricParseFailure, GetApiRequest, InstanceStartExecutor, PatchApiRequest,
         ProcessSessionDiagnostics, ProcessSessionExitStatus, ProcessVmm, PutApiRequest,
         VmmRequestHandler,
     };
@@ -1645,8 +1645,8 @@ mod tests {
             self.inner.handle_put_request(request)
         }
 
-        fn record_observability_put_parse_failure(&mut self, request: ObservabilityPutRequest) {
-            self.inner.record_observability_put_parse_failure(request);
+        fn record_api_request_parse_failure(&mut self, request: ApiRequestMetricParseFailure) {
+            self.inner.record_api_request_parse_failure(request);
         }
 
         fn handle_put_action_request(
