@@ -74,12 +74,9 @@ fn executable_accepts_firecracker_startup_time_args() {
         &socket_path,
         &instance_id,
         &[
-            "--start-time-us",
-            "1000",
-            "--start-time-cpu-us",
-            "2000",
-            "--parent-cpu-time-us",
-            "3000",
+            "--start-time-us=1000",
+            "--start-time-cpu-us=2000",
+            "--parent-cpu-time-us=3000",
         ],
     );
 
@@ -114,18 +111,15 @@ fn executable_startup_metrics_path_writes_initial_metrics() {
     let socket_path = test_dir.path().join("api.socket");
     let metrics_path = test_dir.path().join("startup.metrics");
     let instance_id = test_dir.instance_id();
+    let metrics_arg = format!("--metrics-path={}", path_text(&metrics_path));
     let bangbang = BangbangProcess::start_with_extra_args(
         &socket_path,
         &instance_id,
         &[
-            "--metrics-path",
-            path_text(&metrics_path),
-            "--start-time-us",
-            "1000",
-            "--start-time-cpu-us",
-            "2000",
-            "--parent-cpu-time-us",
-            "3000",
+            metrics_arg.as_str(),
+            "--start-time-us=1000",
+            "--start-time-cpu-us=2000",
+            "--parent-cpu-time-us=3000",
         ],
     );
 
