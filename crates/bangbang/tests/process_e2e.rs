@@ -106,7 +106,9 @@ fn executable_accepts_firecracker_startup_time_args() {
     assert!(
         !vm_config.contains("start_time_us")
             && !vm_config.contains("start_time_cpu_us")
-            && !vm_config.contains("parent_cpu_time_us"),
+            && !vm_config.contains("parent_cpu_time_us")
+            && !vm_config.contains("process_startup_time_us")
+            && !vm_config.contains("process_startup_time_cpu_us"),
         "GET /vm/config should not expose process startup timing; response:\n{vm_config}"
     );
 
@@ -133,7 +135,7 @@ fn executable_startup_metrics_path_writes_initial_metrics() {
 
     assert_eq!(
         fs::read_to_string(&metrics_path).expect("startup metrics should be readable"),
-        "{\"vmm\":{\"metrics_flush_count\":1,\"parent_cpu_time_us\":3000,\"start_time_cpu_us\":2000,\"start_time_us\":1000}}\n"
+        "{\"api_server\":{\"process_startup_time_cpu_us\":5000,\"process_startup_time_us\":1000},\"vmm\":{\"metrics_flush_count\":1}}\n"
     );
 
     let instance_info = http_get(&socket_path, "/");
@@ -2528,28 +2530,24 @@ fn concurrent_executables_keep_api_resources_isolated() {
     assert_startup_metrics_match(
         &first_metrics_path,
         &[
-            r#""start_time_us":1100"#,
-            r#""start_time_cpu_us":1200"#,
-            r#""parent_cpu_time_us":1300"#,
+            r#""process_startup_time_us":1100"#,
+            r#""process_startup_time_cpu_us":2500"#,
         ],
         &[
-            r#""start_time_us":2100"#,
-            r#""start_time_cpu_us":2200"#,
-            r#""parent_cpu_time_us":2300"#,
+            r#""process_startup_time_us":2100"#,
+            r#""process_startup_time_cpu_us":4500"#,
         ],
         "first bangbang",
     );
     assert_startup_metrics_match(
         &second_metrics_path,
         &[
-            r#""start_time_us":2100"#,
-            r#""start_time_cpu_us":2200"#,
-            r#""parent_cpu_time_us":2300"#,
+            r#""process_startup_time_us":2100"#,
+            r#""process_startup_time_cpu_us":4500"#,
         ],
         &[
-            r#""start_time_us":1100"#,
-            r#""start_time_cpu_us":1200"#,
-            r#""parent_cpu_time_us":1300"#,
+            r#""process_startup_time_us":1100"#,
+            r#""process_startup_time_cpu_us":2500"#,
         ],
         "second bangbang",
     );

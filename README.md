@@ -164,9 +164,12 @@ metrics are configured successfully. It also records explicit runtime
 while the VM is running. After `InstanceStart`, the line also includes a
 `boot_run_loop_status` summary such as `running`, `exited`, or `failed` when a
 process-owned boot worker exists. When startup timing CLI values are provided,
-the same metrics output includes `start_time_us`, `start_time_cpu_us`, and
-`parent_cpu_time_us`. The current Firecracker-shaped API request metrics subset
-also reports selected GET counters under `get_api_requests`; parsed core
+the same metrics output includes Firecracker-style
+`api_server.process_startup_time_us` and
+`api_server.process_startup_time_cpu_us`; `--parent-cpu-time-us` contributes to
+the CPU value and is not serialized as a separate field. The current
+Firecracker-shaped API request metrics subset also reports selected GET counters
+under `get_api_requests`; parsed core
 configuration, MMDS, observability, memory hotplug, pmem, and `/actions`
 counters under `put_api_requests`; and selected PATCH counters including memory
 hotplug and pmem under `patch_api_requests`. bangbang also records
