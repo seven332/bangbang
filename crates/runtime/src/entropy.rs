@@ -1431,6 +1431,31 @@ mod tests {
     }
 
     #[test]
+    fn rng_queue_dispatch_completes_empty_descriptor_with_zero_len() {
+        let mut memory = memory();
+        write_descriptor(&mut memory, 0, TEST_DATA, 0, VIRTQUEUE_DESC_F_WRITE, 0);
+        queue_head(&mut memory, 0, 0);
+        set_available_index(&mut memory, 1);
+
+        let mut source = TestEntropySource::default();
+        let mut queue = rng_queue();
+        let dispatch = queue
+            .dispatch_with_source(&mut memory, &mut source)
+            .expect("rng queue dispatch should complete invalid descriptor");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_requests(), 0);
+        assert_eq!(dispatch.buffer_parse_failures(), 1);
+        assert_eq!(dispatch.bytes_written_to_guest(), 0);
+        assert!(source.calls().is_empty());
+        assert!(matches!(
+            dispatch.first_buffer_parse_failure(),
+            Some(VirtioRngBufferParseError::BufferDescriptorEmpty { index: 0 })
+        ));
+        assert_eq!(read_used_len(&memory, 0), 0);
+    }
+
+    #[test]
     fn rng_queue_dispatch_validates_unmapped_descriptor_before_entropy_source() {
         let mut memory = memory();
         write_descriptor(
@@ -1457,6 +1482,37 @@ mod tests {
         assert!(matches!(
             dispatch.first_buffer_parse_failure(),
             Some(VirtioRngBufferParseError::BufferDescriptorAccess { index: 0, .. })
+        ));
+        assert_eq!(read_used_len(&memory, 0), 0);
+    }
+
+    #[test]
+    fn rng_queue_dispatch_validates_range_overflow_before_entropy_source() {
+        let mut memory = memory();
+        write_descriptor(
+            &mut memory,
+            0,
+            GuestAddress::new(u64::MAX),
+            1,
+            VIRTQUEUE_DESC_F_WRITE,
+            0,
+        );
+        queue_head(&mut memory, 0, 0);
+        set_available_index(&mut memory, 1);
+
+        let mut source = TestEntropySource::default();
+        let mut queue = rng_queue();
+        let dispatch = queue
+            .dispatch_with_source(&mut memory, &mut source)
+            .expect("rng queue dispatch should complete invalid descriptor");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_requests(), 0);
+        assert_eq!(dispatch.buffer_parse_failures(), 1);
+        assert!(source.calls().is_empty());
+        assert!(matches!(
+            dispatch.first_buffer_parse_failure(),
+            Some(VirtioRngBufferParseError::BufferDescriptorRange { index: 0, .. })
         ));
         assert_eq!(read_used_len(&memory, 0), 0);
     }
