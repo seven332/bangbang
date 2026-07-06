@@ -344,8 +344,8 @@ connection exchange through the signed executable, including narrow
 multi-payload stream cases and multi-stream retention in both directions. They
 do not claim that bangbang can boot an arbitrary distro image through its
 default init, that full networking compatibility is complete, or that full
-vsock throughput, graceful half-close behavior, and credit accounting are
-complete.
+vsock throughput, Firecracker's full graceful-shutdown timeout/kill-queue
+behavior, and credit accounting are complete.
 
 bangbang appends Firecracker-style root-drive command-line arguments during
 startup resource assembly when a configured drive has `is_root_device=true`.
