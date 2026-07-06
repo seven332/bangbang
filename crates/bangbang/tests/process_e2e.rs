@@ -36,6 +36,14 @@ fn executable_serves_api_and_shuts_down_cleanly() {
         socket_path.exists(),
         "bangbang should publish the configured API socket"
     );
+    let socket_mode = fs::symlink_metadata(&socket_path)
+        .expect("published API socket metadata should be readable")
+        .mode()
+        & 0o777;
+    assert_eq!(
+        socket_mode, 0o600,
+        "bangbang should restrict the published API socket to owner-only access"
+    );
 
     let instance_info = http_get(&socket_path, "/");
     assert_ok_response(&instance_info, "GET /");

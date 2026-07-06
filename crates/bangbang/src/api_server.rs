@@ -2,7 +2,7 @@ use std::ffi::{CString, OsString};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -58,6 +58,7 @@ use crate::vmm::{
 
 const READ_CHUNK_SIZE: usize = 4096;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+const API_SOCKET_MODE: u32 = 0o600;
 static NEXT_TEMP_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -68,6 +69,7 @@ pub(crate) enum ApiServerError {
     PeriodicMetricsFlush(VmmActionError),
     ProcessSessionTerminal,
     SocketMetadata(std::io::ErrorKind),
+    SocketPermissions(std::io::ErrorKind),
     SocketPathCheck(std::io::ErrorKind),
     SocketPathChanged,
     SocketPathExists,
@@ -88,6 +90,9 @@ impl std::fmt::Display for ApiServerError {
             }
             Self::SocketMetadata(kind) => {
                 write!(f, "failed to inspect bound API socket: {kind:?}")
+            }
+            Self::SocketPermissions(kind) => {
+                write!(f, "failed to restrict API socket permissions: {kind:?}")
             }
             Self::SocketPathCheck(kind) => write!(f, "failed to check API socket path: {kind:?}"),
             Self::SocketPathChanged => f.write_str("API socket path changed during bind"),
@@ -370,15 +375,25 @@ fn bind_unpublished_socket(
             Err(err) => return Err(ApiServerError::Bind(err.kind())),
         };
         let metadata = socket_path_metadata(&temp_path)?;
+        let bound_metadata = BoundSocketMetadata {
+            path: temp_path,
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        };
+        if let Err(err) = restrict_socket_path_permissions(
+            &bound_metadata.path,
+            bound_metadata.dev,
+            bound_metadata.ino,
+        ) {
+            remove_socket_path_if_owned(
+                &bound_metadata.path,
+                bound_metadata.dev,
+                bound_metadata.ino,
+            );
+            return Err(err);
+        }
 
-        return Ok((
-            listener,
-            BoundSocketMetadata {
-                path: temp_path,
-                dev: metadata.dev(),
-                ino: metadata.ino(),
-            },
-        ));
+        return Ok((listener, bound_metadata));
     }
 
     Err(ApiServerError::Bind(std::io::ErrorKind::AlreadyExists))
@@ -411,6 +426,13 @@ fn ensure_socket_path_owner(path: &Path, dev: u64, ino: u64) -> Result<(), ApiSe
     } else {
         Err(ApiServerError::SocketPathChanged)
     }
+}
+
+fn restrict_socket_path_permissions(path: &Path, dev: u64, ino: u64) -> Result<(), ApiServerError> {
+    ensure_socket_path_owner(path, dev, ino)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(API_SOCKET_MODE))
+        .map_err(|err| ApiServerError::SocketPermissions(err.kind()))?;
+    ensure_socket_path_owner(path, dev, ino)
 }
 
 fn remove_socket_path_if_owned(path: &Path, dev: u64, ino: u64) {
@@ -4332,6 +4354,15 @@ mod tests {
         drop(listener);
         drop(replacement);
         fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn bind_restricts_socket_path_permissions() {
+        let path = unique_socket_path("mode");
+        let _server = ApiServer::bind(&path).expect("server should bind");
+        let metadata = socket_path_metadata(&path).expect("API socket path should exist");
+
+        assert_eq!(metadata.mode() & 0o777, API_SOCKET_MODE);
     }
 
     #[test]

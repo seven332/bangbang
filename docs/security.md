@@ -15,10 +15,10 @@ permissions around configured host paths. API clients, API request bodies,
 guest-provided MMIO data, guest memory, and configured host paths must be treated
 as untrusted input.
 
-There is no authentication on the HTTP-over-Unix-socket API. Access control is
-provided by the socket path and parent-directory permissions. Operators should
-place the socket in a private directory and use restrictive permissions or
-umask settings on multi-user hosts.
+There is no authentication on the HTTP-over-Unix-socket API. bangbang restricts
+the published socket inode to owner-only permissions, and access control still
+depends on the socket path and parent-directory permissions. Operators should
+place the socket in a private directory on multi-user hosts.
 
 ## Firecracker Differences
 
@@ -63,7 +63,7 @@ changes Firecracker-facing behavior or security posture:
   that intentionally return a Firecracker-shaped fault without mutating state
   are `recognized unsupported`. Add parser/state tests and process e2e coverage
   when the public process boundary is affected.
-- Operator-owned policy: socket-directory permissions, restrictive umask,
+- Operator-owned policy: socket-directory permissions,
   host-path ownership, and current resource-sharing rules are deployment
   assumptions until a launcher or resource broker exists. Document the
   assumption and test that one `bangbang` process does not clean up resources it
@@ -79,11 +79,12 @@ authentication. Any process that can connect to the socket can send supported
 API requests.
 
 When binding the socket, bangbang refuses to overwrite an existing final socket
-path. It first binds a temporary sibling socket, publishes it to the requested
-path, records the socket device and inode, and removes the path on shutdown only
-when it still refers to the socket created by this process. Forced termination,
-such as `SIGKILL`, can still leave a stale socket path that the operator must
-remove.
+path. It first binds a temporary sibling socket, records the socket device and
+inode, restricts that socket inode to owner-only permissions, publishes it to
+the requested path, and verifies that the published path still refers to that
+socket. It removes the path on shutdown only when it still refers to the socket
+created by this process. Forced termination, such as `SIGKILL`, can still leave
+a stale socket path that the operator must remove.
 
 For multiple bangbang processes, use separate socket paths in directories whose
 ownership and permissions match the intended control boundary. Do not share a
