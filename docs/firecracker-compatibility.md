@@ -172,7 +172,7 @@ VMM control are counted under `patch_api_requests`.
 Parsed deprecated HTTP API usage is counted under
 `deprecated_api.deprecated_http_api_calls` for supported machine
 `cpu_template`, MMDS V1 config, deprecated `vsock_id`, and snapshot-load
-`mem_file_path` or `enable_diff_snapshots` request forms. Parser failures,
+`mem_file_path` or `enable_diff_snapshots: true` request forms. Parser failures,
 including malformed bodies and path/body ID mismatches, for the PUT and PATCH
 endpoints above with matching Firecracker-shaped request metric fields are
 counted in the same count/fail counters when the endpoint is identifiable from
@@ -371,7 +371,7 @@ exist.
 | `PUT /snapshot/load` | `mem_backend` | required unless deprecated `mem_file_path` is present; VMM-routed unsupported | Parsed as a strict object with `backend_path` and `backend_type`. Exactly one of `mem_backend` or `mem_file_path` must be present. Real memory backend loading remains deferred. |
 | `PUT /snapshot/load` | `mem_backend.backend_type` | required when `mem_backend` is present | Accepts Firecracker values `File` and `Uffd`; invalid values are rejected before the snapshot unsupported fault. |
 | `PUT /snapshot/load` | `mem_file_path` | deprecated-compatible alternative to `mem_backend`; VMM-routed unsupported | Accepted syntactically to match Firecracker's current parser. It must not be combined with `mem_backend`. Real deprecated-field handling and restore behavior remain deferred. |
-| `PUT /snapshot/load` | `enable_diff_snapshots` | deprecated-compatible optional boolean | Accepted syntactically to match Firecracker's current parser before routing the valid request through the VMM state/action policy. |
+| `PUT /snapshot/load` | `enable_diff_snapshots` | deprecated-compatible optional boolean | Accepted syntactically to match Firecracker's current parser before routing the valid request through the VMM state/action policy. Only `true` increments deprecated API usage metrics; `false` is accepted without incrementing the deprecated counter. |
 | `PUT /snapshot/load` | `track_dirty_pages`, `resume_vm`, `clock_realtime` | optional booleans | Parsed before routing the valid request through the VMM state/action policy. Real dirty tracking, resume behavior, and architecture-specific clock restore remain deferred. |
 | `PUT /snapshot/load` | `network_overrides` | optional | Parsed as Firecracker-shaped override entries with `iface_id` and `host_dev_name` before routing the valid request through the VMM state/action policy. Real network restore override behavior remains deferred. |
 | `PUT /snapshot/load` | `vsock_override` | optional | Parsed as a Firecracker-shaped object with `uds_path` before routing the valid request through the VMM state/action policy. Real vsock restore override behavior remains deferred. |

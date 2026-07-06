@@ -2142,8 +2142,6 @@ fn parse_snapshot_create_request(body: &[u8]) -> Result<ApiRequest, RequestError
 fn parse_snapshot_load_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
     let value = serde_json::from_slice::<serde_json::Value>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
-    let enable_diff_snapshots_field_present =
-        json_object_contains_key(&value, "enable_diff_snapshots");
     let SnapshotLoadRequestBody {
         snapshot_path,
         mem_file_path,
@@ -2161,7 +2159,7 @@ fn parse_snapshot_load_request(body: &[u8]) -> Result<ApiRequest, RequestError> 
         return Err(RequestError::MalformedRequest);
     }
 
-    let deprecated_fields_used = mem_file_path.is_some() || enable_diff_snapshots_field_present;
+    let deprecated_fields_used = mem_file_path.is_some() || enable_diff_snapshots;
 
     let _ = (
         snapshot_path,
@@ -5983,7 +5981,7 @@ mod tests {
             ),
             (
                 r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"},"enable_diff_snapshots":false}"#,
-                true,
+                false,
             ),
             (
                 r#"{"snapshot_path":"vmstate","mem_file_path":"memory","resume_vm":true}"#,
