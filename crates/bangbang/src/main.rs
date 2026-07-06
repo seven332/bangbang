@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::io::Read;
+use std::mem::MaybeUninit;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -84,7 +85,9 @@ fn run() -> Result<(), ProcessError> {
                 no_api,
                 startup_time,
             } = config;
-            let process_metrics_diagnostics = startup_time.metrics_diagnostics();
+            let process_metrics_diagnostics = startup_time
+                .metrics_diagnostics()
+                .map_err(ProcessError::StartupTime)?;
 
             println!("bangbang {}", env!("CARGO_PKG_VERSION"));
             println!(
@@ -534,6 +537,7 @@ enum ProcessError {
     ProcessSessionTerminal,
     SignalHandler(std::io::ErrorKind),
     StartupConfiguration(VmmActionError),
+    StartupTime(StartupTimeClockError),
 }
 
 impl ProcessError {
@@ -548,6 +552,7 @@ impl ProcessError {
             Self::ProcessSessionTerminal => ProcessExitCode::ProcessFailure,
             Self::SignalHandler(_) => ProcessExitCode::ProcessFailure,
             Self::StartupConfiguration(_) => ProcessExitCode::ProcessFailure,
+            Self::StartupTime(_) => ProcessExitCode::ProcessFailure,
         }
     }
 }
@@ -574,6 +579,7 @@ impl fmt::Display for ProcessError {
             Self::StartupConfiguration(err) => {
                 write!(f, "startup configuration error: {err}")
             }
+            Self::StartupTime(err) => write!(f, "startup time error: {err}"),
         }
     }
 }
@@ -850,20 +856,110 @@ struct StartupTimeConfig {
 }
 
 impl StartupTimeConfig {
-    fn metrics_diagnostics(self) -> MetricsDiagnostics {
+    fn metrics_diagnostics(self) -> Result<MetricsDiagnostics, StartupTimeClockError> {
+        if !self.needs_clock_sample() {
+            return Ok(MetricsDiagnostics::new());
+        }
+
+        let clock = StartupTimeClock::sample_for(&self)?;
+        Ok(self.metrics_diagnostics_at(clock))
+    }
+
+    fn metrics_diagnostics_at(self, clock: StartupTimeClock) -> MetricsDiagnostics {
         let mut diagnostics = MetricsDiagnostics::new();
         if let Some(start_time_us) = self.start_time_us {
-            diagnostics = diagnostics.with_start_time_us(start_time_us);
+            diagnostics = diagnostics
+                .with_start_time_us(clock.monotonic_time_us.saturating_sub(start_time_us));
         }
         if let Some(start_time_cpu_us) = self.start_time_cpu_us {
-            diagnostics = diagnostics.with_start_time_cpu_us(start_time_cpu_us);
-        }
-        if let Some(parent_cpu_time_us) = self.parent_cpu_time_us {
-            diagnostics = diagnostics.with_parent_cpu_time_us(parent_cpu_time_us);
+            let process_startup_time_cpu_us = clock
+                .process_cpu_time_us
+                .saturating_sub(start_time_cpu_us)
+                .saturating_add(self.parent_cpu_time_us.unwrap_or_default());
+            diagnostics = diagnostics.with_start_time_cpu_us(process_startup_time_cpu_us);
         }
 
         diagnostics
     }
+
+    fn needs_clock_sample(&self) -> bool {
+        self.start_time_us.is_some() || self.start_time_cpu_us.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StartupTimeClock {
+    monotonic_time_us: u64,
+    process_cpu_time_us: u64,
+}
+
+impl StartupTimeClock {
+    #[cfg(test)]
+    const fn new(monotonic_time_us: u64, process_cpu_time_us: u64) -> Self {
+        Self {
+            monotonic_time_us,
+            process_cpu_time_us,
+        }
+    }
+
+    fn sample_for(config: &StartupTimeConfig) -> Result<Self, StartupTimeClockError> {
+        let monotonic_time_us = if config.start_time_us.is_some() {
+            clock_time_us(libc::CLOCK_MONOTONIC).map_err(StartupTimeClockError::Monotonic)?
+        } else {
+            0
+        };
+        let process_cpu_time_us = if config.start_time_cpu_us.is_some() {
+            clock_time_us(libc::CLOCK_PROCESS_CPUTIME_ID)
+                .map_err(StartupTimeClockError::ProcessCpu)?
+        } else {
+            0
+        };
+
+        Ok(Self {
+            monotonic_time_us,
+            process_cpu_time_us,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupTimeClockError {
+    Monotonic(std::io::ErrorKind),
+    ProcessCpu(std::io::ErrorKind),
+}
+
+impl fmt::Display for StartupTimeClockError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Monotonic(kind) => write!(f, "failed to read monotonic clock: {kind:?}"),
+            Self::ProcessCpu(kind) => write!(f, "failed to read process CPU clock: {kind:?}"),
+        }
+    }
+}
+
+impl std::error::Error for StartupTimeClockError {}
+
+fn clock_time_us(clock_id: libc::clockid_t) -> Result<u64, std::io::ErrorKind> {
+    let mut time = MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: `clock_gettime` writes a valid `timespec` to the provided pointer
+    // when it returns 0. The pointer is valid for writes and properly aligned.
+    let result = unsafe { libc::clock_gettime(clock_id, time.as_mut_ptr()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().kind());
+    }
+    // SAFETY: `clock_gettime` returned success, so the `timespec` was initialized.
+    let time = unsafe { time.assume_init() };
+
+    timespec_time_us(time)
+}
+
+fn timespec_time_us(time: libc::timespec) -> Result<u64, std::io::ErrorKind> {
+    let seconds = u64::try_from(time.tv_sec).map_err(|_| std::io::ErrorKind::InvalidData)?;
+    let nanoseconds = u64::try_from(time.tv_nsec).map_err(|_| std::io::ErrorKind::InvalidData)?;
+
+    Ok(seconds
+        .saturating_mul(1_000_000)
+        .saturating_add(nanoseconds / 1_000))
 }
 
 impl Default for StartupConfig {
@@ -1378,7 +1474,7 @@ mod tests {
     use super::{
         ApiServerError, Args, Command, DEFAULT_API_SOCK_PATH, DEFAULT_INSTANCE_ID,
         HTTP_MAX_PAYLOAD_SIZE, MAX_INSTANCE_ID_LEN, ProcessError, ProcessExitCode, StartupConfig,
-        StartupTimeConfig, parse_process_args,
+        StartupTimeClock, StartupTimeConfig, parse_process_args,
     };
 
     #[derive(Debug, Clone)]
@@ -2016,17 +2112,57 @@ mod tests {
     }
 
     #[test]
-    fn startup_time_config_builds_metrics_diagnostics() {
+    fn startup_time_config_builds_elapsed_metrics_diagnostics() {
         let diagnostics = StartupTimeConfig {
             start_time_us: Some(1000),
+            start_time_cpu_us: Some(2000),
+            parent_cpu_time_us: Some(3000),
+        }
+        .metrics_diagnostics_at(StartupTimeClock::new(1500, 2500));
+
+        assert_eq!(diagnostics.start_time_us(), Some(500));
+        assert_eq!(diagnostics.start_time_cpu_us(), Some(3500));
+        assert_eq!(diagnostics.parent_cpu_time_us(), None);
+    }
+
+    #[test]
+    fn startup_time_config_omits_parent_only_diagnostics() {
+        let diagnostics = StartupTimeConfig {
+            start_time_us: None,
             start_time_cpu_us: None,
             parent_cpu_time_us: Some(3000),
         }
-        .metrics_diagnostics();
+        .metrics_diagnostics_at(StartupTimeClock::new(1500, 2500));
 
-        assert_eq!(diagnostics.start_time_us(), Some(1000));
-        assert_eq!(diagnostics.start_time_cpu_us(), None);
-        assert_eq!(diagnostics.parent_cpu_time_us(), Some(3000));
+        assert_eq!(diagnostics, MetricsDiagnostics::default());
+    }
+
+    #[test]
+    fn startup_time_config_saturates_future_start_times() {
+        let diagnostics = StartupTimeConfig {
+            start_time_us: Some(2000),
+            start_time_cpu_us: Some(3000),
+            parent_cpu_time_us: Some(4000),
+        }
+        .metrics_diagnostics_at(StartupTimeClock::new(1000, 2500));
+
+        assert_eq!(diagnostics.start_time_us(), Some(0));
+        assert_eq!(diagnostics.start_time_cpu_us(), Some(4000));
+        assert_eq!(diagnostics.parent_cpu_time_us(), None);
+    }
+
+    #[test]
+    fn startup_time_config_saturates_parent_cpu_overflow() {
+        let diagnostics = StartupTimeConfig {
+            start_time_us: None,
+            start_time_cpu_us: Some(0),
+            parent_cpu_time_us: Some(1),
+        }
+        .metrics_diagnostics_at(StartupTimeClock::new(0, u64::MAX));
+
+        assert_eq!(diagnostics.start_time_us(), None);
+        assert_eq!(diagnostics.start_time_cpu_us(), Some(u64::MAX));
+        assert_eq!(diagnostics.parent_cpu_time_us(), None);
     }
 
     #[test]

@@ -122,20 +122,23 @@ fn executable_startup_metrics_path_writes_initial_metrics() {
     let metrics_path = test_dir.path().join("startup.metrics");
     let instance_id = test_dir.instance_id();
     let metrics_arg = format!("--metrics-path={}", path_text(&metrics_path));
+    let future_start_time = u64::MAX.to_string();
     let bangbang = BangbangProcess::start_with_extra_args(
         &socket_path,
         &instance_id,
         &[
             metrics_arg.as_str(),
-            "--start-time-us=1000",
-            "--start-time-cpu-us=2000",
+            "--start-time-us",
+            future_start_time.as_str(),
+            "--start-time-cpu-us",
+            future_start_time.as_str(),
             "--parent-cpu-time-us=3000",
         ],
     );
 
     assert_eq!(
         fs::read_to_string(&metrics_path).expect("startup metrics should be readable"),
-        "{\"api_server\":{\"process_startup_time_cpu_us\":5000,\"process_startup_time_us\":1000},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        "{\"api_server\":{\"process_startup_time_cpu_us\":3000,\"process_startup_time_us\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
     );
 
     let instance_info = http_get(&socket_path, "/");
@@ -2466,6 +2469,7 @@ fn concurrent_executables_keep_api_resources_isolated() {
     )
     .expect("second metadata file should be written");
 
+    let future_start_time = u64::MAX.to_string();
     let first_bangbang = BangbangProcess::start_with_extra_args(
         &first_socket_path,
         &first_instance_id,
@@ -2475,9 +2479,9 @@ fn concurrent_executables_keep_api_resources_isolated() {
             "--metrics-path",
             path_text(&first_metrics_path),
             "--start-time-us",
-            "1100",
+            future_start_time.as_str(),
             "--start-time-cpu-us",
-            "1200",
+            future_start_time.as_str(),
             "--parent-cpu-time-us",
             "1300",
         ],
@@ -2491,9 +2495,9 @@ fn concurrent_executables_keep_api_resources_isolated() {
             "--metrics-path",
             path_text(&second_metrics_path),
             "--start-time-us",
-            "2100",
+            future_start_time.as_str(),
             "--start-time-cpu-us",
-            "2200",
+            future_start_time.as_str(),
             "--parent-cpu-time-us",
             "2300",
         ],
@@ -2530,25 +2534,19 @@ fn concurrent_executables_keep_api_resources_isolated() {
     assert_startup_metrics_match(
         &first_metrics_path,
         &[
-            r#""process_startup_time_us":1100"#,
-            r#""process_startup_time_cpu_us":2500"#,
+            r#""process_startup_time_us":0"#,
+            r#""process_startup_time_cpu_us":1300"#,
         ],
-        &[
-            r#""process_startup_time_us":2100"#,
-            r#""process_startup_time_cpu_us":4500"#,
-        ],
+        &[r#""process_startup_time_cpu_us":2300"#],
         "first bangbang",
     );
     assert_startup_metrics_match(
         &second_metrics_path,
         &[
-            r#""process_startup_time_us":2100"#,
-            r#""process_startup_time_cpu_us":4500"#,
+            r#""process_startup_time_us":0"#,
+            r#""process_startup_time_cpu_us":2300"#,
         ],
-        &[
-            r#""process_startup_time_us":1100"#,
-            r#""process_startup_time_cpu_us":2500"#,
-        ],
+        &[r#""process_startup_time_cpu_us":1300"#],
         "second bangbang",
     );
 

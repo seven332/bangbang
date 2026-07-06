@@ -166,8 +166,12 @@ while the VM is running. After `InstanceStart`, the line also includes a
 process-owned boot worker exists. When startup timing CLI values are provided,
 the same metrics output includes Firecracker-style
 `api_server.process_startup_time_us` and
-`api_server.process_startup_time_cpu_us`; `--parent-cpu-time-us` contributes to
-the CPU value and is not serialized as a separate field. The current
+`api_server.process_startup_time_cpu_us` elapsed values. `--start-time-us` is
+subtracted from the sampled monotonic clock, `--start-time-cpu-us` is
+subtracted from the sampled process CPU clock, and `--parent-cpu-time-us`
+contributes to the CPU value without being serialized as a separate field. If a
+provided start timestamp is later than the sampled clock value, the elapsed
+component saturates at zero. The current
 Firecracker-shaped API request metrics subset also reports selected GET counters
 under `get_api_requests`; parsed core
 configuration, MMDS, observability, memory hotplug, pmem, and `/actions`
