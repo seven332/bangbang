@@ -391,28 +391,10 @@ impl PutApiRequestKind {
             Self::Vsock => controller.record_put_vsock_failure(),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ObservabilityPutRequest {
-    Logger,
-    Metrics,
-    Serial,
-}
-
-impl ObservabilityPutRequest {
-    const fn put_kind(self) -> PutApiRequestKind {
-        match self {
-            Self::Logger => PutApiRequestKind::Logger,
-            Self::Metrics => PutApiRequestKind::Metrics,
-            Self::Serial => PutApiRequestKind::Serial,
-        }
-    }
 
     fn record_parse_failure(self, controller: &mut VmmController) {
-        let kind = self.put_kind();
-        kind.record_request(controller);
-        kind.record_failure(controller);
+        self.record_request(controller);
+        self.record_failure(controller);
     }
 }
 
@@ -503,6 +485,92 @@ impl PatchApiRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApiRequestMetricParseFailure {
+    Patch(ApiRequestMetricPatchParseFailure),
+    Put(ApiRequestMetricPutParseFailure),
+}
+
+impl ApiRequestMetricParseFailure {
+    fn record(self, controller: &mut VmmController) {
+        match self {
+            Self::Patch(request) => request.record(controller),
+            Self::Put(request) => request.record(controller),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApiRequestMetricPutParseFailure {
+    Actions,
+    BootSource,
+    CpuConfig,
+    Drive,
+    HotplugMemory,
+    Logger,
+    MachineConfig,
+    Metrics,
+    Mmds,
+    Network,
+    Pmem,
+    Serial,
+    Vsock,
+}
+
+impl ApiRequestMetricPutParseFailure {
+    fn record(self, controller: &mut VmmController) {
+        match self {
+            Self::Actions => {
+                controller.record_put_actions_request();
+                controller.record_put_actions_failure();
+            }
+            Self::BootSource => PutApiRequestKind::BootSource.record_parse_failure(controller),
+            Self::CpuConfig => PutApiRequestKind::CpuConfig.record_parse_failure(controller),
+            Self::Drive => PutApiRequestKind::Drive.record_parse_failure(controller),
+            Self::HotplugMemory => {
+                PutApiRequestKind::HotplugMemory.record_parse_failure(controller)
+            }
+            Self::Logger => PutApiRequestKind::Logger.record_parse_failure(controller),
+            Self::MachineConfig => {
+                PutApiRequestKind::MachineConfig.record_parse_failure(controller)
+            }
+            Self::Metrics => PutApiRequestKind::Metrics.record_parse_failure(controller),
+            Self::Mmds => PutApiRequestKind::Mmds.record_parse_failure(controller),
+            Self::Network => PutApiRequestKind::Network.record_parse_failure(controller),
+            Self::Pmem => PutApiRequestKind::Pmem.record_parse_failure(controller),
+            Self::Serial => PutApiRequestKind::Serial.record_parse_failure(controller),
+            Self::Vsock => PutApiRequestKind::Vsock.record_parse_failure(controller),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApiRequestMetricPatchParseFailure {
+    Drive,
+    HotplugMemory,
+    MachineConfig,
+    Mmds,
+    Network,
+    Pmem,
+}
+
+impl ApiRequestMetricPatchParseFailure {
+    fn record(self, controller: &mut VmmController) {
+        match self {
+            Self::Drive => PatchApiRequestKind::Drive.record_parse_failure(controller),
+            Self::HotplugMemory => {
+                PatchApiRequestKind::HotplugMemory.record_parse_failure(controller)
+            }
+            Self::MachineConfig => {
+                PatchApiRequestKind::MachineConfig.record_parse_failure(controller)
+            }
+            Self::Mmds => PatchApiRequestKind::Mmds.record_parse_failure(controller),
+            Self::Network => PatchApiRequestKind::Network.record_parse_failure(controller),
+            Self::Pmem => PatchApiRequestKind::Pmem.record_parse_failure(controller),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PatchApiRequestKind {
     Balloon,
     Drive,
@@ -537,6 +605,11 @@ impl PatchApiRequestKind {
             Self::Pmem => controller.record_patch_pmem_failure(),
         }
     }
+
+    fn record_parse_failure(self, controller: &mut VmmController) {
+        self.record_request(controller);
+        self.record_failure(controller);
+    }
 }
 
 pub(crate) trait VmmRequestHandler {
@@ -549,7 +622,7 @@ pub(crate) trait VmmRequestHandler {
 
     fn handle_put_request(&mut self, request: PutApiRequest) -> Result<VmmData, VmmActionError>;
 
-    fn record_observability_put_parse_failure(&mut self, request: ObservabilityPutRequest);
+    fn record_api_request_parse_failure(&mut self, request: ApiRequestMetricParseFailure);
 
     fn handle_put_action_request(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError>;
 
@@ -731,8 +804,8 @@ where
         result
     }
 
-    fn record_observability_put_parse_failure(&mut self, request: ObservabilityPutRequest) {
-        request.record_parse_failure(&mut self.controller);
+    fn record_api_request_parse_failure(&mut self, request: ApiRequestMetricParseFailure) {
+        request.record(&mut self.controller);
     }
 
     fn record_deprecated_api_call(&mut self) {
@@ -872,8 +945,8 @@ where
         ProcessVmm::handle_put_request(self, request)
     }
 
-    fn record_observability_put_parse_failure(&mut self, request: ObservabilityPutRequest) {
-        ProcessVmm::record_observability_put_parse_failure(self, request);
+    fn record_api_request_parse_failure(&mut self, request: ApiRequestMetricParseFailure) {
+        ProcessVmm::record_api_request_parse_failure(self, request);
     }
 
     fn record_deprecated_api_call(&mut self) {
