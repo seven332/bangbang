@@ -12,6 +12,10 @@ use crate::block::{
 use crate::boot::{
     BootCommandLineError, BootSource, BootSourceConfig, BootSourceLoadError, LoadedBootSource,
 };
+use crate::entropy::{
+    EntropyMmioDeviceRegistration, EntropyMmioLayout, EntropyMmioRegistrationError,
+    PreparedEntropyDevice,
+};
 use crate::fdt::{
     Arm64FdtBootInfo, Arm64FdtConfig, Arm64FdtError, Arm64FdtGic, Arm64FdtGuestMemoryWrite,
     Arm64FdtRegion, Arm64FdtSerialDevice, Arm64FdtTimerInterrupts, Arm64FdtVirtioMmioDevice,
@@ -53,6 +57,7 @@ pub struct Arm64BootResourceConfig<'a> {
     pub network_interrupt_lines: &'a [GuestInterruptLine],
     pub vsock_mmio_layout: VsockMmioLayout,
     pub vsock_interrupt_line: Option<GuestInterruptLine>,
+    pub entropy_device: Option<Arm64BootEntropyDeviceConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +84,21 @@ impl Arm64BootSerialDeviceConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Arm64BootEntropyDeviceConfig {
+    pub mmio_layout: EntropyMmioLayout,
+    pub interrupt_line: GuestInterruptLine,
+}
+
+impl Arm64BootEntropyDeviceConfig {
+    pub const fn new(mmio_layout: EntropyMmioLayout, interrupt_line: GuestInterruptLine) -> Self {
+        Self {
+            mmio_layout,
+            interrupt_line,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Arm64BootResources {
     pub machine_config: MachineConfig,
@@ -91,6 +111,7 @@ pub struct Arm64BootResources {
     pub block_devices: Vec<Arm64BootBlockDevice>,
     pub network_devices: Vec<Arm64BootNetworkDevice>,
     pub vsock_device: Option<Arm64BootVsockDevice>,
+    pub entropy_device: Option<Arm64BootEntropyDevice>,
 }
 
 #[derive(Debug)]
@@ -110,6 +131,7 @@ pub struct Arm64BootRuntimeResources {
     pub block_devices: Vec<Arm64BootBlockDevice>,
     pub network_devices: Vec<Arm64BootNetworkDevice>,
     pub vsock_device: Option<Arm64BootVsockDevice>,
+    pub entropy_device: Option<Arm64BootEntropyDevice>,
 }
 
 #[derive(Debug)]
@@ -567,6 +589,12 @@ pub struct Arm64BootVsockDevice {
     pub fdt_device: Arm64FdtVirtioMmioDevice,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Arm64BootEntropyDevice {
+    pub registration: EntropyMmioDeviceRegistration,
+    pub fdt_device: Arm64FdtVirtioMmioDevice,
+}
+
 #[derive(Debug, Clone)]
 pub struct Arm64BootSerialDevice {
     pub region: MmioRegion,
@@ -759,6 +787,9 @@ pub enum Arm64BootResourceError {
     RegisterVsockMmio {
         source: Box<VsockMmioRegistrationError>,
     },
+    RegisterEntropyMmio {
+        source: Box<EntropyMmioRegistrationError>,
+    },
     RegisterSerialMmio {
         source: Box<Arm64BootSerialMmioRegistrationError>,
     },
@@ -781,6 +812,9 @@ pub enum Arm64BootResourceError {
         source: TryReserveError,
     },
     VsockDeviceMetadataAllocation {
+        source: TryReserveError,
+    },
+    EntropyDeviceMetadataAllocation {
         source: TryReserveError,
     },
     Fdt {
@@ -835,6 +869,9 @@ impl fmt::Display for Arm64BootResourceError {
             Self::RegisterVsockMmio { source } => {
                 write!(f, "failed to register vsock MMIO device: {source}")
             }
+            Self::RegisterEntropyMmio { source } => {
+                write!(f, "failed to register entropy MMIO device: {source}")
+            }
             Self::RegisterSerialMmio { source } => {
                 write!(f, "failed to register serial MMIO device: {source}")
             }
@@ -859,6 +896,9 @@ impl fmt::Display for Arm64BootResourceError {
             Self::VsockDeviceMetadataAllocation { source } => {
                 write!(f, "failed to allocate vsock device metadata: {source}")
             }
+            Self::EntropyDeviceMetadataAllocation { source } => {
+                write!(f, "failed to allocate entropy device metadata: {source}")
+            }
             Self::Fdt { source } => write!(f, "failed to write arm64 FDT: {source}"),
         }
     }
@@ -877,10 +917,12 @@ impl std::error::Error for Arm64BootResourceError {
             Self::RegisterBlockMmio { source } => Some(source.as_ref()),
             Self::RegisterNetworkMmio { source } => Some(source.as_ref()),
             Self::RegisterVsockMmio { source } => Some(source.as_ref()),
+            Self::RegisterEntropyMmio { source } => Some(source.as_ref()),
             Self::RegisterSerialMmio { source } => Some(source.as_ref()),
             Self::BlockDeviceMetadataAllocation { source } => Some(source),
             Self::NetworkDeviceMetadataAllocation { source } => Some(source),
             Self::VsockDeviceMetadataAllocation { source } => Some(source),
+            Self::EntropyDeviceMetadataAllocation { source } => Some(source),
             Self::Fdt { source } => Some(source),
             Self::MissingBootSource
             | Self::MemorySizeOverflow { .. }
@@ -949,6 +991,7 @@ impl Arm64BootResources {
             network_interrupt_lines,
             vsock_mmio_layout,
             vsock_interrupt_line,
+            entropy_device,
         } = config;
         let boot_source_config = controller
             .boot_source_config()
@@ -1031,6 +1074,25 @@ impl Arm64BootResources {
                 ));
             }
         };
+        let entropy_device = match entropy_device {
+            Some(config) => {
+                let entropy_mmio = PreparedEntropyDevice::new()
+                    .register_mmio_with_dispatcher(config.mmio_layout, mmio_dispatcher)
+                    .map_err(|source| Arm64BootResourceError::RegisterEntropyMmio {
+                        source: Box::new(source),
+                    })?;
+                let (dispatcher, registration) = entropy_mmio.into_parts();
+                mmio_dispatcher = dispatcher;
+                let (device, fdt_device) =
+                    arm64_boot_entropy_device_metadata(registration, config.interrupt_line);
+                fdt_devices.try_reserve_exact(1).map_err(|source| {
+                    Arm64BootResourceError::EntropyDeviceMetadataAllocation { source }
+                })?;
+                fdt_devices.push(fdt_device);
+                Some(device)
+            }
+            None => None,
+        };
         let serial_device = serial_device
             .map(|serial| register_serial_mmio(&mut mmio_dispatcher, serial))
             .transpose()?;
@@ -1060,6 +1122,7 @@ impl Arm64BootResources {
             block_devices,
             network_devices,
             vsock_device,
+            entropy_device,
         })
     }
 
@@ -1076,6 +1139,7 @@ impl Arm64BootResources {
                 block_devices: self.block_devices,
                 network_devices: self.network_devices,
                 vsock_device: self.vsock_device,
+                entropy_device: self.entropy_device,
             },
         }
     }
@@ -1265,6 +1329,28 @@ fn arm64_boot_vsock_device_metadata(
     )
 }
 
+fn arm64_boot_entropy_device_metadata(
+    registration: EntropyMmioDeviceRegistration,
+    interrupt_line: GuestInterruptLine,
+) -> (Arm64BootEntropyDevice, Arm64FdtVirtioMmioDevice) {
+    let range = registration.region().range();
+    let fdt_device = Arm64FdtVirtioMmioDevice {
+        region: Arm64FdtRegion {
+            base: range.start().raw_value(),
+            size: range.size(),
+        },
+        interrupt_line,
+    };
+
+    (
+        Arm64BootEntropyDevice {
+            registration,
+            fdt_device,
+        },
+        fdt_device,
+    )
+}
+
 fn register_serial_mmio(
     dispatcher: &mut MmioDispatcher,
     config: Arm64BootSerialDeviceConfig,
@@ -1338,6 +1424,7 @@ mod tests {
         BootCommandLineError, BootPayloadKind, BootSourceConfigInput, BootSourceLoadError,
         DEFAULT_KERNEL_COMMAND_LINE,
     };
+    use crate::entropy::{EntropyMmioLayout, VirtioRngMmioHandler};
     use crate::fdt::{Arm64FdtError, Arm64FdtGic, Arm64FdtRegion, Arm64FdtTimerInterrupts};
     use crate::interrupt::{DeviceInterruptKind, GuestInterruptLine};
     use crate::machine::{MachineConfig, MachineConfigInput};
@@ -1384,6 +1471,7 @@ mod tests {
     const TEST_BLOCK_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_0000);
     const TEST_NETWORK_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_4000);
     const TEST_VSOCK_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_6000);
+    const TEST_ENTROPY_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_7000);
     const TEST_SERIAL_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_2000);
     const TEST_QUEUE_SIZE: u16 = 4;
     const TEST_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x8040_0000);
@@ -1605,6 +1693,7 @@ mod tests {
             network_interrupt_lines: &[],
             vsock_mmio_layout: VsockMmioLayout::new(TEST_VSOCK_MMIO_BASE, MmioRegionId::new(90)),
             vsock_interrupt_line: None,
+            entropy_device: None,
         }
     }
 
@@ -2769,6 +2858,7 @@ mod tests {
         assert_eq!(fdt_bootargs(&resources), DEFAULT_KERNEL_COMMAND_LINE);
         assert!(read_fdt(&resources).find("/uart@40002000").is_none());
         assert!(read_fdt(&resources).find("/virtio_mmio@40006000").is_none());
+        assert!(read_fdt(&resources).find("/virtio_mmio@40007000").is_none());
     }
 
     #[test]
@@ -3052,6 +3142,68 @@ mod tests {
     }
 
     #[test]
+    fn assembles_boot_resources_with_entropy_mmio_metadata() {
+        let kernel = temp_file("kernel-with-entropy", &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+        let config = Arm64BootResourceConfig {
+            entropy_device: Some(super::Arm64BootEntropyDeviceConfig::new(
+                EntropyMmioLayout::new(TEST_ENTROPY_MMIO_BASE, MmioRegionId::new(100)),
+                line(36),
+            )),
+            ..valid_config(&[])
+        };
+
+        let mut resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("boot resources should assemble with entropy device");
+
+        assert!(resources.block_devices.is_empty());
+        assert!(resources.network_devices.is_empty());
+        assert!(resources.vsock_device.is_none());
+        let entropy = resources
+            .entropy_device
+            .as_ref()
+            .expect("entropy metadata should be returned");
+        assert_eq!(entropy.registration.region_id(), MmioRegionId::new(100));
+        assert_eq!(entropy.registration.address(), TEST_ENTROPY_MMIO_BASE);
+        assert_eq!(
+            entropy.registration.region().range().size(),
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE
+        );
+        assert_eq!(
+            entropy.fdt_device.region.base,
+            TEST_ENTROPY_MMIO_BASE.raw_value()
+        );
+        assert_eq!(
+            entropy.fdt_device.region.size,
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE
+        );
+        assert_eq!(entropy.fdt_device.interrupt_line, line(36));
+        assert_eq!(resources.mmio_dispatcher.regions().len(), 1);
+        resources
+            .mmio_dispatcher
+            .handler_mut::<VirtioRngMmioHandler>(entropy.registration.region_id())
+            .expect("entropy MMIO handler should be registered");
+
+        let tree = read_fdt(&resources);
+        let entropy_node = tree
+            .find("/virtio_mmio@40007000")
+            .expect("entropy virtio-mmio node should be in assembled FDT");
+        assert_eq!(entropy_node.prop_str("compatible").unwrap(), "virtio,mmio");
+
+        let parts = resources.into_parts();
+        assert_eq!(
+            parts
+                .runtime
+                .entropy_device
+                .as_ref()
+                .expect("runtime entropy metadata should be preserved")
+                .registration
+                .region_id(),
+            MmioRegionId::new(100)
+        );
+    }
+
+    #[test]
     fn configured_vsock_without_interrupt_line_fails_before_socket_access() {
         let kernel = temp_file("kernel-vsock-missing-line", &arm64_image());
         let socket_path = missing_path("vsock-missing-line.sock");
@@ -3154,6 +3306,31 @@ mod tests {
     }
 
     #[test]
+    fn entropy_region_overlapping_block_mmio_fails_during_registration() {
+        let kernel = temp_file("kernel-entropy-overlap-block", &arm64_image());
+        let block = temp_file("block-entropy-overlap", &[0x5a; 512]);
+        let mut controller = controller_with_kernel(kernel.path());
+        add_drive(&mut controller, "rootfs", block.path());
+        let block_interrupt_lines = [line(32)];
+        let config = Arm64BootResourceConfig {
+            entropy_device: Some(super::Arm64BootEntropyDeviceConfig::new(
+                EntropyMmioLayout::new(TEST_BLOCK_MMIO_BASE, MmioRegionId::new(100)),
+                line(36),
+            )),
+            ..valid_config(&block_interrupt_lines)
+        };
+
+        let err = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect_err("overlapping entropy MMIO should fail");
+
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::RegisterEntropyMmio { .. }
+        ));
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
     fn assembles_boot_resources_preserve_multiple_network_order() {
         let kernel = temp_file("kernel-with-networks", &arm64_image());
         let mut controller = controller_with_kernel(kernel.path());
@@ -3189,6 +3366,57 @@ mod tests {
         let tree = read_fdt(&resources);
         assert!(tree.find("/virtio_mmio@40004000").is_some());
         assert!(tree.find("/virtio_mmio@40005000").is_some());
+    }
+
+    #[test]
+    fn assembles_boot_resources_with_entropy_and_existing_mmio_devices() {
+        let kernel = temp_file("kernel-entropy-with-existing-mmio", &arm64_image());
+        let block = temp_file("block-entropy-with-existing-mmio", &[0x5a; 512]);
+        let socket_path = missing_path("vsock-entropy.sock");
+        let mut controller = controller_with_kernel(kernel.path());
+        add_drive(&mut controller, "rootfs", block.path());
+        add_network(&mut controller, "eth0", "tap0");
+        add_vsock(&mut controller, 42, &socket_path);
+        let block_lines = [line(32)];
+        let network_lines = [line(33)];
+        let (serial, _output) =
+            serial_config(TEST_SERIAL_MMIO_BASE, MmioRegionId::new(9), line(37));
+        let config = Arm64BootResourceConfig {
+            serial_device: Some(serial),
+            network_interrupt_lines: &network_lines,
+            vsock_interrupt_line: Some(line(35)),
+            entropy_device: Some(super::Arm64BootEntropyDeviceConfig::new(
+                EntropyMmioLayout::new(TEST_ENTROPY_MMIO_BASE, MmioRegionId::new(100)),
+                line(36),
+            )),
+            ..valid_config(&block_lines)
+        };
+
+        let resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("boot resources should assemble with entropy and existing MMIO devices");
+
+        assert_eq!(resources.block_devices.len(), 1);
+        assert_eq!(resources.network_devices.len(), 1);
+        assert!(resources.vsock_device.is_some());
+        assert!(resources.entropy_device.is_some());
+        assert!(resources.serial_device.is_some());
+        assert_eq!(resources.mmio_dispatcher.regions().len(), 5);
+        assert_eq!(
+            resources
+                .entropy_device
+                .as_ref()
+                .expect("entropy metadata should exist")
+                .fdt_device
+                .interrupt_line,
+            line(36)
+        );
+
+        let tree = read_fdt(&resources);
+        assert!(tree.find("/virtio_mmio@40000000").is_some());
+        assert!(tree.find("/uart@40002000").is_some());
+        assert!(tree.find("/virtio_mmio@40004000").is_some());
+        assert!(tree.find("/virtio_mmio@40006000").is_some());
+        assert!(tree.find("/virtio_mmio@40007000").is_some());
     }
 
     #[test]
@@ -3314,6 +3542,7 @@ mod tests {
         assert_eq!(parts.runtime.fdt, fdt);
         assert_eq!(parts.runtime.block_devices.len(), 1);
         assert!(parts.runtime.vsock_device.is_none());
+        assert!(parts.runtime.entropy_device.is_none());
         assert_eq!(
             parts.runtime.block_devices[0].registration,
             block_registration
