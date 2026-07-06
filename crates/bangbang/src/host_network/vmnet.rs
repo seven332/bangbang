@@ -222,6 +222,9 @@ impl VmnetInterfaceConfig {
         if interface_name.as_bytes().contains(&0) {
             return Err(VmnetInterfaceConfigError::InteriorNulInBridgedInterfaceName);
         }
+        if interface_name.bytes().any(|byte| byte.is_ascii_control()) {
+            return Err(VmnetInterfaceConfigError::ControlCharacterInBridgedInterfaceName);
+        }
 
         Ok(Self {
             mode: VmnetMode::Bridged,
@@ -270,6 +273,7 @@ impl std::error::Error for VmnetHostDeviceNameConfigError {
 pub enum VmnetInterfaceConfigError {
     EmptyBridgedInterfaceName,
     InteriorNulInBridgedInterfaceName,
+    ControlCharacterInBridgedInterfaceName,
 }
 
 impl fmt::Display for VmnetInterfaceConfigError {
@@ -281,6 +285,9 @@ impl fmt::Display for VmnetInterfaceConfigError {
             Self::InteriorNulInBridgedInterfaceName => {
                 f.write_str("vmnet bridged interface name must not contain NUL bytes")
             }
+            Self::ControlCharacterInBridgedInterfaceName => f.write_str(
+                "vmnet bridged interface name must not contain ASCII control characters",
+            ),
         }
     }
 }
@@ -2661,6 +2668,27 @@ mod tests {
     }
 
     #[test]
+    fn vmnet_host_dev_name_rejects_control_character_bridged_interface() {
+        let error = VmnetInterfaceConfig::from_host_dev_name("vmnet:bridged:en\n0")
+            .expect_err("control-character bridged interface should be rejected");
+
+        assert_eq!(
+            error,
+            VmnetHostDeviceNameConfigError::BridgedInterface {
+                source: VmnetInterfaceConfigError::ControlCharacterInBridgedInterfaceName
+            }
+        );
+        assert_eq!(
+            error
+                .source()
+                .expect("bridged error should expose source")
+                .to_string(),
+            "vmnet bridged interface name must not contain ASCII control characters"
+        );
+        assert!(!error.to_string().contains("en\n0"));
+    }
+
+    #[test]
     fn bridged_config_rejects_empty_interface_name() {
         let error = VmnetInterfaceConfig::bridged("")
             .expect_err("empty bridged interface should be rejected");
@@ -2684,6 +2712,21 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "vmnet bridged interface name must not contain NUL bytes"
+        );
+    }
+
+    #[test]
+    fn bridged_config_rejects_control_character_interface_name() {
+        let error = VmnetInterfaceConfig::bridged("en\t0")
+            .expect_err("control-character bridged interface should be rejected");
+
+        assert_eq!(
+            error,
+            VmnetInterfaceConfigError::ControlCharacterInBridgedInterfaceName
+        );
+        assert_eq!(
+            error.to_string(),
+            "vmnet bridged interface name must not contain ASCII control characters"
         );
     }
 
