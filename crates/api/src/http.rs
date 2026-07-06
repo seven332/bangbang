@@ -261,6 +261,91 @@ impl CpuConfigRequest {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CpuConfigRequestBody {
+    #[serde(default)]
+    kvm_capabilities: Vec<CpuConfigKvmCapability>,
+    #[serde(default)]
+    reg_modifiers: Vec<CpuConfigArmRegisterModifier>,
+    #[serde(default)]
+    vcpu_features: Vec<CpuConfigVcpuFeature>,
+}
+
+impl CpuConfigRequestBody {
+    fn validate(&self) -> Result<(), ()> {
+        for capability in &self.kvm_capabilities {
+            capability.validate()?;
+        }
+        for modifier in &self.reg_modifiers {
+            modifier.validate()?;
+        }
+        for feature in &self.vcpu_features {
+            feature.validate()?;
+        }
+        Ok(())
+    }
+
+    const fn custom_template_configured(&self) -> bool {
+        !(self.kvm_capabilities.is_empty()
+            && self.reg_modifiers.is_empty()
+            && self.vcpu_features.is_empty())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(transparent)]
+struct CpuConfigKvmCapability(String);
+
+impl CpuConfigKvmCapability {
+    fn validate(&self) -> Result<(), ()> {
+        let capability = self.0.strip_prefix('!').unwrap_or(&self.0);
+
+        if capability.is_empty() {
+            return Err(());
+        }
+
+        capability.parse::<u32>().map(|_| ()).map_err(|_| ())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CpuConfigArmRegisterModifier {
+    addr: String,
+    bitmap: String,
+}
+
+impl CpuConfigArmRegisterModifier {
+    fn validate(&self) -> Result<(), ()> {
+        let register_id = validate_prefixed_u64(&self.addr)?;
+        let register_bits = validate_arm64_register_bits(register_id)?;
+        let bitmap = validate_bitmap(&self.bitmap, u128::BITS)?;
+
+        if let Some(limit) = register_bitmap_limit(register_bits)
+            && (bitmap.value > limit || bitmap.filter > limit)
+        {
+            return Err(());
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CpuConfigVcpuFeature {
+    index: u32,
+    bitmap: String,
+}
+
+impl CpuConfigVcpuFeature {
+    fn validate(&self) -> Result<(), ()> {
+        let _ = self.index;
+        validate_bitmap(&self.bitmap, u32::BITS).map(|_| ())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmStateUpdateRequest {
     state: VmStateUpdate,
@@ -1810,94 +1895,51 @@ fn parse_vm_state_update_request(body: &[u8]) -> Result<ApiRequest, RequestError
 fn parse_cpu_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
     let value = serde_json::from_slice::<serde_json::Value>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
-    let custom_template_configured =
-        validate_cpu_config_value(&value).map_err(|()| RequestError::MalformedRequest)?;
+    validate_cpu_config_json_shape(&value).map_err(|()| RequestError::MalformedRequest)?;
+
+    let body = serde_json::from_slice::<CpuConfigRequestBody>(body)
+        .map_err(|_| RequestError::MalformedRequest)?;
+    body.validate()
+        .map_err(|()| RequestError::MalformedRequest)?;
 
     Ok(ApiRequest::PutCpuConfig(Box::new(CpuConfigRequest {
-        custom_template_configured,
+        custom_template_configured: body.custom_template_configured(),
     })))
 }
 
-fn validate_cpu_config_value(value: &serde_json::Value) -> Result<bool, ()> {
+fn validate_cpu_config_json_shape(value: &serde_json::Value) -> Result<(), ()> {
     let object = value.as_object().ok_or(())?;
 
-    for key in object.keys() {
-        if !matches!(
-            key.as_str(),
-            "kvm_capabilities" | "reg_modifiers" | "vcpu_features"
-        ) {
-            return Err(());
+    for (key, value) in object {
+        match key.as_str() {
+            "kvm_capabilities" => {
+                value.as_array().ok_or(())?;
+            }
+            "reg_modifiers" => validate_cpu_config_json_object_array(value, &["addr", "bitmap"])?,
+            "vcpu_features" => {
+                validate_cpu_config_json_object_array(value, &["index", "bitmap"])?;
+            }
+            _ => return Err(()),
         }
-    }
-
-    let mut custom_template_configured = false;
-    if let Some(kvm_capabilities) = object.get("kvm_capabilities") {
-        custom_template_configured |=
-            validate_cpu_config_array(kvm_capabilities, validate_kvm_capability)?;
-    }
-    if let Some(reg_modifiers) = object.get("reg_modifiers") {
-        custom_template_configured |=
-            validate_cpu_config_array(reg_modifiers, validate_arm_register_modifier)?;
-    }
-    if let Some(vcpu_features) = object.get("vcpu_features") {
-        custom_template_configured |=
-            validate_cpu_config_array(vcpu_features, validate_vcpu_feature)?;
-    }
-
-    Ok(custom_template_configured)
-}
-
-fn validate_cpu_config_array(
-    value: &serde_json::Value,
-    mut validate_item: impl FnMut(&serde_json::Value) -> Result<(), ()>,
-) -> Result<bool, ()> {
-    let values = value.as_array().ok_or(())?;
-
-    for item in values {
-        validate_item(item)?;
-    }
-
-    Ok(!values.is_empty())
-}
-
-fn validate_kvm_capability(value: &serde_json::Value) -> Result<(), ()> {
-    let capability = value.as_str().ok_or(())?;
-    let capability = capability.strip_prefix('!').unwrap_or(capability);
-
-    if capability.is_empty() {
-        return Err(());
-    }
-
-    capability.parse::<u32>().map(|_| ()).map_err(|_| ())
-}
-
-fn validate_arm_register_modifier(value: &serde_json::Value) -> Result<(), ()> {
-    let object = exact_object(value, &["addr", "bitmap"])?;
-
-    let register_id = validate_prefixed_u64(required_field(object, "addr")?)?;
-    let register_bits = validate_arm64_register_bits(register_id)?;
-    let bitmap = validate_bitmap(required_field(object, "bitmap")?, u128::BITS)?;
-
-    if let Some(limit) = register_bitmap_limit(register_bits)
-        && (bitmap.value > limit || bitmap.filter > limit)
-    {
-        return Err(());
     }
 
     Ok(())
 }
 
-fn validate_vcpu_feature(value: &serde_json::Value) -> Result<(), ()> {
-    let object = exact_object(value, &["index", "bitmap"])?;
+fn validate_cpu_config_json_object_array(
+    value: &serde_json::Value,
+    fields: &[&str],
+) -> Result<(), ()> {
+    let values = value.as_array().ok_or(())?;
 
-    validate_u32_number(required_field(object, "index")?)?;
-    validate_bitmap(required_field(object, "bitmap")?, u32::BITS).map(|_| ())
+    for value in values {
+        validate_cpu_config_json_object(value, fields)?;
+    }
+
+    Ok(())
 }
 
-fn exact_object<'value>(
-    value: &'value serde_json::Value,
-    fields: &[&str],
-) -> Result<&'value serde_json::Map<String, serde_json::Value>, ()> {
+fn validate_cpu_config_json_object(value: &serde_json::Value, fields: &[&str]) -> Result<(), ()> {
     let object = value.as_object().ok_or(())?;
 
     for field in fields {
@@ -1911,19 +1953,11 @@ fn exact_object<'value>(
         }
     }
 
-    Ok(object)
+    Ok(())
 }
 
-fn required_field<'value>(
-    object: &'value serde_json::Map<String, serde_json::Value>,
-    field: &str,
-) -> Result<&'value serde_json::Value, ()> {
-    object.get(field).ok_or(())
-}
-
-fn validate_prefixed_u64(value: &serde_json::Value) -> Result<u64, ()> {
-    let string = value.as_str().ok_or(())?;
-    parse_prefixed_integer(string, u64::from_str_radix)
+fn validate_prefixed_u64(value: &str) -> Result<u64, ()> {
+    parse_prefixed_integer(value, u64::from_str_radix)
 }
 
 fn parse_prefixed_integer<T>(
@@ -1943,12 +1977,6 @@ fn parse_prefixed_integer<T>(
     }
 
     parse(digits, radix).map_err(|_| ())
-}
-
-fn validate_u32_number(value: &serde_json::Value) -> Result<(), ()> {
-    let number = value.as_u64().ok_or(())?;
-
-    u32::try_from(number).map(|_| ()).map_err(|_| ())
 }
 
 fn validate_arm64_register_bits(register_id: u64) -> Result<u32, ()> {
@@ -1974,8 +2002,7 @@ struct CpuTemplateBitmap {
     value: u128,
 }
 
-fn validate_bitmap(value: &serde_json::Value, max_bits: u32) -> Result<CpuTemplateBitmap, ()> {
-    let bitmap = value.as_str().ok_or(())?;
+fn validate_bitmap(bitmap: &str, max_bits: u32) -> Result<CpuTemplateBitmap, ()> {
     let bitmap = bitmap.strip_prefix("0b").unwrap_or(bitmap);
     let mut bit_count = 0;
     let mut filter = 0;
@@ -5064,11 +5091,17 @@ mod tests {
             r#"{"reg_modifiers":[{"addr":"1","bitmap":"0b1"}]}"#,
             r#"{"reg_modifiers":[{"addr":"0x1","bitmap":"0b2"}]}"#,
             r#"{"reg_modifiers":[{"addr":"0x0010000000000000","bitmap":"0b1"}]}"#,
+            r#"{"reg_modifiers":[["0x0030000000000000","0b1"]]}"#,
+            r#"{"vcpu_features":[[0,"0b1"]]}"#,
             r#"{"vcpu_features":[{"index":4294967296,"bitmap":"0b1"}]}"#,
         ] {
             let request = request_with_body("PUT", "/cpu-config", body);
 
-            assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+            assert_eq!(
+                parse_request(&request),
+                Err(RequestError::MalformedRequest),
+                "{body}"
+            );
         }
 
         let high_bit_body = format!(
@@ -5078,6 +5111,27 @@ mod tests {
         let request = request_with_body("PUT", "/cpu-config", &high_bit_body);
 
         assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_duplicate_cpu_config_fields() {
+        for body in [
+            r#"{"kvm_capabilities":[],"kvm_capabilities":[]}"#,
+            r#"{"reg_modifiers":[],"reg_modifiers":[]}"#,
+            r#"{"vcpu_features":[],"vcpu_features":[]}"#,
+            r#"{"reg_modifiers":[{"addr":"0x0030000000000000","addr":"0x0030000000000000","bitmap":"0b1"}]}"#,
+            r#"{"reg_modifiers":[{"addr":"0x0030000000000000","bitmap":"0b1","bitmap":"0b0"}]}"#,
+            r#"{"vcpu_features":[{"index":0,"index":1,"bitmap":"0b1"}]}"#,
+            r#"{"vcpu_features":[{"index":0,"bitmap":"0b1","bitmap":"0b0"}]}"#,
+        ] {
+            let request = request_with_body("PUT", "/cpu-config", body);
+
+            assert_eq!(
+                parse_request(&request),
+                Err(RequestError::MalformedRequest),
+                "{body}"
+            );
+        }
     }
 
     #[test]
