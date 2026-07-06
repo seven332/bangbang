@@ -6,8 +6,8 @@ use std::os::fd::RawFd;
 
 use crate::VmmController;
 use crate::block::{
-    BlockMmioDeviceRegistration, BlockMmioLayout, BlockMmioRegistrationError, DriveConfig,
-    DriveUpdateError, PreparedBlockDeviceError, PreparedBlockDevices,
+    BlockFileBacking, BlockMmioDeviceRegistration, BlockMmioLayout, BlockMmioRegistrationError,
+    DriveConfig, DriveUpdateError, PreparedBlockDeviceError, PreparedBlockDevices,
     VirtioBlockDeviceNotificationDispatch, VirtioBlockDeviceNotificationError,
     VirtioBlockMmioHandler,
 };
@@ -1074,6 +1074,26 @@ pub fn update_block_device_backing_for_devices(
     mmio_dispatcher: &mut MmioDispatcher,
     config: &DriveConfig,
 ) -> Result<(), DriveUpdateError> {
+    let backing =
+        BlockFileBacking::open(config).map_err(|source| DriveUpdateError::OpenBacking {
+            drive_id: config.drive_id().to_string(),
+            message: source.to_string(),
+        })?;
+
+    update_block_device_backing_for_devices_with_opened(
+        block_devices,
+        mmio_dispatcher,
+        config,
+        backing,
+    )
+}
+
+pub fn update_block_device_backing_for_devices_with_opened(
+    block_devices: &[Arm64BootBlockDevice],
+    mmio_dispatcher: &mut MmioDispatcher,
+    config: &DriveConfig,
+    backing: BlockFileBacking,
+) -> Result<(), DriveUpdateError> {
     let Some(device) = block_devices
         .iter()
         .find(|device| device.registration.drive_id() == config.drive_id())
@@ -1091,7 +1111,9 @@ pub fn update_block_device_backing_for_devices(
             message: source.to_string(),
         })?;
 
-    handler.refresh_block_backing(config)
+    handler.refresh_block_backing_with_opened(config, backing);
+
+    Ok(())
 }
 
 #[derive(Debug)]

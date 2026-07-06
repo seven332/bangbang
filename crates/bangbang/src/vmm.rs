@@ -16,7 +16,8 @@ use bangbang_hvf::{
     HvfArm64BootSessionConfig, HvfVcpuRunnerError, OwnedHvfArm64BootSession,
 };
 use bangbang_runtime::block::{
-    BlockMmioLayout, DriveConfig, DriveConfigInput, DriveUpdateError, DriveUpdateInput,
+    BlockFileBacking, BlockMmioLayout, DriveConfig, DriveConfigInput, DriveUpdateError,
+    DriveUpdateInput,
 };
 use bangbang_runtime::boot::BootSourceConfigInput;
 use bangbang_runtime::cpu::CpuConfigInput;
@@ -42,7 +43,7 @@ use bangbang_runtime::serial::{
 use bangbang_runtime::startup::{
     Arm64BootBlockDevice, Arm64BootNetworkDevice, Arm64BootNetworkPacketIo,
     Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
-    update_block_device_backing_for_devices,
+    update_block_device_backing_for_devices_with_opened,
 };
 use bangbang_runtime::vsock::{VsockConfigInput, VsockMmioLayout};
 use bangbang_runtime::{BackendError, VmmAction, VmmActionError, VmmController, VmmData};
@@ -130,12 +131,22 @@ impl BootRunLoopBlockDeviceUpdater {
     }
 
     fn update_block_device(&self, config: &DriveConfig) -> Result<(), DriveUpdateError> {
+        let backing =
+            BlockFileBacking::open(config).map_err(|source| DriveUpdateError::OpenBacking {
+                drive_id: config.drive_id().to_string(),
+                message: source.to_string(),
+            })?;
         let mut dispatcher = self
             .mmio_dispatcher
             .lock()
             .map_err(|_| DriveUpdateError::MmioDispatcherUnavailable)?;
 
-        update_block_device_backing_for_devices(&self.block_devices, &mut dispatcher, config)
+        update_block_device_backing_for_devices_with_opened(
+            &self.block_devices,
+            &mut dispatcher,
+            config,
+            backing,
+        )
     }
 }
 

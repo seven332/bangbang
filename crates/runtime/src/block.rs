@@ -2948,14 +2948,23 @@ impl VirtioMmioRegisterHandler<VirtioBlockConfigSpace, VirtioBlockDevice> {
                 drive_id: config.drive_id().to_string(),
                 message: source.to_string(),
             })?;
+
+        self.refresh_block_backing_with_opened(config, backing);
+
+        Ok(())
+    }
+
+    pub fn refresh_block_backing_with_opened(
+        &mut self,
+        config: &DriveConfig,
+        backing: BlockFileBacking,
+    ) {
         let config_space = VirtioBlockConfigSpace::from_backing(&backing, config.cache_type());
 
         self.activation_handler_mut().refresh_backing(backing);
         *self.device_config_handler_mut() = config_space;
         self.increment_config_generation();
         self.mark_interrupt_pending(DeviceInterruptKind::Config);
-
-        Ok(())
     }
 }
 
