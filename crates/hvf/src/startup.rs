@@ -2025,6 +2025,7 @@ impl HvfArm64BootRunLoopWakeupMonitor {
     }
 
     fn finish(mut self) -> Result<bool, HvfArm64BootRunLoopWakeupMonitorError> {
+        let mut stop_signal_error = None;
         if let Some(mut stop_writer) = self.stop_writer.take() {
             match stop_writer.write_all(&VSOCK_WAKEUP_MONITOR_STOP_BYTE) {
                 Ok(()) => {}
@@ -2034,20 +2035,24 @@ impl HvfArm64BootRunLoopWakeupMonitor {
                         io::ErrorKind::BrokenPipe | io::ErrorKind::NotConnected
                     ) => {}
                 Err(source) => {
-                    return Err(HvfArm64BootRunLoopWakeupMonitorError::StopSignal {
-                        source: source.kind(),
-                    });
+                    stop_signal_error = Some(source.kind());
                 }
             }
         }
 
-        let Some(thread) = self.thread.take() else {
-            return Ok(self.completed_wakeup);
+        let completed_wakeup = if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| HvfArm64BootRunLoopWakeupMonitorError::ThreadPanicked)?
+        } else {
+            self.completed_wakeup
         };
 
-        thread
-            .join()
-            .map_err(|_| HvfArm64BootRunLoopWakeupMonitorError::ThreadPanicked)
+        if let Some(source) = stop_signal_error {
+            return Err(HvfArm64BootRunLoopWakeupMonitorError::StopSignal { source });
+        }
+
+        Ok(completed_wakeup)
     }
 
     const fn create_stop_pipe_error(
