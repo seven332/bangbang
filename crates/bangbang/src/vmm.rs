@@ -1374,7 +1374,11 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
     }
 
     fn should_continue_after_outcome(outcome: &Self::Outcome) -> bool {
-        matches!(outcome, HvfArm64BootRunLoopOutcome::StepLimitReached { .. })
+        matches!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::StepLimitReached { .. }
+                | HvfArm64BootRunLoopOutcome::Wakeup { .. }
+        )
     }
 }
 
@@ -1445,7 +1449,11 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
     }
 
     fn should_continue_after_outcome(outcome: &Self::Outcome) -> bool {
-        matches!(outcome, HvfArm64BootRunLoopOutcome::StepLimitReached { .. })
+        matches!(
+            outcome,
+            HvfArm64BootRunLoopOutcome::StepLimitReached { .. }
+                | HvfArm64BootRunLoopOutcome::Wakeup { .. }
+        )
     }
 }
 
@@ -1494,6 +1502,9 @@ trait BootRunLoopProcessExit {
 impl BootRunLoopProcessExit for HvfArm64BootRunLoopOutcome {
     fn process_exit_status(&self) -> ProcessSessionExitStatus {
         match self {
+            Self::StepLimitReached { .. } | Self::Wakeup { .. } => {
+                ProcessSessionExitStatus::Running
+            }
             Self::GuestShutdown { .. } | Self::GuestReset { .. } => {
                 ProcessSessionExitStatus::GuestRequestedStop
             }
@@ -1976,13 +1987,14 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum FakeRunLoopOutcome {
         StepLimitReached,
+        Wakeup,
         Terminal,
     }
 
     impl super::BootRunLoopProcessExit for FakeRunLoopOutcome {
         fn process_exit_status(&self) -> super::ProcessSessionExitStatus {
             match self {
-                Self::StepLimitReached => super::ProcessSessionExitStatus::Running,
+                Self::StepLimitReached | Self::Wakeup => super::ProcessSessionExitStatus::Running,
                 Self::Terminal => super::ProcessSessionExitStatus::GuestRequestedStop,
             }
         }
@@ -2026,6 +2038,22 @@ mod tests {
                 },
             ),
             super::ProcessSessionExitStatus::Terminal
+        );
+    }
+
+    #[test]
+    fn hvf_resumable_run_loop_outcomes_keep_process_running() {
+        assert_eq!(
+            super::BootRunLoopProcessExit::process_exit_status(
+                &super::HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 1 },
+            ),
+            super::ProcessSessionExitStatus::Running
+        );
+        assert_eq!(
+            super::BootRunLoopProcessExit::process_exit_status(
+                &super::HvfArm64BootRunLoopOutcome::Wakeup { steps: 1 },
+            ),
+            super::ProcessSessionExitStatus::Running
         );
     }
 
@@ -2192,7 +2220,10 @@ mod tests {
         }
 
         fn should_continue_after_outcome(outcome: &Self::Outcome) -> bool {
-            matches!(outcome, FakeRunLoopOutcome::StepLimitReached)
+            matches!(
+                outcome,
+                FakeRunLoopOutcome::StepLimitReached | FakeRunLoopOutcome::Wakeup
+            )
         }
     }
 
@@ -2236,7 +2267,10 @@ mod tests {
         }
 
         fn should_continue_after_outcome(outcome: &Self::Outcome) -> bool {
-            matches!(outcome, FakeRunLoopOutcome::StepLimitReached)
+            matches!(
+                outcome,
+                FakeRunLoopOutcome::StepLimitReached | FakeRunLoopOutcome::Wakeup
+            )
         }
     }
 
@@ -3218,6 +3252,41 @@ mod tests {
             );
         }
         assert_eq!(run_count.load(Ordering::SeqCst), 3);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 0);
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_repeats_after_wakeup_outcome() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_wait_for_stop(false)
+                .with_outcomes([
+                    Ok(FakeRunLoopOutcome::Wakeup),
+                    Ok(FakeRunLoopOutcome::Terminal),
+                ]);
+        let run_count = session.run_count();
+
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(13).expect("non-zero limit"))
+                .expect("supervisor should start");
+
+        for _ in 0..2 {
+            assert_eq!(
+                max_steps_receiver
+                    .recv()
+                    .expect("worker should enter run loop"),
+                13
+            );
+        }
+        assert_eq!(run_count.load(Ordering::SeqCst), 2);
         assert_eq!(drop_count.load(Ordering::SeqCst), 0);
 
         drop(supervisor);
