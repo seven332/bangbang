@@ -2494,6 +2494,12 @@ mod tests {
             VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
         )
         .expect("vsock MMIO region should be valid");
+        let entropy_region = MmioRegion::new(
+            DEFAULT_ENTROPY_MMIO_REGION_ID,
+            DEFAULT_ENTROPY_MMIO_BASE,
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+        )
+        .expect("entropy MMIO region should be valid");
         let serial_region = MmioRegion::new(
             serial_region_id,
             DEFAULT_SERIAL_MMIO_BASE,
@@ -2506,16 +2512,17 @@ mod tests {
                 .registrations()
                 .iter()
                 .all(|registration| registration.region_id() != serial_region_id
-                    && registration.region_id() != vsock_region.id())
+                    && registration.region_id() != vsock_region.id()
+                    && registration.region_id() != entropy_region.id())
         );
-        assert!(
-            network_devices
-                .registrations()
-                .iter()
-                .all(|registration| registration.region_id() != serial_region_id
-                    && registration.region_id() != vsock_region.id())
-        );
+        assert!(network_devices.registrations().iter().all(
+            |registration| registration.region_id() != serial_region_id
+                && registration.region_id() != vsock_region.id()
+                && registration.region_id() != entropy_region.id()
+        ));
         assert_ne!(vsock_region.id(), serial_region_id);
+        assert_ne!(entropy_region.id(), serial_region_id);
+        assert_ne!(entropy_region.id(), vsock_region.id());
         assert!(block_devices.registrations().iter().all(|block| {
             network_devices
                 .registrations()
@@ -2523,12 +2530,16 @@ mod tests {
                 .all(|network| !block.region().range().overlaps(network.region().range()))
                 && !block.region().range().overlaps(serial_region.range())
                 && !block.region().range().overlaps(vsock_region.range())
+                && !block.region().range().overlaps(entropy_region.range())
         }));
         assert!(network_devices.registrations().iter().all(|network| {
             !network.region().range().overlaps(serial_region.range())
                 && !network.region().range().overlaps(vsock_region.range())
+                && !network.region().range().overlaps(entropy_region.range())
         }));
         assert!(!vsock_region.range().overlaps(serial_region.range()));
+        assert!(!entropy_region.range().overlaps(serial_region.range()));
+        assert!(!entropy_region.range().overlaps(vsock_region.range()));
     }
 
     #[test]
