@@ -4409,6 +4409,25 @@ mod tests {
             bangbang_api::http::StatusCode::NoContent
         );
 
+        let machine_none_request = request_with_body(
+            "PUT",
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256,"cpu_template":"None"}"#,
+        );
+        assert_eq!(
+            handle_request_bytes(machine_none_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+
+        let unsupported_machine_patch_response = handle_request_bytes(
+            request_with_body("PATCH", "/machine-config", r#"{"cpu_template":"T2A"}"#).as_bytes(),
+            &mut vmm,
+        );
+        assert_eq!(
+            unsupported_machine_patch_response.status(),
+            bangbang_api::http::StatusCode::BadRequest
+        );
+
         let mmds_config_response = handle_request_bytes(
             request_with_body("PUT", "/mmds/config", r#"{"network_interfaces":[]}"#).as_bytes(),
             &mut vmm,
@@ -4490,7 +4509,7 @@ mod tests {
             fs::read_to_string(&metrics_path).expect("metrics output should be readable");
         assert_eq!(
             metrics_output,
-            "{\"deprecated_api\":{\"deprecated_http_api_calls\":3},\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":1,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":1,\"mmds_fails\":1,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":1,\"vsock_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"deprecated_api\":{\"deprecated_http_api_calls\":5},\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":3,\"machine_cfg_fails\":1,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":1,\"mmds_fails\":1,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":1,\"vsock_fails\":1},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
         assert!(!metrics_output.contains("vsock-secret"));
         assert!(!metrics_output.contains("deprecated-vsock-secret"));
