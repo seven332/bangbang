@@ -458,6 +458,20 @@ success; invalid updates leave the stored configuration unchanged.
 `GET /machine-config` returns the stored or default configuration. The stored
 values are applied during `InstanceStart` startup.
 
+Entropy support is tracked by #797 and needs to move as one guest-visible
+capability instead of only accepting configuration. The target supported subset
+is one Firecracker-shaped virtio-rng device configured before startup, attached
+as a virtio-mmio device in the arm64 FDT, backed by host randomness, and
+validated through the signed executable process/HVF path by a guest read from
+the RNG device. The follow-up split should keep PRs independently mergeable:
+first add the API/runtime configuration model while preserving unsupported
+rate-limiter behavior, then add the backend-neutral virtio-rng queue handler,
+then wire startup, MMIO layout, FDT, interrupts, reset/cleanup, and finally add
+signed executable e2e and metrics/security docs. Entropy device metrics and
+real rate limiting remain deferred until their producers exist. `PUT /entropy`
+must continue to return unsupported until a later PR exposes guest-visible
+entropy behavior.
+
 The API and VMM state path also route valid snapshot requests through explicit
 actions before returning unsupported faults. `PUT /snapshot/create` fails as an
 unsupported state before startup and reaches the snapshot unsupported fault once
@@ -486,9 +500,10 @@ without side effects. It includes the stored/default `machine-config`, includes
 `boot-source` only after it is configured, and always includes a `drives` array
 for configured virtio-block drives plus a `network-interfaces` array for stored
 network interface configs. It includes `vsock` only after `PUT /vsock` stores a
-valid configuration. Firecracker sections without stored configuration models,
-including MMDS, balloon, snapshots, and hotplug, are omitted until those models
-exist.
+valid configuration. It includes `mmds-config` after successful MMDS
+configuration storage. Firecracker sections without stored configuration
+models, including balloon, entropy, snapshots, and hotplug, are omitted until
+those models exist.
 Metrics and logger output configuration are also omitted because they are
 process observability state rather than guest configuration.
 
