@@ -531,6 +531,22 @@ mod tests {
     }
 
     #[test]
+    fn page_conversion_accepts_maximum_amount() {
+        let pages = mib_to_4k_pages(VIRTIO_BALLOON_MAX_AMOUNT_MIB)
+            .expect("maximum balloon amount should convert");
+        let device = prepared(balloon_config(
+            VIRTIO_BALLOON_MAX_AMOUNT_MIB,
+            false,
+            0,
+            false,
+            false,
+        ));
+
+        assert_eq!(pages, u32::MAX - 255);
+        assert_eq!(device.config_space().num_pages(), pages);
+    }
+
+    #[test]
     fn config_space_uses_firecracker_little_endian_layout() {
         let config_space = VirtioBalloonConfigSpace::new(0x0102_0304, 0x0506_0708, 0x090a_0b0c);
 
