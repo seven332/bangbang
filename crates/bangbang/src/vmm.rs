@@ -15,7 +15,9 @@ use bangbang_hvf::{
     HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig,
     HvfArm64BootSessionConfig, HvfVcpuRunnerError, OwnedHvfArm64BootSession,
 };
-use bangbang_runtime::block::{BlockMmioLayout, DriveConfigInput, DriveUpdateInput};
+use bangbang_runtime::block::{
+    BlockMmioLayout, DriveConfig, DriveConfigInput, DriveUpdateError, DriveUpdateInput,
+};
 use bangbang_runtime::boot::BootSourceConfigInput;
 use bangbang_runtime::cpu::CpuConfigInput;
 use bangbang_runtime::entropy::EntropyMmioLayout;
@@ -26,7 +28,7 @@ use bangbang_runtime::metrics::{BootRunLoopMetricStatus, MetricsConfigInput, Met
 use bangbang_runtime::mmds::{
     MmdsConfig, MmdsConfigInput, MmdsContentInput, MmdsStateHandle, MmdsStateLockError,
 };
-use bangbang_runtime::mmio::MmioRegionId;
+use bangbang_runtime::mmio::{MmioDispatcher, MmioRegionId};
 use bangbang_runtime::network::{
     NetworkInterfaceConfig, NetworkInterfaceConfigError, NetworkInterfaceConfigInput,
     NetworkInterfaceUpdateInput, NetworkMmioLayout, VirtioNetworkRxPacket,
@@ -38,8 +40,9 @@ use bangbang_runtime::serial::{
     SharedSerialOutputBuffer,
 };
 use bangbang_runtime::startup::{
-    Arm64BootNetworkDevice, Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError,
-    Arm64BootNetworkPacketIoProvider,
+    Arm64BootBlockDevice, Arm64BootNetworkDevice, Arm64BootNetworkPacketIo,
+    Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
+    update_block_device_backing_for_devices,
 };
 use bangbang_runtime::vsock::{VsockConfigInput, VsockMmioLayout};
 use bangbang_runtime::{BackendError, VmmAction, VmmActionError, VmmController, VmmData};
@@ -59,8 +62,6 @@ use crate::host_network::vmnet::{
 
 #[cfg(test)]
 use bangbang_runtime::InstanceInfo;
-#[cfg(test)]
-use bangbang_runtime::block::DriveConfig;
 #[cfg(test)]
 use bangbang_runtime::boot::BootSourceConfig;
 #[cfg(test)]
@@ -92,6 +93,10 @@ pub(crate) trait ProcessSessionDiagnostics {
         MetricsDiagnostics::default()
     }
 
+    fn update_block_device(&mut self, _config: &DriveConfig) -> Result<(), DriveUpdateError> {
+        Err(DriveUpdateError::ActiveSessionUnavailable)
+    }
+
     fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
         None
     }
@@ -106,6 +111,33 @@ pub(crate) trait ProcessSessionDiagnostics {
 }
 
 impl ProcessSessionDiagnostics for () {}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BootRunLoopBlockDeviceUpdater {
+    block_devices: Vec<Arm64BootBlockDevice>,
+    mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
+}
+
+impl BootRunLoopBlockDeviceUpdater {
+    fn new(
+        block_devices: Vec<Arm64BootBlockDevice>,
+        mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
+    ) -> Self {
+        Self {
+            block_devices,
+            mmio_dispatcher,
+        }
+    }
+
+    fn update_block_device(&self, config: &DriveConfig) -> Result<(), DriveUpdateError> {
+        let mut dispatcher = self
+            .mmio_dispatcher
+            .lock()
+            .map_err(|_| DriveUpdateError::MmioDispatcherUnavailable)?;
+
+        update_block_device_backing_for_devices(&self.block_devices, &mut dispatcher, config)
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum ProcessSessionExitStatus {
@@ -609,6 +641,7 @@ where
     pub(crate) fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
         match action {
             VmmAction::InstanceStart => self.start_instance(),
+            VmmAction::UpdateBlockDevice(input) => self.update_block_device(input),
             VmmAction::FlushMetrics => self.flush_metrics(),
             action => self.controller.handle_action(action),
         }
@@ -685,6 +718,32 @@ where
         let diagnostics = self.metrics_diagnostics();
 
         self.controller.flush_metrics_with_diagnostics(&diagnostics)
+    }
+
+    fn update_block_device(&mut self, input: DriveUpdateInput) -> Result<VmmData, VmmActionError> {
+        if self.controller.instance_info().state == bangbang_runtime::InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: VmmAction::UpdateBlockDevice(input).name(),
+                state: self.controller.instance_info().state,
+            });
+        }
+
+        let refresh_backing = input.path_on_host().is_some();
+        let updated_config = self.controller.updated_drive_config(input)?;
+        if refresh_backing {
+            let Some(session) = self.started_session.as_mut() else {
+                return Err(VmmActionError::DriveUpdate(
+                    DriveUpdateError::ActiveSessionUnavailable,
+                ));
+            };
+
+            session
+                .update_block_device(&updated_config)
+                .map_err(VmmActionError::DriveUpdate)?;
+        }
+        self.controller.commit_drive_update(updated_config)?;
+
+        Ok(VmmData::Empty)
     }
 
     pub(crate) fn flush_startup_metrics(&mut self) -> Result<bool, VmmActionError> {
@@ -1257,6 +1316,10 @@ pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
 
     fn run_loop_control(&self) -> Self::Control;
 
+    fn block_device_updater(&self) -> Option<BootRunLoopBlockDeviceUpdater> {
+        None
+    }
+
     fn run_loop_with_network_packet_io<P>(
         &mut self,
         stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
@@ -1276,6 +1339,13 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
 
     fn run_loop_control(&self) -> Self::Control {
         OwnedHvfArm64BootSession::run_loop_control(self)
+    }
+
+    fn block_device_updater(&self) -> Option<BootRunLoopBlockDeviceUpdater> {
+        Some(BootRunLoopBlockDeviceUpdater::new(
+            self.runtime_resources().block_devices.clone(),
+            self.mmio_dispatcher(),
+        ))
     }
 
     fn run_loop_with_network_packet_io<P>(
@@ -1326,6 +1396,10 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
 
     fn run_loop_control(&self) -> Self::Control;
 
+    fn block_device_updater(&self) -> Option<BootRunLoopBlockDeviceUpdater> {
+        None
+    }
+
     fn run_loop(
         &mut self,
         stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
@@ -1342,6 +1416,13 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
 
     fn run_loop_control(&self) -> Self::Control {
         OwnedHvfArm64BootSession::run_loop_control(self)
+    }
+
+    fn block_device_updater(&self) -> Option<BootRunLoopBlockDeviceUpdater> {
+        Some(BootRunLoopBlockDeviceUpdater::new(
+            self.runtime_resources().block_devices.clone(),
+            self.mmio_dispatcher(),
+        ))
     }
 
     fn run_loop(
@@ -1368,6 +1449,10 @@ where
 
     fn run_loop_control(&self) -> Self::Control {
         self.session.run_loop_control()
+    }
+
+    fn block_device_updater(&self) -> Option<BootRunLoopBlockDeviceUpdater> {
+        self.session.block_device_updater()
     }
 
     fn run_loop(
@@ -1472,6 +1557,7 @@ where
     S: BootRunLoopSession,
 {
     control: S::Control,
+    block_device_updater: Option<BootRunLoopBlockDeviceUpdater>,
     status: Arc<BootRunLoopWorkerStatusCell<S::Outcome>>,
     terminal_wakeup_reader: UnixStream,
     session_release_sender: Option<mpsc::Sender<()>>,
@@ -1484,6 +1570,7 @@ where
 {
     fn start(mut session: S, max_steps: NonZeroUsize) -> Result<Self, BackendError> {
         let control = session.run_loop_control();
+        let block_device_updater = session.block_device_updater();
         let stop_token = control.stop_token();
         let status = Arc::new(BootRunLoopWorkerStatusCell::new());
         let worker_status = Arc::clone(&status);
@@ -1528,6 +1615,7 @@ where
 
         Ok(Self {
             control,
+            block_device_updater,
             status,
             terminal_wakeup_reader,
             session_release_sender: Some(session_release_sender),
@@ -1576,6 +1664,14 @@ where
 {
     fn metrics_diagnostics(&self) -> MetricsDiagnostics {
         MetricsDiagnostics::new().with_boot_run_loop_status(self.metric_status())
+    }
+
+    fn update_block_device(&mut self, config: &DriveConfig) -> Result<(), DriveUpdateError> {
+        let Some(updater) = self.block_device_updater.as_ref() else {
+            return Err(DriveUpdateError::ActiveSessionUnavailable);
+        };
+
+        updater.update_block_device(config)
     }
 
     fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
@@ -1656,7 +1752,8 @@ mod tests {
     use std::sync::{Arc, Condvar, Mutex, mpsc};
 
     use bangbang_runtime::block::{
-        DriveConfigInput, DriveConfigs, DriveUpdateInput, PreparedBlockDevices,
+        DriveConfig, DriveConfigInput, DriveConfigs, DriveUpdateError, DriveUpdateInput,
+        PreparedBlockDevices,
     };
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::cpu::CpuConfigInput;
@@ -1744,9 +1841,41 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct FakeSession {
         id: u64,
+        block_update_count: usize,
+        last_block_update: Option<String>,
+        block_update_result: Option<DriveUpdateError>,
     }
 
-    impl ProcessSessionDiagnostics for FakeSession {}
+    impl FakeSession {
+        const fn new(id: u64) -> Self {
+            Self {
+                id,
+                block_update_count: 0,
+                last_block_update: None,
+                block_update_result: None,
+            }
+        }
+
+        fn with_block_update_result(id: u64, result: DriveUpdateError) -> Self {
+            Self {
+                id,
+                block_update_count: 0,
+                last_block_update: None,
+                block_update_result: Some(result),
+            }
+        }
+    }
+
+    impl ProcessSessionDiagnostics for FakeSession {
+        fn update_block_device(&mut self, config: &DriveConfig) -> Result<(), DriveUpdateError> {
+            self.block_update_count += 1;
+            self.last_block_update = Some(config.drive_id().to_string());
+            match self.block_update_result.clone() {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        }
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct DiagnosticSession {
@@ -1788,7 +1917,7 @@ mod tests {
 
     #[derive(Debug, Clone)]
     enum FakeStartResult {
-        Success(u64),
+        Success(FakeSession),
         Failure(BackendError),
     }
 
@@ -1800,8 +1929,12 @@ mod tests {
 
     impl FakeStarter {
         const fn success(id: u64) -> Self {
+            Self::success_with_session(FakeSession::new(id))
+        }
+
+        const fn success_with_session(session: FakeSession) -> Self {
             Self {
-                result: FakeStartResult::Success(id),
+                result: FakeStartResult::Success(session),
                 calls: 0,
             }
         }
@@ -1823,7 +1956,7 @@ mod tests {
         ) -> Result<Self::Session, BackendError> {
             self.calls += 1;
             match &self.result {
-                FakeStartResult::Success(id) => Ok(FakeSession { id: *id }),
+                FakeStartResult::Success(session) => Ok(session.clone()),
                 FakeStartResult::Failure(source) => Err(source.clone()),
             }
         }
@@ -2875,6 +3008,7 @@ mod tests {
             | VmmActionError::MissingBootSource
             | VmmActionError::BootSourceConfig(_)
             | VmmActionError::DriveConfig(_)
+            | VmmActionError::DriveUpdate(_)
             | VmmActionError::DriveUpdateUnsupported
             | VmmActionError::LoggerConfig(_)
             | VmmActionError::LoggerWrite(_)
@@ -3220,7 +3354,140 @@ mod tests {
         assert_eq!(data, bangbang_runtime::VmmData::Empty);
         assert_eq!(vmm.instance_info().state, InstanceState::Running);
         assert_eq!(vmm.starter.calls, 1);
-        assert_eq!(vmm.started_session, Some(FakeSession { id: 7 }));
+        assert_eq!(vmm.started_session, Some(FakeSession::new(7)));
+    }
+
+    #[test]
+    fn runtime_drive_update_refreshes_active_session_before_config_commit() {
+        let original = TempFilePath::create("runtime-drive-original");
+        let replacement = TempFilePath::create("runtime-drive-replacement");
+        let mut vmm = configured_vmm(FakeStarter::success(11));
+        vmm.handle_action(VmmAction::PutDrive(DriveConfigInput::new(
+            "data",
+            "data",
+            original.path(),
+            false,
+        )))
+        .expect("initial drive should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        let data = vmm
+            .handle_action(VmmAction::UpdateBlockDevice(DriveUpdateInput::new(
+                "data",
+                "data",
+                Some(replacement.path().to_path_buf()),
+            )))
+            .expect("runtime drive update should succeed");
+
+        assert_eq!(data, bangbang_runtime::VmmData::Empty);
+        assert_eq!(vmm.drive_configs().len(), 1);
+        assert_eq!(vmm.drive_configs()[0].path_on_host(), replacement.path());
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.block_update_count, 1);
+        assert_eq!(session.last_block_update.as_deref(), Some("data"));
+    }
+
+    #[test]
+    fn runtime_drive_update_without_path_is_noop_without_session_refresh() {
+        let original = TempFilePath::create("runtime-drive-noop-original");
+        let mut vmm = configured_vmm(FakeStarter::success(14));
+        vmm.handle_action(VmmAction::PutDrive(DriveConfigInput::new(
+            "data",
+            "data",
+            original.path(),
+            false,
+        )))
+        .expect("initial drive should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        let data = vmm
+            .handle_action(VmmAction::UpdateBlockDevice(DriveUpdateInput::new(
+                "data", "data", None,
+            )))
+            .expect("pathless runtime drive update should be a no-op");
+
+        assert_eq!(data, bangbang_runtime::VmmData::Empty);
+        assert_eq!(vmm.drive_configs().len(), 1);
+        assert_eq!(vmm.drive_configs()[0].path_on_host(), original.path());
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.block_update_count, 0);
+        assert_eq!(session.last_block_update, None);
+    }
+
+    #[test]
+    fn runtime_drive_update_failure_preserves_stored_config() {
+        let original = TempFilePath::create("runtime-drive-failure-original");
+        let replacement = TempFilePath::create("runtime-drive-failure-replacement");
+        let mut vmm = configured_vmm(FakeStarter::success_with_session(
+            FakeSession::with_block_update_result(12, DriveUpdateError::ActiveSessionUnavailable),
+        ));
+        vmm.handle_action(VmmAction::PutDrive(DriveConfigInput::new(
+            "data",
+            "data",
+            original.path(),
+            false,
+        )))
+        .expect("initial drive should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        let err = vmm
+            .handle_action(VmmAction::UpdateBlockDevice(DriveUpdateInput::new(
+                "data",
+                "data",
+                Some(replacement.path().to_path_buf()),
+            )))
+            .expect_err("failed session update should fail action");
+
+        assert_eq!(
+            err,
+            VmmActionError::DriveUpdate(DriveUpdateError::ActiveSessionUnavailable)
+        );
+        assert_eq!(vmm.drive_configs().len(), 1);
+        assert_eq!(vmm.drive_configs()[0].path_on_host(), original.path());
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.block_update_count, 1);
+        assert_eq!(session.last_block_update.as_deref(), Some("data"));
+    }
+
+    #[test]
+    fn runtime_drive_update_unknown_drive_does_not_touch_session() {
+        let replacement = TempFilePath::create("runtime-drive-unknown-replacement");
+        let mut vmm = configured_vmm(FakeStarter::success(13));
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        let err = vmm
+            .handle_action(VmmAction::UpdateBlockDevice(DriveUpdateInput::new(
+                "missing",
+                "missing",
+                Some(replacement.path().to_path_buf()),
+            )))
+            .expect_err("unknown drive should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::DriveUpdate(DriveUpdateError::UnknownDrive {
+                drive_id: "missing".to_string()
+            })
+        );
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.block_update_count, 0);
+        assert_eq!(session.last_block_update, None);
     }
 
     #[test]
@@ -3418,6 +3685,6 @@ mod tests {
             }
         );
         assert_eq!(vmm.starter.calls, 1);
-        assert_eq!(vmm.started_session, Some(FakeSession { id: 9 }));
+        assert_eq!(vmm.started_session, Some(FakeSession::new(9)));
     }
 }

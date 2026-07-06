@@ -270,6 +270,7 @@ pub enum VmmActionError {
     InstanceStart(BackendError),
     BootSourceConfig(boot::BootSourceConfigError),
     DriveConfig(block::DriveConfigError),
+    DriveUpdate(block::DriveUpdateError),
     DriveUpdateUnsupported,
     EntropyConfig(entropy::EntropyConfigError),
     LoggerConfig(logger::LoggerConfigError),
@@ -309,6 +310,7 @@ impl fmt::Display for VmmActionError {
             Self::InstanceStart(err) => write!(f, "failed to start microVM: {err}"),
             Self::BootSourceConfig(err) => write!(f, "{err}"),
             Self::DriveConfig(err) => write!(f, "{err}"),
+            Self::DriveUpdate(err) => write!(f, "{err}"),
             Self::DriveUpdateUnsupported => f.write_str("Drive updates are not supported."),
             Self::EntropyConfig(err) => write!(f, "{err}"),
             Self::LoggerConfig(err) => write!(f, "{err}"),
@@ -338,6 +340,7 @@ impl std::error::Error for VmmActionError {
             Self::InstanceStart(err) => Some(err),
             Self::BootSourceConfig(err) => Some(err),
             Self::DriveConfig(err) => Some(err),
+            Self::DriveUpdate(err) => Some(err),
             Self::EntropyConfig(err) => Some(err),
             Self::LoggerConfig(err) => Some(err),
             Self::LoggerWrite(err) => Some(err),
@@ -471,6 +474,24 @@ impl VmmController {
             self.vsock_config.clone(),
             self.entropy_config,
         ))
+    }
+
+    pub fn updated_drive_config(
+        &self,
+        input: block::DriveUpdateInput,
+    ) -> Result<block::DriveConfig, VmmActionError> {
+        self.drive_configs
+            .updated_config(input)
+            .map_err(VmmActionError::DriveUpdate)
+    }
+
+    pub fn commit_drive_update(
+        &mut self,
+        config: block::DriveConfig,
+    ) -> Result<(), VmmActionError> {
+        self.drive_configs
+            .commit_update(config)
+            .map_err(VmmActionError::DriveUpdate)
     }
 
     pub fn preflight_instance_start(&self) -> Result<(), VmmActionError> {

@@ -75,10 +75,10 @@ same runtime metrics sink every 60 seconds while the VM is running. Metrics
 flush failures increment the minimal Firecracker-shaped
 `logger.missed_metrics_count` counter, and logger action write failures
 increment `logger.missed_log_count`, for later successful metrics output. Public drive configuration is
-recorded as pre-boot VM state and applied only during startup preparation; separate internal runtime helpers can
-prepare owned block-device resources from that stored configuration and
-register prepared resources in an internal MMIO dispatcher, but public
-block-device attachment, boot selection, and runtime hotplug remain deferred.
+recorded as pre-boot VM state and applied during startup preparation. Runtime
+`PATCH /drives/{drive_id}` can refresh the backing file of an existing active
+virtio-block device through the process-owned boot session, but public
+block-device attachment, boot selection changes, and hotplug remain deferred.
 
 ## Firecracker Model Alignment
 
@@ -104,7 +104,7 @@ socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
 `PUT /network-interfaces/{iface_id}`, pre-boot `PUT /vsock`, pre-boot
 `PUT /metrics`, pre-boot `PUT /logger`, pre-boot `PUT /serial`, parsed `PUT /actions`,
 pre-boot `PATCH /machine-config`, parsed `PATCH /mmds`, parsed `PATCH /vm`, and
-recognized `PATCH /drives/{drive_id}` requests already map through a minimal internal VMM
+runtime `PATCH /drives/{drive_id}` requests already map through a minimal internal VMM
 action/data boundary. Validation rejects malformed boot-source, drive update,
 VM state update, and actions requests before VMM state mutation.
 Successful `InstanceStart` startup, the `Running` transition, and an internal boot run-loop worker across bounded step windows are implemented with configured or default internal serial MMIO
@@ -117,8 +117,8 @@ The current `bangbang` executable parses only the first process-lifecycle
 arguments and starts the first API socket surface. It binds a Unix socket and
 serves `GET /`, `GET /version`, `GET /vm/config`, `GET /machine-config`,
 pre-boot `PUT /machine-config`, pre-boot `PUT /boot-source` configuration storage, and
-pre-boot `PUT /drives/{drive_id}` configuration storage, recognized
-`PATCH /drives/{drive_id}` update rejection, pre-boot
+pre-boot `PUT /drives/{drive_id}` configuration storage, runtime
+`PATCH /drives/{drive_id}` backing refresh, pre-boot
 `PUT /network-interfaces/{iface_id}` configuration storage, pre-boot `PUT /vsock` configuration storage, pre-boot `PUT /metrics`
 output configuration, pre-boot `PUT /logger` output configuration, pre-boot
 `PUT /serial` output configuration, metrics and logger startup CLI configuration, plus process-routed `PUT /actions` startup and metrics
@@ -329,7 +329,7 @@ compatibility targets.
 | `PUT` | `/entropy` | supported target; configuration storage, startup attachment, and signed executable guest read validation implemented | Stores one Firecracker-shaped virtio-rng entropy configuration before boot when `rate_limiter` is omitted or `null`. `GET /vm/config` includes `"entropy": {}` after API or config-file configuration, and `InstanceStart` attaches the existing HVF virtio-rng MMIO/FDT device backed by the session-owned host OS randomness source. The signed executable HVF e2e target boots a direct-rootfs guest, checks that Linux selected `virtio_rng` as the current hardware RNG, reads non-empty data from `/dev/hwrng`, and writes a host-observable success marker. Configured rate limiters are validated and then rejected with the entropy rate-limiter unsupported fault without mutating stored entropy configuration. Post-start requests follow the pre-boot-only unsupported-state policy. Real rate limiting and entropy metrics remain deferred. |
 | `GET`, `PUT`, `PATCH` | `/hotplug/memory` | recognized; VMM-routed unsupported | Parses Firecracker-shaped `PUT` and `PATCH` memory hotplug request bodies, rejects malformed or schema-invalid bodies first, and then routes valid requests through the VMM state/action policy. `PUT` is treated as pre-boot-only and reaches the memory-hotplug-specific unsupported fault before startup. `GET` and `PATCH` are treated as post-boot-only and reach the memory-hotplug-specific unsupported fault after startup. Requests made in the wrong lifecycle state return the normal unsupported-state fault. Real virtio-mem device support, guest memory accounting, semantic config validation, and runtime memory update behavior need a dedicated design. |
 | `PATCH` | `/vm` | recognized; rejected | Parses the Firecracker-shaped VM state request with required `state` values `Paused` and `Resumed`, then routes valid requests through `Pause` or `Resume` VMM actions. Requests before startup fail as unsupported in `Not started` state, and runtime requests fail as unsupported actions without mutating VM state. Real pause/resume state transitions and public run-loop control remain deferred. |
-| `PATCH` | `/drives/{drive_id}` | recognized; rejected | Parses the Firecracker-shaped block-device update request with required `drive_id`, optional `path_on_host`, and optional `rate_limiter`, then routes valid updates through `UpdateBlockDevice`. Pre-boot requests fail as post-boot-only operations and runtime requests fail as unsupported actions without mutating stored drive configuration. Configured rate limiters remain unsupported until block update behavior exists. |
+| `PATCH` | `/drives/{drive_id}` | supported target; runtime backing refresh implemented | Parses the Firecracker-shaped block-device update request with required `drive_id`, optional `path_on_host`, and optional `rate_limiter`, then routes valid updates through `UpdateBlockDevice`. Pre-boot requests fail as post-boot-only operations. Runtime requests for an existing active drive open the replacement backing before mutating stored configuration, refresh the matching virtio-block MMIO handler, update the guest-visible block capacity/config generation, and leave the old backing and stored config intact on failure. Configured rate limiters remain unsupported. |
 | `PATCH` | `/network-interfaces/{iface_id}` | recognized; rejected | Returns device-update-specific unsupported faults. Real network-interface updates, runtime mutation, and hotplug behavior need dedicated device designs. |
 | `DELETE` | `/drives/{drive_id}`, `/pmem/{id}`, `/network-interfaces/{iface_id}` | recognized; VMM-routed unsupported | Firecracker routes bodyless hot-unplug requests in `parsed_request.rs`, but they are not in the `v1.16.0` swagger surface. bangbang parses bodyless hot-unplug requests into one VMM action, returns the normal post-boot-only unsupported-state fault before startup, and returns the matching device-specific unsupported fault after startup. Body-bearing `DELETE` requests fail first as malformed request shape before hot-unplug routing. Real hot-unplug behavior remains deferred. |
 
@@ -399,8 +399,8 @@ exist.
 | `PUT /drives/{drive_id}` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PATCH /drives/{drive_id}` | path `drive_id` | required | The API parser captures this value before building the runtime update action. |
 | `PATCH /drives/{drive_id}` | body `drive_id` | required | The API parser rejects requests where this does not match the path `drive_id`. |
-| `PATCH /drives/{drive_id}` | `path_on_host` | optional | Valid request parsing preserves this value for the future block update action, but the current runtime rejects the operation without opening the path or mutating stored configuration. |
-| `PATCH /drives/{drive_id}` | `rate_limiter` | optional when absent or `null`; rejected when configured | The parser accepts the Firecracker-shaped field name and returns the existing drive-update unsupported fault for configured rate limiters; real rate limiting belongs with future block update work. |
+| `PATCH /drives/{drive_id}` | `path_on_host` | optional | When present at runtime, the process opens the replacement backing for the existing active drive before committing the stored configuration. When omitted, the existing path is retained without refreshing the active handler. Open and handler lookup failures leave the old backing and stored configuration intact. |
+| `PATCH /drives/{drive_id}` | `rate_limiter` | optional when absent or `null`; rejected when configured | The parser accepts the Firecracker-shaped field name and rejects configured rate limiters before runtime mutation. Real rate limiting belongs with future block update work. |
 | `PATCH /drives/{drive_id}` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /pmem/{id}` | path `id` | required | The API parser captures the path ID for path/body validation before routing valid requests through the VMM state/action policy. Invalid path IDs continue to fail as invalid path/method. |
 | `PUT /pmem/{id}` | body `id` | required | The API parser rejects requests where this does not match the path `id`. |
@@ -788,7 +788,7 @@ rejects malformed or incomplete JSON bodies, rejects extra path segments, and
 rejects path/body `drive_id` mismatches without echoing host paths. Drive update
 requests parse the Firecracker-shaped `drive_id`, `path_on_host`, and
 `rate_limiter` fields, reject invalid or mismatched bodies, and route valid
-updates to the runtime as unsupported update operations. The running API server
+runtime updates to the process-owned block-device refresh path. The running API server
 converts parsed initial drive requests into a VMM action; valid pre-boot
 requests are recorded as VM configuration state and return `204 No Content`.
 
@@ -809,13 +809,20 @@ host file, preserve the configured read-only mode, report byte length, and
 perform bounded positioned reads/writes and flushes for internal virtio-block
 request execution. It rejects non-regular backing paths before data I/O and
 rejects read-only writes before mutating the file. Backing errors also avoid
-echoing `path_on_host`. This host-file opening path is internal and not invoked
-by public drive configuration yet.
+echoing `path_on_host`. Public startup opens configured backing paths during
+`InstanceStart`, and runtime drive updates open replacement backing paths before
+mutating the active virtio-block handler or stored VMM configuration.
 
 Virtio-block feature negotiation follows the selected cache mode:
 `cache_type=Unsafe` keeps the flush feature hidden, while
 `cache_type=Writeback` advertises `VIRTIO_BLK_F_FLUSH` and uses the existing
 backing-file flush path for guest flush requests.
+
+Runtime drive backing refresh is limited to replacing an existing active drive's
+host file. It does not create new virtio-block devices, remove existing devices,
+renegotiate features, or apply rate limiters. A successful refresh updates the
+matching MMIO handler's backing, config space, config generation, and config
+interrupt status; failure preserves the previous backing and stored config.
 
 ## Internal Network Interface Configuration
 
@@ -1450,7 +1457,7 @@ The first API implementation should model the same broad stages as Firecracker:
 | `PATCH /machine-config` | implemented; `204` empty response on successful partial config update | unsupported after start; `400` `fault_message` | Pre-boot-only partial configuration. Omitted fields preserve current stored values; invalid updates leave stored values unchanged. |
 | `PUT /boot-source` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config; host paths are opened during startup preparation. Host path errors must avoid leaking sensitive path details. |
 | `PUT /drives/{drive_id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config; startup preparation opens backing files and registers initial block MMIO devices. Runtime hotplug remains deferred. |
-| `PATCH /drives/{drive_id}` | recognized post-boot-only operation; `400` `fault_message` | recognized but unsupported; `400` `fault_message` | Parses Firecracker-shaped update requests and routes valid bodies through `UpdateBlockDevice`, but does not open new backing files or mutate stored drive configuration yet. Configured rate limiters remain parser-level unsupported until real update support exists. |
+| `PATCH /drives/{drive_id}` | recognized post-boot-only operation; `400` `fault_message` | supported target; `204` empty response on successful backing refresh | Parses Firecracker-shaped update requests and routes valid bodies through `UpdateBlockDevice`. Runtime updates for existing active drives open replacement backing files first, refresh the matching virtio-block MMIO handler, update stored drive configuration after handler success, and preserve previous state on failure. Configured rate limiters remain parser-level unsupported until rate limiting exists. |
 | `DELETE /drives/{drive_id}`, `DELETE /pmem/{id}`, `DELETE /network-interfaces/{iface_id}` | recognized bodyless hot-unplug; `400` `fault_message` | recognized bodyless hot-unplug; `400` `fault_message` | Bodyless requests route through one `HotUnplugDevice` VMM action. Pre-boot requests return the normal unsupported-state fault, and runtime requests return the matching device-specific unsupported fault without mutating stored configuration. Requests with a body fail first as malformed request shape before hot-unplug routing. Real hot-unplug remains deferred. |
 | `PUT /network-interfaces/{iface_id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records up to 16 validated pre-boot configs without opening host networking resources. Startup preparation attaches configured interfaces as virtio-mmio devices in the MMIO dispatcher and guest FDT. `InstanceStart` revalidates the count before selecting packet I/O. If every configured interface is listed in MMDS config, startup validates supported `host_dev_name` syntax and uses process-local MMDS-only packet I/O without opening vmnet resources; otherwise it opens vmnet packet I/O for `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>` host device names. Unsupported names fail before `Running`. Internal network notification dispatch can route each interface through selected packet I/O, complete TX descriptor heads through a packet sink boundary, and write injected RX packets into guest buffers through a packet source boundary. Public packet movement, real PATCH updates, and DELETE remain deferred. |
 | `PATCH /network-interfaces/{iface_id}` | recognized post-boot-only operation; `400` `fault_message` | recognized but unsupported; `400` `fault_message` | Parses Firecracker-shaped update requests, rejects malformed or mismatched bodies first, returns unsupported-state before startup, and returns the network-interface-update unsupported fault after startup without mutating stored configuration. Real post-boot updates and rate limiting remain deferred. |

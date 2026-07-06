@@ -99,6 +99,26 @@ impl DriveUpdateInput {
     pub fn path_on_host(&self) -> Option<&Path> {
         self.path_on_host.as_deref()
     }
+
+    pub fn validate(self) -> Result<DriveUpdate, DriveUpdateError> {
+        DriveUpdate::try_from(self)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriveUpdate {
+    drive_id: String,
+    path_on_host: Option<PathBuf>,
+}
+
+impl DriveUpdate {
+    pub fn drive_id(&self) -> &str {
+        &self.drive_id
+    }
+
+    pub fn path_on_host(&self) -> Option<&Path> {
+        self.path_on_host.as_deref()
+    }
 }
 
 impl DriveConfigInput {
@@ -236,6 +256,27 @@ impl DriveConfig {
     pub const fn io_engine(&self) -> DriveIoEngine {
         self.io_engine
     }
+
+    fn updated(&self, update: &DriveUpdate) -> Result<Self, DriveUpdateError> {
+        if self.drive_id() != update.drive_id() {
+            return Err(DriveUpdateError::UnknownDrive {
+                drive_id: update.drive_id().to_string(),
+            });
+        }
+
+        Ok(Self {
+            drive_id: self.drive_id.clone(),
+            path_on_host: update
+                .path_on_host()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.path_on_host.clone()),
+            is_root_device: self.is_root_device,
+            is_read_only: self.is_read_only,
+            partuuid: self.partuuid.clone(),
+            cache_type: self.cache_type,
+            io_engine: self.io_engine,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -276,6 +317,35 @@ impl DriveConfigs {
             self.configs.push(config);
         }
 
+        Ok(())
+    }
+
+    pub fn updated_config(&self, input: DriveUpdateInput) -> Result<DriveConfig, DriveUpdateError> {
+        let update = input.validate()?;
+        let Some(existing) = self
+            .configs
+            .iter()
+            .find(|config| config.drive_id() == update.drive_id())
+        else {
+            return Err(DriveUpdateError::UnknownDrive {
+                drive_id: update.drive_id().to_string(),
+            });
+        };
+
+        existing.updated(&update)
+    }
+
+    pub fn commit_update(&mut self, config: DriveConfig) -> Result<(), DriveUpdateError> {
+        let drive_id = config.drive_id().to_string();
+        let Some(existing) = self
+            .configs
+            .iter_mut()
+            .find(|existing| existing.drive_id() == drive_id)
+        else {
+            return Err(DriveUpdateError::UnknownDrive { drive_id });
+        };
+
+        *existing = config;
         Ok(())
     }
 }
@@ -319,6 +389,34 @@ impl TryFrom<DriveConfigInput> for DriveConfig {
             partuuid: input.partuuid,
             cache_type,
             io_engine,
+        })
+    }
+}
+
+impl TryFrom<DriveUpdateInput> for DriveUpdate {
+    type Error = DriveUpdateError;
+
+    fn try_from(input: DriveUpdateInput) -> Result<Self, Self::Error> {
+        validate_drive_update_id(DriveIdSource::Path, &input.path_drive_id)?;
+        validate_drive_update_id(DriveIdSource::Body, &input.body_drive_id)?;
+        if input.path_drive_id != input.body_drive_id {
+            return Err(DriveUpdateError::MismatchedDriveId {
+                path_drive_id: input.path_drive_id,
+                body_drive_id: input.body_drive_id,
+            });
+        }
+
+        if input
+            .path_on_host
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(DriveUpdateError::EmptyPathOnHost);
+        }
+
+        Ok(Self {
+            drive_id: input.path_drive_id,
+            path_on_host: input.path_on_host,
         })
     }
 }
@@ -392,6 +490,36 @@ pub enum DriveConfigError {
     RootDeviceAlreadyConfigured,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriveUpdateError {
+    EmptyDriveId {
+        source: DriveIdSource,
+    },
+    InvalidDriveId {
+        source: DriveIdSource,
+        drive_id: String,
+    },
+    MismatchedDriveId {
+        path_drive_id: String,
+        body_drive_id: String,
+    },
+    EmptyPathOnHost,
+    UnknownDrive {
+        drive_id: String,
+    },
+    OpenBacking {
+        drive_id: String,
+        message: String,
+    },
+    HandlerLookup {
+        drive_id: String,
+        region_id: MmioRegionId,
+        message: String,
+    },
+    ActiveSessionUnavailable,
+    MmioDispatcherUnavailable,
+}
+
 impl fmt::Display for DriveConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -415,6 +543,44 @@ impl fmt::Display for DriveConfigError {
 }
 
 impl std::error::Error for DriveConfigError {}
+
+impl fmt::Display for DriveUpdateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyDriveId { source } => write!(f, "{source} must not be empty"),
+            Self::InvalidDriveId { source, .. } => {
+                write!(
+                    f,
+                    "{source} must contain only alphanumeric characters or '_'"
+                )
+            }
+            Self::MismatchedDriveId { .. } => f.write_str("path drive_id must match body drive_id"),
+            Self::EmptyPathOnHost => f.write_str("drive path_on_host must not be empty"),
+            Self::UnknownDrive { drive_id } => {
+                write!(f, "drive {drive_id} is not configured")
+            }
+            Self::OpenBacking { message, .. } => {
+                write!(f, "failed to open updated drive backing: {message}")
+            }
+            Self::HandlerLookup {
+                drive_id,
+                region_id,
+                message,
+            } => write!(
+                f,
+                "failed to find active drive {drive_id} handler for MMIO region {region_id}: {message}"
+            ),
+            Self::ActiveSessionUnavailable => {
+                f.write_str("active drive update session is unavailable")
+            }
+            Self::MmioDispatcherUnavailable => {
+                f.write_str("active drive MMIO dispatcher is unavailable")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DriveUpdateError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtioBlockConfigSpace {
@@ -2089,6 +2255,10 @@ impl VirtioBlockDevice {
         &self.backing
     }
 
+    pub fn refresh_backing(&mut self, backing: BlockFileBacking) {
+        self.backing = backing;
+    }
+
     pub fn device_id(&self) -> VirtioBlockDeviceId {
         self.device_id
     }
@@ -2771,6 +2941,24 @@ impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioBlockD
     }
 }
 
+impl VirtioMmioRegisterHandler<VirtioBlockConfigSpace, VirtioBlockDevice> {
+    pub fn refresh_block_backing(&mut self, config: &DriveConfig) -> Result<(), DriveUpdateError> {
+        let backing =
+            BlockFileBacking::open(config).map_err(|source| DriveUpdateError::OpenBacking {
+                drive_id: config.drive_id().to_string(),
+                message: source.to_string(),
+            })?;
+        let config_space = VirtioBlockConfigSpace::from_backing(&backing, config.cache_type());
+
+        self.activation_handler_mut().refresh_backing(backing);
+        *self.device_config_handler_mut() = config_space;
+        self.increment_config_generation();
+        self.mark_interrupt_pending(DeviceInterruptKind::Config);
+
+        Ok(())
+    }
+}
+
 impl VirtioMmioDeviceActivationHandler for VirtioBlockDevice {
     fn activate(
         &mut self,
@@ -2960,6 +3148,24 @@ fn validate_drive_id(source: DriveIdSource, drive_id: &str) -> Result<(), DriveC
     Ok(())
 }
 
+fn validate_drive_update_id(source: DriveIdSource, drive_id: &str) -> Result<(), DriveUpdateError> {
+    if drive_id.is_empty() {
+        return Err(DriveUpdateError::EmptyDriveId { source });
+    }
+
+    if !drive_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(DriveUpdateError::InvalidDriveId {
+            source,
+            drive_id: drive_id.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
@@ -2996,21 +3202,21 @@ mod tests {
     use super::{
         BlockFileBacking, BlockFileBackingError, BlockMmioDevices, BlockMmioLayout,
         BlockMmioRegistrationError, DriveCacheType, DriveConfig, DriveConfigError,
-        DriveConfigInput, DriveConfigs, DriveIdSource, DriveIoEngine, PreparedBlockDeviceError,
-        PreparedBlockDevices, VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE, VIRTIO_BLOCK_DEVICE_ID,
-        VIRTIO_BLOCK_FEATURE_FLUSH, VIRTIO_BLOCK_FEATURE_READ_ONLY, VIRTIO_BLOCK_ID_BYTES,
-        VIRTIO_BLOCK_QUEUE_COUNT, VIRTIO_BLOCK_QUEUE_SIZE, VIRTIO_BLOCK_QUEUE_SIZES,
-        VIRTIO_BLOCK_REQUEST_HEADER_SIZE, VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
-        VIRTIO_BLOCK_REQUEST_TYPE_GET_ID, VIRTIO_BLOCK_REQUEST_TYPE_IN,
-        VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT, VIRTIO_BLOCK_SECTOR_SIZE,
-        VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK, VIRTIO_BLOCK_STATUS_SIZE,
-        VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1, VIRTIO_RING_FEATURE_EVENT_IDX,
-        VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioBlockConfigSpace, VirtioBlockDevice,
-        VirtioBlockDeviceActivationError, VirtioBlockDeviceId, VirtioBlockDeviceNotificationError,
-        VirtioBlockQueue, VirtioBlockQueueBuildError, VirtioBlockQueueDispatchError,
-        VirtioBlockRequest, VirtioBlockRequestCompletion, VirtioBlockRequestError,
-        VirtioBlockRequestExecutionError, VirtioBlockRequestExecutionOutcome,
-        VirtioBlockRequestType, normalize_completion_status,
+        DriveConfigInput, DriveConfigs, DriveIdSource, DriveIoEngine, DriveUpdateError,
+        DriveUpdateInput, PreparedBlockDeviceError, PreparedBlockDevices,
+        VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE, VIRTIO_BLOCK_DEVICE_ID, VIRTIO_BLOCK_FEATURE_FLUSH,
+        VIRTIO_BLOCK_FEATURE_READ_ONLY, VIRTIO_BLOCK_ID_BYTES, VIRTIO_BLOCK_QUEUE_COUNT,
+        VIRTIO_BLOCK_QUEUE_SIZE, VIRTIO_BLOCK_QUEUE_SIZES, VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
+        VIRTIO_BLOCK_REQUEST_TYPE_FLUSH, VIRTIO_BLOCK_REQUEST_TYPE_GET_ID,
+        VIRTIO_BLOCK_REQUEST_TYPE_IN, VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT,
+        VIRTIO_BLOCK_SECTOR_SIZE, VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK,
+        VIRTIO_BLOCK_STATUS_SIZE, VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1,
+        VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioBlockConfigSpace,
+        VirtioBlockDevice, VirtioBlockDeviceActivationError, VirtioBlockDeviceId,
+        VirtioBlockDeviceNotificationError, VirtioBlockQueue, VirtioBlockQueueBuildError,
+        VirtioBlockQueueDispatchError, VirtioBlockRequest, VirtioBlockRequestCompletion,
+        VirtioBlockRequestError, VirtioBlockRequestExecutionError,
+        VirtioBlockRequestExecutionOutcome, VirtioBlockRequestType, normalize_completion_status,
     };
 
     static NEXT_TEMP_PATH_ID: AtomicUsize = AtomicUsize::new(0);
@@ -4102,6 +4308,136 @@ mod tests {
     }
 
     #[test]
+    fn drive_update_input_validates_ids_and_empty_path() {
+        assert_eq!(
+            DriveUpdateInput::new("", "", None).validate(),
+            Err(DriveUpdateError::EmptyDriveId {
+                source: DriveIdSource::Path
+            })
+        );
+        assert_eq!(
+            DriveUpdateInput::new("rootfs", "", None).validate(),
+            Err(DriveUpdateError::EmptyDriveId {
+                source: DriveIdSource::Body
+            })
+        );
+        assert_eq!(
+            DriveUpdateInput::new("rootfs", "root-fs", None).validate(),
+            Err(DriveUpdateError::InvalidDriveId {
+                source: DriveIdSource::Body,
+                drive_id: "root-fs".to_string(),
+            })
+        );
+        assert_eq!(
+            DriveUpdateInput::new("rootfs", "data", None).validate(),
+            Err(DriveUpdateError::MismatchedDriveId {
+                path_drive_id: "rootfs".to_string(),
+                body_drive_id: "data".to_string(),
+            })
+        );
+        assert_eq!(
+            DriveUpdateInput::new("rootfs", "rootfs", Some(PathBuf::new())).validate(),
+            Err(DriveUpdateError::EmptyPathOnHost)
+        );
+    }
+
+    #[test]
+    fn drive_configs_build_and_commit_runtime_update() {
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(
+                DriveConfigInput::new("rootfs", "rootfs", "/tmp/rootfs.ext4", true)
+                    .with_is_read_only(true),
+            )
+            .expect("root drive config should insert");
+        configs
+            .insert(DriveConfigInput::new(
+                "data",
+                "data",
+                "/tmp/data.ext4",
+                false,
+            ))
+            .expect("data drive config should insert");
+
+        let updated = configs
+            .updated_config(DriveUpdateInput::new(
+                "data",
+                "data",
+                Some(PathBuf::from("/tmp/data-updated.ext4")),
+            ))
+            .expect("runtime drive update should build");
+
+        assert_eq!(updated.drive_id(), "data");
+        assert_eq!(updated.path_on_host(), Path::new("/tmp/data-updated.ext4"));
+        assert!(!updated.is_root_device());
+        configs
+            .commit_update(updated)
+            .expect("runtime drive update should commit");
+        assert_eq!(configs.as_slice()[0].drive_id(), "rootfs");
+        assert_eq!(
+            configs.as_slice()[0].path_on_host(),
+            Path::new("/tmp/rootfs.ext4")
+        );
+        assert_eq!(configs.as_slice()[1].drive_id(), "data");
+        assert_eq!(
+            configs.as_slice()[1].path_on_host(),
+            Path::new("/tmp/data-updated.ext4")
+        );
+    }
+
+    #[test]
+    fn drive_configs_update_without_path_keeps_existing_path() {
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new(
+                "rootfs",
+                "rootfs",
+                "/tmp/rootfs.ext4",
+                true,
+            ))
+            .expect("root drive config should insert");
+
+        let updated = configs
+            .updated_config(DriveUpdateInput::new("rootfs", "rootfs", None))
+            .expect("pathless runtime drive update should build");
+
+        assert_eq!(updated.path_on_host(), Path::new("/tmp/rootfs.ext4"));
+    }
+
+    #[test]
+    fn drive_configs_reject_unknown_runtime_update_without_mutation() {
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(DriveConfigInput::new(
+                "rootfs",
+                "rootfs",
+                "/tmp/rootfs.ext4",
+                true,
+            ))
+            .expect("root drive config should insert");
+
+        let err = configs
+            .updated_config(DriveUpdateInput::new(
+                "missing",
+                "missing",
+                Some(PathBuf::from("/tmp/missing.ext4")),
+            ))
+            .expect_err("unknown runtime drive should fail");
+
+        assert_eq!(
+            err,
+            DriveUpdateError::UnknownDrive {
+                drive_id: "missing".to_string()
+            }
+        );
+        assert_eq!(configs.as_slice().len(), 1);
+        assert_eq!(
+            configs.as_slice()[0].path_on_host(),
+            Path::new("/tmp/rootfs.ext4")
+        );
+    }
+
+    #[test]
     fn prepared_block_devices_accept_empty_configs() {
         let configs = DriveConfigs::new();
 
@@ -4792,6 +5128,62 @@ mod tests {
         assert_eq!(config.capacity_sectors(), 2);
         assert!(config.is_read_only());
         assert_eq!(config.cache_type(), DriveCacheType::Writeback);
+    }
+
+    #[test]
+    fn block_handler_refresh_updates_backing_config_generation_and_interrupt() {
+        let first = temp_file("refresh-first.img", &[0; 512]);
+        let second = temp_file("refresh-second.img", &[0; 1024]);
+        let first_backing =
+            open_backing(first.as_path(), false).expect("first backing should open");
+        let mut handler = block_notification_handler(first_backing, &VIRTIO_BLOCK_QUEUE_SIZES);
+        let replacement_config = config_for_path(second.as_path(), false);
+
+        assert_eq!(handler.device_config_handler().capacity_sectors(), 1);
+        assert_eq!(handler.activation_handler().backing().len(), 512);
+        assert_eq!(
+            handler.read_register(VirtioMmioRegister::ConfigGeneration),
+            Ok(0)
+        );
+
+        handler
+            .refresh_block_backing(&replacement_config)
+            .expect("replacement backing should refresh");
+
+        assert_eq!(handler.device_config_handler().capacity_sectors(), 2);
+        assert_eq!(handler.activation_handler().backing().len(), 1024);
+        assert_eq!(
+            handler.read_register(VirtioMmioRegister::ConfigGeneration),
+            Ok(1)
+        );
+        assert_eq!(
+            read_interrupt_status(&handler),
+            DeviceInterruptKind::Config.status().bits()
+        );
+    }
+
+    #[test]
+    fn block_handler_refresh_failure_preserves_previous_backing_and_config() {
+        let first = temp_file("refresh-failure-first.img", &[0; 512]);
+        let missing = missing_path("secret-refresh-missing.img");
+        let first_backing =
+            open_backing(first.as_path(), false).expect("first backing should open");
+        let mut handler = block_notification_handler(first_backing, &VIRTIO_BLOCK_QUEUE_SIZES);
+        let replacement_config = config_for_path(&missing, false);
+
+        let err = handler
+            .refresh_block_backing(&replacement_config)
+            .expect_err("missing replacement backing should fail");
+
+        assert!(matches!(err, DriveUpdateError::OpenBacking { .. }));
+        assert!(!err.to_string().contains("secret-refresh-missing"));
+        assert_eq!(handler.device_config_handler().capacity_sectors(), 1);
+        assert_eq!(handler.activation_handler().backing().len(), 512);
+        assert_eq!(
+            handler.read_register(VirtioMmioRegister::ConfigGeneration),
+            Ok(0)
+        );
+        assert_eq!(read_interrupt_status(&handler), 0);
     }
 
     #[test]

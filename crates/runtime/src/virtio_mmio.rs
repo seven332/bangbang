@@ -94,6 +94,10 @@ impl VirtioMmioDeviceRegisters {
         self.config_generation
     }
 
+    pub fn increment_config_generation(&mut self) {
+        self.config_generation = self.config_generation.wrapping_add(1);
+    }
+
     pub const fn device_features_select(self) -> u32 {
         self.device_features_select
     }
@@ -1604,6 +1608,10 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
         &self.device_config
     }
 
+    pub(crate) fn device_config_handler_mut(&mut self) -> &mut C {
+        &mut self.device_config
+    }
+
     pub const fn activation_handler(&self) -> &A {
         &self.activation
     }
@@ -1614,6 +1622,10 @@ impl<C: VirtioMmioDeviceConfigHandler, A: VirtioMmioDeviceActivationHandler>
 
     pub const fn is_device_activated(&self) -> bool {
         self.device_activated
+    }
+
+    pub fn increment_config_generation(&mut self) {
+        self.device.increment_config_generation();
     }
 
     pub fn mark_interrupt_pending(&mut self, kind: DeviceInterruptKind) {

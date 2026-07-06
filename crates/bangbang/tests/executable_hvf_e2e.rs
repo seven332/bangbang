@@ -302,24 +302,15 @@ mod macos_arm64 {
             replacement_put_backing_path.display()
         );
 
-        let replacement_backing_path = test_dir.path().join("replacement-data.img");
-        let replacement_backing_path_json = json_string(path_text(&replacement_backing_path));
-        let drive_update_body = format!(
-            r#"{{
-                "drive_id":"data",
-                "path_on_host":{replacement_backing_path_json}
-            }}"#
+        let drive_update_response = http_json(
+            &socket_path,
+            "PATCH",
+            "/drives/data",
+            r#"{"drive_id":"data"}"#,
         );
-        let drive_update_response =
-            http_json(&socket_path, "PATCH", "/drives/data", &drive_update_body);
-        assert_bad_request_response(
+        assert_no_content_response(
             &drive_update_response,
-            "PATCH /drives/data after InstanceStart",
-        );
-        assert_response_contains(
-            &drive_update_response,
-            r#"{"fault_message":"The requested operation is not supported: UpdateBlockDevice"}"#,
-            "PATCH /drives/data after InstanceStart",
+            "PATCH /drives/data no-op after InstanceStart",
         );
 
         let replacement_serial_output_path = test_dir.path().join("replacement-serial.out");
@@ -573,13 +564,7 @@ mod macos_arm64 {
         assert_eq!(
             vm_config.matches(r#""drive_id":"#).count(),
             1,
-            "rejected drive update must not add another drive; response:\n{vm_config}"
-        );
-        assert!(
-            !vm_config.contains(&format!(
-                r#""path_on_host":{replacement_backing_path_json}"#
-            )),
-            "rejected drive update must not mutate the configured drive path; response:\n{vm_config}"
+            "drive no-op update must not add another drive; response:\n{vm_config}"
         );
         assert!(
             !vm_config.contains(r#""drive_id":"replacement""#),
@@ -642,7 +627,7 @@ mod macos_arm64 {
             ),
             r#"{"actions_count":2,"actions_fails":0,"balloon_count":1,"balloon_fails":1,"boot_source_count":2,"boot_source_fails":1,"cpu_cfg_count":1,"cpu_cfg_fails":1,"drive_count":2,"drive_fails":1,"hotplug_memory_count":0,"hotplug_memory_fails":0,"logger_count":2,"logger_fails":1,"machine_cfg_count":1,"machine_cfg_fails":0,"metrics_count":2,"metrics_fails":1,"mmds_count":2,"mmds_fails":1,"network_count":1,"network_fails":1,"pmem_count":0,"pmem_fails":0,"serial_count":2,"serial_fails":1,"vsock_count":2,"vsock_fails":1}"#,
             Some(
-                r#"{"balloon_count":4,"balloon_fails":4,"drive_count":1,"drive_fails":1,"hotplug_memory_count":0,"hotplug_memory_fails":0,"machine_cfg_count":0,"machine_cfg_fails":0,"mmds_count":1,"mmds_fails":0,"network_count":0,"network_fails":0,"pmem_count":0,"pmem_fails":0}"#,
+                r#"{"balloon_count":4,"balloon_fails":4,"drive_count":1,"drive_fails":0,"hotplug_memory_count":0,"hotplug_memory_fails":0,"machine_cfg_count":0,"machine_cfg_fails":0,"mmds_count":1,"mmds_fails":0,"network_count":0,"network_fails":0,"pmem_count":0,"pmem_fails":0}"#,
             ),
         );
         assert_startup_time_metrics_output(&metrics_path);

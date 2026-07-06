@@ -1344,6 +1344,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use bangbang_runtime::block::DriveUpdateError;
     use bangbang_runtime::logger::{LoggerConfigInput, LoggerWriteError};
     use bangbang_runtime::machine::MAX_MEM_SIZE_MIB;
     use bangbang_runtime::metrics::{
@@ -1368,6 +1369,7 @@ mod tests {
     struct TestSession {
         boot_run_loop_status: Option<BootRunLoopMetricStatus>,
         process_exit_signal: Option<TestProcessExitSignal>,
+        drive_update_result: Option<DriveUpdateError>,
     }
 
     impl TestSession {
@@ -1375,6 +1377,7 @@ mod tests {
             Self {
                 boot_run_loop_status: None,
                 process_exit_signal: None,
+                drive_update_result: None,
             }
         }
 
@@ -1382,6 +1385,7 @@ mod tests {
             Self {
                 boot_run_loop_status: Some(status),
                 process_exit_signal: None,
+                drive_update_result: None,
             }
         }
 
@@ -1389,6 +1393,7 @@ mod tests {
             Self {
                 boot_run_loop_status: None,
                 process_exit_signal: Some(signal),
+                drive_update_result: None,
             }
         }
     }
@@ -1398,6 +1403,13 @@ mod tests {
             self.boot_run_loop_status
                 .map(|status| MetricsDiagnostics::new().with_boot_run_loop_status(status))
                 .unwrap_or_default()
+        }
+
+        fn update_block_device(&mut self, _config: &DriveConfig) -> Result<(), DriveUpdateError> {
+            match self.drive_update_result.clone() {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
         }
 
         fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
@@ -6054,7 +6066,7 @@ mod tests {
     }
 
     #[test]
-    fn running_state_rejects_drive_patch_without_mutating() {
+    fn running_state_accepts_drive_patch_and_updates_stored_config() {
         let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
         vmm.handle_action(VmmAction::PutDrive(
             DriveConfigInput::new("rootfs", "rootfs", "/tmp/rootfs.ext4", true)
@@ -6083,10 +6095,9 @@ mod tests {
 
         let response = request_over_socket(&mut vmm, "drive-patch-running", &request);
 
-        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        assert!(response.contains(
-            r#"{"fault_message":"The requested operation is not supported: UpdateBlockDevice"}"#
-        ));
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(response.contains("Content-Length: 0\r\n"));
+        assert!(response.ends_with("\r\n\r\n"));
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::Running
@@ -6095,7 +6106,7 @@ mod tests {
         let config = &vmm.drive_configs()[0];
         assert_eq!(
             config.path_on_host(),
-            std::path::Path::new("/tmp/rootfs.ext4")
+            std::path::Path::new("/tmp/replaced.ext4")
         );
         assert!(config.is_read_only());
     }
