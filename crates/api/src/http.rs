@@ -2140,8 +2140,6 @@ fn parse_snapshot_create_request(body: &[u8]) -> Result<ApiRequest, RequestError
 }
 
 fn parse_snapshot_load_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
-    let value = serde_json::from_slice::<serde_json::Value>(body)
-        .map_err(|_| RequestError::MalformedRequest)?;
     let SnapshotLoadRequestBody {
         snapshot_path,
         mem_file_path,
@@ -2152,7 +2150,7 @@ fn parse_snapshot_load_request(body: &[u8]) -> Result<ApiRequest, RequestError> 
         network_overrides,
         vsock_override,
         clock_realtime,
-    } = serde_json::from_value::<SnapshotLoadRequestBody>(value)
+    } = serde_json::from_slice::<SnapshotLoadRequestBody>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
 
     if mem_file_path.is_some() == mem_backend.is_some() {
@@ -6022,10 +6020,14 @@ mod tests {
             r#"{"snapshot_path":"vmstate","mem_backend":null}"#,
             r#"{"snapshot_path":"vmstate","mem_file_path":42}"#,
             r#"{"snapshot_path":42,"mem_file_path":"memory"}"#,
+            r#"{"snapshot_path":"vmstate","mem_file_path":"memory","mem_file_path":"memory2"}"#,
+            r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"},"mem_backend":{"backend_path":"memory2","backend_type":"File"}}"#,
             r#"{"snapshot_path":"vmstate","mem_backend":{"backend_type":"File"}}"#,
             r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory"}}"#,
             r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"Shared"}}"#,
+            r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_path":"memory2","backend_type":"File"}}"#,
             r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File","unknown":true}}"#,
+            r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"},"enable_diff_snapshots":false,"enable_diff_snapshots":true}"#,
             r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"},"enable_diff_snapshots":"true"}"#,
             r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"},"track_dirty_pages":"true"}"#,
             r#"{"snapshot_path":"vmstate","mem_backend":{"backend_path":"memory","backend_type":"File"},"resume_vm":"true"}"#,
