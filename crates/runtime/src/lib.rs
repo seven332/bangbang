@@ -559,6 +559,14 @@ impl VmmController {
         self.metrics_state.record_put_mmds_failure();
     }
 
+    pub fn record_put_hotplug_memory_request(&mut self) {
+        self.metrics_state.record_put_hotplug_memory_request();
+    }
+
+    pub fn record_put_hotplug_memory_failure(&mut self) {
+        self.metrics_state.record_put_hotplug_memory_failure();
+    }
+
     pub fn record_put_pmem_request(&mut self) {
         self.metrics_state.record_put_pmem_request();
     }
@@ -623,6 +631,14 @@ impl VmmController {
         self.metrics_state.record_patch_mmds_failure();
     }
 
+    pub fn record_patch_hotplug_memory_request(&mut self) {
+        self.metrics_state.record_patch_hotplug_memory_request();
+    }
+
+    pub fn record_patch_hotplug_memory_failure(&mut self) {
+        self.metrics_state.record_patch_hotplug_memory_failure();
+    }
+
     pub fn record_patch_pmem_request(&mut self) {
         self.metrics_state.record_patch_pmem_request();
     }
@@ -645,6 +661,10 @@ impl VmmController {
 
     pub fn record_get_mmds_request(&mut self) {
         self.metrics_state.record_get_mmds_request();
+    }
+
+    pub fn record_get_hotplug_memory_request(&mut self) {
+        self.metrics_state.record_get_hotplug_memory_request();
     }
 
     pub fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {

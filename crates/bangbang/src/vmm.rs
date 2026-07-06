@@ -131,6 +131,7 @@ impl ProcessSessionExitStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GetApiRequest {
+    HotplugMemory,
     InstanceInfo,
     VmmVersion,
     MachineConfig,
@@ -140,6 +141,7 @@ pub(crate) enum GetApiRequest {
 impl GetApiRequest {
     const fn action(self) -> VmmAction {
         match self {
+            Self::HotplugMemory => VmmAction::GetMemoryHotplug,
             Self::InstanceInfo => VmmAction::GetVmInstanceInfo,
             Self::VmmVersion => VmmAction::GetVmmVersion,
             Self::MachineConfig => VmmAction::GetMachineConfig,
@@ -149,6 +151,7 @@ impl GetApiRequest {
 
     fn record(self, controller: &mut VmmController) {
         match self {
+            Self::HotplugMemory => controller.record_get_hotplug_memory_request(),
             Self::InstanceInfo => controller.record_get_instance_info_request(),
             Self::VmmVersion => controller.record_get_vmm_version_request(),
             Self::MachineConfig => controller.record_get_machine_config_request(),
@@ -189,6 +192,13 @@ impl PutApiRequest {
         Self {
             kind: PutApiRequestKind::Metrics,
             action: VmmAction::PutMetrics(input),
+        }
+    }
+
+    pub(crate) const fn memory_hotplug() -> Self {
+        Self {
+            kind: PutApiRequestKind::HotplugMemory,
+            action: VmmAction::PutMemoryHotplug,
         }
     }
 
@@ -262,6 +272,7 @@ enum PutApiRequestKind {
     BootSource,
     CpuConfig,
     Drive,
+    HotplugMemory,
     Metrics,
     Logger,
     MachineConfig,
@@ -278,6 +289,7 @@ impl PutApiRequestKind {
             Self::BootSource => controller.record_put_boot_source_request(),
             Self::CpuConfig => controller.record_put_cpu_config_request(),
             Self::Drive => controller.record_put_drive_request(),
+            Self::HotplugMemory => controller.record_put_hotplug_memory_request(),
             Self::Metrics => controller.record_put_metrics_request(),
             Self::Logger => controller.record_put_logger_request(),
             Self::MachineConfig => controller.record_put_machine_config_request(),
@@ -294,6 +306,7 @@ impl PutApiRequestKind {
             Self::BootSource => controller.record_put_boot_source_failure(),
             Self::CpuConfig => controller.record_put_cpu_config_failure(),
             Self::Drive => controller.record_put_drive_failure(),
+            Self::HotplugMemory => controller.record_put_hotplug_memory_failure(),
             Self::Metrics => controller.record_put_metrics_failure(),
             Self::Logger => controller.record_put_logger_failure(),
             Self::MachineConfig => controller.record_put_machine_config_failure(),
@@ -334,6 +347,13 @@ impl PatchApiRequest {
         }
     }
 
+    pub(crate) const fn memory_hotplug() -> Self {
+        Self {
+            kind: PatchApiRequestKind::HotplugMemory,
+            action: VmmAction::PatchMemoryHotplug,
+        }
+    }
+
     pub(crate) fn network(input: NetworkInterfaceUpdateInput) -> Self {
         Self {
             kind: PatchApiRequestKind::Network,
@@ -360,6 +380,7 @@ impl PatchApiRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PatchApiRequestKind {
     Drive,
+    HotplugMemory,
     MachineConfig,
     Mmds,
     Network,
@@ -370,6 +391,7 @@ impl PatchApiRequestKind {
     fn record_request(self, controller: &mut VmmController) {
         match self {
             Self::Drive => controller.record_patch_drive_request(),
+            Self::HotplugMemory => controller.record_patch_hotplug_memory_request(),
             Self::MachineConfig => controller.record_patch_machine_config_request(),
             Self::Mmds => controller.record_patch_mmds_request(),
             Self::Network => controller.record_patch_network_request(),
@@ -380,6 +402,7 @@ impl PatchApiRequestKind {
     fn record_failure(self, controller: &mut VmmController) {
         match self {
             Self::Drive => controller.record_patch_drive_failure(),
+            Self::HotplugMemory => controller.record_patch_hotplug_memory_failure(),
             Self::MachineConfig => controller.record_patch_machine_config_failure(),
             Self::Mmds => controller.record_patch_mmds_failure(),
             Self::Network => controller.record_patch_network_failure(),

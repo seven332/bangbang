@@ -157,13 +157,15 @@ logs because they are process observability data, not guest configuration. When
 metrics are configured, startup, explicit `FlushMetrics`, and periodic runtime
 metrics flushes write provided values under the minimal `vmm` metrics object;
 omitted timing arguments remain omitted. Parsed `GET /`,
-`GET /version`, `GET /machine-config`, and
-`GET /mmds` API requests are counted under `get_api_requests`; parsed
+`GET /version`, `GET /machine-config`, `GET /mmds`, and
+`GET /hotplug/memory` API requests are counted under `get_api_requests`; parsed
 core configuration PUTs, `PUT /mmds`, `PUT /mmds/config`, `PUT /metrics`,
-`PUT /logger`, `PUT /serial`, `PUT /pmem/{pmem_id}`, and `/actions` API
+`PUT /logger`, `PUT /serial`, `PUT /hotplug/memory`,
+`PUT /pmem/{pmem_id}`, and `/actions` API
 requests are counted under `put_api_requests`; parsed `PATCH /machine-config`,
 `PATCH /mmds`, `PATCH /drives/{drive_id}`,
-`PATCH /network-interfaces/{iface_id}`, and `PATCH /pmem/{pmem_id}` requests
+`PATCH /network-interfaces/{iface_id}`, `PATCH /hotplug/memory`, and
+`PATCH /pmem/{pmem_id}` requests
 routed through VMM control are counted under `patch_api_requests`.
 Direct config-file and startup initialization paths are not API requests and
 are not included in these counters. `PATCH /vm` remains outside
@@ -491,15 +493,16 @@ API-enabled and no-api runtime loops flush the same metrics line every 60
 seconds while the VM is running; those periodic flushes do not log `/actions`
 events. The line includes initial
 Firecracker-shaped `get_api_requests.instance_info_count`,
-`vmm_version_count`, `machine_cfg_count`, and `mmds_count` counters for parsed
-GET API requests, plus selected `put_api_requests` counters for parsed core
-configuration PUTs, `PUT /mmds`, `PUT /mmds/config`, `PUT /metrics`,
-`PUT /logger`, `PUT /serial`, `PUT /pmem/{pmem_id}`, and `/actions` requests
-routed through VMM control, plus selected `patch_api_requests` counters for
-parsed `PATCH /machine-config`, `PATCH /mmds`, `PATCH /drives/{drive_id}`,
-`PATCH /network-interfaces/{iface_id}`, and `PATCH /pmem/{pmem_id}` requests
-routed through VMM control.
-Remaining-device counters, remaining PATCH counters, and parser-level
+`vmm_version_count`, `machine_cfg_count`, `mmds_count`, and
+`hotplug_memory_count` counters for parsed GET API requests, plus selected
+`put_api_requests` counters for parsed core configuration PUTs, `PUT /mmds`,
+`PUT /mmds/config`, `PUT /metrics`, `PUT /logger`, `PUT /serial`,
+`PUT /hotplug/memory`, `PUT /pmem/{pmem_id}`, and `/actions` requests routed
+through VMM control, plus selected `patch_api_requests` counters for parsed
+`PATCH /machine-config`, `PATCH /mmds`, `PATCH /drives/{drive_id}`,
+`PATCH /network-interfaces/{iface_id}`, `PATCH /hotplug/memory`, and
+`PATCH /pmem/{pmem_id}` requests routed through VMM control.
+Device runtime counters, remaining API request counters, and parser-level
 malformed-request counters remain deferred. Public run-loop control, guest boot
 output, public runner loop scheduling, full Firecracker metrics counters, and
 full logger integration remain deferred. Metrics write failures increment
