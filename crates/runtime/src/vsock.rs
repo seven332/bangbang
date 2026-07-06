@@ -5274,7 +5274,7 @@ impl VirtioVsockDevice {
         self.active_event_queue.as_ref()
     }
 
-    pub fn host_read_wakeup_fds(&self) -> Result<Vec<RawFd>, TryReserveError> {
+    pub(crate) fn host_read_wakeup_fds(&self) -> Result<Vec<RawFd>, TryReserveError> {
         let mut fds = Vec::new();
         if !self.is_activated() {
             return Ok(fds);
