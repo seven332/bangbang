@@ -14,7 +14,8 @@ use crate::boot::{
 };
 use crate::entropy::{
     EntropyMmioDeviceRegistration, EntropyMmioLayout, EntropyMmioRegistrationError,
-    PreparedEntropyDevice,
+    PreparedEntropyDevice, VirtioRngDeviceNotificationDispatch, VirtioRngDeviceNotificationError,
+    VirtioRngEntropySource, VirtioRngEntropySourceError, VirtioRngMmioHandler,
 };
 use crate::fdt::{
     Arm64FdtBootInfo, Arm64FdtConfig, Arm64FdtError, Arm64FdtGic, Arm64FdtGuestMemoryWrite,
@@ -571,6 +572,205 @@ impl std::error::Error for Arm64BootVsockNotificationDispatchError {
     }
 }
 
+#[derive(Debug)]
+pub struct Arm64BootEntropyNotificationDispatches {
+    devices: Vec<Arm64BootEntropyNotificationDispatch>,
+}
+
+impl Arm64BootEntropyNotificationDispatches {
+    fn new(devices: Vec<Arm64BootEntropyNotificationDispatch>) -> Self {
+        Self { devices }
+    }
+
+    pub fn as_slice(&self) -> &[Arm64BootEntropyNotificationDispatch] {
+        &self.devices
+    }
+
+    pub fn into_vec(self) -> Vec<Arm64BootEntropyNotificationDispatch> {
+        self.devices
+    }
+
+    pub fn len(&self) -> usize {
+        self.devices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.devices.is_empty()
+    }
+
+    pub fn needs_queue_interrupt(&self) -> bool {
+        self.devices
+            .iter()
+            .any(Arm64BootEntropyNotificationDispatch::needs_queue_interrupt)
+    }
+}
+
+#[derive(Debug)]
+pub struct Arm64BootEntropyNotificationDispatch {
+    device: Arm64BootEntropyDevice,
+    outcome: Arm64BootEntropyNotificationOutcome,
+}
+
+impl Arm64BootEntropyNotificationDispatch {
+    fn new(device: Arm64BootEntropyDevice, outcome: Arm64BootEntropyNotificationOutcome) -> Self {
+        Self { device, outcome }
+    }
+
+    pub const fn device(&self) -> &Arm64BootEntropyDevice {
+        &self.device
+    }
+
+    pub const fn outcome(&self) -> &Arm64BootEntropyNotificationOutcome {
+        &self.outcome
+    }
+
+    pub fn needs_queue_interrupt(&self) -> bool {
+        self.outcome.needs_queue_interrupt()
+    }
+}
+
+#[derive(Debug)]
+pub enum Arm64BootEntropyNotificationOutcome {
+    Dispatched(VirtioRngDeviceNotificationDispatch),
+    DispatchFailed(VirtioRngDeviceNotificationError),
+    HandlerLookupFailed(MmioHandlerLookupError),
+    EntropySourceProviderFailed(Arm64BootEntropySourceError),
+}
+
+impl Arm64BootEntropyNotificationOutcome {
+    pub fn needs_queue_interrupt(&self) -> bool {
+        match self {
+            Self::Dispatched(dispatch) => dispatch.needs_queue_interrupt(),
+            Self::DispatchFailed(source) => source
+                .completed_dispatch()
+                .is_some_and(crate::entropy::VirtioRngQueueDispatch::needs_queue_interrupt),
+            Self::HandlerLookupFailed(_) | Self::EntropySourceProviderFailed(_) => false,
+        }
+    }
+
+    pub const fn dispatched(&self) -> Option<&VirtioRngDeviceNotificationDispatch> {
+        match self {
+            Self::Dispatched(dispatch) => Some(dispatch),
+            Self::DispatchFailed(_)
+            | Self::HandlerLookupFailed(_)
+            | Self::EntropySourceProviderFailed(_) => None,
+        }
+    }
+
+    pub const fn dispatch_error(&self) -> Option<&VirtioRngDeviceNotificationError> {
+        match self {
+            Self::DispatchFailed(source) => Some(source),
+            Self::Dispatched(_)
+            | Self::HandlerLookupFailed(_)
+            | Self::EntropySourceProviderFailed(_) => None,
+        }
+    }
+
+    pub const fn handler_lookup_error(&self) -> Option<&MmioHandlerLookupError> {
+        match self {
+            Self::HandlerLookupFailed(source) => Some(source),
+            Self::Dispatched(_)
+            | Self::DispatchFailed(_)
+            | Self::EntropySourceProviderFailed(_) => None,
+        }
+    }
+
+    pub const fn entropy_source_error(&self) -> Option<&Arm64BootEntropySourceError> {
+        match self {
+            Self::EntropySourceProviderFailed(source) => Some(source),
+            Self::Dispatched(_) | Self::DispatchFailed(_) | Self::HandlerLookupFailed(_) => None,
+        }
+    }
+}
+
+pub struct Arm64BootEntropySource<'a> {
+    source: &'a mut dyn VirtioRngEntropySource,
+}
+
+impl<'a> Arm64BootEntropySource<'a> {
+    pub fn new(source: &'a mut dyn VirtioRngEntropySource) -> Self {
+        Self { source }
+    }
+
+    fn into_inner(self) -> &'a mut dyn VirtioRngEntropySource {
+        self.source
+    }
+}
+
+impl fmt::Debug for Arm64BootEntropySource<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Arm64BootEntropySource")
+            .finish_non_exhaustive()
+    }
+}
+
+pub trait Arm64BootEntropySourceProvider {
+    fn entropy_source(
+        &mut self,
+        device: &Arm64BootEntropyDevice,
+    ) -> Result<Arm64BootEntropySource<'_>, Arm64BootEntropySourceError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Arm64BootEntropySourceError {
+    message: String,
+}
+
+impl Arm64BootEntropySourceError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for Arm64BootEntropySourceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Arm64BootEntropySourceError {}
+
+#[derive(Debug)]
+pub enum Arm64BootEntropyNotificationDispatchError {
+    ResultAllocation { source: TryReserveError },
+}
+
+impl fmt::Display for Arm64BootEntropyNotificationDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ResultAllocation { source } => {
+                write!(
+                    f,
+                    "failed to allocate entropy notification results: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for Arm64BootEntropyNotificationDispatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ResultAllocation { source } => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Arm64BootNoopEntropySource;
+
+impl VirtioRngEntropySource for Arm64BootNoopEntropySource {
+    fn fill_entropy(&mut self, _destination: &mut [u8]) -> Result<(), VirtioRngEntropySourceError> {
+        Err(VirtioRngEntropySourceError::new())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arm64BootBlockDevice {
     pub registration: BlockMmioDeviceRegistration,
@@ -744,6 +944,61 @@ impl Arm64BootRuntimeResources {
         }
 
         Ok(Arm64BootVsockNotificationDispatches::new(devices))
+    }
+
+    pub fn dispatch_entropy_queue_notifications_with_source(
+        &mut self,
+        memory: &mut GuestMemory,
+        mmio_dispatcher: &mut MmioDispatcher,
+        entropy_source: &mut impl Arm64BootEntropySourceProvider,
+    ) -> Result<Arm64BootEntropyNotificationDispatches, Arm64BootEntropyNotificationDispatchError>
+    {
+        let mut devices = Vec::new();
+        let device_count = if self.entropy_device.is_some() { 1 } else { 0 };
+        devices.try_reserve_exact(device_count).map_err(|source| {
+            Arm64BootEntropyNotificationDispatchError::ResultAllocation { source }
+        })?;
+
+        if let Some(device) = self.entropy_device.clone() {
+            let region_id = device.registration.region_id();
+            let outcome = match mmio_dispatcher.handler_mut::<VirtioRngMmioHandler>(region_id) {
+                Ok(handler) => {
+                    if handler.has_pending_queue_notifications() {
+                        match entropy_source.entropy_source(&device) {
+                            Ok(source) => match handler
+                                .dispatch_rng_queue_notifications(memory, source.into_inner())
+                            {
+                                Ok(dispatch) => {
+                                    Arm64BootEntropyNotificationOutcome::Dispatched(dispatch)
+                                }
+                                Err(source) => {
+                                    Arm64BootEntropyNotificationOutcome::DispatchFailed(source)
+                                }
+                            },
+                            Err(source) => {
+                                Arm64BootEntropyNotificationOutcome::EntropySourceProviderFailed(
+                                    source,
+                                )
+                            }
+                        }
+                    } else {
+                        let mut source = Arm64BootNoopEntropySource;
+                        match handler.dispatch_rng_queue_notifications(memory, &mut source) {
+                            Ok(dispatch) => {
+                                Arm64BootEntropyNotificationOutcome::Dispatched(dispatch)
+                            }
+                            Err(source) => {
+                                Arm64BootEntropyNotificationOutcome::DispatchFailed(source)
+                            }
+                        }
+                    }
+                }
+                Err(source) => Arm64BootEntropyNotificationOutcome::HandlerLookupFailed(source),
+            };
+            devices.push(Arm64BootEntropyNotificationDispatch::new(device, outcome));
+        }
+
+        Ok(Arm64BootEntropyNotificationDispatches::new(devices))
     }
 }
 
@@ -1408,6 +1663,7 @@ mod tests {
     use device_tree::DeviceTree;
 
     use super::{
+        Arm64BootEntropySource, Arm64BootEntropySourceError, Arm64BootEntropySourceProvider,
         Arm64BootNetworkNotificationOutcome, Arm64BootNetworkPacketIo,
         Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider, Arm64BootResourceConfig,
         Arm64BootResourceError, Arm64BootResources, Arm64BootSerialDeviceConfig,
@@ -1424,7 +1680,10 @@ mod tests {
         BootCommandLineError, BootPayloadKind, BootSourceConfigInput, BootSourceLoadError,
         DEFAULT_KERNEL_COMMAND_LINE,
     };
-    use crate::entropy::{EntropyMmioLayout, VirtioRngMmioHandler};
+    use crate::entropy::{
+        EntropyMmioLayout, VirtioRngEntropySource, VirtioRngEntropySourceError,
+        VirtioRngMmioHandler,
+    };
     use crate::fdt::{Arm64FdtError, Arm64FdtGic, Arm64FdtRegion, Arm64FdtTimerInterrupts};
     use crate::interrupt::{DeviceInterruptKind, GuestInterruptLine};
     use crate::machine::{MachineConfig, MachineConfigInput};
@@ -1695,6 +1954,31 @@ mod tests {
             vsock_interrupt_line: None,
             entropy_device: None,
         }
+    }
+
+    fn boot_runtime_with_entropy(
+        kernel_name: &str,
+    ) -> (
+        crate::memory::GuestMemory,
+        super::Arm64BootRuntimeResources,
+        MmioDispatcher,
+    ) {
+        let kernel = temp_file(kernel_name, &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            Arm64BootResourceConfig {
+                entropy_device: Some(super::Arm64BootEntropyDeviceConfig::new(
+                    EntropyMmioLayout::new(TEST_ENTROPY_MMIO_BASE, MmioRegionId::new(100)),
+                    line(36),
+                )),
+                ..valid_config(&[])
+            },
+        )
+        .expect("boot resources should assemble with entropy device");
+        let parts = resources.into_parts();
+
+        (parts.memory, parts.runtime, parts.mmio_dispatcher)
     }
 
     fn valid_gic() -> Arm64FdtGic {
@@ -2264,6 +2548,160 @@ mod tests {
         );
     }
 
+    fn write_boot_entropy_mmio_u32(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        register: VirtioMmioRegister,
+        value: u32,
+    ) {
+        let address = runtime
+            .entropy_device
+            .as_ref()
+            .expect("entropy device should exist")
+            .registration
+            .address()
+            .checked_add(register.offset())
+            .expect("test entropy MMIO address should not overflow");
+        let access = mmio_dispatcher
+            .lookup(address, 4)
+            .expect("entropy MMIO access should resolve");
+        let data = MmioAccessBytes::new(&value.to_le_bytes()).expect("u32 bytes should be valid");
+        mmio_dispatcher
+            .dispatch(
+                MmioOperation::write(access, data).expect("u32 write operation should be valid"),
+            )
+            .expect("entropy MMIO write should dispatch");
+    }
+
+    fn read_boot_entropy_mmio_u32(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        register: VirtioMmioRegister,
+    ) -> u32 {
+        let address = runtime
+            .entropy_device
+            .as_ref()
+            .expect("entropy device should exist")
+            .registration
+            .address()
+            .checked_add(register.offset())
+            .expect("test entropy MMIO address should not overflow");
+        let access = mmio_dispatcher
+            .lookup(address, 4)
+            .expect("entropy MMIO access should resolve");
+        let outcome = mmio_dispatcher
+            .dispatch(MmioOperation::read(access).expect("u32 read operation should be valid"))
+            .expect("entropy MMIO read should dispatch");
+        match outcome {
+            MmioDispatchOutcome::Read { data } => u32::from_le_bytes(
+                data.as_slice()
+                    .try_into()
+                    .expect("u32 read should return four bytes"),
+            ),
+            MmioDispatchOutcome::Write => panic!("read operation should not produce write outcome"),
+        }
+    }
+
+    fn configure_boot_entropy_queue(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        device_ring: GuestAddress,
+    ) {
+        write_boot_entropy_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+        );
+        write_boot_entropy_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+        );
+        write_boot_entropy_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            QUEUE_CONFIG_STATUS,
+        );
+        write_boot_entropy_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueNum,
+            u32::from(TEST_QUEUE_SIZE),
+        );
+        write_boot_entropy_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueDescLow,
+            guest_address_low(TEST_DESCRIPTOR_TABLE),
+        );
+        write_boot_entropy_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueDriverLow,
+            guest_address_low(TEST_AVAILABLE_RING),
+        );
+        write_boot_entropy_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueDeviceLow,
+            guest_address_low(device_ring),
+        );
+        write_boot_entropy_mmio_u32(runtime, mmio_dispatcher, VirtioMmioRegister::QueueReady, 1);
+        write_boot_entropy_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            DRIVER_OK_STATUS,
+        );
+    }
+
+    fn notify_boot_entropy_queue(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+    ) {
+        write_boot_entropy_mmio_u32(runtime, mmio_dispatcher, VirtioMmioRegister::QueueNotify, 0);
+    }
+
+    fn write_boot_entropy_request(memory: &mut crate::memory::GuestMemory, len: u32) {
+        write_descriptor(memory, 0, TestDescriptor::writable(DATA_ADDR, len, None));
+        write_available_heads(memory, &[0]);
+    }
+
+    fn write_partially_invalid_entropy_request(memory: &mut crate::memory::GuestMemory) {
+        write_descriptor(memory, 0, TestDescriptor::writable(DATA_ADDR, 16, None));
+        write_available_heads(memory, &[0, TEST_QUEUE_SIZE]);
+    }
+
+    fn read_boot_entropy_used_index(memory: &crate::memory::GuestMemory) -> u16 {
+        read_guest_u16(
+            memory,
+            TEST_USED_RING
+                .checked_add(2)
+                .expect("entropy used idx address should not overflow"),
+        )
+    }
+
+    fn read_boot_entropy_used_element(
+        memory: &crate::memory::GuestMemory,
+        ring_index: u16,
+    ) -> (u32, u32) {
+        let element = TEST_USED_RING
+            .checked_add(4 + u64::from(ring_index) * 8)
+            .expect("entropy used element address should not overflow");
+        (
+            read_guest_u32(memory, element),
+            read_guest_u32(
+                memory,
+                element
+                    .checked_add(4)
+                    .expect("entropy used len address should not overflow"),
+            ),
+        )
+    }
+
     fn write_boot_vsock_tx_packet_header(
         memory: &mut crate::memory::GuestMemory,
         header: VirtioVsockPacketHeader,
@@ -2539,6 +2977,60 @@ mod tests {
                 &mut endpoint.tx_sink,
                 &mut endpoint.rx_source,
             ))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingEntropySource {
+        calls: Vec<usize>,
+        next_byte: u8,
+    }
+
+    impl VirtioRngEntropySource for RecordingEntropySource {
+        fn fill_entropy(
+            &mut self,
+            destination: &mut [u8],
+        ) -> Result<(), VirtioRngEntropySourceError> {
+            self.calls.push(destination.len());
+            for byte in destination {
+                *byte = self.next_byte;
+                self.next_byte = self.next_byte.wrapping_add(1);
+            }
+
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingEntropySourceProvider {
+        source: RecordingEntropySource,
+        requested_regions: Vec<MmioRegionId>,
+        fail: bool,
+    }
+
+    impl RecordingEntropySourceProvider {
+        fn failing() -> Self {
+            Self {
+                source: RecordingEntropySource::default(),
+                requested_regions: Vec::new(),
+                fail: true,
+            }
+        }
+    }
+
+    impl Arm64BootEntropySourceProvider for RecordingEntropySourceProvider {
+        fn entropy_source(
+            &mut self,
+            device: &super::Arm64BootEntropyDevice,
+        ) -> Result<Arm64BootEntropySource<'_>, Arm64BootEntropySourceError> {
+            self.requested_regions.push(device.registration.region_id());
+            if self.fail {
+                return Err(Arm64BootEntropySourceError::new(
+                    "test entropy source unavailable",
+                ));
+            }
+
+            Ok(Arm64BootEntropySource::new(&mut self.source))
         }
     }
 
@@ -3646,6 +4138,237 @@ mod tests {
         assert!(dispatches.is_empty());
         assert_eq!(dispatches.len(), 0);
         assert!(!dispatches.needs_queue_interrupt());
+    }
+
+    #[test]
+    fn boot_runtime_entropy_notification_dispatch_accepts_empty_entropy_device() {
+        let kernel = temp_file("kernel-empty-entropy-dispatch", &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+        let resources =
+            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
+                .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
+        let mut runtime = parts.runtime;
+        let mut provider = RecordingEntropySourceProvider::default();
+
+        let dispatches = runtime
+            .dispatch_entropy_queue_notifications_with_source(
+                &mut memory,
+                &mut mmio_dispatcher,
+                &mut provider,
+            )
+            .expect("empty entropy dispatch result should allocate");
+
+        assert!(dispatches.is_empty());
+        assert_eq!(dispatches.len(), 0);
+        assert!(!dispatches.needs_queue_interrupt());
+        assert!(provider.requested_regions.is_empty());
+    }
+
+    #[test]
+    fn boot_runtime_entropy_notification_dispatch_without_pending_notification_is_noop() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_entropy("kernel-entropy-noop-dispatch");
+        let mut provider = RecordingEntropySourceProvider::default();
+
+        let dispatches = runtime
+            .dispatch_entropy_queue_notifications_with_source(
+                &mut memory,
+                &mut mmio_dispatcher,
+                &mut provider,
+            )
+            .expect("entropy dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 1);
+        assert!(!dispatches.needs_queue_interrupt());
+        let device_dispatch = &dispatches.as_slice()[0];
+        assert_eq!(
+            device_dispatch.device().registration.region_id(),
+            MmioRegionId::new(100)
+        );
+        assert_eq!(device_dispatch.device().fdt_device.interrupt_line, line(36));
+        let dispatch = device_dispatch
+            .outcome()
+            .dispatched()
+            .expect("no pending entropy notification should dispatch as no-op");
+        assert!(dispatch.drained_notifications().is_empty());
+        assert!(dispatch.queue_dispatch().is_none());
+        assert!(!device_dispatch.needs_queue_interrupt());
+        assert!(provider.requested_regions.is_empty());
+        assert_eq!(
+            read_boot_entropy_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                VirtioMmioRegister::InterruptStatus,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn boot_runtime_entropy_notification_dispatch_executes_queued_request() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_entropy("kernel-entropy-request-dispatch");
+        configure_boot_entropy_queue(&mut runtime, &mut mmio_dispatcher, TEST_USED_RING);
+        write_boot_entropy_request(&mut memory, 16);
+        notify_boot_entropy_queue(&mut runtime, &mut mmio_dispatcher);
+        let mut provider = RecordingEntropySourceProvider::default();
+
+        let dispatches = runtime
+            .dispatch_entropy_queue_notifications_with_source(
+                &mut memory,
+                &mut mmio_dispatcher,
+                &mut provider,
+            )
+            .expect("entropy dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 1);
+        assert!(dispatches.needs_queue_interrupt());
+        let device_dispatch = &dispatches.as_slice()[0];
+        assert_eq!(device_dispatch.device().fdt_device.interrupt_line, line(36));
+        assert!(device_dispatch.needs_queue_interrupt());
+        let dispatch = device_dispatch
+            .outcome()
+            .dispatched()
+            .expect("queued entropy notification should dispatch");
+        assert_eq!(dispatch.drained_notifications(), [0]);
+        let queue = dispatch
+            .queue_dispatch()
+            .expect("entropy queue dispatch summary should be present");
+        assert_eq!(queue.processed_requests(), 1);
+        assert_eq!(queue.successful_requests(), 1);
+        assert_eq!(queue.bytes_written_to_guest(), 16);
+        assert!(queue.needs_queue_interrupt());
+        assert_eq!(provider.requested_regions, [MmioRegionId::new(100)]);
+        assert_eq!(provider.source.calls, [16]);
+        assert_eq!(
+            read_guest_bytes(&memory, DATA_ADDR, 16),
+            (0_u8..16).collect::<Vec<_>>()
+        );
+        assert_eq!(read_boot_entropy_used_index(&memory), 1);
+        assert_eq!(read_boot_entropy_used_element(&memory, 0), (0, 16));
+        assert_eq!(
+            read_boot_entropy_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                VirtioMmioRegister::InterruptStatus,
+            ),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+    }
+
+    #[test]
+    fn boot_runtime_entropy_notification_dispatch_reports_source_provider_error() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_entropy("kernel-entropy-provider-error-dispatch");
+        configure_boot_entropy_queue(&mut runtime, &mut mmio_dispatcher, TEST_USED_RING);
+        write_boot_entropy_request(&mut memory, 16);
+        notify_boot_entropy_queue(&mut runtime, &mut mmio_dispatcher);
+        let mut provider = RecordingEntropySourceProvider::failing();
+
+        let dispatches = runtime
+            .dispatch_entropy_queue_notifications_with_source(
+                &mut memory,
+                &mut mmio_dispatcher,
+                &mut provider,
+            )
+            .expect("entropy dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 1);
+        assert!(!dispatches.needs_queue_interrupt());
+        let error = dispatches.as_slice()[0]
+            .outcome()
+            .entropy_source_error()
+            .expect("source-provider error should be preserved");
+        assert_eq!(error.message(), "test entropy source unavailable");
+        assert_eq!(provider.requested_regions, [MmioRegionId::new(100)]);
+        assert!(provider.source.calls.is_empty());
+        assert_eq!(read_boot_entropy_used_index(&memory), 0);
+        assert_eq!(
+            read_boot_entropy_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                VirtioMmioRegister::InterruptStatus,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn boot_runtime_entropy_notification_dispatch_reports_missing_handler() {
+        let (mut memory, mut runtime, original_mmio_dispatcher) =
+            boot_runtime_with_entropy("kernel-entropy-missing-handler-dispatch");
+        drop(original_mmio_dispatcher);
+        let mut mmio_dispatcher = MmioDispatcher::new();
+        let mut provider = RecordingEntropySourceProvider::default();
+
+        let dispatches = runtime
+            .dispatch_entropy_queue_notifications_with_source(
+                &mut memory,
+                &mut mmio_dispatcher,
+                &mut provider,
+            )
+            .expect("entropy dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 1);
+        assert!(!dispatches.needs_queue_interrupt());
+        let error = dispatches.as_slice()[0]
+            .outcome()
+            .handler_lookup_error()
+            .expect("missing entropy handler should be reported");
+        assert!(matches!(
+            error,
+            crate::mmio::MmioHandlerLookupError::MissingHandler { region_id }
+                if *region_id == MmioRegionId::new(100)
+        ));
+        assert!(provider.requested_regions.is_empty());
+    }
+
+    #[test]
+    fn boot_runtime_entropy_notification_dispatch_preserves_partial_error_interrupt_intent() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_entropy("kernel-entropy-partial-error-dispatch");
+        configure_boot_entropy_queue(&mut runtime, &mut mmio_dispatcher, TEST_USED_RING);
+        write_partially_invalid_entropy_request(&mut memory);
+        notify_boot_entropy_queue(&mut runtime, &mut mmio_dispatcher);
+        let mut provider = RecordingEntropySourceProvider::default();
+
+        let dispatches = runtime
+            .dispatch_entropy_queue_notifications_with_source(
+                &mut memory,
+                &mut mmio_dispatcher,
+                &mut provider,
+            )
+            .expect("entropy dispatch result should allocate");
+
+        assert!(dispatches.needs_queue_interrupt());
+        let device_dispatch = &dispatches.as_slice()[0];
+        assert!(device_dispatch.needs_queue_interrupt());
+        let error = device_dispatch
+            .outcome()
+            .dispatch_error()
+            .expect("partial entropy failure should be preserved as a device error");
+        assert_eq!(error.drained_notifications(), [0]);
+        let completed = error
+            .completed_dispatch()
+            .expect("partial entropy failure should preserve completed dispatch metadata");
+        assert_eq!(completed.processed_requests(), 1);
+        assert_eq!(completed.successful_requests(), 1);
+        assert_eq!(completed.bytes_written_to_guest(), 16);
+        assert!(completed.needs_queue_interrupt());
+        assert_eq!(provider.source.calls, [16]);
+        assert_eq!(read_boot_entropy_used_index(&memory), 1);
+        assert_eq!(read_boot_entropy_used_element(&memory, 0), (0, 16));
+        assert_eq!(
+            read_boot_entropy_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                VirtioMmioRegister::InterruptStatus,
+            ),
+            DeviceInterruptKind::Queue.status().bits()
+        );
     }
 
     #[test]
