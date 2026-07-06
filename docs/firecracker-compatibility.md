@@ -170,7 +170,7 @@ core configuration PUTs, `PUT /mmds`, `PUT /mmds/config`, `PUT /metrics`,
 `PATCH /hotplug/memory`, and `PATCH /pmem/{pmem_id}` requests routed through
 VMM control are counted under `patch_api_requests`.
 Parsed deprecated HTTP API usage is counted under
-`deprecated_api.deprecated_http_api_calls` for supported machine
+`deprecated_api.deprecated_http_api_calls` for explicit non-null machine
 `cpu_template`, MMDS V1 config, deprecated `vsock_id`, and snapshot-load
 `mem_file_path` or `enable_diff_snapshots: true` request forms. Parser failures,
 including malformed bodies and path/body ID mismatches, for the PUT and PATCH
@@ -352,17 +352,17 @@ exist.
 | `PUT /machine-config` | `vcpu_count` | required | Firecracker bounds this to `1..=32`, and bangbang stores that range for API compatibility. Current HVF startup supports exactly one vCPU and rejects larger stored values during `InstanceStart` before creating an HVF VM. |
 | `PUT /machine-config` | `mem_size_mib` | required | Drives guest memory allocation and mapping; accepted range is `1..=1046528` MiB for the current Apple Silicon/aarch64 target. Host free-memory preflight remains deferred. |
 | `PUT /machine-config` | `smt` | optional when `false`; rejected when `true` | Firecracker defaults this to `false`; the initial HVF target accepts explicit no-SMT config and currently returns `machine smt is not supported` when SMT is enabled. |
-| `PUT /machine-config` | `cpu_template` | optional when omitted, `null`, or `None`; rejected for known non-`None` templates | Explicit `None` matches Firecracker's deprecated default; known non-default CPU templates currently return `machine cpu_template <template> is not supported` and need a separate HVF compatibility design. |
+| `PUT /machine-config` | `cpu_template` | optional when omitted, `null`, or `None`; rejected for known non-`None` templates | Explicit `null` is treated as omitted and does not count as deprecated API usage. Explicit `None` matches Firecracker's deprecated default and counts as deprecated API usage; known non-default CPU templates currently return `machine cpu_template <template> is not supported` and need a separate HVF compatibility design. |
 | `PUT /machine-config` | `track_dirty_pages` | optional when `false`; rejected when `true` | Explicit `false` matches Firecracker's default; enabling dirty tracking belongs with snapshot support and currently returns `machine track_dirty_pages is not supported`. |
 | `PUT /machine-config` | `huge_pages` | optional when `None`; rejected for `2M` | Explicit `None` matches Firecracker's default; Linux hugetlbfs does not directly apply to the macOS target and `2M` currently returns `machine huge_pages is not supported`. |
-| `PUT /machine-config` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
+| `PUT /machine-config` | unknown or duplicate fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PATCH /machine-config` | `vcpu_count` | optional | When present, updates the stored vCPU count with the same `1..=32` bounds as `PUT`; omitted fields keep their current values. Current HVF startup still rejects values above one during `InstanceStart`. |
 | `PATCH /machine-config` | `mem_size_mib` | optional | When present, updates the stored memory size with the same `1..=1046528` MiB target bound as `PUT`; omitted fields keep their current values. |
 | `PATCH /machine-config` | `smt` | optional when `false`; rejected when `true` | Matches the current `PUT` policy for the Apple Silicon target and currently returns `machine smt is not supported` when SMT is enabled. |
-| `PATCH /machine-config` | `cpu_template` | optional when omitted or `null`; accepted when `None`; rejected for known non-`None` templates | `null` is treated as omitted. Explicit `None` is accepted; known non-default CPU templates currently return `machine cpu_template <template> is not supported`. |
+| `PATCH /machine-config` | `cpu_template` | optional when omitted or `null`; accepted when `None`; rejected for known non-`None` templates | Explicit `null` is treated as omitted and does not count as deprecated API usage. Explicit `None` is accepted and counts as deprecated API usage; known non-default CPU templates currently return `machine cpu_template <template> is not supported`. |
 | `PATCH /machine-config` | `track_dirty_pages` | optional when `false`; rejected when `true` | Matches the current `PUT` dirty-tracking policy. |
 | `PATCH /machine-config` | `huge_pages` | optional when `None`; rejected for `2M` | Matches the current `PUT` huge-pages policy and currently returns `machine huge_pages is not supported` for `2M`. |
-| `PATCH /machine-config` | unknown fields or empty patch | rejected | Matches Firecracker's strict request model behavior and avoids silent no-op updates. |
+| `PATCH /machine-config` | unknown or duplicate fields; empty patch | rejected | Matches Firecracker's strict request model behavior and avoids silent no-op updates. |
 | `PUT /snapshot/create` | `snapshot_type` | optional; VMM-routed unsupported | Accepts Firecracker values `Full` and `Diff`, defaulting to `Full`, before routing the valid request through the VMM state/action policy. Real snapshot type behavior remains deferred. |
 | `PUT /snapshot/create` | `snapshot_path` | required; VMM-routed unsupported | Parsed as a Firecracker-shaped path string before routing the valid request through the VMM state/action policy. Host file creation remains deferred. |
 | `PUT /snapshot/create` | `mem_file_path` | required; VMM-routed unsupported | Parsed as a Firecracker-shaped path string before routing the valid request through the VMM state/action policy. Guest memory persistence remains deferred. |

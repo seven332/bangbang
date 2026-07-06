@@ -2363,18 +2363,8 @@ fn parse_network_interface_patch_request(
     )))
 }
 
-fn json_object_contains_key(value: &serde_json::Value, key: &str) -> bool {
-    match value.as_object() {
-        Some(object) => object.contains_key(key),
-        None => false,
-    }
-}
-
 fn parse_machine_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
-    let value = serde_json::from_slice::<serde_json::Value>(body)
-        .map_err(|_| RequestError::MalformedRequest)?;
-    let cpu_template_field_present = json_object_contains_key(&value, "cpu_template");
-    let body = serde_json::from_value::<MachineConfigRequestBody>(value)
+    let body = serde_json::from_slice::<MachineConfigRequestBody>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
 
     validate_machine_config_request(&body)?;
@@ -2385,7 +2375,7 @@ fn parse_machine_config_request(body: &[u8]) -> Result<ApiRequest, RequestError>
             mem_size_mib: body.mem_size_mib,
             smt: body.smt,
             cpu_template: body.cpu_template,
-            cpu_template_field_present,
+            cpu_template_field_present: body.cpu_template.is_some(),
             track_dirty_pages: body.track_dirty_pages,
             huge_pages: body.huge_pages,
         },
@@ -2393,10 +2383,7 @@ fn parse_machine_config_request(body: &[u8]) -> Result<ApiRequest, RequestError>
 }
 
 fn parse_machine_config_patch_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
-    let value = serde_json::from_slice::<serde_json::Value>(body)
-        .map_err(|_| RequestError::MalformedRequest)?;
-    let cpu_template_field_present = json_object_contains_key(&value, "cpu_template");
-    let body = serde_json::from_value::<MachineConfigPatchRequestBody>(value)
+    let body = serde_json::from_slice::<MachineConfigPatchRequestBody>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
 
     validate_machine_config_patch_request(&body)?;
@@ -2407,7 +2394,7 @@ fn parse_machine_config_patch_request(body: &[u8]) -> Result<ApiRequest, Request
             mem_size_mib: body.mem_size_mib,
             smt: body.smt,
             cpu_template: body.cpu_template,
-            cpu_template_field_present,
+            cpu_template_field_present: body.cpu_template.is_some(),
             track_dirty_pages: body.track_dirty_pages,
             huge_pages: body.huge_pages,
         },
@@ -3393,7 +3380,7 @@ mod tests {
             panic!("expected machine-config request");
         };
         assert_eq!(config.cpu_template(), None);
-        assert!(config.cpu_template_field_present());
+        assert!(!config.cpu_template_field_present());
     }
 
     #[test]
@@ -3450,6 +3437,21 @@ mod tests {
         let request = request_with_body("PUT", "/machine-config", body);
 
         assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_put_machine_config_duplicate_field() {
+        for body in [
+            r#"{"vcpu_count":1,"vcpu_count":2,"mem_size_mib":128}"#,
+            r#"{"vcpu_count":1,"mem_size_mib":128,"mem_size_mib":256}"#,
+            r#"{"vcpu_count":1,"mem_size_mib":128,"cpu_template":null,"cpu_template":"None"}"#,
+        ] {
+            assert_eq!(
+                parse_request(&request_with_body("PUT", "/machine-config", body)),
+                Err(RequestError::MalformedRequest),
+                "{body}"
+            );
+        }
     }
 
     #[test]
@@ -3615,7 +3617,7 @@ mod tests {
         assert_eq!(config.vcpu_count(), Some(2));
         assert_eq!(config.smt(), None);
         assert_eq!(config.cpu_template(), None);
-        assert!(config.cpu_template_field_present());
+        assert!(!config.cpu_template_field_present());
     }
 
     #[test]
@@ -3637,6 +3639,21 @@ mod tests {
         let request = request_with_body("PATCH", "/machine-config", body);
 
         assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_patch_machine_config_duplicate_field() {
+        for body in [
+            r#"{"mem_size_mib":128,"mem_size_mib":256}"#,
+            r#"{"cpu_template":null,"cpu_template":"None"}"#,
+            r#"{"smt":false,"smt":true}"#,
+        ] {
+            assert_eq!(
+                parse_request(&request_with_body("PATCH", "/machine-config", body)),
+                Err(RequestError::MalformedRequest),
+                "{body}"
+            );
+        }
     }
 
     #[test]
