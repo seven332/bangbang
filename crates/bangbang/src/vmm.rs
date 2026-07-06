@@ -393,6 +393,29 @@ impl PutApiRequestKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObservabilityPutRequest {
+    Logger,
+    Metrics,
+    Serial,
+}
+
+impl ObservabilityPutRequest {
+    const fn put_kind(self) -> PutApiRequestKind {
+        match self {
+            Self::Logger => PutApiRequestKind::Logger,
+            Self::Metrics => PutApiRequestKind::Metrics,
+            Self::Serial => PutApiRequestKind::Serial,
+        }
+    }
+
+    fn record_parse_failure(self, controller: &mut VmmController) {
+        let kind = self.put_kind();
+        kind.record_request(controller);
+        kind.record_failure(controller);
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct PatchApiRequest {
     kind: PatchApiRequestKind,
@@ -525,6 +548,8 @@ pub(crate) trait VmmRequestHandler {
     -> Result<VmmData, VmmActionError>;
 
     fn handle_put_request(&mut self, request: PutApiRequest) -> Result<VmmData, VmmActionError>;
+
+    fn record_observability_put_parse_failure(&mut self, request: ObservabilityPutRequest);
 
     fn handle_put_action_request(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError>;
 
@@ -706,6 +731,10 @@ where
         result
     }
 
+    fn record_observability_put_parse_failure(&mut self, request: ObservabilityPutRequest) {
+        request.record_parse_failure(&mut self.controller);
+    }
+
     fn record_deprecated_api_call(&mut self) {
         self.controller.record_deprecated_api_call();
     }
@@ -841,6 +870,10 @@ where
 
     fn handle_put_request(&mut self, request: PutApiRequest) -> Result<VmmData, VmmActionError> {
         ProcessVmm::handle_put_request(self, request)
+    }
+
+    fn record_observability_put_parse_failure(&mut self, request: ObservabilityPutRequest) {
+        ProcessVmm::record_observability_put_parse_failure(self, request);
     }
 
     fn record_deprecated_api_call(&mut self) {

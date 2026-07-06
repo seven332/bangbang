@@ -102,6 +102,24 @@ impl fmt::Display for RequestError {
 
 impl std::error::Error for RequestError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservabilityPutEndpoint {
+    Logger,
+    Metrics,
+    Serial,
+}
+
+pub fn observability_put_endpoint(bytes: &[u8]) -> Option<ObservabilityPutEndpoint> {
+    let (method, path, _, _) = parse_request_head(bytes).ok()?;
+
+    match (method, path) {
+        ("PUT", "/logger") => Some(ObservabilityPutEndpoint::Logger),
+        ("PUT", "/metrics") => Some(ObservabilityPutEndpoint::Metrics),
+        ("PUT", "/serial") => Some(ObservabilityPutEndpoint::Serial),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionRequest {
     action_type: ActionType,
@@ -2711,6 +2729,42 @@ mod tests {
 
     fn request_without_body(method: &str, path: &str) -> Vec<u8> {
         format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").into_bytes()
+    }
+
+    #[test]
+    fn identifies_observability_put_endpoints_from_request_head() {
+        assert_eq!(
+            observability_put_endpoint(&request_with_body("PUT", "/metrics", "{")),
+            Some(ObservabilityPutEndpoint::Metrics)
+        );
+        assert_eq!(
+            observability_put_endpoint(&request_with_body("PUT", "/logger", "{")),
+            Some(ObservabilityPutEndpoint::Logger)
+        );
+        assert_eq!(
+            observability_put_endpoint(&request_with_body("PUT", "/serial", "{")),
+            Some(ObservabilityPutEndpoint::Serial)
+        );
+    }
+
+    #[test]
+    fn ignores_non_observability_put_endpoint_requests() {
+        assert_eq!(
+            observability_put_endpoint(&request_with_body("GET", "/metrics", "{}")),
+            None
+        );
+        assert_eq!(
+            observability_put_endpoint(&request_with_body("PUT", "/metrics/extra", "{}")),
+            None
+        );
+        assert_eq!(
+            observability_put_endpoint(&request_with_body("PUT", "/boot-source", "{}")),
+            None
+        );
+        assert_eq!(
+            observability_put_endpoint(b"PUT /metrics HTTP/1.1\r\nHost: localhost\r\n"),
+            None
+        );
     }
 
     #[test]
