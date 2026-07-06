@@ -227,6 +227,13 @@ impl PutApiRequest {
         }
     }
 
+    pub(crate) const fn pmem() -> Self {
+        Self {
+            kind: PutApiRequestKind::Pmem,
+            action: VmmAction::PutPmem,
+        }
+    }
+
     pub(crate) fn serial(input: SerialConfigInput) -> Self {
         Self {
             kind: PutApiRequestKind::Serial,
@@ -260,6 +267,7 @@ enum PutApiRequestKind {
     MachineConfig,
     Mmds,
     Network,
+    Pmem,
     Serial,
     Vsock,
 }
@@ -275,6 +283,7 @@ impl PutApiRequestKind {
             Self::MachineConfig => controller.record_put_machine_config_request(),
             Self::Mmds => controller.record_put_mmds_request(),
             Self::Network => controller.record_put_network_request(),
+            Self::Pmem => controller.record_put_pmem_request(),
             Self::Serial => controller.record_put_serial_request(),
             Self::Vsock => controller.record_put_vsock_request(),
         }
@@ -290,6 +299,7 @@ impl PutApiRequestKind {
             Self::MachineConfig => controller.record_put_machine_config_failure(),
             Self::Mmds => controller.record_put_mmds_failure(),
             Self::Network => controller.record_put_network_failure(),
+            Self::Pmem => controller.record_put_pmem_failure(),
             Self::Serial => controller.record_put_serial_failure(),
             Self::Vsock => controller.record_put_vsock_failure(),
         }
@@ -331,6 +341,13 @@ impl PatchApiRequest {
         }
     }
 
+    pub(crate) const fn pmem() -> Self {
+        Self {
+            kind: PatchApiRequestKind::Pmem,
+            action: VmmAction::PatchPmem,
+        }
+    }
+
     fn record_request(&self, controller: &mut VmmController) {
         self.kind.record_request(controller);
     }
@@ -346,6 +363,7 @@ enum PatchApiRequestKind {
     MachineConfig,
     Mmds,
     Network,
+    Pmem,
 }
 
 impl PatchApiRequestKind {
@@ -355,6 +373,7 @@ impl PatchApiRequestKind {
             Self::MachineConfig => controller.record_patch_machine_config_request(),
             Self::Mmds => controller.record_patch_mmds_request(),
             Self::Network => controller.record_patch_network_request(),
+            Self::Pmem => controller.record_patch_pmem_request(),
         }
     }
 
@@ -364,6 +383,7 @@ impl PatchApiRequestKind {
             Self::MachineConfig => controller.record_patch_machine_config_failure(),
             Self::Mmds => controller.record_patch_mmds_failure(),
             Self::Network => controller.record_patch_network_failure(),
+            Self::Pmem => controller.record_patch_pmem_failure(),
         }
     }
 }
