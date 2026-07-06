@@ -3665,6 +3665,17 @@ mod tests {
             r#"{"fault_message":"The requested operation is not supported in Not started state: GetMemoryHotplug"}"#
         ));
 
+        let malformed_get_response = request_over_socket(
+            &mut vmm,
+            "mh-m-get-bad",
+            &request_with_body("GET", "/hotplug/memory", "{}"),
+        );
+        assert!(malformed_get_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(
+            malformed_get_response
+                .contains(r#"{"fault_message":"GET request cannot have a body."}"#)
+        );
+
         let valid_put_body =
             r#"{"total_size_mib":222222222,"block_size_mib":2,"slot_size_mib":128}"#;
         let valid_put_response = request_over_socket(
