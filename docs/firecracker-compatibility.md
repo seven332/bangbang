@@ -343,6 +343,9 @@ Field policy is based on Firecracker `v1.16.0` schemas and parser behavior. The
 future API should use these tables as golden/API test input once JSON models
 exist.
 
+Firecracker-shaped rate limiter objects reject duplicate `bandwidth` or `ops`
+fields and duplicate token bucket fields before VMM dispatch.
+
 | Endpoint | Field | Handling | Notes |
 | --- | --- | --- | --- |
 | `PUT /boot-source` | `kernel_image_path` | required | Host path to the kernel image. The API/VMM storage path rejects empty paths without file IO; future startup validation must check access without leaking sensitive path details. |
