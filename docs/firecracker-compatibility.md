@@ -547,8 +547,8 @@ records `balloon_count` extension fields for parsed balloon GET, PUT, and PATCH
 routes, plus `balloon_fails` extension fields for parsed balloon PUT and PATCH
 failures, because Firecracker does not expose matching request metrics. It does
 not emit entropy request-counter fields; Firecracker does not define
-`put_api_requests.entropy_count` or `entropy_fails`, and bangbang keeps entropy
-work under the unsupported virtio-rng device surface until that device exists.
+`put_api_requests.entropy_count` or `entropy_fails`. Entropy device runtime
+metrics remain deferred until their producers exist.
 Parsed deprecated HTTP API usage is counted under
 `deprecated_api.deprecated_http_api_calls` for the supported deprecated fields
 above; malformed parser failures remain outside the counter.
@@ -1591,7 +1591,9 @@ Their eventual support level should follow the endpoint matrix:
 - full MMDS TCP routing, stream reassembly, and retransmission policy
 - balloon devices and balloon statistics
 - pmem
-- entropy device configuration
+- entropy config-file support, rate limiting, runtime metrics, security docs,
+  and signed guest-visible e2e coverage beyond the current public API storage
+  and startup attachment path
 - serial input, serial rate limiting, public serial streaming, and serial metrics
 - full logger integration, full Firecracker metrics counters beyond the minimal
   `logger.missed_metrics_count` and `logger.missed_log_count`
