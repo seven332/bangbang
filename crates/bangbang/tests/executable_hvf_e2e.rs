@@ -28,6 +28,7 @@ mod macos_arm64 {
     const BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV: &str = "BANGBANG_GUEST_EXT4_ROOTFS_PATH";
     const BLOCK_WRITE_MARKER: &[u8] = b"BANGBANG_BLOCK_WRITE_OK";
     const DIRECT_ROOTFS_BLOCK_MARKER: &[u8] = b"BANGBANG_DIRECT_ROOTFS_BLOCK_OK";
+    const DIRECT_ROOTFS_ENTROPY_MARKER: &[u8] = b"BANGBANG_ENTROPY_GUEST_READ_OK";
     const DIRECT_ROOTFS_MMDS_MARKER: &[u8] = b"BANGBANG_MMDS_GUEST_FETCH_OK";
     const DIRECT_ROOTFS_MMDS_V2_MARKER: &[u8] = b"BANGBANG_MMDS_V2_GUEST_FETCH_OK";
     const DIRECT_ROOTFS_VSOCK_MARKER: &[u8] = b"BANGBANG_VSOCK_GUEST_CONNECT_OK";
@@ -89,6 +90,7 @@ mod macos_arm64 {
     const GUEST_RESET_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 rdinit=/reboot-init";
     const DIRECT_ROOTFS_BOOT_ARGS: &str =
         "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init";
+    const DIRECT_ROOTFS_ENTROPY_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.entropy-read=1";
     const DIRECT_ROOTFS_MMDS_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-fetch=1";
     const DIRECT_ROOTFS_MMDS_V2_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.mmds-v2-fetch=1";
     const DIRECT_ROOTFS_VSOCK_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.vsock-guest-connect=1";
@@ -1125,6 +1127,119 @@ mod macos_arm64 {
         }
 
         assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang direct rootfs");
+    }
+
+    #[test]
+    fn signed_executable_reads_entropy_from_direct_rootfs_guest() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let data_backing_path = test_dir.path().join("data.img");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+
+        create_zeroed_block_backing(&data_backing_path);
+
+        let mut bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+        let machine_response = http_put_json(
+            &socket_path,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        );
+        assert_no_content_response(
+            &machine_response,
+            "PUT /machine-config entropy direct rootfs",
+        );
+
+        let entropy_response = http_put_json(&socket_path, "/entropy", "{}");
+        assert_no_content_response(&entropy_response, "PUT /entropy direct rootfs");
+
+        let vm_config = http_get(&socket_path, "/vm/config");
+        assert_ok_response(&vm_config, "GET /vm/config after PUT /entropy");
+        assert_response_contains(
+            &vm_config,
+            r#""entropy":{}"#,
+            "GET /vm/config after PUT /entropy",
+        );
+
+        let kernel_path_json = json_string(path_text(&kernel_path));
+        let boot_args_json = json_string(DIRECT_ROOTFS_ENTROPY_BOOT_ARGS);
+        let boot_body = format!(
+            r#"{{
+                "kernel_image_path":{kernel_path_json},
+                "boot_args":{boot_args_json}
+            }}"#
+        );
+        let boot_response = http_put_json(&socket_path, "/boot-source", &boot_body);
+        assert_no_content_response(&boot_response, "PUT /boot-source entropy direct rootfs");
+
+        let rootfs_path_json = json_string(path_text(&rootfs_path));
+        let rootfs_body = format!(
+            r#"{{
+                "drive_id":"rootfs",
+                "path_on_host":{rootfs_path_json},
+                "is_root_device":true,
+                "is_read_only":true
+            }}"#
+        );
+        let rootfs_response = http_put_json(&socket_path, "/drives/rootfs", &rootfs_body);
+        assert_no_content_response(&rootfs_response, "PUT /drives/rootfs entropy direct rootfs");
+
+        let data_backing_path_json = json_string(path_text(&data_backing_path));
+        let data_drive_body = format!(
+            r#"{{
+                "drive_id":"data",
+                "path_on_host":{data_backing_path_json},
+                "is_root_device":false,
+                "is_read_only":false
+            }}"#
+        );
+        let data_drive_response = http_put_json(&socket_path, "/drives/data", &data_drive_body);
+        assert_no_content_response(
+            &data_drive_response,
+            "PUT /drives/data entropy direct rootfs",
+        );
+
+        let start_response = http_put_json(
+            &socket_path,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        );
+        assert_no_content_response(
+            &start_response,
+            "PUT /actions InstanceStart entropy direct rootfs",
+        );
+
+        let running_instance_info = http_get(&socket_path, "/");
+        assert_ok_response(
+            &running_instance_info,
+            "GET / after entropy direct rootfs InstanceStart",
+        );
+        assert_response_contains(
+            &running_instance_info,
+            r#""state":"Running""#,
+            "GET / after entropy direct rootfs InstanceStart",
+        );
+
+        if let Err(err) = wait_for_file_prefix_marker(
+            &data_backing_path,
+            DIRECT_ROOTFS_ENTROPY_MARKER,
+            GUEST_EXECUTION_TIMEOUT,
+        ) {
+            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "direct rootfs guest did not read entropy through signed bangbang executable: {err}; backing prefix: {backing_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
+        assert_clean_shutdown(
+            bangbang.terminate(),
+            &socket_path,
+            "bangbang entropy direct rootfs",
+        );
     }
 
     #[test]
