@@ -4488,7 +4488,7 @@ mod tests {
         assert_eq!(vmm.starter.calls, 1);
         assert_eq!(
             fs::read_to_string(metrics.path()).expect("metrics output should read"),
-            "{\"vmm\":{\"boot_run_loop_status\":\"failed\",\"metrics_flush_count\":1,\"parent_cpu_time_us\":3000,\"start_time_us\":1000}}\n"
+            "{\"api_server\":{\"process_startup_time_us\":1000},\"vmm\":{\"boot_run_loop_status\":\"failed\",\"metrics_flush_count\":1}}\n"
         );
     }
 
@@ -4526,7 +4526,7 @@ mod tests {
         assert_eq!(vmm.starter.calls, 1);
         assert_eq!(
             fs::read_to_string(metrics.path()).expect("metrics output should read"),
-            "{\"vmm\":{\"boot_run_loop_status\":\"failed\",\"metrics_flush_count\":1,\"parent_cpu_time_us\":3000,\"start_time_us\":1000}}\n"
+            "{\"api_server\":{\"process_startup_time_us\":1000},\"vmm\":{\"boot_run_loop_status\":\"failed\",\"metrics_flush_count\":1}}\n"
         );
         assert_eq!(
             fs::read_to_string(logger.path()).expect("logger output should read"),

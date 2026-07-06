@@ -2639,16 +2639,16 @@ mod macos_arm64 {
         });
 
         assert!(
-            output.contains(r#""start_time_us":1000"#),
-            "metrics output should include start_time_us; output:\n{output}"
+            output.contains(r#""process_startup_time_us":1000"#),
+            "metrics output should include process_startup_time_us; output:\n{output}"
         );
         assert!(
-            output.contains(r#""start_time_cpu_us":2000"#),
-            "metrics output should include start_time_cpu_us; output:\n{output}"
+            output.contains(r#""process_startup_time_cpu_us":5000"#),
+            "metrics output should include process_startup_time_cpu_us; output:\n{output}"
         );
         assert!(
-            output.contains(r#""parent_cpu_time_us":3000"#),
-            "metrics output should include parent_cpu_time_us; output:\n{output}"
+            output.contains(r#""api_server""#),
+            "metrics output should include api_server metrics object; output:\n{output}"
         );
     }
 

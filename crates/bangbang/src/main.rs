@@ -3310,7 +3310,7 @@ mod tests {
         assert!(!vmm.has_started_session());
         assert_eq!(
             fs::read_to_string(&path).expect("startup metrics output should be readable"),
-            "{\"vmm\":{\"metrics_flush_count\":1,\"parent_cpu_time_us\":3000,\"start_time_cpu_us\":2000,\"start_time_us\":1000}}\n"
+            "{\"api_server\":{\"process_startup_time_cpu_us\":5000,\"process_startup_time_us\":1000},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(path).expect("fixture should clean up");

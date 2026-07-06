@@ -1059,26 +1059,29 @@ impl MetricsSink {
             "metrics_flush_count".to_string(),
             serde_json::Value::Number(flush_count.into()),
         );
-        if let Some(value) = diagnostics.parent_cpu_time_us() {
-            vmm.insert(
-                "parent_cpu_time_us".to_string(),
+
+        let mut root = serde_json::Map::new();
+        let mut api_server = serde_json::Map::new();
+        if let Some(value) = diagnostics.start_time_us() {
+            api_server.insert(
+                "process_startup_time_us".to_string(),
                 serde_json::Value::Number(value.into()),
             );
         }
         if let Some(value) = diagnostics.start_time_cpu_us() {
-            vmm.insert(
-                "start_time_cpu_us".to_string(),
-                serde_json::Value::Number(value.into()),
+            let process_startup_time_cpu_us =
+                value.saturating_add(diagnostics.parent_cpu_time_us().unwrap_or_default());
+            api_server.insert(
+                "process_startup_time_cpu_us".to_string(),
+                serde_json::Value::Number(process_startup_time_cpu_us.into()),
             );
         }
-        if let Some(value) = diagnostics.start_time_us() {
-            vmm.insert(
-                "start_time_us".to_string(),
-                serde_json::Value::Number(value.into()),
+        if !api_server.is_empty() {
+            root.insert(
+                "api_server".to_string(),
+                serde_json::Value::Object(api_server),
             );
         }
-
-        let mut root = serde_json::Map::new();
         if !deprecated_api.is_empty() {
             let mut deprecated = serde_json::Map::new();
             deprecated.insert(
@@ -1544,7 +1547,46 @@ mod tests {
         let output = fs::read_to_string(&path).expect("metrics output should be readable");
         assert_eq!(
             output,
-            "{\"vmm\":{\"metrics_flush_count\":1,\"parent_cpu_time_us\":3000,\"start_time_cpu_us\":2000,\"start_time_us\":1000}}\n"
+            "{\"api_server\":{\"process_startup_time_cpu_us\":5000,\"process_startup_time_us\":1000},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn omits_api_server_cpu_time_when_only_parent_cpu_time_is_provided() {
+        let path = unique_metrics_path("startup-parent-only");
+        let mut state = MetricsState::default();
+        let diagnostics = MetricsDiagnostics::new().with_parent_cpu_time_us(3000);
+
+        state
+            .configure(MetricsConfigInput::new(&path))
+            .expect("metrics should configure");
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("metrics output should be readable");
+        assert_eq!(output, "{\"vmm\":{\"metrics_flush_count\":1}}\n");
+
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn startup_cpu_time_diagnostics_saturate_when_parent_time_overflows() {
+        let path = unique_metrics_path("startup-time-saturates");
+        let mut state = MetricsState::default();
+        let diagnostics = MetricsDiagnostics::new()
+            .with_start_time_cpu_us(u64::MAX)
+            .with_parent_cpu_time_us(1);
+
+        state
+            .configure(MetricsConfigInput::new(&path))
+            .expect("metrics should configure");
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("metrics output should be readable");
+        assert_eq!(
+            output,
+            "{\"api_server\":{\"process_startup_time_cpu_us\":18446744073709551615},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(path).expect("fixture should clean up");
