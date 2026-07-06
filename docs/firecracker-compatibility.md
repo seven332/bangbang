@@ -502,7 +502,7 @@ through VMM control, plus selected `patch_api_requests` counters for parsed
 `PATCH /machine-config`, `PATCH /mmds`, `PATCH /drives/{drive_id}`,
 `PATCH /network-interfaces/{iface_id}`, `PATCH /hotplug/memory`, and
 `PATCH /pmem/{pmem_id}` requests routed through VMM control.
-Remaining-device counters, remaining PATCH counters, and parser-level
+Device runtime counters, remaining API request counters, and parser-level
 malformed-request counters remain deferred. Public run-loop control, guest boot
 output, public runner loop scheduling, full Firecracker metrics counters, and
 full logger integration remain deferred. Metrics write failures increment
