@@ -62,7 +62,6 @@ pub enum ApiRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestError {
     BalloonUnsupported,
-    DriveUpdateUnsupported,
     GetRequestBody,
     InvalidPathMethod,
     MismatchedDriveId,
@@ -79,7 +78,6 @@ impl RequestError {
     pub fn fault_message(&self) -> &'static str {
         match self {
             Self::BalloonUnsupported => "Balloon device is not supported.",
-            Self::DriveUpdateUnsupported => "Drive updates are not supported.",
             Self::GetRequestBody => "GET request cannot have a body.",
             Self::InvalidPathMethod => "Invalid request method and/or path.",
             Self::MismatchedDriveId => "path drive_id must match body drive_id.",
@@ -932,6 +930,7 @@ pub struct DrivePatchRequest {
     path_drive_id: String,
     body_drive_id: String,
     path_on_host: Option<String>,
+    rate_limiter_configured: bool,
 }
 
 impl DrivePatchRequest {
@@ -945,6 +944,10 @@ impl DrivePatchRequest {
 
     pub fn path_on_host(&self) -> Option<&str> {
         self.path_on_host.as_deref()
+    }
+
+    pub const fn rate_limiter_configured(&self) -> bool {
+        self.rate_limiter_configured
     }
 }
 
@@ -2163,15 +2166,19 @@ fn parse_drive_patch_request(path_drive_id: &str, body: &[u8]) -> Result<ApiRequ
     if path_drive_id != body.drive_id {
         return Err(RequestError::MismatchedDriveId);
     }
-    if let Some(rate_limiter) = &body.rate_limiter {
-        validate_rate_limiter_config(rate_limiter)?;
-        return Err(RequestError::DriveUpdateUnsupported);
-    }
+    let rate_limiter_configured = match &body.rate_limiter {
+        Some(rate_limiter) => {
+            validate_rate_limiter_config(rate_limiter)?;
+            true
+        }
+        None => false,
+    };
 
     Ok(ApiRequest::PatchDrive(Box::new(DrivePatchRequest {
         path_drive_id: path_drive_id.to_string(),
         body_drive_id: body.drive_id,
         path_on_host: body.path_on_host,
+        rate_limiter_configured,
     })))
 }
 
@@ -4278,6 +4285,7 @@ mod tests {
         assert_eq!(config.path_drive_id(), "rootfs");
         assert_eq!(config.body_drive_id(), "rootfs");
         assert_eq!(config.path_on_host(), Some("/tmp/replaced.ext4"));
+        assert!(!config.rate_limiter_configured());
     }
 
     #[test]
@@ -4292,6 +4300,7 @@ mod tests {
         assert_eq!(config.path_drive_id(), "rootfs");
         assert_eq!(config.body_drive_id(), "rootfs");
         assert_eq!(config.path_on_host(), None);
+        assert!(!config.rate_limiter_configured());
     }
 
     #[test]
@@ -4310,6 +4319,7 @@ mod tests {
         assert_eq!(config.path_drive_id(), "rootfs");
         assert_eq!(config.body_drive_id(), "rootfs");
         assert_eq!(config.path_on_host(), None);
+        assert!(!config.rate_limiter_configured());
     }
 
     #[test]
@@ -4359,17 +4369,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_patch_drive_configured_rate_limiter_as_unsupported_update() {
+    fn parses_patch_drive_configured_rate_limiter_marker() {
         let request = request_with_body(
             "PATCH",
             "/drives/rootfs",
             r#"{"drive_id":"rootfs","rate_limiter":{"ops":{"size":100,"one_time_burst":null,"refill_time":1000}}}"#,
         );
 
-        assert_eq!(
-            parse_request(&request),
-            Err(RequestError::DriveUpdateUnsupported)
-        );
+        let parsed = parse_request(&request).expect("drive patch should parse");
+
+        let ApiRequest::PatchDrive(config) = parsed else {
+            panic!("expected drive patch request");
+        };
+        assert_eq!(config.path_drive_id(), "rootfs");
+        assert_eq!(config.body_drive_id(), "rootfs");
+        assert_eq!(config.path_on_host(), None);
+        assert!(config.rate_limiter_configured());
     }
 
     #[test]

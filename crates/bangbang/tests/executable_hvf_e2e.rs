@@ -313,6 +313,22 @@ mod macos_arm64 {
             "PATCH /drives/data no-op after InstanceStart",
         );
 
+        let drive_rate_limiter_update_response = http_json(
+            &socket_path,
+            "PATCH",
+            "/drives/data",
+            r#"{"drive_id":"data","rate_limiter":{"bandwidth":{"size":1000,"one_time_burst":1000,"refill_time":100}}}"#,
+        );
+        assert_bad_request_response(
+            &drive_rate_limiter_update_response,
+            "PATCH /drives/data rate_limiter after InstanceStart",
+        );
+        assert_response_contains(
+            &drive_rate_limiter_update_response,
+            r#"{"fault_message":"drive rate_limiter is not supported"}"#,
+            "PATCH /drives/data rate_limiter after InstanceStart",
+        );
+
         let replacement_serial_output_path = test_dir.path().join("replacement-serial.out");
         let replacement_serial_output_path_json =
             json_string(path_text(&replacement_serial_output_path));
@@ -627,7 +643,7 @@ mod macos_arm64 {
             ),
             r#"{"actions_count":2,"actions_fails":0,"balloon_count":1,"balloon_fails":1,"boot_source_count":2,"boot_source_fails":1,"cpu_cfg_count":1,"cpu_cfg_fails":1,"drive_count":2,"drive_fails":1,"hotplug_memory_count":0,"hotplug_memory_fails":0,"logger_count":2,"logger_fails":1,"machine_cfg_count":1,"machine_cfg_fails":0,"metrics_count":2,"metrics_fails":1,"mmds_count":2,"mmds_fails":1,"network_count":1,"network_fails":1,"pmem_count":0,"pmem_fails":0,"serial_count":2,"serial_fails":1,"vsock_count":2,"vsock_fails":1}"#,
             Some(
-                r#"{"balloon_count":4,"balloon_fails":4,"drive_count":1,"drive_fails":0,"hotplug_memory_count":0,"hotplug_memory_fails":0,"machine_cfg_count":0,"machine_cfg_fails":0,"mmds_count":1,"mmds_fails":0,"network_count":0,"network_fails":0,"pmem_count":0,"pmem_fails":0}"#,
+                r#"{"balloon_count":4,"balloon_fails":4,"drive_count":2,"drive_fails":1,"hotplug_memory_count":0,"hotplug_memory_fails":0,"machine_cfg_count":0,"machine_cfg_fails":0,"mmds_count":1,"mmds_fails":0,"network_count":0,"network_fails":0,"pmem_count":0,"pmem_fails":0}"#,
             ),
         );
         assert_startup_time_metrics_output(&metrics_path);

@@ -1181,11 +1181,17 @@ fn drive_config_input_from_request(config: &DriveConfigRequest) -> DriveConfigIn
 }
 
 fn drive_update_input_from_request(config: &DrivePatchRequest) -> DriveUpdateInput {
-    DriveUpdateInput::new(
+    let mut input = DriveUpdateInput::new(
         config.path_drive_id(),
         config.body_drive_id(),
         config.path_on_host().map(std::path::PathBuf::from),
-    )
+    );
+
+    if config.rate_limiter_configured() {
+        input = input.with_rate_limiter_configured();
+    }
+
+    input
 }
 
 fn network_interface_config_input_from_request(
@@ -6043,7 +6049,8 @@ mod tests {
         .expect("initial drive should configure");
         let body = r#"{
             "drive_id": "rootfs",
-            "path_on_host": "/tmp/replaced.ext4"
+            "path_on_host": "/tmp/replaced.ext4",
+            "rate_limiter": null
         }"#;
         let request = format!(
             "PATCH /drives/rootfs HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
@@ -6107,6 +6114,59 @@ mod tests {
         assert_eq!(
             config.path_on_host(),
             std::path::Path::new("/tmp/replaced.ext4")
+        );
+        assert!(config.is_read_only());
+    }
+
+    #[test]
+    fn running_state_rejects_drive_patch_rate_limiter_without_mutating() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        vmm.handle_action(VmmAction::PutDrive(
+            DriveConfigInput::new("rootfs", "rootfs", "/tmp/rootfs.ext4", true)
+                .with_is_read_only(true),
+        ))
+        .expect("initial drive should configure");
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_request = format!(
+            "PUT /boot-source HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{boot_body}",
+            boot_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "dprl-start", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "/tmp/rejected.ext4",
+            "rate_limiter": {
+                "bandwidth": {
+                    "size": 1000,
+                    "one_time_burst": 1000,
+                    "refill_time": 100
+                }
+            }
+        }"#;
+        let request = format!(
+            "PATCH /drives/rootfs HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        let response = request_over_socket(&mut vmm, "dprl", &request);
+
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.contains(r#"{"fault_message":"drive rate_limiter is not supported"}"#));
+        assert!(!response.contains("/tmp/rejected.ext4"));
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::Running
+        );
+        assert_eq!(vmm.drive_configs().len(), 1);
+        let config = &vmm.drive_configs()[0];
+        assert_eq!(
+            config.path_on_host(),
+            std::path::Path::new("/tmp/rootfs.ext4")
         );
         assert!(config.is_read_only());
     }
