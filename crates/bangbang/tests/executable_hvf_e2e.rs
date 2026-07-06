@@ -1034,7 +1034,7 @@ mod macos_arm64 {
     }
 
     #[test]
-    fn signed_executable_boots_direct_rootfs_and_writes_block_marker() {
+    fn signed_executable_boots_direct_rootfs_when_data_drive_configured_before_root() {
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join("api.socket");
         let data_backing_path = test_dir.path().join("data.img");
@@ -1064,18 +1064,6 @@ mod macos_arm64 {
         let boot_response = http_put_json(&socket_path, "/boot-source", &boot_body);
         assert_no_content_response(&boot_response, "PUT /boot-source direct rootfs");
 
-        let rootfs_path_json = json_string(path_text(&rootfs_path));
-        let rootfs_body = format!(
-            r#"{{
-                "drive_id":"rootfs",
-                "path_on_host":{rootfs_path_json},
-                "is_root_device":true,
-                "is_read_only":true
-            }}"#
-        );
-        let rootfs_response = http_put_json(&socket_path, "/drives/rootfs", &rootfs_body);
-        assert_no_content_response(&rootfs_response, "PUT /drives/rootfs direct rootfs");
-
         let data_backing_path_json = json_string(path_text(&data_backing_path));
         let data_drive_body = format!(
             r#"{{
@@ -1086,7 +1074,25 @@ mod macos_arm64 {
             }}"#
         );
         let data_drive_response = http_put_json(&socket_path, "/drives/data", &data_drive_body);
-        assert_no_content_response(&data_drive_response, "PUT /drives/data direct rootfs");
+        assert_no_content_response(
+            &data_drive_response,
+            "PUT /drives/data before rootfs direct rootfs",
+        );
+
+        let rootfs_path_json = json_string(path_text(&rootfs_path));
+        let rootfs_body = format!(
+            r#"{{
+                "drive_id":"rootfs",
+                "path_on_host":{rootfs_path_json},
+                "is_root_device":true,
+                "is_read_only":true
+            }}"#
+        );
+        let rootfs_response = http_put_json(&socket_path, "/drives/rootfs", &rootfs_body);
+        assert_no_content_response(
+            &rootfs_response,
+            "PUT /drives/rootfs after data direct rootfs",
+        );
 
         let start_response = http_put_json(
             &socket_path,
@@ -1113,7 +1119,7 @@ mod macos_arm64 {
         ) {
             let output = bangbang.force_stop_and_collect();
             panic!(
-                "direct rootfs guest did not write block marker through signed bangbang executable: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                "direct rootfs guest did not write block marker after data-first drive configuration: {err}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
                 output.status, output.stdout, output.stderr
             );
         }
