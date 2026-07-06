@@ -1360,7 +1360,16 @@ fn network_interface_config_input_from_request(
 fn network_interface_update_input_from_request(
     config: &NetworkInterfacePatchRequest,
 ) -> NetworkInterfaceUpdateInput {
-    NetworkInterfaceUpdateInput::new(config.path_iface_id(), config.body_iface_id())
+    let mut input =
+        NetworkInterfaceUpdateInput::new(config.path_iface_id(), config.body_iface_id());
+    if config.rx_rate_limiter_configured() {
+        input = input.with_rx_rate_limiter_configured();
+    }
+    if config.tx_rate_limiter_configured() {
+        input = input.with_tx_rate_limiter_configured();
+    }
+
+    input
 }
 
 fn serial_config_input_from_request(config: &SerialConfigRequest) -> SerialConfigInput {
@@ -4765,8 +4774,8 @@ mod tests {
         );
         assert!(
             runtime_network_patch_response
-                .contains(r#"{"fault_message":"Network interface updates are not supported."}"#),
-            "running-state network patch should keep the existing unsupported fault body; response:\n{runtime_network_patch_response}"
+                .contains(r#"{"fault_message":"network rx_rate_limiter is not supported"}"#),
+            "running-state configured network patch should reject the limiter; response:\n{runtime_network_patch_response}"
         );
         for private_value in ["223456", "334567", "445678"] {
             assert!(
@@ -4788,6 +4797,96 @@ mod tests {
         );
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
+    }
+
+    #[test]
+    fn running_state_network_patch_noop_validates_existing_interface_over_socket() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        vmm.handle_action(VmmAction::PutNetworkInterface(
+            NetworkInterfaceConfigInput::new("eth0", "eth0", "vmnet:shared")
+                .with_guest_mac("12:34:56:78:9a:bc")
+                .with_mtu(1500),
+        ))
+        .expect("network interface should configure");
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+
+        let start_response = put_action_over_socket(&mut vmm, "nps", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        for (socket_name, body) in [
+            ("npn", r#"{"iface_id":"eth0"}"#),
+            (
+                "npnl",
+                r#"{"iface_id":"eth0","rx_rate_limiter":null,"tx_rate_limiter":null}"#,
+            ),
+        ] {
+            let response = request_over_socket(
+                &mut vmm,
+                socket_name,
+                &request_with_body("PATCH", "/network-interfaces/eth0", body),
+            );
+            assert!(
+                response.starts_with("HTTP/1.1 204 No Content\r\n"),
+                "{socket_name} should accept the running-state no-op update; response:\n{response}"
+            );
+        }
+
+        let unknown_response = request_over_socket(
+            &mut vmm,
+            "npu",
+            &request_with_body(
+                "PATCH",
+                "/network-interfaces/eth9",
+                r#"{"iface_id":"eth9"}"#,
+            ),
+        );
+        assert!(unknown_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(
+            unknown_response.contains(r#"{"fault_message":"network interface is not configured"}"#)
+        );
+        assert!(
+            !unknown_response.contains("eth9"),
+            "unknown network patch response must not echo the rejected iface_id: {unknown_response}"
+        );
+
+        let rate_limiter_response = request_over_socket(
+            &mut vmm,
+            "npr",
+            &request_with_body(
+                "PATCH",
+                "/network-interfaces/eth0",
+                r#"{"iface_id":"eth0","rx_rate_limiter":{"bandwidth":{"size":223456,"one_time_burst":334567,"refill_time":445678}}}"#,
+            ),
+        );
+        assert!(rate_limiter_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(
+            rate_limiter_response
+                .contains(r#"{"fault_message":"network rx_rate_limiter is not supported"}"#)
+        );
+        for private_value in ["223456", "334567", "445678"] {
+            assert!(
+                !rate_limiter_response.contains(private_value),
+                "rate-limiter rejection must not echo {private_value}: {rate_limiter_response}"
+            );
+        }
+
+        let vm_config_response = request_over_socket(
+            &mut vmm,
+            "npc",
+            "GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(vm_config_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(vm_config_response.contains(r#""iface_id":"eth0""#));
+        assert!(vm_config_response.contains(r#""host_dev_name":"vmnet:shared""#));
+        assert!(vm_config_response.contains(r#""guest_mac":"12:34:56:78:9a:bc""#));
+        assert!(vm_config_response.contains(r#""mtu":1500"#));
+        assert!(
+            !vm_config_response.contains(r#""iface_id":"eth9""#),
+            "rejected unknown network PATCH must not add an interface; response:\n{vm_config_response}"
+        );
     }
 
     #[test]

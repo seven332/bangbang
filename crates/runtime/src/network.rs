@@ -68,6 +68,8 @@ pub struct NetworkInterfaceConfigInput {
 pub struct NetworkInterfaceUpdateInput {
     path_iface_id: String,
     body_iface_id: String,
+    rx_rate_limiter_configured: bool,
+    tx_rate_limiter_configured: bool,
 }
 
 impl NetworkInterfaceConfigInput {
@@ -145,6 +147,8 @@ impl NetworkInterfaceUpdateInput {
         Self {
             path_iface_id: path_iface_id.into(),
             body_iface_id: body_iface_id.into(),
+            rx_rate_limiter_configured: false,
+            tx_rate_limiter_configured: false,
         }
     }
 
@@ -154,6 +158,28 @@ impl NetworkInterfaceUpdateInput {
 
     pub fn body_iface_id(&self) -> &str {
         &self.body_iface_id
+    }
+
+    pub const fn rx_rate_limiter_configured(&self) -> bool {
+        self.rx_rate_limiter_configured
+    }
+
+    pub const fn tx_rate_limiter_configured(&self) -> bool {
+        self.tx_rate_limiter_configured
+    }
+
+    pub const fn with_rx_rate_limiter_configured(mut self) -> Self {
+        self.rx_rate_limiter_configured = true;
+        self
+    }
+
+    pub const fn with_tx_rate_limiter_configured(mut self) -> Self {
+        self.tx_rate_limiter_configured = true;
+        self
+    }
+
+    pub fn validate(self) -> Result<NetworkInterfaceUpdate, NetworkInterfaceUpdateError> {
+        NetworkInterfaceUpdate::try_from(self)
     }
 }
 
@@ -226,6 +252,43 @@ impl TryFrom<NetworkInterfaceConfigInput> for NetworkInterfaceConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkInterfaceUpdate {
+    iface_id: String,
+}
+
+impl NetworkInterfaceUpdate {
+    pub fn iface_id(&self) -> &str {
+        &self.iface_id
+    }
+}
+
+impl TryFrom<NetworkInterfaceUpdateInput> for NetworkInterfaceUpdate {
+    type Error = NetworkInterfaceUpdateError;
+
+    fn try_from(input: NetworkInterfaceUpdateInput) -> Result<Self, Self::Error> {
+        validate_interface_update_id(InterfaceIdSource::Path, &input.path_iface_id)?;
+        validate_interface_update_id(InterfaceIdSource::Body, &input.body_iface_id)?;
+        if input.path_iface_id != input.body_iface_id {
+            return Err(NetworkInterfaceUpdateError::MismatchedInterfaceId {
+                path_iface_id: input.path_iface_id,
+                body_iface_id: input.body_iface_id,
+            });
+        }
+
+        if input.rx_rate_limiter_configured {
+            return Err(NetworkInterfaceUpdateError::UnsupportedRxRateLimiter);
+        }
+        if input.tx_rate_limiter_configured {
+            return Err(NetworkInterfaceUpdateError::UnsupportedTxRateLimiter);
+        }
+
+        Ok(Self {
+            iface_id: input.path_iface_id,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NetworkInterfaceConfigs {
     configs: Vec<NetworkInterfaceConfig>,
@@ -269,6 +332,25 @@ impl NetworkInterfaceConfigs {
         self.configs.push(config);
 
         Ok(())
+    }
+
+    pub fn validate_update(
+        &self,
+        input: NetworkInterfaceUpdateInput,
+    ) -> Result<NetworkInterfaceUpdate, NetworkInterfaceUpdateError> {
+        let update = input.validate()?;
+
+        if !self
+            .configs
+            .iter()
+            .any(|config| config.iface_id() == update.iface_id())
+        {
+            return Err(NetworkInterfaceUpdateError::UnknownInterface {
+                iface_id: update.iface_id().to_string(),
+            });
+        }
+
+        Ok(update)
     }
 }
 
@@ -3737,6 +3819,26 @@ pub enum NetworkInterfaceConfigError {
     UnsupportedTxRateLimiter,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkInterfaceUpdateError {
+    EmptyInterfaceId {
+        source: InterfaceIdSource,
+    },
+    InvalidInterfaceId {
+        source: InterfaceIdSource,
+        iface_id: String,
+    },
+    MismatchedInterfaceId {
+        path_iface_id: String,
+        body_iface_id: String,
+    },
+    UnknownInterface {
+        iface_id: String,
+    },
+    UnsupportedRxRateLimiter,
+    UnsupportedTxRateLimiter,
+}
+
 impl fmt::Display for NetworkInterfaceConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -3776,6 +3878,32 @@ impl fmt::Display for NetworkInterfaceConfigError {
 
 impl std::error::Error for NetworkInterfaceConfigError {}
 
+impl fmt::Display for NetworkInterfaceUpdateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyInterfaceId { source } => write!(f, "{source} must not be empty"),
+            Self::InvalidInterfaceId { source, .. } => {
+                write!(
+                    f,
+                    "{source} must contain only alphanumeric characters or '_'"
+                )
+            }
+            Self::MismatchedInterfaceId { .. } => {
+                f.write_str("path iface_id must match body iface_id")
+            }
+            Self::UnknownInterface { .. } => f.write_str("network interface is not configured"),
+            Self::UnsupportedRxRateLimiter => {
+                f.write_str("network rx_rate_limiter is not supported")
+            }
+            Self::UnsupportedTxRateLimiter => {
+                f.write_str("network tx_rate_limiter is not supported")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NetworkInterfaceUpdateError {}
+
 pub fn validate_network_interface_count(count: usize) -> Result<(), NetworkInterfaceConfigError> {
     if count > MAX_NETWORK_INTERFACE_COUNT {
         return Err(NetworkInterfaceConfigError::TooManyNetworkInterfaces {
@@ -3800,6 +3928,27 @@ fn validate_interface_id(
         .all(|character| character == '_' || character.is_alphanumeric())
     {
         return Err(NetworkInterfaceConfigError::InvalidInterfaceId {
+            source,
+            iface_id: iface_id.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_interface_update_id(
+    source: InterfaceIdSource,
+    iface_id: &str,
+) -> Result<(), NetworkInterfaceUpdateError> {
+    if iface_id.is_empty() {
+        return Err(NetworkInterfaceUpdateError::EmptyInterfaceId { source });
+    }
+
+    if !iface_id
+        .chars()
+        .all(|character| character == '_' || character.is_alphanumeric())
+    {
+        return Err(NetworkInterfaceUpdateError::InvalidInterfaceId {
             source,
             iface_id: iface_id.to_string(),
         });
@@ -3836,19 +3985,19 @@ mod tests {
     use super::{
         GuestMacAddress, InterfaceIdSource, MAX_NETWORK_INTERFACE_COUNT, NetworkInterfaceConfig,
         NetworkInterfaceConfigError, NetworkInterfaceConfigInput, NetworkInterfaceConfigs,
-        NetworkMmioDevices, NetworkMmioLayout, NetworkMmioRegistrationError,
-        PreparedNetworkDevices, VIRTIO_FEATURE_VERSION_1, VIRTIO_NET_CONFIG_MAC_SIZE,
-        VIRTIO_NET_CONFIG_MTU_OFFSET, VIRTIO_NET_CONFIG_MTU_SIZE, VIRTIO_NET_DEVICE_ID,
-        VIRTIO_NET_F_MAC, VIRTIO_NET_F_MTU, VIRTIO_NET_MAX_BUFFER_SIZE, VIRTIO_NET_MAX_MTU,
-        VIRTIO_NET_MIN_MTU, VIRTIO_NET_QUEUE_COUNT, VIRTIO_NET_QUEUE_SIZE, VIRTIO_NET_QUEUE_SIZES,
-        VIRTIO_NET_RX_MIN_BUFFER_SIZE, VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_HEADER_SIZE,
-        VIRTIO_NET_TX_QUEUE_INDEX, VIRTIO_RING_FEATURE_EVENT_IDX,
-        VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioNetworkConfigSpace, VirtioNetworkDevice,
-        VirtioNetworkDeviceActivationError, VirtioNetworkDeviceNotificationError,
-        VirtioNetworkMmioHandler, VirtioNetworkRxBuffer, VirtioNetworkRxBufferParseError,
-        VirtioNetworkRxPacket, VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError,
-        VirtioNetworkRxQueueDispatchError, VirtioNetworkTxFrame, VirtioNetworkTxFrameParseError,
-        VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
+        NetworkInterfaceUpdateError, NetworkInterfaceUpdateInput, NetworkMmioDevices,
+        NetworkMmioLayout, NetworkMmioRegistrationError, PreparedNetworkDevices,
+        VIRTIO_FEATURE_VERSION_1, VIRTIO_NET_CONFIG_MAC_SIZE, VIRTIO_NET_CONFIG_MTU_OFFSET,
+        VIRTIO_NET_CONFIG_MTU_SIZE, VIRTIO_NET_DEVICE_ID, VIRTIO_NET_F_MAC, VIRTIO_NET_F_MTU,
+        VIRTIO_NET_MAX_BUFFER_SIZE, VIRTIO_NET_MAX_MTU, VIRTIO_NET_MIN_MTU, VIRTIO_NET_QUEUE_COUNT,
+        VIRTIO_NET_QUEUE_SIZE, VIRTIO_NET_QUEUE_SIZES, VIRTIO_NET_RX_MIN_BUFFER_SIZE,
+        VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_HEADER_SIZE, VIRTIO_NET_TX_QUEUE_INDEX,
+        VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioNetworkConfigSpace,
+        VirtioNetworkDevice, VirtioNetworkDeviceActivationError,
+        VirtioNetworkDeviceNotificationError, VirtioNetworkMmioHandler, VirtioNetworkRxBuffer,
+        VirtioNetworkRxBufferParseError, VirtioNetworkRxPacket, VirtioNetworkRxPacketSource,
+        VirtioNetworkRxPacketSourceError, VirtioNetworkRxQueueDispatchError, VirtioNetworkTxFrame,
+        VirtioNetworkTxFrameParseError, VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
         VirtioNetworkTxQueueDispatchError,
     };
 
@@ -4986,11 +5135,79 @@ mod tests {
     }
 
     #[test]
+    fn network_interface_update_input_exposes_firecracker_shape() {
+        let input = NetworkInterfaceUpdateInput::new("eth0", "eth0")
+            .with_rx_rate_limiter_configured()
+            .with_tx_rate_limiter_configured();
+
+        assert_eq!(input.path_iface_id(), "eth0");
+        assert_eq!(input.body_iface_id(), "eth0");
+        assert!(input.rx_rate_limiter_configured());
+        assert!(input.tx_rate_limiter_configured());
+    }
+
+    #[test]
+    fn network_interface_update_validates_ids_and_deferred_fields() {
+        let update = NetworkInterfaceUpdateInput::new("eth0", "eth0")
+            .validate()
+            .expect("matching no-op update should validate");
+        assert_eq!(update.iface_id(), "eth0");
+
+        assert_eq!(
+            NetworkInterfaceUpdateInput::new("", "").validate(),
+            Err(NetworkInterfaceUpdateError::EmptyInterfaceId {
+                source: InterfaceIdSource::Path,
+            })
+        );
+        assert_eq!(
+            NetworkInterfaceUpdateInput::new("eth-0", "eth-0").validate(),
+            Err(NetworkInterfaceUpdateError::InvalidInterfaceId {
+                source: InterfaceIdSource::Path,
+                iface_id: "eth-0".to_string(),
+            })
+        );
+        assert_eq!(
+            NetworkInterfaceUpdateInput::new("eth0", "eth1").validate(),
+            Err(NetworkInterfaceUpdateError::MismatchedInterfaceId {
+                path_iface_id: "eth0".to_string(),
+                body_iface_id: "eth1".to_string(),
+            })
+        );
+        assert_eq!(
+            NetworkInterfaceUpdateInput::new("eth0", "eth0")
+                .with_rx_rate_limiter_configured()
+                .validate(),
+            Err(NetworkInterfaceUpdateError::UnsupportedRxRateLimiter)
+        );
+        assert_eq!(
+            NetworkInterfaceUpdateInput::new("eth0", "eth0")
+                .with_tx_rate_limiter_configured()
+                .validate(),
+            Err(NetworkInterfaceUpdateError::UnsupportedTxRateLimiter)
+        );
+    }
+
+    #[test]
     fn network_interface_config_errors_display_without_sources() {
         let err = NetworkInterfaceConfigError::UnsupportedRxRateLimiter;
 
         assert_eq!(err.to_string(), "network rx_rate_limiter is not supported");
         assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn network_interface_update_errors_display_without_sources() {
+        let err = NetworkInterfaceUpdateError::UnsupportedRxRateLimiter;
+
+        assert_eq!(err.to_string(), "network rx_rate_limiter is not supported");
+        assert!(std::error::Error::source(&err).is_none());
+
+        let err = NetworkInterfaceUpdateError::UnknownInterface {
+            iface_id: "eth9".to_string(),
+        };
+        assert_eq!(err.to_string(), "network interface is not configured");
+        assert!(std::error::Error::source(&err).is_none());
+        assert!(!err.to_string().contains("eth9"));
     }
 
     #[test]
@@ -5036,6 +5253,28 @@ mod tests {
         assert_eq!(config.iface_id(), "eth0");
         assert_eq!(config.host_dev_name(), "tap1");
         assert_eq!(config.guest_mac(), None);
+    }
+
+    #[test]
+    fn network_interface_configs_validate_runtime_update_existence() {
+        let mut configs = NetworkInterfaceConfigs::new();
+        configs
+            .insert(input())
+            .expect("interface config should be stored");
+
+        let update = configs
+            .validate_update(NetworkInterfaceUpdateInput::new("eth0", "eth0"))
+            .expect("existing no-op update should validate");
+        assert_eq!(update.iface_id(), "eth0");
+
+        assert_eq!(
+            configs.validate_update(NetworkInterfaceUpdateInput::new("eth9", "eth9")),
+            Err(NetworkInterfaceUpdateError::UnknownInterface {
+                iface_id: "eth9".to_string(),
+            })
+        );
+        assert_eq!(configs.as_slice().len(), 1);
+        assert_eq!(configs.as_slice()[0].iface_id(), "eth0");
     }
 
     #[test]

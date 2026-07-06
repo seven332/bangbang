@@ -2230,6 +2230,83 @@ mod macos_arm64 {
         assert_ok_response(&running_instance_info, &get_context);
         assert_response_contains(&running_instance_info, r#""state":"Running""#, &get_context);
 
+        let network_patch_context = format!(
+            "PATCH /network-interfaces/eth0 no-op {}",
+            case.request_context
+        );
+        let network_patch_response = http_json(
+            &socket_path,
+            "PATCH",
+            "/network-interfaces/eth0",
+            r#"{"iface_id":"eth0","rx_rate_limiter":null,"tx_rate_limiter":null}"#,
+        );
+        assert_no_content_response(&network_patch_response, &network_patch_context);
+
+        let unknown_network_patch_context =
+            format!("PATCH /network-interfaces/eth9 {}", case.request_context);
+        let unknown_network_patch_response = http_json(
+            &socket_path,
+            "PATCH",
+            "/network-interfaces/eth9",
+            r#"{"iface_id":"eth9"}"#,
+        );
+        assert_bad_request_response(
+            &unknown_network_patch_response,
+            &unknown_network_patch_context,
+        );
+        assert_response_contains(
+            &unknown_network_patch_response,
+            r#"{"fault_message":"network interface is not configured"}"#,
+            &unknown_network_patch_context,
+        );
+        assert!(
+            !unknown_network_patch_response.contains("eth9"),
+            "{unknown_network_patch_context} must not echo the rejected iface_id; response:\n{unknown_network_patch_response}"
+        );
+
+        let rate_limiter_network_patch_context = format!(
+            "PATCH /network-interfaces/eth0 rx_rate_limiter {}",
+            case.request_context
+        );
+        let rate_limiter_network_patch_response = http_json(
+            &socket_path,
+            "PATCH",
+            "/network-interfaces/eth0",
+            r#"{"iface_id":"eth0","rx_rate_limiter":{"bandwidth":{"size":223456,"one_time_burst":334567,"refill_time":445678}}}"#,
+        );
+        assert_bad_request_response(
+            &rate_limiter_network_patch_response,
+            &rate_limiter_network_patch_context,
+        );
+        assert_response_contains(
+            &rate_limiter_network_patch_response,
+            r#"{"fault_message":"network rx_rate_limiter is not supported"}"#,
+            &rate_limiter_network_patch_context,
+        );
+        for private_value in ["223456", "334567", "445678"] {
+            assert!(
+                !rate_limiter_network_patch_response.contains(private_value),
+                "{rate_limiter_network_patch_context} must not echo {private_value}; response:\n{rate_limiter_network_patch_response}"
+            );
+        }
+
+        let vm_config_context = format!(
+            "GET /vm/config after network PATCH {}",
+            case.request_context
+        );
+        let vm_config = http_get(&socket_path, "/vm/config");
+        assert_ok_response(&vm_config, &vm_config_context);
+        assert_response_contains(&vm_config, r#""iface_id":"eth0""#, &vm_config_context);
+        assert_response_contains(
+            &vm_config,
+            r#""host_dev_name":"vmnet:shared""#,
+            &vm_config_context,
+        );
+        assert!(
+            !vm_config.contains(r#""iface_id":"eth9""#),
+            "{vm_config_context} must not add the rejected interface; response:\n{vm_config}"
+        );
+
         if let Err(err) = wait_for_file_prefix_marker(
             &data_backing_path,
             case.success_marker,

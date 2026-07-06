@@ -3537,6 +3537,7 @@ mod tests {
             | VmmActionError::MmdsDataStore(_)
             | VmmActionError::MmdsState(_)
             | VmmActionError::NetworkInterfaceConfig(_)
+            | VmmActionError::NetworkInterfaceUpdate(_)
             | VmmActionError::NetworkInterfaceUpdateUnsupported
             | VmmActionError::MemoryHotplugUnsupported
             | VmmActionError::PmemUnsupported
