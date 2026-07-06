@@ -14,7 +14,7 @@ use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_api::http::{
     ActionRequest, ActionType, ApiRequest, BootSourceRequest, BootSourceResponse, CpuConfigRequest,
     DriveCacheType as ApiDriveCacheType, DriveConfigRequest, DriveConfigResponse,
-    DriveIoEngine as ApiDriveIoEngine, DrivePatchRequest,
+    DriveIoEngine as ApiDriveIoEngine, DrivePatchRequest, EntropyConfigRequest,
     HotUnplugDeviceKind as ApiHotUnplugDeviceKind, HotUnplugDeviceRequest, HttpResponse,
     LoggerConfigRequest, LoggerLevel as ApiLoggerLevel, MachineConfigPatchRequest,
     MachineConfigRequest, MachineConfigResponse, MetricsConfigRequest, MmdsConfigRequest,
@@ -29,6 +29,7 @@ use bangbang_runtime::block::{
 };
 use bangbang_runtime::boot::{BootSourceConfig, BootSourceConfigInput};
 use bangbang_runtime::cpu::CpuConfigInput;
+use bangbang_runtime::entropy::EntropyConfigInput;
 use bangbang_runtime::logger::{LoggerConfigInput, LoggerLevel};
 use bangbang_runtime::machine::{
     MachineConfig, MachineConfigCpuTemplate as RuntimeMachineConfigCpuTemplate,
@@ -639,7 +640,9 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PatchMemoryHotplug => {
             handle_empty(vmm.handle_patch_request(PatchApiRequest::memory_hotplug()))
         }
-        ApiRequest::PutEntropy => handle_empty(vmm.handle_action(VmmAction::PutEntropy)),
+        ApiRequest::PutEntropy(config) => handle_empty(vmm.handle_action(VmmAction::PutEntropy(
+            entropy_config_input_from_request(config.as_ref()),
+        ))),
         ApiRequest::PutPmem => handle_empty(vmm.handle_put_request(PutApiRequest::pmem())),
         ApiRequest::PatchPmem => handle_empty(vmm.handle_patch_request(PatchApiRequest::pmem())),
         ApiRequest::PutSnapshotCreate => handle_empty(vmm.handle_action(VmmAction::CreateSnapshot)),
@@ -688,7 +691,7 @@ fn request_uses_deprecated_api(request: &ApiRequest) -> bool {
         | ApiRequest::PutBootSource(_)
         | ApiRequest::PutCpuConfig(_)
         | ApiRequest::PutDrive(_)
-        | ApiRequest::PutEntropy
+        | ApiRequest::PutEntropy(_)
         | ApiRequest::PutLogger(_)
         | ApiRequest::PutMemoryHotplug
         | ApiRequest::PutMetrics(_)
@@ -784,7 +787,7 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         | ApiRequest::PatchVmState(_)
         | ApiRequest::PutAction(_)
         | ApiRequest::PutBalloon
-        | ApiRequest::PutEntropy
+        | ApiRequest::PutEntropy(_)
         | ApiRequest::PutMemoryHotplug
         | ApiRequest::PutMmds(_)
         | ApiRequest::PutPmem
@@ -1211,6 +1214,16 @@ fn serial_config_input_from_request(config: &SerialConfigRequest) -> SerialConfi
     if let Some(serial_out_path) = config.serial_out_path() {
         input = input.with_serial_out_path(serial_out_path);
     }
+    if config.rate_limiter_configured() {
+        input = input.with_rate_limiter_configured();
+    }
+
+    input
+}
+
+fn entropy_config_input_from_request(config: &EntropyConfigRequest) -> EntropyConfigInput {
+    let mut input = EntropyConfigInput::new();
+
     if config.rate_limiter_configured() {
         input = input.with_rate_limiter_configured();
     }
@@ -4839,7 +4852,7 @@ mod tests {
             (
                 "ent-rl",
                 r#"{"rate_limiter":{"bandwidth":{"size":123456789,"one_time_burst":987654321,"refill_time":777}}}"#,
-                "Entropy device is not supported.",
+                "entropy rate_limiter is not supported",
                 &["123456789", "987654321", "777"][..],
             ),
             ("ent-bad", "not-json", "Malformed HTTP request.", &[][..]),

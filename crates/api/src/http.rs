@@ -32,7 +32,7 @@ pub enum ApiRequest {
     PutBootSource(Box<BootSourceRequest>),
     PutCpuConfig(Box<CpuConfigRequest>),
     PutDrive(Box<DriveConfigRequest>),
-    PutEntropy,
+    PutEntropy(Box<EntropyConfigRequest>),
     PutMemoryHotplug,
     PatchBalloon,
     PatchBalloonStats,
@@ -318,6 +318,17 @@ impl SerialConfigRequest {
         self.serial_out_path.as_deref()
     }
 
+    pub const fn rate_limiter_configured(&self) -> bool {
+        self.rate_limiter_configured
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntropyConfigRequest {
+    rate_limiter_configured: bool,
+}
+
+impl EntropyConfigRequest {
     pub const fn rate_limiter_configured(&self) -> bool {
         self.rate_limiter_configured
     }
@@ -1937,11 +1948,17 @@ fn parse_serial_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> 
 fn parse_entropy_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
     let body = serde_json::from_slice::<EntropyDeviceConfigRequestBody>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
-    if let Some(rate_limiter) = &body.rate_limiter {
-        validate_rate_limiter_config(rate_limiter)?;
-    }
+    let rate_limiter_configured = match &body.rate_limiter {
+        Some(rate_limiter) => {
+            validate_rate_limiter_config(rate_limiter)?;
+            true
+        }
+        None => false,
+    };
 
-    Ok(ApiRequest::PutEntropy)
+    Ok(ApiRequest::PutEntropy(Box::new(EntropyConfigRequest {
+        rate_limiter_configured,
+    })))
 }
 
 fn parse_balloon_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
@@ -2624,7 +2641,7 @@ impl From<ApiRequest> for Endpoint {
             ApiRequest::PutAction(_) => Self::Actions,
             ApiRequest::PutBootSource(_) => Self::BootSource,
             ApiRequest::PutCpuConfig(_) => Self::CpuConfig,
-            ApiRequest::PutEntropy => Self::Entropy,
+            ApiRequest::PutEntropy(_) => Self::Entropy,
             ApiRequest::PutDrive(_) | ApiRequest::PatchDrive(_) => Self::Drive,
             ApiRequest::HotUnplugDevice(request) => match request.kind() {
                 HotUnplugDeviceKind::Drive => Self::Drive,
@@ -4875,21 +4892,34 @@ mod tests {
     }
 
     #[test]
-    fn parses_valid_entropy_config() {
+    fn parses_entropy_config_without_rate_limiter() {
+        for body in ["{}", r#"{"rate_limiter":null}"#] {
+            let request = request_with_body("PUT", "/entropy", body);
+
+            let parsed = parse_request(&request).expect("entropy config should parse");
+
+            let ApiRequest::PutEntropy(config) = parsed else {
+                panic!("expected entropy config request");
+            };
+            assert!(!config.rate_limiter_configured(), "{body}");
+        }
+    }
+
+    #[test]
+    fn parses_entropy_config_with_rate_limiter_marker() {
         for body in [
-            "{}",
-            r#"{"rate_limiter":null}"#,
             r#"{"rate_limiter":{}}"#,
             r#"{"rate_limiter":{"bandwidth":{"size":100,"one_time_burst":null,"refill_time":1000}}}"#,
             r#"{"rate_limiter":{"ops":{"size":100,"one_time_burst":200,"refill_time":1000}}}"#,
         ] {
             let request = request_with_body("PUT", "/entropy", body);
 
-            assert_eq!(
-                parse_request(&request),
-                Ok(ApiRequest::PutEntropy),
-                "{body}"
-            );
+            let parsed = parse_request(&request).expect("entropy config should parse");
+
+            let ApiRequest::PutEntropy(config) = parsed else {
+                panic!("expected entropy config request");
+            };
+            assert!(config.rate_limiter_configured(), "{body}");
         }
     }
 
