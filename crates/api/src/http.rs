@@ -112,6 +112,7 @@ pub enum ApiRequestMetricEndpoint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiRequestMetricPutEndpoint {
     Actions,
+    Balloon,
     BootSource,
     CpuConfig,
     Drive,
@@ -128,6 +129,7 @@ pub enum ApiRequestMetricPutEndpoint {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiRequestMetricPatchEndpoint {
+    Balloon,
     Drive,
     HotplugMemory,
     MachineConfig,
@@ -159,6 +161,7 @@ fn put_api_request_metric_endpoint(path: &str) -> Option<ApiRequestMetricPutEndp
 
     match path {
         "/actions" => Some(ApiRequestMetricPutEndpoint::Actions),
+        "/balloon" => Some(ApiRequestMetricPutEndpoint::Balloon),
         "/boot-source" => Some(ApiRequestMetricPutEndpoint::BootSource),
         "/cpu-config" => Some(ApiRequestMetricPutEndpoint::CpuConfig),
         "/hotplug/memory" => Some(ApiRequestMetricPutEndpoint::HotplugMemory),
@@ -184,6 +187,9 @@ fn patch_api_request_metric_endpoint(path: &str) -> Option<ApiRequestMetricPatch
     }
 
     match path {
+        "/balloon" | "/balloon/statistics" | "/balloon/hinting/start" | "/balloon/hinting/stop" => {
+            Some(ApiRequestMetricPatchEndpoint::Balloon)
+        }
         "/hotplug/memory" => Some(ApiRequestMetricPatchEndpoint::HotplugMemory),
         "/machine-config" => Some(ApiRequestMetricPatchEndpoint::MachineConfig),
         "/mmds" => Some(ApiRequestMetricPatchEndpoint::Mmds),
@@ -2914,6 +2920,7 @@ mod tests {
     fn identifies_put_api_request_metric_endpoints_from_request_head() {
         for (path, endpoint) in [
             ("/actions", ApiRequestMetricPutEndpoint::Actions),
+            ("/balloon", ApiRequestMetricPutEndpoint::Balloon),
             ("/boot-source", ApiRequestMetricPutEndpoint::BootSource),
             ("/cpu-config", ApiRequestMetricPutEndpoint::CpuConfig),
             ("/drives/rootfs", ApiRequestMetricPutEndpoint::Drive),
@@ -2948,6 +2955,19 @@ mod tests {
     #[test]
     fn identifies_patch_api_request_metric_endpoints_from_request_head() {
         for (path, endpoint) in [
+            ("/balloon", ApiRequestMetricPatchEndpoint::Balloon),
+            (
+                "/balloon/statistics",
+                ApiRequestMetricPatchEndpoint::Balloon,
+            ),
+            (
+                "/balloon/hinting/start",
+                ApiRequestMetricPatchEndpoint::Balloon,
+            ),
+            (
+                "/balloon/hinting/stop",
+                ApiRequestMetricPatchEndpoint::Balloon,
+            ),
             ("/drives/rootfs", ApiRequestMetricPatchEndpoint::Drive),
             (
                 "/hotplug/memory",
@@ -2976,11 +2996,13 @@ mod tests {
     fn ignores_requests_without_matching_api_request_metric_endpoint() {
         for request in [
             request_with_body("GET", "/metrics", "{}"),
+            request_with_body("GET", "/balloon", "{}"),
             request_with_body("DELETE", "/drives/rootfs", "{}"),
             request_with_body("PUT", "/entropy", "{}"),
-            request_with_body("PUT", "/balloon", "{}"),
             request_with_body("PATCH", "/vm", "{}"),
-            request_with_body("PATCH", "/balloon", "{}"),
+            request_with_body("PUT", "/balloon/extra", "{}"),
+            request_with_body("PATCH", "/balloon/hinting/status", "{}"),
+            request_with_body("PATCH", "/balloon/hinting/start/extra", "{}"),
             request_with_body("PUT", "/metrics/extra", "{}"),
             request_with_body("PUT", "/drives/rootfs/extra", "{}"),
             request_with_body("PUT", "/drives/rootfs?debug=true", "{}"),
