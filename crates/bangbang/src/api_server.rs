@@ -543,12 +543,22 @@ fn handle_request_bytes_with_limit(
     match parse_request_with_limit(bytes, http_api_max_payload_size) {
         Ok(request) => handle_api_request(request, vmm),
         Err(err) => {
-            if err == RequestError::MalformedRequest {
+            if should_record_api_request_parse_failure(&err) {
                 record_api_request_parse_failure(bytes, vmm);
             }
             HttpResponse::fault(err.fault_message())
         }
     }
+}
+
+const fn should_record_api_request_parse_failure(err: &RequestError) -> bool {
+    matches!(
+        err,
+        RequestError::MalformedRequest
+            | RequestError::MismatchedDriveId
+            | RequestError::MismatchedInterfaceId
+            | RequestError::MismatchedPmemId
+    )
 }
 
 fn record_api_request_parse_failure(bytes: &[u8], vmm: &mut impl VmmRequestHandler) {
@@ -3755,6 +3765,58 @@ mod tests {
             );
         }
 
+        for (method, path, body, fault_message) in [
+            (
+                "PUT",
+                "/drives/data",
+                r#"{"drive_id":"other","path_on_host":"/tmp/drive.img","is_root_device":false}"#,
+                "path drive_id must match body drive_id.",
+            ),
+            (
+                "PUT",
+                "/network-interfaces/eth0",
+                r#"{"iface_id":"eth1","host_dev_name":"vmnet:shared"}"#,
+                "path iface_id must match body iface_id.",
+            ),
+            (
+                "PUT",
+                "/pmem/pmem0",
+                r#"{"id":"other","path_on_host":"/tmp/pmem.img"}"#,
+                "path pmem id must match body id.",
+            ),
+            (
+                "PATCH",
+                "/drives/data",
+                r#"{"drive_id":"other","path_on_host":"/tmp/drive.img"}"#,
+                "path drive_id must match body drive_id.",
+            ),
+            (
+                "PATCH",
+                "/network-interfaces/eth0",
+                r#"{"iface_id":"eth1"}"#,
+                "path iface_id must match body iface_id.",
+            ),
+            (
+                "PATCH",
+                "/pmem/pmem0",
+                r#"{"id":"other"}"#,
+                "path pmem id must match body id.",
+            ),
+        ] {
+            let response =
+                handle_request_bytes(request_with_body(method, path, body).as_bytes(), &mut vmm);
+            assert_eq!(
+                response.status(),
+                bangbang_api::http::StatusCode::BadRequest,
+                "{method} {path}"
+            );
+            assert_eq!(
+                response.body(),
+                format!(r#"{{"fault_message":"{fault_message}"}}"#),
+                "{method} {path}"
+            );
+        }
+
         for (method, path, body) in [
             ("DELETE", "/drives/data", "{}"),
             ("PUT", "/balloon", "not-json"),
@@ -3806,14 +3868,14 @@ mod tests {
             ("balloon", 0, 0),
             ("boot_source", 2, 1),
             ("cpu_cfg", 1, 1),
-            ("drive", 1, 1),
+            ("drive", 2, 2),
             ("hotplug_memory", 1, 1),
             ("logger", 1, 1),
             ("machine_cfg", 1, 1),
             ("metrics", 1, 0),
             ("mmds", 2, 2),
-            ("network", 1, 1),
-            ("pmem", 1, 1),
+            ("network", 2, 2),
+            ("pmem", 2, 2),
             ("serial", 1, 1),
             ("vsock", 1, 1),
         ] {
@@ -3839,7 +3901,11 @@ mod tests {
             "network",
             "pmem",
         ] {
-            let (count, fails) = if field == "balloon" { (0, 0) } else { (1, 1) };
+            let (count, fails) = match field {
+                "balloon" => (0, 0),
+                "drive" | "network" | "pmem" => (2, 2),
+                _ => (1, 1),
+            };
             assert_metric(
                 &metrics,
                 "patch_api_requests",
@@ -4179,7 +4245,7 @@ mod tests {
             fs::read_to_string(&metrics_path).expect("metrics output should be readable");
         assert_eq!(
             metrics_output,
-            "{\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":1,\"pmem_fails\":1},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":2,\"pmem_fails\":2,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":2,\"pmem_fails\":2},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":2,\"pmem_fails\":2,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
         assert!(!metrics_output.contains("pmem0"));
         assert!(!metrics_output.contains("/private/tmp/pmem.img"));
@@ -4587,7 +4653,7 @@ mod tests {
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":1,\"drive_fails\":1,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"mmds_count\":2,\"mmds_fails\":1,\"network_count\":3,\"network_fails\":3,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":1,\"drive_fails\":1,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"mmds_count\":2,\"mmds_fails\":1,\"network_count\":4,\"network_fails\":4,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
