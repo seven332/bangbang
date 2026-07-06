@@ -2443,7 +2443,7 @@ mod tests {
             let (lock, condition) = &*self.wakeup;
             let mut wakeup_count = lock.lock().expect("wakeup count should lock");
             *wakeup_count += 1;
-            condition.notify_one();
+            condition.notify_all();
             Ok(())
         }
 
@@ -2452,7 +2452,7 @@ mod tests {
             let (lock, condition) = &*self.wakeup;
             let mut wakeup_count = lock.lock().expect("wakeup count should lock");
             *wakeup_count += 1;
-            condition.notify_one();
+            condition.notify_all();
             Ok(())
         }
     }
@@ -3962,6 +3962,82 @@ mod tests {
             .expect("drive update should run on worker");
 
         assert_eq!(control.request_wakeup_count(), 1);
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_serializes_drive_update_after_existing_command() {
+        let original =
+            TempFilePath::create_with_bytes("run-loop-drive-serialized-original", &[0x11; 512]);
+        let replacement =
+            TempFilePath::create_with_bytes("run-loop-drive-serialized-replacement", &[0x22; 1024]);
+        let (updater, _original_config) = block_device_updater_fixture("data", original.path());
+        let replacement_config = drive_config("data", replacement.path());
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_block_device_updater(updater)
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true)
+                .with_outcomes([
+                    Ok(FakeRunLoopOutcome::Wakeup),
+                    Ok(FakeRunLoopOutcome::Terminal),
+                ]);
+
+        let mut supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(44).expect("non-zero limit"))
+                .expect("supervisor should start");
+        let command_handle = supervisor.command_handle();
+        let (command_started_sender, command_started_receiver) = mpsc::channel();
+        let (release_command_sender, release_command_receiver) = mpsc::channel();
+
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            44
+        );
+
+        std::thread::scope(|scope| {
+            let blocking_command = scope.spawn(move || {
+                command_handle.run(move |_| {
+                    command_started_sender
+                        .send(())
+                        .expect("command start should be observed");
+                    release_command_receiver
+                        .recv()
+                        .expect("command should be released");
+                    Ok::<_, FakeRunLoopCommandError>(())
+                })
+            });
+            control.wait_for_request_wakeup_count(1);
+            command_started_receiver
+                .recv()
+                .expect("blocking command should start on worker");
+
+            let drive_update = scope.spawn(|| supervisor.update_block_device(&replacement_config));
+            control.wait_for_request_wakeup_count(2);
+            release_command_sender
+                .send(())
+                .expect("blocking command release should send");
+
+            blocking_command
+                .join()
+                .expect("blocking command caller should not panic")
+                .expect("blocking command should complete");
+            drive_update
+                .join()
+                .expect("drive update caller should not panic")
+                .expect("drive update should run after blocking command");
+        });
+
+        assert_eq!(control.request_wakeup_count(), 2);
 
         drop(supervisor);
 
