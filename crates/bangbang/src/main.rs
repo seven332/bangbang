@@ -219,7 +219,8 @@ fn config_file_actions(config_file: &str) -> Result<Vec<VmmAction>, ConfigFileEr
 }
 
 fn config_file_actions_from_str(contents: &str) -> Result<Vec<VmmAction>, ConfigFileError> {
-    let value = parse_config_file_json_value(contents)?;
+    let value = parse_json_value_without_duplicate_object_keys(contents)
+        .map_err(|_| ConfigFileError::Malformed)?;
     let object = value.as_object().ok_or(ConfigFileError::Malformed)?;
 
     validate_config_file_sections(object)?;
@@ -341,30 +342,32 @@ fn config_file_actions_from_str(contents: &str) -> Result<Vec<VmmAction>, Config
         .collect()
 }
 
-fn parse_config_file_json_value(contents: &str) -> Result<serde_json::Value, ConfigFileError> {
-    let ConfigFileJsonValue(value) = serde_json::from_str::<ConfigFileJsonValue>(contents)
-        .map_err(|_| ConfigFileError::Malformed)?;
+fn parse_json_value_without_duplicate_object_keys(
+    contents: &str,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let JsonValueWithoutDuplicateObjectKeys(value) =
+        serde_json::from_str::<JsonValueWithoutDuplicateObjectKeys>(contents)?;
     Ok(value)
 }
 
 #[derive(Debug)]
-struct ConfigFileJsonValue(serde_json::Value);
+struct JsonValueWithoutDuplicateObjectKeys(serde_json::Value);
 
-impl<'de> serde::Deserialize<'de> for ConfigFileJsonValue {
+impl<'de> serde::Deserialize<'de> for JsonValueWithoutDuplicateObjectKeys {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         deserializer
-            .deserialize_any(ConfigFileJsonValueVisitor)
+            .deserialize_any(JsonValueWithoutDuplicateObjectKeysVisitor)
             .map(Self)
     }
 }
 
 #[derive(Debug)]
-struct ConfigFileJsonValueVisitor;
+struct JsonValueWithoutDuplicateObjectKeysVisitor;
 
-impl<'de> Visitor<'de> for ConfigFileJsonValueVisitor {
+impl<'de> Visitor<'de> for JsonValueWithoutDuplicateObjectKeysVisitor {
     type Value = serde_json::Value;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -415,7 +418,8 @@ impl<'de> Visitor<'de> for ConfigFileJsonValueVisitor {
     where
         D: serde::Deserializer<'de>,
     {
-        serde::Deserialize::deserialize(deserializer).map(|ConfigFileJsonValue(value)| value)
+        serde::Deserialize::deserialize(deserializer)
+            .map(|JsonValueWithoutDuplicateObjectKeys(value)| value)
     }
 
     fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
@@ -424,7 +428,7 @@ impl<'de> Visitor<'de> for ConfigFileJsonValueVisitor {
     {
         let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
 
-        while let Some(ConfigFileJsonValue(value)) = sequence.next_element()? {
+        while let Some(JsonValueWithoutDuplicateObjectKeys(value)) = sequence.next_element()? {
             values.push(value);
         }
 
@@ -442,7 +446,7 @@ impl<'de> Visitor<'de> for ConfigFileJsonValueVisitor {
                 return Err(de::Error::custom("duplicate object key"));
             }
 
-            let ConfigFileJsonValue(value) = map.next_value()?;
+            let JsonValueWithoutDuplicateObjectKeys(value) = map.next_value()?;
             object.insert(key, value);
         }
 
@@ -571,7 +575,7 @@ fn metadata_content_input(metadata_file: &str) -> Result<MmdsContentInput, Metad
                 StartupFileReadError::TooLarge => MetadataFileError::TooLarge,
             }
         })?;
-    let value = serde_json::from_str::<serde_json::Value>(&contents)
+    let value = parse_json_value_without_duplicate_object_keys(&contents)
         .map_err(|_| MetadataFileError::Malformed)?;
 
     Ok(MmdsContentInput::new(value))
@@ -3664,6 +3668,50 @@ mod tests {
         fs::remove_file(path).expect("fixture metadata should clean up");
     }
 
+    fn assert_malformed_metadata_file(name: &str, metadata: &str) {
+        let metadata_path = unique_config_path(name);
+        fs::write(&metadata_path, metadata).expect("fixture metadata file should be written");
+
+        let err = super::metadata_content_input(metadata_path.to_str().expect("UTF-8 path"))
+            .expect_err("metadata file should fail as malformed");
+
+        assert_eq!(err, super::MetadataFileError::Malformed, "{metadata}");
+
+        fs::remove_file(metadata_path).expect("fixture metadata should clean up");
+    }
+
+    #[test]
+    fn metadata_file_rejects_duplicate_top_level_object_key() {
+        assert_malformed_metadata_file(
+            "metadata-duplicate-top-level",
+            r#"{"latest":{"user-data":"hello"},"latest":{"user-data":"goodbye"}}"#,
+        );
+    }
+
+    #[test]
+    fn metadata_file_rejects_duplicate_nested_object_key() {
+        assert_malformed_metadata_file(
+            "metadata-duplicate-nested",
+            r#"{"latest":{"meta-data":{"ami-id":"ami-one","ami-id":"ami-two"}}}"#,
+        );
+    }
+
+    #[test]
+    fn metadata_file_rejects_escaped_duplicate_object_key() {
+        assert_malformed_metadata_file(
+            "metadata-duplicate-escaped",
+            r#"{"latest":{"user-data":"hello"},"\u006catest":{"user-data":"goodbye"}}"#,
+        );
+    }
+
+    #[test]
+    fn metadata_file_rejects_duplicate_array_item_object_key() {
+        assert_malformed_metadata_file(
+            "metadata-duplicate-array-item",
+            r#"{"latest":{"meta-data":{"public-keys":[{"key":"one","key":"two"}]}}}"#,
+        );
+    }
+
     #[test]
     fn metadata_file_rejects_non_regular_file() {
         let metadata_path = unique_config_path("metadata-directory");
@@ -3737,6 +3785,12 @@ mod tests {
     fn startup_metadata_errors_do_not_start_instance() {
         let malformed_path = unique_config_path("metadata-malformed");
         fs::write(&malformed_path, "{").expect("malformed metadata file should be written");
+        let duplicate_path = unique_config_path("metadata-duplicate");
+        fs::write(
+            &duplicate_path,
+            r#"{"latest":{"user-data":"hello"},"latest":{"user-data":"goodbye"}}"#,
+        )
+        .expect("duplicate metadata file should be written");
         let non_object_path = unique_config_path("metadata-non-object");
         fs::write(&non_object_path, r#"["not","object"]"#)
             .expect("non-object metadata file should be written");
@@ -3751,6 +3805,11 @@ mod tests {
         let cases = [
             (
                 &malformed_path,
+                bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
+                "malformed",
+            ),
+            (
+                &duplicate_path,
                 bangbang_runtime::mmds::MMDS_DATA_STORE_LIMIT_BYTES,
                 "malformed",
             ),
@@ -3808,6 +3867,7 @@ mod tests {
         }
 
         fs::remove_file(malformed_path).expect("malformed fixture should clean up");
+        fs::remove_file(duplicate_path).expect("duplicate fixture should clean up");
         fs::remove_file(non_object_path).expect("non-object fixture should clean up");
         fs::remove_file(oversized_path).expect("oversized fixture should clean up");
     }
