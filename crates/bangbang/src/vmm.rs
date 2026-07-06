@@ -624,6 +624,8 @@ pub(crate) trait VmmRequestHandler {
 
     fn record_api_request_parse_failure(&mut self, request: ApiRequestMetricParseFailure);
 
+    fn record_put_actions_request(&mut self);
+
     fn handle_put_action_request(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError>;
 
     fn record_deprecated_api_call(&mut self);
@@ -808,6 +810,10 @@ where
         request.record(&mut self.controller);
     }
 
+    fn record_put_actions_request(&mut self) {
+        self.controller.record_put_actions_request();
+    }
+
     fn record_deprecated_api_call(&mut self) {
         self.controller.record_deprecated_api_call();
     }
@@ -947,6 +953,10 @@ where
 
     fn record_api_request_parse_failure(&mut self, request: ApiRequestMetricParseFailure) {
         ProcessVmm::record_api_request_parse_failure(self, request);
+    }
+
+    fn record_put_actions_request(&mut self) {
+        ProcessVmm::record_put_actions_request(self);
     }
 
     fn record_deprecated_api_call(&mut self) {

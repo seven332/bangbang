@@ -543,11 +543,24 @@ fn handle_request_bytes_with_limit(
     match parse_request_with_limit(bytes, http_api_max_payload_size) {
         Ok(request) => handle_api_request(request, vmm),
         Err(err) => {
-            if should_record_api_request_parse_failure(&err) {
+            if err == RequestError::SendCtrlAltDelUnsupported {
+                record_unsupported_put_action_request(bytes, vmm);
+            } else if should_record_api_request_parse_failure(&err) {
                 record_api_request_parse_failure(bytes, vmm);
             }
             HttpResponse::fault(err.fault_message())
         }
+    }
+}
+
+fn record_unsupported_put_action_request(bytes: &[u8], vmm: &mut impl VmmRequestHandler) {
+    if matches!(
+        api_request_metric_endpoint(bytes),
+        Some(ApiRequestMetricEndpoint::Put(
+            ApiRequestMetricPutEndpoint::Actions
+        ))
+    ) {
+        vmm.record_put_actions_request();
     }
 }
 
@@ -1794,6 +1807,10 @@ mod tests {
 
         fn record_api_request_parse_failure(&mut self, request: ApiRequestMetricParseFailure) {
             self.inner.record_api_request_parse_failure(request);
+        }
+
+        fn record_put_actions_request(&mut self) {
+            self.inner.record_put_actions_request();
         }
 
         fn handle_put_action_request(
@@ -3355,13 +3372,20 @@ mod tests {
         let duplicate_start_response =
             put_action_over_socket(&mut vmm, "duplicate-start", "InstanceStart");
         assert!(duplicate_start_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        let unsupported_action_response =
+            put_action_over_socket(&mut vmm, "send-ctrl-alt-del", "SendCtrlAltDel");
+        assert!(unsupported_action_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(
+            unsupported_action_response
+                .contains(r#"{"fault_message":"SendCtrlAltDel is not supported on aarch64."}"#)
+        );
         let flush_response =
             put_action_over_socket(&mut vmm, "flush-after-failure", "FlushMetrics");
 
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"put_api_requests\":{\"actions_count\":3,\"actions_fails\":1,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"put_api_requests\":{\"actions_count\":4,\"actions_fails\":1,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("fixture should clean up");
