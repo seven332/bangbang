@@ -99,7 +99,12 @@ is resource-specific:
 - `/boot-source` stores kernel and optional initrd paths during configuration.
   Files are opened later during `InstanceStart`.
 - `/drives/{drive_id}` stores block backing paths during configuration. Backing
-  files are opened later during `InstanceStart`.
+  files are opened later during `InstanceStart`. Runtime
+  `PATCH /drives/{drive_id}` opens a replacement backing for an existing active
+  drive before mutating stored configuration, refreshes only the matching
+  virtio-block MMIO handler, and leaves the old backing and stored
+  configuration in place if opening or handler lookup fails. It does not
+  implement block-device hotplug or removal.
 - `/snapshot/create` and `/snapshot/load` currently parse Firecracker-shaped
   snapshot paths before returning unsupported faults, and they do not open or
   create snapshot state or memory files. Future snapshot support must treat

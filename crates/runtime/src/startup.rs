@@ -6,9 +6,10 @@ use std::os::fd::RawFd;
 
 use crate::VmmController;
 use crate::block::{
-    BlockMmioDeviceRegistration, BlockMmioLayout, BlockMmioRegistrationError, DriveConfig,
-    PreparedBlockDeviceError, PreparedBlockDevices, VirtioBlockDeviceNotificationDispatch,
-    VirtioBlockDeviceNotificationError, VirtioBlockMmioHandler,
+    BlockFileBacking, BlockMmioDeviceRegistration, BlockMmioLayout, BlockMmioRegistrationError,
+    DriveConfig, DriveUpdateError, PreparedBlockDeviceError, PreparedBlockDevices,
+    VirtioBlockDeviceNotificationDispatch, VirtioBlockDeviceNotificationError,
+    VirtioBlockMmioHandler,
 };
 use crate::boot::{
     BootCommandLineError, BootSource, BootSourceConfig, BootSourceLoadError, LoadedBootSource,
@@ -842,6 +843,14 @@ pub struct Arm64BootSerialDevice {
 }
 
 impl Arm64BootRuntimeResources {
+    pub fn update_block_device_backing(
+        &self,
+        mmio_dispatcher: &mut MmioDispatcher,
+        config: &DriveConfig,
+    ) -> Result<(), DriveUpdateError> {
+        update_block_device_backing_for_devices(&self.block_devices, mmio_dispatcher, config)
+    }
+
     pub fn vsock_host_read_wakeup_fds(
         &self,
         mmio_dispatcher: &mut MmioDispatcher,
@@ -1058,6 +1067,67 @@ impl Arm64BootRuntimeResources {
 
         Ok(Arm64BootEntropyNotificationDispatches::new(devices))
     }
+}
+
+pub fn update_block_device_backing_for_devices(
+    block_devices: &[Arm64BootBlockDevice],
+    mmio_dispatcher: &mut MmioDispatcher,
+    config: &DriveConfig,
+) -> Result<(), DriveUpdateError> {
+    let region_id = block_device_region_id(block_devices, config)?;
+    let backing =
+        BlockFileBacking::open(config).map_err(|source| DriveUpdateError::OpenBacking {
+            drive_id: config.drive_id().to_string(),
+            message: source.to_string(),
+        })?;
+
+    update_block_device_backing_for_region_with_opened(mmio_dispatcher, region_id, config, backing)
+}
+
+pub fn update_block_device_backing_for_devices_with_opened(
+    block_devices: &[Arm64BootBlockDevice],
+    mmio_dispatcher: &mut MmioDispatcher,
+    config: &DriveConfig,
+    backing: BlockFileBacking,
+) -> Result<(), DriveUpdateError> {
+    let region_id = block_device_region_id(block_devices, config)?;
+
+    update_block_device_backing_for_region_with_opened(mmio_dispatcher, region_id, config, backing)
+}
+
+fn block_device_region_id(
+    block_devices: &[Arm64BootBlockDevice],
+    config: &DriveConfig,
+) -> Result<MmioRegionId, DriveUpdateError> {
+    let Some(device) = block_devices
+        .iter()
+        .find(|device| device.registration.drive_id() == config.drive_id())
+    else {
+        return Err(DriveUpdateError::UnknownDrive {
+            drive_id: config.drive_id().to_string(),
+        });
+    };
+
+    Ok(device.registration.region_id())
+}
+
+fn update_block_device_backing_for_region_with_opened(
+    mmio_dispatcher: &mut MmioDispatcher,
+    region_id: MmioRegionId,
+    config: &DriveConfig,
+    backing: BlockFileBacking,
+) -> Result<(), DriveUpdateError> {
+    let handler = mmio_dispatcher
+        .handler_mut::<VirtioBlockMmioHandler>(region_id)
+        .map_err(|source| DriveUpdateError::HandlerLookup {
+            drive_id: config.drive_id().to_string(),
+            region_id,
+            message: source.to_string(),
+        })?;
+
+    handler.refresh_block_backing_with_opened(config, backing);
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1730,9 +1800,9 @@ mod tests {
     };
     use crate::VmmAction;
     use crate::block::{
-        DriveConfigInput, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
-        VIRTIO_BLOCK_REQUEST_TYPE_IN, VIRTIO_BLOCK_SECTOR_SIZE, VIRTIO_BLOCK_STATUS_OK,
-        VIRTIO_BLOCK_STATUS_SIZE,
+        DriveConfigInput, DriveUpdateError, VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
+        VIRTIO_BLOCK_REQUEST_TYPE_FLUSH, VIRTIO_BLOCK_REQUEST_TYPE_IN, VIRTIO_BLOCK_SECTOR_SIZE,
+        VIRTIO_BLOCK_STATUS_OK, VIRTIO_BLOCK_STATUS_SIZE, VirtioBlockMmioHandler,
     };
     use crate::boot::{
         BootCommandLineError, BootPayloadKind, BootSourceConfigInput, BootSourceLoadError,
@@ -5803,6 +5873,101 @@ mod tests {
         assert_eq!(
             read_guest_bytes(&memory, DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as usize),
             second_payload
+        );
+    }
+
+    #[test]
+    fn boot_runtime_update_block_device_backing_updates_matching_device_only() {
+        let kernel = temp_file("kernel-block-refresh", &arm64_image());
+        let first_block = temp_file("block-refresh-first", &[0x11; 512]);
+        let second_block = temp_file("block-refresh-second", &[0x22; 512]);
+        let replacement = temp_file("block-refresh-replacement", &[0x33; 1024]);
+        let mut controller = controller_with_kernel(kernel.path());
+        add_drive(&mut controller, "rootfs", first_block.path());
+        add_drive_with_root(&mut controller, "data", second_block.path(), false);
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            valid_config(&[line(32), line(33)]),
+        )
+        .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
+        let runtime = parts.runtime;
+        let updated = DriveConfigInput::new("data", "data", replacement.path(), false)
+            .validate()
+            .expect("updated drive config should validate");
+
+        runtime
+            .update_block_device_backing(&mut mmio_dispatcher, &updated)
+            .expect("matching block device should refresh");
+
+        let first_region = runtime.block_devices[0].registration.region_id();
+        let first = mmio_dispatcher
+            .handler_mut::<VirtioBlockMmioHandler>(first_region)
+            .expect("first block handler should exist");
+        assert_eq!(first.device_config_handler().capacity_sectors(), 1);
+        assert_eq!(first.activation_handler().backing().len(), 512);
+        assert_eq!(
+            first.read_register(VirtioMmioRegister::ConfigGeneration),
+            Ok(0)
+        );
+        assert_eq!(
+            first.read_register(VirtioMmioRegister::InterruptStatus),
+            Ok(0)
+        );
+
+        let second_region = runtime.block_devices[1].registration.region_id();
+        let second = mmio_dispatcher
+            .handler_mut::<VirtioBlockMmioHandler>(second_region)
+            .expect("second block handler should exist");
+        assert_eq!(second.device_config_handler().capacity_sectors(), 2);
+        assert_eq!(second.activation_handler().backing().len(), 1024);
+        assert_eq!(
+            second.read_register(VirtioMmioRegister::ConfigGeneration),
+            Ok(1)
+        );
+        assert_eq!(
+            second.read_register(VirtioMmioRegister::InterruptStatus),
+            Ok(DeviceInterruptKind::Config.status().bits())
+        );
+    }
+
+    #[test]
+    fn boot_runtime_update_block_device_backing_rejects_unknown_drive() {
+        let kernel = temp_file("kernel-block-refresh-unknown", &arm64_image());
+        let block = temp_file("block-refresh-unknown", &[0x11; 512]);
+        let replacement = temp_file("block-refresh-unknown-replacement", &[0x33; 1024]);
+        let mut controller = controller_with_kernel(kernel.path());
+        add_drive(&mut controller, "rootfs", block.path());
+        let resources =
+            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[line(32)]))
+                .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
+        let runtime = parts.runtime;
+        let updated = DriveConfigInput::new("missing", "missing", replacement.path(), false)
+            .validate()
+            .expect("updated drive config should validate");
+
+        let err = runtime
+            .update_block_device_backing(&mut mmio_dispatcher, &updated)
+            .expect_err("unknown block device should fail");
+
+        assert_eq!(
+            err,
+            DriveUpdateError::UnknownDrive {
+                drive_id: "missing".to_string()
+            }
+        );
+        let region = runtime.block_devices[0].registration.region_id();
+        let handler = mmio_dispatcher
+            .handler_mut::<VirtioBlockMmioHandler>(region)
+            .expect("block handler should exist");
+        assert_eq!(handler.device_config_handler().capacity_sectors(), 1);
+        assert_eq!(handler.activation_handler().backing().len(), 512);
+        assert_eq!(
+            handler.read_register(VirtioMmioRegister::ConfigGeneration),
+            Ok(0)
         );
     }
 
