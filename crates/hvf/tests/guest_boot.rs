@@ -390,7 +390,7 @@ fn run_guest_boot_with_boot_source(
             break;
         }
 
-        if !run_diagnostics.loop_outcome_was_step_limit(&outcome) {
+        if !run_diagnostics.loop_outcome_was_resumable(&outcome) {
             terminal_outcome = Some(outcome);
             break;
         }
@@ -637,7 +637,7 @@ struct GuestBootRunDiagnostics {
     run_loop_calls: usize,
     raw_steps: usize,
     completed_steps: usize,
-    step_limit_outcomes: usize,
+    resumable_outcomes: usize,
     hvc_steps: usize,
     sys64_steps: usize,
     mmio_steps: usize,
@@ -688,20 +688,21 @@ impl GuestBootRunDiagnostics {
     fn record_loop_outcome(&mut self, outcome: &bangbang_hvf::HvfArm64BootRunLoopOutcome) {
         self.run_loop_calls += 1;
         self.completed_steps += run_loop_completed_steps(outcome);
-        if self.loop_outcome_was_step_limit(outcome) {
-            self.step_limit_outcomes += 1;
+        if self.loop_outcome_was_resumable(outcome) {
+            self.resumable_outcomes += 1;
         } else {
             self.terminal_outcome = Some(format!("{outcome:?}"));
         }
     }
 
-    fn loop_outcome_was_step_limit(
+    fn loop_outcome_was_resumable(
         &self,
         outcome: &bangbang_hvf::HvfArm64BootRunLoopOutcome,
     ) -> bool {
         matches!(
             outcome,
             bangbang_hvf::HvfArm64BootRunLoopOutcome::StepLimitReached { .. }
+                | bangbang_hvf::HvfArm64BootRunLoopOutcome::Wakeup { .. }
         )
     }
 
@@ -732,7 +733,7 @@ impl GuestBootRunDiagnostics {
             "watchdog-canceled-in-flight-vcpu-run"
         } else if self.terminal_outcome.is_some() {
             "terminal-run-loop-outcome"
-        } else if self.run_loop_calls > 0 && self.run_loop_calls == self.step_limit_outcomes {
+        } else if self.run_loop_calls > 0 && self.run_loop_calls == self.resumable_outcomes {
             "outer-timeout-after-handled-steps"
         } else {
             "outer-timeout-without-terminal-outcome"
@@ -785,7 +786,7 @@ impl std::fmt::Display for GuestBootFailureReport<'_> {
             self.run.completed_steps
         )?;
         writeln!(f, "  raw observed steps: {}", self.run.raw_steps)?;
-        writeln!(f, "  step-limit outcomes: {}", self.run.step_limit_outcomes)?;
+        writeln!(f, "  resumable outcomes: {}", self.run.resumable_outcomes)?;
         writeln!(
             f,
             "  raw step counts: hvc={}, sys64={}, mmio={}, vtimer={}, canceled={}, unknown={}",
@@ -891,6 +892,7 @@ fn validate_pre_run_boot_metadata(
 fn run_loop_completed_steps(outcome: &bangbang_hvf::HvfArm64BootRunLoopOutcome) -> usize {
     match outcome {
         bangbang_hvf::HvfArm64BootRunLoopOutcome::StepLimitReached { steps }
+        | bangbang_hvf::HvfArm64BootRunLoopOutcome::Wakeup { steps }
         | bangbang_hvf::HvfArm64BootRunLoopOutcome::Stopped { steps }
         | bangbang_hvf::HvfArm64BootRunLoopOutcome::Canceled { steps }
         | bangbang_hvf::HvfArm64BootRunLoopOutcome::GuestShutdown { steps }
@@ -1036,7 +1038,7 @@ mod tests {
             "outer-timeout-after-handled-steps"
         );
         assert_eq!(diagnostics.run_loop_calls, 1);
-        assert_eq!(diagnostics.step_limit_outcomes, 1);
+        assert_eq!(diagnostics.resumable_outcomes, 1);
         assert_eq!(diagnostics.virtual_timer_steps, 1);
         assert_eq!(diagnostics.last_mmio_step, None);
     }
@@ -1106,6 +1108,12 @@ mod tests {
                 &bangbang_hvf::HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 7 }
             ),
             7
+        );
+        assert_eq!(
+            run_loop_completed_steps(&bangbang_hvf::HvfArm64BootRunLoopOutcome::Wakeup {
+                steps: 8
+            }),
+            8
         );
         assert_eq!(
             run_loop_completed_steps(&bangbang_hvf::HvfArm64BootRunLoopOutcome::Stopped {

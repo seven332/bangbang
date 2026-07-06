@@ -143,6 +143,7 @@ pub struct HvfArm64BootSession<'vm> {
     backend: &'vm mut HvfBackend,
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
+    control_wakeup: HvfArm64BootRunLoopControlWakeupToken,
     run_loop_wakeup: HvfArm64BootRunLoopWakeupToken,
     entropy_source: VirtioRngOsEntropySource,
     gic: HvfGicMetadata,
@@ -161,6 +162,7 @@ pub struct OwnedHvfArm64BootSession {
     backend: HvfBackend,
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
+    control_wakeup: HvfArm64BootRunLoopControlWakeupToken,
     run_loop_wakeup: HvfArm64BootRunLoopWakeupToken,
     entropy_source: VirtioRngOsEntropySource,
     gic: HvfGicMetadata,
@@ -207,16 +209,36 @@ impl HvfArm64BootRunLoopWakeupToken {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct HvfArm64BootRunLoopControlWakeupToken {
+    wakeup_requested: Arc<AtomicBool>,
+}
+
+impl HvfArm64BootRunLoopControlWakeupToken {
+    fn request_wakeup(&self) {
+        self.wakeup_requested.store(true, Ordering::Relaxed);
+    }
+
+    fn take_wakeup_request(&self) -> bool {
+        self.wakeup_requested.swap(false, Ordering::Relaxed)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HvfArm64BootRunLoopControl {
     stop_token: HvfArm64BootRunLoopStopToken,
+    control_wakeup: HvfArm64BootRunLoopControlWakeupToken,
     cancel_handle: HvfVcpuRunCancelHandle,
 }
 
 impl HvfArm64BootRunLoopControl {
-    fn new(cancel_handle: HvfVcpuRunCancelHandle) -> Self {
+    fn new(
+        cancel_handle: HvfVcpuRunCancelHandle,
+        control_wakeup: HvfArm64BootRunLoopControlWakeupToken,
+    ) -> Self {
         Self {
             stop_token: HvfArm64BootRunLoopStopToken::new(),
+            control_wakeup,
             cancel_handle,
         }
     }
@@ -229,11 +251,27 @@ impl HvfArm64BootRunLoopControl {
         self.stop_token.request_stop();
         self.cancel_handle.cancel()
     }
+
+    /// Wake the boot run loop without requesting guest shutdown.
+    ///
+    /// This is runner-command plumbing for future runtime device updates. It
+    /// lets the process worker regain control while keeping stop semantics
+    /// separate from ordinary command dispatch.
+    pub fn request_wakeup(&self) -> Result<(), HvfVcpuRunnerError> {
+        self.control_wakeup.request_wakeup();
+        if let Err(source) = self.cancel_handle.cancel() {
+            let _ = self.control_wakeup.take_wakeup_request();
+            return Err(source);
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HvfArm64BootRunLoopOutcome {
     StepLimitReached { steps: usize },
+    Wakeup { steps: usize },
     Stopped { steps: usize },
     Canceled { steps: usize },
     GuestShutdown { steps: usize },
@@ -526,10 +564,11 @@ impl HvfArm64BootSession<'_> {
 
     /// Return a control handle for the bounded internal boot-session run loop.
     ///
-    /// Stop requests use the existing runner cancellation boundary. This remains
-    /// internal runner-loop plumbing and does not start an unbounded guest loop.
+    /// Stop and non-stop wakeup requests use the existing runner cancellation
+    /// boundary. This remains internal runner-loop plumbing and does not start
+    /// an unbounded guest loop.
     pub fn run_loop_control(&self) -> HvfArm64BootRunLoopControl {
-        HvfArm64BootRunLoopControl::new(self.run_cancel_handle())
+        HvfArm64BootRunLoopControl::new(self.run_cancel_handle(), self.control_wakeup.clone())
     }
 
     /// Run bounded vCPU steps and dispatch boot block and virtio-net TX
@@ -708,6 +747,7 @@ impl OwnedHvfArm64BootSession {
             backend,
             mmio_dispatcher: prepared.mmio_dispatcher,
             runtime_resources: prepared.runtime_resources,
+            control_wakeup: prepared.control_wakeup,
             run_loop_wakeup: prepared.run_loop_wakeup,
             entropy_source: VirtioRngOsEntropySource::new(),
             gic: prepared.gic,
@@ -803,7 +843,7 @@ impl OwnedHvfArm64BootSession {
     }
 
     pub fn run_loop_control(&self) -> HvfArm64BootRunLoopControl {
-        HvfArm64BootRunLoopControl::new(self.run_cancel_handle())
+        HvfArm64BootRunLoopControl::new(self.run_cancel_handle(), self.control_wakeup.clone())
     }
 
     pub fn run_loop(
@@ -972,6 +1012,10 @@ impl BootSessionRunLoopSession for OwnedHvfArm64BootSession {
         self.run_loop_wakeup.take_wakeup_request()
     }
 
+    fn take_run_loop_control_wakeup_request(&mut self) -> bool {
+        self.control_wakeup.take_wakeup_request()
+    }
+
     fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
         self.run_once_and_handle_mmio()
     }
@@ -1052,6 +1096,10 @@ where
 
     fn take_run_loop_wakeup_request(&mut self) -> bool {
         self.session.take_run_loop_wakeup_request()
+    }
+
+    fn take_run_loop_control_wakeup_request(&mut self) -> bool {
+        self.session.take_run_loop_control_wakeup_request()
     }
 
     fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
@@ -1695,6 +1743,10 @@ trait BootSessionRunLoopSession {
         false
     }
 
+    fn take_run_loop_control_wakeup_request(&mut self) -> bool {
+        false
+    }
+
     fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError>;
 
     fn handle_run_loop_virtual_timer(&mut self) -> Result<(), HvfVcpuRunnerError>;
@@ -1736,6 +1788,10 @@ impl BootSessionRunLoopSession for HvfArm64BootSession<'_> {
 
     fn take_run_loop_wakeup_request(&mut self) -> bool {
         self.run_loop_wakeup.take_wakeup_request()
+    }
+
+    fn take_run_loop_control_wakeup_request(&mut self) -> bool {
+        self.control_wakeup.take_wakeup_request()
     }
 
     fn run_loop_vcpu_step(&mut self) -> Result<HvfVcpuRunStepOutcome, HvfVcpuRunnerError> {
@@ -1862,6 +1918,7 @@ fn run_boot_session_loop_with_observer(
                 if stop_token.is_stop_requested() {
                     return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
                 }
+                let control_wakeup_requested = session.take_run_loop_control_wakeup_request();
                 let wakeup_requested =
                     session.take_run_loop_wakeup_request() || monitor_wakeup_requested;
                 if wakeup_requested {
@@ -1869,6 +1926,11 @@ fn run_boot_session_loop_with_observer(
                     if stop_token.is_stop_requested() {
                         return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
                     }
+                }
+                if control_wakeup_requested {
+                    return Ok(HvfArm64BootRunLoopOutcome::Wakeup { steps });
+                }
+                if wakeup_requested {
                     if steps == max_steps {
                         return Ok(HvfArm64BootRunLoopOutcome::StepLimitReached { steps });
                     }
@@ -2625,6 +2687,7 @@ struct PreparedHvfArm64BootSession<'vm> {
     runner: HvfVcpuRunner<'vm>,
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
     runtime_resources: Arm64BootRuntimeResources,
+    control_wakeup: HvfArm64BootRunLoopControlWakeupToken,
     run_loop_wakeup: HvfArm64BootRunLoopWakeupToken,
     gic: HvfGicMetadata,
     primary_mpidr: u64,
@@ -2668,6 +2731,7 @@ impl HvfBackend {
             backend: self,
             mmio_dispatcher: prepared.mmio_dispatcher,
             runtime_resources: prepared.runtime_resources,
+            control_wakeup: prepared.control_wakeup,
             run_loop_wakeup: prepared.run_loop_wakeup,
             entropy_source: VirtioRngOsEntropySource::new(),
             gic: prepared.gic,
@@ -2754,6 +2818,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
         runner,
         mmio_dispatcher: Arc::new(Mutex::new(parts.mmio_dispatcher)),
         runtime_resources: parts.runtime,
+        control_wakeup: HvfArm64BootRunLoopControlWakeupToken::default(),
         run_loop_wakeup: HvfArm64BootRunLoopWakeupToken::default(),
         gic,
         primary_mpidr,
@@ -3311,6 +3376,7 @@ mod tests {
         request_stop_on_vsock_dispatch: Option<HvfArm64BootRunLoopStopToken>,
         request_stop_on_entropy_dispatch: Option<HvfArm64BootRunLoopStopToken>,
         request_stop_on_timer: Option<HvfArm64BootRunLoopStopToken>,
+        control_wakeup_requested: bool,
         wakeup_requested: bool,
     }
 
@@ -3331,6 +3397,7 @@ mod tests {
                 request_stop_on_vsock_dispatch: None,
                 request_stop_on_entropy_dispatch: None,
                 request_stop_on_timer: None,
+                control_wakeup_requested: false,
                 wakeup_requested: false,
             }
         }
@@ -3351,6 +3418,7 @@ mod tests {
                 request_stop_on_vsock_dispatch: None,
                 request_stop_on_entropy_dispatch: None,
                 request_stop_on_timer: None,
+                control_wakeup_requested: false,
                 wakeup_requested: false,
             }
         }
@@ -3415,6 +3483,10 @@ mod tests {
         const fn request_run_loop_wakeup(&mut self) {
             self.wakeup_requested = true;
         }
+
+        const fn request_run_loop_control_wakeup(&mut self) {
+            self.control_wakeup_requested = true;
+        }
     }
 
     impl super::BootSessionRunLoopSession for RecordingBootSessionRunLoopSession {
@@ -3437,6 +3509,12 @@ mod tests {
         fn take_run_loop_wakeup_request(&mut self) -> bool {
             let wakeup_requested = self.wakeup_requested;
             self.wakeup_requested = false;
+            wakeup_requested
+        }
+
+        fn take_run_loop_control_wakeup_request(&mut self) -> bool {
+            let wakeup_requested = self.control_wakeup_requested;
+            self.control_wakeup_requested = false;
             wakeup_requested
         }
 
@@ -6443,6 +6521,50 @@ mod tests {
 
         assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Canceled { steps: 1 });
         assert_eq!(session.events, ["run"]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_reports_control_wakeup_after_canceled_step() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session =
+            RecordingBootSessionRunLoopSession::new([HvfVcpuRunStepOutcome::Canceled]);
+        session.request_run_loop_control_wakeup();
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("control wakeup loop should succeed");
+
+        assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Wakeup { steps: 1 });
+        assert_eq!(session.events, ["run"]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_stop_takes_priority_over_control_wakeup() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session =
+            RecordingBootSessionRunLoopSession::new([HvfVcpuRunStepOutcome::Canceled]);
+        session.request_run_loop_control_wakeup();
+        session.request_stop_on_run(stop_token.clone());
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("stop should take priority over control wakeup");
+
+        assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Stopped { steps: 1 });
+        assert_eq!(session.events, ["run"]);
+    }
+
+    #[test]
+    fn boot_session_run_loop_dispatches_vsock_before_control_wakeup() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session =
+            RecordingBootSessionRunLoopSession::new([HvfVcpuRunStepOutcome::Canceled]);
+        session.request_run_loop_wakeup();
+        session.request_run_loop_control_wakeup();
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("combined wakeup loop should succeed");
+
+        assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Wakeup { steps: 1 });
+        assert_eq!(session.events, ["run", "vsock-dispatch"]);
     }
 
     #[test]
