@@ -626,6 +626,52 @@ fn executable_no_api_config_file_failure_does_not_publish_socket() {
 }
 
 #[test]
+fn executable_config_file_malformed_entropy_section_does_not_publish_socket() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let config_path = test_dir.path().join("vm-config.json");
+    let instance_id = test_dir.instance_id();
+    fs::write(
+        &config_path,
+        r#"{
+            "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
+            "entropy":{"unknown":true}
+        }"#,
+    )
+    .expect("config file should be written");
+
+    let output = BangbangProcess::start_with_extra_args_expect_failure(
+        &socket_path,
+        &instance_id,
+        &["--config-file", path_text(&config_path)],
+    );
+
+    assert!(
+        !output.status.success(),
+        "malformed entropy config should fail startup; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        !socket_path.exists(),
+        "malformed entropy config should fail before API socket publication"
+    );
+    assert!(
+        !output.stdout.contains("status: API server listening"),
+        "malformed entropy config must not report API readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        output
+            .stderr
+            .contains("bangbang: config-file error: invalid config-file section entropy: Malformed HTTP request."),
+        "stderr should describe entropy section parse failure; stderr:\n{}",
+        output.stderr
+    );
+}
+
+#[test]
 fn executable_config_file_rejected_entropy_rate_limiter_does_not_publish_socket() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
