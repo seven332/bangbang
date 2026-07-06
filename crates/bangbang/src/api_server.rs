@@ -600,6 +600,7 @@ const fn api_request_metric_put_parse_failure(
 ) -> ApiRequestMetricPutParseFailure {
     match endpoint {
         ApiRequestMetricPutEndpoint::Actions => ApiRequestMetricPutParseFailure::Actions,
+        ApiRequestMetricPutEndpoint::Balloon => ApiRequestMetricPutParseFailure::Balloon,
         ApiRequestMetricPutEndpoint::BootSource => ApiRequestMetricPutParseFailure::BootSource,
         ApiRequestMetricPutEndpoint::CpuConfig => ApiRequestMetricPutParseFailure::CpuConfig,
         ApiRequestMetricPutEndpoint::Drive => ApiRequestMetricPutParseFailure::Drive,
@@ -623,6 +624,7 @@ const fn api_request_metric_patch_parse_failure(
     endpoint: ApiRequestMetricPatchEndpoint,
 ) -> ApiRequestMetricPatchParseFailure {
     match endpoint {
+        ApiRequestMetricPatchEndpoint::Balloon => ApiRequestMetricPatchParseFailure::Balloon,
         ApiRequestMetricPatchEndpoint::Drive => ApiRequestMetricPatchParseFailure::Drive,
         ApiRequestMetricPatchEndpoint::HotplugMemory => {
             ApiRequestMetricPatchParseFailure::HotplugMemory
@@ -3542,7 +3544,7 @@ mod tests {
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"get_api_requests\":{\"balloon_count\":3,\"hotplug_memory_count\":0,\"instance_info_count\":0,\"machine_cfg_count\":0,\"mmds_count\":0,\"vmm_version_count\":0},\"patch_api_requests\":{\"balloon_count\":4,\"balloon_fails\":4,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":1,\"balloon_fails\":1,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"get_api_requests\":{\"balloon_count\":3,\"hotplug_memory_count\":0,\"instance_info_count\":0,\"machine_cfg_count\":0,\"mmds_count\":0,\"vmm_version_count\":0},\"patch_api_requests\":{\"balloon_count\":4,\"balloon_fails\":4,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":2,\"balloon_fails\":2,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("fixture should clean up");
@@ -3740,7 +3742,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_metrics_counts_core_parser_failures() {
+    fn configured_metrics_counts_identifiable_parser_failures() {
         let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
         let metrics_path = unique_socket_path("metrics-core-parser").with_extension("metrics");
 
@@ -3756,6 +3758,7 @@ mod tests {
 
         for (method, path, body) in [
             ("PUT", "/actions", "not-json"),
+            ("PUT", "/balloon", "not-json"),
             ("PUT", "/boot-source", "{}"),
             ("PUT", "/cpu-config", "not-json"),
             ("PUT", "/drives/data", "not-json"),
@@ -3768,6 +3771,9 @@ mod tests {
             ("PUT", "/pmem/pmem0", "not-json"),
             ("PUT", "/serial", "not-json"),
             ("PUT", "/vsock", "not-json"),
+            ("PATCH", "/balloon", "not-json"),
+            ("PATCH", "/balloon/statistics", "not-json"),
+            ("PATCH", "/balloon/hinting/start", "not-json"),
             ("PATCH", "/drives/data", "not-json"),
             ("PATCH", "/hotplug/memory", "not-json"),
             ("PATCH", "/machine-config", "not-json"),
@@ -3843,9 +3849,7 @@ mod tests {
 
         for (method, path, body) in [
             ("DELETE", "/drives/data", "{}"),
-            ("PUT", "/balloon", "not-json"),
             ("PUT", "/entropy", "not-json"),
-            ("PATCH", "/balloon", "not-json"),
             ("PATCH", "/vm", "not-json"),
         ] {
             let response =
@@ -3889,7 +3893,7 @@ mod tests {
         let metrics = read_metrics_json(&metrics_path);
         for (field, count, fails) in [
             ("actions", 1, 1),
-            ("balloon", 0, 0),
+            ("balloon", 1, 1),
             ("boot_source", 2, 1),
             ("cpu_cfg", 1, 1),
             ("drive", 2, 2),
@@ -3926,7 +3930,7 @@ mod tests {
             "pmem",
         ] {
             let (count, fails) = match field {
-                "balloon" => (0, 0),
+                "balloon" => (3, 3),
                 "drive" | "network" | "pmem" => (2, 2),
                 _ => (1, 1),
             };

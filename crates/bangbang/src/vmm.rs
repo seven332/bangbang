@@ -502,6 +502,7 @@ impl ApiRequestMetricParseFailure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ApiRequestMetricPutParseFailure {
     Actions,
+    Balloon,
     BootSource,
     CpuConfig,
     Drive,
@@ -523,6 +524,7 @@ impl ApiRequestMetricPutParseFailure {
                 controller.record_put_actions_request();
                 controller.record_put_actions_failure();
             }
+            Self::Balloon => PutApiRequestKind::Balloon.record_parse_failure(controller),
             Self::BootSource => PutApiRequestKind::BootSource.record_parse_failure(controller),
             Self::CpuConfig => PutApiRequestKind::CpuConfig.record_parse_failure(controller),
             Self::Drive => PutApiRequestKind::Drive.record_parse_failure(controller),
@@ -545,6 +547,7 @@ impl ApiRequestMetricPutParseFailure {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ApiRequestMetricPatchParseFailure {
+    Balloon,
     Drive,
     HotplugMemory,
     MachineConfig,
@@ -556,6 +559,7 @@ pub(crate) enum ApiRequestMetricPatchParseFailure {
 impl ApiRequestMetricPatchParseFailure {
     fn record(self, controller: &mut VmmController) {
         match self {
+            Self::Balloon => PatchApiRequestKind::Balloon.record_parse_failure(controller),
             Self::Drive => PatchApiRequestKind::Drive.record_parse_failure(controller),
             Self::HotplugMemory => {
                 PatchApiRequestKind::HotplugMemory.record_parse_failure(controller)

@@ -564,9 +564,9 @@ through VMM control, parser failures for those endpoints in the matching
 for those PATCH endpoints. bangbang also records
 `balloon_count` extension fields for parsed balloon GET, PUT, and PATCH routes,
 plus `balloon_fails` extension fields for parsed balloon PUT and PATCH
-failures, because Firecracker does not expose matching request metrics. It does
-not count malformed balloon parser failures in those extension fields. It also
-does not emit entropy request-counter fields; Firecracker does not define
+failures and identifiable malformed balloon PUT/PATCH parser failures, because
+Firecracker does not expose matching request metrics. It also does not emit
+entropy request-counter fields; Firecracker does not define
 `put_api_requests.entropy_count` or `entropy_fails`. Entropy device runtime
 metrics remain deferred until their producers exist.
 Parsed deprecated HTTP API usage is counted under

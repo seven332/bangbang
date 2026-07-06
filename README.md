@@ -183,8 +183,9 @@ memory hotplug and pmem under `patch_api_requests`, including parser failures
 for those PATCH endpoints. bangbang also records
 bangbang-specific `balloon_count` API request counters for parsed balloon GET,
 PUT, and PATCH routes, plus `balloon_fails` counters for parsed balloon PUT and
-PATCH failures, because Firecracker does not expose matching balloon API request
-metric fields. Parsed deprecated HTTP API
+PATCH failures and identifiable malformed balloon PUT/PATCH parser failures,
+because Firecracker does not expose matching balloon API request metric fields.
+Parsed deprecated HTTP API
 usage is counted under `deprecated_api.deprecated_http_api_calls` for supported
 deprecated machine `cpu_template`, MMDS V1 config, `vsock_id`, and snapshot-load
 field forms.
