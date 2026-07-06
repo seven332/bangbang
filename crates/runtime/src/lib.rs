@@ -503,6 +503,14 @@ impl VmmController {
         self.metrics_state.record_put_actions_failure();
     }
 
+    pub fn record_put_balloon_request(&mut self) {
+        self.metrics_state.record_put_balloon_request();
+    }
+
+    pub fn record_put_balloon_failure(&mut self) {
+        self.metrics_state.record_put_balloon_failure();
+    }
+
     pub fn record_put_boot_source_request(&mut self) {
         self.metrics_state.record_put_boot_source_request();
     }
@@ -611,6 +619,14 @@ impl VmmController {
         self.metrics_state.record_patch_drive_failure();
     }
 
+    pub fn record_patch_balloon_request(&mut self) {
+        self.metrics_state.record_patch_balloon_request();
+    }
+
+    pub fn record_patch_balloon_failure(&mut self) {
+        self.metrics_state.record_patch_balloon_failure();
+    }
+
     pub fn record_patch_network_request(&mut self) {
         self.metrics_state.record_patch_network_request();
     }
@@ -649,6 +665,10 @@ impl VmmController {
 
     pub fn record_patch_pmem_failure(&mut self) {
         self.metrics_state.record_patch_pmem_failure();
+    }
+
+    pub fn record_get_balloon_request(&mut self) {
+        self.metrics_state.record_get_balloon_request();
     }
 
     pub fn record_get_instance_info_request(&mut self) {

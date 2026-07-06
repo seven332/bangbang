@@ -165,10 +165,13 @@ while the VM is running. After `InstanceStart`, the line also includes a
 process-owned boot worker exists. When startup timing CLI values are provided,
 the same metrics output includes `start_time_us`, `start_time_cpu_us`, and
 `parent_cpu_time_us`. The current Firecracker-shaped API request metrics subset
-also reports selected GET counters under `get_api_requests`, parsed core
+also reports selected GET counters under `get_api_requests`; parsed core
 configuration, MMDS, observability, memory hotplug, pmem, and `/actions`
-counters under `put_api_requests`, and selected PATCH counters including
-memory hotplug and pmem under `patch_api_requests`. Parsed deprecated HTTP API
+counters under `put_api_requests`; and selected PATCH counters including memory
+hotplug and pmem under `patch_api_requests`. bangbang also records
+bangbang-specific `balloon_count` and `balloon_fails` API request counters for
+parsed balloon routes because Firecracker does not expose matching balloon API
+request metric fields. Parsed deprecated HTTP API
 usage is counted under `deprecated_api.deprecated_http_api_calls` for supported
 deprecated machine `cpu_template`, MMDS V1 config, `vsock_id`, and snapshot-load
 field forms.

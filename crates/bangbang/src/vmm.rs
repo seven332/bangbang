@@ -131,6 +131,9 @@ impl ProcessSessionExitStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GetApiRequest {
+    Balloon,
+    BalloonHintingStatus,
+    BalloonStats,
     HotplugMemory,
     InstanceInfo,
     VmmVersion,
@@ -141,6 +144,9 @@ pub(crate) enum GetApiRequest {
 impl GetApiRequest {
     const fn action(self) -> VmmAction {
         match self {
+            Self::Balloon => VmmAction::GetBalloon,
+            Self::BalloonHintingStatus => VmmAction::GetBalloonHintingStatus,
+            Self::BalloonStats => VmmAction::GetBalloonStats,
             Self::HotplugMemory => VmmAction::GetMemoryHotplug,
             Self::InstanceInfo => VmmAction::GetVmInstanceInfo,
             Self::VmmVersion => VmmAction::GetVmmVersion,
@@ -151,6 +157,9 @@ impl GetApiRequest {
 
     fn record(self, controller: &mut VmmController) {
         match self {
+            Self::Balloon | Self::BalloonHintingStatus | Self::BalloonStats => {
+                controller.record_get_balloon_request();
+            }
             Self::HotplugMemory => controller.record_get_hotplug_memory_request(),
             Self::InstanceInfo => controller.record_get_instance_info_request(),
             Self::VmmVersion => controller.record_get_vmm_version_request(),
@@ -167,6 +176,13 @@ pub(crate) struct PutApiRequest {
 }
 
 impl PutApiRequest {
+    pub(crate) const fn balloon() -> Self {
+        Self {
+            kind: PutApiRequestKind::Balloon,
+            action: VmmAction::PutBalloon,
+        }
+    }
+
     pub(crate) fn boot_source(input: BootSourceConfigInput) -> Self {
         Self {
             kind: PutApiRequestKind::BootSource,
@@ -269,6 +285,7 @@ impl PutApiRequest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PutApiRequestKind {
+    Balloon,
     BootSource,
     CpuConfig,
     Drive,
@@ -286,6 +303,7 @@ enum PutApiRequestKind {
 impl PutApiRequestKind {
     fn record_request(self, controller: &mut VmmController) {
         match self {
+            Self::Balloon => controller.record_put_balloon_request(),
             Self::BootSource => controller.record_put_boot_source_request(),
             Self::CpuConfig => controller.record_put_cpu_config_request(),
             Self::Drive => controller.record_put_drive_request(),
@@ -303,6 +321,7 @@ impl PutApiRequestKind {
 
     fn record_failure(self, controller: &mut VmmController) {
         match self {
+            Self::Balloon => controller.record_put_balloon_failure(),
             Self::BootSource => controller.record_put_boot_source_failure(),
             Self::CpuConfig => controller.record_put_cpu_config_failure(),
             Self::Drive => controller.record_put_drive_failure(),
@@ -326,6 +345,34 @@ pub(crate) struct PatchApiRequest {
 }
 
 impl PatchApiRequest {
+    pub(crate) const fn balloon() -> Self {
+        Self {
+            kind: PatchApiRequestKind::Balloon,
+            action: VmmAction::PatchBalloon,
+        }
+    }
+
+    pub(crate) const fn balloon_hinting_start() -> Self {
+        Self {
+            kind: PatchApiRequestKind::Balloon,
+            action: VmmAction::PatchBalloonHintingStart,
+        }
+    }
+
+    pub(crate) const fn balloon_hinting_stop() -> Self {
+        Self {
+            kind: PatchApiRequestKind::Balloon,
+            action: VmmAction::PatchBalloonHintingStop,
+        }
+    }
+
+    pub(crate) const fn balloon_stats() -> Self {
+        Self {
+            kind: PatchApiRequestKind::Balloon,
+            action: VmmAction::PatchBalloonStats,
+        }
+    }
+
     pub(crate) fn drive(input: DriveUpdateInput) -> Self {
         Self {
             kind: PatchApiRequestKind::Drive,
@@ -379,6 +426,7 @@ impl PatchApiRequest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PatchApiRequestKind {
+    Balloon,
     Drive,
     HotplugMemory,
     MachineConfig,
@@ -390,6 +438,7 @@ enum PatchApiRequestKind {
 impl PatchApiRequestKind {
     fn record_request(self, controller: &mut VmmController) {
         match self {
+            Self::Balloon => controller.record_patch_balloon_request(),
             Self::Drive => controller.record_patch_drive_request(),
             Self::HotplugMemory => controller.record_patch_hotplug_memory_request(),
             Self::MachineConfig => controller.record_patch_machine_config_request(),
@@ -401,6 +450,7 @@ impl PatchApiRequestKind {
 
     fn record_failure(self, controller: &mut VmmController) {
         match self {
+            Self::Balloon => controller.record_patch_balloon_failure(),
             Self::Drive => controller.record_patch_drive_failure(),
             Self::HotplugMemory => controller.record_patch_hotplug_memory_failure(),
             Self::MachineConfig => controller.record_patch_machine_config_failure(),
