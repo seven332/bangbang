@@ -5737,7 +5737,7 @@ mod tests {
             ),
             (
                 "serial-rate-limiter",
-                r#"{"rate_limiter":{"bandwidth":{"size":1,"refill_time":1}}}"#,
+                r#"{"rate_limiter":{"size":1,"refill_time":1}}"#,
                 "serial output rate limiting is not supported",
             ),
         ] {

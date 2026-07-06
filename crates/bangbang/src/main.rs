@@ -3425,7 +3425,7 @@ mod tests {
                 "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
                 "serial":{
                     "serial_out_path":"/tmp/private-serial.out",
-                    "rate_limiter":{"bandwidth":{"size":1,"refill_time":1}}
+                    "rate_limiter":{"size":1,"refill_time":1}
                 }
             }"#,
         )
