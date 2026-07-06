@@ -2041,6 +2041,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hvf_resumable_run_loop_outcomes_keep_process_running() {
+        assert_eq!(
+            super::BootRunLoopProcessExit::process_exit_status(
+                &super::HvfArm64BootRunLoopOutcome::StepLimitReached { steps: 1 },
+            ),
+            super::ProcessSessionExitStatus::Running
+        );
+        assert_eq!(
+            super::BootRunLoopProcessExit::process_exit_status(
+                &super::HvfArm64BootRunLoopOutcome::Wakeup { steps: 1 },
+            ),
+            super::ProcessSessionExitStatus::Running
+        );
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct FakeRunLoopError;
 
