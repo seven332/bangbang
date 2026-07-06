@@ -160,10 +160,11 @@ omitted timing arguments remain omitted. Parsed `GET /`,
 `GET /version`, `GET /machine-config`, and
 `GET /mmds` API requests are counted under `get_api_requests`; parsed
 core configuration PUTs, `PUT /mmds`, `PUT /mmds/config`, `PUT /metrics`,
-`PUT /logger`, `PUT /serial`, and `/actions` API requests are counted under
-`put_api_requests`; parsed `PATCH /machine-config`, `PATCH /mmds`,
-`PATCH /drives/{drive_id}`, and `PATCH /network-interfaces/{iface_id}`
-requests routed through VMM control are counted under `patch_api_requests`.
+`PUT /logger`, `PUT /serial`, `PUT /pmem/{pmem_id}`, and `/actions` API
+requests are counted under `put_api_requests`; parsed `PATCH /machine-config`,
+`PATCH /mmds`, `PATCH /drives/{drive_id}`,
+`PATCH /network-interfaces/{iface_id}`, and `PATCH /pmem/{pmem_id}` requests
+routed through VMM control are counted under `patch_api_requests`.
 Direct config-file and startup initialization paths are not API requests and
 are not included in these counters. `PATCH /vm` remains outside
 `patch_api_requests` because Firecracker does not expose a matching
@@ -493,10 +494,11 @@ Firecracker-shaped `get_api_requests.instance_info_count`,
 `vmm_version_count`, `machine_cfg_count`, and `mmds_count` counters for parsed
 GET API requests, plus selected `put_api_requests` counters for parsed core
 configuration PUTs, `PUT /mmds`, `PUT /mmds/config`, `PUT /metrics`,
-`PUT /logger`, `PUT /serial`, and `/actions` requests routed through VMM
-control, plus selected `patch_api_requests` counters for parsed
-`PATCH /machine-config`, `PATCH /mmds`, `PATCH /drives/{drive_id}`, and
-`PATCH /network-interfaces/{iface_id}` requests routed through VMM control.
+`PUT /logger`, `PUT /serial`, `PUT /pmem/{pmem_id}`, and `/actions` requests
+routed through VMM control, plus selected `patch_api_requests` counters for
+parsed `PATCH /machine-config`, `PATCH /mmds`, `PATCH /drives/{drive_id}`,
+`PATCH /network-interfaces/{iface_id}`, and `PATCH /pmem/{pmem_id}` requests
+routed through VMM control.
 Remaining-device counters, remaining PATCH counters, and parser-level
 malformed-request counters remain deferred. Public run-loop control, guest boot
 output, public runner loop scheduling, full Firecracker metrics counters, and

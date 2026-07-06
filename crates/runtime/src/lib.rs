@@ -559,6 +559,14 @@ impl VmmController {
         self.metrics_state.record_put_mmds_failure();
     }
 
+    pub fn record_put_pmem_request(&mut self) {
+        self.metrics_state.record_put_pmem_request();
+    }
+
+    pub fn record_put_pmem_failure(&mut self) {
+        self.metrics_state.record_put_pmem_failure();
+    }
+
     pub fn record_put_network_request(&mut self) {
         self.metrics_state.record_put_network_request();
     }
@@ -613,6 +621,14 @@ impl VmmController {
 
     pub fn record_patch_mmds_failure(&mut self) {
         self.metrics_state.record_patch_mmds_failure();
+    }
+
+    pub fn record_patch_pmem_request(&mut self) {
+        self.metrics_state.record_patch_pmem_request();
+    }
+
+    pub fn record_patch_pmem_failure(&mut self) {
+        self.metrics_state.record_patch_pmem_failure();
     }
 
     pub fn record_get_instance_info_request(&mut self) {
