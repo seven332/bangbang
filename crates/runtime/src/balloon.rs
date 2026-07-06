@@ -547,6 +547,15 @@ mod tests {
     }
 
     #[test]
+    fn page_conversion_accepts_zero_amount() {
+        let pages = mib_to_4k_pages(0).expect("zero balloon amount should convert");
+        let device = prepared(balloon_config(0, false, 0, false, false));
+
+        assert_eq!(pages, 0);
+        assert_eq!(device.config_space().num_pages(), 0);
+    }
+
+    #[test]
     fn config_space_uses_firecracker_little_endian_layout() {
         let config_space = VirtioBalloonConfigSpace::new(0x0102_0304, 0x0506_0708, 0x090a_0b0c);
 
@@ -620,5 +629,60 @@ mod tests {
         assert_eq!(queues.len(), VIRTIO_BALLOON_MIN_QUEUE_COUNT + 1);
         assert_eq!(queues[2].kind(), VirtioBalloonQueueKind::FreePageReporting);
         assert_eq!(queues[2].index(), VIRTIO_BALLOON_STATS_QUEUE_INDEX);
+    }
+
+    #[test]
+    fn sparse_optional_queue_combinations_keep_expected_indexes() {
+        let stats_only = prepared(balloon_config(64, false, 1, false, false)).queue_layout();
+        assert_eq!(stats_only.queue_count(), VIRTIO_BALLOON_MIN_QUEUE_COUNT + 1);
+        assert_eq!(
+            stats_only.statistics(),
+            Some(VirtioBalloonQueueConfig::new(
+                VirtioBalloonQueueKind::Statistics,
+                VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+                VIRTIO_BALLOON_QUEUE_SIZE,
+            ))
+        );
+        assert_eq!(stats_only.free_page_hinting(), None);
+        assert_eq!(stats_only.free_page_reporting(), None);
+
+        let hinting_only = prepared(balloon_config(64, false, 0, true, false)).queue_layout();
+        assert_eq!(
+            hinting_only.queue_count(),
+            VIRTIO_BALLOON_MIN_QUEUE_COUNT + 1
+        );
+        assert_eq!(hinting_only.statistics(), None);
+        assert_eq!(
+            hinting_only.free_page_hinting(),
+            Some(VirtioBalloonQueueConfig::new(
+                VirtioBalloonQueueKind::FreePageHinting,
+                VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+                VIRTIO_BALLOON_QUEUE_SIZE,
+            ))
+        );
+        assert_eq!(hinting_only.free_page_reporting(), None);
+
+        let stats_reporting = prepared(balloon_config(64, false, 1, false, true)).queue_layout();
+        assert_eq!(
+            stats_reporting.queue_count(),
+            VIRTIO_BALLOON_MIN_QUEUE_COUNT + 2
+        );
+        assert_eq!(
+            stats_reporting.statistics(),
+            Some(VirtioBalloonQueueConfig::new(
+                VirtioBalloonQueueKind::Statistics,
+                VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+                VIRTIO_BALLOON_QUEUE_SIZE,
+            ))
+        );
+        assert_eq!(stats_reporting.free_page_hinting(), None);
+        assert_eq!(
+            stats_reporting.free_page_reporting(),
+            Some(VirtioBalloonQueueConfig::new(
+                VirtioBalloonQueueKind::FreePageReporting,
+                VIRTIO_BALLOON_STATS_QUEUE_INDEX + 1,
+                VIRTIO_BALLOON_QUEUE_SIZE,
+            ))
+        );
     }
 }
