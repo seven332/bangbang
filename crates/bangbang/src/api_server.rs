@@ -20,9 +20,9 @@ use bangbang_api::http::{
     MachineConfigRequest, MachineConfigResponse, MetricsConfigRequest, MmdsConfigRequest,
     MmdsConfigResponse, MmdsContentRequest, MmdsVersion as ApiMmdsVersion,
     NetworkInterfaceConfigRequest, NetworkInterfaceConfigResponse, NetworkInterfacePatchRequest,
-    RequestError, SerialConfigRequest, VmConfigResponse, VmStateUpdate, VmStateUpdateRequest,
-    VsockConfigRequest, VsockConfigResponse, parse_request_with_limit,
-    request_total_len_with_limit,
+    ObservabilityPutEndpoint, RequestError, SerialConfigRequest, VmConfigResponse, VmStateUpdate,
+    VmStateUpdateRequest, VsockConfigRequest, VsockConfigResponse, observability_put_endpoint,
+    parse_request_with_limit, request_total_len_with_limit,
 };
 use bangbang_runtime::block::{
     DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine, DriveUpdateInput,
@@ -54,7 +54,8 @@ use bangbang_runtime::{
 
 use crate::periodic_metrics::PeriodicMetricsScheduler;
 use crate::vmm::{
-    GetApiRequest, PatchApiRequest, ProcessSessionExitDecision, PutApiRequest, VmmRequestHandler,
+    GetApiRequest, ObservabilityPutRequest, PatchApiRequest, ProcessSessionExitDecision,
+    PutApiRequest, VmmRequestHandler,
 };
 
 const READ_CHUNK_SIZE: usize = 4096;
@@ -539,8 +540,26 @@ fn handle_request_bytes_with_limit(
 ) -> HttpResponse {
     match parse_request_with_limit(bytes, http_api_max_payload_size) {
         Ok(request) => handle_api_request(request, vmm),
-        Err(err) => HttpResponse::fault(err.fault_message()),
+        Err(err) => {
+            if err == RequestError::MalformedRequest {
+                record_observability_put_parse_failure(bytes, vmm);
+            }
+            HttpResponse::fault(err.fault_message())
+        }
     }
+}
+
+fn record_observability_put_parse_failure(bytes: &[u8], vmm: &mut impl VmmRequestHandler) {
+    let Some(endpoint) = observability_put_endpoint(bytes) else {
+        return;
+    };
+
+    let request = match endpoint {
+        ObservabilityPutEndpoint::Logger => ObservabilityPutRequest::Logger,
+        ObservabilityPutEndpoint::Metrics => ObservabilityPutRequest::Metrics,
+        ObservabilityPutEndpoint::Serial => ObservabilityPutRequest::Serial,
+    };
+    vmm.record_observability_put_parse_failure(request);
 }
 
 fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> HttpResponse {
@@ -1696,6 +1715,10 @@ mod tests {
             request: PutApiRequest,
         ) -> Result<VmmData, VmmActionError> {
             self.inner.handle_put_request(request)
+        }
+
+        fn record_observability_put_parse_failure(&mut self, request: ObservabilityPutRequest) {
+            self.inner.record_observability_put_parse_failure(request);
         }
 
         fn handle_put_action_request(
@@ -3528,6 +3551,100 @@ mod tests {
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
         fs::remove_file(logger_path).expect("logger fixture should clean up");
+    }
+
+    #[test]
+    fn configured_metrics_counts_observability_parser_failures() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let metrics_path =
+            unique_socket_path("metrics-observability-parser").with_extension("metrics");
+        let rejected_metrics_path =
+            unique_socket_path("metrics-observability-parser-rejected").with_extension("metrics");
+        let rejected_logger_path =
+            unique_socket_path("logger-observability-parser-rejected").with_extension("log");
+        let rejected_serial_path =
+            unique_socket_path("serial-observability-parser-rejected").with_extension("out");
+
+        let metrics_body = format!(r#"{{"metrics_path":"{}"}}"#, metrics_path.to_string_lossy());
+        let metrics_response = request_over_socket(
+            &mut vmm,
+            "op-m0",
+            &request_with_body("PUT", "/metrics", &metrics_body),
+        );
+        assert!(metrics_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let malformed_metrics_body = format!(
+            r#"{{"metrics_path":"{}","unknown":true}}"#,
+            rejected_metrics_path.to_string_lossy()
+        );
+        let malformed_metrics_response = request_over_socket(
+            &mut vmm,
+            "op-m1",
+            &request_with_body("PUT", "/metrics", &malformed_metrics_body),
+        );
+        assert!(malformed_metrics_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(
+            malformed_metrics_response.contains(r#"{"fault_message":"Malformed HTTP request."}"#)
+        );
+        assert!(!rejected_metrics_path.exists());
+
+        let malformed_logger_body = format!(
+            r#"{{"log_path":"{}","unknown":true}}"#,
+            rejected_logger_path.to_string_lossy()
+        );
+        let malformed_logger_response = request_over_socket(
+            &mut vmm,
+            "op-l1",
+            &request_with_body("PUT", "/logger", &malformed_logger_body),
+        );
+        assert!(malformed_logger_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(
+            malformed_logger_response.contains(r#"{"fault_message":"Malformed HTTP request."}"#)
+        );
+        assert!(!rejected_logger_path.exists());
+
+        let malformed_serial_body = format!(
+            r#"{{"serial_out_path":"{}","unknown":true}}"#,
+            rejected_serial_path.to_string_lossy()
+        );
+        let malformed_serial_response = request_over_socket(
+            &mut vmm,
+            "op-s1",
+            &request_with_body("PUT", "/serial", &malformed_serial_body),
+        );
+        assert!(malformed_serial_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(
+            malformed_serial_response.contains(r#"{"fault_message":"Malformed HTTP request."}"#)
+        );
+        assert!(!rejected_serial_path.exists());
+        assert_eq!(vmm.serial_config().serial_out_path(), None);
+
+        let malformed_boot_response = request_over_socket(
+            &mut vmm,
+            "op-bad-boot",
+            &request_with_body("PUT", "/boot-source", "{}"),
+        );
+        assert!(malformed_boot_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_response = request_over_socket(
+            &mut vmm,
+            "op-boot",
+            &request_with_body("PUT", "/boot-source", boot_body),
+        );
+        assert!(boot_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let start_response = put_action_over_socket(&mut vmm, "op-a1", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let flush_response = put_action_over_socket(&mut vmm, "op-a2", "FlushMetrics");
+        assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        assert_eq!(
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
+            "{\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":1,\"logger_fails\":1,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":2,\"metrics_fails\":1,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":1,\"serial_fails\":1,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+        assert!(!rejected_metrics_path.exists());
+
+        fs::remove_file(metrics_path).expect("metrics fixture should clean up");
     }
 
     #[test]
