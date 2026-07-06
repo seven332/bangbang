@@ -1104,8 +1104,9 @@ mod tests {
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
         VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
-        VIRTIO_DEVICE_STATUS_INIT, VirtioMmioDeviceActivation, VirtioMmioDeviceRegisters,
-        VirtioMmioQueueRegisters, VirtioMmioRegister,
+        VIRTIO_DEVICE_STATUS_INIT, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
+        VirtioMmioDeviceActivationHandler, VirtioMmioDeviceRegisters, VirtioMmioQueueRegisters,
+        VirtioMmioRegister,
     };
     use crate::virtio_queue::{
         VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
@@ -1664,6 +1665,30 @@ mod tests {
                 .to_string(),
             "virtio-rng queue is not ready"
         );
+    }
+
+    #[test]
+    fn rng_device_activation_trait_error_is_generic_handler_error() {
+        let queues = configured_mmio_queue(TEST_QUEUE_SIZE, false);
+        let device_registers = rng_device_registers();
+        let mut device = VirtioRngDevice::new();
+
+        let error = VirtioMmioDeviceActivationHandler::activate(
+            &mut device,
+            rng_device_activation(&device_registers, &queues),
+        )
+        .expect_err("trait activation should fail with generic handler error");
+
+        match error {
+            VirtioMmioDeviceActivationError::Handler { source } => {
+                assert_eq!(
+                    source.to_string(),
+                    "failed to activate virtio-rng queue 0: virtio-rng queue is not ready"
+                );
+            }
+        }
+        assert!(!device.is_activated());
+        assert!(device.active_queue().is_none());
     }
 
     #[test]
