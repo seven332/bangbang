@@ -474,9 +474,12 @@ MMIO handler, register it in a fresh or existing dispatcher, and return
 deterministic region metadata. The internal arm64 startup resource path can
 optionally consume that layout, attach one virtio-rng MMIO device to the shared
 boot dispatcher, preserve runtime metadata, and emit one FDT virtio-mmio node.
-Remaining follow-up PRs should wire real host randomness ownership, boot-loop
-entropy notification dispatch, public API configuration storage, signed
-executable e2e, and metrics/security docs.
+The internal startup runtime and HVF boot-loop helpers can now dispatch
+virtio-rng queue notifications from an injected entropy source, preserve
+dispatch and signal errors, and signal the configured queue interrupt under
+unit tests. Remaining follow-up PRs should wire real host randomness ownership,
+public API configuration storage, signed executable e2e, and metrics/security
+docs.
 Entropy device metrics and real rate limiting remain deferred until their
 producers exist. `PUT /entropy` must continue to return unsupported until a
 later PR exposes guest-visible entropy behavior.
