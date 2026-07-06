@@ -3173,6 +3173,16 @@ mod tests {
     }
 
     #[test]
+    fn config_file_rejects_escaped_duplicate_object_key() {
+        let err = super::config_file_actions_from_str(
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"\u0062oot-source":{"kernel_image_path":"/tmp/vmlinux-2"}}"#,
+        )
+        .expect_err("escaped duplicate object key should fail");
+
+        assert_eq!(err, super::ConfigFileError::Malformed);
+    }
+
+    #[test]
     fn config_file_rejects_duplicate_array_item_field() {
         let err = super::config_file_actions_from_str(
             r#"{
