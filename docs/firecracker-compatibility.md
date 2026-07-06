@@ -210,11 +210,11 @@ fails if the configured socket path already exists. Socket cleanup removes the
 socket inode created by the current process during normal shutdown and handled
 `SIGINT`/`SIGTERM` shutdown; uncatchable forced termination such as `SIGKILL`
 can still leave a stale socket path behind. The API socket is unauthenticated;
-filesystem permissions on the socket path and parent directory are the current
-access-control boundary. Operators should use a private socket directory or a
-restrictive umask on multi-user hosts. Process CLI parsing stays outside the
-future VM/vCPU fast path and should add only trivial startup overhead. Error and
-status output avoid echoing path-like CLI values.
+bangbang restricts the published socket inode to owner-only permissions, and
+the parent directory remains part of the access-control boundary. Operators
+should use a private socket directory on multi-user hosts. Process CLI parsing
+stays outside the future VM/vCPU fast path and should add only trivial startup
+overhead. Error and status output avoid echoing path-like CLI values.
 
 ### Process Exit Status
 

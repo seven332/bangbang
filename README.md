@@ -60,9 +60,10 @@ Value-less flags, such as `--no-api`, do not accept an attached value.
   without publishing an API socket, and exits cleanly on `SIGINT` or `SIGTERM`.
 - `--help`, `-h`, `--version`, and `-V` are supported.
 
-The API socket is an unauthenticated local control interface. Filesystem
-permissions on the socket path and parent directory are the access-control
-boundary, so use a private directory or restrictive umask on multi-user hosts.
+The API socket is an unauthenticated local control interface. bangbang restricts
+the published socket inode to owner-only permissions; the parent directory is
+still part of the access-control boundary, so use a private directory on
+multi-user hosts.
 
 Start with metrics and logger output configured:
 
