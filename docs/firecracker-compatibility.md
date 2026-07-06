@@ -156,17 +156,19 @@ Startup timing arguments are intentionally not exposed in `GET /vm/config` or
 logs because they are process observability data, not guest configuration. When
 metrics are configured, startup, explicit `FlushMetrics`, and periodic runtime
 metrics flushes write provided values under the minimal `vmm` metrics object;
-omitted timing arguments remain omitted. Parsed `GET /`,
-`GET /version`, `GET /machine-config`, `GET /mmds`, and
+omitted timing arguments remain omitted. Parsed `GET /`, `GET /version`,
+`GET /machine-config`, `GET /mmds`, `GET /balloon`,
+`GET /balloon/statistics`, `GET /balloon/hinting/status`, and
 `GET /hotplug/memory` API requests are counted under `get_api_requests`; parsed
 core configuration PUTs, `PUT /mmds`, `PUT /mmds/config`, `PUT /metrics`,
-`PUT /logger`, `PUT /serial`, `PUT /hotplug/memory`,
-`PUT /pmem/{pmem_id}`, and `/actions` API
-requests are counted under `put_api_requests`; parsed `PATCH /machine-config`,
-`PATCH /mmds`, `PATCH /drives/{drive_id}`,
-`PATCH /network-interfaces/{iface_id}`, `PATCH /hotplug/memory`, and
-`PATCH /pmem/{pmem_id}` requests
-routed through VMM control are counted under `patch_api_requests`.
+`PUT /logger`, `PUT /serial`, `PUT /balloon`, `PUT /hotplug/memory`,
+`PUT /pmem/{pmem_id}`, and `/actions` API requests are counted under
+`put_api_requests`; parsed `PATCH /machine-config`, `PATCH /mmds`,
+`PATCH /drives/{drive_id}`, `PATCH /network-interfaces/{iface_id}`,
+`PATCH /balloon`, `PATCH /balloon/statistics`,
+`PATCH /balloon/hinting/start`, `PATCH /balloon/hinting/stop`,
+`PATCH /hotplug/memory`, and `PATCH /pmem/{pmem_id}` requests routed through
+VMM control are counted under `patch_api_requests`.
 Parsed deprecated HTTP API usage is counted under
 `deprecated_api.deprecated_http_api_calls` for supported machine
 `cpu_template`, MMDS V1 config, deprecated `vsock_id`, and snapshot-load
@@ -175,7 +177,11 @@ failures are not counted.
 Direct config-file and startup initialization paths are not API requests and
 are not included in these counters. `PATCH /vm` remains outside
 `patch_api_requests` because Firecracker does not expose a matching
-`PatchRequestsMetrics` field for VM state changes. Full Firecracker
+`PatchRequestsMetrics` field for VM state changes. The balloon API request
+fields are bangbang-specific extension counters: GET, PUT, and PATCH balloon
+routes report `balloon_count`, and PUT/PATCH failures also report
+`balloon_fails`. Firecracker exposes balloon device metrics but no matching
+balloon API request metric fields. Full Firecracker
 `ProcessTimeReporter` parity remains deferred.
 
 bangbang intentionally treats `--id` alphanumeric characters as ASCII only.
@@ -496,17 +502,19 @@ unconfigured, and writes one minimal JSON line when `--metrics-path` or
 paths also write one initial minimal metrics line when the sink is configured.
 API-enabled and no-api runtime loops flush the same metrics line every 60
 seconds while the VM is running; those periodic flushes do not log `/actions`
-events. The line includes initial
-Firecracker-shaped `get_api_requests.instance_info_count`,
-`vmm_version_count`, `machine_cfg_count`, `mmds_count`, and
-`hotplug_memory_count` counters for parsed GET API requests, plus selected
+events. The line includes initial Firecracker-shaped GET API counters for
+`get_api_requests.instance_info_count`, `vmm_version_count`,
+`machine_cfg_count`, `mmds_count`, and `hotplug_memory_count`, plus selected
 `put_api_requests` counters for parsed core configuration PUTs, `PUT /mmds`,
 `PUT /mmds/config`, `PUT /metrics`, `PUT /logger`, `PUT /serial`,
 `PUT /hotplug/memory`, `PUT /pmem/{pmem_id}`, and `/actions` requests routed
 through VMM control, plus selected `patch_api_requests` counters for parsed
 `PATCH /machine-config`, `PATCH /mmds`, `PATCH /drives/{drive_id}`,
 `PATCH /network-interfaces/{iface_id}`, `PATCH /hotplug/memory`, and
-`PATCH /pmem/{pmem_id}` requests routed through VMM control.
+`PATCH /pmem/{pmem_id}` requests routed through VMM control. bangbang also
+records `balloon_count` extension fields for parsed balloon GET, PUT, and PATCH
+routes, plus `balloon_fails` extension fields for parsed balloon PUT and PATCH
+failures, because Firecracker does not expose matching request metrics.
 Parsed deprecated HTTP API usage is counted under
 `deprecated_api.deprecated_http_api_calls` for the supported deprecated fields
 above; malformed parser failures remain outside the counter.

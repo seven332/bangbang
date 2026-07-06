@@ -20,7 +20,7 @@ mod macos_arm64 {
     use crate::support::{
         BangbangProcess, TestDir, assert_bad_request_response, assert_clean_shutdown,
         assert_no_content_response, assert_ok_response, assert_response_contains, http_get,
-        http_json, http_put_json, json_string, path_text,
+        http_json, http_no_body, http_put_json, json_string, path_text,
     };
 
     const BANGBANG_GUEST_KERNEL_PATH_ENV: &str = "BANGBANG_GUEST_KERNEL_PATH";
@@ -461,6 +461,70 @@ mod macos_arm64 {
             "PATCH /mmds should remove null-valued fields; response:\n{mmds_data}"
         );
 
+        for (request_name, response, fault_message) in [
+            (
+                "GET /balloon",
+                http_get(&socket_path, "/balloon"),
+                "Balloon device is not supported.",
+            ),
+            (
+                "GET /balloon/statistics",
+                http_get(&socket_path, "/balloon/statistics"),
+                "Balloon device is not supported.",
+            ),
+            (
+                "GET /balloon/hinting/status",
+                http_get(&socket_path, "/balloon/hinting/status"),
+                "Balloon device is not supported.",
+            ),
+            (
+                "PUT /balloon",
+                http_put_json(
+                    &socket_path,
+                    "/balloon",
+                    r#"{"amount_mib":64,"deflate_on_oom":true}"#,
+                ),
+                "The requested operation is not supported in Running state: PutBalloon",
+            ),
+            (
+                "PATCH /balloon",
+                http_json(&socket_path, "PATCH", "/balloon", r#"{"amount_mib":32}"#),
+                "Balloon device is not supported.",
+            ),
+            (
+                "PATCH /balloon/statistics",
+                http_json(
+                    &socket_path,
+                    "PATCH",
+                    "/balloon/statistics",
+                    r#"{"stats_polling_interval_s":1}"#,
+                ),
+                "Balloon device is not supported.",
+            ),
+            (
+                "PATCH /balloon/hinting/start",
+                http_json(
+                    &socket_path,
+                    "PATCH",
+                    "/balloon/hinting/start",
+                    r#"{"acknowledge_on_stop":false}"#,
+                ),
+                "Balloon device is not supported.",
+            ),
+            (
+                "PATCH /balloon/hinting/stop",
+                http_no_body(&socket_path, "PATCH", "/balloon/hinting/stop"),
+                "Balloon device is not supported.",
+            ),
+        ] {
+            assert_bad_request_response(&response, request_name);
+            assert_response_contains(
+                &response,
+                &format!(r#"{{"fault_message":"{fault_message}"}}"#),
+                request_name,
+            );
+        }
+
         let vm_config = http_get(&socket_path, "/vm/config");
         assert_ok_response(&vm_config, "GET /vm/config after InstanceStart");
         assert_response_contains(
@@ -571,9 +635,12 @@ mod macos_arm64 {
         assert_no_content_response(&flush_metrics_response, "PUT /actions FlushMetrics");
         assert_metrics_output(
             &metrics_path,
-            r#"{"actions_count":2,"actions_fails":0,"boot_source_count":2,"boot_source_fails":1,"cpu_cfg_count":1,"cpu_cfg_fails":1,"drive_count":2,"drive_fails":1,"logger_count":2,"logger_fails":1,"machine_cfg_count":1,"machine_cfg_fails":0,"metrics_count":2,"metrics_fails":1,"mmds_count":2,"mmds_fails":1,"network_count":1,"network_fails":1,"pmem_count":0,"pmem_fails":0,"serial_count":2,"serial_fails":1,"vsock_count":2,"vsock_fails":1}"#,
             Some(
-                r#"{"drive_count":1,"drive_fails":1,"machine_cfg_count":0,"machine_cfg_fails":0,"mmds_count":1,"mmds_fails":0,"network_count":0,"network_fails":0,"pmem_count":0,"pmem_fails":0}"#,
+                r#"{"balloon_count":3,"hotplug_memory_count":0,"instance_info_count":5,"machine_cfg_count":0,"mmds_count":1,"vmm_version_count":0}"#,
+            ),
+            r#"{"actions_count":2,"actions_fails":0,"balloon_count":1,"balloon_fails":1,"boot_source_count":2,"boot_source_fails":1,"cpu_cfg_count":1,"cpu_cfg_fails":1,"drive_count":2,"drive_fails":1,"hotplug_memory_count":0,"hotplug_memory_fails":0,"logger_count":2,"logger_fails":1,"machine_cfg_count":1,"machine_cfg_fails":0,"metrics_count":2,"metrics_fails":1,"mmds_count":2,"mmds_fails":1,"network_count":1,"network_fails":1,"pmem_count":0,"pmem_fails":0,"serial_count":2,"serial_fails":1,"vsock_count":2,"vsock_fails":1}"#,
+            Some(
+                r#"{"balloon_count":4,"balloon_fails":4,"drive_count":1,"drive_fails":1,"hotplug_memory_count":0,"hotplug_memory_fails":0,"machine_cfg_count":0,"machine_cfg_fails":0,"mmds_count":1,"mmds_fails":0,"network_count":0,"network_fails":0,"pmem_count":0,"pmem_fails":0}"#,
             ),
         );
         assert_startup_time_metrics_output(&metrics_path);
@@ -838,7 +905,8 @@ mod macos_arm64 {
         assert_no_content_response(&flush_metrics_response, "PUT /actions FlushMetrics");
         assert_metrics_output(
             &metrics_path,
-            r#"{"actions_count":2,"actions_fails":1,"boot_source_count":0,"boot_source_fails":0,"cpu_cfg_count":0,"cpu_cfg_fails":0,"drive_count":0,"drive_fails":0,"logger_count":0,"logger_fails":0,"machine_cfg_count":1,"machine_cfg_fails":1,"metrics_count":0,"metrics_fails":0,"mmds_count":0,"mmds_fails":0,"network_count":0,"network_fails":0,"pmem_count":0,"pmem_fails":0,"serial_count":0,"serial_fails":0,"vsock_count":0,"vsock_fails":0}"#,
+            None,
+            r#"{"actions_count":2,"actions_fails":1,"balloon_count":0,"balloon_fails":0,"boot_source_count":0,"boot_source_fails":0,"cpu_cfg_count":0,"cpu_cfg_fails":0,"drive_count":0,"drive_fails":0,"hotplug_memory_count":0,"hotplug_memory_fails":0,"logger_count":0,"logger_fails":0,"machine_cfg_count":1,"machine_cfg_fails":1,"metrics_count":0,"metrics_fails":0,"mmds_count":0,"mmds_fails":0,"network_count":0,"network_fails":0,"pmem_count":0,"pmem_fails":0,"serial_count":0,"serial_fails":0,"vsock_count":0,"vsock_fails":0}"#,
             None,
         );
         assert_logger_output(&logger_path);
@@ -2389,6 +2457,7 @@ mod macos_arm64 {
 
     fn assert_metrics_output(
         path: &Path,
+        expected_get_api_requests: Option<&str>,
         expected_put_api_requests: &str,
         expected_patch_api_requests: Option<&str>,
     ) {
@@ -2403,6 +2472,13 @@ mod macos_arm64 {
             output.contains(r#""metrics_flush_count":1"#),
             "metrics output should include first flush count; output:\n{output}"
         );
+        if let Some(expected_get_api_requests) = expected_get_api_requests {
+            let expected_get_metrics = format!(r#""get_api_requests":{expected_get_api_requests}"#);
+            assert!(
+                output.contains(&expected_get_metrics),
+                "metrics output should include expected GET API request counters; output:\n{output}"
+            );
+        }
         let expected_put_metrics = format!(r#""put_api_requests":{expected_put_api_requests}"#);
         assert!(
             output.contains(&expected_put_metrics),
