@@ -1,8 +1,14 @@
 use std::collections::TryReserveError;
 use std::fmt;
 
+use crate::interrupt::DeviceInterruptKind;
 use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError};
-use crate::virtio_mmio::VirtioMmioQueueState;
+use crate::mmio::MmioHandlerError;
+use crate::virtio_mmio::{
+    UnsupportedVirtioMmioDeviceConfig, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
+    VirtioMmioDeviceActivationHandler, VirtioMmioQueueRegisterError, VirtioMmioQueueState,
+    VirtioMmioRegisterHandler,
+};
 use crate::virtio_queue::{
     VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
     VirtqueueDescriptorChain, VirtqueueNotificationSuppression, VirtqueueUsedRing,
@@ -12,9 +18,16 @@ use crate::virtio_queue::{
 pub const VIRTIO_RNG_DEVICE_ID: u32 = 4;
 pub const VIRTIO_RNG_QUEUE_INDEX: u16 = 0;
 pub const VIRTIO_RNG_QUEUE_COUNT: usize = 1;
+pub const VIRTIO_RNG_QUEUE_SIZE: u16 = 256;
+pub const VIRTIO_RNG_QUEUE_SIZES: [u16; VIRTIO_RNG_QUEUE_COUNT] = [VIRTIO_RNG_QUEUE_SIZE];
 pub const VIRTIO_RNG_MAX_REQUEST_BYTES: usize = 64 * 1024;
 
+pub type VirtioRngMmioHandler =
+    VirtioMmioRegisterHandler<UnsupportedVirtioMmioDeviceConfig, VirtioRngDevice>;
+
 const VIRTIO_RNG_MAX_REQUEST_BYTES_U64: u64 = 64 * 1024;
+const VIRTIO_RNG_QUEUE_INDEX_U32: u32 = 0;
+const VIRTIO_RNG_QUEUE_INDEX_USIZE: usize = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntropyConfigInput {
@@ -243,6 +256,315 @@ impl VirtioRngQueue {
         }
 
         Ok(dispatch)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct VirtioRngDevice {
+    active_queue: Option<VirtioRngQueue>,
+}
+
+impl VirtioRngDevice {
+    pub const fn new() -> Self {
+        Self { active_queue: None }
+    }
+
+    pub fn is_activated(&self) -> bool {
+        self.active_queue.is_some()
+    }
+
+    pub fn active_queue(&self) -> Option<&VirtioRngQueue> {
+        self.active_queue.as_ref()
+    }
+
+    pub fn active_queue_mut(&mut self) -> Option<&mut VirtioRngQueue> {
+        self.active_queue.as_mut()
+    }
+
+    pub fn activate_rng(
+        &mut self,
+        activation: VirtioMmioDeviceActivation<'_>,
+    ) -> Result<(), VirtioRngDeviceActivationError> {
+        if self.active_queue.is_some() {
+            return Err(VirtioRngDeviceActivationError::AlreadyActive);
+        }
+        let queue_count = activation.queue_count();
+        if queue_count != VIRTIO_RNG_QUEUE_COUNT {
+            return Err(VirtioRngDeviceActivationError::QueueCountMismatch {
+                expected: VIRTIO_RNG_QUEUE_COUNT,
+                actual: queue_count,
+            });
+        }
+
+        let queue_index = VIRTIO_RNG_QUEUE_INDEX_U32;
+        let queue = activation
+            .queue(queue_index)
+            .map_err(|source| VirtioRngDeviceActivationError::QueueMetadata {
+                queue_index,
+                source,
+            })
+            .and_then(|queue| {
+                VirtioRngQueue::from_mmio_queue_state(queue).map_err(|source| {
+                    VirtioRngDeviceActivationError::QueueBuild {
+                        queue_index,
+                        source,
+                    }
+                })
+            })?;
+        self.active_queue = Some(queue);
+
+        Ok(())
+    }
+
+    fn dispatch_drained_queue_notifications(
+        &mut self,
+        memory: &mut GuestMemory,
+        drained_notifications: Vec<usize>,
+        entropy_source: &mut (impl VirtioRngEntropySource + ?Sized),
+    ) -> Result<VirtioRngDeviceNotificationDispatch, VirtioRngDeviceNotificationError> {
+        if drained_notifications.is_empty() {
+            return Ok(VirtioRngDeviceNotificationDispatch::new(
+                drained_notifications,
+                None,
+            ));
+        }
+
+        if let Some(queue_index) = drained_notifications
+            .iter()
+            .copied()
+            .find(|queue_index| *queue_index != VIRTIO_RNG_QUEUE_INDEX_USIZE)
+        {
+            return Err(VirtioRngDeviceNotificationError::UnsupportedQueue {
+                drained_notifications,
+                queue_index,
+            });
+        }
+
+        let Some(queue) = self.active_queue.as_mut() else {
+            return Err(VirtioRngDeviceNotificationError::Inactive {
+                drained_notifications,
+            });
+        };
+
+        match queue.dispatch_with_source(memory, entropy_source) {
+            Ok(dispatch) => Ok(VirtioRngDeviceNotificationDispatch::new(
+                drained_notifications,
+                Some(dispatch),
+            )),
+            Err(source) => Err(VirtioRngDeviceNotificationError::QueueDispatch {
+                drained_notifications,
+                source,
+            }),
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.active_queue = None;
+    }
+}
+
+impl VirtioMmioRegisterHandler<UnsupportedVirtioMmioDeviceConfig, VirtioRngDevice> {
+    pub fn dispatch_rng_queue_notifications(
+        &mut self,
+        memory: &mut GuestMemory,
+        entropy_source: &mut (impl VirtioRngEntropySource + ?Sized),
+    ) -> Result<VirtioRngDeviceNotificationDispatch, VirtioRngDeviceNotificationError> {
+        let drained_notifications = self.take_pending_queue_notifications();
+        let dispatch = self
+            .activation_handler_mut()
+            .dispatch_drained_queue_notifications(memory, drained_notifications, entropy_source);
+        let needs_queue_interrupt = match &dispatch {
+            Ok(dispatch) => dispatch.needs_queue_interrupt(),
+            Err(error) => error
+                .completed_dispatch()
+                .is_some_and(VirtioRngQueueDispatch::needs_queue_interrupt),
+        };
+        if needs_queue_interrupt {
+            self.mark_interrupt_pending(DeviceInterruptKind::Queue);
+        }
+
+        dispatch
+    }
+}
+
+impl VirtioMmioDeviceActivationHandler for VirtioRngDevice {
+    fn activate(
+        &mut self,
+        activation: VirtioMmioDeviceActivation<'_>,
+    ) -> Result<(), VirtioMmioDeviceActivationError> {
+        self.activate_rng(activation).map_err(Into::into)
+    }
+
+    fn reset(&mut self) {
+        VirtioRngDevice::reset(self);
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioRngDeviceActivationError {
+    AlreadyActive,
+    QueueCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    QueueMetadata {
+        queue_index: u32,
+        source: VirtioMmioQueueRegisterError,
+    },
+    QueueBuild {
+        queue_index: u32,
+        source: VirtioRngQueueBuildError,
+    },
+}
+
+impl fmt::Display for VirtioRngDeviceActivationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyActive => f.write_str("virtio-rng device is already active"),
+            Self::QueueCountMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "virtio-rng device requires {expected} queue(s), got {actual}"
+                )
+            }
+            Self::QueueMetadata {
+                queue_index,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to read virtio-rng queue {queue_index} activation metadata: {source}"
+                )
+            }
+            Self::QueueBuild {
+                queue_index,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to activate virtio-rng queue {queue_index}: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioRngDeviceActivationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::QueueMetadata { source, .. } => Some(source),
+            Self::QueueBuild { source, .. } => Some(source),
+            Self::AlreadyActive | Self::QueueCountMismatch { .. } => None,
+        }
+    }
+}
+
+impl From<VirtioRngDeviceActivationError> for VirtioMmioDeviceActivationError {
+    fn from(source: VirtioRngDeviceActivationError) -> Self {
+        MmioHandlerError::new(source.to_string()).into()
+    }
+}
+
+#[derive(Debug)]
+pub struct VirtioRngDeviceNotificationDispatch {
+    drained_notifications: Vec<usize>,
+    queue_dispatch: Option<VirtioRngQueueDispatch>,
+}
+
+impl VirtioRngDeviceNotificationDispatch {
+    fn new(
+        drained_notifications: Vec<usize>,
+        queue_dispatch: Option<VirtioRngQueueDispatch>,
+    ) -> Self {
+        Self {
+            drained_notifications,
+            queue_dispatch,
+        }
+    }
+
+    pub fn drained_notifications(&self) -> &[usize] {
+        &self.drained_notifications
+    }
+
+    pub const fn queue_dispatch(&self) -> Option<&VirtioRngQueueDispatch> {
+        self.queue_dispatch.as_ref()
+    }
+
+    pub fn needs_queue_interrupt(&self) -> bool {
+        self.queue_dispatch
+            .as_ref()
+            .is_some_and(VirtioRngQueueDispatch::needs_queue_interrupt)
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioRngDeviceNotificationError {
+    Inactive {
+        drained_notifications: Vec<usize>,
+    },
+    UnsupportedQueue {
+        drained_notifications: Vec<usize>,
+        queue_index: usize,
+    },
+    QueueDispatch {
+        drained_notifications: Vec<usize>,
+        source: VirtioRngQueueDispatchError,
+    },
+}
+
+impl VirtioRngDeviceNotificationError {
+    pub fn drained_notifications(&self) -> &[usize] {
+        match self {
+            Self::Inactive {
+                drained_notifications,
+            }
+            | Self::UnsupportedQueue {
+                drained_notifications,
+                ..
+            }
+            | Self::QueueDispatch {
+                drained_notifications,
+                ..
+            } => drained_notifications,
+        }
+    }
+
+    pub const fn completed_dispatch(&self) -> Option<&VirtioRngQueueDispatch> {
+        match self {
+            Self::QueueDispatch { source, .. } => Some(source.completed_dispatch()),
+            Self::Inactive { .. } | Self::UnsupportedQueue { .. } => None,
+        }
+    }
+}
+
+impl fmt::Display for VirtioRngDeviceNotificationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inactive { .. } => {
+                f.write_str("virtio-rng queue notification cannot be dispatched before activation")
+            }
+            Self::UnsupportedQueue { queue_index, .. } => {
+                write!(
+                    f,
+                    "virtio-rng queue notification for unsupported queue {queue_index}"
+                )
+            }
+            Self::QueueDispatch { source, .. } => {
+                write!(
+                    f,
+                    "failed to dispatch virtio-rng queue notification: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioRngDeviceNotificationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::QueueDispatch { source, .. } => Some(source),
+            Self::Inactive { .. } | Self::UnsupportedQueue { .. } => None,
+        }
     }
 }
 
@@ -777,10 +1099,13 @@ fn descriptor_chain_head(chain: &VirtqueueDescriptorChain) -> Option<u16> {
 mod tests {
     use std::error::Error as _;
 
+    use crate::interrupt::DeviceInterruptKind;
     use crate::memory::{GuestMemoryLayout, GuestMemoryRange};
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
-        VIRTIO_DEVICE_STATUS_FEATURES_OK, VirtioMmioQueueRegisters, VirtioMmioRegister,
+        VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
+        VirtioMmioDeviceActivation, VirtioMmioDeviceRegisters, VirtioMmioQueueRegisters,
+        VirtioMmioRegister,
     };
     use crate::virtio_queue::{
         VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
@@ -788,8 +1113,10 @@ mod tests {
     };
 
     use super::{
-        GuestAddress, GuestMemory, VIRTIO_RNG_MAX_REQUEST_BYTES, VirtioRngBufferParseError,
-        VirtioRngEntropySource, VirtioRngEntropySourceError, VirtioRngQueue,
+        GuestAddress, GuestMemory, VIRTIO_RNG_DEVICE_ID, VIRTIO_RNG_MAX_REQUEST_BYTES,
+        VIRTIO_RNG_QUEUE_SIZES, VirtioRngBufferParseError, VirtioRngDevice,
+        VirtioRngDeviceActivationError, VirtioRngDeviceNotificationError, VirtioRngEntropySource,
+        VirtioRngEntropySourceError, VirtioRngMmioHandler, VirtioRngQueue,
         VirtioRngQueueBuildError, VirtioRngQueueDispatchError,
     };
 
@@ -809,6 +1136,7 @@ mod tests {
     const QUEUE_CONFIG_STATUS: u32 = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
         | VIRTIO_DEVICE_STATUS_DRIVER
         | VIRTIO_DEVICE_STATUS_FEATURES_OK;
+    const DRIVER_OK_STATUS: u32 = QUEUE_CONFIG_STATUS | VIRTIO_DEVICE_STATUS_DRIVER_OK;
 
     #[derive(Debug, Default)]
     struct TestEntropySource {
@@ -877,6 +1205,81 @@ mod tests {
 
     fn configured_mmio_queue(size: u16, ready: bool) -> VirtioMmioQueueRegisters {
         configured_mmio_queue_with_device_ring(size, guest_address_low(TEST_USED_RING), 0, ready)
+    }
+
+    fn rng_device_activation<'a>(
+        device: &'a VirtioMmioDeviceRegisters,
+        queues: &'a VirtioMmioQueueRegisters,
+    ) -> VirtioMmioDeviceActivation<'a> {
+        VirtioMmioDeviceActivation::new(device, queues)
+    }
+
+    fn rng_device_registers() -> VirtioMmioDeviceRegisters {
+        VirtioMmioDeviceRegisters::new(VIRTIO_RNG_DEVICE_ID, 0)
+    }
+
+    fn rng_mmio_handler() -> VirtioRngMmioHandler {
+        VirtioRngMmioHandler::with_activation(
+            VIRTIO_RNG_DEVICE_ID,
+            0,
+            &VIRTIO_RNG_QUEUE_SIZES,
+            VirtioRngDevice::new(),
+        )
+        .expect("virtio-rng MMIO handler should build")
+    }
+
+    fn configure_rng_mmio_handler_queue(
+        handler: &mut VirtioRngMmioHandler,
+        device_ring: GuestAddress,
+    ) {
+        handler
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
+            .expect("ACKNOWLEDGE status should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            )
+            .expect("DRIVER status should write");
+        handler
+            .write_register(VirtioMmioRegister::Status, QUEUE_CONFIG_STATUS)
+            .expect("FEATURES_OK status should write");
+        handler
+            .write_register(VirtioMmioRegister::QueueNum, u32::from(TEST_QUEUE_SIZE))
+            .expect("queue size should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueDescLow,
+                guest_address_low(TEST_DESCRIPTOR_TABLE),
+            )
+            .expect("queue descriptor table should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueDriverLow,
+                guest_address_low(TEST_AVAILABLE_RING),
+            )
+            .expect("queue driver ring should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueDeviceLow,
+                guest_address_low(device_ring),
+            )
+            .expect("queue device ring should write");
+        handler
+            .write_register(VirtioMmioRegister::QueueReady, 1)
+            .expect("queue ready should write");
+    }
+
+    fn activate_rng_mmio_handler(handler: &mut VirtioRngMmioHandler) {
+        handler
+            .write_register(VirtioMmioRegister::Status, DRIVER_OK_STATUS)
+            .expect("DRIVER_OK status should activate virtio-rng");
+    }
+
+    fn notify_rng_queue(handler: &mut VirtioRngMmioHandler, queue_index: u32) {
+        handler
+            .write_register(VirtioMmioRegister::QueueNotify, queue_index)
+            .expect("queue notification should write");
     }
 
     fn configured_mmio_queue_with_device_ring(
@@ -1146,6 +1549,337 @@ mod tests {
                 .to_string(),
             "virtqueue used ring address 0xfffffffffffffffc with queue size 8 overflows address space"
         );
+    }
+
+    #[test]
+    fn rng_device_starts_inactive_and_reset_clears_active_queue() {
+        let queues = configured_mmio_queue(TEST_QUEUE_SIZE, true);
+        let device_registers = rng_device_registers();
+        let mut device = VirtioRngDevice::new();
+
+        assert!(!device.is_activated());
+        assert!(device.active_queue().is_none());
+
+        device
+            .activate_rng(rng_device_activation(&device_registers, &queues))
+            .expect("virtio-rng device should activate");
+
+        assert!(device.is_activated());
+        assert!(device.active_queue().is_some());
+
+        device.reset();
+
+        assert!(!device.is_activated());
+        assert!(device.active_queue().is_none());
+    }
+
+    #[test]
+    fn rng_device_activation_uses_configured_queue_metadata() {
+        let queues = configured_mmio_queue(4, true);
+        let device_registers = rng_device_registers();
+        let mut device = VirtioRngDevice::new();
+
+        device
+            .activate_rng(rng_device_activation(&device_registers, &queues))
+            .expect("virtio-rng device should activate");
+
+        let queue = device
+            .active_queue()
+            .expect("activated device should retain active queue");
+        assert_eq!(
+            queue.available_ring().descriptor_table(),
+            TEST_DESCRIPTOR_TABLE
+        );
+        assert_eq!(queue.available_ring().available_ring(), TEST_AVAILABLE_RING);
+        assert_eq!(queue.available_ring().queue_size(), 4);
+        assert_eq!(queue.used_ring().used_ring(), TEST_USED_RING);
+        assert_eq!(queue.used_ring().queue_size(), 4);
+    }
+
+    #[test]
+    fn rng_device_activation_rejects_duplicate_activation() {
+        let queues = configured_mmio_queue(TEST_QUEUE_SIZE, true);
+        let device_registers = rng_device_registers();
+        let mut device = VirtioRngDevice::new();
+
+        device
+            .activate_rng(rng_device_activation(&device_registers, &queues))
+            .expect("first virtio-rng activation should succeed");
+        let error = device
+            .activate_rng(rng_device_activation(&device_registers, &queues))
+            .expect_err("second virtio-rng activation should fail");
+
+        assert!(matches!(
+            error,
+            VirtioRngDeviceActivationError::AlreadyActive
+        ));
+        assert_eq!(error.to_string(), "virtio-rng device is already active");
+    }
+
+    #[test]
+    fn rng_device_activation_rejects_unexpected_queue_count() {
+        let queues = VirtioMmioQueueRegisters::new(&[TEST_QUEUE_SIZE, TEST_QUEUE_SIZE])
+            .expect("queue table should build");
+        let device_registers = rng_device_registers();
+        let mut device = VirtioRngDevice::new();
+
+        let error = device
+            .activate_rng(rng_device_activation(&device_registers, &queues))
+            .expect_err("extra queue should fail virtio-rng activation");
+
+        assert!(matches!(
+            error,
+            VirtioRngDeviceActivationError::QueueCountMismatch {
+                expected: 1,
+                actual: 2
+            }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "virtio-rng device requires 1 queue(s), got 2"
+        );
+    }
+
+    #[test]
+    fn rng_device_activation_wraps_not_ready_queue_error() {
+        let queues = configured_mmio_queue(TEST_QUEUE_SIZE, false);
+        let device_registers = rng_device_registers();
+        let mut device = VirtioRngDevice::new();
+
+        let error = device
+            .activate_rng(rng_device_activation(&device_registers, &queues))
+            .expect_err("not-ready queue should fail virtio-rng activation");
+
+        assert!(matches!(
+            error,
+            VirtioRngDeviceActivationError::QueueBuild {
+                queue_index: 0,
+                source: VirtioRngQueueBuildError::QueueNotReady
+            }
+        ));
+        assert_eq!(
+            error
+                .source()
+                .expect("queue build error source should be preserved")
+                .to_string(),
+            "virtio-rng queue is not ready"
+        );
+    }
+
+    #[test]
+    fn rng_device_notification_without_pending_queues_is_noop() {
+        let mut memory = memory();
+        let mut source = TestEntropySource::default();
+        let mut handler = rng_mmio_handler();
+        configure_rng_mmio_handler_queue(&mut handler, TEST_USED_RING);
+        activate_rng_mmio_handler(&mut handler);
+
+        let dispatch = handler
+            .dispatch_rng_queue_notifications(&mut memory, &mut source)
+            .expect("empty notification dispatch should succeed");
+
+        assert!(dispatch.drained_notifications().is_empty());
+        assert!(dispatch.queue_dispatch().is_none());
+        assert!(!dispatch.needs_queue_interrupt());
+        assert!(source.calls().is_empty());
+        assert!(!handler.has_pending_queue_notifications());
+        assert!(
+            !handler
+                .interrupt_registers()
+                .pending_status()
+                .contains(DeviceInterruptKind::Queue)
+        );
+    }
+
+    #[test]
+    fn rng_device_notification_rejects_inactive_device() {
+        let mut memory = memory();
+        let mut source = TestEntropySource::default();
+        let mut device = VirtioRngDevice::new();
+
+        let error = device
+            .dispatch_drained_queue_notifications(&mut memory, vec![0], &mut source)
+            .expect_err("inactive virtio-rng device should reject notifications");
+
+        assert!(matches!(
+            error,
+            VirtioRngDeviceNotificationError::Inactive { .. }
+        ));
+        assert_eq!(error.drained_notifications(), &[0]);
+        assert_eq!(
+            error.to_string(),
+            "virtio-rng queue notification cannot be dispatched before activation"
+        );
+    }
+
+    #[test]
+    fn rng_device_notification_rejects_unsupported_queue() {
+        let mut memory = memory();
+        let queues = configured_mmio_queue(TEST_QUEUE_SIZE, true);
+        let device_registers = rng_device_registers();
+        let mut source = TestEntropySource::default();
+        let mut device = VirtioRngDevice::new();
+        device
+            .activate_rng(rng_device_activation(&device_registers, &queues))
+            .expect("virtio-rng device should activate");
+
+        let error = device
+            .dispatch_drained_queue_notifications(&mut memory, vec![0, 1], &mut source)
+            .expect_err("unsupported virtio-rng queue should fail notification dispatch");
+
+        match &error {
+            VirtioRngDeviceNotificationError::UnsupportedQueue {
+                drained_notifications,
+                queue_index,
+            } => {
+                assert_eq!(drained_notifications, &[0, 1]);
+                assert_eq!(*queue_index, 1);
+            }
+            other => panic!("expected unsupported queue error, got {other:?}"),
+        }
+        assert!(source.calls().is_empty());
+    }
+
+    #[test]
+    fn rng_mmio_handler_dispatches_notification_and_marks_queue_interrupt() {
+        let mut memory = memory();
+        write_descriptor(&mut memory, 0, TEST_DATA, 8, VIRTQUEUE_DESC_F_WRITE, 0);
+        queue_head(&mut memory, 0, 0);
+        set_available_index(&mut memory, 1);
+
+        let mut handler = rng_mmio_handler();
+        configure_rng_mmio_handler_queue(&mut handler, TEST_USED_RING);
+        activate_rng_mmio_handler(&mut handler);
+        notify_rng_queue(&mut handler, 0);
+
+        let mut source = TestEntropySource::default();
+        let dispatch = handler
+            .dispatch_rng_queue_notifications(&mut memory, &mut source)
+            .expect("virtio-rng notification should dispatch");
+
+        assert_eq!(dispatch.drained_notifications(), &[0]);
+        let queue_dispatch = dispatch
+            .queue_dispatch()
+            .expect("queue dispatch should be present");
+        assert_eq!(queue_dispatch.processed_requests(), 1);
+        assert_eq!(queue_dispatch.successful_requests(), 1);
+        assert!(queue_dispatch.needs_queue_interrupt());
+        assert_eq!(source.calls(), &[8]);
+        assert_eq!(
+            read_guest_bytes(&memory, TEST_DATA, 8),
+            vec![0, 1, 2, 3, 4, 5, 6, 7]
+        );
+        assert_eq!(read_used_index(&memory), 1);
+        assert_eq!(read_used_len(&memory, 0), 8);
+        assert!(!handler.has_pending_queue_notifications());
+        assert!(
+            handler
+                .interrupt_registers()
+                .pending_status()
+                .contains(DeviceInterruptKind::Queue)
+        );
+    }
+
+    #[test]
+    fn rng_mmio_handler_preserves_partial_queue_error_and_marks_interrupt() {
+        let mut memory = memory();
+        write_descriptor(&mut memory, 0, TEST_DATA, 4, VIRTQUEUE_DESC_F_WRITE, 0);
+        queue_head(&mut memory, 0, 0);
+        queue_head(&mut memory, 1, TEST_QUEUE_SIZE);
+        set_available_index(&mut memory, 2);
+
+        let mut handler = rng_mmio_handler();
+        configure_rng_mmio_handler_queue(&mut handler, TEST_USED_RING);
+        activate_rng_mmio_handler(&mut handler);
+        notify_rng_queue(&mut handler, 0);
+
+        let mut source = TestEntropySource::default();
+        let error = handler
+            .dispatch_rng_queue_notifications(&mut memory, &mut source)
+            .expect_err("second available head should fail");
+
+        match &error {
+            VirtioRngDeviceNotificationError::QueueDispatch { source, .. } => {
+                assert!(matches!(
+                    source,
+                    VirtioRngQueueDispatchError::AvailableRing { .. }
+                ));
+            }
+            other => panic!("expected queue dispatch error, got {other:?}"),
+        }
+        assert_eq!(error.drained_notifications(), &[0]);
+        let completed = error
+            .completed_dispatch()
+            .expect("partial dispatch should be preserved");
+        assert_eq!(completed.processed_requests(), 1);
+        assert_eq!(completed.successful_requests(), 1);
+        assert_eq!(completed.bytes_written_to_guest(), 4);
+        assert!(completed.needs_queue_interrupt());
+        assert_eq!(source.calls(), &[4]);
+        assert_eq!(read_guest_bytes(&memory, TEST_DATA, 4), vec![0, 1, 2, 3]);
+        assert!(!handler.has_pending_queue_notifications());
+        assert!(
+            handler
+                .interrupt_registers()
+                .pending_status()
+                .contains(DeviceInterruptKind::Queue)
+        );
+    }
+
+    #[test]
+    fn rng_mmio_handler_repeated_notifications_do_not_reuse_stale_state() {
+        let mut memory = memory();
+        write_descriptor(&mut memory, 0, TEST_DATA, 4, VIRTQUEUE_DESC_F_WRITE, 0);
+        queue_head(&mut memory, 0, 0);
+        set_available_index(&mut memory, 1);
+
+        let mut handler = rng_mmio_handler();
+        configure_rng_mmio_handler_queue(&mut handler, TEST_USED_RING);
+        activate_rng_mmio_handler(&mut handler);
+        notify_rng_queue(&mut handler, 0);
+
+        let mut source = TestEntropySource::default();
+        let first = handler
+            .dispatch_rng_queue_notifications(&mut memory, &mut source)
+            .expect("first notification should dispatch");
+
+        write_descriptor(
+            &mut memory,
+            1,
+            TEST_SECOND_DATA,
+            4,
+            VIRTQUEUE_DESC_F_WRITE,
+            0,
+        );
+        queue_head(&mut memory, 1, 1);
+        set_available_index(&mut memory, 2);
+        notify_rng_queue(&mut handler, 0);
+        let second = handler
+            .dispatch_rng_queue_notifications(&mut memory, &mut source)
+            .expect("second notification should dispatch");
+
+        assert_eq!(
+            first
+                .queue_dispatch()
+                .expect("first queue dispatch should be present")
+                .processed_requests(),
+            1
+        );
+        assert_eq!(
+            second
+                .queue_dispatch()
+                .expect("second queue dispatch should be present")
+                .processed_requests(),
+            1
+        );
+        assert_eq!(source.calls(), &[4, 4]);
+        assert_eq!(read_guest_bytes(&memory, TEST_DATA, 4), vec![0, 1, 2, 3]);
+        assert_eq!(
+            read_guest_bytes(&memory, TEST_SECOND_DATA, 4),
+            vec![4, 5, 6, 7]
+        );
+        assert_eq!(read_used_index(&memory), 2);
+        assert!(!handler.has_pending_queue_notifications());
     }
 
     #[test]
