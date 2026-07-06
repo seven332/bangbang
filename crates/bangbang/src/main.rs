@@ -297,6 +297,15 @@ fn config_file_actions_from_str(contents: &str) -> Result<Vec<VmmAction>, Config
         )?);
     }
 
+    if let Some(balloon) = object.get("balloon") {
+        requests.push(config_section_request(
+            "balloon",
+            "PUT",
+            "/balloon".to_string(),
+            balloon,
+        )?);
+    }
+
     if let Some(cpu_config) = object.get("cpu-config") {
         requests.push(config_section_request(
             "cpu-config",
@@ -459,9 +468,10 @@ fn validate_config_file_sections(
 ) -> Result<(), ConfigFileError> {
     for section in object.keys() {
         match section.as_str() {
-            "boot-source" | "cpu-config" | "drives" | "logger" | "machine-config" | "metrics"
-            | "mmds-config" | "network-interfaces" | "serial" | "vsock" | "entropy" => {}
-            "balloon" | "memory-hotplug" | "pmem" => {
+            "balloon" | "boot-source" | "cpu-config" | "drives" | "logger" | "machine-config"
+            | "metrics" | "mmds-config" | "network-interfaces" | "serial" | "vsock" | "entropy" => {
+            }
+            "memory-hotplug" | "pmem" => {
                 return Err(ConfigFileError::UnsupportedSection(section.clone()));
             }
             _ => return Err(ConfigFileError::UnknownSection(section.clone())),
@@ -3238,6 +3248,27 @@ mod tests {
     }
 
     #[test]
+    fn config_file_accepts_balloon_section() {
+        let actions = super::config_file_actions_from_str(
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"balloon":{"amount_mib":64,"deflate_on_oom":true,"stats_polling_interval_s":60,"free_page_hinting":true,"free_page_reporting":false}}"#,
+        )
+        .expect("balloon config section should parse");
+
+        assert_eq!(
+            actions,
+            [
+                VmmAction::PutBootSource(BootSourceConfigInput::new("/tmp/vmlinux")),
+                VmmAction::PutBalloon(
+                    bangbang_runtime::balloon::BalloonConfigInput::new(64, true)
+                        .with_stats_polling_interval_s(60)
+                        .with_free_page_hinting(true)
+                        .with_free_page_reporting(false)
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn config_file_rejects_malformed_entropy_section() {
         for config in [
             r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"entropy":"bad"}"#,
@@ -3296,6 +3327,48 @@ mod tests {
             panic!("expected VM config");
         };
         assert_eq!(config.entropy_config(), None);
+
+        fs::remove_file(config_path).expect("fixture config should clean up");
+    }
+
+    #[test]
+    fn config_file_balloon_config_fails_before_starting() {
+        let config_path = unique_config_path("balloon");
+        let config = r#"{
+            "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
+            "balloon":{"amount_mib":64,"deflate_on_oom":true}
+        }"#;
+        fs::write(&config_path, config).expect("config file should be written");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        let err = super::apply_startup_config_file(
+            &mut vmm,
+            Some(config_path.to_str().expect("UTF-8 path")),
+        )
+        .expect_err("configured balloon should fail before start");
+
+        assert_eq!(
+            err,
+            ProcessError::ConfigFile(super::ConfigFileError::Apply(
+                bangbang_runtime::VmmActionError::BalloonUnsupported
+            ))
+        );
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+        let data = vmm
+            .handle_action(VmmAction::GetBalloon)
+            .expect("balloon config should be retained");
+        assert_eq!(
+            data,
+            VmmData::BalloonConfiguration(bangbang_runtime::balloon::BalloonConfig::from(
+                bangbang_runtime::balloon::BalloonConfigInput::new(64, true)
+            ))
+        );
 
         fs::remove_file(config_path).expect("fixture config should clean up");
     }
