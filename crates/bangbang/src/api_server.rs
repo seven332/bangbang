@@ -3607,7 +3607,7 @@ mod tests {
             &request_with_body(
                 "PATCH",
                 "/network-interfaces/eth0",
-                r#"{"iface_id":"eth0"}"#,
+                r#"{"iface_id":"eth0","rx_rate_limiter":{"bandwidth":{"size":123456,"one_time_burst":234567,"refill_time":345678}}}"#,
             ),
         );
         assert!(
@@ -3615,10 +3615,17 @@ mod tests {
             "network patch should fail through the API socket; response:\n{network_patch_response}"
         );
         assert!(
-            network_patch_response
-                .contains(r#"{"fault_message":"Network interface updates are not supported."}"#),
-            "network patch should keep the existing unsupported fault body; response:\n{network_patch_response}"
+            network_patch_response.contains(
+                r#"{"fault_message":"The requested operation is not supported in Not started state: UpdateNetworkInterface"}"#
+            ),
+            "preboot network patch should fail on lifecycle state; response:\n{network_patch_response}"
         );
+        for private_value in ["123456", "234567", "345678"] {
+            assert!(
+                !network_patch_response.contains(private_value),
+                "preboot network patch response must not echo {private_value}: {network_patch_response}"
+            );
+        }
         for (socket_name, body, fault_message) in [
             (
                 "pn-mis",
@@ -3677,6 +3684,31 @@ mod tests {
         let start_response = put_action_over_socket(&mut vmm, "patch-a1", "InstanceStart");
         assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
 
+        let runtime_network_patch_response = request_over_socket(
+            &mut vmm,
+            "pn-running",
+            &request_with_body(
+                "PATCH",
+                "/network-interfaces/eth0",
+                r#"{"iface_id":"eth0","rx_rate_limiter":{"bandwidth":{"size":223456,"one_time_burst":334567,"refill_time":445678}}}"#,
+            ),
+        );
+        assert!(
+            runtime_network_patch_response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "running-state network patch should fail through the API socket; response:\n{runtime_network_patch_response}"
+        );
+        assert!(
+            runtime_network_patch_response
+                .contains(r#"{"fault_message":"Network interface updates are not supported."}"#),
+            "running-state network patch should keep the existing unsupported fault body; response:\n{runtime_network_patch_response}"
+        );
+        for private_value in ["223456", "334567", "445678"] {
+            assert!(
+                !runtime_network_patch_response.contains(private_value),
+                "running-state network patch response must not echo {private_value}: {runtime_network_patch_response}"
+            );
+        }
+
         assert_eq!(
             handle_request_bytes(machine_patch_request.as_bytes(), &mut vmm).status(),
             bangbang_api::http::StatusCode::BadRequest
@@ -3686,7 +3718,7 @@ mod tests {
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
-            "{\"patch_api_requests\":{\"drive_count\":1,\"drive_fails\":1,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"mmds_count\":2,\"mmds_fails\":1,\"network_count\":1,\"network_fails\":1},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"patch_api_requests\":{\"drive_count\":1,\"drive_fails\":1,\"machine_cfg_count\":2,\"machine_cfg_fails\":1,\"mmds_count\":2,\"mmds_fails\":1,\"network_count\":2,\"network_fails\":2},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(metrics_path).expect("metrics fixture should clean up");
@@ -4965,7 +4997,7 @@ mod tests {
                 "PATCH",
                 "/network-interfaces/eth0",
                 r#"{"iface_id":"eth0"}"#,
-                r#"{"fault_message":"Network interface updates are not supported."}"#,
+                r#"{"fault_message":"The requested operation is not supported in Not started state: UpdateNetworkInterface"}"#,
             ),
             (
                 "net-delete",

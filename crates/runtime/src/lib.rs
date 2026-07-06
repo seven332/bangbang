@@ -897,6 +897,13 @@ impl VmmController {
                 Ok(VmmData::Empty)
             }
             VmmAction::UpdateNetworkInterface(_) => {
+                if self.instance_info.state == InstanceState::NotStarted {
+                    return Err(VmmActionError::UnsupportedState {
+                        action: action_name,
+                        state: self.instance_info.state,
+                    });
+                }
+
                 Err(VmmActionError::NetworkInterfaceUpdateUnsupported)
             }
             VmmAction::PutVsock(config) => {
@@ -3886,8 +3893,43 @@ mod tests {
     }
 
     #[test]
-    fn update_network_interface_is_unsupported_without_mutating() {
-        for state in [InstanceState::NotStarted, InstanceState::Running] {
+    fn update_network_interface_rejects_not_started_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutNetworkInterface(network_input(
+                "eth0", "tap0",
+            )))
+            .expect("initial network interface config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::UpdateNetworkInterface(
+                NetworkInterfaceUpdateInput::new("eth0", "eth0"),
+            ))
+            .expect_err("preboot network update should fail on state");
+
+        assert_eq!(
+            err,
+            VmmActionError::UnsupportedState {
+                action: "UpdateNetworkInterface",
+                state: InstanceState::NotStarted,
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "The requested operation is not supported in Not started state: UpdateNetworkInterface"
+        );
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert_eq!(controller.network_interface_configs().len(), 1);
+        assert_eq!(controller.network_interface_configs()[0].iface_id(), "eth0");
+        assert_eq!(
+            controller.network_interface_configs()[0].host_dev_name(),
+            "tap0"
+        );
+    }
+
+    #[test]
+    fn update_network_interface_is_unsupported_after_start_without_mutating() {
+        for state in [InstanceState::Running, InstanceState::Paused] {
             let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
             controller
                 .handle_action(VmmAction::PutNetworkInterface(network_input(

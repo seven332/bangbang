@@ -1711,7 +1711,7 @@ fn executable_configures_network_and_mmds() {
     assert_bad_request_response(&network_patch_response, "PATCH /network-interfaces/eth0");
     assert_response_contains(
         &network_patch_response,
-        r#"{"fault_message":"Network interface updates are not supported."}"#,
+        r#"{"fault_message":"The requested operation is not supported in Not started state: UpdateNetworkInterface"}"#,
         "PATCH /network-interfaces/eth0",
     );
 
