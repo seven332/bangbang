@@ -114,7 +114,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v19"
+direct_boot_variant="direct-boot-v20"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -476,6 +476,36 @@ read_entropy_marker() {
       write_vdb_marker BANGBANG_ENTROPY_GUEST_READ_OK
       ;;
   esac
+}
+
+check_balloon_marker() {
+  if [ ! -d /sys/bus/virtio/devices ]; then
+    emit_line BANGBANG_BALLOON_GUEST_CHECK_FAIL_NO_VIRTIO_BUS
+    write_vdb_marker BANGBANG_BALLOON_GUEST_CHECK_FAIL
+    return
+  fi
+
+  balloon_device=
+  for driver_link in /sys/bus/virtio/devices/*/driver; do
+    if [ ! -L "$driver_link" ]; then
+      continue
+    fi
+
+    driver_target=$(readlink "$driver_link" 2>/dev/null || true)
+    if [ "${driver_target##*/}" = virtio_balloon ]; then
+      balloon_device=${driver_link%/driver}
+      break
+    fi
+  done
+
+  if [ -z "$balloon_device" ]; then
+    emit_line BANGBANG_BALLOON_GUEST_CHECK_FAIL_NO_DEVICE
+    write_vdb_marker BANGBANG_BALLOON_GUEST_CHECK_FAIL
+    return
+  fi
+
+  emit_line BANGBANG_BALLOON_GUEST_CHECK_OK
+  write_vdb_marker BANGBANG_BALLOON_GUEST_CHECK_OK
 }
 
 first_pmem_device() {
@@ -1001,6 +1031,8 @@ if [ -r /proc/cmdline ]; then
 fi
 if cmdline_has bangbang.entropy-read=1; then
   read_entropy_marker
+elif cmdline_has bangbang.balloon-check=1; then
+  check_balloon_marker
 elif cmdline_has bangbang.pmem-read-flush=1; then
   read_flush_pmem_marker
 elif cmdline_has bangbang.mmds-v2-fetch=1; then
