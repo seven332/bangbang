@@ -1515,14 +1515,16 @@ pub fn balloon_stats_for_device(
     mmio_dispatcher: &mut MmioDispatcher,
     config: BalloonConfig,
 ) -> Result<BalloonStats, BalloonStatsError> {
-    let actual_pages = mmio_dispatcher
+    let handler = mmio_dispatcher
         .handler_mut::<VirtioBalloonMmioHandler>(device.registration.region_id())
-        .map_err(BalloonStatsError::HandlerLookup)?
+        .map_err(BalloonStatsError::HandlerLookup)?;
+    let actual_pages = handler
         .activation_handler()
         .memory_accounting()
         .inflated_page_count();
+    let optional_stats = handler.activation_handler().statistics();
 
-    BalloonStats::from_config_and_actual_pages(config, actual_pages)
+    BalloonStats::from_config_actual_pages_and_optional_stats(config, actual_pages, optional_stats)
 }
 
 pub fn balloon_hinting_status_for_device(
@@ -2419,7 +2421,8 @@ mod tests {
         BalloonHintingStatusError, BalloonMmioLayout, VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX,
         VIRTIO_BALLOON_DEVICE_ID, VIRTIO_BALLOON_FREE_PAGE_HINT_DONE,
         VIRTIO_BALLOON_FREE_PAGE_HINT_STOP, VIRTIO_BALLOON_INFLATE_QUEUE_INDEX,
-        VIRTIO_BALLOON_MIB_TO_4K_PAGES, VirtioBalloonMmioHandler,
+        VIRTIO_BALLOON_MIB_TO_4K_PAGES, VIRTIO_BALLOON_S_MEMFREE, VIRTIO_BALLOON_S_SWAP_OUT,
+        VIRTIO_BALLOON_STAT_SIZE, VIRTIO_BALLOON_STATS_QUEUE_INDEX, VirtioBalloonMmioHandler,
     };
     use crate::block::{
         DriveConfigInput, DriveUpdateError, VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
@@ -2515,6 +2518,10 @@ mod tests {
     const TEST_BALLOON_DEFLATE_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x8064_0000);
     const TEST_BALLOON_DEFLATE_USED_RING: GuestAddress = GuestAddress::new(0x8065_0000);
     const TEST_BALLOON_PFN_PAYLOAD: GuestAddress = GuestAddress::new(0x8066_0000);
+    const TEST_BALLOON_STATS_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x8067_0000);
+    const TEST_BALLOON_STATS_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x8068_0000);
+    const TEST_BALLOON_STATS_USED_RING: GuestAddress = GuestAddress::new(0x8069_0000);
+    const TEST_BALLOON_STATS_PAYLOAD: GuestAddress = GuestAddress::new(0x806a_0000);
     const TEST_BALLOON_MAPPED_PFN: u32 = 0x80000;
     const TEST_NETWORK_QUEUE_DEVICE_STRIDE: u64 = 0x0010_0000;
     const TEST_AVAILABLE_RING_IDX_OFFSET: u64 = 2;
@@ -2585,6 +2592,15 @@ mod tests {
     fn write_u32_le(bytes: &mut [u8], offset: usize, value: u32) {
         let end = offset + std::mem::size_of::<u32>();
         bytes[offset..end].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn balloon_stat_payload_bytes(stats: &[(u16, u64)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for (tag, value) in stats {
+            bytes.extend_from_slice(&tag.to_le_bytes());
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes
     }
 
     fn controller_with_kernel(kernel: &Path) -> crate::VmmController {
@@ -3543,6 +3559,60 @@ mod tests {
         );
     }
 
+    fn configure_boot_balloon_statistics_queues(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+    ) {
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+        );
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+        );
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            QUEUE_CONFIG_STATUS,
+        );
+        configure_boot_balloon_queue(
+            runtime,
+            mmio_dispatcher,
+            VIRTIO_BALLOON_INFLATE_QUEUE_INDEX,
+            TEST_BALLOON_INFLATE_DESCRIPTOR_TABLE,
+            TEST_BALLOON_INFLATE_AVAILABLE_RING,
+            TEST_BALLOON_INFLATE_USED_RING,
+        );
+        configure_boot_balloon_queue(
+            runtime,
+            mmio_dispatcher,
+            VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX,
+            TEST_BALLOON_DEFLATE_DESCRIPTOR_TABLE,
+            TEST_BALLOON_DEFLATE_AVAILABLE_RING,
+            TEST_BALLOON_DEFLATE_USED_RING,
+        );
+        configure_boot_balloon_queue(
+            runtime,
+            mmio_dispatcher,
+            VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+            TEST_BALLOON_STATS_DESCRIPTOR_TABLE,
+            TEST_BALLOON_STATS_AVAILABLE_RING,
+            TEST_BALLOON_STATS_USED_RING,
+        );
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            DRIVER_OK_STATUS,
+        );
+    }
+
     fn notify_boot_balloon_queue(
         runtime: &mut super::Arm64BootRuntimeResources,
         mmio_dispatcher: &mut MmioDispatcher,
@@ -3735,6 +3805,28 @@ mod tests {
         write_available_heads_at(memory, TEST_BALLOON_DEFLATE_AVAILABLE_RING, &[0]);
     }
 
+    fn write_queued_balloon_statistics_request(memory: &mut crate::memory::GuestMemory) {
+        let stats = balloon_stat_payload_bytes(&[
+            (VIRTIO_BALLOON_S_SWAP_OUT, 9),
+            (VIRTIO_BALLOON_S_MEMFREE, 0x5678),
+        ]);
+        assert_eq!(stats.len(), 2 * VIRTIO_BALLOON_STAT_SIZE);
+        memory
+            .write_slice(&stats, TEST_BALLOON_STATS_PAYLOAD)
+            .expect("balloon statistics payload should write");
+        write_descriptor_at(
+            memory,
+            TEST_BALLOON_STATS_DESCRIPTOR_TABLE,
+            0,
+            TestDescriptor::readable(
+                TEST_BALLOON_STATS_PAYLOAD,
+                u32::try_from(stats.len()).expect("stats payload length should fit"),
+                None,
+            ),
+        );
+        write_available_heads_at(memory, TEST_BALLOON_STATS_AVAILABLE_RING, &[0]);
+    }
+
     fn read_boot_entropy_used_index(memory: &crate::memory::GuestMemory) -> u16 {
         read_guest_u16(
             memory,
@@ -3759,6 +3851,15 @@ mod tests {
             TEST_BALLOON_DEFLATE_USED_RING
                 .checked_add(2)
                 .expect("balloon deflate used idx address should not overflow"),
+        )
+    }
+
+    fn read_boot_balloon_statistics_used_index(memory: &crate::memory::GuestMemory) -> u16 {
+        read_guest_u16(
+            memory,
+            TEST_BALLOON_STATS_USED_RING
+                .checked_add(2)
+                .expect("balloon statistics used idx address should not overflow"),
         )
     }
 
@@ -5775,6 +5876,50 @@ mod tests {
         assert_eq!(stats.actual_pages(), 1);
         assert_eq!(stats.target_mib(), amount_mib);
         assert_eq!(stats.actual_mib(), 0);
+    }
+
+    #[test]
+    fn boot_runtime_balloon_stats_reads_recorded_guest_optional_stats() {
+        let amount_mib = TEST_MEMORY_MIB as u32 / 2;
+        let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_with_balloon_config(
+            "kernel-balloon-optional-stats",
+            BalloonConfigInput::new(amount_mib, false).with_stats_polling_interval_s(1),
+        );
+        configure_boot_balloon_statistics_queues(&mut runtime, &mut mmio_dispatcher);
+        write_queued_balloon_statistics_request(&mut memory);
+        notify_boot_balloon_queue(
+            &mut runtime,
+            &mut mmio_dispatcher,
+            VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+        );
+
+        let dispatches = runtime
+            .dispatch_balloon_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("balloon stats dispatch should succeed");
+        let dispatch = dispatches.as_slice()[0]
+            .outcome()
+            .dispatched()
+            .expect("statistics notification should dispatch");
+        assert_eq!(dispatch.statistics_notifications(), 1);
+        assert_eq!(read_boot_balloon_statistics_used_index(&memory), 0);
+        let device = runtime
+            .balloon_device
+            .as_ref()
+            .expect("balloon device should exist")
+            .clone();
+
+        let stats = balloon_stats_for_device(
+            &device,
+            &mut mmio_dispatcher,
+            BalloonConfigInput::new(amount_mib, false)
+                .with_stats_polling_interval_s(1)
+                .into(),
+        )
+        .expect("balloon stats should read optional stats from active handler");
+
+        assert_eq!(stats.optional().swap_out(), Some(9));
+        assert_eq!(stats.optional().free_memory(), Some(0x5678));
+        assert_eq!(stats.optional().swap_in(), None);
     }
 
     #[test]
