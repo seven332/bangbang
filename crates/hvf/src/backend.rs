@@ -233,6 +233,7 @@ impl HvfBackend {
         permissions: HvfMemoryPermissions,
     ) -> Result<(), HvfGuestMemoryMappingError> {
         self.validate_guest_memory_mapping_state()?;
+        HvfGuestMemoryMapping::validate_guest_memory(&memory, permissions)?;
         let host_mappings = pmem_host_memory_mappings(pmem_devices)?;
         self.map_guest_memory_with_host_mappings(memory, permissions, host_mappings)
     }
@@ -803,6 +804,46 @@ mod tests {
                 super::VM_NOT_CREATED_FOR_MEMORY_MESSAGE
             )
         ));
+    }
+
+    #[test]
+    fn pmem_mapping_checks_guest_permissions_before_shadow_copy() {
+        let page_size = page_size();
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut backend = HvfBackend::new_with_memory_mapper(mapper.clone());
+        backend.vm_created = true;
+        let layout =
+            GuestMemoryLayout::new(vec![range(0, page_size)]).expect("layout should be valid");
+        let memory = GuestMemory::allocate(&layout).expect("guest memory should allocate");
+        let backing = TempPmemFile::new("invalid-permissions-pmem", VIRTIO_PMEM_ALIGNMENT)
+            .expect("pmem backing should be created");
+        let mut configs = PmemConfigs::new();
+        configs.upsert(pmem_config(PmemConfigInput::new(
+            "pmem0",
+            backing.path_text(),
+        )));
+        let devices =
+            PreparedPmemDevices::from_configs(&configs, &layout).expect("pmem should prepare");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(backing.path())
+            .expect("pmem backing should open for truncation")
+            .set_len(1)
+            .expect("pmem backing should truncate");
+
+        let err = backend
+            .map_guest_memory_with_pmem_devices_and_configured_mapper(
+                memory,
+                devices.as_slice(),
+                HvfMemoryPermissions::new(false, false, false),
+            )
+            .expect_err("invalid permissions should fail before pmem shadow copy");
+
+        assert!(matches!(
+            err,
+            crate::memory::HvfGuestMemoryMappingError::EmptyPermissions
+        ));
+        assert_eq!(mapper.map_count(), 0);
     }
 
     #[test]

@@ -281,6 +281,16 @@ impl HvfGuestMemoryMapping {
         }
     }
 
+    pub(crate) fn validate_guest_memory(
+        memory: &GuestMemory,
+        permissions: HvfMemoryPermissions,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        let page_size = host_page_size()?;
+        let _requests = validated_map_requests(memory, permissions, page_size)?;
+
+        Ok(())
+    }
+
     pub(crate) fn unmap_all(&mut self) -> Result<(), HvfGuestMemoryMappingError> {
         let failures = self.unmap_mapped_regions();
         if failures.is_empty() {
