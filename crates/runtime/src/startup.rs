@@ -6,10 +6,11 @@ use std::os::fd::RawFd;
 
 use crate::VmmController;
 use crate::balloon::{
-    BalloonConfig, BalloonMmioDeviceRegistration, BalloonMmioLayout, BalloonMmioRegistrationError,
-    BalloonPageCountOverflow, BalloonStats, BalloonStatsError, BalloonUpdateError,
-    PreparedBalloonDevice, VirtioBalloonDeviceNotificationDispatch,
-    VirtioBalloonDeviceNotificationError, VirtioBalloonMmioHandler,
+    BalloonConfig, BalloonHintingStatus, BalloonHintingStatusError, BalloonMmioDeviceRegistration,
+    BalloonMmioLayout, BalloonMmioRegistrationError, BalloonPageCountOverflow, BalloonStats,
+    BalloonStatsError, BalloonUpdateError, PreparedBalloonDevice,
+    VirtioBalloonDeviceNotificationDispatch, VirtioBalloonDeviceNotificationError,
+    VirtioBalloonMmioHandler,
 };
 use crate::block::{
     BlockFileBacking, BlockMmioDeviceRegistration, BlockMmioLayout, BlockMmioRegistrationError,
@@ -1501,6 +1502,16 @@ pub fn balloon_stats_for_device(
     BalloonStats::from_config_and_actual_pages(config, actual_pages)
 }
 
+pub fn balloon_hinting_status_for_device(
+    device: &Arm64BootBalloonDevice,
+    mmio_dispatcher: &mut MmioDispatcher,
+) -> Result<BalloonHintingStatus, BalloonHintingStatusError> {
+    mmio_dispatcher
+        .handler_mut::<VirtioBalloonMmioHandler>(device.registration.region_id())
+        .map_err(BalloonHintingStatusError::HandlerLookup)?
+        .balloon_hinting_status()
+}
+
 #[derive(Debug)]
 pub enum Arm64BootResourceError {
     MissingBootSource,
@@ -2375,12 +2386,14 @@ mod tests {
         Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider, Arm64BootResourceConfig,
         Arm64BootResourceError, Arm64BootResources, Arm64BootSerialDeviceConfig,
         Arm64BootSerialMmioRegistrationError, MIB, arm64_boot_network_device_metadata,
-        balloon_stats_for_device, block_device_metadata, update_balloon_config_for_device,
+        balloon_hinting_status_for_device, balloon_stats_for_device, block_device_metadata,
+        update_balloon_config_for_device,
     };
     use crate::VmmAction;
     use crate::balloon::{
-        BalloonConfigInput, BalloonMmioLayout, VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX,
-        VIRTIO_BALLOON_DEVICE_ID, VIRTIO_BALLOON_INFLATE_QUEUE_INDEX,
+        BalloonConfigInput, BalloonHintingStatusError, BalloonMmioLayout,
+        VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX, VIRTIO_BALLOON_DEVICE_ID,
+        VIRTIO_BALLOON_FREE_PAGE_HINT_STOP, VIRTIO_BALLOON_INFLATE_QUEUE_INDEX,
         VIRTIO_BALLOON_MIB_TO_4K_PAGES, VirtioBalloonMmioHandler,
     };
     use crate::block::{
@@ -2646,10 +2659,12 @@ mod tests {
     }
 
     fn add_balloon(controller: &mut crate::VmmController, amount_mib: u32) {
+        add_balloon_config(controller, BalloonConfigInput::new(amount_mib, false));
+    }
+
+    fn add_balloon_config(controller: &mut crate::VmmController, config: BalloonConfigInput) {
         controller
-            .handle_action(VmmAction::PutBalloon(BalloonConfigInput::new(
-                amount_mib, false,
-            )))
+            .handle_action(VmmAction::PutBalloon(config))
             .expect("balloon config should be stored");
     }
 
@@ -2758,6 +2773,30 @@ mod tests {
         let kernel = temp_file(kernel_name, &arm64_image());
         let mut controller = controller_with_kernel(kernel.path());
         add_balloon(&mut controller, amount_mib);
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            Arm64BootResourceConfig {
+                balloon_interrupt_line: Some(line(36)),
+                ..valid_config(&[])
+            },
+        )
+        .expect("boot resources should assemble with balloon device");
+        let parts = resources.into_parts();
+
+        (parts.memory, parts.runtime, parts.mmio_dispatcher)
+    }
+
+    fn boot_runtime_with_balloon_config(
+        kernel_name: &str,
+        config: BalloonConfigInput,
+    ) -> (
+        crate::memory::GuestMemory,
+        super::Arm64BootRuntimeResources,
+        MmioDispatcher,
+    ) {
+        let kernel = temp_file(kernel_name, &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        add_balloon_config(&mut controller, config);
         let resources = Arm64BootResources::assemble_from_controller(
             &controller,
             Arm64BootResourceConfig {
@@ -5711,6 +5750,41 @@ mod tests {
         assert_eq!(stats.actual_pages(), 1);
         assert_eq!(stats.target_mib(), amount_mib);
         assert_eq!(stats.actual_mib(), 0);
+    }
+
+    #[test]
+    fn boot_runtime_balloon_hinting_status_reads_active_handler_state() {
+        let (_memory, runtime, mut mmio_dispatcher) = boot_runtime_with_balloon_config(
+            "kernel-balloon-hinting-status",
+            BalloonConfigInput::new(TEST_MEMORY_MIB as u32 / 2, false).with_free_page_hinting(true),
+        );
+        let device = runtime
+            .balloon_device
+            .as_ref()
+            .expect("balloon device should exist")
+            .clone();
+
+        let status = balloon_hinting_status_for_device(&device, &mut mmio_dispatcher)
+            .expect("balloon hinting status should read from active handler");
+
+        assert_eq!(status.host_cmd(), VIRTIO_BALLOON_FREE_PAGE_HINT_STOP);
+        assert_eq!(status.guest_cmd(), None);
+    }
+
+    #[test]
+    fn boot_runtime_balloon_hinting_status_rejects_without_hinting_queue() {
+        let (_memory, runtime, mut mmio_dispatcher) =
+            boot_runtime_with_balloon("kernel-balloon-hinting-status-disabled");
+        let device = runtime
+            .balloon_device
+            .as_ref()
+            .expect("balloon device should exist")
+            .clone();
+
+        let err = balloon_hinting_status_for_device(&device, &mut mmio_dispatcher)
+            .expect_err("balloon hinting status should require hinting support");
+
+        assert_eq!(err, BalloonHintingStatusError::HintingNotEnabled);
     }
 
     #[test]

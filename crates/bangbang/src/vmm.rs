@@ -18,8 +18,8 @@ use bangbang_hvf::{
 };
 use bangbang_runtime::balloon::BalloonMmioLayout;
 use bangbang_runtime::balloon::{
-    BalloonConfig, BalloonConfigInput, BalloonStats, BalloonStatsError, BalloonUpdateError,
-    BalloonUpdateInput,
+    BalloonConfig, BalloonConfigInput, BalloonHintingStatus, BalloonHintingStatusError,
+    BalloonStats, BalloonStatsError, BalloonUpdateError, BalloonUpdateInput,
 };
 use bangbang_runtime::block::{
     BlockFileBacking, BlockMmioLayout, DriveConfig, DriveConfigInput, DriveUpdateError,
@@ -49,8 +49,9 @@ use bangbang_runtime::serial::{
 };
 use bangbang_runtime::startup::{
     Arm64BootBalloonDevice, Arm64BootBlockDevice, Arm64BootNetworkDevice, Arm64BootNetworkPacketIo,
-    Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider, balloon_stats_for_device,
-    update_balloon_config_for_device, update_block_device_backing_for_devices_with_opened,
+    Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
+    balloon_hinting_status_for_device, balloon_stats_for_device, update_balloon_config_for_device,
+    update_block_device_backing_for_devices_with_opened,
 };
 use bangbang_runtime::vsock::{VsockConfigInput, VsockMmioLayout};
 use bangbang_runtime::{BackendError, VmmAction, VmmActionError, VmmController, VmmData};
@@ -118,6 +119,12 @@ pub(crate) trait ProcessSessionDiagnostics {
         Err(BalloonStatsError::ActiveSessionUnavailable)
     }
 
+    fn balloon_hinting_status(
+        &mut self,
+    ) -> Result<BalloonHintingStatus, BalloonHintingStatusError> {
+        Err(BalloonHintingStatusError::ActiveSessionUnavailable)
+    }
+
     fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
         None
     }
@@ -172,6 +179,15 @@ impl BootRunLoopBalloonDeviceUpdater {
             .map_err(|_| BalloonStatsError::MmioDispatcherUnavailable)?;
 
         balloon_stats_for_device(&self.balloon_device, &mut dispatcher, config)
+    }
+
+    fn balloon_hinting_status(&self) -> Result<BalloonHintingStatus, BalloonHintingStatusError> {
+        let mut dispatcher = self
+            .mmio_dispatcher
+            .lock()
+            .map_err(|_| BalloonHintingStatusError::MmioDispatcherUnavailable)?;
+
+        balloon_hinting_status_for_device(&self.balloon_device, &mut dispatcher)
     }
 }
 
@@ -823,6 +839,7 @@ where
             VmmAction::UpdateBlockDevice(input) => self.update_block_device(input),
             VmmAction::PatchBalloon(input) => self.update_balloon(input),
             VmmAction::GetBalloonStats => self.balloon_stats(),
+            VmmAction::GetBalloonHintingStatus => self.balloon_hinting_status(),
             VmmAction::FlushMetrics => self.flush_metrics(),
             action => self.controller.handle_action(action),
         }
@@ -973,6 +990,35 @@ where
             .map_err(VmmActionError::BalloonStats)?;
 
         Ok(VmmData::BalloonStatistics(stats))
+    }
+
+    fn balloon_hinting_status(&mut self) -> Result<VmmData, VmmActionError> {
+        if self.controller.instance_info().state == bangbang_runtime::InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: VmmAction::GetBalloonHintingStatus.name(),
+                state: self.controller.instance_info().state,
+            });
+        }
+
+        let config = self
+            .controller
+            .balloon_config()
+            .ok_or(VmmActionError::BalloonUnsupported)?;
+        if !config.free_page_hinting() {
+            return Err(VmmActionError::BalloonUnsupported);
+        }
+
+        let Some(session) = self.started_session.as_mut() else {
+            return Err(VmmActionError::BalloonHintingStatus(
+                BalloonHintingStatusError::ActiveSessionUnavailable,
+            ));
+        };
+        let status = session.balloon_hinting_status().map_err(|err| match err {
+            BalloonHintingStatusError::HintingNotEnabled => VmmActionError::BalloonUnsupported,
+            err => VmmActionError::BalloonHintingStatus(err),
+        })?;
+
+        Ok(VmmData::BalloonHintingStatus(status))
     }
 
     pub(crate) fn flush_startup_metrics(&mut self) -> Result<bool, VmmActionError> {
@@ -1910,6 +1956,20 @@ where
     }
 }
 
+fn balloon_hinting_status_error_from_boot_run_loop_command<C>(
+    err: BootRunLoopCommandError<C, BalloonHintingStatusError>,
+) -> BalloonHintingStatusError
+where
+    C: fmt::Display,
+{
+    match err {
+        BootRunLoopCommandError::Command { source } => source,
+        other => BalloonHintingStatusError::ActiveSessionCommand {
+            message: other.to_string(),
+        },
+    }
+}
+
 pub(crate) struct BootRunLoopCommandHandle<S>
 where
     S: BootRunLoopSession,
@@ -2226,6 +2286,23 @@ where
             .map_err(balloon_stats_error_from_boot_run_loop_command)
     }
 
+    fn balloon_hinting_status(
+        &mut self,
+    ) -> Result<BalloonHintingStatus, BalloonHintingStatusError> {
+        let Some(updater) = self.balloon_device_updater.as_ref() else {
+            return Err(BalloonHintingStatusError::ActiveSessionUnavailable);
+        };
+
+        if !matches!(self.status(), BootRunLoopWorkerStatus::Running) {
+            return Err(BalloonHintingStatusError::ActiveSessionUnavailable);
+        }
+
+        let updater = updater.clone();
+
+        self.run_command(move |_| updater.balloon_hinting_status())
+            .map_err(balloon_hinting_status_error_from_boot_run_loop_command)
+    }
+
     fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
         Some(self.terminal_wakeup_reader.as_raw_fd())
     }
@@ -2310,8 +2387,8 @@ mod tests {
     use std::sync::{Arc, Condvar, Mutex, mpsc};
 
     use bangbang_runtime::balloon::{
-        BalloonConfig, BalloonConfigInput, BalloonStats, BalloonStatsError, BalloonUpdateError,
-        BalloonUpdateInput,
+        BalloonConfig, BalloonConfigInput, BalloonHintingStatus, BalloonHintingStatusError,
+        BalloonStats, BalloonStatsError, BalloonUpdateError, BalloonUpdateInput,
     };
     use bangbang_runtime::block::{
         BlockMmioLayout, DriveConfig, DriveConfigInput, DriveConfigs, DriveUpdateError,
@@ -2477,6 +2554,9 @@ mod tests {
         balloon_stats_count: usize,
         last_balloon_stats_mib: Option<u32>,
         balloon_stats_result: Option<Result<BalloonStats, BalloonStatsError>>,
+        balloon_hinting_status_count: usize,
+        balloon_hinting_status_result:
+            Option<Result<BalloonHintingStatus, BalloonHintingStatusError>>,
     }
 
     impl FakeSession {
@@ -2492,6 +2572,8 @@ mod tests {
                 balloon_stats_count: 0,
                 last_balloon_stats_mib: None,
                 balloon_stats_result: None,
+                balloon_hinting_status_count: 0,
+                balloon_hinting_status_result: None,
             }
         }
 
@@ -2507,6 +2589,8 @@ mod tests {
                 balloon_stats_count: 0,
                 last_balloon_stats_mib: None,
                 balloon_stats_result: None,
+                balloon_hinting_status_count: 0,
+                balloon_hinting_status_result: None,
             }
         }
 
@@ -2522,6 +2606,8 @@ mod tests {
                 balloon_stats_count: 0,
                 last_balloon_stats_mib: None,
                 balloon_stats_result: None,
+                balloon_hinting_status_count: 0,
+                balloon_hinting_status_result: None,
             }
         }
 
@@ -2540,6 +2626,28 @@ mod tests {
                 balloon_stats_count: 0,
                 last_balloon_stats_mib: None,
                 balloon_stats_result: Some(result),
+                balloon_hinting_status_count: 0,
+                balloon_hinting_status_result: None,
+            }
+        }
+
+        fn with_balloon_hinting_status_result(
+            id: u64,
+            result: Result<BalloonHintingStatus, BalloonHintingStatusError>,
+        ) -> Self {
+            Self {
+                id,
+                block_update_count: 0,
+                last_block_update: None,
+                block_update_result: None,
+                balloon_update_count: 0,
+                last_balloon_update_mib: None,
+                balloon_update_result: None,
+                balloon_stats_count: 0,
+                last_balloon_stats_mib: None,
+                balloon_stats_result: None,
+                balloon_hinting_status_count: 0,
+                balloon_hinting_status_result: Some(result),
             }
         }
     }
@@ -2575,6 +2683,16 @@ mod tests {
             match self.balloon_stats_result.clone() {
                 Some(result) => result,
                 None => BalloonStats::from_config_and_actual_pages(config, 0),
+            }
+        }
+
+        fn balloon_hinting_status(
+            &mut self,
+        ) -> Result<BalloonHintingStatus, BalloonHintingStatusError> {
+            self.balloon_hinting_status_count += 1;
+            match self.balloon_hinting_status_result.clone() {
+                Some(result) => result,
+                None => Ok(BalloonHintingStatus::new(0, None)),
             }
         }
     }
@@ -2619,7 +2737,7 @@ mod tests {
 
     #[derive(Debug, Clone)]
     enum FakeStartResult {
-        Success(FakeSession),
+        Success(Box<FakeSession>),
         Failure(BackendError),
     }
 
@@ -2630,13 +2748,13 @@ mod tests {
     }
 
     impl FakeStarter {
-        const fn success(id: u64) -> Self {
+        fn success(id: u64) -> Self {
             Self::success_with_session(FakeSession::new(id))
         }
 
-        const fn success_with_session(session: FakeSession) -> Self {
+        fn success_with_session(session: FakeSession) -> Self {
             Self {
-                result: FakeStartResult::Success(session),
+                result: FakeStartResult::Success(Box::new(session)),
                 calls: 0,
             }
         }
@@ -2658,7 +2776,7 @@ mod tests {
         ) -> Result<Self::Session, BackendError> {
             self.calls += 1;
             match &self.result {
-                FakeStartResult::Success(session) => Ok(session.clone()),
+                FakeStartResult::Success(session) => Ok((**session).clone()),
                 FakeStartResult::Failure(source) => Err(source.clone()),
             }
         }
@@ -3863,6 +3981,7 @@ mod tests {
             | VmmActionError::UnsupportedAction(_)
             | VmmActionError::UnsupportedState { .. }
             | VmmActionError::BalloonConfig(_)
+            | VmmActionError::BalloonHintingStatus(_)
             | VmmActionError::BalloonStats(_)
             | VmmActionError::BalloonUnsupported
             | VmmActionError::BalloonUpdate(_)
@@ -4920,6 +5039,81 @@ mod tests {
                 BalloonConfigInput::new(64, false)
             ))
         );
+    }
+
+    #[test]
+    fn runtime_balloon_hinting_status_reads_active_session_when_enabled() {
+        let expected = BalloonHintingStatus::new(0, None);
+        let mut vmm = configured_vmm(FakeStarter::success_with_session(
+            FakeSession::with_balloon_hinting_status_result(19, Ok(expected)),
+        ));
+        vmm.handle_action(VmmAction::PutBalloon(
+            BalloonConfigInput::new(64, false).with_free_page_hinting(true),
+        ))
+        .expect("initial balloon should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        let data = vmm
+            .handle_action(VmmAction::GetBalloonHintingStatus)
+            .expect("balloon hinting status should be returned");
+
+        assert_eq!(
+            data,
+            bangbang_runtime::VmmData::BalloonHintingStatus(expected)
+        );
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.balloon_hinting_status_count, 1);
+    }
+
+    #[test]
+    fn runtime_balloon_hinting_status_rejects_without_hinting_enabled() {
+        let mut vmm = configured_vmm(FakeStarter::success(20));
+        vmm.handle_action(VmmAction::PutBalloon(BalloonConfigInput::new(64, false)))
+            .expect("initial balloon should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        let err = vmm
+            .handle_action(VmmAction::GetBalloonHintingStatus)
+            .expect_err("balloon hinting status should require hinting support");
+
+        assert_eq!(err, VmmActionError::BalloonUnsupported);
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.balloon_hinting_status_count, 0);
+    }
+
+    #[test]
+    fn runtime_balloon_hinting_status_maps_handler_hinting_disabled_to_unsupported() {
+        let mut vmm = configured_vmm(FakeStarter::success_with_session(
+            FakeSession::with_balloon_hinting_status_result(
+                21,
+                Err(BalloonHintingStatusError::HintingNotEnabled),
+            ),
+        ));
+        vmm.handle_action(VmmAction::PutBalloon(
+            BalloonConfigInput::new(64, false).with_free_page_hinting(true),
+        ))
+        .expect("initial balloon should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        let err = vmm
+            .handle_action(VmmAction::GetBalloonHintingStatus)
+            .expect_err("handler mismatch should map to existing balloon fault");
+
+        assert_eq!(err, VmmActionError::BalloonUnsupported);
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.balloon_hinting_status_count, 1);
     }
 
     #[test]

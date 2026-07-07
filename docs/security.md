@@ -283,6 +283,11 @@ virtio-balloon `num_pages` config-space value, then signal a config interrupt;
 they do not map, unmap, reclaim, or release host memory. Balloon statistics
 queries read the stored target and internal inflated-page count only; they do
 not process guest statistics descriptors or change host memory accounting.
+Balloon hinting status queries read only the active device's internal host
+command identifier and guest-command state, which is `null` until hinting queue
+processing exists. They do not start or stop hinting, trust guest config-space
+writes as host commands, acknowledge guest hinting descriptors, or reclaim host
+memory.
 
 The current serial device is a TX-only MMIO output path. By default, guest
 serial bytes go to a bounded internal capture buffer; when `/serial` configures

@@ -196,6 +196,7 @@ pub enum VmmData {
     MachineConfiguration(machine::MachineConfig),
     BalloonConfiguration(balloon::BalloonConfig),
     BalloonStatistics(balloon::BalloonStats),
+    BalloonHintingStatus(balloon::BalloonHintingStatus),
     MmdsValue(serde_json::Value),
     VmConfiguration(VmConfiguration),
 }
@@ -296,6 +297,7 @@ pub enum VmmActionError {
     BalloonConfig(balloon::BalloonConfigError),
     BalloonUnsupported,
     BalloonStats(balloon::BalloonStatsError),
+    BalloonHintingStatus(balloon::BalloonHintingStatusError),
     BalloonUpdate(balloon::BalloonUpdateError),
     EntropyUnsupported,
     MissingBootSource,
@@ -339,6 +341,7 @@ impl fmt::Display for VmmActionError {
             Self::BalloonConfig(err) => write!(f, "{err}"),
             Self::BalloonUnsupported => f.write_str("Balloon device is not supported."),
             Self::BalloonStats(err) => write!(f, "{err}"),
+            Self::BalloonHintingStatus(err) => write!(f, "{err}"),
             Self::BalloonUpdate(err) => write!(f, "{err}"),
             Self::EntropyUnsupported => f.write_str("Entropy device is not supported."),
             Self::MissingBootSource => {
@@ -380,6 +383,7 @@ impl std::error::Error for VmmActionError {
             Self::BootSourceConfig(err) => Some(err),
             Self::BalloonConfig(err) => Some(err),
             Self::BalloonStats(err) => Some(err),
+            Self::BalloonHintingStatus(err) => Some(err),
             Self::BalloonUpdate(err) => Some(err),
             Self::DriveConfig(err) => Some(err),
             Self::DriveUpdate(err) => Some(err),
@@ -1318,8 +1322,8 @@ mod tests {
         BackendError, HotUnplugDeviceInput, HotUnplugDeviceKind, InstanceState, VmmAction,
         VmmActionError, VmmController, VmmData,
         balloon::{
-            BalloonConfig, BalloonConfigError, BalloonConfigInput, BalloonStatsError,
-            BalloonUpdateError, BalloonUpdateInput,
+            BalloonConfig, BalloonConfigError, BalloonConfigInput, BalloonHintingStatusError,
+            BalloonStatsError, BalloonUpdateError, BalloonUpdateInput,
         },
         block::{DriveConfigError, DriveConfigInput, DriveUpdateInput},
         boot::{
@@ -5255,6 +5259,15 @@ mod tests {
                 u32::MAX
             )
         );
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn displays_balloon_hinting_status_error() {
+        let err =
+            VmmActionError::BalloonHintingStatus(BalloonHintingStatusError::HintingNotEnabled);
+
+        assert_eq!(err.to_string(), "balloon free-page hinting is not enabled");
         assert!(err.source().is_some());
     }
 
