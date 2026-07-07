@@ -72,6 +72,20 @@ changes Firecracker-facing behavior or security posture:
 When a capability moves between these categories, update the compatibility docs,
 validation matrix, tests, and related issue links in the same PR.
 
+## Isolation Compatibility Checklist
+
+Use this checklist when reviewing Firecracker-facing host isolation changes:
+
+| Area | Current status | Review expectation |
+| --- | --- | --- |
+| Linux jailer, seccomp, namespaces, cgroups, chroot, and privilege dropping | Platform-limited unsupported | Reject matching Firecracker process options or document a concrete macOS replacement before accepting any no-op behavior. |
+| API socket ownership | Implemented subset | Keep owner-only socket permissions, final-path ownership checks, and owner-only cleanup tests current when API socket behavior changes. |
+| Host path policy | Operator-owned with per-resource validation | Redact sensitive path details in errors, avoid opening paths during pre-boot storage unless the resource explicitly requires it, and test cleanup for owned resources. |
+| HVF entitlement and code signing | Implemented validation path | Keep real HVF tests in signed targets and keep unsupported CI hosts on explicit compile/sign-only validation, not silent skips. |
+| vmnet networking | Deferred feasible macOS work | Treat live connectivity, host policy, and cleanup as open design work until a public vmnet integration proof exists. |
+| macOS sandboxing | Deferred feasible macOS work | Do not claim production containment until a sandbox profile and resource policy are designed and tested. |
+| Launcher or resource broker | Deferred feasible macOS work | Keep host-path and shared-resource isolation as operator responsibility until a separate broker owns privileged preparation and cleanup. |
+
 ## API Socket Handling
 
 The API socket is a local control interface with no protocol-level
