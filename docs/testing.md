@@ -207,6 +207,9 @@ It also includes a direct-rootfs entropy scenario that configures `/entropy`,
 checks that the guest selected `virtio_rng` as the current hardware RNG, reads
 from `/dev/hwrng`, and writes a host-observable marker only after a non-empty
 read succeeds.
+It also includes a direct-rootfs balloon scenario that configures `/balloon`,
+checks that the guest bound a virtio-balloon driver, and writes a
+host-observable marker after the driver path is visible.
 It also includes a direct-rootfs pmem scenario that configures `/pmem/pmem0`
 through the public API, waits for `BANGBANG_PMEM_READ_FLUSH_OK` in a scratch
 drive, and then verifies the guest-written pmem marker in the host backing
@@ -299,7 +302,7 @@ artifacts and is not a substitute for a production rootfs build process.
 The signed `guest_boot` and executable HVF e2e targets also validate a
 deterministic direct-rootfs boot. For those scenarios,
 `scripts/run-integration-tests.sh` prepares
-`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v19.ext4`
+`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v20.ext4`
 after confirming the host can execute HVF. The generated image is an ext4 copy
 of the pinned Firecracker rootfs with a test-specific
 `/bangbang-direct-rootfs-init` script added before image creation. The test
@@ -322,6 +325,10 @@ metadata values. When the boot args include `bangbang.entropy-read=1`, the same
 init script checks `/sys/class/misc/hw_random/rng_current` for `virtio_rng`,
 reads bytes from `/dev/hwrng`, and writes
 `BANGBANG_ENTROPY_GUEST_READ_OK` only after the read returns non-empty data.
+When the boot args include `bangbang.balloon-check=1`, the same init script
+checks the virtio bus for a device bound to the `virtio_balloon` driver and
+writes `BANGBANG_BALLOON_GUEST_CHECK_OK` only after that driver binding is
+visible.
 When the boot args include `bangbang.pmem-read-flush=1`, the same init script
 finds the first `/dev/pmem*` block device, reads a deterministic host marker,
 writes a deterministic guest marker at a fixed offset, runs `sync` for the
@@ -354,14 +361,14 @@ waits for distinct host replies, and writes
 `BANGBANG_VSOCK_HOST_MULTISTREAM_OK` only after both streams complete. These
 checks prove the kernel mounted the virtio-block root drive as `/`, give
 executable-boundary MMDS fetch coverage through the process-local MMDS-only
-packet path, prove guest-visible virtio-rng reads through `/dev/hwrng`, and
-cover guest-initiated plus host-initiated virtio-vsock
-connection exchange through the signed executable, including narrow
-multi-payload stream cases and multi-stream retention in both directions. They
-do not claim that bangbang can boot an arbitrary distro image through its
-default init, that full networking compatibility is complete, or that full
-vsock throughput, Firecracker's full graceful-shutdown timeout/kill-queue
-behavior, and credit accounting are complete.
+packet path, prove guest-visible virtio-rng reads through `/dev/hwrng`, prove
+guest virtio-balloon driver binding, prove the current virtio-pmem read/flush
+path, and cover guest-initiated plus host-initiated virtio-vsock connection
+exchange through the signed executable, including narrow multi-payload stream
+cases and multi-stream retention in both directions. They do not claim that
+bangbang can boot an arbitrary distro image through its default init, that full
+networking compatibility is complete, or that full balloon, pmem, and vsock
+runtime behavior is complete.
 
 bangbang appends Firecracker-style root-drive command-line arguments during
 startup resource assembly when a configured drive has `is_root_device=true`.
