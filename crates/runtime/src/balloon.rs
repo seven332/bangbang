@@ -7107,6 +7107,109 @@ mod tests {
     }
 
     #[test]
+    fn balloon_mmio_handler_acknowledges_completed_hinting_run_before_malformed_command() {
+        let mut memory = pfn_descriptor_memory();
+        let command = VIRTIO_BALLOON_FREE_PAGE_HINT_STOP;
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &command.to_le_bytes());
+        let config = balloon_config(64, false, 0, true, false);
+        let hinting_queue_index = prepared(config)
+            .queue_layout()
+            .free_page_hinting()
+            .expect("hinting queue should be configured")
+            .index();
+        write_hinting_descriptor(
+            &mut memory,
+            hinting_queue_index,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, VIRTIO_BALLOON_HINTING_COMMAND_SIZE_U32, None),
+        );
+        write_hinting_descriptor(
+            &mut memory,
+            hinting_queue_index,
+            1,
+            TestDescriptor::readable(
+                GuestAddress::new(TEST_MEMORY_SIZE),
+                VIRTIO_BALLOON_HINTING_COMMAND_SIZE_U32,
+                None,
+            ),
+        );
+        write_available_heads(
+            &mut memory,
+            queue_available_ring(hinting_queue_index),
+            &[0, 1],
+        );
+        let mut device = balloon_mmio_device(config);
+        {
+            let handler = device
+                .dispatcher_mut()
+                .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+                .expect("balloon handler should be registered");
+            activate_handler(handler);
+
+            handler
+                .start_balloon_hinting(BalloonHintingStartInput::new(true))
+                .expect("hinting start should update active config");
+            handler
+                .write_register(
+                    VirtioMmioRegister::InterruptAck,
+                    DeviceInterruptKind::Config.status().bits(),
+                )
+                .expect("config interrupt should acknowledge");
+
+            handler
+                .write_register(
+                    VirtioMmioRegister::QueueNotify,
+                    queue_index_u32(hinting_queue_index),
+                )
+                .expect("hinting queue notification should write");
+
+            let error = handler
+                .dispatch_balloon_queue_notifications(&mut memory)
+                .expect_err("malformed later hinting command should fail dispatch");
+
+            assert!(matches!(
+                error,
+                VirtioBalloonDeviceNotificationError::QueueDispatch {
+                    source: VirtioBalloonQueueDispatchError::HintingCommandRead { .. },
+                    ..
+                }
+            ));
+            let completed = error
+                .completed_notification_dispatch()
+                .expect("completed hinting dispatch should be preserved");
+            assert!(completed.hinting_completed_run());
+            let status = handler
+                .balloon_hinting_status()
+                .expect("hinting status should read");
+            assert_eq!(status.guest_cmd(), Some(command));
+            assert_eq!(status.host_cmd(), VIRTIO_BALLOON_FREE_PAGE_HINT_DONE);
+            assert_eq!(
+                handler
+                    .read_register(VirtioMmioRegister::ConfigGeneration)
+                    .expect("config generation should read"),
+                2
+            );
+            let mut expected_status = DeviceInterruptKind::Queue.status();
+            expected_status.insert(DeviceInterruptKind::Config);
+            assert_eq!(
+                handler
+                    .read_register(VirtioMmioRegister::InterruptStatus)
+                    .expect("interrupt status should read"),
+                expected_status.bits()
+            );
+            assert!(handler.pending_queue_notifications().is_empty());
+        }
+        assert_eq!(
+            read_mmio_config(&mut device, 8, 4).as_slice(),
+            &VIRTIO_BALLOON_FREE_PAGE_HINT_DONE.to_le_bytes()
+        );
+        assert_eq!(
+            read_used_idx(&memory, queue_used_ring(hinting_queue_index)),
+            1
+        );
+    }
+
+    #[test]
     fn balloon_mmio_handler_rejects_unsupported_optional_queue_notification() {
         let mut memory = pfn_descriptor_memory();
         let mut device = balloon_mmio_device(balloon_config(64, false, 1, false, false));
