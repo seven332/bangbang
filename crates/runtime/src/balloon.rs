@@ -3,7 +3,9 @@
 use std::collections::TryReserveError;
 use std::fmt;
 
-use crate::memory::{GuestAddress, GuestMemoryError};
+use crate::memory::{
+    GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryRange,
+};
 use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
     MmioHandlerError, MmioRegion, MmioRegionId,
@@ -15,7 +17,8 @@ use crate::virtio_mmio::{
     VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
 };
 use crate::virtio_queue::{
-    VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueUsedRing, VirtqueueUsedRingError,
+    VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
+    VirtqueueDescriptorChain, VirtqueueUsedRing, VirtqueueUsedRingError,
 };
 
 pub const VIRTIO_BALLOON_DEVICE_ID: u32 = 5;
@@ -397,6 +400,320 @@ impl std::error::Error for VirtioBalloonPfnPayloadParseError {
             Self::EmptyPayload | Self::UnalignedLength { .. } | Self::TooManyPfns { .. } => None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioBalloonPfnDescriptorPayload {
+    bytes: Vec<u8>,
+}
+
+impl VirtioBalloonPfnDescriptorPayload {
+    pub fn read(
+        memory: &GuestMemory,
+        chain: &VirtqueueDescriptorChain,
+    ) -> Result<Self, VirtioBalloonPfnDescriptorPayloadReadError> {
+        let payload_len = validate_balloon_pfn_descriptor_chain(memory, chain)?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(payload_len).map_err(|source| {
+            VirtioBalloonPfnDescriptorPayloadReadError::PayloadAllocation {
+                len: payload_len,
+                source,
+            }
+        })?;
+        bytes.resize(payload_len, 0);
+
+        let mut offset = 0;
+        for descriptor in chain.descriptors().iter().copied() {
+            offset = read_balloon_pfn_descriptor_segment(memory, descriptor, &mut bytes, offset)?;
+        }
+
+        Ok(Self { bytes })
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn into_vec(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub fn parse_pfn_payload(
+        &self,
+    ) -> Result<VirtioBalloonPfnPayload, VirtioBalloonPfnPayloadParseError> {
+        VirtioBalloonPfnPayload::parse(&self.bytes)
+    }
+
+    pub fn into_pfn_payload(
+        self,
+    ) -> Result<VirtioBalloonPfnPayload, VirtioBalloonPfnPayloadParseError> {
+        VirtioBalloonPfnPayload::parse(&self.bytes)
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioBalloonPfnDescriptorPayloadReadError {
+    EmptyDescriptorChain,
+    DescriptorWriteOnly {
+        index: u16,
+    },
+    DescriptorEmpty {
+        index: u16,
+    },
+    DescriptorLengthTooLarge {
+        index: u16,
+        len: u32,
+    },
+    DescriptorRange {
+        index: u16,
+        address: GuestAddress,
+        len: u32,
+        source: GuestMemoryError,
+    },
+    DescriptorAccess {
+        index: u16,
+        address: GuestAddress,
+        len: u32,
+        source: GuestMemoryAccessError,
+    },
+    PayloadLengthOverflow {
+        current: usize,
+        len: u32,
+    },
+    PayloadLengthTooLarge {
+        len: usize,
+        max: usize,
+    },
+    PayloadAllocation {
+        len: usize,
+        source: TryReserveError,
+    },
+    PayloadBufferRange {
+        offset: usize,
+        len: usize,
+        buffer_len: usize,
+    },
+    DescriptorRead {
+        index: u16,
+        address: GuestAddress,
+        len: u32,
+        source: GuestMemoryAccessError,
+    },
+}
+
+impl fmt::Display for VirtioBalloonPfnDescriptorPayloadReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyDescriptorChain => {
+                f.write_str("virtio-balloon PFN descriptor chain cannot be empty")
+            }
+            Self::DescriptorWriteOnly { index } => {
+                write!(f, "virtio-balloon PFN descriptor {index} is write-only")
+            }
+            Self::DescriptorEmpty { index } => {
+                write!(f, "virtio-balloon PFN descriptor {index} is empty")
+            }
+            Self::DescriptorLengthTooLarge { index, len } => write!(
+                f,
+                "virtio-balloon PFN descriptor {index} length {len} is too large to represent"
+            ),
+            Self::DescriptorRange {
+                index,
+                address,
+                len,
+                source,
+            } => write!(
+                f,
+                "virtio-balloon PFN descriptor {index} range address={address}, len={len} is invalid: {source}"
+            ),
+            Self::DescriptorAccess {
+                index,
+                address,
+                len,
+                source,
+            } => write!(
+                f,
+                "virtio-balloon PFN descriptor {index} range address={address}, len={len} is not readable: {source}"
+            ),
+            Self::PayloadLengthOverflow { current, len } => write!(
+                f,
+                "virtio-balloon PFN descriptor payload length overflows: current={current}, len={len}"
+            ),
+            Self::PayloadLengthTooLarge { len, max } => write!(
+                f,
+                "virtio-balloon PFN descriptor payload length {len} exceeds maximum {max}"
+            ),
+            Self::PayloadAllocation { len, source } => write!(
+                f,
+                "failed to allocate virtio-balloon PFN descriptor payload with {len} bytes: {source}"
+            ),
+            Self::PayloadBufferRange {
+                offset,
+                len,
+                buffer_len,
+            } => write!(
+                f,
+                "internal virtio-balloon PFN payload buffer range offset={offset}, len={len}, buffer_len={buffer_len} is invalid"
+            ),
+            Self::DescriptorRead {
+                index,
+                address,
+                len,
+                source,
+            } => write!(
+                f,
+                "failed to read virtio-balloon PFN descriptor {index} at address={address}, len={len}: {source}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VirtioBalloonPfnDescriptorPayloadReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DescriptorRange { source, .. } => Some(source),
+            Self::DescriptorAccess { source, .. } => Some(source),
+            Self::PayloadAllocation { source, .. } => Some(source),
+            Self::DescriptorRead { source, .. } => Some(source),
+            Self::EmptyDescriptorChain
+            | Self::DescriptorWriteOnly { .. }
+            | Self::DescriptorEmpty { .. }
+            | Self::DescriptorLengthTooLarge { .. }
+            | Self::PayloadLengthOverflow { .. }
+            | Self::PayloadLengthTooLarge { .. }
+            | Self::PayloadBufferRange { .. } => None,
+        }
+    }
+}
+
+fn validate_balloon_pfn_descriptor_chain(
+    memory: &GuestMemory,
+    chain: &VirtqueueDescriptorChain,
+) -> Result<usize, VirtioBalloonPfnDescriptorPayloadReadError> {
+    if chain.is_empty() {
+        return Err(VirtioBalloonPfnDescriptorPayloadReadError::EmptyDescriptorChain);
+    }
+
+    let mut payload_len: usize = 0;
+    for descriptor in chain.descriptors().iter().copied() {
+        validate_balloon_pfn_descriptor_header(descriptor)?;
+        let segment_len = balloon_pfn_descriptor_len(descriptor)?;
+        payload_len = payload_len.checked_add(segment_len).ok_or(
+            VirtioBalloonPfnDescriptorPayloadReadError::PayloadLengthOverflow {
+                current: payload_len,
+                len: descriptor.len(),
+            },
+        )?;
+        if payload_len > VIRTIO_BALLOON_MAX_PFN_PAYLOAD_SIZE {
+            return Err(
+                VirtioBalloonPfnDescriptorPayloadReadError::PayloadLengthTooLarge {
+                    len: payload_len,
+                    max: VIRTIO_BALLOON_MAX_PFN_PAYLOAD_SIZE,
+                },
+            );
+        }
+        validate_balloon_pfn_descriptor_range(memory, descriptor)?;
+    }
+
+    Ok(payload_len)
+}
+
+fn validate_balloon_pfn_descriptor_header(
+    descriptor: VirtqueueDescriptor,
+) -> Result<(), VirtioBalloonPfnDescriptorPayloadReadError> {
+    if descriptor.is_write_only() {
+        return Err(
+            VirtioBalloonPfnDescriptorPayloadReadError::DescriptorWriteOnly {
+                index: descriptor.index(),
+            },
+        );
+    }
+    if descriptor.is_empty() {
+        return Err(
+            VirtioBalloonPfnDescriptorPayloadReadError::DescriptorEmpty {
+                index: descriptor.index(),
+            },
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_balloon_pfn_descriptor_range(
+    memory: &GuestMemory,
+    descriptor: VirtqueueDescriptor,
+) -> Result<(), VirtioBalloonPfnDescriptorPayloadReadError> {
+    let range = GuestMemoryRange::new(descriptor.address(), u64::from(descriptor.len())).map_err(
+        |source| VirtioBalloonPfnDescriptorPayloadReadError::DescriptorRange {
+            index: descriptor.index(),
+            address: descriptor.address(),
+            len: descriptor.len(),
+            source,
+        },
+    )?;
+    memory.validate_mapped_range(range).map_err(|source| {
+        VirtioBalloonPfnDescriptorPayloadReadError::DescriptorAccess {
+            index: descriptor.index(),
+            address: descriptor.address(),
+            len: descriptor.len(),
+            source,
+        }
+    })
+}
+
+fn balloon_pfn_descriptor_len(
+    descriptor: VirtqueueDescriptor,
+) -> Result<usize, VirtioBalloonPfnDescriptorPayloadReadError> {
+    usize::try_from(descriptor.len()).map_err(|_| {
+        VirtioBalloonPfnDescriptorPayloadReadError::DescriptorLengthTooLarge {
+            index: descriptor.index(),
+            len: descriptor.len(),
+        }
+    })
+}
+
+fn read_balloon_pfn_descriptor_segment(
+    memory: &GuestMemory,
+    descriptor: VirtqueueDescriptor,
+    bytes: &mut [u8],
+    offset: usize,
+) -> Result<usize, VirtioBalloonPfnDescriptorPayloadReadError> {
+    let segment_len = balloon_pfn_descriptor_len(descriptor)?;
+    let end = offset.checked_add(segment_len).ok_or(
+        VirtioBalloonPfnDescriptorPayloadReadError::PayloadLengthOverflow {
+            current: offset,
+            len: descriptor.len(),
+        },
+    )?;
+    let buffer_len = bytes.len();
+    let destination = bytes.get_mut(offset..end).ok_or(
+        VirtioBalloonPfnDescriptorPayloadReadError::PayloadBufferRange {
+            offset,
+            len: segment_len,
+            buffer_len,
+        },
+    )?;
+
+    memory
+        .read_slice(destination, descriptor.address())
+        .map_err(
+            |source| VirtioBalloonPfnDescriptorPayloadReadError::DescriptorRead {
+                index: descriptor.index(),
+                address: descriptor.address(),
+                len: descriptor.len(),
+                source,
+            },
+        )?;
+
+    Ok(end)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1506,7 +1823,10 @@ fn balloon_config_bytes_error(source: MmioAccessBytesError) -> VirtioMmioDeviceC
 mod tests {
     use super::*;
 
-    use crate::memory::GuestAddress;
+    use crate::memory::{
+        GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryLayout,
+        GuestMemoryRange,
+    };
     use crate::mmio::{MmioAccessBytes, MmioDispatchOutcome, MmioOperation, MmioRegionId};
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
@@ -1514,10 +1834,18 @@ mod tests {
         VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VirtioMmioDeviceActivation, VirtioMmioDeviceRegisters,
         VirtioMmioQueueRegisters, VirtioMmioRegister, VirtioMmioRegisterHandlerError,
     };
+    use crate::virtio_queue::{
+        VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
+        read_descriptor_chain,
+    };
 
     const TEST_BALLOON_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_8000);
     const TEST_BALLOON_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(4000);
     const TEST_QUEUE_SIZE: u16 = 8;
+    const TEST_MEMORY_SIZE: u64 = 0x20000;
+    const TEST_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x2000);
+    const TEST_PFN_DATA: GuestAddress = GuestAddress::new(0x4000);
+    const TEST_PFN_DATA_SPLIT: GuestAddress = GuestAddress::new(0x5000);
     const TEST_DESCRIPTOR_BASE: u64 = 0x1000;
     const TEST_DRIVER_BASE: u64 = 0x8000;
     const TEST_DEVICE_BASE: u64 = 0x10000;
@@ -1551,6 +1879,87 @@ mod tests {
             bytes.extend_from_slice(&pfn.to_le_bytes());
         }
         bytes
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct TestDescriptor {
+        address: GuestAddress,
+        len: u32,
+        flags: u16,
+        next: u16,
+    }
+
+    impl TestDescriptor {
+        const fn readable(address: GuestAddress, len: u32, next: Option<u16>) -> Self {
+            let (flags, next_index) = match next {
+                Some(index) => (VIRTQUEUE_DESC_F_NEXT, index),
+                None => (0, 0),
+            };
+            Self {
+                address,
+                len,
+                flags,
+                next: next_index,
+            }
+        }
+
+        const fn writable(address: GuestAddress, len: u32, next: Option<u16>) -> Self {
+            let (flags, next_index) = match next {
+                Some(index) => (VIRTQUEUE_DESC_F_WRITE | VIRTQUEUE_DESC_F_NEXT, index),
+                None => (VIRTQUEUE_DESC_F_WRITE, 0),
+            };
+            Self {
+                address,
+                len,
+                flags,
+                next: next_index,
+            }
+        }
+    }
+
+    fn pfn_descriptor_memory() -> GuestMemory {
+        let layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(GuestAddress::new(0), TEST_MEMORY_SIZE)
+                .expect("test memory range should be valid"),
+        ])
+        .expect("test memory layout should be valid");
+        GuestMemory::allocate(&layout).expect("test guest memory should allocate")
+    }
+
+    fn write_guest_bytes(memory: &mut GuestMemory, address: GuestAddress, bytes: &[u8]) {
+        memory
+            .write_slice(bytes, address)
+            .expect("guest bytes should write");
+    }
+
+    fn write_descriptor(memory: &mut GuestMemory, index: u16, descriptor: TestDescriptor) {
+        let mut bytes = [0; VIRTQUEUE_DESCRIPTOR_SIZE];
+        let (address_bytes, tail) = bytes.split_at_mut(8);
+        let (len_bytes, tail) = tail.split_at_mut(4);
+        let (flags_bytes, next_bytes) = tail.split_at_mut(2);
+        address_bytes.copy_from_slice(&descriptor.address.raw_value().to_le_bytes());
+        len_bytes.copy_from_slice(&descriptor.len.to_le_bytes());
+        flags_bytes.copy_from_slice(&descriptor.flags.to_le_bytes());
+        next_bytes.copy_from_slice(&descriptor.next.to_le_bytes());
+
+        let descriptor_address = TEST_DESCRIPTOR_TABLE
+            .checked_add(
+                u64::from(index)
+                    * u64::try_from(VIRTQUEUE_DESCRIPTOR_SIZE).expect("descriptor size should fit"),
+            )
+            .expect("descriptor address should not overflow");
+        memory
+            .write_slice(&bytes, descriptor_address)
+            .expect("descriptor should write");
+    }
+
+    fn descriptor_chain(memory: &GuestMemory, head_index: u16) -> VirtqueueDescriptorChain {
+        read_descriptor_chain(memory, TEST_DESCRIPTOR_TABLE, TEST_QUEUE_SIZE, head_index)
+            .expect("descriptor chain should read")
+    }
+
+    fn descriptor_len(bytes: &[u8]) -> u32 {
+        u32::try_from(bytes.len()).expect("test descriptor length should fit u32")
     }
 
     fn has_feature(features: u64, feature: u32) -> bool {
@@ -1971,6 +2380,299 @@ mod tests {
         let oversized_payload =
             vec![0; VIRTIO_BALLOON_MAX_PFN_PAYLOAD_SIZE + VIRTIO_BALLOON_PFN_SIZE];
         assert!(VirtioBalloonPfnPayload::parse(&oversized_payload).is_err());
+    }
+
+    #[test]
+    fn pfn_descriptor_payload_reads_single_descriptor() {
+        let mut memory = pfn_descriptor_memory();
+        let bytes = pfn_payload_bytes(&[0x0102_0304, 0x0506_0708, 0xffff_ffff]);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
+        write_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&bytes), None),
+        );
+        let chain = descriptor_chain(&memory, 0);
+
+        let payload = VirtioBalloonPfnDescriptorPayload::read(&memory, &chain)
+            .expect("single PFN descriptor payload should read");
+
+        assert_eq!(payload.bytes(), bytes.as_slice());
+        assert_eq!(payload.len(), bytes.len());
+        assert!(!payload.is_empty());
+        assert_eq!(payload.clone().into_vec(), bytes);
+        assert_eq!(
+            payload
+                .into_pfn_payload()
+                .expect("descriptor payload should parse")
+                .pfns(),
+            &[0x0102_0304, 0x0506_0708, 0xffff_ffff]
+        );
+    }
+
+    #[test]
+    fn pfn_descriptor_payload_reads_split_descriptor_chain() {
+        let mut memory = pfn_descriptor_memory();
+        let bytes = pfn_payload_bytes(&[1, 2, 3]);
+        write_guest_bytes(
+            &mut memory,
+            TEST_PFN_DATA,
+            &bytes[..VIRTIO_BALLOON_PFN_SIZE],
+        );
+        write_guest_bytes(
+            &mut memory,
+            TEST_PFN_DATA_SPLIT,
+            &bytes[VIRTIO_BALLOON_PFN_SIZE..],
+        );
+        write_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(
+                TEST_PFN_DATA,
+                u32::try_from(VIRTIO_BALLOON_PFN_SIZE).expect("PFN size should fit u32"),
+                Some(1),
+            ),
+        );
+        write_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::readable(
+                TEST_PFN_DATA_SPLIT,
+                descriptor_len(&bytes[VIRTIO_BALLOON_PFN_SIZE..]),
+                None,
+            ),
+        );
+        let chain = descriptor_chain(&memory, 0);
+
+        let payload = VirtioBalloonPfnDescriptorPayload::read(&memory, &chain)
+            .expect("split PFN descriptor payload should read");
+
+        assert_eq!(payload.bytes(), bytes.as_slice());
+    }
+
+    #[test]
+    fn pfn_descriptor_payload_rejects_write_only_descriptor() {
+        let mut memory = pfn_descriptor_memory();
+        let bytes = pfn_payload_bytes(&[1]);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
+        write_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::writable(TEST_PFN_DATA, descriptor_len(&bytes), None),
+        );
+        let chain = descriptor_chain(&memory, 0);
+
+        let err = VirtioBalloonPfnDescriptorPayload::read(&memory, &chain)
+            .expect_err("write-only PFN descriptor should be rejected");
+
+        assert!(matches!(
+            err,
+            VirtioBalloonPfnDescriptorPayloadReadError::DescriptorWriteOnly { index: 0 }
+        ));
+        assert_eq!(
+            err.to_string(),
+            "virtio-balloon PFN descriptor 0 is write-only"
+        );
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn pfn_descriptor_payload_rejects_empty_descriptor() {
+        let mut memory = pfn_descriptor_memory();
+        write_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, 0, None),
+        );
+        let chain = descriptor_chain(&memory, 0);
+
+        let err = VirtioBalloonPfnDescriptorPayload::read(&memory, &chain)
+            .expect_err("empty PFN descriptor should be rejected");
+
+        assert!(matches!(
+            err,
+            VirtioBalloonPfnDescriptorPayloadReadError::DescriptorEmpty { index: 0 }
+        ));
+        assert_eq!(err.to_string(), "virtio-balloon PFN descriptor 0 is empty");
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn pfn_descriptor_payload_rejects_unmapped_descriptor() {
+        let mut memory = pfn_descriptor_memory();
+        write_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(GuestAddress::new(TEST_MEMORY_SIZE), 4, None),
+        );
+        let chain = descriptor_chain(&memory, 0);
+
+        let err = VirtioBalloonPfnDescriptorPayload::read(&memory, &chain)
+            .expect_err("unmapped PFN descriptor should be rejected");
+
+        assert!(matches!(
+            err,
+            VirtioBalloonPfnDescriptorPayloadReadError::DescriptorAccess {
+                index: 0,
+                address,
+                len: 4,
+                source: GuestMemoryAccessError::UnmappedRange { .. },
+            } if address == GuestAddress::new(TEST_MEMORY_SIZE)
+        ));
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn pfn_descriptor_payload_rejects_range_overflow() {
+        let mut memory = pfn_descriptor_memory();
+        write_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(GuestAddress::new(u64::MAX), 4, None),
+        );
+        let chain = descriptor_chain(&memory, 0);
+
+        let err = VirtioBalloonPfnDescriptorPayload::read(&memory, &chain)
+            .expect_err("overflowing PFN descriptor range should be rejected");
+
+        assert!(matches!(
+            err,
+            VirtioBalloonPfnDescriptorPayloadReadError::DescriptorRange {
+                index: 0,
+                address,
+                len: 4,
+                source: GuestMemoryError::AddressOverflow { .. },
+            } if address == GuestAddress::new(u64::MAX)
+        ));
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn pfn_descriptor_payload_reports_unaligned_total_length() {
+        let mut memory = pfn_descriptor_memory();
+        let bytes = [1, 2, 3, 4, 5];
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
+        write_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&bytes), None),
+        );
+        let chain = descriptor_chain(&memory, 0);
+        let payload = VirtioBalloonPfnDescriptorPayload::read(&memory, &chain)
+            .expect("unaligned descriptor payload bytes should still read");
+
+        let err = payload
+            .parse_pfn_payload()
+            .expect_err("unaligned PFN payload should fail parsing");
+
+        assert!(matches!(
+            err,
+            VirtioBalloonPfnPayloadParseError::UnalignedLength { len: 5 }
+        ));
+    }
+
+    #[test]
+    fn pfn_descriptor_payload_accepts_exact_maximum_payload() {
+        let mut memory = pfn_descriptor_memory();
+        let bytes = vec![0; VIRTIO_BALLOON_MAX_PFN_PAYLOAD_SIZE];
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
+        write_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&bytes), None),
+        );
+        let chain = descriptor_chain(&memory, 0);
+
+        let payload = VirtioBalloonPfnDescriptorPayload::read(&memory, &chain)
+            .expect("maximum PFN descriptor payload should read");
+        let parsed = payload
+            .parse_pfn_payload()
+            .expect("maximum PFN descriptor payload should parse");
+
+        assert_eq!(payload.len(), VIRTIO_BALLOON_MAX_PFN_PAYLOAD_SIZE);
+        assert_eq!(parsed.len(), VIRTIO_BALLOON_MAX_PFNS_PER_DESCRIPTOR);
+    }
+
+    #[test]
+    fn pfn_descriptor_payload_rejects_one_over_maximum_payload() {
+        let mut memory = pfn_descriptor_memory();
+        let len = u32::try_from(VIRTIO_BALLOON_MAX_PFN_PAYLOAD_SIZE + 1)
+            .expect("test payload length should fit u32");
+        write_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, len, None),
+        );
+        let chain = descriptor_chain(&memory, 0);
+
+        let err = VirtioBalloonPfnDescriptorPayload::read(&memory, &chain)
+            .expect_err("oversized PFN descriptor payload should be rejected");
+
+        assert!(matches!(
+            err,
+            VirtioBalloonPfnDescriptorPayloadReadError::PayloadLengthTooLarge {
+                len,
+                max: VIRTIO_BALLOON_MAX_PFN_PAYLOAD_SIZE,
+            } if len == VIRTIO_BALLOON_MAX_PFN_PAYLOAD_SIZE + 1
+        ));
+        assert_eq!(
+            err.to_string(),
+            "virtio-balloon PFN descriptor payload length 1025 exceeds maximum 1024"
+        );
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn pfn_descriptor_payload_rejects_oversized_payload_before_guest_range_access() {
+        let mut memory = pfn_descriptor_memory();
+        let len = u32::try_from(VIRTIO_BALLOON_MAX_PFN_PAYLOAD_SIZE + 1)
+            .expect("test payload length should fit u32");
+        write_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(GuestAddress::new(TEST_MEMORY_SIZE), len, None),
+        );
+        let chain = descriptor_chain(&memory, 0);
+
+        let err = VirtioBalloonPfnDescriptorPayload::read(&memory, &chain)
+            .expect_err("oversized PFN descriptor payload should be rejected before access");
+
+        assert!(matches!(
+            err,
+            VirtioBalloonPfnDescriptorPayloadReadError::PayloadLengthTooLarge {
+                len,
+                max: VIRTIO_BALLOON_MAX_PFN_PAYLOAD_SIZE,
+            } if len == VIRTIO_BALLOON_MAX_PFN_PAYLOAD_SIZE + 1
+        ));
+    }
+
+    #[test]
+    fn pfn_descriptor_payload_converts_into_ranges() {
+        let mut memory = pfn_descriptor_memory();
+        let bytes = pfn_payload_bytes(&[3, 1, 2, 2]);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
+        write_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&bytes), None),
+        );
+        let chain = descriptor_chain(&memory, 0);
+        let payload = VirtioBalloonPfnDescriptorPayload::read(&memory, &chain)
+            .expect("PFN descriptor payload should read");
+
+        let ranges = payload
+            .parse_pfn_payload()
+            .expect("PFN descriptor payload should parse")
+            .into_page_ranges()
+            .expect("PFN descriptor payload should compact");
+
+        assert_eq!(
+            ranges.ranges(),
+            &[VirtioBalloonPfnRange {
+                start_pfn: 1,
+                page_count: 3
+            }]
+        );
     }
 
     #[test]
