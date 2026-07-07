@@ -230,10 +230,11 @@ local device register state. The backend-neutral inflate notification dispatcher
 can read bounded PFN descriptor payloads, compact them into page ranges, and
 acknowledge descriptor heads with zero-length used-ring entries. The deflate
 notification dispatcher can acknowledge descriptor heads with zero-length
-used-ring entries. Parsed PFNs, statistics descriptors, free-page hinting
-commands, and reporting queue data remain untrusted guest input and must not
-change host memory accounting or reclaim behavior until those host-side paths
-are implemented and reviewed.
+used-ring entries. The HVF boot loop can drain these balloon notifications and
+signal the allocated balloon interrupt line, but parsed PFNs, statistics
+descriptors, free-page hinting commands, and reporting queue data remain
+untrusted guest input and must not change host memory accounting or reclaim
+behavior until those host-side paths are implemented and reviewed.
 
 The current serial device is a TX-only MMIO output path. By default, guest
 serial bytes go to a bounded internal capture buffer; when `/serial` configures

@@ -7,7 +7,8 @@ use std::os::fd::RawFd;
 use crate::VmmController;
 use crate::balloon::{
     BalloonMmioDeviceRegistration, BalloonMmioLayout, BalloonMmioRegistrationError,
-    BalloonPageCountOverflow, PreparedBalloonDevice,
+    BalloonPageCountOverflow, PreparedBalloonDevice, VirtioBalloonDeviceNotificationDispatch,
+    VirtioBalloonDeviceNotificationError, VirtioBalloonMmioHandler,
 };
 use crate::block::{
     BlockFileBacking, BlockMmioDeviceRegistration, BlockMmioLayout, BlockMmioRegistrationError,
@@ -612,6 +613,129 @@ impl std::error::Error for Arm64BootVsockNotificationDispatchError {
 }
 
 #[derive(Debug)]
+pub struct Arm64BootBalloonNotificationDispatches {
+    devices: Vec<Arm64BootBalloonNotificationDispatch>,
+}
+
+impl Arm64BootBalloonNotificationDispatches {
+    fn new(devices: Vec<Arm64BootBalloonNotificationDispatch>) -> Self {
+        Self { devices }
+    }
+
+    pub fn as_slice(&self) -> &[Arm64BootBalloonNotificationDispatch] {
+        &self.devices
+    }
+
+    pub fn into_vec(self) -> Vec<Arm64BootBalloonNotificationDispatch> {
+        self.devices
+    }
+
+    pub fn len(&self) -> usize {
+        self.devices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.devices.is_empty()
+    }
+
+    pub fn needs_queue_interrupt(&self) -> bool {
+        self.devices
+            .iter()
+            .any(Arm64BootBalloonNotificationDispatch::needs_queue_interrupt)
+    }
+}
+
+#[derive(Debug)]
+pub struct Arm64BootBalloonNotificationDispatch {
+    device: Arm64BootBalloonDevice,
+    outcome: Arm64BootBalloonNotificationOutcome,
+}
+
+impl Arm64BootBalloonNotificationDispatch {
+    fn new(device: Arm64BootBalloonDevice, outcome: Arm64BootBalloonNotificationOutcome) -> Self {
+        Self { device, outcome }
+    }
+
+    pub const fn device(&self) -> &Arm64BootBalloonDevice {
+        &self.device
+    }
+
+    pub const fn outcome(&self) -> &Arm64BootBalloonNotificationOutcome {
+        &self.outcome
+    }
+
+    pub fn needs_queue_interrupt(&self) -> bool {
+        self.outcome.needs_queue_interrupt()
+    }
+}
+
+#[derive(Debug)]
+pub enum Arm64BootBalloonNotificationOutcome {
+    Dispatched(VirtioBalloonDeviceNotificationDispatch),
+    DispatchFailed(VirtioBalloonDeviceNotificationError),
+    HandlerLookupFailed(MmioHandlerLookupError),
+}
+
+impl Arm64BootBalloonNotificationOutcome {
+    pub fn needs_queue_interrupt(&self) -> bool {
+        match self {
+            Self::Dispatched(dispatch) => dispatch.needs_queue_interrupt(),
+            Self::DispatchFailed(source) => source.completed_notification_dispatch().is_some_and(
+                crate::balloon::VirtioBalloonDeviceNotificationDispatch::needs_queue_interrupt,
+            ),
+            Self::HandlerLookupFailed(_) => false,
+        }
+    }
+
+    pub const fn dispatched(&self) -> Option<&VirtioBalloonDeviceNotificationDispatch> {
+        match self {
+            Self::Dispatched(dispatch) => Some(dispatch),
+            Self::DispatchFailed(_) | Self::HandlerLookupFailed(_) => None,
+        }
+    }
+
+    pub const fn dispatch_error(&self) -> Option<&VirtioBalloonDeviceNotificationError> {
+        match self {
+            Self::DispatchFailed(source) => Some(source),
+            Self::Dispatched(_) | Self::HandlerLookupFailed(_) => None,
+        }
+    }
+
+    pub const fn handler_lookup_error(&self) -> Option<&MmioHandlerLookupError> {
+        match self {
+            Self::HandlerLookupFailed(source) => Some(source),
+            Self::Dispatched(_) | Self::DispatchFailed(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum Arm64BootBalloonNotificationDispatchError {
+    ResultAllocation { source: TryReserveError },
+}
+
+impl fmt::Display for Arm64BootBalloonNotificationDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ResultAllocation { source } => {
+                write!(
+                    f,
+                    "failed to allocate balloon notification results: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for Arm64BootBalloonNotificationDispatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ResultAllocation { source } => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct Arm64BootEntropyNotificationDispatches {
     devices: Vec<Arm64BootEntropyNotificationDispatch>,
 }
@@ -1025,6 +1149,33 @@ impl Arm64BootRuntimeResources {
         }
 
         Ok(Arm64BootVsockNotificationDispatches::new(devices))
+    }
+
+    pub fn dispatch_balloon_queue_notifications(
+        &mut self,
+        memory: &mut GuestMemory,
+        mmio_dispatcher: &mut MmioDispatcher,
+    ) -> Result<Arm64BootBalloonNotificationDispatches, Arm64BootBalloonNotificationDispatchError>
+    {
+        let mut devices = Vec::new();
+        let device_count = if self.balloon_device.is_some() { 1 } else { 0 };
+        devices.try_reserve_exact(device_count).map_err(|source| {
+            Arm64BootBalloonNotificationDispatchError::ResultAllocation { source }
+        })?;
+
+        if let Some(device) = self.balloon_device.clone() {
+            let region_id = device.registration.region_id();
+            let outcome = match mmio_dispatcher.handler_mut::<VirtioBalloonMmioHandler>(region_id) {
+                Ok(handler) => match handler.dispatch_balloon_queue_notifications(memory) {
+                    Ok(dispatch) => Arm64BootBalloonNotificationOutcome::Dispatched(dispatch),
+                    Err(source) => Arm64BootBalloonNotificationOutcome::DispatchFailed(source),
+                },
+                Err(source) => Arm64BootBalloonNotificationOutcome::HandlerLookupFailed(source),
+            };
+            devices.push(Arm64BootBalloonNotificationDispatch::new(device, outcome));
+        }
+
+        Ok(Arm64BootBalloonNotificationDispatches::new(devices))
     }
 
     pub fn dispatch_entropy_queue_notifications_with_source(
@@ -1922,7 +2073,8 @@ mod tests {
     };
     use crate::VmmAction;
     use crate::balloon::{
-        BalloonConfigInput, BalloonMmioLayout, VIRTIO_BALLOON_DEVICE_ID,
+        BalloonConfigInput, BalloonMmioLayout, VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX,
+        VIRTIO_BALLOON_DEVICE_ID, VIRTIO_BALLOON_INFLATE_QUEUE_INDEX,
         VIRTIO_BALLOON_MIB_TO_4K_PAGES, VirtioBalloonMmioHandler,
     };
     use crate::block::{
@@ -1943,8 +2095,8 @@ mod tests {
     use crate::machine::{MachineConfig, MachineConfigInput};
     use crate::memory::{GuestAddress, aarch64};
     use crate::mmio::{
-        MmioAccessBytes, MmioBusError, MmioDispatchOutcome, MmioDispatcher, MmioOperation,
-        MmioRegionId,
+        MmioAccess, MmioAccessBytes, MmioBusError, MmioDispatchOutcome, MmioDispatcher,
+        MmioHandler, MmioHandlerError, MmioOperation, MmioRegionId,
     };
     use crate::network::{
         NetworkInterfaceConfigInput, NetworkInterfaceConfigs, NetworkMmioDeviceRegistration,
@@ -2008,6 +2160,13 @@ mod tests {
     const TEST_VSOCK_EVENT_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x8057_0000);
     const TEST_VSOCK_EVENT_USED_RING: GuestAddress = GuestAddress::new(0x8058_0000);
     const TEST_VSOCK_HEADER: GuestAddress = GuestAddress::new(0x8059_0000);
+    const TEST_BALLOON_INFLATE_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x8060_0000);
+    const TEST_BALLOON_INFLATE_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x8061_0000);
+    const TEST_BALLOON_INFLATE_USED_RING: GuestAddress = GuestAddress::new(0x8062_0000);
+    const TEST_BALLOON_DEFLATE_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x8063_0000);
+    const TEST_BALLOON_DEFLATE_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x8064_0000);
+    const TEST_BALLOON_DEFLATE_USED_RING: GuestAddress = GuestAddress::new(0x8065_0000);
+    const TEST_BALLOON_PFN_PAYLOAD: GuestAddress = GuestAddress::new(0x8066_0000);
     const TEST_NETWORK_QUEUE_DEVICE_STRIDE: u64 = 0x0010_0000;
     const TEST_AVAILABLE_RING_IDX_OFFSET: u64 = 2;
     const TEST_AVAILABLE_RING_RING_OFFSET: u64 = 4;
@@ -2249,6 +2408,29 @@ mod tests {
         (parts.memory, parts.runtime, parts.mmio_dispatcher)
     }
 
+    fn boot_runtime_with_balloon(
+        kernel_name: &str,
+    ) -> (
+        crate::memory::GuestMemory,
+        super::Arm64BootRuntimeResources,
+        MmioDispatcher,
+    ) {
+        let kernel = temp_file(kernel_name, &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        add_balloon(&mut controller, 64);
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            Arm64BootResourceConfig {
+                balloon_interrupt_line: Some(line(36)),
+                ..valid_config(&[])
+            },
+        )
+        .expect("boot resources should assemble with balloon device");
+        let parts = resources.into_parts();
+
+        (parts.memory, parts.runtime, parts.mmio_dispatcher)
+    }
+
     fn valid_gic() -> Arm64FdtGic {
         Arm64FdtGic {
             distributor: Arm64FdtRegion {
@@ -2465,6 +2647,60 @@ mod tests {
         let outcome = mmio_dispatcher
             .dispatch(MmioOperation::read(access).expect("u32 read operation should be valid"))
             .expect("vsock MMIO read should dispatch");
+        match outcome {
+            MmioDispatchOutcome::Read { data } => u32::from_le_bytes(
+                data.as_slice()
+                    .try_into()
+                    .expect("u32 read should return four bytes"),
+            ),
+            MmioDispatchOutcome::Write => panic!("read operation should not produce write outcome"),
+        }
+    }
+
+    fn write_boot_balloon_mmio_u32(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        register: VirtioMmioRegister,
+        value: u32,
+    ) {
+        let address = runtime
+            .balloon_device
+            .as_ref()
+            .expect("balloon device should be configured")
+            .registration
+            .address()
+            .checked_add(register.offset())
+            .expect("test MMIO address should not overflow");
+        let access = mmio_dispatcher
+            .lookup(address, 4)
+            .expect("balloon MMIO access should resolve");
+        let data = MmioAccessBytes::new(&value.to_le_bytes()).expect("u32 bytes should be valid");
+        mmio_dispatcher
+            .dispatch(
+                MmioOperation::write(access, data).expect("u32 write operation should be valid"),
+            )
+            .expect("balloon MMIO write should dispatch");
+    }
+
+    fn read_boot_balloon_mmio_u32(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        register: VirtioMmioRegister,
+    ) -> u32 {
+        let address = runtime
+            .balloon_device
+            .as_ref()
+            .expect("balloon device should be configured")
+            .registration
+            .address()
+            .checked_add(register.offset())
+            .expect("test MMIO address should not overflow");
+        let access = mmio_dispatcher
+            .lookup(address, 4)
+            .expect("balloon MMIO access should resolve");
+        let outcome = mmio_dispatcher
+            .dispatch(MmioOperation::read(access).expect("u32 read operation should be valid"))
+            .expect("balloon MMIO read should dispatch");
         match outcome {
             MmioDispatchOutcome::Read { data } => u32::from_le_bytes(
                 data.as_slice()
@@ -2816,6 +3052,106 @@ mod tests {
         );
     }
 
+    fn configure_boot_balloon_queue(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        queue_index: usize,
+        descriptor_table: GuestAddress,
+        driver_ring: GuestAddress,
+        device_ring: GuestAddress,
+    ) {
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueSel,
+            u32::try_from(queue_index).expect("queue index should fit"),
+        );
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueNum,
+            u32::from(TEST_QUEUE_SIZE),
+        );
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueDescLow,
+            guest_address_low(descriptor_table),
+        );
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueDriverLow,
+            guest_address_low(driver_ring),
+        );
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueDeviceLow,
+            guest_address_low(device_ring),
+        );
+        write_boot_balloon_mmio_u32(runtime, mmio_dispatcher, VirtioMmioRegister::QueueReady, 1);
+    }
+
+    fn configure_boot_balloon_queues(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+    ) {
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+        );
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+        );
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            QUEUE_CONFIG_STATUS,
+        );
+        configure_boot_balloon_queue(
+            runtime,
+            mmio_dispatcher,
+            VIRTIO_BALLOON_INFLATE_QUEUE_INDEX,
+            TEST_BALLOON_INFLATE_DESCRIPTOR_TABLE,
+            TEST_BALLOON_INFLATE_AVAILABLE_RING,
+            TEST_BALLOON_INFLATE_USED_RING,
+        );
+        configure_boot_balloon_queue(
+            runtime,
+            mmio_dispatcher,
+            VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX,
+            TEST_BALLOON_DEFLATE_DESCRIPTOR_TABLE,
+            TEST_BALLOON_DEFLATE_AVAILABLE_RING,
+            TEST_BALLOON_DEFLATE_USED_RING,
+        );
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            DRIVER_OK_STATUS,
+        );
+    }
+
+    fn notify_boot_balloon_queue(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        queue_index: usize,
+    ) {
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueNotify,
+            u32::try_from(queue_index).expect("queue index should fit"),
+        );
+    }
+
     fn write_boot_entropy_mmio_u32(
         runtime: &mut super::Arm64BootRuntimeResources,
         mmio_dispatcher: &mut MmioDispatcher,
@@ -2943,12 +3279,70 @@ mod tests {
         write_available_heads(memory, &[0, TEST_QUEUE_SIZE]);
     }
 
+    fn write_queued_balloon_inflate_request(memory: &mut crate::memory::GuestMemory) {
+        memory
+            .write_slice(&1u32.to_le_bytes(), TEST_BALLOON_PFN_PAYLOAD)
+            .expect("balloon PFN payload should write");
+        write_descriptor_at(
+            memory,
+            TEST_BALLOON_INFLATE_DESCRIPTOR_TABLE,
+            0,
+            TestDescriptor::readable(TEST_BALLOON_PFN_PAYLOAD, 4, None),
+        );
+        write_available_heads_at(memory, TEST_BALLOON_INFLATE_AVAILABLE_RING, &[0]);
+    }
+
+    fn write_partially_invalid_balloon_inflate_request(memory: &mut crate::memory::GuestMemory) {
+        memory
+            .write_slice(&1u32.to_le_bytes(), TEST_BALLOON_PFN_PAYLOAD)
+            .expect("balloon PFN payload should write");
+        write_descriptor_at(
+            memory,
+            TEST_BALLOON_INFLATE_DESCRIPTOR_TABLE,
+            0,
+            TestDescriptor::readable(TEST_BALLOON_PFN_PAYLOAD, 4, None),
+        );
+        write_available_heads_at(
+            memory,
+            TEST_BALLOON_INFLATE_AVAILABLE_RING,
+            &[0, TEST_QUEUE_SIZE],
+        );
+    }
+
+    fn write_queued_balloon_deflate_request(memory: &mut crate::memory::GuestMemory) {
+        write_descriptor_at(
+            memory,
+            TEST_BALLOON_DEFLATE_DESCRIPTOR_TABLE,
+            0,
+            TestDescriptor::readable(TEST_BALLOON_PFN_PAYLOAD, 4, None),
+        );
+        write_available_heads_at(memory, TEST_BALLOON_DEFLATE_AVAILABLE_RING, &[0]);
+    }
+
     fn read_boot_entropy_used_index(memory: &crate::memory::GuestMemory) -> u16 {
         read_guest_u16(
             memory,
             TEST_USED_RING
                 .checked_add(2)
                 .expect("entropy used idx address should not overflow"),
+        )
+    }
+
+    fn read_boot_balloon_inflate_used_index(memory: &crate::memory::GuestMemory) -> u16 {
+        read_guest_u16(
+            memory,
+            TEST_BALLOON_INFLATE_USED_RING
+                .checked_add(2)
+                .expect("balloon inflate used idx address should not overflow"),
+        )
+    }
+
+    fn read_boot_balloon_deflate_used_index(memory: &crate::memory::GuestMemory) -> u16 {
+        read_guest_u16(
+            memory,
+            TEST_BALLOON_DEFLATE_USED_RING
+                .checked_add(2)
+                .expect("balloon deflate used idx address should not overflow"),
         )
     }
 
@@ -3299,6 +3693,23 @@ mod tests {
             }
 
             Ok(Arm64BootEntropySource::new(&mut self.source))
+        }
+    }
+
+    #[derive(Debug)]
+    struct WrongBalloonHandler;
+
+    impl MmioHandler for WrongBalloonHandler {
+        fn read(&mut self, _access: MmioAccess) -> Result<MmioAccessBytes, MmioHandlerError> {
+            Err(MmioHandlerError::new("wrong balloon handler read"))
+        }
+
+        fn write(
+            &mut self,
+            _access: MmioAccess,
+            _data: MmioAccessBytes,
+        ) -> Result<(), MmioHandlerError> {
+            Err(MmioHandlerError::new("wrong balloon handler write"))
         }
     }
 
@@ -4523,6 +4934,240 @@ mod tests {
         assert!(dispatches.is_empty());
         assert_eq!(dispatches.len(), 0);
         assert!(!dispatches.needs_queue_interrupt());
+    }
+
+    #[test]
+    fn boot_runtime_balloon_notification_dispatch_accepts_empty_balloon_device() {
+        let kernel = temp_file("kernel-empty-balloon-dispatch", &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+        let resources =
+            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
+                .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
+        let mut runtime = parts.runtime;
+
+        let dispatches = runtime
+            .dispatch_balloon_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("empty balloon dispatch result should allocate");
+
+        assert!(dispatches.is_empty());
+        assert_eq!(dispatches.len(), 0);
+        assert!(!dispatches.needs_queue_interrupt());
+    }
+
+    #[test]
+    fn boot_runtime_balloon_notification_dispatch_without_pending_notification_is_noop() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_balloon("kernel-balloon-noop-dispatch");
+
+        let dispatches = runtime
+            .dispatch_balloon_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("balloon dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 1);
+        assert!(!dispatches.needs_queue_interrupt());
+        let device_dispatch = &dispatches.as_slice()[0];
+        assert_eq!(
+            device_dispatch.device().registration.region_id(),
+            MmioRegionId::new(110)
+        );
+        assert_eq!(device_dispatch.device().fdt_device.interrupt_line, line(36));
+        let dispatch = device_dispatch
+            .outcome()
+            .dispatched()
+            .expect("no pending balloon notification should dispatch as no-op");
+        assert!(dispatch.drained_notifications().is_empty());
+        assert_eq!(dispatch.inflate_notifications(), 0);
+        assert_eq!(dispatch.deflate_notifications(), 0);
+        assert!(dispatch.inflate_queue_dispatch().is_none());
+        assert!(dispatch.deflate_queue_dispatch().is_none());
+        assert!(!device_dispatch.needs_queue_interrupt());
+        assert_eq!(
+            read_boot_balloon_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                VirtioMmioRegister::InterruptStatus,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn boot_runtime_balloon_notification_dispatch_executes_queued_inflate_request() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_balloon("kernel-balloon-inflate-dispatch");
+        configure_boot_balloon_queues(&mut runtime, &mut mmio_dispatcher);
+        write_queued_balloon_inflate_request(&mut memory);
+        notify_boot_balloon_queue(
+            &mut runtime,
+            &mut mmio_dispatcher,
+            VIRTIO_BALLOON_INFLATE_QUEUE_INDEX,
+        );
+
+        let dispatches = runtime
+            .dispatch_balloon_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("balloon dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 1);
+        assert!(dispatches.needs_queue_interrupt());
+        let device_dispatch = &dispatches.as_slice()[0];
+        assert!(device_dispatch.needs_queue_interrupt());
+        let dispatch = device_dispatch
+            .outcome()
+            .dispatched()
+            .expect("queued inflate notification should dispatch");
+        assert_eq!(
+            dispatch.drained_notifications(),
+            [VIRTIO_BALLOON_INFLATE_QUEUE_INDEX]
+        );
+        assert_eq!(dispatch.inflate_notifications(), 1);
+        assert_eq!(dispatch.deflate_notifications(), 0);
+        let inflate = dispatch
+            .inflate_queue_dispatch()
+            .expect("inflate queue dispatch should be present");
+        assert_eq!(inflate.completed_descriptors(), 1);
+        let ranges = inflate.inflated_page_ranges();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].start_pfn(), 1);
+        assert_eq!(ranges[0].page_count(), 1);
+        assert!(inflate.needs_queue_interrupt());
+        assert!(dispatch.deflate_queue_dispatch().is_none());
+        assert_eq!(read_boot_balloon_inflate_used_index(&memory), 1);
+        assert_eq!(
+            read_boot_balloon_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                VirtioMmioRegister::InterruptStatus,
+            ),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+    }
+
+    #[test]
+    fn boot_runtime_balloon_notification_dispatch_executes_queued_deflate_request() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_balloon("kernel-balloon-deflate-dispatch");
+        configure_boot_balloon_queues(&mut runtime, &mut mmio_dispatcher);
+        write_queued_balloon_deflate_request(&mut memory);
+        notify_boot_balloon_queue(
+            &mut runtime,
+            &mut mmio_dispatcher,
+            VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX,
+        );
+
+        let dispatches = runtime
+            .dispatch_balloon_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("balloon dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 1);
+        assert!(dispatches.needs_queue_interrupt());
+        let device_dispatch = &dispatches.as_slice()[0];
+        let dispatch = device_dispatch
+            .outcome()
+            .dispatched()
+            .expect("queued deflate notification should dispatch");
+        assert_eq!(
+            dispatch.drained_notifications(),
+            [VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX]
+        );
+        assert_eq!(dispatch.inflate_notifications(), 0);
+        assert_eq!(dispatch.deflate_notifications(), 1);
+        assert!(dispatch.inflate_queue_dispatch().is_none());
+        let deflate = dispatch
+            .deflate_queue_dispatch()
+            .expect("deflate queue dispatch should be present");
+        assert_eq!(deflate.completed_descriptors(), 1);
+        assert!(deflate.needs_queue_interrupt());
+        assert_eq!(read_boot_balloon_deflate_used_index(&memory), 1);
+    }
+
+    #[test]
+    fn boot_runtime_balloon_notification_dispatch_preserves_partial_error_interrupt_intent() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_balloon("kernel-balloon-partial-error-dispatch");
+        configure_boot_balloon_queues(&mut runtime, &mut mmio_dispatcher);
+        write_partially_invalid_balloon_inflate_request(&mut memory);
+        notify_boot_balloon_queue(
+            &mut runtime,
+            &mut mmio_dispatcher,
+            VIRTIO_BALLOON_INFLATE_QUEUE_INDEX,
+        );
+
+        let dispatches = runtime
+            .dispatch_balloon_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("balloon dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 1);
+        assert!(dispatches.needs_queue_interrupt());
+        let device_dispatch = &dispatches.as_slice()[0];
+        assert!(device_dispatch.needs_queue_interrupt());
+        let err = device_dispatch
+            .outcome()
+            .dispatch_error()
+            .expect("partial inflate dispatch error should be preserved");
+        let completed = err
+            .completed_notification_dispatch()
+            .expect("completed notification metadata should be preserved");
+        let inflate = completed
+            .inflate_queue_dispatch()
+            .expect("completed inflate metadata should be present");
+        assert_eq!(inflate.completed_descriptors(), 1);
+        assert!(inflate.needs_queue_interrupt());
+        assert_eq!(read_boot_balloon_inflate_used_index(&memory), 1);
+        assert_eq!(
+            read_boot_balloon_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                VirtioMmioRegister::InterruptStatus,
+            ),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+    }
+
+    #[test]
+    fn boot_runtime_balloon_notification_dispatch_preserves_missing_handler() {
+        let (mut memory, mut runtime, _) =
+            boot_runtime_with_balloon("kernel-balloon-missing-handler-dispatch");
+        let mut mmio_dispatcher = MmioDispatcher::new();
+
+        let dispatches = runtime
+            .dispatch_balloon_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("balloon dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 1);
+        let device_dispatch = &dispatches.as_slice()[0];
+        assert!(device_dispatch.outcome().handler_lookup_error().is_some());
+        assert!(!device_dispatch.needs_queue_interrupt());
+    }
+
+    #[test]
+    fn boot_runtime_balloon_notification_dispatch_preserves_wrong_handler() {
+        let (mut memory, mut runtime, _) =
+            boot_runtime_with_balloon("kernel-balloon-wrong-handler-dispatch");
+        let region = runtime
+            .balloon_device
+            .as_ref()
+            .expect("balloon device should exist")
+            .registration
+            .region();
+        let mut mmio_dispatcher = MmioDispatcher::new();
+        mmio_dispatcher
+            .insert_region(region.id(), region.range().start(), region.range().size())
+            .expect("replacement balloon region should insert");
+        mmio_dispatcher
+            .register_handler(region.id(), WrongBalloonHandler)
+            .expect("wrong balloon handler should register");
+
+        let dispatches = runtime
+            .dispatch_balloon_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("balloon dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 1);
+        let device_dispatch = &dispatches.as_slice()[0];
+        assert!(device_dispatch.outcome().handler_lookup_error().is_some());
+        assert!(!device_dispatch.needs_queue_interrupt());
     }
 
     #[test]

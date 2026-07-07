@@ -22,8 +22,9 @@ use bangbang_runtime::mmio::{MmioDispatcher, MmioRegionId};
 use bangbang_runtime::network::NetworkMmioLayout;
 use bangbang_runtime::serial::SharedSerialOutput;
 use bangbang_runtime::startup::{
-    Arm64BootBlockNotificationDispatch, Arm64BootBlockNotificationDispatchError,
-    Arm64BootBlockNotificationDispatches,
+    Arm64BootBalloonNotificationDispatch, Arm64BootBalloonNotificationDispatchError,
+    Arm64BootBalloonNotificationDispatches, Arm64BootBlockNotificationDispatch,
+    Arm64BootBlockNotificationDispatchError, Arm64BootBlockNotificationDispatches,
     Arm64BootEntropyDeviceConfig as RuntimeArm64BootEntropyDeviceConfig,
     Arm64BootEntropyNotificationDispatch, Arm64BootEntropyNotificationDispatchError,
     Arm64BootEntropyNotificationDispatches, Arm64BootEntropySourceProvider,
@@ -329,6 +330,10 @@ pub enum HvfArm64BootRunLoopError {
         steps_completed: usize,
         source: Box<HvfArm64BootVsockNotificationDispatchError>,
     },
+    DispatchBalloonNotifications {
+        steps_completed: usize,
+        source: Box<HvfArm64BootBalloonNotificationDispatchError>,
+    },
     DispatchEntropyNotifications {
         steps_completed: usize,
         source: Box<HvfArm64BootEntropyNotificationDispatchError>,
@@ -384,6 +389,13 @@ impl fmt::Display for HvfArm64BootRunLoopError {
                 f,
                 "failed to dispatch HVF boot-session vsock notifications after {steps_completed} completed steps: {source}"
             ),
+            Self::DispatchBalloonNotifications {
+                steps_completed,
+                source,
+            } => write!(
+                f,
+                "failed to dispatch HVF boot-session balloon notifications after {steps_completed} completed steps: {source}"
+            ),
             Self::DispatchEntropyNotifications {
                 steps_completed,
                 source,
@@ -411,6 +423,7 @@ impl std::error::Error for HvfArm64BootRunLoopError {
             Self::DispatchBlockNotifications { source, .. } => Some(source.as_ref()),
             Self::DispatchNetworkNotifications { source, .. } => Some(source.as_ref()),
             Self::DispatchVsockNotifications { source, .. } => Some(source.as_ref()),
+            Self::DispatchBalloonNotifications { source, .. } => Some(source.as_ref()),
             Self::DispatchEntropyNotifications { source, .. } => Some(source.as_ref()),
             Self::HandleVirtualTimer { source, .. } => Some(source.as_ref()),
         }
@@ -732,6 +745,31 @@ impl HvfArm64BootSession<'_> {
         collect_or_signal_vsock_queue_interrupts(dispatches, &self.gic)
     }
 
+    pub fn dispatch_balloon_queue_notifications_and_signal_interrupts(
+        &mut self,
+    ) -> Result<
+        HvfArm64BootBalloonNotificationDispatches,
+        HvfArm64BootBalloonNotificationDispatchError,
+    > {
+        let dispatches = {
+            let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
+                HvfArm64BootBalloonNotificationDispatchError::MapGuestMemory { source }
+            })?;
+            let mut mmio_dispatcher =
+                lock_boot_mmio_dispatcher(&self.mmio_dispatcher).map_err(|source| {
+                    HvfArm64BootBalloonNotificationDispatchError::MmioDispatcher { source }
+                })?;
+
+            dispatch_balloon_runtime_notifications(
+                memory,
+                &mut self.runtime_resources,
+                &mut mmio_dispatcher,
+            )?
+        };
+
+        collect_or_signal_balloon_queue_interrupts(dispatches, &self.gic)
+    }
+
     pub fn dispatch_entropy_queue_notifications_and_signal_interrupts(
         &mut self,
         entropy_source: &mut impl Arm64BootEntropySourceProvider,
@@ -1012,6 +1050,31 @@ impl OwnedHvfArm64BootSession {
         collect_or_signal_vsock_queue_interrupts(dispatches, &self.gic)
     }
 
+    pub fn dispatch_balloon_queue_notifications_and_signal_interrupts(
+        &mut self,
+    ) -> Result<
+        HvfArm64BootBalloonNotificationDispatches,
+        HvfArm64BootBalloonNotificationDispatchError,
+    > {
+        let dispatches = {
+            let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
+                HvfArm64BootBalloonNotificationDispatchError::MapGuestMemory { source }
+            })?;
+            let mut mmio_dispatcher =
+                lock_boot_mmio_dispatcher(&self.mmio_dispatcher).map_err(|source| {
+                    HvfArm64BootBalloonNotificationDispatchError::MmioDispatcher { source }
+                })?;
+
+            dispatch_balloon_runtime_notifications(
+                memory,
+                &mut self.runtime_resources,
+                &mut mmio_dispatcher,
+            )?
+        };
+
+        collect_or_signal_balloon_queue_interrupts(dispatches, &self.gic)
+    }
+
     pub fn dispatch_entropy_queue_notifications_and_signal_interrupts(
         &mut self,
         entropy_source: &mut impl Arm64BootEntropySourceProvider,
@@ -1079,6 +1142,15 @@ impl BootSessionRunLoopSession for OwnedHvfArm64BootSession {
     ) -> Result<HvfArm64BootVsockNotificationDispatches, HvfArm64BootVsockNotificationDispatchError>
     {
         self.dispatch_vsock_queue_notifications_and_signal_interrupts()
+    }
+
+    fn dispatch_run_loop_balloon_notifications(
+        &mut self,
+    ) -> Result<
+        HvfArm64BootBalloonNotificationDispatches,
+        HvfArm64BootBalloonNotificationDispatchError,
+    > {
+        self.dispatch_balloon_queue_notifications_and_signal_interrupts()
     }
 
     fn dispatch_run_loop_entropy_notifications(
@@ -1170,6 +1242,16 @@ where
     {
         self.session
             .dispatch_vsock_queue_notifications_and_signal_interrupts()
+    }
+
+    fn dispatch_run_loop_balloon_notifications(
+        &mut self,
+    ) -> Result<
+        HvfArm64BootBalloonNotificationDispatches,
+        HvfArm64BootBalloonNotificationDispatchError,
+    > {
+        self.session
+            .dispatch_balloon_queue_notifications_and_signal_interrupts()
     }
 
     fn dispatch_run_loop_entropy_notifications(
@@ -1372,6 +1454,65 @@ impl HvfArm64BootVsockNotificationDispatch {
 }
 
 #[derive(Debug)]
+pub struct HvfArm64BootBalloonNotificationDispatches {
+    devices: Vec<HvfArm64BootBalloonNotificationDispatch>,
+}
+
+impl HvfArm64BootBalloonNotificationDispatches {
+    fn new(devices: Vec<HvfArm64BootBalloonNotificationDispatch>) -> Self {
+        Self { devices }
+    }
+
+    pub fn as_slice(&self) -> &[HvfArm64BootBalloonNotificationDispatch] {
+        &self.devices
+    }
+
+    pub fn len(&self) -> usize {
+        self.devices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.devices.is_empty()
+    }
+
+    pub fn has_signal_failure(&self) -> bool {
+        self.devices
+            .iter()
+            .any(|device| device.signal_error().is_some())
+    }
+}
+
+#[derive(Debug)]
+pub struct HvfArm64BootBalloonNotificationDispatch {
+    dispatch: Arm64BootBalloonNotificationDispatch,
+    signal_error: Option<DeviceInterruptTriggerError>,
+}
+
+impl HvfArm64BootBalloonNotificationDispatch {
+    fn new(
+        dispatch: Arm64BootBalloonNotificationDispatch,
+        signal_error: Option<DeviceInterruptTriggerError>,
+    ) -> Self {
+        Self {
+            dispatch,
+            signal_error,
+        }
+    }
+
+    pub const fn dispatch(&self) -> &Arm64BootBalloonNotificationDispatch {
+        &self.dispatch
+    }
+
+    pub const fn signal_error(&self) -> Option<&DeviceInterruptTriggerError> {
+        self.signal_error.as_ref()
+    }
+
+    pub fn queue_interrupt_signaled(&self) -> bool {
+        self.dispatch.needs_queue_interrupt() && self.signal_error.is_none()
+    }
+}
+
+#[derive(Debug)]
 pub struct HvfArm64BootEntropyNotificationDispatches {
     devices: Vec<HvfArm64BootEntropyNotificationDispatch>,
 }
@@ -1488,6 +1629,25 @@ pub enum HvfArm64BootVsockNotificationDispatchError {
 }
 
 #[derive(Debug)]
+pub enum HvfArm64BootBalloonNotificationDispatchError {
+    MapGuestMemory {
+        source: HvfGuestMemoryMappingError,
+    },
+    MmioDispatcher {
+        source: HvfArm64BootMmioDispatcherError,
+    },
+    DispatchNotifications {
+        source: Arm64BootBalloonNotificationDispatchError,
+    },
+    CreateSignalSink {
+        source: HvfGicSpiSignalError,
+    },
+    ResultAllocation {
+        source: TryReserveError,
+    },
+}
+
+#[derive(Debug)]
 pub enum HvfArm64BootEntropyNotificationDispatchError {
     MapGuestMemory {
         source: HvfGuestMemoryMappingError,
@@ -1580,6 +1740,43 @@ impl fmt::Display for HvfArm64BootVsockNotificationDispatchError {
     }
 }
 
+impl fmt::Display for HvfArm64BootBalloonNotificationDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MapGuestMemory { source } => {
+                write!(
+                    f,
+                    "failed to borrow HVF boot-session guest memory for balloon notifications: {source}"
+                )
+            }
+            Self::MmioDispatcher { source } => {
+                write!(
+                    f,
+                    "failed to lock HVF boot-session MMIO dispatcher: {source}"
+                )
+            }
+            Self::DispatchNotifications { source } => {
+                write!(
+                    f,
+                    "failed to dispatch boot balloon queue notifications: {source}"
+                )
+            }
+            Self::CreateSignalSink { source } => {
+                write!(
+                    f,
+                    "failed to create HVF boot balloon interrupt signaler: {source}"
+                )
+            }
+            Self::ResultAllocation { source } => {
+                write!(
+                    f,
+                    "failed to allocate HVF boot balloon notification results: {source}"
+                )
+            }
+        }
+    }
+}
+
 impl fmt::Display for HvfArm64BootEntropyNotificationDispatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1630,6 +1827,18 @@ impl std::error::Error for HvfArm64BootEntropyNotificationDispatchError {
 }
 
 impl std::error::Error for HvfArm64BootVsockNotificationDispatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MapGuestMemory { source } => Some(source),
+            Self::MmioDispatcher { source } => Some(source),
+            Self::DispatchNotifications { source } => Some(source),
+            Self::CreateSignalSink { source } => Some(source),
+            Self::ResultAllocation { source } => Some(source),
+        }
+    }
+}
+
+impl std::error::Error for HvfArm64BootBalloonNotificationDispatchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::MapGuestMemory { source } => Some(source),
@@ -1799,6 +2008,13 @@ trait BootSessionRunLoopSession {
         &mut self,
     ) -> Result<HvfArm64BootVsockNotificationDispatches, HvfArm64BootVsockNotificationDispatchError>;
 
+    fn dispatch_run_loop_balloon_notifications(
+        &mut self,
+    ) -> Result<
+        HvfArm64BootBalloonNotificationDispatches,
+        HvfArm64BootBalloonNotificationDispatchError,
+    >;
+
     fn dispatch_run_loop_entropy_notifications(
         &mut self,
     ) -> Result<
@@ -1857,6 +2073,15 @@ impl BootSessionRunLoopSession for HvfArm64BootSession<'_> {
     ) -> Result<HvfArm64BootVsockNotificationDispatches, HvfArm64BootVsockNotificationDispatchError>
     {
         self.dispatch_vsock_queue_notifications_and_signal_interrupts()
+    }
+
+    fn dispatch_run_loop_balloon_notifications(
+        &mut self,
+    ) -> Result<
+        HvfArm64BootBalloonNotificationDispatches,
+        HvfArm64BootBalloonNotificationDispatchError,
+    > {
+        self.dispatch_balloon_queue_notifications_and_signal_interrupts()
     }
 
     fn dispatch_run_loop_entropy_notifications(
@@ -2034,6 +2259,17 @@ fn run_boot_session_loop_with_observer(
                     return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
                 }
                 dispatch_run_loop_vsock_notifications_for_step(session, steps)?;
+                if stop_token.is_stop_requested() {
+                    return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+                }
+                session
+                    .dispatch_run_loop_balloon_notifications()
+                    .map_err(
+                        |source| HvfArm64BootRunLoopError::DispatchBalloonNotifications {
+                            steps_completed: steps,
+                            source: Box::new(source),
+                        },
+                    )?;
                 if stop_token.is_stop_requested() {
                     return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
                 }
@@ -2315,6 +2551,25 @@ fn collect_vsock_notification_dispatches(
     Ok(HvfArm64BootVsockNotificationDispatches::new(devices))
 }
 
+fn collect_balloon_notification_dispatches(
+    dispatches: Arm64BootBalloonNotificationDispatches,
+) -> Result<HvfArm64BootBalloonNotificationDispatches, HvfArm64BootBalloonNotificationDispatchError>
+{
+    let runtime_dispatches = dispatches.into_vec();
+    let mut devices = Vec::new();
+    devices
+        .try_reserve_exact(runtime_dispatches.len())
+        .map_err(
+            |source| HvfArm64BootBalloonNotificationDispatchError::ResultAllocation { source },
+        )?;
+
+    for dispatch in runtime_dispatches {
+        devices.push(HvfArm64BootBalloonNotificationDispatch::new(dispatch, None));
+    }
+
+    Ok(HvfArm64BootBalloonNotificationDispatches::new(devices))
+}
+
 fn collect_entropy_notification_dispatches(
     dispatches: Arm64BootEntropyNotificationDispatches,
 ) -> Result<HvfArm64BootEntropyNotificationDispatches, HvfArm64BootEntropyNotificationDispatchError>
@@ -2368,6 +2623,18 @@ fn dispatch_vsock_runtime_notifications(
         .dispatch_vsock_queue_notifications(memory, mmio_dispatcher)
         .map_err(
             |source| HvfArm64BootVsockNotificationDispatchError::DispatchNotifications { source },
+        )
+}
+
+fn dispatch_balloon_runtime_notifications(
+    memory: &mut GuestMemory,
+    runtime_resources: &mut Arm64BootRuntimeResources,
+    mmio_dispatcher: &mut MmioDispatcher,
+) -> Result<Arm64BootBalloonNotificationDispatches, HvfArm64BootBalloonNotificationDispatchError> {
+    runtime_resources
+        .dispatch_balloon_queue_notifications(memory, mmio_dispatcher)
+        .map_err(
+            |source| HvfArm64BootBalloonNotificationDispatchError::DispatchNotifications { source },
         )
 }
 
@@ -2442,6 +2709,22 @@ fn collect_or_signal_vsock_queue_interrupts(
     signal_vsock_queue_interrupts(dispatches, &signaler)
 }
 
+fn collect_or_signal_balloon_queue_interrupts(
+    dispatches: Arm64BootBalloonNotificationDispatches,
+    gic: &HvfGicMetadata,
+) -> Result<HvfArm64BootBalloonNotificationDispatches, HvfArm64BootBalloonNotificationDispatchError>
+{
+    if !dispatches.needs_queue_interrupt() {
+        return collect_balloon_notification_dispatches(dispatches);
+    }
+
+    let signaler = HvfGicSpiSignaler::from_metadata(gic).map_err(|source| {
+        HvfArm64BootBalloonNotificationDispatchError::CreateSignalSink { source }
+    })?;
+
+    signal_balloon_queue_interrupts(dispatches, &signaler)
+}
+
 fn collect_or_signal_entropy_queue_interrupts(
     dispatches: Arm64BootEntropyNotificationDispatches,
     gic: &HvfGicMetadata,
@@ -2511,6 +2794,34 @@ fn signal_vsock_queue_interrupts(
     }
 
     Ok(HvfArm64BootVsockNotificationDispatches::new(devices))
+}
+
+fn signal_balloon_queue_interrupts(
+    dispatches: Arm64BootBalloonNotificationDispatches,
+    signaler: &dyn InterruptSink,
+) -> Result<HvfArm64BootBalloonNotificationDispatches, HvfArm64BootBalloonNotificationDispatchError>
+{
+    let runtime_dispatches = dispatches.into_vec();
+    let mut devices = Vec::new();
+    devices
+        .try_reserve_exact(runtime_dispatches.len())
+        .map_err(
+            |source| HvfArm64BootBalloonNotificationDispatchError::ResultAllocation { source },
+        )?;
+
+    for dispatch in runtime_dispatches {
+        let signal_error = if dispatch.needs_queue_interrupt() {
+            signal_queue_interrupt(dispatch.device().fdt_device.interrupt_line, signaler).err()
+        } else {
+            None
+        };
+        devices.push(HvfArm64BootBalloonNotificationDispatch::new(
+            dispatch,
+            signal_error,
+        ));
+    }
+
+    Ok(HvfArm64BootBalloonNotificationDispatches::new(devices))
 }
 
 fn signal_entropy_queue_interrupts(
@@ -2997,7 +3308,10 @@ mod tests {
     use std::thread;
 
     use bangbang_runtime::VmmAction;
-    use bangbang_runtime::balloon::BalloonMmioLayout;
+    use bangbang_runtime::balloon::{
+        BalloonConfigInput, BalloonMmioLayout, VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX,
+        VIRTIO_BALLOON_INFLATE_QUEUE_INDEX,
+    };
     use bangbang_runtime::block::{
         BlockMmioLayout, DriveConfigInput, VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
         VIRTIO_BLOCK_REQUEST_TYPE_FLUSH, VIRTIO_BLOCK_REQUEST_TYPE_IN, VIRTIO_BLOCK_SECTOR_SIZE,
@@ -3025,9 +3339,9 @@ mod tests {
     };
     use bangbang_runtime::serial::{SharedSerialOutput, SharedSerialOutputBuffer};
     use bangbang_runtime::startup::{
-        Arm64BootBlockNotificationDispatches, Arm64BootEntropyDeviceConfig,
-        Arm64BootEntropyNotificationDispatches, Arm64BootEntropySource,
-        Arm64BootEntropySourceError, Arm64BootEntropySourceProvider,
+        Arm64BootBalloonNotificationDispatches, Arm64BootBlockNotificationDispatches,
+        Arm64BootEntropyDeviceConfig, Arm64BootEntropyNotificationDispatches,
+        Arm64BootEntropySource, Arm64BootEntropySourceError, Arm64BootEntropySourceProvider,
         Arm64BootNetworkNotificationDispatches, Arm64BootNetworkNotificationOutcome,
         Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
         Arm64BootResourceConfig, Arm64BootResources, Arm64BootRuntimeResources,
@@ -3047,19 +3361,20 @@ mod tests {
     };
 
     use super::{
-        HvfArm64BootBalloonDeviceConfig, HvfArm64BootBlockNotificationDispatchError,
-        HvfArm64BootEntropyDeviceConfig, HvfArm64BootEntropyNotificationDispatchError,
-        HvfArm64BootInterruptLinePurpose, HvfArm64BootMmioDispatcherError,
-        HvfArm64BootNetworkNotificationDispatchError, HvfArm64BootRunLoopOutcome,
-        HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
-        HvfArm64BootSessionError, HvfArm64BootVsockNotificationDispatchError,
-        allocate_interrupt_lines, collect_block_notification_dispatches,
+        HvfArm64BootBalloonDeviceConfig, HvfArm64BootBalloonNotificationDispatchError,
+        HvfArm64BootBlockNotificationDispatchError, HvfArm64BootEntropyDeviceConfig,
+        HvfArm64BootEntropyNotificationDispatchError, HvfArm64BootInterruptLinePurpose,
+        HvfArm64BootMmioDispatcherError, HvfArm64BootNetworkNotificationDispatchError,
+        HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig,
+        HvfArm64BootSessionConfig, HvfArm64BootSessionError,
+        HvfArm64BootVsockNotificationDispatchError, allocate_interrupt_lines,
+        collect_balloon_notification_dispatches, collect_block_notification_dispatches,
         collect_entropy_notification_dispatches, collect_network_notification_dispatches,
         collect_vsock_notification_dispatches,
         dispatch_network_runtime_notifications_with_packet_io, lock_boot_mmio_dispatcher,
-        run_boot_session_loop, run_boot_session_vcpu_step, signal_block_queue_interrupts,
-        signal_entropy_queue_interrupts, signal_network_queue_interrupts,
-        signal_vsock_queue_interrupts, validate_single_vcpu,
+        run_boot_session_loop, run_boot_session_vcpu_step, signal_balloon_queue_interrupts,
+        signal_block_queue_interrupts, signal_entropy_queue_interrupts,
+        signal_network_queue_interrupts, signal_vsock_queue_interrupts, validate_single_vcpu,
     };
     use crate::exit::{
         HvfExceptionExit, HvfHvcExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
@@ -3112,6 +3427,13 @@ mod tests {
     const TEST_VSOCK_EVENT_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x8077_0000);
     const TEST_VSOCK_EVENT_USED_RING: GuestAddress = GuestAddress::new(0x8078_0000);
     const TEST_VSOCK_HEADER: GuestAddress = GuestAddress::new(0x8079_0000);
+    const TEST_BALLOON_INFLATE_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x807a_0000);
+    const TEST_BALLOON_INFLATE_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x807a_1000);
+    const TEST_BALLOON_INFLATE_USED_RING: GuestAddress = GuestAddress::new(0x807a_2000);
+    const TEST_BALLOON_DEFLATE_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x807a_3000);
+    const TEST_BALLOON_DEFLATE_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x807a_4000);
+    const TEST_BALLOON_DEFLATE_USED_RING: GuestAddress = GuestAddress::new(0x807a_5000);
+    const TEST_BALLOON_PFN_PAYLOAD: GuestAddress = GuestAddress::new(0x807a_6000);
     const TEST_AVAILABLE_RING_IDX_OFFSET: u64 = 2;
     const TEST_AVAILABLE_RING_RING_OFFSET: u64 = 4;
     const TEST_AVAILABLE_RING_ENTRY_SIZE: u64 = 2;
@@ -3356,6 +3678,23 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct WrongBalloonHandler;
+
+    impl MmioHandler for WrongBalloonHandler {
+        fn read(&mut self, _access: MmioAccess) -> Result<MmioAccessBytes, MmioHandlerError> {
+            Err(MmioHandlerError::new("wrong balloon handler read"))
+        }
+
+        fn write(
+            &mut self,
+            _access: MmioAccess,
+            _data: MmioAccessBytes,
+        ) -> Result<(), MmioHandlerError> {
+            Err(MmioHandlerError::new("wrong balloon handler write"))
+        }
+    }
+
     type RecordedRunStepDispatchers = Arc<Mutex<Vec<Arc<Mutex<MmioDispatcher>>>>>;
 
     #[derive(Debug)]
@@ -3425,6 +3764,12 @@ mod tests {
                 HvfArm64BootVsockNotificationDispatchError,
             >,
         >,
+        balloon_dispatch_results: VecDeque<
+            Result<
+                super::HvfArm64BootBalloonNotificationDispatches,
+                HvfArm64BootBalloonNotificationDispatchError,
+            >,
+        >,
         entropy_dispatch_results: VecDeque<
             Result<
                 super::HvfArm64BootEntropyNotificationDispatches,
@@ -3437,6 +3782,7 @@ mod tests {
         request_stop_on_dispatch: Option<HvfArm64BootRunLoopStopToken>,
         request_stop_on_network_dispatch: Option<HvfArm64BootRunLoopStopToken>,
         request_stop_on_vsock_dispatch: Option<HvfArm64BootRunLoopStopToken>,
+        request_stop_on_balloon_dispatch: Option<HvfArm64BootRunLoopStopToken>,
         request_stop_on_entropy_dispatch: Option<HvfArm64BootRunLoopStopToken>,
         request_stop_on_timer: Option<HvfArm64BootRunLoopStopToken>,
         control_wakeup_requested: bool,
@@ -3451,6 +3797,7 @@ mod tests {
                 monitor_wakeup_results: VecDeque::new(),
                 network_dispatch_results: VecDeque::new(),
                 vsock_dispatch_results: VecDeque::new(),
+                balloon_dispatch_results: VecDeque::new(),
                 entropy_dispatch_results: VecDeque::new(),
                 timer_results: VecDeque::new(),
                 events: Vec::new(),
@@ -3458,6 +3805,7 @@ mod tests {
                 request_stop_on_dispatch: None,
                 request_stop_on_network_dispatch: None,
                 request_stop_on_vsock_dispatch: None,
+                request_stop_on_balloon_dispatch: None,
                 request_stop_on_entropy_dispatch: None,
                 request_stop_on_timer: None,
                 control_wakeup_requested: false,
@@ -3472,6 +3820,7 @@ mod tests {
                 monitor_wakeup_results: VecDeque::new(),
                 network_dispatch_results: VecDeque::new(),
                 vsock_dispatch_results: VecDeque::new(),
+                balloon_dispatch_results: VecDeque::new(),
                 entropy_dispatch_results: VecDeque::new(),
                 timer_results: VecDeque::new(),
                 events: Vec::new(),
@@ -3479,6 +3828,7 @@ mod tests {
                 request_stop_on_dispatch: None,
                 request_stop_on_network_dispatch: None,
                 request_stop_on_vsock_dispatch: None,
+                request_stop_on_balloon_dispatch: None,
                 request_stop_on_entropy_dispatch: None,
                 request_stop_on_timer: None,
                 control_wakeup_requested: false,
@@ -3508,6 +3858,13 @@ mod tests {
             self.vsock_dispatch_results.push_back(Err(source));
         }
 
+        fn push_balloon_dispatch_error(
+            &mut self,
+            source: HvfArm64BootBalloonNotificationDispatchError,
+        ) {
+            self.balloon_dispatch_results.push_back(Err(source));
+        }
+
         fn push_entropy_dispatch_error(
             &mut self,
             source: HvfArm64BootEntropyNotificationDispatchError,
@@ -3533,6 +3890,10 @@ mod tests {
 
         fn request_stop_on_vsock_dispatch(&mut self, stop_token: HvfArm64BootRunLoopStopToken) {
             self.request_stop_on_vsock_dispatch = Some(stop_token);
+        }
+
+        fn request_stop_on_balloon_dispatch(&mut self, stop_token: HvfArm64BootRunLoopStopToken) {
+            self.request_stop_on_balloon_dispatch = Some(stop_token);
         }
 
         fn request_stop_on_entropy_dispatch(&mut self, stop_token: HvfArm64BootRunLoopStopToken) {
@@ -3655,6 +4016,26 @@ mod tests {
                     Vec::new(),
                 ))
             })
+        }
+
+        fn dispatch_run_loop_balloon_notifications(
+            &mut self,
+        ) -> Result<
+            super::HvfArm64BootBalloonNotificationDispatches,
+            HvfArm64BootBalloonNotificationDispatchError,
+        > {
+            self.events.push("balloon-dispatch");
+            if let Some(stop_token) = self.request_stop_on_balloon_dispatch.take() {
+                stop_token.request_stop();
+            }
+
+            self.balloon_dispatch_results
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Ok(super::HvfArm64BootBalloonNotificationDispatches::new(
+                        Vec::new(),
+                    ))
+                })
         }
 
         fn dispatch_run_loop_entropy_notifications(
@@ -3941,6 +4322,14 @@ mod tests {
             .expect("vsock config should be stored");
     }
 
+    fn add_balloon(controller: &mut bangbang_runtime::VmmController, amount_mib: u32) {
+        controller
+            .handle_action(VmmAction::PutBalloon(BalloonConfigInput::new(
+                amount_mib, false,
+            )))
+            .expect("balloon config should be stored");
+    }
+
     fn valid_boot_resource_config(lines: &[GuestInterruptLine]) -> Arm64BootResourceConfig<'_> {
         valid_boot_resource_config_with_network_lines(lines, &[])
     }
@@ -4087,6 +4476,23 @@ mod tests {
         (parts.memory, parts.runtime, parts.mmio_dispatcher)
     }
 
+    fn boot_runtime_with_balloon() -> (GuestMemory, Arm64BootRuntimeResources, MmioDispatcher) {
+        let kernel = temp_file("kernel-with-balloon", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        add_balloon(&mut controller, 64);
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            Arm64BootResourceConfig {
+                balloon_interrupt_line: Some(line(32)),
+                ..valid_boot_resource_config(&[])
+            },
+        )
+        .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+
+        (parts.memory, parts.runtime, parts.mmio_dispatcher)
+    }
+
     fn boot_runtime_with_entropy() -> (GuestMemory, Arm64BootRuntimeResources, MmioDispatcher) {
         let kernel = temp_file("kernel-with-entropy", &arm64_image());
         let controller = controller_with_kernel(kernel.path());
@@ -4149,6 +4555,16 @@ mod tests {
         runtime
             .dispatch_vsock_queue_notifications(memory, mmio_dispatcher)
             .expect("vsock notification dispatch result should allocate")
+    }
+
+    fn dispatch_boot_balloon_notifications(
+        memory: &mut GuestMemory,
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+    ) -> Arm64BootBalloonNotificationDispatches {
+        runtime
+            .dispatch_balloon_queue_notifications(memory, mmio_dispatcher)
+            .expect("balloon notification dispatch result should allocate")
     }
 
     fn dispatch_boot_entropy_notifications(
@@ -4308,6 +4724,61 @@ mod tests {
         let outcome = mmio_dispatcher
             .dispatch(MmioOperation::read(access).expect("u32 read should be valid"))
             .expect("vsock MMIO read should dispatch");
+
+        match outcome {
+            MmioDispatchOutcome::Read { data } => u32::from_le_bytes(
+                data.as_slice()
+                    .try_into()
+                    .expect("u32 read should return four bytes"),
+            ),
+            MmioDispatchOutcome::Write => panic!("read operation should not return write outcome"),
+        }
+    }
+
+    fn write_boot_balloon_mmio_u32(
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        register: VirtioMmioRegister,
+        value: u32,
+    ) {
+        let address = runtime
+            .balloon_device
+            .as_ref()
+            .expect("balloon device should exist")
+            .registration
+            .address()
+            .checked_add(register.offset())
+            .expect("test MMIO address should not overflow");
+        let access = mmio_dispatcher
+            .lookup(address, 4)
+            .expect("balloon MMIO access should resolve");
+        let data = MmioAccessBytes::new(&value.to_le_bytes()).expect("u32 bytes should be valid");
+        let outcome = mmio_dispatcher
+            .dispatch(MmioOperation::write(access, data).expect("u32 write should be valid"))
+            .expect("balloon MMIO write should dispatch");
+
+        assert_eq!(outcome, MmioDispatchOutcome::Write);
+    }
+
+    fn read_boot_balloon_mmio_u32(
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        register: VirtioMmioRegister,
+    ) -> u32 {
+        let address = runtime
+            .balloon_device
+            .as_ref()
+            .expect("balloon device should exist")
+            .registration
+            .address()
+            .checked_add(register.offset())
+            .expect("test MMIO address should not overflow");
+        let access = mmio_dispatcher
+            .lookup(address, 4)
+            .expect("balloon MMIO access should resolve");
+        let outcome = mmio_dispatcher
+            .dispatch(MmioOperation::read(access).expect("u32 read should be valid"))
+            .expect("balloon MMIO read should dispatch");
 
         match outcome {
             MmioDispatchOutcome::Read { data } => u32::from_le_bytes(
@@ -4723,6 +5194,91 @@ mod tests {
         );
     }
 
+    fn configure_boot_balloon_queues(
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+    ) {
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+        );
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+        );
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            QUEUE_CONFIG_STATUS,
+        );
+        configure_boot_balloon_queue(runtime, mmio_dispatcher, VIRTIO_BALLOON_INFLATE_QUEUE_INDEX);
+        configure_boot_balloon_queue(runtime, mmio_dispatcher, VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX);
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::Status,
+            DRIVER_OK_STATUS,
+        );
+    }
+
+    fn configure_boot_balloon_queue(
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        queue_index: usize,
+    ) {
+        let queue_index_u32 = u32::try_from(queue_index).expect("test queue index should fit");
+        let (descriptor_table, driver_ring, device_ring) = balloon_queue_addresses(queue_index_u32);
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueSel,
+            queue_index_u32,
+        );
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueNum,
+            u32::from(TEST_QUEUE_SIZE),
+        );
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueDescLow,
+            guest_address_low(descriptor_table),
+        );
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueDriverLow,
+            guest_address_low(driver_ring),
+        );
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueDeviceLow,
+            guest_address_low(device_ring),
+        );
+        write_boot_balloon_mmio_u32(runtime, mmio_dispatcher, VirtioMmioRegister::QueueReady, 1);
+    }
+
+    fn notify_boot_balloon_queue(
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        queue_index: usize,
+    ) {
+        write_boot_balloon_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            VirtioMmioRegister::QueueNotify,
+            queue_index.try_into().expect("queue index should fit"),
+        );
+    }
+
     fn network_queue_addresses(queue_index: u32) -> (GuestAddress, GuestAddress, GuestAddress) {
         match queue_index {
             0 => (
@@ -4757,6 +5313,22 @@ mod tests {
                 TEST_VSOCK_EVENT_USED_RING,
             ),
             other => panic!("unsupported test vsock queue index {other}"),
+        }
+    }
+
+    fn balloon_queue_addresses(queue_index: u32) -> (GuestAddress, GuestAddress, GuestAddress) {
+        match usize::try_from(queue_index).expect("queue index should fit") {
+            VIRTIO_BALLOON_INFLATE_QUEUE_INDEX => (
+                TEST_BALLOON_INFLATE_DESCRIPTOR_TABLE,
+                TEST_BALLOON_INFLATE_AVAILABLE_RING,
+                TEST_BALLOON_INFLATE_USED_RING,
+            ),
+            VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX => (
+                TEST_BALLOON_DEFLATE_DESCRIPTOR_TABLE,
+                TEST_BALLOON_DEFLATE_AVAILABLE_RING,
+                TEST_BALLOON_DEFLATE_USED_RING,
+            ),
+            other => panic!("unsupported test balloon queue index {other}"),
         }
     }
 
@@ -4841,6 +5413,39 @@ mod tests {
         write_available_heads(memory, &[0, TEST_QUEUE_SIZE]);
     }
 
+    fn write_queued_balloon_inflate_request(memory: &mut GuestMemory) {
+        memory
+            .write_slice(&1u32.to_le_bytes(), TEST_BALLOON_PFN_PAYLOAD)
+            .expect("balloon PFN payload should write");
+        write_balloon_inflate_descriptor(
+            memory,
+            0,
+            TestDescriptor::readable(TEST_BALLOON_PFN_PAYLOAD, 4, None),
+        );
+        write_balloon_inflate_available_heads(memory, &[0]);
+    }
+
+    fn write_partially_invalid_balloon_inflate_request(memory: &mut GuestMemory) {
+        memory
+            .write_slice(&1u32.to_le_bytes(), TEST_BALLOON_PFN_PAYLOAD)
+            .expect("balloon PFN payload should write");
+        write_balloon_inflate_descriptor(
+            memory,
+            0,
+            TestDescriptor::readable(TEST_BALLOON_PFN_PAYLOAD, 4, None),
+        );
+        write_balloon_inflate_available_heads(memory, &[0, TEST_QUEUE_SIZE]);
+    }
+
+    fn write_queued_balloon_deflate_request(memory: &mut GuestMemory) {
+        write_balloon_deflate_descriptor(
+            memory,
+            0,
+            TestDescriptor::readable(TEST_BALLOON_PFN_PAYLOAD, 4, None),
+        );
+        write_balloon_deflate_available_heads(memory, &[0]);
+    }
+
     fn write_request_header(
         memory: &mut GuestMemory,
         address: GuestAddress,
@@ -4876,6 +5481,58 @@ mod tests {
         memory
             .write_slice(&bytes, descriptor_address)
             .expect("descriptor should write");
+    }
+
+    fn write_balloon_inflate_descriptor(
+        memory: &mut GuestMemory,
+        index: u16,
+        descriptor: TestDescriptor,
+    ) {
+        write_balloon_descriptor_at(
+            memory,
+            TEST_BALLOON_INFLATE_DESCRIPTOR_TABLE,
+            index,
+            descriptor,
+        );
+    }
+
+    fn write_balloon_deflate_descriptor(
+        memory: &mut GuestMemory,
+        index: u16,
+        descriptor: TestDescriptor,
+    ) {
+        write_balloon_descriptor_at(
+            memory,
+            TEST_BALLOON_DEFLATE_DESCRIPTOR_TABLE,
+            index,
+            descriptor,
+        );
+    }
+
+    fn write_balloon_descriptor_at(
+        memory: &mut GuestMemory,
+        descriptor_table: GuestAddress,
+        index: u16,
+        descriptor: TestDescriptor,
+    ) {
+        let mut bytes = [0; VIRTQUEUE_DESCRIPTOR_SIZE];
+        let (address_bytes, tail) = bytes.split_at_mut(8);
+        let (len_bytes, tail) = tail.split_at_mut(4);
+        let (flags_bytes, next_bytes) = tail.split_at_mut(2);
+        address_bytes.copy_from_slice(&descriptor.address.raw_value().to_le_bytes());
+        len_bytes.copy_from_slice(&descriptor.len.to_le_bytes());
+        flags_bytes.copy_from_slice(&descriptor.flags.to_le_bytes());
+        next_bytes.copy_from_slice(&descriptor.next.to_le_bytes());
+
+        let descriptor_address = descriptor_table
+            .checked_add(
+                u64::from(index)
+                    * u64::try_from(VIRTQUEUE_DESCRIPTOR_SIZE).expect("descriptor size should fit"),
+            )
+            .expect("descriptor address should not overflow");
+        memory
+            .write_slice(&bytes, descriptor_address)
+            .expect("balloon descriptor should write");
     }
 
     fn write_network_tx_header(memory: &mut GuestMemory) {
@@ -5161,6 +5818,88 @@ mod tests {
 
     fn read_vsock_tx_used_index(memory: &GuestMemory) -> u16 {
         read_guest_u16(memory, vsock_tx_used_ring_idx_address())
+    }
+
+    fn balloon_inflate_available_ring_idx_address() -> GuestAddress {
+        TEST_BALLOON_INFLATE_AVAILABLE_RING
+            .checked_add(TEST_AVAILABLE_RING_IDX_OFFSET)
+            .expect("balloon inflate available idx address should not overflow")
+    }
+
+    fn balloon_inflate_available_ring_entry_address(ring_index: u16) -> GuestAddress {
+        TEST_BALLOON_INFLATE_AVAILABLE_RING
+            .checked_add(
+                TEST_AVAILABLE_RING_RING_OFFSET
+                    + u64::from(ring_index) * TEST_AVAILABLE_RING_ENTRY_SIZE,
+            )
+            .expect("balloon inflate available entry address should not overflow")
+    }
+
+    fn write_balloon_inflate_available_heads(memory: &mut GuestMemory, heads: &[u16]) {
+        for (ring_index, head) in heads.iter().copied().enumerate() {
+            write_guest_u16(
+                memory,
+                balloon_inflate_available_ring_entry_address(
+                    u16::try_from(ring_index).expect("test ring index should fit in u16"),
+                ),
+                head,
+            );
+        }
+        write_guest_u16(
+            memory,
+            balloon_inflate_available_ring_idx_address(),
+            u16::try_from(heads.len()).expect("test available length should fit in u16"),
+        );
+    }
+
+    fn balloon_deflate_available_ring_idx_address() -> GuestAddress {
+        TEST_BALLOON_DEFLATE_AVAILABLE_RING
+            .checked_add(TEST_AVAILABLE_RING_IDX_OFFSET)
+            .expect("balloon deflate available idx address should not overflow")
+    }
+
+    fn balloon_deflate_available_ring_entry_address(ring_index: u16) -> GuestAddress {
+        TEST_BALLOON_DEFLATE_AVAILABLE_RING
+            .checked_add(
+                TEST_AVAILABLE_RING_RING_OFFSET
+                    + u64::from(ring_index) * TEST_AVAILABLE_RING_ENTRY_SIZE,
+            )
+            .expect("balloon deflate available entry address should not overflow")
+    }
+
+    fn write_balloon_deflate_available_heads(memory: &mut GuestMemory, heads: &[u16]) {
+        for (ring_index, head) in heads.iter().copied().enumerate() {
+            write_guest_u16(
+                memory,
+                balloon_deflate_available_ring_entry_address(
+                    u16::try_from(ring_index).expect("test ring index should fit in u16"),
+                ),
+                head,
+            );
+        }
+        write_guest_u16(
+            memory,
+            balloon_deflate_available_ring_idx_address(),
+            u16::try_from(heads.len()).expect("test available length should fit in u16"),
+        );
+    }
+
+    fn read_balloon_inflate_used_index(memory: &GuestMemory) -> u16 {
+        read_guest_u16(
+            memory,
+            TEST_BALLOON_INFLATE_USED_RING
+                .checked_add(2)
+                .expect("balloon inflate used idx address should not overflow"),
+        )
+    }
+
+    fn read_balloon_deflate_used_index(memory: &GuestMemory) -> u16 {
+        read_guest_u16(
+            memory,
+            TEST_BALLOON_DEFLATE_USED_RING
+                .checked_add(2)
+                .expect("balloon deflate used idx address should not overflow"),
+        )
     }
 
     #[test]
@@ -6262,6 +7001,250 @@ mod tests {
     }
 
     #[test]
+    fn balloon_notification_signal_dispatch_accepts_empty_device() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_without_drives();
+        let dispatches =
+            dispatch_boot_balloon_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let result = collect_balloon_notification_dispatches(dispatches)
+            .expect("empty balloon dispatch result should collect");
+
+        assert!(result.is_empty());
+        assert_eq!(result.len(), 0);
+        assert!(!result.has_signal_failure());
+    }
+
+    #[test]
+    fn balloon_notification_signal_dispatch_skips_noop_device() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_with_balloon();
+        let dispatches =
+            dispatch_boot_balloon_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let (lines, sink) = RecordingSink::successful();
+
+        let result = signal_balloon_queue_interrupts(dispatches, sink.as_ref())
+            .expect("noop balloon dispatch should collect");
+
+        assert_eq!(result.len(), 1);
+        let device = &result.as_slice()[0];
+        assert_eq!(
+            device.dispatch().device().registration.region_id(),
+            MmioRegionId::new(110)
+        );
+        assert!(!device.dispatch().needs_queue_interrupt());
+        assert!(!device.queue_interrupt_signaled());
+        assert!(device.signal_error().is_none());
+        assert!(recorded_lines(&lines).is_empty());
+        assert_eq!(
+            read_boot_balloon_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                VirtioMmioRegister::InterruptStatus
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn balloon_notification_signal_dispatch_signals_queued_inflate_descriptor() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_with_balloon();
+        configure_boot_balloon_queues(&mut runtime, &mut mmio_dispatcher);
+        write_queued_balloon_inflate_request(&mut memory);
+        notify_boot_balloon_queue(
+            &mut runtime,
+            &mut mmio_dispatcher,
+            VIRTIO_BALLOON_INFLATE_QUEUE_INDEX,
+        );
+        let dispatches =
+            dispatch_boot_balloon_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let (lines, sink) = RecordingSink::successful();
+
+        let result = signal_balloon_queue_interrupts(dispatches, sink.as_ref())
+            .expect("queued balloon dispatch should collect");
+
+        assert_eq!(result.len(), 1);
+        let device = &result.as_slice()[0];
+        assert!(device.dispatch().needs_queue_interrupt());
+        assert!(device.queue_interrupt_signaled());
+        assert!(device.signal_error().is_none());
+        assert_eq!(recorded_lines(&lines), vec![32]);
+        let dispatch = device
+            .dispatch()
+            .outcome()
+            .dispatched()
+            .expect("balloon notification should dispatch");
+        let inflate = dispatch
+            .inflate_queue_dispatch()
+            .expect("inflate queue dispatch should be present");
+        assert_eq!(inflate.completed_descriptors(), 1);
+        assert!(inflate.needs_queue_interrupt());
+        assert_eq!(
+            read_boot_balloon_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                VirtioMmioRegister::InterruptStatus
+            ),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        assert_eq!(read_balloon_inflate_used_index(&memory), 1);
+    }
+
+    #[test]
+    fn balloon_notification_signal_dispatch_signals_queued_deflate_descriptor() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_with_balloon();
+        configure_boot_balloon_queues(&mut runtime, &mut mmio_dispatcher);
+        write_queued_balloon_deflate_request(&mut memory);
+        notify_boot_balloon_queue(
+            &mut runtime,
+            &mut mmio_dispatcher,
+            VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX,
+        );
+        let dispatches =
+            dispatch_boot_balloon_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let (lines, sink) = RecordingSink::successful();
+
+        let result = signal_balloon_queue_interrupts(dispatches, sink.as_ref())
+            .expect("queued balloon deflate dispatch should collect");
+
+        let device = &result.as_slice()[0];
+        assert!(device.dispatch().needs_queue_interrupt());
+        assert!(device.queue_interrupt_signaled());
+        assert_eq!(recorded_lines(&lines), vec![32]);
+        let dispatch = device
+            .dispatch()
+            .outcome()
+            .dispatched()
+            .expect("balloon deflate notification should dispatch");
+        let deflate = dispatch
+            .deflate_queue_dispatch()
+            .expect("deflate queue dispatch should be present");
+        assert_eq!(deflate.completed_descriptors(), 1);
+        assert!(deflate.needs_queue_interrupt());
+        assert_eq!(read_balloon_deflate_used_index(&memory), 1);
+    }
+
+    #[test]
+    fn balloon_notification_signal_dispatch_preserves_partial_error_interrupt_intent() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_with_balloon();
+        configure_boot_balloon_queues(&mut runtime, &mut mmio_dispatcher);
+        write_partially_invalid_balloon_inflate_request(&mut memory);
+        notify_boot_balloon_queue(
+            &mut runtime,
+            &mut mmio_dispatcher,
+            VIRTIO_BALLOON_INFLATE_QUEUE_INDEX,
+        );
+        let dispatches =
+            dispatch_boot_balloon_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let (lines, sink) = RecordingSink::successful();
+
+        let result = signal_balloon_queue_interrupts(dispatches, sink.as_ref())
+            .expect("partial balloon dispatch result should collect");
+
+        let device = &result.as_slice()[0];
+        assert!(device.dispatch().needs_queue_interrupt());
+        assert!(device.queue_interrupt_signaled());
+        let err = device
+            .dispatch()
+            .outcome()
+            .dispatch_error()
+            .expect("partial inflate dispatch error should be preserved");
+        let completed = err
+            .completed_notification_dispatch()
+            .expect("completed notification metadata should be preserved");
+        let inflate = completed
+            .inflate_queue_dispatch()
+            .expect("completed inflate metadata should be present");
+        assert_eq!(inflate.completed_descriptors(), 1);
+        assert!(inflate.needs_queue_interrupt());
+        assert_eq!(recorded_lines(&lines), vec![32]);
+        assert_eq!(read_balloon_inflate_used_index(&memory), 1);
+    }
+
+    #[test]
+    fn balloon_notification_signal_dispatch_preserves_signal_failure_per_device() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_with_balloon();
+        configure_boot_balloon_queues(&mut runtime, &mut mmio_dispatcher);
+        write_queued_balloon_inflate_request(&mut memory);
+        notify_boot_balloon_queue(
+            &mut runtime,
+            &mut mmio_dispatcher,
+            VIRTIO_BALLOON_INFLATE_QUEUE_INDEX,
+        );
+        let dispatches =
+            dispatch_boot_balloon_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let (lines, sink) = RecordingSink::failing("injected balloon signal failure");
+
+        let result = signal_balloon_queue_interrupts(dispatches, sink.as_ref())
+            .expect("balloon signal failure should stay per-device");
+
+        let device = &result.as_slice()[0];
+        assert!(result.has_signal_failure());
+        assert!(!device.queue_interrupt_signaled());
+        let err = device
+            .signal_error()
+            .expect("balloon signal failure should be preserved");
+        assert_eq!(
+            err.to_string(),
+            "failed to signal guest interrupt line 32 for queue interrupt: injected balloon signal failure"
+        );
+        assert_eq!(recorded_lines(&lines), vec![32]);
+        assert_eq!(
+            read_boot_balloon_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                VirtioMmioRegister::InterruptStatus
+            ),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+    }
+
+    #[test]
+    fn balloon_notification_signal_dispatch_preserves_missing_handler_without_signal() {
+        let (mut memory, mut runtime, _) = boot_runtime_with_balloon();
+        let mut mmio_dispatcher = MmioDispatcher::new();
+        let dispatches =
+            dispatch_boot_balloon_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let (lines, sink) = RecordingSink::successful();
+
+        let result = signal_balloon_queue_interrupts(dispatches, sink.as_ref())
+            .expect("missing balloon handler dispatch should collect");
+
+        let device = &result.as_slice()[0];
+        assert!(device.dispatch().outcome().handler_lookup_error().is_some());
+        assert!(!device.queue_interrupt_signaled());
+        assert!(device.signal_error().is_none());
+        assert!(recorded_lines(&lines).is_empty());
+    }
+
+    #[test]
+    fn balloon_notification_signal_dispatch_preserves_wrong_handler_without_signal() {
+        let (mut memory, mut runtime, _) = boot_runtime_with_balloon();
+        let region = runtime
+            .balloon_device
+            .as_ref()
+            .expect("balloon device should exist")
+            .registration
+            .region();
+        let mut mmio_dispatcher = MmioDispatcher::new();
+        mmio_dispatcher
+            .insert_region(region.id(), region.range().start(), region.range().size())
+            .expect("replacement balloon region should insert");
+        mmio_dispatcher
+            .register_handler(region.id(), WrongBalloonHandler)
+            .expect("wrong balloon handler should register");
+        let dispatches =
+            dispatch_boot_balloon_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let (lines, sink) = RecordingSink::successful();
+
+        let result = signal_balloon_queue_interrupts(dispatches, sink.as_ref())
+            .expect("wrong balloon handler dispatch should collect");
+
+        let device = &result.as_slice()[0];
+        assert!(device.dispatch().outcome().handler_lookup_error().is_some());
+        assert!(!device.queue_interrupt_signaled());
+        assert!(device.signal_error().is_none());
+        assert!(recorded_lines(&lines).is_empty());
+    }
+
+    #[test]
     fn boot_session_run_step_delegates_with_session_dispatcher() {
         let dispatcher = Arc::new(Mutex::new(MmioDispatcher::new()));
         let (runner, recorded_dispatchers) =
@@ -6343,11 +7326,13 @@ mod tests {
                 "dispatch",
                 "network-dispatch",
                 "vsock-dispatch",
+                "balloon-dispatch",
                 "entropy-dispatch",
                 "run",
                 "dispatch",
                 "network-dispatch",
                 "vsock-dispatch",
+                "balloon-dispatch",
                 "entropy-dispatch",
             ]
         );
@@ -6469,6 +7454,7 @@ mod tests {
                 "dispatch",
                 "network-dispatch",
                 "vsock-dispatch",
+                "balloon-dispatch",
                 "entropy-dispatch",
             ]
         );
@@ -6517,6 +7503,28 @@ mod tests {
     }
 
     #[test]
+    fn boot_session_run_loop_reports_stop_after_balloon_dispatch_before_step_limit() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([mmio_run_step_outcome()]);
+        session.request_stop_on_balloon_dispatch(stop_token.clone());
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("stop after balloon dispatch should succeed");
+
+        assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Stopped { steps: 1 });
+        assert_eq!(
+            session.events,
+            [
+                "run",
+                "dispatch",
+                "network-dispatch",
+                "vsock-dispatch",
+                "balloon-dispatch",
+            ]
+        );
+    }
+
+    #[test]
     fn boot_session_run_loop_reports_stop_after_non_mmio_vsock_dispatch() {
         let stop_token = HvfArm64BootRunLoopStopToken::new();
         let mut session = RecordingBootSessionRunLoopSession::new([hvc_run_step_outcome()]);
@@ -6546,6 +7554,7 @@ mod tests {
                 "dispatch",
                 "network-dispatch",
                 "vsock-dispatch",
+                "balloon-dispatch",
                 "entropy-dispatch",
             ]
         );
@@ -6785,6 +7794,44 @@ mod tests {
     }
 
     #[test]
+    fn boot_session_run_loop_preserves_balloon_notification_error_after_mmio_step() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([mmio_run_step_outcome()]);
+        session.push_balloon_dispatch_error(
+            HvfArm64BootBalloonNotificationDispatchError::MmioDispatcher {
+                source: HvfArm64BootMmioDispatcherError::Busy,
+            },
+        );
+
+        let err = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect_err("balloon notification error should stop loop");
+
+        match err {
+            super::HvfArm64BootRunLoopError::DispatchBalloonNotifications {
+                steps_completed,
+                source,
+            } => {
+                assert_eq!(steps_completed, 1);
+                assert_eq!(
+                    source.to_string(),
+                    "failed to lock HVF boot-session MMIO dispatcher: HVF boot-session MMIO dispatcher lock is busy"
+                );
+            }
+            other => panic!("expected balloon notification error, got {other:?}"),
+        }
+        assert_eq!(
+            session.events,
+            [
+                "run",
+                "dispatch",
+                "network-dispatch",
+                "vsock-dispatch",
+                "balloon-dispatch",
+            ]
+        );
+    }
+
+    #[test]
     fn boot_session_run_loop_preserves_vsock_notification_error_after_non_mmio_step() {
         let stop_token = HvfArm64BootRunLoopStopToken::new();
         let mut session = RecordingBootSessionRunLoopSession::new([hvc_run_step_outcome()]);
@@ -6846,6 +7893,7 @@ mod tests {
                 "dispatch",
                 "network-dispatch",
                 "vsock-dispatch",
+                "balloon-dispatch",
                 "entropy-dispatch",
             ]
         );
