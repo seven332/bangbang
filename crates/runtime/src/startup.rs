@@ -45,6 +45,7 @@ use crate::network::{
     VirtioNetworkDeviceNotificationError, VirtioNetworkMmioHandler, VirtioNetworkRxPacketSource,
     VirtioNetworkTxPacketSink,
 };
+use crate::pmem::{PreparedPmemDevice, PreparedPmemDeviceError, PreparedPmemDevices};
 use crate::serial::{SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialMmioDevice, SharedSerialOutput};
 use crate::vsock::{
     PreparedVsockDevice, PreparedVsockDeviceError, VirtioVsockDeviceNotificationDispatch,
@@ -120,6 +121,7 @@ pub struct Arm64BootResources {
     pub mmio_dispatcher: MmioDispatcher,
     pub serial_device: Option<Arm64BootSerialDevice>,
     pub block_devices: Vec<Arm64BootBlockDevice>,
+    pub pmem_devices: Vec<PreparedPmemDevice>,
     pub network_devices: Vec<Arm64BootNetworkDevice>,
     pub vsock_device: Option<Arm64BootVsockDevice>,
     pub balloon_device: Option<Arm64BootBalloonDevice>,
@@ -141,6 +143,7 @@ pub struct Arm64BootRuntimeResources {
     pub fdt: Arm64FdtGuestMemoryWrite,
     pub serial_device: Option<Arm64BootSerialDevice>,
     pub block_devices: Vec<Arm64BootBlockDevice>,
+    pub pmem_devices: Vec<PreparedPmemDevice>,
     pub network_devices: Vec<Arm64BootNetworkDevice>,
     pub vsock_device: Option<Arm64BootVsockDevice>,
     pub balloon_device: Option<Arm64BootBalloonDevice>,
@@ -1320,6 +1323,9 @@ pub enum Arm64BootResourceError {
     PrepareBlockDevices {
         source: PreparedBlockDeviceError,
     },
+    PreparePmemDevices {
+        source: PreparedPmemDeviceError,
+    },
     PrepareNetworkDevices {
         source: PreparedNetworkDeviceError,
     },
@@ -1415,6 +1421,9 @@ impl fmt::Display for Arm64BootResourceError {
             Self::PrepareBlockDevices { source } => {
                 write!(f, "failed to prepare block devices: {source}")
             }
+            Self::PreparePmemDevices { source } => {
+                write!(f, "failed to prepare pmem devices: {source}")
+            }
             Self::PrepareNetworkDevices { source } => {
                 write!(f, "failed to prepare network devices: {source}")
             }
@@ -1486,6 +1495,7 @@ impl std::error::Error for Arm64BootResourceError {
             Self::BootSourceLoad { source } => Some(source),
             Self::RootDriveCommandLine { source } => Some(source),
             Self::PrepareBlockDevices { source } => Some(source),
+            Self::PreparePmemDevices { source } => Some(source),
             Self::PrepareNetworkDevices { source } => Some(source),
             Self::PrepareVsockDevice { source } => Some(source),
             Self::PrepareBalloonDevice { source } => Some(source),
@@ -1604,6 +1614,8 @@ impl Arm64BootResources {
             .load(&layout, &mut memory)
             .map_err(|source| Arm64BootResourceError::BootSourceLoad { source })?;
         append_root_drive_command_line(&mut loaded_boot_source, controller.drive_configs())?;
+        let prepared_pmems = PreparedPmemDevices::from_config_slice(controller.pmem_configs())
+            .map_err(|source| Arm64BootResourceError::PreparePmemDevices { source })?;
 
         let prepared_blocks =
             PreparedBlockDevices::from_config_slice(controller.drive_configs())
@@ -1731,6 +1743,7 @@ impl Arm64BootResources {
             mmio_dispatcher,
             serial_device,
             block_devices,
+            pmem_devices: prepared_pmems.into_vec(),
             network_devices,
             vsock_device,
             balloon_device,
@@ -1749,6 +1762,7 @@ impl Arm64BootResources {
                 fdt: self.fdt,
                 serial_device: self.serial_device,
                 block_devices: self.block_devices,
+                pmem_devices: self.pmem_devices,
                 network_devices: self.network_devices,
                 vsock_device: self.vsock_device,
                 balloon_device: self.balloon_device,
@@ -2105,6 +2119,7 @@ mod tests {
         VirtioNetworkRxPacket, VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError,
         VirtioNetworkTxFrame, VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
     };
+    use crate::pmem::{PmemConfigInput, PreparedPmemDeviceError};
     use crate::serial::{
         SERIAL_MMIO_DEVICE_WINDOW_SIZE, SERIAL_TRANSMIT_REGISTER_OFFSET, SerialMmioDevice,
         SerialOutputFile, SharedSerialOutput, SharedSerialOutputBuffer,
@@ -2307,6 +2322,15 @@ mod tests {
         controller
             .handle_action(VmmAction::PutDrive(input))
             .expect("drive config should be stored");
+    }
+
+    fn add_pmem(controller: &mut crate::VmmController, id: &str, path: &Path, read_only: bool) {
+        controller
+            .handle_action(VmmAction::PutPmem(
+                PmemConfigInput::new(id, path.to_string_lossy().into_owned())
+                    .with_read_only(read_only),
+            ))
+            .expect("pmem config should be stored");
     }
 
     fn add_network(controller: &mut crate::VmmController, iface_id: &str, host_dev_name: &str) {
@@ -4031,6 +4055,7 @@ mod tests {
             aarch64::fdt_address(&resources.layout).expect("FDT address should be valid")
         );
         assert!(resources.block_devices.is_empty());
+        assert!(resources.pmem_devices.is_empty());
         assert!(resources.network_devices.is_empty());
         assert!(resources.vsock_device.is_none());
         assert!(resources.balloon_device.is_none());
@@ -4074,6 +4099,101 @@ mod tests {
             line(32)
         );
         assert_eq!(resources.mmio_dispatcher.regions().len(), 1);
+    }
+
+    #[test]
+    fn assembles_boot_resources_with_prepared_pmem_backings() {
+        let kernel = temp_file("kernel-with-pmem", &arm64_image());
+        let first_pmem = temp_file("pmem-first", b"first");
+        let second_pmem = temp_file("pmem-second", b"second");
+        let mut controller = controller_with_kernel(kernel.path());
+        add_pmem(&mut controller, "pmem0", first_pmem.path(), false);
+        add_pmem(&mut controller, "pmem1", second_pmem.path(), true);
+
+        let resources =
+            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
+                .expect("boot resources should assemble with pmem backing files");
+
+        assert_eq!(resources.pmem_devices.len(), 2);
+        assert_eq!(resources.pmem_devices[0].id(), "pmem0");
+        assert_eq!(resources.pmem_devices[0].backing().len(), 5);
+        assert!(!resources.pmem_devices[0].backing().is_read_only());
+        assert_eq!(resources.pmem_devices[1].id(), "pmem1");
+        assert_eq!(resources.pmem_devices[1].backing().len(), 6);
+        assert!(resources.pmem_devices[1].backing().is_read_only());
+        assert!(resources.mmio_dispatcher.regions().is_empty());
+        assert_eq!(
+            resources.loaded_boot_source.command_line.as_str(),
+            DEFAULT_KERNEL_COMMAND_LINE
+        );
+        assert_eq!(fdt_bootargs(&resources), DEFAULT_KERNEL_COMMAND_LINE);
+    }
+
+    #[test]
+    fn runtime_parts_retain_prepared_pmem_backings() {
+        let kernel = temp_file("kernel-runtime-pmem", &arm64_image());
+        let pmem = temp_file("pmem-runtime", b"pmem");
+        let mut controller = controller_with_kernel(kernel.path());
+        add_pmem(&mut controller, "pmem0", pmem.path(), false);
+
+        let parts = Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
+            .expect("boot resources should assemble with pmem")
+            .into_parts();
+
+        assert_eq!(parts.runtime.pmem_devices.len(), 1);
+        assert_eq!(parts.runtime.pmem_devices[0].id(), "pmem0");
+        assert_eq!(parts.runtime.pmem_devices[0].backing().len(), 4);
+    }
+
+    #[test]
+    fn missing_pmem_backing_fails_startup_without_echoing_path() {
+        let kernel = temp_file("kernel-missing-pmem", &arm64_image());
+        let missing = missing_path("secret-missing-pmem.img");
+        let mut controller = controller_with_kernel(kernel.path());
+        add_pmem(&mut controller, "pmem0", &missing, false);
+
+        let err = Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
+            .expect_err("missing pmem backing should fail startup resource assembly");
+
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::PreparePmemDevices { ref source }
+                if matches!(
+                    source,
+                    PreparedPmemDeviceError::OpenBacking {
+                        pmem_id,
+                        source: crate::pmem::PmemFileBackingError::OpenFile { .. },
+                    } if pmem_id == "pmem0"
+                )
+        ));
+        assert!(!err.to_string().contains("secret-missing-pmem"));
+    }
+
+    #[test]
+    fn zero_sized_pmem_backing_fails_startup() {
+        let kernel = temp_file("kernel-empty-pmem", &arm64_image());
+        let pmem = temp_file("empty-pmem", b"");
+        let mut controller = controller_with_kernel(kernel.path());
+        add_pmem(&mut controller, "pmem0", pmem.path(), true);
+
+        let err = Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
+            .expect_err("zero-sized pmem backing should fail startup resource assembly");
+
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::PreparePmemDevices { ref source }
+                if matches!(
+                    source,
+                    PreparedPmemDeviceError::OpenBacking {
+                        pmem_id,
+                        source: crate::pmem::PmemFileBackingError::ZeroSizedFile,
+                    } if pmem_id == "pmem0"
+                )
+        ));
+        assert_eq!(
+            err.to_string(),
+            "failed to prepare pmem devices: failed to prepare pmem device pmem0: pmem backing file is zero-sized"
+        );
     }
 
     #[test]

@@ -107,9 +107,12 @@ is resource-specific:
   implement block-device hotplug or removal.
 - `/pmem/{id}` stores Firecracker-shaped pmem backing paths during pre-boot
   configuration after rejecting empty paths, and reports them through
-  `GET /vm/config`. It does not open, stat, mmap, normalize, or attach those
-  paths to a guest-visible virtio-pmem device yet. Configured rate limiters are
-  rejected without replacing stored pmem configuration.
+  `GET /vm/config`. Startup opens each configured path with nonblocking
+  read/write access according to the configured read-only flag, verifies it is a
+  non-zero regular file, and keeps the file handles with the boot resources. It
+  does not mmap, normalize, or attach those paths to a guest-visible
+  virtio-pmem device yet. Configured rate limiters are rejected without
+  replacing stored pmem configuration.
 - `/snapshot/create` and `/snapshot/load` currently parse Firecracker-shaped
   snapshot paths before returning unsupported faults, and they do not open or
   create snapshot state or memory files. Future snapshot support must treat
