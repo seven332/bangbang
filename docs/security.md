@@ -225,12 +225,12 @@ generic no-ops.
 The current virtio-balloon foundation derives a startup-attached virtio-mmio/FDT
 shell from stored control-plane configuration. It exposes guest-visible
 identity, feature, queue, and config-space registers, but does not map guest
-memory, process guest descriptors, or change host memory accounting. Guest
-config-space writes update only local device register state, and queue
-notifications do not perform descriptor dispatch yet. Future balloon descriptor
-handling must treat PFNs, statistics descriptors, free-page hinting commands,
-and reporting queue data as untrusted guest input before changing host memory
-accounting or reclaim behavior.
+memory or change host memory accounting. Guest config-space writes update only
+local device register state. The backend-neutral deflate notification dispatcher
+can acknowledge descriptor heads by publishing zero-length used-ring entries;
+other balloon descriptor handling must treat PFNs, statistics descriptors,
+free-page hinting commands, and reporting queue data as untrusted guest input
+before changing host memory accounting or reclaim behavior.
 
 The current serial device is a TX-only MMIO output path. By default, guest
 serial bytes go to a bounded internal capture buffer; when `/serial` configures
