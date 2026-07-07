@@ -207,6 +207,10 @@ It also includes a direct-rootfs entropy scenario that configures `/entropy`,
 checks that the guest selected `virtio_rng` as the current hardware RNG, reads
 from `/dev/hwrng`, and writes a host-observable marker only after a non-empty
 read succeeds.
+It also includes a direct-rootfs pmem scenario that configures `/pmem/pmem0`
+through the public API, waits for `BANGBANG_PMEM_READ_FLUSH_OK` in a scratch
+drive, and then verifies the guest-written pmem marker in the host backing
+file.
 Because every configured network interface is bound to MMDS in these scenarios,
 startup uses the process-local MMDS-only packet path and does not require
 external vmnet packet movement.
