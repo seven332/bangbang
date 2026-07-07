@@ -556,21 +556,22 @@ impl VmmController {
             });
         }
 
-        let updated_config = self
+        let current_config = self
             .balloon_config
-            .ok_or(VmmActionError::BalloonUnsupported)?
-            .updated(input)
-            .map_err(VmmActionError::BalloonUpdate)?;
-        if u64::from(updated_config.amount_mib()) > self.machine_config.mem_size_mib() {
+            .ok_or(VmmActionError::BalloonUnsupported)?;
+
+        if u64::from(input.amount_mib()) > self.machine_config.mem_size_mib() {
             return Err(VmmActionError::BalloonUpdate(
                 balloon::BalloonUpdateError::TargetExceedsGuestMemory {
-                    amount_mib: updated_config.amount_mib(),
+                    amount_mib: input.amount_mib(),
                     mem_size_mib: self.machine_config.mem_size_mib(),
                 },
             ));
         }
 
-        Ok(updated_config)
+        current_config
+            .updated(input)
+            .map_err(VmmActionError::BalloonUpdate)
     }
 
     pub fn commit_balloon_update(&mut self, config: balloon::BalloonConfig) {
@@ -2041,7 +2042,7 @@ mod tests {
     }
 
     #[test]
-    fn patch_balloon_rejects_oversized_target_without_mutating() {
+    fn patch_balloon_rejects_max_target_without_mutating() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         controller
             .handle_action(VmmAction::PutBalloon(balloon_input(64, true)))
@@ -2050,12 +2051,15 @@ mod tests {
 
         let err = controller
             .handle_action(VmmAction::PatchBalloon(balloon_update_input(u32::MAX)))
-            .expect_err("oversized balloon target should fail");
+            .expect_err("maximum balloon target should fail");
 
-        assert!(matches!(
+        assert_eq!(
             err,
-            VmmActionError::BalloonUpdate(BalloonUpdateError::PageCountOverflow(_))
-        ));
+            VmmActionError::BalloonUpdate(BalloonUpdateError::TargetExceedsGuestMemory {
+                amount_mib: u32::MAX,
+                mem_size_mib: DEFAULT_MEM_SIZE_MIB,
+            })
+        );
         assert_eq!(
             controller.balloon_config(),
             Some(BalloonConfig::from(balloon_input(64, true)))
