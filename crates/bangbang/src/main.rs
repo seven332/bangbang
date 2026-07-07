@@ -3353,7 +3353,7 @@ mod tests {
     }
 
     #[test]
-    fn config_file_balloon_config_fails_before_starting() {
+    fn config_file_balloon_config_starts_instance() {
         let config_path = unique_config_path("balloon");
         let config = r#"{
             "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
@@ -3367,20 +3367,11 @@ mod tests {
             TestInstanceStarter,
         );
 
-        let err = super::apply_startup_config_file(
-            &mut vmm,
-            Some(config_path.to_str().expect("UTF-8 path")),
-        )
-        .expect_err("configured balloon should fail before start");
+        super::apply_startup_config_file(&mut vmm, Some(config_path.to_str().expect("UTF-8 path")))
+            .expect("configured balloon should not block start");
 
-        assert_eq!(
-            err,
-            ProcessError::ConfigFile(super::ConfigFileError::Apply(
-                bangbang_runtime::VmmActionError::BalloonUnsupported
-            ))
-        );
-        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
-        assert!(!vmm.has_started_session());
+        assert_eq!(vmm.instance_info().state, InstanceState::Running);
+        assert!(vmm.has_started_session());
         let data = vmm
             .handle_action(VmmAction::GetBalloon)
             .expect("balloon config should be retained");

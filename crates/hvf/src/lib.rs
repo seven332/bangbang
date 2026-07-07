@@ -29,14 +29,14 @@ pub use runner::{
     HvfVcpuRunCancelHandle, HvfVcpuRunStepOutcome, HvfVcpuRunner, HvfVcpuRunnerError,
 };
 pub use startup::{
-    HvfArm64BootBlockNotificationDispatch, HvfArm64BootBlockNotificationDispatchError,
-    HvfArm64BootBlockNotificationDispatches, HvfArm64BootEntropyDeviceConfig,
-    HvfArm64BootInterruptLinePurpose, HvfArm64BootMmioDispatcherError,
-    HvfArm64BootNetworkNotificationDispatch, HvfArm64BootNetworkNotificationDispatchError,
-    HvfArm64BootNetworkNotificationDispatches, HvfArm64BootRunLoopControl,
-    HvfArm64BootRunLoopError, HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopStopToken,
-    HvfArm64BootSerialDeviceConfig, HvfArm64BootSession, HvfArm64BootSessionConfig,
-    HvfArm64BootSessionError, HvfArm64BootSessionShutdownError,
+    HvfArm64BootBalloonDeviceConfig, HvfArm64BootBlockNotificationDispatch,
+    HvfArm64BootBlockNotificationDispatchError, HvfArm64BootBlockNotificationDispatches,
+    HvfArm64BootEntropyDeviceConfig, HvfArm64BootInterruptLinePurpose,
+    HvfArm64BootMmioDispatcherError, HvfArm64BootNetworkNotificationDispatch,
+    HvfArm64BootNetworkNotificationDispatchError, HvfArm64BootNetworkNotificationDispatches,
+    HvfArm64BootRunLoopControl, HvfArm64BootRunLoopError, HvfArm64BootRunLoopOutcome,
+    HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSession,
+    HvfArm64BootSessionConfig, HvfArm64BootSessionError, HvfArm64BootSessionShutdownError,
     HvfArm64BootVsockNotificationDispatch, HvfArm64BootVsockNotificationDispatchError,
     HvfArm64BootVsockNotificationDispatches, OwnedHvfArm64BootSession,
 };

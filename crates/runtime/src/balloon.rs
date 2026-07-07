@@ -2,6 +2,16 @@
 
 use std::fmt;
 
+use crate::memory::{GuestAddress, GuestMemoryError};
+use crate::mmio::{
+    MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
+    MmioHandlerError, MmioRegion, MmioRegionId,
+};
+use crate::virtio_mmio::{
+    VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
+    VirtioMmioDeviceConfigHandler, VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
+};
+
 pub const VIRTIO_BALLOON_DEVICE_ID: u32 = 5;
 pub const VIRTIO_BALLOON_QUEUE_SIZE: u16 = 256;
 pub const VIRTIO_BALLOON_MIN_QUEUE_COUNT: usize = 2;
@@ -19,6 +29,8 @@ pub const VIRTIO_BALLOON_F_DEFLATE_ON_OOM: u32 = 2;
 pub const VIRTIO_BALLOON_F_FREE_PAGE_HINTING: u32 = 3;
 pub const VIRTIO_BALLOON_F_FREE_PAGE_REPORTING: u32 = 5;
 pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
+
+pub type VirtioBalloonMmioHandler = VirtioMmioRegisterHandler<VirtioBalloonConfigSpace>;
 
 const fn virtio_feature_bit(feature: u32) -> u64 {
     1_u64 << feature
@@ -193,6 +205,33 @@ impl VirtioBalloonConfigSpace {
         self.free_page_hint_cmd_id
     }
 
+    pub const fn from_le_bytes(bytes: [u8; VIRTIO_BALLOON_CONFIG_SPACE_SIZE]) -> Self {
+        let [
+            num_pages0,
+            num_pages1,
+            num_pages2,
+            num_pages3,
+            actual_pages0,
+            actual_pages1,
+            actual_pages2,
+            actual_pages3,
+            cmd0,
+            cmd1,
+            cmd2,
+            cmd3,
+        ] = bytes;
+        Self {
+            num_pages: u32::from_le_bytes([num_pages0, num_pages1, num_pages2, num_pages3]),
+            actual_pages: u32::from_le_bytes([
+                actual_pages0,
+                actual_pages1,
+                actual_pages2,
+                actual_pages3,
+            ]),
+            free_page_hint_cmd_id: u32::from_le_bytes([cmd0, cmd1, cmd2, cmd3]),
+        }
+    }
+
     pub fn to_le_bytes(self) -> [u8; VIRTIO_BALLOON_CONFIG_SPACE_SIZE] {
         let [num_pages0, num_pages1, num_pages2, num_pages3] = self.num_pages.to_le_bytes();
         let [actual_pages0, actual_pages1, actual_pages2, actual_pages3] =
@@ -213,6 +252,29 @@ impl VirtioBalloonConfigSpace {
             cmd2,
             cmd3,
         ]
+    }
+}
+
+impl VirtioMmioDeviceConfigHandler for VirtioBalloonConfigSpace {
+    fn read_device_config(
+        &self,
+        access: VirtioMmioDeviceConfigAccess,
+    ) -> Result<MmioAccessBytes, VirtioMmioDeviceConfigError> {
+        let bytes = self.to_le_bytes();
+        let bytes = balloon_config_access_bytes(&bytes, access)?;
+        MmioAccessBytes::new(bytes).map_err(balloon_config_bytes_error)
+    }
+
+    fn write_device_config(
+        &mut self,
+        access: VirtioMmioDeviceConfigAccess,
+        data: MmioAccessBytes,
+    ) -> Result<(), VirtioMmioDeviceConfigError> {
+        let mut bytes = self.to_le_bytes();
+        let destination = balloon_config_access_bytes_mut(&mut bytes, access)?;
+        destination.copy_from_slice(data.as_slice());
+        *self = Self::from_le_bytes(bytes);
+        Ok(())
     }
 }
 
@@ -348,6 +410,10 @@ impl VirtioBalloonQueueLayout {
         self.iter().count()
     }
 
+    pub fn queue_sizes(self) -> VirtioBalloonQueueSizes {
+        VirtioBalloonQueueSizes::from_layout(self)
+    }
+
     pub fn iter(self) -> impl Iterator<Item = VirtioBalloonQueueConfig> {
         [
             Some(self.inflate),
@@ -358,6 +424,40 @@ impl VirtioBalloonQueueLayout {
         ]
         .into_iter()
         .flatten()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioBalloonQueueSizes {
+    sizes: [u16; VIRTIO_BALLOON_MAX_QUEUE_COUNT],
+    len: usize,
+}
+
+impl VirtioBalloonQueueSizes {
+    pub fn from_layout(layout: VirtioBalloonQueueLayout) -> Self {
+        let mut sizes = [0; VIRTIO_BALLOON_MAX_QUEUE_COUNT];
+        let mut len = 0;
+        for queue in layout.iter() {
+            if let Some(size) = sizes.get_mut(len) {
+                *size = queue.size();
+                len += 1;
+            }
+        }
+
+        Self { sizes, len }
+    }
+
+    pub const fn len(self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_slice(&self) -> &[u16] {
+        let (used, _) = self.sizes.split_at(self.len);
+        used
     }
 }
 
@@ -388,6 +488,25 @@ impl PreparedBalloonDevice {
     pub const fn queue_layout(self) -> VirtioBalloonQueueLayout {
         self.queue_layout
     }
+
+    pub fn queue_sizes(self) -> VirtioBalloonQueueSizes {
+        self.queue_layout.queue_sizes()
+    }
+
+    pub fn register_mmio(
+        self,
+        layout: BalloonMmioLayout,
+    ) -> Result<BalloonMmioDevice, BalloonMmioRegistrationError> {
+        BalloonMmioDevice::from_prepared(self, layout)
+    }
+
+    pub fn register_mmio_with_dispatcher(
+        self,
+        layout: BalloonMmioLayout,
+        dispatcher: MmioDispatcher,
+    ) -> Result<BalloonMmioDevice, BalloonMmioRegistrationError> {
+        BalloonMmioDevice::from_prepared_with_dispatcher(self, layout, dispatcher)
+    }
 }
 
 impl TryFrom<BalloonConfig> for PreparedBalloonDevice {
@@ -416,9 +535,277 @@ pub const fn available_features(config: BalloonConfig) -> u64 {
     features
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BalloonMmioLayout {
+    address: GuestAddress,
+    region_id: MmioRegionId,
+}
+
+impl BalloonMmioLayout {
+    pub const fn new(address: GuestAddress, region_id: MmioRegionId) -> Self {
+        Self { address, region_id }
+    }
+
+    pub const fn address(self) -> GuestAddress {
+        self.address
+    }
+
+    pub const fn region_id(self) -> MmioRegionId {
+        self.region_id
+    }
+
+    fn region(self) -> Result<MmioRegion, BalloonMmioRegistrationError> {
+        MmioRegion::new(self.region_id, self.address, VIRTIO_MMIO_DEVICE_WINDOW_SIZE).map_err(
+            |source| BalloonMmioRegistrationError::InvalidRegion {
+                region_id: self.region_id,
+                address: self.address,
+                source,
+            },
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BalloonMmioDeviceRegistration {
+    region: MmioRegion,
+}
+
+impl BalloonMmioDeviceRegistration {
+    pub const fn region(self) -> MmioRegion {
+        self.region
+    }
+
+    pub const fn region_id(self) -> MmioRegionId {
+        self.region.id()
+    }
+
+    pub const fn address(self) -> GuestAddress {
+        self.region.range().start()
+    }
+}
+
+#[derive(Debug)]
+pub struct BalloonMmioDevice {
+    dispatcher: MmioDispatcher,
+    registration: BalloonMmioDeviceRegistration,
+}
+
+impl BalloonMmioDevice {
+    pub fn from_prepared(
+        prepared: PreparedBalloonDevice,
+        layout: BalloonMmioLayout,
+    ) -> Result<Self, BalloonMmioRegistrationError> {
+        Self::from_prepared_with_dispatcher(prepared, layout, MmioDispatcher::new())
+    }
+
+    pub fn from_prepared_with_dispatcher(
+        prepared: PreparedBalloonDevice,
+        layout: BalloonMmioLayout,
+        dispatcher: MmioDispatcher,
+    ) -> Result<Self, BalloonMmioRegistrationError> {
+        let region = layout.region()?;
+        let queue_sizes = prepared.queue_sizes();
+        let handler = VirtioBalloonMmioHandler::with_device_config(
+            VIRTIO_BALLOON_DEVICE_ID,
+            prepared.available_features(),
+            queue_sizes.as_slice(),
+            prepared.config_space(),
+        )
+        .map_err(|source| BalloonMmioRegistrationError::BuildHandler {
+            region_id: layout.region_id(),
+            source,
+        })?;
+        let mut dispatcher = dispatcher;
+        let inserted_region = dispatcher
+            .insert_region(
+                layout.region_id(),
+                layout.address(),
+                VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+            )
+            .map_err(|source| BalloonMmioRegistrationError::InsertRegion {
+                region_id: layout.region_id(),
+                address: layout.address(),
+                source,
+            })?;
+        dispatcher
+            .register_handler(layout.region_id(), handler)
+            .map_err(|source| BalloonMmioRegistrationError::RegisterHandler {
+                region_id: layout.region_id(),
+                source,
+            })?;
+        debug_assert_eq!(inserted_region, region);
+
+        Ok(Self {
+            dispatcher,
+            registration: BalloonMmioDeviceRegistration { region },
+        })
+    }
+
+    pub fn dispatcher(&self) -> &MmioDispatcher {
+        &self.dispatcher
+    }
+
+    pub fn dispatcher_mut(&mut self) -> &mut MmioDispatcher {
+        &mut self.dispatcher
+    }
+
+    pub const fn registration(&self) -> BalloonMmioDeviceRegistration {
+        self.registration
+    }
+
+    pub fn into_parts(self) -> (MmioDispatcher, BalloonMmioDeviceRegistration) {
+        (self.dispatcher, self.registration)
+    }
+}
+
+#[derive(Debug)]
+pub enum BalloonMmioRegistrationError {
+    InvalidRegion {
+        region_id: MmioRegionId,
+        address: GuestAddress,
+        source: GuestMemoryError,
+    },
+    BuildHandler {
+        region_id: MmioRegionId,
+        source: VirtioMmioRegisterHandlerError,
+    },
+    InsertRegion {
+        region_id: MmioRegionId,
+        address: GuestAddress,
+        source: MmioBusError,
+    },
+    RegisterHandler {
+        region_id: MmioRegionId,
+        source: MmioDispatchError,
+    },
+}
+
+impl fmt::Display for BalloonMmioRegistrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRegion {
+                region_id,
+                address,
+                source,
+            } => {
+                write!(
+                    f,
+                    "invalid balloon MMIO region id={region_id} at {address}: {source}"
+                )
+            }
+            Self::BuildHandler { region_id, source } => {
+                write!(
+                    f,
+                    "failed to build balloon MMIO handler for region id={region_id}: {source}"
+                )
+            }
+            Self::InsertRegion {
+                region_id,
+                address,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to insert balloon MMIO region id={region_id} at {address}: {source}"
+                )
+            }
+            Self::RegisterHandler { region_id, source } => {
+                write!(
+                    f,
+                    "failed to register balloon MMIO handler for region id={region_id}: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for BalloonMmioRegistrationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidRegion { source, .. } => Some(source),
+            Self::BuildHandler { source, .. } => Some(source),
+            Self::InsertRegion { source, .. } => Some(source),
+            Self::RegisterHandler { source, .. } => Some(source),
+        }
+    }
+}
+
+fn balloon_config_access_bytes(
+    bytes: &[u8; VIRTIO_BALLOON_CONFIG_SPACE_SIZE],
+    access: VirtioMmioDeviceConfigAccess,
+) -> Result<&[u8], VirtioMmioDeviceConfigError> {
+    let offset = usize::try_from(access.offset()).map_err(|_| {
+        VirtioMmioDeviceConfigError::UnsupportedRead {
+            offset: access.offset(),
+            len: access.len(),
+        }
+    })?;
+    let Some(end) = offset.checked_add(access.len()) else {
+        return Err(VirtioMmioDeviceConfigError::UnsupportedRead {
+            offset: access.offset(),
+            len: access.len(),
+        });
+    };
+
+    bytes
+        .get(offset..end)
+        .ok_or(VirtioMmioDeviceConfigError::UnsupportedRead {
+            offset: access.offset(),
+            len: access.len(),
+        })
+}
+
+fn balloon_config_access_bytes_mut(
+    bytes: &mut [u8; VIRTIO_BALLOON_CONFIG_SPACE_SIZE],
+    access: VirtioMmioDeviceConfigAccess,
+) -> Result<&mut [u8], VirtioMmioDeviceConfigError> {
+    let offset = usize::try_from(access.offset()).map_err(|_| {
+        VirtioMmioDeviceConfigError::UnsupportedWrite {
+            offset: access.offset(),
+            len: access.len(),
+        }
+    })?;
+    let Some(end) = offset.checked_add(access.len()) else {
+        return Err(VirtioMmioDeviceConfigError::UnsupportedWrite {
+            offset: access.offset(),
+            len: access.len(),
+        });
+    };
+
+    bytes
+        .get_mut(offset..end)
+        .ok_or(VirtioMmioDeviceConfigError::UnsupportedWrite {
+            offset: access.offset(),
+            len: access.len(),
+        })
+}
+
+fn balloon_config_bytes_error(source: MmioAccessBytesError) -> VirtioMmioDeviceConfigError {
+    VirtioMmioDeviceConfigError::Handler {
+        source: MmioHandlerError::new(format!(
+            "virtio-balloon config access bytes failed: {source}"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::memory::GuestAddress;
+    use crate::mmio::{MmioAccessBytes, MmioDispatchOutcome, MmioOperation, MmioRegionId};
+    use crate::virtio_mmio::{
+        VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
+        VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
+        VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VirtioMmioRegister, VirtioMmioRegisterHandlerError,
+    };
+
+    const TEST_BALLOON_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_8000);
+    const TEST_BALLOON_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(4000);
+    const QUEUE_CONFIG_STATUS: u32 = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
+        | VIRTIO_DEVICE_STATUS_DRIVER
+        | VIRTIO_DEVICE_STATUS_FEATURES_OK;
+    const DRIVER_OK_STATUS: u32 = QUEUE_CONFIG_STATUS | VIRTIO_DEVICE_STATUS_DRIVER_OK;
 
     fn balloon_config(
         amount_mib: u32,
@@ -440,6 +827,52 @@ mod tests {
 
     fn has_feature(features: u64, feature: u32) -> bool {
         features & virtio_feature_bit(feature) != 0
+    }
+
+    fn read_mmio_config(device: &mut BalloonMmioDevice, offset: u64, len: u64) -> MmioAccessBytes {
+        let address = TEST_BALLOON_MMIO_BASE
+            .checked_add(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET + offset)
+            .expect("test MMIO address should not overflow");
+        let access = device
+            .dispatcher()
+            .lookup(address, len)
+            .expect("balloon config access should resolve");
+        let outcome = device
+            .dispatcher_mut()
+            .dispatch(MmioOperation::read(access).expect("read operation should build"))
+            .expect("balloon config read should dispatch");
+
+        match outcome {
+            MmioDispatchOutcome::Read { data } => data,
+            MmioDispatchOutcome::Write => panic!("read should return read data"),
+        }
+    }
+
+    fn write_mmio_config(device: &mut BalloonMmioDevice, offset: u64, data: &[u8]) {
+        let address = TEST_BALLOON_MMIO_BASE
+            .checked_add(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET + offset)
+            .expect("test MMIO address should not overflow");
+        let access = device
+            .dispatcher()
+            .lookup(
+                address,
+                u64::try_from(data.len()).expect("test data length should fit u64"),
+            )
+            .expect("balloon config access should resolve");
+        let data = MmioAccessBytes::new(data).expect("test config bytes should build");
+        device
+            .dispatcher_mut()
+            .dispatch(MmioOperation::write(access, data).expect("write operation should build"))
+            .expect("balloon config write should dispatch");
+    }
+
+    fn balloon_mmio_device(config: BalloonConfig) -> BalloonMmioDevice {
+        prepared(config)
+            .register_mmio(BalloonMmioLayout::new(
+                TEST_BALLOON_MMIO_BASE,
+                TEST_BALLOON_MMIO_REGION_ID,
+            ))
+            .expect("balloon MMIO device should register")
     }
 
     #[test]
@@ -684,5 +1117,202 @@ mod tests {
                 VIRTIO_BALLOON_QUEUE_SIZE,
             ))
         );
+    }
+
+    #[test]
+    fn queue_sizes_follow_compacted_queue_layout() {
+        let base = prepared(balloon_config(64, false, 0, false, false)).queue_sizes();
+        assert_eq!(base.as_slice(), &[VIRTIO_BALLOON_QUEUE_SIZE; 2]);
+
+        let all_enabled = prepared(balloon_config(64, false, 1, true, true)).queue_sizes();
+        assert_eq!(all_enabled.len(), VIRTIO_BALLOON_MAX_QUEUE_COUNT);
+        assert_eq!(all_enabled.as_slice(), &[VIRTIO_BALLOON_QUEUE_SIZE; 5]);
+
+        let reporting_only = prepared(balloon_config(64, false, 0, false, true)).queue_sizes();
+        assert_eq!(
+            reporting_only.as_slice(),
+            &[VIRTIO_BALLOON_QUEUE_SIZE; VIRTIO_BALLOON_MIN_QUEUE_COUNT + 1]
+        );
+    }
+
+    #[test]
+    fn mmio_registration_exposes_identity_features_and_queues() {
+        let mut device = balloon_mmio_device(balloon_config(64, true, 1, true, true));
+        let registration = device.registration();
+
+        assert_eq!(registration.region_id(), TEST_BALLOON_MMIO_REGION_ID);
+        assert_eq!(registration.address(), TEST_BALLOON_MMIO_BASE);
+
+        let handler = device
+            .dispatcher_mut()
+            .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+            .expect("balloon handler should be registered");
+        assert_eq!(
+            handler.device_registers().device_id(),
+            VIRTIO_BALLOON_DEVICE_ID
+        );
+        assert!(has_feature(
+            handler.device_registers().device_features(),
+            VIRTIO_FEATURE_VERSION_1
+        ));
+        assert!(has_feature(
+            handler.device_registers().device_features(),
+            VIRTIO_BALLOON_F_DEFLATE_ON_OOM
+        ));
+        assert_eq!(
+            handler.queue_registers().queue_count(),
+            VIRTIO_BALLOON_MAX_QUEUE_COUNT
+        );
+        assert_eq!(
+            handler
+                .queue_registers()
+                .queue(0)
+                .expect("inflate queue should exist")
+                .max_size(),
+            VIRTIO_BALLOON_QUEUE_SIZE
+        );
+    }
+
+    #[test]
+    fn mmio_config_space_reads_firecracker_layout() {
+        let mut device = balloon_mmio_device(balloon_config(64, false, 0, false, false));
+
+        assert_eq!(
+            read_mmio_config(&mut device, 0, 4).as_slice(),
+            &(64 * VIRTIO_BALLOON_MIB_TO_4K_PAGES).to_le_bytes()
+        );
+        assert_eq!(
+            read_mmio_config(&mut device, 4, 4).as_slice(),
+            &[0, 0, 0, 0]
+        );
+        assert_eq!(
+            read_mmio_config(&mut device, 8, 4).as_slice(),
+            &[0, 0, 0, 0]
+        );
+        let mut config_space = [0; VIRTIO_BALLOON_CONFIG_SPACE_SIZE];
+        config_space[0..4].copy_from_slice(read_mmio_config(&mut device, 0, 4).as_slice());
+        config_space[4..8].copy_from_slice(read_mmio_config(&mut device, 4, 4).as_slice());
+        config_space[8..12].copy_from_slice(read_mmio_config(&mut device, 8, 4).as_slice());
+        assert_eq!(
+            config_space,
+            VirtioBalloonConfigSpace::from_config(balloon_config(64, false, 0, false, false))
+                .expect("balloon config space should build")
+                .to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn mmio_config_space_keeps_guest_writes_in_local_state() {
+        let mut device = balloon_mmio_device(balloon_config(64, false, 0, false, false));
+        let handler = device
+            .dispatcher_mut()
+            .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+            .expect("balloon handler should be registered");
+
+        handler
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
+            .expect("acknowledge status should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            )
+            .expect("driver status should write");
+
+        write_mmio_config(&mut device, 4, &0x0102_0304_u32.to_le_bytes());
+        write_mmio_config(&mut device, 8, &0x0506_0708_u32.to_le_bytes());
+
+        assert_eq!(
+            read_mmio_config(&mut device, 4, 4).as_slice(),
+            &0x0102_0304_u32.to_le_bytes()
+        );
+        assert_eq!(
+            read_mmio_config(&mut device, 8, 4).as_slice(),
+            &0x0506_0708_u32.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn mmio_config_space_rejects_out_of_bounds_accesses() {
+        let mut device = balloon_mmio_device(balloon_config(64, false, 0, false, false));
+        let read_access = device
+            .dispatcher()
+            .lookup(
+                TEST_BALLOON_MMIO_BASE
+                    .checked_add(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET + 12)
+                    .expect("test MMIO address should not overflow"),
+                1,
+            )
+            .expect("access should resolve inside MMIO window");
+        let read = device
+            .dispatcher_mut()
+            .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+            .expect("balloon handler should be registered")
+            .read_access(read_access);
+        assert_eq!(
+            read,
+            Err(VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigRead { offset: 12, len: 1 })
+        );
+
+        let write_access = device
+            .dispatcher()
+            .lookup(
+                TEST_BALLOON_MMIO_BASE
+                    .checked_add(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET + 11)
+                    .expect("test MMIO address should not overflow"),
+                2,
+            )
+            .expect("access should resolve inside MMIO window");
+        let write_data = MmioAccessBytes::new(&[1, 2]).expect("test bytes should build");
+        let handler = device
+            .dispatcher_mut()
+            .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+            .expect("balloon handler should be registered");
+        handler
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
+            .expect("acknowledge status should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            )
+            .expect("driver status should write");
+        let write = handler.write_access(write_access, write_data);
+        assert_eq!(
+            write,
+            Err(
+                VirtioMmioRegisterHandlerError::UnsupportedDeviceConfigWrite { offset: 11, len: 2 }
+            )
+        );
+    }
+
+    #[test]
+    fn mmio_queue_notifications_are_recorded_without_dispatching_descriptors() {
+        let mut device = balloon_mmio_device(balloon_config(64, false, 0, false, false));
+        let handler = device
+            .dispatcher_mut()
+            .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+            .expect("balloon handler should be registered");
+
+        handler
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
+            .expect("acknowledge status should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            )
+            .expect("driver status should write");
+        handler
+            .write_register(VirtioMmioRegister::Status, QUEUE_CONFIG_STATUS)
+            .expect("features-ok status should write");
+        handler
+            .write_register(VirtioMmioRegister::Status, DRIVER_OK_STATUS)
+            .expect("driver-ok status should write");
+        handler
+            .write_register(VirtioMmioRegister::QueueNotify, 0)
+            .expect("queue notification should be accepted");
+
+        assert_eq!(handler.pending_queue_notifications(), vec![0]);
     }
 }
