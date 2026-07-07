@@ -727,11 +727,12 @@ reads bounded PFN descriptor payloads, compacts them into page ranges,
 and publishes zero-length used-ring entries; the deflate queue dispatcher
 also reads bounded PFN descriptor payloads, compacts them into page ranges, and
 publishes zero-length used-ring entries. The hinting queue dispatcher records
-the latest 4-byte command descriptor as `guest_cmd`, publishes zero-length
-used-ring entries, and ignores range descriptors until host-side hinting reclaim
-is designed. Boot runtime resources and the HVF boot loop can drain pending
-balloon inflate/deflate/hinting notifications and signal the allocated balloon
-interrupt line when the runtime dispatch summary reports queue-interrupt intent.
+the latest 4-byte command descriptor as `guest_cmd`, validates and records
+active-run range descriptors in dispatch state, and publishes zero-length
+used-ring entries. Host-side hinting reclaim and reporting remain deferred.
+Boot runtime resources and the HVF boot loop can drain pending balloon
+inflate/deflate/hinting notifications and signal the allocated balloon interrupt
+line when the runtime dispatch summary reports queue-interrupt intent.
 Completed inflate/deflate descriptors update internal inflated-page accounting
 on the owning balloon device after PFN ranges are validated against mapped guest
 memory, and reset clears that accounting.
