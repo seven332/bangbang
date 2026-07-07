@@ -1,11 +1,18 @@
 //! Backend-neutral pmem configuration model.
 
 use std::collections::TryReserveError;
+use std::ffi::c_void;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io;
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+use std::ptr::{self, NonNull};
+#[cfg(test)]
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::mmio::{MmioAccessBytes, MmioAccessBytesError, MmioHandlerError};
 use crate::virtio_mmio::{
@@ -339,24 +346,473 @@ impl std::error::Error for PmemFileBackingError {
     }
 }
 
+pub struct PmemBackingMapping {
+    address: NonNull<c_void>,
+    file_len: u64,
+    mapped_len: u64,
+    host_size: usize,
+    read_only: bool,
+    kind: PmemBackingMappingKind,
+}
+
+// SAFETY: `PmemBackingMapping` owns a process-local mmap region. Moving the
+// owner to another thread does not invalidate the mapping, and `munmap` may run
+// from any thread when ownership is dropped.
+unsafe impl Send for PmemBackingMapping {}
+
+// SAFETY: Shared references expose only copyable metadata and a raw pointer.
+// Safe Rust cannot mutate mapped bytes through this type, and unsafe users must
+// uphold normal raw-pointer aliasing and lifetime requirements.
+unsafe impl Sync for PmemBackingMapping {}
+
+impl PmemBackingMapping {
+    pub fn map(backing: &PmemFileBacking) -> Result<Self, PmemBackingMappingError> {
+        let mapped_len = align_pmem_mapping_len(backing.len())?;
+        let file_len = usize::try_from(backing.len())
+            .map_err(|_| PmemBackingMappingError::FileLengthTooLarge { len: backing.len() })?;
+        let host_size = usize::try_from(mapped_len).map_err(|_| {
+            PmemBackingMappingError::MappedLengthTooLarge {
+                len: backing.len(),
+                mapped_len,
+            }
+        })?;
+        let prot = pmem_mapping_protection(backing.is_read_only());
+        let address = map_pmem_file(backing.file(), prot, file_len, host_size)?;
+
+        Ok(Self {
+            address,
+            file_len: backing.len(),
+            mapped_len,
+            host_size,
+            read_only: backing.is_read_only(),
+            kind: PmemBackingMappingKind::System,
+        })
+    }
+
+    #[cfg(test)]
+    fn test_mapping(
+        file_len: u64,
+        mapped_len: u64,
+        read_only: bool,
+        drop_count: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            address: NonNull::<u8>::dangling().cast(),
+            file_len,
+            mapped_len,
+            host_size: usize::try_from(mapped_len).expect("test mapped length should fit in usize"),
+            read_only,
+            kind: PmemBackingMappingKind::Test { drop_count },
+        }
+    }
+
+    pub const fn host_address(&self) -> NonNull<c_void> {
+        self.address
+    }
+
+    pub const fn file_len(&self) -> u64 {
+        self.file_len
+    }
+
+    pub const fn mapped_len(&self) -> u64 {
+        self.mapped_len
+    }
+
+    pub const fn host_size(&self) -> usize {
+        self.host_size
+    }
+
+    pub const fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+}
+
+impl fmt::Debug for PmemBackingMapping {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PmemBackingMapping")
+            .field("file_len", &self.file_len)
+            .field("mapped_len", &self.mapped_len)
+            .field("host_size", &self.host_size)
+            .field("read_only", &self.read_only)
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+enum PmemBackingMappingKind {
+    System,
+    #[cfg(test)]
+    Test {
+        drop_count: Arc<AtomicUsize>,
+    },
+}
+
+impl Drop for PmemBackingMapping {
+    fn drop(&mut self) {
+        match &self.kind {
+            PmemBackingMappingKind::System => {
+                // SAFETY: system mappings are constructed only after `mmap`
+                // succeeds and each `PmemBackingMapping` owns one mapping.
+                unsafe {
+                    let _ = libc::munmap(self.address.as_ptr(), self.host_size);
+                }
+            }
+            #[cfg(test)]
+            PmemBackingMappingKind::Test { drop_count } => {
+                drop_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum PmemBackingMappingError {
+    MappedLengthOverflow {
+        len: u64,
+        alignment: u64,
+    },
+    FileLengthTooLarge {
+        len: u64,
+    },
+    MappedLengthTooLarge {
+        len: u64,
+        mapped_len: u64,
+    },
+    MapFile {
+        len: usize,
+        source: io::Error,
+    },
+    ReserveAlignedMapping {
+        len: usize,
+        source: io::Error,
+    },
+    MapFileOverReservation {
+        file_len: usize,
+        mapped_len: usize,
+        source: io::Error,
+        cleanup_source: Option<io::Error>,
+    },
+    FileMappingReturnedNull {
+        file_len: usize,
+        mapped_len: usize,
+        cleanup_source: Option<io::Error>,
+    },
+    MmapReturnedNull {
+        len: usize,
+    },
+    FixedMappingMoved {
+        cleanup_source: Option<io::Error>,
+    },
+}
+
+impl fmt::Display for PmemBackingMappingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MappedLengthOverflow { len, alignment } => write!(
+                f,
+                "pmem backing length {len} cannot be aligned to {alignment} bytes without overflow"
+            ),
+            Self::FileLengthTooLarge { len } => {
+                write!(f, "pmem backing length {len} does not fit this host")
+            }
+            Self::MappedLengthTooLarge { len, mapped_len } => write!(
+                f,
+                "pmem backing length {len} maps to {mapped_len} bytes, which does not fit this host"
+            ),
+            Self::MapFile { len, source } => {
+                write!(
+                    f,
+                    "failed to mmap pmem backing file with length {len}: {source}"
+                )
+            }
+            Self::ReserveAlignedMapping { len, source } => write!(
+                f,
+                "failed to reserve aligned pmem mapping with length {len}: {source}"
+            ),
+            Self::MapFileOverReservation {
+                file_len,
+                mapped_len,
+                source,
+                cleanup_source,
+            } => {
+                if let Some(cleanup_source) = cleanup_source {
+                    write!(
+                        f,
+                        "failed to mmap pmem backing file with length {file_len} over reserved length {mapped_len}: {source}; also failed to clean up the reserved mapping: {cleanup_source}"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "failed to mmap pmem backing file with length {file_len} over reserved length {mapped_len}: {source}"
+                    )
+                }
+            }
+            Self::FileMappingReturnedNull {
+                file_len,
+                mapped_len,
+                cleanup_source,
+            } => {
+                if let Some(cleanup_source) = cleanup_source {
+                    write!(
+                        f,
+                        "pmem backing file mapping with length {file_len} over reserved length {mapped_len} returned a null address; also failed to clean up the reserved mapping: {cleanup_source}"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "pmem backing file mapping with length {file_len} over reserved length {mapped_len} returned a null address"
+                    )
+                }
+            }
+            Self::MmapReturnedNull { len } => {
+                write!(f, "pmem mapping with length {len} returned a null address")
+            }
+            Self::FixedMappingMoved { cleanup_source, .. } => {
+                if let Some(cleanup_source) = cleanup_source {
+                    write!(
+                        f,
+                        "fixed pmem file mapping did not reuse the reserved address; also failed to clean up the reserved mapping: {cleanup_source}"
+                    )
+                } else {
+                    f.write_str("fixed pmem file mapping did not reuse the reserved address")
+                }
+            }
+        }
+    }
+}
+
+impl std::error::Error for PmemBackingMappingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MapFile { source, .. } | Self::ReserveAlignedMapping { source, .. } => {
+                Some(source)
+            }
+            Self::MapFileOverReservation { source, .. } => Some(source),
+            Self::MappedLengthOverflow { .. }
+            | Self::FileLengthTooLarge { .. }
+            | Self::MappedLengthTooLarge { .. }
+            | Self::FileMappingReturnedNull { .. }
+            | Self::MmapReturnedNull { .. }
+            | Self::FixedMappingMoved { .. } => None,
+        }
+    }
+}
+
+fn align_pmem_mapping_len(len: u64) -> Result<u64, PmemBackingMappingError> {
+    let remainder = len % VIRTIO_PMEM_ALIGNMENT;
+    if remainder == 0 {
+        return Ok(len);
+    }
+
+    let padding = VIRTIO_PMEM_ALIGNMENT - remainder;
+    len.checked_add(padding)
+        .ok_or(PmemBackingMappingError::MappedLengthOverflow {
+            len,
+            alignment: VIRTIO_PMEM_ALIGNMENT,
+        })
+}
+
+const fn pmem_mapping_protection(read_only: bool) -> libc::c_int {
+    let mut prot = libc::PROT_READ;
+    if !read_only {
+        prot |= libc::PROT_WRITE;
+    }
+    prot
+}
+
+fn map_pmem_file(
+    file: &File,
+    prot: libc::c_int,
+    file_len: usize,
+    host_size: usize,
+) -> Result<NonNull<c_void>, PmemBackingMappingError> {
+    if file_len == host_size {
+        return map_pmem_file_exact(file, prot, file_len);
+    }
+
+    map_pmem_file_with_aligned_reservation(file, prot, file_len, host_size)
+}
+
+fn map_pmem_file_exact(
+    file: &File,
+    prot: libc::c_int,
+    file_len: usize,
+) -> Result<NonNull<c_void>, PmemBackingMappingError> {
+    // SAFETY: The call requests a new shared mapping for the already-open
+    // regular backing file. Lengths are non-zero, fit usize, and the result is
+    // checked before ownership is created.
+    let address = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            file_len,
+            prot,
+            libc::MAP_SHARED | libc::MAP_NORESERVE,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+
+    if address == libc::MAP_FAILED {
+        return Err(PmemBackingMappingError::MapFile {
+            len: file_len,
+            source: io::Error::last_os_error(),
+        });
+    }
+
+    non_null_mapping(address, file_len)
+}
+
+fn map_pmem_file_with_aligned_reservation(
+    file: &File,
+    prot: libc::c_int,
+    file_len: usize,
+    host_size: usize,
+) -> Result<NonNull<c_void>, PmemBackingMappingError> {
+    // SAFETY: The call reserves a private anonymous region with the final
+    // aligned length. No Rust references are created from the raw mapping.
+    let reserved = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            host_size,
+            prot,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            -1,
+            0,
+        )
+    };
+
+    if reserved == libc::MAP_FAILED {
+        return Err(PmemBackingMappingError::ReserveAlignedMapping {
+            len: host_size,
+            source: io::Error::last_os_error(),
+        });
+    }
+
+    let reserved = non_null_mapping(reserved, host_size)?;
+
+    // SAFETY: `reserved` owns a live mapping of `host_size` bytes. This maps
+    // the file over the prefix at the same address, matching Firecracker's
+    // aligned pmem mapping shape.
+    let file_address = unsafe {
+        libc::mmap(
+            reserved.as_ptr(),
+            file_len,
+            prot,
+            libc::MAP_SHARED | libc::MAP_FIXED | libc::MAP_NORESERVE,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+
+    if file_address == libc::MAP_FAILED {
+        let source = io::Error::last_os_error();
+        let cleanup_source = unmap_pmem_region(reserved, host_size).err();
+        return Err(PmemBackingMappingError::MapFileOverReservation {
+            file_len,
+            mapped_len: host_size,
+            source,
+            cleanup_source,
+        });
+    }
+
+    let file_address = match NonNull::new(file_address) {
+        Some(file_address) => file_address,
+        None => {
+            let cleanup_source = unmap_pmem_region(reserved, host_size).err();
+            return Err(PmemBackingMappingError::FileMappingReturnedNull {
+                file_len,
+                mapped_len: host_size,
+                cleanup_source,
+            });
+        }
+    };
+
+    if file_address != reserved {
+        let cleanup_source = unmap_pmem_region(reserved, host_size).err();
+        return Err(PmemBackingMappingError::FixedMappingMoved { cleanup_source });
+    }
+
+    Ok(reserved)
+}
+
+fn non_null_mapping(
+    address: *mut c_void,
+    len: usize,
+) -> Result<NonNull<c_void>, PmemBackingMappingError> {
+    let Some(address) = NonNull::new(address) else {
+        // SAFETY: `mmap` reported success, so the returned address and length
+        // describe a live mapping even if the address is null.
+        unsafe {
+            let _ = libc::munmap(address, len);
+        }
+
+        return Err(PmemBackingMappingError::MmapReturnedNull { len });
+    };
+
+    Ok(address)
+}
+
+fn unmap_pmem_region(address: NonNull<c_void>, len: usize) -> Result<(), io::Error> {
+    // SAFETY: Callers pass only addresses returned by successful `mmap` calls
+    // and the same length used to create the mapping.
+    let result = unsafe { libc::munmap(address.as_ptr(), len) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+trait PmemBackingMapper {
+    fn map(
+        &mut self,
+        backing: &PmemFileBacking,
+    ) -> Result<PmemBackingMapping, PmemBackingMappingError>;
+}
+
+#[derive(Debug, Default)]
+struct SystemPmemBackingMapper;
+
+impl PmemBackingMapper for SystemPmemBackingMapper {
+    fn map(
+        &mut self,
+        backing: &PmemFileBacking,
+    ) -> Result<PmemBackingMapping, PmemBackingMappingError> {
+        PmemBackingMapping::map(backing)
+    }
+}
+
 #[derive(Debug)]
 pub struct PreparedPmemDevice {
     id: String,
     backing: PmemFileBacking,
+    mapping: PmemBackingMapping,
 }
 
 impl PreparedPmemDevice {
-    fn from_config(config: &PmemConfig) -> Result<Self, PreparedPmemDeviceError> {
+    fn from_config_with_mapper(
+        config: &PmemConfig,
+        mapper: &mut impl PmemBackingMapper,
+    ) -> Result<Self, PreparedPmemDeviceError> {
         let backing = PmemFileBacking::open(config).map_err(|source| {
             PreparedPmemDeviceError::OpenBacking {
                 pmem_id: config.id().to_string(),
                 source,
             }
         })?;
+        let mapping =
+            mapper
+                .map(&backing)
+                .map_err(|source| PreparedPmemDeviceError::MapBacking {
+                    pmem_id: config.id().to_string(),
+                    source,
+                })?;
 
         Ok(Self {
             id: config.id().to_string(),
             backing,
+            mapping,
         })
     }
 
@@ -368,8 +824,12 @@ impl PreparedPmemDevice {
         &self.backing
     }
 
-    pub fn into_parts(self) -> (String, PmemFileBacking) {
-        (self.id, self.backing)
+    pub const fn mapping(&self) -> &PmemBackingMapping {
+        &self.mapping
+    }
+
+    pub fn into_parts(self) -> (String, PmemFileBacking, PmemBackingMapping) {
+        (self.id, self.backing, self.mapping)
     }
 }
 
@@ -386,13 +846,21 @@ impl PreparedPmemDevices {
     pub(crate) fn from_config_slice(
         configs: &[PmemConfig],
     ) -> Result<Self, PreparedPmemDeviceError> {
+        let mut mapper = SystemPmemBackingMapper;
+        Self::from_config_slice_with_mapper(configs, &mut mapper)
+    }
+
+    fn from_config_slice_with_mapper(
+        configs: &[PmemConfig],
+        mapper: &mut impl PmemBackingMapper,
+    ) -> Result<Self, PreparedPmemDeviceError> {
         let mut devices = Vec::new();
         devices
             .try_reserve_exact(configs.len())
             .map_err(|source| PreparedPmemDeviceError::AllocateDevices { source })?;
 
         for config in configs {
-            devices.push(PreparedPmemDevice::from_config(config)?);
+            devices.push(PreparedPmemDevice::from_config_with_mapper(config, mapper)?);
         }
 
         Ok(Self { devices })
@@ -424,6 +892,10 @@ pub enum PreparedPmemDeviceError {
         pmem_id: String,
         source: PmemFileBackingError,
     },
+    MapBacking {
+        pmem_id: String,
+        source: PmemBackingMappingError,
+    },
 }
 
 impl fmt::Display for PreparedPmemDeviceError {
@@ -435,6 +907,9 @@ impl fmt::Display for PreparedPmemDeviceError {
             Self::OpenBacking { pmem_id, source } => {
                 write!(f, "failed to prepare pmem device {pmem_id}: {source}")
             }
+            Self::MapBacking { pmem_id, source } => {
+                write!(f, "failed to map pmem device {pmem_id}: {source}")
+            }
         }
     }
 }
@@ -444,6 +919,7 @@ impl std::error::Error for PreparedPmemDeviceError {
         match self {
             Self::AllocateDevices { source } => Some(source),
             Self::OpenBacking { source, .. } => Some(source),
+            Self::MapBacking { source, .. } => Some(source),
         }
     }
 }
@@ -530,7 +1006,8 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use super::*;
 
@@ -587,6 +1064,15 @@ mod tests {
             path: temp_path(name),
         };
         fs::write(temp.as_path(), bytes).expect("test file should be written");
+        temp
+    }
+
+    fn temp_sized_file(name: &str, len: u64) -> TempPath {
+        let temp = TempPath {
+            path: temp_path(name),
+        };
+        let file = fs::File::create(temp.as_path()).expect("test file should be created");
+        file.set_len(len).expect("test file size should be set");
         temp
     }
 
@@ -651,6 +1137,51 @@ mod tests {
 
     fn open_backing(path: &Path, read_only: bool) -> Result<PmemFileBacking, PmemFileBackingError> {
         PmemFileBacking::open(&config_for_path(path, read_only))
+    }
+
+    fn map_backing(path: &Path, read_only: bool) -> PmemBackingMapping {
+        let backing = open_backing(path, read_only).expect("pmem backing should open");
+        PmemBackingMapping::map(&backing).expect("pmem backing should map")
+    }
+
+    #[derive(Debug)]
+    struct ScriptedPmemBackingMapper {
+        drop_count: Arc<AtomicUsize>,
+        calls: usize,
+        fail_on_call: usize,
+    }
+
+    impl ScriptedPmemBackingMapper {
+        fn new(drop_count: Arc<AtomicUsize>, fail_on_call: usize) -> Self {
+            Self {
+                drop_count,
+                calls: 0,
+                fail_on_call,
+            }
+        }
+    }
+
+    impl PmemBackingMapper for ScriptedPmemBackingMapper {
+        fn map(
+            &mut self,
+            backing: &PmemFileBacking,
+        ) -> Result<PmemBackingMapping, PmemBackingMappingError> {
+            self.calls += 1;
+            if self.calls == self.fail_on_call {
+                return Err(PmemBackingMappingError::MapFile {
+                    len: usize::try_from(backing.len())
+                        .expect("test backing length should fit usize"),
+                    source: io::Error::other("scripted pmem map failure"),
+                });
+            }
+
+            Ok(PmemBackingMapping::test_mapping(
+                backing.len(),
+                align_pmem_mapping_len(backing.len()).expect("test mapping length should align"),
+                backing.is_read_only(),
+                Arc::clone(&self.drop_count),
+            ))
+        }
     }
 
     fn device_config_read_access(offset: u64, len: u64) -> VirtioMmioDeviceConfigAccess {
@@ -970,6 +1501,111 @@ mod tests {
     }
 
     #[test]
+    fn backing_mapping_maps_unaligned_file_to_2m_region() {
+        let file = temp_file("mapped-unaligned-pmem.img", b"pmem");
+        let mapping = map_backing(file.as_path(), false);
+        let mut bytes = [0; 4];
+        let last_offset = mapping
+            .host_size()
+            .checked_sub(1)
+            .expect("mapping should be non-empty");
+
+        // SAFETY: `mapping` owns a live mapping whose first `file_len` bytes
+        // are backed by the test file. The final byte is inside the retained
+        // aligned reservation, and `bytes` is a valid destination.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                mapping.host_address().as_ptr().cast::<u8>(),
+                bytes.as_mut_ptr(),
+                bytes.len(),
+            );
+            assert_eq!(
+                mapping
+                    .host_address()
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(last_offset)
+                    .read(),
+                0
+            );
+        }
+
+        assert_eq!(mapping.file_len(), 4);
+        assert_eq!(mapping.mapped_len(), VIRTIO_PMEM_ALIGNMENT);
+        assert_eq!(
+            mapping.host_size(),
+            usize::try_from(VIRTIO_PMEM_ALIGNMENT).expect("alignment should fit usize")
+        );
+        assert!(!mapping.is_read_only());
+        assert_eq!(&bytes, b"pmem");
+    }
+
+    #[test]
+    fn backing_mapping_keeps_aligned_file_length() {
+        let file = temp_sized_file("mapped-aligned-pmem.img", VIRTIO_PMEM_ALIGNMENT);
+        let mapping = map_backing(file.as_path(), true);
+
+        assert_eq!(mapping.file_len(), VIRTIO_PMEM_ALIGNMENT);
+        assert_eq!(mapping.mapped_len(), VIRTIO_PMEM_ALIGNMENT);
+        assert_eq!(
+            mapping.host_size(),
+            usize::try_from(VIRTIO_PMEM_ALIGNMENT).expect("alignment should fit usize")
+        );
+        assert!(mapping.is_read_only());
+    }
+
+    #[test]
+    fn backing_mapping_writable_mapping_updates_file() {
+        let file = temp_file("mapped-writable-pmem.img", b"pmem");
+        let mapping = map_backing(file.as_path(), false);
+
+        // SAFETY: `mapping` owns a live writable mapping because the backing
+        // was opened with read_only=false. The write stays within file_len.
+        unsafe {
+            mapping.host_address().as_ptr().cast::<u8>().write(b'P');
+            let result = libc::msync(
+                mapping.host_address().as_ptr(),
+                usize::try_from(mapping.file_len()).expect("file length should fit usize"),
+                libc::MS_SYNC,
+            );
+            assert_eq!(result, 0, "msync failed: {}", io::Error::last_os_error());
+        }
+        drop(mapping);
+
+        assert_eq!(
+            fs::read(file.as_path()).expect("test file should read"),
+            b"Pmem"
+        );
+    }
+
+    #[test]
+    fn backing_mapping_debug_omits_host_address_and_path() {
+        let file = temp_file("secret-debug-pmem.img", b"pmem");
+        let mapping = map_backing(file.as_path(), true);
+        let debug = format!("{mapping:?}");
+        let host_address = format!("{:p}", mapping.host_address().as_ptr());
+
+        assert!(!debug.contains(&host_address));
+        assert!(!debug.contains("secret-debug-pmem"));
+        assert!(debug.contains("file_len"));
+        assert!(debug.contains("mapped_len"));
+    }
+
+    #[test]
+    fn backing_mapping_alignment_rejects_overflow() {
+        let err = align_pmem_mapping_len(u64::MAX)
+            .expect_err("maximum length should not align without overflow");
+
+        assert!(matches!(
+            err,
+            PmemBackingMappingError::MappedLengthOverflow {
+                len: u64::MAX,
+                alignment: VIRTIO_PMEM_ALIGNMENT,
+            }
+        ));
+    }
+
+    #[test]
     fn prepared_devices_open_all_configured_backings() {
         let first = temp_file("first-pmem.img", b"first");
         let second = temp_file("second-pmem.img", b"second");
@@ -992,9 +1628,21 @@ mod tests {
         assert_eq!(prepared.as_slice()[0].id(), "pmem0");
         assert_eq!(prepared.as_slice()[0].backing().len(), 5);
         assert!(!prepared.as_slice()[0].backing().is_read_only());
+        assert_eq!(prepared.as_slice()[0].mapping().file_len(), 5);
+        assert_eq!(
+            prepared.as_slice()[0].mapping().mapped_len(),
+            VIRTIO_PMEM_ALIGNMENT
+        );
+        assert!(!prepared.as_slice()[0].mapping().is_read_only());
         assert_eq!(prepared.as_slice()[1].id(), "pmem1");
         assert_eq!(prepared.as_slice()[1].backing().len(), 6);
         assert!(prepared.as_slice()[1].backing().is_read_only());
+        assert_eq!(prepared.as_slice()[1].mapping().file_len(), 6);
+        assert_eq!(
+            prepared.as_slice()[1].mapping().mapped_len(),
+            VIRTIO_PMEM_ALIGNMENT
+        );
+        assert!(prepared.as_slice()[1].mapping().is_read_only());
     }
 
     #[test]
@@ -1024,5 +1672,60 @@ mod tests {
         ));
         assert!(err.to_string().contains("pmem1"));
         assert!(!err.to_string().contains("secret-prepared-pmem"));
+    }
+
+    #[test]
+    fn prepared_devices_cleanup_previous_mappings_after_later_map_failure() {
+        let first = temp_file("first-cleanup-pmem.img", b"first");
+        let second = temp_file("second-cleanup-pmem.img", b"second");
+        let configs = [
+            pmem_config(PmemConfigInput::new(
+                "pmem0",
+                first.as_path().to_string_lossy().into_owned(),
+            )),
+            pmem_config(PmemConfigInput::new(
+                "pmem1",
+                second.as_path().to_string_lossy().into_owned(),
+            )),
+        ];
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let mut mapper = ScriptedPmemBackingMapper::new(Arc::clone(&drop_count), 2);
+
+        let err = PreparedPmemDevices::from_config_slice_with_mapper(&configs, &mut mapper)
+            .expect_err("second pmem mapping should fail");
+
+        assert!(matches!(
+            err,
+            PreparedPmemDeviceError::MapBacking {
+                ref pmem_id,
+                source: PmemBackingMappingError::MapFile { .. },
+            } if pmem_id == "pmem1"
+        ));
+        assert_eq!(mapper.calls, 2);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn prepared_devices_report_mapping_error_without_echoing_path() {
+        let file = temp_file("secret-map-failure-pmem.img", b"pmem");
+        let configs = [pmem_config(PmemConfigInput::new(
+            "pmem0",
+            file.as_path().to_string_lossy().into_owned(),
+        ))];
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let mut mapper = ScriptedPmemBackingMapper::new(drop_count, 1);
+
+        let err = PreparedPmemDevices::from_config_slice_with_mapper(&configs, &mut mapper)
+            .expect_err("pmem mapping should fail");
+
+        assert!(matches!(
+            err,
+            PreparedPmemDeviceError::MapBacking {
+                ref pmem_id,
+                source: PmemBackingMappingError::MapFile { .. },
+            } if pmem_id == "pmem0"
+        ));
+        assert!(err.to_string().contains("pmem0"));
+        assert!(!err.to_string().contains("secret-map-failure-pmem"));
     }
 }
