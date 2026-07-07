@@ -408,7 +408,7 @@ impl Drop for HvfGuestMemoryMapping {
 }
 
 impl HvfGuestMemoryMappingError {
-    fn host_mapping(
+    pub(crate) fn host_mapping(
         label: &str,
         range: GuestMemoryRange,
         source: HvfGuestMemoryMappingError,
