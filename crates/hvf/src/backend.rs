@@ -231,6 +231,7 @@ impl HvfBackend {
         pmem_devices: &[PreparedPmemDevice],
         permissions: HvfMemoryPermissions,
     ) -> Result<(), HvfGuestMemoryMappingError> {
+        self.validate_guest_memory_mapping_state()?;
         let host_mappings = pmem_host_memory_mappings(pmem_devices)?;
         self.map_guest_memory_with_host_mappings(memory, permissions, host_mappings)
     }
@@ -241,17 +242,7 @@ impl HvfBackend {
         permissions: HvfMemoryPermissions,
         host_mappings: Vec<HvfHostMemoryMapping>,
     ) -> Result<(), HvfGuestMemoryMappingError> {
-        if !self.vm_created {
-            return Err(HvfGuestMemoryMappingError::InvalidState(
-                VM_NOT_CREATED_FOR_MEMORY_MESSAGE,
-            ));
-        }
-
-        if self.guest_memory.is_some() {
-            return Err(HvfGuestMemoryMappingError::InvalidState(
-                GUEST_MEMORY_ALREADY_MAPPED_MESSAGE,
-            ));
-        }
+        self.validate_guest_memory_mapping_state()?;
 
         match HvfGuestMemoryMapping::map_with_mapper_and_host_mappings(
             memory,
@@ -271,6 +262,22 @@ impl HvfBackend {
                 Err(failed_mapping.error)
             }
         }
+    }
+
+    fn validate_guest_memory_mapping_state(&self) -> Result<(), HvfGuestMemoryMappingError> {
+        if !self.vm_created {
+            return Err(HvfGuestMemoryMappingError::InvalidState(
+                VM_NOT_CREATED_FOR_MEMORY_MESSAGE,
+            ));
+        }
+
+        if self.guest_memory.is_some() {
+            return Err(HvfGuestMemoryMappingError::InvalidState(
+                GUEST_MEMORY_ALREADY_MAPPED_MESSAGE,
+            ));
+        }
+
+        Ok(())
     }
 
     #[cfg(test)]
@@ -710,6 +717,45 @@ mod tests {
     }
 
     #[test]
+    fn pmem_mapping_before_vm_checks_state_before_shadow_copy() {
+        let page_size = page_size();
+        let mut backend = HvfBackend::new_with_memory_mapper(Arc::new(RecordingMapper::default()));
+        let layout =
+            GuestMemoryLayout::new(vec![range(0, page_size)]).expect("layout should be valid");
+        let memory = GuestMemory::allocate(&layout).expect("guest memory should allocate");
+        let backing = TempPmemFile::new("before-vm-pmem", VIRTIO_PMEM_ALIGNMENT)
+            .expect("pmem backing should be created");
+        let mut configs = PmemConfigs::new();
+        configs.upsert(pmem_config(PmemConfigInput::new(
+            "pmem0",
+            backing.path_text(),
+        )));
+        let devices =
+            PreparedPmemDevices::from_configs(&configs, &layout).expect("pmem should prepare");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(backing.path())
+            .expect("pmem backing should open for truncation")
+            .set_len(1)
+            .expect("pmem backing should truncate");
+
+        let err = backend
+            .map_guest_memory_with_pmem_devices_and_configured_mapper(
+                memory,
+                devices.as_slice(),
+                HvfMemoryPermissions::GUEST_RAM,
+            )
+            .expect_err("mapping pmem before VM creation should fail on state first");
+
+        assert!(matches!(
+            err,
+            crate::memory::HvfGuestMemoryMappingError::InvalidState(
+                super::VM_NOT_CREATED_FOR_MEMORY_MESSAGE
+            )
+        ));
+    }
+
+    #[test]
     fn duplicate_guest_memory_mapping_is_rejected() {
         let page_size = page_size();
         let mapper = Arc::new(RecordingMapper::default());
@@ -728,6 +774,57 @@ mod tests {
                 HvfMemoryPermissions::GUEST_RAM,
             )
             .expect_err("second guest memory mapping should fail");
+
+        assert!(matches!(
+            err,
+            crate::memory::HvfGuestMemoryMappingError::InvalidState(
+                super::GUEST_MEMORY_ALREADY_MAPPED_MESSAGE
+            )
+        ));
+        assert!(backend.has_guest_memory_mapping());
+        assert_eq!(mapper.map_count(), 1);
+    }
+
+    #[test]
+    fn duplicate_pmem_mapping_checks_state_before_shadow_copy() {
+        let page_size = page_size();
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut backend = HvfBackend::new_with_memory_mapper(mapper.clone());
+        backend.vm_created = true;
+
+        backend
+            .map_guest_memory_with_configured_mapper(
+                memory_for_ranges(vec![range(0, page_size)]),
+                HvfMemoryPermissions::GUEST_RAM,
+            )
+            .expect("first guest memory mapping should succeed");
+
+        let layout =
+            GuestMemoryLayout::new(vec![range(0, page_size)]).expect("layout should be valid");
+        let memory = GuestMemory::allocate(&layout).expect("guest memory should allocate");
+        let backing = TempPmemFile::new("duplicate-pmem", VIRTIO_PMEM_ALIGNMENT)
+            .expect("pmem backing should be created");
+        let mut configs = PmemConfigs::new();
+        configs.upsert(pmem_config(PmemConfigInput::new(
+            "pmem0",
+            backing.path_text(),
+        )));
+        let devices =
+            PreparedPmemDevices::from_configs(&configs, &layout).expect("pmem should prepare");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(backing.path())
+            .expect("pmem backing should open for truncation")
+            .set_len(1)
+            .expect("pmem backing should truncate");
+
+        let err = backend
+            .map_guest_memory_with_pmem_devices_and_configured_mapper(
+                memory,
+                devices.as_slice(),
+                HvfMemoryPermissions::GUEST_RAM,
+            )
+            .expect_err("duplicate pmem mapping should fail on state first");
 
         assert!(matches!(
             err,
