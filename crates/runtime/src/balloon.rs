@@ -604,7 +604,7 @@ fn validate_balloon_pfn_descriptor_chain(
 
     let mut payload_len: usize = 0;
     for descriptor in chain.descriptors().iter().copied() {
-        validate_balloon_pfn_descriptor(memory, descriptor)?;
+        validate_balloon_pfn_descriptor_header(descriptor)?;
         let segment_len = balloon_pfn_descriptor_len(descriptor)?;
         payload_len = payload_len.checked_add(segment_len).ok_or(
             VirtioBalloonPfnDescriptorPayloadReadError::PayloadLengthOverflow {
@@ -620,13 +620,13 @@ fn validate_balloon_pfn_descriptor_chain(
                 },
             );
         }
+        validate_balloon_pfn_descriptor_range(memory, descriptor)?;
     }
 
     Ok(payload_len)
 }
 
-fn validate_balloon_pfn_descriptor(
-    memory: &GuestMemory,
+fn validate_balloon_pfn_descriptor_header(
     descriptor: VirtqueueDescriptor,
 ) -> Result<(), VirtioBalloonPfnDescriptorPayloadReadError> {
     if descriptor.is_write_only() {
@@ -644,6 +644,13 @@ fn validate_balloon_pfn_descriptor(
         );
     }
 
+    Ok(())
+}
+
+fn validate_balloon_pfn_descriptor_range(
+    memory: &GuestMemory,
+    descriptor: VirtqueueDescriptor,
+) -> Result<(), VirtioBalloonPfnDescriptorPayloadReadError> {
     let range = GuestMemoryRange::new(descriptor.address(), u64::from(descriptor.len())).map_err(
         |source| VirtioBalloonPfnDescriptorPayloadReadError::DescriptorRange {
             index: descriptor.index(),
@@ -2613,6 +2620,30 @@ mod tests {
             "virtio-balloon PFN descriptor payload length 1025 exceeds maximum 1024"
         );
         assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn pfn_descriptor_payload_rejects_oversized_payload_before_guest_range_access() {
+        let mut memory = pfn_descriptor_memory();
+        let len = u32::try_from(VIRTIO_BALLOON_MAX_PFN_PAYLOAD_SIZE + 1)
+            .expect("test payload length should fit u32");
+        write_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(GuestAddress::new(TEST_MEMORY_SIZE), len, None),
+        );
+        let chain = descriptor_chain(&memory, 0);
+
+        let err = VirtioBalloonPfnDescriptorPayload::read(&memory, &chain)
+            .expect_err("oversized PFN descriptor payload should be rejected before access");
+
+        assert!(matches!(
+            err,
+            VirtioBalloonPfnDescriptorPayloadReadError::PayloadLengthTooLarge {
+                len,
+                max: VIRTIO_BALLOON_MAX_PFN_PAYLOAD_SIZE,
+            } if len == VIRTIO_BALLOON_MAX_PFN_PAYLOAD_SIZE + 1
+        ));
     }
 
     #[test]
