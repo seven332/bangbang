@@ -739,6 +739,17 @@ mod tests {
     }
 
     #[test]
+    fn virtio_pmem_config_space_preserves_u64_boundaries() {
+        let config = VirtioPmemConfigSpace::new(u64::MAX, u64::MAX);
+
+        assert_eq!(config.to_le_bytes(), [0xff; VIRTIO_PMEM_CONFIG_SPACE_SIZE]);
+        assert_eq!(
+            VirtioPmemConfigSpace::from_le_bytes([0xff; VIRTIO_PMEM_CONFIG_SPACE_SIZE]),
+            config
+        );
+    }
+
+    #[test]
     fn virtio_pmem_config_space_advertises_modern_virtio_feature() {
         let config = VirtioPmemConfigSpace::new(0, 0);
 
