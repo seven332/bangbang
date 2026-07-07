@@ -13,9 +13,9 @@ use std::time::{Duration, Instant};
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_api::http::{
     ActionRequest, ActionType, ApiRequest, ApiRequestMetricEndpoint, ApiRequestMetricPatchEndpoint,
-    ApiRequestMetricPutEndpoint, BalloonConfigRequest, BalloonConfigResponse, BootSourceRequest,
-    BootSourceResponse, CpuConfigRequest, DriveCacheType as ApiDriveCacheType, DriveConfigRequest,
-    DriveConfigResponse, DriveIoEngine as ApiDriveIoEngine, DrivePatchRequest,
+    ApiRequestMetricPutEndpoint, BalloonConfigRequest, BalloonConfigResponse, BalloonUpdateRequest,
+    BootSourceRequest, BootSourceResponse, CpuConfigRequest, DriveCacheType as ApiDriveCacheType,
+    DriveConfigRequest, DriveConfigResponse, DriveIoEngine as ApiDriveIoEngine, DrivePatchRequest,
     EntropyConfigRequest, EntropyConfigResponse, HotUnplugDeviceKind as ApiHotUnplugDeviceKind,
     HotUnplugDeviceRequest, HttpResponse, LoggerConfigRequest, LoggerLevel as ApiLoggerLevel,
     MachineConfigPatchRequest, MachineConfigRequest, MachineConfigResponse, MetricsConfigRequest,
@@ -25,7 +25,7 @@ use bangbang_api::http::{
     VmStateUpdate, VmStateUpdateRequest, VsockConfigRequest, VsockConfigResponse,
     api_request_metric_endpoint, parse_request_with_limit, request_total_len_with_limit,
 };
-use bangbang_runtime::balloon::{BalloonConfig, BalloonConfigInput};
+use bangbang_runtime::balloon::{BalloonConfig, BalloonConfigInput, BalloonUpdateInput};
 use bangbang_runtime::block::{
     DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine, DriveUpdateInput,
 };
@@ -718,9 +718,9 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PutBalloon(config) => handle_empty(vmm.handle_put_request(
             PutApiRequest::balloon(balloon_config_input_from_request(*config)),
         )),
-        ApiRequest::PatchBalloon => {
-            handle_empty(vmm.handle_patch_request(PatchApiRequest::balloon()))
-        }
+        ApiRequest::PatchBalloon(update) => handle_empty(vmm.handle_patch_request(
+            PatchApiRequest::balloon(balloon_update_input_from_request(*update)),
+        )),
         ApiRequest::PatchBalloonStats => {
             handle_empty(vmm.handle_patch_request(PatchApiRequest::balloon_stats()))
         }
@@ -777,7 +777,7 @@ fn request_uses_deprecated_api(request: &ApiRequest) -> bool {
         | ApiRequest::GetVmConfig
         | ApiRequest::GetVersion
         | ApiRequest::HotUnplugDevice(_)
-        | ApiRequest::PatchBalloon
+        | ApiRequest::PatchBalloon(_)
         | ApiRequest::PatchBalloonStats
         | ApiRequest::PatchBalloonHintingStart
         | ApiRequest::PatchBalloonHintingStop
@@ -884,7 +884,7 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         | ApiRequest::GetVmConfig
         | ApiRequest::GetVersion
         | ApiRequest::HotUnplugDevice(_)
-        | ApiRequest::PatchBalloon
+        | ApiRequest::PatchBalloon(_)
         | ApiRequest::PatchBalloonStats
         | ApiRequest::PatchBalloonHintingStart
         | ApiRequest::PatchBalloonHintingStop
@@ -1435,6 +1435,10 @@ fn balloon_config_input_from_request(config: BalloonConfigRequest) -> BalloonCon
         .with_free_page_reporting(config.free_page_reporting())
 }
 
+fn balloon_update_input_from_request(update: BalloonUpdateRequest) -> BalloonUpdateInput {
+    BalloonUpdateInput::new(update.amount_mib())
+}
+
 fn vsock_config_input_from_request(config: &VsockConfigRequest) -> VsockConfigInput {
     let mut input = VsockConfigInput::new(config.guest_cid(), config.uds_path());
     if let Some(vsock_id) = config.vsock_id() {
@@ -1537,6 +1541,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use bangbang_runtime::balloon::{BalloonConfig, BalloonUpdateError};
     use bangbang_runtime::block::DriveUpdateError;
     use bangbang_runtime::logger::{LoggerConfigInput, LoggerWriteError};
     use bangbang_runtime::machine::MAX_MEM_SIZE_MIB;
@@ -1603,6 +1608,10 @@ mod tests {
                 Some(err) => Err(err),
                 None => Ok(()),
             }
+        }
+
+        fn update_balloon(&mut self, _config: BalloonConfig) -> Result<(), BalloonUpdateError> {
+            Ok(())
         }
 
         fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
@@ -5796,6 +5805,43 @@ mod tests {
             bangbang_runtime::InstanceState::Running
         );
         assert!(vmm.has_started_session());
+
+        let patch_response = request_over_socket(
+            &mut vmm,
+            "b-patch-running",
+            &request_with_body("PATCH", "/balloon", r#"{"amount_mib":128}"#),
+        );
+        assert!(patch_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let get_updated_response = request_over_socket(
+            &mut vmm,
+            "b-get-updated",
+            "GET /balloon HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(get_updated_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(get_updated_response.contains(r#""amount_mib":128"#));
+        assert!(get_updated_response.contains(r#""deflate_on_oom":true"#));
+        assert!(get_updated_response.contains(r#""stats_polling_interval_s":60"#));
+        assert!(get_updated_response.contains(r#""free_page_hinting":true"#));
+        assert!(get_updated_response.contains(r#""free_page_reporting":false"#));
+
+        let oversized_patch_response = request_over_socket(
+            &mut vmm,
+            "b-p-o",
+            &request_with_body("PATCH", "/balloon", r#"{"amount_mib":129}"#),
+        );
+        assert!(oversized_patch_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(oversized_patch_response.contains(
+            r#""fault_message":"balloon amount_mib 129 exceeds configured guest memory 128 MiB""#
+        ));
+
+        let get_after_oversized_response = request_over_socket(
+            &mut vmm,
+            "b-g-o",
+            "GET /balloon HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(get_after_oversized_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(get_after_oversized_response.contains(r#""amount_mib":128"#));
     }
 
     #[test]

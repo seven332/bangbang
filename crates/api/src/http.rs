@@ -35,7 +35,7 @@ pub enum ApiRequest {
     PutDrive(Box<DriveConfigRequest>),
     PutEntropy(Box<EntropyConfigRequest>),
     PutMemoryHotplug,
-    PatchBalloon,
+    PatchBalloon(Box<BalloonUpdateRequest>),
     PatchBalloonStats,
     PatchBalloonHintingStart,
     PatchBalloonHintingStop,
@@ -540,6 +540,17 @@ impl BalloonConfigRequest {
 
     pub const fn free_page_reporting(self) -> bool {
         self.free_page_reporting
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BalloonUpdateRequest {
+    amount_mib: u32,
+}
+
+impl BalloonUpdateRequest {
+    pub const fn amount_mib(self) -> u32 {
+        self.amount_mib
     }
 }
 
@@ -2409,9 +2420,10 @@ fn parse_balloon_update_request(body: &[u8]) -> Result<ApiRequest, RequestError>
     let BalloonUpdateRequestBody { amount_mib } =
         serde_json::from_slice::<BalloonUpdateRequestBody>(body)
             .map_err(|_| RequestError::MalformedRequest)?;
-    let _ = amount_mib;
 
-    Ok(ApiRequest::PatchBalloon)
+    Ok(ApiRequest::PatchBalloon(Box::new(BalloonUpdateRequest {
+        amount_mib,
+    })))
 }
 
 fn parse_balloon_stats_update_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
@@ -3062,7 +3074,7 @@ impl From<ApiRequest> for Endpoint {
             | ApiRequest::GetBalloonStats
             | ApiRequest::GetBalloonHintingStatus
             | ApiRequest::PutBalloon(_)
-            | ApiRequest::PatchBalloon
+            | ApiRequest::PatchBalloon(_)
             | ApiRequest::PatchBalloonStats
             | ApiRequest::PatchBalloonHintingStart
             | ApiRequest::PatchBalloonHintingStop => Self::Balloon,
@@ -5696,12 +5708,14 @@ mod tests {
             (
                 "PATCH /balloon",
                 request_with_body("PATCH", "/balloon", r#"{"amount_mib":32}"#),
-                ApiRequest::PatchBalloon,
+                ApiRequest::PatchBalloon(Box::new(BalloonUpdateRequest { amount_mib: 32 })),
             ),
             (
                 "PATCH /balloon max amount",
                 request_with_body("PATCH", "/balloon", r#"{"amount_mib":4294967295}"#),
-                ApiRequest::PatchBalloon,
+                ApiRequest::PatchBalloon(Box::new(BalloonUpdateRequest {
+                    amount_mib: 4_294_967_295,
+                })),
             ),
             (
                 "PATCH /balloon/statistics",
