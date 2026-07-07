@@ -84,7 +84,7 @@ pub enum VmmAction {
     PutBalloon(balloon::BalloonConfigInput),
     PatchBalloon(balloon::BalloonUpdateInput),
     PatchBalloonStats,
-    PatchBalloonHintingStart,
+    PatchBalloonHintingStart(balloon::BalloonHintingStartInput),
     PatchBalloonHintingStop,
     GetMemoryHotplug,
     PutMemoryHotplug,
@@ -160,7 +160,7 @@ impl VmmAction {
             Self::PutBalloon(_) => "PutBalloon",
             Self::PatchBalloon(_) => "PatchBalloon",
             Self::PatchBalloonStats => "PatchBalloonStats",
-            Self::PatchBalloonHintingStart => "PatchBalloonHintingStart",
+            Self::PatchBalloonHintingStart(_) => "PatchBalloonHintingStart",
             Self::PatchBalloonHintingStop => "PatchBalloonHintingStop",
             Self::GetMemoryHotplug => "GetMemoryHotplug",
             Self::PutMemoryHotplug => "PutMemoryHotplug",
@@ -297,6 +297,7 @@ pub enum VmmActionError {
     BalloonConfig(balloon::BalloonConfigError),
     BalloonUnsupported,
     BalloonStats(balloon::BalloonStatsError),
+    BalloonHintingCommand(balloon::BalloonHintingCommandError),
     BalloonHintingStatus(balloon::BalloonHintingStatusError),
     BalloonUpdate(balloon::BalloonUpdateError),
     EntropyUnsupported,
@@ -341,6 +342,7 @@ impl fmt::Display for VmmActionError {
             Self::BalloonConfig(err) => write!(f, "{err}"),
             Self::BalloonUnsupported => f.write_str("Balloon device is not supported."),
             Self::BalloonStats(err) => write!(f, "{err}"),
+            Self::BalloonHintingCommand(err) => write!(f, "{err}"),
             Self::BalloonHintingStatus(err) => write!(f, "{err}"),
             Self::BalloonUpdate(err) => write!(f, "{err}"),
             Self::EntropyUnsupported => f.write_str("Entropy device is not supported."),
@@ -383,6 +385,7 @@ impl std::error::Error for VmmActionError {
             Self::BootSourceConfig(err) => Some(err),
             Self::BalloonConfig(err) => Some(err),
             Self::BalloonStats(err) => Some(err),
+            Self::BalloonHintingCommand(err) => Some(err),
             Self::BalloonHintingStatus(err) => Some(err),
             Self::BalloonUpdate(err) => Some(err),
             Self::DriveConfig(err) => Some(err),
@@ -959,7 +962,7 @@ impl VmmController {
             VmmAction::GetBalloonStats
             | VmmAction::GetBalloonHintingStatus
             | VmmAction::PatchBalloonStats
-            | VmmAction::PatchBalloonHintingStart
+            | VmmAction::PatchBalloonHintingStart(_)
             | VmmAction::PatchBalloonHintingStop => {
                 if self.instance_info.state == InstanceState::NotStarted {
                     return Err(VmmActionError::UnsupportedState {
@@ -1322,8 +1325,9 @@ mod tests {
         BackendError, HotUnplugDeviceInput, HotUnplugDeviceKind, InstanceState, VmmAction,
         VmmActionError, VmmController, VmmData,
         balloon::{
-            BalloonConfig, BalloonConfigError, BalloonConfigInput, BalloonHintingStatusError,
-            BalloonStatsError, BalloonUpdateError, BalloonUpdateInput,
+            BalloonConfig, BalloonConfigError, BalloonConfigInput, BalloonHintingCommandError,
+            BalloonHintingStartInput, BalloonHintingStatusError, BalloonStatsError,
+            BalloonUpdateError, BalloonUpdateInput,
         },
         block::{DriveConfigError, DriveConfigInput, DriveUpdateInput},
         boot::{
@@ -1752,7 +1756,7 @@ mod tests {
         );
         assert_eq!(VmmAction::PatchBalloonStats.name(), "PatchBalloonStats");
         assert_eq!(
-            VmmAction::PatchBalloonHintingStart.name(),
+            VmmAction::PatchBalloonHintingStart(BalloonHintingStartInput::new(true)).name(),
             "PatchBalloonHintingStart"
         );
         assert_eq!(
@@ -2246,7 +2250,7 @@ mod tests {
             VmmAction::GetBalloonHintingStatus,
             VmmAction::PatchBalloon(balloon_update_input(32)),
             VmmAction::PatchBalloonStats,
-            VmmAction::PatchBalloonHintingStart,
+            VmmAction::PatchBalloonHintingStart(BalloonHintingStartInput::new(true)),
             VmmAction::PatchBalloonHintingStop,
         ] {
             let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
@@ -2279,7 +2283,7 @@ mod tests {
                 VmmAction::GetBalloonStats,
                 VmmAction::GetBalloonHintingStatus,
                 VmmAction::PatchBalloonStats,
-                VmmAction::PatchBalloonHintingStart,
+                VmmAction::PatchBalloonHintingStart(BalloonHintingStartInput::new(true)),
                 VmmAction::PatchBalloonHintingStop,
             ] {
                 let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
@@ -5266,6 +5270,15 @@ mod tests {
     fn displays_balloon_hinting_status_error() {
         let err =
             VmmActionError::BalloonHintingStatus(BalloonHintingStatusError::HintingNotEnabled);
+
+        assert_eq!(err.to_string(), "balloon free-page hinting is not enabled");
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn displays_balloon_hinting_command_error() {
+        let err =
+            VmmActionError::BalloonHintingCommand(BalloonHintingCommandError::HintingNotEnabled);
 
         assert_eq!(err.to_string(), "balloon free-page hinting is not enabled");
         assert!(err.source().is_some());

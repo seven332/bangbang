@@ -37,7 +37,7 @@ pub enum ApiRequest {
     PutMemoryHotplug,
     PatchBalloon(Box<BalloonUpdateRequest>),
     PatchBalloonStats,
-    PatchBalloonHintingStart,
+    PatchBalloonHintingStart(BalloonHintingStartRequest),
     PatchBalloonHintingStop,
     PatchMemoryHotplug,
     PatchDrive(Box<DrivePatchRequest>),
@@ -1360,6 +1360,23 @@ impl BalloonHintingStatusResponse {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BalloonHintingStartRequest {
+    acknowledge_on_stop: bool,
+}
+
+impl BalloonHintingStartRequest {
+    pub const fn new(acknowledge_on_stop: bool) -> Self {
+        Self {
+            acknowledge_on_stop,
+        }
+    }
+
+    pub const fn acknowledge_on_stop(self) -> bool {
+        self.acknowledge_on_stop
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EntropyConfigResponse;
 
@@ -2509,16 +2526,19 @@ fn parse_balloon_stats_update_request(body: &[u8]) -> Result<ApiRequest, Request
 
 fn parse_balloon_hinting_start_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
     if body.is_empty() {
-        return Ok(ApiRequest::PatchBalloonHintingStart);
+        return Ok(ApiRequest::PatchBalloonHintingStart(
+            BalloonHintingStartRequest::new(default_balloon_acknowledge_on_stop()),
+        ));
     }
 
     let BalloonHintingStartRequestBody {
         acknowledge_on_stop,
     } = serde_json::from_slice::<BalloonHintingStartRequestBody>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
-    let _ = acknowledge_on_stop;
 
-    Ok(ApiRequest::PatchBalloonHintingStart)
+    Ok(ApiRequest::PatchBalloonHintingStart(
+        BalloonHintingStartRequest::new(acknowledge_on_stop),
+    ))
 }
 
 fn parse_snapshot_create_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
@@ -3147,7 +3167,7 @@ impl From<ApiRequest> for Endpoint {
             | ApiRequest::PutBalloon(_)
             | ApiRequest::PatchBalloon(_)
             | ApiRequest::PatchBalloonStats
-            | ApiRequest::PatchBalloonHintingStart
+            | ApiRequest::PatchBalloonHintingStart(_)
             | ApiRequest::PatchBalloonHintingStop => Self::Balloon,
             ApiRequest::PatchVmState(_) => Self::VmState,
             ApiRequest::PutAction(_) => Self::Actions,
@@ -5809,22 +5829,22 @@ mod tests {
             (
                 "PATCH /balloon/hinting/start without body",
                 b"PATCH /balloon/hinting/start HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
-                ApiRequest::PatchBalloonHintingStart,
+                ApiRequest::PatchBalloonHintingStart(BalloonHintingStartRequest::new(true)),
             ),
             (
                 "PATCH /balloon/hinting/start empty body",
                 request_with_body("PATCH", "/balloon/hinting/start", ""),
-                ApiRequest::PatchBalloonHintingStart,
+                ApiRequest::PatchBalloonHintingStart(BalloonHintingStartRequest::new(true)),
             ),
             (
                 "PATCH /balloon/hinting/start",
                 request_with_body("PATCH", "/balloon/hinting/start", "{}"),
-                ApiRequest::PatchBalloonHintingStart,
+                ApiRequest::PatchBalloonHintingStart(BalloonHintingStartRequest::new(true)),
             ),
             (
                 "PATCH /balloon/hinting/start empty sequence",
                 request_with_body("PATCH", "/balloon/hinting/start", "[]"),
-                ApiRequest::PatchBalloonHintingStart,
+                ApiRequest::PatchBalloonHintingStart(BalloonHintingStartRequest::new(true)),
             ),
             (
                 "PATCH /balloon/hinting/start explicit",
@@ -5833,7 +5853,7 @@ mod tests {
                     "/balloon/hinting/start",
                     r#"{"acknowledge_on_stop":false}"#,
                 ),
-                ApiRequest::PatchBalloonHintingStart,
+                ApiRequest::PatchBalloonHintingStart(BalloonHintingStartRequest::new(false)),
             ),
             (
                 "PATCH /balloon/hinting/start unknown field",
@@ -5842,12 +5862,12 @@ mod tests {
                     "/balloon/hinting/start",
                     r#"{"acknowledge_on_stop":false,"unknown":true}"#,
                 ),
-                ApiRequest::PatchBalloonHintingStart,
+                ApiRequest::PatchBalloonHintingStart(BalloonHintingStartRequest::new(false)),
             ),
             (
                 "PATCH /balloon/hinting/start only unknown field",
                 request_with_body("PATCH", "/balloon/hinting/start", r#"{"unknown":true}"#),
-                ApiRequest::PatchBalloonHintingStart,
+                ApiRequest::PatchBalloonHintingStart(BalloonHintingStartRequest::new(true)),
             ),
             (
                 "PATCH /balloon/hinting/stop",

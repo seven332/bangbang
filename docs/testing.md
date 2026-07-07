@@ -211,13 +211,14 @@ checks that the guest selected `virtio_rng` as the current hardware RNG, reads
 from `/dev/hwrng`, and writes a host-observable marker only after a non-empty
 read succeeds.
 It also includes a direct-rootfs balloon scenario that configures `/balloon`,
-checks that the guest bound a virtio-balloon driver, and writes a
-host-observable marker after the driver path is visible.
+checks that the guest bound a virtio-balloon driver, exercises the minimal
+hinting start/stop command-state APIs, and writes a host-observable marker after
+the driver path is visible.
 Runtime `PATCH /balloon` target-size updates are covered by unit, API socket,
 and process-session tests that verify stored config updates, active config-space
 generation changes, and config interrupt signaling; they do not require a
-separate signed guest scenario until host reclaim, statistics, hinting, or
-reporting behavior is added.
+separate signed guest scenario until host reclaim, guest-reported statistics,
+hinting queue processing, or reporting behavior is added.
 It also includes a direct-rootfs writeback block scenario that configures a
 non-root data drive with `cache_type=Writeback`, writes through `/dev/vdb`,
 calls `fsync` on the block-device file descriptor, and writes a host-observable

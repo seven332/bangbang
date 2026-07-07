@@ -6,11 +6,11 @@ use std::os::fd::RawFd;
 
 use crate::VmmController;
 use crate::balloon::{
-    BalloonConfig, BalloonHintingStatus, BalloonHintingStatusError, BalloonMmioDeviceRegistration,
-    BalloonMmioLayout, BalloonMmioRegistrationError, BalloonPageCountOverflow, BalloonStats,
-    BalloonStatsError, BalloonUpdateError, PreparedBalloonDevice,
-    VirtioBalloonDeviceNotificationDispatch, VirtioBalloonDeviceNotificationError,
-    VirtioBalloonMmioHandler,
+    BalloonConfig, BalloonHintingCommandError, BalloonHintingStartInput, BalloonHintingStatus,
+    BalloonHintingStatusError, BalloonMmioDeviceRegistration, BalloonMmioLayout,
+    BalloonMmioRegistrationError, BalloonPageCountOverflow, BalloonStats, BalloonStatsError,
+    BalloonUpdateError, PreparedBalloonDevice, VirtioBalloonDeviceNotificationDispatch,
+    VirtioBalloonDeviceNotificationError, VirtioBalloonMmioHandler,
 };
 use crate::block::{
     BlockFileBacking, BlockMmioDeviceRegistration, BlockMmioLayout, BlockMmioRegistrationError,
@@ -1487,6 +1487,27 @@ pub fn update_balloon_config_for_device(
         .update_balloon_config(config)
 }
 
+pub fn start_balloon_hinting_for_device(
+    device: &Arm64BootBalloonDevice,
+    mmio_dispatcher: &mut MmioDispatcher,
+    input: BalloonHintingStartInput,
+) -> Result<(), BalloonHintingCommandError> {
+    mmio_dispatcher
+        .handler_mut::<VirtioBalloonMmioHandler>(device.registration.region_id())
+        .map_err(BalloonHintingCommandError::HandlerLookup)?
+        .start_balloon_hinting(input)
+}
+
+pub fn stop_balloon_hinting_for_device(
+    device: &Arm64BootBalloonDevice,
+    mmio_dispatcher: &mut MmioDispatcher,
+) -> Result<(), BalloonHintingCommandError> {
+    mmio_dispatcher
+        .handler_mut::<VirtioBalloonMmioHandler>(device.registration.region_id())
+        .map_err(BalloonHintingCommandError::HandlerLookup)?
+        .stop_balloon_hinting()
+}
+
 pub fn balloon_stats_for_device(
     device: &Arm64BootBalloonDevice,
     mmio_dispatcher: &mut MmioDispatcher,
@@ -2387,12 +2408,14 @@ mod tests {
         Arm64BootResourceError, Arm64BootResources, Arm64BootSerialDeviceConfig,
         Arm64BootSerialMmioRegistrationError, MIB, arm64_boot_network_device_metadata,
         balloon_hinting_status_for_device, balloon_stats_for_device, block_device_metadata,
+        start_balloon_hinting_for_device, stop_balloon_hinting_for_device,
         update_balloon_config_for_device,
     };
     use crate::VmmAction;
     use crate::balloon::{
-        BalloonConfigInput, BalloonHintingStatusError, BalloonMmioLayout,
-        VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX, VIRTIO_BALLOON_DEVICE_ID,
+        BalloonConfigInput, BalloonHintingCommandError, BalloonHintingStartInput,
+        BalloonHintingStatusError, BalloonMmioLayout, VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX,
+        VIRTIO_BALLOON_DEVICE_ID, VIRTIO_BALLOON_FREE_PAGE_HINT_DONE,
         VIRTIO_BALLOON_FREE_PAGE_HINT_STOP, VIRTIO_BALLOON_INFLATE_QUEUE_INDEX,
         VIRTIO_BALLOON_MIB_TO_4K_PAGES, VirtioBalloonMmioHandler,
     };
@@ -5772,6 +5795,39 @@ mod tests {
     }
 
     #[test]
+    fn boot_runtime_balloon_hinting_start_stop_updates_active_handler_state() {
+        let (_memory, runtime, mut mmio_dispatcher) = boot_runtime_with_balloon_config(
+            "kernel-balloon-hinting-start-stop",
+            BalloonConfigInput::new(TEST_MEMORY_MIB as u32 / 2, false).with_free_page_hinting(true),
+        );
+        let device = runtime
+            .balloon_device
+            .as_ref()
+            .expect("balloon device should exist")
+            .clone();
+
+        start_balloon_hinting_for_device(
+            &device,
+            &mut mmio_dispatcher,
+            BalloonHintingStartInput::new(false),
+        )
+        .expect("balloon hinting start should update active handler");
+
+        let started = balloon_hinting_status_for_device(&device, &mut mmio_dispatcher)
+            .expect("balloon hinting status should read after start");
+        assert_eq!(started.host_cmd(), VIRTIO_BALLOON_FREE_PAGE_HINT_DONE + 1);
+        assert_eq!(started.guest_cmd(), None);
+
+        stop_balloon_hinting_for_device(&device, &mut mmio_dispatcher)
+            .expect("balloon hinting stop should update active handler");
+
+        let stopped = balloon_hinting_status_for_device(&device, &mut mmio_dispatcher)
+            .expect("balloon hinting status should read after stop");
+        assert_eq!(stopped.host_cmd(), VIRTIO_BALLOON_FREE_PAGE_HINT_DONE);
+        assert_eq!(stopped.guest_cmd(), None);
+    }
+
+    #[test]
     fn boot_runtime_balloon_hinting_status_rejects_without_hinting_queue() {
         let (_memory, runtime, mut mmio_dispatcher) =
             boot_runtime_with_balloon("kernel-balloon-hinting-status-disabled");
@@ -5785,6 +5841,26 @@ mod tests {
             .expect_err("balloon hinting status should require hinting support");
 
         assert_eq!(err, BalloonHintingStatusError::HintingNotEnabled);
+    }
+
+    #[test]
+    fn boot_runtime_balloon_hinting_start_rejects_without_hinting_queue() {
+        let (_memory, runtime, mut mmio_dispatcher) =
+            boot_runtime_with_balloon("kernel-balloon-hinting-start-disabled");
+        let device = runtime
+            .balloon_device
+            .as_ref()
+            .expect("balloon device should exist")
+            .clone();
+
+        let err = start_balloon_hinting_for_device(
+            &device,
+            &mut mmio_dispatcher,
+            BalloonHintingStartInput::new(true),
+        )
+        .expect_err("balloon hinting start should require hinting support");
+
+        assert_eq!(err, BalloonHintingCommandError::HintingNotEnabled);
     }
 
     #[test]

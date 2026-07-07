@@ -14,20 +14,22 @@ use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_api::http::{
     ActionRequest, ActionType, ApiRequest, ApiRequestMetricEndpoint, ApiRequestMetricPatchEndpoint,
     ApiRequestMetricPutEndpoint, BalloonConfigRequest, BalloonConfigResponse,
-    BalloonHintingStatusResponse, BalloonStatsResponse, BalloonUpdateRequest, BootSourceRequest,
-    BootSourceResponse, CpuConfigRequest, DriveCacheType as ApiDriveCacheType, DriveConfigRequest,
-    DriveConfigResponse, DriveIoEngine as ApiDriveIoEngine, DrivePatchRequest,
-    EntropyConfigRequest, EntropyConfigResponse, HotUnplugDeviceKind as ApiHotUnplugDeviceKind,
-    HotUnplugDeviceRequest, HttpResponse, LoggerConfigRequest, LoggerLevel as ApiLoggerLevel,
-    MachineConfigPatchRequest, MachineConfigRequest, MachineConfigResponse, MetricsConfigRequest,
-    MmdsConfigRequest, MmdsConfigResponse, MmdsContentRequest, MmdsVersion as ApiMmdsVersion,
+    BalloonHintingStartRequest, BalloonHintingStatusResponse, BalloonStatsResponse,
+    BalloonUpdateRequest, BootSourceRequest, BootSourceResponse, CpuConfigRequest,
+    DriveCacheType as ApiDriveCacheType, DriveConfigRequest, DriveConfigResponse,
+    DriveIoEngine as ApiDriveIoEngine, DrivePatchRequest, EntropyConfigRequest,
+    EntropyConfigResponse, HotUnplugDeviceKind as ApiHotUnplugDeviceKind, HotUnplugDeviceRequest,
+    HttpResponse, LoggerConfigRequest, LoggerLevel as ApiLoggerLevel, MachineConfigPatchRequest,
+    MachineConfigRequest, MachineConfigResponse, MetricsConfigRequest, MmdsConfigRequest,
+    MmdsConfigResponse, MmdsContentRequest, MmdsVersion as ApiMmdsVersion,
     NetworkInterfaceConfigRequest, NetworkInterfaceConfigResponse, NetworkInterfacePatchRequest,
     PmemConfigRequest, PmemConfigResponse, RequestError, SerialConfigRequest, VmConfigResponse,
     VmStateUpdate, VmStateUpdateRequest, VsockConfigRequest, VsockConfigResponse,
     api_request_metric_endpoint, parse_request_with_limit, request_total_len_with_limit,
 };
 use bangbang_runtime::balloon::{
-    BalloonConfig, BalloonConfigInput, BalloonHintingStatus, BalloonStats, BalloonUpdateInput,
+    BalloonConfig, BalloonConfigInput, BalloonHintingStartInput, BalloonHintingStatus,
+    BalloonStats, BalloonUpdateInput,
 };
 use bangbang_runtime::block::{
     DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine, DriveUpdateInput,
@@ -727,9 +729,11 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PatchBalloonStats => {
             handle_empty(vmm.handle_patch_request(PatchApiRequest::balloon_stats()))
         }
-        ApiRequest::PatchBalloonHintingStart => {
-            handle_empty(vmm.handle_patch_request(PatchApiRequest::balloon_hinting_start()))
-        }
+        ApiRequest::PatchBalloonHintingStart(request) => handle_empty(vmm.handle_patch_request(
+            PatchApiRequest::balloon_hinting_start(balloon_hinting_start_input_from_request(
+                request,
+            )),
+        )),
         ApiRequest::PatchBalloonHintingStop => {
             handle_empty(vmm.handle_patch_request(PatchApiRequest::balloon_hinting_stop()))
         }
@@ -782,7 +786,7 @@ fn request_uses_deprecated_api(request: &ApiRequest) -> bool {
         | ApiRequest::HotUnplugDevice(_)
         | ApiRequest::PatchBalloon(_)
         | ApiRequest::PatchBalloonStats
-        | ApiRequest::PatchBalloonHintingStart
+        | ApiRequest::PatchBalloonHintingStart(_)
         | ApiRequest::PatchBalloonHintingStop
         | ApiRequest::PatchDrive(_)
         | ApiRequest::PatchMemoryHotplug
@@ -889,7 +893,7 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         | ApiRequest::HotUnplugDevice(_)
         | ApiRequest::PatchBalloon(_)
         | ApiRequest::PatchBalloonStats
-        | ApiRequest::PatchBalloonHintingStart
+        | ApiRequest::PatchBalloonHintingStart(_)
         | ApiRequest::PatchBalloonHintingStop
         | ApiRequest::PatchDrive(_)
         | ApiRequest::PatchMachineConfig(_)
@@ -1511,6 +1515,12 @@ fn balloon_update_input_from_request(update: BalloonUpdateRequest) -> BalloonUpd
     BalloonUpdateInput::new(update.amount_mib())
 }
 
+fn balloon_hinting_start_input_from_request(
+    request: BalloonHintingStartRequest,
+) -> BalloonHintingStartInput {
+    BalloonHintingStartInput::new(request.acknowledge_on_stop())
+}
+
 fn vsock_config_input_from_request(config: &VsockConfigRequest) -> VsockConfigInput {
     let mut input = VsockConfigInput::new(config.guest_cid(), config.uds_path());
     if let Some(vsock_id) = config.vsock_id() {
@@ -1614,8 +1624,9 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use bangbang_runtime::balloon::{
-        BalloonConfig, BalloonHintingStatus, BalloonHintingStatusError, BalloonStats,
-        BalloonStatsError, BalloonUpdateError,
+        BalloonConfig, BalloonHintingCommandError, BalloonHintingStartInput, BalloonHintingStatus,
+        BalloonHintingStatusError, BalloonStats, BalloonStatsError, BalloonUpdateError,
+        VIRTIO_BALLOON_FREE_PAGE_HINT_DONE, VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
     };
     use bangbang_runtime::block::DriveUpdateError;
     use bangbang_runtime::logger::{LoggerConfigInput, LoggerWriteError};
@@ -1643,6 +1654,8 @@ mod tests {
         boot_run_loop_status: Option<BootRunLoopMetricStatus>,
         process_exit_signal: Option<TestProcessExitSignal>,
         drive_update_result: Option<DriveUpdateError>,
+        hinting_host_cmd: u32,
+        hinting_last_cmd: u32,
     }
 
     impl TestSession {
@@ -1651,6 +1664,8 @@ mod tests {
                 boot_run_loop_status: None,
                 process_exit_signal: None,
                 drive_update_result: None,
+                hinting_host_cmd: VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
+                hinting_last_cmd: VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
             }
         }
 
@@ -1659,6 +1674,8 @@ mod tests {
                 boot_run_loop_status: Some(status),
                 process_exit_signal: None,
                 drive_update_result: None,
+                hinting_host_cmd: VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
+                hinting_last_cmd: VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
             }
         }
 
@@ -1667,6 +1684,8 @@ mod tests {
                 boot_run_loop_status: None,
                 process_exit_signal: Some(signal),
                 drive_update_result: None,
+                hinting_host_cmd: VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
+                hinting_last_cmd: VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
             }
         }
     }
@@ -1699,7 +1718,27 @@ mod tests {
         fn balloon_hinting_status(
             &mut self,
         ) -> Result<BalloonHintingStatus, BalloonHintingStatusError> {
-            Ok(BalloonHintingStatus::new(0, None))
+            Ok(BalloonHintingStatus::new(self.hinting_host_cmd, None))
+        }
+
+        fn start_balloon_hinting(
+            &mut self,
+            _input: BalloonHintingStartInput,
+        ) -> Result<(), BalloonHintingCommandError> {
+            let mut cmd_id = self.hinting_last_cmd.wrapping_add(1);
+            if cmd_id <= VIRTIO_BALLOON_FREE_PAGE_HINT_DONE {
+                cmd_id = VIRTIO_BALLOON_FREE_PAGE_HINT_DONE + 1;
+            }
+            self.hinting_last_cmd = cmd_id;
+            self.hinting_host_cmd = cmd_id;
+
+            Ok(())
+        }
+
+        fn stop_balloon_hinting(&mut self) -> Result<(), BalloonHintingCommandError> {
+            self.hinting_host_cmd = VIRTIO_BALLOON_FREE_PAGE_HINT_DONE;
+
+            Ok(())
         }
 
         fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
@@ -5954,6 +5993,58 @@ mod tests {
         assert!(hinting_status_response.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(hinting_status_response.contains(r#""host_cmd":0"#));
         assert!(hinting_status_response.contains(r#""guest_cmd":null"#));
+
+        let hinting_start_response = request_over_socket(
+            &mut vmm,
+            "b-hsa",
+            &request_with_body(
+                "PATCH",
+                "/balloon/hinting/start",
+                r#"{"acknowledge_on_stop":false}"#,
+            ),
+        );
+        assert!(hinting_start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let hinting_status_after_start_response = request_over_socket(
+            &mut vmm,
+            "b-hs2",
+            "GET /balloon/hinting/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(hinting_status_after_start_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(hinting_status_after_start_response.contains(r#""host_cmd":2"#));
+        assert!(hinting_status_after_start_response.contains(r#""guest_cmd":null"#));
+
+        let repeated_hinting_start_response = request_over_socket(
+            &mut vmm,
+            "b-hsb",
+            &request_with_body("PATCH", "/balloon/hinting/start", "{}"),
+        );
+        assert!(repeated_hinting_start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let hinting_status_after_repeated_start_response = request_over_socket(
+            &mut vmm,
+            "b-hs3",
+            "GET /balloon/hinting/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(hinting_status_after_repeated_start_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(hinting_status_after_repeated_start_response.contains(r#""host_cmd":3"#));
+        assert!(hinting_status_after_repeated_start_response.contains(r#""guest_cmd":null"#));
+
+        let hinting_stop_response = request_over_socket(
+            &mut vmm,
+            "b-hso",
+            "PATCH /balloon/hinting/stop HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(hinting_stop_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let hinting_status_after_stop_response = request_over_socket(
+            &mut vmm,
+            "b-hs1",
+            "GET /balloon/hinting/status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(hinting_status_after_stop_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(hinting_status_after_stop_response.contains(r#""host_cmd":1"#));
+        assert!(hinting_status_after_stop_response.contains(r#""guest_cmd":null"#));
 
         let oversized_patch_response = request_over_socket(
             &mut vmm,

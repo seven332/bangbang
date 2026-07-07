@@ -202,6 +202,43 @@ impl std::error::Error for BalloonStatsError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BalloonHintingCommandError {
+    HintingNotEnabled,
+    ActiveSessionUnavailable,
+    ActiveSessionCommand { message: String },
+    MmioDispatcherUnavailable,
+    HandlerLookup(MmioHandlerLookupError),
+}
+
+impl fmt::Display for BalloonHintingCommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HintingNotEnabled => f.write_str("balloon free-page hinting is not enabled"),
+            Self::ActiveSessionUnavailable => {
+                f.write_str("active balloon device session is unavailable")
+            }
+            Self::ActiveSessionCommand { message } => {
+                write!(f, "active balloon device hinting command failed: {message}")
+            }
+            Self::MmioDispatcherUnavailable => f.write_str("active MMIO dispatcher is unavailable"),
+            Self::HandlerLookup(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for BalloonHintingCommandError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::HandlerLookup(err) => Some(err),
+            Self::HintingNotEnabled
+            | Self::ActiveSessionUnavailable
+            | Self::ActiveSessionCommand { .. }
+            | Self::MmioDispatcherUnavailable => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BalloonHintingStatusError {
     HintingNotEnabled,
     ActiveSessionUnavailable,
@@ -434,6 +471,23 @@ impl BalloonHintingStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BalloonHintingStartInput {
+    acknowledge_on_stop: bool,
+}
+
+impl BalloonHintingStartInput {
+    pub const fn new(acknowledge_on_stop: bool) -> Self {
+        Self {
+            acknowledge_on_stop,
+        }
+    }
+
+    pub const fn acknowledge_on_stop(self) -> bool {
+        self.acknowledge_on_stop
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VirtioBalloonConfigSpace {
     num_pages: u32,
@@ -472,6 +526,11 @@ impl VirtioBalloonConfigSpace {
 
     pub const fn with_num_pages(mut self, num_pages: u32) -> Self {
         self.num_pages = num_pages;
+        self
+    }
+
+    pub const fn with_free_page_hint_cmd_id(mut self, cmd_id: u32) -> Self {
+        self.free_page_hint_cmd_id = cmd_id;
         self
     }
 
@@ -2104,6 +2163,8 @@ pub struct VirtioBalloonDevice {
     memory_accounting: VirtioBalloonMemoryAccounting,
     hinting_host_cmd: u32,
     hinting_guest_cmd: Option<u32>,
+    hinting_last_cmd: u32,
+    hinting_acknowledge_on_stop: bool,
 }
 
 impl VirtioBalloonDevice {
@@ -2114,6 +2175,8 @@ impl VirtioBalloonDevice {
             memory_accounting: VirtioBalloonMemoryAccounting::new(),
             hinting_host_cmd: VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
             hinting_guest_cmd: None,
+            hinting_last_cmd: VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
+            hinting_acknowledge_on_stop: true,
         }
     }
 
@@ -2146,6 +2209,44 @@ impl VirtioBalloonDevice {
             self.hinting_host_cmd,
             self.hinting_guest_cmd,
         ))
+    }
+
+    pub fn hinting_acknowledge_on_stop(&self) -> Result<bool, BalloonHintingCommandError> {
+        if self.queue_layout.free_page_hinting().is_none() {
+            return Err(BalloonHintingCommandError::HintingNotEnabled);
+        }
+
+        Ok(self.hinting_acknowledge_on_stop)
+    }
+
+    pub fn start_hinting(
+        &mut self,
+        input: BalloonHintingStartInput,
+    ) -> Result<u32, BalloonHintingCommandError> {
+        if self.queue_layout.free_page_hinting().is_none() {
+            return Err(BalloonHintingCommandError::HintingNotEnabled);
+        }
+
+        let mut cmd_id = self.hinting_last_cmd.wrapping_add(1);
+        if cmd_id <= VIRTIO_BALLOON_FREE_PAGE_HINT_DONE {
+            cmd_id = VIRTIO_BALLOON_FREE_PAGE_HINT_DONE + 1;
+        }
+
+        self.hinting_last_cmd = cmd_id;
+        self.hinting_acknowledge_on_stop = input.acknowledge_on_stop();
+        self.hinting_host_cmd = cmd_id;
+
+        Ok(cmd_id)
+    }
+
+    pub fn stop_hinting(&mut self) -> Result<u32, BalloonHintingCommandError> {
+        if self.queue_layout.free_page_hinting().is_none() {
+            return Err(BalloonHintingCommandError::HintingNotEnabled);
+        }
+
+        self.hinting_host_cmd = VIRTIO_BALLOON_FREE_PAGE_HINT_DONE;
+
+        Ok(VIRTIO_BALLOON_FREE_PAGE_HINT_DONE)
     }
 
     pub fn activate_balloon(
@@ -2300,10 +2401,29 @@ impl VirtioBalloonDevice {
         self.memory_accounting = VirtioBalloonMemoryAccounting::new();
         self.hinting_host_cmd = VIRTIO_BALLOON_FREE_PAGE_HINT_STOP;
         self.hinting_guest_cmd = None;
+        self.hinting_last_cmd = VIRTIO_BALLOON_FREE_PAGE_HINT_STOP;
+        self.hinting_acknowledge_on_stop = true;
     }
 }
 
 impl VirtioMmioRegisterHandler<VirtioBalloonConfigSpace, VirtioBalloonDevice> {
+    pub fn start_balloon_hinting(
+        &mut self,
+        input: BalloonHintingStartInput,
+    ) -> Result<(), BalloonHintingCommandError> {
+        let cmd_id = self.activation_handler_mut().start_hinting(input)?;
+        self.update_balloon_hinting_host_cmd(cmd_id);
+
+        Ok(())
+    }
+
+    pub fn stop_balloon_hinting(&mut self) -> Result<(), BalloonHintingCommandError> {
+        let cmd_id = self.activation_handler_mut().stop_hinting()?;
+        self.update_balloon_hinting_host_cmd(cmd_id);
+
+        Ok(())
+    }
+
     pub fn balloon_hinting_status(
         &self,
     ) -> Result<BalloonHintingStatus, BalloonHintingStatusError> {
@@ -2344,6 +2464,15 @@ impl VirtioMmioRegisterHandler<VirtioBalloonConfigSpace, VirtioBalloonDevice> {
         self.mark_interrupt_pending(DeviceInterruptKind::Config);
 
         Ok(())
+    }
+
+    fn update_balloon_hinting_host_cmd(&mut self, cmd_id: u32) {
+        let config_space = self
+            .device_config_handler()
+            .with_free_page_hint_cmd_id(cmd_id);
+        *self.device_config_handler_mut() = config_space;
+        self.increment_config_generation();
+        self.mark_interrupt_pending(DeviceInterruptKind::Config);
     }
 }
 
@@ -5226,6 +5355,88 @@ mod tests {
     }
 
     #[test]
+    fn balloon_device_hinting_start_stop_updates_host_command_state() {
+        let layout = prepared(balloon_config(64, false, 0, true, false)).queue_layout();
+        let mut device = VirtioBalloonDevice::new(layout);
+
+        let first = device
+            .start_hinting(BalloonHintingStartInput::new(false))
+            .expect("hinting start should assign command id");
+        assert_eq!(first, VIRTIO_BALLOON_FREE_PAGE_HINT_DONE + 1);
+        assert!(
+            !device
+                .hinting_acknowledge_on_stop()
+                .expect("hinting ack setting should read")
+        );
+        assert_eq!(
+            device
+                .hinting_status()
+                .expect("hinting status should read after start")
+                .host_cmd(),
+            first
+        );
+
+        let second = device
+            .start_hinting(BalloonHintingStartInput::new(true))
+            .expect("second hinting start should assign command id");
+        assert_eq!(second, first + 1);
+        assert!(
+            device
+                .hinting_acknowledge_on_stop()
+                .expect("hinting ack setting should read")
+        );
+
+        let stopped = device
+            .stop_hinting()
+            .expect("hinting stop should set done command");
+        assert_eq!(stopped, VIRTIO_BALLOON_FREE_PAGE_HINT_DONE);
+        assert_eq!(
+            device
+                .hinting_status()
+                .expect("hinting status should read after stop")
+                .host_cmd(),
+            VIRTIO_BALLOON_FREE_PAGE_HINT_DONE
+        );
+
+        let third = device
+            .start_hinting(BalloonHintingStartInput::new(false))
+            .expect("hinting start after stop should continue command ids");
+        assert_eq!(third, second + 1);
+    }
+
+    #[test]
+    fn balloon_device_hinting_start_skips_reserved_ids_after_wrap() {
+        let layout = prepared(balloon_config(64, false, 0, true, false)).queue_layout();
+        let mut device = VirtioBalloonDevice::new(layout);
+        device.hinting_last_cmd = u32::MAX;
+
+        let cmd = device
+            .start_hinting(BalloonHintingStartInput::new(true))
+            .expect("wrapped hinting command id should skip reserved values");
+
+        assert_eq!(cmd, VIRTIO_BALLOON_FREE_PAGE_HINT_DONE + 1);
+    }
+
+    #[test]
+    fn balloon_device_hinting_start_stop_rejects_disabled_hinting() {
+        let layout = prepared(balloon_config(64, false, 0, false, false)).queue_layout();
+        let mut device = VirtioBalloonDevice::new(layout);
+
+        assert_eq!(
+            device
+                .start_hinting(BalloonHintingStartInput::new(true))
+                .expect_err("hinting start should require hinting support"),
+            BalloonHintingCommandError::HintingNotEnabled
+        );
+        assert_eq!(
+            device
+                .stop_hinting()
+                .expect_err("hinting stop should require hinting support"),
+            BalloonHintingCommandError::HintingNotEnabled
+        );
+    }
+
+    #[test]
     fn balloon_device_activation_rejects_queue_count_mismatch() {
         let layout = prepared(balloon_config(64, false, 0, false, false)).queue_layout();
         let device_registers = VirtioMmioDeviceRegisters::new(
@@ -6097,6 +6308,94 @@ mod tests {
         assert_eq!(
             read_mmio_config(&mut device, 8, 4).as_slice(),
             &0x5678_u32.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn mmio_hinting_start_stop_marks_config_interrupt_and_generation() {
+        let mut device = balloon_mmio_device(balloon_config(64, false, 0, true, false));
+        {
+            let handler = device
+                .dispatcher_mut()
+                .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+                .expect("balloon handler should be registered");
+            handler
+                .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
+                .expect("acknowledge status should write");
+            handler
+                .write_register(
+                    VirtioMmioRegister::Status,
+                    VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+                )
+                .expect("driver status should write");
+        }
+        {
+            let handler = device
+                .dispatcher_mut()
+                .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+                .expect("balloon handler should be registered");
+
+            handler
+                .start_balloon_hinting(BalloonHintingStartInput::new(false))
+                .expect("hinting start should update active config");
+
+            assert_eq!(
+                handler
+                    .read_register(VirtioMmioRegister::ConfigGeneration)
+                    .expect("config generation should read"),
+                1
+            );
+            assert_eq!(
+                handler
+                    .read_register(VirtioMmioRegister::InterruptStatus)
+                    .expect("interrupt status should read"),
+                DeviceInterruptKind::Config.status().bits()
+            );
+            assert!(
+                !handler
+                    .activation_handler()
+                    .hinting_acknowledge_on_stop()
+                    .expect("hinting ack setting should read")
+            );
+            assert_eq!(
+                handler
+                    .balloon_hinting_status()
+                    .expect("hinting status should read")
+                    .host_cmd(),
+                VIRTIO_BALLOON_FREE_PAGE_HINT_DONE + 1
+            );
+        }
+        assert_eq!(
+            read_mmio_config(&mut device, 8, 4).as_slice(),
+            &(VIRTIO_BALLOON_FREE_PAGE_HINT_DONE + 1).to_le_bytes()
+        );
+        {
+            let handler = device
+                .dispatcher_mut()
+                .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+                .expect("balloon handler should be registered");
+
+            handler
+                .stop_balloon_hinting()
+                .expect("hinting stop should update active config");
+
+            assert_eq!(
+                handler
+                    .read_register(VirtioMmioRegister::ConfigGeneration)
+                    .expect("config generation should read"),
+                2
+            );
+            assert_eq!(
+                handler
+                    .balloon_hinting_status()
+                    .expect("hinting status should read")
+                    .host_cmd(),
+                VIRTIO_BALLOON_FREE_PAGE_HINT_DONE
+            );
+        }
+        assert_eq!(
+            read_mmio_config(&mut device, 8, 4).as_slice(),
+            &VIRTIO_BALLOON_FREE_PAGE_HINT_DONE.to_le_bytes()
         );
     }
 
