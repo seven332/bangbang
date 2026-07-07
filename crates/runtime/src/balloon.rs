@@ -1793,8 +1793,10 @@ impl VirtioBalloonQueue {
     pub fn dispatch_hinting_commands(
         &mut self,
         memory: &mut GuestMemory,
+        context: VirtioBalloonHintingDispatchContext,
     ) -> Result<VirtioBalloonQueueDispatch, VirtioBalloonQueueDispatchError> {
         let mut dispatch = VirtioBalloonQueueDispatch::default();
+        let mut current_guest_cmd = context.guest_cmd();
 
         while let Some(chain) = self
             .available
@@ -1811,8 +1813,24 @@ impl VirtioBalloonQueue {
                     completed_dispatch: Box::new(dispatch.clone()),
                 }
             })?;
-            let guest_cmd =
-                read_balloon_hinting_guest_cmd(memory, &chain, descriptor_head, &dispatch)?;
+            let descriptor_dispatch = read_balloon_hinting_descriptor(
+                memory,
+                &chain,
+                descriptor_head,
+                context.host_cmd(),
+                current_guest_cmd,
+                &dispatch,
+            )?;
+            dispatch
+                .reserve_hinting_page_ranges(descriptor_dispatch.hinting_page_ranges().len())
+                .map_err(
+                    |source| VirtioBalloonQueueDispatchError::HintingRangeAllocation {
+                        completed_dispatch: Box::new(dispatch.clone()),
+                        descriptor_head,
+                        range_count: descriptor_dispatch.hinting_page_ranges().len(),
+                        source,
+                    },
+                )?;
             let publication = self
                 .used
                 .publish_used_element_with_notification(
@@ -1827,10 +1845,36 @@ impl VirtioBalloonQueue {
                     descriptor_head,
                     source,
                 })?;
-            dispatch.record_hinting_descriptor(guest_cmd, publication);
+            if let Some(guest_cmd) = descriptor_dispatch.guest_cmd() {
+                current_guest_cmd = Some(guest_cmd);
+            }
+            dispatch.record_hinting_descriptor(descriptor_dispatch, publication);
         }
 
         Ok(dispatch)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioBalloonHintingDispatchContext {
+    host_cmd: u32,
+    guest_cmd: Option<u32>,
+}
+
+impl VirtioBalloonHintingDispatchContext {
+    pub const fn new(host_cmd: u32, guest_cmd: Option<u32>) -> Self {
+        Self {
+            host_cmd,
+            guest_cmd,
+        }
+    }
+
+    pub const fn host_cmd(self) -> u32 {
+        self.host_cmd
+    }
+
+    pub const fn guest_cmd(self) -> Option<u32> {
+        self.guest_cmd
     }
 }
 
@@ -1840,6 +1884,7 @@ pub struct VirtioBalloonQueueDispatch {
     needs_queue_interrupt: bool,
     inflated_page_ranges: Vec<VirtioBalloonPfnRange>,
     deflated_page_ranges: Vec<VirtioBalloonPfnRange>,
+    hinting_page_ranges: Vec<GuestMemoryRange>,
     hinting_guest_cmd: Option<u32>,
     hinting_completed_run: bool,
 }
@@ -1861,6 +1906,10 @@ impl VirtioBalloonQueueDispatch {
         &self.deflated_page_ranges
     }
 
+    pub fn hinting_page_ranges(&self) -> &[GuestMemoryRange] {
+        &self.hinting_page_ranges
+    }
+
     pub const fn hinting_guest_cmd(&self) -> Option<u32> {
         self.hinting_guest_cmd
     }
@@ -1875,6 +1924,10 @@ impl VirtioBalloonQueueDispatch {
 
     fn reserve_deflated_page_ranges(&mut self, range_count: usize) -> Result<(), TryReserveError> {
         self.deflated_page_ranges.try_reserve(range_count)
+    }
+
+    fn reserve_hinting_page_ranges(&mut self, range_count: usize) -> Result<(), TryReserveError> {
+        self.hinting_page_ranges.try_reserve(range_count)
     }
 
     fn record_inflate_descriptor(
@@ -1899,47 +1952,98 @@ impl VirtioBalloonQueueDispatch {
 
     fn record_hinting_descriptor(
         &mut self,
-        guest_cmd: Option<u32>,
+        mut descriptor_dispatch: VirtioBalloonHintingDescriptorDispatch,
         publication: VirtqueueUsedRingPublication,
     ) {
         self.completed_descriptors += 1;
         self.needs_queue_interrupt |= publication.needs_queue_interrupt();
-        if let Some(guest_cmd) = guest_cmd {
+        self.hinting_page_ranges
+            .append(&mut descriptor_dispatch.hinting_page_ranges);
+        if let Some(guest_cmd) = descriptor_dispatch.guest_cmd {
             self.hinting_guest_cmd = Some(guest_cmd);
             self.hinting_completed_run = is_completed_balloon_hinting_guest_cmd(guest_cmd);
         }
     }
 }
 
-fn read_balloon_hinting_guest_cmd(
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct VirtioBalloonHintingDescriptorDispatch {
+    guest_cmd: Option<u32>,
+    hinting_page_ranges: Vec<GuestMemoryRange>,
+}
+
+impl VirtioBalloonHintingDescriptorDispatch {
+    const fn guest_cmd(&self) -> Option<u32> {
+        self.guest_cmd
+    }
+
+    fn hinting_page_ranges(&self) -> &[GuestMemoryRange] {
+        &self.hinting_page_ranges
+    }
+
+    fn reserve_hinting_page_range(&mut self) -> Result<(), TryReserveError> {
+        self.hinting_page_ranges.try_reserve(1)
+    }
+}
+
+fn read_balloon_hinting_descriptor(
     memory: &GuestMemory,
     chain: &VirtqueueDescriptorChain,
     descriptor_head: u16,
+    host_cmd: u32,
+    mut current_guest_cmd: Option<u32>,
     completed_dispatch: &VirtioBalloonQueueDispatch,
-) -> Result<Option<u32>, VirtioBalloonQueueDispatchError> {
-    let mut guest_cmd = None;
+) -> Result<VirtioBalloonHintingDescriptorDispatch, VirtioBalloonQueueDispatchError> {
+    let mut descriptor_dispatch = VirtioBalloonHintingDescriptorDispatch::default();
     for descriptor in chain.descriptors().iter().copied() {
         // Firecracker identifies free-page hinting command descriptors by length.
-        if descriptor.len() != VIRTIO_BALLOON_HINTING_COMMAND_SIZE_U32 {
+        if descriptor.len() == VIRTIO_BALLOON_HINTING_COMMAND_SIZE_U32 {
+            let mut bytes = [0; VIRTIO_BALLOON_HINTING_COMMAND_SIZE];
+            memory
+                .read_slice(&mut bytes, descriptor.address())
+                .map_err(
+                    |source| VirtioBalloonQueueDispatchError::HintingCommandRead {
+                        completed_dispatch: Box::new(completed_dispatch.clone()),
+                        descriptor_head,
+                        descriptor_index: descriptor.index(),
+                        address: descriptor.address(),
+                        source,
+                    },
+                )?;
+            let guest_cmd = u32::from_le_bytes(bytes);
+            descriptor_dispatch.guest_cmd = Some(guest_cmd);
+            current_guest_cmd = Some(guest_cmd);
             continue;
         }
 
-        let mut bytes = [0; VIRTIO_BALLOON_HINTING_COMMAND_SIZE];
-        memory
-            .read_slice(&mut bytes, descriptor.address())
+        if !should_record_balloon_hinting_range(host_cmd, current_guest_cmd) {
+            continue;
+        }
+
+        let range = read_balloon_hinting_range(memory, descriptor).map_err(|source| {
+            VirtioBalloonQueueDispatchError::HintingRange {
+                completed_dispatch: Box::new(completed_dispatch.clone()),
+                descriptor_head,
+                descriptor_index: descriptor.index(),
+                address: descriptor.address(),
+                len: descriptor.len(),
+                source,
+            }
+        })?;
+        descriptor_dispatch
+            .reserve_hinting_page_range()
             .map_err(
-                |source| VirtioBalloonQueueDispatchError::HintingCommandRead {
+                |source| VirtioBalloonQueueDispatchError::HintingRangeAllocation {
                     completed_dispatch: Box::new(completed_dispatch.clone()),
                     descriptor_head,
-                    descriptor_index: descriptor.index(),
-                    address: descriptor.address(),
+                    range_count: descriptor_dispatch.hinting_page_ranges.len() + 1,
                     source,
                 },
             )?;
-        guest_cmd = Some(u32::from_le_bytes(bytes));
+        descriptor_dispatch.hinting_page_ranges.push(range);
     }
 
-    Ok(guest_cmd)
+    Ok(descriptor_dispatch)
 }
 
 const fn is_completed_balloon_hinting_guest_cmd(guest_cmd: u32) -> bool {
@@ -1947,6 +2051,54 @@ const fn is_completed_balloon_hinting_guest_cmd(guest_cmd: u32) -> bool {
         guest_cmd,
         VIRTIO_BALLOON_FREE_PAGE_HINT_STOP | VIRTIO_BALLOON_FREE_PAGE_HINT_DONE
     )
+}
+
+const fn is_active_balloon_hinting_host_cmd(host_cmd: u32) -> bool {
+    !matches!(
+        host_cmd,
+        VIRTIO_BALLOON_FREE_PAGE_HINT_STOP | VIRTIO_BALLOON_FREE_PAGE_HINT_DONE
+    )
+}
+
+fn should_record_balloon_hinting_range(host_cmd: u32, guest_cmd: Option<u32>) -> bool {
+    is_active_balloon_hinting_host_cmd(host_cmd) && guest_cmd == Some(host_cmd)
+}
+
+fn read_balloon_hinting_range(
+    memory: &GuestMemory,
+    descriptor: VirtqueueDescriptor,
+) -> Result<GuestMemoryRange, VirtioBalloonHintingRangeError> {
+    let range = GuestMemoryRange::new(descriptor.address(), u64::from(descriptor.len()))
+        .map_err(VirtioBalloonHintingRangeError::Range)?;
+    memory
+        .validate_mapped_range(range)
+        .map_err(VirtioBalloonHintingRangeError::Access)?;
+
+    Ok(range)
+}
+
+#[derive(Debug)]
+pub enum VirtioBalloonHintingRangeError {
+    Range(GuestMemoryError),
+    Access(GuestMemoryAccessError),
+}
+
+impl fmt::Display for VirtioBalloonHintingRangeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Range(source) => write!(f, "{source}"),
+            Self::Access(source) => write!(f, "{source}"),
+        }
+    }
+}
+
+impl std::error::Error for VirtioBalloonHintingRangeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Range(source) => Some(source),
+            Self::Access(source) => Some(source),
+        }
+    }
 }
 
 fn read_balloon_queue_pfn_ranges(
@@ -2046,6 +2198,20 @@ pub enum VirtioBalloonQueueDispatchError {
         range_count: usize,
         source: TryReserveError,
     },
+    HintingRange {
+        completed_dispatch: Box<VirtioBalloonQueueDispatch>,
+        descriptor_head: u16,
+        descriptor_index: u16,
+        address: GuestAddress,
+        len: u32,
+        source: VirtioBalloonHintingRangeError,
+    },
+    HintingRangeAllocation {
+        completed_dispatch: Box<VirtioBalloonQueueDispatch>,
+        descriptor_head: u16,
+        range_count: usize,
+        source: TryReserveError,
+    },
     HintingCommandRead {
         completed_dispatch: Box<VirtioBalloonQueueDispatch>,
         descriptor_head: u16,
@@ -2083,6 +2249,12 @@ impl VirtioBalloonQueueDispatchError {
                 completed_dispatch, ..
             }
             | Self::DeflatedRangeAllocation {
+                completed_dispatch, ..
+            }
+            | Self::HintingRange {
+                completed_dispatch, ..
+            }
+            | Self::HintingRangeAllocation {
                 completed_dispatch, ..
             }
             | Self::HintingCommandRead {
@@ -2181,6 +2353,30 @@ impl fmt::Display for VirtioBalloonQueueDispatchError {
                     "failed to reserve {range_count} deflated page range(s) for virtio-balloon deflate descriptor {descriptor_head}: {source}"
                 )
             }
+            Self::HintingRange {
+                descriptor_head,
+                descriptor_index,
+                address,
+                len,
+                source,
+                ..
+            } => {
+                write!(
+                    f,
+                    "failed to validate virtio-balloon free-page-hinting descriptor {descriptor_head} range from descriptor {descriptor_index} at {address} with length {len}: {source}"
+                )
+            }
+            Self::HintingRangeAllocation {
+                descriptor_head,
+                range_count,
+                source,
+                ..
+            } => {
+                write!(
+                    f,
+                    "failed to reserve {range_count} free-page-hinting range(s) for virtio-balloon descriptor {descriptor_head}: {source}"
+                )
+            }
             Self::HintingCommandRead {
                 descriptor_head,
                 descriptor_index,
@@ -2208,6 +2404,8 @@ impl std::error::Error for VirtioBalloonQueueDispatchError {
             Self::PfnRangeAccess { source, .. } => Some(source),
             Self::InflatedRangeAllocation { source, .. } => Some(source),
             Self::DeflatedRangeAllocation { source, .. } => Some(source),
+            Self::HintingRange { source, .. } => Some(source),
+            Self::HintingRangeAllocation { source, .. } => Some(source),
             Self::HintingCommandRead { source, .. } => Some(source),
             Self::EmptyDescriptorChain { .. } => None,
         }
@@ -2449,6 +2647,8 @@ impl VirtioBalloonDevice {
             });
         }
 
+        let hinting_context =
+            VirtioBalloonHintingDispatchContext::new(self.hinting_host_cmd, self.hinting_guest_cmd);
         let Some(active_queues) = self.active_queues.as_mut() else {
             return Err(VirtioBalloonDeviceNotificationError::Inactive {
                 drained_notifications,
@@ -2555,7 +2755,7 @@ impl VirtioBalloonDevice {
                     queue_index: hinting_queue_index.unwrap_or(VIRTIO_BALLOON_STATS_QUEUE_INDEX),
                 });
             };
-            match hinting_queue.dispatch_hinting_commands(memory) {
+            match hinting_queue.dispatch_hinting_commands(memory, hinting_context) {
                 Ok(hinting_dispatch) => {
                     dispatch.hinting_queue_dispatch = Some(hinting_dispatch);
                     apply_completed_balloon_hinting_guest_cmd(
@@ -3701,6 +3901,17 @@ mod tests {
         let used = VirtqueueUsedRing::new(used_ring, TEST_QUEUE_SIZE)
             .expect("hinting used ring should build");
         VirtioBalloonQueue::new(available, used)
+    }
+
+    const fn hinting_context(
+        host_cmd: u32,
+        guest_cmd: Option<u32>,
+    ) -> VirtioBalloonHintingDispatchContext {
+        VirtioBalloonHintingDispatchContext::new(host_cmd, guest_cmd)
+    }
+
+    const fn default_hinting_context() -> VirtioBalloonHintingDispatchContext {
+        hinting_context(VIRTIO_BALLOON_FREE_PAGE_HINT_STOP, None)
     }
 
     fn queue_available_ring(queue_index: usize) -> GuestAddress {
@@ -5428,7 +5639,7 @@ mod tests {
         let mut queue = hinting_queue(queue_index);
 
         let dispatch = queue
-            .dispatch_hinting_commands(&mut memory)
+            .dispatch_hinting_commands(&mut memory, default_hinting_context())
             .expect("hinting command descriptor should dispatch");
 
         assert_eq!(dispatch.completed_descriptors(), 1);
@@ -5460,7 +5671,7 @@ mod tests {
         let mut queue = hinting_queue(queue_index);
 
         let dispatch = queue
-            .dispatch_hinting_commands(&mut memory)
+            .dispatch_hinting_commands(&mut memory, default_hinting_context())
             .expect("hinting command descriptor should dispatch by length");
 
         assert_eq!(dispatch.completed_descriptors(), 1);
@@ -5492,7 +5703,7 @@ mod tests {
             let mut queue = hinting_queue(queue_index);
 
             let dispatch = queue
-                .dispatch_hinting_commands(&mut memory)
+                .dispatch_hinting_commands(&mut memory, default_hinting_context())
                 .expect("hinting completion command should dispatch");
 
             assert_eq!(dispatch.completed_descriptors(), 1);
@@ -5537,7 +5748,7 @@ mod tests {
         let mut queue = hinting_queue(queue_index);
 
         let dispatch = queue
-            .dispatch_hinting_commands(&mut memory)
+            .dispatch_hinting_commands(&mut memory, default_hinting_context())
             .expect("later hinting command should dispatch");
 
         assert_eq!(dispatch.completed_descriptors(), 2);
@@ -5547,7 +5758,7 @@ mod tests {
     }
 
     #[test]
-    fn hinting_queue_dispatch_ignores_range_descriptor_payloads_for_now() {
+    fn hinting_queue_dispatch_records_active_run_range_descriptor() {
         let mut memory = pfn_descriptor_memory();
         let queue_index = VIRTIO_BALLOON_STATS_QUEUE_INDEX;
         let command = 7_u32;
@@ -5573,17 +5784,212 @@ mod tests {
         let mut queue = hinting_queue(queue_index);
 
         let dispatch = queue
-            .dispatch_hinting_commands(&mut memory)
-            .expect("hinting command with ignored range payload should dispatch");
+            .dispatch_hinting_commands(&mut memory, hinting_context(command, None))
+            .expect("hinting command with active range payload should dispatch");
 
         assert_eq!(dispatch.completed_descriptors(), 1);
         assert_eq!(dispatch.hinting_guest_cmd(), Some(command));
         assert!(!dispatch.hinting_completed_run());
+        assert_eq!(
+            dispatch.hinting_page_ranges(),
+            &[GuestMemoryRange::new(TEST_PFN_DATA_SPLIT, 64).expect("test range should be valid")]
+        );
         assert_eq!(read_used_idx(&memory, queue_used_ring(queue_index)), 1);
         assert_eq!(
             read_used_element(&memory, queue_used_ring(queue_index), 0),
             (0, 0)
         );
+    }
+
+    #[test]
+    fn hinting_queue_dispatch_records_range_from_context_guest_command() {
+        let mut memory = pfn_descriptor_memory();
+        let queue_index = VIRTIO_BALLOON_STATS_QUEUE_INDEX;
+        let command = 9_u32;
+        write_guest_bytes(&mut memory, TEST_PFN_DATA_SPLIT, &[0xbb; 64]);
+        write_hinting_descriptor(
+            &mut memory,
+            queue_index,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA_SPLIT, 64, None),
+        );
+        write_available_heads(&mut memory, queue_available_ring(queue_index), &[0]);
+        let mut queue = hinting_queue(queue_index);
+
+        let dispatch = queue
+            .dispatch_hinting_commands(&mut memory, hinting_context(command, Some(command)))
+            .expect("hinting range with matching context command should dispatch");
+
+        assert_eq!(dispatch.completed_descriptors(), 1);
+        assert_eq!(dispatch.hinting_guest_cmd(), None);
+        assert_eq!(
+            dispatch.hinting_page_ranges(),
+            &[GuestMemoryRange::new(TEST_PFN_DATA_SPLIT, 64).expect("test range should be valid")]
+        );
+        assert_eq!(read_used_idx(&memory, queue_used_ring(queue_index)), 1);
+        assert_eq!(
+            read_used_element(&memory, queue_used_ring(queue_index), 0),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn hinting_queue_dispatch_ignores_range_without_guest_command() {
+        let mut memory = pfn_descriptor_memory();
+        let queue_index = VIRTIO_BALLOON_STATS_QUEUE_INDEX;
+        let command = 7_u32;
+        write_guest_bytes(&mut memory, TEST_PFN_DATA_SPLIT, &[0xcc; 64]);
+        write_hinting_descriptor(
+            &mut memory,
+            queue_index,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA_SPLIT, 64, None),
+        );
+        write_available_heads(&mut memory, queue_available_ring(queue_index), &[0]);
+        let mut queue = hinting_queue(queue_index);
+
+        let dispatch = queue
+            .dispatch_hinting_commands(&mut memory, hinting_context(command, None))
+            .expect("hinting range without guest command should be ignored");
+
+        assert_eq!(dispatch.completed_descriptors(), 1);
+        assert!(dispatch.hinting_page_ranges().is_empty());
+        assert_eq!(read_used_idx(&memory, queue_used_ring(queue_index)), 1);
+    }
+
+    #[test]
+    fn hinting_queue_dispatch_ignores_range_for_stale_guest_command() {
+        let mut memory = pfn_descriptor_memory();
+        let queue_index = VIRTIO_BALLOON_STATS_QUEUE_INDEX;
+        let command = 7_u32;
+        let active_host_command = 8_u32;
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &command.to_le_bytes());
+        write_guest_bytes(&mut memory, TEST_PFN_DATA_SPLIT, &[0xdd; 64]);
+        write_hinting_descriptor(
+            &mut memory,
+            queue_index,
+            0,
+            TestDescriptor::readable(
+                TEST_PFN_DATA,
+                VIRTIO_BALLOON_HINTING_COMMAND_SIZE_U32,
+                Some(1),
+            ),
+        );
+        write_hinting_descriptor(
+            &mut memory,
+            queue_index,
+            1,
+            TestDescriptor::readable(TEST_PFN_DATA_SPLIT, 64, None),
+        );
+        write_available_heads(&mut memory, queue_available_ring(queue_index), &[0]);
+        let mut queue = hinting_queue(queue_index);
+
+        let dispatch = queue
+            .dispatch_hinting_commands(&mut memory, hinting_context(active_host_command, None))
+            .expect("stale hinting range should be ignored");
+
+        assert_eq!(dispatch.completed_descriptors(), 1);
+        assert_eq!(dispatch.hinting_guest_cmd(), Some(command));
+        assert!(dispatch.hinting_page_ranges().is_empty());
+        assert_eq!(read_used_idx(&memory, queue_used_ring(queue_index)), 1);
+    }
+
+    #[test]
+    fn hinting_queue_dispatch_ignores_range_when_host_command_is_inactive() {
+        for command in [
+            VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
+            VIRTIO_BALLOON_FREE_PAGE_HINT_DONE,
+        ] {
+            let mut memory = pfn_descriptor_memory();
+            let queue_index = VIRTIO_BALLOON_STATS_QUEUE_INDEX;
+            write_guest_bytes(&mut memory, TEST_PFN_DATA, &command.to_le_bytes());
+            write_guest_bytes(&mut memory, TEST_PFN_DATA_SPLIT, &[0xee; 64]);
+            write_hinting_descriptor(
+                &mut memory,
+                queue_index,
+                0,
+                TestDescriptor::readable(
+                    TEST_PFN_DATA,
+                    VIRTIO_BALLOON_HINTING_COMMAND_SIZE_U32,
+                    Some(1),
+                ),
+            );
+            write_hinting_descriptor(
+                &mut memory,
+                queue_index,
+                1,
+                TestDescriptor::readable(TEST_PFN_DATA_SPLIT, 64, None),
+            );
+            write_available_heads(&mut memory, queue_available_ring(queue_index), &[0]);
+            let mut queue = hinting_queue(queue_index);
+
+            let dispatch = queue
+                .dispatch_hinting_commands(&mut memory, hinting_context(command, Some(command)))
+                .expect("inactive host command should ignore hinting range");
+
+            assert_eq!(dispatch.completed_descriptors(), 1);
+            assert_eq!(dispatch.hinting_guest_cmd(), Some(command));
+            assert!(dispatch.hinting_completed_run());
+            assert!(dispatch.hinting_page_ranges().is_empty());
+            assert_eq!(read_used_idx(&memory, queue_used_ring(queue_index)), 1);
+        }
+    }
+
+    #[test]
+    fn hinting_queue_dispatch_range_error_preserves_completed_dispatch() {
+        let mut memory = pfn_descriptor_memory();
+        let queue_index = VIRTIO_BALLOON_STATS_QUEUE_INDEX;
+        let command = 7_u32;
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &command.to_le_bytes());
+        write_guest_bytes(&mut memory, TEST_PFN_DATA_SPLIT, &[0xff; 64]);
+        write_hinting_descriptor(
+            &mut memory,
+            queue_index,
+            0,
+            TestDescriptor::readable(
+                TEST_PFN_DATA,
+                VIRTIO_BALLOON_HINTING_COMMAND_SIZE_U32,
+                Some(1),
+            ),
+        );
+        write_hinting_descriptor(
+            &mut memory,
+            queue_index,
+            1,
+            TestDescriptor::readable(TEST_PFN_DATA_SPLIT, 64, None),
+        );
+        write_hinting_descriptor(
+            &mut memory,
+            queue_index,
+            2,
+            TestDescriptor::readable(GuestAddress::new(TEST_MEMORY_SIZE), 64, None),
+        );
+        write_available_heads(&mut memory, queue_available_ring(queue_index), &[0, 2]);
+        let mut queue = hinting_queue(queue_index);
+
+        let error = queue
+            .dispatch_hinting_commands(&mut memory, hinting_context(command, None))
+            .expect_err("unmapped hinting range should fail");
+
+        assert!(matches!(
+            error,
+            VirtioBalloonQueueDispatchError::HintingRange {
+                descriptor_head: 2,
+                descriptor_index: 2,
+                ..
+            }
+        ));
+        assert_eq!(error.completed_dispatch().completed_descriptors(), 1);
+        assert_eq!(
+            error.completed_dispatch().hinting_page_ranges(),
+            &[GuestMemoryRange::new(TEST_PFN_DATA_SPLIT, 64).expect("test range should be valid")]
+        );
+        assert_eq!(read_used_idx(&memory, queue_used_ring(queue_index)), 1);
+        assert_eq!(
+            read_used_element(&memory, queue_used_ring(queue_index), 0),
+            (0, 0)
+        );
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     #[test]
@@ -5612,7 +6018,7 @@ mod tests {
         let mut queue = hinting_queue(queue_index);
 
         let error = queue
-            .dispatch_hinting_commands(&mut memory)
+            .dispatch_hinting_commands(&mut memory, default_hinting_context())
             .expect_err("unmapped hinting command should fail");
 
         assert!(matches!(
@@ -5663,7 +6069,7 @@ mod tests {
         let mut queue = hinting_queue(queue_index);
 
         let error = queue
-            .dispatch_hinting_commands(&mut memory)
+            .dispatch_hinting_commands(&mut memory, default_hinting_context())
             .expect_err("unmapped hinting command should fail after completed stop");
 
         assert!(matches!(
@@ -6931,6 +7337,94 @@ mod tests {
             DeviceInterruptKind::Queue.status().bits()
         );
         assert!(handler.pending_queue_notifications().is_empty());
+    }
+
+    #[test]
+    fn balloon_mmio_handler_dispatches_active_hinting_range_notification() {
+        let mut memory = pfn_descriptor_memory();
+        write_guest_bytes(&mut memory, TEST_PFN_DATA_SPLIT, &[0xab; 64]);
+        let config = balloon_config(64, false, 0, true, false);
+        let hinting_queue_index = prepared(config)
+            .queue_layout()
+            .free_page_hinting()
+            .expect("hinting queue should be configured")
+            .index();
+        let mut device = balloon_mmio_device(config);
+        {
+            let handler = device
+                .dispatcher_mut()
+                .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+                .expect("balloon handler should be registered");
+            activate_handler(handler);
+
+            handler
+                .start_balloon_hinting(BalloonHintingStartInput::new(true))
+                .expect("hinting start should update active config");
+            let command = handler
+                .balloon_hinting_status()
+                .expect("hinting status should read")
+                .host_cmd();
+            write_guest_bytes(&mut memory, TEST_PFN_DATA, &command.to_le_bytes());
+            write_hinting_descriptor(
+                &mut memory,
+                hinting_queue_index,
+                0,
+                TestDescriptor::readable(
+                    TEST_PFN_DATA,
+                    VIRTIO_BALLOON_HINTING_COMMAND_SIZE_U32,
+                    Some(1),
+                ),
+            );
+            write_hinting_descriptor(
+                &mut memory,
+                hinting_queue_index,
+                1,
+                TestDescriptor::readable(TEST_PFN_DATA_SPLIT, 64, None),
+            );
+            write_available_heads(&mut memory, queue_available_ring(hinting_queue_index), &[0]);
+            handler
+                .write_register(
+                    VirtioMmioRegister::InterruptAck,
+                    DeviceInterruptKind::Config.status().bits(),
+                )
+                .expect("config interrupt should acknowledge");
+
+            handler
+                .write_register(
+                    VirtioMmioRegister::QueueNotify,
+                    queue_index_u32(hinting_queue_index),
+                )
+                .expect("hinting queue notification should write");
+
+            let dispatch = handler
+                .dispatch_balloon_queue_notifications(&mut memory)
+                .expect("active hinting range notification should dispatch");
+
+            let hinting_dispatch = dispatch
+                .hinting_queue_dispatch()
+                .expect("hinting queue should dispatch");
+            assert_eq!(hinting_dispatch.hinting_guest_cmd(), Some(command));
+            assert_eq!(
+                hinting_dispatch.hinting_page_ranges(),
+                &[GuestMemoryRange::new(TEST_PFN_DATA_SPLIT, 64)
+                    .expect("test range should be valid")]
+            );
+            assert_eq!(
+                handler
+                    .read_register(VirtioMmioRegister::InterruptStatus)
+                    .expect("interrupt status should read"),
+                DeviceInterruptKind::Queue.status().bits()
+            );
+            assert!(handler.pending_queue_notifications().is_empty());
+        }
+        assert_eq!(
+            read_used_idx(&memory, queue_used_ring(hinting_queue_index)),
+            1
+        );
+        assert_eq!(
+            read_used_element(&memory, queue_used_ring(hinting_queue_index), 0),
+            (0, 0)
+        );
     }
 
     #[test]
