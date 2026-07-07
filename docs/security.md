@@ -264,6 +264,9 @@ interrupt line, but parsed PFNs, statistics descriptors, free-page hinting
 commands, and reporting queue data remain untrusted guest input and must not
 change host memory accounting or reclaim behavior until those host-side paths
 are implemented and reviewed.
+Runtime balloon target-size updates change only the stored target and active
+virtio-balloon `num_pages` config-space value, then signal a config interrupt;
+they do not map, unmap, reclaim, or release host memory.
 
 The current serial device is a TX-only MMIO output path. By default, guest
 serial bytes go to a bounded internal capture buffer; when `/serial` configures

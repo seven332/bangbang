@@ -6,9 +6,10 @@ use std::os::fd::RawFd;
 
 use crate::VmmController;
 use crate::balloon::{
-    BalloonMmioDeviceRegistration, BalloonMmioLayout, BalloonMmioRegistrationError,
-    BalloonPageCountOverflow, PreparedBalloonDevice, VirtioBalloonDeviceNotificationDispatch,
-    VirtioBalloonDeviceNotificationError, VirtioBalloonMmioHandler,
+    BalloonConfig, BalloonMmioDeviceRegistration, BalloonMmioLayout, BalloonMmioRegistrationError,
+    BalloonPageCountOverflow, BalloonUpdateError, PreparedBalloonDevice,
+    VirtioBalloonDeviceNotificationDispatch, VirtioBalloonDeviceNotificationError,
+    VirtioBalloonMmioHandler,
 };
 use crate::block::{
     BlockFileBacking, BlockMmioDeviceRegistration, BlockMmioLayout, BlockMmioRegistrationError,
@@ -1474,6 +1475,17 @@ fn update_block_device_backing_for_region_with_opened(
     Ok(())
 }
 
+pub fn update_balloon_config_for_device(
+    device: &Arm64BootBalloonDevice,
+    mmio_dispatcher: &mut MmioDispatcher,
+    config: BalloonConfig,
+) -> Result<(), BalloonUpdateError> {
+    mmio_dispatcher
+        .handler_mut::<VirtioBalloonMmioHandler>(device.registration.region_id())
+        .map_err(BalloonUpdateError::HandlerLookup)?
+        .update_balloon_config(config)
+}
+
 #[derive(Debug)]
 pub enum Arm64BootResourceError {
     MissingBootSource,
@@ -2348,7 +2360,7 @@ mod tests {
         Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider, Arm64BootResourceConfig,
         Arm64BootResourceError, Arm64BootResources, Arm64BootSerialDeviceConfig,
         Arm64BootSerialMmioRegistrationError, MIB, arm64_boot_network_device_metadata,
-        block_device_metadata,
+        block_device_metadata, update_balloon_config_for_device,
     };
     use crate::VmmAction;
     use crate::balloon::{
@@ -5532,6 +5544,48 @@ mod tests {
                 VirtioMmioRegister::InterruptStatus,
             ),
             0
+        );
+    }
+
+    #[test]
+    fn boot_runtime_balloon_config_update_updates_active_handler() {
+        let (_, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_balloon("kernel-balloon-update-config");
+        let device = runtime
+            .balloon_device
+            .as_ref()
+            .expect("balloon device should exist")
+            .clone();
+
+        update_balloon_config_for_device(
+            &device,
+            &mut mmio_dispatcher,
+            BalloonConfigInput::new(128, false).into(),
+        )
+        .expect("balloon config update should succeed");
+
+        let handler = mmio_dispatcher
+            .handler_mut::<VirtioBalloonMmioHandler>(device.registration.region_id())
+            .expect("balloon handler should be registered");
+        assert_eq!(
+            handler.device_config_handler().num_pages(),
+            128 * VIRTIO_BALLOON_MIB_TO_4K_PAGES
+        );
+        assert_eq!(
+            read_boot_balloon_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                VirtioMmioRegister::ConfigGeneration,
+            ),
+            1
+        );
+        assert_eq!(
+            read_boot_balloon_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                VirtioMmioRegister::InterruptStatus,
+            ),
+            DeviceInterruptKind::Config.status().bits()
         );
     }
 

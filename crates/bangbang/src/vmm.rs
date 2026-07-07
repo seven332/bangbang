@@ -16,8 +16,10 @@ use bangbang_hvf::{
     HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig, HvfVcpuRunnerError,
     OwnedHvfArm64BootSession,
 };
-use bangbang_runtime::balloon::BalloonConfigInput;
 use bangbang_runtime::balloon::BalloonMmioLayout;
+use bangbang_runtime::balloon::{
+    BalloonConfig, BalloonConfigInput, BalloonUpdateError, BalloonUpdateInput,
+};
 use bangbang_runtime::block::{
     BlockFileBacking, BlockMmioLayout, DriveConfig, DriveConfigInput, DriveUpdateError,
     DriveUpdateInput,
@@ -45,9 +47,9 @@ use bangbang_runtime::serial::{
     SharedSerialOutputBuffer,
 };
 use bangbang_runtime::startup::{
-    Arm64BootBlockDevice, Arm64BootNetworkDevice, Arm64BootNetworkPacketIo,
+    Arm64BootBalloonDevice, Arm64BootBlockDevice, Arm64BootNetworkDevice, Arm64BootNetworkPacketIo,
     Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
-    update_block_device_backing_for_devices_with_opened,
+    update_balloon_config_for_device, update_block_device_backing_for_devices_with_opened,
 };
 use bangbang_runtime::vsock::{VsockConfigInput, VsockMmioLayout};
 use bangbang_runtime::{BackendError, VmmAction, VmmActionError, VmmController, VmmData};
@@ -107,6 +109,10 @@ pub(crate) trait ProcessSessionDiagnostics {
         Err(DriveUpdateError::ActiveSessionUnavailable)
     }
 
+    fn update_balloon(&mut self, _config: BalloonConfig) -> Result<(), BalloonUpdateError> {
+        Err(BalloonUpdateError::ActiveSessionUnavailable)
+    }
+
     fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
         None
     }
@@ -126,6 +132,33 @@ impl ProcessSessionDiagnostics for () {}
 pub(crate) struct BootRunLoopBlockDeviceUpdater {
     block_devices: Vec<Arm64BootBlockDevice>,
     mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BootRunLoopBalloonDeviceUpdater {
+    balloon_device: Arm64BootBalloonDevice,
+    mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
+}
+
+impl BootRunLoopBalloonDeviceUpdater {
+    fn new(
+        balloon_device: Arm64BootBalloonDevice,
+        mmio_dispatcher: Arc<Mutex<MmioDispatcher>>,
+    ) -> Self {
+        Self {
+            balloon_device,
+            mmio_dispatcher,
+        }
+    }
+
+    fn update_balloon_config(&self, config: BalloonConfig) -> Result<(), BalloonUpdateError> {
+        let mut dispatcher = self
+            .mmio_dispatcher
+            .lock()
+            .map_err(|_| BalloonUpdateError::MmioDispatcherUnavailable)?;
+
+        update_balloon_config_for_device(&self.balloon_device, &mut dispatcher, config)
+    }
 }
 
 impl BootRunLoopBlockDeviceUpdater {
@@ -413,10 +446,10 @@ pub(crate) struct PatchApiRequest {
 }
 
 impl PatchApiRequest {
-    pub(crate) const fn balloon() -> Self {
+    pub(crate) const fn balloon(input: BalloonUpdateInput) -> Self {
         Self {
             kind: PatchApiRequestKind::Balloon,
-            action: VmmAction::PatchBalloon,
+            action: VmmAction::PatchBalloon(input),
         }
     }
 
@@ -774,6 +807,7 @@ where
         match action {
             VmmAction::InstanceStart => self.start_instance(),
             VmmAction::UpdateBlockDevice(input) => self.update_block_device(input),
+            VmmAction::PatchBalloon(input) => self.update_balloon(input),
             VmmAction::FlushMetrics => self.flush_metrics(),
             action => self.controller.handle_action(action),
         }
@@ -882,6 +916,22 @@ where
                 .map_err(VmmActionError::DriveUpdate)?;
         }
         self.controller.commit_drive_update(updated_config)?;
+
+        Ok(VmmData::Empty)
+    }
+
+    fn update_balloon(&mut self, input: BalloonUpdateInput) -> Result<VmmData, VmmActionError> {
+        let updated_config = self.controller.updated_balloon_config(input)?;
+        let Some(session) = self.started_session.as_mut() else {
+            return Err(VmmActionError::BalloonUpdate(
+                BalloonUpdateError::ActiveSessionUnavailable,
+            ));
+        };
+
+        session
+            .update_balloon(updated_config)
+            .map_err(VmmActionError::BalloonUpdate)?;
+        self.controller.commit_balloon_update(updated_config);
 
         Ok(VmmData::Empty)
     }
@@ -1473,6 +1523,10 @@ pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
         None
     }
 
+    fn balloon_device_updater(&self) -> Option<BootRunLoopBalloonDeviceUpdater> {
+        None
+    }
+
     fn run_loop_with_network_packet_io<P>(
         &mut self,
         stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
@@ -1499,6 +1553,13 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
             self.runtime_resources().block_devices.clone(),
             self.mmio_dispatcher(),
         ))
+    }
+
+    fn balloon_device_updater(&self) -> Option<BootRunLoopBalloonDeviceUpdater> {
+        self.runtime_resources()
+            .balloon_device
+            .clone()
+            .map(|device| BootRunLoopBalloonDeviceUpdater::new(device, self.mmio_dispatcher()))
     }
 
     fn run_loop_with_network_packet_io<P>(
@@ -1563,6 +1624,10 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
         None
     }
 
+    fn balloon_device_updater(&self) -> Option<BootRunLoopBalloonDeviceUpdater> {
+        None
+    }
+
     fn run_loop(
         &mut self,
         stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
@@ -1586,6 +1651,13 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
             self.runtime_resources().block_devices.clone(),
             self.mmio_dispatcher(),
         ))
+    }
+
+    fn balloon_device_updater(&self) -> Option<BootRunLoopBalloonDeviceUpdater> {
+        self.runtime_resources()
+            .balloon_device
+            .clone()
+            .map(|device| BootRunLoopBalloonDeviceUpdater::new(device, self.mmio_dispatcher()))
     }
 
     fn run_loop(
@@ -1620,6 +1692,10 @@ where
 
     fn block_device_updater(&self) -> Option<BootRunLoopBlockDeviceUpdater> {
         self.session.block_device_updater()
+    }
+
+    fn balloon_device_updater(&self) -> Option<BootRunLoopBalloonDeviceUpdater> {
+        self.session.balloon_device_updater()
     }
 
     fn run_loop(
@@ -1767,6 +1843,20 @@ where
     }
 }
 
+fn balloon_update_error_from_boot_run_loop_command<C>(
+    err: BootRunLoopCommandError<C, BalloonUpdateError>,
+) -> BalloonUpdateError
+where
+    C: fmt::Display,
+{
+    match err {
+        BootRunLoopCommandError::Command { source } => source,
+        other => BalloonUpdateError::ActiveSessionCommand {
+            message: other.to_string(),
+        },
+    }
+}
+
 pub(crate) struct BootRunLoopCommandHandle<S>
 where
     S: BootRunLoopSession,
@@ -1884,6 +1974,7 @@ where
 {
     control: S::Control,
     block_device_updater: Option<BootRunLoopBlockDeviceUpdater>,
+    balloon_device_updater: Option<BootRunLoopBalloonDeviceUpdater>,
     command_handle: BootRunLoopCommandHandle<S>,
     status: Arc<BootRunLoopWorkerStatusCell<S::Outcome>>,
     terminal_wakeup_reader: UnixStream,
@@ -1910,6 +2001,7 @@ where
     ) -> Result<Self, BackendError> {
         let control = session.run_loop_control();
         let block_device_updater = session.block_device_updater();
+        let balloon_device_updater = session.balloon_device_updater();
         let stop_token = control.stop_token();
         let status = Arc::new(BootRunLoopWorkerStatusCell::new());
         let worker_status = Arc::clone(&status);
@@ -1964,6 +2056,7 @@ where
         Ok(Self {
             control,
             block_device_updater,
+            balloon_device_updater,
             command_handle,
             status,
             terminal_wakeup_reader,
@@ -2050,6 +2143,21 @@ where
             .map_err(drive_update_error_from_boot_run_loop_command)
     }
 
+    fn update_balloon(&mut self, config: BalloonConfig) -> Result<(), BalloonUpdateError> {
+        let Some(updater) = self.balloon_device_updater.as_ref() else {
+            return Err(BalloonUpdateError::ActiveSessionUnavailable);
+        };
+
+        if !matches!(self.status(), BootRunLoopWorkerStatus::Running) {
+            return Err(BalloonUpdateError::ActiveSessionUnavailable);
+        }
+
+        let updater = updater.clone();
+
+        self.run_command(move |_| updater.update_balloon_config(config))
+            .map_err(balloon_update_error_from_boot_run_loop_command)
+    }
+
     fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
         Some(self.terminal_wakeup_reader.as_raw_fd())
     }
@@ -2096,6 +2204,10 @@ where
             .field("control", &self.control)
             .field("command_handle", &self.command_handle)
             .field("status", &self.status())
+            .field(
+                "has_balloon_device_updater",
+                &self.balloon_device_updater.is_some(),
+            )
             .field("worker_active", &self.worker.is_some())
             .finish()
     }
@@ -2129,7 +2241,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
 
-    use bangbang_runtime::balloon::BalloonConfigInput;
+    use bangbang_runtime::balloon::{
+        BalloonConfig, BalloonConfigInput, BalloonUpdateError, BalloonUpdateInput,
+    };
     use bangbang_runtime::block::{
         BlockMmioLayout, DriveConfig, DriveConfigInput, DriveConfigs, DriveUpdateError,
         DriveUpdateInput, PreparedBlockDevices,
@@ -2223,6 +2337,10 @@ mod tests {
             .expect("drive config should validate")
     }
 
+    const fn balloon_update_input(amount_mib: u32) -> BalloonUpdateInput {
+        BalloonUpdateInput::new(amount_mib)
+    }
+
     fn block_device_updater_fixture(
         drive_id: &str,
         backing_path: &Path,
@@ -2284,6 +2402,9 @@ mod tests {
         block_update_count: usize,
         last_block_update: Option<String>,
         block_update_result: Option<DriveUpdateError>,
+        balloon_update_count: usize,
+        last_balloon_update_mib: Option<u32>,
+        balloon_update_result: Option<BalloonUpdateError>,
     }
 
     impl FakeSession {
@@ -2293,6 +2414,9 @@ mod tests {
                 block_update_count: 0,
                 last_block_update: None,
                 block_update_result: None,
+                balloon_update_count: 0,
+                last_balloon_update_mib: None,
+                balloon_update_result: None,
             }
         }
 
@@ -2302,6 +2426,21 @@ mod tests {
                 block_update_count: 0,
                 last_block_update: None,
                 block_update_result: Some(result),
+                balloon_update_count: 0,
+                last_balloon_update_mib: None,
+                balloon_update_result: None,
+            }
+        }
+
+        fn with_balloon_update_result(id: u64, result: BalloonUpdateError) -> Self {
+            Self {
+                id,
+                block_update_count: 0,
+                last_block_update: None,
+                block_update_result: None,
+                balloon_update_count: 0,
+                last_balloon_update_mib: None,
+                balloon_update_result: Some(result),
             }
         }
     }
@@ -2311,6 +2450,18 @@ mod tests {
             self.block_update_count += 1;
             self.last_block_update = Some(config.drive_id().to_string());
             match self.block_update_result.clone() {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        }
+
+        fn update_balloon(
+            &mut self,
+            config: bangbang_runtime::balloon::BalloonConfig,
+        ) -> Result<(), BalloonUpdateError> {
+            self.balloon_update_count += 1;
+            self.last_balloon_update_mib = Some(config.amount_mib());
+            match self.balloon_update_result.clone() {
                 Some(err) => Err(err),
                 None => Ok(()),
             }
@@ -3601,6 +3752,7 @@ mod tests {
             | VmmActionError::UnsupportedAction(_)
             | VmmActionError::UnsupportedState { .. }
             | VmmActionError::BalloonUnsupported
+            | VmmActionError::BalloonUpdate(_)
             | VmmActionError::EntropyConfig(_)
             | VmmActionError::EntropyUnsupported
             | VmmActionError::MissingBootSource
@@ -4526,6 +4678,70 @@ mod tests {
         assert_eq!(vmm.instance_info().state, InstanceState::Running);
         assert_eq!(vmm.starter.calls, 1);
         assert_eq!(vmm.started_session, Some(FakeSession::new(7)));
+    }
+
+    #[test]
+    fn runtime_balloon_update_refreshes_active_session_before_config_commit() {
+        let mut vmm = configured_vmm(FakeStarter::success(15));
+        vmm.handle_action(VmmAction::PutBalloon(BalloonConfigInput::new(64, false)))
+            .expect("initial balloon should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        let data = vmm
+            .handle_action(VmmAction::PatchBalloon(balloon_update_input(96)))
+            .expect("runtime balloon target update should succeed");
+
+        assert_eq!(data, bangbang_runtime::VmmData::Empty);
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.balloon_update_count, 1);
+        assert_eq!(session.last_balloon_update_mib, Some(96));
+        assert_eq!(
+            vmm.handle_action(VmmAction::GetBalloon)
+                .expect("balloon config should be returned"),
+            bangbang_runtime::VmmData::BalloonConfiguration(BalloonConfig::from(
+                BalloonConfigInput::new(96, false)
+            ))
+        );
+    }
+
+    #[test]
+    fn runtime_balloon_update_failure_does_not_commit_config() {
+        let mut vmm = configured_vmm(FakeStarter::success_with_session(
+            FakeSession::with_balloon_update_result(
+                16,
+                BalloonUpdateError::ActiveSessionUnavailable,
+            ),
+        ));
+        vmm.handle_action(VmmAction::PutBalloon(BalloonConfigInput::new(64, false)))
+            .expect("initial balloon should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        let err = vmm
+            .handle_action(VmmAction::PatchBalloon(balloon_update_input(96)))
+            .expect_err("runtime balloon target update should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::BalloonUpdate(BalloonUpdateError::ActiveSessionUnavailable)
+        );
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.balloon_update_count, 1);
+        assert_eq!(session.last_balloon_update_mib, Some(96));
+        assert_eq!(
+            vmm.handle_action(VmmAction::GetBalloon)
+                .expect("balloon config should be returned"),
+            bangbang_runtime::VmmData::BalloonConfiguration(BalloonConfig::from(
+                BalloonConfigInput::new(64, false)
+            ))
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ use crate::memory::{
 };
 use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
-    MmioHandlerError, MmioRegion, MmioRegionId,
+    MmioHandlerError, MmioHandlerLookupError, MmioRegion, MmioRegionId,
 };
 use crate::virtio_mmio::{
     VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
@@ -87,6 +87,43 @@ impl fmt::Display for BalloonPageCountOverflow {
 
 impl std::error::Error for BalloonPageCountOverflow {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BalloonUpdateError {
+    PageCountOverflow(BalloonPageCountOverflow),
+    ActiveSessionUnavailable,
+    ActiveSessionCommand { message: String },
+    MmioDispatcherUnavailable,
+    HandlerLookup(MmioHandlerLookupError),
+}
+
+impl fmt::Display for BalloonUpdateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PageCountOverflow(err) => write!(f, "{err}"),
+            Self::ActiveSessionUnavailable => {
+                f.write_str("active balloon device session is unavailable")
+            }
+            Self::ActiveSessionCommand { message } => {
+                write!(f, "active balloon device update failed: {message}")
+            }
+            Self::MmioDispatcherUnavailable => f.write_str("active MMIO dispatcher is unavailable"),
+            Self::HandlerLookup(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for BalloonUpdateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::PageCountOverflow(err) => Some(err),
+            Self::HandlerLookup(err) => Some(err),
+            Self::ActiveSessionUnavailable
+            | Self::ActiveSessionCommand { .. }
+            | Self::MmioDispatcherUnavailable => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BalloonConfigInput {
     amount_mib: u32,
@@ -144,6 +181,21 @@ impl BalloonConfigInput {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BalloonUpdateInput {
+    amount_mib: u32,
+}
+
+impl BalloonUpdateInput {
+    pub const fn new(amount_mib: u32) -> Self {
+        Self { amount_mib }
+    }
+
+    pub const fn amount_mib(self) -> u32 {
+        self.amount_mib
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BalloonConfig {
     amount_mib: u32,
     deflate_on_oom: bool,
@@ -171,6 +223,19 @@ impl BalloonConfig {
 
     pub const fn free_page_reporting(self) -> bool {
         self.free_page_reporting
+    }
+
+    pub fn updated(self, input: BalloonUpdateInput) -> Result<Self, BalloonUpdateError> {
+        let amount_mib = input.amount_mib();
+        mib_to_4k_pages(amount_mib).map_err(BalloonUpdateError::PageCountOverflow)?;
+
+        Ok(Self {
+            amount_mib,
+            deflate_on_oom: self.deflate_on_oom,
+            stats_polling_interval_s: self.stats_polling_interval_s,
+            free_page_hinting: self.free_page_hinting,
+            free_page_reporting: self.free_page_reporting,
+        })
     }
 }
 
@@ -2054,6 +2119,20 @@ impl VirtioMmioRegisterHandler<VirtioBalloonConfigSpace, VirtioBalloonDevice> {
 
         dispatch
     }
+
+    pub fn update_balloon_config(
+        &mut self,
+        config: BalloonConfig,
+    ) -> Result<(), BalloonUpdateError> {
+        let config_space = VirtioBalloonConfigSpace::from_config(config)
+            .map_err(BalloonUpdateError::PageCountOverflow)?;
+
+        *self.device_config_handler_mut() = config_space;
+        self.increment_config_generation();
+        self.mark_interrupt_pending(DeviceInterruptKind::Config);
+
+        Ok(())
+    }
 }
 
 impl VirtioMmioDeviceActivationHandler for VirtioBalloonDevice {
@@ -3265,6 +3344,35 @@ mod tests {
                 TEST_BALLOON_MMIO_REGION_ID,
             ))
             .expect("balloon MMIO device should register")
+    }
+
+    #[test]
+    fn balloon_config_update_changes_only_target_amount() {
+        let config = balloon_config(64, true, 60, true, false);
+
+        let updated = config
+            .updated(BalloonUpdateInput::new(128))
+            .expect("balloon target update should validate");
+
+        assert_eq!(updated.amount_mib(), 128);
+        assert_eq!(updated.deflate_on_oom(), config.deflate_on_oom());
+        assert_eq!(
+            updated.stats_polling_interval_s(),
+            config.stats_polling_interval_s()
+        );
+        assert_eq!(updated.free_page_hinting(), config.free_page_hinting());
+        assert_eq!(updated.free_page_reporting(), config.free_page_reporting());
+    }
+
+    #[test]
+    fn balloon_config_update_rejects_page_count_overflow() {
+        let config = balloon_config(64, false, 0, false, false);
+
+        let err = config
+            .updated(BalloonUpdateInput::new(u32::MAX))
+            .expect_err("oversized target should fail");
+
+        assert!(matches!(err, BalloonUpdateError::PageCountOverflow(_)));
     }
 
     #[test]
@@ -5657,6 +5765,46 @@ mod tests {
             VirtioBalloonConfigSpace::from_config(balloon_config(64, false, 0, false, false))
                 .expect("balloon config space should build")
                 .to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn mmio_config_update_marks_config_interrupt_and_generation() {
+        let mut device = balloon_mmio_device(balloon_config(64, false, 0, false, false));
+        {
+            let handler = device
+                .dispatcher_mut()
+                .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+                .expect("balloon handler should be registered");
+
+            assert_eq!(
+                handler
+                    .read_register(VirtioMmioRegister::ConfigGeneration)
+                    .expect("config generation should read"),
+                0
+            );
+
+            handler
+                .update_balloon_config(balloon_config(128, false, 0, false, false))
+                .expect("balloon config update should succeed");
+
+            assert_eq!(
+                handler
+                    .read_register(VirtioMmioRegister::ConfigGeneration)
+                    .expect("config generation should read"),
+                1
+            );
+            assert_eq!(
+                handler
+                    .read_register(VirtioMmioRegister::InterruptStatus)
+                    .expect("interrupt status should read"),
+                DeviceInterruptKind::Config.status().bits()
+            );
+        }
+
+        assert_eq!(
+            read_mmio_config(&mut device, 0, 4).as_slice(),
+            &(128 * VIRTIO_BALLOON_MIB_TO_4K_PAGES).to_le_bytes()
         );
     }
 

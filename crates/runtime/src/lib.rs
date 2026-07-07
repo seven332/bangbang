@@ -82,7 +82,7 @@ pub enum VmmAction {
     GetBalloonStats,
     GetBalloonHintingStatus,
     PutBalloon(balloon::BalloonConfigInput),
-    PatchBalloon,
+    PatchBalloon(balloon::BalloonUpdateInput),
     PatchBalloonStats,
     PatchBalloonHintingStart,
     PatchBalloonHintingStop,
@@ -158,7 +158,7 @@ impl VmmAction {
             Self::GetBalloonStats => "GetBalloonStats",
             Self::GetBalloonHintingStatus => "GetBalloonHintingStatus",
             Self::PutBalloon(_) => "PutBalloon",
-            Self::PatchBalloon => "PatchBalloon",
+            Self::PatchBalloon(_) => "PatchBalloon",
             Self::PatchBalloonStats => "PatchBalloonStats",
             Self::PatchBalloonHintingStart => "PatchBalloonHintingStart",
             Self::PatchBalloonHintingStop => "PatchBalloonHintingStop",
@@ -293,6 +293,7 @@ pub enum VmmActionError {
         state: InstanceState,
     },
     BalloonUnsupported,
+    BalloonUpdate(balloon::BalloonUpdateError),
     EntropyUnsupported,
     MissingBootSource,
     InstanceStart(BackendError),
@@ -333,6 +334,7 @@ impl fmt::Display for VmmActionError {
                 )
             }
             Self::BalloonUnsupported => f.write_str("Balloon device is not supported."),
+            Self::BalloonUpdate(err) => write!(f, "{err}"),
             Self::EntropyUnsupported => f.write_str("Entropy device is not supported."),
             Self::MissingBootSource => {
                 f.write_str("boot source must be configured before InstanceStart")
@@ -371,6 +373,7 @@ impl std::error::Error for VmmActionError {
         match self {
             Self::InstanceStart(err) => Some(err),
             Self::BootSourceConfig(err) => Some(err),
+            Self::BalloonUpdate(err) => Some(err),
             Self::DriveConfig(err) => Some(err),
             Self::DriveUpdate(err) => Some(err),
             Self::EntropyConfig(err) => Some(err),
@@ -540,6 +543,27 @@ impl VmmController {
         self.drive_configs
             .commit_update(config)
             .map_err(VmmActionError::DriveUpdate)
+    }
+
+    pub fn updated_balloon_config(
+        &self,
+        input: balloon::BalloonUpdateInput,
+    ) -> Result<balloon::BalloonConfig, VmmActionError> {
+        if self.instance_info.state == InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: VmmAction::PatchBalloon(input).name(),
+                state: self.instance_info.state,
+            });
+        }
+
+        self.balloon_config
+            .ok_or(VmmActionError::BalloonUnsupported)?
+            .updated(input)
+            .map_err(VmmActionError::BalloonUpdate)
+    }
+
+    pub fn commit_balloon_update(&mut self, config: balloon::BalloonConfig) {
+        self.balloon_config = Some(config);
     }
 
     pub fn preflight_instance_start(&self) -> Result<(), VmmActionError> {
@@ -849,9 +873,13 @@ impl VmmController {
                 self.balloon_config = Some(config.into());
                 Ok(VmmData::Empty)
             }
+            VmmAction::PatchBalloon(input) => {
+                let config = self.updated_balloon_config(input)?;
+                self.commit_balloon_update(config);
+                Ok(VmmData::Empty)
+            }
             VmmAction::GetBalloonStats
             | VmmAction::GetBalloonHintingStatus
-            | VmmAction::PatchBalloon
             | VmmAction::PatchBalloonStats
             | VmmAction::PatchBalloonHintingStart
             | VmmAction::PatchBalloonHintingStop => {
@@ -1211,7 +1239,7 @@ mod tests {
     use super::{
         BackendError, HotUnplugDeviceInput, HotUnplugDeviceKind, InstanceState, VmmAction,
         VmmActionError, VmmController, VmmData,
-        balloon::{BalloonConfig, BalloonConfigInput},
+        balloon::{BalloonConfig, BalloonConfigInput, BalloonUpdateError, BalloonUpdateInput},
         block::{DriveConfigError, DriveConfigInput, DriveUpdateInput},
         boot::{
             BootCommandLineError, BootPayloadKind, BootSourceConfigError, BootSourceConfigInput,
@@ -1262,6 +1290,10 @@ mod tests {
             .with_stats_polling_interval_s(60)
             .with_free_page_hinting(true)
             .with_free_page_reporting(false)
+    }
+
+    const fn balloon_update_input(amount_mib: u32) -> BalloonUpdateInput {
+        BalloonUpdateInput::new(amount_mib)
     }
 
     fn boot_source_input(kernel_image_path: &str) -> BootSourceConfigInput {
@@ -1629,7 +1661,10 @@ mod tests {
             VmmAction::PutBalloon(balloon_input(64, true)).name(),
             "PutBalloon"
         );
-        assert_eq!(VmmAction::PatchBalloon.name(), "PatchBalloon");
+        assert_eq!(
+            VmmAction::PatchBalloon(balloon_update_input(32)).name(),
+            "PatchBalloon"
+        );
         assert_eq!(VmmAction::PatchBalloonStats.name(), "PatchBalloonStats");
         assert_eq!(
             VmmAction::PatchBalloonHintingStart.name(),
@@ -1966,11 +2001,62 @@ mod tests {
     }
 
     #[test]
+    fn patch_balloon_updates_target_after_start_without_changing_other_fields() {
+        for state in [InstanceState::Running, InstanceState::Paused] {
+            let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+            controller
+                .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+                .expect("boot source config should be stored");
+            controller
+                .handle_action(VmmAction::PutBalloon(balloon_input(64, true)))
+                .expect("initial balloon config should be stored");
+            controller.instance_info.state = state;
+
+            let data = controller
+                .handle_action(VmmAction::PatchBalloon(balloon_update_input(128)))
+                .expect("balloon target should update after start");
+
+            assert_eq!(data, VmmData::Empty);
+            assert_eq!(controller.instance_info().state, state);
+            assert_eq!(
+                controller.balloon_config(),
+                Some(
+                    BalloonConfig::from(balloon_input(64, true))
+                        .updated(balloon_update_input(128))
+                        .expect("balloon update should be valid")
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn patch_balloon_rejects_oversized_target_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBalloon(balloon_input(64, true)))
+            .expect("initial balloon config should be stored");
+        controller.instance_info.state = InstanceState::Running;
+
+        let err = controller
+            .handle_action(VmmAction::PatchBalloon(balloon_update_input(u32::MAX)))
+            .expect_err("oversized balloon target should fail");
+
+        assert!(matches!(
+            err,
+            VmmActionError::BalloonUpdate(BalloonUpdateError::PageCountOverflow(_))
+        ));
+        assert_eq!(
+            controller.balloon_config(),
+            Some(BalloonConfig::from(balloon_input(64, true)))
+        );
+    }
+
+    #[test]
     fn postboot_balloon_actions_reject_not_started_without_mutating() {
         for action in [
             VmmAction::GetBalloonStats,
             VmmAction::GetBalloonHintingStatus,
-            VmmAction::PatchBalloon,
+            VmmAction::PatchBalloon(balloon_update_input(32)),
             VmmAction::PatchBalloonStats,
             VmmAction::PatchBalloonHintingStart,
             VmmAction::PatchBalloonHintingStop,
@@ -2004,7 +2090,6 @@ mod tests {
             for action in [
                 VmmAction::GetBalloonStats,
                 VmmAction::GetBalloonHintingStatus,
-                VmmAction::PatchBalloon,
                 VmmAction::PatchBalloonStats,
                 VmmAction::PatchBalloonHintingStart,
                 VmmAction::PatchBalloonHintingStop,
@@ -2025,6 +2110,23 @@ mod tests {
                 assert!(controller.drive_configs().is_empty());
                 assert!(controller.network_interface_configs().is_empty());
             }
+
+            let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+            controller
+                .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+                .expect("boot source config should be stored");
+            controller.instance_info.state = state;
+
+            let err = controller
+                .handle_action(VmmAction::PatchBalloon(balloon_update_input(32)))
+                .expect_err("missing balloon config should reject patch");
+
+            assert_eq!(err, VmmActionError::BalloonUnsupported);
+            assert_eq!(controller.instance_info().state, state);
+            assert!(controller.boot_source_config().is_some());
+            assert!(controller.drive_configs().is_empty());
+            assert!(controller.network_interface_configs().is_empty());
+            assert_eq!(controller.balloon_config(), None);
         }
     }
 
