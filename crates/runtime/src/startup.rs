@@ -45,7 +45,10 @@ use crate::network::{
     VirtioNetworkDeviceNotificationError, VirtioNetworkMmioHandler, VirtioNetworkRxPacketSource,
     VirtioNetworkTxPacketSink,
 };
-use crate::pmem::{PreparedPmemDevice, PreparedPmemDeviceError, PreparedPmemDevices};
+use crate::pmem::{
+    PmemMmioDeviceRegistration, PmemMmioLayout, PmemMmioRegistrationError, PreparedPmemDevice,
+    PreparedPmemDeviceError, PreparedPmemDevices,
+};
 use crate::serial::{SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialMmioDevice, SharedSerialOutput};
 use crate::vsock::{
     PreparedVsockDevice, PreparedVsockDeviceError, VirtioVsockDeviceNotificationDispatch,
@@ -63,6 +66,8 @@ pub struct Arm64BootResourceConfig<'a> {
     pub serial_device: Option<Arm64BootSerialDeviceConfig>,
     pub block_mmio_layout: BlockMmioLayout,
     pub block_interrupt_lines: &'a [GuestInterruptLine],
+    pub pmem_mmio_layout: PmemMmioLayout,
+    pub pmem_interrupt_lines: &'a [GuestInterruptLine],
     pub network_mmio_layout: NetworkMmioLayout,
     pub network_interrupt_lines: &'a [GuestInterruptLine],
     pub vsock_mmio_layout: VsockMmioLayout,
@@ -122,6 +127,7 @@ pub struct Arm64BootResources {
     pub serial_device: Option<Arm64BootSerialDevice>,
     pub block_devices: Vec<Arm64BootBlockDevice>,
     pub pmem_devices: Vec<PreparedPmemDevice>,
+    pub pmem_mmio_devices: Vec<Arm64BootPmemDevice>,
     pub network_devices: Vec<Arm64BootNetworkDevice>,
     pub vsock_device: Option<Arm64BootVsockDevice>,
     pub balloon_device: Option<Arm64BootBalloonDevice>,
@@ -144,6 +150,7 @@ pub struct Arm64BootRuntimeResources {
     pub serial_device: Option<Arm64BootSerialDevice>,
     pub block_devices: Vec<Arm64BootBlockDevice>,
     pub pmem_devices: Vec<PreparedPmemDevice>,
+    pub pmem_mmio_devices: Vec<Arm64BootPmemDevice>,
     pub network_devices: Vec<Arm64BootNetworkDevice>,
     pub vsock_device: Option<Arm64BootVsockDevice>,
     pub balloon_device: Option<Arm64BootBalloonDevice>,
@@ -953,6 +960,12 @@ pub struct Arm64BootBlockDevice {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Arm64BootPmemDevice {
+    pub registration: PmemMmioDeviceRegistration,
+    pub fdt_device: Arm64FdtVirtioMmioDevice,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arm64BootNetworkDevice {
     pub registration: NetworkMmioDeviceRegistration,
     pub fdt_device: Arm64FdtVirtioMmioDevice,
@@ -1338,6 +1351,9 @@ pub enum Arm64BootResourceError {
     RegisterBlockMmio {
         source: Box<BlockMmioRegistrationError>,
     },
+    RegisterPmemMmio {
+        source: Box<PmemMmioRegistrationError>,
+    },
     RegisterNetworkMmio {
         source: Box<NetworkMmioRegistrationError>,
     },
@@ -1357,6 +1373,10 @@ pub enum Arm64BootResourceError {
         devices: usize,
         lines: usize,
     },
+    PmemInterruptLineCount {
+        devices: usize,
+        lines: usize,
+    },
     NetworkInterruptLineCount {
         devices: usize,
         lines: usize,
@@ -1370,6 +1390,9 @@ pub enum Arm64BootResourceError {
         lines: usize,
     },
     BlockDeviceMetadataAllocation {
+        source: TryReserveError,
+    },
+    PmemDeviceMetadataAllocation {
         source: TryReserveError,
     },
     NetworkDeviceMetadataAllocation {
@@ -1436,6 +1459,9 @@ impl fmt::Display for Arm64BootResourceError {
             Self::RegisterBlockMmio { source } => {
                 write!(f, "failed to register block MMIO devices: {source}")
             }
+            Self::RegisterPmemMmio { source } => {
+                write!(f, "failed to register pmem MMIO devices: {source}")
+            }
             Self::RegisterNetworkMmio { source } => {
                 write!(f, "failed to register network MMIO devices: {source}")
             }
@@ -1455,6 +1481,10 @@ impl fmt::Display for Arm64BootResourceError {
                 f,
                 "block MMIO device count {devices} does not match interrupt line count {lines}"
             ),
+            Self::PmemInterruptLineCount { devices, lines } => write!(
+                f,
+                "pmem MMIO device count {devices} does not match interrupt line count {lines}"
+            ),
             Self::NetworkInterruptLineCount { devices, lines } => write!(
                 f,
                 "network MMIO device count {devices} does not match interrupt line count {lines}"
@@ -1469,6 +1499,9 @@ impl fmt::Display for Arm64BootResourceError {
             ),
             Self::BlockDeviceMetadataAllocation { source } => {
                 write!(f, "failed to allocate block device metadata: {source}")
+            }
+            Self::PmemDeviceMetadataAllocation { source } => {
+                write!(f, "failed to allocate pmem device metadata: {source}")
             }
             Self::NetworkDeviceMetadataAllocation { source } => {
                 write!(f, "failed to allocate network device metadata: {source}")
@@ -1500,12 +1533,14 @@ impl std::error::Error for Arm64BootResourceError {
             Self::PrepareVsockDevice { source } => Some(source),
             Self::PrepareBalloonDevice { source } => Some(source),
             Self::RegisterBlockMmio { source } => Some(source.as_ref()),
+            Self::RegisterPmemMmio { source } => Some(source.as_ref()),
             Self::RegisterNetworkMmio { source } => Some(source.as_ref()),
             Self::RegisterVsockMmio { source } => Some(source.as_ref()),
             Self::RegisterBalloonMmio { source } => Some(source.as_ref()),
             Self::RegisterEntropyMmio { source } => Some(source.as_ref()),
             Self::RegisterSerialMmio { source } => Some(source.as_ref()),
             Self::BlockDeviceMetadataAllocation { source } => Some(source),
+            Self::PmemDeviceMetadataAllocation { source } => Some(source),
             Self::NetworkDeviceMetadataAllocation { source } => Some(source),
             Self::VsockDeviceMetadataAllocation { source } => Some(source),
             Self::BalloonDeviceMetadataAllocation { source } => Some(source),
@@ -1515,6 +1550,7 @@ impl std::error::Error for Arm64BootResourceError {
             | Self::MemorySizeOverflow { .. }
             | Self::MemorySizeExceedsArchitecturalMaximum { .. }
             | Self::BlockInterruptLineCount { .. }
+            | Self::PmemInterruptLineCount { .. }
             | Self::NetworkInterruptLineCount { .. }
             | Self::VsockInterruptLineCount { .. }
             | Self::BalloonInterruptLineCount { .. } => None,
@@ -1575,6 +1611,8 @@ impl Arm64BootResources {
             serial_device,
             block_mmio_layout,
             block_interrupt_lines,
+            pmem_mmio_layout,
+            pmem_interrupt_lines,
             network_mmio_layout,
             network_interrupt_lines,
             vsock_mmio_layout,
@@ -1589,6 +1627,10 @@ impl Arm64BootResources {
         validate_block_interrupt_line_count(
             controller.drive_configs().len(),
             block_interrupt_lines.len(),
+        )?;
+        validate_pmem_interrupt_line_count(
+            controller.pmem_configs().len(),
+            pmem_interrupt_lines.len(),
         )?;
         validate_network_interrupt_line_count(
             controller.network_interface_configs().len(),
@@ -1629,6 +1671,18 @@ impl Arm64BootResources {
         let (mmio_dispatcher, registrations) = block_mmio.into_parts();
         let (block_devices, mut fdt_devices) =
             block_device_metadata(&registrations, block_interrupt_lines)?;
+        let pmem_mmio = prepared_pmems
+            .register_mmio_with_dispatcher(pmem_mmio_layout, mmio_dispatcher)
+            .map_err(|source| Arm64BootResourceError::RegisterPmemMmio {
+                source: Box::new(source),
+            })?;
+        let (mmio_dispatcher, pmem_registrations, pmem_devices) = pmem_mmio.into_parts();
+        let (pmem_mmio_devices, pmem_fdt_devices) =
+            pmem_device_metadata(&pmem_registrations, pmem_interrupt_lines)?;
+        fdt_devices
+            .try_reserve_exact(pmem_fdt_devices.len())
+            .map_err(|source| Arm64BootResourceError::PmemDeviceMetadataAllocation { source })?;
+        fdt_devices.extend(pmem_fdt_devices);
         let prepared_networks =
             PreparedNetworkDevices::from_config_slice(controller.network_interface_configs())
                 .map_err(|source| Arm64BootResourceError::PrepareNetworkDevices { source })?;
@@ -1744,7 +1798,8 @@ impl Arm64BootResources {
             mmio_dispatcher,
             serial_device,
             block_devices,
-            pmem_devices: prepared_pmems.into_vec(),
+            pmem_devices,
+            pmem_mmio_devices,
             network_devices,
             vsock_device,
             balloon_device,
@@ -1764,6 +1819,7 @@ impl Arm64BootResources {
                 serial_device: self.serial_device,
                 block_devices: self.block_devices,
                 pmem_devices: self.pmem_devices,
+                pmem_mmio_devices: self.pmem_mmio_devices,
                 network_devices: self.network_devices,
                 vsock_device: self.vsock_device,
                 balloon_device: self.balloon_device,
@@ -1832,6 +1888,17 @@ fn validate_block_interrupt_line_count(
         Ok(())
     } else {
         Err(Arm64BootResourceError::BlockInterruptLineCount { devices, lines })
+    }
+}
+
+fn validate_pmem_interrupt_line_count(
+    devices: usize,
+    lines: usize,
+) -> Result<(), Arm64BootResourceError> {
+    if devices == lines {
+        Ok(())
+    } else {
+        Err(Arm64BootResourceError::PmemInterruptLineCount { devices, lines })
     }
 }
 
@@ -1920,6 +1987,40 @@ fn block_device_metadata(
     }
 
     Ok((block_devices, fdt_devices))
+}
+
+fn pmem_device_metadata(
+    registrations: &[PmemMmioDeviceRegistration],
+    interrupt_lines: &[GuestInterruptLine],
+) -> Result<(Vec<Arm64BootPmemDevice>, Vec<Arm64FdtVirtioMmioDevice>), Arm64BootResourceError> {
+    validate_pmem_interrupt_line_count(registrations.len(), interrupt_lines.len())?;
+
+    let mut pmem_devices = Vec::new();
+    pmem_devices
+        .try_reserve_exact(registrations.len())
+        .map_err(|source| Arm64BootResourceError::PmemDeviceMetadataAllocation { source })?;
+    let mut fdt_devices = Vec::new();
+    fdt_devices
+        .try_reserve_exact(registrations.len())
+        .map_err(|source| Arm64BootResourceError::PmemDeviceMetadataAllocation { source })?;
+
+    for (registration, interrupt_line) in registrations.iter().zip(interrupt_lines) {
+        let range = registration.region().range();
+        let fdt_device = Arm64FdtVirtioMmioDevice {
+            region: Arm64FdtRegion {
+                base: range.start().raw_value(),
+                size: range.size(),
+            },
+            interrupt_line: *interrupt_line,
+        };
+        pmem_devices.push(Arm64BootPmemDevice {
+            registration: registration.clone(),
+            fdt_device,
+        });
+        fdt_devices.push(fdt_device);
+    }
+
+    Ok((pmem_devices, fdt_devices))
 }
 
 pub fn arm64_boot_network_device_metadata(
@@ -2120,7 +2221,9 @@ mod tests {
         VirtioNetworkRxPacket, VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError,
         VirtioNetworkTxFrame, VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
     };
-    use crate::pmem::{PmemConfigInput, PreparedPmemDeviceError, VIRTIO_PMEM_ALIGNMENT};
+    use crate::pmem::{
+        PmemConfigInput, PmemMmioLayout, PreparedPmemDeviceError, VIRTIO_PMEM_ALIGNMENT,
+    };
     use crate::serial::{
         SERIAL_MMIO_DEVICE_WINDOW_SIZE, SERIAL_TRANSMIT_REGISTER_OFFSET, SerialMmioDevice,
         SerialOutputFile, SharedSerialOutput, SharedSerialOutputBuffer,
@@ -2150,6 +2253,7 @@ mod tests {
     const ARM64_IMAGE_MAGIC_OFFSET: usize = 56;
     const ARM64_IMAGE_MAGIC: u32 = 0x644d_5241;
     const TEST_BLOCK_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_0000);
+    const TEST_PMEM_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_9000);
     const TEST_NETWORK_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_4000);
     const TEST_VSOCK_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_6000);
     const TEST_ENTROPY_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_7000);
@@ -2383,6 +2487,13 @@ mod tests {
     }
 
     fn valid_config(lines: &[GuestInterruptLine]) -> Arm64BootResourceConfig<'_> {
+        valid_config_with_pmem_lines(lines, &[])
+    }
+
+    fn valid_config_with_pmem_lines<'a>(
+        block_lines: &'a [GuestInterruptLine],
+        pmem_lines: &'a [GuestInterruptLine],
+    ) -> Arm64BootResourceConfig<'a> {
         Arm64BootResourceConfig {
             vcpu_mpidrs: &[0],
             gic: valid_gic(),
@@ -2392,7 +2503,9 @@ mod tests {
                 TEST_BLOCK_MMIO_BASE,
                 MmioRegionId::new(1),
             ),
-            block_interrupt_lines: lines,
+            block_interrupt_lines: block_lines,
+            pmem_mmio_layout: PmemMmioLayout::new(TEST_PMEM_MMIO_BASE, MmioRegionId::new(25)),
+            pmem_interrupt_lines: pmem_lines,
             network_mmio_layout: NetworkMmioLayout::new(
                 TEST_NETWORK_MMIO_BASE,
                 MmioRegionId::new(50),
@@ -4057,6 +4170,7 @@ mod tests {
         );
         assert!(resources.block_devices.is_empty());
         assert!(resources.pmem_devices.is_empty());
+        assert!(resources.pmem_mmio_devices.is_empty());
         assert!(resources.network_devices.is_empty());
         assert!(resources.vsock_device.is_none());
         assert!(resources.balloon_device.is_none());
@@ -4111,9 +4225,11 @@ mod tests {
         add_pmem(&mut controller, "pmem0", first_pmem.path(), false);
         add_pmem(&mut controller, "pmem1", second_pmem.path(), true);
 
-        let resources =
-            Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
-                .expect("boot resources should assemble with pmem backing files");
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            valid_config_with_pmem_lines(&[], &[line(32), line(33)]),
+        )
+        .expect("boot resources should assemble with pmem backing files");
 
         assert_eq!(resources.pmem_devices.len(), 2);
         assert_eq!(resources.pmem_devices[0].id(), "pmem0");
@@ -4163,12 +4279,49 @@ mod tests {
                 .guest_range()
                 .overlaps(resources.pmem_devices[1].guest_range())
         );
-        assert!(resources.mmio_dispatcher.regions().is_empty());
+        assert_eq!(resources.pmem_mmio_devices.len(), 2);
+        assert_eq!(
+            resources.pmem_mmio_devices[0].registration.pmem_id(),
+            "pmem0"
+        );
+        assert_eq!(
+            resources.pmem_mmio_devices[0].registration.address(),
+            TEST_PMEM_MMIO_BASE
+        );
+        assert_eq!(
+            resources.pmem_mmio_devices[0].registration.config_space(),
+            resources.pmem_devices[0].config_space()
+        );
+        assert_eq!(
+            resources.pmem_mmio_devices[0].fdt_device.interrupt_line,
+            line(32)
+        );
+        assert_eq!(
+            resources.pmem_mmio_devices[1].registration.pmem_id(),
+            "pmem1"
+        );
+        assert_eq!(
+            resources.pmem_mmio_devices[1].registration.address(),
+            TEST_PMEM_MMIO_BASE
+                .checked_add(VIRTIO_MMIO_DEVICE_WINDOW_SIZE)
+                .expect("second pmem MMIO address should not overflow")
+        );
+        assert_eq!(
+            resources.pmem_mmio_devices[1].registration.config_space(),
+            resources.pmem_devices[1].config_space()
+        );
+        assert_eq!(
+            resources.pmem_mmio_devices[1].fdt_device.interrupt_line,
+            line(33)
+        );
+        assert_eq!(resources.mmio_dispatcher.regions().len(), 2);
         assert_eq!(
             resources.loaded_boot_source.command_line.as_str(),
             DEFAULT_KERNEL_COMMAND_LINE
         );
         assert_eq!(fdt_bootargs(&resources), DEFAULT_KERNEL_COMMAND_LINE);
+        assert!(read_fdt(&resources).find("/virtio_mmio@40009000").is_some());
+        assert!(read_fdt(&resources).find("/virtio_mmio@4000a000").is_some());
     }
 
     #[test]
@@ -4178,9 +4331,12 @@ mod tests {
         let mut controller = controller_with_kernel(kernel.path());
         add_pmem(&mut controller, "pmem0", pmem.path(), false);
 
-        let parts = Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
-            .expect("boot resources should assemble with pmem")
-            .into_parts();
+        let parts = Arm64BootResources::assemble_from_controller(
+            &controller,
+            valid_config_with_pmem_lines(&[], &[line(32)]),
+        )
+        .expect("boot resources should assemble with pmem")
+        .into_parts();
 
         assert_eq!(parts.runtime.pmem_devices.len(), 1);
         assert_eq!(parts.runtime.pmem_devices[0].id(), "pmem0");
@@ -4198,6 +4354,34 @@ mod tests {
             parts.runtime.pmem_devices[0].config_space().size(),
             VIRTIO_PMEM_ALIGNMENT
         );
+        assert_eq!(parts.runtime.pmem_mmio_devices.len(), 1);
+        assert_eq!(
+            parts.runtime.pmem_mmio_devices[0].registration.pmem_id(),
+            "pmem0"
+        );
+        assert_eq!(
+            parts.runtime.pmem_mmio_devices[0].fdt_device.interrupt_line,
+            line(32)
+        );
+    }
+
+    #[test]
+    fn pmem_interrupt_line_count_mismatch_fails_startup() {
+        let kernel = temp_file("kernel-pmem-lines", &arm64_image());
+        let pmem = temp_file("pmem-lines", b"pmem");
+        let mut controller = controller_with_kernel(kernel.path());
+        add_pmem(&mut controller, "pmem0", pmem.path(), false);
+
+        let err = Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
+            .expect_err("missing pmem interrupt line should fail startup resource assembly");
+
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::PmemInterruptLineCount {
+                devices: 1,
+                lines: 0
+            }
+        ));
     }
 
     #[test]
@@ -4207,8 +4391,11 @@ mod tests {
         let mut controller = controller_with_kernel(kernel.path());
         add_pmem(&mut controller, "pmem0", &missing, false);
 
-        let err = Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
-            .expect_err("missing pmem backing should fail startup resource assembly");
+        let err = Arm64BootResources::assemble_from_controller(
+            &controller,
+            valid_config_with_pmem_lines(&[], &[line(32)]),
+        )
+        .expect_err("missing pmem backing should fail startup resource assembly");
 
         assert!(matches!(
             err,
@@ -4231,8 +4418,11 @@ mod tests {
         let mut controller = controller_with_kernel(kernel.path());
         add_pmem(&mut controller, "pmem0", pmem.path(), true);
 
-        let err = Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
-            .expect_err("zero-sized pmem backing should fail startup resource assembly");
+        let err = Arm64BootResources::assemble_from_controller(
+            &controller,
+            valid_config_with_pmem_lines(&[], &[line(32)]),
+        )
+        .expect_err("zero-sized pmem backing should fail startup resource assembly");
 
         assert!(matches!(
             err,
