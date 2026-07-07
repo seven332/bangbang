@@ -88,6 +88,8 @@ impl TryFrom<PmemConfigInput> for PmemConfig {
     type Error = PmemConfigError;
 
     fn try_from(input: PmemConfigInput) -> Result<Self, Self::Error> {
+        validate_pmem_id(&input.id)?;
+
         if input.path_on_host.is_empty() {
             return Err(PmemConfigError::EmptyPathOnHost);
         }
@@ -137,6 +139,8 @@ impl PmemConfigs {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PmemConfigError {
+    EmptyPmemId,
+    InvalidPmemId,
     EmptyPathOnHost,
     UnsupportedRateLimiter,
 }
@@ -144,6 +148,10 @@ pub enum PmemConfigError {
 impl fmt::Display for PmemConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::EmptyPmemId => f.write_str("pmem id must not be empty"),
+            Self::InvalidPmemId => {
+                f.write_str("pmem id must contain only alphanumeric characters or '_'")
+            }
             Self::EmptyPathOnHost => f.write_str("pmem path_on_host must not be empty"),
             Self::UnsupportedRateLimiter => f.write_str("pmem rate_limiter is not supported"),
         }
@@ -151,6 +159,21 @@ impl fmt::Display for PmemConfigError {
 }
 
 impl std::error::Error for PmemConfigError {}
+
+fn validate_pmem_id(id: &str) -> Result<(), PmemConfigError> {
+    if id.is_empty() {
+        return Err(PmemConfigError::EmptyPmemId);
+    }
+
+    if !id
+        .chars()
+        .all(|character| character == '_' || character.is_alphanumeric())
+    {
+        return Err(PmemConfigError::InvalidPmemId);
+    }
+
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -169,6 +192,36 @@ mod tests {
         assert!(!input.root_device());
         assert!(!input.read_only());
         assert!(!input.rate_limiter_configured());
+    }
+
+    #[test]
+    fn config_accepts_firecracker_id_character_set() {
+        let config = pmem_config(PmemConfigInput::new("pmem_\u{00e9}1", "/tmp/pmem.img"));
+
+        assert_eq!(config.id(), "pmem_\u{00e9}1");
+    }
+
+    #[test]
+    fn config_rejects_empty_pmem_id() {
+        let err = PmemConfig::try_from(PmemConfigInput::new("", "/tmp/pmem.img"))
+            .expect_err("empty pmem id should fail");
+
+        assert_eq!(err, PmemConfigError::EmptyPmemId);
+        assert_eq!(err.to_string(), "pmem id must not be empty");
+    }
+
+    #[test]
+    fn config_rejects_invalid_pmem_id_without_echoing_it() {
+        let invalid = "bad/id\nsecret";
+        let err = PmemConfig::try_from(PmemConfigInput::new(invalid, "/tmp/pmem.img"))
+            .expect_err("invalid pmem id should fail");
+
+        assert_eq!(err, PmemConfigError::InvalidPmemId);
+        assert_eq!(
+            err.to_string(),
+            "pmem id must contain only alphanumeric characters or '_'"
+        );
+        assert!(!err.to_string().contains(invalid));
     }
 
     #[test]

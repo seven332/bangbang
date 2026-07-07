@@ -2349,6 +2349,32 @@ mod tests {
     }
 
     #[test]
+    fn put_pmem_rejects_invalid_id_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutPmem(pmem_input("pmem0", "/tmp/pmem-old.img")))
+            .expect("pmem config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PutPmem(pmem_input(
+                "pmem0/secret",
+                "/tmp/pmem-new.img",
+            )))
+            .expect_err("invalid pmem id should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::PmemConfig(PmemConfigError::InvalidPmemId)
+        );
+        assert_eq!(controller.pmem_configs().len(), 1);
+        assert_eq!(controller.pmem_configs()[0].id(), "pmem0");
+        assert_eq!(
+            controller.pmem_configs()[0].path_on_host(),
+            "/tmp/pmem-old.img"
+        );
+    }
+
+    #[test]
     fn patch_pmem_rejects_not_started_without_mutating() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         controller
