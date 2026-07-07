@@ -296,6 +296,11 @@ impl VirtioBalloonConfigSpace {
         self.free_page_hint_cmd_id
     }
 
+    pub const fn with_num_pages(mut self, num_pages: u32) -> Self {
+        self.num_pages = num_pages;
+        self
+    }
+
     pub const fn from_le_bytes(bytes: [u8; VIRTIO_BALLOON_CONFIG_SPACE_SIZE]) -> Self {
         let [
             num_pages0,
@@ -2133,9 +2138,10 @@ impl VirtioMmioRegisterHandler<VirtioBalloonConfigSpace, VirtioBalloonDevice> {
         &mut self,
         config: BalloonConfig,
     ) -> Result<(), BalloonUpdateError> {
-        let config_space = VirtioBalloonConfigSpace::from_config(config)
-            .map_err(BalloonUpdateError::PageCountOverflow)?;
+        let num_pages =
+            mib_to_4k_pages(config.amount_mib()).map_err(BalloonUpdateError::PageCountOverflow)?;
 
+        let config_space = self.device_config_handler().with_num_pages(num_pages);
         *self.device_config_handler_mut() = config_space;
         self.increment_config_generation();
         self.mark_interrupt_pending(DeviceInterruptKind::Config);
@@ -5785,6 +5791,23 @@ mod tests {
                 .dispatcher_mut()
                 .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
                 .expect("balloon handler should be registered");
+            handler
+                .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
+                .expect("acknowledge status should write");
+            handler
+                .write_register(
+                    VirtioMmioRegister::Status,
+                    VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+                )
+                .expect("driver status should write");
+        }
+        write_mmio_config(&mut device, 4, &0x1234_u32.to_le_bytes());
+        write_mmio_config(&mut device, 8, &0x5678_u32.to_le_bytes());
+        {
+            let handler = device
+                .dispatcher_mut()
+                .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+                .expect("balloon handler should be registered");
 
             assert_eq!(
                 handler
@@ -5814,6 +5837,14 @@ mod tests {
         assert_eq!(
             read_mmio_config(&mut device, 0, 4).as_slice(),
             &(128 * VIRTIO_BALLOON_MIB_TO_4K_PAGES).to_le_bytes()
+        );
+        assert_eq!(
+            read_mmio_config(&mut device, 4, 4).as_slice(),
+            &0x1234_u32.to_le_bytes()
+        );
+        assert_eq!(
+            read_mmio_config(&mut device, 8, 4).as_slice(),
+            &0x5678_u32.to_le_bytes()
         );
     }
 
