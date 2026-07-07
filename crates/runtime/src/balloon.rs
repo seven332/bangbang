@@ -5834,6 +5834,49 @@ mod tests {
     }
 
     #[test]
+    fn hinting_queue_dispatch_records_range_after_prior_command_head() {
+        let mut memory = pfn_descriptor_memory();
+        let queue_index = VIRTIO_BALLOON_STATS_QUEUE_INDEX;
+        let command = 11_u32;
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &command.to_le_bytes());
+        write_guest_bytes(&mut memory, TEST_PFN_DATA_SPLIT, &[0xbc; 64]);
+        write_hinting_descriptor(
+            &mut memory,
+            queue_index,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, VIRTIO_BALLOON_HINTING_COMMAND_SIZE_U32, None),
+        );
+        write_hinting_descriptor(
+            &mut memory,
+            queue_index,
+            1,
+            TestDescriptor::readable(TEST_PFN_DATA_SPLIT, 64, None),
+        );
+        write_available_heads(&mut memory, queue_available_ring(queue_index), &[0, 1]);
+        let mut queue = hinting_queue(queue_index);
+
+        let dispatch = queue
+            .dispatch_hinting_commands(&mut memory, hinting_context(command, None))
+            .expect("hinting range after matching command head should dispatch");
+
+        assert_eq!(dispatch.completed_descriptors(), 2);
+        assert_eq!(dispatch.hinting_guest_cmd(), Some(command));
+        assert_eq!(
+            dispatch.hinting_page_ranges(),
+            &[GuestMemoryRange::new(TEST_PFN_DATA_SPLIT, 64).expect("test range should be valid")]
+        );
+        assert_eq!(read_used_idx(&memory, queue_used_ring(queue_index)), 2);
+        assert_eq!(
+            read_used_element(&memory, queue_used_ring(queue_index), 0),
+            (0, 0)
+        );
+        assert_eq!(
+            read_used_element(&memory, queue_used_ring(queue_index), 1),
+            (1, 0)
+        );
+    }
+
+    #[test]
     fn hinting_queue_dispatch_ignores_range_without_guest_command() {
         let mut memory = pfn_descriptor_memory();
         let queue_index = VIRTIO_BALLOON_STATS_QUEUE_INDEX;
