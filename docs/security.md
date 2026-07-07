@@ -226,11 +226,14 @@ The current virtio-balloon foundation derives a startup-attached virtio-mmio/FDT
 shell from stored control-plane configuration. It exposes guest-visible
 identity, feature, queue, and config-space registers, but does not map guest
 memory or change host memory accounting. Guest config-space writes update only
-local device register state. The backend-neutral deflate notification dispatcher
-can acknowledge descriptor heads by publishing zero-length used-ring entries;
-other balloon descriptor handling must treat PFNs, statistics descriptors,
-free-page hinting commands, and reporting queue data as untrusted guest input
-before changing host memory accounting or reclaim behavior.
+local device register state. The backend-neutral inflate notification dispatcher
+can read bounded PFN descriptor payloads, compact them into page ranges, and
+acknowledge descriptor heads with zero-length used-ring entries. The deflate
+notification dispatcher can acknowledge descriptor heads with zero-length
+used-ring entries. Parsed PFNs, statistics descriptors, free-page hinting
+commands, and reporting queue data remain untrusted guest input and must not
+change host memory accounting or reclaim behavior until those host-side paths
+are implemented and reviewed.
 
 The current serial device is a TX-only MMIO output path. By default, guest
 serial bytes go to a bounded internal capture buffer; when `/serial` configures
