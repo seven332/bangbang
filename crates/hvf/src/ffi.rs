@@ -91,6 +91,9 @@ mod imp {
 
     #[link(name = "Hypervisor", kind = "framework")]
     unsafe extern "C" {
+        pub fn hv_vm_config_create() -> HvVmConfig;
+        pub fn hv_vm_config_get_max_ipa_size(ipa_bit_length: *mut u32) -> HvReturn;
+        pub fn hv_vm_config_set_ipa_size(config: HvVmConfig, ipa_bit_length: u32) -> HvReturn;
         pub fn hv_vm_create(config: HvVmConfig) -> HvReturn;
         pub fn hv_vm_destroy() -> HvReturn;
         pub fn hv_vm_map(
@@ -114,6 +117,57 @@ mod imp {
         pub fn hv_vcpu_set_vtimer_mask(vcpu: HvVcpu, vtimer_is_masked: bool) -> HvReturn;
         pub fn hv_vcpu_run(vcpu: HvVcpu) -> HvReturn;
         pub fn hv_vcpus_exit(vcpus: *mut HvVcpu, vcpu_count: u32) -> HvReturn;
+    }
+
+    unsafe extern "C" {
+        fn os_release(object: *mut c_void);
+    }
+
+    #[derive(Debug)]
+    struct HvVmConfigOwner {
+        config: NonNull<c_void>,
+    }
+
+    impl HvVmConfigOwner {
+        fn with_max_ipa_size() -> Result<Self, BackendError> {
+            // SAFETY: Creates a retained Hypervisor.framework VM configuration object.
+            let config = unsafe { hv_vm_config_create() };
+            let config = NonNull::new(config).ok_or(BackendError::Hypervisor(
+                "hv_vm_config_create returned null".to_string(),
+            ))?;
+            let owner = Self { config };
+            let mut max_ipa_size = 0;
+
+            // SAFETY: `max_ipa_size` is a valid out-pointer for the duration of the call.
+            unsafe {
+                check(
+                    hv_vm_config_get_max_ipa_size(&mut max_ipa_size),
+                    "hv_vm_config_get_max_ipa_size",
+                )?;
+            }
+
+            // SAFETY: `owner.config` owns a live VM configuration, and the requested IPA size
+            // is the framework-reported maximum for the current host.
+            unsafe {
+                check(
+                    hv_vm_config_set_ipa_size(owner.config.as_ptr(), max_ipa_size),
+                    "hv_vm_config_set_ipa_size",
+                )?;
+            }
+
+            Ok(owner)
+        }
+
+        fn as_ptr(&self) -> HvVmConfig {
+            self.config.as_ptr()
+        }
+    }
+
+    impl Drop for HvVmConfigOwner {
+        fn drop(&mut self) {
+            // SAFETY: `self.config` is a retained OS object returned by `hv_vm_config_create`.
+            unsafe { os_release(self.config.as_ptr()) };
+        }
     }
 
     fn hv_return_name(code: HvReturn) -> Option<&'static str> {
@@ -151,8 +205,10 @@ mod imp {
     }
 
     pub fn create_vm() -> Result<(), BackendError> {
-        // SAFETY: Passing null requests the default VM configuration per Hypervisor.framework.
-        unsafe { check(hv_vm_create(ptr::null_mut()), "hv_vm_create") }
+        let config = HvVmConfigOwner::with_max_ipa_size()?;
+
+        // SAFETY: `config` owns a live VM configuration for the duration of the call.
+        unsafe { check(hv_vm_create(config.as_ptr()), "hv_vm_create") }
     }
 
     pub fn destroy_vm() -> Result<(), BackendError> {

@@ -30,8 +30,8 @@ use bangbang_runtime::startup::{
     Arm64BootEntropyNotificationDispatches, Arm64BootEntropySourceProvider,
     Arm64BootNetworkNotificationDispatch, Arm64BootNetworkNotificationDispatchError,
     Arm64BootNetworkNotificationDispatches, Arm64BootNetworkPacketIoProvider,
-    Arm64BootResourceConfig, Arm64BootResourceError, Arm64BootResources, Arm64BootRuntimeResources,
-    Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig,
+    Arm64BootResourceConfig, Arm64BootResourceError, Arm64BootResourceParts, Arm64BootResources,
+    Arm64BootRuntimeResources, Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig,
     Arm64BootVsockNotificationDispatch, Arm64BootVsockNotificationDispatchError,
     Arm64BootVsockNotificationDispatches, Arm64BootVsockWakeupFdsError,
 };
@@ -3158,14 +3158,22 @@ fn prepare_arm64_boot_session_parts<'vm>(
         },
     )
     .map_err(|source| HvfArm64BootSessionError::AssembleResources { source })?;
-    let parts = resources.into_parts();
+    let Arm64BootResourceParts {
+        memory,
+        mmio_dispatcher,
+        runtime,
+    } = resources.into_parts();
 
     backend
-        .map_guest_memory(parts.memory, HvfMemoryPermissions::GUEST_RAM)
+        .map_guest_memory_with_pmem_devices(
+            memory,
+            runtime.pmem_devices.as_slice(),
+            HvfMemoryPermissions::GUEST_RAM,
+        )
         .map_err(|source| HvfArm64BootSessionError::MapGuestMemory { source })?;
     let boot_registers = HvfArm64BootRegisters {
-        kernel_entry: parts.runtime.loaded_boot_source.kernel.entry_address,
-        fdt_address: parts.runtime.fdt.address,
+        kernel_entry: runtime.loaded_boot_source.kernel.entry_address,
+        fdt_address: runtime.fdt.address,
     };
     runner
         .configure_arm64_boot_registers(boot_registers)
@@ -3173,8 +3181,8 @@ fn prepare_arm64_boot_session_parts<'vm>(
 
     Ok(PreparedHvfArm64BootSession {
         runner,
-        mmio_dispatcher: Arc::new(Mutex::new(parts.mmio_dispatcher)),
-        runtime_resources: parts.runtime,
+        mmio_dispatcher: Arc::new(Mutex::new(mmio_dispatcher)),
+        runtime_resources: runtime,
         control_wakeup: HvfArm64BootRunLoopControlWakeupToken::default(),
         run_loop_wakeup: HvfArm64BootRunLoopWakeupToken::default(),
         gic,
