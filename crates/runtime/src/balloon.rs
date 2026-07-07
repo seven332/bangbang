@@ -88,6 +88,27 @@ impl fmt::Display for BalloonPageCountOverflow {
 impl std::error::Error for BalloonPageCountOverflow {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BalloonConfigError {
+    TargetExceedsGuestMemory { amount_mib: u32, mem_size_mib: u64 },
+}
+
+impl fmt::Display for BalloonConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TargetExceedsGuestMemory {
+                amount_mib,
+                mem_size_mib,
+            } => write!(
+                f,
+                "balloon amount_mib {amount_mib} exceeds configured guest memory {mem_size_mib} MiB"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BalloonConfigError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BalloonUpdateError {
     PageCountOverflow(BalloonPageCountOverflow),
     TargetExceedsGuestMemory { amount_mib: u32, mem_size_mib: u64 },

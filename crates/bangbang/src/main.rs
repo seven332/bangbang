@@ -3543,6 +3543,50 @@ mod tests {
     }
 
     #[test]
+    fn config_file_rejects_oversized_balloon_before_starting() {
+        let config_path = unique_config_path("oversized-balloon");
+        let config = r#"{
+            "machine-config":{"vcpu_count":1,"mem_size_mib":128},
+            "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
+            "balloon":{"amount_mib":129,"deflate_on_oom":true}
+        }"#;
+        fs::write(&config_path, config).expect("config file should be written");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        let err = super::apply_startup_config_file(
+            &mut vmm,
+            Some(config_path.to_str().expect("UTF-8 path")),
+        )
+        .expect_err("oversized balloon should fail before start");
+
+        assert_eq!(
+            err,
+            ProcessError::ConfigFile(super::ConfigFileError::Apply(
+                VmmActionError::BalloonConfig(
+                    bangbang_runtime::balloon::BalloonConfigError::TargetExceedsGuestMemory {
+                        amount_mib: 129,
+                        mem_size_mib: 128,
+                    },
+                ),
+            ))
+        );
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+        assert_eq!(vmm.machine_config().mem_size_mib(), 128);
+        assert_eq!(
+            vmm.handle_action(VmmAction::GetBalloon),
+            Err(VmmActionError::BalloonUnsupported)
+        );
+
+        fs::remove_file(config_path).expect("fixture config should clean up");
+    }
+
+    #[test]
     fn config_file_rejects_malformed_drive_array() {
         let err = super::config_file_actions_from_str(
             r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"drives":{}}"#,

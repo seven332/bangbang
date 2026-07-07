@@ -4884,7 +4884,7 @@ mod tests {
     fn boot_runtime_with_balloon() -> (GuestMemory, Arm64BootRuntimeResources, MmioDispatcher) {
         let kernel = temp_file("kernel-with-balloon", &arm64_image());
         let mut controller = controller_with_kernel(kernel.path());
-        add_balloon(&mut controller, 64);
+        add_balloon(&mut controller, TEST_MEMORY_MIB as u32);
         let resources = Arm64BootResources::assemble_from_controller(
             &controller,
             Arm64BootResourceConfig {

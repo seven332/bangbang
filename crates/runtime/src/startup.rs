@@ -2731,7 +2731,7 @@ mod tests {
     ) {
         let kernel = temp_file(kernel_name, &arm64_image());
         let mut controller = controller_with_kernel(kernel.path());
-        add_balloon(&mut controller, 64);
+        add_balloon(&mut controller, TEST_MEMORY_MIB as u32);
         let resources = Arm64BootResources::assemble_from_controller(
             &controller,
             Arm64BootResourceConfig {
@@ -4876,7 +4876,7 @@ mod tests {
     fn assembles_boot_resources_with_balloon_mmio_metadata() {
         let kernel = temp_file("kernel-with-balloon", &arm64_image());
         let mut controller = controller_with_kernel(kernel.path());
-        add_balloon(&mut controller, 64);
+        add_balloon(&mut controller, TEST_MEMORY_MIB as u32);
         let config = Arm64BootResourceConfig {
             balloon_interrupt_line: Some(line(36)),
             ..valid_config(&[])
@@ -4921,7 +4921,7 @@ mod tests {
         );
         assert_eq!(
             handler.device_config_handler().num_pages(),
-            64 * VIRTIO_BALLOON_MIB_TO_4K_PAGES
+            TEST_MEMORY_MIB as u32 * VIRTIO_BALLOON_MIB_TO_4K_PAGES
         );
 
         let tree = read_fdt(&resources);
@@ -5030,7 +5030,7 @@ mod tests {
     fn configured_balloon_without_interrupt_line_fails() {
         let kernel = temp_file("kernel-balloon-missing-line", &arm64_image());
         let mut controller = controller_with_kernel(kernel.path());
-        add_balloon(&mut controller, 64);
+        add_balloon(&mut controller, TEST_MEMORY_MIB as u32);
 
         let err = Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
             .expect_err("configured balloon without interrupt line should fail");
@@ -5560,7 +5560,7 @@ mod tests {
         update_balloon_config_for_device(
             &device,
             &mut mmio_dispatcher,
-            BalloonConfigInput::new(128, false).into(),
+            BalloonConfigInput::new(TEST_MEMORY_MIB as u32, false).into(),
         )
         .expect("balloon config update should succeed");
 
@@ -5569,7 +5569,7 @@ mod tests {
             .expect("balloon handler should be registered");
         assert_eq!(
             handler.device_config_handler().num_pages(),
-            128 * VIRTIO_BALLOON_MIB_TO_4K_PAGES
+            TEST_MEMORY_MIB as u32 * VIRTIO_BALLOON_MIB_TO_4K_PAGES
         );
         assert_eq!(
             read_boot_balloon_mmio_u32(
