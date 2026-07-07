@@ -6004,6 +6004,47 @@ mod tests {
     }
 
     #[test]
+    fn balloon_notification_dispatch_keeps_other_optional_queues_unsupported_with_hinting() {
+        let mut memory = pfn_descriptor_memory();
+        let layout = prepared(balloon_config(64, false, 1, true, true)).queue_layout();
+        let unsupported_queue_indexes = [
+            layout
+                .statistics()
+                .expect("statistics queue should be configured")
+                .index(),
+            layout
+                .free_page_reporting()
+                .expect("reporting queue should be configured")
+                .index(),
+        ];
+
+        for queue_index in unsupported_queue_indexes {
+            let device_registers = VirtioMmioDeviceRegisters::new(
+                VIRTIO_BALLOON_DEVICE_ID,
+                virtio_feature_bit(VIRTIO_FEATURE_VERSION_1),
+            );
+            let queues = configured_queue_registers(layout.queue_count());
+            let mut device = VirtioBalloonDevice::new(layout);
+            device
+                .activate_balloon(activation_for_queues(&device_registers, &queues))
+                .expect("activation should succeed");
+
+            let error = device
+                .dispatch_drained_queue_notifications(&mut memory, vec![queue_index])
+                .expect_err("non-hinting optional queue should remain unsupported");
+
+            assert!(matches!(
+                error,
+                VirtioBalloonDeviceNotificationError::UnsupportedQueue {
+                    queue_index: unsupported_queue_index,
+                    ..
+                } if unsupported_queue_index == queue_index
+            ));
+            assert_eq!(error.drained_notifications(), &[queue_index]);
+        }
+    }
+
+    #[test]
     fn balloon_notification_dispatch_updates_hinting_guest_command_state() {
         let mut memory = pfn_descriptor_memory();
         let command = 55_u32;
