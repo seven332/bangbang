@@ -1,11 +1,16 @@
 use std::collections::TryReserveError;
 use std::ffi::c_void;
 use std::fmt;
+use std::fs::File;
+use std::io;
+use std::os::unix::fs::FileExt;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 use bangbang_runtime::BackendError;
 use bangbang_runtime::memory::{GuestMemory, GuestMemoryRange, GuestMemoryRegion};
+
+const HOST_MEMORY_WRITEBACK_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HvfMemoryPermissions {
@@ -93,6 +98,9 @@ pub enum HvfGuestMemoryMappingError {
         range: GuestMemoryRange,
         source: Box<HvfGuestMemoryMappingError>,
     },
+    FlushFailed {
+        failures: Vec<HvfGuestMemoryFlushFailure>,
+    },
     MappingMetadataAllocationFailed {
         source: TryReserveError,
     },
@@ -167,6 +175,37 @@ impl fmt::Display for HvfGuestMemoryMappingError {
                     "failed to map host-backed guest memory range {range} for {label}: {source}"
                 )
             }
+            Self::FlushFailed { failures } => match failures.as_slice() {
+                [failure] => match failure.range {
+                    Some(range) => write!(
+                        f,
+                        "failed to flush host-backed guest memory range {range} for {}: {}",
+                        failure.label, failure.source
+                    ),
+                    None => write!(
+                        f,
+                        "failed to flush host-backed guest memory for {}: {}",
+                        failure.label, failure.source
+                    ),
+                },
+                [first, ..] => match first.range {
+                    Some(range) => write!(
+                        f,
+                        "failed to flush {} host-backed guest memory mapping(s); first failure at range {range} for {}: {}",
+                        failures.len(),
+                        first.label,
+                        first.source
+                    ),
+                    None => write!(
+                        f,
+                        "failed to flush {} host-backed guest memory mapping(s); first failure for {}: {}",
+                        failures.len(),
+                        first.label,
+                        first.source
+                    ),
+                },
+                [] => f.write_str("failed to flush host-backed guest memory mapping(s)"),
+            },
             Self::MappingMetadataAllocationFailed { source } => {
                 write!(
                     f,
@@ -204,6 +243,9 @@ impl std::error::Error for HvfGuestMemoryMappingError {
         match self {
             Self::Backend(source) | Self::MapFailed { source, .. } => Some(source),
             Self::HostMapping { source, .. } => Some(source),
+            Self::FlushFailed { failures } => failures
+                .first()
+                .map(|failure| &failure.source as &(dyn std::error::Error + 'static)),
             Self::MappingMetadataAllocationFailed { source } => Some(source),
             Self::UnmapFailed { failures } => failures
                 .first()
@@ -244,10 +286,33 @@ impl HvfGuestMemoryUnmapFailure {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HvfGuestMemoryFlushFailure {
+    label: String,
+    range: Option<GuestMemoryRange>,
+    source: BackendError,
+}
+
+impl HvfGuestMemoryFlushFailure {
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub const fn range(&self) -> Option<GuestMemoryRange> {
+        self.range
+    }
+
+    pub const fn source(&self) -> &BackendError {
+        &self.source
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct HvfGuestMemoryMapping {
     memory: Option<GuestMemory>,
     host_memory: Vec<HvfHostMemoryMapping>,
+    host_memory_should_flush: bool,
+    host_memory_flushed: bool,
     mapped_regions: Vec<HvfMappedGuestMemoryRegion>,
     mapper: Arc<dyn HvfMemoryMapper>,
 }
@@ -271,6 +336,8 @@ impl HvfGuestMemoryMapping {
         let mut mapping = Self {
             memory: Some(memory),
             host_memory,
+            host_memory_should_flush: false,
+            host_memory_flushed: false,
             mapped_regions: Vec::new(),
             mapper,
         };
@@ -293,11 +360,11 @@ impl HvfGuestMemoryMapping {
 
     pub(crate) fn unmap_all(&mut self) -> Result<(), HvfGuestMemoryMappingError> {
         let failures = self.unmap_mapped_regions();
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(HvfGuestMemoryMappingError::UnmapFailed { failures })
+        if !failures.is_empty() {
+            return Err(HvfGuestMemoryMappingError::UnmapFailed { failures });
         }
+
+        self.flush_host_memory()
     }
 
     pub(crate) fn has_mapped_regions(&self) -> bool {
@@ -324,6 +391,7 @@ impl HvfGuestMemoryMapping {
     // succeeds following an earlier unmap failure.
     pub(crate) fn release_after_vm_destroy(mut self) {
         self.mapped_regions.clear();
+        self.host_memory_should_flush = false;
     }
 
     fn map_all(
@@ -361,6 +429,7 @@ impl HvfGuestMemoryMapping {
                 })?;
         }
 
+        self.host_memory_should_flush = true;
         Ok(())
     }
 
@@ -403,11 +472,31 @@ impl HvfGuestMemoryMapping {
 
         failures
     }
+
+    fn flush_host_memory(&mut self) -> Result<(), HvfGuestMemoryMappingError> {
+        if !self.host_memory_should_flush || self.host_memory_flushed {
+            return Ok(());
+        }
+
+        let mut failures = Vec::new();
+        for mapping in &self.host_memory {
+            if let Err(source) = mapping.flush() {
+                failures.push(source);
+            }
+        }
+
+        if failures.is_empty() {
+            self.host_memory_flushed = true;
+            Ok(())
+        } else {
+            Err(HvfGuestMemoryMappingError::FlushFailed { failures })
+        }
+    }
 }
 
 impl Drop for HvfGuestMemoryMapping {
     fn drop(&mut self) {
-        if self.unmap_all().is_err() {
+        if self.unmap_all().is_err() && self.has_mapped_regions() {
             if let Some(memory) = self.memory.take() {
                 std::mem::forget(memory);
             }
@@ -451,9 +540,11 @@ pub(crate) struct HvfHostMemoryMapping {
     label: String,
     memory: GuestMemory,
     permissions: HvfMemoryPermissions,
+    writeback: HvfHostMemoryWriteback,
 }
 
 impl HvfHostMemoryMapping {
+    #[cfg(test)]
     pub(crate) fn new(
         label: impl Into<String>,
         memory: GuestMemory,
@@ -463,8 +554,186 @@ impl HvfHostMemoryMapping {
             label: label.into(),
             memory,
             permissions,
+            writeback: HvfHostMemoryWriteback::None,
         }
     }
+
+    pub(crate) fn new_pmem_shadow(
+        label: impl Into<String>,
+        memory: GuestMemory,
+        permissions: HvfMemoryPermissions,
+        backing: File,
+        file_len: u64,
+        read_only: bool,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            memory,
+            permissions,
+            writeback: HvfHostMemoryWriteback::PmemShadow(HvfPmemShadowWriteback {
+                backing,
+                file_len,
+                read_only,
+            }),
+        }
+    }
+
+    fn flush(&self) -> Result<(), HvfGuestMemoryFlushFailure> {
+        #[cfg(not(test))]
+        let HvfHostMemoryWriteback::PmemShadow(writeback) = &self.writeback;
+
+        #[cfg(test)]
+        let writeback = match &self.writeback {
+            HvfHostMemoryWriteback::None => return Ok(()),
+            HvfHostMemoryWriteback::PmemShadow(writeback) => writeback,
+        };
+
+        if writeback.read_only {
+            return Ok(());
+        }
+
+        writeback
+            .write_shadow_to_backing(&self.memory)
+            .map_err(|source| self.flush_failure(source))
+    }
+
+    fn flush_failure(&self, source: BackendError) -> HvfGuestMemoryFlushFailure {
+        let range = self.memory.regions().first().map(GuestMemoryRegion::range);
+
+        HvfGuestMemoryFlushFailure {
+            label: self.label.clone(),
+            range,
+            source,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum HvfHostMemoryWriteback {
+    #[cfg(test)]
+    None,
+    PmemShadow(HvfPmemShadowWriteback),
+}
+
+#[derive(Debug)]
+struct HvfPmemShadowWriteback {
+    backing: File,
+    file_len: u64,
+    read_only: bool,
+}
+
+impl HvfPmemShadowWriteback {
+    fn write_shadow_to_backing(&self, memory: &GuestMemory) -> Result<(), BackendError> {
+        let range = self.shadow_range(memory)?;
+        let mut buffer = [0_u8; HOST_MEMORY_WRITEBACK_BUFFER_SIZE];
+        let mut copied = 0;
+
+        while copied < self.file_len {
+            let write_len = writeback_chunk_len(self.file_len - copied)?;
+            let Some(chunk) = buffer.get_mut(..write_len) else {
+                return Err(BackendError::Hypervisor(format!(
+                    "HVF pmem shadow writeback chunk of {write_len} bytes is larger than the writeback buffer"
+                )));
+            };
+            let source = range.start().checked_add(copied).ok_or_else(|| {
+                BackendError::Hypervisor(format!(
+                    "HVF pmem shadow writeback offset {copied} overflows guest address space"
+                ))
+            })?;
+
+            memory.read_slice(chunk, source).map_err(|read_error| {
+                BackendError::Hypervisor(format!(
+                    "failed to read HVF pmem shadow memory at {source}: {read_error}"
+                ))
+            })?;
+            write_pmem_shadow_chunk(&self.backing, chunk, copied)?;
+
+            let write_len = u64::try_from(write_len).map_err(|_| {
+                BackendError::Hypervisor(format!(
+                    "HVF pmem shadow writeback chunk length {write_len} does not fit the guest address space"
+                ))
+            })?;
+            copied = copied.checked_add(write_len).ok_or_else(|| {
+                BackendError::Hypervisor(format!(
+                    "HVF pmem shadow writeback offset {copied} overflows"
+                ))
+            })?;
+        }
+
+        self.backing.sync_data().map_err(|source| {
+            BackendError::Hypervisor(format!("failed to sync HVF pmem backing file: {source}"))
+        })
+    }
+
+    fn shadow_range(&self, memory: &GuestMemory) -> Result<GuestMemoryRange, BackendError> {
+        let Some(region) = memory.regions().first() else {
+            return Err(BackendError::Hypervisor(
+                "HVF pmem shadow memory has no region to write back".to_string(),
+            ));
+        };
+
+        Ok(region.range())
+    }
+}
+
+fn write_pmem_shadow_chunk(backing: &File, chunk: &[u8], offset: u64) -> Result<(), BackendError> {
+    let mut written = 0;
+
+    while written < chunk.len() {
+        let Some(remaining) = chunk.get(written..) else {
+            return Err(BackendError::Hypervisor(format!(
+                "HVF pmem shadow writeback written length {written} exceeds chunk length {}",
+                chunk.len()
+            )));
+        };
+        let file_offset = checked_writeback_file_offset(offset, written)?;
+
+        match backing.write_at(remaining, file_offset) {
+            Ok(0) => {
+                return Err(BackendError::Hypervisor(format!(
+                    "failed to write HVF pmem shadow to backing file: {}",
+                    io::Error::from(io::ErrorKind::WriteZero)
+                )));
+            }
+            Ok(write_len) => {
+                written = written.checked_add(write_len).ok_or_else(|| {
+                    BackendError::Hypervisor(format!(
+                        "HVF pmem shadow writeback written length {written} overflows"
+                    ))
+                })?;
+            }
+            Err(source) if source.kind() == io::ErrorKind::Interrupted => {}
+            Err(source) => {
+                return Err(BackendError::Hypervisor(format!(
+                    "failed to write HVF pmem shadow to backing file: {source}"
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn checked_writeback_file_offset(offset: u64, written: usize) -> Result<u64, BackendError> {
+    let written = u64::try_from(written).map_err(|_| {
+        BackendError::Hypervisor(format!(
+            "HVF pmem shadow writeback written length {written} does not fit the backing file offset"
+        ))
+    })?;
+
+    offset.checked_add(written).ok_or_else(|| {
+        BackendError::Hypervisor(format!(
+            "HVF pmem shadow writeback file offset {offset}+{written} overflows"
+        ))
+    })
+}
+
+fn writeback_chunk_len(remaining: u64) -> Result<usize, BackendError> {
+    usize::try_from(remaining.min(HOST_MEMORY_WRITEBACK_BUFFER_SIZE as u64)).map_err(|_| {
+        BackendError::Hypervisor(format!(
+            "HVF pmem shadow writeback remaining length {remaining} does not fit this host"
+        ))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -718,6 +987,9 @@ fn validate_host_page_size(page_size: u64) -> Result<(), HvfGuestMemoryMappingEr
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use bangbang_runtime::memory::{
@@ -745,6 +1017,42 @@ mod tests {
 
     fn page_size() -> u64 {
         host_page_size().expect("host page size should be available for tests")
+    }
+
+    fn writable_pmem_permissions() -> HvfMemoryPermissions {
+        HvfMemoryPermissions::new(true, true, false)
+    }
+
+    fn host_pmem_mapping(
+        label: &str,
+        mut host_memory: GuestMemory,
+        range: GuestMemoryRange,
+        contents: &[u8],
+        file: &TempFile,
+        read_only: bool,
+    ) -> HvfHostMemoryMapping {
+        host_memory
+            .write_slice(contents, range.start())
+            .expect("test should write host mapping contents");
+        let backing = if read_only {
+            file.open_read_only()
+        } else {
+            file.open_read_write()
+        }
+        .expect("test should open pmem backing");
+
+        HvfHostMemoryMapping::new_pmem_shadow(
+            label,
+            host_memory,
+            if read_only {
+                HvfMemoryPermissions::READ
+            } else {
+                writable_pmem_permissions()
+            },
+            backing,
+            u64::try_from(contents.len()).expect("test contents length should fit in u64"),
+            read_only,
+        )
     }
 
     #[test]
@@ -1236,6 +1544,248 @@ mod tests {
         assert_eq!(mapper.unmap_count(), 0);
     }
 
+    #[test]
+    fn explicit_unmap_flushes_writable_pmem_shadow_to_backing() {
+        let page_size = page_size();
+        let guest_memory = memory_for_ranges(vec![range(0, page_size)]);
+        let pmem_range = range(page_size * 8, page_size);
+        let host_memory = memory_for_ranges(vec![pmem_range]);
+        let file = TempFile::with_bytes("pmem-writeback", b"before");
+        let mapper = Arc::new(RecordingMapper::default());
+        let host_mappings = vec![host_pmem_mapping(
+            "pmem device `pmem0`",
+            host_memory,
+            pmem_range,
+            b"after!",
+            &file,
+            false,
+        )];
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper_and_host_mappings(
+            guest_memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            host_mappings,
+            mapper,
+        )
+        .expect("guest and pmem memory should map");
+
+        mapping
+            .unmap_all()
+            .expect("unmap should flush writable pmem shadow");
+
+        assert_eq!(file.read_all(), b"after!");
+    }
+
+    #[test]
+    fn explicit_unmap_does_not_flush_read_only_pmem_shadow() {
+        let page_size = page_size();
+        let guest_memory = memory_for_ranges(vec![range(0, page_size)]);
+        let pmem_range = range(page_size * 8, page_size);
+        let host_memory = memory_for_ranges(vec![pmem_range]);
+        let file = TempFile::with_bytes("pmem-read-only-writeback", b"before");
+        let mapper = Arc::new(RecordingMapper::default());
+        let host_mappings = vec![host_pmem_mapping(
+            "pmem device `pmem0`",
+            host_memory,
+            pmem_range,
+            b"after!",
+            &file,
+            true,
+        )];
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper_and_host_mappings(
+            guest_memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            host_mappings,
+            mapper,
+        )
+        .expect("guest and read-only pmem memory should map");
+
+        mapping
+            .unmap_all()
+            .expect("unmap should skip read-only pmem writeback");
+
+        assert_eq!(file.read_all(), b"before");
+    }
+
+    #[test]
+    fn pmem_shadow_writeback_preserves_backing_file_position() {
+        let page_size = page_size();
+        let guest_memory = memory_for_ranges(vec![range(0, page_size)]);
+        let pmem_range = range(page_size * 8, page_size);
+        let mut host_memory = memory_for_ranges(vec![pmem_range]);
+        host_memory
+            .write_slice(b"after!", pmem_range.start())
+            .expect("test should write host mapping contents");
+        let file = TempFile::with_bytes("pmem-writeback-position", b"before");
+        let mut backing = file
+            .open_read_write()
+            .expect("test should open pmem backing");
+        backing
+            .seek(SeekFrom::Start(2))
+            .expect("test should set backing cursor");
+        let position_before = backing
+            .stream_position()
+            .expect("test should read backing cursor");
+        let mapper = Arc::new(RecordingMapper::default());
+        let host_mappings = vec![HvfHostMemoryMapping::new_pmem_shadow(
+            "pmem device `pmem0`",
+            host_memory,
+            writable_pmem_permissions(),
+            backing
+                .try_clone()
+                .expect("test should clone pmem backing handle"),
+            6,
+            false,
+        )];
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper_and_host_mappings(
+            guest_memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            host_mappings,
+            mapper,
+        )
+        .expect("guest and pmem memory should map");
+
+        mapping
+            .unmap_all()
+            .expect("unmap should flush writable pmem shadow");
+        let position_after = backing
+            .stream_position()
+            .expect("test should read backing cursor");
+
+        assert_eq!(position_after, position_before);
+        assert_eq!(file.read_all(), b"after!");
+    }
+
+    #[test]
+    fn pmem_shadow_writeback_error_does_not_leak_path() {
+        let page_size = page_size();
+        let guest_memory = memory_for_ranges(vec![range(0, page_size)]);
+        let pmem_range = range(page_size * 8, page_size);
+        let mut host_memory = memory_for_ranges(vec![pmem_range]);
+        host_memory
+            .write_slice(b"after!", pmem_range.start())
+            .expect("test should write host mapping contents");
+        let file = TempFile::with_bytes("secret-pmem-writeback-error", b"before");
+        let mapper = Arc::new(RecordingMapper::default());
+        let host_mappings = vec![HvfHostMemoryMapping::new_pmem_shadow(
+            "pmem device `pmem0`",
+            host_memory,
+            writable_pmem_permissions(),
+            file.open_read_only()
+                .expect("test should open read-only pmem backing"),
+            6,
+            false,
+        )];
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper_and_host_mappings(
+            guest_memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            host_mappings,
+            mapper,
+        )
+        .expect("guest and pmem memory should map");
+
+        let err = mapping
+            .unmap_all()
+            .expect_err("read-only file descriptor should fail writable writeback");
+        let message = err.to_string();
+
+        assert!(matches!(
+            err,
+            HvfGuestMemoryMappingError::FlushFailed { failures }
+                if failures.len() == 1
+                    && failures.first().is_some_and(|failure| {
+                        failure.label() == "pmem device `pmem0`"
+                            && failure.range() == Some(pmem_range)
+                    })
+        ));
+        assert!(message.contains("pmem device `pmem0`"));
+        assert!(message.contains(&pmem_range.to_string()));
+        assert!(!message.contains(&file.path_text()));
+    }
+
+    #[test]
+    fn explicit_unmap_flushes_multiple_pmem_shadows_independently() {
+        let page_size = page_size();
+        let guest_memory = memory_for_ranges(vec![range(0, page_size)]);
+        let first_range = range(page_size * 8, page_size);
+        let second_range = range(page_size * 9, page_size);
+        let first_host = memory_for_ranges(vec![first_range]);
+        let second_host = memory_for_ranges(vec![second_range]);
+        let first_file = TempFile::with_bytes("first-pmem-writeback", b"first-old");
+        let second_file = TempFile::with_bytes("second-pmem-writeback", b"second-old");
+        let mapper = Arc::new(RecordingMapper::default());
+        let host_mappings = vec![
+            host_pmem_mapping(
+                "pmem device `pmem0`",
+                first_host,
+                first_range,
+                b"first-new",
+                &first_file,
+                false,
+            ),
+            host_pmem_mapping(
+                "pmem device `pmem1`",
+                second_host,
+                second_range,
+                b"second-new",
+                &second_file,
+                false,
+            ),
+        ];
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper_and_host_mappings(
+            guest_memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            host_mappings,
+            mapper,
+        )
+        .expect("guest and pmem memory should map");
+
+        mapping
+            .unmap_all()
+            .expect("unmap should flush all writable pmem shadows");
+
+        assert_eq!(first_file.read_all(), b"first-new");
+        assert_eq!(second_file.read_all(), b"second-new");
+    }
+
+    #[test]
+    fn failed_unmap_does_not_flush_writable_pmem_shadow() {
+        let page_size = page_size();
+        let guest_memory = memory_for_ranges(vec![range(0, page_size)]);
+        let pmem_range = range(page_size * 8, page_size);
+        let host_memory = memory_for_ranges(vec![pmem_range]);
+        let file = TempFile::with_bytes("pmem-writeback-unmap-failure", b"before");
+        let mapper = Arc::new(RecordingMapper::new(None, true));
+        let host_mappings = vec![host_pmem_mapping(
+            "pmem device `pmem0`",
+            host_memory,
+            pmem_range,
+            b"after!",
+            &file,
+            false,
+        )];
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper_and_host_mappings(
+            guest_memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            host_mappings,
+            mapper,
+        )
+        .expect("guest and pmem memory should map");
+
+        let err = mapping
+            .unmap_all()
+            .expect_err("unmap failure should not flush pmem shadow");
+
+        assert!(matches!(
+            err,
+            HvfGuestMemoryMappingError::UnmapFailed { failures } if failures.len() == 2
+        ));
+        assert_eq!(file.read_all(), b"before");
+
+        drop(mapping);
+
+        assert_eq!(file.read_all(), b"before");
+    }
+
     #[derive(Debug)]
     struct RecordingMapper {
         state: Mutex<RecordingMapperState>,
@@ -1346,6 +1896,69 @@ mod tests {
         unmaps: Vec<HvfMappedGuestMemoryRegion>,
         fail_map_on: Option<usize>,
         fail_unmap: bool,
+    }
+
+    #[derive(Debug)]
+    struct TempFile {
+        path: PathBuf,
+    }
+
+    impl TempFile {
+        fn with_bytes(name: &str, bytes: &[u8]) -> Self {
+            static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "bangbang-hvf-memory-{name}-{}-{id}",
+                std::process::id()
+            ));
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .expect("test temp file should be created");
+            file.write_all(bytes)
+                .expect("test temp file should be initialized");
+            file.flush().expect("test temp file should flush");
+
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn path_text(&self) -> String {
+            self.path.to_string_lossy().into_owned()
+        }
+
+        fn open_read_only(&self) -> std::io::Result<std::fs::File> {
+            std::fs::OpenOptions::new().read(true).open(self.path())
+        }
+
+        fn open_read_write(&self) -> std::io::Result<std::fs::File> {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(self.path())
+        }
+
+        fn read_all(&self) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            let mut file = self
+                .open_read_only()
+                .expect("test temp file should open for read");
+            file.read_to_end(&mut bytes)
+                .expect("test temp file should read");
+            bytes
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 
     fn assert_send_sync<T: Send + Sync>() {}
