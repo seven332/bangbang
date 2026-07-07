@@ -1380,6 +1380,41 @@ mod macos_arm64 {
             );
         }
 
+        let hinting_start = http_json(
+            &socket_path,
+            "PATCH",
+            "/balloon/hinting/start",
+            r#"{"acknowledge_on_stop":false}"#,
+        );
+        assert_no_content_response(&hinting_start, "PATCH /balloon/hinting/start direct rootfs");
+        let started_hinting_status = http_get(&socket_path, "/balloon/hinting/status");
+        assert_ok_response(
+            &started_hinting_status,
+            "GET /balloon/hinting/status after start direct rootfs",
+        );
+        for expected in [r#""host_cmd":2"#, r#""guest_cmd":null"#] {
+            assert_response_contains(
+                &started_hinting_status,
+                expected,
+                "GET /balloon/hinting/status after start direct rootfs",
+            );
+        }
+
+        let hinting_stop = http_no_body(&socket_path, "PATCH", "/balloon/hinting/stop");
+        assert_no_content_response(&hinting_stop, "PATCH /balloon/hinting/stop direct rootfs");
+        let stopped_hinting_status = http_get(&socket_path, "/balloon/hinting/status");
+        assert_ok_response(
+            &stopped_hinting_status,
+            "GET /balloon/hinting/status after stop direct rootfs",
+        );
+        for expected in [r#""host_cmd":1"#, r#""guest_cmd":null"#] {
+            assert_response_contains(
+                &stopped_hinting_status,
+                expected,
+                "GET /balloon/hinting/status after stop direct rootfs",
+            );
+        }
+
         if let Err(err) = wait_for_file_prefix_marker(
             &data_backing_path,
             DIRECT_ROOTFS_BALLOON_MARKER,
