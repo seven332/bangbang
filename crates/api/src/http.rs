@@ -1321,6 +1321,30 @@ impl BalloonConfigResponse {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BalloonStatsResponse {
+    target_pages: u32,
+    actual_pages: u32,
+    target_mib: u32,
+    actual_mib: u32,
+}
+
+impl BalloonStatsResponse {
+    pub const fn new(
+        target_pages: u32,
+        actual_pages: u32,
+        target_mib: u32,
+        actual_mib: u32,
+    ) -> Self {
+        Self {
+            target_pages,
+            actual_pages,
+            target_mib,
+            actual_mib,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EntropyConfigResponse;
 
@@ -1757,6 +1781,13 @@ impl HttpResponse {
         }
     }
 
+    pub fn balloon_stats(stats: BalloonStatsResponse) -> Self {
+        Self {
+            status: StatusCode::Ok,
+            body: balloon_stats_response_value(&stats).to_string(),
+        }
+    }
+
     pub fn fault(message: &str) -> Self {
         let body = serde_json::json!({ "fault_message": message }).to_string();
 
@@ -1916,6 +1947,15 @@ fn balloon_config_response_value(balloon: &BalloonConfigResponse) -> serde_json:
         "free_page_hinting": balloon.free_page_hinting,
         "free_page_reporting": balloon.free_page_reporting,
         "stats_polling_interval_s": balloon.stats_polling_interval_s,
+    })
+}
+
+fn balloon_stats_response_value(stats: &BalloonStatsResponse) -> serde_json::Value {
+    serde_json::json!({
+        "actual_mib": stats.actual_mib,
+        "actual_pages": stats.actual_pages,
+        "target_mib": stats.target_mib,
+        "target_pages": stats.target_pages,
     })
 }
 
@@ -6964,6 +7004,24 @@ mod tests {
         assert_eq!(
             body.get("vsock").and_then(|vsock| vsock.get("vsock_id")),
             None
+        );
+    }
+
+    #[test]
+    fn response_body_contains_balloon_stats() {
+        let response = HttpResponse::balloon_stats(BalloonStatsResponse::new(1024, 513, 4, 2));
+        let body: serde_json::Value =
+            serde_json::from_str(response.body()).expect("body should be JSON");
+
+        assert_eq!(response.status(), StatusCode::Ok);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "actual_mib": 2,
+                "actual_pages": 513,
+                "target_mib": 4,
+                "target_pages": 1024,
+            })
         );
     }
 

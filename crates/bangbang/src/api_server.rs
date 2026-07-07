@@ -13,19 +13,22 @@ use std::time::{Duration, Instant};
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_api::http::{
     ActionRequest, ActionType, ApiRequest, ApiRequestMetricEndpoint, ApiRequestMetricPatchEndpoint,
-    ApiRequestMetricPutEndpoint, BalloonConfigRequest, BalloonConfigResponse, BalloonUpdateRequest,
-    BootSourceRequest, BootSourceResponse, CpuConfigRequest, DriveCacheType as ApiDriveCacheType,
-    DriveConfigRequest, DriveConfigResponse, DriveIoEngine as ApiDriveIoEngine, DrivePatchRequest,
-    EntropyConfigRequest, EntropyConfigResponse, HotUnplugDeviceKind as ApiHotUnplugDeviceKind,
-    HotUnplugDeviceRequest, HttpResponse, LoggerConfigRequest, LoggerLevel as ApiLoggerLevel,
-    MachineConfigPatchRequest, MachineConfigRequest, MachineConfigResponse, MetricsConfigRequest,
-    MmdsConfigRequest, MmdsConfigResponse, MmdsContentRequest, MmdsVersion as ApiMmdsVersion,
+    ApiRequestMetricPutEndpoint, BalloonConfigRequest, BalloonConfigResponse, BalloonStatsResponse,
+    BalloonUpdateRequest, BootSourceRequest, BootSourceResponse, CpuConfigRequest,
+    DriveCacheType as ApiDriveCacheType, DriveConfigRequest, DriveConfigResponse,
+    DriveIoEngine as ApiDriveIoEngine, DrivePatchRequest, EntropyConfigRequest,
+    EntropyConfigResponse, HotUnplugDeviceKind as ApiHotUnplugDeviceKind, HotUnplugDeviceRequest,
+    HttpResponse, LoggerConfigRequest, LoggerLevel as ApiLoggerLevel, MachineConfigPatchRequest,
+    MachineConfigRequest, MachineConfigResponse, MetricsConfigRequest, MmdsConfigRequest,
+    MmdsConfigResponse, MmdsContentRequest, MmdsVersion as ApiMmdsVersion,
     NetworkInterfaceConfigRequest, NetworkInterfaceConfigResponse, NetworkInterfacePatchRequest,
     PmemConfigRequest, PmemConfigResponse, RequestError, SerialConfigRequest, VmConfigResponse,
     VmStateUpdate, VmStateUpdateRequest, VsockConfigRequest, VsockConfigResponse,
     api_request_metric_endpoint, parse_request_with_limit, request_total_len_with_limit,
 };
-use bangbang_runtime::balloon::{BalloonConfig, BalloonConfigInput, BalloonUpdateInput};
+use bangbang_runtime::balloon::{
+    BalloonConfig, BalloonConfigInput, BalloonStats, BalloonUpdateInput,
+};
 use bangbang_runtime::block::{
     DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine, DriveUpdateInput,
 };
@@ -710,7 +713,7 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         )),
         ApiRequest::GetBalloon => handle_balloon(vmm.handle_get_request(GetApiRequest::Balloon)),
         ApiRequest::GetBalloonStats => {
-            handle_empty(vmm.handle_get_request(GetApiRequest::BalloonStats))
+            handle_balloon_stats(vmm.handle_get_request(GetApiRequest::BalloonStats))
         }
         ApiRequest::GetBalloonHintingStatus => {
             handle_empty(vmm.handle_get_request(GetApiRequest::BalloonHintingStatus))
@@ -927,6 +930,7 @@ fn handle_vmm_version(result: Result<VmmData, bangbang_runtime::VmmActionError>)
             VmmData::Empty
             | VmmData::InstanceInformation(_)
             | VmmData::BalloonConfiguration(_)
+            | VmmData::BalloonStatistics(_)
             | VmmData::MachineConfiguration(_)
             | VmmData::MmdsValue(_)
             | VmmData::VmConfiguration(_),
@@ -945,6 +949,7 @@ fn handle_instance_info(result: Result<VmmData, bangbang_runtime::VmmActionError
             VmmData::Empty
             | VmmData::VmmVersion(_)
             | VmmData::BalloonConfiguration(_)
+            | VmmData::BalloonStatistics(_)
             | VmmData::MachineConfiguration(_)
             | VmmData::MmdsValue(_)
             | VmmData::VmConfiguration(_),
@@ -969,6 +974,7 @@ fn handle_machine_config(
             | VmmData::VmmVersion(_)
             | VmmData::InstanceInformation(_)
             | VmmData::BalloonConfiguration(_)
+            | VmmData::BalloonStatistics(_)
             | VmmData::MmdsValue(_)
             | VmmData::VmConfiguration(_),
         ) => HttpResponse::fault("machine config request returned unexpected VMM data."),
@@ -985,10 +991,29 @@ fn handle_balloon(result: Result<VmmData, bangbang_runtime::VmmActionError>) -> 
             VmmData::Empty
             | VmmData::VmmVersion(_)
             | VmmData::InstanceInformation(_)
+            | VmmData::BalloonStatistics(_)
             | VmmData::MachineConfiguration(_)
             | VmmData::MmdsValue(_)
             | VmmData::VmConfiguration(_),
         ) => HttpResponse::fault("balloon request returned unexpected VMM data."),
+        Err(err) => HttpResponse::fault(&err.to_string()),
+    }
+}
+
+fn handle_balloon_stats(result: Result<VmmData, bangbang_runtime::VmmActionError>) -> HttpResponse {
+    match result {
+        Ok(VmmData::BalloonStatistics(stats)) => {
+            HttpResponse::balloon_stats(balloon_stats_response_from_runtime(stats))
+        }
+        Ok(
+            VmmData::Empty
+            | VmmData::VmmVersion(_)
+            | VmmData::InstanceInformation(_)
+            | VmmData::BalloonConfiguration(_)
+            | VmmData::MachineConfiguration(_)
+            | VmmData::MmdsValue(_)
+            | VmmData::VmConfiguration(_),
+        ) => HttpResponse::fault("balloon statistics request returned unexpected VMM data."),
         Err(err) => HttpResponse::fault(&err.to_string()),
     }
 }
@@ -1003,6 +1028,7 @@ fn handle_vm_config(result: Result<VmmData, bangbang_runtime::VmmActionError>) -
             | VmmData::VmmVersion(_)
             | VmmData::InstanceInformation(_)
             | VmmData::BalloonConfiguration(_)
+            | VmmData::BalloonStatistics(_)
             | VmmData::MachineConfiguration(_)
             | VmmData::MmdsValue(_),
         ) => HttpResponse::fault("VM config request returned unexpected VMM data."),
@@ -1018,6 +1044,7 @@ fn handle_mmds(result: Result<VmmData, bangbang_runtime::VmmActionError>) -> Htt
             | VmmData::VmmVersion(_)
             | VmmData::InstanceInformation(_)
             | VmmData::BalloonConfiguration(_)
+            | VmmData::BalloonStatistics(_)
             | VmmData::MachineConfiguration(_)
             | VmmData::VmConfiguration(_),
         ) => HttpResponse::fault("MMDS request returned unexpected VMM data."),
@@ -1032,6 +1059,7 @@ fn handle_empty(result: Result<VmmData, bangbang_runtime::VmmActionError>) -> Ht
             VmmData::InstanceInformation(_)
             | VmmData::VmmVersion(_)
             | VmmData::BalloonConfiguration(_)
+            | VmmData::BalloonStatistics(_)
             | VmmData::MachineConfiguration(_)
             | VmmData::MmdsValue(_)
             | VmmData::VmConfiguration(_),
@@ -1085,6 +1113,15 @@ fn balloon_config_response_from_runtime(config: BalloonConfig) -> BalloonConfigR
         config.stats_polling_interval_s(),
         config.free_page_hinting(),
         config.free_page_reporting(),
+    )
+}
+
+fn balloon_stats_response_from_runtime(stats: BalloonStats) -> BalloonStatsResponse {
+    BalloonStatsResponse::new(
+        stats.target_pages(),
+        stats.actual_pages(),
+        stats.target_mib(),
+        stats.actual_mib(),
     )
 }
 
@@ -1541,7 +1578,9 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use bangbang_runtime::balloon::{BalloonConfig, BalloonUpdateError};
+    use bangbang_runtime::balloon::{
+        BalloonConfig, BalloonStats, BalloonStatsError, BalloonUpdateError,
+    };
     use bangbang_runtime::block::DriveUpdateError;
     use bangbang_runtime::logger::{LoggerConfigInput, LoggerWriteError};
     use bangbang_runtime::machine::MAX_MEM_SIZE_MIB;
@@ -1612,6 +1651,13 @@ mod tests {
 
         fn update_balloon(&mut self, _config: BalloonConfig) -> Result<(), BalloonUpdateError> {
             Ok(())
+        }
+
+        fn balloon_stats(
+            &mut self,
+            config: BalloonConfig,
+        ) -> Result<BalloonStats, BalloonStatsError> {
+            BalloonStats::from_config_and_actual_pages(config, 0)
         }
 
         fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
@@ -5846,6 +5892,17 @@ mod tests {
         assert!(get_updated_response.contains(r#""stats_polling_interval_s":60"#));
         assert!(get_updated_response.contains(r#""free_page_hinting":true"#));
         assert!(get_updated_response.contains(r#""free_page_reporting":false"#));
+
+        let stats_response = request_over_socket(
+            &mut vmm,
+            "b-get-stats-running",
+            "GET /balloon/statistics HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(stats_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(stats_response.contains(r#""target_pages":32768"#));
+        assert!(stats_response.contains(r#""actual_pages":0"#));
+        assert!(stats_response.contains(r#""target_mib":128"#));
+        assert!(stats_response.contains(r#""actual_mib":0"#));
 
         let oversized_patch_response = request_over_socket(
             &mut vmm,

@@ -280,7 +280,9 @@ change host memory accounting or reclaim behavior until those host-side paths
 are implemented and reviewed.
 Runtime balloon target-size updates change only the stored target and active
 virtio-balloon `num_pages` config-space value, then signal a config interrupt;
-they do not map, unmap, reclaim, or release host memory.
+they do not map, unmap, reclaim, or release host memory. Balloon statistics
+queries read the stored target and internal inflated-page count only; they do
+not process guest statistics descriptors or change host memory accounting.
 
 The current serial device is a TX-only MMIO output path. By default, guest
 serial bytes go to a bounded internal capture buffer; when `/serial` configures
