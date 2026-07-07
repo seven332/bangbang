@@ -7,6 +7,111 @@ use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+use crate::mmio::{MmioAccessBytes, MmioAccessBytesError, MmioHandlerError};
+use crate::virtio_mmio::{
+    VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError, VirtioMmioDeviceConfigHandler,
+};
+
+pub const VIRTIO_PMEM_DEVICE_ID: u32 = 27;
+pub const VIRTIO_PMEM_QUEUE_COUNT: usize = 1;
+pub const VIRTIO_PMEM_QUEUE_SIZE: u16 = 256;
+pub const VIRTIO_PMEM_QUEUE_SIZES: [u16; VIRTIO_PMEM_QUEUE_COUNT] = [VIRTIO_PMEM_QUEUE_SIZE];
+pub const VIRTIO_PMEM_CONFIG_SPACE_SIZE: usize = 16;
+pub const VIRTIO_PMEM_ALIGNMENT: u64 = 2 * 1024 * 1024;
+pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VirtioPmemConfigSpace {
+    start: u64,
+    size: u64,
+}
+
+impl VirtioPmemConfigSpace {
+    pub const fn new(start: u64, size: u64) -> Self {
+        Self { start, size }
+    }
+
+    pub const fn start(self) -> u64 {
+        self.start
+    }
+
+    pub const fn size(self) -> u64 {
+        self.size
+    }
+
+    pub const fn available_features(self) -> u64 {
+        virtio_feature_bit(VIRTIO_FEATURE_VERSION_1)
+    }
+
+    pub const fn from_le_bytes(bytes: [u8; VIRTIO_PMEM_CONFIG_SPACE_SIZE]) -> Self {
+        let [
+            start0,
+            start1,
+            start2,
+            start3,
+            start4,
+            start5,
+            start6,
+            start7,
+            size0,
+            size1,
+            size2,
+            size3,
+            size4,
+            size5,
+            size6,
+            size7,
+        ] = bytes;
+        Self {
+            start: u64::from_le_bytes([
+                start0, start1, start2, start3, start4, start5, start6, start7,
+            ]),
+            size: u64::from_le_bytes([size0, size1, size2, size3, size4, size5, size6, size7]),
+        }
+    }
+
+    pub fn to_le_bytes(self) -> [u8; VIRTIO_PMEM_CONFIG_SPACE_SIZE] {
+        let [
+            start0,
+            start1,
+            start2,
+            start3,
+            start4,
+            start5,
+            start6,
+            start7,
+        ] = self.start.to_le_bytes();
+        let [size0, size1, size2, size3, size4, size5, size6, size7] = self.size.to_le_bytes();
+
+        [
+            start0, start1, start2, start3, start4, start5, start6, start7, size0, size1, size2,
+            size3, size4, size5, size6, size7,
+        ]
+    }
+}
+
+impl VirtioMmioDeviceConfigHandler for VirtioPmemConfigSpace {
+    fn read_device_config(
+        &self,
+        access: VirtioMmioDeviceConfigAccess,
+    ) -> Result<MmioAccessBytes, VirtioMmioDeviceConfigError> {
+        let bytes = self.to_le_bytes();
+        let bytes = read_virtio_pmem_config_bytes(&bytes, access)?;
+        MmioAccessBytes::new(bytes).map_err(config_bytes_error)
+    }
+
+    fn write_device_config(
+        &mut self,
+        access: VirtioMmioDeviceConfigAccess,
+        _data: MmioAccessBytes,
+    ) -> Result<(), VirtioMmioDeviceConfigError> {
+        Err(VirtioMmioDeviceConfigError::UnsupportedWrite {
+            offset: access.offset(),
+            len: access.len(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PmemConfigInput {
     id: String,
@@ -381,6 +486,41 @@ fn validate_pmem_id(id: &str) -> Result<(), PmemConfigError> {
     Ok(())
 }
 
+const fn virtio_feature_bit(feature: u32) -> u64 {
+    1_u64 << feature
+}
+
+fn read_virtio_pmem_config_bytes(
+    bytes: &[u8; VIRTIO_PMEM_CONFIG_SPACE_SIZE],
+    access: VirtioMmioDeviceConfigAccess,
+) -> Result<&[u8], VirtioMmioDeviceConfigError> {
+    let offset = usize::try_from(access.offset()).map_err(|_| {
+        VirtioMmioDeviceConfigError::UnsupportedRead {
+            offset: access.offset(),
+            len: access.len(),
+        }
+    })?;
+    let Some(end) = offset.checked_add(access.len()) else {
+        return Err(VirtioMmioDeviceConfigError::UnsupportedRead {
+            offset: access.offset(),
+            len: access.len(),
+        });
+    };
+
+    bytes
+        .get(offset..end)
+        .ok_or(VirtioMmioDeviceConfigError::UnsupportedRead {
+            offset: access.offset(),
+            len: access.len(),
+        })
+}
+
+fn config_bytes_error(source: MmioAccessBytesError) -> VirtioMmioDeviceConfigError {
+    VirtioMmioDeviceConfigError::Handler {
+        source: MmioHandlerError::new(format!("virtio-pmem config access bytes failed: {source}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
@@ -394,6 +534,15 @@ mod tests {
 
     use super::*;
 
+    use crate::memory::GuestAddress;
+    use crate::mmio::{MmioAccess, MmioAccessBytes, MmioBus, MmioOperation, MmioRegionId};
+    use crate::virtio_mmio::{
+        VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioAccess,
+        VirtioMmioDeviceConfigError, decode_virtio_mmio_access,
+    };
+
+    const TEST_PMEM_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_0000);
+    const TEST_PMEM_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(9000);
     static NEXT_TEMP_PATH_ID: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Debug)]
@@ -502,6 +651,167 @@ mod tests {
 
     fn open_backing(path: &Path, read_only: bool) -> Result<PmemFileBacking, PmemFileBackingError> {
         PmemFileBacking::open(&config_for_path(path, read_only))
+    }
+
+    fn device_config_read_access(offset: u64, len: u64) -> VirtioMmioDeviceConfigAccess {
+        let operation =
+            MmioOperation::read(mmio_access(offset, len)).expect("read operation should build");
+        decode_device_config_access(operation)
+    }
+
+    fn device_config_write_access(
+        offset: u64,
+        data: MmioAccessBytes,
+    ) -> VirtioMmioDeviceConfigAccess {
+        let len = u64::try_from(data.len()).expect("test write length should fit u64");
+        let operation = MmioOperation::write(mmio_access(offset, len), data)
+            .expect("write operation should build");
+        decode_device_config_access(operation)
+    }
+
+    fn mmio_access(offset: u64, len: u64) -> MmioAccess {
+        let mut bus = MmioBus::new();
+        bus.insert(
+            TEST_PMEM_MMIO_REGION_ID,
+            TEST_PMEM_MMIO_BASE,
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+        )
+        .expect("test MMIO region should insert");
+        let start = TEST_PMEM_MMIO_BASE
+            .checked_add(VIRTIO_MMIO_DEVICE_CONFIG_OFFSET + offset)
+            .expect("test MMIO address should not overflow");
+        bus.lookup(start, len)
+            .expect("test MMIO access should look up")
+    }
+
+    fn decode_device_config_access(operation: MmioOperation) -> VirtioMmioDeviceConfigAccess {
+        match decode_virtio_mmio_access(&operation).expect("access should decode") {
+            VirtioMmioAccess::DeviceConfig(access) => access,
+            _ => panic!("test access should target device config"),
+        }
+    }
+
+    fn read_pmem_config(
+        config: &VirtioPmemConfigSpace,
+        offset: u64,
+        len: u64,
+    ) -> Result<MmioAccessBytes, VirtioMmioDeviceConfigError> {
+        config.read_device_config(device_config_read_access(offset, len))
+    }
+
+    fn write_pmem_config(
+        config: &mut VirtioPmemConfigSpace,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), VirtioMmioDeviceConfigError> {
+        let data = MmioAccessBytes::new(data).expect("write bytes should be valid");
+        config.write_device_config(device_config_write_access(offset, data), data)
+    }
+
+    #[test]
+    fn virtio_pmem_constants_match_firecracker_shape() {
+        assert_eq!(VIRTIO_PMEM_DEVICE_ID, 27);
+        assert_eq!(VIRTIO_PMEM_QUEUE_COUNT, 1);
+        assert_eq!(VIRTIO_PMEM_QUEUE_SIZE, 256);
+        assert_eq!(VIRTIO_PMEM_QUEUE_SIZES, [VIRTIO_PMEM_QUEUE_SIZE]);
+        assert_eq!(VIRTIO_PMEM_CONFIG_SPACE_SIZE, 16);
+        assert_eq!(VIRTIO_PMEM_ALIGNMENT, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn virtio_pmem_config_space_tracks_start_and_size() {
+        let config = VirtioPmemConfigSpace::new(0x1000_0000, 0x0200_0000);
+
+        assert_eq!(config.start(), 0x1000_0000);
+        assert_eq!(config.size(), 0x0200_0000);
+    }
+
+    #[test]
+    fn virtio_pmem_config_space_uses_firecracker_little_endian_layout() {
+        let config = VirtioPmemConfigSpace::new(0x0102_0304_0506_0708, 0x1112_1314_1516_1718);
+        let bytes = [
+            0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13,
+            0x12, 0x11,
+        ];
+
+        assert_eq!(config.to_le_bytes(), bytes);
+        assert_eq!(VirtioPmemConfigSpace::from_le_bytes(bytes), config);
+    }
+
+    #[test]
+    fn virtio_pmem_config_space_preserves_u64_boundaries() {
+        let config = VirtioPmemConfigSpace::new(u64::MAX, u64::MAX);
+
+        assert_eq!(config.to_le_bytes(), [0xff; VIRTIO_PMEM_CONFIG_SPACE_SIZE]);
+        assert_eq!(
+            VirtioPmemConfigSpace::from_le_bytes([0xff; VIRTIO_PMEM_CONFIG_SPACE_SIZE]),
+            config
+        );
+    }
+
+    #[test]
+    fn virtio_pmem_config_space_advertises_modern_virtio_feature() {
+        let config = VirtioPmemConfigSpace::new(0, 0);
+
+        assert_eq!(
+            config.available_features(),
+            1_u64 << VIRTIO_FEATURE_VERSION_1
+        );
+    }
+
+    #[test]
+    fn virtio_pmem_config_space_reads_within_layout() {
+        let config = VirtioPmemConfigSpace::new(0x0102_0304_0506_0708, 0x1112_1314_1516_1718);
+
+        assert_eq!(
+            read_pmem_config(&config, 0, 8)
+                .expect("start read should succeed")
+                .as_slice(),
+            &0x0102_0304_0506_0708_u64.to_le_bytes()
+        );
+        assert_eq!(
+            read_pmem_config(&config, 8, 8)
+                .expect("size read should succeed")
+                .as_slice(),
+            &0x1112_1314_1516_1718_u64.to_le_bytes()
+        );
+        assert_eq!(
+            read_pmem_config(&config, 4, 4)
+                .expect("partial read should succeed")
+                .as_slice(),
+            &[0x04, 0x03, 0x02, 0x01]
+        );
+        assert_eq!(
+            read_pmem_config(&config, 15, 1)
+                .expect("last byte read should succeed")
+                .as_slice(),
+            &[0x11]
+        );
+    }
+
+    #[test]
+    fn virtio_pmem_config_space_rejects_out_of_bounds_reads() {
+        let config = VirtioPmemConfigSpace::new(0, 0);
+
+        assert_eq!(
+            read_pmem_config(&config, 16, 1),
+            Err(VirtioMmioDeviceConfigError::UnsupportedRead { offset: 16, len: 1 })
+        );
+        assert_eq!(
+            read_pmem_config(&config, 15, 2),
+            Err(VirtioMmioDeviceConfigError::UnsupportedRead { offset: 15, len: 2 })
+        );
+    }
+
+    #[test]
+    fn virtio_pmem_config_space_rejects_guest_writes() {
+        let mut config = VirtioPmemConfigSpace::new(0, 0);
+
+        assert_eq!(
+            write_pmem_config(&mut config, 0, &[1, 2, 3, 4]),
+            Err(VirtioMmioDeviceConfigError::UnsupportedWrite { offset: 0, len: 4 })
+        );
+        assert_eq!(config, VirtioPmemConfigSpace::new(0, 0));
     }
 
     #[test]
