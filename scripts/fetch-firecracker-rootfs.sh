@@ -114,7 +114,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v18"
+direct_boot_variant="direct-boot-v19"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -476,6 +476,49 @@ read_entropy_marker() {
       write_vdb_marker BANGBANG_ENTROPY_GUEST_READ_OK
       ;;
   esac
+}
+
+first_pmem_device() {
+  for pmem_device_path in /dev/pmem*; do
+    if [ -b "$pmem_device_path" ]; then
+      printf '%s\n' "$pmem_device_path"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+read_flush_pmem_marker() {
+  host_marker=BANGBANG_PMEM_HOST_MARKER
+  guest_marker=BANGBANG_PMEM_GUEST_FLUSH_OK
+  guest_marker_offset=4096
+  pmem_device=$(first_pmem_device || true)
+  if [ -z "$pmem_device" ]; then
+    emit_line BANGBANG_PMEM_READ_FLUSH_FAIL_NO_DEVICE
+    write_vdb_marker BANGBANG_PMEM_READ_FLUSH_FAIL
+    return
+  fi
+
+  host_marker_value=$(
+    dd if="$pmem_device" bs=1 count="${#host_marker}" 2>/dev/null || true
+  )
+  if [ "$host_marker_value" != "$host_marker" ]; then
+    emit_line BANGBANG_PMEM_READ_FLUSH_FAIL_BAD_MARKER
+    write_vdb_marker BANGBANG_PMEM_READ_FLUSH_FAIL
+    return
+  fi
+
+  if ! printf '%s' "$guest_marker" \
+    | dd of="$pmem_device" bs=1 seek="$guest_marker_offset" conv=notrunc 2>/dev/null; then
+    emit_line BANGBANG_PMEM_READ_FLUSH_FAIL_WRITE
+    write_vdb_marker BANGBANG_PMEM_READ_FLUSH_FAIL
+    return
+  fi
+
+  sync "$pmem_device" 2>/dev/null || sync
+  emit_line BANGBANG_PMEM_READ_FLUSH_OK
+  write_vdb_marker BANGBANG_PMEM_READ_FLUSH_OK
 }
 
 fetch_mmds_v2_marker() {
@@ -958,6 +1001,8 @@ if [ -r /proc/cmdline ]; then
 fi
 if cmdline_has bangbang.entropy-read=1; then
   read_entropy_marker
+elif cmdline_has bangbang.pmem-read-flush=1; then
+  read_flush_pmem_marker
 elif cmdline_has bangbang.mmds-v2-fetch=1; then
   fetch_mmds_v2_marker
 elif cmdline_has bangbang.mmds-fetch=1; then

@@ -112,6 +112,15 @@ impl HvfBackend {
             .memory_mut()
     }
 
+    pub(crate) fn flush_mapped_pmem_shadows(&self) -> Result<(), HvfGuestMemoryMappingError> {
+        self.guest_memory
+            .as_ref()
+            .ok_or(HvfGuestMemoryMappingError::InvalidState(
+                GUEST_MEMORY_NOT_MAPPED_MESSAGE,
+            ))?
+            .flush_host_memory_now()
+    }
+
     pub fn create_gic(&mut self) -> Result<&HvfGicMetadata, HvfGicError> {
         if !Self::is_supported_target() {
             return Err(HvfGicError::Unsupported(

@@ -21,6 +21,14 @@ const ROOTFS_READ_MARKER: &[u8] = b"BANGBANG_ROOTFS_READ_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const DIRECT_ROOTFS_BOOT_MARKER: &[u8] = b"BANGBANG_DIRECT_ROOTFS_BOOT_OK";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PMEM_READ_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_READ_FLUSH_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PMEM_HOST_MARKER: &[u8] = b"BANGBANG_PMEM_HOST_MARKER";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PMEM_GUEST_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_GUEST_FLUSH_OK";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PMEM_GUEST_FLUSH_OFFSET: u64 = 4096;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const ROOTFS_OS_RELEASE_ID: &[u8] = b"ID=ubuntu";
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const ROOTFS_OS_RELEASE_CODENAME: &[u8] = b"VERSION_CODENAME=noble";
@@ -290,6 +298,56 @@ fn boots_firecracker_kernel_from_ext4_rootfs() {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn boots_firecracker_kernel_reads_and_flushes_virtio_pmem() {
+    use bangbang_runtime::VmmAction;
+    use bangbang_runtime::block::DriveConfigInput;
+    use bangbang_runtime::pmem::PmemConfigInput;
+
+    let _test_lock = GUEST_BOOT_TEST_LOCK
+        .lock()
+        .expect("guest boot integration test lock should not be poisoned");
+    let rootfs_path = env_path("BANGBANG_GUEST_EXT4_ROOTFS_PATH");
+    let pmem_backing = GuestPmemBacking::new(PMEM_HOST_MARKER);
+    let boot_args = format!("{DIRECT_ROOTFS_BOOT_ARGS} bangbang.pmem-read-flush=1");
+    let observation = run_guest_boot_without_initrd_until_marker(
+        "guest-pmem-read-flush",
+        DIRECT_ROOTFS_BOOT_MARKER,
+        &boot_args,
+        |controller| {
+            controller
+                .handle_action(VmmAction::PutDrive(
+                    DriveConfigInput::new("rootfs", "rootfs", rootfs_path.as_path(), true)
+                        .with_is_read_only(true),
+                ))
+                .expect("guest ext4 rootfs drive should configure");
+            controller
+                .handle_action(VmmAction::PutPmem(PmemConfigInput::new(
+                    "pmem0",
+                    pmem_backing.path_text(),
+                )))
+                .expect("guest pmem device should configure");
+        },
+    );
+
+    assert_guest_boot_observed_marker(
+        &observation,
+        DIRECT_ROOTFS_BOOT_MARKER,
+        "direct rootfs boot marker",
+    );
+    assert!(
+        bytes_contain_marker(&observation.serial_bytes, PMEM_READ_FLUSH_MARKER),
+        "pmem read-flush boot should observe pmem marker\nserial output:\n{}",
+        String::from_utf8_lossy(&observation.serial_bytes)
+    );
+    assert_eq!(
+        pmem_backing.bytes_at(PMEM_GUEST_FLUSH_OFFSET, PMEM_GUEST_FLUSH_MARKER.len()),
+        PMEM_GUEST_FLUSH_MARKER,
+        "guest pmem flush should persist the guest marker to the host backing file"
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run_guest_boot_until_marker(
     instance_id: &str,
     marker: &[u8],
@@ -511,6 +569,64 @@ impl GuestBlockBacking {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl Drop for GuestBlockBacking {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct GuestPmemBacking {
+    path: std::path::PathBuf,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl GuestPmemBacking {
+    fn new(marker: &[u8]) -> Self {
+        use std::io::Write;
+
+        let mut path = std::env::temp_dir();
+        let unique = format!(
+            "bangbang-guest-pmem-{}-{}.img",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("guest pmem backing timestamp should be after epoch")
+                .as_nanos()
+        );
+        path.push(unique);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("guest pmem backing should create");
+        file.set_len(bangbang_runtime::pmem::VIRTIO_PMEM_ALIGNMENT)
+            .expect("guest pmem backing size should be set");
+        file.write_all(marker)
+            .expect("guest pmem host marker should write");
+
+        Self { path }
+    }
+
+    fn path_text(&self) -> String {
+        self.path.to_string_lossy().into_owned()
+    }
+
+    fn bytes_at(&self, offset: u64, len: usize) -> Vec<u8> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut bytes = vec![0; len];
+        let mut file = std::fs::File::open(&self.path).expect("guest pmem backing should open");
+        file.seek(SeekFrom::Start(offset))
+            .expect("guest pmem backing should seek");
+        file.read_exact(&mut bytes)
+            .expect("guest pmem backing should read");
+        bytes
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for GuestPmemBacking {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }

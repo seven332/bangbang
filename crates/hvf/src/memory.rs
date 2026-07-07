@@ -387,6 +387,21 @@ impl HvfGuestMemoryMapping {
             ))
     }
 
+    pub(crate) fn flush_host_memory_now(&self) -> Result<(), HvfGuestMemoryMappingError> {
+        let mut failures = Vec::new();
+        for mapping in &self.host_memory {
+            if let Err(source) = mapping.flush() {
+                failures.push(source);
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(HvfGuestMemoryMappingError::FlushFailed { failures })
+        }
+    }
+
     // HVF destroys guest mappings with the VM. Use this only after `hv_vm_destroy`
     // succeeds following an earlier unmap failure.
     pub(crate) fn release_after_vm_destroy(mut self) {
@@ -478,19 +493,9 @@ impl HvfGuestMemoryMapping {
             return Ok(());
         }
 
-        let mut failures = Vec::new();
-        for mapping in &self.host_memory {
-            if let Err(source) = mapping.flush() {
-                failures.push(source);
-            }
-        }
-
-        if failures.is_empty() {
-            self.host_memory_flushed = true;
-            Ok(())
-        } else {
-            Err(HvfGuestMemoryMappingError::FlushFailed { failures })
-        }
+        self.flush_host_memory_now()?;
+        self.host_memory_flushed = true;
+        Ok(())
     }
 }
 
@@ -1602,6 +1607,68 @@ mod tests {
         mapping
             .unmap_all()
             .expect("unmap should skip read-only pmem writeback");
+
+        assert_eq!(file.read_all(), b"before");
+    }
+
+    #[test]
+    fn explicit_pmem_shadow_flush_writes_writable_shadow_to_backing() {
+        let page_size = page_size();
+        let guest_memory = memory_for_ranges(vec![range(0, page_size)]);
+        let pmem_range = range(page_size * 8, page_size);
+        let host_memory = memory_for_ranges(vec![pmem_range]);
+        let file = TempFile::with_bytes("pmem-explicit-flush", b"before");
+        let mapper = Arc::new(RecordingMapper::default());
+        let host_mappings = vec![host_pmem_mapping(
+            "pmem device `pmem0`",
+            host_memory,
+            pmem_range,
+            b"after!",
+            &file,
+            false,
+        )];
+        let mapping = HvfGuestMemoryMapping::map_with_mapper_and_host_mappings(
+            guest_memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            host_mappings,
+            mapper,
+        )
+        .expect("guest and pmem memory should map");
+
+        mapping
+            .flush_host_memory_now()
+            .expect("explicit flush should write writable pmem shadow");
+
+        assert_eq!(file.read_all(), b"after!");
+    }
+
+    #[test]
+    fn explicit_pmem_shadow_flush_skips_read_only_shadow() {
+        let page_size = page_size();
+        let guest_memory = memory_for_ranges(vec![range(0, page_size)]);
+        let pmem_range = range(page_size * 8, page_size);
+        let host_memory = memory_for_ranges(vec![pmem_range]);
+        let file = TempFile::with_bytes("pmem-explicit-flush-read-only", b"before");
+        let mapper = Arc::new(RecordingMapper::default());
+        let host_mappings = vec![host_pmem_mapping(
+            "pmem device `pmem0`",
+            host_memory,
+            pmem_range,
+            b"after!",
+            &file,
+            true,
+        )];
+        let mapping = HvfGuestMemoryMapping::map_with_mapper_and_host_mappings(
+            guest_memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            host_mappings,
+            mapper,
+        )
+        .expect("guest and read-only pmem memory should map");
+
+        mapping
+            .flush_host_memory_now()
+            .expect("explicit flush should skip read-only pmem shadow");
 
         assert_eq!(file.read_all(), b"before");
     }
