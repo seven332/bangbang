@@ -186,7 +186,7 @@ starts `bangbang` as a child process, configures the VM through the Unix-socket
 API or a Firecracker-shaped config file depending on the scenario, and waits for
 the guest to write deterministic markers to host-observable outputs. The
 tiny-initrd scenarios write `BANGBANG_BLOCK_WRITE_OK` to scratch block backing
-files. The API-request scenario also verifies the configured serial output file.
+files and include API/config-file coverage for configured serial output files.
 The API-request, API-enabled config-file, and no-api config-file scenarios
 verify vsock listener binding during startup and owned vsock listener cleanup
 on shutdown. The API-request and API-enabled config-file scenarios verify
@@ -195,11 +195,14 @@ stop scenarios boot the tiny initrd's `/poweroff-init` or `/reboot-init`, which
 invoke Linux reboot syscalls so the kernel issues PSCI `SYSTEM_OFF` or
 `SYSTEM_RESET`, and verify that API-enabled and no-api `bangbang` processes
 exit successfully. The
-direct-rootfs scenarios boot the generated ext4 rootfs without an initrd and
-write `BANGBANG_DIRECT_ROOTFS_BLOCK_OK` through a second writable drive. This
-verifies the public process/API/config-file/HVF path, including public serial
-output redirection and minimal observability output. The executable HVF e2e
-target also includes direct-rootfs MMDS v1 and v2 token-flow scenarios that
+direct-rootfs scenarios boot the generated ext4 rootfs without an initrd. They
+include a public `/serial` scenario that waits for
+`BANGBANG_DIRECT_ROOTFS_BOOT_OK` in the configured serial output file, plus
+scratch-drive scenarios that write `BANGBANG_DIRECT_ROOTFS_BLOCK_OK` through a
+second writable drive. This verifies the public process/API/config-file/HVF
+path, including public serial output redirection and minimal observability
+output. The executable HVF e2e target also includes direct-rootfs MMDS v1 and
+v2 token-flow scenarios that
 configure a `vmnet:shared` network interface, configure MMDS for that
 interface, fetch a deterministic MMDS value from the guest through
 `169.254.169.254`, and write host-observable markers to unique scratch drives.
@@ -313,10 +316,13 @@ of the pinned Firecracker rootfs with a test-specific
 boots without the tiny initrd, attaches that ext4 image as a read-only root
 drive, and passes `init=/bangbang-direct-rootfs-init`. The `guest_boot` target
 expects deterministic serial markers plus Ubuntu os-release content from
-`/etc/os-release`; the direct-rootfs executable HVF e2e scenarios observe
-`BANGBANG_DIRECT_ROOTFS_BLOCK_OK` in a second writable scratch drive because
-those scenarios do not configure a public serial output path. When the boot
-args also include `bangbang.mmds-fetch=1`, the same init script configures the
+`/etc/os-release`; one direct-rootfs executable HVF e2e scenario configures
+public `/serial` output and waits for `BANGBANG_DIRECT_ROOTFS_BOOT_OK` in the
+host output file. Most other direct-rootfs executable HVF e2e scenarios observe
+guest success through a second writable scratch drive, using markers such as
+`BANGBANG_DIRECT_ROOTFS_BLOCK_OK`, because they do not configure a public serial
+output path. When the boot args also include `bangbang.mmds-fetch=1`, the same
+init script configures the
 first non-loopback guest interface with a link-local address, runs a bounded
 `curl` request for `/meta-data/bangbang-marker`, and writes
 `BANGBANG_MMDS_GUEST_FETCH_OK` to the scratch drive only after the expected
