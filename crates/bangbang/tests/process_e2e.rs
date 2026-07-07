@@ -436,6 +436,28 @@ fn executable_handles_remaining_device_requests_and_pmem_config() {
         "rejected pmem update must not replace stored path: {pmem_vm_config_after_fault}"
     );
 
+    let pmem_empty_path_response = http_put_json(
+        &socket_path,
+        "/pmem/pmem0",
+        r#"{"id":"pmem0","path_on_host":""}"#,
+    );
+    assert_bad_request_response(&pmem_empty_path_response, "PUT /pmem/pmem0 empty path");
+    assert_response_contains(
+        &pmem_empty_path_response,
+        r#"{"fault_message":"pmem path_on_host must not be empty"}"#,
+        "PUT /pmem/pmem0 empty path",
+    );
+    let pmem_vm_config_after_empty_path = http_get(&socket_path, "/vm/config");
+    assert_ok_response(
+        &pmem_vm_config_after_empty_path,
+        "GET /vm/config after rejected PUT /pmem/pmem0 empty path",
+    );
+    assert_response_contains(
+        &pmem_vm_config_after_empty_path,
+        r#""path_on_host":"secret-pmem.img""#,
+        "GET /vm/config after rejected PUT /pmem/pmem0 empty path",
+    );
+
     for (path, body, fault_message, private_values) in [(
         "/hotplug/memory",
         r#"{"total_size_mib":2048}"#,

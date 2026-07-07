@@ -6219,6 +6219,11 @@ mod tests {
                 "pmem rate_limiter is not supported",
             ),
             (
+                "p-put-empty-path",
+                request_with_body("PUT", "/pmem/pmem0", r#"{"id":"pmem0","path_on_host":""}"#),
+                "pmem path_on_host must not be empty",
+            ),
+            (
                 "p-patch",
                 request_with_body("PATCH", "/pmem/pmem0", r#"{"id":"pmem0"}"#),
                 "The requested operation is not supported in Not started state: PatchPmem",

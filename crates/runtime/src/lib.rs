@@ -907,13 +907,8 @@ impl VmmController {
                         state: self.instance_info.state,
                     });
                 }
-                if config.rate_limiter_configured() {
-                    return Err(VmmActionError::PmemConfig(
-                        pmem::PmemConfigError::UnsupportedRateLimiter,
-                    ));
-                }
-
-                self.pmem_configs.upsert(config.into());
+                self.pmem_configs
+                    .upsert(config.try_into().map_err(VmmActionError::PmemConfig)?);
                 Ok(VmmData::Empty)
             }
             VmmAction::PatchPmem => {
@@ -2323,6 +2318,28 @@ mod tests {
         assert_eq!(
             err,
             VmmActionError::PmemConfig(PmemConfigError::UnsupportedRateLimiter)
+        );
+        assert_eq!(controller.pmem_configs().len(), 1);
+        assert_eq!(
+            controller.pmem_configs()[0].path_on_host(),
+            "/tmp/pmem-old.img"
+        );
+    }
+
+    #[test]
+    fn put_pmem_rejects_empty_path_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutPmem(pmem_input("pmem0", "/tmp/pmem-old.img")))
+            .expect("pmem config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PutPmem(pmem_input("pmem0", "")))
+            .expect_err("empty pmem path should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::PmemConfig(PmemConfigError::EmptyPathOnHost)
         );
         assert_eq!(controller.pmem_configs().len(), 1);
         assert_eq!(

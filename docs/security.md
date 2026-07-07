@@ -106,10 +106,10 @@ is resource-specific:
   configuration in place if opening or handler lookup fails. It does not
   implement block-device hotplug or removal.
 - `/pmem/{id}` stores Firecracker-shaped pmem backing paths during pre-boot
-  configuration and reports them through `GET /vm/config`. It does not open,
-  stat, mmap, normalize, or attach those paths to a guest-visible virtio-pmem
-  device yet. Configured rate limiters are rejected without replacing stored
-  pmem configuration.
+  configuration after rejecting empty paths, and reports them through
+  `GET /vm/config`. It does not open, stat, mmap, normalize, or attach those
+  paths to a guest-visible virtio-pmem device yet. Configured rate limiters are
+  rejected without replacing stored pmem configuration.
 - `/snapshot/create` and `/snapshot/load` currently parse Firecracker-shaped
   snapshot paths before returning unsupported faults, and they do not open or
   create snapshot state or memory files. Future snapshot support must treat

@@ -3424,6 +3424,50 @@ mod tests {
     }
 
     #[test]
+    fn config_file_pmem_empty_path_fails_before_starting() {
+        let config_path = unique_config_path("pmem-empty-path");
+        let config = r#"{
+            "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
+            "pmem":[
+                {"id":"pmem0","path_on_host":"/tmp/pmem-old.img"},
+                {"id":"pmem0","path_on_host":""}
+            ]
+        }"#;
+        fs::write(&config_path, config).expect("config file should be written");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        let err = super::apply_startup_config_file(
+            &mut vmm,
+            Some(config_path.to_str().expect("UTF-8 path")),
+        )
+        .expect_err("empty pmem path should fail");
+
+        assert_eq!(
+            err,
+            ProcessError::ConfigFile(super::ConfigFileError::Apply(VmmActionError::PmemConfig(
+                PmemConfigError::EmptyPathOnHost
+            )))
+        );
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+        let data = vmm
+            .handle_action(VmmAction::GetVmConfig)
+            .expect("VM config should be returned");
+        let VmmData::VmConfiguration(config) = data else {
+            panic!("expected VM config");
+        };
+        assert_eq!(config.pmem_configs().len(), 1);
+        assert_eq!(config.pmem_configs()[0].path_on_host(), "/tmp/pmem-old.img");
+
+        fs::remove_file(config_path).expect("fixture config should clean up");
+    }
+
+    #[test]
     fn config_file_entropy_rate_limiter_fails_before_starting() {
         let config_path = unique_config_path("entropy-rate-limiter");
         let config = r#"{

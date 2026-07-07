@@ -84,14 +84,24 @@ impl PmemConfig {
     }
 }
 
-impl From<PmemConfigInput> for PmemConfig {
-    fn from(input: PmemConfigInput) -> Self {
-        Self {
+impl TryFrom<PmemConfigInput> for PmemConfig {
+    type Error = PmemConfigError;
+
+    fn try_from(input: PmemConfigInput) -> Result<Self, Self::Error> {
+        if input.path_on_host.is_empty() {
+            return Err(PmemConfigError::EmptyPathOnHost);
+        }
+
+        if input.rate_limiter_configured {
+            return Err(PmemConfigError::UnsupportedRateLimiter);
+        }
+
+        Ok(Self {
             id: input.id,
             path_on_host: input.path_on_host,
             root_device: input.root_device,
             read_only: input.read_only,
-        }
+        })
     }
 }
 
@@ -127,12 +137,14 @@ impl PmemConfigs {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PmemConfigError {
+    EmptyPathOnHost,
     UnsupportedRateLimiter,
 }
 
 impl fmt::Display for PmemConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::EmptyPathOnHost => f.write_str("pmem path_on_host must not be empty"),
             Self::UnsupportedRateLimiter => f.write_str("pmem rate_limiter is not supported"),
         }
     }
@@ -143,6 +155,10 @@ impl std::error::Error for PmemConfigError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pmem_config(input: PmemConfigInput) -> PmemConfig {
+        input.try_into().expect("pmem input should validate")
+    }
 
     #[test]
     fn input_defaults_to_firecracker_pmem_defaults() {
@@ -156,16 +172,24 @@ mod tests {
     }
 
     #[test]
+    fn config_rejects_empty_path_on_host() {
+        let err = PmemConfig::try_from(PmemConfigInput::new("pmem0", ""))
+            .expect_err("empty pmem path should fail");
+
+        assert_eq!(err, PmemConfigError::EmptyPathOnHost);
+        assert_eq!(err.to_string(), "pmem path_on_host must not be empty");
+    }
+
+    #[test]
     fn upsert_replaces_matching_id_without_mutating_others() {
         let mut configs = PmemConfigs::new();
-        configs.upsert(PmemConfigInput::new("pmem0", "/tmp/old.img").into());
-        configs.upsert(PmemConfigInput::new("pmem1", "/tmp/other.img").into());
-        configs.upsert(
+        configs.upsert(pmem_config(PmemConfigInput::new("pmem0", "/tmp/old.img")));
+        configs.upsert(pmem_config(PmemConfigInput::new("pmem1", "/tmp/other.img")));
+        configs.upsert(pmem_config(
             PmemConfigInput::new("pmem0", "/tmp/new.img")
                 .with_root_device(true)
-                .with_read_only(true)
-                .into(),
-        );
+                .with_read_only(true),
+        ));
 
         assert_eq!(configs.as_slice().len(), 2);
         assert_eq!(configs.as_slice()[0].id(), "pmem0");
