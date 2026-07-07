@@ -532,10 +532,6 @@ impl VmmController {
             return Err(VmmActionError::MissingBootSource);
         }
 
-        if self.balloon_config.is_some() {
-            return Err(VmmActionError::BalloonUnsupported);
-        }
-
         Ok(())
     }
 
@@ -2813,7 +2809,7 @@ mod tests {
     }
 
     #[test]
-    fn instance_start_preflight_rejects_configured_balloon_without_mutating() {
+    fn instance_start_preflight_accepts_configured_balloon_without_mutating() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         controller
             .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
@@ -2822,11 +2818,7 @@ mod tests {
             .handle_action(VmmAction::PutBalloon(balloon_input(64, true)))
             .expect("balloon config should be stored");
 
-        let err = controller
-            .preflight_instance_start()
-            .expect_err("configured balloon should fail preflight");
-
-        assert_eq!(err, VmmActionError::BalloonUnsupported);
+        assert_eq!(controller.preflight_instance_start(), Ok(()));
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
         assert!(controller.boot_source_config().is_some());
         assert_eq!(
@@ -3067,7 +3059,7 @@ mod tests {
     }
 
     #[test]
-    fn start_instance_with_configured_balloon_does_not_invoke_executor() {
+    fn start_instance_with_configured_balloon_invokes_executor() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         controller
             .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
@@ -3077,16 +3069,15 @@ mod tests {
             .expect("balloon config should be stored");
         let called = Cell::new(false);
 
-        let err = controller
+        controller
             .start_instance_with(|_| {
                 called.set(true);
                 Ok(())
             })
-            .expect_err("configured balloon should fail before executor");
+            .expect("configured balloon should reach executor");
 
-        assert_eq!(err, VmmActionError::BalloonUnsupported);
-        assert!(!called.get());
-        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert!(called.get());
+        assert_eq!(controller.instance_info().state, InstanceState::Running);
         assert_eq!(
             controller.balloon_config(),
             Some(BalloonConfig::from(balloon_input(64, true)))

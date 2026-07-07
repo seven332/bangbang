@@ -5645,7 +5645,7 @@ mod tests {
 
     #[test]
     fn stores_and_returns_balloon_config_over_socket() {
-        let mut vmm = test_controller();
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
         for (socket_name, request, fault_message) in [
             (
                 "b-get",
@@ -5760,12 +5760,12 @@ mod tests {
         );
         assert!(boot_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         let start_response = put_action_over_socket(&mut vmm, "b-start", "InstanceStart");
-        assert!(start_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        assert!(start_response.contains(r#"{"fault_message":"Balloon device is not supported."}"#));
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             vmm.instance_info().state,
-            bangbang_runtime::InstanceState::NotStarted
+            bangbang_runtime::InstanceState::Running
         );
+        assert!(vmm.has_started_session());
     }
 
     #[test]

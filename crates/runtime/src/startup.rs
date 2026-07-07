@@ -5,6 +5,10 @@ use std::fmt;
 use std::os::fd::RawFd;
 
 use crate::VmmController;
+use crate::balloon::{
+    BalloonMmioDeviceRegistration, BalloonMmioLayout, BalloonMmioRegistrationError,
+    BalloonPageCountOverflow, PreparedBalloonDevice,
+};
 use crate::block::{
     BlockFileBacking, BlockMmioDeviceRegistration, BlockMmioLayout, BlockMmioRegistrationError,
     DriveConfig, DriveUpdateError, PreparedBlockDeviceError, PreparedBlockDevices,
@@ -61,6 +65,8 @@ pub struct Arm64BootResourceConfig<'a> {
     pub network_interrupt_lines: &'a [GuestInterruptLine],
     pub vsock_mmio_layout: VsockMmioLayout,
     pub vsock_interrupt_line: Option<GuestInterruptLine>,
+    pub balloon_mmio_layout: BalloonMmioLayout,
+    pub balloon_interrupt_line: Option<GuestInterruptLine>,
     pub entropy_device: Option<Arm64BootEntropyDeviceConfig>,
 }
 
@@ -115,6 +121,7 @@ pub struct Arm64BootResources {
     pub block_devices: Vec<Arm64BootBlockDevice>,
     pub network_devices: Vec<Arm64BootNetworkDevice>,
     pub vsock_device: Option<Arm64BootVsockDevice>,
+    pub balloon_device: Option<Arm64BootBalloonDevice>,
     pub entropy_device: Option<Arm64BootEntropyDevice>,
 }
 
@@ -135,6 +142,7 @@ pub struct Arm64BootRuntimeResources {
     pub block_devices: Vec<Arm64BootBlockDevice>,
     pub network_devices: Vec<Arm64BootNetworkDevice>,
     pub vsock_device: Option<Arm64BootVsockDevice>,
+    pub balloon_device: Option<Arm64BootBalloonDevice>,
     pub entropy_device: Option<Arm64BootEntropyDevice>,
 }
 
@@ -830,6 +838,12 @@ pub struct Arm64BootVsockDevice {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Arm64BootBalloonDevice {
+    pub registration: BalloonMmioDeviceRegistration,
+    pub fdt_device: Arm64FdtVirtioMmioDevice,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arm64BootEntropyDevice {
     pub registration: EntropyMmioDeviceRegistration,
     pub fdt_device: Arm64FdtVirtioMmioDevice,
@@ -1161,6 +1175,9 @@ pub enum Arm64BootResourceError {
     PrepareVsockDevice {
         source: PreparedVsockDeviceError,
     },
+    PrepareBalloonDevice {
+        source: BalloonPageCountOverflow,
+    },
     RegisterBlockMmio {
         source: Box<BlockMmioRegistrationError>,
     },
@@ -1169,6 +1186,9 @@ pub enum Arm64BootResourceError {
     },
     RegisterVsockMmio {
         source: Box<VsockMmioRegistrationError>,
+    },
+    RegisterBalloonMmio {
+        source: Box<BalloonMmioRegistrationError>,
     },
     RegisterEntropyMmio {
         source: Box<EntropyMmioRegistrationError>,
@@ -1188,6 +1208,10 @@ pub enum Arm64BootResourceError {
         devices: usize,
         lines: usize,
     },
+    BalloonInterruptLineCount {
+        devices: usize,
+        lines: usize,
+    },
     BlockDeviceMetadataAllocation {
         source: TryReserveError,
     },
@@ -1195,6 +1219,9 @@ pub enum Arm64BootResourceError {
         source: TryReserveError,
     },
     VsockDeviceMetadataAllocation {
+        source: TryReserveError,
+    },
+    BalloonDeviceMetadataAllocation {
         source: TryReserveError,
     },
     EntropyDeviceMetadataAllocation {
@@ -1243,6 +1270,9 @@ impl fmt::Display for Arm64BootResourceError {
             Self::PrepareVsockDevice { source } => {
                 write!(f, "failed to prepare vsock device: {source}")
             }
+            Self::PrepareBalloonDevice { source } => {
+                write!(f, "failed to prepare balloon device: {source}")
+            }
             Self::RegisterBlockMmio { source } => {
                 write!(f, "failed to register block MMIO devices: {source}")
             }
@@ -1251,6 +1281,9 @@ impl fmt::Display for Arm64BootResourceError {
             }
             Self::RegisterVsockMmio { source } => {
                 write!(f, "failed to register vsock MMIO device: {source}")
+            }
+            Self::RegisterBalloonMmio { source } => {
+                write!(f, "failed to register balloon MMIO device: {source}")
             }
             Self::RegisterEntropyMmio { source } => {
                 write!(f, "failed to register entropy MMIO device: {source}")
@@ -1270,6 +1303,10 @@ impl fmt::Display for Arm64BootResourceError {
                 f,
                 "vsock MMIO device count {devices} does not match interrupt line count {lines}"
             ),
+            Self::BalloonInterruptLineCount { devices, lines } => write!(
+                f,
+                "balloon MMIO device count {devices} does not match interrupt line count {lines}"
+            ),
             Self::BlockDeviceMetadataAllocation { source } => {
                 write!(f, "failed to allocate block device metadata: {source}")
             }
@@ -1278,6 +1315,9 @@ impl fmt::Display for Arm64BootResourceError {
             }
             Self::VsockDeviceMetadataAllocation { source } => {
                 write!(f, "failed to allocate vsock device metadata: {source}")
+            }
+            Self::BalloonDeviceMetadataAllocation { source } => {
+                write!(f, "failed to allocate balloon device metadata: {source}")
             }
             Self::EntropyDeviceMetadataAllocation { source } => {
                 write!(f, "failed to allocate entropy device metadata: {source}")
@@ -1297,14 +1337,17 @@ impl std::error::Error for Arm64BootResourceError {
             Self::PrepareBlockDevices { source } => Some(source),
             Self::PrepareNetworkDevices { source } => Some(source),
             Self::PrepareVsockDevice { source } => Some(source),
+            Self::PrepareBalloonDevice { source } => Some(source),
             Self::RegisterBlockMmio { source } => Some(source.as_ref()),
             Self::RegisterNetworkMmio { source } => Some(source.as_ref()),
             Self::RegisterVsockMmio { source } => Some(source.as_ref()),
+            Self::RegisterBalloonMmio { source } => Some(source.as_ref()),
             Self::RegisterEntropyMmio { source } => Some(source.as_ref()),
             Self::RegisterSerialMmio { source } => Some(source.as_ref()),
             Self::BlockDeviceMetadataAllocation { source } => Some(source),
             Self::NetworkDeviceMetadataAllocation { source } => Some(source),
             Self::VsockDeviceMetadataAllocation { source } => Some(source),
+            Self::BalloonDeviceMetadataAllocation { source } => Some(source),
             Self::EntropyDeviceMetadataAllocation { source } => Some(source),
             Self::Fdt { source } => Some(source),
             Self::MissingBootSource
@@ -1312,7 +1355,8 @@ impl std::error::Error for Arm64BootResourceError {
             | Self::MemorySizeExceedsArchitecturalMaximum { .. }
             | Self::BlockInterruptLineCount { .. }
             | Self::NetworkInterruptLineCount { .. }
-            | Self::VsockInterruptLineCount { .. } => None,
+            | Self::VsockInterruptLineCount { .. }
+            | Self::BalloonInterruptLineCount { .. } => None,
         }
     }
 }
@@ -1374,6 +1418,8 @@ impl Arm64BootResources {
             network_interrupt_lines,
             vsock_mmio_layout,
             vsock_interrupt_line,
+            balloon_mmio_layout,
+            balloon_interrupt_line,
             entropy_device,
         } = config;
         let boot_source_config = controller
@@ -1390,6 +1436,10 @@ impl Arm64BootResources {
         validate_vsock_interrupt_line_count(
             controller.vsock_config().is_some(),
             vsock_interrupt_line.is_some(),
+        )?;
+        validate_balloon_interrupt_line_count(
+            controller.balloon_config().is_some(),
+            balloon_interrupt_line.is_some(),
         )?;
 
         let machine_config = controller.machine_config();
@@ -1457,6 +1507,33 @@ impl Arm64BootResources {
                 ));
             }
         };
+        let balloon_device = match (controller.balloon_config(), balloon_interrupt_line) {
+            (Some(config), Some(interrupt_line)) => {
+                let prepared_balloon = PreparedBalloonDevice::from_config(config)
+                    .map_err(|source| Arm64BootResourceError::PrepareBalloonDevice { source })?;
+                let balloon_mmio = prepared_balloon
+                    .register_mmio_with_dispatcher(balloon_mmio_layout, mmio_dispatcher)
+                    .map_err(|source| Arm64BootResourceError::RegisterBalloonMmio {
+                        source: Box::new(source),
+                    })?;
+                let (dispatcher, registration) = balloon_mmio.into_parts();
+                mmio_dispatcher = dispatcher;
+                let (device, fdt_device) =
+                    arm64_boot_balloon_device_metadata(registration, interrupt_line);
+                fdt_devices.try_reserve_exact(1).map_err(|source| {
+                    Arm64BootResourceError::BalloonDeviceMetadataAllocation { source }
+                })?;
+                fdt_devices.push(fdt_device);
+                Some(device)
+            }
+            (None, None) => None,
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(balloon_interrupt_line_count_error(
+                    controller.balloon_config().is_some(),
+                    balloon_interrupt_line.is_some(),
+                ));
+            }
+        };
         let entropy_device = match entropy_device {
             Some(config) => {
                 let entropy_mmio = PreparedEntropyDevice::new()
@@ -1505,6 +1582,7 @@ impl Arm64BootResources {
             block_devices,
             network_devices,
             vsock_device,
+            balloon_device,
             entropy_device,
         })
     }
@@ -1522,6 +1600,7 @@ impl Arm64BootResources {
                 block_devices: self.block_devices,
                 network_devices: self.network_devices,
                 vsock_device: self.vsock_device,
+                balloon_device: self.balloon_device,
                 entropy_device: self.entropy_device,
             },
         }
@@ -1612,11 +1691,32 @@ fn validate_vsock_interrupt_line_count(
     }
 }
 
+fn validate_balloon_interrupt_line_count(
+    configured: bool,
+    line_present: bool,
+) -> Result<(), Arm64BootResourceError> {
+    if configured == line_present {
+        Ok(())
+    } else {
+        Err(balloon_interrupt_line_count_error(configured, line_present))
+    }
+}
+
 fn vsock_interrupt_line_count_error(
     configured: bool,
     line_present: bool,
 ) -> Arm64BootResourceError {
     Arm64BootResourceError::VsockInterruptLineCount {
+        devices: usize::from(configured),
+        lines: usize::from(line_present),
+    }
+}
+
+fn balloon_interrupt_line_count_error(
+    configured: bool,
+    line_present: bool,
+) -> Arm64BootResourceError {
+    Arm64BootResourceError::BalloonInterruptLineCount {
         devices: usize::from(configured),
         lines: usize::from(line_present),
     }
@@ -1734,6 +1834,28 @@ fn arm64_boot_entropy_device_metadata(
     )
 }
 
+fn arm64_boot_balloon_device_metadata(
+    registration: BalloonMmioDeviceRegistration,
+    interrupt_line: GuestInterruptLine,
+) -> (Arm64BootBalloonDevice, Arm64FdtVirtioMmioDevice) {
+    let range = registration.region().range();
+    let fdt_device = Arm64FdtVirtioMmioDevice {
+        region: Arm64FdtRegion {
+            base: range.start().raw_value(),
+            size: range.size(),
+        },
+        interrupt_line,
+    };
+
+    (
+        Arm64BootBalloonDevice {
+            registration,
+            fdt_device,
+        },
+        fdt_device,
+    )
+}
+
 fn register_serial_mmio(
     dispatcher: &mut MmioDispatcher,
     config: Arm64BootSerialDeviceConfig,
@@ -1799,6 +1921,10 @@ mod tests {
         block_device_metadata,
     };
     use crate::VmmAction;
+    use crate::balloon::{
+        BalloonConfigInput, BalloonMmioLayout, VIRTIO_BALLOON_DEVICE_ID,
+        VIRTIO_BALLOON_MIB_TO_4K_PAGES, VirtioBalloonMmioHandler,
+    };
     use crate::block::{
         DriveConfigInput, DriveUpdateError, VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
         VIRTIO_BLOCK_REQUEST_TYPE_FLUSH, VIRTIO_BLOCK_REQUEST_TYPE_IN, VIRTIO_BLOCK_SECTOR_SIZE,
@@ -1859,6 +1985,7 @@ mod tests {
     const TEST_NETWORK_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_4000);
     const TEST_VSOCK_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_6000);
     const TEST_ENTROPY_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_7000);
+    const TEST_BALLOON_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_8000);
     const TEST_SERIAL_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_2000);
     const TEST_QUEUE_SIZE: u16 = 4;
     const TEST_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x8040_0000);
@@ -2039,6 +2166,14 @@ mod tests {
             .expect("vsock config should be stored");
     }
 
+    fn add_balloon(controller: &mut crate::VmmController, amount_mib: u32) {
+        controller
+            .handle_action(VmmAction::PutBalloon(BalloonConfigInput::new(
+                amount_mib, false,
+            )))
+            .expect("balloon config should be stored");
+    }
+
     fn network_registrations(
         interfaces: &[(&str, &str)],
         layout: NetworkMmioLayout,
@@ -2080,6 +2215,11 @@ mod tests {
             network_interrupt_lines: &[],
             vsock_mmio_layout: VsockMmioLayout::new(TEST_VSOCK_MMIO_BASE, MmioRegionId::new(90)),
             vsock_interrupt_line: None,
+            balloon_mmio_layout: BalloonMmioLayout::new(
+                TEST_BALLOON_MMIO_BASE,
+                MmioRegionId::new(110),
+            ),
+            balloon_interrupt_line: None,
             entropy_device: None,
         }
     }
@@ -3469,6 +3609,7 @@ mod tests {
         assert!(resources.block_devices.is_empty());
         assert!(resources.network_devices.is_empty());
         assert!(resources.vsock_device.is_none());
+        assert!(resources.balloon_device.is_none());
         assert!(resources.serial_device.is_none());
         assert!(resources.mmio_dispatcher.regions().is_empty());
         assert_eq!(
@@ -3479,6 +3620,7 @@ mod tests {
         assert!(read_fdt(&resources).find("/uart@40002000").is_none());
         assert!(read_fdt(&resources).find("/virtio_mmio@40006000").is_none());
         assert!(read_fdt(&resources).find("/virtio_mmio@40007000").is_none());
+        assert!(read_fdt(&resources).find("/virtio_mmio@40008000").is_none());
     }
 
     #[test]
@@ -3715,6 +3857,11 @@ mod tests {
         add_vsock(&mut controller, 42, &socket_path);
         let config = Arm64BootResourceConfig {
             vsock_interrupt_line: Some(line(35)),
+            balloon_mmio_layout: BalloonMmioLayout::new(
+                TEST_BALLOON_MMIO_BASE,
+                MmioRegionId::new(110),
+            ),
+            balloon_interrupt_line: None,
             ..valid_config(&[])
         };
 
@@ -3759,6 +3906,77 @@ mod tests {
         drop(resources);
 
         assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn assembles_boot_resources_with_balloon_mmio_metadata() {
+        let kernel = temp_file("kernel-with-balloon", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        add_balloon(&mut controller, 64);
+        let config = Arm64BootResourceConfig {
+            balloon_interrupt_line: Some(line(36)),
+            ..valid_config(&[])
+        };
+
+        let mut resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("boot resources should assemble with balloon device");
+
+        assert!(resources.block_devices.is_empty());
+        assert!(resources.network_devices.is_empty());
+        assert!(resources.vsock_device.is_none());
+        assert!(resources.entropy_device.is_none());
+        let balloon = resources
+            .balloon_device
+            .as_ref()
+            .expect("balloon metadata should be returned");
+        assert_eq!(balloon.registration.region_id(), MmioRegionId::new(110));
+        assert_eq!(balloon.registration.address(), TEST_BALLOON_MMIO_BASE);
+        assert_eq!(
+            balloon.registration.region().range().size(),
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE
+        );
+        assert_eq!(
+            balloon.fdt_device.region.base,
+            TEST_BALLOON_MMIO_BASE.raw_value()
+        );
+        assert_eq!(
+            balloon.fdt_device.region.size,
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE
+        );
+        assert_eq!(balloon.fdt_device.interrupt_line, line(36));
+        assert_eq!(resources.mmio_dispatcher.regions().len(), 1);
+
+        let region_id = balloon.registration.region_id();
+        let handler = resources
+            .mmio_dispatcher
+            .handler_mut::<VirtioBalloonMmioHandler>(region_id)
+            .expect("balloon MMIO handler should be registered");
+        assert_eq!(
+            handler.device_registers().device_id(),
+            VIRTIO_BALLOON_DEVICE_ID
+        );
+        assert_eq!(
+            handler.device_config_handler().num_pages(),
+            64 * VIRTIO_BALLOON_MIB_TO_4K_PAGES
+        );
+
+        let tree = read_fdt(&resources);
+        let balloon_node = tree
+            .find("/virtio_mmio@40008000")
+            .expect("balloon virtio-mmio node should be in assembled FDT");
+        assert_eq!(balloon_node.prop_str("compatible").unwrap(), "virtio,mmio");
+
+        let parts = resources.into_parts();
+        assert_eq!(
+            parts
+                .runtime
+                .balloon_device
+                .as_ref()
+                .expect("runtime balloon metadata should be preserved")
+                .registration
+                .region_id(),
+            MmioRegionId::new(110)
+        );
     }
 
     #[test]
@@ -3845,6 +4063,25 @@ mod tests {
     }
 
     #[test]
+    fn configured_balloon_without_interrupt_line_fails() {
+        let kernel = temp_file("kernel-balloon-missing-line", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        add_balloon(&mut controller, 64);
+
+        let err = Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
+            .expect_err("configured balloon without interrupt line should fail");
+
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::BalloonInterruptLineCount {
+                devices: 1,
+                lines: 0
+            }
+        ));
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
     fn configured_vsock_existing_socket_path_fails_without_unlinking() {
         let kernel = temp_file("kernel-vsock-existing-socket-path", &arm64_image());
         let socket_path = missing_path("vsock-existing-secret.sock");
@@ -3853,6 +4090,11 @@ mod tests {
         add_vsock(&mut controller, 44, &socket_path);
         let config = Arm64BootResourceConfig {
             vsock_interrupt_line: Some(line(35)),
+            balloon_mmio_layout: BalloonMmioLayout::new(
+                TEST_BALLOON_MMIO_BASE,
+                MmioRegionId::new(110),
+            ),
+            balloon_interrupt_line: None,
             ..valid_config(&[])
         };
 
@@ -3883,6 +4125,11 @@ mod tests {
         let controller = controller_with_kernel(kernel.path());
         let config = Arm64BootResourceConfig {
             vsock_interrupt_line: Some(line(35)),
+            balloon_mmio_layout: BalloonMmioLayout::new(
+                TEST_BALLOON_MMIO_BASE,
+                MmioRegionId::new(110),
+            ),
+            balloon_interrupt_line: None,
             ..valid_config(&[])
         };
 
@@ -3911,6 +4158,11 @@ mod tests {
         let config = Arm64BootResourceConfig {
             vsock_mmio_layout: VsockMmioLayout::new(TEST_BLOCK_MMIO_BASE, MmioRegionId::new(90)),
             vsock_interrupt_line: Some(line(35)),
+            balloon_mmio_layout: BalloonMmioLayout::new(
+                TEST_BALLOON_MMIO_BASE,
+                MmioRegionId::new(110),
+            ),
+            balloon_interrupt_line: None,
             ..valid_config(&block_interrupt_lines)
         };
 
@@ -4005,6 +4257,11 @@ mod tests {
             serial_device: Some(serial),
             network_interrupt_lines: &network_lines,
             vsock_interrupt_line: Some(line(35)),
+            balloon_mmio_layout: BalloonMmioLayout::new(
+                TEST_BALLOON_MMIO_BASE,
+                MmioRegionId::new(110),
+            ),
+            balloon_interrupt_line: None,
             entropy_device: Some(super::Arm64BootEntropyDeviceConfig::new(
                 EntropyMmioLayout::new(TEST_ENTROPY_MMIO_BASE, MmioRegionId::new(100)),
                 line(36),
@@ -4549,6 +4806,11 @@ mod tests {
         add_vsock(&mut controller, 42, &socket_path);
         let config = Arm64BootResourceConfig {
             vsock_interrupt_line: Some(line(35)),
+            balloon_mmio_layout: BalloonMmioLayout::new(
+                TEST_BALLOON_MMIO_BASE,
+                MmioRegionId::new(110),
+            ),
+            balloon_interrupt_line: None,
             ..valid_config(&[])
         };
         let resources = Arm64BootResources::assemble_from_controller(&controller, config)
@@ -4595,6 +4857,11 @@ mod tests {
         add_vsock(&mut controller, 43, &socket_path);
         let config = Arm64BootResourceConfig {
             vsock_interrupt_line: Some(line(35)),
+            balloon_mmio_layout: BalloonMmioLayout::new(
+                TEST_BALLOON_MMIO_BASE,
+                MmioRegionId::new(110),
+            ),
+            balloon_interrupt_line: None,
             ..valid_config(&[])
         };
         let resources = Arm64BootResources::assemble_from_controller(&controller, config)
@@ -4667,6 +4934,11 @@ mod tests {
         add_vsock(&mut controller, 44, &socket_path);
         let config = Arm64BootResourceConfig {
             vsock_interrupt_line: Some(line(35)),
+            balloon_mmio_layout: BalloonMmioLayout::new(
+                TEST_BALLOON_MMIO_BASE,
+                MmioRegionId::new(110),
+            ),
+            balloon_interrupt_line: None,
             ..valid_config(&[])
         };
         let resources = Arm64BootResources::assemble_from_controller(&controller, config)
@@ -4724,6 +4996,11 @@ mod tests {
         add_vsock(&mut controller, 44, &socket_path);
         let config = Arm64BootResourceConfig {
             vsock_interrupt_line: Some(line(35)),
+            balloon_mmio_layout: BalloonMmioLayout::new(
+                TEST_BALLOON_MMIO_BASE,
+                MmioRegionId::new(110),
+            ),
+            balloon_interrupt_line: None,
             ..valid_config(&[])
         };
         let resources = Arm64BootResources::assemble_from_controller(&controller, config)
@@ -4890,6 +5167,11 @@ mod tests {
         add_vsock(&mut controller, 44, &socket_path);
         let config = Arm64BootResourceConfig {
             vsock_interrupt_line: Some(line(35)),
+            balloon_mmio_layout: BalloonMmioLayout::new(
+                TEST_BALLOON_MMIO_BASE,
+                MmioRegionId::new(110),
+            ),
+            balloon_interrupt_line: None,
             ..valid_config(&[])
         };
         let resources = Arm64BootResources::assemble_from_controller(&controller, config)
@@ -4944,6 +5226,11 @@ mod tests {
         add_vsock(&mut controller, 45, &socket_path);
         let config = Arm64BootResourceConfig {
             vsock_interrupt_line: Some(line(35)),
+            balloon_mmio_layout: BalloonMmioLayout::new(
+                TEST_BALLOON_MMIO_BASE,
+                MmioRegionId::new(110),
+            ),
+            balloon_interrupt_line: None,
             ..valid_config(&[])
         };
         let resources = Arm64BootResources::assemble_from_controller(&controller, config)
@@ -5010,6 +5297,11 @@ mod tests {
         add_vsock(&mut controller, 46, &socket_path);
         let config = Arm64BootResourceConfig {
             vsock_interrupt_line: Some(line(35)),
+            balloon_mmio_layout: BalloonMmioLayout::new(
+                TEST_BALLOON_MMIO_BASE,
+                MmioRegionId::new(110),
+            ),
+            balloon_interrupt_line: None,
             ..valid_config(&[])
         };
         let resources = Arm64BootResources::assemble_from_controller(&controller, config)
@@ -5048,6 +5340,11 @@ mod tests {
         add_vsock(&mut controller, 47, &socket_path);
         let config = Arm64BootResourceConfig {
             vsock_interrupt_line: Some(line(35)),
+            balloon_mmio_layout: BalloonMmioLayout::new(
+                TEST_BALLOON_MMIO_BASE,
+                MmioRegionId::new(110),
+            ),
+            balloon_interrupt_line: None,
             ..valid_config(&[])
         };
         let resources = Arm64BootResources::assemble_from_controller(&controller, config)

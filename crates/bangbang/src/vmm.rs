@@ -11,11 +11,13 @@ use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
 
 use bangbang_hvf::{
-    HvfArm64BootEntropyDeviceConfig, HvfArm64BootRunLoopControl, HvfArm64BootRunLoopError,
-    HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig,
-    HvfArm64BootSessionConfig, HvfVcpuRunnerError, OwnedHvfArm64BootSession,
+    HvfArm64BootBalloonDeviceConfig, HvfArm64BootEntropyDeviceConfig, HvfArm64BootRunLoopControl,
+    HvfArm64BootRunLoopError, HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopStopToken,
+    HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig, HvfVcpuRunnerError,
+    OwnedHvfArm64BootSession,
 };
 use bangbang_runtime::balloon::BalloonConfigInput;
+use bangbang_runtime::balloon::BalloonMmioLayout;
 use bangbang_runtime::block::{
     BlockFileBacking, BlockMmioLayout, DriveConfig, DriveConfigInput, DriveUpdateError,
     DriveUpdateInput,
@@ -81,6 +83,8 @@ const DEFAULT_SERIAL_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_0000);
 const DEFAULT_SERIAL_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(0);
 const DEFAULT_ENTROPY_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_7000);
 const DEFAULT_ENTROPY_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(3000);
+const DEFAULT_BALLOON_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_8000);
+const DEFAULT_BALLOON_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(4000);
 const DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT: usize = 1024;
 const BOOT_RUN_LOOP_COMMAND_QUEUE_CAPACITY: usize = 32;
 const HVF_BOOT_RUN_LOOP_THREAD_NAME: &str = "bangbang-hvf-boot-loop";
@@ -1005,6 +1009,11 @@ impl HvfInstanceStartExecutor {
         if controller.entropy_config().is_some() {
             config = config.with_entropy_device(HvfArm64BootEntropyDeviceConfig::new(
                 EntropyMmioLayout::new(DEFAULT_ENTROPY_MMIO_BASE, DEFAULT_ENTROPY_MMIO_REGION_ID),
+            ));
+        }
+        if controller.balloon_config().is_some() {
+            config = config.with_balloon_device(HvfArm64BootBalloonDeviceConfig::new(
+                BalloonMmioLayout::new(DEFAULT_BALLOON_MMIO_BASE, DEFAULT_BALLOON_MMIO_REGION_ID),
             ));
         }
 
@@ -2116,6 +2125,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
 
+    use bangbang_runtime::balloon::BalloonConfigInput;
     use bangbang_runtime::block::{
         BlockMmioLayout, DriveConfig, DriveConfigInput, DriveConfigs, DriveUpdateError,
         DriveUpdateInput, PreparedBlockDevices,
@@ -2157,8 +2167,9 @@ mod tests {
 
     use super::{
         BootRunLoopBlockDeviceUpdater, BootRunLoopControl, BootRunLoopSession,
-        BootRunLoopSupervisor, BootRunLoopWorkerStatus, DEFAULT_BLOCK_MMIO_BASE,
-        DEFAULT_BLOCK_MMIO_REGION_ID, DEFAULT_ENTROPY_MMIO_BASE, DEFAULT_ENTROPY_MMIO_REGION_ID,
+        BootRunLoopSupervisor, BootRunLoopWorkerStatus, DEFAULT_BALLOON_MMIO_BASE,
+        DEFAULT_BALLOON_MMIO_REGION_ID, DEFAULT_BLOCK_MMIO_BASE, DEFAULT_BLOCK_MMIO_REGION_ID,
+        DEFAULT_ENTROPY_MMIO_BASE, DEFAULT_ENTROPY_MMIO_REGION_ID,
         DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT, DEFAULT_NETWORK_MMIO_BASE,
         DEFAULT_NETWORK_MMIO_REGION_ID, DEFAULT_SERIAL_MMIO_BASE, DEFAULT_SERIAL_MMIO_REGION_ID,
         DEFAULT_VSOCK_MMIO_BASE, DEFAULT_VSOCK_MMIO_REGION_ID, EmptyProcessNetworkRxPacketSource,
@@ -2962,6 +2973,7 @@ mod tests {
 
         let config = executor.boot_session_config();
 
+        assert_eq!(config.balloon_device, None);
         assert_eq!(config.entropy_device, None);
         let serial = config
             .serial_device
@@ -2976,6 +2988,28 @@ mod tests {
         assert_eq!(
             retained_output.bytes().expect("serial output should read"),
             b"B"
+        );
+    }
+
+    #[test]
+    fn configured_hvf_boot_session_config_includes_balloon_device() {
+        let executor = HvfInstanceStartExecutor::default();
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBalloon(BalloonConfigInput::new(64, false)))
+            .expect("balloon config should store");
+
+        let config = executor
+            .boot_session_config_for_controller(&controller)
+            .expect("configured balloon should build boot config");
+
+        let balloon = config
+            .balloon_device
+            .expect("configured balloon should add HVF boot balloon device");
+        assert_eq!(balloon.mmio_layout.address(), DEFAULT_BALLOON_MMIO_BASE);
+        assert_eq!(
+            balloon.mmio_layout.region_id(),
+            DEFAULT_BALLOON_MMIO_REGION_ID
         );
     }
 
@@ -3151,6 +3185,12 @@ mod tests {
             VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
         )
         .expect("entropy MMIO region should be valid");
+        let balloon_region = MmioRegion::new(
+            DEFAULT_BALLOON_MMIO_REGION_ID,
+            DEFAULT_BALLOON_MMIO_BASE,
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+        )
+        .expect("balloon MMIO region should be valid");
         let serial_region = MmioRegion::new(
             serial_region_id,
             DEFAULT_SERIAL_MMIO_BASE,
@@ -3164,16 +3204,21 @@ mod tests {
                 .iter()
                 .all(|registration| registration.region_id() != serial_region_id
                     && registration.region_id() != vsock_region.id()
-                    && registration.region_id() != entropy_region.id())
+                    && registration.region_id() != entropy_region.id()
+                    && registration.region_id() != balloon_region.id())
         );
         assert!(network_devices.registrations().iter().all(
             |registration| registration.region_id() != serial_region_id
                 && registration.region_id() != vsock_region.id()
                 && registration.region_id() != entropy_region.id()
+                && registration.region_id() != balloon_region.id()
         ));
         assert_ne!(vsock_region.id(), serial_region_id);
         assert_ne!(entropy_region.id(), serial_region_id);
         assert_ne!(entropy_region.id(), vsock_region.id());
+        assert_ne!(balloon_region.id(), serial_region_id);
+        assert_ne!(balloon_region.id(), vsock_region.id());
+        assert_ne!(balloon_region.id(), entropy_region.id());
         assert!(block_devices.registrations().iter().all(|block| {
             network_devices
                 .registrations()
@@ -3182,15 +3227,20 @@ mod tests {
                 && !block.region().range().overlaps(serial_region.range())
                 && !block.region().range().overlaps(vsock_region.range())
                 && !block.region().range().overlaps(entropy_region.range())
+                && !block.region().range().overlaps(balloon_region.range())
         }));
         assert!(network_devices.registrations().iter().all(|network| {
             !network.region().range().overlaps(serial_region.range())
                 && !network.region().range().overlaps(vsock_region.range())
                 && !network.region().range().overlaps(entropy_region.range())
+                && !network.region().range().overlaps(balloon_region.range())
         }));
         assert!(!vsock_region.range().overlaps(serial_region.range()));
         assert!(!entropy_region.range().overlaps(serial_region.range()));
         assert!(!entropy_region.range().overlaps(vsock_region.range()));
+        assert!(!balloon_region.range().overlaps(serial_region.range()));
+        assert!(!balloon_region.range().overlaps(vsock_region.range()));
+        assert!(!balloon_region.range().overlaps(entropy_region.range()));
     }
 
     #[test]
