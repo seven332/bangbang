@@ -218,7 +218,9 @@ Runtime `PATCH /balloon` target-size updates are covered by unit, API socket,
 and process-session tests that verify stored config updates, active config-space
 generation changes, and config interrupt signaling; they do not require a
 separate signed guest scenario until host reclaim, guest-reported statistics,
-hinting queue processing, or reporting behavior is added.
+hinting range processing, automatic done acknowledgement, or reporting behavior
+is added. Hinting queue guest-command acknowledgement is covered by runtime
+unit and MMIO handler tests.
 It also includes a direct-rootfs writeback block scenario that configures a
 non-root data drive with `cache_type=Writeback`, writes through `/dev/vdb`,
 calls `fsync` on the block-device file descriptor, and writes a host-observable
