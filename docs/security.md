@@ -229,12 +229,15 @@ memory or change host memory accounting. Guest config-space writes update only
 local device register state. The backend-neutral inflate notification dispatcher
 can read bounded PFN descriptor payloads, compact them into page ranges, and
 acknowledge descriptor heads with zero-length used-ring entries. The deflate
-notification dispatcher can acknowledge descriptor heads with zero-length
-used-ring entries. The HVF boot loop can drain these balloon notifications and
-signal the allocated balloon interrupt line, but parsed PFNs, statistics
-descriptors, free-page hinting commands, and reporting queue data remain
-untrusted guest input and must not change host memory accounting or reclaim
-behavior until those host-side paths are implemented and reviewed.
+notification dispatcher follows the same bounded PFN parsing and mapped guest
+memory validation path before acknowledging descriptor heads. Completed
+descriptors update only internal inflated-page accounting on the owning balloon
+device; they do not release, remap, or otherwise alter host memory. The HVF boot
+loop can drain these balloon notifications and signal the allocated balloon
+interrupt line, but parsed PFNs, statistics descriptors, free-page hinting
+commands, and reporting queue data remain untrusted guest input and must not
+change host memory accounting or reclaim behavior until those host-side paths
+are implemented and reviewed.
 
 The current serial device is a TX-only MMIO output path. By default, guest
 serial bytes go to a bounded internal capture buffer; when `/serial` configures

@@ -2167,6 +2167,7 @@ mod tests {
     const TEST_BALLOON_DEFLATE_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x8064_0000);
     const TEST_BALLOON_DEFLATE_USED_RING: GuestAddress = GuestAddress::new(0x8065_0000);
     const TEST_BALLOON_PFN_PAYLOAD: GuestAddress = GuestAddress::new(0x8066_0000);
+    const TEST_BALLOON_MAPPED_PFN: u32 = 0x80000;
     const TEST_NETWORK_QUEUE_DEVICE_STRIDE: u64 = 0x0010_0000;
     const TEST_AVAILABLE_RING_IDX_OFFSET: u64 = 2;
     const TEST_AVAILABLE_RING_RING_OFFSET: u64 = 4;
@@ -3281,7 +3282,10 @@ mod tests {
 
     fn write_queued_balloon_inflate_request(memory: &mut crate::memory::GuestMemory) {
         memory
-            .write_slice(&1u32.to_le_bytes(), TEST_BALLOON_PFN_PAYLOAD)
+            .write_slice(
+                &TEST_BALLOON_MAPPED_PFN.to_le_bytes(),
+                TEST_BALLOON_PFN_PAYLOAD,
+            )
             .expect("balloon PFN payload should write");
         write_descriptor_at(
             memory,
@@ -3294,7 +3298,10 @@ mod tests {
 
     fn write_partially_invalid_balloon_inflate_request(memory: &mut crate::memory::GuestMemory) {
         memory
-            .write_slice(&1u32.to_le_bytes(), TEST_BALLOON_PFN_PAYLOAD)
+            .write_slice(
+                &TEST_BALLOON_MAPPED_PFN.to_le_bytes(),
+                TEST_BALLOON_PFN_PAYLOAD,
+            )
             .expect("balloon PFN payload should write");
         write_descriptor_at(
             memory,
@@ -3310,6 +3317,12 @@ mod tests {
     }
 
     fn write_queued_balloon_deflate_request(memory: &mut crate::memory::GuestMemory) {
+        memory
+            .write_slice(
+                &TEST_BALLOON_MAPPED_PFN.to_le_bytes(),
+                TEST_BALLOON_PFN_PAYLOAD,
+            )
+            .expect("balloon PFN payload should write");
         write_descriptor_at(
             memory,
             TEST_BALLOON_DEFLATE_DESCRIPTOR_TABLE,
@@ -5030,7 +5043,7 @@ mod tests {
         assert_eq!(inflate.completed_descriptors(), 1);
         let ranges = inflate.inflated_page_ranges();
         assert_eq!(ranges.len(), 1);
-        assert_eq!(ranges[0].start_pfn(), 1);
+        assert_eq!(ranges[0].start_pfn(), TEST_BALLOON_MAPPED_PFN);
         assert_eq!(ranges[0].page_count(), 1);
         assert!(inflate.needs_queue_interrupt());
         assert!(dispatch.deflate_queue_dispatch().is_none());

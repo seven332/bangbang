@@ -3434,6 +3434,7 @@ mod tests {
     const TEST_BALLOON_DEFLATE_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x807a_4000);
     const TEST_BALLOON_DEFLATE_USED_RING: GuestAddress = GuestAddress::new(0x807a_5000);
     const TEST_BALLOON_PFN_PAYLOAD: GuestAddress = GuestAddress::new(0x807a_6000);
+    const TEST_BALLOON_MAPPED_PFN: u32 = 0x80000;
     const TEST_AVAILABLE_RING_IDX_OFFSET: u64 = 2;
     const TEST_AVAILABLE_RING_RING_OFFSET: u64 = 4;
     const TEST_AVAILABLE_RING_ENTRY_SIZE: u64 = 2;
@@ -5415,7 +5416,10 @@ mod tests {
 
     fn write_queued_balloon_inflate_request(memory: &mut GuestMemory) {
         memory
-            .write_slice(&1u32.to_le_bytes(), TEST_BALLOON_PFN_PAYLOAD)
+            .write_slice(
+                &TEST_BALLOON_MAPPED_PFN.to_le_bytes(),
+                TEST_BALLOON_PFN_PAYLOAD,
+            )
             .expect("balloon PFN payload should write");
         write_balloon_inflate_descriptor(
             memory,
@@ -5427,7 +5431,10 @@ mod tests {
 
     fn write_partially_invalid_balloon_inflate_request(memory: &mut GuestMemory) {
         memory
-            .write_slice(&1u32.to_le_bytes(), TEST_BALLOON_PFN_PAYLOAD)
+            .write_slice(
+                &TEST_BALLOON_MAPPED_PFN.to_le_bytes(),
+                TEST_BALLOON_PFN_PAYLOAD,
+            )
             .expect("balloon PFN payload should write");
         write_balloon_inflate_descriptor(
             memory,
@@ -5438,6 +5445,12 @@ mod tests {
     }
 
     fn write_queued_balloon_deflate_request(memory: &mut GuestMemory) {
+        memory
+            .write_slice(
+                &TEST_BALLOON_MAPPED_PFN.to_le_bytes(),
+                TEST_BALLOON_PFN_PAYLOAD,
+            )
+            .expect("balloon PFN payload should write");
         write_balloon_deflate_descriptor(
             memory,
             0,
