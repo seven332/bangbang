@@ -90,6 +90,7 @@ impl std::error::Error for BalloonPageCountOverflow {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BalloonUpdateError {
     PageCountOverflow(BalloonPageCountOverflow),
+    TargetExceedsGuestMemory { amount_mib: u32, mem_size_mib: u64 },
     ActiveSessionUnavailable,
     ActiveSessionCommand { message: String },
     MmioDispatcherUnavailable,
@@ -100,6 +101,13 @@ impl fmt::Display for BalloonUpdateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::PageCountOverflow(err) => write!(f, "{err}"),
+            Self::TargetExceedsGuestMemory {
+                amount_mib,
+                mem_size_mib,
+            } => write!(
+                f,
+                "balloon amount_mib {amount_mib} exceeds configured guest memory {mem_size_mib} MiB"
+            ),
             Self::ActiveSessionUnavailable => {
                 f.write_str("active balloon device session is unavailable")
             }
@@ -117,7 +125,8 @@ impl std::error::Error for BalloonUpdateError {
         match self {
             Self::PageCountOverflow(err) => Some(err),
             Self::HandlerLookup(err) => Some(err),
-            Self::ActiveSessionUnavailable
+            Self::TargetExceedsGuestMemory { .. }
+            | Self::ActiveSessionUnavailable
             | Self::ActiveSessionCommand { .. }
             | Self::MmioDispatcherUnavailable => None,
         }

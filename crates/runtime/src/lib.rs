@@ -556,10 +556,21 @@ impl VmmController {
             });
         }
 
-        self.balloon_config
+        let updated_config = self
+            .balloon_config
             .ok_or(VmmActionError::BalloonUnsupported)?
             .updated(input)
-            .map_err(VmmActionError::BalloonUpdate)
+            .map_err(VmmActionError::BalloonUpdate)?;
+        if u64::from(updated_config.amount_mib()) > self.machine_config.mem_size_mib() {
+            return Err(VmmActionError::BalloonUpdate(
+                balloon::BalloonUpdateError::TargetExceedsGuestMemory {
+                    amount_mib: updated_config.amount_mib(),
+                    mem_size_mib: self.machine_config.mem_size_mib(),
+                },
+            ));
+        }
+
+        Ok(updated_config)
     }
 
     pub fn commit_balloon_update(&mut self, config: balloon::BalloonConfig) {
@@ -2045,6 +2056,31 @@ mod tests {
             err,
             VmmActionError::BalloonUpdate(BalloonUpdateError::PageCountOverflow(_))
         ));
+        assert_eq!(
+            controller.balloon_config(),
+            Some(BalloonConfig::from(balloon_input(64, true)))
+        );
+    }
+
+    #[test]
+    fn patch_balloon_rejects_target_larger_than_memory_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBalloon(balloon_input(64, true)))
+            .expect("initial balloon config should be stored");
+        controller.instance_info.state = InstanceState::Running;
+
+        let err = controller
+            .handle_action(VmmAction::PatchBalloon(balloon_update_input(129)))
+            .expect_err("balloon target larger than guest memory should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::BalloonUpdate(BalloonUpdateError::TargetExceedsGuestMemory {
+                amount_mib: 129,
+                mem_size_mib: DEFAULT_MEM_SIZE_MIB,
+            })
+        );
         assert_eq!(
             controller.balloon_config(),
             Some(BalloonConfig::from(balloon_input(64, true)))

@@ -5824,6 +5824,24 @@ mod tests {
         assert!(get_updated_response.contains(r#""stats_polling_interval_s":60"#));
         assert!(get_updated_response.contains(r#""free_page_hinting":true"#));
         assert!(get_updated_response.contains(r#""free_page_reporting":false"#));
+
+        let oversized_patch_response = request_over_socket(
+            &mut vmm,
+            "b-p-o",
+            &request_with_body("PATCH", "/balloon", r#"{"amount_mib":129}"#),
+        );
+        assert!(oversized_patch_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(oversized_patch_response.contains(
+            r#""fault_message":"balloon amount_mib 129 exceeds configured guest memory 128 MiB""#
+        ));
+
+        let get_after_oversized_response = request_over_socket(
+            &mut vmm,
+            "b-g-o",
+            "GET /balloon HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(get_after_oversized_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(get_after_oversized_response.contains(r#""amount_mib":128"#));
     }
 
     #[test]
