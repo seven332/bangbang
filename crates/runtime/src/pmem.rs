@@ -1505,14 +1505,28 @@ mod tests {
         let file = temp_file("mapped-unaligned-pmem.img", b"pmem");
         let mapping = map_backing(file.as_path(), false);
         let mut bytes = [0; 4];
+        let last_offset = mapping
+            .host_size()
+            .checked_sub(1)
+            .expect("mapping should be non-empty");
 
         // SAFETY: `mapping` owns a live mapping whose first `file_len` bytes
-        // are backed by the test file, and `bytes` is a valid destination.
+        // are backed by the test file. The final byte is inside the retained
+        // aligned reservation, and `bytes` is a valid destination.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 mapping.host_address().as_ptr().cast::<u8>(),
                 bytes.as_mut_ptr(),
                 bytes.len(),
+            );
+            assert_eq!(
+                mapping
+                    .host_address()
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(last_offset)
+                    .read(),
+                0
             );
         }
 
