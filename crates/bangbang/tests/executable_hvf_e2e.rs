@@ -12,7 +12,7 @@ mod support;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod macos_arm64 {
     use std::fs;
-    use std::io::{Read, Write};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -29,6 +29,11 @@ mod macos_arm64 {
     const BLOCK_WRITE_MARKER: &[u8] = b"BANGBANG_BLOCK_WRITE_OK";
     const DIRECT_ROOTFS_BLOCK_MARKER: &[u8] = b"BANGBANG_DIRECT_ROOTFS_BLOCK_OK";
     const DIRECT_ROOTFS_ENTROPY_MARKER: &[u8] = b"BANGBANG_ENTROPY_GUEST_READ_OK";
+    const DIRECT_ROOTFS_PMEM_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 quiet loglevel=1 init=/bangbang-direct-rootfs-init bangbang.pmem-read-flush=1";
+    const DIRECT_ROOTFS_PMEM_READ_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_READ_FLUSH_OK";
+    const PMEM_HOST_MARKER: &[u8] = b"BANGBANG_PMEM_HOST_MARKER";
+    const PMEM_GUEST_FLUSH_MARKER: &[u8] = b"BANGBANG_PMEM_GUEST_FLUSH_OK";
+    const PMEM_GUEST_FLUSH_OFFSET: u64 = 4096;
     const DIRECT_ROOTFS_MMDS_MARKER: &[u8] = b"BANGBANG_MMDS_GUEST_FETCH_OK";
     const DIRECT_ROOTFS_MMDS_V2_MARKER: &[u8] = b"BANGBANG_MMDS_V2_GUEST_FETCH_OK";
     const DIRECT_ROOTFS_VSOCK_MARKER: &[u8] = b"BANGBANG_VSOCK_GUEST_CONNECT_OK";
@@ -1241,6 +1246,138 @@ mod macos_arm64 {
             bangbang.terminate(),
             &socket_path,
             "bangbang entropy direct rootfs",
+        );
+    }
+
+    #[test]
+    fn signed_executable_flushes_virtio_pmem_from_direct_rootfs_guest() {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join("api.socket");
+        let data_backing_path = test_dir.path().join("data.img");
+        let pmem_backing_path = test_dir.path().join("pmem.img");
+        let kernel_path = env_path(BANGBANG_GUEST_KERNEL_PATH_ENV);
+        let rootfs_path = env_path(BANGBANG_GUEST_EXT4_ROOTFS_PATH_ENV);
+        let instance_id = test_dir.instance_id();
+
+        create_zeroed_block_backing(&data_backing_path);
+        create_pmem_backing(&pmem_backing_path, PMEM_HOST_MARKER);
+
+        let mut bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+        let machine_response = http_put_json(
+            &socket_path,
+            "/machine-config",
+            r#"{"vcpu_count":1,"mem_size_mib":256}"#,
+        );
+        assert_no_content_response(&machine_response, "PUT /machine-config pmem direct rootfs");
+
+        let kernel_path_json = json_string(path_text(&kernel_path));
+        let boot_args_json = json_string(DIRECT_ROOTFS_PMEM_BOOT_ARGS);
+        let boot_body = format!(
+            r#"{{
+                "kernel_image_path":{kernel_path_json},
+                "boot_args":{boot_args_json}
+            }}"#
+        );
+        let boot_response = http_put_json(&socket_path, "/boot-source", &boot_body);
+        assert_no_content_response(&boot_response, "PUT /boot-source pmem direct rootfs");
+
+        let rootfs_path_json = json_string(path_text(&rootfs_path));
+        let rootfs_body = format!(
+            r#"{{
+                "drive_id":"rootfs",
+                "path_on_host":{rootfs_path_json},
+                "is_root_device":true,
+                "is_read_only":true
+            }}"#
+        );
+        let rootfs_response = http_put_json(&socket_path, "/drives/rootfs", &rootfs_body);
+        assert_no_content_response(&rootfs_response, "PUT /drives/rootfs pmem direct rootfs");
+
+        let data_backing_path_json = json_string(path_text(&data_backing_path));
+        let data_drive_body = format!(
+            r#"{{
+                "drive_id":"data",
+                "path_on_host":{data_backing_path_json},
+                "is_root_device":false,
+                "is_read_only":false
+            }}"#
+        );
+        let data_drive_response = http_put_json(&socket_path, "/drives/data", &data_drive_body);
+        assert_no_content_response(&data_drive_response, "PUT /drives/data pmem direct rootfs");
+
+        let pmem_backing_path_json = json_string(path_text(&pmem_backing_path));
+        let pmem_body = format!(
+            r#"{{
+                "id":"pmem0",
+                "path_on_host":{pmem_backing_path_json}
+            }}"#
+        );
+        let pmem_response = http_put_json(&socket_path, "/pmem/pmem0", &pmem_body);
+        assert_no_content_response(&pmem_response, "PUT /pmem/pmem0 direct rootfs");
+
+        let vm_config = http_get(&socket_path, "/vm/config");
+        assert_ok_response(&vm_config, "GET /vm/config after PUT /pmem/pmem0");
+        assert_response_contains(
+            &vm_config,
+            r#""id":"pmem0""#,
+            "GET /vm/config after PUT /pmem/pmem0",
+        );
+        assert_response_contains(
+            &vm_config,
+            &format!(r#""path_on_host":{pmem_backing_path_json}"#),
+            "GET /vm/config after PUT /pmem/pmem0",
+        );
+
+        let start_response = http_put_json(
+            &socket_path,
+            "/actions",
+            r#"{"action_type":"InstanceStart"}"#,
+        );
+        assert_no_content_response(
+            &start_response,
+            "PUT /actions InstanceStart pmem direct rootfs",
+        );
+
+        let running_instance_info = http_get(&socket_path, "/");
+        assert_ok_response(
+            &running_instance_info,
+            "GET / after pmem direct rootfs InstanceStart",
+        );
+        assert_response_contains(
+            &running_instance_info,
+            r#""state":"Running""#,
+            "GET / after pmem direct rootfs InstanceStart",
+        );
+
+        if let Err(err) = wait_for_file_prefix_marker(
+            &data_backing_path,
+            DIRECT_ROOTFS_PMEM_READ_FLUSH_MARKER,
+            GUEST_EXECUTION_TIMEOUT,
+        ) {
+            let backing_prefix = file_prefix_lossy(&data_backing_path, 128);
+            let pmem_prefix = file_prefix_lossy(&pmem_backing_path, 128);
+            let output = bangbang.force_stop_and_collect();
+            panic!(
+                "direct rootfs guest did not flush pmem through signed bangbang executable: {err}; data backing prefix: {backing_prefix:?}; pmem prefix: {pmem_prefix:?}; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status, output.stdout, output.stderr
+            );
+        }
+
+        assert_eq!(
+            file_bytes_at(
+                &pmem_backing_path,
+                PMEM_GUEST_FLUSH_OFFSET,
+                PMEM_GUEST_FLUSH_MARKER.len(),
+            ),
+            PMEM_GUEST_FLUSH_MARKER,
+            "guest pmem flush should persist the guest marker to the host backing file"
+        );
+
+        assert_clean_shutdown(
+            bangbang.terminate(),
+            &socket_path,
+            "bangbang pmem direct rootfs",
         );
     }
 
@@ -2647,6 +2784,19 @@ mod macos_arm64 {
             .expect("guest block backing should be one sector");
     }
 
+    fn create_pmem_backing(path: &Path, marker: &[u8]) {
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("guest pmem backing should create");
+        file.set_len(bangbang_runtime::pmem::VIRTIO_PMEM_ALIGNMENT)
+            .expect("guest pmem backing should be aligned");
+        file.write_all(marker)
+            .expect("guest pmem host marker should write");
+    }
+
     fn create_empty_file(path: &Path) {
         fs::OpenOptions::new()
             .write(true)
@@ -2946,6 +3096,25 @@ mod macos_arm64 {
             .map_err(|err| format!("failed to read serial output {}: {err}", path.display()))?;
 
         Ok(bytes.windows(marker.len()).any(|window| window == marker))
+    }
+
+    fn file_bytes_at(path: &Path, offset: u64, len: usize) -> Vec<u8> {
+        let mut bytes = vec![0; len];
+        let mut file = fs::File::open(path)
+            .unwrap_or_else(|err| panic!("failed to open {}: {err}", path.display()));
+        file.seek(SeekFrom::Start(offset)).unwrap_or_else(|err| {
+            panic!(
+                "failed to seek {} to offset {offset}: {err}",
+                path.display()
+            )
+        });
+        file.read_exact(&mut bytes).unwrap_or_else(|err| {
+            panic!(
+                "failed to read {} at offset {offset}: {err}",
+                path.display()
+            )
+        });
+        bytes
     }
 
     fn file_prefix_lossy(path: &Path, len: usize) -> String {
