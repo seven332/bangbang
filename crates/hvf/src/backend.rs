@@ -409,9 +409,14 @@ fn copy_pmem_backing_to_shadow(
             ))
         })?;
 
-        copied += u64::try_from(read_len).map_err(|_| {
+        let read_len = u64::try_from(read_len).map_err(|_| {
             BackendError::Hypervisor(format!(
                 "HVF pmem shadow copy chunk length {read_len} does not fit the guest address space"
+            ))
+        })?;
+        copied = copied.checked_add(read_len).ok_or_else(|| {
+            BackendError::Hypervisor(format!(
+                "HVF pmem shadow copy offset {copied} overflows guest address space"
             ))
         })?;
     }
