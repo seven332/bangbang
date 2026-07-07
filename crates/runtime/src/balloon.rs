@@ -3594,6 +3594,41 @@ mod tests {
     }
 
     #[test]
+    fn inflate_queue_dispatch_available_ring_error_preserves_completed_dispatch() {
+        let mut memory = pfn_descriptor_memory();
+        let bytes = pfn_payload_bytes(&[13, 14]);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
+        write_inflate_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&bytes), None),
+        );
+        write_available_heads(&mut memory, inflate_available_ring(), &[0, TEST_QUEUE_SIZE]);
+        let mut queue = inflate_queue();
+
+        let error = queue
+            .dispatch_inflate(&mut memory)
+            .expect_err("invalid second inflate queue head should fail");
+
+        assert!(matches!(
+            error,
+            VirtioBalloonQueueDispatchError::AvailableRing { .. }
+        ));
+        assert_eq!(error.completed_dispatch().completed_descriptors(), 1);
+        assert!(error.completed_dispatch().needs_queue_interrupt());
+        assert_eq!(
+            error.completed_dispatch().inflated_page_ranges(),
+            &[VirtioBalloonPfnRange {
+                start_pfn: 13,
+                page_count: 2,
+            }]
+        );
+        assert_eq!(read_used_idx(&memory, inflate_used_ring()), 1);
+        assert_eq!(read_used_element(&memory, inflate_used_ring(), 0), (0, 0));
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
     fn inflate_queue_dispatch_parse_error_preserves_completed_dispatch() {
         let mut memory = pfn_descriptor_memory();
         let first = pfn_payload_bytes(&[7]);
