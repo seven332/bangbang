@@ -292,6 +292,7 @@ pub enum VmmActionError {
         action: &'static str,
         state: InstanceState,
     },
+    BalloonConfig(balloon::BalloonConfigError),
     BalloonUnsupported,
     BalloonUpdate(balloon::BalloonUpdateError),
     EntropyUnsupported,
@@ -333,6 +334,7 @@ impl fmt::Display for VmmActionError {
                     "The requested operation is not supported in {state} state: {action}"
                 )
             }
+            Self::BalloonConfig(err) => write!(f, "{err}"),
             Self::BalloonUnsupported => f.write_str("Balloon device is not supported."),
             Self::BalloonUpdate(err) => write!(f, "{err}"),
             Self::EntropyUnsupported => f.write_str("Entropy device is not supported."),
@@ -373,6 +375,7 @@ impl std::error::Error for VmmActionError {
         match self {
             Self::InstanceStart(err) => Some(err),
             Self::BootSourceConfig(err) => Some(err),
+            Self::BalloonConfig(err) => Some(err),
             Self::BalloonUpdate(err) => Some(err),
             Self::DriveConfig(err) => Some(err),
             Self::DriveUpdate(err) => Some(err),
@@ -545,6 +548,65 @@ impl VmmController {
             .map_err(VmmActionError::DriveUpdate)
     }
 
+    fn validate_balloon_config_target_against_memory(
+        amount_mib: u32,
+        mem_size_mib: u64,
+    ) -> Result<(), VmmActionError> {
+        if u64::from(amount_mib) > mem_size_mib {
+            return Err(VmmActionError::BalloonConfig(
+                balloon::BalloonConfigError::TargetExceedsGuestMemory {
+                    amount_mib,
+                    mem_size_mib,
+                },
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn validate_balloon_update_target_against_memory(
+        amount_mib: u32,
+        mem_size_mib: u64,
+    ) -> Result<(), VmmActionError> {
+        if u64::from(amount_mib) > mem_size_mib {
+            return Err(VmmActionError::BalloonUpdate(
+                balloon::BalloonUpdateError::TargetExceedsGuestMemory {
+                    amount_mib,
+                    mem_size_mib,
+                },
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn validated_balloon_config(
+        &self,
+        input: balloon::BalloonConfigInput,
+    ) -> Result<balloon::BalloonConfig, VmmActionError> {
+        let config = balloon::BalloonConfig::from(input);
+        Self::validate_balloon_config_target_against_memory(
+            config.amount_mib(),
+            self.machine_config.mem_size_mib(),
+        )?;
+        Ok(config)
+    }
+
+    fn validate_machine_config_compatible_with_balloon(
+        &self,
+        config: machine::MachineConfig,
+    ) -> Result<machine::MachineConfig, VmmActionError> {
+        if let Some(balloon_config) = self.balloon_config
+            && u64::from(balloon_config.amount_mib()) > config.mem_size_mib()
+        {
+            return Err(VmmActionError::MachineConfig(
+                machine::MachineConfigError::IncompatibleBalloonSize,
+            ));
+        }
+
+        Ok(config)
+    }
+
     pub fn updated_balloon_config(
         &self,
         input: balloon::BalloonUpdateInput,
@@ -560,14 +622,10 @@ impl VmmController {
             .balloon_config
             .ok_or(VmmActionError::BalloonUnsupported)?;
 
-        if u64::from(input.amount_mib()) > self.machine_config.mem_size_mib() {
-            return Err(VmmActionError::BalloonUpdate(
-                balloon::BalloonUpdateError::TargetExceedsGuestMemory {
-                    amount_mib: input.amount_mib(),
-                    mem_size_mib: self.machine_config.mem_size_mib(),
-                },
-            ));
-        }
+        Self::validate_balloon_update_target_against_memory(
+            input.amount_mib(),
+            self.machine_config.mem_size_mib(),
+        )?;
 
         current_config
             .updated(input)
@@ -882,7 +940,7 @@ impl VmmController {
                     });
                 }
 
-                self.balloon_config = Some(config.into());
+                self.balloon_config = Some(self.validated_balloon_config(config)?);
                 Ok(VmmData::Empty)
             }
             VmmAction::PatchBalloon(input) => {
@@ -1013,7 +1071,9 @@ impl VmmController {
                     });
                 }
 
-                self.machine_config = config.validate().map_err(VmmActionError::MachineConfig)?;
+                let config = config.validate().map_err(VmmActionError::MachineConfig)?;
+                self.machine_config =
+                    self.validate_machine_config_compatible_with_balloon(config)?;
 
                 Ok(VmmData::Empty)
             }
@@ -1025,9 +1085,11 @@ impl VmmController {
                     });
                 }
 
-                self.machine_config = config
+                let config = config
                     .apply_to(self.machine_config)
                     .map_err(VmmActionError::MachineConfig)?;
+                self.machine_config =
+                    self.validate_machine_config_compatible_with_balloon(config)?;
 
                 Ok(VmmData::Empty)
             }
@@ -1251,7 +1313,10 @@ mod tests {
     use super::{
         BackendError, HotUnplugDeviceInput, HotUnplugDeviceKind, InstanceState, VmmAction,
         VmmActionError, VmmController, VmmData,
-        balloon::{BalloonConfig, BalloonConfigInput, BalloonUpdateError, BalloonUpdateInput},
+        balloon::{
+            BalloonConfig, BalloonConfigError, BalloonConfigInput, BalloonUpdateError,
+            BalloonUpdateInput,
+        },
         block::{DriveConfigError, DriveConfigInput, DriveUpdateInput},
         boot::{
             BootCommandLineError, BootPayloadKind, BootSourceConfigError, BootSourceConfigInput,
@@ -1957,6 +2022,81 @@ mod tests {
         assert_eq!(
             controller.balloon_config(),
             Some(BalloonConfig::from(balloon_input(128, false)))
+        );
+    }
+
+    #[test]
+    fn put_balloon_accepts_target_equal_to_machine_memory() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
+        let data = controller
+            .handle_action(VmmAction::PutBalloon(balloon_input(
+                DEFAULT_MEM_SIZE_MIB as u32,
+                false,
+            )))
+            .expect("balloon target equal to guest memory should be accepted");
+
+        assert_eq!(data, VmmData::Empty);
+        assert_eq!(
+            controller.balloon_config(),
+            Some(BalloonConfig::from(balloon_input(
+                DEFAULT_MEM_SIZE_MIB as u32,
+                false,
+            )))
+        );
+    }
+
+    #[test]
+    fn put_balloon_rejects_target_larger_than_default_memory_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBalloon(balloon_input(64, true)))
+            .expect("initial balloon should store");
+
+        let err = controller
+            .handle_action(VmmAction::PutBalloon(balloon_input(
+                (DEFAULT_MEM_SIZE_MIB + 1) as u32,
+                false,
+            )))
+            .expect_err("oversized balloon target should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::BalloonConfig(BalloonConfigError::TargetExceedsGuestMemory {
+                amount_mib: (DEFAULT_MEM_SIZE_MIB + 1) as u32,
+                mem_size_mib: DEFAULT_MEM_SIZE_MIB,
+            })
+        );
+        assert_eq!(
+            controller.balloon_config(),
+            Some(BalloonConfig::from(balloon_input(64, true)))
+        );
+    }
+
+    #[test]
+    fn put_balloon_uses_custom_machine_memory_limit() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 256)))
+            .expect("custom machine memory should store");
+
+        controller
+            .handle_action(VmmAction::PutBalloon(balloon_input(256, true)))
+            .expect("balloon target equal to custom memory should store");
+        let err = controller
+            .handle_action(VmmAction::PutBalloon(balloon_input(257, false)))
+            .expect_err("balloon target larger than custom memory should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::BalloonConfig(BalloonConfigError::TargetExceedsGuestMemory {
+                amount_mib: 257,
+                mem_size_mib: 256,
+            })
+        );
+        assert_eq!(
+            controller.balloon_config(),
+            Some(BalloonConfig::from(balloon_input(256, true)))
         );
     }
 
@@ -3981,6 +4121,38 @@ mod tests {
     }
 
     #[test]
+    fn put_machine_config_rejects_memory_smaller_than_balloon_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 256)))
+            .expect("initial machine config should store");
+        controller
+            .handle_action(VmmAction::PutBalloon(balloon_input(128, true)))
+            .expect("balloon config should store");
+
+        let err = controller
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(4, 127)))
+            .expect_err("machine memory smaller than balloon target should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::MachineConfig(MachineConfigError::IncompatibleBalloonSize)
+        );
+        assert_eq!(controller.machine_config().vcpu_count(), 2);
+        assert_eq!(controller.machine_config().mem_size_mib(), 256);
+        assert_eq!(
+            controller.balloon_config(),
+            Some(BalloonConfig::from(balloon_input(128, true)))
+        );
+
+        controller
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(4, 128)))
+            .expect("machine memory equal to balloon target should store");
+        assert_eq!(controller.machine_config().vcpu_count(), 4);
+        assert_eq!(controller.machine_config().mem_size_mib(), 128);
+    }
+
+    #[test]
     fn put_machine_config_rejects_invalid_input_without_mutating() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         controller
@@ -4049,6 +4221,42 @@ mod tests {
 
         assert_eq!(controller.machine_config().vcpu_count(), 2);
         assert_eq!(controller.machine_config().mem_size_mib(), 512);
+    }
+
+    #[test]
+    fn patch_machine_config_rejects_memory_smaller_than_balloon_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMachineConfig(MachineConfigInput::new(2, 256)))
+            .expect("initial machine config should store");
+        controller
+            .handle_action(VmmAction::PutBalloon(balloon_input(128, true)))
+            .expect("balloon config should store");
+
+        let err = controller
+            .handle_action(VmmAction::PatchMachineConfig(
+                MachineConfigPatchInput::new().with_mem_size_mib(127),
+            ))
+            .expect_err("machine memory patch smaller than balloon target should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::MachineConfig(MachineConfigError::IncompatibleBalloonSize)
+        );
+        assert_eq!(controller.machine_config().vcpu_count(), 2);
+        assert_eq!(controller.machine_config().mem_size_mib(), 256);
+        assert_eq!(
+            controller.balloon_config(),
+            Some(BalloonConfig::from(balloon_input(128, true)))
+        );
+
+        controller
+            .handle_action(VmmAction::PatchMachineConfig(
+                MachineConfigPatchInput::new().with_mem_size_mib(128),
+            ))
+            .expect("machine memory equal to balloon target should store");
+        assert_eq!(controller.machine_config().vcpu_count(), 2);
+        assert_eq!(controller.machine_config().mem_size_mib(), 128);
     }
 
     #[test]
@@ -5013,6 +5221,20 @@ mod tests {
 
         assert_eq!(err.to_string(), "Balloon device is not supported.");
         assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn displays_balloon_config_error() {
+        let err = VmmActionError::BalloonConfig(BalloonConfigError::TargetExceedsGuestMemory {
+            amount_mib: 129,
+            mem_size_mib: 128,
+        });
+
+        assert_eq!(
+            err.to_string(),
+            "balloon amount_mib 129 exceeds configured guest memory 128 MiB"
+        );
+        assert!(err.source().is_some());
     }
 
     #[test]

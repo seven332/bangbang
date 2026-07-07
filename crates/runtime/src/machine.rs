@@ -275,6 +275,7 @@ pub enum MachineConfigHugePages {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MachineConfigError {
     EmptyPatch,
+    IncompatibleBalloonSize,
     InvalidVcpuCount,
     InvalidMemorySize,
     SmtNotSupported,
@@ -289,6 +290,9 @@ impl fmt::Display for MachineConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyPatch => f.write_str("machine config patch must update at least one field"),
+            Self::IncompatibleBalloonSize => f.write_str(
+                "machine mem_size_mib cannot be smaller than configured balloon amount_mib",
+            ),
             Self::InvalidVcpuCount => {
                 write!(f, "machine vcpu_count must be in 1..={MAX_SUPPORTED_VCPUS}")
             }
@@ -481,6 +485,10 @@ mod tests {
         assert_eq!(
             MachineConfigError::InvalidMemorySize.to_string(),
             format!("machine mem_size_mib must be in 1..={MAX_MEM_SIZE_MIB}")
+        );
+        assert_eq!(
+            MachineConfigError::IncompatibleBalloonSize.to_string(),
+            "machine mem_size_mib cannot be smaller than configured balloon amount_mib"
         );
         assert_eq!(
             MachineConfigError::SmtNotSupported.to_string(),

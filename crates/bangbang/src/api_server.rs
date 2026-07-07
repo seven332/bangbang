@@ -5779,6 +5779,28 @@ mod tests {
         assert!(get_response.contains(r#""free_page_hinting":true"#));
         assert!(get_response.contains(r#""free_page_reporting":false"#));
 
+        let oversized_put_response = request_over_socket(
+            &mut vmm,
+            "b-put-o",
+            &request_with_body(
+                "PUT",
+                "/balloon",
+                r#"{"amount_mib":129,"deflate_on_oom":false}"#,
+            ),
+        );
+        assert!(oversized_put_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(oversized_put_response.contains(
+            r#""fault_message":"balloon amount_mib 129 exceeds configured guest memory 128 MiB""#
+        ));
+
+        let get_after_oversized_put_response = request_over_socket(
+            &mut vmm,
+            "b-get-po",
+            "GET /balloon HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(get_after_oversized_put_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(get_after_oversized_put_response.contains(r#""amount_mib":64"#));
+
         let vm_config_response = request_over_socket(
             &mut vmm,
             "b-vm-config",

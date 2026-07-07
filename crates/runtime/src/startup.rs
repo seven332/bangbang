@@ -2729,9 +2729,20 @@ mod tests {
         super::Arm64BootRuntimeResources,
         MmioDispatcher,
     ) {
+        boot_runtime_with_balloon_target(kernel_name, TEST_MEMORY_MIB as u32)
+    }
+
+    fn boot_runtime_with_balloon_target(
+        kernel_name: &str,
+        amount_mib: u32,
+    ) -> (
+        crate::memory::GuestMemory,
+        super::Arm64BootRuntimeResources,
+        MmioDispatcher,
+    ) {
         let kernel = temp_file(kernel_name, &arm64_image());
         let mut controller = controller_with_kernel(kernel.path());
-        add_balloon(&mut controller, 64);
+        add_balloon(&mut controller, amount_mib);
         let resources = Arm64BootResources::assemble_from_controller(
             &controller,
             Arm64BootResourceConfig {
@@ -4876,7 +4887,7 @@ mod tests {
     fn assembles_boot_resources_with_balloon_mmio_metadata() {
         let kernel = temp_file("kernel-with-balloon", &arm64_image());
         let mut controller = controller_with_kernel(kernel.path());
-        add_balloon(&mut controller, 64);
+        add_balloon(&mut controller, TEST_MEMORY_MIB as u32);
         let config = Arm64BootResourceConfig {
             balloon_interrupt_line: Some(line(36)),
             ..valid_config(&[])
@@ -4921,7 +4932,7 @@ mod tests {
         );
         assert_eq!(
             handler.device_config_handler().num_pages(),
-            64 * VIRTIO_BALLOON_MIB_TO_4K_PAGES
+            TEST_MEMORY_MIB as u32 * VIRTIO_BALLOON_MIB_TO_4K_PAGES
         );
 
         let tree = read_fdt(&resources);
@@ -5030,7 +5041,7 @@ mod tests {
     fn configured_balloon_without_interrupt_line_fails() {
         let kernel = temp_file("kernel-balloon-missing-line", &arm64_image());
         let mut controller = controller_with_kernel(kernel.path());
-        add_balloon(&mut controller, 64);
+        add_balloon(&mut controller, TEST_MEMORY_MIB as u32);
 
         let err = Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
             .expect_err("configured balloon without interrupt line should fail");
@@ -5549,18 +5560,27 @@ mod tests {
 
     #[test]
     fn boot_runtime_balloon_config_update_updates_active_handler() {
+        let initial_amount_mib = TEST_MEMORY_MIB as u32 / 2;
         let (_, mut runtime, mut mmio_dispatcher) =
-            boot_runtime_with_balloon("kernel-balloon-update-config");
+            boot_runtime_with_balloon_target("kernel-balloon-update-config", initial_amount_mib);
         let device = runtime
             .balloon_device
             .as_ref()
             .expect("balloon device should exist")
             .clone();
 
+        let handler = mmio_dispatcher
+            .handler_mut::<VirtioBalloonMmioHandler>(device.registration.region_id())
+            .expect("balloon handler should be registered");
+        assert_eq!(
+            handler.device_config_handler().num_pages(),
+            initial_amount_mib * VIRTIO_BALLOON_MIB_TO_4K_PAGES
+        );
+
         update_balloon_config_for_device(
             &device,
             &mut mmio_dispatcher,
-            BalloonConfigInput::new(128, false).into(),
+            BalloonConfigInput::new(TEST_MEMORY_MIB as u32, false).into(),
         )
         .expect("balloon config update should succeed");
 
@@ -5569,7 +5589,7 @@ mod tests {
             .expect("balloon handler should be registered");
         assert_eq!(
             handler.device_config_handler().num_pages(),
-            128 * VIRTIO_BALLOON_MIB_TO_4K_PAGES
+            TEST_MEMORY_MIB as u32 * VIRTIO_BALLOON_MIB_TO_4K_PAGES
         );
         assert_eq!(
             read_boot_balloon_mmio_u32(

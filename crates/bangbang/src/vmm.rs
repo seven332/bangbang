@@ -3751,6 +3751,7 @@ mod tests {
             )
             | VmmActionError::UnsupportedAction(_)
             | VmmActionError::UnsupportedState { .. }
+            | VmmActionError::BalloonConfig(_)
             | VmmActionError::BalloonUnsupported
             | VmmActionError::BalloonUpdate(_)
             | VmmActionError::EntropyConfig(_)
