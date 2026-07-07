@@ -1881,6 +1881,31 @@ mod tests {
     }
 
     #[test]
+    fn guest_range_allocator_skips_guest_ram_inside_candidate_range() {
+        let high_ram_start = TEST_PMEM_START + (VIRTIO_PMEM_ALIGNMENT * 4);
+        let high_ram_size = VIRTIO_PMEM_ALIGNMENT * 2;
+        let requested_size = VIRTIO_PMEM_ALIGNMENT * 6;
+        let layout = guest_layout(vec![
+            guest_range(aarch64::DRAM_MEM_START, 8 * 1024 * 1024),
+            guest_range(high_ram_start, high_ram_size),
+        ]);
+        let mut allocator = PmemGuestRangeAllocator::for_layout(&layout);
+
+        let range = allocator
+            .allocate(requested_size)
+            .expect("pmem guest range should skip later high RAM");
+
+        assert_eq!(
+            range.start(),
+            GuestAddress::new(high_ram_start + high_ram_size)
+        );
+        assert_eq!(range.size(), requested_size);
+        for reserved in layout.ranges() {
+            assert!(!range.overlaps(*reserved));
+        }
+    }
+
+    #[test]
     fn guest_range_allocator_rejects_unaligned_size() {
         let mut allocator = PmemGuestRangeAllocator::without_reserved_ranges();
 
