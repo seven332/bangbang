@@ -3682,6 +3682,46 @@ mod tests {
     }
 
     #[test]
+    fn balloon_notification_dispatch_coalesces_duplicate_deflate_notifications() {
+        let mut memory = pfn_descriptor_memory();
+        write_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, VIRTIO_BALLOON_PFN_SIZE as u32, None),
+        );
+        write_available_heads(&mut memory, deflate_available_ring(), &[0]);
+        let layout = prepared(balloon_config(64, false, 0, false, false)).queue_layout();
+        let device_registers = VirtioMmioDeviceRegisters::new(
+            VIRTIO_BALLOON_DEVICE_ID,
+            virtio_feature_bit(VIRTIO_FEATURE_VERSION_1),
+        );
+        let queues = configured_queue_registers(layout.queue_count());
+        let mut device = VirtioBalloonDevice::new(layout);
+        device
+            .activate_balloon(activation_for_queues(&device_registers, &queues))
+            .expect("activation should succeed");
+
+        let dispatch = device
+            .dispatch_drained_queue_notifications(
+                &mut memory,
+                vec![
+                    VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX,
+                    VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX,
+                ],
+            )
+            .expect("duplicate deflate notifications should dispatch once");
+
+        assert_eq!(dispatch.deflate_notifications(), 2);
+        let deflate_dispatch = dispatch
+            .deflate_queue_dispatch()
+            .expect("deflate queue should dispatch");
+        assert_eq!(deflate_dispatch.completed_descriptors(), 1);
+        assert!(deflate_dispatch.needs_queue_interrupt());
+        assert_eq!(read_used_idx(&memory, deflate_used_ring()), 1);
+        assert_eq!(read_used_element(&memory, deflate_used_ring(), 0), (0, 0));
+    }
+
+    #[test]
     fn balloon_mmio_handler_activates_device_with_configured_queues() {
         let mut device = balloon_mmio_device(balloon_config(64, false, 0, false, false));
         let handler = device
