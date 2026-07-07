@@ -88,6 +88,11 @@ pub enum HvfGuestMemoryMappingError {
         host_size: usize,
         expected_size: usize,
     },
+    HostMapping {
+        label: String,
+        range: GuestMemoryRange,
+        source: Box<HvfGuestMemoryMappingError>,
+    },
     MappingMetadataAllocationFailed {
         source: TryReserveError,
     },
@@ -152,6 +157,16 @@ impl fmt::Display for HvfGuestMemoryMappingError {
                     "host mapping for guest memory range {range} has size {host_size}, expected {expected_size}"
                 )
             }
+            Self::HostMapping {
+                label,
+                range,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to map host-backed guest memory range {range} for {label}: {source}"
+                )
+            }
             Self::MappingMetadataAllocationFailed { source } => {
                 write!(
                     f,
@@ -188,6 +203,7 @@ impl std::error::Error for HvfGuestMemoryMappingError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Backend(source) | Self::MapFailed { source, .. } => Some(source),
+            Self::HostMapping { source, .. } => Some(source),
             Self::MappingMetadataAllocationFailed { source } => Some(source),
             Self::UnmapFailed { failures } => failures
                 .first()
@@ -231,18 +247,30 @@ impl HvfGuestMemoryUnmapFailure {
 #[derive(Debug)]
 pub(crate) struct HvfGuestMemoryMapping {
     memory: Option<GuestMemory>,
+    host_memory: Vec<HvfHostMemoryMapping>,
     mapped_regions: Vec<HvfMappedGuestMemoryRegion>,
     mapper: Arc<dyn HvfMemoryMapper>,
 }
 
 impl HvfGuestMemoryMapping {
+    #[cfg(test)]
     pub(crate) fn map_with_mapper(
         memory: GuestMemory,
         permissions: HvfMemoryPermissions,
         mapper: Arc<dyn HvfMemoryMapper>,
     ) -> Result<Self, Box<FailedGuestMemoryMapping>> {
+        Self::map_with_mapper_and_host_mappings(memory, permissions, Vec::new(), mapper)
+    }
+
+    pub(crate) fn map_with_mapper_and_host_mappings(
+        memory: GuestMemory,
+        permissions: HvfMemoryPermissions,
+        host_memory: Vec<HvfHostMemoryMapping>,
+        mapper: Arc<dyn HvfMemoryMapper>,
+    ) -> Result<Self, Box<FailedGuestMemoryMapping>> {
         let mut mapping = Self {
             memory: Some(memory),
+            host_memory,
             mapped_regions: Vec::new(),
             mapper,
         };
@@ -298,27 +326,49 @@ impl HvfGuestMemoryMapping {
             .ok_or(HvfGuestMemoryMappingError::InvalidState(
                 "guest memory owner is missing",
             ))?;
-        let requests = validated_map_requests(memory, permissions)?;
+        let page_size = host_page_size()?;
+        let requests = validated_map_requests(memory, permissions, page_size)?;
+        let host_requests = validated_host_map_requests(&self.host_memory, page_size)?;
         self.mapped_regions
-            .try_reserve_exact(requests.len())
+            .try_reserve_exact(requests.len() + host_requests.len())
             .map_err(
                 |source| HvfGuestMemoryMappingError::MappingMetadataAllocationFailed { source },
             )?;
 
         for request in requests {
-            let mapped_region = request.mapped_region();
-            if let Err(source) = self.mapper.map_region(request, permissions) {
-                let cleanup_failures = self.unmap_mapped_regions();
-                return Err(HvfGuestMemoryMappingError::MapFailed {
-                    range: request.range,
-                    source,
-                    cleanup_failures,
-                });
-            }
-
-            self.mapped_regions.push(mapped_region);
+            self.map_validated_request(request, permissions)?;
         }
 
+        for request in host_requests {
+            self.map_validated_request(request.request, request.permissions)
+                .map_err(|source| {
+                    HvfGuestMemoryMappingError::host_mapping(
+                        &request.label,
+                        request.request.range,
+                        source,
+                    )
+                })?;
+        }
+
+        Ok(())
+    }
+
+    fn map_validated_request(
+        &mut self,
+        request: HvfMemoryMapRequest,
+        permissions: HvfMemoryPermissions,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        let mapped_region = request.mapped_region();
+        if let Err(source) = self.mapper.map_region(request, permissions) {
+            let cleanup_failures = self.unmap_mapped_regions();
+            return Err(HvfGuestMemoryMappingError::MapFailed {
+                range: request.range,
+                source,
+                cleanup_failures,
+            });
+        }
+
+        self.mapped_regions.push(mapped_region);
         Ok(())
     }
 
@@ -346,10 +396,27 @@ impl HvfGuestMemoryMapping {
 
 impl Drop for HvfGuestMemoryMapping {
     fn drop(&mut self) {
-        if self.unmap_all().is_err()
-            && let Some(memory) = self.memory.take()
-        {
-            std::mem::forget(memory);
+        if self.unmap_all().is_err() {
+            if let Some(memory) = self.memory.take() {
+                std::mem::forget(memory);
+            }
+
+            let host_memory = std::mem::take(&mut self.host_memory);
+            std::mem::forget(host_memory);
+        }
+    }
+}
+
+impl HvfGuestMemoryMappingError {
+    fn host_mapping(
+        label: &str,
+        range: GuestMemoryRange,
+        source: HvfGuestMemoryMappingError,
+    ) -> Self {
+        Self::HostMapping {
+            label: label.to_string(),
+            range,
+            source: Box::new(source),
         }
     }
 }
@@ -368,7 +435,40 @@ pub(crate) struct HvfMemoryMapRequest {
     size: usize,
 }
 
+#[derive(Debug)]
+pub(crate) struct HvfHostMemoryMapping {
+    label: String,
+    memory: GuestMemory,
+    permissions: HvfMemoryPermissions,
+}
+
+impl HvfHostMemoryMapping {
+    pub(crate) fn new(
+        label: impl Into<String>,
+        memory: GuestMemory,
+        permissions: HvfMemoryPermissions,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            memory,
+            permissions,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HvfValidatedHostMemoryMapRequest {
+    label: String,
+    request: HvfMemoryMapRequest,
+    permissions: HvfMemoryPermissions,
+}
+
 impl HvfMemoryMapRequest {
+    #[cfg(test)]
+    pub(crate) const fn range(self) -> GuestMemoryRange {
+        self.range
+    }
+
     const fn mapped_region(self) -> HvfMappedGuestMemoryRegion {
         HvfMappedGuestMemoryRegion {
             range: self.range,
@@ -424,6 +524,7 @@ impl HvfMemoryMapper for RealHvfMemoryMapper {
 fn validated_map_requests(
     memory: &GuestMemory,
     permissions: HvfMemoryPermissions,
+    page_size: u64,
 ) -> Result<Vec<HvfMemoryMapRequest>, HvfGuestMemoryMappingError> {
     if permissions.is_empty() {
         return Err(HvfGuestMemoryMappingError::EmptyPermissions);
@@ -433,7 +534,6 @@ fn validated_map_requests(
         return Err(HvfGuestMemoryMappingError::EmptyGuestMemory);
     }
 
-    let page_size = host_page_size()?;
     let mut requests = Vec::new();
     requests
         .try_reserve_exact(memory.regions().len())
@@ -444,6 +544,68 @@ fn validated_map_requests(
     }
 
     Ok(requests)
+}
+
+fn validated_host_map_requests(
+    host_mappings: &[HvfHostMemoryMapping],
+    page_size: u64,
+) -> Result<Vec<HvfValidatedHostMemoryMapRequest>, HvfGuestMemoryMappingError> {
+    let mut requests = Vec::new();
+    let request_count = host_mappings
+        .iter()
+        .map(|mapping| mapping.memory.regions().len())
+        .sum();
+    requests
+        .try_reserve_exact(request_count)
+        .map_err(|source| HvfGuestMemoryMappingError::MappingMetadataAllocationFailed { source })?;
+
+    for mapping in host_mappings {
+        if mapping.memory.regions().is_empty() {
+            return Err(HvfGuestMemoryMappingError::EmptyGuestMemory);
+        }
+
+        for region in mapping.memory.regions() {
+            requests.push(validate_host_map_request(
+                &mapping.label,
+                mapping.permissions,
+                region,
+                page_size,
+            )?);
+        }
+    }
+
+    Ok(requests)
+}
+
+fn validate_host_map_request(
+    label: &str,
+    permissions: HvfMemoryPermissions,
+    region: &GuestMemoryRegion,
+    page_size: u64,
+) -> Result<HvfValidatedHostMemoryMapRequest, HvfGuestMemoryMappingError> {
+    let range = region.range();
+
+    if permissions.is_empty() {
+        return Err(HvfGuestMemoryMappingError::host_mapping(
+            label,
+            range,
+            HvfGuestMemoryMappingError::EmptyPermissions,
+        ));
+    }
+
+    let request = validate_map_request(
+        range,
+        region.host_address().as_ptr() as usize,
+        region.host_size(),
+        page_size,
+    )
+    .map_err(|source| HvfGuestMemoryMappingError::host_mapping(label, range, source))?;
+
+    Ok(HvfValidatedHostMemoryMapRequest {
+        label: label.to_string(),
+        request,
+        permissions,
+    })
 }
 
 fn validated_region_map_request(
@@ -538,9 +700,9 @@ mod tests {
     };
 
     use super::{
-        HvfGuestMemoryMapping, HvfGuestMemoryMappingError, HvfMappedGuestMemoryRegion,
-        HvfMemoryMapRequest, HvfMemoryMapper, HvfMemoryPermissions, host_page_size,
-        validate_map_request,
+        HvfGuestMemoryMapping, HvfGuestMemoryMappingError, HvfHostMemoryMapping,
+        HvfMappedGuestMemoryRegion, HvfMemoryMapRequest, HvfMemoryMapper, HvfMemoryPermissions,
+        host_page_size, validate_map_request,
     };
     use crate::memory::FailedGuestMemoryMapping;
 
@@ -727,6 +889,116 @@ mod tests {
     }
 
     #[test]
+    fn mapping_maps_host_mappings_after_guest_memory_with_own_permissions() {
+        let page_size = page_size();
+        let memory = memory_for_ranges(vec![range(0, page_size)]);
+        let readonly_pmem_range = range(page_size * 8, page_size);
+        let writable_pmem_range = range(page_size * 9, page_size);
+        let readonly_host = memory_for_ranges(vec![readonly_pmem_range]);
+        let writable_host = memory_for_ranges(vec![writable_pmem_range]);
+        let writable_pmem_permissions = HvfMemoryPermissions::new(true, true, false);
+        let host_mappings = vec![
+            HvfHostMemoryMapping::new(
+                "pmem device `readonly`",
+                readonly_host,
+                HvfMemoryPermissions::READ,
+            ),
+            HvfHostMemoryMapping::new(
+                "pmem device `writable`",
+                writable_host,
+                writable_pmem_permissions,
+            ),
+        ];
+        let mapper = Arc::new(RecordingMapper::default());
+
+        let mapping = HvfGuestMemoryMapping::map_with_mapper_and_host_mappings(
+            memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            host_mappings,
+            mapper.clone(),
+        )
+        .expect("guest and host-backed memory mapping should succeed");
+
+        assert_eq!(mapping.mapped_regions.len(), 3);
+        let maps = mapper.maps();
+        let mut mapped = maps
+            .iter()
+            .map(|(request, permissions)| (request.range, request.guest_address, *permissions));
+        assert_eq!(
+            mapped.next(),
+            Some((range(0, page_size), 0, HvfMemoryPermissions::GUEST_RAM))
+        );
+        assert_eq!(
+            mapped.next(),
+            Some((
+                readonly_pmem_range,
+                readonly_pmem_range.start().raw_value(),
+                HvfMemoryPermissions::READ
+            ))
+        );
+        assert_eq!(
+            mapped.next(),
+            Some((
+                writable_pmem_range,
+                writable_pmem_range.start().raw_value(),
+                writable_pmem_permissions
+            ))
+        );
+        assert_eq!(mapped.next(), None);
+
+        drop(mapping);
+
+        let unmaps = mapper.unmaps();
+        let mut unmapped_ranges = unmaps.iter().map(|mapped_region| mapped_region.range);
+        assert_eq!(unmapped_ranges.next(), Some(writable_pmem_range));
+        assert_eq!(unmapped_ranges.next(), Some(readonly_pmem_range));
+        assert_eq!(unmapped_ranges.next(), Some(range(0, page_size)));
+        assert_eq!(unmapped_ranges.next(), None);
+    }
+
+    #[test]
+    fn host_mapping_validation_error_identifies_label_and_range_without_path() {
+        let page_size = page_size();
+        let memory = memory_for_ranges(vec![range(0, page_size)]);
+        let pmem_range = range(page_size * 8, page_size);
+        let host_memory = memory_for_ranges(vec![pmem_range]);
+        let host_mappings = vec![HvfHostMemoryMapping::new(
+            "pmem device `pmem0`",
+            host_memory,
+            HvfMemoryPermissions::new(false, false, false),
+        )];
+        let mapper = Arc::new(RecordingMapper::default());
+
+        let failure = HvfGuestMemoryMapping::map_with_mapper_and_host_mappings(
+            memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            host_mappings,
+            mapper.clone(),
+        )
+        .expect_err("empty host mapping permissions should be rejected");
+
+        assert!(matches!(
+            &failure.error,
+            HvfGuestMemoryMappingError::HostMapping {
+                label,
+                range,
+                source,
+            } if label == "pmem device `pmem0`"
+                && *range == pmem_range
+                && matches!(
+                    source.as_ref(),
+                    HvfGuestMemoryMappingError::EmptyPermissions
+                )
+        ));
+        let message = failure.error.to_string();
+        assert!(message.contains("pmem device `pmem0`"));
+        assert!(message.contains(&pmem_range.to_string()));
+        assert!(!message.contains('/'));
+        assert_eq!(mapper.map_count(), 0);
+        assert_eq!(mapper.unmap_count(), 0);
+    }
+
+    #[test]
     fn partial_map_failure_unmaps_previously_mapped_regions() {
         let page_size = page_size();
         let memory = memory_for_ranges(vec![range(0, page_size), range(page_size, page_size)]);
@@ -785,6 +1057,63 @@ mod tests {
     }
 
     #[test]
+    fn partial_host_mapping_failure_unmaps_guest_and_previous_host_regions() {
+        let page_size = page_size();
+        let memory = memory_for_ranges(vec![range(0, page_size)]);
+        let first_pmem_range = range(page_size * 8, page_size);
+        let failed_pmem_range = range(page_size * 9, page_size);
+        let first_host = memory_for_ranges(vec![first_pmem_range]);
+        let second_host = memory_for_ranges(vec![failed_pmem_range]);
+        let host_mappings = vec![
+            HvfHostMemoryMapping::new(
+                "pmem device `pmem0`",
+                first_host,
+                HvfMemoryPermissions::READ,
+            ),
+            HvfHostMemoryMapping::new(
+                "pmem device `pmem1`",
+                second_host,
+                HvfMemoryPermissions::READ,
+            ),
+        ];
+        let mapper = Arc::new(RecordingMapper::new(Some(3), false));
+
+        let failure = HvfGuestMemoryMapping::map_with_mapper_and_host_mappings(
+            memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            host_mappings,
+            mapper.clone(),
+        )
+        .expect_err("second host-backed mapping should fail");
+
+        assert!(matches!(
+            &failure.error,
+            HvfGuestMemoryMappingError::HostMapping {
+                label,
+                range,
+                source,
+            } if label == "pmem device `pmem1`"
+                && *range == failed_pmem_range
+                && matches!(
+                    source.as_ref(),
+                    HvfGuestMemoryMappingError::MapFailed {
+                        range,
+                        cleanup_failures,
+                        ..
+                    } if *range == failed_pmem_range && cleanup_failures.is_empty()
+                )
+        ));
+        assert!(!failure.mapping.has_mapped_regions());
+        assert_eq!(mapper.map_count(), 3);
+
+        let unmaps = mapper.unmaps();
+        let mut unmapped_ranges = unmaps.iter().map(|mapped_region| mapped_region.range);
+        assert_eq!(unmapped_ranges.next(), Some(first_pmem_range));
+        assert_eq!(unmapped_ranges.next(), Some(range(0, page_size)));
+        assert_eq!(unmapped_ranges.next(), None);
+    }
+
+    #[test]
     fn explicit_unmap_keeps_failed_regions_for_retry() {
         let page_size = page_size();
         let memory = memory_for_ranges(vec![range(0, page_size)]);
@@ -813,6 +1142,45 @@ mod tests {
 
         assert!(!mapping.has_mapped_regions());
         assert_eq!(mapper.unmap_count(), 2);
+    }
+
+    #[test]
+    fn explicit_unmap_keeps_failed_host_regions_for_retry() {
+        let page_size = page_size();
+        let memory = memory_for_ranges(vec![range(0, page_size)]);
+        let host_range = range(page_size * 8, page_size);
+        let host_memory = memory_for_ranges(vec![host_range]);
+        let mapper = Arc::new(RecordingMapper::new(None, true));
+        let host_mappings = vec![HvfHostMemoryMapping::new(
+            "pmem device `pmem0`",
+            host_memory,
+            HvfMemoryPermissions::READ,
+        )];
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper_and_host_mappings(
+            memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            host_mappings,
+            mapper.clone(),
+        )
+        .expect("guest and host-backed memory mapping should succeed");
+
+        let err = mapping
+            .unmap_all()
+            .expect_err("first unmap should report failures");
+
+        assert!(matches!(
+            err,
+            HvfGuestMemoryMappingError::UnmapFailed { failures } if failures.len() == 2
+        ));
+        assert!(mapping.has_mapped_regions());
+
+        mapper.set_fail_unmap(false);
+        mapping
+            .unmap_all()
+            .expect("second unmap should clean up retained regions");
+
+        assert!(!mapping.has_mapped_regions());
+        assert_eq!(mapper.unmap_count(), 4);
     }
 
     #[test]

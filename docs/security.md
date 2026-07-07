@@ -113,12 +113,17 @@ is resource-specific:
   file handles and mappings with the boot resources. Startup also assigns
   deterministic non-overlapping 2 MiB-aligned guest physical ranges after the
   aarch64 MMIO64 gap, skipping current guest RAM, and records those ranges in
-  the internal virtio-pmem config-space `start`/`size` fields. It does not
-  normalize or attach those paths to a guest-visible virtio-pmem device yet.
-  The internal virtio-pmem config-space and host mapping model does not expose
-  host backing bytes until guest attachment and HVF guest-memory registration
-  are implemented. Configured rate limiters are rejected without replacing
-  stored pmem configuration.
+  the internal virtio-pmem config-space `start`/`size` fields. HVF startup
+  creates the VM with the framework-reported maximum IPA size, copies each
+  prepared pmem mapping into an HVF-compatible anonymous shadow, and registers
+  that shadow at the guest physical range after DRAM mapping, using read-only
+  HVF permissions for read-only pmem and read/write non-executable permissions
+  for writable pmem. It does not normalize or attach those paths to a
+  guest-visible virtio-pmem device or FDT node yet, and shadow allocation or HVF
+  registration errors identify the pmem ID and guest range without echoing
+  `path_on_host`. Configured rate limiters are rejected without replacing stored
+  pmem configuration. Shadow writeback and flush semantics remain deferred until
+  guest-visible virtio-pmem behavior is implemented.
 - `/snapshot/create` and `/snapshot/load` currently parse Firecracker-shaped
   snapshot paths before returning unsupported faults, and they do not open or
   create snapshot state or memory files. Future snapshot support must treat

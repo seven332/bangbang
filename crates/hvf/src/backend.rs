@@ -1,12 +1,14 @@
+use std::ptr;
 use std::sync::Arc;
 
-use bangbang_runtime::memory::GuestMemory;
+use bangbang_runtime::memory::{GuestMemory, GuestMemoryLayout, GuestMemoryRange};
+use bangbang_runtime::pmem::PreparedPmemDevice;
 use bangbang_runtime::{BackendError, VmBackend};
 
 use crate::gic::{HvfGicCreator, HvfGicError, HvfGicMetadata, RealHvfGicCreator};
 use crate::memory::{
-    HvfGuestMemoryMapping, HvfGuestMemoryMappingError, HvfMemoryMapper, HvfMemoryPermissions,
-    RealHvfMemoryMapper,
+    HvfGuestMemoryMapping, HvfGuestMemoryMappingError, HvfHostMemoryMapping, HvfMemoryMapper,
+    HvfMemoryPermissions, RealHvfMemoryMapper,
 };
 use crate::runner::{HvfVcpuRunner, HvfVcpuRunnerError};
 use crate::vcpu::HvfVcpu;
@@ -60,6 +62,23 @@ impl HvfBackend {
         }
 
         self.map_guest_memory_with_configured_mapper(memory, permissions)
+    }
+
+    pub(crate) fn map_guest_memory_with_pmem_devices(
+        &mut self,
+        memory: GuestMemory,
+        pmem_devices: &[PreparedPmemDevice],
+        permissions: HvfMemoryPermissions,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        if !Self::is_supported_target() {
+            return Err(BackendError::Unsupported(crate::ffi::UNSUPPORTED_TARGET_MESSAGE).into());
+        }
+
+        self.map_guest_memory_with_pmem_devices_and_configured_mapper(
+            memory,
+            pmem_devices,
+            permissions,
+        )
     }
 
     pub fn unmap_guest_memory(&mut self) -> Result<(), HvfGuestMemoryMappingError> {
@@ -202,6 +221,25 @@ impl HvfBackend {
         memory: GuestMemory,
         permissions: HvfMemoryPermissions,
     ) -> Result<(), HvfGuestMemoryMappingError> {
+        self.map_guest_memory_with_host_mappings(memory, permissions, Vec::new())
+    }
+
+    fn map_guest_memory_with_pmem_devices_and_configured_mapper(
+        &mut self,
+        memory: GuestMemory,
+        pmem_devices: &[PreparedPmemDevice],
+        permissions: HvfMemoryPermissions,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        let host_mappings = pmem_host_memory_mappings(pmem_devices)?;
+        self.map_guest_memory_with_host_mappings(memory, permissions, host_mappings)
+    }
+
+    fn map_guest_memory_with_host_mappings(
+        &mut self,
+        memory: GuestMemory,
+        permissions: HvfMemoryPermissions,
+        host_mappings: Vec<HvfHostMemoryMapping>,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
         if !self.vm_created {
             return Err(HvfGuestMemoryMappingError::InvalidState(
                 VM_NOT_CREATED_FOR_MEMORY_MESSAGE,
@@ -214,9 +252,10 @@ impl HvfBackend {
             ));
         }
 
-        match HvfGuestMemoryMapping::map_with_mapper(
+        match HvfGuestMemoryMapping::map_with_mapper_and_host_mappings(
             memory,
             permissions,
+            host_mappings,
             Arc::clone(&self.memory_mapper),
         ) {
             Ok(mapping) => {
@@ -255,6 +294,94 @@ impl HvfBackend {
             memory_mapper: Arc::new(RealHvfMemoryMapper),
             gic_creator,
         }
+    }
+}
+
+fn pmem_host_memory_mappings(
+    pmem_devices: &[PreparedPmemDevice],
+) -> Result<Vec<HvfHostMemoryMapping>, HvfGuestMemoryMappingError> {
+    let mut host_mappings = Vec::new();
+    host_mappings
+        .try_reserve_exact(pmem_devices.len())
+        .map_err(|source| HvfGuestMemoryMappingError::MappingMetadataAllocationFailed { source })?;
+
+    for device in pmem_devices {
+        let memory = pmem_shadow_memory(device)?;
+        host_mappings.push(HvfHostMemoryMapping::new(
+            format!("pmem device `{}`", device.id()),
+            memory,
+            pmem_memory_permissions(device.mapping().is_read_only()),
+        ));
+    }
+
+    Ok(host_mappings)
+}
+
+fn pmem_shadow_memory(
+    device: &PreparedPmemDevice,
+) -> Result<GuestMemory, HvfGuestMemoryMappingError> {
+    let range = device.guest_range();
+    let layout = GuestMemoryLayout::new(vec![range]).map_err(|source| {
+        BackendError::Hypervisor(format!(
+            "failed to build HVF pmem shadow layout for range {range}: {source}"
+        ))
+    })?;
+    let memory = GuestMemory::allocate(&layout).map_err(|source| {
+        BackendError::Hypervisor(format!(
+            "failed to allocate HVF pmem shadow memory for range {range}: {source}"
+        ))
+    })?;
+    let Some(region) = memory.regions().first() else {
+        return Err(BackendError::Hypervisor(format!(
+            "HVF pmem shadow memory has no region for range {range}"
+        ))
+        .into());
+    };
+
+    validate_pmem_shadow_size(range, region.host_size(), device.mapping().host_size())?;
+    copy_pmem_mapping_to_shadow(device, region);
+
+    Ok(memory)
+}
+
+fn validate_pmem_shadow_size(
+    range: GuestMemoryRange,
+    shadow_size: usize,
+    pmem_size: usize,
+) -> Result<(), HvfGuestMemoryMappingError> {
+    if shadow_size == pmem_size {
+        return Ok(());
+    }
+
+    Err(BackendError::Hypervisor(format!(
+        "HVF pmem shadow memory for range {range} has size {shadow_size}, expected {pmem_size}"
+    ))
+    .into())
+}
+
+fn copy_pmem_mapping_to_shadow(
+    device: &PreparedPmemDevice,
+    region: &bangbang_runtime::memory::GuestMemoryRegion,
+) {
+    let len = device.mapping().host_size();
+
+    // SAFETY: `region` owns a live anonymous mapping with `host_size()`
+    // validated to equal the prepared pmem mapping size. Both mappings remain
+    // alive for the duration of the copy and do not overlap.
+    unsafe {
+        ptr::copy_nonoverlapping(
+            device.mapping().host_address().as_ptr().cast::<u8>(),
+            region.host_address().as_ptr().cast::<u8>(),
+            len,
+        );
+    }
+}
+
+fn pmem_memory_permissions(read_only: bool) -> HvfMemoryPermissions {
+    if read_only {
+        HvfMemoryPermissions::READ
+    } else {
+        HvfMemoryPermissions::new(true, true, false)
     }
 }
 
@@ -304,11 +431,16 @@ impl Drop for HvfBackend {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use bangbang_runtime::BackendError;
     use bangbang_runtime::memory::{
         GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
+    };
+    use bangbang_runtime::pmem::{
+        PmemConfig, PmemConfigInput, PmemConfigs, PreparedPmemDevice, PreparedPmemDevices,
+        VIRTIO_PMEM_ALIGNMENT,
     };
 
     use super::HvfBackend;
@@ -331,6 +463,10 @@ mod tests {
 
     fn page_size() -> u64 {
         host_page_size().expect("host page size should be available for tests")
+    }
+
+    fn pmem_config(input: PmemConfigInput) -> PmemConfig {
+        PmemConfig::try_from(input).expect("pmem config should be valid for test")
     }
 
     fn gic_metadata() -> crate::gic::HvfGicMetadata {
@@ -598,6 +734,63 @@ mod tests {
     }
 
     #[test]
+    fn map_guest_memory_with_pmem_devices_maps_dram_then_pmem_permissions() {
+        let page_size = page_size();
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut backend = HvfBackend::new_with_memory_mapper(mapper.clone());
+        backend.vm_created = true;
+        let layout =
+            GuestMemoryLayout::new(vec![range(0, page_size)]).expect("layout should be valid");
+        let memory = GuestMemory::allocate(&layout).expect("guest memory should allocate");
+        let writable = TempPmemFile::new("writable", VIRTIO_PMEM_ALIGNMENT)
+            .expect("writable pmem file should be created");
+        let readonly = TempPmemFile::new("readonly", VIRTIO_PMEM_ALIGNMENT)
+            .expect("readonly pmem file should be created");
+        let mut configs = PmemConfigs::new();
+        configs.upsert(pmem_config(PmemConfigInput::new(
+            "pmem0",
+            writable.path_text(),
+        )));
+        configs.upsert(pmem_config(
+            PmemConfigInput::new("pmem1", readonly.path_text()).with_read_only(true),
+        ));
+        let devices =
+            PreparedPmemDevices::from_configs(&configs, &layout).expect("pmem should prepare");
+        let pmem_ranges: Vec<_> = devices
+            .as_slice()
+            .iter()
+            .map(PreparedPmemDevice::guest_range)
+            .collect();
+
+        backend
+            .map_guest_memory_with_pmem_devices_and_configured_mapper(
+                memory,
+                devices.as_slice(),
+                HvfMemoryPermissions::GUEST_RAM,
+            )
+            .expect("guest and pmem memory should map");
+
+        assert!(backend.has_guest_memory_mapping());
+        let maps = mapper.maps();
+        let mut mapped = maps
+            .iter()
+            .map(|(request, permissions)| (request.range(), *permissions));
+        assert_eq!(
+            mapped.next(),
+            Some((range(0, page_size), HvfMemoryPermissions::GUEST_RAM))
+        );
+        assert_eq!(
+            mapped.next(),
+            Some((pmem_ranges[0], HvfMemoryPermissions::new(true, true, false)))
+        );
+        assert_eq!(
+            mapped.next(),
+            Some((pmem_ranges[1], HvfMemoryPermissions::READ))
+        );
+        assert_eq!(mapped.next(), None);
+    }
+
+    #[test]
     fn unmap_guest_memory_clears_active_mapping() {
         let page_size = page_size();
         let mapper = Arc::new(RecordingMapper::default());
@@ -699,8 +892,8 @@ mod tests {
         fn new(fail_unmap: bool) -> Self {
             Self {
                 state: Mutex::new(RecordingMapperState {
-                    maps: 0,
-                    unmaps: 0,
+                    maps: Vec::new(),
+                    unmaps: Vec::new(),
                     fail_unmap,
                 }),
             }
@@ -711,6 +904,7 @@ mod tests {
                 .lock()
                 .expect("state lock should not be poisoned")
                 .maps
+                .len()
         }
 
         fn unmap_count(&self) -> usize {
@@ -718,6 +912,15 @@ mod tests {
                 .lock()
                 .expect("state lock should not be poisoned")
                 .unmaps
+                .len()
+        }
+
+        fn maps(&self) -> Vec<(HvfMemoryMapRequest, HvfMemoryPermissions)> {
+            self.state
+                .lock()
+                .expect("state lock should not be poisoned")
+                .maps
+                .clone()
         }
 
         fn set_fail_unmap(&self, fail_unmap: bool) {
@@ -731,22 +934,26 @@ mod tests {
     impl HvfMemoryMapper for RecordingMapper {
         fn map_region(
             &self,
-            _: HvfMemoryMapRequest,
-            _: HvfMemoryPermissions,
+            request: HvfMemoryMapRequest,
+            permissions: HvfMemoryPermissions,
         ) -> Result<(), BackendError> {
             self.state
                 .lock()
                 .expect("state lock should not be poisoned")
-                .maps += 1;
+                .maps
+                .push((request, permissions));
             Ok(())
         }
 
-        fn unmap_region(&self, _: HvfMappedGuestMemoryRegion) -> Result<(), BackendError> {
+        fn unmap_region(
+            &self,
+            mapped_region: HvfMappedGuestMemoryRegion,
+        ) -> Result<(), BackendError> {
             let mut state = self
                 .state
                 .lock()
                 .expect("state lock should not be poisoned");
-            state.unmaps += 1;
+            state.unmaps.push(mapped_region);
 
             if state.fail_unmap {
                 return Err(BackendError::Hypervisor(
@@ -760,9 +967,44 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct RecordingMapperState {
-        maps: usize,
-        unmaps: usize,
+        maps: Vec<(HvfMemoryMapRequest, HvfMemoryPermissions)>,
+        unmaps: Vec<HvfMappedGuestMemoryRegion>,
         fail_unmap: bool,
+    }
+
+    #[derive(Debug)]
+    struct TempPmemFile {
+        path: std::path::PathBuf,
+    }
+
+    impl TempPmemFile {
+        fn new(name: &str, size: u64) -> std::io::Result<Self> {
+            static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "bangbang-hvf-backend-{name}-{}-{id}",
+                std::process::id()
+            ));
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            file.set_len(size)?;
+
+            Ok(Self { path })
+        }
+
+        fn path_text(&self) -> String {
+            self.path.to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for TempPmemFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 
     #[derive(Debug)]

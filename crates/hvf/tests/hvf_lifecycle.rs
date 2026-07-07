@@ -268,6 +268,7 @@ fn prepares_internal_hvf_arm64_boot_session() {
     use bangbang_runtime::memory::GuestAddress;
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::{PmemConfigInput, VIRTIO_PMEM_ALIGNMENT};
     use bangbang_runtime::vsock::VsockMmioLayout;
 
     let _test_lock = HVF_LIFECYCLE_TEST_LOCK
@@ -275,12 +276,27 @@ fn prepares_internal_hvf_arm64_boot_session() {
         .expect("HVF lifecycle test lock should not be poisoned");
     let image = arm64_image().expect("test arm64 image should build");
     let kernel = TempFile::new("session-kernel", &image).expect("temp kernel should be created");
+    let writable_pmem = TempFile::new_len("session-writable-pmem", VIRTIO_PMEM_ALIGNMENT)
+        .expect("temp writable pmem should be created");
+    let readonly_pmem = TempFile::new_len("session-readonly-pmem", VIRTIO_PMEM_ALIGNMENT)
+        .expect("temp readonly pmem should be created");
     let mut controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
     controller
         .handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
             kernel.path(),
         )))
         .expect("boot source config should be stored");
+    controller
+        .handle_action(VmmAction::PutPmem(PmemConfigInput::new(
+            "pmem0",
+            path_text(writable_pmem.path()),
+        )))
+        .expect("writable pmem config should be stored");
+    controller
+        .handle_action(VmmAction::PutPmem(
+            PmemConfigInput::new("pmem1", path_text(readonly_pmem.path())).with_read_only(true),
+        ))
+        .expect("readonly pmem config should be stored");
     let mut backend = HvfBackend::new();
     let config = HvfArm64BootSessionConfig::new(
         BlockMmioLayout::new(GuestAddress::new(0x4000_0000), MmioRegionId::new(1)),
@@ -301,6 +317,27 @@ fn prepares_internal_hvf_arm64_boot_session() {
             .is_empty()
     );
     assert!(session.block_interrupt_lines().is_empty());
+    assert_eq!(session.runtime_resources().pmem_devices.len(), 2);
+    assert!(
+        !session.runtime_resources().pmem_devices[0]
+            .mapping()
+            .is_read_only()
+    );
+    assert!(
+        session.runtime_resources().pmem_devices[1]
+            .mapping()
+            .is_read_only()
+    );
+    assert!(
+        !session.runtime_resources().pmem_devices[0]
+            .guest_range()
+            .overlaps(session.runtime_resources().layout.ranges()[0])
+    );
+    assert!(
+        !session.runtime_resources().pmem_devices[0]
+            .guest_range()
+            .overlaps(session.runtime_resources().pmem_devices[1].guest_range())
+    );
     assert_eq!(
         session
             .guest_memory()
@@ -576,9 +613,28 @@ impl TempFile {
         Ok(Self { path })
     }
 
+    fn new_len(name: &str, len: u64) -> std::io::Result<Self> {
+        let id = NEXT_HVF_TEST_FILE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("bangbang-hvf-{name}-{}-{}", std::process::id(), id));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        file.set_len(len)?;
+
+        Ok(Self { path })
+    }
+
     fn path(&self) -> &std::path::Path {
         &self.path
     }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn path_text(path: &std::path::Path) -> String {
+    path.to_string_lossy().into_owned()
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
