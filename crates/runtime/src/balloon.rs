@@ -739,6 +739,10 @@ impl VirtioBalloonPfnRange {
     pub const fn page_count(self) -> u32 {
         self.page_count
     }
+
+    fn end_pfn_exclusive(self) -> u64 {
+        u64::from(self.start_pfn) + u64::from(self.page_count)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -807,6 +811,143 @@ impl VirtioBalloonPfnRanges {
 
     pub fn is_empty(&self) -> bool {
         self.ranges.is_empty()
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct VirtioBalloonMemoryAccounting {
+    inflated_page_ranges: Vec<VirtioBalloonPfnRange>,
+}
+
+impl VirtioBalloonMemoryAccounting {
+    pub const fn new() -> Self {
+        Self {
+            inflated_page_ranges: Vec::new(),
+        }
+    }
+
+    pub fn inflated_page_ranges(&self) -> &[VirtioBalloonPfnRange] {
+        &self.inflated_page_ranges
+    }
+
+    pub fn inflated_page_count(&self) -> u64 {
+        self.inflated_page_ranges
+            .iter()
+            .map(|range| u64::from(range.page_count()))
+            .sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inflated_page_ranges.is_empty()
+    }
+
+    fn add_inflated_ranges(
+        &mut self,
+        ranges: &[VirtioBalloonPfnRange],
+    ) -> Result<(), TryReserveError> {
+        let mut next = self.try_clone()?;
+        for range in ranges {
+            next.add_inflated_range(*range)?;
+        }
+        *self = next;
+        Ok(())
+    }
+
+    fn remove_inflated_ranges(
+        &mut self,
+        ranges: &[VirtioBalloonPfnRange],
+    ) -> Result<(), TryReserveError> {
+        let mut next = self.try_clone()?;
+        for range in ranges {
+            next.remove_inflated_range(*range)?;
+        }
+        *self = next;
+        Ok(())
+    }
+
+    fn try_clone(&self) -> Result<Self, TryReserveError> {
+        let mut inflated_page_ranges = Vec::new();
+        inflated_page_ranges.try_reserve_exact(self.inflated_page_ranges.len())?;
+        inflated_page_ranges.extend_from_slice(&self.inflated_page_ranges);
+        Ok(Self {
+            inflated_page_ranges,
+        })
+    }
+
+    fn add_inflated_range(&mut self, range: VirtioBalloonPfnRange) -> Result<(), TryReserveError> {
+        let mut pending_start = u64::from(range.start_pfn());
+        let mut pending_end = range.end_pfn_exclusive();
+        let mut inserted = false;
+        let mut merged = Vec::new();
+        merged.try_reserve_exact(self.inflated_page_ranges.len().saturating_add(2))?;
+
+        for existing in &self.inflated_page_ranges {
+            let existing_start = u64::from(existing.start_pfn());
+            let existing_end = existing.end_pfn_exclusive();
+
+            if existing_end < pending_start {
+                merged.push(*existing);
+            } else if pending_end < existing_start {
+                if !inserted {
+                    push_pfn_bounds(&mut merged, pending_start, pending_end);
+                    inserted = true;
+                }
+                merged.push(*existing);
+            } else {
+                pending_start = pending_start.min(existing_start);
+                pending_end = pending_end.max(existing_end);
+            }
+        }
+
+        if !inserted {
+            push_pfn_bounds(&mut merged, pending_start, pending_end);
+        }
+
+        self.inflated_page_ranges = merged;
+        Ok(())
+    }
+
+    fn remove_inflated_range(
+        &mut self,
+        range: VirtioBalloonPfnRange,
+    ) -> Result<(), TryReserveError> {
+        let remove_start = u64::from(range.start_pfn());
+        let remove_end = range.end_pfn_exclusive();
+        let mut retained = Vec::new();
+        retained.try_reserve_exact(self.inflated_page_ranges.len().saturating_add(1))?;
+
+        for existing in &self.inflated_page_ranges {
+            let existing_start = u64::from(existing.start_pfn());
+            let existing_end = existing.end_pfn_exclusive();
+
+            if existing_end <= remove_start || remove_end <= existing_start {
+                retained.push(*existing);
+                continue;
+            }
+
+            if existing_start < remove_start {
+                push_pfn_bounds(&mut retained, existing_start, remove_start);
+            }
+            if remove_end < existing_end {
+                push_pfn_bounds(&mut retained, remove_end, existing_end);
+            }
+        }
+
+        self.inflated_page_ranges = retained;
+        Ok(())
+    }
+}
+
+fn push_pfn_bounds(ranges: &mut Vec<VirtioBalloonPfnRange>, start: u64, end_exclusive: u64) {
+    let mut next_start = start;
+    while next_start < end_exclusive {
+        let Ok(start_pfn) = u32::try_from(next_start) else {
+            break;
+        };
+        let remaining = end_exclusive - next_start;
+        let page_count = u32::try_from(remaining).unwrap_or(u32::MAX);
+        ranges.push(VirtioBalloonPfnRange::new(start_pfn, page_count));
+        next_start += u64::from(page_count);
     }
 }
 
@@ -1129,6 +1270,24 @@ impl VirtioBalloonQueue {
                     completed_dispatch: Box::new(dispatch.clone()),
                 }
             })?;
+            let pfn_ranges = read_balloon_queue_pfn_ranges(
+                memory,
+                &chain,
+                VirtioBalloonQueueKind::Deflate,
+                descriptor_head,
+                &dispatch,
+            )?;
+            let range_count = pfn_ranges.len();
+            dispatch
+                .reserve_deflated_page_ranges(range_count)
+                .map_err(
+                    |source| VirtioBalloonQueueDispatchError::DeflatedRangeAllocation {
+                        completed_dispatch: Box::new(dispatch.clone()),
+                        descriptor_head,
+                        range_count,
+                        source,
+                    },
+                )?;
             let publication = self
                 .used
                 .publish_used_element_with_notification(
@@ -1143,7 +1302,7 @@ impl VirtioBalloonQueue {
                     descriptor_head,
                     source,
                 })?;
-            dispatch.record_deflate_descriptor(publication);
+            dispatch.record_deflate_descriptor(pfn_ranges.ranges(), publication);
         }
 
         Ok(dispatch)
@@ -1170,28 +1329,13 @@ impl VirtioBalloonQueue {
                     completed_dispatch: Box::new(dispatch.clone()),
                 }
             })?;
-            let payload =
-                VirtioBalloonPfnDescriptorPayload::read(memory, &chain).map_err(|source| {
-                    VirtioBalloonQueueDispatchError::PfnDescriptorRead {
-                        completed_dispatch: Box::new(dispatch.clone()),
-                        descriptor_head,
-                        source,
-                    }
-                })?;
-            let pfn_payload = payload.into_pfn_payload().map_err(|source| {
-                VirtioBalloonQueueDispatchError::PfnPayloadParse {
-                    completed_dispatch: Box::new(dispatch.clone()),
-                    descriptor_head,
-                    source,
-                }
-            })?;
-            let pfn_ranges = pfn_payload.into_page_ranges().map_err(|source| {
-                VirtioBalloonQueueDispatchError::PfnRangeCompact {
-                    completed_dispatch: Box::new(dispatch.clone()),
-                    descriptor_head,
-                    source,
-                }
-            })?;
+            let pfn_ranges = read_balloon_queue_pfn_ranges(
+                memory,
+                &chain,
+                VirtioBalloonQueueKind::Inflate,
+                descriptor_head,
+                &dispatch,
+            )?;
             let range_count = pfn_ranges.len();
             dispatch
                 .reserve_inflated_page_ranges(range_count)
@@ -1229,6 +1373,7 @@ pub struct VirtioBalloonQueueDispatch {
     completed_descriptors: usize,
     needs_queue_interrupt: bool,
     inflated_page_ranges: Vec<VirtioBalloonPfnRange>,
+    deflated_page_ranges: Vec<VirtioBalloonPfnRange>,
 }
 
 impl VirtioBalloonQueueDispatch {
@@ -1244,13 +1389,16 @@ impl VirtioBalloonQueueDispatch {
         &self.inflated_page_ranges
     }
 
-    fn record_deflate_descriptor(&mut self, publication: VirtqueueUsedRingPublication) {
-        self.completed_descriptors += 1;
-        self.needs_queue_interrupt |= publication.needs_queue_interrupt();
+    pub fn deflated_page_ranges(&self) -> &[VirtioBalloonPfnRange] {
+        &self.deflated_page_ranges
     }
 
     fn reserve_inflated_page_ranges(&mut self, range_count: usize) -> Result<(), TryReserveError> {
         self.inflated_page_ranges.try_reserve(range_count)
+    }
+
+    fn reserve_deflated_page_ranges(&mut self, range_count: usize) -> Result<(), TryReserveError> {
+        self.deflated_page_ranges.try_reserve(range_count)
     }
 
     fn record_inflate_descriptor(
@@ -1262,6 +1410,49 @@ impl VirtioBalloonQueueDispatch {
         self.needs_queue_interrupt |= publication.needs_queue_interrupt();
         self.inflated_page_ranges.extend_from_slice(ranges);
     }
+
+    fn record_deflate_descriptor(
+        &mut self,
+        ranges: &[VirtioBalloonPfnRange],
+        publication: VirtqueueUsedRingPublication,
+    ) {
+        self.completed_descriptors += 1;
+        self.needs_queue_interrupt |= publication.needs_queue_interrupt();
+        self.deflated_page_ranges.extend_from_slice(ranges);
+    }
+}
+
+fn read_balloon_queue_pfn_ranges(
+    memory: &GuestMemory,
+    chain: &VirtqueueDescriptorChain,
+    queue: VirtioBalloonQueueKind,
+    descriptor_head: u16,
+    completed_dispatch: &VirtioBalloonQueueDispatch,
+) -> Result<VirtioBalloonPfnRanges, VirtioBalloonQueueDispatchError> {
+    let payload = VirtioBalloonPfnDescriptorPayload::read(memory, chain).map_err(|source| {
+        VirtioBalloonQueueDispatchError::PfnDescriptorRead {
+            queue,
+            completed_dispatch: Box::new(completed_dispatch.clone()),
+            descriptor_head,
+            source,
+        }
+    })?;
+    let pfn_payload = payload.into_pfn_payload().map_err(|source| {
+        VirtioBalloonQueueDispatchError::PfnPayloadParse {
+            queue,
+            completed_dispatch: Box::new(completed_dispatch.clone()),
+            descriptor_head,
+            source,
+        }
+    })?;
+    pfn_payload.into_page_ranges().map_err(|source| {
+        VirtioBalloonQueueDispatchError::PfnRangeCompact {
+            queue,
+            completed_dispatch: Box::new(completed_dispatch.clone()),
+            descriptor_head,
+            source,
+        }
+    })
 }
 
 #[derive(Debug)]
@@ -1282,21 +1473,30 @@ pub enum VirtioBalloonQueueDispatchError {
         source: VirtqueueUsedRingError,
     },
     PfnDescriptorRead {
+        queue: VirtioBalloonQueueKind,
         completed_dispatch: Box<VirtioBalloonQueueDispatch>,
         descriptor_head: u16,
         source: VirtioBalloonPfnDescriptorPayloadReadError,
     },
     PfnPayloadParse {
+        queue: VirtioBalloonQueueKind,
         completed_dispatch: Box<VirtioBalloonQueueDispatch>,
         descriptor_head: u16,
         source: VirtioBalloonPfnPayloadParseError,
     },
     PfnRangeCompact {
+        queue: VirtioBalloonQueueKind,
         completed_dispatch: Box<VirtioBalloonQueueDispatch>,
         descriptor_head: u16,
         source: VirtioBalloonPfnRangeCompactError,
     },
     InflatedRangeAllocation {
+        completed_dispatch: Box<VirtioBalloonQueueDispatch>,
+        descriptor_head: u16,
+        range_count: usize,
+        source: TryReserveError,
+    },
+    DeflatedRangeAllocation {
         completed_dispatch: Box<VirtioBalloonQueueDispatch>,
         descriptor_head: u16,
         range_count: usize,
@@ -1327,6 +1527,9 @@ impl VirtioBalloonQueueDispatchError {
             }
             | Self::InflatedRangeAllocation {
                 completed_dispatch, ..
+            }
+            | Self::DeflatedRangeAllocation {
+                completed_dispatch, ..
             } => completed_dispatch,
         }
     }
@@ -1356,33 +1559,36 @@ impl fmt::Display for VirtioBalloonQueueDispatchError {
                 )
             }
             Self::PfnDescriptorRead {
+                queue,
                 descriptor_head,
                 source,
                 ..
             } => {
                 write!(
                     f,
-                    "failed to read virtio-balloon inflate descriptor {descriptor_head}: {source}"
+                    "failed to read virtio-balloon {queue} descriptor {descriptor_head}: {source}"
                 )
             }
             Self::PfnPayloadParse {
+                queue,
                 descriptor_head,
                 source,
                 ..
             } => {
                 write!(
                     f,
-                    "failed to parse virtio-balloon inflate descriptor {descriptor_head} PFNs: {source}"
+                    "failed to parse virtio-balloon {queue} descriptor {descriptor_head} PFNs: {source}"
                 )
             }
             Self::PfnRangeCompact {
+                queue,
                 descriptor_head,
                 source,
                 ..
             } => {
                 write!(
                     f,
-                    "failed to compact virtio-balloon inflate descriptor {descriptor_head} PFNs: {source}"
+                    "failed to compact virtio-balloon {queue} descriptor {descriptor_head} PFNs: {source}"
                 )
             }
             Self::InflatedRangeAllocation {
@@ -1394,6 +1600,17 @@ impl fmt::Display for VirtioBalloonQueueDispatchError {
                 write!(
                     f,
                     "failed to reserve {range_count} inflated page range(s) for virtio-balloon inflate descriptor {descriptor_head}: {source}"
+                )
+            }
+            Self::DeflatedRangeAllocation {
+                descriptor_head,
+                range_count,
+                source,
+                ..
+            } => {
+                write!(
+                    f,
+                    "failed to reserve {range_count} deflated page range(s) for virtio-balloon deflate descriptor {descriptor_head}: {source}"
                 )
             }
         }
@@ -1409,6 +1626,7 @@ impl std::error::Error for VirtioBalloonQueueDispatchError {
             Self::PfnPayloadParse { source, .. } => Some(source),
             Self::PfnRangeCompact { source, .. } => Some(source),
             Self::InflatedRangeAllocation { source, .. } => Some(source),
+            Self::DeflatedRangeAllocation { source, .. } => Some(source),
             Self::EmptyDescriptorChain { .. } => None,
         }
     }
@@ -1489,6 +1707,7 @@ impl VirtioBalloonActiveQueues {
 pub struct VirtioBalloonDevice {
     queue_layout: VirtioBalloonQueueLayout,
     active_queues: Option<VirtioBalloonActiveQueues>,
+    memory_accounting: VirtioBalloonMemoryAccounting,
 }
 
 impl VirtioBalloonDevice {
@@ -1496,6 +1715,7 @@ impl VirtioBalloonDevice {
         Self {
             queue_layout,
             active_queues: None,
+            memory_accounting: VirtioBalloonMemoryAccounting::new(),
         }
     }
 
@@ -1513,6 +1733,10 @@ impl VirtioBalloonDevice {
 
     pub fn active_queues_mut(&mut self) -> Option<&mut VirtioBalloonActiveQueues> {
         self.active_queues.as_mut()
+    }
+
+    pub const fn memory_accounting(&self) -> &VirtioBalloonMemoryAccounting {
+        &self.memory_accounting
     }
 
     pub fn activate_balloon(
@@ -1593,9 +1817,29 @@ impl VirtioBalloonDevice {
             match active_queues.inflate_mut().dispatch_inflate(memory) {
                 Ok(inflate_dispatch) => {
                     dispatch.inflate_queue_dispatch = Some(inflate_dispatch);
+                    if let Err(source) = apply_completed_balloon_queue_accounting(
+                        &mut self.memory_accounting,
+                        VirtioBalloonQueueKind::Inflate,
+                        &dispatch,
+                    ) {
+                        return Err(VirtioBalloonDeviceNotificationError::Accounting {
+                            completed_dispatch: Box::new(dispatch),
+                            source,
+                        });
+                    }
                 }
                 Err(source) => {
                     dispatch.inflate_queue_dispatch = Some(source.completed_dispatch().clone());
+                    if let Err(accounting_source) = apply_completed_balloon_queue_accounting(
+                        &mut self.memory_accounting,
+                        VirtioBalloonQueueKind::Inflate,
+                        &dispatch,
+                    ) {
+                        return Err(VirtioBalloonDeviceNotificationError::Accounting {
+                            completed_dispatch: Box::new(dispatch),
+                            source: accounting_source,
+                        });
+                    }
                     return Err(VirtioBalloonDeviceNotificationError::QueueDispatch {
                         completed_dispatch: Box::new(dispatch),
                         source,
@@ -1608,9 +1852,29 @@ impl VirtioBalloonDevice {
             match active_queues.deflate_mut().dispatch_deflate(memory) {
                 Ok(deflate_dispatch) => {
                     dispatch.deflate_queue_dispatch = Some(deflate_dispatch);
+                    if let Err(source) = apply_completed_balloon_queue_accounting(
+                        &mut self.memory_accounting,
+                        VirtioBalloonQueueKind::Deflate,
+                        &dispatch,
+                    ) {
+                        return Err(VirtioBalloonDeviceNotificationError::Accounting {
+                            completed_dispatch: Box::new(dispatch),
+                            source,
+                        });
+                    }
                 }
                 Err(source) => {
                     dispatch.deflate_queue_dispatch = Some(source.completed_dispatch().clone());
+                    if let Err(accounting_source) = apply_completed_balloon_queue_accounting(
+                        &mut self.memory_accounting,
+                        VirtioBalloonQueueKind::Deflate,
+                        &dispatch,
+                    ) {
+                        return Err(VirtioBalloonDeviceNotificationError::Accounting {
+                            completed_dispatch: Box::new(dispatch),
+                            source: accounting_source,
+                        });
+                    }
                     return Err(VirtioBalloonDeviceNotificationError::QueueDispatch {
                         completed_dispatch: Box::new(dispatch),
                         source,
@@ -1624,6 +1888,7 @@ impl VirtioBalloonDevice {
 
     pub fn reset(&mut self) {
         self.active_queues = None;
+        self.memory_accounting = VirtioBalloonMemoryAccounting::new();
     }
 }
 
@@ -1811,6 +2076,10 @@ pub enum VirtioBalloonDeviceNotificationError {
         completed_dispatch: Box<VirtioBalloonDeviceNotificationDispatch>,
         source: VirtioBalloonQueueDispatchError,
     },
+    Accounting {
+        completed_dispatch: Box<VirtioBalloonDeviceNotificationDispatch>,
+        source: VirtioBalloonAccountingError,
+    },
 }
 
 impl VirtioBalloonDeviceNotificationError {
@@ -1825,6 +2094,9 @@ impl VirtioBalloonDeviceNotificationError {
             } => drained_notifications,
             Self::QueueDispatch {
                 completed_dispatch, ..
+            }
+            | Self::Accounting {
+                completed_dispatch, ..
             } => completed_dispatch.drained_notifications(),
         }
     }
@@ -1832,7 +2104,7 @@ impl VirtioBalloonDeviceNotificationError {
     pub const fn completed_dispatch(&self) -> Option<&VirtioBalloonQueueDispatch> {
         match self {
             Self::QueueDispatch { source, .. } => Some(source.completed_dispatch()),
-            Self::Inactive { .. } | Self::UnsupportedQueue { .. } => None,
+            Self::Inactive { .. } | Self::UnsupportedQueue { .. } | Self::Accounting { .. } => None,
         }
     }
 
@@ -1841,6 +2113,9 @@ impl VirtioBalloonDeviceNotificationError {
     ) -> Option<&VirtioBalloonDeviceNotificationDispatch> {
         match self {
             Self::QueueDispatch {
+                completed_dispatch, ..
+            }
+            | Self::Accounting {
                 completed_dispatch, ..
             } => Some(completed_dispatch),
             Self::Inactive { .. } | Self::UnsupportedQueue { .. } => None,
@@ -1866,6 +2141,12 @@ impl fmt::Display for VirtioBalloonDeviceNotificationError {
                     "failed to dispatch virtio-balloon queue notification: {source}"
                 )
             }
+            Self::Accounting { source, .. } => {
+                write!(
+                    f,
+                    "failed to update virtio-balloon memory accounting: {source}"
+                )
+            }
         }
     }
 }
@@ -1874,9 +2155,75 @@ impl std::error::Error for VirtioBalloonDeviceNotificationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::QueueDispatch { source, .. } => Some(source),
+            Self::Accounting { source, .. } => Some(source),
             Self::Inactive { .. } | Self::UnsupportedQueue { .. } => None,
         }
     }
+}
+
+#[derive(Debug)]
+pub enum VirtioBalloonAccountingError {
+    RangeUpdate {
+        queue: VirtioBalloonQueueKind,
+        source: TryReserveError,
+    },
+}
+
+impl fmt::Display for VirtioBalloonAccountingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RangeUpdate { queue, source } => {
+                write!(
+                    f,
+                    "failed to update virtio-balloon {queue} page ranges: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioBalloonAccountingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::RangeUpdate { source, .. } => Some(source),
+        }
+    }
+}
+
+fn apply_balloon_queue_accounting(
+    accounting: &mut VirtioBalloonMemoryAccounting,
+    queue: VirtioBalloonQueueKind,
+    dispatch: &VirtioBalloonQueueDispatch,
+) -> Result<(), VirtioBalloonAccountingError> {
+    match queue {
+        VirtioBalloonQueueKind::Inflate => accounting
+            .add_inflated_ranges(dispatch.inflated_page_ranges())
+            .map_err(|source| VirtioBalloonAccountingError::RangeUpdate { queue, source }),
+        VirtioBalloonQueueKind::Deflate => accounting
+            .remove_inflated_ranges(dispatch.deflated_page_ranges())
+            .map_err(|source| VirtioBalloonAccountingError::RangeUpdate { queue, source }),
+        VirtioBalloonQueueKind::Statistics
+        | VirtioBalloonQueueKind::FreePageHinting
+        | VirtioBalloonQueueKind::FreePageReporting => Ok(()),
+    }
+}
+
+fn apply_completed_balloon_queue_accounting(
+    accounting: &mut VirtioBalloonMemoryAccounting,
+    queue: VirtioBalloonQueueKind,
+    dispatch: &VirtioBalloonDeviceNotificationDispatch,
+) -> Result<(), VirtioBalloonAccountingError> {
+    let Some(queue_dispatch) = (match queue {
+        VirtioBalloonQueueKind::Inflate => dispatch.inflate_queue_dispatch(),
+        VirtioBalloonQueueKind::Deflate => dispatch.deflate_queue_dispatch(),
+        VirtioBalloonQueueKind::Statistics
+        | VirtioBalloonQueueKind::FreePageHinting
+        | VirtioBalloonQueueKind::FreePageReporting => None,
+    }) else {
+        return Ok(());
+    };
+
+    apply_balloon_queue_accounting(accounting, queue, queue_dispatch)
 }
 
 fn active_optional_queue_from_activation(
@@ -3448,6 +3795,109 @@ mod tests {
     }
 
     #[test]
+    fn memory_accounting_adds_and_merges_ranges() {
+        let mut accounting = VirtioBalloonMemoryAccounting::default();
+
+        accounting
+            .add_inflated_ranges(&[
+                VirtioBalloonPfnRange::new(10, 2),
+                VirtioBalloonPfnRange::new(12, 1),
+                VirtioBalloonPfnRange::new(8, 2),
+                VirtioBalloonPfnRange::new(20, 1),
+            ])
+            .expect("inflated ranges should add");
+
+        assert_eq!(
+            accounting.inflated_page_ranges(),
+            &[
+                VirtioBalloonPfnRange {
+                    start_pfn: 8,
+                    page_count: 5,
+                },
+                VirtioBalloonPfnRange {
+                    start_pfn: 20,
+                    page_count: 1,
+                }
+            ]
+        );
+        assert_eq!(accounting.inflated_page_count(), 6);
+    }
+
+    #[test]
+    fn memory_accounting_removes_and_splits_ranges() {
+        let mut accounting = VirtioBalloonMemoryAccounting::default();
+        accounting
+            .add_inflated_ranges(&[VirtioBalloonPfnRange::new(10, 10)])
+            .expect("inflated range should add");
+
+        accounting
+            .remove_inflated_ranges(&[VirtioBalloonPfnRange::new(13, 3)])
+            .expect("inflated range should remove");
+
+        assert_eq!(
+            accounting.inflated_page_ranges(),
+            &[
+                VirtioBalloonPfnRange {
+                    start_pfn: 10,
+                    page_count: 3,
+                },
+                VirtioBalloonPfnRange {
+                    start_pfn: 16,
+                    page_count: 4,
+                }
+            ]
+        );
+        assert_eq!(accounting.inflated_page_count(), 7);
+    }
+
+    #[test]
+    fn memory_accounting_ignores_untracked_deflate_ranges() {
+        let mut accounting = VirtioBalloonMemoryAccounting::default();
+        accounting
+            .add_inflated_ranges(&[VirtioBalloonPfnRange::new(30, 2)])
+            .expect("inflated range should add");
+
+        accounting
+            .remove_inflated_ranges(&[VirtioBalloonPfnRange::new(10, 5)])
+            .expect("untracked deflate range should be a no-op");
+
+        assert_eq!(
+            accounting.inflated_page_ranges(),
+            &[VirtioBalloonPfnRange {
+                start_pfn: 30,
+                page_count: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn memory_accounting_handles_max_pfn_adjacency() {
+        let mut accounting = VirtioBalloonMemoryAccounting::default();
+
+        accounting
+            .add_inflated_ranges(&[
+                VirtioBalloonPfnRange::new(0, u32::MAX),
+                VirtioBalloonPfnRange::new(u32::MAX, 1),
+            ])
+            .expect("maximum adjacent ranges should add");
+
+        assert_eq!(
+            accounting.inflated_page_ranges(),
+            &[
+                VirtioBalloonPfnRange {
+                    start_pfn: 0,
+                    page_count: u32::MAX,
+                },
+                VirtioBalloonPfnRange {
+                    start_pfn: u32::MAX,
+                    page_count: 1,
+                }
+            ]
+        );
+        assert_eq!(accounting.inflated_page_count(), u64::from(u32::MAX) + 1);
+    }
+
+    #[test]
     fn inflate_queue_dispatch_empty_available_ring_is_noop() {
         let mut memory = pfn_descriptor_memory();
         let mut queue = inflate_queue();
@@ -3757,16 +4207,19 @@ mod tests {
 
         assert_eq!(dispatch.completed_descriptors(), 0);
         assert!(!dispatch.needs_queue_interrupt());
+        assert!(dispatch.deflated_page_ranges().is_empty());
         assert_eq!(read_used_idx(&memory, deflate_used_ring()), 0);
     }
 
     #[test]
-    fn deflate_queue_dispatch_publishes_zero_length_used_element() {
+    fn deflate_queue_dispatch_publishes_zero_length_used_element_and_records_ranges() {
         let mut memory = pfn_descriptor_memory();
+        let bytes = pfn_payload_bytes(&[4, 5, 7]);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
         write_descriptor(
             &mut memory,
             0,
-            TestDescriptor::readable(TEST_PFN_DATA, VIRTIO_BALLOON_PFN_SIZE as u32, None),
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&bytes), None),
         );
         write_available_heads(&mut memory, deflate_available_ring(), &[0]);
         let mut queue = deflate_queue();
@@ -3777,22 +4230,39 @@ mod tests {
 
         assert_eq!(dispatch.completed_descriptors(), 1);
         assert!(dispatch.needs_queue_interrupt());
+        assert_eq!(
+            dispatch.deflated_page_ranges(),
+            &[
+                VirtioBalloonPfnRange {
+                    start_pfn: 4,
+                    page_count: 2,
+                },
+                VirtioBalloonPfnRange {
+                    start_pfn: 7,
+                    page_count: 1,
+                }
+            ]
+        );
         assert_eq!(read_used_idx(&memory, deflate_used_ring()), 1);
         assert_eq!(read_used_element(&memory, deflate_used_ring(), 0), (0, 0));
     }
 
     #[test]
-    fn deflate_queue_dispatch_publishes_multiple_zero_length_used_elements() {
+    fn deflate_queue_dispatch_publishes_multiple_zero_length_used_elements_and_records_ranges() {
         let mut memory = pfn_descriptor_memory();
+        let first = pfn_payload_bytes(&[15]);
+        let second = pfn_payload_bytes(&[16, 18]);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &first);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA_SPLIT, &second);
         write_descriptor(
             &mut memory,
             0,
-            TestDescriptor::readable(TEST_PFN_DATA, VIRTIO_BALLOON_PFN_SIZE as u32, None),
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&first), None),
         );
         write_descriptor(
             &mut memory,
             1,
-            TestDescriptor::readable(TEST_PFN_DATA_SPLIT, VIRTIO_BALLOON_PFN_SIZE as u32, None),
+            TestDescriptor::readable(TEST_PFN_DATA_SPLIT, descriptor_len(&second), None),
         );
         write_available_heads(&mut memory, deflate_available_ring(), &[0, 1]);
         let mut queue = deflate_queue();
@@ -3803,6 +4273,23 @@ mod tests {
 
         assert_eq!(dispatch.completed_descriptors(), 2);
         assert!(dispatch.needs_queue_interrupt());
+        assert_eq!(
+            dispatch.deflated_page_ranges(),
+            &[
+                VirtioBalloonPfnRange {
+                    start_pfn: 15,
+                    page_count: 1,
+                },
+                VirtioBalloonPfnRange {
+                    start_pfn: 16,
+                    page_count: 1,
+                },
+                VirtioBalloonPfnRange {
+                    start_pfn: 18,
+                    page_count: 1,
+                }
+            ]
+        );
         assert_eq!(read_used_idx(&memory, deflate_used_ring()), 2);
         assert_eq!(read_used_element(&memory, deflate_used_ring(), 0), (0, 0));
         assert_eq!(read_used_element(&memory, deflate_used_ring(), 1), (1, 0));
@@ -3811,10 +4298,12 @@ mod tests {
     #[test]
     fn deflate_queue_dispatch_available_ring_error_preserves_completed_dispatch() {
         let mut memory = pfn_descriptor_memory();
+        let bytes = pfn_payload_bytes(&[22]);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
         write_descriptor(
             &mut memory,
             0,
-            TestDescriptor::readable(TEST_PFN_DATA, VIRTIO_BALLOON_PFN_SIZE as u32, None),
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&bytes), None),
         );
         write_available_heads(&mut memory, deflate_available_ring(), &[0, TEST_QUEUE_SIZE]);
         let mut queue = deflate_queue();
@@ -3829,18 +4318,71 @@ mod tests {
         ));
         assert_eq!(error.completed_dispatch().completed_descriptors(), 1);
         assert!(error.completed_dispatch().needs_queue_interrupt());
+        assert_eq!(
+            error.completed_dispatch().deflated_page_ranges(),
+            &[VirtioBalloonPfnRange {
+                start_pfn: 22,
+                page_count: 1,
+            }]
+        );
         assert_eq!(read_used_idx(&memory, deflate_used_ring()), 1);
         assert_eq!(read_used_element(&memory, deflate_used_ring(), 0), (0, 0));
         assert!(std::error::Error::source(&error).is_some());
     }
 
     #[test]
-    fn deflate_queue_dispatch_used_ring_error_preserves_completed_dispatch() {
+    fn deflate_queue_dispatch_parse_error_preserves_completed_dispatch() {
         let mut memory = pfn_descriptor_memory();
+        let first = pfn_payload_bytes(&[60]);
+        let malformed = [1, 2, 3, 4, 5];
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &first);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA_SPLIT, &malformed);
         write_descriptor(
             &mut memory,
             0,
-            TestDescriptor::readable(TEST_PFN_DATA, VIRTIO_BALLOON_PFN_SIZE as u32, None),
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&first), None),
+        );
+        write_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::readable(TEST_PFN_DATA_SPLIT, descriptor_len(&malformed), None),
+        );
+        write_available_heads(&mut memory, deflate_available_ring(), &[0, 1]);
+        let mut queue = deflate_queue();
+
+        let error = queue
+            .dispatch_deflate(&mut memory)
+            .expect_err("malformed second deflate descriptor should fail");
+
+        assert!(matches!(
+            error,
+            VirtioBalloonQueueDispatchError::PfnPayloadParse {
+                queue: VirtioBalloonQueueKind::Deflate,
+                descriptor_head: 1,
+                ..
+            }
+        ));
+        assert_eq!(error.completed_dispatch().completed_descriptors(), 1);
+        assert_eq!(
+            error.completed_dispatch().deflated_page_ranges(),
+            &[VirtioBalloonPfnRange {
+                start_pfn: 60,
+                page_count: 1,
+            }]
+        );
+        assert_eq!(read_used_idx(&memory, deflate_used_ring()), 1);
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn deflate_queue_dispatch_used_ring_error_preserves_completed_dispatch() {
+        let mut memory = pfn_descriptor_memory();
+        let bytes = pfn_payload_bytes(&[24]);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
+        write_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&bytes), None),
         );
         write_available_heads(&mut memory, deflate_available_ring(), &[0]);
         let mut queue = deflate_queue_with_used_ring(GuestAddress::new(TEST_MEMORY_SIZE));
@@ -3858,6 +4400,7 @@ mod tests {
         ));
         assert_eq!(error.completed_dispatch().completed_descriptors(), 0);
         assert!(!error.completed_dispatch().needs_queue_interrupt());
+        assert!(error.completed_dispatch().deflated_page_ranges().is_empty());
         assert!(std::error::Error::source(&error).is_some());
     }
 
@@ -4159,11 +4702,38 @@ mod tests {
         device
             .activate_balloon(activation_for_queues(&device_registers, &queues))
             .expect("activation should succeed");
+        device
+            .memory_accounting
+            .add_inflated_ranges(&[VirtioBalloonPfnRange::new(100, 2)])
+            .expect("test accounting range should add");
+        assert!(!device.memory_accounting().is_empty());
 
         device.reset();
 
         assert!(!device.is_activated());
         assert!(device.active_queues().is_none());
+        assert!(device.memory_accounting().is_empty());
+    }
+
+    #[test]
+    fn balloon_devices_keep_memory_accounting_independent() {
+        let layout = prepared(balloon_config(64, false, 0, false, false)).queue_layout();
+        let mut first = VirtioBalloonDevice::new(layout);
+        let second = VirtioBalloonDevice::new(layout);
+
+        first
+            .memory_accounting
+            .add_inflated_ranges(&[VirtioBalloonPfnRange::new(100, 2)])
+            .expect("test accounting range should add");
+
+        assert_eq!(
+            first.memory_accounting().inflated_page_ranges(),
+            &[VirtioBalloonPfnRange {
+                start_pfn: 100,
+                page_count: 2,
+            }]
+        );
+        assert!(second.memory_accounting().is_empty());
     }
 
     #[test]
@@ -4216,10 +4786,12 @@ mod tests {
     #[test]
     fn balloon_notification_dispatch_preserves_completed_deflate_queue_dispatch() {
         let mut memory = pfn_descriptor_memory();
+        let bytes = pfn_payload_bytes(&[70]);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
         write_descriptor(
             &mut memory,
             0,
-            TestDescriptor::readable(TEST_PFN_DATA, VIRTIO_BALLOON_PFN_SIZE as u32, None),
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&bytes), None),
         );
         write_available_heads(&mut memory, deflate_available_ring(), &[0, TEST_QUEUE_SIZE]);
         let layout = prepared(balloon_config(64, false, 0, false, false)).queue_layout();
@@ -4253,6 +4825,14 @@ mod tests {
             .expect("queue dispatch error should expose completed work");
         assert_eq!(completed.completed_descriptors(), 1);
         assert!(completed.needs_queue_interrupt());
+        assert_eq!(
+            completed.deflated_page_ranges(),
+            &[VirtioBalloonPfnRange {
+                start_pfn: 70,
+                page_count: 1,
+            }]
+        );
+        assert!(device.memory_accounting().is_empty());
         assert_eq!(read_used_idx(&memory, deflate_used_ring()), 1);
         assert_eq!(read_used_element(&memory, deflate_used_ring(), 0), (0, 0));
         assert!(std::error::Error::source(&error).is_some());
@@ -4313,15 +4893,92 @@ mod tests {
         assert_eq!(read_used_idx(&memory, inflate_used_ring()), 1);
         assert_eq!(read_used_element(&memory, inflate_used_ring(), 0), (0, 0));
         assert_eq!(read_used_idx(&memory, deflate_used_ring()), 0);
+        assert_eq!(
+            device.memory_accounting().inflated_page_ranges(),
+            &[VirtioBalloonPfnRange {
+                start_pfn: 30,
+                page_count: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn balloon_notification_dispatch_updates_memory_accounting_from_inflate_and_deflate() {
+        let mut memory = pfn_descriptor_memory();
+        let inflate_bytes = pfn_payload_bytes(&[80, 81, 83]);
+        let deflate_bytes = pfn_payload_bytes(&[81]);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &inflate_bytes);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA_SPLIT, &deflate_bytes);
+        write_inflate_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&inflate_bytes), None),
+        );
+        write_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA_SPLIT, descriptor_len(&deflate_bytes), None),
+        );
+        write_available_heads(&mut memory, inflate_available_ring(), &[0]);
+        write_available_heads(&mut memory, deflate_available_ring(), &[0]);
+        let layout = prepared(balloon_config(64, false, 0, false, false)).queue_layout();
+        let device_registers = VirtioMmioDeviceRegisters::new(
+            VIRTIO_BALLOON_DEVICE_ID,
+            virtio_feature_bit(VIRTIO_FEATURE_VERSION_1),
+        );
+        let queues = configured_queue_registers(layout.queue_count());
+        let mut device = VirtioBalloonDevice::new(layout);
+        device
+            .activate_balloon(activation_for_queues(&device_registers, &queues))
+            .expect("activation should succeed");
+
+        let dispatch = device
+            .dispatch_drained_queue_notifications(
+                &mut memory,
+                vec![
+                    VIRTIO_BALLOON_INFLATE_QUEUE_INDEX,
+                    VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX,
+                ],
+            )
+            .expect("inflate and deflate notifications should dispatch");
+
+        assert_eq!(dispatch.inflate_notifications(), 1);
+        assert_eq!(dispatch.deflate_notifications(), 1);
+        assert_eq!(
+            dispatch
+                .deflate_queue_dispatch()
+                .expect("deflate dispatch should be present")
+                .deflated_page_ranges(),
+            &[VirtioBalloonPfnRange {
+                start_pfn: 81,
+                page_count: 1,
+            }]
+        );
+        assert_eq!(
+            device.memory_accounting().inflated_page_ranges(),
+            &[
+                VirtioBalloonPfnRange {
+                    start_pfn: 80,
+                    page_count: 1,
+                },
+                VirtioBalloonPfnRange {
+                    start_pfn: 83,
+                    page_count: 1,
+                }
+            ]
+        );
+        assert_eq!(device.memory_accounting().inflated_page_count(), 2);
     }
 
     #[test]
     fn balloon_notification_dispatch_coalesces_duplicate_deflate_notifications() {
         let mut memory = pfn_descriptor_memory();
+        let bytes = pfn_payload_bytes(&[90]);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
         write_descriptor(
             &mut memory,
             0,
-            TestDescriptor::readable(TEST_PFN_DATA, VIRTIO_BALLOON_PFN_SIZE as u32, None),
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&bytes), None),
         );
         write_available_heads(&mut memory, deflate_available_ring(), &[0]);
         let layout = prepared(balloon_config(64, false, 0, false, false)).queue_layout();
@@ -4351,6 +5008,13 @@ mod tests {
             .expect("deflate queue should dispatch");
         assert_eq!(deflate_dispatch.completed_descriptors(), 1);
         assert!(deflate_dispatch.needs_queue_interrupt());
+        assert_eq!(
+            deflate_dispatch.deflated_page_ranges(),
+            &[VirtioBalloonPfnRange {
+                start_pfn: 90,
+                page_count: 1,
+            }]
+        );
         assert_eq!(read_used_idx(&memory, deflate_used_ring()), 1);
         assert_eq!(read_used_element(&memory, deflate_used_ring(), 0), (0, 0));
     }
@@ -4408,6 +5072,19 @@ mod tests {
         );
         assert_eq!(read_used_idx(&memory, inflate_used_ring()), 1);
         assert_eq!(read_used_element(&memory, inflate_used_ring(), 0), (0, 0));
+        assert_eq!(
+            device.memory_accounting().inflated_page_ranges(),
+            &[
+                VirtioBalloonPfnRange {
+                    start_pfn: 40,
+                    page_count: 1,
+                },
+                VirtioBalloonPfnRange {
+                    start_pfn: 42,
+                    page_count: 1,
+                }
+            ]
+        );
     }
 
     #[test]
@@ -4436,7 +5113,9 @@ mod tests {
     fn balloon_mmio_handler_dispatches_inflate_and_deflate_notifications() {
         let mut memory = pfn_descriptor_memory();
         let inflate_bytes = pfn_payload_bytes(&[50, 51]);
+        let deflate_bytes = pfn_payload_bytes(&[50]);
         write_guest_bytes(&mut memory, TEST_PFN_DATA, &inflate_bytes);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA_SPLIT, &deflate_bytes);
         write_inflate_descriptor(
             &mut memory,
             0,
@@ -4446,7 +5125,7 @@ mod tests {
         write_descriptor(
             &mut memory,
             0,
-            TestDescriptor::readable(TEST_PFN_DATA_SPLIT, VIRTIO_BALLOON_PFN_SIZE as u32, None),
+            TestDescriptor::readable(TEST_PFN_DATA_SPLIT, descriptor_len(&deflate_bytes), None),
         );
         write_available_heads(&mut memory, deflate_available_ring(), &[0]);
         let mut device = balloon_mmio_device(balloon_config(64, false, 0, false, false));
@@ -4498,6 +5177,23 @@ mod tests {
             .expect("deflate queue should dispatch");
         assert_eq!(deflate_dispatch.completed_descriptors(), 1);
         assert!(deflate_dispatch.needs_queue_interrupt());
+        assert_eq!(
+            deflate_dispatch.deflated_page_ranges(),
+            &[VirtioBalloonPfnRange {
+                start_pfn: 50,
+                page_count: 1,
+            }]
+        );
+        assert_eq!(
+            handler
+                .activation_handler()
+                .memory_accounting()
+                .inflated_page_ranges(),
+            &[VirtioBalloonPfnRange {
+                start_pfn: 51,
+                page_count: 1,
+            }]
+        );
         assert_eq!(read_used_idx(&memory, inflate_used_ring()), 1);
         assert_eq!(read_used_element(&memory, inflate_used_ring(), 0), (0, 0));
         assert_eq!(read_used_idx(&memory, deflate_used_ring()), 1);
