@@ -322,8 +322,8 @@ fn pmem_host_memory_mappings(
         })?;
         let backing = device.backing().file().try_clone().map_err(|source| {
             BackendError::Hypervisor(format!(
-                "failed to clone HVF pmem backing handle for range {}: {source}",
-                device.guest_range()
+                "failed to clone HVF pmem backing handle for {label} at range {}: {source}",
+                device.guest_range(),
             ))
         })?;
         host_mappings.push(HvfHostMemoryMapping::new_pmem_shadow(
