@@ -114,7 +114,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v20"
+direct_boot_variant="direct-boot-v21"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -506,6 +506,86 @@ check_balloon_marker() {
 
   emit_line BANGBANG_BALLOON_GUEST_CHECK_OK
   write_vdb_marker BANGBANG_BALLOON_GUEST_CHECK_OK
+}
+
+flush_writeback_block_marker() {
+  if [ ! -b /dev/vdb ]; then
+    emit_line BANGBANG_BLOCK_WRITEBACK_FLUSH_FAIL_NO_VDB
+    write_vdb_marker BANGBANG_BLOCK_WRITEBACK_FLUSH_FAIL
+    return
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    emit_line BANGBANG_BLOCK_WRITEBACK_FLUSH_FAIL_NO_PYTHON
+    write_vdb_marker BANGBANG_BLOCK_WRITEBACK_FLUSH_FAIL
+    return
+  fi
+
+  block_flush_result=$(
+    python3 - <<'PY' 2>/dev/null || true
+import os
+import sys
+
+DEVICE = "/dev/vdb"
+SECTOR_SIZE = 512
+PRE_FLUSH_MARKER = b"BANGBANG_BLOCK_WRITEBACK_FLUSH_BEFORE"
+SUCCESS_MARKER = b"BANGBANG_BLOCK_WRITEBACK_FLUSH_OK"
+
+
+def fail(reason):
+    print(f"BANGBANG_BLOCK_WRITEBACK_FLUSH_FAIL_{reason}")
+    sys.exit(1)
+
+
+def write_sector(fd, marker):
+    payload = marker.ljust(SECTOR_SIZE, b" ")
+    view = memoryview(payload)
+    while view:
+        try:
+            written = os.write(fd, view)
+        except OSError:
+            fail("WRITE")
+        if written <= 0:
+            fail("WRITE_SHORT")
+        view = view[written:]
+
+
+try:
+    fd = os.open(DEVICE, os.O_RDWR)
+except OSError:
+    fail("OPEN")
+
+try:
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+    except OSError:
+        fail("SEEK")
+    write_sector(fd, PRE_FLUSH_MARKER)
+    try:
+        os.fsync(fd)
+    except OSError:
+        fail("FSYNC")
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+    except OSError:
+        fail("SEEK")
+    write_sector(fd, SUCCESS_MARKER)
+finally:
+    os.close(fd)
+
+print(SUCCESS_MARKER.decode("ascii"))
+PY
+  )
+
+  if [ "$block_flush_result" = BANGBANG_BLOCK_WRITEBACK_FLUSH_OK ]; then
+    emit_line BANGBANG_BLOCK_WRITEBACK_FLUSH_OK
+  else
+    case "$block_flush_result" in
+      BANGBANG_BLOCK_WRITEBACK_FLUSH_FAIL_*) emit_line "$block_flush_result" ;;
+      *) emit_line BANGBANG_BLOCK_WRITEBACK_FLUSH_FAIL_RESULT ;;
+    esac
+    write_vdb_marker BANGBANG_BLOCK_WRITEBACK_FLUSH_FAIL
+  fi
 }
 
 first_pmem_device() {
@@ -1033,6 +1113,8 @@ if cmdline_has bangbang.entropy-read=1; then
   read_entropy_marker
 elif cmdline_has bangbang.balloon-check=1; then
   check_balloon_marker
+elif cmdline_has bangbang.block-writeback-flush=1; then
+  flush_writeback_block_marker
 elif cmdline_has bangbang.pmem-read-flush=1; then
   read_flush_pmem_marker
 elif cmdline_has bangbang.mmds-v2-fetch=1; then
