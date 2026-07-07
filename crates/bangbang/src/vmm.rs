@@ -39,6 +39,7 @@ use bangbang_runtime::network::{
     VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame,
     VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError, validate_network_interface_count,
 };
+use bangbang_runtime::pmem::PmemMmioLayout;
 use bangbang_runtime::serial::{
     SerialConfigError, SerialConfigInput, SerialOutputFile, SharedSerialOutput,
     SharedSerialOutputBuffer,
@@ -75,6 +76,8 @@ use bangbang_runtime::serial::SerialConfig;
 
 const DEFAULT_BLOCK_MMIO_BASE: GuestAddress = GuestAddress::new(0x5000_0000);
 const DEFAULT_BLOCK_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(1);
+const DEFAULT_PMEM_MMIO_BASE: GuestAddress = GuestAddress::new(0x5800_0000);
+const DEFAULT_PMEM_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(500);
 const DEFAULT_NETWORK_MMIO_BASE: GuestAddress = GuestAddress::new(0x6000_0000);
 const DEFAULT_NETWORK_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(1000);
 const DEFAULT_VSOCK_MMIO_BASE: GuestAddress = GuestAddress::new(0x7000_0000);
@@ -2105,6 +2108,7 @@ fn default_hvf_boot_run_loop_step_limit() -> NonZeroUsize {
 fn default_hvf_boot_session_config(serial_output: SharedSerialOutput) -> HvfArm64BootSessionConfig {
     HvfArm64BootSessionConfig::new(
         BlockMmioLayout::new(DEFAULT_BLOCK_MMIO_BASE, DEFAULT_BLOCK_MMIO_REGION_ID),
+        PmemMmioLayout::new(DEFAULT_PMEM_MMIO_BASE, DEFAULT_PMEM_MMIO_REGION_ID),
         NetworkMmioLayout::new(DEFAULT_NETWORK_MMIO_BASE, DEFAULT_NETWORK_MMIO_REGION_ID),
         VsockMmioLayout::new(DEFAULT_VSOCK_MMIO_BASE, DEFAULT_VSOCK_MMIO_REGION_ID),
     )
@@ -2171,14 +2175,14 @@ mod tests {
         DEFAULT_BALLOON_MMIO_REGION_ID, DEFAULT_BLOCK_MMIO_BASE, DEFAULT_BLOCK_MMIO_REGION_ID,
         DEFAULT_ENTROPY_MMIO_BASE, DEFAULT_ENTROPY_MMIO_REGION_ID,
         DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT, DEFAULT_NETWORK_MMIO_BASE,
-        DEFAULT_NETWORK_MMIO_REGION_ID, DEFAULT_SERIAL_MMIO_BASE, DEFAULT_SERIAL_MMIO_REGION_ID,
-        DEFAULT_VSOCK_MMIO_BASE, DEFAULT_VSOCK_MMIO_REGION_ID, EmptyProcessNetworkRxPacketSource,
-        HvfInstanceStartExecutor, InstanceStartExecutor, NetworkPacketIoRunLoopSession,
-        NoopProcessNetworkTxPacketSink, ProcessHvfBootSession, ProcessMmdsPacketDetourConfig,
-        ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError,
-        ProcessSessionDiagnostics, ProcessVmm, ProcessVmnetPacketIoBackendFactory,
-        default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
-        process_vmnet_packet_io_provider_from_configs,
+        DEFAULT_NETWORK_MMIO_REGION_ID, DEFAULT_PMEM_MMIO_BASE, DEFAULT_PMEM_MMIO_REGION_ID,
+        DEFAULT_SERIAL_MMIO_BASE, DEFAULT_SERIAL_MMIO_REGION_ID, DEFAULT_VSOCK_MMIO_BASE,
+        DEFAULT_VSOCK_MMIO_REGION_ID, EmptyProcessNetworkRxPacketSource, HvfInstanceStartExecutor,
+        InstanceStartExecutor, NetworkPacketIoRunLoopSession, NoopProcessNetworkTxPacketSink,
+        ProcessHvfBootSession, ProcessMmdsPacketDetourConfig, ProcessNetworkPacketIoProvider,
+        ProcessNetworkPacketIoProviderBuildError, ProcessSessionDiagnostics, ProcessVmm,
+        ProcessVmnetPacketIoBackendFactory, default_hvf_boot_run_loop_step_limit,
+        default_hvf_boot_session_config, process_vmnet_packet_io_provider_from_configs,
     };
 
     static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -3160,6 +3164,14 @@ mod tests {
             config.network_mmio_layout.base_region_id(),
             DEFAULT_NETWORK_MMIO_REGION_ID
         );
+        assert_eq!(
+            config.pmem_mmio_layout.base_address(),
+            DEFAULT_PMEM_MMIO_BASE
+        );
+        assert_eq!(
+            config.pmem_mmio_layout.base_region_id(),
+            DEFAULT_PMEM_MMIO_REGION_ID
+        );
         assert_eq!(config.vsock_mmio_layout.address(), DEFAULT_VSOCK_MMIO_BASE);
         assert_eq!(
             config.vsock_mmio_layout.region_id(),
@@ -3173,6 +3185,12 @@ mod tests {
             .expect("network devices should prepare")
             .register_mmio(config.network_mmio_layout)
             .expect("network MMIO should register");
+        let pmem_first_region = MmioRegion::new(
+            config.pmem_mmio_layout.base_region_id(),
+            config.pmem_mmio_layout.base_address(),
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+        )
+        .expect("pmem MMIO region should be valid");
         let vsock_region = MmioRegion::new(
             config.vsock_mmio_layout.region_id(),
             config.vsock_mmio_layout.address(),
@@ -3203,20 +3221,26 @@ mod tests {
                 .registrations()
                 .iter()
                 .all(|registration| registration.region_id() != serial_region_id
+                    && registration.region_id() != pmem_first_region.id()
                     && registration.region_id() != vsock_region.id()
                     && registration.region_id() != entropy_region.id()
                     && registration.region_id() != balloon_region.id())
         );
         assert!(network_devices.registrations().iter().all(
             |registration| registration.region_id() != serial_region_id
+                && registration.region_id() != pmem_first_region.id()
                 && registration.region_id() != vsock_region.id()
                 && registration.region_id() != entropy_region.id()
                 && registration.region_id() != balloon_region.id()
         ));
+        assert_ne!(pmem_first_region.id(), serial_region_id);
         assert_ne!(vsock_region.id(), serial_region_id);
+        assert_ne!(vsock_region.id(), pmem_first_region.id());
         assert_ne!(entropy_region.id(), serial_region_id);
+        assert_ne!(entropy_region.id(), pmem_first_region.id());
         assert_ne!(entropy_region.id(), vsock_region.id());
         assert_ne!(balloon_region.id(), serial_region_id);
+        assert_ne!(balloon_region.id(), pmem_first_region.id());
         assert_ne!(balloon_region.id(), vsock_region.id());
         assert_ne!(balloon_region.id(), entropy_region.id());
         assert!(block_devices.registrations().iter().all(|block| {
@@ -3225,20 +3249,26 @@ mod tests {
                 .iter()
                 .all(|network| !block.region().range().overlaps(network.region().range()))
                 && !block.region().range().overlaps(serial_region.range())
+                && !block.region().range().overlaps(pmem_first_region.range())
                 && !block.region().range().overlaps(vsock_region.range())
                 && !block.region().range().overlaps(entropy_region.range())
                 && !block.region().range().overlaps(balloon_region.range())
         }));
         assert!(network_devices.registrations().iter().all(|network| {
             !network.region().range().overlaps(serial_region.range())
+                && !network.region().range().overlaps(pmem_first_region.range())
                 && !network.region().range().overlaps(vsock_region.range())
                 && !network.region().range().overlaps(entropy_region.range())
                 && !network.region().range().overlaps(balloon_region.range())
         }));
+        assert!(!pmem_first_region.range().overlaps(serial_region.range()));
         assert!(!vsock_region.range().overlaps(serial_region.range()));
+        assert!(!vsock_region.range().overlaps(pmem_first_region.range()));
         assert!(!entropy_region.range().overlaps(serial_region.range()));
+        assert!(!entropy_region.range().overlaps(pmem_first_region.range()));
         assert!(!entropy_region.range().overlaps(vsock_region.range()));
         assert!(!balloon_region.range().overlaps(serial_region.range()));
+        assert!(!balloon_region.range().overlaps(pmem_first_region.range()));
         assert!(!balloon_region.range().overlaps(vsock_region.range()));
         assert!(!balloon_region.range().overlaps(entropy_region.range()));
     }

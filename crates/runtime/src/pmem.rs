@@ -15,9 +15,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::memory::{GuestAddress, GuestMemoryError, GuestMemoryLayout, GuestMemoryRange, aarch64};
-use crate::mmio::{MmioAccessBytes, MmioAccessBytesError, MmioHandlerError};
+use crate::mmio::{
+    MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
+    MmioHandlerError, MmioRegion, MmioRegionId,
+};
 use crate::virtio_mmio::{
-    VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError, VirtioMmioDeviceConfigHandler,
+    VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
+    VirtioMmioDeviceConfigHandler, VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
 };
 
 pub const VIRTIO_PMEM_DEVICE_ID: u32 = 27;
@@ -27,6 +31,8 @@ pub const VIRTIO_PMEM_QUEUE_SIZES: [u16; VIRTIO_PMEM_QUEUE_COUNT] = [VIRTIO_PMEM
 pub const VIRTIO_PMEM_CONFIG_SPACE_SIZE: usize = 16;
 pub const VIRTIO_PMEM_ALIGNMENT: u64 = 2 * 1024 * 1024;
 pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
+
+pub type VirtioPmemMmioHandler = VirtioMmioRegisterHandler<VirtioPmemConfigSpace>;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VirtioPmemConfigSpace {
@@ -940,6 +946,21 @@ impl PreparedPmemDevices {
     pub fn into_vec(self) -> Vec<PreparedPmemDevice> {
         self.devices
     }
+
+    pub fn register_mmio(
+        self,
+        layout: PmemMmioLayout,
+    ) -> Result<PmemMmioDevices, PmemMmioRegistrationError> {
+        PmemMmioDevices::from_prepared(self, layout)
+    }
+
+    pub fn register_mmio_with_dispatcher(
+        self,
+        layout: PmemMmioLayout,
+        dispatcher: MmioDispatcher,
+    ) -> Result<PmemMmioDevices, PmemMmioRegistrationError> {
+        PmemMmioDevices::from_prepared_with_dispatcher(self, layout, dispatcher)
+    }
 }
 
 #[derive(Debug)]
@@ -990,6 +1011,457 @@ impl std::error::Error for PreparedPmemDeviceError {
             Self::OpenBacking { source, .. } => Some(source),
             Self::MapBacking { source, .. } => Some(source),
             Self::AllocateGuestRange { source, .. } => Some(source),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmemMmioLayout {
+    base_address: GuestAddress,
+    base_region_id: MmioRegionId,
+    address_stride: u64,
+    region_id_stride: u64,
+}
+
+impl PmemMmioLayout {
+    pub const fn new(base_address: GuestAddress, base_region_id: MmioRegionId) -> Self {
+        Self {
+            base_address,
+            base_region_id,
+            address_stride: VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+            region_id_stride: 1,
+        }
+    }
+
+    pub const fn base_address(self) -> GuestAddress {
+        self.base_address
+    }
+
+    pub const fn base_region_id(self) -> MmioRegionId {
+        self.base_region_id
+    }
+
+    pub const fn address_stride(self) -> u64 {
+        self.address_stride
+    }
+
+    pub const fn region_id_stride(self) -> u64 {
+        self.region_id_stride
+    }
+
+    pub const fn with_address_stride(mut self, address_stride: u64) -> Self {
+        self.address_stride = address_stride;
+        self
+    }
+
+    pub const fn with_region_id_stride(mut self, region_id_stride: u64) -> Self {
+        self.region_id_stride = region_id_stride;
+        self
+    }
+
+    fn validate(self) -> Result<(), PmemMmioRegistrationError> {
+        if self.address_stride < VIRTIO_MMIO_DEVICE_WINDOW_SIZE {
+            return Err(PmemMmioRegistrationError::AddressStrideTooSmall {
+                stride: self.address_stride,
+                minimum: VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+            });
+        }
+
+        if self.region_id_stride == 0 {
+            return Err(PmemMmioRegistrationError::DuplicateRegionIdStride {
+                region_id: self.base_region_id,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn placement(self, index: usize) -> Result<PmemMmioDevicePlacement, PmemMmioRegistrationError> {
+        let device_index = u64::try_from(index)
+            .map_err(|_| PmemMmioRegistrationError::DeviceIndexTooLarge { index })?;
+        let address_offset = device_index.checked_mul(self.address_stride).ok_or(
+            PmemMmioRegistrationError::AddressOffsetOverflow {
+                device_index,
+                stride: self.address_stride,
+            },
+        )?;
+        let address = self.base_address.checked_add(address_offset).ok_or(
+            PmemMmioRegistrationError::AddressOverflow {
+                base_address: self.base_address,
+                offset: address_offset,
+            },
+        )?;
+        let region_id_offset = device_index.checked_mul(self.region_id_stride).ok_or(
+            PmemMmioRegistrationError::RegionIdOffsetOverflow {
+                device_index,
+                stride: self.region_id_stride,
+            },
+        )?;
+        let region_id = self
+            .base_region_id
+            .raw_value()
+            .checked_add(region_id_offset)
+            .map(MmioRegionId::new)
+            .ok_or(PmemMmioRegistrationError::RegionIdOverflow {
+                base_region_id: self.base_region_id,
+                offset: region_id_offset,
+            })?;
+        let region = MmioRegion::new(region_id, address, VIRTIO_MMIO_DEVICE_WINDOW_SIZE).map_err(
+            |source| PmemMmioRegistrationError::InvalidRegion {
+                region_id,
+                address,
+                source,
+            },
+        )?;
+
+        Ok(PmemMmioDevicePlacement {
+            index,
+            address,
+            region_id,
+            region,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PmemMmioDevicePlacement {
+    index: usize,
+    address: GuestAddress,
+    region_id: MmioRegionId,
+    region: MmioRegion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PmemMmioDeviceRegistration {
+    index: usize,
+    pmem_id: String,
+    region: MmioRegion,
+    config_space: VirtioPmemConfigSpace,
+}
+
+impl PmemMmioDeviceRegistration {
+    pub const fn index(&self) -> usize {
+        self.index
+    }
+
+    pub fn pmem_id(&self) -> &str {
+        &self.pmem_id
+    }
+
+    pub const fn region(&self) -> MmioRegion {
+        self.region
+    }
+
+    pub const fn region_id(&self) -> MmioRegionId {
+        self.region.id()
+    }
+
+    pub const fn address(&self) -> GuestAddress {
+        self.region.range().start()
+    }
+
+    pub const fn config_space(&self) -> VirtioPmemConfigSpace {
+        self.config_space
+    }
+}
+
+#[derive(Debug)]
+pub struct PmemMmioDevices {
+    dispatcher: MmioDispatcher,
+    registrations: Vec<PmemMmioDeviceRegistration>,
+    pmem_devices: Vec<PreparedPmemDevice>,
+}
+
+impl PmemMmioDevices {
+    pub fn from_prepared(
+        prepared: PreparedPmemDevices,
+        layout: PmemMmioLayout,
+    ) -> Result<Self, PmemMmioRegistrationError> {
+        Self::from_prepared_with_dispatcher(prepared, layout, MmioDispatcher::new())
+    }
+
+    pub fn from_prepared_with_dispatcher(
+        prepared: PreparedPmemDevices,
+        layout: PmemMmioLayout,
+        dispatcher: MmioDispatcher,
+    ) -> Result<Self, PmemMmioRegistrationError> {
+        layout.validate()?;
+
+        let mut registrations = Vec::new();
+        registrations
+            .try_reserve_exact(prepared.len())
+            .map_err(|source| PmemMmioRegistrationError::AllocateRegistrations { source })?;
+        let mut placements = Vec::new();
+        placements
+            .try_reserve_exact(prepared.len())
+            .map_err(|source| PmemMmioRegistrationError::AllocatePlacements { source })?;
+        for index in 0..prepared.len() {
+            placements.push(layout.placement(index)?);
+        }
+
+        let mut dispatcher = dispatcher;
+        for (prepared_device, placement) in prepared.as_slice().iter().zip(placements) {
+            let pmem_id = prepared_device.id().to_string();
+            let config_space = prepared_device.config_space();
+            let handler = VirtioMmioRegisterHandler::with_device_config(
+                VIRTIO_PMEM_DEVICE_ID,
+                config_space.available_features(),
+                &VIRTIO_PMEM_QUEUE_SIZES,
+                config_space,
+            )
+            .map_err(|source| PmemMmioRegistrationError::BuildHandler {
+                pmem_id: pmem_id.clone(),
+                region_id: placement.region_id,
+                source,
+            })?;
+            let region = dispatcher
+                .insert_region(
+                    placement.region_id,
+                    placement.address,
+                    VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+                )
+                .map_err(|source| PmemMmioRegistrationError::InsertRegion {
+                    pmem_id: pmem_id.clone(),
+                    region_id: placement.region_id,
+                    address: placement.address,
+                    source,
+                })?;
+            dispatcher
+                .register_handler(placement.region_id, handler)
+                .map_err(|source| PmemMmioRegistrationError::RegisterHandler {
+                    pmem_id: pmem_id.clone(),
+                    region_id: placement.region_id,
+                    source,
+                })?;
+            debug_assert_eq!(region, placement.region);
+            registrations.push(PmemMmioDeviceRegistration {
+                index: placement.index,
+                pmem_id,
+                region,
+                config_space,
+            });
+        }
+
+        Ok(Self {
+            dispatcher,
+            registrations,
+            pmem_devices: prepared.into_vec(),
+        })
+    }
+
+    pub fn dispatcher(&self) -> &MmioDispatcher {
+        &self.dispatcher
+    }
+
+    pub fn dispatcher_mut(&mut self) -> &mut MmioDispatcher {
+        &mut self.dispatcher
+    }
+
+    pub fn registrations(&self) -> &[PmemMmioDeviceRegistration] {
+        &self.registrations
+    }
+
+    pub fn pmem_devices(&self) -> &[PreparedPmemDevice] {
+        &self.pmem_devices
+    }
+
+    pub fn len(&self) -> usize {
+        self.registrations.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.registrations.is_empty()
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        MmioDispatcher,
+        Vec<PmemMmioDeviceRegistration>,
+        Vec<PreparedPmemDevice>,
+    ) {
+        (self.dispatcher, self.registrations, self.pmem_devices)
+    }
+}
+
+#[derive(Debug)]
+pub enum PmemMmioRegistrationError {
+    AddressStrideTooSmall {
+        stride: u64,
+        minimum: u64,
+    },
+    DuplicateRegionIdStride {
+        region_id: MmioRegionId,
+    },
+    DeviceIndexTooLarge {
+        index: usize,
+    },
+    AddressOffsetOverflow {
+        device_index: u64,
+        stride: u64,
+    },
+    AddressOverflow {
+        base_address: GuestAddress,
+        offset: u64,
+    },
+    RegionIdOffsetOverflow {
+        device_index: u64,
+        stride: u64,
+    },
+    RegionIdOverflow {
+        base_region_id: MmioRegionId,
+        offset: u64,
+    },
+    AllocateRegistrations {
+        source: TryReserveError,
+    },
+    AllocatePlacements {
+        source: TryReserveError,
+    },
+    InvalidRegion {
+        region_id: MmioRegionId,
+        address: GuestAddress,
+        source: GuestMemoryError,
+    },
+    BuildHandler {
+        pmem_id: String,
+        region_id: MmioRegionId,
+        source: VirtioMmioRegisterHandlerError,
+    },
+    InsertRegion {
+        pmem_id: String,
+        region_id: MmioRegionId,
+        address: GuestAddress,
+        source: MmioBusError,
+    },
+    RegisterHandler {
+        pmem_id: String,
+        region_id: MmioRegionId,
+        source: MmioDispatchError,
+    },
+}
+
+impl fmt::Display for PmemMmioRegistrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AddressStrideTooSmall { stride, minimum } => {
+                write!(
+                    f,
+                    "pmem MMIO address stride {stride} is smaller than the required device window size {minimum}"
+                )
+            }
+            Self::DuplicateRegionIdStride { region_id } => {
+                write!(
+                    f,
+                    "pmem MMIO region id stride cannot be 0 because it would duplicate region id={region_id}"
+                )
+            }
+            Self::DeviceIndexTooLarge { index } => {
+                write!(f, "pmem MMIO device index {index} does not fit in u64")
+            }
+            Self::AddressOffsetOverflow {
+                device_index,
+                stride,
+            } => {
+                write!(
+                    f,
+                    "pmem MMIO address offset overflows for device index {device_index} with stride {stride}"
+                )
+            }
+            Self::AddressOverflow {
+                base_address,
+                offset,
+            } => {
+                write!(
+                    f,
+                    "pmem MMIO address overflows from base {base_address} with offset {offset}"
+                )
+            }
+            Self::RegionIdOffsetOverflow {
+                device_index,
+                stride,
+            } => {
+                write!(
+                    f,
+                    "pmem MMIO region id offset overflows for device index {device_index} with stride {stride}"
+                )
+            }
+            Self::RegionIdOverflow {
+                base_region_id,
+                offset,
+            } => {
+                write!(
+                    f,
+                    "pmem MMIO region id overflows from base id={base_region_id} with offset {offset}"
+                )
+            }
+            Self::AllocateRegistrations { source } => {
+                write!(f, "failed to allocate pmem MMIO registrations: {source}")
+            }
+            Self::AllocatePlacements { source } => {
+                write!(f, "failed to allocate pmem MMIO placements: {source}")
+            }
+            Self::InvalidRegion {
+                region_id,
+                address,
+                source,
+            } => {
+                write!(
+                    f,
+                    "invalid pmem MMIO region id={region_id} at {address}: {source}"
+                )
+            }
+            Self::BuildHandler {
+                pmem_id,
+                region_id,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to build pmem MMIO handler for pmem device {pmem_id} region id={region_id}: {source}"
+                )
+            }
+            Self::InsertRegion {
+                pmem_id,
+                region_id,
+                address,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to insert pmem MMIO region for pmem device {pmem_id} region id={region_id} at {address}: {source}"
+                )
+            }
+            Self::RegisterHandler {
+                pmem_id,
+                region_id,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to register pmem MMIO handler for pmem device {pmem_id} region id={region_id}: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for PmemMmioRegistrationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AllocateRegistrations { source } => Some(source),
+            Self::AllocatePlacements { source } => Some(source),
+            Self::InvalidRegion { source, .. } => Some(source),
+            Self::BuildHandler { source, .. } => Some(source),
+            Self::InsertRegion { source, .. } => Some(source),
+            Self::RegisterHandler { source, .. } => Some(source),
+            Self::AddressStrideTooSmall { .. }
+            | Self::DuplicateRegionIdStride { .. }
+            | Self::DeviceIndexTooLarge { .. }
+            | Self::AddressOffsetOverflow { .. }
+            | Self::AddressOverflow { .. }
+            | Self::RegionIdOffsetOverflow { .. }
+            | Self::RegionIdOverflow { .. } => None,
         }
     }
 }
@@ -1218,8 +1690,9 @@ mod tests {
     use crate::memory::{GuestAddress, GuestMemoryLayout, GuestMemoryRange, aarch64};
     use crate::mmio::{MmioAccess, MmioAccessBytes, MmioBus, MmioOperation, MmioRegionId};
     use crate::virtio_mmio::{
-        VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioAccess,
-        VirtioMmioDeviceConfigError, decode_virtio_mmio_access,
+        VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VIRTIO_MMIO_MAGIC_VALUE,
+        VirtioMmioAccess, VirtioMmioDeviceConfigError, VirtioMmioRegister,
+        decode_virtio_mmio_access,
     };
 
     const TEST_PMEM_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_0000);
@@ -1453,6 +1926,42 @@ mod tests {
         config.write_device_config(device_config_write_access(offset, data), data)
     }
 
+    fn dispatch_pmem_mmio_read(
+        devices: &mut PmemMmioDevices,
+        index: usize,
+        offset: u64,
+        len: u64,
+    ) -> MmioAccessBytes {
+        let registration = devices.registrations()[index].clone();
+        let address = registration
+            .address()
+            .checked_add(offset)
+            .expect("test MMIO address should not overflow");
+        let access = devices
+            .dispatcher()
+            .lookup(address, len)
+            .expect("pmem MMIO access should resolve");
+        devices
+            .dispatcher_mut()
+            .handler_mut::<VirtioPmemMmioHandler>(registration.region_id())
+            .expect("pmem MMIO handler should be registered")
+            .read_access(access)
+            .expect("pmem MMIO read should dispatch")
+    }
+
+    fn dispatch_pmem_mmio_read_u32(
+        devices: &mut PmemMmioDevices,
+        index: usize,
+        offset: u64,
+    ) -> u32 {
+        let data = dispatch_pmem_mmio_read(devices, index, offset, 4);
+        u32::from_le_bytes(
+            data.as_slice()
+                .try_into()
+                .expect("u32 MMIO read should return 4 bytes"),
+        )
+    }
+
     #[test]
     fn virtio_pmem_constants_match_firecracker_shape() {
         assert_eq!(VIRTIO_PMEM_DEVICE_ID, 27);
@@ -1557,6 +2066,194 @@ mod tests {
             Err(VirtioMmioDeviceConfigError::UnsupportedWrite { offset: 0, len: 4 })
         );
         assert_eq!(config, VirtioPmemConfigSpace::new(0, 0));
+    }
+
+    #[test]
+    fn pmem_mmio_devices_register_single_prepared_device() {
+        let file = temp_sized_file("pmem-mmio-single.img", VIRTIO_PMEM_ALIGNMENT);
+        let configs = [pmem_config(PmemConfigInput::new(
+            "pmem0",
+            file.as_path().display().to_string(),
+        ))];
+        let prepared =
+            PreparedPmemDevices::from_config_slice(&configs).expect("pmem device should prepare");
+
+        let mut devices = prepared
+            .register_mmio(PmemMmioLayout::new(
+                TEST_PMEM_MMIO_BASE,
+                TEST_PMEM_MMIO_REGION_ID,
+            ))
+            .expect("pmem MMIO device should register");
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices.pmem_devices().len(), 1);
+        let registration = &devices.registrations()[0];
+        assert_eq!(registration.index(), 0);
+        assert_eq!(registration.pmem_id(), "pmem0");
+        assert_eq!(registration.region_id(), TEST_PMEM_MMIO_REGION_ID);
+        assert_eq!(registration.address(), TEST_PMEM_MMIO_BASE);
+        assert_eq!(
+            registration.region().range().size(),
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE
+        );
+        assert_eq!(
+            registration.config_space(),
+            devices.pmem_devices()[0].config_space()
+        );
+        assert_eq!(devices.dispatcher().regions().len(), 1);
+        assert_eq!(devices.dispatcher().regions()[0], registration.region());
+        assert_eq!(
+            dispatch_pmem_mmio_read_u32(&mut devices, 0, VirtioMmioRegister::MagicValue.offset()),
+            VIRTIO_MMIO_MAGIC_VALUE
+        );
+        assert_eq!(
+            dispatch_pmem_mmio_read_u32(&mut devices, 0, VirtioMmioRegister::DeviceId.offset()),
+            VIRTIO_PMEM_DEVICE_ID
+        );
+    }
+
+    #[test]
+    fn pmem_mmio_devices_preserve_order_and_layout() {
+        let first = temp_sized_file("pmem-mmio-first.img", VIRTIO_PMEM_ALIGNMENT);
+        let second = temp_sized_file("pmem-mmio-second.img", VIRTIO_PMEM_ALIGNMENT);
+        let configs = [
+            pmem_config(PmemConfigInput::new(
+                "pmem0",
+                first.as_path().display().to_string(),
+            )),
+            pmem_config(PmemConfigInput::new(
+                "pmem1",
+                second.as_path().display().to_string(),
+            )),
+        ];
+        let prepared =
+            PreparedPmemDevices::from_config_slice(&configs).expect("pmem devices should prepare");
+
+        let devices = prepared
+            .register_mmio(
+                PmemMmioLayout::new(TEST_PMEM_MMIO_BASE, MmioRegionId::new(9100))
+                    .with_address_stride(VIRTIO_MMIO_DEVICE_WINDOW_SIZE * 2)
+                    .with_region_id_stride(3),
+            )
+            .expect("pmem MMIO devices should register");
+
+        assert_eq!(devices.registrations()[0].pmem_id(), "pmem0");
+        assert_eq!(devices.registrations()[0].index(), 0);
+        assert_eq!(
+            devices.registrations()[0].region_id(),
+            MmioRegionId::new(9100)
+        );
+        assert_eq!(devices.registrations()[0].address(), TEST_PMEM_MMIO_BASE);
+        assert_eq!(devices.registrations()[1].pmem_id(), "pmem1");
+        assert_eq!(devices.registrations()[1].index(), 1);
+        assert_eq!(
+            devices.registrations()[1].region_id(),
+            MmioRegionId::new(9103)
+        );
+        assert_eq!(
+            devices.registrations()[1].address(),
+            GuestAddress::new(
+                TEST_PMEM_MMIO_BASE.raw_value() + (VIRTIO_MMIO_DEVICE_WINDOW_SIZE * 2)
+            )
+        );
+        assert_eq!(devices.pmem_devices()[0].id(), "pmem0");
+        assert_eq!(devices.pmem_devices()[1].id(), "pmem1");
+    }
+
+    #[test]
+    fn pmem_mmio_devices_dispatch_config_space_reads() {
+        let file = temp_sized_file("pmem-mmio-config.img", VIRTIO_PMEM_ALIGNMENT);
+        let configs = [pmem_config(PmemConfigInput::new(
+            "pmem0",
+            file.as_path().display().to_string(),
+        ))];
+        let prepared =
+            PreparedPmemDevices::from_config_slice(&configs).expect("pmem device should prepare");
+        let expected_config = prepared.as_slice()[0].config_space();
+        let mut devices = prepared
+            .register_mmio(PmemMmioLayout::new(
+                TEST_PMEM_MMIO_BASE,
+                TEST_PMEM_MMIO_REGION_ID,
+            ))
+            .expect("pmem MMIO device should register");
+
+        let start = dispatch_pmem_mmio_read(&mut devices, 0, VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, 8);
+        let size =
+            dispatch_pmem_mmio_read(&mut devices, 0, VIRTIO_MMIO_DEVICE_CONFIG_OFFSET + 8, 8);
+
+        assert_eq!(start.as_slice(), &expected_config.start().to_le_bytes());
+        assert_eq!(size.as_slice(), &expected_config.size().to_le_bytes());
+    }
+
+    #[test]
+    fn pmem_mmio_devices_reject_overlapping_existing_dispatcher_region() {
+        let file = temp_sized_file("pmem-mmio-overlap.img", VIRTIO_PMEM_ALIGNMENT);
+        let configs = [pmem_config(PmemConfigInput::new(
+            "pmem0",
+            file.as_path().display().to_string(),
+        ))];
+        let prepared =
+            PreparedPmemDevices::from_config_slice(&configs).expect("pmem device should prepare");
+        let mut dispatcher = MmioDispatcher::new();
+        dispatcher
+            .insert_region(
+                MmioRegionId::new(1),
+                TEST_PMEM_MMIO_BASE,
+                VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+            )
+            .expect("existing MMIO region should insert");
+
+        let err = prepared
+            .register_mmio_with_dispatcher(
+                PmemMmioLayout::new(TEST_PMEM_MMIO_BASE, TEST_PMEM_MMIO_REGION_ID),
+                dispatcher,
+            )
+            .expect_err("overlapping pmem MMIO region should fail");
+
+        assert!(matches!(
+            err,
+            PmemMmioRegistrationError::InsertRegion {
+                pmem_id,
+                region_id: TEST_PMEM_MMIO_REGION_ID,
+                source: crate::mmio::MmioBusError::OverlappingRegion { .. },
+                ..
+            } if pmem_id == "pmem0"
+        ));
+    }
+
+    #[test]
+    fn pmem_mmio_layout_rejects_overlapping_address_stride() {
+        let err = PreparedPmemDevices::default()
+            .register_mmio(
+                PmemMmioLayout::new(TEST_PMEM_MMIO_BASE, TEST_PMEM_MMIO_REGION_ID)
+                    .with_address_stride(VIRTIO_MMIO_DEVICE_WINDOW_SIZE - 1),
+            )
+            .expect_err("overlapping pmem MMIO address stride should fail");
+
+        assert!(matches!(
+            err,
+            PmemMmioRegistrationError::AddressStrideTooSmall {
+                stride,
+                minimum: VIRTIO_MMIO_DEVICE_WINDOW_SIZE
+            } if stride == VIRTIO_MMIO_DEVICE_WINDOW_SIZE - 1
+        ));
+    }
+
+    #[test]
+    fn pmem_mmio_layout_rejects_duplicate_region_id_stride() {
+        let err = PreparedPmemDevices::default()
+            .register_mmio(
+                PmemMmioLayout::new(TEST_PMEM_MMIO_BASE, TEST_PMEM_MMIO_REGION_ID)
+                    .with_region_id_stride(0),
+            )
+            .expect_err("duplicate pmem MMIO region id stride should fail");
+
+        assert!(matches!(
+            err,
+            PmemMmioRegistrationError::DuplicateRegionIdStride {
+                region_id: TEST_PMEM_MMIO_REGION_ID
+            }
+        ));
     }
 
     #[test]

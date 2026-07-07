@@ -40,6 +40,8 @@ const SERIAL_MMIO_BASE: u64 = 0x4000_0000;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const BLOCK_MMIO_BASE: u64 = 0x5000_0000;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PMEM_MMIO_BASE: u64 = 0x5800_0000;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const NETWORK_MMIO_BASE: u64 = 0x6000_0000;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const VSOCK_MMIO_BASE: u64 = 0x7000_0000;
@@ -332,6 +334,7 @@ fn run_guest_boot_with_boot_source(
     use bangbang_runtime::memory::GuestAddress;
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::PmemMmioLayout;
     use bangbang_runtime::serial::{SharedSerialOutput, SharedSerialOutputBuffer};
     use bangbang_runtime::vsock::VsockMmioLayout;
     use bangbang_runtime::{VmmAction, VmmController};
@@ -350,6 +353,7 @@ fn run_guest_boot_with_boot_source(
     let serial_address = GuestAddress::new(SERIAL_MMIO_BASE);
     let config = HvfArm64BootSessionConfig::new(
         BlockMmioLayout::new(GuestAddress::new(BLOCK_MMIO_BASE), MmioRegionId::new(1)),
+        PmemMmioLayout::new(GuestAddress::new(PMEM_MMIO_BASE), MmioRegionId::new(500)),
         NetworkMmioLayout::new(
             GuestAddress::new(NETWORK_MMIO_BASE),
             MmioRegionId::new(1000),

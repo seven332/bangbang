@@ -268,7 +268,7 @@ fn prepares_internal_hvf_arm64_boot_session() {
     use bangbang_runtime::memory::GuestAddress;
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::network::NetworkMmioLayout;
-    use bangbang_runtime::pmem::{PmemConfigInput, VIRTIO_PMEM_ALIGNMENT};
+    use bangbang_runtime::pmem::{PmemConfigInput, PmemMmioLayout, VIRTIO_PMEM_ALIGNMENT};
     use bangbang_runtime::vsock::VsockMmioLayout;
 
     let _test_lock = HVF_LIFECYCLE_TEST_LOCK
@@ -298,8 +298,11 @@ fn prepares_internal_hvf_arm64_boot_session() {
         ))
         .expect("readonly pmem config should be stored");
     let mut backend = HvfBackend::new();
+    let pmem_mmio_layout =
+        PmemMmioLayout::new(GuestAddress::new(0x4800_0000), MmioRegionId::new(500));
     let config = HvfArm64BootSessionConfig::new(
         BlockMmioLayout::new(GuestAddress::new(0x4000_0000), MmioRegionId::new(1)),
+        pmem_mmio_layout,
         NetworkMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1000)),
         VsockMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(2000)),
     );
@@ -309,14 +312,38 @@ fn prepares_internal_hvf_arm64_boot_session() {
         .expect("internal HVF arm64 boot session should prepare");
 
     let mmio_dispatcher = session.mmio_dispatcher();
-    assert!(
-        mmio_dispatcher
-            .try_lock()
-            .expect("session MMIO dispatcher should lock")
-            .regions()
-            .is_empty()
+    let mmio_regions = mmio_dispatcher
+        .try_lock()
+        .expect("session MMIO dispatcher should lock")
+        .regions()
+        .to_vec();
+    assert_eq!(mmio_regions.len(), 2);
+    assert_eq!(mmio_regions[0].id(), pmem_mmio_layout.base_region_id());
+    assert_eq!(
+        mmio_regions[0].range().start(),
+        pmem_mmio_layout.base_address()
+    );
+    assert_eq!(
+        mmio_regions[0].range().size(),
+        bangbang_runtime::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE
+    );
+    assert_eq!(
+        mmio_regions[1].id(),
+        MmioRegionId::new(pmem_mmio_layout.base_region_id().raw_value() + 1)
+    );
+    assert_eq!(
+        mmio_regions[1].range().start(),
+        pmem_mmio_layout
+            .base_address()
+            .checked_add(pmem_mmio_layout.address_stride())
+            .expect("second pmem MMIO address should fit")
+    );
+    assert_eq!(
+        mmio_regions[1].range().size(),
+        bangbang_runtime::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE
     );
     assert!(session.block_interrupt_lines().is_empty());
+    assert_eq!(session.pmem_interrupt_lines().len(), 2);
     assert_eq!(session.runtime_resources().pmem_devices.len(), 2);
     assert!(
         !session.runtime_resources().pmem_devices[0]
@@ -402,6 +429,7 @@ fn prepares_owned_hvf_arm64_boot_session() {
     use bangbang_runtime::memory::GuestAddress;
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::PmemMmioLayout;
     use bangbang_runtime::vsock::VsockMmioLayout;
 
     let _test_lock = HVF_LIFECYCLE_TEST_LOCK
@@ -418,6 +446,7 @@ fn prepares_owned_hvf_arm64_boot_session() {
         .expect("boot source config should be stored");
     let config = HvfArm64BootSessionConfig::new(
         BlockMmioLayout::new(GuestAddress::new(0x4000_0000), MmioRegionId::new(1)),
+        PmemMmioLayout::new(GuestAddress::new(0x4800_0000), MmioRegionId::new(500)),
         NetworkMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1000)),
         VsockMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(2000)),
     );
@@ -502,6 +531,7 @@ fn owned_hvf_arm64_boot_session_cleans_up_after_prepare_error() {
     use bangbang_runtime::memory::GuestAddress;
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::PmemMmioLayout;
     use bangbang_runtime::startup::Arm64BootResourceError;
     use bangbang_runtime::vsock::VsockMmioLayout;
 
@@ -510,6 +540,7 @@ fn owned_hvf_arm64_boot_session_cleans_up_after_prepare_error() {
         .expect("HVF lifecycle test lock should not be poisoned");
     let config = HvfArm64BootSessionConfig::new(
         BlockMmioLayout::new(GuestAddress::new(0x4000_0000), MmioRegionId::new(1)),
+        PmemMmioLayout::new(GuestAddress::new(0x4800_0000), MmioRegionId::new(500)),
         NetworkMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1000)),
         VsockMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(2000)),
     );
@@ -550,6 +581,7 @@ fn rejects_boot_session_on_existing_hvf_vm_without_destroying_it() {
     use bangbang_runtime::memory::GuestAddress;
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::network::NetworkMmioLayout;
+    use bangbang_runtime::pmem::PmemMmioLayout;
     use bangbang_runtime::vsock::VsockMmioLayout;
 
     let _test_lock = HVF_LIFECYCLE_TEST_LOCK
@@ -564,6 +596,7 @@ fn rejects_boot_session_on_existing_hvf_vm_without_destroying_it() {
             &controller,
             HvfArm64BootSessionConfig::new(
                 BlockMmioLayout::new(GuestAddress::new(0x4000_0000), MmioRegionId::new(1)),
+                PmemMmioLayout::new(GuestAddress::new(0x4800_0000), MmioRegionId::new(500)),
                 NetworkMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1000)),
                 VsockMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(2000)),
             ),

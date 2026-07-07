@@ -55,6 +55,13 @@ must run through
 `com.apple.security.hypervisor` entitlement. Do not add real HVF tests to the
 unsigned workspace test path.
 
+For virtio-pmem attachment changes, unit tests should cover MMIO registration,
+FDT metadata, config-space `start`/`size`, deterministic multi-device layout,
+and cleanup/error paths. The current signed HVF coverage validates startup
+assembly and mapped pmem ownership through the signed lifecycle target; guest
+side pmem discovery, reads, and queue-driven flush behavior require a dedicated
+guest probe and remain follow-up work until that device behavior is implemented.
+
 ## What To Cover
 
 For CLI and API changes, cover successful requests, unknown options or fields,
