@@ -329,8 +329,9 @@ impl HvfGuestMemoryMapping {
         let page_size = host_page_size()?;
         let requests = validated_map_requests(memory, permissions, page_size)?;
         let host_requests = validated_host_map_requests(&self.host_memory, page_size)?;
+        let request_count = checked_map_request_count(requests.len(), host_requests.len())?;
         self.mapped_regions
-            .try_reserve_exact(requests.len() + host_requests.len())
+            .try_reserve_exact(request_count)
             .map_err(
                 |source| HvfGuestMemoryMappingError::MappingMetadataAllocationFailed { source },
             )?;
@@ -551,10 +552,7 @@ fn validated_host_map_requests(
     page_size: u64,
 ) -> Result<Vec<HvfValidatedHostMemoryMapRequest>, HvfGuestMemoryMappingError> {
     let mut requests = Vec::new();
-    let request_count = host_mappings
-        .iter()
-        .map(|mapping| mapping.memory.regions().len())
-        .sum();
+    let request_count = host_map_request_count(host_mappings)?;
     requests
         .try_reserve_exact(request_count)
         .map_err(|source| HvfGuestMemoryMappingError::MappingMetadataAllocationFailed { source })?;
@@ -575,6 +573,23 @@ fn validated_host_map_requests(
     }
 
     Ok(requests)
+}
+
+fn host_map_request_count(
+    host_mappings: &[HvfHostMemoryMapping],
+) -> Result<usize, HvfGuestMemoryMappingError> {
+    host_mappings.iter().try_fold(0, |count, mapping| {
+        checked_map_request_count(count, mapping.memory.regions().len())
+    })
+}
+
+fn checked_map_request_count(
+    first: usize,
+    second: usize,
+) -> Result<usize, HvfGuestMemoryMappingError> {
+    first.checked_add(second).ok_or_else(|| {
+        BackendError::Hypervisor("too many HVF guest memory map requests".to_string()).into()
+    })
 }
 
 fn validate_host_map_request(
@@ -836,6 +851,17 @@ mod tests {
                 expected_size,
             } if range == guest_range && host_size == alignment * 2 && expected_size == alignment
         ));
+    }
+
+    #[test]
+    fn checked_map_request_count_rejects_overflow() {
+        let err = super::checked_map_request_count(usize::MAX, 1)
+            .expect_err("overflowing request count should be rejected");
+
+        assert_eq!(
+            err.to_string(),
+            "hypervisor error: too many HVF guest memory map requests"
+        );
     }
 
     #[test]
