@@ -20,7 +20,7 @@ use bangbang_runtime::interrupt::{
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
 use bangbang_runtime::mmio::{MmioDispatcher, MmioRegionId};
 use bangbang_runtime::network::NetworkMmioLayout;
-use bangbang_runtime::pmem::PmemMmioLayout;
+use bangbang_runtime::pmem::{PmemMmioLayout, VirtioPmemFlushStatus};
 use bangbang_runtime::serial::SharedSerialOutput;
 use bangbang_runtime::startup::{
     Arm64BootBalloonNotificationDispatch, Arm64BootBalloonNotificationDispatchError,
@@ -31,8 +31,10 @@ use bangbang_runtime::startup::{
     Arm64BootEntropyNotificationDispatches, Arm64BootEntropySourceProvider,
     Arm64BootNetworkNotificationDispatch, Arm64BootNetworkNotificationDispatchError,
     Arm64BootNetworkNotificationDispatches, Arm64BootNetworkPacketIoProvider,
-    Arm64BootResourceConfig, Arm64BootResourceError, Arm64BootResourceParts, Arm64BootResources,
-    Arm64BootRuntimeResources, Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig,
+    Arm64BootPmemNotificationDispatch, Arm64BootPmemNotificationDispatchError,
+    Arm64BootPmemNotificationDispatches, Arm64BootResourceConfig, Arm64BootResourceError,
+    Arm64BootResourceParts, Arm64BootResources, Arm64BootRuntimeResources,
+    Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig,
     Arm64BootVsockNotificationDispatch, Arm64BootVsockNotificationDispatchError,
     Arm64BootVsockNotificationDispatches, Arm64BootVsockWakeupFdsError,
 };
@@ -328,6 +330,10 @@ pub enum HvfArm64BootRunLoopError {
         steps_completed: usize,
         source: Box<HvfArm64BootBlockNotificationDispatchError>,
     },
+    DispatchPmemNotifications {
+        steps_completed: usize,
+        source: Box<HvfArm64BootPmemNotificationDispatchError>,
+    },
     DispatchNetworkNotifications {
         steps_completed: usize,
         source: Box<HvfArm64BootNetworkNotificationDispatchError>,
@@ -381,6 +387,13 @@ impl fmt::Display for HvfArm64BootRunLoopError {
                 f,
                 "failed to dispatch HVF boot-session block notifications after {steps_completed} completed steps: {source}"
             ),
+            Self::DispatchPmemNotifications {
+                steps_completed,
+                source,
+            } => write!(
+                f,
+                "failed to dispatch HVF boot-session pmem notifications after {steps_completed} completed steps: {source}"
+            ),
             Self::DispatchNetworkNotifications {
                 steps_completed,
                 source,
@@ -427,6 +440,7 @@ impl std::error::Error for HvfArm64BootRunLoopError {
             Self::RunStep { source, .. } => Some(source.as_ref()),
             Self::StopVsockWakeupMonitor { source, .. } => Some(source.as_ref()),
             Self::DispatchBlockNotifications { source, .. } => Some(source.as_ref()),
+            Self::DispatchPmemNotifications { source, .. } => Some(source.as_ref()),
             Self::DispatchNetworkNotifications { source, .. } => Some(source.as_ref()),
             Self::DispatchVsockNotifications { source, .. } => Some(source.as_ref()),
             Self::DispatchBalloonNotifications { source, .. } => Some(source.as_ref()),
@@ -678,6 +692,18 @@ impl HvfArm64BootSession<'_> {
         })?;
 
         signal_block_queue_interrupts(dispatches, &signaler)
+    }
+
+    pub fn dispatch_pmem_queue_notifications_and_signal_interrupts(
+        &mut self,
+    ) -> Result<HvfArm64BootPmemNotificationDispatches, HvfArm64BootPmemNotificationDispatchError>
+    {
+        dispatch_pmem_queue_notifications_and_signal_interrupts(
+            self.backend,
+            &self.mmio_dispatcher,
+            &mut self.runtime_resources,
+            &self.gic,
+        )
     }
 
     pub fn dispatch_network_queue_notifications_and_signal_interrupts(
@@ -990,6 +1016,18 @@ impl OwnedHvfArm64BootSession {
         signal_block_queue_interrupts(dispatches, &signaler)
     }
 
+    pub fn dispatch_pmem_queue_notifications_and_signal_interrupts(
+        &mut self,
+    ) -> Result<HvfArm64BootPmemNotificationDispatches, HvfArm64BootPmemNotificationDispatchError>
+    {
+        dispatch_pmem_queue_notifications_and_signal_interrupts(
+            &mut self.backend,
+            &self.mmio_dispatcher,
+            &mut self.runtime_resources,
+            &self.gic,
+        )
+    }
+
     pub fn dispatch_network_queue_notifications_and_signal_interrupts(
         &mut self,
     ) -> Result<
@@ -1143,6 +1181,13 @@ impl BootSessionRunLoopSession for OwnedHvfArm64BootSession {
         self.dispatch_block_queue_notifications_and_signal_interrupts()
     }
 
+    fn dispatch_run_loop_pmem_notifications(
+        &mut self,
+    ) -> Result<HvfArm64BootPmemNotificationDispatches, HvfArm64BootPmemNotificationDispatchError>
+    {
+        self.dispatch_pmem_queue_notifications_and_signal_interrupts()
+    }
+
     fn dispatch_run_loop_network_notifications(
         &mut self,
     ) -> Result<
@@ -1237,6 +1282,14 @@ where
     {
         self.session
             .dispatch_block_queue_notifications_and_signal_interrupts()
+    }
+
+    fn dispatch_run_loop_pmem_notifications(
+        &mut self,
+    ) -> Result<HvfArm64BootPmemNotificationDispatches, HvfArm64BootPmemNotificationDispatchError>
+    {
+        self.session
+            .dispatch_pmem_queue_notifications_and_signal_interrupts()
     }
 
     fn dispatch_run_loop_network_notifications(
@@ -1338,6 +1391,65 @@ impl HvfArm64BootBlockNotificationDispatch {
     }
 
     pub const fn dispatch(&self) -> &Arm64BootBlockNotificationDispatch {
+        &self.dispatch
+    }
+
+    pub const fn signal_error(&self) -> Option<&DeviceInterruptTriggerError> {
+        self.signal_error.as_ref()
+    }
+
+    pub fn queue_interrupt_signaled(&self) -> bool {
+        self.dispatch.needs_queue_interrupt() && self.signal_error.is_none()
+    }
+}
+
+#[derive(Debug)]
+pub struct HvfArm64BootPmemNotificationDispatches {
+    devices: Vec<HvfArm64BootPmemNotificationDispatch>,
+}
+
+impl HvfArm64BootPmemNotificationDispatches {
+    fn new(devices: Vec<HvfArm64BootPmemNotificationDispatch>) -> Self {
+        Self { devices }
+    }
+
+    pub fn as_slice(&self) -> &[HvfArm64BootPmemNotificationDispatch] {
+        &self.devices
+    }
+
+    pub fn len(&self) -> usize {
+        self.devices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.devices.is_empty()
+    }
+
+    pub fn has_signal_failure(&self) -> bool {
+        self.devices
+            .iter()
+            .any(|device| device.signal_error().is_some())
+    }
+}
+
+#[derive(Debug)]
+pub struct HvfArm64BootPmemNotificationDispatch {
+    dispatch: Arm64BootPmemNotificationDispatch,
+    signal_error: Option<DeviceInterruptTriggerError>,
+}
+
+impl HvfArm64BootPmemNotificationDispatch {
+    fn new(
+        dispatch: Arm64BootPmemNotificationDispatch,
+        signal_error: Option<DeviceInterruptTriggerError>,
+    ) -> Self {
+        Self {
+            dispatch,
+            signal_error,
+        }
+    }
+
+    pub const fn dispatch(&self) -> &Arm64BootPmemNotificationDispatch {
         &self.dispatch
     }
 
@@ -1606,6 +1718,25 @@ pub enum HvfArm64BootBlockNotificationDispatchError {
 }
 
 #[derive(Debug)]
+pub enum HvfArm64BootPmemNotificationDispatchError {
+    MapGuestMemory {
+        source: HvfGuestMemoryMappingError,
+    },
+    MmioDispatcher {
+        source: HvfArm64BootMmioDispatcherError,
+    },
+    DispatchNotifications {
+        source: Arm64BootPmemNotificationDispatchError,
+    },
+    CreateSignalSink {
+        source: HvfGicSpiSignalError,
+    },
+    ResultAllocation {
+        source: TryReserveError,
+    },
+}
+
+#[derive(Debug)]
 pub enum HvfArm64BootNetworkNotificationDispatchError {
     MapGuestMemory {
         source: HvfGuestMemoryMappingError,
@@ -1712,6 +1843,43 @@ impl fmt::Display for HvfArm64BootNetworkNotificationDispatchError {
                 write!(
                     f,
                     "failed to allocate HVF boot network notification results: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl fmt::Display for HvfArm64BootPmemNotificationDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MapGuestMemory { source } => {
+                write!(
+                    f,
+                    "failed to borrow HVF boot-session guest memory for pmem notifications: {source}"
+                )
+            }
+            Self::MmioDispatcher { source } => {
+                write!(
+                    f,
+                    "failed to lock HVF boot-session MMIO dispatcher: {source}"
+                )
+            }
+            Self::DispatchNotifications { source } => {
+                write!(
+                    f,
+                    "failed to dispatch boot pmem queue notifications: {source}"
+                )
+            }
+            Self::CreateSignalSink { source } => {
+                write!(
+                    f,
+                    "failed to create HVF boot pmem interrupt signaler: {source}"
+                )
+            }
+            Self::ResultAllocation { source } => {
+                write!(
+                    f,
+                    "failed to allocate HVF boot pmem notification results: {source}"
                 )
             }
         }
@@ -1830,6 +1998,18 @@ impl fmt::Display for HvfArm64BootEntropyNotificationDispatchError {
 }
 
 impl std::error::Error for HvfArm64BootEntropyNotificationDispatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MapGuestMemory { source } => Some(source),
+            Self::MmioDispatcher { source } => Some(source),
+            Self::DispatchNotifications { source } => Some(source),
+            Self::CreateSignalSink { source } => Some(source),
+            Self::ResultAllocation { source } => Some(source),
+        }
+    }
+}
+
+impl std::error::Error for HvfArm64BootPmemNotificationDispatchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::MapGuestMemory { source } => Some(source),
@@ -2012,6 +2192,10 @@ trait BootSessionRunLoopSession {
         &mut self,
     ) -> Result<HvfArm64BootBlockNotificationDispatches, HvfArm64BootBlockNotificationDispatchError>;
 
+    fn dispatch_run_loop_pmem_notifications(
+        &mut self,
+    ) -> Result<HvfArm64BootPmemNotificationDispatches, HvfArm64BootPmemNotificationDispatchError>;
+
     fn dispatch_run_loop_network_notifications(
         &mut self,
     ) -> Result<
@@ -2072,6 +2256,13 @@ impl BootSessionRunLoopSession for HvfArm64BootSession<'_> {
     ) -> Result<HvfArm64BootBlockNotificationDispatches, HvfArm64BootBlockNotificationDispatchError>
     {
         self.dispatch_block_queue_notifications_and_signal_interrupts()
+    }
+
+    fn dispatch_run_loop_pmem_notifications(
+        &mut self,
+    ) -> Result<HvfArm64BootPmemNotificationDispatches, HvfArm64BootPmemNotificationDispatchError>
+    {
+        self.dispatch_pmem_queue_notifications_and_signal_interrupts()
     }
 
     fn dispatch_run_loop_network_notifications(
@@ -2255,6 +2446,17 @@ fn run_boot_session_loop_with_observer(
                     .dispatch_run_loop_block_notifications()
                     .map_err(
                         |source| HvfArm64BootRunLoopError::DispatchBlockNotifications {
+                            steps_completed: steps,
+                            source: Box::new(source),
+                        },
+                    )?;
+                if stop_token.is_stop_requested() {
+                    return Ok(HvfArm64BootRunLoopOutcome::Stopped { steps });
+                }
+                session
+                    .dispatch_run_loop_pmem_notifications()
+                    .map_err(
+                        |source| HvfArm64BootRunLoopError::DispatchPmemNotifications {
                             steps_completed: steps,
                             source: Box::new(source),
                         },
@@ -2502,6 +2704,22 @@ fn collect_block_notification_dispatches(
     Ok(HvfArm64BootBlockNotificationDispatches::new(devices))
 }
 
+fn collect_pmem_notification_dispatches(
+    dispatches: Arm64BootPmemNotificationDispatches,
+) -> Result<HvfArm64BootPmemNotificationDispatches, HvfArm64BootPmemNotificationDispatchError> {
+    let runtime_dispatches = dispatches.into_vec();
+    let mut devices = Vec::new();
+    devices
+        .try_reserve_exact(runtime_dispatches.len())
+        .map_err(|source| HvfArm64BootPmemNotificationDispatchError::ResultAllocation { source })?;
+
+    for dispatch in runtime_dispatches {
+        devices.push(HvfArm64BootPmemNotificationDispatch::new(dispatch, None));
+    }
+
+    Ok(HvfArm64BootPmemNotificationDispatches::new(devices))
+}
+
 fn signal_block_queue_interrupts(
     dispatches: Arm64BootBlockNotificationDispatches,
     signaler: &dyn InterruptSink,
@@ -2527,6 +2745,31 @@ fn signal_block_queue_interrupts(
     }
 
     Ok(HvfArm64BootBlockNotificationDispatches::new(devices))
+}
+
+fn signal_pmem_queue_interrupts(
+    dispatches: Arm64BootPmemNotificationDispatches,
+    signaler: &dyn InterruptSink,
+) -> Result<HvfArm64BootPmemNotificationDispatches, HvfArm64BootPmemNotificationDispatchError> {
+    let runtime_dispatches = dispatches.into_vec();
+    let mut devices = Vec::new();
+    devices
+        .try_reserve_exact(runtime_dispatches.len())
+        .map_err(|source| HvfArm64BootPmemNotificationDispatchError::ResultAllocation { source })?;
+
+    for dispatch in runtime_dispatches {
+        let signal_error = if dispatch.needs_queue_interrupt() {
+            signal_queue_interrupt(dispatch.device().fdt_device.interrupt_line, signaler).err()
+        } else {
+            None
+        };
+        devices.push(HvfArm64BootPmemNotificationDispatch::new(
+            dispatch,
+            signal_error,
+        ));
+    }
+
+    Ok(HvfArm64BootPmemNotificationDispatches::new(devices))
 }
 
 fn collect_network_notification_dispatches(
@@ -2602,6 +2845,56 @@ fn collect_entropy_notification_dispatches(
     }
 
     Ok(HvfArm64BootEntropyNotificationDispatches::new(devices))
+}
+
+fn dispatch_pmem_queue_notifications_and_signal_interrupts(
+    backend: &mut HvfBackend,
+    dispatcher: &Arc<Mutex<MmioDispatcher>>,
+    runtime_resources: &mut Arm64BootRuntimeResources,
+    gic: &HvfGicMetadata,
+) -> Result<HvfArm64BootPmemNotificationDispatches, HvfArm64BootPmemNotificationDispatchError> {
+    let flush_status = {
+        let mut mmio_dispatcher = lock_boot_mmio_dispatcher(dispatcher).map_err(|source| {
+            HvfArm64BootPmemNotificationDispatchError::MmioDispatcher { source }
+        })?;
+
+        if runtime_resources.has_pending_pmem_queue_notifications(&mut mmio_dispatcher) {
+            VirtioPmemFlushStatus::from_result(backend.flush_mapped_pmem_shadows().is_ok())
+        } else {
+            VirtioPmemFlushStatus::Success
+        }
+    };
+
+    let dispatches = {
+        let memory = backend.mapped_guest_memory_mut().map_err(|source| {
+            HvfArm64BootPmemNotificationDispatchError::MapGuestMemory { source }
+        })?;
+        let mut mmio_dispatcher = lock_boot_mmio_dispatcher(dispatcher).map_err(|source| {
+            HvfArm64BootPmemNotificationDispatchError::MmioDispatcher { source }
+        })?;
+
+        dispatch_pmem_runtime_notifications(
+            memory,
+            runtime_resources,
+            &mut mmio_dispatcher,
+            flush_status,
+        )?
+    };
+
+    collect_or_signal_pmem_queue_interrupts(dispatches, gic)
+}
+
+fn dispatch_pmem_runtime_notifications(
+    memory: &mut GuestMemory,
+    runtime_resources: &mut Arm64BootRuntimeResources,
+    mmio_dispatcher: &mut MmioDispatcher,
+    flush_status: VirtioPmemFlushStatus,
+) -> Result<Arm64BootPmemNotificationDispatches, HvfArm64BootPmemNotificationDispatchError> {
+    runtime_resources
+        .dispatch_pmem_queue_notifications(memory, mmio_dispatcher, flush_status)
+        .map_err(
+            |source| HvfArm64BootPmemNotificationDispatchError::DispatchNotifications { source },
+        )
 }
 
 fn dispatch_network_runtime_notifications(
@@ -2691,6 +2984,20 @@ fn dispatch_entropy_runtime_notifications_with_source(
         .map_err(
             |source| HvfArm64BootEntropyNotificationDispatchError::DispatchNotifications { source },
         )
+}
+
+fn collect_or_signal_pmem_queue_interrupts(
+    dispatches: Arm64BootPmemNotificationDispatches,
+    gic: &HvfGicMetadata,
+) -> Result<HvfArm64BootPmemNotificationDispatches, HvfArm64BootPmemNotificationDispatchError> {
+    if !dispatches.needs_queue_interrupt() {
+        return collect_pmem_notification_dispatches(dispatches);
+    }
+
+    let signaler = HvfGicSpiSignaler::from_metadata(gic)
+        .map_err(|source| HvfArm64BootPmemNotificationDispatchError::CreateSignalSink { source })?;
+
+    signal_pmem_queue_interrupts(dispatches, &signaler)
 }
 
 fn collect_or_signal_network_queue_interrupts(
@@ -3421,12 +3728,13 @@ mod tests {
         HvfArm64BootBlockNotificationDispatchError, HvfArm64BootEntropyDeviceConfig,
         HvfArm64BootEntropyNotificationDispatchError, HvfArm64BootInterruptLinePurpose,
         HvfArm64BootInterruptRequest, HvfArm64BootMmioDispatcherError,
-        HvfArm64BootNetworkNotificationDispatchError, HvfArm64BootRunLoopOutcome,
-        HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig,
-        HvfArm64BootSessionError, HvfArm64BootVsockNotificationDispatchError,
-        allocate_interrupt_lines, collect_balloon_notification_dispatches,
-        collect_block_notification_dispatches, collect_entropy_notification_dispatches,
-        collect_network_notification_dispatches, collect_vsock_notification_dispatches,
+        HvfArm64BootNetworkNotificationDispatchError, HvfArm64BootPmemNotificationDispatchError,
+        HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig,
+        HvfArm64BootSessionConfig, HvfArm64BootSessionError,
+        HvfArm64BootVsockNotificationDispatchError, allocate_interrupt_lines,
+        collect_balloon_notification_dispatches, collect_block_notification_dispatches,
+        collect_entropy_notification_dispatches, collect_network_notification_dispatches,
+        collect_vsock_notification_dispatches,
         dispatch_network_runtime_notifications_with_packet_io, lock_boot_mmio_dispatcher,
         run_boot_session_loop, run_boot_session_vcpu_step, signal_balloon_queue_interrupts,
         signal_block_queue_interrupts, signal_entropy_queue_interrupts,
@@ -3809,6 +4117,12 @@ mod tests {
                 HvfArm64BootBlockNotificationDispatchError,
             >,
         >,
+        pmem_dispatch_results: VecDeque<
+            Result<
+                super::HvfArm64BootPmemNotificationDispatches,
+                HvfArm64BootPmemNotificationDispatchError,
+            >,
+        >,
         monitor_wakeup_results: VecDeque<bool>,
         network_dispatch_results: VecDeque<
             Result<
@@ -3838,6 +4152,7 @@ mod tests {
         events: Vec<&'static str>,
         request_stop_on_run: Option<HvfArm64BootRunLoopStopToken>,
         request_stop_on_dispatch: Option<HvfArm64BootRunLoopStopToken>,
+        request_stop_on_pmem_dispatch: Option<HvfArm64BootRunLoopStopToken>,
         request_stop_on_network_dispatch: Option<HvfArm64BootRunLoopStopToken>,
         request_stop_on_vsock_dispatch: Option<HvfArm64BootRunLoopStopToken>,
         request_stop_on_balloon_dispatch: Option<HvfArm64BootRunLoopStopToken>,
@@ -3852,6 +4167,7 @@ mod tests {
             Self {
                 run_results: run_results.into_iter().map(Ok).collect(),
                 dispatch_results: VecDeque::new(),
+                pmem_dispatch_results: VecDeque::new(),
                 monitor_wakeup_results: VecDeque::new(),
                 network_dispatch_results: VecDeque::new(),
                 vsock_dispatch_results: VecDeque::new(),
@@ -3861,6 +4177,7 @@ mod tests {
                 events: Vec::new(),
                 request_stop_on_run: None,
                 request_stop_on_dispatch: None,
+                request_stop_on_pmem_dispatch: None,
                 request_stop_on_network_dispatch: None,
                 request_stop_on_vsock_dispatch: None,
                 request_stop_on_balloon_dispatch: None,
@@ -3875,6 +4192,7 @@ mod tests {
             Self {
                 run_results: VecDeque::from([Err(source)]),
                 dispatch_results: VecDeque::new(),
+                pmem_dispatch_results: VecDeque::new(),
                 monitor_wakeup_results: VecDeque::new(),
                 network_dispatch_results: VecDeque::new(),
                 vsock_dispatch_results: VecDeque::new(),
@@ -3884,6 +4202,7 @@ mod tests {
                 events: Vec::new(),
                 request_stop_on_run: None,
                 request_stop_on_dispatch: None,
+                request_stop_on_pmem_dispatch: None,
                 request_stop_on_network_dispatch: None,
                 request_stop_on_vsock_dispatch: None,
                 request_stop_on_balloon_dispatch: None,
@@ -3896,6 +4215,10 @@ mod tests {
 
         fn push_dispatch_error(&mut self, source: HvfArm64BootBlockNotificationDispatchError) {
             self.dispatch_results.push_back(Err(source));
+        }
+
+        fn push_pmem_dispatch_error(&mut self, source: HvfArm64BootPmemNotificationDispatchError) {
+            self.pmem_dispatch_results.push_back(Err(source));
         }
 
         fn push_monitor_wakeup(&mut self) {
@@ -3940,6 +4263,10 @@ mod tests {
 
         fn request_stop_on_dispatch(&mut self, stop_token: HvfArm64BootRunLoopStopToken) {
             self.request_stop_on_dispatch = Some(stop_token);
+        }
+
+        fn request_stop_on_pmem_dispatch(&mut self, stop_token: HvfArm64BootRunLoopStopToken) {
+            self.request_stop_on_pmem_dispatch = Some(stop_token);
         }
 
         fn request_stop_on_network_dispatch(&mut self, stop_token: HvfArm64BootRunLoopStopToken) {
@@ -4033,6 +4360,24 @@ mod tests {
 
             self.dispatch_results.pop_front().unwrap_or_else(|| {
                 Ok(super::HvfArm64BootBlockNotificationDispatches::new(
+                    Vec::new(),
+                ))
+            })
+        }
+
+        fn dispatch_run_loop_pmem_notifications(
+            &mut self,
+        ) -> Result<
+            super::HvfArm64BootPmemNotificationDispatches,
+            HvfArm64BootPmemNotificationDispatchError,
+        > {
+            self.events.push("pmem-dispatch");
+            if let Some(stop_token) = self.request_stop_on_pmem_dispatch.take() {
+                stop_token.request_stop();
+            }
+
+            self.pmem_dispatch_results.pop_front().unwrap_or_else(|| {
+                Ok(super::HvfArm64BootPmemNotificationDispatches::new(
                     Vec::new(),
                 ))
             })
@@ -7396,12 +7741,14 @@ mod tests {
             [
                 "run",
                 "dispatch",
+                "pmem-dispatch",
                 "network-dispatch",
                 "vsock-dispatch",
                 "balloon-dispatch",
                 "entropy-dispatch",
                 "run",
                 "dispatch",
+                "pmem-dispatch",
                 "network-dispatch",
                 "vsock-dispatch",
                 "balloon-dispatch",
@@ -7524,6 +7871,7 @@ mod tests {
                 "vsock-dispatch",
                 "run",
                 "dispatch",
+                "pmem-dispatch",
                 "network-dispatch",
                 "vsock-dispatch",
                 "balloon-dispatch",
@@ -7546,6 +7894,19 @@ mod tests {
     }
 
     #[test]
+    fn boot_session_run_loop_reports_stop_after_pmem_dispatch_before_step_limit() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([mmio_run_step_outcome()]);
+        session.request_stop_on_pmem_dispatch(stop_token.clone());
+
+        let outcome = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect("stop after pmem dispatch should succeed");
+
+        assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Stopped { steps: 1 });
+        assert_eq!(session.events, ["run", "dispatch", "pmem-dispatch"]);
+    }
+
+    #[test]
     fn boot_session_run_loop_reports_stop_after_network_dispatch_before_step_limit() {
         let stop_token = HvfArm64BootRunLoopStopToken::new();
         let mut session = RecordingBootSessionRunLoopSession::new([mmio_run_step_outcome()]);
@@ -7555,7 +7916,10 @@ mod tests {
             .expect("stop after network dispatch should succeed");
 
         assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Stopped { steps: 1 });
-        assert_eq!(session.events, ["run", "dispatch", "network-dispatch"]);
+        assert_eq!(
+            session.events,
+            ["run", "dispatch", "pmem-dispatch", "network-dispatch"]
+        );
     }
 
     #[test]
@@ -7570,7 +7934,13 @@ mod tests {
         assert_eq!(outcome, HvfArm64BootRunLoopOutcome::Stopped { steps: 1 });
         assert_eq!(
             session.events,
-            ["run", "dispatch", "network-dispatch", "vsock-dispatch"]
+            [
+                "run",
+                "dispatch",
+                "pmem-dispatch",
+                "network-dispatch",
+                "vsock-dispatch",
+            ]
         );
     }
 
@@ -7589,6 +7959,7 @@ mod tests {
             [
                 "run",
                 "dispatch",
+                "pmem-dispatch",
                 "network-dispatch",
                 "vsock-dispatch",
                 "balloon-dispatch",
@@ -7624,6 +7995,7 @@ mod tests {
             [
                 "run",
                 "dispatch",
+                "pmem-dispatch",
                 "network-dispatch",
                 "vsock-dispatch",
                 "balloon-dispatch",
@@ -7805,6 +8177,35 @@ mod tests {
     }
 
     #[test]
+    fn boot_session_run_loop_preserves_pmem_notification_error_after_mmio_step() {
+        let stop_token = HvfArm64BootRunLoopStopToken::new();
+        let mut session = RecordingBootSessionRunLoopSession::new([mmio_run_step_outcome()]);
+        session.push_pmem_dispatch_error(
+            HvfArm64BootPmemNotificationDispatchError::MmioDispatcher {
+                source: HvfArm64BootMmioDispatcherError::Busy,
+            },
+        );
+
+        let err = run_boot_session_loop(&mut session, &stop_token, max_steps(1))
+            .expect_err("pmem notification error should stop loop");
+
+        match err {
+            super::HvfArm64BootRunLoopError::DispatchPmemNotifications {
+                steps_completed,
+                source,
+            } => {
+                assert_eq!(steps_completed, 1);
+                assert_eq!(
+                    source.to_string(),
+                    "failed to lock HVF boot-session MMIO dispatcher: HVF boot-session MMIO dispatcher lock is busy"
+                );
+            }
+            other => panic!("expected pmem notification error, got {other:?}"),
+        }
+        assert_eq!(session.events, ["run", "dispatch", "pmem-dispatch"]);
+    }
+
+    #[test]
     fn boot_session_run_loop_preserves_network_notification_error_after_mmio_step() {
         let stop_token = HvfArm64BootRunLoopStopToken::new();
         let mut session = RecordingBootSessionRunLoopSession::new([mmio_run_step_outcome()]);
@@ -7830,7 +8231,10 @@ mod tests {
             }
             other => panic!("expected network notification error, got {other:?}"),
         }
-        assert_eq!(session.events, ["run", "dispatch", "network-dispatch"]);
+        assert_eq!(
+            session.events,
+            ["run", "dispatch", "pmem-dispatch", "network-dispatch"]
+        );
     }
 
     #[test]
@@ -7861,7 +8265,13 @@ mod tests {
         }
         assert_eq!(
             session.events,
-            ["run", "dispatch", "network-dispatch", "vsock-dispatch"]
+            [
+                "run",
+                "dispatch",
+                "pmem-dispatch",
+                "network-dispatch",
+                "vsock-dispatch",
+            ]
         );
     }
 
@@ -7896,6 +8306,7 @@ mod tests {
             [
                 "run",
                 "dispatch",
+                "pmem-dispatch",
                 "network-dispatch",
                 "vsock-dispatch",
                 "balloon-dispatch",
@@ -7963,6 +8374,7 @@ mod tests {
             [
                 "run",
                 "dispatch",
+                "pmem-dispatch",
                 "network-dispatch",
                 "vsock-dispatch",
                 "balloon-dispatch",

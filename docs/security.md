@@ -119,17 +119,18 @@ is resource-specific:
   that shadow at the guest physical range after DRAM mapping, using read-only
   HVF permissions for read-only pmem and read/write non-executable permissions
   for writable pmem. Writable shadows are copied back to the backing file with
-  positional writes and a data sync only after clean HVF unmap; read-only
-  shadows never write back, and failed unmap cleanup does not flush memory that
-  HVF may still reference. Startup also attaches each prepared pmem device as a
-  guest-visible virtio-mmio/FDT node whose config-space exposes the assigned
-  `start` and `size` values. It does not normalize stored host paths, and
-  shadow allocation, HVF registration, MMIO attachment, or writeback errors
+  positional writes and a data sync for guest queue-driven flush requests and
+  after clean HVF unmap; read-only shadows never write back, and failed unmap
+  cleanup does not flush memory that HVF may still reference. Startup also
+  attaches each prepared pmem device as a guest-visible virtio-mmio/FDT node
+  whose config-space exposes the assigned `start` and `size` values. It does
+  not normalize stored host paths, and shadow allocation, HVF registration,
+  MMIO attachment, flush, or writeback errors
   identify the pmem ID and guest range without echoing `path_on_host`.
   Configured rate limiters are rejected without replacing stored pmem
-  configuration. Guest queue-driven flush dispatch, root-device boot semantics,
-  runtime updates, direct file-backed HVF mapping, dirty-range tracking, and
-  hot-unplug remain deferred.
+  configuration. Root-device boot semantics, runtime updates, direct
+  file-backed HVF mapping, dirty-range tracking, and hot-unplug remain
+  deferred.
 - `/snapshot/create` and `/snapshot/load` currently parse Firecracker-shaped
   snapshot paths before returning unsupported faults, and they do not open or
   create snapshot state or memory files. Future snapshot support must treat

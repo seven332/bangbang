@@ -14,14 +14,25 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::memory::{GuestAddress, GuestMemoryError, GuestMemoryLayout, GuestMemoryRange, aarch64};
+use crate::interrupt::DeviceInterruptKind;
+use crate::memory::{
+    GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryLayout,
+    GuestMemoryRange, aarch64,
+};
 use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
     MmioHandlerError, MmioRegion, MmioRegionId,
 };
 use crate::virtio_mmio::{
-    VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
-    VirtioMmioDeviceConfigHandler, VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
+    VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
+    VirtioMmioDeviceActivationHandler, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
+    VirtioMmioDeviceConfigHandler, VirtioMmioQueueRegisterError, VirtioMmioQueueState,
+    VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
+};
+use crate::virtio_queue::{
+    VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueDescriptor,
+    VirtqueueDescriptorChain, VirtqueueNotificationSuppression, VirtqueueUsedRing,
+    VirtqueueUsedRingError, VirtqueueUsedRingPublication,
 };
 
 pub const VIRTIO_PMEM_DEVICE_ID: u32 = 27;
@@ -31,8 +42,13 @@ pub const VIRTIO_PMEM_QUEUE_SIZES: [u16; VIRTIO_PMEM_QUEUE_COUNT] = [VIRTIO_PMEM
 pub const VIRTIO_PMEM_CONFIG_SPACE_SIZE: usize = 16;
 pub const VIRTIO_PMEM_ALIGNMENT: u64 = 2 * 1024 * 1024;
 pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
+pub const VIRTIO_PMEM_REQUEST_SIZE: u32 = 4;
+pub const VIRTIO_PMEM_STATUS_SIZE: u32 = 4;
+pub const VIRTIO_PMEM_REQUEST_TYPE_FLUSH: u32 = 0;
+pub const VIRTIO_PMEM_STATUS_SUCCESS: i32 = 0;
+pub const VIRTIO_PMEM_STATUS_FAILURE: i32 = -1;
 
-pub type VirtioPmemMmioHandler = VirtioMmioRegisterHandler<VirtioPmemConfigSpace>;
+pub type VirtioPmemMmioHandler = VirtioMmioRegisterHandler<VirtioPmemConfigSpace, VirtioPmemDevice>;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VirtioPmemConfigSpace {
@@ -124,6 +140,907 @@ impl VirtioMmioDeviceConfigHandler for VirtioPmemConfigSpace {
             len: access.len(),
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioPmemFlushStatus {
+    Success,
+    Failure,
+}
+
+impl VirtioPmemFlushStatus {
+    pub const fn from_result(is_success: bool) -> Self {
+        if is_success {
+            Self::Success
+        } else {
+            Self::Failure
+        }
+    }
+
+    pub const fn status_code(self) -> i32 {
+        match self {
+            Self::Success => VIRTIO_PMEM_STATUS_SUCCESS,
+            Self::Failure => VIRTIO_PMEM_STATUS_FAILURE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioPmemStatusDescriptor {
+    index: u16,
+    address: GuestAddress,
+}
+
+impl VirtioPmemStatusDescriptor {
+    pub const fn index(self) -> u16 {
+        self.index
+    }
+
+    pub const fn address(self) -> GuestAddress {
+        self.address
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioPmemRequest {
+    descriptor_head: u16,
+    status: VirtioPmemStatusDescriptor,
+}
+
+impl VirtioPmemRequest {
+    pub fn parse(
+        memory: &GuestMemory,
+        chain: &VirtqueueDescriptorChain,
+    ) -> Result<Self, VirtioPmemRequestError> {
+        let request = descriptor_at(chain, 0, 1)?;
+        validate_request_descriptor(request)?;
+        let request_type = read_virtio_pmem_request_type(memory, request)?;
+        if request_type != VIRTIO_PMEM_REQUEST_TYPE_FLUSH {
+            return Err(VirtioPmemRequestError::UnsupportedRequestType { request_type });
+        }
+
+        let status = validate_status_descriptor(descriptor_at(chain, 1, 2)?)?;
+
+        Ok(Self {
+            descriptor_head: chain.head_index(),
+            status,
+        })
+    }
+
+    pub const fn descriptor_head(&self) -> u16 {
+        self.descriptor_head
+    }
+
+    pub const fn status(&self) -> VirtioPmemStatusDescriptor {
+        self.status
+    }
+
+    pub fn execute(
+        &self,
+        memory: &mut GuestMemory,
+        flush_status: VirtioPmemFlushStatus,
+    ) -> VirtioPmemRequestExecution {
+        let status_code = flush_status.status_code();
+        match memory.write_slice(&status_code.to_le_bytes(), self.status.address()) {
+            Ok(()) => VirtioPmemRequestExecution::new(
+                VirtioPmemRequestCompletion::new(self.descriptor_head, VIRTIO_PMEM_STATUS_SIZE),
+                status_code,
+                match flush_status {
+                    VirtioPmemFlushStatus::Success => VirtioPmemRequestExecutionOutcome::Ok,
+                    VirtioPmemFlushStatus::Failure => {
+                        VirtioPmemRequestExecutionOutcome::FlushFailed
+                    }
+                },
+            ),
+            Err(source) => VirtioPmemRequestExecution::new(
+                VirtioPmemRequestCompletion::new(self.descriptor_head, 0),
+                status_code,
+                VirtioPmemRequestExecutionOutcome::StatusWriteFailed {
+                    address: self.status.address(),
+                    source,
+                },
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioPmemRequestCompletion {
+    descriptor_head: u16,
+    bytes_written_to_guest: u32,
+}
+
+impl VirtioPmemRequestCompletion {
+    pub const fn new(descriptor_head: u16, bytes_written_to_guest: u32) -> Self {
+        Self {
+            descriptor_head,
+            bytes_written_to_guest,
+        }
+    }
+
+    pub const fn descriptor_head(self) -> u16 {
+        self.descriptor_head
+    }
+
+    pub const fn bytes_written_to_guest(self) -> u32 {
+        self.bytes_written_to_guest
+    }
+}
+
+#[derive(Debug)]
+pub struct VirtioPmemRequestExecution {
+    completion: VirtioPmemRequestCompletion,
+    status_code: i32,
+    outcome: VirtioPmemRequestExecutionOutcome,
+}
+
+impl VirtioPmemRequestExecution {
+    pub const fn new(
+        completion: VirtioPmemRequestCompletion,
+        status_code: i32,
+        outcome: VirtioPmemRequestExecutionOutcome,
+    ) -> Self {
+        Self {
+            completion,
+            status_code,
+            outcome,
+        }
+    }
+
+    pub const fn completion(&self) -> VirtioPmemRequestCompletion {
+        self.completion
+    }
+
+    pub const fn status_code(&self) -> i32 {
+        self.status_code
+    }
+
+    pub const fn outcome(&self) -> &VirtioPmemRequestExecutionOutcome {
+        &self.outcome
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VirtioPmemRequestExecutionOutcome {
+    Ok,
+    FlushFailed,
+    StatusWriteFailed {
+        address: GuestAddress,
+        source: GuestMemoryAccessError,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VirtioPmemRequestError {
+    DescriptorChainTooShort {
+        expected: usize,
+        actual: usize,
+    },
+    RequestDescriptorWriteOnly {
+        index: u16,
+    },
+    RequestDescriptorInvalidLength {
+        index: u16,
+        len: u32,
+        expected: u32,
+    },
+    ReadRequest {
+        address: GuestAddress,
+        source: GuestMemoryAccessError,
+    },
+    UnsupportedRequestType {
+        request_type: u32,
+    },
+    StatusDescriptorReadOnly {
+        index: u16,
+    },
+    StatusDescriptorInvalidLength {
+        index: u16,
+        len: u32,
+        expected: u32,
+    },
+}
+
+impl fmt::Display for VirtioPmemRequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DescriptorChainTooShort { expected, actual } => write!(
+                f,
+                "virtio-pmem descriptor chain has {actual} descriptor(s), expected at least {expected}"
+            ),
+            Self::RequestDescriptorWriteOnly { index } => {
+                write!(f, "virtio-pmem request descriptor {index} is write-only")
+            }
+            Self::RequestDescriptorInvalidLength {
+                index,
+                len,
+                expected,
+            } => write!(
+                f,
+                "virtio-pmem request descriptor {index} has length {len}, expected {expected}"
+            ),
+            Self::ReadRequest { address, source } => {
+                write!(
+                    f,
+                    "failed to read virtio-pmem request at {address}: {source}"
+                )
+            }
+            Self::UnsupportedRequestType { request_type } => {
+                write!(f, "unsupported virtio-pmem request type {request_type}")
+            }
+            Self::StatusDescriptorReadOnly { index } => {
+                write!(f, "virtio-pmem status descriptor {index} is not writable")
+            }
+            Self::StatusDescriptorInvalidLength {
+                index,
+                len,
+                expected,
+            } => write!(
+                f,
+                "virtio-pmem status descriptor {index} has length {len}, expected {expected}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VirtioPmemRequestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ReadRequest { source, .. } => Some(source),
+            Self::DescriptorChainTooShort { .. }
+            | Self::RequestDescriptorWriteOnly { .. }
+            | Self::RequestDescriptorInvalidLength { .. }
+            | Self::UnsupportedRequestType { .. }
+            | Self::StatusDescriptorReadOnly { .. }
+            | Self::StatusDescriptorInvalidLength { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioPmemQueue {
+    available: VirtqueueAvailableRing,
+    used: VirtqueueUsedRing,
+}
+
+impl VirtioPmemQueue {
+    pub const fn new(available: VirtqueueAvailableRing, used: VirtqueueUsedRing) -> Self {
+        Self { available, used }
+    }
+
+    pub fn from_mmio_queue_state(
+        queue: &VirtioMmioQueueState,
+    ) -> Result<Self, VirtioPmemQueueBuildError> {
+        if !queue.ready() {
+            return Err(VirtioPmemQueueBuildError::QueueNotReady);
+        }
+
+        let available = VirtqueueAvailableRing::new(
+            queue.descriptor_table(),
+            queue.driver_ring(),
+            queue.size(),
+        )
+        .map_err(|source| VirtioPmemQueueBuildError::AvailableRing { source })?;
+        let used = VirtqueueUsedRing::new(queue.device_ring(), queue.size())
+            .map_err(|source| VirtioPmemQueueBuildError::UsedRing { source })?;
+
+        Ok(Self { available, used })
+    }
+
+    pub const fn available_ring(&self) -> &VirtqueueAvailableRing {
+        &self.available
+    }
+
+    pub const fn used_ring(&self) -> &VirtqueueUsedRing {
+        &self.used
+    }
+
+    pub fn dispatch(
+        &mut self,
+        memory: &mut GuestMemory,
+        flush_status: VirtioPmemFlushStatus,
+    ) -> Result<VirtioPmemQueueDispatch, VirtioPmemQueueDispatchError> {
+        let mut dispatch = VirtioPmemQueueDispatch::default();
+        while let Some(chain) = self
+            .available
+            .pop_descriptor_chain(memory)
+            .map_err(|source| VirtioPmemQueueDispatchError::AvailableRing {
+                completed_dispatch: Box::new(dispatch.clone()),
+                source,
+            })?
+        {
+            let descriptor_head = descriptor_chain_head(&chain).ok_or_else(|| {
+                VirtioPmemQueueDispatchError::EmptyDescriptorChain {
+                    completed_dispatch: Box::new(dispatch.clone()),
+                }
+            })?;
+            let (completion, outcome) = match VirtioPmemRequest::parse(memory, &chain) {
+                Ok(request) => {
+                    let execution = request.execute(memory, flush_status);
+                    (
+                        execution.completion(),
+                        VirtioPmemQueueDispatchOutcome::from_execution(&execution),
+                    )
+                }
+                Err(source) => (
+                    VirtioPmemRequestCompletion::new(descriptor_head, 0),
+                    VirtioPmemQueueDispatchOutcome::ParseError(source),
+                ),
+            };
+
+            let publication = self
+                .used
+                .publish_used_element_with_notification(
+                    memory,
+                    completion.descriptor_head(),
+                    completion.bytes_written_to_guest(),
+                    VirtqueueNotificationSuppression::Disabled,
+                )
+                .map_err(|source| VirtioPmemQueueDispatchError::UsedRing {
+                    completed_dispatch: Box::new(dispatch.clone()),
+                    descriptor_head: completion.descriptor_head(),
+                    bytes_written_to_guest: completion.bytes_written_to_guest(),
+                    source,
+                })?;
+            dispatch.record(outcome, publication);
+        }
+
+        Ok(dispatch)
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioPmemQueueBuildError {
+    QueueNotReady,
+    AvailableRing { source: VirtqueueAvailableRingError },
+    UsedRing { source: VirtqueueUsedRingError },
+}
+
+impl fmt::Display for VirtioPmemQueueBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::QueueNotReady => f.write_str("virtio-pmem queue is not ready"),
+            Self::AvailableRing { source } => {
+                write!(f, "failed to build virtio-pmem available ring: {source}")
+            }
+            Self::UsedRing { source } => {
+                write!(f, "failed to build virtio-pmem used ring: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioPmemQueueBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AvailableRing { source } => Some(source),
+            Self::UsedRing { source } => Some(source),
+            Self::QueueNotReady => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VirtioPmemQueueDispatch {
+    processed_requests: usize,
+    successful_flushes: usize,
+    failed_flushes: usize,
+    parse_failures: usize,
+    status_write_failures: usize,
+    first_parse_failure: Option<VirtioPmemRequestError>,
+    needs_queue_interrupt: bool,
+}
+
+impl VirtioPmemQueueDispatch {
+    pub const fn processed_requests(&self) -> usize {
+        self.processed_requests
+    }
+
+    pub const fn successful_flushes(&self) -> usize {
+        self.successful_flushes
+    }
+
+    pub const fn failed_flushes(&self) -> usize {
+        self.failed_flushes
+    }
+
+    pub const fn parse_failures(&self) -> usize {
+        self.parse_failures
+    }
+
+    pub const fn first_parse_failure(&self) -> Option<&VirtioPmemRequestError> {
+        self.first_parse_failure.as_ref()
+    }
+
+    pub const fn status_write_failures(&self) -> usize {
+        self.status_write_failures
+    }
+
+    pub const fn needs_queue_interrupt(&self) -> bool {
+        self.needs_queue_interrupt
+    }
+
+    fn record(
+        &mut self,
+        outcome: VirtioPmemQueueDispatchOutcome,
+        publication: VirtqueueUsedRingPublication,
+    ) {
+        self.processed_requests += 1;
+        self.needs_queue_interrupt |= publication.needs_queue_interrupt();
+        match outcome {
+            VirtioPmemQueueDispatchOutcome::Ok => {
+                self.successful_flushes += 1;
+            }
+            VirtioPmemQueueDispatchOutcome::FlushFailed => {
+                self.failed_flushes += 1;
+            }
+            VirtioPmemQueueDispatchOutcome::ParseError(source) => {
+                self.parse_failures += 1;
+                if self.first_parse_failure.is_none() {
+                    self.first_parse_failure = Some(source);
+                }
+            }
+            VirtioPmemQueueDispatchOutcome::StatusWriteFailed => {
+                self.status_write_failures += 1;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VirtioPmemQueueDispatchOutcome {
+    Ok,
+    FlushFailed,
+    ParseError(VirtioPmemRequestError),
+    StatusWriteFailed,
+}
+
+impl VirtioPmemQueueDispatchOutcome {
+    const fn from_execution(execution: &VirtioPmemRequestExecution) -> Self {
+        match execution.outcome() {
+            VirtioPmemRequestExecutionOutcome::Ok => Self::Ok,
+            VirtioPmemRequestExecutionOutcome::FlushFailed => Self::FlushFailed,
+            VirtioPmemRequestExecutionOutcome::StatusWriteFailed { .. } => Self::StatusWriteFailed,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioPmemQueueDispatchError {
+    AvailableRing {
+        completed_dispatch: Box<VirtioPmemQueueDispatch>,
+        source: VirtqueueAvailableRingError,
+    },
+    EmptyDescriptorChain {
+        completed_dispatch: Box<VirtioPmemQueueDispatch>,
+    },
+    UsedRing {
+        completed_dispatch: Box<VirtioPmemQueueDispatch>,
+        descriptor_head: u16,
+        bytes_written_to_guest: u32,
+        source: VirtqueueUsedRingError,
+    },
+}
+
+impl fmt::Display for VirtioPmemQueueDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AvailableRing { source, .. } => {
+                write!(
+                    f,
+                    "failed to pop virtio-pmem available descriptor chain: {source}"
+                )
+            }
+            Self::EmptyDescriptorChain { .. } => {
+                f.write_str("virtio-pmem queue produced an empty descriptor chain")
+            }
+            Self::UsedRing {
+                descriptor_head,
+                bytes_written_to_guest,
+                source,
+                ..
+            } => {
+                write!(
+                    f,
+                    "failed to publish virtio-pmem used descriptor head {descriptor_head} with length {bytes_written_to_guest}: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioPmemQueueDispatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AvailableRing { source, .. } => Some(source),
+            Self::UsedRing { source, .. } => Some(source),
+            Self::EmptyDescriptorChain { .. } => None,
+        }
+    }
+}
+
+impl VirtioPmemQueueDispatchError {
+    pub const fn completed_dispatch(&self) -> &VirtioPmemQueueDispatch {
+        match self {
+            Self::AvailableRing {
+                completed_dispatch, ..
+            }
+            | Self::EmptyDescriptorChain {
+                completed_dispatch, ..
+            }
+            | Self::UsedRing {
+                completed_dispatch, ..
+            } => completed_dispatch,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct VirtioPmemDevice {
+    active_queue: Option<VirtioPmemQueue>,
+}
+
+impl VirtioPmemDevice {
+    pub const fn new() -> Self {
+        Self { active_queue: None }
+    }
+
+    pub fn is_activated(&self) -> bool {
+        self.active_queue.is_some()
+    }
+
+    pub const fn active_queue(&self) -> Option<&VirtioPmemQueue> {
+        self.active_queue.as_ref()
+    }
+
+    pub fn active_queue_mut(&mut self) -> Option<&mut VirtioPmemQueue> {
+        self.active_queue.as_mut()
+    }
+
+    fn dispatch_drained_queue_notifications(
+        &mut self,
+        memory: &mut GuestMemory,
+        drained_notifications: Vec<usize>,
+        flush_status: VirtioPmemFlushStatus,
+    ) -> Result<VirtioPmemDeviceNotificationDispatch, VirtioPmemDeviceNotificationError> {
+        if drained_notifications.is_empty() {
+            return Ok(VirtioPmemDeviceNotificationDispatch::new(
+                drained_notifications,
+                None,
+            ));
+        }
+
+        if let Some(queue_index) = drained_notifications
+            .iter()
+            .copied()
+            .find(|queue_index| *queue_index != 0)
+        {
+            return Err(VirtioPmemDeviceNotificationError::UnsupportedQueue {
+                drained_notifications,
+                queue_index,
+            });
+        }
+
+        let Some(queue) = self.active_queue.as_mut() else {
+            return Err(VirtioPmemDeviceNotificationError::Inactive {
+                drained_notifications,
+            });
+        };
+
+        match queue.dispatch(memory, flush_status) {
+            Ok(dispatch) => Ok(VirtioPmemDeviceNotificationDispatch::new(
+                drained_notifications,
+                Some(dispatch),
+            )),
+            Err(source) => Err(VirtioPmemDeviceNotificationError::QueueDispatch {
+                drained_notifications,
+                source,
+            }),
+        }
+    }
+
+    pub fn activate_pmem(
+        &mut self,
+        activation: VirtioMmioDeviceActivation<'_>,
+    ) -> Result<(), VirtioPmemDeviceActivationError> {
+        if self.active_queue.is_some() {
+            return Err(VirtioPmemDeviceActivationError::AlreadyActive);
+        }
+
+        let queue_index = 0;
+        let queue = activation
+            .queue(queue_index)
+            .map_err(|source| VirtioPmemDeviceActivationError::QueueMetadata {
+                queue_index,
+                source,
+            })
+            .and_then(|queue| {
+                VirtioPmemQueue::from_mmio_queue_state(queue).map_err(|source| {
+                    VirtioPmemDeviceActivationError::QueueBuild {
+                        queue_index,
+                        source,
+                    }
+                })
+            })?;
+        self.active_queue = Some(queue);
+
+        Ok(())
+    }
+
+    pub fn reset(&mut self) {
+        self.active_queue = None;
+    }
+}
+
+impl<C: VirtioMmioDeviceConfigHandler> VirtioMmioRegisterHandler<C, VirtioPmemDevice> {
+    pub fn dispatch_pmem_queue_notifications(
+        &mut self,
+        memory: &mut GuestMemory,
+        flush_status: VirtioPmemFlushStatus,
+    ) -> Result<VirtioPmemDeviceNotificationDispatch, VirtioPmemDeviceNotificationError> {
+        let drained_notifications = self.take_pending_queue_notifications();
+        let dispatch = self
+            .activation_handler_mut()
+            .dispatch_drained_queue_notifications(memory, drained_notifications, flush_status);
+        let needs_queue_interrupt = match &dispatch {
+            Ok(dispatch) => dispatch.needs_queue_interrupt(),
+            Err(error) => error
+                .completed_dispatch()
+                .is_some_and(VirtioPmemQueueDispatch::needs_queue_interrupt),
+        };
+        if needs_queue_interrupt {
+            self.mark_interrupt_pending(DeviceInterruptKind::Queue);
+        }
+
+        dispatch
+    }
+}
+
+impl VirtioMmioDeviceActivationHandler for VirtioPmemDevice {
+    fn activate(
+        &mut self,
+        activation: VirtioMmioDeviceActivation<'_>,
+    ) -> Result<(), VirtioMmioDeviceActivationError> {
+        self.activate_pmem(activation).map_err(Into::into)
+    }
+
+    fn reset(&mut self) {
+        VirtioPmemDevice::reset(self);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioPmemDeviceNotificationDispatch {
+    drained_notifications: Vec<usize>,
+    queue_dispatch: Option<VirtioPmemQueueDispatch>,
+}
+
+impl VirtioPmemDeviceNotificationDispatch {
+    const fn new(
+        drained_notifications: Vec<usize>,
+        queue_dispatch: Option<VirtioPmemQueueDispatch>,
+    ) -> Self {
+        Self {
+            drained_notifications,
+            queue_dispatch,
+        }
+    }
+
+    pub fn drained_notifications(&self) -> &[usize] {
+        &self.drained_notifications
+    }
+
+    pub const fn queue_dispatch(&self) -> Option<&VirtioPmemQueueDispatch> {
+        self.queue_dispatch.as_ref()
+    }
+
+    pub fn needs_queue_interrupt(&self) -> bool {
+        self.queue_dispatch
+            .as_ref()
+            .is_some_and(VirtioPmemQueueDispatch::needs_queue_interrupt)
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioPmemDeviceNotificationError {
+    Inactive {
+        drained_notifications: Vec<usize>,
+    },
+    UnsupportedQueue {
+        drained_notifications: Vec<usize>,
+        queue_index: usize,
+    },
+    QueueDispatch {
+        drained_notifications: Vec<usize>,
+        source: VirtioPmemQueueDispatchError,
+    },
+}
+
+impl VirtioPmemDeviceNotificationError {
+    pub fn drained_notifications(&self) -> &[usize] {
+        match self {
+            Self::Inactive {
+                drained_notifications,
+            }
+            | Self::UnsupportedQueue {
+                drained_notifications,
+                ..
+            }
+            | Self::QueueDispatch {
+                drained_notifications,
+                ..
+            } => drained_notifications,
+        }
+    }
+
+    pub const fn completed_dispatch(&self) -> Option<&VirtioPmemQueueDispatch> {
+        match self {
+            Self::QueueDispatch { source, .. } => Some(source.completed_dispatch()),
+            Self::Inactive { .. } | Self::UnsupportedQueue { .. } => None,
+        }
+    }
+}
+
+impl fmt::Display for VirtioPmemDeviceNotificationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inactive { .. } => {
+                f.write_str("virtio-pmem queue notification cannot be dispatched before activation")
+            }
+            Self::UnsupportedQueue { queue_index, .. } => {
+                write!(
+                    f,
+                    "virtio-pmem queue notification for unsupported queue {queue_index}"
+                )
+            }
+            Self::QueueDispatch { source, .. } => {
+                write!(
+                    f,
+                    "virtio-pmem queue notification dispatch failed: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioPmemDeviceNotificationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::QueueDispatch { source, .. } => Some(source),
+            Self::Inactive { .. } | Self::UnsupportedQueue { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioPmemDeviceActivationError {
+    AlreadyActive,
+    QueueMetadata {
+        queue_index: u32,
+        source: VirtioMmioQueueRegisterError,
+    },
+    QueueBuild {
+        queue_index: u32,
+        source: VirtioPmemQueueBuildError,
+    },
+}
+
+impl fmt::Display for VirtioPmemDeviceActivationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyActive => f.write_str("virtio-pmem device is already active"),
+            Self::QueueMetadata {
+                queue_index,
+                source,
+            } => write!(
+                f,
+                "failed to read virtio-pmem queue {queue_index} metadata during activation: {source}"
+            ),
+            Self::QueueBuild {
+                queue_index,
+                source,
+            } => write!(
+                f,
+                "failed to activate virtio-pmem queue {queue_index}: {source}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VirtioPmemDeviceActivationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::QueueMetadata { source, .. } => Some(source),
+            Self::QueueBuild { source, .. } => Some(source),
+            Self::AlreadyActive => None,
+        }
+    }
+}
+
+impl From<VirtioPmemDeviceActivationError> for VirtioMmioDeviceActivationError {
+    fn from(source: VirtioPmemDeviceActivationError) -> Self {
+        Self::from(MmioHandlerError::new(source.to_string()))
+    }
+}
+
+fn descriptor_chain_head(chain: &VirtqueueDescriptorChain) -> Option<u16> {
+    if chain.is_empty() {
+        None
+    } else {
+        Some(chain.head_index())
+    }
+}
+
+fn descriptor_at(
+    chain: &VirtqueueDescriptorChain,
+    index: usize,
+    expected: usize,
+) -> Result<&VirtqueueDescriptor, VirtioPmemRequestError> {
+    chain
+        .descriptors()
+        .get(index)
+        .ok_or(VirtioPmemRequestError::DescriptorChainTooShort {
+            expected,
+            actual: chain.len(),
+        })
+}
+
+fn validate_request_descriptor(
+    descriptor: &VirtqueueDescriptor,
+) -> Result<(), VirtioPmemRequestError> {
+    if descriptor.is_write_only() {
+        return Err(VirtioPmemRequestError::RequestDescriptorWriteOnly {
+            index: descriptor.index(),
+        });
+    }
+
+    if descriptor.len() != VIRTIO_PMEM_REQUEST_SIZE {
+        return Err(VirtioPmemRequestError::RequestDescriptorInvalidLength {
+            index: descriptor.index(),
+            len: descriptor.len(),
+            expected: VIRTIO_PMEM_REQUEST_SIZE,
+        });
+    }
+
+    Ok(())
+}
+
+fn read_virtio_pmem_request_type(
+    memory: &GuestMemory,
+    descriptor: &VirtqueueDescriptor,
+) -> Result<u32, VirtioPmemRequestError> {
+    let mut bytes = [0; VIRTIO_PMEM_REQUEST_SIZE as usize];
+    memory
+        .read_slice(&mut bytes, descriptor.address())
+        .map_err(|source| VirtioPmemRequestError::ReadRequest {
+            address: descriptor.address(),
+            source,
+        })?;
+
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn validate_status_descriptor(
+    descriptor: &VirtqueueDescriptor,
+) -> Result<VirtioPmemStatusDescriptor, VirtioPmemRequestError> {
+    if !descriptor.is_write_only() {
+        return Err(VirtioPmemRequestError::StatusDescriptorReadOnly {
+            index: descriptor.index(),
+        });
+    }
+
+    if descriptor.len() != VIRTIO_PMEM_STATUS_SIZE {
+        return Err(VirtioPmemRequestError::StatusDescriptorInvalidLength {
+            index: descriptor.index(),
+            len: descriptor.len(),
+            expected: VIRTIO_PMEM_STATUS_SIZE,
+        });
+    }
+
+    Ok(VirtioPmemStatusDescriptor {
+        index: descriptor.index(),
+        address: descriptor.address(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1203,11 +2120,12 @@ impl PmemMmioDevices {
         for (prepared_device, placement) in prepared.as_slice().iter().zip(placements) {
             let pmem_id = prepared_device.id().to_string();
             let config_space = prepared_device.config_space();
-            let handler = VirtioMmioRegisterHandler::with_device_config(
+            let handler = VirtioMmioRegisterHandler::with_device_config_and_activation(
                 VIRTIO_PMEM_DEVICE_ID,
                 config_space.available_features(),
                 &VIRTIO_PMEM_QUEUE_SIZES,
                 config_space,
+                VirtioPmemDevice::new(),
             )
             .map_err(|source| PmemMmioRegistrationError::BuildHandler {
                 pmem_id: pmem_id.clone(),
@@ -1694,10 +2612,26 @@ mod tests {
         VirtioMmioAccess, VirtioMmioDeviceConfigError, VirtioMmioRegister,
         decode_virtio_mmio_access,
     };
+    use crate::virtio_queue::{
+        VIRTQUEUE_DESC_F_NEXT, VIRTQUEUE_DESC_F_WRITE, VIRTQUEUE_DESCRIPTOR_SIZE,
+    };
 
     const TEST_PMEM_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_0000);
     const TEST_PMEM_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(9000);
     const TEST_PMEM_START: u64 = aarch64::FIRST_ADDR_PAST_64BITS_MMIO;
+    const TEST_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x1000);
+    const TEST_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x5000);
+    const TEST_USED_RING: GuestAddress = GuestAddress::new(0x6000);
+    const TEST_QUEUE_SIZE: u16 = 8;
+    const TEST_MEMORY_SIZE: u64 = 0x10_000;
+    const TEST_AVAILABLE_RING_IDX_OFFSET: u64 = 2;
+    const TEST_AVAILABLE_RING_RING_OFFSET: u64 = 4;
+    const TEST_AVAILABLE_RING_ENTRY_SIZE: u64 = 2;
+    const TEST_USED_RING_IDX_OFFSET: u64 = 2;
+    const TEST_USED_RING_RING_OFFSET: u64 = 4;
+    const TEST_USED_RING_ELEMENT_SIZE: u64 = 8;
+    const TEST_PMEM_REQUEST_ADDR: GuestAddress = GuestAddress::new(0x2000);
+    const TEST_PMEM_STATUS_ADDR: GuestAddress = GuestAddress::new(0x3000);
     static NEXT_TEMP_PATH_ID: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Debug)]
@@ -1962,6 +2896,196 @@ mod tests {
         )
     }
 
+    #[derive(Debug, Clone, Copy)]
+    struct TestDescriptor {
+        address: GuestAddress,
+        len: u32,
+        flags: u16,
+        next: u16,
+    }
+
+    impl TestDescriptor {
+        const fn readable(address: GuestAddress, len: u32, next: Option<u16>) -> Self {
+            let (flags, next_index) = match next {
+                Some(index) => (VIRTQUEUE_DESC_F_NEXT, index),
+                None => (0, 0),
+            };
+            Self {
+                address,
+                len,
+                flags,
+                next: next_index,
+            }
+        }
+
+        const fn writable(address: GuestAddress, len: u32, next: Option<u16>) -> Self {
+            let (flags, next_index) = match next {
+                Some(index) => (VIRTQUEUE_DESC_F_WRITE | VIRTQUEUE_DESC_F_NEXT, index),
+                None => (VIRTQUEUE_DESC_F_WRITE, 0),
+            };
+            Self {
+                address,
+                len,
+                flags,
+                next: next_index,
+            }
+        }
+    }
+
+    fn request_memory() -> GuestMemory {
+        let layout = GuestMemoryLayout::new(vec![
+            GuestMemoryRange::new(GuestAddress::new(0), TEST_MEMORY_SIZE)
+                .expect("test range should be valid"),
+        ])
+        .expect("test layout should be valid");
+        GuestMemory::allocate(&layout).expect("test guest memory should allocate")
+    }
+
+    fn write_request_type(memory: &mut GuestMemory, request_type: u32) {
+        memory
+            .write_slice(&request_type.to_le_bytes(), TEST_PMEM_REQUEST_ADDR)
+            .expect("pmem request type should write");
+    }
+
+    fn write_descriptor(memory: &mut GuestMemory, index: u16, descriptor: TestDescriptor) {
+        let mut bytes = [0; VIRTQUEUE_DESCRIPTOR_SIZE];
+        let (address_bytes, tail) = bytes.split_at_mut(8);
+        let (len_bytes, tail) = tail.split_at_mut(4);
+        let (flags_bytes, next_bytes) = tail.split_at_mut(2);
+        address_bytes.copy_from_slice(&descriptor.address.raw_value().to_le_bytes());
+        len_bytes.copy_from_slice(&descriptor.len.to_le_bytes());
+        flags_bytes.copy_from_slice(&descriptor.flags.to_le_bytes());
+        next_bytes.copy_from_slice(&descriptor.next.to_le_bytes());
+
+        let descriptor_address = TEST_DESCRIPTOR_TABLE
+            .checked_add(
+                u64::from(index)
+                    * u64::try_from(VIRTQUEUE_DESCRIPTOR_SIZE).expect("descriptor size fits u64"),
+            )
+            .expect("descriptor address should not overflow");
+        memory
+            .write_slice(&bytes, descriptor_address)
+            .expect("descriptor should write");
+    }
+
+    fn write_guest_u16(memory: &mut GuestMemory, address: GuestAddress, value: u16) {
+        memory
+            .write_slice(&value.to_le_bytes(), address)
+            .expect("u16 field should write");
+    }
+
+    fn read_guest_u16(memory: &GuestMemory, address: GuestAddress) -> u16 {
+        let mut bytes = [0; 2];
+        memory
+            .read_slice(&mut bytes, address)
+            .expect("u16 field should read");
+        u16::from_le_bytes(bytes)
+    }
+
+    fn read_guest_u32(memory: &GuestMemory, address: GuestAddress) -> u32 {
+        let mut bytes = [0; 4];
+        memory
+            .read_slice(&mut bytes, address)
+            .expect("u32 field should read");
+        u32::from_le_bytes(bytes)
+    }
+
+    fn read_guest_i32(memory: &GuestMemory, address: GuestAddress) -> i32 {
+        let mut bytes = [0; 4];
+        memory
+            .read_slice(&mut bytes, address)
+            .expect("i32 field should read");
+        i32::from_le_bytes(bytes)
+    }
+
+    fn available_ring_idx_address() -> GuestAddress {
+        TEST_AVAILABLE_RING
+            .checked_add(TEST_AVAILABLE_RING_IDX_OFFSET)
+            .expect("available idx address should not overflow")
+    }
+
+    fn available_ring_entry_address(ring_index: u16) -> GuestAddress {
+        TEST_AVAILABLE_RING
+            .checked_add(
+                TEST_AVAILABLE_RING_RING_OFFSET
+                    + u64::from(ring_index) * TEST_AVAILABLE_RING_ENTRY_SIZE,
+            )
+            .expect("available entry address should not overflow")
+    }
+
+    fn used_ring_idx_address() -> GuestAddress {
+        TEST_USED_RING
+            .checked_add(TEST_USED_RING_IDX_OFFSET)
+            .expect("used idx address should not overflow")
+    }
+
+    fn used_ring_entry_address(ring_index: u16) -> GuestAddress {
+        TEST_USED_RING
+            .checked_add(
+                TEST_USED_RING_RING_OFFSET + u64::from(ring_index) * TEST_USED_RING_ELEMENT_SIZE,
+            )
+            .expect("used entry address should not overflow")
+    }
+
+    fn write_available_heads(memory: &mut GuestMemory, heads: &[u16]) {
+        for (ring_index, head) in heads.iter().copied().enumerate() {
+            write_guest_u16(
+                memory,
+                available_ring_entry_address(
+                    u16::try_from(ring_index).expect("ring index should fit u16"),
+                ),
+                head,
+            );
+        }
+        write_guest_u16(
+            memory,
+            available_ring_idx_address(),
+            u16::try_from(heads.len()).expect("head count should fit u16"),
+        );
+    }
+
+    fn read_used_index(memory: &GuestMemory) -> u16 {
+        read_guest_u16(memory, used_ring_idx_address())
+    }
+
+    fn read_used_element(memory: &GuestMemory, ring_index: u16) -> (u32, u32) {
+        let entry = used_ring_entry_address(ring_index);
+        let len_address = entry
+            .checked_add(4)
+            .expect("used element len address should not overflow");
+        (
+            read_guest_u32(memory, entry),
+            read_guest_u32(memory, len_address),
+        )
+    }
+
+    fn pmem_queue() -> VirtioPmemQueue {
+        let available = VirtqueueAvailableRing::new(
+            TEST_DESCRIPTOR_TABLE,
+            TEST_AVAILABLE_RING,
+            TEST_QUEUE_SIZE,
+        )
+        .expect("available ring should build");
+        let used = VirtqueueUsedRing::new(TEST_USED_RING, TEST_QUEUE_SIZE)
+            .expect("used ring should build");
+        VirtioPmemQueue::new(available, used)
+    }
+
+    fn write_pmem_flush_chain(memory: &mut GuestMemory) {
+        write_request_type(memory, VIRTIO_PMEM_REQUEST_TYPE_FLUSH);
+        write_descriptor(
+            memory,
+            0,
+            TestDescriptor::readable(TEST_PMEM_REQUEST_ADDR, VIRTIO_PMEM_REQUEST_SIZE, Some(1)),
+        );
+        write_descriptor(
+            memory,
+            1,
+            TestDescriptor::writable(TEST_PMEM_STATUS_ADDR, VIRTIO_PMEM_STATUS_SIZE, None),
+        );
+        write_available_heads(memory, &[0]);
+    }
+
     #[test]
     fn virtio_pmem_constants_match_firecracker_shape() {
         assert_eq!(VIRTIO_PMEM_DEVICE_ID, 27);
@@ -2066,6 +3190,128 @@ mod tests {
             Err(VirtioMmioDeviceConfigError::UnsupportedWrite { offset: 0, len: 4 })
         );
         assert_eq!(config, VirtioPmemConfigSpace::new(0, 0));
+    }
+
+    #[test]
+    fn pmem_queue_dispatch_completes_successful_flush() {
+        let mut memory = request_memory();
+        write_pmem_flush_chain(&mut memory);
+        let mut queue = pmem_queue();
+
+        let dispatch = queue
+            .dispatch(&mut memory, VirtioPmemFlushStatus::Success)
+            .expect("pmem flush queue should dispatch");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_flushes(), 1);
+        assert_eq!(dispatch.failed_flushes(), 0);
+        assert_eq!(dispatch.parse_failures(), 0);
+        assert_eq!(dispatch.status_write_failures(), 0);
+        assert!(dispatch.needs_queue_interrupt());
+        assert_eq!(
+            read_guest_i32(&memory, TEST_PMEM_STATUS_ADDR),
+            VIRTIO_PMEM_STATUS_SUCCESS
+        );
+        assert_eq!(read_used_index(&memory), 1);
+        assert_eq!(read_used_element(&memory, 0), (0, VIRTIO_PMEM_STATUS_SIZE));
+    }
+
+    #[test]
+    fn pmem_queue_dispatch_reports_failed_flush_to_guest() {
+        let mut memory = request_memory();
+        write_pmem_flush_chain(&mut memory);
+        let mut queue = pmem_queue();
+
+        let dispatch = queue
+            .dispatch(&mut memory, VirtioPmemFlushStatus::Failure)
+            .expect("pmem flush queue should dispatch");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_flushes(), 0);
+        assert_eq!(dispatch.failed_flushes(), 1);
+        assert_eq!(dispatch.parse_failures(), 0);
+        assert_eq!(dispatch.status_write_failures(), 0);
+        assert!(dispatch.needs_queue_interrupt());
+        assert_eq!(
+            read_guest_i32(&memory, TEST_PMEM_STATUS_ADDR),
+            VIRTIO_PMEM_STATUS_FAILURE
+        );
+        assert_eq!(read_used_index(&memory), 1);
+        assert_eq!(read_used_element(&memory, 0), (0, VIRTIO_PMEM_STATUS_SIZE));
+    }
+
+    #[test]
+    fn pmem_queue_dispatch_publishes_zero_length_used_element_for_parse_failure() {
+        let mut memory = request_memory();
+        write_request_type(&mut memory, VIRTIO_PMEM_REQUEST_TYPE_FLUSH);
+        write_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::writable(TEST_PMEM_REQUEST_ADDR, VIRTIO_PMEM_REQUEST_SIZE, Some(1)),
+        );
+        write_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::writable(TEST_PMEM_STATUS_ADDR, VIRTIO_PMEM_STATUS_SIZE, None),
+        );
+        memory
+            .write_slice(&99_i32.to_le_bytes(), TEST_PMEM_STATUS_ADDR)
+            .expect("sentinel status should write");
+        write_available_heads(&mut memory, &[0]);
+        let mut queue = pmem_queue();
+
+        let dispatch = queue
+            .dispatch(&mut memory, VirtioPmemFlushStatus::Success)
+            .expect("invalid pmem request should still publish a completion");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_flushes(), 0);
+        assert_eq!(dispatch.failed_flushes(), 0);
+        assert_eq!(dispatch.parse_failures(), 1);
+        assert_eq!(dispatch.status_write_failures(), 0);
+        assert!(matches!(
+            dispatch.first_parse_failure(),
+            Some(VirtioPmemRequestError::RequestDescriptorWriteOnly { index: 0 })
+        ));
+        assert!(dispatch.needs_queue_interrupt());
+        assert_eq!(read_guest_i32(&memory, TEST_PMEM_STATUS_ADDR), 99);
+        assert_eq!(read_used_index(&memory), 1);
+        assert_eq!(read_used_element(&memory, 0), (0, 0));
+    }
+
+    #[test]
+    fn pmem_queue_dispatch_publishes_zero_length_used_element_for_status_write_failure() {
+        let mut memory = request_memory();
+        write_request_type(&mut memory, VIRTIO_PMEM_REQUEST_TYPE_FLUSH);
+        write_descriptor(
+            &mut memory,
+            0,
+            TestDescriptor::readable(TEST_PMEM_REQUEST_ADDR, VIRTIO_PMEM_REQUEST_SIZE, Some(1)),
+        );
+        write_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::writable(
+                GuestAddress::new(TEST_MEMORY_SIZE),
+                VIRTIO_PMEM_STATUS_SIZE,
+                None,
+            ),
+        );
+        write_available_heads(&mut memory, &[0]);
+        let mut queue = pmem_queue();
+
+        let dispatch = queue
+            .dispatch(&mut memory, VirtioPmemFlushStatus::Success)
+            .expect("status write failure should still publish a completion");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_flushes(), 0);
+        assert_eq!(dispatch.failed_flushes(), 0);
+        assert_eq!(dispatch.parse_failures(), 0);
+        assert_eq!(dispatch.status_write_failures(), 1);
+        assert!(dispatch.needs_queue_interrupt());
+        assert_eq!(read_used_index(&memory), 1);
+        assert_eq!(read_used_element(&memory, 0), (0, 0));
     }
 
     #[test]

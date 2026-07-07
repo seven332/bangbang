@@ -47,7 +47,8 @@ use crate::network::{
 };
 use crate::pmem::{
     PmemMmioDeviceRegistration, PmemMmioLayout, PmemMmioRegistrationError, PreparedPmemDevice,
-    PreparedPmemDeviceError, PreparedPmemDevices,
+    PreparedPmemDeviceError, PreparedPmemDevices, VirtioPmemDeviceNotificationDispatch,
+    VirtioPmemDeviceNotificationError, VirtioPmemFlushStatus, VirtioPmemMmioHandler,
 };
 use crate::serial::{SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialMmioDevice, SharedSerialOutput};
 use crate::vsock::{
@@ -298,6 +299,126 @@ impl fmt::Display for Arm64BootBlockNotificationDispatchError {
 }
 
 impl std::error::Error for Arm64BootBlockNotificationDispatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ResultAllocation { source } => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Arm64BootPmemNotificationDispatches {
+    devices: Vec<Arm64BootPmemNotificationDispatch>,
+}
+
+impl Arm64BootPmemNotificationDispatches {
+    fn new(devices: Vec<Arm64BootPmemNotificationDispatch>) -> Self {
+        Self { devices }
+    }
+
+    pub fn as_slice(&self) -> &[Arm64BootPmemNotificationDispatch] {
+        &self.devices
+    }
+
+    pub fn into_vec(self) -> Vec<Arm64BootPmemNotificationDispatch> {
+        self.devices
+    }
+
+    pub fn len(&self) -> usize {
+        self.devices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.devices.is_empty()
+    }
+
+    pub fn needs_queue_interrupt(&self) -> bool {
+        self.devices
+            .iter()
+            .any(Arm64BootPmemNotificationDispatch::needs_queue_interrupt)
+    }
+}
+
+#[derive(Debug)]
+pub struct Arm64BootPmemNotificationDispatch {
+    device: Arm64BootPmemDevice,
+    outcome: Arm64BootPmemNotificationOutcome,
+}
+
+impl Arm64BootPmemNotificationDispatch {
+    fn new(device: Arm64BootPmemDevice, outcome: Arm64BootPmemNotificationOutcome) -> Self {
+        Self { device, outcome }
+    }
+
+    pub const fn device(&self) -> &Arm64BootPmemDevice {
+        &self.device
+    }
+
+    pub const fn outcome(&self) -> &Arm64BootPmemNotificationOutcome {
+        &self.outcome
+    }
+
+    pub fn needs_queue_interrupt(&self) -> bool {
+        self.outcome.needs_queue_interrupt()
+    }
+}
+
+#[derive(Debug)]
+pub enum Arm64BootPmemNotificationOutcome {
+    Dispatched(VirtioPmemDeviceNotificationDispatch),
+    DispatchFailed(VirtioPmemDeviceNotificationError),
+    HandlerLookupFailed(MmioHandlerLookupError),
+}
+
+impl Arm64BootPmemNotificationOutcome {
+    pub fn needs_queue_interrupt(&self) -> bool {
+        match self {
+            Self::Dispatched(dispatch) => dispatch.needs_queue_interrupt(),
+            Self::DispatchFailed(source) => source
+                .completed_dispatch()
+                .is_some_and(crate::pmem::VirtioPmemQueueDispatch::needs_queue_interrupt),
+            Self::HandlerLookupFailed(_) => false,
+        }
+    }
+
+    pub const fn dispatched(&self) -> Option<&VirtioPmemDeviceNotificationDispatch> {
+        match self {
+            Self::Dispatched(dispatch) => Some(dispatch),
+            Self::DispatchFailed(_) | Self::HandlerLookupFailed(_) => None,
+        }
+    }
+
+    pub const fn dispatch_error(&self) -> Option<&VirtioPmemDeviceNotificationError> {
+        match self {
+            Self::DispatchFailed(source) => Some(source),
+            Self::Dispatched(_) | Self::HandlerLookupFailed(_) => None,
+        }
+    }
+
+    pub const fn handler_lookup_error(&self) -> Option<&MmioHandlerLookupError> {
+        match self {
+            Self::HandlerLookupFailed(source) => Some(source),
+            Self::Dispatched(_) | Self::DispatchFailed(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum Arm64BootPmemNotificationDispatchError {
+    ResultAllocation { source: TryReserveError },
+}
+
+impl fmt::Display for Arm64BootPmemNotificationDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ResultAllocation { source } => {
+                write!(f, "failed to allocate pmem notification results: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Arm64BootPmemNotificationDispatchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ResultAllocation { source } => Some(source),
@@ -1049,6 +1170,48 @@ impl Arm64BootRuntimeResources {
         }
 
         Ok(Arm64BootBlockNotificationDispatches::new(devices))
+    }
+
+    pub fn has_pending_pmem_queue_notifications(
+        &self,
+        mmio_dispatcher: &mut MmioDispatcher,
+    ) -> bool {
+        self.pmem_mmio_devices.iter().any(|device| {
+            let region_id = device.registration.region_id();
+            mmio_dispatcher
+                .handler_mut::<VirtioPmemMmioHandler>(region_id)
+                .is_ok_and(|handler| handler.has_pending_queue_notifications())
+        })
+    }
+
+    pub fn dispatch_pmem_queue_notifications(
+        &mut self,
+        memory: &mut GuestMemory,
+        mmio_dispatcher: &mut MmioDispatcher,
+        flush_status: VirtioPmemFlushStatus,
+    ) -> Result<Arm64BootPmemNotificationDispatches, Arm64BootPmemNotificationDispatchError> {
+        let mut devices = Vec::new();
+        devices
+            .try_reserve_exact(self.pmem_mmio_devices.len())
+            .map_err(
+                |source| Arm64BootPmemNotificationDispatchError::ResultAllocation { source },
+            )?;
+
+        for device in self.pmem_mmio_devices.iter().cloned() {
+            let region_id = device.registration.region_id();
+            let outcome = match mmio_dispatcher.handler_mut::<VirtioPmemMmioHandler>(region_id) {
+                Ok(handler) => {
+                    match handler.dispatch_pmem_queue_notifications(memory, flush_status) {
+                        Ok(dispatch) => Arm64BootPmemNotificationOutcome::Dispatched(dispatch),
+                        Err(source) => Arm64BootPmemNotificationOutcome::DispatchFailed(source),
+                    }
+                }
+                Err(source) => Arm64BootPmemNotificationOutcome::HandlerLookupFailed(source),
+            };
+            devices.push(Arm64BootPmemNotificationDispatch::new(device, outcome));
+        }
+
+        Ok(Arm64BootPmemNotificationDispatches::new(devices))
     }
 
     pub fn dispatch_network_queue_notifications(

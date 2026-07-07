@@ -55,12 +55,12 @@ must run through
 `com.apple.security.hypervisor` entitlement. Do not add real HVF tests to the
 unsigned workspace test path.
 
-For virtio-pmem attachment changes, unit tests should cover MMIO registration,
-FDT metadata, config-space `start`/`size`, deterministic multi-device layout,
-and cleanup/error paths. The current signed HVF coverage validates startup
-assembly and mapped pmem ownership through the signed lifecycle target; guest
-side pmem discovery, reads, and queue-driven flush behavior require a dedicated
-guest probe and remain follow-up work until that device behavior is implemented.
+For virtio-pmem changes, unit tests should cover MMIO registration, FDT
+metadata, config-space `start`/`size`, deterministic multi-device layout,
+queue parsing/completion, shadow writeback, and cleanup/error paths. Signed HVF
+coverage validates startup assembly and mapped pmem ownership through the
+lifecycle target; the signed `guest_boot` target should cover guest-side pmem
+discovery, backing reads, guest writes, and queue-driven flush behavior.
 
 ## What To Cover
 
@@ -295,7 +295,7 @@ artifacts and is not a substitute for a production rootfs build process.
 The signed `guest_boot` and executable HVF e2e targets also validate a
 deterministic direct-rootfs boot. For those scenarios,
 `scripts/run-integration-tests.sh` prepares
-`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v18.ext4`
+`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v19.ext4`
 after confirming the host can execute HVF. The generated image is an ext4 copy
 of the pinned Firecracker rootfs with a test-specific
 `/bangbang-direct-rootfs-init` script added before image creation. The test
@@ -318,6 +318,11 @@ metadata values. When the boot args include `bangbang.entropy-read=1`, the same
 init script checks `/sys/class/misc/hw_random/rng_current` for `virtio_rng`,
 reads bytes from `/dev/hwrng`, and writes
 `BANGBANG_ENTROPY_GUEST_READ_OK` only after the read returns non-empty data.
+When the boot args include `bangbang.pmem-read-flush=1`, the same init script
+finds the first `/dev/pmem*` block device, reads a deterministic host marker,
+writes a deterministic guest marker at a fixed offset, runs `sync` for the
+device path, and emits `BANGBANG_PMEM_READ_FLUSH_OK` only after those steps
+complete.
 When the boot args include `bangbang.vsock-guest-connect=1`,
 the same init script uses the rootfs-provided Python `AF_VSOCK` support to
 connect to host CID 2 on the test port, exchange multiple ordered deterministic
