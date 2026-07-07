@@ -2729,9 +2729,20 @@ mod tests {
         super::Arm64BootRuntimeResources,
         MmioDispatcher,
     ) {
+        boot_runtime_with_balloon_target(kernel_name, TEST_MEMORY_MIB as u32)
+    }
+
+    fn boot_runtime_with_balloon_target(
+        kernel_name: &str,
+        amount_mib: u32,
+    ) -> (
+        crate::memory::GuestMemory,
+        super::Arm64BootRuntimeResources,
+        MmioDispatcher,
+    ) {
         let kernel = temp_file(kernel_name, &arm64_image());
         let mut controller = controller_with_kernel(kernel.path());
-        add_balloon(&mut controller, TEST_MEMORY_MIB as u32);
+        add_balloon(&mut controller, amount_mib);
         let resources = Arm64BootResources::assemble_from_controller(
             &controller,
             Arm64BootResourceConfig {
@@ -5549,13 +5560,22 @@ mod tests {
 
     #[test]
     fn boot_runtime_balloon_config_update_updates_active_handler() {
+        let initial_amount_mib = TEST_MEMORY_MIB as u32 / 2;
         let (_, mut runtime, mut mmio_dispatcher) =
-            boot_runtime_with_balloon("kernel-balloon-update-config");
+            boot_runtime_with_balloon_target("kernel-balloon-update-config", initial_amount_mib);
         let device = runtime
             .balloon_device
             .as_ref()
             .expect("balloon device should exist")
             .clone();
+
+        let handler = mmio_dispatcher
+            .handler_mut::<VirtioBalloonMmioHandler>(device.registration.region_id())
+            .expect("balloon handler should be registered");
+        assert_eq!(
+            handler.device_config_handler().num_pages(),
+            initial_amount_mib * VIRTIO_BALLOON_MIB_TO_4K_PAGES
+        );
 
         update_balloon_config_for_device(
             &device,
