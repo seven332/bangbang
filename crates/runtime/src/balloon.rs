@@ -340,6 +340,12 @@ impl VirtioBalloonPfnPayload {
     pub fn is_empty(&self) -> bool {
         self.pfns.is_empty()
     }
+
+    pub fn into_page_ranges(
+        self,
+    ) -> Result<VirtioBalloonPfnRanges, VirtioBalloonPfnRangeCompactError> {
+        VirtioBalloonPfnRanges::from_pfns(self.pfns)
+    }
 }
 
 #[derive(Debug)]
@@ -383,6 +389,134 @@ impl std::error::Error for VirtioBalloonPfnPayloadParseError {
         match self {
             Self::PfnAllocation { source, .. } => Some(source),
             Self::EmptyPayload | Self::UnalignedLength { .. } | Self::TooManyPfns { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioBalloonPfnRange {
+    start_pfn: u32,
+    page_count: u32,
+}
+
+impl VirtioBalloonPfnRange {
+    const fn new(start_pfn: u32, page_count: u32) -> Self {
+        Self {
+            start_pfn,
+            page_count,
+        }
+    }
+
+    pub const fn start_pfn(self) -> u32 {
+        self.start_pfn
+    }
+
+    pub const fn page_count(self) -> u32 {
+        self.page_count
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioBalloonPfnRanges {
+    ranges: Vec<VirtioBalloonPfnRange>,
+}
+
+impl VirtioBalloonPfnRanges {
+    pub fn from_pfns(mut pfns: Vec<u32>) -> Result<Self, VirtioBalloonPfnRangeCompactError> {
+        let pfn_count = pfns.len();
+        if pfn_count > VIRTIO_BALLOON_MAX_PFNS_PER_DESCRIPTOR {
+            return Err(VirtioBalloonPfnRangeCompactError::TooManyPfns {
+                count: pfn_count,
+                max: VIRTIO_BALLOON_MAX_PFNS_PER_DESCRIPTOR,
+            });
+        }
+        if pfns.is_empty() {
+            return Ok(Self { ranges: Vec::new() });
+        }
+
+        pfns.sort_unstable();
+
+        let mut ranges = Vec::new();
+        ranges.try_reserve_exact(pfn_count).map_err(|source| {
+            VirtioBalloonPfnRangeCompactError::RangeAllocation { pfn_count, source }
+        })?;
+
+        let mut iter = pfns.into_iter();
+        let Some(mut start_pfn) = iter.next() else {
+            return Ok(Self { ranges });
+        };
+        let mut previous_pfn = start_pfn;
+        let mut page_count = 1;
+
+        for pfn in iter {
+            if pfn == previous_pfn {
+                continue;
+            }
+
+            if previous_pfn.checked_add(1) == Some(pfn) {
+                page_count += 1;
+            } else {
+                ranges.push(VirtioBalloonPfnRange::new(start_pfn, page_count));
+                start_pfn = pfn;
+                page_count = 1;
+            }
+            previous_pfn = pfn;
+        }
+
+        ranges.push(VirtioBalloonPfnRange::new(start_pfn, page_count));
+
+        Ok(Self { ranges })
+    }
+
+    pub fn ranges(&self) -> &[VirtioBalloonPfnRange] {
+        &self.ranges
+    }
+
+    pub fn into_vec(self) -> Vec<VirtioBalloonPfnRange> {
+        self.ranges
+    }
+
+    pub fn len(&self) -> usize {
+        self.ranges.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioBalloonPfnRangeCompactError {
+    TooManyPfns {
+        count: usize,
+        max: usize,
+    },
+    RangeAllocation {
+        pfn_count: usize,
+        source: TryReserveError,
+    },
+}
+
+impl fmt::Display for VirtioBalloonPfnRangeCompactError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooManyPfns { count, max } => write!(
+                f,
+                "virtio-balloon PFN compaction input contains {count} PFNs, exceeding maximum {max}"
+            ),
+            Self::RangeAllocation { pfn_count, source } => write!(
+                f,
+                "failed to allocate virtio-balloon PFN ranges for {pfn_count} PFNs: {source}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VirtioBalloonPfnRangeCompactError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::RangeAllocation { source, .. } => Some(source),
+            Self::TooManyPfns { .. } => None,
         }
     }
 }
@@ -1201,6 +1335,167 @@ mod tests {
         let oversized_payload =
             vec![0; VIRTIO_BALLOON_MAX_PFN_PAYLOAD_SIZE + VIRTIO_BALLOON_PFN_SIZE];
         assert!(VirtioBalloonPfnPayload::parse(&oversized_payload).is_err());
+    }
+
+    #[test]
+    fn pfn_ranges_accept_empty_input() {
+        let ranges =
+            VirtioBalloonPfnRanges::from_pfns(Vec::new()).expect("empty PFN input should compact");
+
+        assert!(ranges.is_empty());
+        assert_eq!(ranges.len(), 0);
+        assert_eq!(ranges.ranges(), &[]);
+        assert_eq!(ranges.into_vec(), Vec::new());
+    }
+
+    #[test]
+    fn pfn_ranges_compact_contiguous_pfns() {
+        let ranges = VirtioBalloonPfnRanges::from_pfns(vec![0, 1, 2, 3])
+            .expect("contiguous PFNs should compact");
+
+        assert_eq!(
+            ranges.ranges(),
+            &[VirtioBalloonPfnRange {
+                start_pfn: 0,
+                page_count: 4
+            }]
+        );
+        assert_eq!(ranges.ranges()[0].start_pfn(), 0);
+        assert_eq!(ranges.ranges()[0].page_count(), 4);
+    }
+
+    #[test]
+    fn pfn_ranges_sort_unsorted_pfns() {
+        let ranges = VirtioBalloonPfnRanges::from_pfns(vec![5, 2, 4, 3, 9])
+            .expect("unsorted PFNs should compact");
+
+        assert_eq!(
+            ranges.ranges(),
+            &[
+                VirtioBalloonPfnRange {
+                    start_pfn: 2,
+                    page_count: 4
+                },
+                VirtioBalloonPfnRange {
+                    start_pfn: 9,
+                    page_count: 1
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn pfn_ranges_deduplicate_pfns() {
+        let ranges = VirtioBalloonPfnRanges::from_pfns(vec![7, 7, 8, 8, 10, 9])
+            .expect("duplicate PFNs should compact");
+
+        assert_eq!(
+            ranges.ranges(),
+            &[VirtioBalloonPfnRange {
+                start_pfn: 7,
+                page_count: 4
+            }]
+        );
+    }
+
+    #[test]
+    fn pfn_ranges_keep_separated_ranges() {
+        let ranges = VirtioBalloonPfnRanges::from_pfns(vec![0, 1, 3, 4, 6])
+            .expect("separated PFNs should compact");
+
+        assert_eq!(
+            ranges.ranges(),
+            &[
+                VirtioBalloonPfnRange {
+                    start_pfn: 0,
+                    page_count: 2
+                },
+                VirtioBalloonPfnRange {
+                    start_pfn: 3,
+                    page_count: 2
+                },
+                VirtioBalloonPfnRange {
+                    start_pfn: 6,
+                    page_count: 1
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn pfn_ranges_handle_maximum_pfn_without_overflow() {
+        let ranges = VirtioBalloonPfnRanges::from_pfns(vec![u32::MAX, u32::MAX - 1, u32::MAX, 0])
+            .expect("maximum PFN should compact without overflow");
+
+        assert_eq!(
+            ranges.ranges(),
+            &[
+                VirtioBalloonPfnRange {
+                    start_pfn: 0,
+                    page_count: 1
+                },
+                VirtioBalloonPfnRange {
+                    start_pfn: u32::MAX - 1,
+                    page_count: 2
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn pfn_ranges_accept_maximum_pfn_count() {
+        let max_page_count = u32::try_from(VIRTIO_BALLOON_MAX_PFNS_PER_DESCRIPTOR)
+            .expect("maximum PFN count should fit u32");
+        let pfns = (0..max_page_count).collect();
+
+        let ranges =
+            VirtioBalloonPfnRanges::from_pfns(pfns).expect("maximum PFN count should compact");
+
+        assert_eq!(
+            ranges.ranges(),
+            &[VirtioBalloonPfnRange {
+                start_pfn: 0,
+                page_count: max_page_count
+            }]
+        );
+    }
+
+    #[test]
+    fn pfn_ranges_reject_one_over_maximum_pfn_count() {
+        let err =
+            VirtioBalloonPfnRanges::from_pfns(vec![0; VIRTIO_BALLOON_MAX_PFNS_PER_DESCRIPTOR + 1])
+                .expect_err("oversized PFN range input should be rejected before sorting");
+
+        assert!(matches!(
+            err,
+            VirtioBalloonPfnRangeCompactError::TooManyPfns {
+                count,
+                max: VIRTIO_BALLOON_MAX_PFNS_PER_DESCRIPTOR
+            } if count == VIRTIO_BALLOON_MAX_PFNS_PER_DESCRIPTOR + 1
+        ));
+        assert_eq!(
+            err.to_string(),
+            "virtio-balloon PFN compaction input contains 257 PFNs, exceeding maximum 256"
+        );
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn pfn_payload_converts_into_ranges() {
+        let bytes = pfn_payload_bytes(&[3, 1, 2, 2]);
+        let payload = VirtioBalloonPfnPayload::parse(&bytes).expect("PFN payload should parse");
+
+        let ranges = payload
+            .into_page_ranges()
+            .expect("parsed PFNs should compact into ranges");
+
+        assert_eq!(
+            ranges.ranges(),
+            &[VirtioBalloonPfnRange {
+                start_pfn: 1,
+                page_count: 3
+            }]
+        );
     }
 
     #[test]
