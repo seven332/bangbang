@@ -109,11 +109,12 @@ is resource-specific:
   configuration after rejecting empty paths, and reports them through
   `GET /vm/config`. Startup opens each configured path with nonblocking
   read/write access according to the configured read-only flag, verifies it is a
-  non-zero regular file, and keeps the file handles with the boot resources. It
-  does not mmap, normalize, or attach those paths to a guest-visible
-  virtio-pmem device yet. The internal virtio-pmem config-space model does not
-  expose host backing bytes until guest attachment is implemented. Configured
-  rate limiters are rejected without replacing stored pmem configuration.
+  non-zero regular file, mmaps it to a 2 MiB-aligned host range, and keeps the
+  file handles and mappings with the boot resources. It does not normalize or
+  attach those paths to a guest-visible virtio-pmem device yet. The internal
+  virtio-pmem config-space and host mapping model does not expose host backing
+  bytes until guest attachment is implemented. Configured rate limiters are
+  rejected without replacing stored pmem configuration.
 - `/snapshot/create` and `/snapshot/load` currently parse Firecracker-shaped
   snapshot paths before returning unsupported faults, and they do not open or
   create snapshot state or memory files. Future snapshot support must treat

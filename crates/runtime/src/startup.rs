@@ -2119,7 +2119,7 @@ mod tests {
         VirtioNetworkRxPacket, VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError,
         VirtioNetworkTxFrame, VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
     };
-    use crate::pmem::{PmemConfigInput, PreparedPmemDeviceError};
+    use crate::pmem::{PmemConfigInput, PreparedPmemDeviceError, VIRTIO_PMEM_ALIGNMENT};
     use crate::serial::{
         SERIAL_MMIO_DEVICE_WINDOW_SIZE, SERIAL_TRANSMIT_REGISTER_OFFSET, SerialMmioDevice,
         SerialOutputFile, SharedSerialOutput, SharedSerialOutputBuffer,
@@ -4118,9 +4118,21 @@ mod tests {
         assert_eq!(resources.pmem_devices[0].id(), "pmem0");
         assert_eq!(resources.pmem_devices[0].backing().len(), 5);
         assert!(!resources.pmem_devices[0].backing().is_read_only());
+        assert_eq!(resources.pmem_devices[0].mapping().file_len(), 5);
+        assert_eq!(
+            resources.pmem_devices[0].mapping().mapped_len(),
+            VIRTIO_PMEM_ALIGNMENT
+        );
+        assert!(!resources.pmem_devices[0].mapping().is_read_only());
         assert_eq!(resources.pmem_devices[1].id(), "pmem1");
         assert_eq!(resources.pmem_devices[1].backing().len(), 6);
         assert!(resources.pmem_devices[1].backing().is_read_only());
+        assert_eq!(resources.pmem_devices[1].mapping().file_len(), 6);
+        assert_eq!(
+            resources.pmem_devices[1].mapping().mapped_len(),
+            VIRTIO_PMEM_ALIGNMENT
+        );
+        assert!(resources.pmem_devices[1].mapping().is_read_only());
         assert!(resources.mmio_dispatcher.regions().is_empty());
         assert_eq!(
             resources.loaded_boot_source.command_line.as_str(),
@@ -4143,6 +4155,11 @@ mod tests {
         assert_eq!(parts.runtime.pmem_devices.len(), 1);
         assert_eq!(parts.runtime.pmem_devices[0].id(), "pmem0");
         assert_eq!(parts.runtime.pmem_devices[0].backing().len(), 4);
+        assert_eq!(parts.runtime.pmem_devices[0].mapping().file_len(), 4);
+        assert_eq!(
+            parts.runtime.pmem_devices[0].mapping().mapped_len(),
+            VIRTIO_PMEM_ALIGNMENT
+        );
     }
 
     #[test]
