@@ -275,9 +275,10 @@ descriptors update only internal inflated-page accounting on the owning balloon
 device; they do not release, remap, or otherwise alter host memory. The HVF boot
 loop can drain these balloon notifications and signal the allocated balloon
 interrupt line, but parsed PFNs, statistics descriptors, free-page hinting
-commands, and reporting queue data remain untrusted guest input and must not
-change host memory accounting or reclaim behavior until those host-side paths
-are implemented and reviewed.
+range descriptors, and reporting queue data remain untrusted guest input and
+must not change host memory accounting or reclaim behavior until those host-side
+paths are implemented and reviewed. Free-page hinting command descriptors are
+limited to 4-byte command identifiers stored in active device state.
 Runtime balloon target-size updates change only the stored target and active
 virtio-balloon `num_pages` config-space value, then signal a config interrupt;
 they do not map, unmap, reclaim, or release host memory. Balloon statistics
@@ -286,10 +287,9 @@ not process guest statistics descriptors or change host memory accounting.
 Balloon hinting start and stop commands update only host-owned command state,
 mirror that state into active config space, and signal a config interrupt.
 Balloon hinting status queries read only the active device's internal host
-command identifier and guest-command state, which is `null` until hinting queue
-processing exists. These paths do not trust guest config-space writes as host
-commands, acknowledge guest hinting descriptors, parse hinting queues, or
-reclaim host memory.
+command identifier and latest 4-byte guest command identifier observed on the
+hinting queue. These paths do not trust guest config-space writes as host
+commands, parse hinting range descriptors, or reclaim host memory.
 
 The current serial device is a TX-only MMIO output path. By default, guest
 serial bytes go to a bounded internal capture buffer; when `/serial` configures
