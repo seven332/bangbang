@@ -1346,6 +1346,21 @@ mod macos_arm64 {
             "GET / after balloon direct rootfs InstanceStart",
         );
 
+        let balloon_stats = http_get(&socket_path, "/balloon/statistics");
+        assert_ok_response(&balloon_stats, "GET /balloon/statistics direct rootfs");
+        for expected in [
+            r#""target_pages":2048"#,
+            r#""target_mib":8"#,
+            r#""actual_pages":"#,
+            r#""actual_mib":"#,
+        ] {
+            assert_response_contains(
+                &balloon_stats,
+                expected,
+                "GET /balloon/statistics direct rootfs",
+            );
+        }
+
         if let Err(err) = wait_for_file_prefix_marker(
             &data_backing_path,
             DIRECT_ROOTFS_BALLOON_MARKER,

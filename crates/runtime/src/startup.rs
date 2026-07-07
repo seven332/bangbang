@@ -7,9 +7,9 @@ use std::os::fd::RawFd;
 use crate::VmmController;
 use crate::balloon::{
     BalloonConfig, BalloonMmioDeviceRegistration, BalloonMmioLayout, BalloonMmioRegistrationError,
-    BalloonPageCountOverflow, BalloonUpdateError, PreparedBalloonDevice,
-    VirtioBalloonDeviceNotificationDispatch, VirtioBalloonDeviceNotificationError,
-    VirtioBalloonMmioHandler,
+    BalloonPageCountOverflow, BalloonStats, BalloonStatsError, BalloonUpdateError,
+    PreparedBalloonDevice, VirtioBalloonDeviceNotificationDispatch,
+    VirtioBalloonDeviceNotificationError, VirtioBalloonMmioHandler,
 };
 use crate::block::{
     BlockFileBacking, BlockMmioDeviceRegistration, BlockMmioLayout, BlockMmioRegistrationError,
@@ -1486,6 +1486,21 @@ pub fn update_balloon_config_for_device(
         .update_balloon_config(config)
 }
 
+pub fn balloon_stats_for_device(
+    device: &Arm64BootBalloonDevice,
+    mmio_dispatcher: &mut MmioDispatcher,
+    config: BalloonConfig,
+) -> Result<BalloonStats, BalloonStatsError> {
+    let actual_pages = mmio_dispatcher
+        .handler_mut::<VirtioBalloonMmioHandler>(device.registration.region_id())
+        .map_err(BalloonStatsError::HandlerLookup)?
+        .activation_handler()
+        .memory_accounting()
+        .inflated_page_count();
+
+    BalloonStats::from_config_and_actual_pages(config, actual_pages)
+}
+
 #[derive(Debug)]
 pub enum Arm64BootResourceError {
     MissingBootSource,
@@ -2360,7 +2375,7 @@ mod tests {
         Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider, Arm64BootResourceConfig,
         Arm64BootResourceError, Arm64BootResources, Arm64BootSerialDeviceConfig,
         Arm64BootSerialMmioRegistrationError, MIB, arm64_boot_network_device_metadata,
-        block_device_metadata, update_balloon_config_for_device,
+        balloon_stats_for_device, block_device_metadata, update_balloon_config_for_device,
     };
     use crate::VmmAction;
     use crate::balloon::{
@@ -5658,6 +5673,44 @@ mod tests {
             ),
             DeviceInterruptKind::Queue.status().bits()
         );
+    }
+
+    #[test]
+    fn boot_runtime_balloon_stats_reads_active_handler_accounting() {
+        let amount_mib = TEST_MEMORY_MIB as u32 / 2;
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_balloon_target("kernel-balloon-stats", amount_mib);
+        configure_boot_balloon_queues(&mut runtime, &mut mmio_dispatcher);
+        write_queued_balloon_inflate_request(&mut memory);
+        notify_boot_balloon_queue(
+            &mut runtime,
+            &mut mmio_dispatcher,
+            VIRTIO_BALLOON_INFLATE_QUEUE_INDEX,
+        );
+
+        runtime
+            .dispatch_balloon_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("balloon dispatch should update accounting");
+        let device = runtime
+            .balloon_device
+            .as_ref()
+            .expect("balloon device should exist")
+            .clone();
+
+        let stats = balloon_stats_for_device(
+            &device,
+            &mut mmio_dispatcher,
+            BalloonConfigInput::new(amount_mib, false).into(),
+        )
+        .expect("balloon stats should read from active handler");
+
+        assert_eq!(
+            stats.target_pages(),
+            amount_mib * VIRTIO_BALLOON_MIB_TO_4K_PAGES
+        );
+        assert_eq!(stats.actual_pages(), 1);
+        assert_eq!(stats.target_mib(), amount_mib);
+        assert_eq!(stats.actual_mib(), 0);
     }
 
     #[test]

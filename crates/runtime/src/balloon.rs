@@ -154,6 +154,53 @@ impl std::error::Error for BalloonUpdateError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BalloonStatsError {
+    PageCountOverflow(BalloonPageCountOverflow),
+    ActualPageCountTooLarge { actual_pages: u64 },
+    ActiveSessionUnavailable,
+    ActiveSessionCommand { message: String },
+    MmioDispatcherUnavailable,
+    HandlerLookup(MmioHandlerLookupError),
+}
+
+impl fmt::Display for BalloonStatsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PageCountOverflow(err) => write!(f, "{err}"),
+            Self::ActualPageCountTooLarge { actual_pages } => write!(
+                f,
+                "balloon actual_pages {actual_pages} exceeds maximum {} representable in the API response",
+                u32::MAX
+            ),
+            Self::ActiveSessionUnavailable => {
+                f.write_str("active balloon device session is unavailable")
+            }
+            Self::ActiveSessionCommand { message } => {
+                write!(
+                    f,
+                    "active balloon device statistics query failed: {message}"
+                )
+            }
+            Self::MmioDispatcherUnavailable => f.write_str("active MMIO dispatcher is unavailable"),
+            Self::HandlerLookup(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for BalloonStatsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::PageCountOverflow(err) => Some(err),
+            Self::HandlerLookup(err) => Some(err),
+            Self::ActualPageCountTooLarge { .. }
+            | Self::ActiveSessionUnavailable
+            | Self::ActiveSessionCommand { .. }
+            | Self::MmioDispatcherUnavailable => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BalloonConfigInput {
     amount_mib: u32,
@@ -278,6 +325,49 @@ impl From<BalloonConfigInput> for BalloonConfig {
             free_page_hinting: input.free_page_hinting,
             free_page_reporting: input.free_page_reporting,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BalloonStats {
+    target_pages: u32,
+    actual_pages: u32,
+    target_mib: u32,
+    actual_mib: u32,
+}
+
+impl BalloonStats {
+    pub fn from_config_and_actual_pages(
+        config: BalloonConfig,
+        actual_pages: u64,
+    ) -> Result<Self, BalloonStatsError> {
+        let target_pages =
+            mib_to_4k_pages(config.amount_mib()).map_err(BalloonStatsError::PageCountOverflow)?;
+        let actual_pages = u32::try_from(actual_pages)
+            .map_err(|_| BalloonStatsError::ActualPageCountTooLarge { actual_pages })?;
+
+        Ok(Self {
+            target_pages,
+            actual_pages,
+            target_mib: config.amount_mib(),
+            actual_mib: actual_pages / VIRTIO_BALLOON_MIB_TO_4K_PAGES,
+        })
+    }
+
+    pub const fn target_pages(self) -> u32 {
+        self.target_pages
+    }
+
+    pub const fn actual_pages(self) -> u32 {
+        self.actual_pages
+    }
+
+    pub const fn target_mib(self) -> u32 {
+        self.target_mib
+    }
+
+    pub const fn actual_mib(self) -> u32 {
+        self.actual_mib
     }
 }
 
@@ -3409,6 +3499,36 @@ mod tests {
             .expect_err("oversized target should fail");
 
         assert!(matches!(err, BalloonUpdateError::PageCountOverflow(_)));
+    }
+
+    #[test]
+    fn balloon_stats_use_target_config_and_actual_accounting() {
+        let stats = BalloonStats::from_config_and_actual_pages(
+            balloon_config(64, false, 0, false, false),
+            513,
+        )
+        .expect("balloon stats should convert");
+
+        assert_eq!(stats.target_pages(), 64 * VIRTIO_BALLOON_MIB_TO_4K_PAGES);
+        assert_eq!(stats.actual_pages(), 513);
+        assert_eq!(stats.target_mib(), 64);
+        assert_eq!(stats.actual_mib(), 2);
+    }
+
+    #[test]
+    fn balloon_stats_reject_actual_page_count_overflow() {
+        let err = BalloonStats::from_config_and_actual_pages(
+            balloon_config(64, false, 0, false, false),
+            u64::from(u32::MAX) + 1,
+        )
+        .expect_err("oversized actual page count should fail");
+
+        assert_eq!(
+            err,
+            BalloonStatsError::ActualPageCountTooLarge {
+                actual_pages: u64::from(u32::MAX) + 1,
+            }
+        );
     }
 
     #[test]
