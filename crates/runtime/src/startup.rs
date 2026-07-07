@@ -804,7 +804,7 @@ impl Arm64BootBalloonNotificationDispatch {
 
 #[derive(Debug)]
 pub enum Arm64BootBalloonNotificationOutcome {
-    Dispatched(VirtioBalloonDeviceNotificationDispatch),
+    Dispatched(Box<VirtioBalloonDeviceNotificationDispatch>),
     DispatchFailed(VirtioBalloonDeviceNotificationError),
     HandlerLookupFailed(MmioHandlerLookupError),
 }
@@ -820,9 +820,9 @@ impl Arm64BootBalloonNotificationOutcome {
         }
     }
 
-    pub const fn dispatched(&self) -> Option<&VirtioBalloonDeviceNotificationDispatch> {
+    pub fn dispatched(&self) -> Option<&VirtioBalloonDeviceNotificationDispatch> {
         match self {
-            Self::Dispatched(dispatch) => Some(dispatch),
+            Self::Dispatched(dispatch) => Some(dispatch.as_ref()),
             Self::DispatchFailed(_) | Self::HandlerLookupFailed(_) => None,
         }
     }
@@ -1348,7 +1348,9 @@ impl Arm64BootRuntimeResources {
             let region_id = device.registration.region_id();
             let outcome = match mmio_dispatcher.handler_mut::<VirtioBalloonMmioHandler>(region_id) {
                 Ok(handler) => match handler.dispatch_balloon_queue_notifications(memory) {
-                    Ok(dispatch) => Arm64BootBalloonNotificationOutcome::Dispatched(dispatch),
+                    Ok(dispatch) => {
+                        Arm64BootBalloonNotificationOutcome::Dispatched(Box::new(dispatch))
+                    }
                     Err(source) => Arm64BootBalloonNotificationOutcome::DispatchFailed(source),
                 },
                 Err(source) => Arm64BootBalloonNotificationOutcome::HandlerLookupFailed(source),
