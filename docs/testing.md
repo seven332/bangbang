@@ -361,14 +361,14 @@ waits for distinct host replies, and writes
 `BANGBANG_VSOCK_HOST_MULTISTREAM_OK` only after both streams complete. These
 checks prove the kernel mounted the virtio-block root drive as `/`, give
 executable-boundary MMDS fetch coverage through the process-local MMDS-only
-packet path, prove guest-visible virtio-rng reads through `/dev/hwrng`, and
-cover guest-initiated plus host-initiated virtio-vsock
-connection exchange through the signed executable, including narrow
-multi-payload stream cases and multi-stream retention in both directions. They
-do not claim that bangbang can boot an arbitrary distro image through its
-default init, that full networking compatibility is complete, or that full
-vsock throughput, Firecracker's full graceful-shutdown timeout/kill-queue
-behavior, and credit accounting are complete.
+packet path, prove guest-visible virtio-rng reads through `/dev/hwrng`, prove
+guest virtio-balloon driver binding, prove the current virtio-pmem read/flush
+path, and cover guest-initiated plus host-initiated virtio-vsock connection
+exchange through the signed executable, including narrow multi-payload stream
+cases and multi-stream retention in both directions. They do not claim that
+bangbang can boot an arbitrary distro image through its default init, that full
+networking compatibility is complete, or that full balloon, pmem, and vsock
+runtime behavior is complete.
 
 bangbang appends Firecracker-style root-drive command-line arguments during
 startup resource assembly when a configured drive has `is_root_device=true`.

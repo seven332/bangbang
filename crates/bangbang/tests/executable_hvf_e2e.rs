@@ -1186,6 +1186,11 @@ mod macos_arm64 {
             r#""amount_mib":8"#,
             "GET /vm/config after PUT /balloon",
         );
+        assert_response_contains(
+            &vm_config,
+            r#""deflate_on_oom":false"#,
+            "GET /vm/config after PUT /balloon",
+        );
 
         let kernel_path_json = json_string(path_text(&kernel_path));
         let boot_args_json = json_string(DIRECT_ROOTFS_BALLOON_BOOT_ARGS);
