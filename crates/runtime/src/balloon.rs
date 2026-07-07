@@ -872,9 +872,13 @@ impl VirtioBalloonMemoryAccounting {
         removals.extend_from_slice(ranges);
         let removals = compact_accounting_ranges(removals)?;
 
+        let max_retained_ranges = self
+            .inflated_page_ranges
+            .len()
+            .checked_add(removals.len())
+            .unwrap_or(usize::MAX);
         let mut retained = Vec::new();
-        retained.try_reserve_exact(self.inflated_page_ranges.len())?;
-        retained.try_reserve_exact(removals.len())?;
+        retained.try_reserve_exact(max_retained_ranges)?;
         let mut removal_iter = removals.iter().peekable();
 
         for existing in &self.inflated_page_ranges {
