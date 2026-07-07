@@ -111,8 +111,9 @@ is resource-specific:
   read/write access according to the configured read-only flag, verifies it is a
   non-zero regular file, and keeps the file handles with the boot resources. It
   does not mmap, normalize, or attach those paths to a guest-visible
-  virtio-pmem device yet. Configured rate limiters are rejected without
-  replacing stored pmem configuration.
+  virtio-pmem device yet. The internal virtio-pmem config-space model does not
+  expose host backing bytes until guest attachment is implemented. Configured
+  rate limiters are rejected without replacing stored pmem configuration.
 - `/snapshot/create` and `/snapshot/load` currently parse Firecracker-shaped
   snapshot paths before returning unsupported faults, and they do not open or
   create snapshot state or memory files. Future snapshot support must treat
