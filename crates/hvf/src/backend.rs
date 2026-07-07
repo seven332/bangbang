@@ -320,10 +320,19 @@ fn pmem_host_memory_mappings(
         let memory = pmem_shadow_memory(device).map_err(|source| {
             HvfGuestMemoryMappingError::host_mapping(&label, device.guest_range(), source)
         })?;
-        host_mappings.push(HvfHostMemoryMapping::new(
+        let backing = device.backing().file().try_clone().map_err(|source| {
+            BackendError::Hypervisor(format!(
+                "failed to clone HVF pmem backing handle for range {}: {source}",
+                device.guest_range()
+            ))
+        })?;
+        host_mappings.push(HvfHostMemoryMapping::new_pmem_shadow(
             label,
             memory,
             pmem_memory_permissions(device.mapping().is_read_only()),
+            backing,
+            device.mapping().file_len(),
+            device.mapping().is_read_only(),
         ));
     }
 
@@ -533,6 +542,7 @@ impl Drop for HvfBackend {
 
             if let Some(mut mapping) = self.guest_memory.take()
                 && mapping.unmap_all().is_err()
+                && mapping.has_mapped_regions()
             {
                 mapping_after_failed_unmap = Some(mapping);
             }

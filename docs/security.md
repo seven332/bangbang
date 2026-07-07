@@ -118,12 +118,15 @@ is resource-specific:
   prepared pmem mapping into an HVF-compatible anonymous shadow, and registers
   that shadow at the guest physical range after DRAM mapping, using read-only
   HVF permissions for read-only pmem and read/write non-executable permissions
-  for writable pmem. It does not normalize or attach those paths to a
-  guest-visible virtio-pmem device or FDT node yet, and shadow allocation or HVF
-  registration errors identify the pmem ID and guest range without echoing
-  `path_on_host`. Configured rate limiters are rejected without replacing stored
-  pmem configuration. Shadow writeback and flush semantics remain deferred until
-  guest-visible virtio-pmem behavior is implemented.
+  for writable pmem. Writable shadows are copied back to the backing file with
+  positional writes and a data sync only after clean HVF unmap; read-only
+  shadows never write back, and failed unmap cleanup does not flush memory that
+  HVF may still reference. It does not normalize or attach those paths to a
+  guest-visible virtio-pmem device or FDT node yet, and shadow allocation, HVF
+  registration, or writeback errors identify the pmem ID and guest range without
+  echoing `path_on_host`. Configured rate limiters are rejected without
+  replacing stored pmem configuration. Guest queue-driven flush dispatch remains
+  deferred until guest-visible virtio-pmem behavior is implemented.
 - `/snapshot/create` and `/snapshot/load` currently parse Firecracker-shaped
   snapshot paths before returning unsupported faults, and they do not open or
   create snapshot state or memory files. Future snapshot support must treat
