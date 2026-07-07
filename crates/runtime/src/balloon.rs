@@ -1,5 +1,6 @@
 //! Backend-neutral virtio-balloon configuration model.
 
+use std::collections::TryReserveError;
 use std::fmt;
 
 use crate::memory::{GuestAddress, GuestMemoryError};
@@ -19,6 +20,10 @@ pub const VIRTIO_BALLOON_MAX_QUEUE_COUNT: usize = 5;
 pub const VIRTIO_BALLOON_INFLATE_QUEUE_INDEX: usize = 0;
 pub const VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX: usize = 1;
 pub const VIRTIO_BALLOON_STATS_QUEUE_INDEX: usize = 2;
+pub const VIRTIO_BALLOON_PFN_SIZE: usize = 4;
+pub const VIRTIO_BALLOON_MAX_PFNS_PER_DESCRIPTOR: usize = 256;
+pub const VIRTIO_BALLOON_MAX_PFN_PAYLOAD_SIZE: usize =
+    VIRTIO_BALLOON_MAX_PFNS_PER_DESCRIPTOR * VIRTIO_BALLOON_PFN_SIZE;
 pub const VIRTIO_BALLOON_MIB_TO_4K_PAGES: u32 = 256;
 pub const VIRTIO_BALLOON_MAX_AMOUNT_MIB: u32 = u32::MAX / VIRTIO_BALLOON_MIB_TO_4K_PAGES;
 pub const VIRTIO_BALLOON_CONFIG_SPACE_SIZE: usize = 12;
@@ -283,6 +288,102 @@ impl TryFrom<BalloonConfig> for VirtioBalloonConfigSpace {
 
     fn try_from(config: BalloonConfig) -> Result<Self, Self::Error> {
         Self::from_config(config)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioBalloonPfnPayload {
+    pfns: Vec<u32>,
+}
+
+impl VirtioBalloonPfnPayload {
+    pub fn parse(bytes: &[u8]) -> Result<Self, VirtioBalloonPfnPayloadParseError> {
+        if bytes.is_empty() {
+            return Err(VirtioBalloonPfnPayloadParseError::EmptyPayload);
+        }
+        if !bytes.len().is_multiple_of(VIRTIO_BALLOON_PFN_SIZE) {
+            return Err(VirtioBalloonPfnPayloadParseError::UnalignedLength { len: bytes.len() });
+        }
+
+        let count = bytes.len() / VIRTIO_BALLOON_PFN_SIZE;
+        if count > VIRTIO_BALLOON_MAX_PFNS_PER_DESCRIPTOR {
+            return Err(VirtioBalloonPfnPayloadParseError::TooManyPfns {
+                count,
+                max: VIRTIO_BALLOON_MAX_PFNS_PER_DESCRIPTOR,
+            });
+        }
+
+        let mut pfns = Vec::new();
+        pfns.try_reserve_exact(count)
+            .map_err(|source| VirtioBalloonPfnPayloadParseError::PfnAllocation { count, source })?;
+        for chunk in bytes.chunks_exact(VIRTIO_BALLOON_PFN_SIZE) {
+            let mut pfn = [0; VIRTIO_BALLOON_PFN_SIZE];
+            pfn.copy_from_slice(chunk);
+            pfns.push(u32::from_le_bytes(pfn));
+        }
+
+        Ok(Self { pfns })
+    }
+
+    pub fn pfns(&self) -> &[u32] {
+        &self.pfns
+    }
+
+    pub fn into_vec(self) -> Vec<u32> {
+        self.pfns
+    }
+
+    pub fn len(&self) -> usize {
+        self.pfns.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pfns.is_empty()
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioBalloonPfnPayloadParseError {
+    EmptyPayload,
+    UnalignedLength {
+        len: usize,
+    },
+    TooManyPfns {
+        count: usize,
+        max: usize,
+    },
+    PfnAllocation {
+        count: usize,
+        source: TryReserveError,
+    },
+}
+
+impl fmt::Display for VirtioBalloonPfnPayloadParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyPayload => f.write_str("virtio-balloon PFN payload cannot be empty"),
+            Self::UnalignedLength { len } => write!(
+                f,
+                "virtio-balloon PFN payload length {len} is not a multiple of {VIRTIO_BALLOON_PFN_SIZE}"
+            ),
+            Self::TooManyPfns { count, max } => write!(
+                f,
+                "virtio-balloon PFN payload contains {count} PFNs, exceeding maximum {max}"
+            ),
+            Self::PfnAllocation { count, source } => write!(
+                f,
+                "failed to allocate virtio-balloon PFN payload with {count} PFNs: {source}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VirtioBalloonPfnPayloadParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::PfnAllocation { source, .. } => Some(source),
+            Self::EmptyPayload | Self::UnalignedLength { .. } | Self::TooManyPfns { .. } => None,
+        }
     }
 }
 
@@ -825,6 +926,14 @@ mod tests {
         PreparedBalloonDevice::from_config(config).expect("balloon config should prepare")
     }
 
+    fn pfn_payload_bytes(pfns: &[u32]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for pfn in pfns {
+            bytes.extend_from_slice(&pfn.to_le_bytes());
+        }
+        bytes
+    }
+
     fn has_feature(features: u64, feature: u32) -> bool {
         features & virtio_feature_bit(feature) != 0
     }
@@ -1002,6 +1111,96 @@ mod tests {
             config_space.to_le_bytes().len(),
             VIRTIO_BALLOON_CONFIG_SPACE_SIZE
         );
+    }
+
+    #[test]
+    fn pfn_payload_parser_accepts_little_endian_pfns() {
+        let bytes = pfn_payload_bytes(&[0x0102_0304, 0x0506_0708, 0xffff_ffff]);
+
+        let payload = VirtioBalloonPfnPayload::parse(&bytes).expect("PFN payload should parse");
+
+        assert_eq!(payload.pfns(), &[0x0102_0304, 0x0506_0708, 0xffff_ffff]);
+        assert_eq!(payload.len(), 3);
+        assert!(!payload.is_empty());
+        assert_eq!(
+            payload.into_vec(),
+            vec![0x0102_0304, 0x0506_0708, 0xffff_ffff]
+        );
+    }
+
+    #[test]
+    fn pfn_payload_parser_rejects_empty_payload() {
+        let err =
+            VirtioBalloonPfnPayload::parse(&[]).expect_err("empty PFN payload should be rejected");
+
+        assert!(matches!(
+            err,
+            VirtioBalloonPfnPayloadParseError::EmptyPayload
+        ));
+        assert_eq!(
+            err.to_string(),
+            "virtio-balloon PFN payload cannot be empty"
+        );
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn pfn_payload_parser_rejects_unaligned_payload_length() {
+        let err = VirtioBalloonPfnPayload::parse(&[1, 2, 3, 4, 5])
+            .expect_err("unaligned PFN payload should be rejected");
+
+        assert!(matches!(
+            err,
+            VirtioBalloonPfnPayloadParseError::UnalignedLength { len: 5 }
+        ));
+        assert_eq!(
+            err.to_string(),
+            "virtio-balloon PFN payload length 5 is not a multiple of 4"
+        );
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn pfn_payload_parser_accepts_maximum_pfn_count() {
+        let bytes = vec![0; VIRTIO_BALLOON_MAX_PFN_PAYLOAD_SIZE];
+
+        let payload =
+            VirtioBalloonPfnPayload::parse(&bytes).expect("maximum PFN payload should parse");
+
+        assert_eq!(payload.len(), VIRTIO_BALLOON_MAX_PFNS_PER_DESCRIPTOR);
+        assert!(
+            payload.pfns().iter().all(|pfn| *pfn == 0),
+            "zero-filled payload should parse as zero PFNs"
+        );
+    }
+
+    #[test]
+    fn pfn_payload_parser_rejects_one_over_maximum_pfn_count() {
+        let bytes = vec![0; VIRTIO_BALLOON_MAX_PFN_PAYLOAD_SIZE + VIRTIO_BALLOON_PFN_SIZE];
+
+        let err = VirtioBalloonPfnPayload::parse(&bytes)
+            .expect_err("oversized PFN payload should be rejected before parsing");
+
+        assert!(matches!(
+            err,
+            VirtioBalloonPfnPayloadParseError::TooManyPfns {
+                count,
+                max: VIRTIO_BALLOON_MAX_PFNS_PER_DESCRIPTOR
+            } if count == VIRTIO_BALLOON_MAX_PFNS_PER_DESCRIPTOR + 1
+        ));
+        assert_eq!(
+            err.to_string(),
+            "virtio-balloon PFN payload contains 257 PFNs, exceeding maximum 256"
+        );
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn pfn_payload_parser_errors_return_no_partial_payload() {
+        assert!(VirtioBalloonPfnPayload::parse(&[0, 1, 2]).is_err());
+        let oversized_payload =
+            vec![0; VIRTIO_BALLOON_MAX_PFN_PAYLOAD_SIZE + VIRTIO_BALLOON_PFN_SIZE];
+        assert!(VirtioBalloonPfnPayload::parse(&oversized_payload).is_err());
     }
 
     #[test]
