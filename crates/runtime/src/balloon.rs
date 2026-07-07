@@ -845,11 +845,17 @@ impl VirtioBalloonMemoryAccounting {
         &mut self,
         ranges: &[VirtioBalloonPfnRange],
     ) -> Result<(), TryReserveError> {
-        let mut next = self.try_clone()?;
-        for range in ranges {
-            next.add_inflated_range(*range)?;
+        if ranges.is_empty() {
+            return Ok(());
         }
-        *self = next;
+
+        let mut combined = Vec::new();
+        combined.try_reserve_exact(self.inflated_page_ranges.len())?;
+        combined.extend_from_slice(&self.inflated_page_ranges);
+        combined.try_reserve_exact(ranges.len())?;
+        combined.extend_from_slice(ranges);
+
+        self.inflated_page_ranges = compact_accounting_ranges(combined)?;
         Ok(())
     }
 
@@ -857,85 +863,96 @@ impl VirtioBalloonMemoryAccounting {
         &mut self,
         ranges: &[VirtioBalloonPfnRange],
     ) -> Result<(), TryReserveError> {
-        let mut next = self.try_clone()?;
-        for range in ranges {
-            next.remove_inflated_range(*range)?;
-        }
-        *self = next;
-        Ok(())
-    }
-
-    fn try_clone(&self) -> Result<Self, TryReserveError> {
-        let mut inflated_page_ranges = Vec::new();
-        inflated_page_ranges.try_reserve_exact(self.inflated_page_ranges.len())?;
-        inflated_page_ranges.extend_from_slice(&self.inflated_page_ranges);
-        Ok(Self {
-            inflated_page_ranges,
-        })
-    }
-
-    fn add_inflated_range(&mut self, range: VirtioBalloonPfnRange) -> Result<(), TryReserveError> {
-        let mut pending_start = u64::from(range.start_pfn());
-        let mut pending_end = range.end_pfn_exclusive();
-        let mut inserted = false;
-        let mut merged = Vec::new();
-        merged.try_reserve_exact(self.inflated_page_ranges.len().saturating_add(2))?;
-
-        for existing in &self.inflated_page_ranges {
-            let existing_start = u64::from(existing.start_pfn());
-            let existing_end = existing.end_pfn_exclusive();
-
-            if existing_end < pending_start {
-                merged.push(*existing);
-            } else if pending_end < existing_start {
-                if !inserted {
-                    push_pfn_bounds(&mut merged, pending_start, pending_end);
-                    inserted = true;
-                }
-                merged.push(*existing);
-            } else {
-                pending_start = pending_start.min(existing_start);
-                pending_end = pending_end.max(existing_end);
-            }
+        if self.inflated_page_ranges.is_empty() || ranges.is_empty() {
+            return Ok(());
         }
 
-        if !inserted {
-            push_pfn_bounds(&mut merged, pending_start, pending_end);
-        }
+        let mut removals = Vec::new();
+        removals.try_reserve_exact(ranges.len())?;
+        removals.extend_from_slice(ranges);
+        let removals = compact_accounting_ranges(removals)?;
 
-        self.inflated_page_ranges = merged;
-        Ok(())
-    }
-
-    fn remove_inflated_range(
-        &mut self,
-        range: VirtioBalloonPfnRange,
-    ) -> Result<(), TryReserveError> {
-        let remove_start = u64::from(range.start_pfn());
-        let remove_end = range.end_pfn_exclusive();
         let mut retained = Vec::new();
-        retained.try_reserve_exact(self.inflated_page_ranges.len().saturating_add(1))?;
+        retained.try_reserve_exact(self.inflated_page_ranges.len())?;
+        retained.try_reserve_exact(removals.len())?;
+        let mut removal_iter = removals.iter().peekable();
 
         for existing in &self.inflated_page_ranges {
             let existing_start = u64::from(existing.start_pfn());
             let existing_end = existing.end_pfn_exclusive();
+            let mut retained_start = existing_start;
 
-            if existing_end <= remove_start || remove_end <= existing_start {
-                retained.push(*existing);
-                continue;
+            while let Some(removal) = removal_iter.peek().copied() {
+                let remove_start = u64::from(removal.start_pfn());
+                let remove_end = removal.end_pfn_exclusive();
+
+                if remove_end <= retained_start {
+                    removal_iter.next();
+                    continue;
+                }
+                if existing_end <= remove_start {
+                    break;
+                }
+                if retained_start < remove_start {
+                    push_pfn_bounds(
+                        &mut retained,
+                        retained_start,
+                        remove_start.min(existing_end),
+                    );
+                }
+
+                retained_start = retained_start.max(remove_end.min(existing_end));
+                if remove_end <= existing_end {
+                    removal_iter.next();
+                } else {
+                    break;
+                }
             }
 
-            if existing_start < remove_start {
-                push_pfn_bounds(&mut retained, existing_start, remove_start);
-            }
-            if remove_end < existing_end {
-                push_pfn_bounds(&mut retained, remove_end, existing_end);
+            if retained_start < existing_end {
+                push_pfn_bounds(&mut retained, retained_start, existing_end);
             }
         }
 
         self.inflated_page_ranges = retained;
         Ok(())
     }
+}
+
+fn compact_accounting_ranges(
+    mut ranges: Vec<VirtioBalloonPfnRange>,
+) -> Result<Vec<VirtioBalloonPfnRange>, TryReserveError> {
+    if ranges.is_empty() {
+        return Ok(ranges);
+    }
+
+    ranges.sort_unstable_by_key(|range| (range.start_pfn(), range.end_pfn_exclusive()));
+
+    let mut merged = Vec::new();
+    merged.try_reserve_exact(ranges.len())?;
+    let mut iter = ranges.into_iter();
+    let Some(first) = iter.next() else {
+        return Ok(merged);
+    };
+    let mut pending_start = u64::from(first.start_pfn());
+    let mut pending_end = first.end_pfn_exclusive();
+
+    for range in iter {
+        let range_start = u64::from(range.start_pfn());
+        let range_end = range.end_pfn_exclusive();
+
+        if pending_end < range_start {
+            push_pfn_bounds(&mut merged, pending_start, pending_end);
+            pending_start = range_start;
+            pending_end = range_end;
+        } else {
+            pending_end = pending_end.max(range_end);
+        }
+    }
+
+    push_pfn_bounds(&mut merged, pending_start, pending_end);
+
+    Ok(merged)
 }
 
 fn push_pfn_bounds(ranges: &mut Vec<VirtioBalloonPfnRange>, start: u64, end_exclusive: u64) {
@@ -3848,6 +3865,71 @@ mod tests {
             ]
         );
         assert_eq!(accounting.inflated_page_count(), 7);
+    }
+
+    #[test]
+    fn memory_accounting_removes_multiple_ranges_from_one_existing_range() {
+        let mut accounting = VirtioBalloonMemoryAccounting::default();
+        accounting
+            .add_inflated_ranges(&[VirtioBalloonPfnRange::new(10, 10)])
+            .expect("inflated range should add");
+
+        accounting
+            .remove_inflated_ranges(&[
+                VirtioBalloonPfnRange::new(12, 2),
+                VirtioBalloonPfnRange::new(16, 1),
+            ])
+            .expect("inflated ranges should remove");
+
+        assert_eq!(
+            accounting.inflated_page_ranges(),
+            &[
+                VirtioBalloonPfnRange {
+                    start_pfn: 10,
+                    page_count: 2,
+                },
+                VirtioBalloonPfnRange {
+                    start_pfn: 14,
+                    page_count: 2,
+                },
+                VirtioBalloonPfnRange {
+                    start_pfn: 17,
+                    page_count: 3,
+                }
+            ]
+        );
+        assert_eq!(accounting.inflated_page_count(), 7);
+    }
+
+    #[test]
+    fn memory_accounting_removal_can_span_multiple_existing_ranges() {
+        let mut accounting = VirtioBalloonMemoryAccounting::default();
+        accounting
+            .add_inflated_ranges(&[
+                VirtioBalloonPfnRange::new(10, 2),
+                VirtioBalloonPfnRange::new(20, 2),
+                VirtioBalloonPfnRange::new(30, 2),
+            ])
+            .expect("inflated ranges should add");
+
+        accounting
+            .remove_inflated_ranges(&[VirtioBalloonPfnRange::new(11, 20)])
+            .expect("spanning removal range should apply");
+
+        assert_eq!(
+            accounting.inflated_page_ranges(),
+            &[
+                VirtioBalloonPfnRange {
+                    start_pfn: 10,
+                    page_count: 1,
+                },
+                VirtioBalloonPfnRange {
+                    start_pfn: 31,
+                    page_count: 1,
+                }
+            ]
+        );
+        assert_eq!(accounting.inflated_page_count(), 2);
     }
 
     #[test]
