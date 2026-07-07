@@ -9,8 +9,13 @@ use crate::mmio::{
     MmioHandlerError, MmioRegion, MmioRegionId,
 };
 use crate::virtio_mmio::{
-    VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
-    VirtioMmioDeviceConfigHandler, VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
+    VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
+    VirtioMmioDeviceActivationHandler, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
+    VirtioMmioDeviceConfigHandler, VirtioMmioQueueRegisterError, VirtioMmioQueueState,
+    VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
+};
+use crate::virtio_queue::{
+    VirtqueueAvailableRing, VirtqueueAvailableRingError, VirtqueueUsedRing, VirtqueueUsedRingError,
 };
 
 pub const VIRTIO_BALLOON_DEVICE_ID: u32 = 5;
@@ -35,7 +40,8 @@ pub const VIRTIO_BALLOON_F_FREE_PAGE_HINTING: u32 = 3;
 pub const VIRTIO_BALLOON_F_FREE_PAGE_REPORTING: u32 = 5;
 pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
 
-pub type VirtioBalloonMmioHandler = VirtioMmioRegisterHandler<VirtioBalloonConfigSpace>;
+pub type VirtioBalloonMmioHandler =
+    VirtioMmioRegisterHandler<VirtioBalloonConfigSpace, VirtioBalloonDevice>;
 
 const fn virtio_feature_bit(feature: u32) -> u64 {
     1_u64 << feature
@@ -530,6 +536,18 @@ pub enum VirtioBalloonQueueKind {
     FreePageReporting,
 }
 
+impl fmt::Display for VirtioBalloonQueueKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inflate => f.write_str("inflate"),
+            Self::Deflate => f.write_str("deflate"),
+            Self::Statistics => f.write_str("statistics"),
+            Self::FreePageHinting => f.write_str("free-page-hinting"),
+            Self::FreePageReporting => f.write_str("free-page-reporting"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtioBalloonQueueConfig {
     kind: VirtioBalloonQueueKind,
@@ -696,6 +714,466 @@ impl VirtioBalloonQueueSizes {
     }
 }
 
+#[derive(Debug)]
+pub enum VirtioBalloonQueueBuildError {
+    QueueNotReady,
+    AvailableRing { source: VirtqueueAvailableRingError },
+    UsedRing { source: VirtqueueUsedRingError },
+}
+
+impl fmt::Display for VirtioBalloonQueueBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::QueueNotReady => f.write_str("virtio-balloon queue is not ready"),
+            Self::AvailableRing { source } => {
+                write!(
+                    f,
+                    "failed to build virtio-balloon available ring from queue state: {source}"
+                )
+            }
+            Self::UsedRing { source } => {
+                write!(
+                    f,
+                    "failed to build virtio-balloon used ring from queue state: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioBalloonQueueBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AvailableRing { source } => Some(source),
+            Self::UsedRing { source } => Some(source),
+            Self::QueueNotReady => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioBalloonQueue {
+    available: VirtqueueAvailableRing,
+    used: VirtqueueUsedRing,
+}
+
+impl VirtioBalloonQueue {
+    pub const fn new(available: VirtqueueAvailableRing, used: VirtqueueUsedRing) -> Self {
+        Self { available, used }
+    }
+
+    pub fn from_mmio_queue_state(
+        queue: &VirtioMmioQueueState,
+    ) -> Result<Self, VirtioBalloonQueueBuildError> {
+        if !queue.ready() {
+            return Err(VirtioBalloonQueueBuildError::QueueNotReady);
+        }
+
+        let available = VirtqueueAvailableRing::new(
+            queue.descriptor_table(),
+            queue.driver_ring(),
+            queue.size(),
+        )
+        .map_err(|source| VirtioBalloonQueueBuildError::AvailableRing { source })?;
+        let used = VirtqueueUsedRing::new(queue.device_ring(), queue.size())
+            .map_err(|source| VirtioBalloonQueueBuildError::UsedRing { source })?;
+
+        Ok(Self { available, used })
+    }
+
+    pub const fn available_ring(&self) -> &VirtqueueAvailableRing {
+        &self.available
+    }
+
+    pub const fn used_ring(&self) -> &VirtqueueUsedRing {
+        &self.used
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioBalloonActiveQueues {
+    inflate: VirtioBalloonQueue,
+    deflate: VirtioBalloonQueue,
+    statistics: Option<VirtioBalloonQueue>,
+    free_page_hinting: Option<VirtioBalloonQueue>,
+    free_page_reporting: Option<VirtioBalloonQueue>,
+}
+
+impl VirtioBalloonActiveQueues {
+    fn from_activation(
+        layout: VirtioBalloonQueueLayout,
+        activation: VirtioMmioDeviceActivation<'_>,
+    ) -> Result<Self, VirtioBalloonDeviceActivationError> {
+        Ok(Self {
+            inflate: active_queue_from_activation(layout.inflate(), activation)?,
+            deflate: active_queue_from_activation(layout.deflate(), activation)?,
+            statistics: active_optional_queue_from_activation(layout.statistics(), activation)?,
+            free_page_hinting: active_optional_queue_from_activation(
+                layout.free_page_hinting(),
+                activation,
+            )?,
+            free_page_reporting: active_optional_queue_from_activation(
+                layout.free_page_reporting(),
+                activation,
+            )?,
+        })
+    }
+
+    pub const fn inflate(&self) -> &VirtioBalloonQueue {
+        &self.inflate
+    }
+
+    pub const fn deflate(&self) -> &VirtioBalloonQueue {
+        &self.deflate
+    }
+
+    pub const fn statistics(&self) -> Option<&VirtioBalloonQueue> {
+        self.statistics.as_ref()
+    }
+
+    pub const fn free_page_hinting(&self) -> Option<&VirtioBalloonQueue> {
+        self.free_page_hinting.as_ref()
+    }
+
+    pub const fn free_page_reporting(&self) -> Option<&VirtioBalloonQueue> {
+        self.free_page_reporting.as_ref()
+    }
+
+    pub fn queue_count(&self) -> usize {
+        [
+            true,
+            true,
+            self.statistics.is_some(),
+            self.free_page_hinting.is_some(),
+            self.free_page_reporting.is_some(),
+        ]
+        .into_iter()
+        .filter(|included| *included)
+        .count()
+    }
+}
+
+#[derive(Debug)]
+pub struct VirtioBalloonDevice {
+    queue_layout: VirtioBalloonQueueLayout,
+    active_queues: Option<VirtioBalloonActiveQueues>,
+}
+
+impl VirtioBalloonDevice {
+    pub const fn new(queue_layout: VirtioBalloonQueueLayout) -> Self {
+        Self {
+            queue_layout,
+            active_queues: None,
+        }
+    }
+
+    pub const fn queue_layout(&self) -> VirtioBalloonQueueLayout {
+        self.queue_layout
+    }
+
+    pub fn is_activated(&self) -> bool {
+        self.active_queues.is_some()
+    }
+
+    pub const fn active_queues(&self) -> Option<&VirtioBalloonActiveQueues> {
+        self.active_queues.as_ref()
+    }
+
+    pub fn active_queues_mut(&mut self) -> Option<&mut VirtioBalloonActiveQueues> {
+        self.active_queues.as_mut()
+    }
+
+    pub fn activate_balloon(
+        &mut self,
+        activation: VirtioMmioDeviceActivation<'_>,
+    ) -> Result<(), VirtioBalloonDeviceActivationError> {
+        if self.active_queues.is_some() {
+            return Err(VirtioBalloonDeviceActivationError::AlreadyActive);
+        }
+
+        let expected = self.queue_layout.queue_count();
+        let actual = activation.queue_count();
+        if actual != expected {
+            return Err(VirtioBalloonDeviceActivationError::QueueCountMismatch {
+                expected,
+                actual,
+            });
+        }
+
+        self.active_queues = Some(VirtioBalloonActiveQueues::from_activation(
+            self.queue_layout,
+            activation,
+        )?);
+
+        Ok(())
+    }
+
+    fn dispatch_drained_queue_notifications(
+        &mut self,
+        drained_notifications: Vec<usize>,
+    ) -> Result<VirtioBalloonDeviceNotificationDispatch, VirtioBalloonDeviceNotificationError> {
+        if drained_notifications.is_empty() {
+            return Ok(VirtioBalloonDeviceNotificationDispatch::new(
+                drained_notifications,
+                0,
+                0,
+            ));
+        }
+
+        if let Some(queue_index) = drained_notifications
+            .iter()
+            .copied()
+            .find(|queue_index| !is_inflate_or_deflate_queue(*queue_index))
+        {
+            return Err(VirtioBalloonDeviceNotificationError::UnsupportedQueue {
+                drained_notifications,
+                queue_index,
+            });
+        }
+
+        if self.active_queues.is_none() {
+            return Err(VirtioBalloonDeviceNotificationError::Inactive {
+                drained_notifications,
+            });
+        }
+
+        let mut inflate_notifications = 0;
+        let mut deflate_notifications = 0;
+        for queue_index in &drained_notifications {
+            match *queue_index {
+                VIRTIO_BALLOON_INFLATE_QUEUE_INDEX => inflate_notifications += 1,
+                VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX => deflate_notifications += 1,
+                _ => {}
+            }
+        }
+
+        Ok(VirtioBalloonDeviceNotificationDispatch::new(
+            drained_notifications,
+            inflate_notifications,
+            deflate_notifications,
+        ))
+    }
+
+    pub fn reset(&mut self) {
+        self.active_queues = None;
+    }
+}
+
+impl VirtioMmioRegisterHandler<VirtioBalloonConfigSpace, VirtioBalloonDevice> {
+    pub fn dispatch_balloon_queue_notifications(
+        &mut self,
+    ) -> Result<VirtioBalloonDeviceNotificationDispatch, VirtioBalloonDeviceNotificationError> {
+        let drained_notifications = self.take_pending_queue_notifications();
+        self.activation_handler_mut()
+            .dispatch_drained_queue_notifications(drained_notifications)
+    }
+}
+
+impl VirtioMmioDeviceActivationHandler for VirtioBalloonDevice {
+    fn activate(
+        &mut self,
+        activation: VirtioMmioDeviceActivation<'_>,
+    ) -> Result<(), VirtioMmioDeviceActivationError> {
+        self.activate_balloon(activation).map_err(Into::into)
+    }
+
+    fn reset(&mut self) {
+        VirtioBalloonDevice::reset(self);
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioBalloonDeviceActivationError {
+    AlreadyActive,
+    QueueCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    QueueIndexTooLarge {
+        queue_index: usize,
+    },
+    QueueMetadata {
+        queue_index: u32,
+        source: VirtioMmioQueueRegisterError,
+    },
+    QueueBuild {
+        queue_index: u32,
+        kind: VirtioBalloonQueueKind,
+        source: VirtioBalloonQueueBuildError,
+    },
+}
+
+impl fmt::Display for VirtioBalloonDeviceActivationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyActive => f.write_str("virtio-balloon device is already active"),
+            Self::QueueCountMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "virtio-balloon device requires {expected} queue(s), got {actual}"
+                )
+            }
+            Self::QueueIndexTooLarge { queue_index } => {
+                write!(
+                    f,
+                    "virtio-balloon queue index {queue_index} does not fit a virtio-mmio queue selector"
+                )
+            }
+            Self::QueueMetadata {
+                queue_index,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to read virtio-balloon queue {queue_index} activation metadata: {source}"
+                )
+            }
+            Self::QueueBuild {
+                queue_index,
+                kind,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to activate virtio-balloon {kind} queue {queue_index}: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioBalloonDeviceActivationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::QueueMetadata { source, .. } => Some(source),
+            Self::QueueBuild { source, .. } => Some(source),
+            Self::AlreadyActive
+            | Self::QueueCountMismatch { .. }
+            | Self::QueueIndexTooLarge { .. } => None,
+        }
+    }
+}
+
+impl From<VirtioBalloonDeviceActivationError> for VirtioMmioDeviceActivationError {
+    fn from(source: VirtioBalloonDeviceActivationError) -> Self {
+        MmioHandlerError::new(source.to_string()).into()
+    }
+}
+
+#[derive(Debug)]
+pub struct VirtioBalloonDeviceNotificationDispatch {
+    drained_notifications: Vec<usize>,
+    inflate_notifications: usize,
+    deflate_notifications: usize,
+}
+
+impl VirtioBalloonDeviceNotificationDispatch {
+    const fn new(
+        drained_notifications: Vec<usize>,
+        inflate_notifications: usize,
+        deflate_notifications: usize,
+    ) -> Self {
+        Self {
+            drained_notifications,
+            inflate_notifications,
+            deflate_notifications,
+        }
+    }
+
+    pub fn drained_notifications(&self) -> &[usize] {
+        &self.drained_notifications
+    }
+
+    pub const fn inflate_notifications(&self) -> usize {
+        self.inflate_notifications
+    }
+
+    pub const fn deflate_notifications(&self) -> usize {
+        self.deflate_notifications
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioBalloonDeviceNotificationError {
+    Inactive {
+        drained_notifications: Vec<usize>,
+    },
+    UnsupportedQueue {
+        drained_notifications: Vec<usize>,
+        queue_index: usize,
+    },
+}
+
+impl VirtioBalloonDeviceNotificationError {
+    pub fn drained_notifications(&self) -> &[usize] {
+        match self {
+            Self::Inactive {
+                drained_notifications,
+            }
+            | Self::UnsupportedQueue {
+                drained_notifications,
+                ..
+            } => drained_notifications,
+        }
+    }
+}
+
+impl fmt::Display for VirtioBalloonDeviceNotificationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inactive { .. } => f.write_str(
+                "virtio-balloon queue notification cannot be dispatched before activation",
+            ),
+            Self::UnsupportedQueue { queue_index, .. } => {
+                write!(
+                    f,
+                    "virtio-balloon queue notification for unsupported queue {queue_index}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioBalloonDeviceNotificationError {}
+
+fn active_optional_queue_from_activation(
+    config: Option<VirtioBalloonQueueConfig>,
+    activation: VirtioMmioDeviceActivation<'_>,
+) -> Result<Option<VirtioBalloonQueue>, VirtioBalloonDeviceActivationError> {
+    config
+        .map(|config| active_queue_from_activation(config, activation))
+        .transpose()
+}
+
+fn active_queue_from_activation(
+    config: VirtioBalloonQueueConfig,
+    activation: VirtioMmioDeviceActivation<'_>,
+) -> Result<VirtioBalloonQueue, VirtioBalloonDeviceActivationError> {
+    let queue_index = u32::try_from(config.index()).map_err(|_| {
+        VirtioBalloonDeviceActivationError::QueueIndexTooLarge {
+            queue_index: config.index(),
+        }
+    })?;
+    let queue = activation.queue(queue_index).map_err(|source| {
+        VirtioBalloonDeviceActivationError::QueueMetadata {
+            queue_index,
+            source,
+        }
+    })?;
+    VirtioBalloonQueue::from_mmio_queue_state(queue).map_err(|source| {
+        VirtioBalloonDeviceActivationError::QueueBuild {
+            queue_index,
+            kind: config.kind(),
+            source,
+        }
+    })
+}
+
+const fn is_inflate_or_deflate_queue(queue_index: usize) -> bool {
+    queue_index == VIRTIO_BALLOON_INFLATE_QUEUE_INDEX
+        || queue_index == VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PreparedBalloonDevice {
     config_space: VirtioBalloonConfigSpace,
@@ -840,11 +1318,12 @@ impl BalloonMmioDevice {
     ) -> Result<Self, BalloonMmioRegistrationError> {
         let region = layout.region()?;
         let queue_sizes = prepared.queue_sizes();
-        let handler = VirtioBalloonMmioHandler::with_device_config(
+        let handler = VirtioBalloonMmioHandler::with_device_config_and_activation(
             VIRTIO_BALLOON_DEVICE_ID,
             prepared.available_features(),
             queue_sizes.as_slice(),
             prepared.config_space(),
+            VirtioBalloonDevice::new(prepared.queue_layout()),
         )
         .map_err(|source| BalloonMmioRegistrationError::BuildHandler {
             region_id: layout.region_id(),
@@ -1032,11 +1511,17 @@ mod tests {
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
         VIRTIO_DEVICE_STATUS_DRIVER_OK, VIRTIO_DEVICE_STATUS_FEATURES_OK,
-        VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VirtioMmioRegister, VirtioMmioRegisterHandlerError,
+        VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VirtioMmioDeviceActivation, VirtioMmioDeviceRegisters,
+        VirtioMmioQueueRegisters, VirtioMmioRegister, VirtioMmioRegisterHandlerError,
     };
 
     const TEST_BALLOON_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_8000);
     const TEST_BALLOON_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(4000);
+    const TEST_QUEUE_SIZE: u16 = 8;
+    const TEST_DESCRIPTOR_BASE: u64 = 0x1000;
+    const TEST_DRIVER_BASE: u64 = 0x8000;
+    const TEST_DEVICE_BASE: u64 = 0x10000;
+    const TEST_QUEUE_STRIDE: u64 = 0x1000;
     const QUEUE_CONFIG_STATUS: u32 = VIRTIO_DEVICE_STATUS_ACKNOWLEDGE
         | VIRTIO_DEVICE_STATUS_DRIVER
         | VIRTIO_DEVICE_STATUS_FEATURES_OK;
@@ -1107,6 +1592,157 @@ mod tests {
             .dispatcher_mut()
             .dispatch(MmioOperation::write(access, data).expect("write operation should build"))
             .expect("balloon config write should dispatch");
+    }
+
+    fn queue_index_u32(queue_index: usize) -> u32 {
+        u32::try_from(queue_index).expect("test queue index should fit u32")
+    }
+
+    fn queue_address(base: u64, queue_index: u32) -> GuestAddress {
+        GuestAddress::new(
+            base.checked_add(u64::from(queue_index) * TEST_QUEUE_STRIDE)
+                .expect("test queue address should not overflow"),
+        )
+    }
+
+    fn address_low(address: GuestAddress) -> u32 {
+        u32::try_from(address.raw_value() & u64::from(u32::MAX))
+            .expect("low address word should fit u32")
+    }
+
+    fn address_high(address: GuestAddress) -> u32 {
+        u32::try_from(address.raw_value() >> u32::BITS).expect("high address word should fit u32")
+    }
+
+    fn configure_queue_registers(queues: &mut VirtioMmioQueueRegisters, queue_index: u32) {
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueSel,
+                queue_index,
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("queue select should write");
+        queues
+            .write_register(
+                VirtioMmioRegister::QueueNum,
+                u32::from(TEST_QUEUE_SIZE),
+                QUEUE_CONFIG_STATUS,
+            )
+            .expect("queue size should write");
+
+        let descriptor_table = queue_address(TEST_DESCRIPTOR_BASE, queue_index);
+        let driver_ring = queue_address(TEST_DRIVER_BASE, queue_index);
+        let device_ring = queue_address(TEST_DEVICE_BASE, queue_index);
+        for (register, value) in [
+            (
+                VirtioMmioRegister::QueueDescLow,
+                address_low(descriptor_table),
+            ),
+            (
+                VirtioMmioRegister::QueueDescHigh,
+                address_high(descriptor_table),
+            ),
+            (VirtioMmioRegister::QueueDriverLow, address_low(driver_ring)),
+            (
+                VirtioMmioRegister::QueueDriverHigh,
+                address_high(driver_ring),
+            ),
+            (VirtioMmioRegister::QueueDeviceLow, address_low(device_ring)),
+            (
+                VirtioMmioRegister::QueueDeviceHigh,
+                address_high(device_ring),
+            ),
+        ] {
+            queues
+                .write_register(register, value, QUEUE_CONFIG_STATUS)
+                .expect("queue address should write");
+        }
+        queues
+            .write_register(VirtioMmioRegister::QueueReady, 1, QUEUE_CONFIG_STATUS)
+            .expect("queue ready should write");
+    }
+
+    fn configured_queue_registers(queue_count: usize) -> VirtioMmioQueueRegisters {
+        let queue_sizes = vec![VIRTIO_BALLOON_QUEUE_SIZE; queue_count];
+        let mut queues =
+            VirtioMmioQueueRegisters::new(&queue_sizes).expect("queue table should build");
+        for queue_index in 0..queue_count {
+            configure_queue_registers(&mut queues, queue_index_u32(queue_index));
+        }
+
+        queues
+    }
+
+    fn activation_for_queues<'a>(
+        device_registers: &'a VirtioMmioDeviceRegisters,
+        queues: &'a VirtioMmioQueueRegisters,
+    ) -> VirtioMmioDeviceActivation<'a> {
+        VirtioMmioDeviceActivation::new(device_registers, queues)
+    }
+
+    fn configure_handler_queue(handler: &mut VirtioBalloonMmioHandler, queue_index: u32) {
+        handler
+            .write_register(VirtioMmioRegister::QueueSel, queue_index)
+            .expect("queue select should write");
+        handler
+            .write_register(VirtioMmioRegister::QueueNum, u32::from(TEST_QUEUE_SIZE))
+            .expect("queue size should write");
+
+        let descriptor_table = queue_address(TEST_DESCRIPTOR_BASE, queue_index);
+        let driver_ring = queue_address(TEST_DRIVER_BASE, queue_index);
+        let device_ring = queue_address(TEST_DEVICE_BASE, queue_index);
+        for (register, value) in [
+            (
+                VirtioMmioRegister::QueueDescLow,
+                address_low(descriptor_table),
+            ),
+            (
+                VirtioMmioRegister::QueueDescHigh,
+                address_high(descriptor_table),
+            ),
+            (VirtioMmioRegister::QueueDriverLow, address_low(driver_ring)),
+            (
+                VirtioMmioRegister::QueueDriverHigh,
+                address_high(driver_ring),
+            ),
+            (VirtioMmioRegister::QueueDeviceLow, address_low(device_ring)),
+            (
+                VirtioMmioRegister::QueueDeviceHigh,
+                address_high(device_ring),
+            ),
+        ] {
+            handler
+                .write_register(register, value)
+                .expect("queue address should write");
+        }
+        handler
+            .write_register(VirtioMmioRegister::QueueReady, 1)
+            .expect("queue ready should write");
+    }
+
+    fn set_handler_queue_config_status(handler: &mut VirtioBalloonMmioHandler) {
+        handler
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
+            .expect("acknowledge status should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            )
+            .expect("driver status should write");
+        handler
+            .write_register(VirtioMmioRegister::Status, QUEUE_CONFIG_STATUS)
+            .expect("features-ok status should write");
+    }
+
+    fn activate_handler(handler: &mut VirtioBalloonMmioHandler) {
+        set_handler_queue_config_status(handler);
+        for queue_index in 0..handler.queue_registers().queue_count() {
+            configure_handler_queue(handler, queue_index_u32(queue_index));
+        }
+        handler
+            .write_register(VirtioMmioRegister::Status, DRIVER_OK_STATUS)
+            .expect("driver-ok status should write");
     }
 
     fn balloon_mmio_device(config: BalloonConfig) -> BalloonMmioDevice {
@@ -1630,6 +2266,341 @@ mod tests {
     }
 
     #[test]
+    fn balloon_device_activation_builds_base_queues_from_mmio_state() {
+        let layout = prepared(balloon_config(64, false, 0, false, false)).queue_layout();
+        let device_registers = VirtioMmioDeviceRegisters::new(
+            VIRTIO_BALLOON_DEVICE_ID,
+            virtio_feature_bit(VIRTIO_FEATURE_VERSION_1),
+        );
+        let queues = configured_queue_registers(layout.queue_count());
+        let mut device = VirtioBalloonDevice::new(layout);
+
+        device
+            .activate_balloon(activation_for_queues(&device_registers, &queues))
+            .expect("balloon device should activate");
+
+        let active = device
+            .active_queues()
+            .expect("balloon device should expose active queues");
+        assert_eq!(active.queue_count(), VIRTIO_BALLOON_MIN_QUEUE_COUNT);
+        assert_eq!(
+            active.inflate().available_ring().descriptor_table(),
+            queue_address(
+                TEST_DESCRIPTOR_BASE,
+                queue_index_u32(VIRTIO_BALLOON_INFLATE_QUEUE_INDEX)
+            )
+        );
+        assert_eq!(
+            active.deflate().used_ring().used_ring(),
+            queue_address(
+                TEST_DEVICE_BASE,
+                queue_index_u32(VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX)
+            )
+        );
+        assert_eq!(
+            active.inflate().available_ring().queue_size(),
+            TEST_QUEUE_SIZE
+        );
+        assert!(active.statistics().is_none());
+        assert!(active.free_page_hinting().is_none());
+        assert!(active.free_page_reporting().is_none());
+    }
+
+    #[test]
+    fn balloon_device_activation_builds_optional_queues_from_mmio_state() {
+        let layout = prepared(balloon_config(64, false, 1, true, true)).queue_layout();
+        let device_registers = VirtioMmioDeviceRegisters::new(
+            VIRTIO_BALLOON_DEVICE_ID,
+            virtio_feature_bit(VIRTIO_FEATURE_VERSION_1),
+        );
+        let queues = configured_queue_registers(layout.queue_count());
+        let mut device = VirtioBalloonDevice::new(layout);
+
+        device
+            .activate_balloon(activation_for_queues(&device_registers, &queues))
+            .expect("balloon device should activate optional queues");
+
+        let active = device
+            .active_queues()
+            .expect("balloon device should expose active queues");
+        assert_eq!(active.queue_count(), VIRTIO_BALLOON_MAX_QUEUE_COUNT);
+        assert!(active.statistics().is_some());
+        assert!(active.free_page_hinting().is_some());
+        assert!(active.free_page_reporting().is_some());
+    }
+
+    #[test]
+    fn balloon_device_activation_rejects_queue_count_mismatch() {
+        let layout = prepared(balloon_config(64, false, 0, false, false)).queue_layout();
+        let device_registers = VirtioMmioDeviceRegisters::new(
+            VIRTIO_BALLOON_DEVICE_ID,
+            virtio_feature_bit(VIRTIO_FEATURE_VERSION_1),
+        );
+        let queues = configured_queue_registers(1);
+        let mut device = VirtioBalloonDevice::new(layout);
+
+        let error = device
+            .activate_balloon(activation_for_queues(&device_registers, &queues))
+            .expect_err("queue count mismatch should fail activation");
+
+        assert!(matches!(
+            error,
+            VirtioBalloonDeviceActivationError::QueueCountMismatch {
+                expected: VIRTIO_BALLOON_MIN_QUEUE_COUNT,
+                actual: 1
+            }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "virtio-balloon device requires 2 queue(s), got 1"
+        );
+        assert!(std::error::Error::source(&error).is_none());
+        assert!(!device.is_activated());
+    }
+
+    #[test]
+    fn balloon_device_activation_rejects_not_ready_queue() {
+        let layout = prepared(balloon_config(64, false, 0, false, false)).queue_layout();
+        let device_registers = VirtioMmioDeviceRegisters::new(
+            VIRTIO_BALLOON_DEVICE_ID,
+            virtio_feature_bit(VIRTIO_FEATURE_VERSION_1),
+        );
+        let queue_sizes = vec![VIRTIO_BALLOON_QUEUE_SIZE; VIRTIO_BALLOON_MIN_QUEUE_COUNT];
+        let mut queues =
+            VirtioMmioQueueRegisters::new(&queue_sizes).expect("queue table should build");
+        configure_queue_registers(
+            &mut queues,
+            queue_index_u32(VIRTIO_BALLOON_INFLATE_QUEUE_INDEX),
+        );
+        let mut device = VirtioBalloonDevice::new(layout);
+
+        let error = device
+            .activate_balloon(activation_for_queues(&device_registers, &queues))
+            .expect_err("not-ready deflate queue should fail activation");
+
+        assert!(matches!(
+            error,
+            VirtioBalloonDeviceActivationError::QueueBuild {
+                queue_index: 1,
+                kind: VirtioBalloonQueueKind::Deflate,
+                source: VirtioBalloonQueueBuildError::QueueNotReady
+            }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "failed to activate virtio-balloon deflate queue 1: virtio-balloon queue is not ready"
+        );
+        assert!(std::error::Error::source(&error).is_some());
+        assert!(!device.is_activated());
+    }
+
+    #[test]
+    fn balloon_device_activation_rejects_duplicate_activation() {
+        let layout = prepared(balloon_config(64, false, 0, false, false)).queue_layout();
+        let device_registers = VirtioMmioDeviceRegisters::new(
+            VIRTIO_BALLOON_DEVICE_ID,
+            virtio_feature_bit(VIRTIO_FEATURE_VERSION_1),
+        );
+        let queues = configured_queue_registers(layout.queue_count());
+        let activation = activation_for_queues(&device_registers, &queues);
+        let mut device = VirtioBalloonDevice::new(layout);
+        device
+            .activate_balloon(activation)
+            .expect("first activation should succeed");
+
+        let error = device
+            .activate_balloon(activation)
+            .expect_err("second activation should fail");
+
+        assert!(matches!(
+            error,
+            VirtioBalloonDeviceActivationError::AlreadyActive
+        ));
+        assert_eq!(error.to_string(), "virtio-balloon device is already active");
+        assert!(device.is_activated());
+    }
+
+    #[test]
+    fn balloon_device_reset_clears_active_queues() {
+        let layout = prepared(balloon_config(64, false, 0, false, false)).queue_layout();
+        let device_registers = VirtioMmioDeviceRegisters::new(
+            VIRTIO_BALLOON_DEVICE_ID,
+            virtio_feature_bit(VIRTIO_FEATURE_VERSION_1),
+        );
+        let queues = configured_queue_registers(layout.queue_count());
+        let mut device = VirtioBalloonDevice::new(layout);
+        device
+            .activate_balloon(activation_for_queues(&device_registers, &queues))
+            .expect("activation should succeed");
+
+        device.reset();
+
+        assert!(!device.is_activated());
+        assert!(device.active_queues().is_none());
+    }
+
+    #[test]
+    fn balloon_notification_dispatch_accepts_empty_batch_before_activation() {
+        let mut device = VirtioBalloonDevice::new(
+            prepared(balloon_config(64, false, 0, false, false)).queue_layout(),
+        );
+
+        let dispatch = device
+            .dispatch_drained_queue_notifications(Vec::new())
+            .expect("empty notification batch should dispatch");
+
+        assert!(dispatch.drained_notifications().is_empty());
+        assert_eq!(dispatch.inflate_notifications(), 0);
+        assert_eq!(dispatch.deflate_notifications(), 0);
+    }
+
+    #[test]
+    fn balloon_notification_dispatch_rejects_supported_queue_before_activation() {
+        let mut device = VirtioBalloonDevice::new(
+            prepared(balloon_config(64, false, 0, false, false)).queue_layout(),
+        );
+
+        let error = device
+            .dispatch_drained_queue_notifications(vec![VIRTIO_BALLOON_INFLATE_QUEUE_INDEX])
+            .expect_err("inactive device should reject supported queue notification");
+
+        assert!(matches!(
+            error,
+            VirtioBalloonDeviceNotificationError::Inactive { .. }
+        ));
+        assert_eq!(
+            error.drained_notifications(),
+            &[VIRTIO_BALLOON_INFLATE_QUEUE_INDEX]
+        );
+        assert_eq!(
+            error.to_string(),
+            "virtio-balloon queue notification cannot be dispatched before activation"
+        );
+    }
+
+    #[test]
+    fn balloon_mmio_handler_activates_device_with_configured_queues() {
+        let mut device = balloon_mmio_device(balloon_config(64, false, 0, false, false));
+        let handler = device
+            .dispatcher_mut()
+            .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+            .expect("balloon handler should be registered");
+
+        activate_handler(handler);
+
+        assert!(handler.is_device_activated());
+        assert!(handler.activation_handler().is_activated());
+        assert_eq!(
+            handler
+                .activation_handler()
+                .active_queues()
+                .expect("active queues should be present")
+                .queue_count(),
+            VIRTIO_BALLOON_MIN_QUEUE_COUNT
+        );
+    }
+
+    #[test]
+    fn balloon_mmio_handler_dispatches_inflate_and_deflate_notifications() {
+        let mut device = balloon_mmio_device(balloon_config(64, false, 0, false, false));
+        let handler = device
+            .dispatcher_mut()
+            .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+            .expect("balloon handler should be registered");
+        activate_handler(handler);
+
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                queue_index_u32(VIRTIO_BALLOON_INFLATE_QUEUE_INDEX),
+            )
+            .expect("inflate queue notification should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                queue_index_u32(VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX),
+            )
+            .expect("deflate queue notification should write");
+
+        let dispatch = handler
+            .dispatch_balloon_queue_notifications()
+            .expect("inflate and deflate notifications should dispatch");
+
+        assert_eq!(
+            dispatch.drained_notifications(),
+            &[
+                VIRTIO_BALLOON_INFLATE_QUEUE_INDEX,
+                VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX
+            ]
+        );
+        assert_eq!(dispatch.inflate_notifications(), 1);
+        assert_eq!(dispatch.deflate_notifications(), 1);
+        assert!(handler.pending_queue_notifications().is_empty());
+    }
+
+    #[test]
+    fn balloon_mmio_handler_rejects_unsupported_optional_queue_notification() {
+        let mut device = balloon_mmio_device(balloon_config(64, false, 1, false, false));
+        let handler = device
+            .dispatcher_mut()
+            .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+            .expect("balloon handler should be registered");
+        activate_handler(handler);
+
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                queue_index_u32(VIRTIO_BALLOON_STATS_QUEUE_INDEX),
+            )
+            .expect("statistics queue notification should write");
+
+        let error = handler
+            .dispatch_balloon_queue_notifications()
+            .expect_err("statistics queue notification should fail closed");
+
+        assert!(matches!(
+            error,
+            VirtioBalloonDeviceNotificationError::UnsupportedQueue {
+                queue_index: VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+                ..
+            }
+        ));
+        assert_eq!(
+            error.drained_notifications(),
+            &[VIRTIO_BALLOON_STATS_QUEUE_INDEX]
+        );
+        assert_eq!(
+            error.to_string(),
+            "virtio-balloon queue notification for unsupported queue 2"
+        );
+        assert!(handler.pending_queue_notifications().is_empty());
+    }
+
+    #[test]
+    fn balloon_mmio_handler_status_reset_clears_active_queues_and_notifications() {
+        let mut device = balloon_mmio_device(balloon_config(64, false, 0, false, false));
+        let handler = device
+            .dispatcher_mut()
+            .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+            .expect("balloon handler should be registered");
+        activate_handler(handler);
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                queue_index_u32(VIRTIO_BALLOON_INFLATE_QUEUE_INDEX),
+            )
+            .expect("inflate queue notification should write");
+
+        handler
+            .write_register(VirtioMmioRegister::Status, 0)
+            .expect("status reset should write");
+
+        assert!(!handler.is_device_activated());
+        assert!(!handler.activation_handler().is_activated());
+        assert!(handler.pending_queue_notifications().is_empty());
+    }
+
+    #[test]
     fn mmio_registration_exposes_identity_features_and_queues() {
         let mut device = balloon_mmio_device(balloon_config(64, true, 1, true, true));
         let registration = device.registration();
@@ -1781,32 +2752,23 @@ mod tests {
     }
 
     #[test]
-    fn mmio_queue_notifications_are_recorded_without_dispatching_descriptors() {
+    fn mmio_queue_notifications_are_recorded_until_balloon_dispatch() {
         let mut device = balloon_mmio_device(balloon_config(64, false, 0, false, false));
         let handler = device
             .dispatcher_mut()
             .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
             .expect("balloon handler should be registered");
 
-        handler
-            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
-            .expect("acknowledge status should write");
-        handler
-            .write_register(
-                VirtioMmioRegister::Status,
-                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
-            )
-            .expect("driver status should write");
-        handler
-            .write_register(VirtioMmioRegister::Status, QUEUE_CONFIG_STATUS)
-            .expect("features-ok status should write");
-        handler
-            .write_register(VirtioMmioRegister::Status, DRIVER_OK_STATUS)
-            .expect("driver-ok status should write");
+        activate_handler(handler);
         handler
             .write_register(VirtioMmioRegister::QueueNotify, 0)
             .expect("queue notification should be accepted");
 
         assert_eq!(handler.pending_queue_notifications(), vec![0]);
+        let dispatch = handler
+            .dispatch_balloon_queue_notifications()
+            .expect("queue notification should drain");
+        assert_eq!(dispatch.drained_notifications(), &[0]);
+        assert!(handler.pending_queue_notifications().is_empty());
     }
 }
