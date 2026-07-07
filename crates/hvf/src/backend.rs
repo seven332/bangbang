@@ -1,4 +1,5 @@
-use std::io::{Read, Seek, SeekFrom};
+use std::io;
+use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 
 use bangbang_runtime::memory::{GuestMemory, GuestMemoryLayout, GuestMemoryRange};
@@ -375,17 +376,6 @@ fn copy_pmem_backing_to_shadow(
     memory: &mut GuestMemory,
 ) -> Result<(), HvfGuestMemoryMappingError> {
     let range = device.guest_range();
-    let mut file = device.backing().file().try_clone().map_err(|source| {
-        BackendError::Hypervisor(format!(
-            "failed to clone HVF pmem backing for range {range}: {source}"
-        ))
-    })?;
-    file.seek(SeekFrom::Start(0)).map_err(|source| {
-        BackendError::Hypervisor(format!(
-            "failed to seek HVF pmem backing for range {range}: {source}"
-        ))
-    })?;
-
     let mut buffer = [0_u8; PMEM_SHADOW_COPY_BUFFER_SIZE];
     let mut copied = 0;
     let file_len = device.mapping().file_len();
@@ -399,11 +389,7 @@ fn copy_pmem_backing_to_shadow(
             .into());
         };
 
-        file.read_exact(chunk).map_err(|source| {
-            BackendError::Hypervisor(format!(
-                "failed to read HVF pmem backing into shadow for range {range}: {source}"
-            ))
-        })?;
+        read_pmem_shadow_chunk(device, chunk, copied)?;
 
         let destination = range.start().checked_add(copied).ok_or_else(|| {
             BackendError::Hypervisor(format!(
@@ -429,6 +415,70 @@ fn copy_pmem_backing_to_shadow(
     }
 
     Ok(())
+}
+
+fn read_pmem_shadow_chunk(
+    device: &PreparedPmemDevice,
+    chunk: &mut [u8],
+    offset: u64,
+) -> Result<(), HvfGuestMemoryMappingError> {
+    let range = device.guest_range();
+    let mut filled = 0;
+
+    while filled < chunk.len() {
+        let Some(remaining) = chunk.get_mut(filled..) else {
+            return Err(BackendError::Hypervisor(format!(
+                "HVF pmem shadow copy filled length {filled} exceeds chunk length {}",
+                chunk.len()
+            ))
+            .into());
+        };
+        let file_offset = checked_pmem_shadow_file_offset(offset, filled)?;
+
+        match device.backing().file().read_at(remaining, file_offset) {
+            Ok(0) => {
+                return Err(BackendError::Hypervisor(format!(
+                    "failed to read HVF pmem backing into shadow for range {range}: {}",
+                    io::Error::from(io::ErrorKind::UnexpectedEof)
+                ))
+                .into());
+            }
+            Ok(read_len) => {
+                filled = filled.checked_add(read_len).ok_or_else(|| {
+                    BackendError::Hypervisor(format!(
+                        "HVF pmem shadow copy filled length {filled} overflows"
+                    ))
+                })?;
+            }
+            Err(source) if source.kind() == io::ErrorKind::Interrupted => {}
+            Err(source) => {
+                return Err(BackendError::Hypervisor(format!(
+                    "failed to read HVF pmem backing into shadow for range {range}: {source}"
+                ))
+                .into());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn checked_pmem_shadow_file_offset(
+    offset: u64,
+    filled: usize,
+) -> Result<u64, HvfGuestMemoryMappingError> {
+    let filled = u64::try_from(filled).map_err(|_| {
+        BackendError::Hypervisor(format!(
+            "HVF pmem shadow copy filled length {filled} does not fit the backing file offset"
+        ))
+    })?;
+
+    offset.checked_add(filled).ok_or_else(|| {
+        BackendError::Hypervisor(format!(
+            "HVF pmem shadow copy file offset {offset}+{filled} overflows"
+        ))
+        .into()
+    })
 }
 
 fn pmem_shadow_read_len(remaining: u64) -> Result<usize, HvfGuestMemoryMappingError> {
@@ -498,7 +548,7 @@ impl Drop for HvfBackend {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::io::{Seek, SeekFrom, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -987,6 +1037,43 @@ mod tests {
             .expect("shadow padding should be readable");
 
         assert_eq!(padding, [0]);
+    }
+
+    #[test]
+    fn pmem_shadow_memory_preserves_backing_file_position() {
+        let payload = [0x11, 0x22, 0x33, 0x44, 0x55];
+        let backing = TempPmemFile::with_bytes("shadow-position", &payload)
+            .expect("pmem backing file should be created");
+        let layout =
+            GuestMemoryLayout::new(vec![range(0, page_size())]).expect("layout should be valid");
+        let mut configs = PmemConfigs::new();
+        configs.upsert(pmem_config(PmemConfigInput::new(
+            "pmem0",
+            backing.path_text(),
+        )));
+        let devices =
+            PreparedPmemDevices::from_configs(&configs, &layout).expect("pmem should prepare");
+        let device = &devices.as_slice()[0];
+        let mut file = device
+            .backing()
+            .file()
+            .try_clone()
+            .expect("pmem backing file clone should succeed");
+
+        file.seek(SeekFrom::Start(1))
+            .expect("test should set backing file position");
+        let position_before = file
+            .stream_position()
+            .expect("test should read backing file position");
+
+        let _shadow =
+            super::pmem_shadow_memory(device).expect("pmem shadow memory should be created");
+
+        let position_after = file
+            .stream_position()
+            .expect("test should read backing file position");
+
+        assert_eq!(position_after, position_before);
     }
 
     #[test]
