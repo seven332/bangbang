@@ -367,6 +367,7 @@ Use unique paths for:
 - metrics files or FIFOs
 - logger files or FIFOs
 - writable block backing files
+- writable pmem backing files
 - configured vsock socket paths
 - future host network devices or sockets
 - temporary test files
