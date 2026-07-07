@@ -51,7 +51,7 @@ pub enum ApiRequest {
     PutNetworkInterface(Box<NetworkInterfaceConfigRequest>),
     PatchNetworkInterface(Box<NetworkInterfacePatchRequest>),
     HotUnplugDevice(Box<HotUnplugDeviceRequest>),
-    PutPmem,
+    PutPmem(Box<PmemConfigRequest>),
     PatchPmem,
     PutSerial(Box<SerialConfigRequest>),
     PutSnapshotCreate,
@@ -1024,6 +1024,42 @@ impl NetworkInterfacePatchRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PmemConfigRequest {
+    path_pmem_id: String,
+    body_pmem_id: String,
+    path_on_host: String,
+    root_device: bool,
+    read_only: bool,
+    rate_limiter_configured: bool,
+}
+
+impl PmemConfigRequest {
+    pub fn path_pmem_id(&self) -> &str {
+        &self.path_pmem_id
+    }
+
+    pub fn body_pmem_id(&self) -> &str {
+        &self.body_pmem_id
+    }
+
+    pub fn path_on_host(&self) -> &str {
+        &self.path_on_host
+    }
+
+    pub const fn root_device(&self) -> bool {
+        self.root_device
+    }
+
+    pub const fn read_only(&self) -> bool {
+        self.read_only
+    }
+
+    pub const fn rate_limiter_configured(&self) -> bool {
+        self.rate_limiter_configured
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VsockConfigRequest {
     vsock_id: Option<String>,
     guest_cid: u32,
@@ -1177,6 +1213,30 @@ impl NetworkInterfaceConfigResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PmemConfigResponse {
+    id: String,
+    path_on_host: String,
+    root_device: bool,
+    read_only: bool,
+}
+
+impl PmemConfigResponse {
+    pub fn new(
+        id: impl Into<String>,
+        path_on_host: impl Into<String>,
+        root_device: bool,
+        read_only: bool,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            path_on_host: path_on_host.into(),
+            root_device,
+            read_only,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmConfigResponse {
     machine_config: MachineConfigResponse,
     boot_source: Option<BootSourceResponse>,
@@ -1186,6 +1246,7 @@ pub struct VmConfigResponse {
     vsock: Option<VsockConfigResponse>,
     entropy: Option<EntropyConfigResponse>,
     balloon: Option<BalloonConfigResponse>,
+    pmem: Vec<PmemConfigResponse>,
 }
 
 impl VmConfigResponse {
@@ -1207,11 +1268,17 @@ impl VmConfigResponse {
             vsock,
             entropy,
             balloon: None,
+            pmem: Vec::new(),
         }
     }
 
     pub const fn with_balloon(mut self, balloon: Option<BalloonConfigResponse>) -> Self {
         self.balloon = balloon;
+        self
+    }
+
+    pub fn with_pmem(mut self, pmem: Vec<PmemConfigResponse>) -> Self {
+        self.pmem = pmem;
         self
     }
 }
@@ -1645,6 +1712,10 @@ impl HttpResponse {
                     .collect(),
             ),
         );
+        body.insert(
+            "pmem".to_string(),
+            serde_json::Value::Array(config.pmem.iter().map(pmem_config_response_value).collect()),
+        );
         if let Some(mmds_config) = &config.mmds_config {
             body.insert(
                 "mmds-config".to_string(),
@@ -1812,6 +1883,15 @@ fn network_interface_config_response_value(
     );
 
     serde_json::Value::Object(body)
+}
+
+fn pmem_config_response_value(pmem: &PmemConfigResponse) -> serde_json::Value {
+    serde_json::json!({
+        "id": pmem.id.clone(),
+        "path_on_host": pmem.path_on_host.clone(),
+        "read_only": pmem.read_only,
+        "root_device": pmem.root_device,
+    })
 }
 
 fn entropy_config_response_value(_entropy: &EntropyConfigResponse) -> serde_json::Value {
@@ -2500,22 +2580,25 @@ fn parse_drive_patch_request(path_drive_id: &str, body: &[u8]) -> Result<ApiRequ
 fn parse_pmem_config_request(path_pmem_id: &str, body: &[u8]) -> Result<ApiRequest, RequestError> {
     let body = serde_json::from_slice::<PmemConfigRequestBody>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
-    if let Some(rate_limiter) = &body.rate_limiter {
-        validate_rate_limiter_config(rate_limiter.as_value())?;
-    }
+    let rate_limiter_configured = match &body.rate_limiter {
+        Some(rate_limiter) => {
+            validate_rate_limiter_config(rate_limiter.as_value())?;
+            rate_limiter_configured(rate_limiter.as_value())?
+        }
+        None => false,
+    };
     if path_pmem_id != body.id {
         return Err(RequestError::MismatchedPmemId);
     }
-    let PmemConfigRequestBody {
-        id,
-        path_on_host,
-        root_device,
-        read_only,
-        rate_limiter,
-    } = body;
-    let _ = (id, path_on_host, root_device, read_only, rate_limiter);
 
-    Ok(ApiRequest::PutPmem)
+    Ok(ApiRequest::PutPmem(Box::new(PmemConfigRequest {
+        path_pmem_id: path_pmem_id.to_string(),
+        body_pmem_id: body.id,
+        path_on_host: body.path_on_host,
+        root_device: body.root_device,
+        read_only: body.read_only,
+        rate_limiter_configured,
+    })))
 }
 
 fn parse_pmem_patch_request(path_pmem_id: &str, body: &[u8]) -> Result<ApiRequest, RequestError> {
@@ -2763,6 +2846,13 @@ fn validate_rate_limiter_config(value: &serde_json::Value) -> Result<(), Request
     Ok(())
 }
 
+fn rate_limiter_configured(value: &serde_json::Value) -> Result<bool, RequestError> {
+    value
+        .as_object()
+        .map(|rate_limiter| !rate_limiter.is_empty())
+        .ok_or(RequestError::MalformedRequest)
+}
+
 fn validate_token_bucket(value: &serde_json::Value) -> Result<(), RequestError> {
     if value.is_null() {
         return Ok(());
@@ -2997,7 +3087,7 @@ impl From<ApiRequest> for Endpoint {
             ApiRequest::PutNetworkInterface(_) | ApiRequest::PatchNetworkInterface(_) => {
                 Self::NetworkInterface
             }
-            ApiRequest::PutPmem | ApiRequest::PatchPmem => Self::Pmem,
+            ApiRequest::PutPmem(_) | ApiRequest::PatchPmem => Self::Pmem,
             ApiRequest::PutSerial(_) => Self::Serial,
             ApiRequest::PutSnapshotCreate | ApiRequest::PutSnapshotLoad(_) => Self::Snapshot,
             ApiRequest::PutVsock(_) => Self::Vsock,
@@ -5978,7 +6068,7 @@ mod tests {
 
     #[test]
     fn parses_valid_pmem_body_methods() {
-        for (route, request) in [
+        for (route, request, expected_root_device, expected_read_only, expected_rate_limiter) in [
             (
                 "PUT /pmem/pmem0",
                 request_with_body(
@@ -5986,6 +6076,9 @@ mod tests {
                     "/pmem/pmem0",
                     r#"{"id":"pmem0","path_on_host":"/tmp/pmem.img"}"#,
                 ),
+                false,
+                false,
+                false,
             ),
             (
                 "PUT /pmem/pmem_0",
@@ -5994,6 +6087,9 @@ mod tests {
                     "/pmem/pmem_0",
                     r#"{"id":"pmem_0","path_on_host":"/tmp/pmem.img","root_device":true,"read_only":false,"rate_limiter":{"bandwidth":{"size":100,"one_time_burst":null,"refill_time":1000}}}"#,
                 ),
+                true,
+                false,
+                true,
             ),
             (
                 "PUT /pmem/pmem1 empty rate limiter",
@@ -6002,6 +6098,9 @@ mod tests {
                     "/pmem/pmem1",
                     r#"{"id":"pmem1","path_on_host":"/tmp/pmem.img","rate_limiter":{}}"#,
                 ),
+                false,
+                false,
+                false,
             ),
             (
                 "PUT /pmem/pmem2 null rate limiter",
@@ -6010,7 +6109,27 @@ mod tests {
                     "/pmem/pmem2",
                     r#"{"id":"pmem2","path_on_host":"/tmp/pmem.img","rate_limiter":null}"#,
                 ),
+                false,
+                false,
+                false,
             ),
+        ] {
+            let parsed = parse_request(&request).expect("pmem request should parse");
+            let ApiRequest::PutPmem(config) = parsed else {
+                panic!("unexpected pmem request for {route}");
+            };
+            assert_eq!(config.path_pmem_id(), config.body_pmem_id(), "{route}");
+            assert_eq!(config.path_on_host(), "/tmp/pmem.img", "{route}");
+            assert_eq!(config.root_device(), expected_root_device, "{route}");
+            assert_eq!(config.read_only(), expected_read_only, "{route}");
+            assert_eq!(
+                config.rate_limiter_configured(),
+                expected_rate_limiter,
+                "{route}"
+            );
+        }
+
+        for (route, request) in [
             (
                 "PATCH /pmem/pmem0",
                 request_with_body("PATCH", "/pmem/pmem0", r#"{"id":"pmem0"}"#),
@@ -6041,9 +6160,9 @@ mod tests {
             ),
         ] {
             let parsed = parse_request(&request).expect("pmem request should parse");
-            match (route.starts_with("PUT"), parsed) {
-                (true, ApiRequest::PutPmem) | (false, ApiRequest::PatchPmem) => {}
-                (_, other) => panic!("unexpected pmem request for {route}: {other:?}"),
+            match parsed {
+                ApiRequest::PatchPmem => {}
+                other => panic!("unexpected pmem request for {route}: {other:?}"),
             }
         }
     }
@@ -6668,6 +6787,7 @@ mod tests {
                     "vcpu_count": 1,
                 },
                 "network-interfaces": [],
+                "pmem": [],
             })
         );
         assert_eq!(body.get("boot-source"), None);
@@ -6675,6 +6795,7 @@ mod tests {
         assert_eq!(body.get("logger"), None);
         assert_eq!(body.get("mmds-config"), None);
         assert_eq!(body.get("entropy"), None);
+        assert_eq!(body.get("pmem"), Some(&serde_json::json!([])));
         assert_eq!(body.get("vsock"), None);
     }
 
@@ -6693,6 +6814,7 @@ mod tests {
             .with_ipv4_address("169.254.169.254");
         let vsock = VsockConfigResponse::new(3, "./v.sock");
         let balloon = BalloonConfigResponse::new(128, true, 60, true, false);
+        let pmem = PmemConfigResponse::new("pmem0", "/tmp/pmem.img", true, false);
         let response = HttpResponse::vm_config(
             &VmConfigResponse::new(
                 MachineConfigResponse::new(2, 256, false, false, "None"),
@@ -6703,7 +6825,8 @@ mod tests {
                 Some(vsock),
                 Some(EntropyConfigResponse::new()),
             )
-            .with_balloon(Some(balloon)),
+            .with_balloon(Some(balloon))
+            .with_pmem(vec![pmem]),
         );
         let body: serde_json::Value =
             serde_json::from_str(response.body()).expect("body should be JSON");
@@ -6749,6 +6872,14 @@ mod tests {
                         "host_dev_name": "tap0",
                         "iface_id": "eth0",
                         "mtu": 1500,
+                    },
+                ],
+                "pmem": [
+                    {
+                        "id": "pmem0",
+                        "path_on_host": "/tmp/pmem.img",
+                        "read_only": false,
+                        "root_device": true,
                     },
                 ],
                 "mmds-config": {

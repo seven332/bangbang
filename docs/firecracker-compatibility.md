@@ -101,7 +101,7 @@ The intended public control plane is Firecracker-style HTTP over a Unix domain
 socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
 `GET /machine-config`, pre-boot `PUT /machine-config`, pre-boot
 `PUT /boot-source`, pre-boot `PUT /drives/{drive_id}`, pre-boot
-`PUT /network-interfaces/{iface_id}`, pre-boot `PUT /vsock`, pre-boot
+`PUT /network-interfaces/{iface_id}`, pre-boot `PUT /pmem/{id}`, pre-boot `PUT /vsock`, pre-boot
 `PUT /metrics`, pre-boot `PUT /logger`, pre-boot `PUT /serial`, parsed `PUT /actions`,
 pre-boot `PATCH /machine-config`, parsed `PATCH /mmds`, parsed `PATCH /vm`, and
 runtime `PATCH /drives/{drive_id}` requests already map through a minimal internal VMM
@@ -117,7 +117,8 @@ The current `bangbang` executable parses only the first process-lifecycle
 arguments and starts the first API socket surface. It binds a Unix socket and
 serves `GET /`, `GET /version`, `GET /vm/config`, `GET /machine-config`,
 pre-boot `PUT /machine-config`, pre-boot `PUT /boot-source` configuration storage, and
-pre-boot `PUT /drives/{drive_id}` configuration storage, runtime
+pre-boot `PUT /drives/{drive_id}` configuration storage, pre-boot
+`PUT /pmem/{id}` configuration storage, runtime
 `PATCH /drives/{drive_id}` backing refresh, pre-boot
 `PUT /network-interfaces/{iface_id}` configuration storage, pre-boot `PUT /vsock` configuration storage, pre-boot `PUT /metrics`
 output configuration, pre-boot `PUT /logger` output configuration, pre-boot
@@ -198,7 +199,7 @@ Supported value-taking startup arguments accept both Firecracker-style
 
 `--config-file` currently accepts the supported Firecracker-shaped sections
 `machine-config`, `boot-source`, `drives`, `network-interfaces`,
-`mmds-config`, `vsock`, `entropy`, `balloon`, `metrics`, `logger`, `serial`, and
+`mmds-config`, `vsock`, `entropy`, `balloon`, `pmem`, `metrics`, `logger`, `serial`, and
 `cpu-config`. The `cpu-config` section is parsed through the same request model
 as `PUT /cpu-config`: empty/no-op custom template bodies are accepted before
 startup, while non-empty custom CPU templates still fail as unsupported CPU
@@ -214,10 +215,12 @@ allocated balloon interrupt line when queue completion requires it. Completed
 inflate and deflate descriptors update internal inflated-page accounting after
 PFN ranges are validated against mapped guest memory.
 Balloon statistics, hinting, reporting, host memory reclaim, and runtime target
-updates remain deferred.
-Known unsupported sections such as `memory-hotplug` and `pmem` fail before the
-API socket is published or before no-api readiness is reported. The config-file
-path does not load MMDS data; use Firecracker's separate
+updates remain deferred. The `pmem` section is parsed through `PUT /pmem/{id}`;
+valid entries store Firecracker-shaped pre-boot configuration and appear in
+`GET /vm/config`, but startup does not open pmem backing files or attach
+virtio-pmem devices yet. Known unsupported sections such as `memory-hotplug`
+fail before the API socket is published or before no-api readiness is reported.
+The config-file path does not load MMDS data; use Firecracker's separate
 `--metadata <PATH>` startup argument for startup MMDS data.
 
 CLI values are untrusted input. Current validation rejects invalid IDs, empty
@@ -338,7 +341,7 @@ compatibility targets.
 | `PATCH` | `/balloon/hinting/start` | recognized; VMM-routed unsupported | Parses Firecracker-shaped free-page hinting start commands, including empty/default commands, rejects malformed or invalid bodies first, and then routes valid requests through the VMM state/action policy. Hinting start is treated as post-boot-only and currently returns the balloon-specific unsupported fault after startup. Real free-page hinting and reporting need a dedicated design. |
 | `PATCH` | `/balloon/hinting/stop` | recognized; VMM-routed unsupported | Routes through the VMM state/action policy without parsing the request body, matching Firecracker's stop-command parser behavior. Hinting stop is treated as post-boot-only and currently returns the balloon-specific unsupported fault after startup. Real free-page hinting and reporting need a dedicated design. |
 | `GET` | `/balloon/hinting/status` | recognized; VMM-routed unsupported | Routes through the VMM state/action policy. Hinting status is treated as post-boot-only and currently returns the balloon-specific unsupported fault after startup. Real free-page hinting state tracking needs a dedicated design. |
-| `PUT`, `PATCH` | `/pmem/{id}` | recognized; VMM-routed unsupported | Parses Firecracker-shaped pmem config and update request bodies, rejects malformed, invalid, or mismatched path/body IDs first, and then routes valid requests through the VMM state/action policy. `PUT` is treated as pre-boot-only and reaches the pmem-specific unsupported fault before startup. `PATCH` is treated as post-boot-only and reaches the pmem-specific unsupported fault after startup. Requests made in the wrong lifecycle state return the normal unsupported-state fault. Real pmem device configuration, guest attachment, rate limiting, and runtime update behavior need a dedicated device design. |
+| `PUT`, `PATCH` | `/pmem/{id}` | partial; pre-boot config storage implemented | `PUT /pmem/{id}` stores Firecracker-shaped pmem configuration before boot, replaces prior config for the same ID, and appears in `GET /vm/config` under `pmem`. It rejects empty backing paths but does not open, stat, mmap, or validate backing file existence, type, permissions, or size; startup does not attach a guest-visible virtio-pmem device yet. Configured rate limiters are rejected without mutating stored pmem configuration. `PATCH /pmem/{id}` remains post-boot-only unsupported, and real runtime updates, rate limiting, root-device semantics, host-file mapping, guest attachment, and hot-unplug need dedicated device designs. |
 | `PUT` | `/entropy` | supported target; configuration storage, startup attachment, and signed executable guest read validation implemented | Stores one Firecracker-shaped virtio-rng entropy configuration before boot when `rate_limiter` is omitted or `null`. `GET /vm/config` includes `"entropy": {}` after API or config-file configuration, and `InstanceStart` attaches the existing HVF virtio-rng MMIO/FDT device backed by the session-owned host OS randomness source. The signed executable HVF e2e target boots a direct-rootfs guest, checks that Linux selected `virtio_rng` as the current hardware RNG, reads non-empty data from `/dev/hwrng`, and writes a host-observable success marker. Configured rate limiters are validated and then rejected with the entropy rate-limiter unsupported fault without mutating stored entropy configuration. Post-start requests follow the pre-boot-only unsupported-state policy. Real rate limiting and entropy metrics remain deferred. |
 | `GET`, `PUT`, `PATCH` | `/hotplug/memory` | recognized; VMM-routed unsupported | Parses Firecracker-shaped `PUT` and `PATCH` memory hotplug request bodies, rejects malformed or schema-invalid bodies first, and then routes valid requests through the VMM state/action policy. `PUT` is treated as pre-boot-only and reaches the memory-hotplug-specific unsupported fault before startup. `GET` and `PATCH` are treated as post-boot-only and reach the memory-hotplug-specific unsupported fault after startup. Requests made in the wrong lifecycle state return the normal unsupported-state fault. Real virtio-mem device support, guest memory accounting, semantic config validation, and runtime memory update behavior need a dedicated design. |
 | `PATCH` | `/vm` | recognized; rejected | Parses the Firecracker-shaped VM state request with required `state` values `Paused` and `Resumed`, then routes valid requests through `Pause` or `Resume` VMM actions. Requests before startup fail as unsupported in `Not started` state, and runtime requests fail as unsupported actions without mutating VM state. Real pause/resume state transitions and public run-loop control remain deferred. |
@@ -418,12 +421,12 @@ fields and duplicate token bucket fields before VMM dispatch.
 | `PATCH /drives/{drive_id}` | `path_on_host` | optional | When present at runtime, the process opens the replacement backing for the existing active drive before committing the stored configuration. When omitted, the existing path is retained without refreshing the active handler. Open and handler lookup failures leave the old backing and stored configuration intact. |
 | `PATCH /drives/{drive_id}` | `rate_limiter` | optional when absent or `null`; rejected when configured | The parser accepts the Firecracker-shaped field name and validates configured rate-limiter shape; the runtime update model rejects configured rate limiters with `drive rate_limiter is not supported` before opening a replacement backing or mutating drive state. Real rate limiting belongs with future block update work. |
 | `PATCH /drives/{drive_id}` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
-| `PUT /pmem/{id}` | path `id` | required | The API parser captures the path ID for path/body validation before routing valid requests through the VMM state/action policy. Invalid path IDs continue to fail as invalid path/method. |
+| `PUT /pmem/{id}` | path `id` | required | The API parser captures the path ID for path/body validation before routing valid requests through the VMM state/action policy. Invalid path IDs continue to fail as invalid path/method, and the runtime model also rejects empty IDs or IDs containing characters other than alphanumeric characters and `_`. |
 | `PUT /pmem/{id}` | body `id` | required | The API parser rejects requests where this does not match the path `id`. |
-| `PUT /pmem/{id}` | `path_on_host` | required; unsupported after parser validation | Required Firecracker-shaped host backing path. The parser accepts syntactically valid strings before VMM dispatch, but the value is not retained, opened, or echoed by the current unsupported action path; real host-path access and redacted open errors remain deferred with virtio-pmem support. |
-| `PUT /pmem/{id}` | `root_device` | optional | Missing values follow Firecracker's parser default shape before VMM dispatch. Real root-device conflict validation remains deferred with virtio-pmem support. |
-| `PUT /pmem/{id}` | `read_only` | optional | Missing values follow Firecracker's parser default shape before VMM dispatch. Real read-only mapping behavior remains deferred with virtio-pmem support. |
-| `PUT /pmem/{id}` | `rate_limiter` | optional; unsupported after parser validation | Missing, `null`, or empty objects are accepted. Configured Firecracker-shaped rate limiter objects are validated before VMM dispatch, but their values are not retained or echoed. Real pmem flush rate limiting remains deferred. |
+| `PUT /pmem/{id}` | `path_on_host` | required; stored only | Required Firecracker-shaped host backing path. The value is retained and reported in `GET /vm/config` after rejecting empty paths, but bangbang does not open, stat, mmap, normalize, or attach it to the guest yet; real host-path access and redacted open errors remain deferred with virtio-pmem support. |
+| `PUT /pmem/{id}` | `root_device` | optional; stored only | Missing values default to `false` and are reported in `GET /vm/config`. Real root-device conflict validation and boot semantics remain deferred with virtio-pmem support. |
+| `PUT /pmem/{id}` | `read_only` | optional; stored only | Missing values default to `false` and are reported in `GET /vm/config`. Real read-only mapping behavior remains deferred with virtio-pmem support. |
+| `PUT /pmem/{id}` | `rate_limiter` | optional when absent, `null`, or empty; rejected when configured | Empty or omitted limiter shapes do not create stored limiter state. Configured Firecracker-shaped rate limiter objects are validated and rejected without mutating stored pmem configuration. Real pmem flush rate limiting remains deferred. |
 | `PUT /pmem/{id}` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PATCH /pmem/{id}` | path `id` | required | The API parser captures the path ID for path/body validation before routing valid requests through the VMM state/action policy. Invalid path IDs continue to fail as invalid path/method. |
 | `PATCH /pmem/{id}` | body `id` | required | The API parser rejects requests where this does not match the path `id`. |
@@ -1501,12 +1504,13 @@ The first API implementation should model the same broad stages as Firecracker:
 | --- | --- | --- | --- |
 | `GET /` | implemented; `200` JSON | implemented; `200` JSON | Response state reflects the current microVM state. |
 | `GET /version` | implemented; `200` JSON | implemented; `200` JSON | Body uses Firecracker's `firecracker_version` field shape. |
-| `GET /vm/config` | implemented; `200` JSON | implemented; `200` JSON | Returns the accumulated supported configuration subset, including `mmds-config` after successful MMDS config storage, `entropy` after successful entropy configuration, and `balloon` after successful pre-boot balloon configuration. Startup applies the supported boot subset to an owned HVF session and internal boot run-loop worker across bounded step windows. |
+| `GET /vm/config` | implemented; `200` JSON | implemented; `200` JSON | Returns the accumulated supported configuration subset, including an always-present `pmem` array that is populated after successful pre-boot pmem configuration, `mmds-config` after successful MMDS config storage, `entropy` after successful entropy configuration, and `balloon` after successful pre-boot balloon configuration. Startup applies the supported boot subset to an owned HVF session and internal boot run-loop worker across bounded step windows. |
 | `GET /machine-config` | implemented; `200` JSON | supported target; `200` JSON | Returns the stored/default machine configuration. |
 | `PUT /machine-config` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Pre-boot-only configuration. Stored values are applied during startup preparation. |
 | `PATCH /machine-config` | implemented; `204` empty response on successful partial config update | unsupported after start; `400` `fault_message` | Pre-boot-only partial configuration. Omitted fields preserve current stored values; invalid updates leave stored values unchanged. |
 | `PUT /boot-source` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config; host paths are opened during startup preparation. Host path errors must avoid leaking sensitive path details. |
 | `PUT /drives/{drive_id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config; startup preparation opens backing files and registers initial block MMIO devices. Runtime hotplug remains deferred. |
+| `PUT /pmem/{id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records Firecracker-shaped pre-boot config and replaces prior config for the same ID without opening the host backing file. Stored configs appear in `GET /vm/config`, but root-device semantics, backing-file mapping, guest-visible virtio-pmem attachment, rate limiting, runtime updates, and hot-unplug remain deferred. |
 | `PATCH /drives/{drive_id}` | recognized post-boot-only operation; `400` `fault_message` | supported target; `204` empty response on successful backing refresh | Parses Firecracker-shaped update requests and routes valid bodies through `UpdateBlockDevice`. Runtime updates for existing active drives open replacement backing files first, refresh the matching virtio-block MMIO handler, update stored drive configuration after handler success, and preserve previous state on failure. Configured rate limiters remain parser-level unsupported until rate limiting exists. |
 | `DELETE /drives/{drive_id}`, `DELETE /pmem/{id}`, `DELETE /network-interfaces/{iface_id}` | recognized bodyless hot-unplug; `400` `fault_message` | recognized bodyless hot-unplug; `400` `fault_message` | Bodyless requests route through one `HotUnplugDevice` VMM action. Pre-boot requests return the normal unsupported-state fault, and runtime requests return the matching device-specific unsupported fault without mutating stored configuration. Requests with a body fail first as malformed request shape before hot-unplug routing. Real hot-unplug remains deferred. |
 | `PUT /network-interfaces/{iface_id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records up to 16 validated pre-boot configs without opening host networking resources. Startup preparation attaches configured interfaces as virtio-mmio devices in the MMIO dispatcher and guest FDT. `InstanceStart` revalidates the count before selecting packet I/O. If every configured interface is listed in MMDS config, startup validates supported `host_dev_name` syntax and uses process-local MMDS-only packet I/O without opening vmnet resources; otherwise it opens vmnet packet I/O for `vmnet:host`, `vmnet:shared`, and `vmnet:bridged:<interface>` host device names. Unsupported names fail before `Running`. Internal network notification dispatch can route each interface through selected packet I/O, complete TX descriptor heads through a packet sink boundary, and write injected RX packets into guest buffers through a packet source boundary. Runtime PATCH accepts a no-op subset for existing interfaces. Public packet movement, real runtime mutation, configured rate limiting, and DELETE remain deferred. |
@@ -1665,7 +1669,7 @@ Their eventual support level should follow the endpoint matrix:
 - snapshots
 - full MMDS TCP routing, stream reassembly, and retransmission policy
 - balloon devices and balloon statistics
-- pmem
+- pmem beyond pre-boot configuration storage and `GET /vm/config` reporting
 - entropy rate limiting, runtime metrics, and security docs
 - serial input, serial rate limiting, public serial streaming, and serial metrics
 - full logger integration, full Firecracker metrics counters beyond the minimal

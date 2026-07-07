@@ -369,26 +369,101 @@ fn executable_rejects_snapshot_requests_without_mutating() {
 }
 
 #[test]
-fn executable_handles_remaining_device_requests_without_mutating() {
+fn executable_handles_remaining_device_requests_and_pmem_config() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
     let instance_id = test_dir.instance_id();
     let bangbang = BangbangProcess::start(&socket_path, &instance_id);
 
-    for (path, body, fault_message, private_values) in [
-        (
-            "/pmem/pmem0",
-            r#"{"id":"pmem0","path_on_host":"secret-pmem.img"}"#,
-            "Pmem device is not supported.",
-            &["secret-pmem.img"][..],
-        ),
-        (
-            "/hotplug/memory",
-            r#"{"total_size_mib":2048}"#,
-            "Memory hotplug is not supported.",
-            &[][..],
-        ),
-    ] {
+    let pmem_response = http_put_json(
+        &socket_path,
+        "/pmem/pmem0",
+        r#"{"id":"pmem0","path_on_host":"secret-pmem.img","read_only":true}"#,
+    );
+    assert_no_content_response(&pmem_response, "PUT /pmem/pmem0");
+    let pmem_vm_config = http_get(&socket_path, "/vm/config");
+    assert_ok_response(&pmem_vm_config, "GET /vm/config after PUT /pmem/pmem0");
+    assert_response_contains(
+        &pmem_vm_config,
+        r#""pmem":[{"#,
+        "GET /vm/config after PUT /pmem/pmem0",
+    );
+    assert_response_contains(
+        &pmem_vm_config,
+        r#""id":"pmem0""#,
+        "GET /vm/config after PUT /pmem/pmem0",
+    );
+    assert_response_contains(
+        &pmem_vm_config,
+        r#""path_on_host":"secret-pmem.img""#,
+        "GET /vm/config after PUT /pmem/pmem0",
+    );
+    assert_response_contains(
+        &pmem_vm_config,
+        r#""read_only":true"#,
+        "GET /vm/config after PUT /pmem/pmem0",
+    );
+
+    let pmem_rate_limiter_response = http_put_json(
+        &socket_path,
+        "/pmem/pmem0",
+        r#"{"id":"pmem0","path_on_host":"secret-new-pmem.img","rate_limiter":{"ops":{"size":123456789,"one_time_burst":987654321,"refill_time":777}}}"#,
+    );
+    assert_bad_request_response(&pmem_rate_limiter_response, "PUT /pmem/pmem0 rate_limiter");
+    assert_response_contains(
+        &pmem_rate_limiter_response,
+        r#"{"fault_message":"pmem rate_limiter is not supported"}"#,
+        "PUT /pmem/pmem0 rate_limiter",
+    );
+    for private_value in ["secret-new-pmem.img", "123456789", "987654321", "777"] {
+        assert!(
+            !pmem_rate_limiter_response.contains(private_value),
+            "PUT /pmem/pmem0 rate_limiter must not echo private config value {private_value:?}; response:\n{pmem_rate_limiter_response}"
+        );
+    }
+    let pmem_vm_config_after_fault = http_get(&socket_path, "/vm/config");
+    assert_ok_response(
+        &pmem_vm_config_after_fault,
+        "GET /vm/config after rejected PUT /pmem/pmem0 rate_limiter",
+    );
+    assert_response_contains(
+        &pmem_vm_config_after_fault,
+        r#""path_on_host":"secret-pmem.img""#,
+        "GET /vm/config after rejected PUT /pmem/pmem0 rate_limiter",
+    );
+    assert!(
+        !pmem_vm_config_after_fault.contains("secret-new-pmem.img"),
+        "rejected pmem update must not replace stored path: {pmem_vm_config_after_fault}"
+    );
+
+    let pmem_empty_path_response = http_put_json(
+        &socket_path,
+        "/pmem/pmem0",
+        r#"{"id":"pmem0","path_on_host":""}"#,
+    );
+    assert_bad_request_response(&pmem_empty_path_response, "PUT /pmem/pmem0 empty path");
+    assert_response_contains(
+        &pmem_empty_path_response,
+        r#"{"fault_message":"pmem path_on_host must not be empty"}"#,
+        "PUT /pmem/pmem0 empty path",
+    );
+    let pmem_vm_config_after_empty_path = http_get(&socket_path, "/vm/config");
+    assert_ok_response(
+        &pmem_vm_config_after_empty_path,
+        "GET /vm/config after rejected PUT /pmem/pmem0 empty path",
+    );
+    assert_response_contains(
+        &pmem_vm_config_after_empty_path,
+        r#""path_on_host":"secret-pmem.img""#,
+        "GET /vm/config after rejected PUT /pmem/pmem0 empty path",
+    );
+
+    for (path, body, fault_message, private_values) in [(
+        "/hotplug/memory",
+        r#"{"total_size_mib":2048}"#,
+        "Memory hotplug is not supported.",
+        &[] as &[&str],
+    )] {
         let response = http_put_json(&socket_path, path, body);
 
         assert_bad_request_response(&response, path);

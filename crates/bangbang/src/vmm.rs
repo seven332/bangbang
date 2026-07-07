@@ -313,10 +313,10 @@ impl PutApiRequest {
         }
     }
 
-    pub(crate) const fn pmem() -> Self {
+    pub(crate) fn pmem(input: bangbang_runtime::pmem::PmemConfigInput) -> Self {
         Self {
             kind: PutApiRequestKind::Pmem,
-            action: VmmAction::PutPmem,
+            action: VmmAction::PutPmem(input),
         }
     }
 
@@ -3590,6 +3590,7 @@ mod tests {
             | VmmActionError::NetworkInterfaceUpdate(_)
             | VmmActionError::NetworkInterfaceUpdateUnsupported
             | VmmActionError::MemoryHotplugUnsupported
+            | VmmActionError::PmemConfig(_)
             | VmmActionError::PmemUnsupported
             | VmmActionError::SerialConfig(_)
             | VmmActionError::SnapshotUnsupported
