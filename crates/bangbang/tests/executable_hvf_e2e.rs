@@ -1259,13 +1259,17 @@ mod macos_arm64 {
         let balloon_response = http_put_json(
             &socket_path,
             "/balloon",
-            r#"{"amount_mib":8,"deflate_on_oom":false}"#,
+            r#"{"amount_mib":8,"deflate_on_oom":false,"free_page_hinting":true}"#,
         );
         assert_no_content_response(&balloon_response, "PUT /balloon direct rootfs");
 
         let configured_balloon = http_get(&socket_path, "/balloon");
         assert_ok_response(&configured_balloon, "GET /balloon direct rootfs");
-        for expected in [r#""amount_mib":8"#, r#""deflate_on_oom":false"#] {
+        for expected in [
+            r#""amount_mib":8"#,
+            r#""deflate_on_oom":false"#,
+            r#""free_page_hinting":true"#,
+        ] {
             assert_response_contains(&configured_balloon, expected, "GET /balloon direct rootfs");
         }
 
@@ -1284,6 +1288,11 @@ mod macos_arm64 {
         assert_response_contains(
             &vm_config,
             r#""deflate_on_oom":false"#,
+            "GET /vm/config after PUT /balloon",
+        );
+        assert_response_contains(
+            &vm_config,
+            r#""free_page_hinting":true"#,
             "GET /vm/config after PUT /balloon",
         );
 
@@ -1358,6 +1367,16 @@ mod macos_arm64 {
                 &balloon_stats,
                 expected,
                 "GET /balloon/statistics direct rootfs",
+            );
+        }
+
+        let hinting_status = http_get(&socket_path, "/balloon/hinting/status");
+        assert_ok_response(&hinting_status, "GET /balloon/hinting/status direct rootfs");
+        for expected in [r#""host_cmd":0"#, r#""guest_cmd":null"#] {
+            assert_response_contains(
+                &hinting_status,
+                expected,
+                "GET /balloon/hinting/status direct rootfs",
             );
         }
 

@@ -1345,6 +1345,21 @@ impl BalloonStatsResponse {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BalloonHintingStatusResponse {
+    host_cmd: u32,
+    guest_cmd: Option<u32>,
+}
+
+impl BalloonHintingStatusResponse {
+    pub const fn new(host_cmd: u32, guest_cmd: Option<u32>) -> Self {
+        Self {
+            host_cmd,
+            guest_cmd,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct EntropyConfigResponse;
 
@@ -1788,6 +1803,13 @@ impl HttpResponse {
         }
     }
 
+    pub fn balloon_hinting_status(status: BalloonHintingStatusResponse) -> Self {
+        Self {
+            status: StatusCode::Ok,
+            body: balloon_hinting_status_response_value(&status).to_string(),
+        }
+    }
+
     pub fn fault(message: &str) -> Self {
         let body = serde_json::json!({ "fault_message": message }).to_string();
 
@@ -1956,6 +1978,15 @@ fn balloon_stats_response_value(stats: &BalloonStatsResponse) -> serde_json::Val
         "actual_pages": stats.actual_pages,
         "target_mib": stats.target_mib,
         "target_pages": stats.target_pages,
+    })
+}
+
+fn balloon_hinting_status_response_value(
+    status: &BalloonHintingStatusResponse,
+) -> serde_json::Value {
+    serde_json::json!({
+        "guest_cmd": status.guest_cmd,
+        "host_cmd": status.host_cmd,
     })
 }
 
@@ -7021,6 +7052,23 @@ mod tests {
                 "actual_pages": 513,
                 "target_mib": 4,
                 "target_pages": 1024,
+            })
+        );
+    }
+
+    #[test]
+    fn response_body_contains_balloon_hinting_status() {
+        let response =
+            HttpResponse::balloon_hinting_status(BalloonHintingStatusResponse::new(7, None));
+        let body: serde_json::Value =
+            serde_json::from_str(response.body()).expect("body should be JSON");
+
+        assert_eq!(response.status(), StatusCode::Ok);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "guest_cmd": null,
+                "host_cmd": 7,
             })
         );
     }

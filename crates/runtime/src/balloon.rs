@@ -201,6 +201,46 @@ impl std::error::Error for BalloonStatsError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BalloonHintingStatusError {
+    HintingNotEnabled,
+    ActiveSessionUnavailable,
+    ActiveSessionCommand { message: String },
+    MmioDispatcherUnavailable,
+    HandlerLookup(MmioHandlerLookupError),
+}
+
+impl fmt::Display for BalloonHintingStatusError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HintingNotEnabled => f.write_str("balloon free-page hinting is not enabled"),
+            Self::ActiveSessionUnavailable => {
+                f.write_str("active balloon device session is unavailable")
+            }
+            Self::ActiveSessionCommand { message } => {
+                write!(
+                    f,
+                    "active balloon device hinting status query failed: {message}"
+                )
+            }
+            Self::MmioDispatcherUnavailable => f.write_str("active MMIO dispatcher is unavailable"),
+            Self::HandlerLookup(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for BalloonHintingStatusError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::HandlerLookup(err) => Some(err),
+            Self::HintingNotEnabled
+            | Self::ActiveSessionUnavailable
+            | Self::ActiveSessionCommand { .. }
+            | Self::MmioDispatcherUnavailable => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BalloonConfigInput {
     amount_mib: u32,
@@ -368,6 +408,29 @@ impl BalloonStats {
 
     pub const fn actual_mib(self) -> u32 {
         self.actual_mib
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BalloonHintingStatus {
+    host_cmd: u32,
+    guest_cmd: Option<u32>,
+}
+
+impl BalloonHintingStatus {
+    pub const fn new(host_cmd: u32, guest_cmd: Option<u32>) -> Self {
+        Self {
+            host_cmd,
+            guest_cmd,
+        }
+    }
+
+    pub const fn host_cmd(self) -> u32 {
+        self.host_cmd
+    }
+
+    pub const fn guest_cmd(self) -> Option<u32> {
+        self.guest_cmd
     }
 }
 
@@ -2039,6 +2102,8 @@ pub struct VirtioBalloonDevice {
     queue_layout: VirtioBalloonQueueLayout,
     active_queues: Option<VirtioBalloonActiveQueues>,
     memory_accounting: VirtioBalloonMemoryAccounting,
+    hinting_host_cmd: u32,
+    hinting_guest_cmd: Option<u32>,
 }
 
 impl VirtioBalloonDevice {
@@ -2047,6 +2112,8 @@ impl VirtioBalloonDevice {
             queue_layout,
             active_queues: None,
             memory_accounting: VirtioBalloonMemoryAccounting::new(),
+            hinting_host_cmd: VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
+            hinting_guest_cmd: None,
         }
     }
 
@@ -2068,6 +2135,17 @@ impl VirtioBalloonDevice {
 
     pub const fn memory_accounting(&self) -> &VirtioBalloonMemoryAccounting {
         &self.memory_accounting
+    }
+
+    pub fn hinting_status(&self) -> Result<BalloonHintingStatus, BalloonHintingStatusError> {
+        if self.queue_layout.free_page_hinting().is_none() {
+            return Err(BalloonHintingStatusError::HintingNotEnabled);
+        }
+
+        Ok(BalloonHintingStatus::new(
+            self.hinting_host_cmd,
+            self.hinting_guest_cmd,
+        ))
     }
 
     pub fn activate_balloon(
@@ -2220,10 +2298,18 @@ impl VirtioBalloonDevice {
     pub fn reset(&mut self) {
         self.active_queues = None;
         self.memory_accounting = VirtioBalloonMemoryAccounting::new();
+        self.hinting_host_cmd = VIRTIO_BALLOON_FREE_PAGE_HINT_STOP;
+        self.hinting_guest_cmd = None;
     }
 }
 
 impl VirtioMmioRegisterHandler<VirtioBalloonConfigSpace, VirtioBalloonDevice> {
+    pub fn balloon_hinting_status(
+        &self,
+    ) -> Result<BalloonHintingStatus, BalloonHintingStatusError> {
+        self.activation_handler().hinting_status()
+    }
+
     pub fn dispatch_balloon_queue_notifications(
         &mut self,
         memory: &mut GuestMemory,
@@ -5112,6 +5198,31 @@ mod tests {
         assert!(active.statistics().is_some());
         assert!(active.free_page_hinting().is_some());
         assert!(active.free_page_reporting().is_some());
+    }
+
+    #[test]
+    fn balloon_device_hinting_status_reports_initial_state_before_activation() {
+        let layout = prepared(balloon_config(64, false, 0, true, false)).queue_layout();
+        let device = VirtioBalloonDevice::new(layout);
+
+        let status = device
+            .hinting_status()
+            .expect("hinting-enabled device should report initial status");
+
+        assert_eq!(status.host_cmd(), VIRTIO_BALLOON_FREE_PAGE_HINT_STOP);
+        assert_eq!(status.guest_cmd(), None);
+    }
+
+    #[test]
+    fn balloon_device_hinting_status_rejects_disabled_hinting() {
+        let layout = prepared(balloon_config(64, false, 0, false, false)).queue_layout();
+        let device = VirtioBalloonDevice::new(layout);
+
+        let err = device
+            .hinting_status()
+            .expect_err("hinting-disabled device should reject status");
+
+        assert_eq!(err, BalloonHintingStatusError::HintingNotEnabled);
     }
 
     #[test]

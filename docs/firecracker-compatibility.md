@@ -420,9 +420,10 @@ fields and duplicate token bucket fields before VMM dispatch.
 | `PUT /balloon` | `amount_mib` | required; stored pre-boot | Stored as an unsigned 32-bit Firecracker-shaped target balloon size and returned by `GET /balloon` and `GET /vm/config`. Values larger than current configured guest memory fail without mutating any prior balloon config. The internal virtio-balloon foundation converts this value to 4 KiB `num_pages` with checked arithmetic and exposes it through the startup-attached config space. Runtime `PATCH /balloon` can update the same stored target and active config-space value after startup. `GET /balloon/statistics` reports this current target through the required `target_*` fields. Guest-reported optional statistics, statistics polling, and host reclaim remain deferred. |
 | `PUT /balloon` | `deflate_on_oom` | required; stored pre-boot | Stored as a boolean and returned by `GET /balloon` and `GET /vm/config`. The internal foundation advertises `VIRTIO_BALLOON_F_DEFLATE_ON_OOM` only when this is enabled. Real guest OOM deflation behavior remains deferred. |
 | `PUT /balloon` | `stats_polling_interval_s` | optional; stored pre-boot | Missing values follow Firecracker's parser default shape and are stored as `0`. Nonzero values add the internal statistics feature bit and queue metadata. Real statistics polling remains deferred. |
-| `PUT /balloon` | `free_page_hinting` | optional; stored pre-boot | Missing values follow Firecracker's parser default shape and are stored as `false`. `true` adds the internal free-page hinting feature bit and queue metadata. Real free-page hinting remains deferred. |
+| `PUT /balloon` | `free_page_hinting` | optional; stored pre-boot | Missing values follow Firecracker's parser default shape and are stored as `false`. `true` adds the internal free-page hinting feature bit and queue metadata. Runtime `GET /balloon/hinting/status` can return the initial read-only host command state when this is enabled. Real free-page hinting remains deferred. |
 | `PUT /balloon` | `free_page_reporting` | optional; stored pre-boot | Missing values follow Firecracker's parser default shape and are stored as `false`. `true` adds the internal free-page reporting feature bit and queue metadata. Real free-page reporting remains deferred. |
 | `PUT /balloon` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
+| `GET /balloon/hinting/status` | response body | runtime read-only initial status implemented | Before startup this remains a state-specific unsupported action. After startup, requests without a configured balloon or with `free_page_hinting: false` return the existing balloon unsupported fault. With `free_page_hinting: true`, bangbang returns Firecracker-shaped `host_cmd` and `guest_cmd` fields from the active device state; current initial state is `host_cmd: 0` and `guest_cmd: null`. Start/stop commands, hinting queue processing, guest acknowledgement, and host reclaim remain deferred. |
 | `PATCH /balloon` | `amount_mib` | required; runtime target update implemented | Parsed as an unsigned 32-bit Firecracker-shaped target balloon size before VMM dispatch. After startup with a configured balloon device, the value replaces the stored `amount_mib`, updates active virtio-balloon `num_pages`, increments config generation, and raises a config interrupt. Values larger than configured guest memory or not representable as 4 KiB pages fail without mutating stored config. |
 | `PATCH /balloon` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PATCH /balloon/statistics` | `stats_polling_interval_s` | required; unsupported after parser validation | Parsed as an unsigned 16-bit Firecracker-shaped polling interval before VMM dispatch. The value is not retained or echoed by the current unsupported action path. Real statistics polling remains deferred. |
@@ -714,8 +715,10 @@ with 256 descriptors per queue, and Firecracker's 12-byte config space:
 
 Startup can attach this model as a virtio-mmio/FDT device with the configured
 identity, feature, queue, and config-space registers. Guest config-space writes
-update only the local device register state. The backend-neutral inflate queue
-dispatcher reads bounded PFN descriptor payloads, compacts them into page ranges,
+update only the local device register state. The read-only hinting status API
+reports the active device's internal host command state and no guest command
+until real hinting runs exist. The backend-neutral inflate queue dispatcher
+reads bounded PFN descriptor payloads, compacts them into page ranges,
 and publishes zero-length used-ring entries; the deflate queue dispatcher
 also reads bounded PFN descriptor payloads, compacts them into page ranges, and
 publishes zero-length used-ring entries. Boot runtime resources and the HVF boot
