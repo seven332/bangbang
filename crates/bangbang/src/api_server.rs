@@ -21,9 +21,9 @@ use bangbang_api::http::{
     MachineConfigPatchRequest, MachineConfigRequest, MachineConfigResponse, MetricsConfigRequest,
     MmdsConfigRequest, MmdsConfigResponse, MmdsContentRequest, MmdsVersion as ApiMmdsVersion,
     NetworkInterfaceConfigRequest, NetworkInterfaceConfigResponse, NetworkInterfacePatchRequest,
-    RequestError, SerialConfigRequest, VmConfigResponse, VmStateUpdate, VmStateUpdateRequest,
-    VsockConfigRequest, VsockConfigResponse, api_request_metric_endpoint, parse_request_with_limit,
-    request_total_len_with_limit,
+    PmemConfigRequest, PmemConfigResponse, RequestError, SerialConfigRequest, VmConfigResponse,
+    VmStateUpdate, VmStateUpdateRequest, VsockConfigRequest, VsockConfigResponse,
+    api_request_metric_endpoint, parse_request_with_limit, request_total_len_with_limit,
 };
 use bangbang_runtime::balloon::{BalloonConfig, BalloonConfigInput};
 use bangbang_runtime::block::{
@@ -47,6 +47,7 @@ use bangbang_runtime::network::MAX_NETWORK_INTERFACE_COUNT;
 use bangbang_runtime::network::{
     NetworkInterfaceConfig, NetworkInterfaceConfigInput, NetworkInterfaceUpdateInput,
 };
+use bangbang_runtime::pmem::{PmemConfig, PmemConfigInput};
 use bangbang_runtime::serial::SerialConfigInput;
 use bangbang_runtime::vsock::{VsockConfig, VsockConfigInput};
 use bangbang_runtime::{
@@ -741,7 +742,9 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PutEntropy(config) => handle_empty(vmm.handle_action(VmmAction::PutEntropy(
             entropy_config_input_from_request(config.as_ref()),
         ))),
-        ApiRequest::PutPmem => handle_empty(vmm.handle_put_request(PutApiRequest::pmem())),
+        ApiRequest::PutPmem(config) => handle_empty(vmm.handle_put_request(PutApiRequest::pmem(
+            pmem_config_input_from_request(config.as_ref()),
+        ))),
         ApiRequest::PatchPmem => handle_empty(vmm.handle_patch_request(PatchApiRequest::pmem())),
         ApiRequest::PutSnapshotCreate => handle_empty(vmm.handle_action(VmmAction::CreateSnapshot)),
         ApiRequest::PutSnapshotLoad(_) => handle_empty(vmm.handle_action(VmmAction::LoadSnapshot)),
@@ -795,7 +798,7 @@ fn request_uses_deprecated_api(request: &ApiRequest) -> bool {
         | ApiRequest::PutMetrics(_)
         | ApiRequest::PutMmds(_)
         | ApiRequest::PutNetworkInterface(_)
-        | ApiRequest::PutPmem
+        | ApiRequest::PutPmem(_)
         | ApiRequest::PutSerial(_)
         | ApiRequest::PutSnapshotCreate => false,
     }
@@ -862,6 +865,9 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         ApiRequest::PutNetworkInterface(config) => Some(VmmAction::PutNetworkInterface(
             network_interface_config_input_from_request(config.as_ref()),
         )),
+        ApiRequest::PutPmem(config) => Some(VmmAction::PutPmem(pmem_config_input_from_request(
+            config.as_ref(),
+        ))),
         ApiRequest::PutSerial(config) => Some(VmmAction::PutSerial(
             serial_config_input_from_request(config.as_ref()),
         )),
@@ -892,7 +898,6 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         | ApiRequest::PutAction(_)
         | ApiRequest::PutMemoryHotplug
         | ApiRequest::PutMmds(_)
-        | ApiRequest::PutPmem
         | ApiRequest::PutSnapshotCreate
         | ApiRequest::PutSnapshotLoad(_) => None,
     }
@@ -1064,6 +1069,13 @@ fn vm_config_response_from_runtime(config: &VmConfiguration) -> VmConfigResponse
             .balloon_config()
             .map(balloon_config_response_from_runtime),
     )
+    .with_pmem(
+        config
+            .pmem_configs()
+            .iter()
+            .map(pmem_config_response_from_runtime)
+            .collect(),
+    )
 }
 
 fn balloon_config_response_from_runtime(config: BalloonConfig) -> BalloonConfigResponse {
@@ -1080,6 +1092,15 @@ fn entropy_config_response_from_runtime(
     _config: bangbang_runtime::entropy::EntropyConfig,
 ) -> EntropyConfigResponse {
     EntropyConfigResponse::new()
+}
+
+fn pmem_config_response_from_runtime(config: &PmemConfig) -> PmemConfigResponse {
+    PmemConfigResponse::new(
+        config.id(),
+        config.path_on_host(),
+        config.root_device(),
+        config.read_only(),
+    )
 }
 
 fn machine_config_response_from_runtime(config: MachineConfig) -> MachineConfigResponse {
@@ -1387,6 +1408,18 @@ fn serial_config_input_from_request(config: &SerialConfigRequest) -> SerialConfi
 
 fn entropy_config_input_from_request(config: &EntropyConfigRequest) -> EntropyConfigInput {
     let mut input = EntropyConfigInput::new();
+
+    if config.rate_limiter_configured() {
+        input = input.with_rate_limiter_configured();
+    }
+
+    input
+}
+
+fn pmem_config_input_from_request(config: &PmemConfigRequest) -> PmemConfigInput {
+    let mut input = PmemConfigInput::new(config.body_pmem_id(), config.path_on_host())
+        .with_root_device(config.root_device())
+        .with_read_only(config.read_only());
 
     if config.rate_limiter_configured() {
         input = input.with_rate_limiter_configured();
@@ -4274,10 +4307,7 @@ mod tests {
             "pm-put",
             &request_with_body("PUT", "/pmem/pmem0", valid_put_body),
         );
-        assert!(valid_put_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        assert!(
-            valid_put_response.contains(r#"{"fault_message":"Pmem device is not supported."}"#)
-        );
+        assert!(valid_put_response.starts_with("HTTP/1.1 204 No Content\r\n"));
 
         let malformed_put_response = request_over_socket(
             &mut vmm,
@@ -4326,7 +4356,7 @@ mod tests {
             fs::read_to_string(&metrics_path).expect("metrics output should be readable");
         assert_eq!(
             metrics_output,
-            "{\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":2,\"pmem_fails\":2},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":2,\"pmem_fails\":2,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":2,\"pmem_fails\":2},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":2,\"pmem_fails\":1,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
         assert!(!metrics_output.contains("pmem0"));
         assert!(!metrics_output.contains("/private/tmp/pmem.img"));
@@ -6151,20 +6181,42 @@ mod tests {
     #[test]
     fn returns_fault_for_pmem_endpoints() {
         let mut vmm = test_controller();
-        for (socket_name, request, fault_message) in [
-            (
-                "p-put",
-                request_with_body(
-                    "PUT",
-                    "/pmem/pmem0",
-                    r#"{"id":"pmem0","path_on_host":"/tmp/pmem.img"}"#,
-                ),
-                "Pmem device is not supported.",
+        let put_response = request_over_socket(
+            &mut vmm,
+            "p-put",
+            &request_with_body(
+                "PUT",
+                "/pmem/pmem0",
+                r#"{"id":"pmem0","path_on_host":"/tmp/pmem.img","root_device":true,"read_only":false}"#,
             ),
+        );
+        assert!(put_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let vm_config_response = request_over_socket(
+            &mut vmm,
+            "p-get",
+            "GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(vm_config_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(vm_config_response.contains(r#""pmem":[{"#));
+        assert!(vm_config_response.contains(r#""id":"pmem0""#));
+        assert!(vm_config_response.contains(r#""path_on_host":"/tmp/pmem.img""#));
+        assert!(vm_config_response.contains(r#""root_device":true"#));
+        assert!(vm_config_response.contains(r#""read_only":false"#));
+
+        for (socket_name, request, fault_message) in [
             (
                 "p-put-bad",
                 request_with_body("PUT", "/pmem/pmem0", r#"{"id":"pmem0"}"#),
                 "Malformed HTTP request.",
+            ),
+            (
+                "p-put-rate-limiter",
+                request_with_body(
+                    "PUT",
+                    "/pmem/pmem0",
+                    r#"{"id":"pmem0","path_on_host":"/tmp/pmem-new.img","rate_limiter":{"ops":{"size":1,"refill_time":1}}}"#,
+                ),
+                "pmem rate_limiter is not supported",
             ),
             (
                 "p-patch",
@@ -6197,6 +6249,14 @@ mod tests {
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::NotStarted
         );
+        let data = vmm
+            .handle_action(VmmAction::GetVmConfig)
+            .expect("VM config should be returned");
+        let VmmData::VmConfiguration(config) = data else {
+            panic!("expected VM config");
+        };
+        assert_eq!(config.pmem_configs().len(), 1);
+        assert_eq!(config.pmem_configs()[0].path_on_host(), "/tmp/pmem.img");
     }
 
     #[test]

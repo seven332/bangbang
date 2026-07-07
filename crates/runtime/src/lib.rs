@@ -14,6 +14,7 @@ pub mod metrics;
 pub mod mmds;
 pub mod mmio;
 pub mod network;
+pub mod pmem;
 pub mod serial;
 pub mod startup;
 pub mod virtio_mmio;
@@ -89,7 +90,7 @@ pub enum VmmAction {
     PutMemoryHotplug,
     PatchMemoryHotplug,
     PutEntropy(entropy::EntropyConfigInput),
-    PutPmem,
+    PutPmem(pmem::PmemConfigInput),
     PatchPmem,
     PutBootSource(boot::BootSourceConfigInput),
     PutCpuConfig(cpu::CpuConfigInput),
@@ -165,7 +166,7 @@ impl VmmAction {
             Self::PutMemoryHotplug => "PutMemoryHotplug",
             Self::PatchMemoryHotplug => "PatchMemoryHotplug",
             Self::PutEntropy(_) => "PutEntropy",
-            Self::PutPmem => "PutPmem",
+            Self::PutPmem(_) => "PutPmem",
             Self::PatchPmem => "PatchPmem",
             Self::PutBootSource(_) => "PutBootSource",
             Self::PutCpuConfig(_) => "PutCpuConfig",
@@ -208,6 +209,7 @@ pub struct VmConfiguration {
     vsock_config: Option<vsock::VsockConfig>,
     entropy_config: Option<entropy::EntropyConfig>,
     balloon_config: Option<balloon::BalloonConfig>,
+    pmem_configs: Vec<pmem::PmemConfig>,
 }
 
 impl VmConfiguration {
@@ -229,6 +231,7 @@ impl VmConfiguration {
             vsock_config,
             entropy_config,
             balloon_config: None,
+            pmem_configs: Vec::new(),
         }
     }
 
@@ -237,6 +240,11 @@ impl VmConfiguration {
         balloon_config: Option<balloon::BalloonConfig>,
     ) -> Self {
         self.balloon_config = balloon_config;
+        self
+    }
+
+    pub fn with_pmem_configs(mut self, pmem_configs: Vec<pmem::PmemConfig>) -> Self {
+        self.pmem_configs = pmem_configs;
         self
     }
 
@@ -271,6 +279,10 @@ impl VmConfiguration {
     pub const fn balloon_config(&self) -> Option<balloon::BalloonConfig> {
         self.balloon_config
     }
+
+    pub fn pmem_configs(&self) -> &[pmem::PmemConfig] {
+        &self.pmem_configs
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -301,6 +313,7 @@ pub enum VmmActionError {
     NetworkInterfaceUpdate(network::NetworkInterfaceUpdateError),
     NetworkInterfaceUpdateUnsupported,
     MemoryHotplugUnsupported,
+    PmemConfig(pmem::PmemConfigError),
     PmemUnsupported,
     SerialConfig(serial::SerialConfigError),
     SnapshotUnsupported,
@@ -344,6 +357,7 @@ impl fmt::Display for VmmActionError {
                 f.write_str("Network interface updates are not supported.")
             }
             Self::MemoryHotplugUnsupported => f.write_str("Memory hotplug is not supported."),
+            Self::PmemConfig(err) => write!(f, "{err}"),
             Self::PmemUnsupported => f.write_str("Pmem device is not supported."),
             Self::SerialConfig(err) => write!(f, "{err}"),
             Self::SnapshotUnsupported => f.write_str("Snapshot and restore are not supported."),
@@ -370,6 +384,7 @@ impl std::error::Error for VmmActionError {
             Self::MmdsState(err) => Some(err),
             Self::NetworkInterfaceConfig(err) => Some(err),
             Self::NetworkInterfaceUpdate(err) => Some(err),
+            Self::PmemConfig(err) => Some(err),
             Self::SerialConfig(err) => Some(err),
             Self::VsockConfig(err) => Some(err),
             Self::BalloonUnsupported
@@ -396,6 +411,7 @@ pub struct VmmController {
     vsock_config: Option<vsock::VsockConfig>,
     entropy_config: Option<entropy::EntropyConfig>,
     balloon_config: Option<balloon::BalloonConfig>,
+    pmem_configs: pmem::PmemConfigs,
     serial_config: serial::SerialConfig,
     logger_state: logger::LoggerState,
     metrics_state: metrics::MetricsState,
@@ -436,6 +452,7 @@ impl VmmController {
             vsock_config: None,
             entropy_config: None,
             balloon_config: None,
+            pmem_configs: pmem::PmemConfigs::new(),
             serial_config: serial::SerialConfig::default(),
             logger_state: logger::LoggerState::default(),
             metrics_state: metrics::MetricsState::default(),
@@ -469,6 +486,10 @@ impl VmmController {
         self.balloon_config
     }
 
+    pub fn pmem_configs(&self) -> &[pmem::PmemConfig] {
+        self.pmem_configs.as_slice()
+    }
+
     pub const fn serial_config(&self) -> &serial::SerialConfig {
         &self.serial_config
     }
@@ -499,7 +520,8 @@ impl VmmController {
             self.vsock_config.clone(),
             self.entropy_config,
         )
-        .with_balloon_config(self.balloon_config))
+        .with_balloon_config(self.balloon_config)
+        .with_pmem_configs(self.pmem_configs.as_slice().to_vec()))
     }
 
     pub fn updated_drive_config(
@@ -878,15 +900,21 @@ impl VmmController {
 
                 Err(VmmActionError::MemoryHotplugUnsupported)
             }
-            VmmAction::PutPmem => {
+            VmmAction::PutPmem(config) => {
                 if self.instance_info.state != InstanceState::NotStarted {
                     return Err(VmmActionError::UnsupportedState {
                         action: action_name,
                         state: self.instance_info.state,
                     });
                 }
+                if config.rate_limiter_configured() {
+                    return Err(VmmActionError::PmemConfig(
+                        pmem::PmemConfigError::UnsupportedRateLimiter,
+                    ));
+                }
 
-                Err(VmmActionError::PmemUnsupported)
+                self.pmem_configs.upsert(config.into());
+                Ok(VmmData::Empty)
             }
             VmmAction::PatchPmem => {
                 if self.instance_info.state == InstanceState::NotStarted {
@@ -1209,6 +1237,7 @@ mod tests {
             GuestMacAddress, MAX_NETWORK_INTERFACE_COUNT, NetworkInterfaceConfigError,
             NetworkInterfaceConfigInput, NetworkInterfaceUpdateError, NetworkInterfaceUpdateInput,
         },
+        pmem::{PmemConfigError, PmemConfigInput},
         serial::{SerialConfigError, SerialConfigInput},
         vsock::{MIN_GUEST_CID, VsockConfigError, VsockConfigInput},
     };
@@ -1219,6 +1248,10 @@ mod tests {
 
     fn network_input(id: &str, host_dev_name: &str) -> NetworkInterfaceConfigInput {
         NetworkInterfaceConfigInput::new(id, id, host_dev_name)
+    }
+
+    fn pmem_input(id: &str, path_on_host: &str) -> PmemConfigInput {
+        PmemConfigInput::new(id, path_on_host)
     }
 
     fn vsock_input(guest_cid: u32, uds_path: &str) -> VsockConfigInput {
@@ -1479,6 +1512,13 @@ mod tests {
         controller
             .handle_action(VmmAction::PutBalloon(balloon_input(64, true)))
             .expect("balloon config should be stored");
+        controller
+            .handle_action(VmmAction::PutPmem(
+                pmem_input("pmem0", "/tmp/pmem.img")
+                    .with_root_device(true)
+                    .with_read_only(true),
+            ))
+            .expect("pmem config should be stored");
 
         let data = controller
             .handle_action(VmmAction::GetVmConfig)
@@ -1538,6 +1578,11 @@ mod tests {
             config.balloon_config(),
             Some(BalloonConfig::from(balloon_input(64, true)))
         );
+        assert_eq!(config.pmem_configs().len(), 1);
+        assert_eq!(config.pmem_configs()[0].id(), "pmem0");
+        assert_eq!(config.pmem_configs()[0].path_on_host(), "/tmp/pmem.img");
+        assert!(config.pmem_configs()[0].root_device());
+        assert!(config.pmem_configs()[0].read_only());
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
     }
 
@@ -1567,6 +1612,7 @@ mod tests {
         assert_eq!(config.vsock_config(), None);
         assert_eq!(config.entropy_config(), None);
         assert_eq!(config.balloon_config(), None);
+        assert!(config.pmem_configs().is_empty());
     }
 
     #[test]
@@ -1605,7 +1651,10 @@ mod tests {
             VmmAction::PutEntropy(EntropyConfigInput::new()).name(),
             "PutEntropy"
         );
-        assert_eq!(VmmAction::PutPmem.name(), "PutPmem");
+        assert_eq!(
+            VmmAction::PutPmem(pmem_input("pmem0", "/tmp/pmem.img")).name(),
+            "PutPmem"
+        );
         assert_eq!(VmmAction::PatchPmem.name(), "PatchPmem");
         assert_eq!(
             VmmAction::PutCpuConfig(CpuConfigInput::noop()).name(),
@@ -2214,21 +2263,72 @@ mod tests {
     }
 
     #[test]
-    fn put_pmem_reaches_pmem_fault_before_start_without_mutating() {
+    fn put_pmem_stores_and_replaces_before_start() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         controller
             .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
             .expect("boot source config should be stored");
 
-        let err = controller
-            .handle_action(VmmAction::PutPmem)
-            .expect_err("pmem should remain unsupported");
+        assert_eq!(
+            controller.handle_action(VmmAction::PutPmem(pmem_input("pmem0", "/tmp/pmem-old.img"))),
+            Ok(VmmData::Empty)
+        );
+        assert_eq!(
+            controller.handle_action(VmmAction::PutPmem(
+                pmem_input("pmem1", "/tmp/pmem-other.img").with_read_only(true)
+            )),
+            Ok(VmmData::Empty)
+        );
+        assert_eq!(
+            controller.handle_action(VmmAction::PutPmem(
+                pmem_input("pmem0", "/tmp/pmem-new.img").with_root_device(true)
+            )),
+            Ok(VmmData::Empty)
+        );
 
-        assert_eq!(err, VmmActionError::PmemUnsupported);
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
         assert!(controller.boot_source_config().is_some());
         assert!(controller.drive_configs().is_empty());
         assert!(controller.network_interface_configs().is_empty());
+        assert_eq!(controller.pmem_configs().len(), 2);
+        assert_eq!(controller.pmem_configs()[0].id(), "pmem0");
+        assert_eq!(
+            controller.pmem_configs()[0].path_on_host(),
+            "/tmp/pmem-new.img"
+        );
+        assert!(controller.pmem_configs()[0].root_device());
+        assert!(!controller.pmem_configs()[0].read_only());
+        assert_eq!(controller.pmem_configs()[1].id(), "pmem1");
+        assert_eq!(
+            controller.pmem_configs()[1].path_on_host(),
+            "/tmp/pmem-other.img"
+        );
+        assert!(!controller.pmem_configs()[1].root_device());
+        assert!(controller.pmem_configs()[1].read_only());
+    }
+
+    #[test]
+    fn put_pmem_rejects_rate_limiter_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutPmem(pmem_input("pmem0", "/tmp/pmem-old.img")))
+            .expect("pmem config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PutPmem(
+                pmem_input("pmem0", "/tmp/pmem-new.img").with_rate_limiter_configured(),
+            ))
+            .expect_err("configured pmem rate limiter should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::PmemConfig(PmemConfigError::UnsupportedRateLimiter)
+        );
+        assert_eq!(controller.pmem_configs().len(), 1);
+        assert_eq!(
+            controller.pmem_configs()[0].path_on_host(),
+            "/tmp/pmem-old.img"
+        );
     }
 
     #[test]
@@ -2253,6 +2353,7 @@ mod tests {
         assert!(controller.boot_source_config().is_some());
         assert!(controller.drive_configs().is_empty());
         assert!(controller.network_interface_configs().is_empty());
+        assert!(controller.pmem_configs().is_empty());
     }
 
     #[test]
@@ -2265,13 +2366,13 @@ mod tests {
             controller.instance_info.state = state;
 
             let err = controller
-                .handle_action(VmmAction::PutPmem)
+                .handle_action(VmmAction::PutPmem(pmem_input("pmem0", "/tmp/pmem.img")))
                 .expect_err("pmem put should be pre-boot-only");
 
             assert_eq!(
                 err,
                 VmmActionError::UnsupportedState {
-                    action: VmmAction::PutPmem.name(),
+                    action: VmmAction::PutPmem(pmem_input("pmem0", "/tmp/pmem.img")).name(),
                     state,
                 }
             );
@@ -2279,6 +2380,7 @@ mod tests {
             assert!(controller.boot_source_config().is_some());
             assert!(controller.drive_configs().is_empty());
             assert!(controller.network_interface_configs().is_empty());
+            assert!(controller.pmem_configs().is_empty());
         }
     }
 
@@ -2300,6 +2402,7 @@ mod tests {
             assert!(controller.boot_source_config().is_some());
             assert!(controller.drive_configs().is_empty());
             assert!(controller.network_interface_configs().is_empty());
+            assert!(controller.pmem_configs().is_empty());
         }
     }
 

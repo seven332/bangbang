@@ -257,6 +257,18 @@ fn config_file_actions_from_str(contents: &str) -> Result<Vec<VmmAction>, Config
         }
     }
 
+    if let Some(pmem_devices) = object.get("pmem") {
+        for pmem in config_section_array("pmem", pmem_devices)? {
+            let pmem_id = config_section_string_field("pmem", pmem, "id")?;
+            requests.push(config_section_request(
+                "pmem",
+                "PUT",
+                format!("/pmem/{pmem_id}"),
+                pmem,
+            )?);
+        }
+    }
+
     if let Some(network_interfaces) = object.get("network-interfaces") {
         for network_interface in config_section_array("network-interfaces", network_interfaces)? {
             let iface_id =
@@ -469,9 +481,9 @@ fn validate_config_file_sections(
     for section in object.keys() {
         match section.as_str() {
             "balloon" | "boot-source" | "cpu-config" | "drives" | "logger" | "machine-config"
-            | "metrics" | "mmds-config" | "network-interfaces" | "serial" | "vsock" | "entropy" => {
-            }
-            "memory-hotplug" | "pmem" => {
+            | "metrics" | "mmds-config" | "network-interfaces" | "pmem" | "serial" | "vsock"
+            | "entropy" => {}
+            "memory-hotplug" => {
                 return Err(ConfigFileError::UnsupportedSection(section.clone()));
             }
             _ => return Err(ConfigFileError::UnknownSection(section.clone())),
@@ -1586,6 +1598,7 @@ mod tests {
     use bangbang_runtime::machine::{MAX_MEM_SIZE_MIB, MachineConfigError};
     use bangbang_runtime::metrics::{MetricsConfigError, MetricsConfigInput, MetricsDiagnostics};
     use bangbang_runtime::mmds::MmdsDataStoreError;
+    use bangbang_runtime::pmem::{PmemConfigError, PmemConfigInput};
     use bangbang_runtime::serial::SerialConfigError;
     use bangbang_runtime::{BackendError, InstanceState, VmmAction, VmmActionError, VmmData};
 
@@ -2938,6 +2951,11 @@ mod tests {
                     "is_root_device": true,
                     "is_read_only": true
                 }}],
+                "pmem": [{{
+                    "id": "pmem0",
+                    "path_on_host": "/tmp/pmem.img",
+                    "read_only": true
+                }}],
                 "metrics": {{"metrics_path": {metrics_path_json}}},
                 "logger": {{"log_path": {logger_path_json}, "show_level": true}},
                 "serial": {{"serial_out_path": {serial_path_json}}},
@@ -2972,6 +2990,11 @@ mod tests {
             panic!("expected VM config");
         };
         assert!(config.entropy_config().is_some());
+        assert_eq!(config.pmem_configs().len(), 1);
+        assert_eq!(config.pmem_configs()[0].id(), "pmem0");
+        assert_eq!(config.pmem_configs()[0].path_on_host(), "/tmp/pmem.img");
+        assert!(!config.pmem_configs()[0].root_device());
+        assert!(config.pmem_configs()[0].read_only());
 
         vmm.handle_action(VmmAction::FlushMetrics)
             .expect("flush metrics should succeed");
@@ -3269,6 +3292,25 @@ mod tests {
     }
 
     #[test]
+    fn config_file_accepts_pmem_section() {
+        let actions = super::config_file_actions_from_str(
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"pmem":[{"id":"pmem0","path_on_host":"/tmp/pmem.img","root_device":true,"read_only":false},{"id":"pmem1","path_on_host":"/tmp/pmem-other.img","rate_limiter":{}}]}"#,
+        )
+        .expect("pmem config section should parse");
+
+        assert_eq!(
+            actions,
+            [
+                VmmAction::PutBootSource(BootSourceConfigInput::new("/tmp/vmlinux")),
+                VmmAction::PutPmem(
+                    PmemConfigInput::new("pmem0", "/tmp/pmem.img").with_root_device(true)
+                ),
+                VmmAction::PutPmem(PmemConfigInput::new("pmem1", "/tmp/pmem-other.img")),
+            ]
+        );
+    }
+
+    #[test]
     fn config_file_rejects_malformed_balloon_section() {
         for config in [
             r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"balloon":"bad"}"#,
@@ -3285,6 +3327,33 @@ mod tests {
                     source: super::RequestError::MalformedRequest
                 },
                 "{config}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_file_rejects_malformed_pmem_section() {
+        for config in [
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"pmem":"bad"}"#,
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"pmem":[{"id":"pmem0"}]}"#,
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"pmem":[{"id":"pmem0","path_on_host":"/tmp/pmem.img","unknown":true}]}"#,
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"pmem":[{"id":"pmem0","path_on_host":"/tmp/pmem.img","rate_limiter":"bad"}]}"#,
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"pmem":[{"id":"pmem0","path_on_host":"/tmp/pmem.img"},{"id":"other","path_on_host":"/tmp/pmem.img","id":"pmem1"}]}"#,
+        ] {
+            let err = super::config_file_actions_from_str(config)
+                .expect_err("malformed pmem section should fail");
+
+            assert!(
+                matches!(
+                    err,
+                    super::ConfigFileError::Malformed
+                        | super::ConfigFileError::MalformedSection { section: "pmem" }
+                        | super::ConfigFileError::Request {
+                            section: "pmem",
+                            source: super::RequestError::MalformedRequest
+                        }
+                ),
+                "{config}: {err:?}"
             );
         }
     }
@@ -3308,6 +3377,50 @@ mod tests {
                 "{config}"
             );
         }
+    }
+
+    #[test]
+    fn config_file_pmem_rate_limiter_fails_before_starting() {
+        let config_path = unique_config_path("pmem-rate-limiter");
+        let config = r#"{
+            "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
+            "pmem":[
+                {"id":"pmem0","path_on_host":"/tmp/pmem-old.img"},
+                {"id":"pmem0","path_on_host":"/tmp/pmem-new.img","rate_limiter":{"ops":{"size":1,"refill_time":1}}}
+            ]
+        }"#;
+        fs::write(&config_path, config).expect("config file should be written");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        let err = super::apply_startup_config_file(
+            &mut vmm,
+            Some(config_path.to_str().expect("UTF-8 path")),
+        )
+        .expect_err("configured pmem rate limiter should fail");
+
+        assert_eq!(
+            err,
+            ProcessError::ConfigFile(super::ConfigFileError::Apply(VmmActionError::PmemConfig(
+                PmemConfigError::UnsupportedRateLimiter
+            )))
+        );
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+        let data = vmm
+            .handle_action(VmmAction::GetVmConfig)
+            .expect("VM config should be returned");
+        let VmmData::VmConfiguration(config) = data else {
+            panic!("expected VM config");
+        };
+        assert_eq!(config.pmem_configs().len(), 1);
+        assert_eq!(config.pmem_configs()[0].path_on_host(), "/tmp/pmem-old.img");
+
+        fs::remove_file(config_path).expect("fixture config should clean up");
     }
 
     #[test]
