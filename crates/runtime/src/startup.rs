@@ -1614,8 +1614,9 @@ impl Arm64BootResources {
             .load(&layout, &mut memory)
             .map_err(|source| Arm64BootResourceError::BootSourceLoad { source })?;
         append_root_drive_command_line(&mut loaded_boot_source, controller.drive_configs())?;
-        let prepared_pmems = PreparedPmemDevices::from_config_slice(controller.pmem_configs())
-            .map_err(|source| Arm64BootResourceError::PreparePmemDevices { source })?;
+        let prepared_pmems =
+            PreparedPmemDevices::from_config_slice_with_layout(controller.pmem_configs(), &layout)
+                .map_err(|source| Arm64BootResourceError::PreparePmemDevices { source })?;
 
         let prepared_blocks =
             PreparedBlockDevices::from_config_slice(controller.drive_configs())
@@ -4124,6 +4125,22 @@ mod tests {
             VIRTIO_PMEM_ALIGNMENT
         );
         assert!(!resources.pmem_devices[0].mapping().is_read_only());
+        assert_eq!(
+            resources.pmem_devices[0].guest_range().start(),
+            GuestAddress::new(aarch64::FIRST_ADDR_PAST_64BITS_MMIO)
+        );
+        assert_eq!(
+            resources.pmem_devices[0].guest_range().size(),
+            VIRTIO_PMEM_ALIGNMENT
+        );
+        assert_eq!(
+            resources.pmem_devices[0].config_space().start(),
+            aarch64::FIRST_ADDR_PAST_64BITS_MMIO
+        );
+        assert_eq!(
+            resources.pmem_devices[0].config_space().size(),
+            VIRTIO_PMEM_ALIGNMENT
+        );
         assert_eq!(resources.pmem_devices[1].id(), "pmem1");
         assert_eq!(resources.pmem_devices[1].backing().len(), 6);
         assert!(resources.pmem_devices[1].backing().is_read_only());
@@ -4133,6 +4150,19 @@ mod tests {
             VIRTIO_PMEM_ALIGNMENT
         );
         assert!(resources.pmem_devices[1].mapping().is_read_only());
+        assert_eq!(
+            resources.pmem_devices[1].guest_range().start(),
+            GuestAddress::new(aarch64::FIRST_ADDR_PAST_64BITS_MMIO + VIRTIO_PMEM_ALIGNMENT)
+        );
+        assert_eq!(
+            resources.pmem_devices[1].guest_range().size(),
+            VIRTIO_PMEM_ALIGNMENT
+        );
+        assert!(
+            !resources.pmem_devices[0]
+                .guest_range()
+                .overlaps(resources.pmem_devices[1].guest_range())
+        );
         assert!(resources.mmio_dispatcher.regions().is_empty());
         assert_eq!(
             resources.loaded_boot_source.command_line.as_str(),
@@ -4158,6 +4188,14 @@ mod tests {
         assert_eq!(parts.runtime.pmem_devices[0].mapping().file_len(), 4);
         assert_eq!(
             parts.runtime.pmem_devices[0].mapping().mapped_len(),
+            VIRTIO_PMEM_ALIGNMENT
+        );
+        assert_eq!(
+            parts.runtime.pmem_devices[0].config_space().start(),
+            aarch64::FIRST_ADDR_PAST_64BITS_MMIO
+        );
+        assert_eq!(
+            parts.runtime.pmem_devices[0].config_space().size(),
             VIRTIO_PMEM_ALIGNMENT
         );
     }

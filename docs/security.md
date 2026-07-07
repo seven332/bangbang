@@ -110,11 +110,15 @@ is resource-specific:
   `GET /vm/config`. Startup opens each configured path with nonblocking
   read/write access according to the configured read-only flag, verifies it is a
   non-zero regular file, mmaps it to a 2 MiB-aligned host range, and keeps the
-  file handles and mappings with the boot resources. It does not normalize or
-  attach those paths to a guest-visible virtio-pmem device yet. The internal
-  virtio-pmem config-space and host mapping model does not expose host backing
-  bytes until guest attachment is implemented. Configured rate limiters are
-  rejected without replacing stored pmem configuration.
+  file handles and mappings with the boot resources. Startup also assigns
+  deterministic non-overlapping 2 MiB-aligned guest physical ranges after the
+  aarch64 MMIO64 gap, skipping current guest RAM, and records those ranges in
+  the internal virtio-pmem config-space `start`/`size` fields. It does not
+  normalize or attach those paths to a guest-visible virtio-pmem device yet.
+  The internal virtio-pmem config-space and host mapping model does not expose
+  host backing bytes until guest attachment and HVF guest-memory registration
+  are implemented. Configured rate limiters are rejected without replacing
+  stored pmem configuration.
 - `/snapshot/create` and `/snapshot/load` currently parse Firecracker-shaped
   snapshot paths before returning unsupported faults, and they do not open or
   create snapshot state or memory files. Future snapshot support must treat

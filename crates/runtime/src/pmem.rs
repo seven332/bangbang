@@ -14,6 +14,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::memory::{GuestAddress, GuestMemoryError, GuestMemoryLayout, GuestMemoryRange, aarch64};
 use crate::mmio::{MmioAccessBytes, MmioAccessBytesError, MmioHandlerError};
 use crate::virtio_mmio::{
     VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError, VirtioMmioDeviceConfigHandler,
@@ -788,12 +789,15 @@ pub struct PreparedPmemDevice {
     id: String,
     backing: PmemFileBacking,
     mapping: PmemBackingMapping,
+    guest_range: GuestMemoryRange,
+    config_space: VirtioPmemConfigSpace,
 }
 
 impl PreparedPmemDevice {
-    fn from_config_with_mapper(
+    fn from_config_with_mapper_and_allocator(
         config: &PmemConfig,
         mapper: &mut impl PmemBackingMapper,
+        allocator: &mut PmemGuestRangeAllocator<'_>,
     ) -> Result<Self, PreparedPmemDeviceError> {
         let backing = PmemFileBacking::open(config).map_err(|source| {
             PreparedPmemDeviceError::OpenBacking {
@@ -808,11 +812,21 @@ impl PreparedPmemDevice {
                     pmem_id: config.id().to_string(),
                     source,
                 })?;
+        let guest_range = allocator.allocate(mapping.mapped_len()).map_err(|source| {
+            PreparedPmemDeviceError::AllocateGuestRange {
+                pmem_id: config.id().to_string(),
+                source,
+            }
+        })?;
+        let config_space =
+            VirtioPmemConfigSpace::new(guest_range.start().raw_value(), guest_range.size());
 
         Ok(Self {
             id: config.id().to_string(),
             backing,
             mapping,
+            guest_range,
+            config_space,
         })
     }
 
@@ -828,8 +842,30 @@ impl PreparedPmemDevice {
         &self.mapping
     }
 
-    pub fn into_parts(self) -> (String, PmemFileBacking, PmemBackingMapping) {
-        (self.id, self.backing, self.mapping)
+    pub const fn guest_range(&self) -> GuestMemoryRange {
+        self.guest_range
+    }
+
+    pub const fn config_space(&self) -> VirtioPmemConfigSpace {
+        self.config_space
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        String,
+        PmemFileBacking,
+        PmemBackingMapping,
+        GuestMemoryRange,
+        VirtioPmemConfigSpace,
+    ) {
+        (
+            self.id,
+            self.backing,
+            self.mapping,
+            self.guest_range,
+            self.config_space,
+        )
     }
 }
 
@@ -839,20 +875,41 @@ pub struct PreparedPmemDevices {
 }
 
 impl PreparedPmemDevices {
-    pub fn from_configs(configs: &PmemConfigs) -> Result<Self, PreparedPmemDeviceError> {
-        Self::from_config_slice(configs.as_slice())
+    pub fn from_configs(
+        configs: &PmemConfigs,
+        layout: &GuestMemoryLayout,
+    ) -> Result<Self, PreparedPmemDeviceError> {
+        Self::from_config_slice_with_layout(configs.as_slice(), layout)
     }
 
-    pub(crate) fn from_config_slice(
+    pub(crate) fn from_config_slice_with_layout(
         configs: &[PmemConfig],
+        layout: &GuestMemoryLayout,
     ) -> Result<Self, PreparedPmemDeviceError> {
+        let mut mapper = SystemPmemBackingMapper;
+        let mut allocator = PmemGuestRangeAllocator::for_layout(layout);
+        Self::from_config_slice_with_mapper_and_allocator(configs, &mut mapper, &mut allocator)
+    }
+
+    #[cfg(test)]
+    fn from_config_slice(configs: &[PmemConfig]) -> Result<Self, PreparedPmemDeviceError> {
         let mut mapper = SystemPmemBackingMapper;
         Self::from_config_slice_with_mapper(configs, &mut mapper)
     }
 
+    #[cfg(test)]
     fn from_config_slice_with_mapper(
         configs: &[PmemConfig],
         mapper: &mut impl PmemBackingMapper,
+    ) -> Result<Self, PreparedPmemDeviceError> {
+        let mut allocator = PmemGuestRangeAllocator::without_reserved_ranges();
+        Self::from_config_slice_with_mapper_and_allocator(configs, mapper, &mut allocator)
+    }
+
+    fn from_config_slice_with_mapper_and_allocator(
+        configs: &[PmemConfig],
+        mapper: &mut impl PmemBackingMapper,
+        allocator: &mut PmemGuestRangeAllocator<'_>,
     ) -> Result<Self, PreparedPmemDeviceError> {
         let mut devices = Vec::new();
         devices
@@ -860,7 +917,9 @@ impl PreparedPmemDevices {
             .map_err(|source| PreparedPmemDeviceError::AllocateDevices { source })?;
 
         for config in configs {
-            devices.push(PreparedPmemDevice::from_config_with_mapper(config, mapper)?);
+            devices.push(PreparedPmemDevice::from_config_with_mapper_and_allocator(
+                config, mapper, allocator,
+            )?);
         }
 
         Ok(Self { devices })
@@ -896,6 +955,10 @@ pub enum PreparedPmemDeviceError {
         pmem_id: String,
         source: PmemBackingMappingError,
     },
+    AllocateGuestRange {
+        pmem_id: String,
+        source: PmemGuestRangeAllocationError,
+    },
 }
 
 impl fmt::Display for PreparedPmemDeviceError {
@@ -910,6 +973,12 @@ impl fmt::Display for PreparedPmemDeviceError {
             Self::MapBacking { pmem_id, source } => {
                 write!(f, "failed to map pmem device {pmem_id}: {source}")
             }
+            Self::AllocateGuestRange { pmem_id, source } => {
+                write!(
+                    f,
+                    "failed to allocate guest range for pmem device {pmem_id}: {source}"
+                )
+            }
         }
     }
 }
@@ -920,8 +989,143 @@ impl std::error::Error for PreparedPmemDeviceError {
             Self::AllocateDevices { source } => Some(source),
             Self::OpenBacking { source, .. } => Some(source),
             Self::MapBacking { source, .. } => Some(source),
+            Self::AllocateGuestRange { source, .. } => Some(source),
         }
     }
+}
+
+#[derive(Debug)]
+struct PmemGuestRangeAllocator<'a> {
+    next_start: u64,
+    reserved_ranges: &'a [GuestMemoryRange],
+}
+
+impl<'a> PmemGuestRangeAllocator<'a> {
+    fn for_layout(layout: &'a GuestMemoryLayout) -> Self {
+        Self {
+            next_start: aarch64::FIRST_ADDR_PAST_64BITS_MMIO,
+            reserved_ranges: layout.ranges(),
+        }
+    }
+
+    #[cfg(test)]
+    fn without_reserved_ranges() -> Self {
+        Self {
+            next_start: aarch64::FIRST_ADDR_PAST_64BITS_MMIO,
+            reserved_ranges: &[],
+        }
+    }
+
+    #[cfg(test)]
+    fn with_start_for_test(next_start: u64, reserved_ranges: &'a [GuestMemoryRange]) -> Self {
+        Self {
+            next_start,
+            reserved_ranges,
+        }
+    }
+
+    fn allocate(&mut self, size: u64) -> Result<GuestMemoryRange, PmemGuestRangeAllocationError> {
+        if !size.is_multiple_of(VIRTIO_PMEM_ALIGNMENT) {
+            return Err(PmemGuestRangeAllocationError::UnalignedSize {
+                size,
+                alignment: VIRTIO_PMEM_ALIGNMENT,
+            });
+        }
+
+        let mut candidate = align_pmem_guest_address(self.next_start)?;
+        loop {
+            let range = build_pmem_guest_range(candidate, size)?;
+            let Some(overlap) = self
+                .reserved_ranges
+                .iter()
+                .copied()
+                .find(|reserved| range.overlaps(*reserved))
+            else {
+                self.next_start = range.end_exclusive().raw_value();
+                return Ok(range);
+            };
+
+            candidate = align_pmem_guest_address(overlap.end_exclusive().raw_value())?;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmemGuestRangeAllocationError {
+    UnalignedSize {
+        size: u64,
+        alignment: u64,
+    },
+    AddressAlignmentOverflow {
+        address: u64,
+        alignment: u64,
+    },
+    InvalidRange {
+        start: GuestAddress,
+        size: u64,
+        source: GuestMemoryError,
+    },
+}
+
+impl fmt::Display for PmemGuestRangeAllocationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnalignedSize { size, alignment } => write!(
+                f,
+                "pmem guest range size {size} is not aligned to {alignment} bytes"
+            ),
+            Self::AddressAlignmentOverflow { address, alignment } => write!(
+                f,
+                "pmem guest address 0x{address:x} cannot be aligned to {alignment} bytes without overflow"
+            ),
+            Self::InvalidRange {
+                start,
+                size,
+                source,
+            } => write!(
+                f,
+                "invalid pmem guest range at {start} with size {size}: {source}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PmemGuestRangeAllocationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidRange { source, .. } => Some(source),
+            Self::UnalignedSize { .. } | Self::AddressAlignmentOverflow { .. } => None,
+        }
+    }
+}
+
+fn align_pmem_guest_address(address: u64) -> Result<u64, PmemGuestRangeAllocationError> {
+    let remainder = address % VIRTIO_PMEM_ALIGNMENT;
+    if remainder == 0 {
+        return Ok(address);
+    }
+
+    let padding = VIRTIO_PMEM_ALIGNMENT - remainder;
+    address
+        .checked_add(padding)
+        .ok_or(PmemGuestRangeAllocationError::AddressAlignmentOverflow {
+            address,
+            alignment: VIRTIO_PMEM_ALIGNMENT,
+        })
+}
+
+fn build_pmem_guest_range(
+    start: u64,
+    size: u64,
+) -> Result<GuestMemoryRange, PmemGuestRangeAllocationError> {
+    let start = GuestAddress::new(start);
+    GuestMemoryRange::new(start, size).map_err(|source| {
+        PmemGuestRangeAllocationError::InvalidRange {
+            start,
+            size,
+            source,
+        }
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1011,7 +1215,7 @@ mod tests {
 
     use super::*;
 
-    use crate::memory::GuestAddress;
+    use crate::memory::{GuestAddress, GuestMemoryLayout, GuestMemoryRange, aarch64};
     use crate::mmio::{MmioAccess, MmioAccessBytes, MmioBus, MmioOperation, MmioRegionId};
     use crate::virtio_mmio::{
         VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioAccess,
@@ -1020,6 +1224,7 @@ mod tests {
 
     const TEST_PMEM_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_0000);
     const TEST_PMEM_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(9000);
+    const TEST_PMEM_START: u64 = aarch64::FIRST_ADDR_PAST_64BITS_MMIO;
     static NEXT_TEMP_PATH_ID: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Debug)]
@@ -1142,6 +1347,15 @@ mod tests {
     fn map_backing(path: &Path, read_only: bool) -> PmemBackingMapping {
         let backing = open_backing(path, read_only).expect("pmem backing should open");
         PmemBackingMapping::map(&backing).expect("pmem backing should map")
+    }
+
+    fn guest_range(start: u64, size: u64) -> GuestMemoryRange {
+        GuestMemoryRange::new(GuestAddress::new(start), size)
+            .expect("test guest range should be valid")
+    }
+
+    fn guest_layout(ranges: Vec<GuestMemoryRange>) -> GuestMemoryLayout {
+        GuestMemoryLayout::new(ranges).expect("test guest layout should be valid")
     }
 
     #[derive(Debug)]
@@ -1606,6 +1820,145 @@ mod tests {
     }
 
     #[test]
+    fn guest_range_allocator_starts_after_mmio64_gap() {
+        let layout = guest_layout(vec![guest_range(aarch64::DRAM_MEM_START, 8 * 1024 * 1024)]);
+        let mut allocator = PmemGuestRangeAllocator::for_layout(&layout);
+
+        let range = allocator
+            .allocate(VIRTIO_PMEM_ALIGNMENT)
+            .expect("pmem guest range should allocate");
+
+        assert_eq!(range.start(), GuestAddress::new(TEST_PMEM_START));
+        assert_eq!(range.size(), VIRTIO_PMEM_ALIGNMENT);
+        assert_eq!(
+            range.end_exclusive(),
+            GuestAddress::new(TEST_PMEM_START + VIRTIO_PMEM_ALIGNMENT)
+        );
+    }
+
+    #[test]
+    fn guest_range_allocator_allocates_multiple_devices_in_order() {
+        let mut allocator = PmemGuestRangeAllocator::without_reserved_ranges();
+
+        let first = allocator
+            .allocate(VIRTIO_PMEM_ALIGNMENT * 2)
+            .expect("first pmem guest range should allocate");
+        let second = allocator
+            .allocate(VIRTIO_PMEM_ALIGNMENT)
+            .expect("second pmem guest range should allocate");
+
+        assert_eq!(first.start(), GuestAddress::new(TEST_PMEM_START));
+        assert_eq!(first.size(), VIRTIO_PMEM_ALIGNMENT * 2);
+        assert_eq!(
+            second.start(),
+            GuestAddress::new(TEST_PMEM_START + (VIRTIO_PMEM_ALIGNMENT * 2))
+        );
+        assert_eq!(second.size(), VIRTIO_PMEM_ALIGNMENT);
+        assert!(!first.overlaps(second));
+    }
+
+    #[test]
+    fn guest_range_allocator_skips_guest_ram_after_mmio64_gap() {
+        let high_ram_size = VIRTIO_PMEM_ALIGNMENT * 3;
+        let layout = guest_layout(vec![
+            guest_range(aarch64::DRAM_MEM_START, 8 * 1024 * 1024),
+            guest_range(aarch64::FIRST_ADDR_PAST_64BITS_MMIO, high_ram_size),
+        ]);
+        let mut allocator = PmemGuestRangeAllocator::for_layout(&layout);
+
+        let range = allocator
+            .allocate(VIRTIO_PMEM_ALIGNMENT)
+            .expect("pmem guest range should skip high RAM");
+
+        assert_eq!(
+            range.start(),
+            GuestAddress::new(aarch64::FIRST_ADDR_PAST_64BITS_MMIO + high_ram_size)
+        );
+        assert_eq!(range.size(), VIRTIO_PMEM_ALIGNMENT);
+        for reserved in layout.ranges() {
+            assert!(!range.overlaps(*reserved));
+        }
+    }
+
+    #[test]
+    fn guest_range_allocator_skips_guest_ram_inside_candidate_range() {
+        let high_ram_start = TEST_PMEM_START + (VIRTIO_PMEM_ALIGNMENT * 4);
+        let high_ram_size = VIRTIO_PMEM_ALIGNMENT * 2;
+        let requested_size = VIRTIO_PMEM_ALIGNMENT * 6;
+        let layout = guest_layout(vec![
+            guest_range(aarch64::DRAM_MEM_START, 8 * 1024 * 1024),
+            guest_range(high_ram_start, high_ram_size),
+        ]);
+        let mut allocator = PmemGuestRangeAllocator::for_layout(&layout);
+
+        let range = allocator
+            .allocate(requested_size)
+            .expect("pmem guest range should skip later high RAM");
+
+        assert_eq!(
+            range.start(),
+            GuestAddress::new(high_ram_start + high_ram_size)
+        );
+        assert_eq!(range.size(), requested_size);
+        for reserved in layout.ranges() {
+            assert!(!range.overlaps(*reserved));
+        }
+    }
+
+    #[test]
+    fn guest_range_allocator_rejects_unaligned_size() {
+        let mut allocator = PmemGuestRangeAllocator::without_reserved_ranges();
+
+        let err = allocator
+            .allocate(VIRTIO_PMEM_ALIGNMENT - 1)
+            .expect_err("unaligned pmem size should fail");
+
+        assert_eq!(
+            err,
+            PmemGuestRangeAllocationError::UnalignedSize {
+                size: VIRTIO_PMEM_ALIGNMENT - 1,
+                alignment: VIRTIO_PMEM_ALIGNMENT,
+            }
+        );
+    }
+
+    #[test]
+    fn guest_range_allocator_rejects_address_alignment_overflow() {
+        let mut allocator = PmemGuestRangeAllocator::with_start_for_test(u64::MAX - 1, &[]);
+
+        let err = allocator
+            .allocate(VIRTIO_PMEM_ALIGNMENT)
+            .expect_err("unalignable high address should fail");
+
+        assert_eq!(
+            err,
+            PmemGuestRangeAllocationError::AddressAlignmentOverflow {
+                address: u64::MAX - 1,
+                alignment: VIRTIO_PMEM_ALIGNMENT,
+            }
+        );
+    }
+
+    #[test]
+    fn guest_range_allocator_rejects_range_end_overflow() {
+        let start = u64::MAX - VIRTIO_PMEM_ALIGNMENT + 1;
+        let mut allocator = PmemGuestRangeAllocator::with_start_for_test(start, &[]);
+
+        let err = allocator
+            .allocate(VIRTIO_PMEM_ALIGNMENT)
+            .expect_err("range ending past u64 should fail");
+
+        assert!(matches!(
+            err,
+            PmemGuestRangeAllocationError::InvalidRange {
+                start: error_start,
+                size,
+                source: GuestMemoryError::AddressOverflow { .. },
+            } if error_start == GuestAddress::new(start) && size == VIRTIO_PMEM_ALIGNMENT
+        ));
+    }
+
+    #[test]
     fn prepared_devices_open_all_configured_backings() {
         let first = temp_file("first-pmem.img", b"first");
         let second = temp_file("second-pmem.img", b"second");
@@ -1634,6 +1987,18 @@ mod tests {
             VIRTIO_PMEM_ALIGNMENT
         );
         assert!(!prepared.as_slice()[0].mapping().is_read_only());
+        assert_eq!(
+            prepared.as_slice()[0].guest_range(),
+            guest_range(TEST_PMEM_START, VIRTIO_PMEM_ALIGNMENT)
+        );
+        assert_eq!(
+            prepared.as_slice()[0].config_space(),
+            VirtioPmemConfigSpace::new(TEST_PMEM_START, VIRTIO_PMEM_ALIGNMENT)
+        );
+        assert_eq!(
+            prepared.as_slice()[0].config_space().to_le_bytes(),
+            VirtioPmemConfigSpace::new(TEST_PMEM_START, VIRTIO_PMEM_ALIGNMENT).to_le_bytes()
+        );
         assert_eq!(prepared.as_slice()[1].id(), "pmem1");
         assert_eq!(prepared.as_slice()[1].backing().len(), 6);
         assert!(prepared.as_slice()[1].backing().is_read_only());
@@ -1643,6 +2008,20 @@ mod tests {
             VIRTIO_PMEM_ALIGNMENT
         );
         assert!(prepared.as_slice()[1].mapping().is_read_only());
+        assert_eq!(
+            prepared.as_slice()[1].guest_range(),
+            guest_range(
+                TEST_PMEM_START + VIRTIO_PMEM_ALIGNMENT,
+                VIRTIO_PMEM_ALIGNMENT
+            )
+        );
+        assert_eq!(
+            prepared.as_slice()[1].config_space(),
+            VirtioPmemConfigSpace::new(
+                TEST_PMEM_START + VIRTIO_PMEM_ALIGNMENT,
+                VIRTIO_PMEM_ALIGNMENT,
+            )
+        );
     }
 
     #[test]
@@ -1703,6 +2082,43 @@ mod tests {
         ));
         assert_eq!(mapper.calls, 2);
         assert_eq!(drop_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn prepared_devices_cleanup_mappings_after_later_guest_range_failure() {
+        let first = temp_sized_file("first-range-cleanup-pmem.img", VIRTIO_PMEM_ALIGNMENT);
+        let second = temp_sized_file("second-range-cleanup-pmem.img", VIRTIO_PMEM_ALIGNMENT);
+        let configs = [
+            pmem_config(PmemConfigInput::new(
+                "pmem0",
+                first.as_path().to_string_lossy().into_owned(),
+            )),
+            pmem_config(PmemConfigInput::new(
+                "pmem1",
+                second.as_path().to_string_lossy().into_owned(),
+            )),
+        ];
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let mut mapper = ScriptedPmemBackingMapper::new(Arc::clone(&drop_count), usize::MAX);
+        let start = u64::MAX - (VIRTIO_PMEM_ALIGNMENT * 2) + 1;
+        let mut allocator = PmemGuestRangeAllocator::with_start_for_test(start, &[]);
+
+        let err = PreparedPmemDevices::from_config_slice_with_mapper_and_allocator(
+            &configs,
+            &mut mapper,
+            &mut allocator,
+        )
+        .expect_err("second pmem guest range should fail");
+
+        assert!(matches!(
+            err,
+            PreparedPmemDeviceError::AllocateGuestRange {
+                ref pmem_id,
+                source: PmemGuestRangeAllocationError::InvalidRange { .. },
+            } if pmem_id == "pmem1"
+        ));
+        assert_eq!(mapper.calls, 2);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 2);
     }
 
     #[test]
