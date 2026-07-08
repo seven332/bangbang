@@ -3153,6 +3153,41 @@ fn vsock_device_metrics_json_object(
     vsock
 }
 
+fn serial_output_metrics_json_object(
+    metrics: SerialOutputMetrics,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut uart = serde_json::Map::new();
+    uart.insert(
+        "error_count".to_string(),
+        serde_json::Value::Number(metrics.error_count().into()),
+    );
+    uart.insert(
+        "flush_count".to_string(),
+        serde_json::Value::Number(metrics.flush_count().into()),
+    );
+    uart.insert(
+        "missed_read_count".to_string(),
+        serde_json::Value::Number(metrics.missed_read_count().into()),
+    );
+    uart.insert(
+        "missed_write_count".to_string(),
+        serde_json::Value::Number(metrics.missed_write_count().into()),
+    );
+    uart.insert(
+        "read_count".to_string(),
+        serde_json::Value::Number(metrics.read_count().into()),
+    );
+    uart.insert(
+        "write_count".to_string(),
+        serde_json::Value::Number(metrics.write_count().into()),
+    );
+    uart.insert(
+        "rate_limiter_dropped_bytes".to_string(),
+        serde_json::Value::Number(metrics.rate_limiter_dropped_bytes().into()),
+    );
+    uart
+}
+
 fn latency_aggregate_metrics_json_object(
     metrics: VirtioBlockLatencyAggregate,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -3377,16 +3412,10 @@ impl MetricsSink {
         if let Some(serial_output_metrics) = diagnostics.serial_output_metrics()
             && !serial_output_metrics.is_empty()
         {
-            let mut uart = serde_json::Map::new();
-            if serial_output_metrics.rate_limiter_dropped_bytes() != 0 {
-                uart.insert(
-                    "rate_limiter_dropped_bytes".to_string(),
-                    serde_json::Value::Number(
-                        serial_output_metrics.rate_limiter_dropped_bytes().into(),
-                    ),
-                );
-            }
-            root.insert("uart".to_string(), serde_json::Value::Object(uart));
+            root.insert(
+                "uart".to_string(),
+                serde_json::Value::Object(serial_output_metrics_json_object(serial_output_metrics)),
+            );
         }
         if !patch_api_requests.is_empty() {
             let mut patch_requests = serde_json::Map::new();
@@ -3863,17 +3892,24 @@ mod tests {
     }
 
     #[test]
-    fn writes_serial_output_diagnostics_when_dropped_bytes_are_nonzero() {
+    fn writes_serial_output_diagnostics_when_uart_metrics_are_nonzero() {
         let output = TestMetricsOutput::default();
         let mut state = MetricsState::with_test_output(output.clone());
-        let diagnostics =
-            MetricsDiagnostics::new().with_serial_output_metrics(SerialOutputMetrics::new(3));
+        let diagnostics = MetricsDiagnostics::new().with_serial_output_metrics(
+            SerialOutputMetrics::default()
+                .with_error_count(1)
+                .with_missed_write_count(2)
+                .with_write_count(3)
+                .with_rate_limiter_dropped_bytes(4),
+        );
 
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
         assert_eq!(
             output.lines(),
-            [r#"{"uart":{"rate_limiter_dropped_bytes":3},"vmm":{"metrics_flush_count":1}}"#]
+            [
+                r#"{"uart":{"error_count":1,"flush_count":0,"missed_read_count":0,"missed_write_count":2,"rate_limiter_dropped_bytes":4,"read_count":0,"write_count":3},"vmm":{"metrics_flush_count":1}}"#
+            ]
         );
     }
 

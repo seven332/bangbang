@@ -7038,8 +7038,9 @@ mod tests {
     #[test]
     fn flush_metrics_includes_starter_serial_output_diagnostics() {
         let metrics = TempFilePath::create("metrics");
-        let starter_diagnostics =
-            MetricsDiagnostics::new().with_serial_output_metrics(SerialOutputMetrics::new(2));
+        let starter_diagnostics = MetricsDiagnostics::new().with_serial_output_metrics(
+            SerialOutputMetrics::default().with_rate_limiter_dropped_bytes(2),
+        );
         let mut vmm = ProcessVmm::with_starter(
             "demo-1",
             "0.1.0",
@@ -7063,7 +7064,7 @@ mod tests {
 
         assert_eq!(
             fs::read_to_string(metrics.path()).expect("metrics output should read"),
-            "{\"uart\":{\"rate_limiter_dropped_bytes\":2},\"vmm\":{\"boot_run_loop_status\":\"running\",\"metrics_flush_count\":1}}\n"
+            "{\"uart\":{\"error_count\":0,\"flush_count\":0,\"missed_read_count\":0,\"missed_write_count\":0,\"rate_limiter_dropped_bytes\":2,\"read_count\":0,\"write_count\":0},\"vmm\":{\"boot_run_loop_status\":\"running\",\"metrics_flush_count\":1}}\n"
         );
     }
 
