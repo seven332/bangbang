@@ -29,6 +29,17 @@ impl TokenBucketConfig {
     pub(crate) const fn refill_time(self) -> u64 {
         self.refill_time
     }
+
+    pub(crate) const fn is_enabled(self) -> bool {
+        if self.size == 0 {
+            return false;
+        }
+
+        match self.refill_time.checked_mul(NANOS_PER_MILLISECOND) {
+            Some(refill_time_nanos) => refill_time_nanos != 0,
+            None => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -47,7 +58,7 @@ impl TokenBucket {
 
     pub(crate) fn new_at(config: TokenBucketConfig, now: Instant) -> Option<Self> {
         let refill_time_nanos = config.refill_time().checked_mul(NANOS_PER_MILLISECOND)?;
-        if config.size() == 0 || refill_time_nanos == 0 {
+        if !config.is_enabled() {
             return None;
         }
 

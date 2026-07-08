@@ -117,10 +117,12 @@ is resource-specific:
   `PATCH /drives/{drive_id}` opens a replacement backing for an existing active
   drive before mutating stored configuration, refreshes only the matching
   virtio-block MMIO handler, and leaves the old backing and stored
-  configuration in place if opening or handler lookup fails. It does not
-  implement block-device hotplug or removal. Initial block rate limiters are
-  process-local runtime state created during startup preparation after backing
-  validation. Exhausted limiters leave the descriptor pending for a later
+  configuration in place if opening or handler lookup fails. Limiter-only
+  runtime updates do not reopen host backing paths; configured limiter buckets
+  update only process-local active device state and stored drive configuration.
+  It does not implement block-device hotplug or removal. Block rate limiters are
+  process-local runtime state created during startup preparation or runtime
+  drive update. Exhausted limiters leave the descriptor pending for a later
   dispatch opportunity instead of sleeping, busy-waiting, writing request
   status, publishing a used-ring entry, or mutating the backing file.
 - `/pmem/{id}` stores Firecracker-shaped pmem backing paths during pre-boot
