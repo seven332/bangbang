@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{LineWriter, Write};
@@ -1025,6 +1026,58 @@ impl BlockDeviceMetrics {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlockDeviceMetricsByDrive {
+    metrics: BTreeMap<String, BlockDeviceMetrics>,
+}
+
+impl BlockDeviceMetricsByDrive {
+    pub fn new() -> Self {
+        Self {
+            metrics: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_drive_metrics(
+        mut self,
+        drive_id: impl Into<String>,
+        metrics: BlockDeviceMetrics,
+    ) -> Self {
+        self.insert_drive_metrics(drive_id, metrics);
+        self
+    }
+
+    pub fn insert_drive_metrics(
+        &mut self,
+        drive_id: impl Into<String>,
+        metrics: BlockDeviceMetrics,
+    ) {
+        self.metrics
+            .entry(drive_id.into())
+            .and_modify(|existing| *existing = existing.merged_with(metrics))
+            .or_insert(metrics);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.metrics
+            .values()
+            .all(|metrics| BlockDeviceMetrics::is_empty(*metrics))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, BlockDeviceMetrics)> {
+        self.metrics
+            .iter()
+            .map(|(drive_id, metrics)| (drive_id.as_str(), *metrics))
+    }
+
+    fn merged_with(mut self, other: Self) -> Self {
+        for (drive_id, metrics) in other.metrics {
+            self.insert_drive_metrics(drive_id, metrics);
+        }
+        self
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SharedBlockDeviceMetrics {
     inner: Arc<SharedBlockDeviceMetricsInner>,
@@ -1134,6 +1187,91 @@ struct SharedBlockDeviceMetricsInner {
     write_bytes: AtomicU64,
     read_count: AtomicU64,
     write_count: AtomicU64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SharedBlockDeviceMetricsRegistry {
+    aggregate: SharedBlockDeviceMetrics,
+    per_drive: Arc<BTreeMap<String, SharedBlockDeviceMetrics>>,
+}
+
+impl SharedBlockDeviceMetricsRegistry {
+    pub fn from_drive_ids<'a>(drive_ids: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut per_drive = BTreeMap::new();
+        for drive_id in drive_ids {
+            per_drive
+                .entry(drive_id.to_string())
+                .or_insert_with(SharedBlockDeviceMetrics::default);
+        }
+
+        Self {
+            aggregate: SharedBlockDeviceMetrics::default(),
+            per_drive: Arc::new(per_drive),
+        }
+    }
+
+    pub fn aggregate(&self) -> SharedBlockDeviceMetrics {
+        self.aggregate.clone()
+    }
+
+    pub fn per_drive(&self, drive_id: &str) -> Option<SharedBlockDeviceMetrics> {
+        self.per_drive.get(drive_id).cloned()
+    }
+
+    pub fn record_notification_dispatch_for_drive(
+        &self,
+        drive_id: &str,
+        dispatch: &VirtioBlockDeviceNotificationDispatch,
+    ) {
+        self.aggregate.record_notification_dispatch(dispatch);
+        if let Some(metrics) = self.per_drive(drive_id) {
+            metrics.record_notification_dispatch(dispatch);
+        }
+    }
+
+    pub fn record_queue_dispatch_for_drive(
+        &self,
+        drive_id: &str,
+        dispatch: &VirtioBlockQueueDispatch,
+    ) {
+        self.aggregate.record_queue_dispatch(dispatch);
+        if let Some(metrics) = self.per_drive(drive_id) {
+            metrics.record_queue_dispatch(dispatch);
+        }
+    }
+
+    pub fn record_queue_events_for_drive(&self, drive_id: &str, count: u64) {
+        self.aggregate.record_queue_events(count);
+        if let Some(metrics) = self.per_drive(drive_id) {
+            metrics.record_queue_events(count);
+        }
+    }
+
+    pub fn record_event_failure(&self) {
+        self.aggregate.record_event_failure();
+    }
+
+    pub fn record_event_failure_for_drive(&self, drive_id: &str) {
+        self.aggregate.record_event_failure();
+        if let Some(metrics) = self.per_drive(drive_id) {
+            metrics.record_event_failure();
+        }
+    }
+
+    pub fn aggregate_snapshot(&self) -> BlockDeviceMetrics {
+        self.aggregate.snapshot()
+    }
+
+    pub fn per_drive_snapshot(&self) -> BlockDeviceMetricsByDrive {
+        let mut snapshot = BlockDeviceMetricsByDrive::new();
+        for (drive_id, metrics) in self.per_drive.iter() {
+            let metrics = metrics.snapshot();
+            if !metrics.is_empty() {
+                snapshot.insert_drive_metrics(drive_id.clone(), metrics);
+            }
+        }
+        snapshot
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1302,9 +1440,10 @@ fn record_atomic_metric(metric: &AtomicU64, increment: u64) {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MetricsDiagnostics {
     block_device_metrics: Option<BlockDeviceMetrics>,
+    block_device_metrics_by_drive: Option<BlockDeviceMetricsByDrive>,
     balloon_device_metrics: Option<BalloonDeviceMetrics>,
     boot_run_loop_status: Option<BootRunLoopMetricStatus>,
     start_time_us: Option<u64>,
@@ -1314,9 +1453,10 @@ pub struct MetricsDiagnostics {
 }
 
 impl MetricsDiagnostics {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             block_device_metrics: None,
+            block_device_metrics_by_drive: None,
             balloon_device_metrics: None,
             boot_run_loop_status: None,
             start_time_us: None,
@@ -1326,15 +1466,20 @@ impl MetricsDiagnostics {
         }
     }
 
-    pub const fn with_block_device_metrics(
-        mut self,
-        block_device_metrics: BlockDeviceMetrics,
-    ) -> Self {
+    pub fn with_block_device_metrics(mut self, block_device_metrics: BlockDeviceMetrics) -> Self {
         self.block_device_metrics = Some(block_device_metrics);
         self
     }
 
-    pub const fn with_balloon_device_metrics(
+    pub fn with_block_device_metrics_by_drive(
+        mut self,
+        block_device_metrics_by_drive: BlockDeviceMetricsByDrive,
+    ) -> Self {
+        self.block_device_metrics_by_drive = Some(block_device_metrics_by_drive);
+        self
+    }
+
+    pub fn with_balloon_device_metrics(
         mut self,
         balloon_device_metrics: BalloonDeviceMetrics,
     ) -> Self {
@@ -1342,27 +1487,27 @@ impl MetricsDiagnostics {
         self
     }
 
-    pub const fn with_boot_run_loop_status(mut self, status: BootRunLoopMetricStatus) -> Self {
+    pub fn with_boot_run_loop_status(mut self, status: BootRunLoopMetricStatus) -> Self {
         self.boot_run_loop_status = Some(status);
         self
     }
 
-    pub const fn with_start_time_us(mut self, start_time_us: u64) -> Self {
+    pub fn with_start_time_us(mut self, start_time_us: u64) -> Self {
         self.start_time_us = Some(start_time_us);
         self
     }
 
-    pub const fn with_start_time_cpu_us(mut self, start_time_cpu_us: u64) -> Self {
+    pub fn with_start_time_cpu_us(mut self, start_time_cpu_us: u64) -> Self {
         self.start_time_cpu_us = Some(start_time_cpu_us);
         self
     }
 
-    pub const fn with_parent_cpu_time_us(mut self, parent_cpu_time_us: u64) -> Self {
+    pub fn with_parent_cpu_time_us(mut self, parent_cpu_time_us: u64) -> Self {
         self.parent_cpu_time_us = Some(parent_cpu_time_us);
         self
     }
 
-    pub const fn with_serial_output_metrics(
+    pub fn with_serial_output_metrics(
         mut self,
         serial_output_metrics: SerialOutputMetrics,
     ) -> Self {
@@ -1370,9 +1515,15 @@ impl MetricsDiagnostics {
         self
     }
 
-    pub const fn merged_with(mut self, other: Self) -> Self {
+    pub fn merged_with(mut self, other: Self) -> Self {
         if let Some(metrics) = other.block_device_metrics {
             self.block_device_metrics = Some(match self.block_device_metrics {
+                Some(existing) => existing.merged_with(metrics),
+                None => metrics,
+            });
+        }
+        if let Some(metrics) = other.block_device_metrics_by_drive {
+            self.block_device_metrics_by_drive = Some(match self.block_device_metrics_by_drive {
                 Some(existing) => existing.merged_with(metrics),
                 None => metrics,
             });
@@ -1402,31 +1553,35 @@ impl MetricsDiagnostics {
         self
     }
 
-    pub const fn block_device_metrics(&self) -> Option<BlockDeviceMetrics> {
+    pub fn block_device_metrics(&self) -> Option<BlockDeviceMetrics> {
         self.block_device_metrics
     }
 
-    pub const fn balloon_device_metrics(&self) -> Option<BalloonDeviceMetrics> {
+    pub fn block_device_metrics_by_drive(&self) -> Option<&BlockDeviceMetricsByDrive> {
+        self.block_device_metrics_by_drive.as_ref()
+    }
+
+    pub fn balloon_device_metrics(&self) -> Option<BalloonDeviceMetrics> {
         self.balloon_device_metrics
     }
 
-    pub const fn boot_run_loop_status(&self) -> Option<BootRunLoopMetricStatus> {
+    pub fn boot_run_loop_status(&self) -> Option<BootRunLoopMetricStatus> {
         self.boot_run_loop_status
     }
 
-    pub const fn start_time_us(&self) -> Option<u64> {
+    pub fn start_time_us(&self) -> Option<u64> {
         self.start_time_us
     }
 
-    pub const fn start_time_cpu_us(&self) -> Option<u64> {
+    pub fn start_time_cpu_us(&self) -> Option<u64> {
         self.start_time_cpu_us
     }
 
-    pub const fn parent_cpu_time_us(&self) -> Option<u64> {
+    pub fn parent_cpu_time_us(&self) -> Option<u64> {
         self.parent_cpu_time_us
     }
 
-    pub const fn serial_output_metrics(&self) -> Option<SerialOutputMetrics> {
+    pub fn serial_output_metrics(&self) -> Option<SerialOutputMetrics> {
         self.serial_output_metrics
     }
 }
@@ -1482,6 +1637,49 @@ impl MetricsOutput for FileMetricsOutput {
             .flush()
             .map_err(|err| MetricsFlushError::Write(err.kind()))
     }
+}
+
+fn block_device_metrics_json_object(
+    metrics: BlockDeviceMetrics,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut block = serde_json::Map::new();
+    block.insert(
+        "event_fails".to_string(),
+        serde_json::Value::Number(metrics.event_fails().into()),
+    );
+    block.insert(
+        "execute_fails".to_string(),
+        serde_json::Value::Number(metrics.execute_fails().into()),
+    );
+    block.insert(
+        "flush_count".to_string(),
+        serde_json::Value::Number(metrics.flush_count().into()),
+    );
+    block.insert(
+        "invalid_reqs_count".to_string(),
+        serde_json::Value::Number(metrics.invalid_reqs_count().into()),
+    );
+    block.insert(
+        "queue_event_count".to_string(),
+        serde_json::Value::Number(metrics.queue_event_count().into()),
+    );
+    block.insert(
+        "read_bytes".to_string(),
+        serde_json::Value::Number(metrics.read_bytes().into()),
+    );
+    block.insert(
+        "read_count".to_string(),
+        serde_json::Value::Number(metrics.read_count().into()),
+    );
+    block.insert(
+        "write_bytes".to_string(),
+        serde_json::Value::Number(metrics.write_bytes().into()),
+    );
+    block.insert(
+        "write_count".to_string(),
+        serde_json::Value::Number(metrics.write_count().into()),
+    );
+    block
 }
 
 impl MetricsSink {
@@ -1561,47 +1759,23 @@ impl MetricsSink {
                 serde_json::Value::Object(deprecated),
             );
         }
+        if let Some(block_device_metrics_by_drive) = diagnostics.block_device_metrics_by_drive() {
+            for (drive_id, metrics) in block_device_metrics_by_drive.iter() {
+                if !metrics.is_empty() {
+                    root.insert(
+                        format!("block_{drive_id}"),
+                        serde_json::Value::Object(block_device_metrics_json_object(metrics)),
+                    );
+                }
+            }
+        }
         if let Some(block_device_metrics) = diagnostics.block_device_metrics()
             && !block_device_metrics.is_empty()
         {
-            let mut block = serde_json::Map::new();
-            block.insert(
-                "event_fails".to_string(),
-                serde_json::Value::Number(block_device_metrics.event_fails().into()),
+            root.insert(
+                "block".to_string(),
+                serde_json::Value::Object(block_device_metrics_json_object(block_device_metrics)),
             );
-            block.insert(
-                "execute_fails".to_string(),
-                serde_json::Value::Number(block_device_metrics.execute_fails().into()),
-            );
-            block.insert(
-                "flush_count".to_string(),
-                serde_json::Value::Number(block_device_metrics.flush_count().into()),
-            );
-            block.insert(
-                "invalid_reqs_count".to_string(),
-                serde_json::Value::Number(block_device_metrics.invalid_reqs_count().into()),
-            );
-            block.insert(
-                "queue_event_count".to_string(),
-                serde_json::Value::Number(block_device_metrics.queue_event_count().into()),
-            );
-            block.insert(
-                "read_bytes".to_string(),
-                serde_json::Value::Number(block_device_metrics.read_bytes().into()),
-            );
-            block.insert(
-                "read_count".to_string(),
-                serde_json::Value::Number(block_device_metrics.read_count().into()),
-            );
-            block.insert(
-                "write_bytes".to_string(),
-                serde_json::Value::Number(block_device_metrics.write_bytes().into()),
-            );
-            block.insert(
-                "write_count".to_string(),
-                serde_json::Value::Number(block_device_metrics.write_count().into()),
-            );
-            root.insert("block".to_string(), serde_json::Value::Object(block));
         }
         if let Some(balloon_device_metrics) = diagnostics.balloon_device_metrics()
             && !balloon_device_metrics.is_empty()
@@ -1893,9 +2067,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        BalloonDeviceMetrics, BlockDeviceMetrics, BootRunLoopMetricStatus, MetricsConfigError,
-        MetricsConfigInput, MetricsDiagnostics, MetricsFlushError, MetricsOutput, MetricsState,
-        SharedBalloonDeviceMetrics, SharedBlockDeviceMetrics,
+        BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive,
+        BootRunLoopMetricStatus, MetricsConfigError, MetricsConfigInput, MetricsDiagnostics,
+        MetricsFlushError, MetricsOutput, MetricsState, SharedBalloonDeviceMetrics,
+        SharedBlockDeviceMetrics, SharedBlockDeviceMetricsRegistry,
     };
     use crate::serial::SerialOutputMetrics;
 
@@ -2177,6 +2352,37 @@ mod tests {
     }
 
     #[test]
+    fn writes_block_device_metrics_by_drive_when_provided() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let rootfs_metrics = BlockDeviceMetrics::default()
+            .with_queue_event_count(1)
+            .with_read_bytes(512)
+            .with_read_count(1);
+        let data_metrics = BlockDeviceMetrics::default()
+            .with_queue_event_count(1)
+            .with_write_bytes(256)
+            .with_write_count(1);
+        let diagnostics = MetricsDiagnostics::new()
+            .with_block_device_metrics(rootfs_metrics.merged_with(data_metrics))
+            .with_block_device_metrics_by_drive(
+                BlockDeviceMetricsByDrive::new()
+                    .with_drive_metrics("rootfs", rootfs_metrics)
+                    .with_drive_metrics("noop", BlockDeviceMetrics::default())
+                    .with_drive_metrics("data", data_metrics),
+            );
+
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        assert_eq!(
+            output.lines(),
+            [
+                r#"{"block":{"event_fails":0,"execute_fails":0,"flush_count":0,"invalid_reqs_count":0,"queue_event_count":2,"read_bytes":512,"read_count":1,"write_bytes":256,"write_count":1},"block_data":{"event_fails":0,"execute_fails":0,"flush_count":0,"invalid_reqs_count":0,"queue_event_count":1,"read_bytes":0,"read_count":0,"write_bytes":256,"write_count":1},"block_rootfs":{"event_fails":0,"execute_fails":0,"flush_count":0,"invalid_reqs_count":0,"queue_event_count":1,"read_bytes":512,"read_count":1,"write_bytes":0,"write_count":0},"vmm":{"metrics_flush_count":1}}"#
+            ]
+        );
+    }
+
+    #[test]
     fn shared_block_device_metrics_snapshot_is_per_instance() {
         let first = SharedBlockDeviceMetrics::default();
         let second = SharedBlockDeviceMetrics::default();
@@ -2191,6 +2397,33 @@ mod tests {
                 .with_queue_event_count(2)
         );
         assert_eq!(second.snapshot(), BlockDeviceMetrics::default());
+    }
+
+    #[test]
+    fn shared_block_device_metrics_registry_snapshot_is_per_instance() {
+        let first = SharedBlockDeviceMetricsRegistry::from_drive_ids(["rootfs", "data"]);
+        let second = SharedBlockDeviceMetricsRegistry::from_drive_ids(["rootfs"]);
+
+        first.record_queue_events_for_drive("rootfs", 2);
+        first.record_event_failure_for_drive("rootfs");
+
+        assert_eq!(
+            first.aggregate_snapshot(),
+            BlockDeviceMetrics::default()
+                .with_event_fails(1)
+                .with_queue_event_count(2)
+        );
+        assert_eq!(
+            first.per_drive_snapshot(),
+            BlockDeviceMetricsByDrive::new().with_drive_metrics(
+                "rootfs",
+                BlockDeviceMetrics::default()
+                    .with_event_fails(1)
+                    .with_queue_event_count(2),
+            )
+        );
+        assert_eq!(second.aggregate_snapshot(), BlockDeviceMetrics::default());
+        assert!(second.per_drive_snapshot().is_empty());
     }
 
     #[test]
@@ -2238,6 +2471,41 @@ mod tests {
                     .with_write_count(u64::MAX)
             )
         );
+    }
+
+    #[test]
+    fn block_diagnostics_merge_per_drive_metrics_saturates() {
+        let base = MetricsDiagnostics::new().with_block_device_metrics_by_drive(
+            BlockDeviceMetricsByDrive::new().with_drive_metrics(
+                "rootfs",
+                BlockDeviceMetrics::default()
+                    .with_event_fails(u64::MAX - 1)
+                    .with_read_count(u64::MAX - 2),
+            ),
+        );
+        let additional = MetricsDiagnostics::new().with_block_device_metrics_by_drive(
+            BlockDeviceMetricsByDrive::new()
+                .with_drive_metrics("rootfs", block_metrics_with_all_fields())
+                .with_drive_metrics("data", BlockDeviceMetrics::default().with_write_count(3)),
+        );
+        let expected = BlockDeviceMetricsByDrive::new()
+            .with_drive_metrics(
+                "rootfs",
+                BlockDeviceMetrics::default()
+                    .with_event_fails(u64::MAX)
+                    .with_execute_fails(2)
+                    .with_invalid_reqs_count(3)
+                    .with_flush_count(4)
+                    .with_queue_event_count(5)
+                    .with_read_bytes(6)
+                    .with_write_bytes(7)
+                    .with_read_count(u64::MAX)
+                    .with_write_count(9),
+            )
+            .with_drive_metrics("data", BlockDeviceMetrics::default().with_write_count(3));
+        let merged = base.merged_with(additional);
+
+        assert_eq!(merged.block_device_metrics_by_drive(), Some(&expected));
     }
 
     #[test]
