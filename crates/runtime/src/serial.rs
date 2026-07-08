@@ -7,6 +7,7 @@ use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::mmio::{
     MmioAccess, MmioAccessBytes, MmioAccessBytesError, MmioHandler, MmioHandlerError,
@@ -35,17 +36,48 @@ pub trait SerialOutput: fmt::Debug + Send {
     fn write_byte(&mut self, byte: u8) -> Result<(), SerialOutputError>;
 }
 
+const NANOS_PER_MILLISECOND: u64 = 1_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SerialRateLimiterConfig {
+    size: u64,
+    one_time_burst: Option<u64>,
+    refill_time: u64,
+}
+
+impl SerialRateLimiterConfig {
+    pub const fn new(size: u64, one_time_burst: Option<u64>, refill_time: u64) -> Self {
+        Self {
+            size,
+            one_time_burst,
+            refill_time,
+        }
+    }
+
+    pub const fn size(self) -> u64 {
+        self.size
+    }
+
+    pub const fn one_time_burst(self) -> Option<u64> {
+        self.one_time_burst
+    }
+
+    pub const fn refill_time(self) -> u64 {
+        self.refill_time
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SerialConfigInput {
     serial_out_path: Option<String>,
-    rate_limiter_configured: bool,
+    rate_limiter: Option<SerialRateLimiterConfig>,
 }
 
 impl SerialConfigInput {
     pub const fn new() -> Self {
         Self {
             serial_out_path: None,
-            rate_limiter_configured: false,
+            rate_limiter: None,
         }
     }
 
@@ -54,8 +86,8 @@ impl SerialConfigInput {
         self
     }
 
-    pub const fn with_rate_limiter_configured(mut self) -> Self {
-        self.rate_limiter_configured = true;
+    pub const fn with_rate_limiter(mut self, rate_limiter: SerialRateLimiterConfig) -> Self {
+        self.rate_limiter = Some(rate_limiter);
         self
     }
 
@@ -63,8 +95,8 @@ impl SerialConfigInput {
         self.serial_out_path.as_deref()
     }
 
-    pub const fn rate_limiter_configured(&self) -> bool {
-        self.rate_limiter_configured
+    pub const fn rate_limiter(&self) -> Option<SerialRateLimiterConfig> {
+        self.rate_limiter
     }
 
     pub fn validate(self) -> Result<SerialConfig, SerialConfigError> {
@@ -75,11 +107,16 @@ impl SerialConfigInput {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SerialConfig {
     serial_out_path: Option<PathBuf>,
+    rate_limiter: Option<SerialRateLimiterConfig>,
 }
 
 impl SerialConfig {
     pub fn serial_out_path(&self) -> Option<&Path> {
         self.serial_out_path.as_deref()
+    }
+
+    pub const fn rate_limiter(&self) -> Option<SerialRateLimiterConfig> {
+        self.rate_limiter
     }
 }
 
@@ -87,10 +124,6 @@ impl TryFrom<SerialConfigInput> for SerialConfig {
     type Error = SerialConfigError;
 
     fn try_from(input: SerialConfigInput) -> Result<Self, Self::Error> {
-        if input.rate_limiter_configured {
-            return Err(SerialConfigError::RateLimiterUnsupported);
-        }
-
         if let Some(serial_out_path) = input.serial_out_path.as_deref() {
             if serial_out_path.is_empty() {
                 return Err(SerialConfigError::EmptyOutputPath);
@@ -102,6 +135,7 @@ impl TryFrom<SerialConfigInput> for SerialConfig {
 
         Ok(Self {
             serial_out_path: input.serial_out_path.map(PathBuf::from),
+            rate_limiter: input.rate_limiter,
         })
     }
 }
@@ -110,7 +144,6 @@ impl TryFrom<SerialConfigInput> for SerialConfig {
 pub enum SerialConfigError {
     EmptyOutputPath,
     InvalidOutputPath,
-    RateLimiterUnsupported,
     OpenOutput(std::io::ErrorKind),
 }
 
@@ -120,9 +153,6 @@ impl fmt::Display for SerialConfigError {
             Self::EmptyOutputPath => f.write_str("serial output path must not be empty"),
             Self::InvalidOutputPath => {
                 f.write_str("serial output path must not contain control characters")
-            }
-            Self::RateLimiterUnsupported => {
-                f.write_str("serial output rate limiting is not supported")
             }
             Self::OpenOutput(kind) => {
                 write!(f, "serial output could not be initialized: {kind:?}")
@@ -244,6 +274,16 @@ impl SharedSerialOutput {
             output: Arc::new(Mutex::new(Box::new(output))),
         }
     }
+
+    pub fn with_rate_limiter(
+        output: impl SerialOutput + 'static,
+        rate_limiter: Option<SerialRateLimiterConfig>,
+    ) -> Self {
+        match rate_limiter.and_then(SerialTokenBucket::new) {
+            Some(bucket) => Self::new(RateLimitedSerialOutput::from_bucket(output, bucket)),
+            None => Self::new(output),
+        }
+    }
 }
 
 impl From<SharedSerialOutputBuffer> for SharedSerialOutput {
@@ -260,6 +300,126 @@ impl SerialOutput for SharedSerialOutput {
             .map_err(|_| SerialOutputError::lock_poisoned())?;
 
         output.write_byte(byte)
+    }
+}
+
+#[derive(Debug)]
+struct RateLimitedSerialOutput<O> {
+    output: O,
+    bucket: SerialTokenBucket,
+}
+
+impl<O> RateLimitedSerialOutput<O> {
+    #[cfg(test)]
+    fn new(output: O, config: SerialRateLimiterConfig) -> Option<Self> {
+        SerialTokenBucket::new(config).map(|bucket| Self { output, bucket })
+    }
+
+    fn from_bucket(output: O, bucket: SerialTokenBucket) -> Self {
+        Self { output, bucket }
+    }
+}
+
+impl<O: SerialOutput> SerialOutput for RateLimitedSerialOutput<O> {
+    fn write_byte(&mut self, byte: u8) -> Result<(), SerialOutputError> {
+        if self.bucket.reduce_at(1, Instant::now()) {
+            self.output.write_byte(byte)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SerialTokenBucket {
+    size: u64,
+    refill_time_nanos: u64,
+    budget: u64,
+    one_time_burst: u64,
+    last_update: Instant,
+}
+
+impl SerialTokenBucket {
+    fn new(config: SerialRateLimiterConfig) -> Option<Self> {
+        Self::new_at(config, Instant::now())
+    }
+
+    fn new_at(config: SerialRateLimiterConfig, now: Instant) -> Option<Self> {
+        let refill_time_nanos = config.refill_time().checked_mul(NANOS_PER_MILLISECOND)?;
+        if config.size() == 0 || refill_time_nanos == 0 {
+            return None;
+        }
+
+        Some(Self {
+            size: config.size(),
+            refill_time_nanos,
+            budget: config.size(),
+            one_time_burst: config.one_time_burst().unwrap_or(0),
+            last_update: now,
+        })
+    }
+
+    fn reduce_at(&mut self, tokens: u64, now: Instant) -> bool {
+        if tokens == 0 {
+            return true;
+        }
+        if self.one_time_burst >= tokens {
+            self.one_time_burst -= tokens;
+            self.last_update = now;
+            return true;
+        }
+
+        let tokens = tokens.saturating_sub(self.one_time_burst);
+        self.one_time_burst = 0;
+        self.replenish_at(now);
+
+        if tokens > self.size {
+            self.budget = 0;
+            return false;
+        }
+        if tokens > self.budget {
+            return false;
+        }
+
+        self.budget -= tokens;
+        true
+    }
+
+    fn replenish_at(&mut self, now: Instant) {
+        if now <= self.last_update {
+            return;
+        }
+
+        let elapsed = now.duration_since(self.last_update);
+        let elapsed_nanos = elapsed.as_nanos();
+        let refill_time_nanos = u128::from(self.refill_time_nanos);
+        if elapsed_nanos >= refill_time_nanos {
+            self.budget = self.size;
+            self.last_update = now;
+            return;
+        }
+
+        let tokens = elapsed_nanos * u128::from(self.size) / refill_time_nanos;
+        if tokens == 0 {
+            return;
+        }
+
+        let budget = u128::from(self.budget)
+            .saturating_add(tokens)
+            .min(u128::from(self.size));
+        self.budget = match u64::try_from(budget) {
+            Ok(value) => value,
+            Err(_) => self.size,
+        };
+
+        let adjusted_nanos = tokens
+            .saturating_mul(refill_time_nanos)
+            .div_ceil(u128::from(self.size));
+        let adjusted_nanos = match u64::try_from(adjusted_nanos) {
+            Ok(value) => value,
+            Err(_) => self.refill_time_nanos,
+        };
+        self.last_update += Duration::from_nanos(adjusted_nanos);
     }
 }
 
@@ -653,10 +813,10 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::{
-        SERIAL_INTERRUPT_ENABLE_REGISTER_OFFSET,
+        RateLimitedSerialOutput, SERIAL_INTERRUPT_ENABLE_REGISTER_OFFSET,
         SERIAL_INTERRUPT_IDENTIFICATION_NO_INTERRUPT_PENDING,
         SERIAL_INTERRUPT_IDENTIFICATION_REGISTER_OFFSET, SERIAL_LINE_CONTROL_DLAB,
         SERIAL_LINE_CONTROL_REGISTER_OFFSET, SERIAL_LINE_STATUS_DEFAULT,
@@ -665,7 +825,7 @@ mod tests {
         SERIAL_OUTPUT_BUFFER_DEFAULT_LIMIT, SERIAL_SCRATCH_REGISTER_OFFSET,
         SERIAL_TRANSMIT_REGISTER_OFFSET, SerialConfigError, SerialConfigInput, SerialMmioDevice,
         SerialMmioError, SerialOutput, SerialOutputBuffer, SerialOutputError, SerialOutputFile,
-        SharedSerialOutput, SharedSerialOutputBuffer,
+        SerialRateLimiterConfig, SerialTokenBucket, SharedSerialOutput, SharedSerialOutputBuffer,
     };
     use crate::memory::GuestAddress;
     use crate::mmio::{
@@ -977,13 +1137,84 @@ mod tests {
     }
 
     #[test]
+    fn token_bucket_consumes_burst_budget_and_refills_by_time() {
+        let now = Instant::now();
+        let mut bucket =
+            SerialTokenBucket::new_at(SerialRateLimiterConfig::new(2, Some(1), 100), now)
+                .expect("bucket should be enabled");
+
+        assert!(bucket.reduce_at(1, now));
+        assert!(bucket.reduce_at(1, now));
+        assert!(bucket.reduce_at(1, now));
+        assert!(!bucket.reduce_at(1, now));
+        assert!(bucket.reduce_at(1, now + Duration::from_millis(50)));
+        assert!(!bucket.reduce_at(1, now + Duration::from_millis(50)));
+        assert!(bucket.reduce_at(1, now + Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn token_bucket_disables_zero_or_overflowing_configs() {
+        let now = Instant::now();
+
+        for config in [
+            SerialRateLimiterConfig::new(0, None, 1),
+            SerialRateLimiterConfig::new(1, None, 0),
+            SerialRateLimiterConfig::new(1, None, u64::MAX),
+        ] {
+            assert!(SerialTokenBucket::new_at(config, now).is_none());
+        }
+    }
+
+    #[test]
+    fn rate_limited_output_drops_exhausted_bytes_without_output_error() {
+        let buffer = SharedSerialOutputBuffer::new(1);
+        let mut output = RateLimitedSerialOutput::new(
+            buffer.clone(),
+            SerialRateLimiterConfig::new(1, None, 100),
+        )
+        .expect("bucket should be enabled");
+
+        output.write_byte(b'a').expect("first byte should write");
+        output
+            .write_byte(b'b')
+            .expect("exhausted byte should be dropped");
+
+        assert_eq!(buffer.bytes().expect("shared bytes should read"), b"a");
+    }
+
+    #[test]
+    fn shared_serial_output_skips_disabled_rate_limiter() {
+        let buffer = SharedSerialOutputBuffer::new(1);
+        let mut output = SharedSerialOutput::with_rate_limiter(
+            buffer.clone(),
+            Some(SerialRateLimiterConfig::new(0, None, 1)),
+        );
+
+        output.write_byte(b'a').expect("first byte should write");
+        let err = output
+            .write_byte(b'b')
+            .expect_err("disabled limiter should expose buffer errors");
+
+        assert_eq!(
+            err.message(),
+            "serial output buffer reached its 1-byte limit"
+        );
+        assert_eq!(buffer.bytes().expect("shared bytes should read"), b"a");
+    }
+
+    #[test]
     fn validates_serial_config_output_path() {
         let config = SerialConfigInput::new()
             .with_serial_out_path("/tmp/serial.out")
+            .with_rate_limiter(SerialRateLimiterConfig::new(2, Some(1), 3))
             .validate()
             .expect("serial config should validate");
 
         assert_eq!(config.serial_out_path(), Some(Path::new("/tmp/serial.out")));
+        assert_eq!(
+            config.rate_limiter(),
+            Some(SerialRateLimiterConfig::new(2, Some(1), 3))
+        );
     }
 
     #[test]
@@ -993,6 +1224,7 @@ mod tests {
             .expect("serial clear request should validate");
 
         assert_eq!(config.serial_out_path(), None);
+        assert_eq!(config.rate_limiter(), None);
     }
 
     #[test]
@@ -1007,11 +1239,6 @@ mod tests {
                 SerialConfigInput::new().with_serial_out_path("/tmp/bad\npath"),
                 SerialConfigError::InvalidOutputPath,
                 "serial output path must not contain control characters",
-            ),
-            (
-                SerialConfigInput::new().with_rate_limiter_configured(),
-                SerialConfigError::RateLimiterUnsupported,
-                "serial output rate limiting is not supported",
             ),
         ] {
             let err = input
