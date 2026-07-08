@@ -939,6 +939,13 @@ impl Arm64BootEntropyNotificationDispatches {
             .iter()
             .any(Arm64BootEntropyNotificationDispatch::needs_queue_interrupt)
     }
+
+    pub fn rate_limiter_retry_after(&self) -> Option<Duration> {
+        self.devices
+            .iter()
+            .filter_map(Arm64BootEntropyNotificationDispatch::rate_limiter_retry_after)
+            .min()
+    }
 }
 
 #[derive(Debug)]
@@ -963,6 +970,10 @@ impl Arm64BootEntropyNotificationDispatch {
     pub fn needs_queue_interrupt(&self) -> bool {
         self.outcome.needs_queue_interrupt()
     }
+
+    pub fn rate_limiter_retry_after(&self) -> Option<Duration> {
+        self.outcome.rate_limiter_retry_after()
+    }
 }
 
 #[derive(Debug)]
@@ -981,6 +992,14 @@ impl Arm64BootEntropyNotificationOutcome {
                 .completed_dispatch()
                 .is_some_and(crate::entropy::VirtioRngQueueDispatch::needs_queue_interrupt),
             Self::HandlerLookupFailed(_) | Self::EntropySourceProviderFailed(_) => false,
+        }
+    }
+
+    pub fn rate_limiter_retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Dispatched(dispatch) => dispatch.rate_limiter_retry_after(),
+            Self::DispatchFailed(source) => source.rate_limiter_retry_after(),
+            Self::HandlerLookupFailed(_) | Self::EntropySourceProviderFailed(_) => None,
         }
     }
 
@@ -2661,8 +2680,9 @@ mod tests {
         DEFAULT_KERNEL_COMMAND_LINE,
     };
     use crate::entropy::{
-        EntropyMmioLayout, VirtioRngEntropySource, VirtioRngEntropySourceError,
-        VirtioRngMmioHandler, VirtioRngOsEntropySource,
+        EntropyConfigInput, EntropyMmioLayout, EntropyRateLimiterConfig, EntropyTokenBucketConfig,
+        VirtioRngEntropySource, VirtioRngEntropySourceError, VirtioRngMmioHandler,
+        VirtioRngOsEntropySource,
     };
     use crate::fdt::{Arm64FdtError, Arm64FdtGic, Arm64FdtRegion, Arm64FdtTimerInterrupts};
     use crate::interrupt::{DeviceInterruptKind, GuestInterruptLine};
@@ -2730,6 +2750,7 @@ mod tests {
     const TEST_RX_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x8047_0000);
     const TEST_RX_USED_RING: GuestAddress = GuestAddress::new(0x8048_0000);
     const TEST_RX_BUFFER: GuestAddress = GuestAddress::new(0x8049_0000);
+    const SECOND_DATA_ADDR: GuestAddress = GuestAddress::new(0x804a_0000);
     const TEST_VSOCK_RX_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x8050_0000);
     const TEST_VSOCK_RX_AVAILABLE_RING: GuestAddress = GuestAddress::new(0x8051_0000);
     const TEST_VSOCK_RX_USED_RING: GuestAddress = GuestAddress::new(0x8052_0000);
@@ -3020,8 +3041,37 @@ mod tests {
         super::Arm64BootRuntimeResources,
         MmioDispatcher,
     ) {
+        boot_runtime_with_optional_entropy_rate_limiter(kernel_name, None)
+    }
+
+    fn boot_runtime_with_entropy_rate_limiter(
+        kernel_name: &str,
+        rate_limiter: EntropyRateLimiterConfig,
+    ) -> (
+        crate::memory::GuestMemory,
+        super::Arm64BootRuntimeResources,
+        MmioDispatcher,
+    ) {
+        boot_runtime_with_optional_entropy_rate_limiter(kernel_name, Some(rate_limiter))
+    }
+
+    fn boot_runtime_with_optional_entropy_rate_limiter(
+        kernel_name: &str,
+        rate_limiter: Option<EntropyRateLimiterConfig>,
+    ) -> (
+        crate::memory::GuestMemory,
+        super::Arm64BootRuntimeResources,
+        MmioDispatcher,
+    ) {
         let kernel = temp_file(kernel_name, &arm64_image());
-        let controller = controller_with_kernel(kernel.path());
+        let mut controller = controller_with_kernel(kernel.path());
+        if let Some(rate_limiter) = rate_limiter {
+            controller
+                .handle_action(VmmAction::PutEntropy(
+                    EntropyConfigInput::new().with_rate_limiter(rate_limiter),
+                ))
+                .expect("entropy config with rate limiter should be stored");
+        }
         let resources = Arm64BootResources::assemble_from_controller(
             &controller,
             Arm64BootResourceConfig {
@@ -4011,6 +4061,16 @@ mod tests {
     fn write_boot_entropy_request(memory: &mut crate::memory::GuestMemory, len: u32) {
         write_descriptor(memory, 0, TestDescriptor::writable(DATA_ADDR, len, None));
         write_available_heads(memory, &[0]);
+    }
+
+    fn write_two_boot_entropy_requests(memory: &mut crate::memory::GuestMemory, len: u32) {
+        write_descriptor(memory, 0, TestDescriptor::writable(DATA_ADDR, len, None));
+        write_descriptor(
+            memory,
+            1,
+            TestDescriptor::writable(SECOND_DATA_ADDR, len, None),
+        );
+        write_available_heads(memory, &[0, 1]);
     }
 
     fn write_partially_invalid_entropy_request(memory: &mut crate::memory::GuestMemory) {
@@ -6716,6 +6776,7 @@ mod tests {
         assert!(dispatch.drained_notifications().is_empty());
         assert!(dispatch.queue_dispatch().is_none());
         assert!(!device_dispatch.needs_queue_interrupt());
+        assert_eq!(device_dispatch.rate_limiter_retry_after(), None);
         assert!(provider.requested_regions.is_empty());
         assert_eq!(
             read_boot_entropy_mmio_u32(
@@ -6746,9 +6807,11 @@ mod tests {
 
         assert_eq!(dispatches.len(), 1);
         assert!(dispatches.needs_queue_interrupt());
+        assert_eq!(dispatches.rate_limiter_retry_after(), None);
         let device_dispatch = &dispatches.as_slice()[0];
         assert_eq!(device_dispatch.device().fdt_device.interrupt_line, line(36));
         assert!(device_dispatch.needs_queue_interrupt());
+        assert_eq!(device_dispatch.rate_limiter_retry_after(), None);
         let dispatch = device_dispatch
             .outcome()
             .dispatched()
@@ -6777,6 +6840,58 @@ mod tests {
             ),
             DeviceInterruptKind::Queue.status().bits()
         );
+    }
+
+    #[test]
+    fn boot_runtime_entropy_notification_dispatch_reports_rate_limiter_retry() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_with_entropy_rate_limiter(
+            "kernel-entropy-rate-limit-retry-dispatch",
+            EntropyRateLimiterConfig::new(
+                Some(EntropyTokenBucketConfig::new(16, None, 86_400_000)),
+                None,
+            ),
+        );
+        configure_boot_entropy_queue(&mut runtime, &mut mmio_dispatcher, TEST_USED_RING);
+        write_two_boot_entropy_requests(&mut memory, 16);
+        notify_boot_entropy_queue(&mut runtime, &mut mmio_dispatcher);
+        let mut provider = RecordingEntropySourceProvider::default();
+
+        let dispatches = runtime
+            .dispatch_entropy_queue_notifications_with_source(
+                &mut memory,
+                &mut mmio_dispatcher,
+                &mut provider,
+            )
+            .expect("entropy dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 1);
+        assert!(dispatches.needs_queue_interrupt());
+        let retry_after = dispatches
+            .rate_limiter_retry_after()
+            .expect("rate-limited entropy dispatch should report retry delay");
+        assert!(retry_after > Duration::ZERO);
+        assert!(retry_after <= Duration::from_secs(86_400));
+        let device_dispatch = &dispatches.as_slice()[0];
+        assert_eq!(
+            device_dispatch.rate_limiter_retry_after(),
+            Some(retry_after)
+        );
+        let dispatch = device_dispatch
+            .outcome()
+            .dispatched()
+            .expect("queued entropy notification should dispatch");
+        assert_eq!(dispatch.rate_limiter_retry_after(), Some(retry_after));
+        let queue = dispatch
+            .queue_dispatch()
+            .expect("entropy queue dispatch summary should be present");
+        assert_eq!(queue.processed_requests(), 1);
+        assert_eq!(queue.successful_requests(), 1);
+        assert_eq!(queue.rate_limiter_throttled_requests(), 1);
+        assert_eq!(queue.rate_limiter_retry_after(), Some(retry_after));
+        assert_eq!(provider.source.calls, [16]);
+        assert_eq!(read_boot_entropy_used_index(&memory), 1);
+        assert_eq!(read_boot_entropy_used_element(&memory, 0), (0, 16));
+        assert_eq!(read_guest_bytes(&memory, SECOND_DATA_ADDR, 16), vec![0; 16]);
     }
 
     #[test]

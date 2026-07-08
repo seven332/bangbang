@@ -158,9 +158,11 @@ is resource-specific:
   read or guest memory is written, and must not sleep or busy-wait while budget
   is exhausted. Throttled descriptors remain pending for a later dispatch
   opportunity instead of completing with zero bytes or exposing host entropy
-  source details. Metrics may count throttling and limiter retry events, but
-  must not include random bytes, descriptor contents, host RNG errors, or host
-  paths.
+  source details. Runtime dispatch may report a process-local retry delay for
+  the pending descriptor, but current HVF entropy dispatch does not schedule
+  timerfd/eventfd-style wakeups. Metrics may count throttling and limiter retry
+  events, but must not include random bytes, descriptor contents, host RNG
+  errors, or host paths.
 - `/snapshot/create` and `/snapshot/load` currently parse Firecracker-shaped
   snapshot paths before returning unsupported faults, and they do not open or
   create snapshot state or memory files. Future snapshot support must treat

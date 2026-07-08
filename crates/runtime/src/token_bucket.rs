@@ -132,11 +132,6 @@ impl TokenBucket {
         TokenBucketReduction::Allowed
     }
 
-    pub(crate) fn reduce_allow_overconsumption_at(&mut self, tokens: u64, now: Instant) -> bool {
-        self.reduce_allow_overconsumption_with_retry_at(tokens, now)
-            .is_allowed()
-    }
-
     pub(crate) fn reduce_allow_overconsumption_with_retry_at(
         &mut self,
         tokens: u64,
@@ -323,7 +318,11 @@ mod tests {
         let mut bucket = TokenBucket::new_at(TokenBucketConfig::new(4, None, 100), now)
             .expect("bucket should be enabled");
 
-        assert!(bucket.reduce_allow_overconsumption_at(8, now));
+        assert!(
+            bucket
+                .reduce_allow_overconsumption_with_retry_at(8, now)
+                .is_allowed()
+        );
         assert_eq!(
             bucket.reduce_allow_overconsumption_with_retry_at(8, now),
             TokenBucketReduction::Throttled {
@@ -336,6 +335,10 @@ mod tests {
                 retry_after: Duration::from_millis(50),
             }
         );
-        assert!(bucket.reduce_allow_overconsumption_at(8, now + Duration::from_millis(100)));
+        assert!(
+            bucket
+                .reduce_allow_overconsumption_with_retry_at(8, now + Duration::from_millis(100))
+                .is_allowed()
+        );
     }
 }
