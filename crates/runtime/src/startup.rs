@@ -5569,6 +5569,36 @@ mod tests {
     }
 
     #[test]
+    fn serial_region_overlapping_rtc_mmio_fails_during_registration() {
+        let kernel = temp_file("kernel-serial-overlap-rtc", &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+        let (serial, _output) = serial_config(TEST_RTC_MMIO_BASE, MmioRegionId::new(9), line(32));
+        let config = Arm64BootResourceConfig {
+            rtc_device: Some(Arm64BootRtcDeviceConfig::new(RtcMmioLayout::new(
+                TEST_RTC_MMIO_BASE,
+                MmioRegionId::new(8),
+            ))),
+            serial_device: Some(serial),
+            ..valid_config(&[])
+        };
+
+        let err = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect_err("overlapping serial and RTC MMIO should fail");
+
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::RegisterSerialMmio { source }
+                if matches!(
+                    source.as_ref(),
+                    Arm64BootSerialMmioRegistrationError::InsertRegion {
+                        source: MmioBusError::OverlappingRegion { .. },
+                        ..
+                    }
+                )
+        ));
+    }
+
+    #[test]
     fn assembles_boot_resources_preserve_multiple_network_order() {
         let kernel = temp_file("kernel-with-networks", &arm64_image());
         let mut controller = controller_with_kernel(kernel.path());
