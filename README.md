@@ -190,8 +190,11 @@ and non-empty per-drive `block_{drive_id}` objects for implemented virtio-block
 queue activity, read/write latency aggregates, backing update counters, and
 failures; top-level aggregate `net` and non-empty per-interface
 `net_{iface_id}` objects for implemented virtio-net RX/TX queue activity,
-packet counts, byte counts, and failures; plus a top-level `balloon` object for
-implemented virtio-balloon activity and failures.
+packet counts, byte counts, and failures; a top-level `vsock` object for
+implemented virtio-vsock RX/TX queue activity, packet counts, byte counts,
+connection cleanup counters, and classifiable queue/event failures; plus a
+top-level `balloon` object for implemented virtio-balloon activity and
+failures.
 Parsed deprecated HTTP API
 usage is counted under `deprecated_api.deprecated_http_api_calls` for supported
 deprecated machine `cpu_template`, MMDS V1 config, `vsock_id`, and snapshot-load
