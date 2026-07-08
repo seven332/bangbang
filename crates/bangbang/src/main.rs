@@ -2142,6 +2142,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_process_args_maps_inline_invalid_logger_level_to_bad_configuration() {
+        let err = parse_process_args([OsString::from("--level=verbose")])
+            .expect_err("invalid inline logger level should fail");
+
+        assert_eq!(
+            err,
+            ProcessError::BadConfiguration("invalid --level: logger level is invalid".to_string())
+        );
+        assert_eq!(err.exit_code(), ProcessExitCode::BadConfiguration);
+    }
+
+    #[test]
     fn parse_os_help_arg_ignores_non_utf8_args() {
         let args = Args::parse_os([OsString::from("--help"), OsString::from_vec(vec![0xff])])
             .expect("help should bypass parsing");
