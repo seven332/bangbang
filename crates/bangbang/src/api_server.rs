@@ -5077,6 +5077,10 @@ mod tests {
                 "npnl",
                 r#"{"iface_id":"eth0","rx_rate_limiter":null,"tx_rate_limiter":null}"#,
             ),
+            (
+                "npne",
+                r#"{"iface_id":"eth0","rx_rate_limiter":{},"tx_rate_limiter":{"bandwidth":null,"ops":null}}"#,
+            ),
         ] {
             let response = request_over_socket(
                 &mut vmm,
@@ -5758,6 +5762,10 @@ mod tests {
             ("ent-empty", "{}"),
             ("ent-null-rl", r#"{"rate_limiter":null}"#),
             ("ent-empty-rl", r#"{"rate_limiter":{}}"#),
+            (
+                "ent-null-buckets",
+                r#"{"rate_limiter":{"bandwidth":null,"ops":null}}"#,
+            ),
         ] {
             let request = format!(
                 "PUT /entropy HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
@@ -6602,7 +6610,7 @@ mod tests {
             &request_with_body(
                 "PUT",
                 "/pmem/pmem0",
-                r#"{"id":"pmem0","path_on_host":"/tmp/pmem.img","root_device":true,"read_only":false}"#,
+                r#"{"id":"pmem0","path_on_host":"/tmp/pmem.img","root_device":true,"read_only":false,"rate_limiter":{"bandwidth":null,"ops":null}}"#,
             ),
         );
         assert!(put_response.starts_with("HTTP/1.1 204 No Content\r\n"));
@@ -7180,6 +7188,33 @@ mod tests {
     }
 
     #[test]
+    fn stores_drive_with_noop_rate_limiter_object() {
+        let body = r#"{
+            "drive_id": "rootfs",
+            "path_on_host": "/tmp/rootfs.ext4",
+            "is_root_device": true,
+            "rate_limiter": {
+                "bandwidth": null,
+                "ops": null
+            }
+        }"#;
+        let request = format!(
+            "PUT /drives/rootfs HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut vmm = test_controller();
+
+        let response = request_over_socket(&mut vmm, "dnl", &request);
+
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert_eq!(vmm.drive_configs().len(), 1);
+        assert_eq!(
+            vmm.drive_configs()[0].path_on_host(),
+            std::path::Path::new("/tmp/rootfs.ext4")
+        );
+    }
+
+    #[test]
     fn returns_state_fault_for_preboot_drive_patch_without_mutating() {
         let mut vmm = test_controller();
         vmm.handle_action(VmmAction::PutDrive(
@@ -7233,7 +7268,11 @@ mod tests {
         assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         let body = r#"{
             "drive_id": "rootfs",
-            "path_on_host": "/tmp/replaced.ext4"
+            "path_on_host": "/tmp/replaced.ext4",
+            "rate_limiter": {
+                "bandwidth": null,
+                "ops": null
+            }
         }"#;
         let request = format!(
             "PATCH /drives/rootfs HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
@@ -7317,7 +7356,12 @@ mod tests {
         let body = r#"{
             "iface_id": "eth0",
             "host_dev_name": "tap0",
-            "mtu": 1500
+            "mtu": 1500,
+            "rx_rate_limiter": {
+                "bandwidth": null,
+                "ops": null
+            },
+            "tx_rate_limiter": {}
         }"#;
         let request = format!(
             "PUT /network-interfaces/eth0 HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",

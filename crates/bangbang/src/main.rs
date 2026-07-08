@@ -1593,11 +1593,13 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+    use bangbang_runtime::block::DriveConfigInput;
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel};
     use bangbang_runtime::machine::{MAX_MEM_SIZE_MIB, MachineConfigError};
     use bangbang_runtime::metrics::{MetricsConfigError, MetricsConfigInput, MetricsDiagnostics};
     use bangbang_runtime::mmds::MmdsDataStoreError;
+    use bangbang_runtime::network::NetworkInterfaceConfigInput;
     use bangbang_runtime::pmem::{PmemConfigError, PmemConfigInput};
     use bangbang_runtime::serial::SerialRateLimiterConfig;
     use bangbang_runtime::{BackendError, InstanceState, VmmAction, VmmActionError, VmmData};
@@ -3259,6 +3261,7 @@ mod tests {
         for config in [
             r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"entropy":{"rate_limiter":null}}"#,
             r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"entropy":{"rate_limiter":{}}}"#,
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"entropy":{"rate_limiter":{"bandwidth":null,"ops":null}}}"#,
         ] {
             let actions = super::config_file_actions_from_str(config)
                 .expect("entropy config section should accept no-op rate limiter");
@@ -3271,6 +3274,54 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn config_file_accepts_shared_noop_rate_limiter_objects() {
+        let actions = super::config_file_actions_from_str(
+            r#"{
+                "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
+                "drives":[{
+                    "drive_id":"rootfs",
+                    "path_on_host":"/tmp/rootfs.ext4",
+                    "is_root_device":true,
+                    "rate_limiter":{"bandwidth":null,"ops":null}
+                }],
+                "pmem":[{
+                    "id":"pmem0",
+                    "path_on_host":"/tmp/pmem.img",
+                    "rate_limiter":{"bandwidth":null}
+                }],
+                "network-interfaces":[{
+                    "iface_id":"eth0",
+                    "host_dev_name":"vmnet:shared",
+                    "rx_rate_limiter":{},
+                    "tx_rate_limiter":{"ops":null}
+                }],
+                "entropy":{"rate_limiter":{"bandwidth":null,"ops":null}}
+            }"#,
+        )
+        .expect("shared no-op rate limiters should parse");
+
+        assert_eq!(
+            actions,
+            [
+                VmmAction::PutBootSource(BootSourceConfigInput::new("/tmp/vmlinux")),
+                VmmAction::PutDrive(DriveConfigInput::new(
+                    "rootfs",
+                    "rootfs",
+                    "/tmp/rootfs.ext4",
+                    true
+                )),
+                VmmAction::PutPmem(PmemConfigInput::new("pmem0", "/tmp/pmem.img")),
+                VmmAction::PutNetworkInterface(NetworkInterfaceConfigInput::new(
+                    "eth0",
+                    "eth0",
+                    "vmnet:shared"
+                )),
+                VmmAction::PutEntropy(bangbang_runtime::entropy::EntropyConfigInput::new()),
+            ]
+        );
     }
 
     #[test]
