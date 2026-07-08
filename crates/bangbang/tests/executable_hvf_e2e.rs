@@ -685,6 +685,10 @@ mod macos_arm64 {
             )
         });
 
+        bangbang.send_signal(libc::SIGPIPE, "SIGPIPE");
+        let instance_info_after_sigpipe = http_get(&socket_path, "/");
+        assert_ok_response(&instance_info_after_sigpipe, "GET / after SIGPIPE");
+
         let flush_metrics_response = http_put_json(
             &socket_path,
             "/actions",
@@ -694,7 +698,7 @@ mod macos_arm64 {
         assert_metrics_output(
             &metrics_path,
             Some(
-                r#"{"balloon_count":3,"hotplug_memory_count":0,"instance_info_count":5,"machine_cfg_count":0,"mmds_count":1,"vmm_version_count":0}"#,
+                r#"{"balloon_count":3,"hotplug_memory_count":0,"instance_info_count":6,"machine_cfg_count":0,"mmds_count":1,"vmm_version_count":0}"#,
             ),
             r#"{"actions_count":2,"actions_fails":0,"balloon_count":1,"balloon_fails":1,"boot_source_count":2,"boot_source_fails":1,"cpu_cfg_count":1,"cpu_cfg_fails":1,"drive_count":3,"drive_fails":1,"hotplug_memory_count":0,"hotplug_memory_fails":0,"logger_count":2,"logger_fails":1,"machine_cfg_count":1,"machine_cfg_fails":0,"metrics_count":2,"metrics_fails":1,"mmds_count":2,"mmds_fails":1,"network_count":1,"network_fails":1,"pmem_count":0,"pmem_fails":0,"serial_count":2,"serial_fails":1,"vsock_count":2,"vsock_fails":1}"#,
             Some(
@@ -703,6 +707,7 @@ mod macos_arm64 {
         );
         assert_block_update_metrics_output(&metrics_path);
         assert_startup_time_metrics_output(&metrics_path);
+        assert_sigpipe_signal_metrics_output(&metrics_path);
         assert!(
             !replacement_metrics_path.exists(),
             "rejected metrics update must not write later metrics output to replacement path {}",
@@ -3433,6 +3438,19 @@ mod macos_arm64 {
         assert!(
             output.contains(r#""api_server""#),
             "metrics output should include api_server metrics object; output:\n{output}"
+        );
+    }
+
+    fn assert_sigpipe_signal_metrics_output(path: &Path) {
+        let output = fs::read_to_string(path).unwrap_or_else(|err| {
+            panic!(
+                "metrics output {} should be readable for signal metrics: {err}",
+                path.display()
+            )
+        });
+        assert!(
+            output.contains(r#""signals":{"sigpipe":1}"#),
+            "metrics output should include SIGPIPE signal metrics; output:\n{output}"
         );
     }
 

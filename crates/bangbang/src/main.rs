@@ -25,13 +25,14 @@ use periodic_metrics::{
     PeriodicBalloonStatisticsScheduler, PeriodicMetricsScheduler, min_poll_timeout_ms,
 };
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
-use signal_hook::consts::signal::{SIGBUS, SIGHUP, SIGILL, SIGINT, SIGSEGV, SIGSYS, SIGTERM};
+use signal_hook::consts::signal::SIGTERM;
+use signal_hook::consts::signal::{SIGBUS, SIGHUP, SIGILL, SIGINT, SIGPIPE, SIGSEGV, SIGSYS};
 use signal_hook::consts::signal::{SIGXCPU, SIGXFSZ};
 use signal_hook::{SigId, low_level};
 use vmm::{ProcessSessionExitDecision, ProcessVmm, VmmRequestHandler};
 
 use bangbang_runtime::logger::{LoggerConfigInput, LoggerLevel};
-use bangbang_runtime::metrics::{MetricsConfigInput, MetricsDiagnostics};
+use bangbang_runtime::metrics::{MetricsConfigInput, MetricsDiagnostics, SharedSignalMetrics};
 use bangbang_runtime::mmds::MmdsContentInput;
 use bangbang_runtime::{VmmAction, VmmActionError};
 
@@ -99,17 +100,20 @@ fn run() -> Result<(), ProcessError> {
                 HvfBackend::is_supported_target()
             );
 
+            let signal_metrics = SharedSignalMetrics::default();
             let mut vmm = ProcessVmm::new(
                 id,
                 env!("CARGO_PKG_VERSION"),
                 APP_NAME,
                 effective_mmds_size_limit,
             )
-            .with_process_metrics_diagnostics(process_metrics_diagnostics);
+            .with_process_metrics_diagnostics(process_metrics_diagnostics)
+            .with_process_signal_metrics(signal_metrics.clone());
             apply_startup_metrics_config(&mut vmm, metrics_config)?;
             apply_startup_logger_config(&mut vmm, logger_config)?;
             apply_startup_metadata(&mut vmm, metadata.as_deref())?;
             let _fatal_signal_handlers = FatalSignalHandlers::install()?;
+            let _sigpipe_signal_handler = SigpipeSignalHandler::install(signal_metrics)?;
             apply_startup_config_file(&mut vmm, config_file.as_deref())?;
             let mut shutdown_signal = ShutdownSignal::install()?;
             if no_api {
@@ -939,6 +943,37 @@ impl Drop for FatalSignalHandlers {
             low_level::unregister(signal_id);
         }
     }
+}
+
+#[derive(Debug)]
+struct SigpipeSignalHandler {
+    signal_id: SigId,
+}
+
+impl SigpipeSignalHandler {
+    fn install(signal_metrics: SharedSignalMetrics) -> Result<Self, ProcessError> {
+        Ok(Self {
+            signal_id: register_sigpipe_metrics(signal_metrics)?,
+        })
+    }
+}
+
+impl Drop for SigpipeSignalHandler {
+    fn drop(&mut self) {
+        low_level::unregister(self.signal_id);
+    }
+}
+
+fn register_sigpipe_metrics(signal_metrics: SharedSignalMetrics) -> Result<SigId, ProcessError> {
+    // SAFETY: The registered SIGPIPE handler only updates an atomic process-local
+    // counter and returns. It does not allocate, lock, perform I/O, or call into
+    // the shutdown path from the signal context.
+    unsafe {
+        low_level::register(SIGPIPE, move || {
+            signal_metrics.record_sigpipe();
+        })
+    }
+    .map_err(|err| ProcessError::SignalHandler(err.kind()))
 }
 
 fn register_fatal_signal_exit(
