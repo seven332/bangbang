@@ -44,6 +44,7 @@ pub const ARM64_FDT_SECURE_PHYSICAL_TIMER_PPI: u32 = 13;
 pub const ARM64_FDT_NON_SECURE_PHYSICAL_TIMER_PPI: u32 = 14;
 pub const ARM64_FDT_VIRTUAL_TIMER_PPI: u32 = 11;
 pub const ARM64_FDT_HYPERVISOR_TIMER_PPI: u32 = 10;
+const LINUX_PCI_PROBE_ONLY: u32 = 1;
 const ARM64_FDT_RNG_SEED_SIZE: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -889,6 +890,7 @@ fn create_chosen_node(
         fdt.property_u64("linux,initrd-end", initrd_end.raw_value())?;
     }
 
+    fdt.property_u32("linux,pci-probe-only", LINUX_PCI_PROBE_ONLY)?;
     fdt.property("rng-seed", rng_seed)?;
     fdt.end_node(chosen)?;
     Ok(())
@@ -1836,6 +1838,10 @@ mod tests {
         assert_eq!(
             chosen.prop_raw("rng-seed").unwrap(),
             TEST_RNG_SEED.as_slice()
+        );
+        assert_eq!(
+            chosen.prop_u32("linux,pci-probe-only").unwrap(),
+            LINUX_PCI_PROBE_ONLY
         );
 
         let psci = required_node(&tree, "/psci");

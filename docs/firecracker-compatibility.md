@@ -1197,12 +1197,12 @@ and preserves later DRAM ranges from the runtime layout, but direct FDT
 configuration must match the aarch64 DRAM layout helper for its total guest RAM
 size. Sparse layouts, ranges overlapping the aarch64 MMIO64 gap, and total RAM
 beyond the aarch64 maximum are rejected. The chosen node carries boot arguments,
-optional initrd start/end properties from loaded boot-source metadata, and a
-Firecracker-shaped 64-byte `rng-seed` generated from host OS randomness during
-FDT construction. `rng-seed` generation failures are reported before guest
-memory is mutated during FDT writes. Firecracker's `linux,pci-probe-only`
-chosen property remains deferred until PCI-related guest startup and device
-work need it.
+optional initrd start/end properties from loaded boot-source metadata,
+Firecracker's `linux,pci-probe-only = 1` property, and a Firecracker-shaped
+64-byte `rng-seed` generated from host OS randomness during FDT construction.
+`rng-seed` generation failures are reported before guest memory is mutated
+during FDT writes. Emitting `linux,pci-probe-only` matches Firecracker's arm64
+FDT shape but does not imply PCI device support.
 Direct FDT configuration still validates that `bootargs` fits in the 2048-byte
 aarch64 command-line capacity including the trailing NUL byte and contains no
 embedded NUL bytes. The GIC node consumes backend-neutral distributor and
