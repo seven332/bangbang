@@ -2551,6 +2551,40 @@ impl VirtioBalloonQueue {
         Ok(dispatch)
     }
 
+    pub fn complete_pending_statistics(
+        &mut self,
+        memory: &mut GuestMemory,
+        context: VirtioBalloonStatisticsDispatchContext,
+    ) -> Result<VirtioBalloonQueueDispatch, VirtioBalloonQueueDispatchError> {
+        let mut dispatch = VirtioBalloonQueueDispatch {
+            statistics_pending_descriptor_head: context.pending_descriptor_head(),
+            statistics: context.statistics(),
+            ..Default::default()
+        };
+        let Some(pending_descriptor_head) = dispatch.statistics_pending_descriptor_head else {
+            return Ok(dispatch);
+        };
+
+        let publication = self
+            .used
+            .publish_used_element_with_notification(
+                memory,
+                pending_descriptor_head,
+                0,
+                VirtqueueNotificationSuppression::Disabled,
+            )
+            .map_err(|source| VirtioBalloonQueueDispatchError::UsedRing {
+                queue: VirtioBalloonQueueKind::Statistics,
+                completed_dispatch: Box::new(dispatch.clone()),
+                descriptor_head: pending_descriptor_head,
+                source,
+            })?;
+        dispatch.statistics_pending_descriptor_head = None;
+        dispatch.record_statistics_completed_descriptor(publication);
+
+        Ok(dispatch)
+    }
+
     pub fn dispatch_hinting_commands(
         &mut self,
         memory: &mut GuestMemory,
@@ -3721,6 +3755,56 @@ impl VirtioBalloonDevice {
         Ok(dispatch)
     }
 
+    pub fn trigger_statistics_update(
+        &mut self,
+        memory: &mut GuestMemory,
+    ) -> Result<VirtioBalloonDeviceNotificationDispatch, VirtioBalloonDeviceNotificationError> {
+        let mut dispatch = VirtioBalloonDeviceNotificationDispatch {
+            drained_notifications: Vec::new(),
+            inflate_notifications: 0,
+            deflate_notifications: 0,
+            statistics_notifications: 0,
+            hinting_notifications: 0,
+            inflate_queue_dispatch: None,
+            deflate_queue_dispatch: None,
+            statistics_queue_dispatch: None,
+            hinting_queue_dispatch: None,
+        };
+        let statistics_context = VirtioBalloonStatisticsDispatchContext::new(
+            self.statistics_pending_descriptor_head,
+            self.statistics,
+        );
+        let Some(active_queues) = self.active_queues.as_mut() else {
+            return Err(VirtioBalloonDeviceNotificationError::Inactive {
+                drained_notifications: Vec::new(),
+            });
+        };
+        let Some(statistics_queue) = active_queues.statistics_mut() else {
+            return Ok(dispatch);
+        };
+
+        match statistics_queue.complete_pending_statistics(memory, statistics_context) {
+            Ok(statistics_dispatch) => {
+                self.statistics = statistics_dispatch.statistics();
+                self.statistics_pending_descriptor_head =
+                    statistics_dispatch.statistics_pending_descriptor_head();
+                dispatch.statistics_queue_dispatch = Some(statistics_dispatch);
+                Ok(dispatch)
+            }
+            Err(source) => {
+                let completed = source.completed_dispatch().clone();
+                self.statistics = completed.statistics();
+                self.statistics_pending_descriptor_head =
+                    completed.statistics_pending_descriptor_head();
+                dispatch.statistics_queue_dispatch = Some(completed);
+                Err(VirtioBalloonDeviceNotificationError::QueueDispatch {
+                    completed_dispatch: Box::new(dispatch),
+                    source,
+                })
+            }
+        }
+    }
+
     pub fn reset(&mut self) {
         self.active_queues = None;
         self.memory_accounting = VirtioBalloonMemoryAccounting::new();
@@ -3786,6 +3870,26 @@ impl VirtioMmioRegisterHandler<VirtioBalloonConfigSpace, VirtioBalloonDevice> {
                 .acknowledge_completed_hinting_run()
         {
             self.update_balloon_hinting_host_cmd(cmd_id);
+        }
+
+        dispatch
+    }
+
+    pub fn trigger_balloon_statistics_update(
+        &mut self,
+        memory: &mut GuestMemory,
+    ) -> Result<VirtioBalloonDeviceNotificationDispatch, VirtioBalloonDeviceNotificationError> {
+        let dispatch = self
+            .activation_handler_mut()
+            .trigger_statistics_update(memory);
+        let needs_queue_interrupt = match &dispatch {
+            Ok(dispatch) => dispatch.needs_queue_interrupt(),
+            Err(error) => error
+                .completed_notification_dispatch()
+                .is_some_and(VirtioBalloonDeviceNotificationDispatch::needs_queue_interrupt),
+        };
+        if needs_queue_interrupt {
+            self.mark_interrupt_pending(DeviceInterruptKind::Queue);
         }
 
         dispatch
@@ -5117,6 +5221,18 @@ mod tests {
     }
 
     fn configure_handler_queue(handler: &mut VirtioBalloonMmioHandler, queue_index: u32) {
+        configure_handler_queue_with_device_ring(
+            handler,
+            queue_index,
+            queue_address(TEST_DEVICE_BASE, queue_index),
+        );
+    }
+
+    fn configure_handler_queue_with_device_ring(
+        handler: &mut VirtioBalloonMmioHandler,
+        queue_index: u32,
+        device_ring: GuestAddress,
+    ) {
         handler
             .write_register(VirtioMmioRegister::QueueSel, queue_index)
             .expect("queue select should write");
@@ -5126,7 +5242,6 @@ mod tests {
 
         let descriptor_table = queue_address(TEST_DESCRIPTOR_BASE, queue_index);
         let driver_ring = queue_address(TEST_DRIVER_BASE, queue_index);
-        let device_ring = queue_address(TEST_DEVICE_BASE, queue_index);
         for (register, value) in [
             (
                 VirtioMmioRegister::QueueDescLow,
@@ -6884,6 +6999,85 @@ mod tests {
             ),
             (5, 0)
         );
+    }
+
+    #[test]
+    fn statistics_queue_trigger_completes_pending_descriptor_without_new_notification() {
+        let mut memory = pfn_descriptor_memory();
+        let mut existing = BalloonOptionalStats::default();
+        assert!(existing.record_stat(VirtioBalloonStat::new(VIRTIO_BALLOON_S_MEMFREE, 0x5678)));
+        let mut queue = statistics_queue(VIRTIO_BALLOON_STATS_QUEUE_INDEX);
+
+        let dispatch = queue
+            .complete_pending_statistics(&mut memory, statistics_context(Some(5), existing))
+            .expect("pending statistics descriptor should complete");
+
+        assert_eq!(dispatch.completed_descriptors(), 1);
+        assert!(dispatch.needs_queue_interrupt());
+        assert_eq!(dispatch.statistics_pending_descriptor_head(), None);
+        assert_eq!(dispatch.statistics().free_memory(), Some(0x5678));
+        assert_eq!(
+            read_used_idx(&memory, queue_used_ring(VIRTIO_BALLOON_STATS_QUEUE_INDEX)),
+            1
+        );
+        assert_eq!(
+            read_used_element(
+                &memory,
+                queue_used_ring(VIRTIO_BALLOON_STATS_QUEUE_INDEX),
+                0
+            ),
+            (5, 0)
+        );
+    }
+
+    #[test]
+    fn statistics_queue_trigger_without_pending_descriptor_is_noop() {
+        let mut memory = pfn_descriptor_memory();
+        let mut existing = BalloonOptionalStats::default();
+        assert!(existing.record_stat(VirtioBalloonStat::new(VIRTIO_BALLOON_S_SWAP_OUT, 9)));
+        let mut queue = statistics_queue(VIRTIO_BALLOON_STATS_QUEUE_INDEX);
+
+        let dispatch = queue
+            .complete_pending_statistics(&mut memory, statistics_context(None, existing))
+            .expect("missing pending statistics descriptor should be a no-op");
+
+        assert_eq!(dispatch.completed_descriptors(), 0);
+        assert!(!dispatch.needs_queue_interrupt());
+        assert_eq!(dispatch.statistics_pending_descriptor_head(), None);
+        assert_eq!(dispatch.statistics().swap_out(), Some(9));
+        assert_eq!(
+            read_used_idx(&memory, queue_used_ring(VIRTIO_BALLOON_STATS_QUEUE_INDEX)),
+            0
+        );
+    }
+
+    #[test]
+    fn statistics_queue_trigger_preserves_pending_descriptor_on_used_ring_error() {
+        let mut memory = pfn_descriptor_memory();
+        let mut existing = BalloonOptionalStats::default();
+        assert!(existing.record_stat(VirtioBalloonStat::new(VIRTIO_BALLOON_S_SWAP_OUT, 9)));
+        let mut queue = statistics_queue_with_used_ring(
+            VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+            GuestAddress::new(TEST_MEMORY_SIZE),
+        );
+
+        let error = queue
+            .complete_pending_statistics(&mut memory, statistics_context(Some(5), existing))
+            .expect_err("unmapped statistics used ring should fail publication");
+
+        assert!(matches!(
+            error,
+            VirtioBalloonQueueDispatchError::UsedRing {
+                queue: VirtioBalloonQueueKind::Statistics,
+                descriptor_head: 5,
+                ..
+            }
+        ));
+        let completed = error.completed_dispatch();
+        assert_eq!(completed.completed_descriptors(), 0);
+        assert!(!completed.needs_queue_interrupt());
+        assert_eq!(completed.statistics_pending_descriptor_head(), Some(5));
+        assert_eq!(completed.statistics().swap_out(), Some(9));
     }
 
     #[test]
@@ -9184,6 +9378,210 @@ mod tests {
             0
         );
         assert!(handler.pending_queue_notifications().is_empty());
+    }
+
+    #[test]
+    fn balloon_mmio_handler_triggers_pending_statistics_update() {
+        let mut memory = pfn_descriptor_memory();
+        let bytes = stat_payload_bytes(&[
+            (VIRTIO_BALLOON_S_SWAP_OUT, 9),
+            (VIRTIO_BALLOON_S_MEMFREE, 0x5678),
+        ]);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
+        write_statistics_descriptor(
+            &mut memory,
+            VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&bytes), None),
+        );
+        write_available_heads(
+            &mut memory,
+            queue_available_ring(VIRTIO_BALLOON_STATS_QUEUE_INDEX),
+            &[0],
+        );
+        let mut device = balloon_mmio_device(balloon_config(64, false, 1, false, false));
+        let handler = device
+            .dispatcher_mut()
+            .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+            .expect("balloon handler should be registered");
+        activate_handler(handler);
+
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                queue_index_u32(VIRTIO_BALLOON_STATS_QUEUE_INDEX),
+            )
+            .expect("statistics queue notification should write");
+        handler
+            .dispatch_balloon_queue_notifications(&mut memory)
+            .expect("statistics queue notification should dispatch");
+
+        let dispatch = handler
+            .trigger_balloon_statistics_update(&mut memory)
+            .expect("pending statistics update should trigger");
+
+        assert!(dispatch.drained_notifications().is_empty());
+        let statistics_dispatch = dispatch
+            .statistics_queue_dispatch()
+            .expect("statistics trigger dispatch should be recorded");
+        assert_eq!(statistics_dispatch.completed_descriptors(), 1);
+        assert!(statistics_dispatch.needs_queue_interrupt());
+        assert_eq!(
+            statistics_dispatch.statistics_pending_descriptor_head(),
+            None
+        );
+        assert_eq!(statistics_dispatch.statistics().swap_out(), Some(9));
+        assert_eq!(statistics_dispatch.statistics().free_memory(), Some(0x5678));
+        assert_eq!(
+            read_used_idx(&memory, queue_used_ring(VIRTIO_BALLOON_STATS_QUEUE_INDEX)),
+            1
+        );
+        assert_eq!(
+            read_used_element(
+                &memory,
+                queue_used_ring(VIRTIO_BALLOON_STATS_QUEUE_INDEX),
+                0
+            ),
+            (0, 0)
+        );
+        assert_eq!(
+            handler
+                .read_register(VirtioMmioRegister::InterruptStatus)
+                .expect("interrupt status should read"),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        let repeat = handler
+            .trigger_balloon_statistics_update(&mut memory)
+            .expect("repeated trigger without pending descriptor should be a no-op");
+        assert_eq!(
+            repeat
+                .statistics_queue_dispatch()
+                .expect("repeat trigger dispatch should be recorded")
+                .completed_descriptors(),
+            0
+        );
+        assert_eq!(
+            read_used_idx(&memory, queue_used_ring(VIRTIO_BALLOON_STATS_QUEUE_INDEX)),
+            1
+        );
+    }
+
+    #[test]
+    fn balloon_mmio_handler_statistics_update_trigger_without_pending_descriptor_is_noop() {
+        let mut memory = pfn_descriptor_memory();
+        let mut device = balloon_mmio_device(balloon_config(64, false, 1, false, false));
+        let handler = device
+            .dispatcher_mut()
+            .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+            .expect("balloon handler should be registered");
+        activate_handler(handler);
+
+        let dispatch = handler
+            .trigger_balloon_statistics_update(&mut memory)
+            .expect("statistics update trigger without pending descriptor should be a no-op");
+
+        assert!(dispatch.drained_notifications().is_empty());
+        let statistics_dispatch = dispatch
+            .statistics_queue_dispatch()
+            .expect("statistics no-op dispatch should be recorded");
+        assert_eq!(statistics_dispatch.completed_descriptors(), 0);
+        assert!(!statistics_dispatch.needs_queue_interrupt());
+        assert_eq!(
+            statistics_dispatch.statistics_pending_descriptor_head(),
+            None
+        );
+        assert_eq!(
+            handler
+                .read_register(VirtioMmioRegister::InterruptStatus)
+                .expect("interrupt status should read"),
+            0
+        );
+        assert_eq!(
+            read_used_idx(&memory, queue_used_ring(VIRTIO_BALLOON_STATS_QUEUE_INDEX)),
+            0
+        );
+    }
+
+    #[test]
+    fn balloon_mmio_handler_statistics_update_trigger_preserves_pending_on_used_ring_error() {
+        let mut memory = pfn_descriptor_memory();
+        let bytes = stat_payload_bytes(&[(VIRTIO_BALLOON_S_MEMFREE, 0x5678)]);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
+        write_statistics_descriptor(
+            &mut memory,
+            VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&bytes), None),
+        );
+        write_available_heads(
+            &mut memory,
+            queue_available_ring(VIRTIO_BALLOON_STATS_QUEUE_INDEX),
+            &[0],
+        );
+        let mut device = balloon_mmio_device(balloon_config(64, false, 1, false, false));
+        let handler = device
+            .dispatcher_mut()
+            .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+            .expect("balloon handler should be registered");
+        set_handler_queue_config_status(handler);
+        for queue_index in 0..handler.queue_registers().queue_count() {
+            let device_ring = if queue_index == VIRTIO_BALLOON_STATS_QUEUE_INDEX {
+                GuestAddress::new(TEST_MEMORY_SIZE)
+            } else {
+                queue_address(TEST_DEVICE_BASE, queue_index_u32(queue_index))
+            };
+            configure_handler_queue_with_device_ring(
+                handler,
+                queue_index_u32(queue_index),
+                device_ring,
+            );
+        }
+        handler
+            .write_register(VirtioMmioRegister::Status, DRIVER_OK_STATUS)
+            .expect("driver-ok status should write");
+
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                queue_index_u32(VIRTIO_BALLOON_STATS_QUEUE_INDEX),
+            )
+            .expect("statistics queue notification should write");
+        handler
+            .dispatch_balloon_queue_notifications(&mut memory)
+            .expect("statistics queue notification should hold pending descriptor");
+
+        let error = handler
+            .trigger_balloon_statistics_update(&mut memory)
+            .expect_err("unmapped used ring should fail statistics update trigger");
+
+        assert!(matches!(
+            error,
+            VirtioBalloonDeviceNotificationError::QueueDispatch {
+                source: VirtioBalloonQueueDispatchError::UsedRing {
+                    queue: VirtioBalloonQueueKind::Statistics,
+                    descriptor_head: 0,
+                    ..
+                },
+                ..
+            }
+        ));
+        let completed = error
+            .completed_notification_dispatch()
+            .expect("completed statistics trigger dispatch should be preserved")
+            .statistics_queue_dispatch()
+            .expect("statistics dispatch should be preserved");
+        assert_eq!(completed.statistics_pending_descriptor_head(), Some(0));
+        assert_eq!(completed.statistics().free_memory(), Some(0x5678));
+        assert_eq!(
+            handler.activation_handler().statistics().free_memory(),
+            Some(0x5678)
+        );
+        assert_eq!(
+            handler
+                .read_register(VirtioMmioRegister::InterruptStatus)
+                .expect("interrupt status should read"),
+            0
+        );
     }
 
     #[test]
