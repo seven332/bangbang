@@ -34,6 +34,7 @@ use bangbang_runtime::memory::{GuestAddress, GuestMemory};
 use bangbang_runtime::memory_hotplug::{MemoryHotplugConfigInput, MemoryHotplugSizeUpdateInput};
 use bangbang_runtime::metrics::{
     BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics, SharedBalloonDeviceMetrics,
+    SharedBlockDeviceMetrics,
 };
 use bangbang_runtime::mmds::{
     MmdsConfig, MmdsConfigInput, MmdsContentInput, MmdsStateHandle, MmdsStateLockError,
@@ -1874,6 +1875,10 @@ pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
         None
     }
 
+    fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetrics> {
+        None
+    }
+
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
         Err(BalloonUpdateError::ActiveSessionUnavailable)
     }
@@ -1917,6 +1922,10 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
         Some(OwnedHvfArm64BootSession::shared_balloon_device_metrics(
             self,
         ))
+    }
+
+    fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetrics> {
+        Some(OwnedHvfArm64BootSession::shared_block_device_metrics(self))
     }
 
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
@@ -1993,6 +2002,10 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
         None
     }
 
+    fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetrics> {
+        None
+    }
+
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
         Err(BalloonUpdateError::ActiveSessionUnavailable)
     }
@@ -2033,6 +2046,10 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
         Some(OwnedHvfArm64BootSession::shared_balloon_device_metrics(
             self,
         ))
+    }
+
+    fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetrics> {
+        Some(OwnedHvfArm64BootSession::shared_block_device_metrics(self))
     }
 
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
@@ -2079,6 +2096,10 @@ where
 
     fn shared_balloon_device_metrics(&self) -> Option<SharedBalloonDeviceMetrics> {
         self.session.shared_balloon_device_metrics()
+    }
+
+    fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetrics> {
+        self.session.shared_block_device_metrics()
     }
 
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
@@ -2527,6 +2548,7 @@ where
     control: S::Control,
     block_device_updater: Option<BootRunLoopBlockDeviceUpdater>,
     balloon_device_updater: Option<BootRunLoopBalloonDeviceUpdater>,
+    block_device_metrics: Option<SharedBlockDeviceMetrics>,
     balloon_device_metrics: Option<SharedBalloonDeviceMetrics>,
     command_handle: BootRunLoopCommandHandle<S>,
     status: Arc<BootRunLoopWorkerStatusCell<S::Outcome>>,
@@ -2556,6 +2578,7 @@ where
         let control = session.run_loop_control();
         let block_device_updater = session.block_device_updater();
         let balloon_device_updater = session.balloon_device_updater();
+        let block_device_metrics = session.shared_block_device_metrics();
         let balloon_device_metrics = session.shared_balloon_device_metrics();
         let stop_token = control.stop_token();
         let status = Arc::new(BootRunLoopWorkerStatusCell::new());
@@ -2637,6 +2660,7 @@ where
             control,
             block_device_updater,
             balloon_device_updater,
+            block_device_metrics,
             balloon_device_metrics,
             command_handle,
             status,
@@ -2740,11 +2764,15 @@ where
     S::Outcome: BootRunLoopProcessExit,
 {
     fn metrics_diagnostics(&self) -> MetricsDiagnostics {
-        let diagnostics = MetricsDiagnostics::new().with_boot_run_loop_status(self.metric_status());
-        match &self.balloon_device_metrics {
-            Some(metrics) => diagnostics.with_balloon_device_metrics(metrics.snapshot()),
-            None => diagnostics,
+        let mut diagnostics =
+            MetricsDiagnostics::new().with_boot_run_loop_status(self.metric_status());
+        if let Some(metrics) = &self.block_device_metrics {
+            diagnostics = diagnostics.with_block_device_metrics(metrics.snapshot());
         }
+        if let Some(metrics) = &self.balloon_device_metrics {
+            diagnostics = diagnostics.with_balloon_device_metrics(metrics.snapshot());
+        }
+        diagnostics
     }
 
     fn pause(&mut self) -> Result<(), BackendError> {
@@ -2988,8 +3016,8 @@ mod tests {
     use bangbang_runtime::logger::LoggerConfigInput;
     use bangbang_runtime::machine::{MachineConfigInput, MachineConfigPatchInput};
     use bangbang_runtime::metrics::{
-        BalloonDeviceMetrics, BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics,
-        SharedBalloonDeviceMetrics,
+        BalloonDeviceMetrics, BlockDeviceMetrics, BootRunLoopMetricStatus, MetricsConfigInput,
+        MetricsDiagnostics, SharedBalloonDeviceMetrics, SharedBlockDeviceMetrics,
     };
     use bangbang_runtime::mmds::{MmdsConfigInput, MmdsContentInput, MmdsStateHandle};
     use bangbang_runtime::mmio::MmioRegion;
@@ -3667,6 +3695,7 @@ mod tests {
         max_steps_sender: mpsc::Sender<usize>,
         outcomes: Arc<Mutex<VecDeque<Result<FakeRunLoopOutcome, FakeRunLoopError>>>>,
         block_device_updater: Option<BootRunLoopBlockDeviceUpdater>,
+        block_device_metrics: Option<SharedBlockDeviceMetrics>,
         balloon_device_metrics: Option<SharedBalloonDeviceMetrics>,
         wait_for_stop: bool,
         wait_for_wakeup: bool,
@@ -3688,6 +3717,7 @@ mod tests {
                     FakeRunLoopOutcome::Terminal,
                 )]))),
                 block_device_updater: None,
+                block_device_metrics: None,
                 balloon_device_metrics: None,
                 wait_for_stop: true,
                 wait_for_wakeup: false,
@@ -3709,6 +3739,11 @@ mod tests {
 
         fn with_block_device_updater(mut self, updater: BootRunLoopBlockDeviceUpdater) -> Self {
             self.block_device_updater = Some(updater);
+            self
+        }
+
+        fn with_block_device_metrics(mut self, metrics: SharedBlockDeviceMetrics) -> Self {
+            self.block_device_metrics = Some(metrics);
             self
         }
 
@@ -3753,6 +3788,10 @@ mod tests {
 
         fn block_device_updater(&self) -> Option<BootRunLoopBlockDeviceUpdater> {
             self.block_device_updater.clone()
+        }
+
+        fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetrics> {
+            self.block_device_metrics.clone()
         }
 
         fn shared_balloon_device_metrics(&self) -> Option<SharedBalloonDeviceMetrics> {
@@ -4853,6 +4892,44 @@ mod tests {
             Some(BootRunLoopMetricStatus::Running)
         );
         assert_eq!(drop_count.load(Ordering::SeqCst), 0);
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_reports_block_device_metrics() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let metrics = SharedBlockDeviceMetrics::default();
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_block_device_metrics(metrics.clone());
+
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(5).expect("non-zero limit"))
+                .expect("supervisor should start");
+
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            5
+        );
+        metrics.record_queue_events(1);
+        metrics.record_event_failure();
+
+        assert_eq!(
+            supervisor.metrics_diagnostics().block_device_metrics(),
+            Some(
+                BlockDeviceMetrics::default()
+                    .with_event_fails(1)
+                    .with_queue_event_count(1)
+            )
+        );
 
         drop(supervisor);
 

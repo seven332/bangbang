@@ -20,7 +20,7 @@ use bangbang_runtime::interrupt::{
     DeviceInterruptKind, DeviceInterruptTriggerError, GuestInterruptLine, InterruptSink,
 };
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
-use bangbang_runtime::metrics::SharedBalloonDeviceMetrics;
+use bangbang_runtime::metrics::{SharedBalloonDeviceMetrics, SharedBlockDeviceMetrics};
 use bangbang_runtime::mmio::{MmioDispatcher, MmioRegionId};
 use bangbang_runtime::network::NetworkMmioLayout;
 use bangbang_runtime::pmem::{PmemMmioLayout, VirtioPmemFlushStatus};
@@ -183,6 +183,7 @@ pub struct HvfArm64BootSession<'vm> {
     control_wakeup: HvfArm64BootRunLoopControlWakeupToken,
     run_loop_wakeup: HvfArm64BootRunLoopWakeupToken,
     entropy_source: VirtioRngOsEntropySource,
+    block_device_metrics: SharedBlockDeviceMetrics,
     balloon_device_metrics: SharedBalloonDeviceMetrics,
     gic: HvfGicMetadata,
     primary_mpidr: u64,
@@ -205,6 +206,7 @@ pub struct OwnedHvfArm64BootSession {
     control_wakeup: HvfArm64BootRunLoopControlWakeupToken,
     run_loop_wakeup: HvfArm64BootRunLoopWakeupToken,
     entropy_source: VirtioRngOsEntropySource,
+    block_device_metrics: SharedBlockDeviceMetrics,
     balloon_device_metrics: SharedBalloonDeviceMetrics,
     gic: HvfGicMetadata,
     primary_mpidr: u64,
@@ -567,6 +569,10 @@ impl HvfArm64BootSession<'_> {
         self.balloon_device_metrics.clone()
     }
 
+    pub fn shared_block_device_metrics(&self) -> SharedBlockDeviceMetrics {
+        self.block_device_metrics.clone()
+    }
+
     /// Return a cloned handle to the runner-compatible MMIO dispatcher.
     ///
     /// The dispatcher is local to this boot session. It is shared only so
@@ -697,15 +703,22 @@ impl HvfArm64BootSession<'_> {
                 })?
         };
 
-        if !dispatches.needs_queue_interrupt() {
-            return collect_block_notification_dispatches(dispatches);
+        record_block_runtime_dispatch_metrics(&self.block_device_metrics, dispatches.as_slice());
+        let result = if !dispatches.needs_queue_interrupt() {
+            collect_block_notification_dispatches(dispatches)
+        } else {
+            match HvfGicSpiSignaler::from_metadata(&self.gic) {
+                Ok(signaler) => signal_block_queue_interrupts(dispatches, &signaler),
+                Err(source) => {
+                    Err(HvfArm64BootBlockNotificationDispatchError::CreateSignalSink { source })
+                }
+            }
+        };
+        match &result {
+            Ok(dispatches) => record_block_signal_metrics(&self.block_device_metrics, dispatches),
+            Err(_) => self.block_device_metrics.record_event_failure(),
         }
-
-        let signaler = HvfGicSpiSignaler::from_metadata(&self.gic).map_err(|source| {
-            HvfArm64BootBlockNotificationDispatchError::CreateSignalSink { source }
-        })?;
-
-        signal_block_queue_interrupts(dispatches, &signaler)
+        result
     }
 
     pub fn dispatch_pmem_queue_notifications_and_signal_interrupts(
@@ -914,6 +927,7 @@ impl OwnedHvfArm64BootSession {
             control_wakeup: prepared.control_wakeup,
             run_loop_wakeup: prepared.run_loop_wakeup,
             entropy_source: VirtioRngOsEntropySource::new(),
+            block_device_metrics: prepared.block_device_metrics,
             balloon_device_metrics: prepared.balloon_device_metrics,
             gic: prepared.gic,
             primary_mpidr: prepared.primary_mpidr,
@@ -953,6 +967,10 @@ impl OwnedHvfArm64BootSession {
 
     pub fn shared_balloon_device_metrics(&self) -> SharedBalloonDeviceMetrics {
         self.balloon_device_metrics.clone()
+    }
+
+    pub fn shared_block_device_metrics(&self) -> SharedBlockDeviceMetrics {
+        self.block_device_metrics.clone()
     }
 
     /// Return a cloned handle to the runner-compatible MMIO dispatcher.
@@ -1072,15 +1090,22 @@ impl OwnedHvfArm64BootSession {
                 })?
         };
 
-        if !dispatches.needs_queue_interrupt() {
-            return collect_block_notification_dispatches(dispatches);
+        record_block_runtime_dispatch_metrics(&self.block_device_metrics, dispatches.as_slice());
+        let result = if !dispatches.needs_queue_interrupt() {
+            collect_block_notification_dispatches(dispatches)
+        } else {
+            match HvfGicSpiSignaler::from_metadata(&self.gic) {
+                Ok(signaler) => signal_block_queue_interrupts(dispatches, &signaler),
+                Err(source) => {
+                    Err(HvfArm64BootBlockNotificationDispatchError::CreateSignalSink { source })
+                }
+            }
+        };
+        match &result {
+            Ok(dispatches) => record_block_signal_metrics(&self.block_device_metrics, dispatches),
+            Err(_) => self.block_device_metrics.record_event_failure(),
         }
-
-        let signaler = HvfGicSpiSignaler::from_metadata(&self.gic).map_err(|source| {
-            HvfArm64BootBlockNotificationDispatchError::CreateSignalSink { source }
-        })?;
-
-        signal_block_queue_interrupts(dispatches, &signaler)
+        result
     }
 
     pub fn dispatch_pmem_queue_notifications_and_signal_interrupts(
@@ -3067,6 +3092,57 @@ fn balloon_update_error_from_display(source: impl fmt::Display) -> BalloonUpdate
     }
 }
 
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+fn record_block_dispatch_metrics(
+    metrics: &SharedBlockDeviceMetrics,
+    dispatches: &HvfArm64BootBlockNotificationDispatches,
+) {
+    let runtime_dispatches = dispatches
+        .as_slice()
+        .iter()
+        .map(HvfArm64BootBlockNotificationDispatch::dispatch);
+    record_block_runtime_dispatch_metrics(metrics, runtime_dispatches);
+    record_block_signal_metrics(metrics, dispatches);
+}
+
+fn record_block_runtime_dispatch_metrics<'a>(
+    metrics: &SharedBlockDeviceMetrics,
+    dispatches: impl IntoIterator<Item = &'a Arm64BootBlockNotificationDispatch>,
+) {
+    for dispatch in dispatches {
+        if let Some(dispatched) = dispatch.outcome().dispatched() {
+            metrics.record_notification_dispatch(dispatched);
+        }
+        if let Some(source) = dispatch.outcome().dispatch_error() {
+            metrics.record_queue_events(usize_to_u64_saturating(
+                source.drained_notifications().len(),
+            ));
+            metrics.record_event_failure();
+            if let Some(completed) = source.completed_dispatch() {
+                metrics.record_queue_dispatch(completed);
+            }
+        }
+        if dispatch.outcome().handler_lookup_error().is_some() {
+            metrics.record_event_failure();
+        }
+    }
+}
+
+fn record_block_signal_metrics(
+    metrics: &SharedBlockDeviceMetrics,
+    dispatches: &HvfArm64BootBlockNotificationDispatches,
+) {
+    for dispatch in dispatches.as_slice() {
+        if dispatch.signal_error().is_some() {
+            metrics.record_event_failure();
+        }
+    }
+}
+
 #[cfg(test)]
 fn record_balloon_dispatch_metrics(
     metrics: &SharedBalloonDeviceMetrics,
@@ -3557,6 +3633,7 @@ struct PreparedHvfArm64BootSession<'vm> {
     runtime_resources: Arm64BootRuntimeResources,
     control_wakeup: HvfArm64BootRunLoopControlWakeupToken,
     run_loop_wakeup: HvfArm64BootRunLoopWakeupToken,
+    block_device_metrics: SharedBlockDeviceMetrics,
     balloon_device_metrics: SharedBalloonDeviceMetrics,
     gic: HvfGicMetadata,
     primary_mpidr: u64,
@@ -3618,6 +3695,7 @@ impl HvfBackend {
             control_wakeup: prepared.control_wakeup,
             run_loop_wakeup: prepared.run_loop_wakeup,
             entropy_source: VirtioRngOsEntropySource::new(),
+            block_device_metrics: prepared.block_device_metrics,
             balloon_device_metrics: prepared.balloon_device_metrics,
             gic: prepared.gic,
             primary_mpidr: prepared.primary_mpidr,
@@ -3730,6 +3808,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
         runtime_resources: runtime,
         control_wakeup: HvfArm64BootRunLoopControlWakeupToken::default(),
         run_loop_wakeup: HvfArm64BootRunLoopWakeupToken::default(),
+        block_device_metrics: SharedBlockDeviceMetrics::default(),
         balloon_device_metrics: SharedBalloonDeviceMetrics::default(),
         gic,
         primary_mpidr,
@@ -3891,7 +3970,10 @@ mod tests {
     };
     use bangbang_runtime::machine::MachineConfigInput;
     use bangbang_runtime::memory::{GuestAddress, GuestMemory};
-    use bangbang_runtime::metrics::{BalloonDeviceMetrics, SharedBalloonDeviceMetrics};
+    use bangbang_runtime::metrics::{
+        BalloonDeviceMetrics, BlockDeviceMetrics, SharedBalloonDeviceMetrics,
+        SharedBlockDeviceMetrics,
+    };
     use bangbang_runtime::mmio::{
         MmioAccess, MmioAccessBytes, MmioDispatchOutcome, MmioDispatcher, MmioHandler,
         MmioHandlerError, MmioOperation, MmioRegionId,
@@ -6736,6 +6818,84 @@ mod tests {
     }
 
     #[test]
+    fn block_metrics_record_successful_signal_dispatch() {
+        let payload = vec![0x74; VIRTIO_BLOCK_SECTOR_SIZE as usize];
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_drives(&[("rootfs", payload.as_slice(), true)]);
+        configure_boot_block_queue(&mut runtime, &mut mmio_dispatcher, 0, TEST_USED_RING);
+        write_queued_read_request(&mut memory);
+        notify_boot_block_queue(&mut runtime, &mut mmio_dispatcher, 0);
+        let dispatches =
+            dispatch_boot_block_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let (_, sink) = RecordingSink::successful();
+        let result = signal_block_queue_interrupts(dispatches, sink.as_ref())
+            .expect("queued dispatch should collect");
+        let metrics = SharedBlockDeviceMetrics::default();
+
+        super::record_block_dispatch_metrics(&metrics, &result);
+
+        assert_eq!(
+            metrics.snapshot(),
+            BlockDeviceMetrics::default()
+                .with_queue_event_count(1)
+                .with_read_bytes(VIRTIO_BLOCK_SECTOR_SIZE)
+                .with_read_count(1)
+        );
+    }
+
+    #[test]
+    fn block_metrics_preserve_partial_dispatch_before_signal() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_drives(&[("rootfs", &[0x5a; 512], true)]);
+        configure_boot_block_queue(&mut runtime, &mut mmio_dispatcher, 0, TEST_USED_RING);
+        write_partially_invalid_queued_flush_request(&mut memory);
+        notify_boot_block_queue(&mut runtime, &mut mmio_dispatcher, 0);
+        let dispatches =
+            dispatch_boot_block_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let (_, sink) = RecordingSink::successful();
+        let result = signal_block_queue_interrupts(dispatches, sink.as_ref())
+            .expect("partial dispatch result should collect");
+        let metrics = SharedBlockDeviceMetrics::default();
+
+        super::record_block_dispatch_metrics(&metrics, &result);
+
+        assert_eq!(
+            metrics.snapshot(),
+            BlockDeviceMetrics::default()
+                .with_event_fails(1)
+                .with_flush_count(1)
+                .with_queue_event_count(1)
+        );
+    }
+
+    #[test]
+    fn block_metrics_record_signal_failure() {
+        let payload = vec![0x74; VIRTIO_BLOCK_SECTOR_SIZE as usize];
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_drives(&[("rootfs", payload.as_slice(), true)]);
+        configure_boot_block_queue(&mut runtime, &mut mmio_dispatcher, 0, TEST_USED_RING);
+        write_queued_read_request(&mut memory);
+        notify_boot_block_queue(&mut runtime, &mut mmio_dispatcher, 0);
+        let dispatches =
+            dispatch_boot_block_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let (_, sink) = RecordingSink::failing("injected signal failure");
+        let result = signal_block_queue_interrupts(dispatches, sink.as_ref())
+            .expect("signal failure should stay per-device");
+        let metrics = SharedBlockDeviceMetrics::default();
+
+        super::record_block_dispatch_metrics(&metrics, &result);
+
+        assert_eq!(
+            metrics.snapshot(),
+            BlockDeviceMetrics::default()
+                .with_event_fails(1)
+                .with_queue_event_count(1)
+                .with_read_bytes(VIRTIO_BLOCK_SECTOR_SIZE)
+                .with_read_count(1)
+        );
+    }
+
+    #[test]
     fn block_notification_signal_dispatch_preserves_missing_handler_without_signal() {
         let (mut memory, mut runtime, _) =
             boot_runtime_with_drives(&[("rootfs", &[0x5a; 512], true)]);
@@ -6752,6 +6912,26 @@ mod tests {
         assert!(!device.queue_interrupt_signaled());
         assert!(device.signal_error().is_none());
         assert!(recorded_lines(&lines).is_empty());
+    }
+
+    #[test]
+    fn block_metrics_record_handler_lookup_failure() {
+        let (mut memory, mut runtime, _) =
+            boot_runtime_with_drives(&[("rootfs", &[0x5a; 512], true)]);
+        let mut mmio_dispatcher = MmioDispatcher::new();
+        let dispatches =
+            dispatch_boot_block_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let (_, sink) = RecordingSink::successful();
+        let result = signal_block_queue_interrupts(dispatches, sink.as_ref())
+            .expect("missing handler dispatch should collect");
+        let metrics = SharedBlockDeviceMetrics::default();
+
+        super::record_block_dispatch_metrics(&metrics, &result);
+
+        assert_eq!(
+            metrics.snapshot(),
+            BlockDeviceMetrics::default().with_event_fails(1)
+        );
     }
 
     #[test]
