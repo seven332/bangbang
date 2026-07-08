@@ -9,8 +9,9 @@ use crate::balloon::{
     BalloonConfig, BalloonHintingCommandError, BalloonHintingStartInput, BalloonHintingStatus,
     BalloonHintingStatusError, BalloonMmioDeviceRegistration, BalloonMmioLayout,
     BalloonMmioRegistrationError, BalloonPageCountOverflow, BalloonStats, BalloonStatsError,
-    BalloonUpdateError, PreparedBalloonDevice, VirtioBalloonDeviceNotificationDispatch,
-    VirtioBalloonDeviceNotificationError, VirtioBalloonMmioHandler,
+    BalloonStatsUpdateInput, BalloonUpdateError, PreparedBalloonDevice,
+    VirtioBalloonDeviceNotificationDispatch, VirtioBalloonDeviceNotificationError,
+    VirtioBalloonMmioHandler,
 };
 use crate::block::{
     BlockFileBacking, BlockMmioDeviceRegistration, BlockMmioLayout, BlockMmioRegistrationError,
@@ -1489,6 +1490,17 @@ pub fn update_balloon_config_for_device(
         .update_balloon_config(config)
 }
 
+pub fn update_balloon_statistics_for_device(
+    device: &Arm64BootBalloonDevice,
+    mmio_dispatcher: &mut MmioDispatcher,
+    input: BalloonStatsUpdateInput,
+) -> Result<(), BalloonUpdateError> {
+    mmio_dispatcher
+        .handler_mut::<VirtioBalloonMmioHandler>(device.registration.region_id())
+        .map_err(BalloonUpdateError::HandlerLookup)?
+        .update_balloon_statistics(input)
+}
+
 pub fn start_balloon_hinting_for_device(
     device: &Arm64BootBalloonDevice,
     mmio_dispatcher: &mut MmioDispatcher,
@@ -2413,16 +2425,17 @@ mod tests {
         Arm64BootSerialMmioRegistrationError, MIB, arm64_boot_network_device_metadata,
         balloon_hinting_status_for_device, balloon_stats_for_device, block_device_metadata,
         start_balloon_hinting_for_device, stop_balloon_hinting_for_device,
-        update_balloon_config_for_device,
+        update_balloon_config_for_device, update_balloon_statistics_for_device,
     };
     use crate::VmmAction;
     use crate::balloon::{
         BalloonConfigInput, BalloonHintingCommandError, BalloonHintingStartInput,
-        BalloonHintingStatusError, BalloonMmioLayout, VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX,
-        VIRTIO_BALLOON_DEVICE_ID, VIRTIO_BALLOON_FREE_PAGE_HINT_DONE,
-        VIRTIO_BALLOON_FREE_PAGE_HINT_STOP, VIRTIO_BALLOON_INFLATE_QUEUE_INDEX,
-        VIRTIO_BALLOON_MIB_TO_4K_PAGES, VIRTIO_BALLOON_S_MEMFREE, VIRTIO_BALLOON_S_SWAP_OUT,
-        VIRTIO_BALLOON_STAT_SIZE, VIRTIO_BALLOON_STATS_QUEUE_INDEX, VirtioBalloonMmioHandler,
+        BalloonHintingStatusError, BalloonMmioLayout, BalloonStatsUpdateInput,
+        VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX, VIRTIO_BALLOON_DEVICE_ID,
+        VIRTIO_BALLOON_FREE_PAGE_HINT_DONE, VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
+        VIRTIO_BALLOON_INFLATE_QUEUE_INDEX, VIRTIO_BALLOON_MIB_TO_4K_PAGES,
+        VIRTIO_BALLOON_S_MEMFREE, VIRTIO_BALLOON_S_SWAP_OUT, VIRTIO_BALLOON_STAT_SIZE,
+        VIRTIO_BALLOON_STATS_QUEUE_INDEX, VirtioBalloonMmioHandler,
     };
     use crate::block::{
         DriveConfigInput, DriveUpdateError, VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
@@ -5787,6 +5800,37 @@ mod tests {
             ),
             DeviceInterruptKind::Config.status().bits()
         );
+    }
+
+    #[test]
+    fn boot_runtime_balloon_statistics_update_updates_active_handler() {
+        let initial_amount_mib = TEST_MEMORY_MIB as u32 / 2;
+        let (_, runtime, mut mmio_dispatcher) = boot_runtime_with_balloon_config(
+            "kernel-balloon-update-stats",
+            BalloonConfigInput::new(initial_amount_mib, false).with_stats_polling_interval_s(60),
+        );
+        let device = runtime
+            .balloon_device
+            .as_ref()
+            .expect("balloon device should exist")
+            .clone();
+
+        let handler = mmio_dispatcher
+            .handler_mut::<VirtioBalloonMmioHandler>(device.registration.region_id())
+            .expect("balloon handler should be registered");
+        assert_eq!(handler.activation_handler().stats_polling_interval_s(), 60);
+
+        update_balloon_statistics_for_device(
+            &device,
+            &mut mmio_dispatcher,
+            BalloonStatsUpdateInput::new(30),
+        )
+        .expect("balloon statistics update should succeed");
+
+        let handler = mmio_dispatcher
+            .handler_mut::<VirtioBalloonMmioHandler>(device.registration.region_id())
+            .expect("balloon handler should be registered");
+        assert_eq!(handler.activation_handler().stats_polling_interval_s(), 30);
     }
 
     #[test]

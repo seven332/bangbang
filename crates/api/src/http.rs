@@ -36,7 +36,7 @@ pub enum ApiRequest {
     PutEntropy(Box<EntropyConfigRequest>),
     PutMemoryHotplug,
     PatchBalloon(Box<BalloonUpdateRequest>),
-    PatchBalloonStats,
+    PatchBalloonStats(Box<BalloonStatsUpdateRequest>),
     PatchBalloonHintingStart(BalloonHintingStartRequest),
     PatchBalloonHintingStop,
     PatchMemoryHotplug,
@@ -551,6 +551,17 @@ pub struct BalloonUpdateRequest {
 impl BalloonUpdateRequest {
     pub const fn amount_mib(self) -> u32 {
         self.amount_mib
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BalloonStatsUpdateRequest {
+    stats_polling_interval_s: u16,
+}
+
+impl BalloonStatsUpdateRequest {
+    pub const fn stats_polling_interval_s(self) -> u16 {
+        self.stats_polling_interval_s
     }
 }
 
@@ -2658,9 +2669,12 @@ fn parse_balloon_stats_update_request(body: &[u8]) -> Result<ApiRequest, Request
         stats_polling_interval_s,
     } = serde_json::from_slice::<BalloonStatsUpdateRequestBody>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
-    let _ = stats_polling_interval_s;
 
-    Ok(ApiRequest::PatchBalloonStats)
+    Ok(ApiRequest::PatchBalloonStats(Box::new(
+        BalloonStatsUpdateRequest {
+            stats_polling_interval_s,
+        },
+    )))
 }
 
 fn parse_balloon_hinting_start_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
@@ -3305,7 +3319,7 @@ impl From<ApiRequest> for Endpoint {
             | ApiRequest::GetBalloonHintingStatus
             | ApiRequest::PutBalloon(_)
             | ApiRequest::PatchBalloon(_)
-            | ApiRequest::PatchBalloonStats
+            | ApiRequest::PatchBalloonStats(_)
             | ApiRequest::PatchBalloonHintingStart(_)
             | ApiRequest::PatchBalloonHintingStop => Self::Balloon,
             ApiRequest::PatchVmState(_) => Self::VmState,
@@ -5954,7 +5968,9 @@ mod tests {
                     "/balloon/statistics",
                     r#"{"stats_polling_interval_s":1}"#,
                 ),
-                ApiRequest::PatchBalloonStats,
+                ApiRequest::PatchBalloonStats(Box::new(BalloonStatsUpdateRequest {
+                    stats_polling_interval_s: 1,
+                })),
             ),
             (
                 "PATCH /balloon/statistics max interval",
@@ -5963,7 +5979,9 @@ mod tests {
                     "/balloon/statistics",
                     r#"{"stats_polling_interval_s":65535}"#,
                 ),
-                ApiRequest::PatchBalloonStats,
+                ApiRequest::PatchBalloonStats(Box::new(BalloonStatsUpdateRequest {
+                    stats_polling_interval_s: 65_535,
+                })),
             ),
             (
                 "PATCH /balloon/hinting/start without body",

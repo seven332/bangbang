@@ -219,10 +219,12 @@ and process-session tests that verify stored config updates, active config-space
 generation changes, and config interrupt signaling; they do not require a
 separate signed guest scenario until periodic polling, host reclaim, or
 reporting behavior is added. Guest-reported statistics queue records are covered
-by runtime unit, API response, and process-session tests. Hinting queue
-guest-command acknowledgement, automatic host DONE acknowledgement, and
-active-run range descriptor validation/recording are covered by runtime unit
-and MMIO handler tests.
+by runtime unit, API response, and process-session tests. Runtime statistics
+interval updates are covered by unit, API socket, and process-session tests
+because they update stored/active interval state without timer-driven guest
+polling. Hinting queue guest-command acknowledgement, automatic host DONE
+acknowledgement, and active-run range descriptor validation/recording are
+covered by runtime unit and MMIO handler tests.
 It also includes a direct-rootfs writeback block scenario that configures a
 non-root data drive with `cache_type=Writeback`, writes through `/dev/vdb`,
 calls `fsync` on the block-device file descriptor, and writes a host-observable
