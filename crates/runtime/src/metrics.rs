@@ -907,6 +907,8 @@ pub struct BlockDeviceMetrics {
     invalid_reqs_count: u64,
     flush_count: u64,
     queue_event_count: u64,
+    update_count: u64,
+    update_fails: u64,
     read_bytes: u64,
     write_bytes: u64,
     read_count: u64,
@@ -920,6 +922,8 @@ impl BlockDeviceMetrics {
             && self.invalid_reqs_count == 0
             && self.flush_count == 0
             && self.queue_event_count == 0
+            && self.update_count == 0
+            && self.update_fails == 0
             && self.read_bytes == 0
             && self.write_bytes == 0
             && self.read_count == 0
@@ -944,6 +948,14 @@ impl BlockDeviceMetrics {
 
     pub const fn queue_event_count(self) -> u64 {
         self.queue_event_count
+    }
+
+    pub const fn update_count(self) -> u64 {
+        self.update_count
+    }
+
+    pub const fn update_fails(self) -> u64 {
+        self.update_fails
     }
 
     pub const fn read_bytes(self) -> u64 {
@@ -987,6 +999,16 @@ impl BlockDeviceMetrics {
         self
     }
 
+    pub const fn with_update_count(mut self, update_count: u64) -> Self {
+        self.update_count = update_count;
+        self
+    }
+
+    pub const fn with_update_fails(mut self, update_fails: u64) -> Self {
+        self.update_fails = update_fails;
+        self
+    }
+
     pub const fn with_read_bytes(mut self, read_bytes: u64) -> Self {
         self.read_bytes = read_bytes;
         self
@@ -1018,6 +1040,8 @@ impl BlockDeviceMetrics {
             queue_event_count: self
                 .queue_event_count
                 .saturating_add(other.queue_event_count),
+            update_count: self.update_count.saturating_add(other.update_count),
+            update_fails: self.update_fails.saturating_add(other.update_fails),
             read_bytes: self.read_bytes.saturating_add(other.read_bytes),
             write_bytes: self.write_bytes.saturating_add(other.write_bytes),
             read_count: self.read_count.saturating_add(other.read_count),
@@ -1125,6 +1149,14 @@ impl SharedBlockDeviceMetrics {
         record_atomic_metric(&self.inner.event_fails, 1);
     }
 
+    pub fn record_update(&self) {
+        record_atomic_metric(&self.inner.update_count, 1);
+    }
+
+    pub fn record_update_failure(&self) {
+        record_atomic_metric(&self.inner.update_fails, 1);
+    }
+
     pub fn snapshot(&self) -> BlockDeviceMetrics {
         BlockDeviceMetrics {
             event_fails: self.inner.event_fails.load(Ordering::Relaxed),
@@ -1132,6 +1164,8 @@ impl SharedBlockDeviceMetrics {
             invalid_reqs_count: self.inner.invalid_reqs_count.load(Ordering::Relaxed),
             flush_count: self.inner.flush_count.load(Ordering::Relaxed),
             queue_event_count: self.inner.queue_event_count.load(Ordering::Relaxed),
+            update_count: self.inner.update_count.load(Ordering::Relaxed),
+            update_fails: self.inner.update_fails.load(Ordering::Relaxed),
             read_bytes: self.inner.read_bytes.load(Ordering::Relaxed),
             write_bytes: self.inner.write_bytes.load(Ordering::Relaxed),
             read_count: self.inner.read_count.load(Ordering::Relaxed),
@@ -1183,6 +1217,8 @@ struct SharedBlockDeviceMetricsInner {
     invalid_reqs_count: AtomicU64,
     flush_count: AtomicU64,
     queue_event_count: AtomicU64,
+    update_count: AtomicU64,
+    update_fails: AtomicU64,
     read_bytes: AtomicU64,
     write_bytes: AtomicU64,
     read_count: AtomicU64,
@@ -1255,6 +1291,20 @@ impl SharedBlockDeviceMetricsRegistry {
         self.aggregate.record_event_failure();
         if let Some(metrics) = self.per_drive(drive_id) {
             metrics.record_event_failure();
+        }
+    }
+
+    pub fn record_update_for_drive(&self, drive_id: &str) {
+        self.aggregate.record_update();
+        if let Some(metrics) = self.per_drive(drive_id) {
+            metrics.record_update();
+        }
+    }
+
+    pub fn record_update_failure_for_drive(&self, drive_id: &str) {
+        self.aggregate.record_update_failure();
+        if let Some(metrics) = self.per_drive(drive_id) {
+            metrics.record_update_failure();
         }
     }
 
@@ -1662,6 +1712,14 @@ fn block_device_metrics_json_object(
     block.insert(
         "queue_event_count".to_string(),
         serde_json::Value::Number(metrics.queue_event_count().into()),
+    );
+    block.insert(
+        "update_count".to_string(),
+        serde_json::Value::Number(metrics.update_count().into()),
+    );
+    block.insert(
+        "update_fails".to_string(),
+        serde_json::Value::Number(metrics.update_fails().into()),
     );
     block.insert(
         "read_bytes".to_string(),
@@ -2139,6 +2197,8 @@ mod tests {
             .with_invalid_reqs_count(3)
             .with_flush_count(4)
             .with_queue_event_count(5)
+            .with_update_count(10)
+            .with_update_fails(11)
             .with_read_bytes(6)
             .with_write_bytes(7)
             .with_read_count(8)
@@ -2334,7 +2394,7 @@ mod tests {
         assert_eq!(
             output.lines(),
             [
-                r#"{"block":{"event_fails":1,"execute_fails":2,"flush_count":4,"invalid_reqs_count":3,"queue_event_count":5,"read_bytes":6,"read_count":8,"write_bytes":7,"write_count":9},"vmm":{"metrics_flush_count":1}}"#
+                r#"{"block":{"event_fails":1,"execute_fails":2,"flush_count":4,"invalid_reqs_count":3,"queue_event_count":5,"read_bytes":6,"read_count":8,"update_count":10,"update_fails":11,"write_bytes":7,"write_count":9},"vmm":{"metrics_flush_count":1}}"#
             ]
         );
     }
@@ -2377,7 +2437,7 @@ mod tests {
         assert_eq!(
             output.lines(),
             [
-                r#"{"block":{"event_fails":0,"execute_fails":0,"flush_count":0,"invalid_reqs_count":0,"queue_event_count":2,"read_bytes":512,"read_count":1,"write_bytes":256,"write_count":1},"block_data":{"event_fails":0,"execute_fails":0,"flush_count":0,"invalid_reqs_count":0,"queue_event_count":1,"read_bytes":0,"read_count":0,"write_bytes":256,"write_count":1},"block_rootfs":{"event_fails":0,"execute_fails":0,"flush_count":0,"invalid_reqs_count":0,"queue_event_count":1,"read_bytes":512,"read_count":1,"write_bytes":0,"write_count":0},"vmm":{"metrics_flush_count":1}}"#
+                r#"{"block":{"event_fails":0,"execute_fails":0,"flush_count":0,"invalid_reqs_count":0,"queue_event_count":2,"read_bytes":512,"read_count":1,"update_count":0,"update_fails":0,"write_bytes":256,"write_count":1},"block_data":{"event_fails":0,"execute_fails":0,"flush_count":0,"invalid_reqs_count":0,"queue_event_count":1,"read_bytes":0,"read_count":0,"update_count":0,"update_fails":0,"write_bytes":256,"write_count":1},"block_rootfs":{"event_fails":0,"execute_fails":0,"flush_count":0,"invalid_reqs_count":0,"queue_event_count":1,"read_bytes":512,"read_count":1,"update_count":0,"update_fails":0,"write_bytes":0,"write_count":0},"vmm":{"metrics_flush_count":1}}"#
             ]
         );
     }
@@ -2406,21 +2466,28 @@ mod tests {
 
         first.record_queue_events_for_drive("rootfs", 2);
         first.record_event_failure_for_drive("rootfs");
+        first.record_update_for_drive("rootfs");
+        first.record_update_failure_for_drive("data");
 
         assert_eq!(
             first.aggregate_snapshot(),
             BlockDeviceMetrics::default()
                 .with_event_fails(1)
                 .with_queue_event_count(2)
+                .with_update_count(1)
+                .with_update_fails(1)
         );
         assert_eq!(
             first.per_drive_snapshot(),
-            BlockDeviceMetricsByDrive::new().with_drive_metrics(
-                "rootfs",
-                BlockDeviceMetrics::default()
-                    .with_event_fails(1)
-                    .with_queue_event_count(2),
-            )
+            BlockDeviceMetricsByDrive::new()
+                .with_drive_metrics(
+                    "rootfs",
+                    BlockDeviceMetrics::default()
+                        .with_event_fails(1)
+                        .with_queue_event_count(2)
+                        .with_update_count(1),
+                )
+                .with_drive_metrics("data", BlockDeviceMetrics::default().with_update_fails(1),)
         );
         assert_eq!(second.aggregate_snapshot(), BlockDeviceMetrics::default());
         assert!(second.per_drive_snapshot().is_empty());
@@ -2448,6 +2515,8 @@ mod tests {
                 .with_invalid_reqs_count(u64::MAX - 3)
                 .with_flush_count(u64::MAX - 4)
                 .with_queue_event_count(u64::MAX - 5)
+                .with_update_count(u64::MAX - 10)
+                .with_update_fails(u64::MAX - 11)
                 .with_read_bytes(u64::MAX - 6)
                 .with_write_bytes(u64::MAX - 7)
                 .with_read_count(u64::MAX - 8)
@@ -2465,6 +2534,8 @@ mod tests {
                     .with_invalid_reqs_count(u64::MAX)
                     .with_flush_count(u64::MAX)
                     .with_queue_event_count(u64::MAX)
+                    .with_update_count(u64::MAX)
+                    .with_update_fails(u64::MAX)
                     .with_read_bytes(u64::MAX)
                     .with_write_bytes(u64::MAX)
                     .with_read_count(u64::MAX)
@@ -2497,6 +2568,8 @@ mod tests {
                     .with_invalid_reqs_count(3)
                     .with_flush_count(4)
                     .with_queue_event_count(5)
+                    .with_update_count(10)
+                    .with_update_fails(11)
                     .with_read_bytes(6)
                     .with_write_bytes(7)
                     .with_read_count(u64::MAX)

@@ -187,8 +187,8 @@ PATCH failures and identifiable malformed balloon PUT/PATCH parser failures,
 because Firecracker does not expose matching balloon API request metric fields.
 Runtime metrics flushes can also include a top-level aggregate `block` object
 and non-empty per-drive `block_{drive_id}` objects for implemented virtio-block
-queue activity and failures, plus a top-level `balloon` object for implemented
-virtio-balloon activity and failures.
+queue activity, backing update counters, and failures, plus a top-level
+`balloon` object for implemented virtio-balloon activity and failures.
 Parsed deprecated HTTP API
 usage is counted under `deprecated_api.deprecated_http_api_calls` for supported
 deprecated machine `cpu_template`, MMDS V1 config, `vsock_id`, and snapshot-load
