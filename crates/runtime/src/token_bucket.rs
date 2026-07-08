@@ -51,6 +51,25 @@ pub(crate) struct TokenBucket {
     last_update: Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TokenBucketReduction {
+    Allowed,
+    Throttled { retry_after: Duration },
+}
+
+impl TokenBucketReduction {
+    pub(crate) const fn is_allowed(self) -> bool {
+        matches!(self, Self::Allowed)
+    }
+
+    pub(crate) const fn retry_after(self) -> Option<Duration> {
+        match self {
+            Self::Allowed => None,
+            Self::Throttled { retry_after } => Some(retry_after),
+        }
+    }
+}
+
 impl TokenBucket {
     pub(crate) fn new(config: TokenBucketConfig) -> Option<Self> {
         Self::new_at(config, Instant::now())
@@ -76,13 +95,21 @@ impl TokenBucket {
     }
 
     pub(crate) fn reduce_at(&mut self, tokens: u64, now: Instant) -> bool {
+        self.reduce_with_retry_at(tokens, now).is_allowed()
+    }
+
+    pub(crate) fn reduce_with_retry_at(
+        &mut self,
+        tokens: u64,
+        now: Instant,
+    ) -> TokenBucketReduction {
         if tokens == 0 {
-            return true;
+            return TokenBucketReduction::Allowed;
         }
         if self.one_time_burst >= tokens {
             self.one_time_burst -= tokens;
             self.last_update = now;
-            return true;
+            return TokenBucketReduction::Allowed;
         }
 
         let tokens = tokens.saturating_sub(self.one_time_burst);
@@ -91,24 +118,37 @@ impl TokenBucket {
 
         if tokens > self.size {
             self.budget = 0;
-            return false;
+            return TokenBucketReduction::Throttled {
+                retry_after: self.retry_after_for_tokens(self.size, now),
+            };
         }
         if tokens > self.budget {
-            return false;
+            return TokenBucketReduction::Throttled {
+                retry_after: self.retry_after_for_tokens(tokens, now),
+            };
         }
 
         self.budget -= tokens;
-        true
+        TokenBucketReduction::Allowed
     }
 
     pub(crate) fn reduce_allow_overconsumption_at(&mut self, tokens: u64, now: Instant) -> bool {
+        self.reduce_allow_overconsumption_with_retry_at(tokens, now)
+            .is_allowed()
+    }
+
+    pub(crate) fn reduce_allow_overconsumption_with_retry_at(
+        &mut self,
+        tokens: u64,
+        now: Instant,
+    ) -> TokenBucketReduction {
         if tokens == 0 || tokens <= self.size {
-            return self.reduce_at(tokens, now);
+            return self.reduce_with_retry_at(tokens, now);
         }
         if self.one_time_burst >= tokens {
             self.one_time_burst -= tokens;
             self.last_update = now;
-            return true;
+            return TokenBucketReduction::Allowed;
         }
 
         let tokens = tokens.saturating_sub(self.one_time_burst);
@@ -116,14 +156,16 @@ impl TokenBucket {
         self.replenish_at(now);
 
         if tokens <= self.size {
-            return self.reduce_at(tokens, now);
+            return self.reduce_with_retry_at(tokens, now);
         }
         if self.budget < self.size {
-            return false;
+            return TokenBucketReduction::Throttled {
+                retry_after: self.retry_after_for_tokens(self.size, now),
+            };
         }
 
         self.budget = 0;
-        true
+        TokenBucketReduction::Allowed
     }
 
     pub(crate) const fn snapshot(&self) -> TokenBucketSnapshot {
@@ -176,6 +218,32 @@ impl TokenBucket {
         };
         self.last_update += Duration::from_nanos(adjusted_nanos);
     }
+
+    fn retry_after_for_tokens(&self, tokens: u64, now: Instant) -> Duration {
+        let target_budget = tokens.min(self.size);
+        let token_deficit = target_budget.saturating_sub(self.budget);
+        if token_deficit == 0 {
+            return Duration::ZERO;
+        }
+
+        let nanos_since_update = if now > self.last_update {
+            now.duration_since(self.last_update).as_nanos()
+        } else {
+            0
+        };
+        let nanos_until_budget = u128::from(token_deficit)
+            .saturating_mul(u128::from(self.refill_time_nanos))
+            .div_ceil(u128::from(self.size));
+        let retry_after_nanos = nanos_until_budget.saturating_sub(nanos_since_update);
+        duration_from_nanos_saturating(retry_after_nanos)
+    }
+}
+
+fn duration_from_nanos_saturating(nanos: u128) -> Duration {
+    match u64::try_from(nanos) {
+        Ok(value) => Duration::from_nanos(value),
+        Err(_) => Duration::from_nanos(u64::MAX),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,7 +257,7 @@ pub(crate) struct TokenBucketSnapshot {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{TokenBucket, TokenBucketConfig};
+    use super::{TokenBucket, TokenBucketConfig, TokenBucketReduction};
 
     #[test]
     fn consumes_burst_budget_and_refills_by_time() {
@@ -200,9 +268,19 @@ mod tests {
         assert!(bucket.reduce_at(1, now));
         assert!(bucket.reduce_at(1, now));
         assert!(bucket.reduce_at(1, now));
-        assert!(!bucket.reduce_at(1, now));
+        assert_eq!(
+            bucket.reduce_with_retry_at(1, now),
+            TokenBucketReduction::Throttled {
+                retry_after: Duration::from_millis(50),
+            }
+        );
         assert!(bucket.reduce_at(1, now + Duration::from_millis(50)));
-        assert!(!bucket.reduce_at(1, now + Duration::from_millis(50)));
+        assert_eq!(
+            bucket.reduce_with_retry_at(1, now + Duration::from_millis(50)),
+            TokenBucketReduction::Throttled {
+                retry_after: Duration::from_millis(50),
+            }
+        );
         assert!(bucket.reduce_at(1, now + Duration::from_millis(100)));
     }
 
@@ -246,8 +324,18 @@ mod tests {
             .expect("bucket should be enabled");
 
         assert!(bucket.reduce_allow_overconsumption_at(8, now));
-        assert!(!bucket.reduce_allow_overconsumption_at(8, now));
-        assert!(!bucket.reduce_allow_overconsumption_at(8, now + Duration::from_millis(50)));
+        assert_eq!(
+            bucket.reduce_allow_overconsumption_with_retry_at(8, now),
+            TokenBucketReduction::Throttled {
+                retry_after: Duration::from_millis(100),
+            }
+        );
+        assert_eq!(
+            bucket.reduce_allow_overconsumption_with_retry_at(8, now + Duration::from_millis(50)),
+            TokenBucketReduction::Throttled {
+                retry_after: Duration::from_millis(50),
+            }
+        );
         assert!(bucket.reduce_allow_overconsumption_at(8, now + Duration::from_millis(100)));
     }
 }
