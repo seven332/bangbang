@@ -1422,7 +1422,9 @@ impl VirtioBlockQueue {
                         let execution = request.execute(memory, backing, device_id);
                         (
                             execution.completion(),
-                            VirtioBlockQueueDispatchOutcome::from_execution(&execution),
+                            VirtioBlockQueueDispatchOutcome::from_request_execution(
+                                &request, &execution,
+                            ),
                         )
                     }
                     Err(source) => (
@@ -1477,6 +1479,11 @@ impl VirtioBlockQueue {
 pub struct VirtioBlockQueueDispatch {
     processed_requests: usize,
     successful_requests: usize,
+    read_count: usize,
+    write_count: usize,
+    flush_count: usize,
+    read_bytes: u64,
+    write_bytes: u64,
     parse_failures: usize,
     io_errors: usize,
     unsupported_requests: usize,
@@ -1492,6 +1499,26 @@ impl VirtioBlockQueueDispatch {
 
     pub const fn successful_requests(&self) -> usize {
         self.successful_requests
+    }
+
+    pub const fn read_count(&self) -> usize {
+        self.read_count
+    }
+
+    pub const fn write_count(&self) -> usize {
+        self.write_count
+    }
+
+    pub const fn flush_count(&self) -> usize {
+        self.flush_count
+    }
+
+    pub const fn read_bytes(&self) -> u64 {
+        self.read_bytes
+    }
+
+    pub const fn write_bytes(&self) -> u64 {
+        self.write_bytes
     }
 
     pub const fn parse_failures(&self) -> usize {
@@ -1526,8 +1553,26 @@ impl VirtioBlockQueueDispatch {
         self.processed_requests += 1;
         self.needs_queue_interrupt |= publication.needs_queue_interrupt();
         match outcome {
-            VirtioBlockQueueDispatchOutcome::Ok => {
+            VirtioBlockQueueDispatchOutcome::Ok {
+                request_type,
+                data_len,
+            } => {
                 self.successful_requests += 1;
+                match request_type {
+                    VirtioBlockRequestType::In => {
+                        self.read_count += 1;
+                        self.read_bytes = self.read_bytes.saturating_add(u64::from(data_len));
+                    }
+                    VirtioBlockRequestType::Out => {
+                        self.write_count += 1;
+                        self.write_bytes = self.write_bytes.saturating_add(u64::from(data_len));
+                    }
+                    VirtioBlockRequestType::Flush => {
+                        self.flush_count += 1;
+                    }
+                    VirtioBlockRequestType::GetDeviceId
+                    | VirtioBlockRequestType::Unsupported(_) => {}
+                }
             }
             VirtioBlockQueueDispatchOutcome::ParseError(source) => {
                 self.parse_failures += 1;
@@ -1550,7 +1595,10 @@ impl VirtioBlockQueueDispatch {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum VirtioBlockQueueDispatchOutcome {
-    Ok,
+    Ok {
+        request_type: VirtioBlockRequestType,
+        data_len: u32,
+    },
     ParseError(VirtioBlockRequestError),
     IoError,
     Unsupported,
@@ -1558,9 +1606,18 @@ enum VirtioBlockQueueDispatchOutcome {
 }
 
 impl VirtioBlockQueueDispatchOutcome {
-    const fn from_execution(execution: &VirtioBlockRequestExecution) -> Self {
+    const fn from_request_execution(
+        request: &VirtioBlockRequest,
+        execution: &VirtioBlockRequestExecution,
+    ) -> Self {
         match execution.outcome() {
-            VirtioBlockRequestExecutionOutcome::Ok => Self::Ok,
+            VirtioBlockRequestExecutionOutcome::Ok => Self::Ok {
+                request_type: request.request_type(),
+                data_len: match request.data() {
+                    Some(data) => data.len(),
+                    None => 0,
+                },
+            },
             VirtioBlockRequestExecutionOutcome::IoError { .. } => Self::IoError,
             VirtioBlockRequestExecutionOutcome::Unsupported { .. } => Self::Unsupported,
             VirtioBlockRequestExecutionOutcome::StatusWriteFailed { .. } => Self::StatusWriteFailed,
@@ -3212,6 +3269,7 @@ mod tests {
 
     use crate::interrupt::DeviceInterruptKind;
     use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
+    use crate::metrics::{BlockDeviceMetrics, SharedBlockDeviceMetrics};
     use crate::mmio::{
         MmioAccess, MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioOperation, MmioRegionId,
     };
@@ -7150,6 +7208,11 @@ mod tests {
 
         assert_eq!(dispatch.processed_requests(), 0);
         assert_eq!(dispatch.successful_requests(), 0);
+        assert_eq!(dispatch.read_count(), 0);
+        assert_eq!(dispatch.write_count(), 0);
+        assert_eq!(dispatch.flush_count(), 0);
+        assert_eq!(dispatch.read_bytes(), 0);
+        assert_eq!(dispatch.write_bytes(), 0);
         assert_eq!(dispatch.parse_failures(), 0);
         assert_eq!(dispatch.io_errors(), 0);
         assert!(!dispatch.needs_queue_interrupt());
@@ -7182,6 +7245,11 @@ mod tests {
 
         assert_eq!(dispatch.processed_requests(), 1);
         assert_eq!(dispatch.successful_requests(), 1);
+        assert_eq!(dispatch.read_count(), 1);
+        assert_eq!(dispatch.read_bytes(), VIRTIO_BLOCK_SECTOR_SIZE);
+        assert_eq!(dispatch.write_count(), 0);
+        assert_eq!(dispatch.write_bytes(), 0);
+        assert_eq!(dispatch.flush_count(), 0);
         assert_eq!(dispatch.parse_failures(), 0);
         assert_eq!(dispatch.io_errors(), 0);
         assert_eq!(dispatch.unsupported_requests(), 0);
@@ -7202,6 +7270,46 @@ mod tests {
                 VIRTIO_BLOCK_SECTOR_SIZE as u32 + VIRTIO_BLOCK_STATUS_SIZE,
             )
         );
+    }
+
+    #[test]
+    fn block_queue_dispatch_executes_write_and_records_write_bytes() {
+        let mut memory = request_memory();
+        let payload = sector_payload(0x29);
+        memory
+            .write_slice(&payload, DATA_ADDR)
+            .expect("guest data should write");
+        let file = temp_file(
+            "queue-write.img",
+            &vec![0; VIRTIO_BLOCK_SECTOR_SIZE as usize],
+        );
+        let backing = open_backing(file.as_path(), false).expect("backing should open");
+        write_queued_request(
+            &mut memory,
+            0,
+            VIRTIO_BLOCK_REQUEST_TYPE_OUT,
+            0,
+            HEADER_ADDR,
+            Some((DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as u32, false)),
+            STATUS_ADDR,
+        );
+        write_available_heads(&mut memory, &[0]);
+        let mut queue = block_queue();
+
+        let dispatch = queue
+            .dispatch(&mut memory, &backing, TEST_DEVICE_ID)
+            .expect("write queue dispatch should succeed");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_requests(), 1);
+        assert_eq!(dispatch.read_count(), 0);
+        assert_eq!(dispatch.read_bytes(), 0);
+        assert_eq!(dispatch.write_count(), 1);
+        assert_eq!(dispatch.write_bytes(), VIRTIO_BLOCK_SECTOR_SIZE);
+        assert_eq!(dispatch.flush_count(), 0);
+        assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_OK);
+        assert_eq!(read_used_element(&memory, 0), (0, VIRTIO_BLOCK_STATUS_SIZE));
+        assert_eq!(fs::read(file.as_path()).expect("file should read"), payload);
     }
 
     #[test]
@@ -7298,6 +7406,11 @@ mod tests {
 
         assert_eq!(dispatch.processed_requests(), 2);
         assert_eq!(dispatch.successful_requests(), 2);
+        assert_eq!(dispatch.read_count(), 0);
+        assert_eq!(dispatch.write_count(), 0);
+        assert_eq!(dispatch.flush_count(), 2);
+        assert_eq!(dispatch.read_bytes(), 0);
+        assert_eq!(dispatch.write_bytes(), 0);
         assert_eq!(dispatch.parse_failures(), 0);
         assert!(dispatch.needs_queue_interrupt());
         assert_eq!(queue.available_ring().next_avail(), 2);
@@ -7338,6 +7451,9 @@ mod tests {
 
         assert_eq!(dispatch.processed_requests(), 1);
         assert_eq!(dispatch.successful_requests(), 0);
+        assert_eq!(dispatch.read_count(), 0);
+        assert_eq!(dispatch.write_count(), 0);
+        assert_eq!(dispatch.flush_count(), 0);
         assert_eq!(dispatch.parse_failures(), 1);
         assert!(matches!(
             dispatch.first_parse_failure(),
@@ -7347,6 +7463,12 @@ mod tests {
             })
         ));
         assert_eq!(dispatch.io_errors(), 0);
+        let metrics = SharedBlockDeviceMetrics::default();
+        metrics.record_queue_dispatch(&dispatch);
+        assert_eq!(
+            metrics.snapshot(),
+            BlockDeviceMetrics::default().with_execute_fails(1)
+        );
         assert_eq!(queue.available_ring().next_avail(), 1);
         assert_eq!(queue.used_ring().next_used(), 1);
         assert_eq!(read_used_element(&memory, 0), (0, 0));
@@ -7381,8 +7503,17 @@ mod tests {
 
         assert_eq!(dispatch.processed_requests(), 1);
         assert_eq!(dispatch.successful_requests(), 0);
+        assert_eq!(dispatch.read_count(), 0);
+        assert_eq!(dispatch.write_count(), 0);
+        assert_eq!(dispatch.flush_count(), 0);
         assert_eq!(dispatch.io_errors(), 1);
         assert_eq!(dispatch.parse_failures(), 0);
+        let metrics = SharedBlockDeviceMetrics::default();
+        metrics.record_queue_dispatch(&dispatch);
+        assert_eq!(
+            metrics.snapshot(),
+            BlockDeviceMetrics::default().with_invalid_reqs_count(1)
+        );
         assert_eq!(read_used_element(&memory, 0), (0, VIRTIO_BLOCK_STATUS_SIZE));
         assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_IOERR);
         assert_eq!(
@@ -7418,7 +7549,16 @@ mod tests {
         assert_eq!(dispatch.processed_requests(), 1);
         assert_eq!(dispatch.unsupported_requests(), 1);
         assert_eq!(dispatch.successful_requests(), 0);
+        assert_eq!(dispatch.read_count(), 0);
+        assert_eq!(dispatch.write_count(), 0);
+        assert_eq!(dispatch.flush_count(), 0);
         assert_eq!(dispatch.io_errors(), 0);
+        let metrics = SharedBlockDeviceMetrics::default();
+        metrics.record_queue_dispatch(&dispatch);
+        assert_eq!(
+            metrics.snapshot(),
+            BlockDeviceMetrics::default().with_invalid_reqs_count(1)
+        );
         assert_eq!(read_guest_bytes(&memory, DATA_ADDR, 8), b"sentinel");
         assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_UNSUPPORTED);
         assert_eq!(read_used_element(&memory, 0), (0, VIRTIO_BLOCK_STATUS_SIZE));
@@ -7449,7 +7589,16 @@ mod tests {
         assert_eq!(dispatch.processed_requests(), 1);
         assert_eq!(dispatch.status_write_failures(), 1);
         assert_eq!(dispatch.successful_requests(), 0);
+        assert_eq!(dispatch.read_count(), 0);
+        assert_eq!(dispatch.write_count(), 0);
+        assert_eq!(dispatch.flush_count(), 0);
         assert_eq!(dispatch.io_errors(), 0);
+        let metrics = SharedBlockDeviceMetrics::default();
+        metrics.record_queue_dispatch(&dispatch);
+        assert_eq!(
+            metrics.snapshot(),
+            BlockDeviceMetrics::default().with_execute_fails(1)
+        );
         assert_eq!(
             read_guest_bytes(&memory, DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as usize),
             payload

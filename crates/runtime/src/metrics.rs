@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::balloon::VirtioBalloonDeviceNotificationDispatch;
+use crate::block::{VirtioBlockDeviceNotificationDispatch, VirtioBlockQueueDispatch};
 use crate::serial::SerialOutputMetrics;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -899,6 +900,243 @@ impl PutApiRequestMetrics {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BlockDeviceMetrics {
+    event_fails: u64,
+    execute_fails: u64,
+    invalid_reqs_count: u64,
+    flush_count: u64,
+    queue_event_count: u64,
+    read_bytes: u64,
+    write_bytes: u64,
+    read_count: u64,
+    write_count: u64,
+}
+
+impl BlockDeviceMetrics {
+    pub const fn is_empty(self) -> bool {
+        self.event_fails == 0
+            && self.execute_fails == 0
+            && self.invalid_reqs_count == 0
+            && self.flush_count == 0
+            && self.queue_event_count == 0
+            && self.read_bytes == 0
+            && self.write_bytes == 0
+            && self.read_count == 0
+            && self.write_count == 0
+    }
+
+    pub const fn event_fails(self) -> u64 {
+        self.event_fails
+    }
+
+    pub const fn execute_fails(self) -> u64 {
+        self.execute_fails
+    }
+
+    pub const fn invalid_reqs_count(self) -> u64 {
+        self.invalid_reqs_count
+    }
+
+    pub const fn flush_count(self) -> u64 {
+        self.flush_count
+    }
+
+    pub const fn queue_event_count(self) -> u64 {
+        self.queue_event_count
+    }
+
+    pub const fn read_bytes(self) -> u64 {
+        self.read_bytes
+    }
+
+    pub const fn write_bytes(self) -> u64 {
+        self.write_bytes
+    }
+
+    pub const fn read_count(self) -> u64 {
+        self.read_count
+    }
+
+    pub const fn write_count(self) -> u64 {
+        self.write_count
+    }
+
+    pub const fn with_event_fails(mut self, event_fails: u64) -> Self {
+        self.event_fails = event_fails;
+        self
+    }
+
+    pub const fn with_execute_fails(mut self, execute_fails: u64) -> Self {
+        self.execute_fails = execute_fails;
+        self
+    }
+
+    pub const fn with_invalid_reqs_count(mut self, invalid_reqs_count: u64) -> Self {
+        self.invalid_reqs_count = invalid_reqs_count;
+        self
+    }
+
+    pub const fn with_flush_count(mut self, flush_count: u64) -> Self {
+        self.flush_count = flush_count;
+        self
+    }
+
+    pub const fn with_queue_event_count(mut self, queue_event_count: u64) -> Self {
+        self.queue_event_count = queue_event_count;
+        self
+    }
+
+    pub const fn with_read_bytes(mut self, read_bytes: u64) -> Self {
+        self.read_bytes = read_bytes;
+        self
+    }
+
+    pub const fn with_write_bytes(mut self, write_bytes: u64) -> Self {
+        self.write_bytes = write_bytes;
+        self
+    }
+
+    pub const fn with_read_count(mut self, read_count: u64) -> Self {
+        self.read_count = read_count;
+        self
+    }
+
+    pub const fn with_write_count(mut self, write_count: u64) -> Self {
+        self.write_count = write_count;
+        self
+    }
+
+    const fn merged_with(self, other: Self) -> Self {
+        Self {
+            event_fails: self.event_fails.saturating_add(other.event_fails),
+            execute_fails: self.execute_fails.saturating_add(other.execute_fails),
+            invalid_reqs_count: self
+                .invalid_reqs_count
+                .saturating_add(other.invalid_reqs_count),
+            flush_count: self.flush_count.saturating_add(other.flush_count),
+            queue_event_count: self
+                .queue_event_count
+                .saturating_add(other.queue_event_count),
+            read_bytes: self.read_bytes.saturating_add(other.read_bytes),
+            write_bytes: self.write_bytes.saturating_add(other.write_bytes),
+            read_count: self.read_count.saturating_add(other.read_count),
+            write_count: self.write_count.saturating_add(other.write_count),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SharedBlockDeviceMetrics {
+    inner: Arc<SharedBlockDeviceMetricsInner>,
+}
+
+impl SharedBlockDeviceMetrics {
+    pub fn record_notification_dispatch(&self, dispatch: &VirtioBlockDeviceNotificationDispatch) {
+        self.record_queue_events(usize_to_u64_saturating(
+            dispatch.drained_notifications().len(),
+        ));
+        if let Some(queue_dispatch) = dispatch.queue_dispatch() {
+            self.record_queue_dispatch(queue_dispatch);
+        }
+    }
+
+    pub fn record_queue_dispatch(&self, dispatch: &VirtioBlockQueueDispatch) {
+        self.record_reads(
+            usize_to_u64_saturating(dispatch.read_count()),
+            dispatch.read_bytes(),
+        );
+        self.record_writes(
+            usize_to_u64_saturating(dispatch.write_count()),
+            dispatch.write_bytes(),
+        );
+        self.record_flushes(usize_to_u64_saturating(dispatch.flush_count()));
+        self.record_execute_failures(usize_to_u64_saturating(
+            dispatch
+                .parse_failures()
+                .saturating_add(dispatch.status_write_failures()),
+        ));
+        self.record_invalid_requests(usize_to_u64_saturating(
+            dispatch
+                .io_errors()
+                .saturating_add(dispatch.unsupported_requests()),
+        ));
+    }
+
+    pub fn record_queue_events(&self, count: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.queue_event_count, count);
+        }
+    }
+
+    pub fn record_event_failure(&self) {
+        record_atomic_metric(&self.inner.event_fails, 1);
+    }
+
+    pub fn snapshot(&self) -> BlockDeviceMetrics {
+        BlockDeviceMetrics {
+            event_fails: self.inner.event_fails.load(Ordering::Relaxed),
+            execute_fails: self.inner.execute_fails.load(Ordering::Relaxed),
+            invalid_reqs_count: self.inner.invalid_reqs_count.load(Ordering::Relaxed),
+            flush_count: self.inner.flush_count.load(Ordering::Relaxed),
+            queue_event_count: self.inner.queue_event_count.load(Ordering::Relaxed),
+            read_bytes: self.inner.read_bytes.load(Ordering::Relaxed),
+            write_bytes: self.inner.write_bytes.load(Ordering::Relaxed),
+            read_count: self.inner.read_count.load(Ordering::Relaxed),
+            write_count: self.inner.write_count.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_reads(&self, count: u64, bytes: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.read_count, count);
+        }
+        if bytes != 0 {
+            record_atomic_metric(&self.inner.read_bytes, bytes);
+        }
+    }
+
+    fn record_writes(&self, count: u64, bytes: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.write_count, count);
+        }
+        if bytes != 0 {
+            record_atomic_metric(&self.inner.write_bytes, bytes);
+        }
+    }
+
+    fn record_flushes(&self, count: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.flush_count, count);
+        }
+    }
+
+    fn record_execute_failures(&self, count: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.execute_fails, count);
+        }
+    }
+
+    fn record_invalid_requests(&self, count: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.invalid_reqs_count, count);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SharedBlockDeviceMetricsInner {
+    event_fails: AtomicU64,
+    execute_fails: AtomicU64,
+    invalid_reqs_count: AtomicU64,
+    flush_count: AtomicU64,
+    queue_event_count: AtomicU64,
+    read_bytes: AtomicU64,
+    write_bytes: AtomicU64,
+    read_count: AtomicU64,
+    write_count: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BalloonDeviceMetrics {
     activate_fails: u64,
     inflate_count: u64,
@@ -1066,6 +1304,7 @@ fn record_atomic_metric(metric: &AtomicU64, increment: u64) {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MetricsDiagnostics {
+    block_device_metrics: Option<BlockDeviceMetrics>,
     balloon_device_metrics: Option<BalloonDeviceMetrics>,
     boot_run_loop_status: Option<BootRunLoopMetricStatus>,
     start_time_us: Option<u64>,
@@ -1077,6 +1316,7 @@ pub struct MetricsDiagnostics {
 impl MetricsDiagnostics {
     pub const fn new() -> Self {
         Self {
+            block_device_metrics: None,
             balloon_device_metrics: None,
             boot_run_loop_status: None,
             start_time_us: None,
@@ -1084,6 +1324,14 @@ impl MetricsDiagnostics {
             parent_cpu_time_us: None,
             serial_output_metrics: None,
         }
+    }
+
+    pub const fn with_block_device_metrics(
+        mut self,
+        block_device_metrics: BlockDeviceMetrics,
+    ) -> Self {
+        self.block_device_metrics = Some(block_device_metrics);
+        self
     }
 
     pub const fn with_balloon_device_metrics(
@@ -1123,6 +1371,12 @@ impl MetricsDiagnostics {
     }
 
     pub const fn merged_with(mut self, other: Self) -> Self {
+        if let Some(metrics) = other.block_device_metrics {
+            self.block_device_metrics = Some(match self.block_device_metrics {
+                Some(existing) => existing.merged_with(metrics),
+                None => metrics,
+            });
+        }
         if let Some(metrics) = other.balloon_device_metrics {
             self.balloon_device_metrics = Some(match self.balloon_device_metrics {
                 Some(existing) => existing.merged_with(metrics),
@@ -1146,6 +1400,10 @@ impl MetricsDiagnostics {
         }
 
         self
+    }
+
+    pub const fn block_device_metrics(&self) -> Option<BlockDeviceMetrics> {
+        self.block_device_metrics
     }
 
     pub const fn balloon_device_metrics(&self) -> Option<BalloonDeviceMetrics> {
@@ -1302,6 +1560,48 @@ impl MetricsSink {
                 "deprecated_api".to_string(),
                 serde_json::Value::Object(deprecated),
             );
+        }
+        if let Some(block_device_metrics) = diagnostics.block_device_metrics()
+            && !block_device_metrics.is_empty()
+        {
+            let mut block = serde_json::Map::new();
+            block.insert(
+                "event_fails".to_string(),
+                serde_json::Value::Number(block_device_metrics.event_fails().into()),
+            );
+            block.insert(
+                "execute_fails".to_string(),
+                serde_json::Value::Number(block_device_metrics.execute_fails().into()),
+            );
+            block.insert(
+                "flush_count".to_string(),
+                serde_json::Value::Number(block_device_metrics.flush_count().into()),
+            );
+            block.insert(
+                "invalid_reqs_count".to_string(),
+                serde_json::Value::Number(block_device_metrics.invalid_reqs_count().into()),
+            );
+            block.insert(
+                "queue_event_count".to_string(),
+                serde_json::Value::Number(block_device_metrics.queue_event_count().into()),
+            );
+            block.insert(
+                "read_bytes".to_string(),
+                serde_json::Value::Number(block_device_metrics.read_bytes().into()),
+            );
+            block.insert(
+                "read_count".to_string(),
+                serde_json::Value::Number(block_device_metrics.read_count().into()),
+            );
+            block.insert(
+                "write_bytes".to_string(),
+                serde_json::Value::Number(block_device_metrics.write_bytes().into()),
+            );
+            block.insert(
+                "write_count".to_string(),
+                serde_json::Value::Number(block_device_metrics.write_count().into()),
+            );
+            root.insert("block".to_string(), serde_json::Value::Object(block));
         }
         if let Some(balloon_device_metrics) = diagnostics.balloon_device_metrics()
             && !balloon_device_metrics.is_empty()
@@ -1593,9 +1893,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        BalloonDeviceMetrics, BootRunLoopMetricStatus, MetricsConfigError, MetricsConfigInput,
-        MetricsDiagnostics, MetricsFlushError, MetricsOutput, MetricsState,
-        SharedBalloonDeviceMetrics,
+        BalloonDeviceMetrics, BlockDeviceMetrics, BootRunLoopMetricStatus, MetricsConfigError,
+        MetricsConfigInput, MetricsDiagnostics, MetricsFlushError, MetricsOutput, MetricsState,
+        SharedBalloonDeviceMetrics, SharedBlockDeviceMetrics,
     };
     use crate::serial::SerialOutputMetrics;
 
@@ -1655,6 +1955,19 @@ mod tests {
             state.lines.push(line.to_string());
             Ok(())
         }
+    }
+
+    fn block_metrics_with_all_fields() -> BlockDeviceMetrics {
+        BlockDeviceMetrics::default()
+            .with_event_fails(1)
+            .with_execute_fails(2)
+            .with_invalid_reqs_count(3)
+            .with_flush_count(4)
+            .with_queue_event_count(5)
+            .with_read_bytes(6)
+            .with_write_bytes(7)
+            .with_read_count(8)
+            .with_write_count(9)
     }
 
     #[test]
@@ -1832,6 +2145,99 @@ mod tests {
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
         assert_eq!(output.lines(), [r#"{"vmm":{"metrics_flush_count":1}}"#]);
+    }
+
+    #[test]
+    fn writes_block_device_metrics_when_provided() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let diagnostics =
+            MetricsDiagnostics::new().with_block_device_metrics(block_metrics_with_all_fields());
+
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        assert_eq!(
+            output.lines(),
+            [
+                r#"{"block":{"event_fails":1,"execute_fails":2,"flush_count":4,"invalid_reqs_count":3,"queue_event_count":5,"read_bytes":6,"read_count":8,"write_bytes":7,"write_count":9},"vmm":{"metrics_flush_count":1}}"#
+            ]
+        );
+    }
+
+    #[test]
+    fn omits_empty_block_device_metrics() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let diagnostics =
+            MetricsDiagnostics::new().with_block_device_metrics(BlockDeviceMetrics::default());
+
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        assert_eq!(output.lines(), [r#"{"vmm":{"metrics_flush_count":1}}"#]);
+    }
+
+    #[test]
+    fn shared_block_device_metrics_snapshot_is_per_instance() {
+        let first = SharedBlockDeviceMetrics::default();
+        let second = SharedBlockDeviceMetrics::default();
+
+        first.record_queue_events(2);
+        first.record_event_failure();
+
+        assert_eq!(
+            first.snapshot(),
+            BlockDeviceMetrics::default()
+                .with_event_fails(1)
+                .with_queue_event_count(2)
+        );
+        assert_eq!(second.snapshot(), BlockDeviceMetrics::default());
+    }
+
+    #[test]
+    fn block_metric_increment_saturates() {
+        let metrics = SharedBlockDeviceMetrics::default();
+        metrics
+            .inner
+            .queue_event_count
+            .store(u64::MAX - 1, Ordering::Relaxed);
+
+        metrics.record_queue_events(3);
+
+        assert_eq!(metrics.snapshot().queue_event_count(), u64::MAX);
+    }
+
+    #[test]
+    fn block_diagnostics_merge_saturates() {
+        let base = MetricsDiagnostics::new().with_block_device_metrics(
+            BlockDeviceMetrics::default()
+                .with_event_fails(u64::MAX - 1)
+                .with_execute_fails(u64::MAX - 2)
+                .with_invalid_reqs_count(u64::MAX - 3)
+                .with_flush_count(u64::MAX - 4)
+                .with_queue_event_count(u64::MAX - 5)
+                .with_read_bytes(u64::MAX - 6)
+                .with_write_bytes(u64::MAX - 7)
+                .with_read_count(u64::MAX - 8)
+                .with_write_count(u64::MAX - 9),
+        );
+        let additional =
+            MetricsDiagnostics::new().with_block_device_metrics(block_metrics_with_all_fields());
+
+        assert_eq!(
+            base.merged_with(additional).block_device_metrics(),
+            Some(
+                BlockDeviceMetrics::default()
+                    .with_event_fails(u64::MAX)
+                    .with_execute_fails(u64::MAX)
+                    .with_invalid_reqs_count(u64::MAX)
+                    .with_flush_count(u64::MAX)
+                    .with_queue_event_count(u64::MAX)
+                    .with_read_bytes(u64::MAX)
+                    .with_write_bytes(u64::MAX)
+                    .with_read_count(u64::MAX)
+                    .with_write_count(u64::MAX)
+            )
+        );
     }
 
     #[test]
