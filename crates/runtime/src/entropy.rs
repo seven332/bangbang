@@ -1,6 +1,6 @@
 use std::collections::TryReserveError;
 use std::fmt;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::interrupt::DeviceInterruptKind;
 use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError};
@@ -479,6 +479,12 @@ pub struct VirtioRngRateLimiter {
     ops: Option<TokenBucket>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VirtioRngRateLimiterReduction {
+    Allowed,
+    Throttled { retry_after: Duration },
+}
+
 impl VirtioRngRateLimiter {
     fn new_at(config: EntropyRateLimiterConfig, now: Instant) -> Option<Self> {
         let bandwidth = config
@@ -495,23 +501,25 @@ impl VirtioRngRateLimiter {
         }
     }
 
-    fn reduce_at(&mut self, bytes: u64, now: Instant) -> bool {
+    fn reduce_with_retry_at(&mut self, bytes: u64, now: Instant) -> VirtioRngRateLimiterReduction {
         let bandwidth_snapshot = self.bandwidth.as_ref().map(TokenBucket::snapshot);
         let ops_snapshot = self.ops.as_ref().map(TokenBucket::snapshot);
 
         if let Some(ops) = self.ops.as_mut()
-            && !ops.reduce_at(1, now)
+            && let Some(retry_after) = ops.reduce_with_retry_at(1, now).retry_after()
         {
-            return false;
+            return VirtioRngRateLimiterReduction::Throttled { retry_after };
         }
         if let Some(bandwidth) = self.bandwidth.as_mut()
-            && !bandwidth.reduce_allow_overconsumption_at(bytes, now)
+            && let Some(retry_after) = bandwidth
+                .reduce_allow_overconsumption_with_retry_at(bytes, now)
+                .retry_after()
         {
             self.restore(bandwidth_snapshot, ops_snapshot);
-            return false;
+            return VirtioRngRateLimiterReduction::Throttled { retry_after };
         }
 
-        true
+        VirtioRngRateLimiterReduction::Allowed
     }
 
     fn restore(
@@ -615,17 +623,20 @@ impl VirtioRngQueue {
                             });
                         }
                     };
-                    if let Some(limiter) = rate_limiter.as_deref_mut()
-                        && !limiter.reduce_at(requested_len as u64, now)
-                    {
-                        if let Err(source) = self.available.undo_pop_descriptor_chain() {
-                            return Err(VirtioRngQueueDispatchError::AvailableRing {
-                                completed_dispatch: Box::new(dispatch),
-                                source,
-                            });
+                    if let Some(limiter) = rate_limiter.as_deref_mut() {
+                        match limiter.reduce_with_retry_at(requested_len as u64, now) {
+                            VirtioRngRateLimiterReduction::Allowed => {}
+                            VirtioRngRateLimiterReduction::Throttled { retry_after } => {
+                                if let Err(source) = self.available.undo_pop_descriptor_chain() {
+                                    return Err(VirtioRngQueueDispatchError::AvailableRing {
+                                        completed_dispatch: Box::new(dispatch),
+                                        source,
+                                    });
+                                }
+                                dispatch.record_rate_limited_request(retry_after);
+                                break;
+                            }
                         }
-                        dispatch.record_rate_limited_request();
-                        break;
                     }
                     match fill_entropy_buffer(memory, &buffer, entropy_source, &mut entropy_buffer)
                     {
@@ -999,6 +1010,12 @@ impl VirtioRngDeviceNotificationDispatch {
             .as_ref()
             .is_some_and(VirtioRngQueueDispatch::needs_queue_interrupt)
     }
+
+    pub fn rate_limiter_retry_after(&self) -> Option<Duration> {
+        self.queue_dispatch
+            .as_ref()
+            .and_then(VirtioRngQueueDispatch::rate_limiter_retry_after)
+    }
 }
 
 #[derive(Debug)]
@@ -1038,6 +1055,11 @@ impl VirtioRngDeviceNotificationError {
             Self::QueueDispatch { source, .. } => Some(source.completed_dispatch()),
             Self::Inactive { .. } | Self::UnsupportedQueue { .. } => None,
         }
+    }
+
+    pub fn rate_limiter_retry_after(&self) -> Option<Duration> {
+        self.completed_dispatch()
+            .and_then(VirtioRngQueueDispatch::rate_limiter_retry_after)
     }
 }
 
@@ -1080,6 +1102,7 @@ pub struct VirtioRngQueueDispatch {
     source_failures: usize,
     rate_limiter_throttled_requests: usize,
     rate_limiter_events: usize,
+    rate_limiter_retry_after: Option<Duration>,
     bytes_written_to_guest: u64,
     first_buffer_parse_failure: Option<VirtioRngBufferParseError>,
     first_source_failure: Option<VirtioRngEntropySourceError>,
@@ -1109,6 +1132,10 @@ impl VirtioRngQueueDispatch {
 
     pub const fn rate_limiter_events(&self) -> usize {
         self.rate_limiter_events
+    }
+
+    pub const fn rate_limiter_retry_after(&self) -> Option<Duration> {
+        self.rate_limiter_retry_after
     }
 
     pub const fn bytes_written_to_guest(&self) -> u64 {
@@ -1156,8 +1183,12 @@ impl VirtioRngQueueDispatch {
         }
     }
 
-    fn record_rate_limited_request(&mut self) {
+    fn record_rate_limited_request(&mut self, retry_after: Duration) {
         self.rate_limiter_throttled_requests += 1;
+        self.rate_limiter_retry_after = Some(match self.rate_limiter_retry_after {
+            Some(existing) => existing.min(retry_after),
+            None => retry_after,
+        });
     }
 
     fn record_rate_limiter_event(&mut self) {
@@ -1652,8 +1683,8 @@ mod tests {
         VIRTIO_RNG_QUEUE_SIZES, VirtioRngBufferParseError, VirtioRngDevice,
         VirtioRngDeviceActivationError, VirtioRngDeviceNotificationError, VirtioRngEntropySource,
         VirtioRngEntropySourceError, VirtioRngMmioHandler, VirtioRngOsEntropySource,
-        VirtioRngQueue, VirtioRngQueueBuildError, VirtioRngQueueDispatchError,
-        VirtioRngRateLimiter,
+        VirtioRngQueue, VirtioRngQueueBuildError, VirtioRngQueueDispatch,
+        VirtioRngQueueDispatchError, VirtioRngRateLimiter, VirtioRngRateLimiterReduction,
     };
 
     const TEST_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x1000);
@@ -1786,6 +1817,17 @@ mod tests {
             now,
         )
         .expect("bandwidth limiter should be enabled")
+    }
+
+    fn ops_limiter(size: u64, refill_time: u64, now: Instant) -> VirtioRngRateLimiter {
+        VirtioRngRateLimiter::new_at(
+            EntropyRateLimiterConfig::new(
+                None,
+                Some(EntropyTokenBucketConfig::new(size, None, refill_time)),
+            ),
+            now,
+        )
+        .expect("ops limiter should be enabled")
     }
 
     fn guest_address_low(address: GuestAddress) -> u32 {
@@ -2876,6 +2918,7 @@ mod tests {
         assert_eq!(dispatch.processed_requests(), 0);
         assert_eq!(dispatch.successful_requests(), 0);
         assert_eq!(dispatch.bytes_written_to_guest(), 0);
+        assert_eq!(dispatch.rate_limiter_retry_after(), None);
         assert!(!dispatch.needs_queue_interrupt());
         assert!(source.calls().is_empty());
         assert_eq!(read_used_index(&memory), 0);
@@ -2908,6 +2951,10 @@ mod tests {
         assert_eq!(dispatch.processed_requests(), 1);
         assert_eq!(dispatch.successful_requests(), 1);
         assert_eq!(dispatch.rate_limiter_throttled_requests(), 1);
+        assert_eq!(
+            dispatch.rate_limiter_retry_after(),
+            Some(Duration::from_millis(100))
+        );
         assert_eq!(source.calls(), &[4]);
         assert_eq!(read_used_index(&memory), 1);
         assert_eq!(queue.available_ring().next_avail(), 1);
@@ -2948,7 +2995,12 @@ mod tests {
             .expect("second dispatch should complete after replenishment");
 
         assert_eq!(first.rate_limiter_throttled_requests(), 1);
+        assert_eq!(
+            first.rate_limiter_retry_after(),
+            Some(Duration::from_millis(100))
+        );
         assert_eq!(second.rate_limiter_throttled_requests(), 0);
+        assert_eq!(second.rate_limiter_retry_after(), None);
         assert_eq!(second.processed_requests(), 1);
         assert_eq!(second.successful_requests(), 1);
         assert_eq!(source.calls(), &[4, 4]);
@@ -2969,9 +3021,56 @@ mod tests {
         let mut limiter =
             VirtioRngRateLimiter::new_at(config, now).expect("limiter should be enabled");
 
-        assert!(limiter.reduce_at(1, now));
-        assert!(!limiter.reduce_at(1, now));
-        assert!(limiter.reduce_at(1, now + Duration::from_millis(100)));
+        assert_eq!(
+            limiter.reduce_with_retry_at(1, now),
+            VirtioRngRateLimiterReduction::Allowed
+        );
+        assert_eq!(
+            limiter.reduce_with_retry_at(1, now),
+            VirtioRngRateLimiterReduction::Throttled {
+                retry_after: Duration::from_millis(100)
+            }
+        );
+        assert_eq!(
+            limiter.reduce_with_retry_at(1, now + Duration::from_millis(100)),
+            VirtioRngRateLimiterReduction::Allowed
+        );
+    }
+
+    #[test]
+    fn rng_rate_limiter_reports_ops_retry_after() {
+        let now = Instant::now();
+        let mut limiter = ops_limiter(1, 250, now);
+
+        assert_eq!(
+            limiter.reduce_with_retry_at(1, now),
+            VirtioRngRateLimiterReduction::Allowed
+        );
+        assert_eq!(
+            limiter.reduce_with_retry_at(1, now),
+            VirtioRngRateLimiterReduction::Throttled {
+                retry_after: Duration::from_millis(250)
+            }
+        );
+        assert_eq!(
+            limiter.reduce_with_retry_at(1, now + Duration::from_millis(250)),
+            VirtioRngRateLimiterReduction::Allowed
+        );
+    }
+
+    #[test]
+    fn rng_queue_dispatch_records_earliest_rate_limiter_retry_after() {
+        let mut dispatch = VirtioRngQueueDispatch::default();
+
+        dispatch.record_rate_limited_request(Duration::from_millis(300));
+        dispatch.record_rate_limited_request(Duration::from_millis(50));
+        dispatch.record_rate_limited_request(Duration::from_millis(150));
+
+        assert_eq!(dispatch.rate_limiter_throttled_requests(), 3);
+        assert_eq!(
+            dispatch.rate_limiter_retry_after(),
+            Some(Duration::from_millis(50))
+        );
     }
 
     #[test]
@@ -3005,6 +3104,7 @@ mod tests {
         assert_eq!(dispatch.processed_requests(), 1);
         assert_eq!(dispatch.successful_requests(), 1);
         assert_eq!(dispatch.bytes_written_to_guest(), 8);
+        assert_eq!(dispatch.rate_limiter_retry_after(), None);
         assert_eq!(source.calls(), &[8]);
         assert_eq!(read_guest_bytes(&memory, TEST_DATA, 4), vec![0, 1, 2, 3]);
         assert_eq!(
