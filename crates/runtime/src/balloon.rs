@@ -9503,6 +9503,57 @@ mod tests {
     }
 
     #[test]
+    fn balloon_mmio_handler_statistics_update_trigger_before_activation_reports_inactive() {
+        let mut memory = pfn_descriptor_memory();
+        let mut device = balloon_mmio_device(balloon_config(64, false, 1, false, false));
+        let handler = device
+            .dispatcher_mut()
+            .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+            .expect("balloon handler should be registered");
+
+        let error = handler
+            .trigger_balloon_statistics_update(&mut memory)
+            .expect_err("statistics update trigger before activation should fail");
+
+        assert!(matches!(
+            error,
+            VirtioBalloonDeviceNotificationError::Inactive { .. }
+        ));
+        assert!(error.drained_notifications().is_empty());
+        assert_eq!(
+            handler
+                .read_register(VirtioMmioRegister::InterruptStatus)
+                .expect("interrupt status should read"),
+            0
+        );
+    }
+
+    #[test]
+    fn balloon_mmio_handler_statistics_update_trigger_without_statistics_queue_is_noop() {
+        let mut memory = pfn_descriptor_memory();
+        let mut device = balloon_mmio_device(balloon_config(64, false, 0, false, false));
+        let handler = device
+            .dispatcher_mut()
+            .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+            .expect("balloon handler should be registered");
+        activate_handler(handler);
+
+        let dispatch = handler
+            .trigger_balloon_statistics_update(&mut memory)
+            .expect("statistics update trigger without statistics queue should be a no-op");
+
+        assert!(dispatch.drained_notifications().is_empty());
+        assert!(dispatch.statistics_queue_dispatch().is_none());
+        assert!(!dispatch.needs_queue_interrupt());
+        assert_eq!(
+            handler
+                .read_register(VirtioMmioRegister::InterruptStatus)
+                .expect("interrupt status should read"),
+            0
+        );
+    }
+
+    #[test]
     fn balloon_mmio_handler_statistics_update_trigger_preserves_pending_on_used_ring_error() {
         let mut memory = pfn_descriptor_memory();
         let bytes = stat_payload_bytes(&[(VIRTIO_BALLOON_S_MEMFREE, 0x5678)]);
