@@ -4157,6 +4157,27 @@ mod tests {
     }
 
     #[test]
+    fn periodic_metrics_while_paused_does_not_write() {
+        let path = unique_metrics_path("periodic-paused");
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(&path)))
+            .expect("metrics config should be stored");
+        controller.instance_info.state = InstanceState::Paused;
+
+        assert_eq!(
+            controller.flush_periodic_metrics_with_diagnostics(&MetricsDiagnostics::default()),
+            Ok(false)
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("metrics output should be readable"),
+            ""
+        );
+
+        fs::remove_file(path).expect("metrics fixture should clean up");
+    }
+
+    #[test]
     fn put_metrics_rejects_duplicate_configuration_without_replacing_sink() {
         let first_path = unique_metrics_path("first");
         let second_path = unique_metrics_path("second");
