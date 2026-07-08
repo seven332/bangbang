@@ -44,6 +44,7 @@ use bangbang_runtime::network::{
     VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError, validate_network_interface_count,
 };
 use bangbang_runtime::pmem::PmemMmioLayout;
+use bangbang_runtime::rtc::RtcMmioLayout;
 use bangbang_runtime::serial::{
     SerialConfigError, SerialConfigInput, SerialOutputFile, SharedSerialOutput,
     SharedSerialOutputBuffer,
@@ -90,6 +91,8 @@ const DEFAULT_VSOCK_MMIO_BASE: GuestAddress = GuestAddress::new(0x7000_0000);
 const DEFAULT_VSOCK_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(2000);
 const DEFAULT_SERIAL_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_0000);
 const DEFAULT_SERIAL_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(0);
+const DEFAULT_RTC_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_1000);
+const DEFAULT_RTC_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(10);
 const DEFAULT_ENTROPY_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_7000);
 const DEFAULT_ENTROPY_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(3000);
 const DEFAULT_BALLOON_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_8000);
@@ -2559,6 +2562,7 @@ fn default_hvf_boot_session_config(serial_output: SharedSerialOutput) -> HvfArm6
         PmemMmioLayout::new(DEFAULT_PMEM_MMIO_BASE, DEFAULT_PMEM_MMIO_REGION_ID),
         NetworkMmioLayout::new(DEFAULT_NETWORK_MMIO_BASE, DEFAULT_NETWORK_MMIO_REGION_ID),
         VsockMmioLayout::new(DEFAULT_VSOCK_MMIO_BASE, DEFAULT_VSOCK_MMIO_REGION_ID),
+        RtcMmioLayout::new(DEFAULT_RTC_MMIO_BASE, DEFAULT_RTC_MMIO_REGION_ID),
     )
     .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
         DEFAULT_SERIAL_MMIO_REGION_ID,

@@ -46,6 +46,8 @@ const GUEST_BOOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const SERIAL_MMIO_BASE: u64 = 0x4000_0000;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const RTC_MMIO_BASE: u64 = 0x4000_1000;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const BLOCK_MMIO_BASE: u64 = 0x5000_0000;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const PMEM_MMIO_BASE: u64 = 0x5800_0000;
@@ -393,6 +395,7 @@ fn run_guest_boot_with_boot_source(
     use bangbang_runtime::mmio::MmioRegionId;
     use bangbang_runtime::network::NetworkMmioLayout;
     use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::rtc::RtcMmioLayout;
     use bangbang_runtime::serial::{SharedSerialOutput, SharedSerialOutputBuffer};
     use bangbang_runtime::vsock::VsockMmioLayout;
     use bangbang_runtime::{VmmAction, VmmController};
@@ -417,6 +420,7 @@ fn run_guest_boot_with_boot_source(
             MmioRegionId::new(1000),
         ),
         VsockMmioLayout::new(GuestAddress::new(VSOCK_MMIO_BASE), MmioRegionId::new(2000)),
+        RtcMmioLayout::new(GuestAddress::new(RTC_MMIO_BASE), MmioRegionId::new(3000)),
     )
     .with_serial_device(HvfArm64BootSerialDeviceConfig::new(
         MmioRegionId::new(0),

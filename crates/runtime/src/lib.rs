@@ -15,6 +15,7 @@ pub mod mmds;
 pub mod mmio;
 pub mod network;
 pub mod pmem;
+pub mod rtc;
 pub mod serial;
 pub mod startup;
 pub mod virtio_mmio;

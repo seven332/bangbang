@@ -26,7 +26,7 @@ create/destroy wrapper, typed HVF exit surface with MMIO data-abort decoding,
 registry resolution, vCPU exit classification, single resolved HVF MMIO
 exit dispatch/completion through runtime handlers, explicit runner-thread MMIO
 handling commands, narrow vCPU register wrappers, internal macOS 15+ HVF GIC v3 boot metadata without MSI/ITS, HVF SPI interrupt-line allocation and signaling, minimal internal
-arm64 FDT generation with optional serial and virtio-mmio device-node descriptors and guest-memory writes, anonymous guest memory allocation
+arm64 FDT generation with optional RTC, serial, and virtio-mmio device-node descriptors and guest-memory writes, anonymous guest memory allocation
 for validated runtime layouts, HVF guest memory map/unmap ownership and
 controlled mapped-memory access for allocated regions, an internal MMIO region ownership registry and operation/data
 model plus handler dispatch boundary, an internal TX-only serial MMIO output
@@ -41,7 +41,7 @@ used-ring write model, and internal virtio-block
 queue construction, drain, resettable active queue ownership, and active queue
 notification dispatch helper with virtio-mmio queue interrupt-status updates
 for future device handlers, internal boot-resource assembly from stored VM
-configuration with optional serial plus block and network MMIO registration,
+configuration with optional RTC and serial plus block and network MMIO registration,
 boot-runtime block and network notification dispatch with per-device metadata,
 including an HVF wrapper path for injected virtio-net packet I/O, an internal
 backend-neutral interrupt line/status/trigger model, single-vCPU arm64 HVF
@@ -1172,9 +1172,13 @@ can signal block SPI interrupts after boot-runtime block notification dispatch.
 The runtime crate can build a minimal Firecracker-shaped arm64 FDT using the
 same `vm-fdt` writer crate that Firecracker uses. The generated tree currently
 contains root properties, CPU data, memory, chosen, timer, PSCI, GIC nodes, and
-an optional serial device node plus optional sorted virtio-mmio device nodes
-from caller-supplied descriptors. It intentionally omits RTC, PCI, vmgenid,
-vmclock, and other device nodes until the corresponding emulation paths exist.
+optional RTC, serial, and sorted virtio-mmio device nodes from caller-supplied
+descriptors. The optional RTC node uses Firecracker's aarch64 PL031 shape with
+`compatible = "arm,pl031", "arm,primecell"`, `reg`, `clocks`, and
+`clock-names = "apb_pclk"`, and intentionally omits `interrupts` because the
+minimal RTC device does not implement alarm interrupts. PCI, vmgenid, vmclock,
+pvtime, and other device nodes remain deferred until the corresponding
+emulation paths exist.
 Because the FDT advertises PSCI with `method = "hvc"`, the HVF backend decodes
 arm64 HVC exception exits and handles `HVC #0` as a minimal PSCI 0.2 responder
 for early single-vCPU boot probing. The responder returns `PSCI_VERSION`,
@@ -1251,22 +1255,24 @@ requires a configured boot source, applies `mem_size_mib` to the aarch64 DRAM
 layout, allocates guest memory, loads the arm64 Linux `Image` and optional
 initrd, prepares configured block and network devices, registers their
 virtio-mmio regions in a fresh internal `MmioDispatcher`, optionally registers
-one TX-only serial MMIO handler in the same dispatcher, pairs block and network
-registrations with supplied SPI interrupt lines, and writes the arm64 FDT with
-matching serial and virtio-mmio metadata.
+one PL031 RTC handler and one TX-only serial MMIO handler in the same dispatcher,
+pairs block and network registrations with supplied SPI interrupt lines, and
+writes the arm64 FDT with matching RTC, serial, and virtio-mmio metadata.
 
 The assembled bundle owns the guest memory, loaded boot metadata, FDT write
-metadata, MMIO dispatcher, optional serial metadata/output sink, and block and
-network FDT device metadata needed by later HVF startup wiring. It fails with typed errors
+metadata, MMIO dispatcher, optional RTC metadata, optional serial metadata/output
+sink, and block and network FDT device metadata needed by later HVF startup
+wiring. It fails with typed errors
 for missing boot source, memory size
 overflow or a memory size above the arm64 architectural maximum,
 layout/allocation failure, boot-source loading failure, block-device preparation
-failure, serial, block, or network MMIO registration failure, interrupt-line count
+failure, RTC, serial, block, or network MMIO registration failure, interrupt-line count
 mismatch, or FDT write failure.
 
 The assembled bundle is used by owned HVF startup preparation. HVF owns the
-mapped guest memory while runtime metadata, the MMIO dispatcher, optional serial
-metadata, and block/network metadata stay available to the retained session. bangbang
+mapped guest memory while runtime metadata, the MMIO dispatcher, optional RTC
+metadata, optional serial metadata, and block/network metadata stay available to
+the retained session. bangbang
 now starts an internal boot run-loop worker across bounded step windows after successful startup and retains internal active, terminal-outcome, or error worker status, but
 does not yet provide public run-loop control, signal backend
 interrupts outside the internal boot block and network notification paths,

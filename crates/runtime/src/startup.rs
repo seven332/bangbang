@@ -30,8 +30,8 @@ use crate::entropy::{
 };
 use crate::fdt::{
     Arm64FdtBootInfo, Arm64FdtConfig, Arm64FdtError, Arm64FdtGic, Arm64FdtGuestMemoryWrite,
-    Arm64FdtRegion, Arm64FdtSerialDevice, Arm64FdtTimerInterrupts, Arm64FdtVirtioMmioDevice,
-    write_arm64_fdt,
+    Arm64FdtRegion, Arm64FdtRtcDevice, Arm64FdtSerialDevice, Arm64FdtTimerInterrupts,
+    Arm64FdtVirtioMmioDevice, write_arm64_fdt,
 };
 use crate::interrupt::GuestInterruptLine;
 use crate::machine::MachineConfig;
@@ -53,6 +53,7 @@ use crate::pmem::{
     PreparedPmemDeviceError, PreparedPmemDevices, VirtioPmemDeviceNotificationDispatch,
     VirtioPmemDeviceNotificationError, VirtioPmemFlushStatus, VirtioPmemMmioHandler,
 };
+use crate::rtc::{Pl031RtcDevice, RTC_MMIO_DEVICE_WINDOW_SIZE, RtcMmioLayout};
 use crate::serial::{SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialMmioDevice, SharedSerialOutput};
 use crate::vsock::{
     PreparedVsockDevice, PreparedVsockDeviceError, VirtioVsockDeviceNotificationDispatch,
@@ -67,6 +68,7 @@ pub struct Arm64BootResourceConfig<'a> {
     pub vcpu_mpidrs: &'a [u64],
     pub gic: Arm64FdtGic,
     pub timer: Arm64FdtTimerInterrupts,
+    pub rtc_device: Option<Arm64BootRtcDeviceConfig>,
     pub serial_device: Option<Arm64BootSerialDeviceConfig>,
     pub block_mmio_layout: BlockMmioLayout,
     pub block_interrupt_lines: &'a [GuestInterruptLine],
@@ -79,6 +81,17 @@ pub struct Arm64BootResourceConfig<'a> {
     pub balloon_mmio_layout: BalloonMmioLayout,
     pub balloon_interrupt_line: Option<GuestInterruptLine>,
     pub entropy_device: Option<Arm64BootEntropyDeviceConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Arm64BootRtcDeviceConfig {
+    pub mmio_layout: RtcMmioLayout,
+}
+
+impl Arm64BootRtcDeviceConfig {
+    pub const fn new(mmio_layout: RtcMmioLayout) -> Self {
+        Self { mmio_layout }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +141,7 @@ pub struct Arm64BootResources {
     pub loaded_boot_source: LoadedBootSource,
     pub fdt: Arm64FdtGuestMemoryWrite,
     pub mmio_dispatcher: MmioDispatcher,
+    pub rtc_device: Option<Arm64BootRtcDevice>,
     pub serial_device: Option<Arm64BootSerialDevice>,
     pub block_devices: Vec<Arm64BootBlockDevice>,
     pub pmem_devices: Vec<PreparedPmemDevice>,
@@ -151,6 +165,7 @@ pub struct Arm64BootRuntimeResources {
     pub layout: GuestMemoryLayout,
     pub loaded_boot_source: LoadedBootSource,
     pub fdt: Arm64FdtGuestMemoryWrite,
+    pub rtc_device: Option<Arm64BootRtcDevice>,
     pub serial_device: Option<Arm64BootSerialDevice>,
     pub block_devices: Vec<Arm64BootBlockDevice>,
     pub pmem_devices: Vec<PreparedPmemDevice>,
@@ -1113,6 +1128,12 @@ pub struct Arm64BootEntropyDevice {
     pub fdt_device: Arm64FdtVirtioMmioDevice,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Arm64BootRtcDevice {
+    pub region: MmioRegion,
+    pub fdt_device: Arm64FdtRtcDevice,
+}
+
 #[derive(Debug, Clone)]
 pub struct Arm64BootSerialDevice {
     pub region: MmioRegion,
@@ -1604,6 +1625,9 @@ pub enum Arm64BootResourceError {
     RegisterEntropyMmio {
         source: Box<EntropyMmioRegistrationError>,
     },
+    RegisterRtcMmio {
+        source: Box<Arm64BootRtcMmioRegistrationError>,
+    },
     RegisterSerialMmio {
         source: Box<Arm64BootSerialMmioRegistrationError>,
     },
@@ -1712,6 +1736,9 @@ impl fmt::Display for Arm64BootResourceError {
             Self::RegisterEntropyMmio { source } => {
                 write!(f, "failed to register entropy MMIO device: {source}")
             }
+            Self::RegisterRtcMmio { source } => {
+                write!(f, "failed to register RTC MMIO device: {source}")
+            }
             Self::RegisterSerialMmio { source } => {
                 write!(f, "failed to register serial MMIO device: {source}")
             }
@@ -1776,6 +1803,7 @@ impl std::error::Error for Arm64BootResourceError {
             Self::RegisterVsockMmio { source } => Some(source.as_ref()),
             Self::RegisterBalloonMmio { source } => Some(source.as_ref()),
             Self::RegisterEntropyMmio { source } => Some(source.as_ref()),
+            Self::RegisterRtcMmio { source } => Some(source.as_ref()),
             Self::RegisterSerialMmio { source } => Some(source.as_ref()),
             Self::BlockDeviceMetadataAllocation { source } => Some(source),
             Self::PmemDeviceMetadataAllocation { source } => Some(source),
@@ -1807,6 +1835,47 @@ pub enum Arm64BootSerialMmioRegistrationError {
         region_id: MmioRegionId,
         source: MmioDispatchError,
     },
+}
+
+#[derive(Debug)]
+pub enum Arm64BootRtcMmioRegistrationError {
+    InsertRegion {
+        region_id: MmioRegionId,
+        address: crate::memory::GuestAddress,
+        source: MmioBusError,
+    },
+    RegisterHandler {
+        region_id: MmioRegionId,
+        source: MmioDispatchError,
+    },
+}
+
+impl fmt::Display for Arm64BootRtcMmioRegistrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InsertRegion {
+                region_id,
+                address,
+                source,
+            } => write!(
+                f,
+                "failed to insert RTC MMIO region id={region_id} at {address}: {source}"
+            ),
+            Self::RegisterHandler { region_id, source } => write!(
+                f,
+                "failed to register RTC MMIO handler for region id={region_id}: {source}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Arm64BootRtcMmioRegistrationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InsertRegion { source, .. } => Some(source),
+            Self::RegisterHandler { source, .. } => Some(source),
+        }
+    }
 }
 
 impl fmt::Display for Arm64BootSerialMmioRegistrationError {
@@ -1846,6 +1915,7 @@ impl Arm64BootResources {
             vcpu_mpidrs,
             gic,
             timer,
+            rtc_device,
             serial_device,
             block_mmio_layout,
             block_interrupt_lines,
@@ -2009,9 +2079,13 @@ impl Arm64BootResources {
             }
             None => None,
         };
+        let rtc_device = rtc_device
+            .map(|rtc| register_rtc_mmio(&mut mmio_dispatcher, rtc))
+            .transpose()?;
         let serial_device = serial_device
             .map(|serial| register_serial_mmio(&mut mmio_dispatcher, serial))
             .transpose()?;
+        let rtc_fdt_device = rtc_device.as_ref().map(|device| device.fdt_device);
         let serial_fdt_device = serial_device.as_ref().map(|device| device.fdt_device);
         let fdt = write_arm64_fdt(
             &Arm64FdtConfig {
@@ -2020,6 +2094,7 @@ impl Arm64BootResources {
                 vcpu_mpidrs,
                 gic,
                 timer,
+                rtc_device: rtc_fdt_device,
                 serial_device: serial_fdt_device,
                 virtio_mmio_devices: &fdt_devices,
             },
@@ -2034,6 +2109,7 @@ impl Arm64BootResources {
             loaded_boot_source,
             fdt,
             mmio_dispatcher,
+            rtc_device,
             serial_device,
             block_devices,
             pmem_devices,
@@ -2054,6 +2130,7 @@ impl Arm64BootResources {
                 layout: self.layout,
                 loaded_boot_source: self.loaded_boot_source,
                 fdt: self.fdt,
+                rtc_device: self.rtc_device,
                 serial_device: self.serial_device,
                 block_devices: self.block_devices,
                 pmem_devices: self.pmem_devices,
@@ -2361,6 +2438,41 @@ fn arm64_boot_balloon_device_metadata(
     )
 }
 
+fn register_rtc_mmio(
+    dispatcher: &mut MmioDispatcher,
+    config: Arm64BootRtcDeviceConfig,
+) -> Result<Arm64BootRtcDevice, Arm64BootResourceError> {
+    let region_id = config.mmio_layout.region_id();
+    let address = config.mmio_layout.base();
+    let region = dispatcher
+        .insert_region(region_id, address, RTC_MMIO_DEVICE_WINDOW_SIZE)
+        .map_err(|source| Arm64BootResourceError::RegisterRtcMmio {
+            source: Box::new(Arm64BootRtcMmioRegistrationError::InsertRegion {
+                region_id,
+                address,
+                source,
+            }),
+        })?;
+
+    dispatcher
+        .register_handler(region_id, Pl031RtcDevice::system())
+        .map_err(|source| Arm64BootResourceError::RegisterRtcMmio {
+            source: Box::new(Arm64BootRtcMmioRegistrationError::RegisterHandler {
+                region_id,
+                source,
+            }),
+        })?;
+
+    let fdt_device = Arm64FdtRtcDevice {
+        region: Arm64FdtRegion {
+            base: region.range().start().raw_value(),
+            size: region.range().size(),
+        },
+    };
+
+    Ok(Arm64BootRtcDevice { region, fdt_device })
+}
+
 fn register_serial_mmio(
     dispatcher: &mut MmioDispatcher,
     config: Arm64BootSerialDeviceConfig,
@@ -2421,7 +2533,8 @@ mod tests {
         Arm64BootEntropySource, Arm64BootEntropySourceError, Arm64BootEntropySourceProvider,
         Arm64BootNetworkNotificationOutcome, Arm64BootNetworkPacketIo,
         Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider, Arm64BootResourceConfig,
-        Arm64BootResourceError, Arm64BootResources, Arm64BootSerialDeviceConfig,
+        Arm64BootResourceError, Arm64BootResources, Arm64BootRtcDeviceConfig,
+        Arm64BootRtcMmioRegistrationError, Arm64BootSerialDeviceConfig,
         Arm64BootSerialMmioRegistrationError, MIB, arm64_boot_network_device_metadata,
         balloon_hinting_status_for_device, balloon_stats_for_device, block_device_metadata,
         start_balloon_hinting_for_device, stop_balloon_hinting_for_device,
@@ -2468,6 +2581,7 @@ mod tests {
     use crate::pmem::{
         PmemConfigInput, PmemMmioLayout, PreparedPmemDeviceError, VIRTIO_PMEM_ALIGNMENT,
     };
+    use crate::rtc::{Pl031RtcDevice, RTC_MMIO_DEVICE_WINDOW_SIZE, RtcMmioLayout};
     use crate::serial::{
         SERIAL_MMIO_DEVICE_WINDOW_SIZE, SERIAL_TRANSMIT_REGISTER_OFFSET, SerialMmioDevice,
         SerialOutputFile, SharedSerialOutput, SharedSerialOutputBuffer,
@@ -2502,6 +2616,7 @@ mod tests {
     const TEST_VSOCK_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_6000);
     const TEST_ENTROPY_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_7000);
     const TEST_BALLOON_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_8000);
+    const TEST_RTC_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_1000);
     const TEST_SERIAL_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_2000);
     const TEST_QUEUE_SIZE: u16 = 4;
     const TEST_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x8040_0000);
@@ -2757,6 +2872,7 @@ mod tests {
             vcpu_mpidrs: &[0],
             gic: valid_gic(),
             timer: Arm64FdtTimerInterrupts::firecracker_default(),
+            rtc_device: None,
             serial_device: None,
             block_mmio_layout: crate::block::BlockMmioLayout::new(
                 TEST_BLOCK_MMIO_BASE,
@@ -5210,6 +5326,58 @@ mod tests {
     }
 
     #[test]
+    fn assembles_boot_resources_with_rtc_mmio_metadata() {
+        let kernel = temp_file("kernel-with-rtc", &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+        let config = Arm64BootResourceConfig {
+            rtc_device: Some(Arm64BootRtcDeviceConfig::new(RtcMmioLayout::new(
+                TEST_RTC_MMIO_BASE,
+                MmioRegionId::new(8),
+            ))),
+            ..valid_config(&[])
+        };
+
+        let mut resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("boot resources should assemble with RTC device");
+
+        let rtc = resources
+            .rtc_device
+            .as_ref()
+            .expect("RTC metadata should be returned");
+        assert_eq!(rtc.region.id(), MmioRegionId::new(8));
+        assert_eq!(rtc.region.range().start(), TEST_RTC_MMIO_BASE);
+        assert_eq!(rtc.region.range().size(), RTC_MMIO_DEVICE_WINDOW_SIZE);
+        assert_eq!(rtc.fdt_device.region.base, TEST_RTC_MMIO_BASE.raw_value());
+        assert_eq!(rtc.fdt_device.region.size, RTC_MMIO_DEVICE_WINDOW_SIZE);
+        assert_eq!(resources.mmio_dispatcher.regions().len(), 1);
+        resources
+            .mmio_dispatcher
+            .handler_mut::<Pl031RtcDevice>(rtc.region.id())
+            .expect("RTC MMIO handler should be registered");
+
+        let tree = read_fdt(&resources);
+        let rtc_node = tree
+            .find("/rtc@40001000")
+            .expect("RTC node should be in assembled FDT");
+        assert_eq!(
+            rtc_node.prop_raw("compatible").unwrap(),
+            b"arm,pl031\0arm,primecell\0"
+        );
+
+        let parts = resources.into_parts();
+        assert_eq!(
+            parts
+                .runtime
+                .rtc_device
+                .as_ref()
+                .expect("runtime RTC metadata should be preserved")
+                .region
+                .id(),
+            MmioRegionId::new(8)
+        );
+    }
+
+    #[test]
     fn configured_vsock_without_interrupt_line_fails_before_socket_access() {
         let kernel = temp_file("kernel-vsock-missing-line", &arm64_image());
         let socket_path = missing_path("vsock-missing-line.sock");
@@ -5368,6 +5536,66 @@ mod tests {
             Arm64BootResourceError::RegisterEntropyMmio { .. }
         ));
         assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn rtc_region_overlapping_block_mmio_fails_during_registration() {
+        let kernel = temp_file("kernel-rtc-overlap-block", &arm64_image());
+        let block = temp_file("block-rtc-overlap", &[0x5a; 512]);
+        let mut controller = controller_with_kernel(kernel.path());
+        add_drive(&mut controller, "rootfs", block.path());
+        let block_interrupt_lines = [line(32)];
+        let config = Arm64BootResourceConfig {
+            rtc_device: Some(Arm64BootRtcDeviceConfig::new(RtcMmioLayout::new(
+                TEST_BLOCK_MMIO_BASE,
+                MmioRegionId::new(8),
+            ))),
+            ..valid_config(&block_interrupt_lines)
+        };
+
+        let err = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect_err("overlapping RTC MMIO should fail");
+
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::RegisterRtcMmio {
+                ref source
+            } if matches!(
+                source.as_ref(),
+                Arm64BootRtcMmioRegistrationError::InsertRegion { .. }
+            )
+        ));
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn serial_region_overlapping_rtc_mmio_fails_during_registration() {
+        let kernel = temp_file("kernel-serial-overlap-rtc", &arm64_image());
+        let controller = controller_with_kernel(kernel.path());
+        let (serial, _output) = serial_config(TEST_RTC_MMIO_BASE, MmioRegionId::new(9), line(32));
+        let config = Arm64BootResourceConfig {
+            rtc_device: Some(Arm64BootRtcDeviceConfig::new(RtcMmioLayout::new(
+                TEST_RTC_MMIO_BASE,
+                MmioRegionId::new(8),
+            ))),
+            serial_device: Some(serial),
+            ..valid_config(&[])
+        };
+
+        let err = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect_err("overlapping serial and RTC MMIO should fail");
+
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::RegisterSerialMmio { source }
+                if matches!(
+                    source.as_ref(),
+                    Arm64BootSerialMmioRegistrationError::InsertRegion {
+                        source: MmioBusError::OverlappingRegion { .. },
+                        ..
+                    }
+                )
+        ));
     }
 
     #[test]
