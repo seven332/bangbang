@@ -44,6 +44,7 @@ pub const ARM64_FDT_SECURE_PHYSICAL_TIMER_PPI: u32 = 13;
 pub const ARM64_FDT_NON_SECURE_PHYSICAL_TIMER_PPI: u32 = 14;
 pub const ARM64_FDT_VIRTUAL_TIMER_PPI: u32 = 11;
 pub const ARM64_FDT_HYPERVISOR_TIMER_PPI: u32 = 10;
+const ARM64_FDT_RNG_SEED_SIZE: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Arm64FdtBootInfo<'a> {
@@ -159,6 +160,48 @@ pub struct Arm64FdtGuestMemoryWrite {
     pub size: usize,
 }
 
+trait Arm64FdtRngSeedSource {
+    fn fill_rng_seed(
+        &mut self,
+        destination: &mut [u8; ARM64_FDT_RNG_SEED_SIZE],
+    ) -> Result<(), Arm64FdtRngSeedError>;
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Arm64FdtOsRngSeedSource;
+
+impl Arm64FdtOsRngSeedSource {
+    const fn new() -> Self {
+        Self
+    }
+}
+
+impl Arm64FdtRngSeedSource for Arm64FdtOsRngSeedSource {
+    fn fill_rng_seed(
+        &mut self,
+        destination: &mut [u8; ARM64_FDT_RNG_SEED_SIZE],
+    ) -> Result<(), Arm64FdtRngSeedError> {
+        getrandom::fill(destination).map_err(|_| Arm64FdtRngSeedError::new())
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Arm64FdtRngSeedError;
+
+impl Arm64FdtRngSeedError {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl fmt::Display for Arm64FdtRngSeedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("failed to generate arm64 FDT rng-seed")
+    }
+}
+
+impl std::error::Error for Arm64FdtRngSeedError {}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Arm64FdtError {
     MissingCpu,
@@ -239,6 +282,9 @@ pub enum Arm64FdtError {
     InvalidPpiIntid {
         name: &'static str,
         intid: u32,
+    },
+    RngSeed {
+        source: Arm64FdtRngSeedError,
     },
     UnsupportedMsi,
     InvalidVirtioMmioRegion {
@@ -424,6 +470,9 @@ impl fmt::Display for Arm64FdtError {
                 f,
                 "arm64 FDT {name} INTID must be in the PPI range [16, 32), got {intid}"
             ),
+            Self::RngSeed { source } => {
+                write!(f, "failed to create arm64 FDT rng-seed: {source}")
+            }
             Self::UnsupportedMsi => f.write_str("arm64 FDT MSI/ITS nodes are not supported yet"),
             Self::InvalidVirtioMmioRegion {
                 index,
@@ -552,6 +601,7 @@ impl std::error::Error for Arm64FdtError {
             Self::InvalidVirtioMmioRegion { source, .. } => Some(source),
             Self::InvalidSerialRegion { source, .. } => Some(source),
             Self::InvalidRtcRegion { source, .. } => Some(source),
+            Self::RngSeed { source } => Some(source),
             Self::CreateFdt { source } => Some(source),
             Self::GuestMemoryWrite { source } => Some(source),
             Self::MissingCpu
@@ -626,7 +676,22 @@ struct ValidatedArm64FdtVirtioMmioDevice {
 }
 
 pub fn build_arm64_fdt(config: &Arm64FdtConfig<'_>) -> Result<Vec<u8>, Arm64FdtError> {
+    let mut rng_seed_source = Arm64FdtOsRngSeedSource::new();
+    build_arm64_fdt_with_rng_seed_source(config, &mut rng_seed_source)
+}
+
+fn build_arm64_fdt_with_rng_seed_source<Source>(
+    config: &Arm64FdtConfig<'_>,
+    rng_seed_source: &mut Source,
+) -> Result<Vec<u8>, Arm64FdtError>
+where
+    Source: Arm64FdtRngSeedSource + ?Sized,
+{
     let validated = validate_config(config)?;
+    let mut rng_seed = [0; ARM64_FDT_RNG_SEED_SIZE];
+    rng_seed_source
+        .fill_rng_seed(&mut rng_seed)
+        .map_err(|source| Arm64FdtError::RngSeed { source })?;
 
     let mut fdt = FdtWriter::new()?;
     let root = fdt.begin_node("")?;
@@ -637,7 +702,7 @@ pub fn build_arm64_fdt(config: &Arm64FdtConfig<'_>) -> Result<Vec<u8>, Arm64FdtE
 
     create_cpu_nodes(&mut fdt, config.vcpu_mpidrs)?;
     create_memory_node(&mut fdt, &validated.memory_reg_cells)?;
-    create_chosen_node(&mut fdt, config.boot)?;
+    create_chosen_node(&mut fdt, config.boot, &rng_seed)?;
     create_gic_node(&mut fdt, config.gic)?;
     create_timer_node(&mut fdt, config.timer)?;
     if validated.rtc_device.is_some() || validated.serial_device.is_some() {
@@ -662,8 +727,20 @@ pub fn write_arm64_fdt(
     config: &Arm64FdtConfig<'_>,
     memory: &mut GuestMemory,
 ) -> Result<Arm64FdtGuestMemoryWrite, Arm64FdtError> {
+    let mut rng_seed_source = Arm64FdtOsRngSeedSource::new();
+    write_arm64_fdt_with_rng_seed_source(config, memory, &mut rng_seed_source)
+}
+
+fn write_arm64_fdt_with_rng_seed_source<Source>(
+    config: &Arm64FdtConfig<'_>,
+    memory: &mut GuestMemory,
+    rng_seed_source: &mut Source,
+) -> Result<Arm64FdtGuestMemoryWrite, Arm64FdtError>
+where
+    Source: Arm64FdtRngSeedSource + ?Sized,
+{
     validate_guest_memory_matches_layout(config.layout, memory)?;
-    let bytes = build_arm64_fdt(config)?;
+    let bytes = build_arm64_fdt_with_rng_seed_source(config, rng_seed_source)?;
     write_arm64_fdt_bytes(config.layout, memory, &bytes)
 }
 
@@ -801,6 +878,7 @@ fn create_memory_node(fdt: &mut FdtWriter, reg_cells: &[u64]) -> Result<(), Arm6
 fn create_chosen_node(
     fdt: &mut FdtWriter,
     boot: Arm64FdtBootInfo<'_>,
+    rng_seed: &[u8; ARM64_FDT_RNG_SEED_SIZE],
 ) -> Result<(), Arm64FdtError> {
     let chosen = fdt.begin_node("chosen")?;
     fdt.property_string("bootargs", boot.command_line)?;
@@ -811,6 +889,7 @@ fn create_chosen_node(
         fdt.property_u64("linux,initrd-end", initrd_end.raw_value())?;
     }
 
+    fdt.property("rng-seed", rng_seed)?;
     fdt.end_node(chosen)?;
     Ok(())
 }
@@ -1698,6 +1777,7 @@ mod tests {
         GuestAddress::new(aarch64::DRAM_MEM_START + 0x30_0000);
     const TEST_INITRD_SIZE: u64 = 0x1000;
     const TEST_VCPU_MPIDRS: &[u64] = &[0];
+    const TEST_RNG_SEED: [u8; ARM64_FDT_RNG_SEED_SIZE] = [0xa5; ARM64_FDT_RNG_SEED_SIZE];
 
     #[test]
     fn builds_minimal_firecracker_shaped_fdt_with_initrd() {
@@ -1710,7 +1790,7 @@ mod tests {
             },
         );
 
-        let bytes = build_arm64_fdt(&config).expect("FDT should be built");
+        let bytes = build_test_arm64_fdt(&config).expect("FDT should be built");
         let tree = DeviceTree::load(&bytes).expect("FDT should parse");
 
         assert_eq!(
@@ -1753,6 +1833,10 @@ mod tests {
             chosen.prop_u64("linux,initrd-end").unwrap(),
             TEST_INITRD_ADDRESS.raw_value() + TEST_INITRD_SIZE
         );
+        assert_eq!(
+            chosen.prop_raw("rng-seed").unwrap(),
+            TEST_RNG_SEED.as_slice()
+        );
 
         let psci = required_node(&tree, "/psci");
         assert_eq!(psci.prop_str("compatible").unwrap(), "arm,psci-0.2");
@@ -1770,13 +1854,72 @@ mod tests {
             },
         );
 
-        let bytes = build_arm64_fdt(&config).expect("FDT should be built");
+        let bytes = build_test_arm64_fdt(&config).expect("FDT should be built");
         let tree = DeviceTree::load(&bytes).expect("FDT should parse");
         let chosen = required_node(&tree, "/chosen");
 
         assert_eq!(chosen.prop_str("bootargs").unwrap(), "panic=1");
         assert!(!chosen.has_prop("linux,initrd-start"));
         assert!(!chosen.has_prop("linux,initrd-end"));
+    }
+
+    #[test]
+    fn chosen_node_contains_injected_rng_seed() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let config = test_config(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+        );
+        let mut seed = [0; ARM64_FDT_RNG_SEED_SIZE];
+        for (index, byte) in seed.iter_mut().enumerate() {
+            *byte = u8::try_from(index).expect("test seed index should fit in u8");
+        }
+        let mut source = FixedRngSeedSource::new(seed);
+
+        let bytes = build_arm64_fdt_with_rng_seed_source(&config, &mut source)
+            .expect("FDT should be built");
+        let tree = DeviceTree::load(&bytes).expect("FDT should parse");
+        let chosen = required_node(&tree, "/chosen");
+        let rng_seed = chosen.prop_raw("rng-seed").expect("rng-seed should exist");
+
+        assert_eq!(rng_seed.len(), ARM64_FDT_RNG_SEED_SIZE);
+        assert_eq!(rng_seed, seed.as_slice());
+    }
+
+    #[test]
+    fn reports_rng_seed_source_errors() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let config = test_config(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+        );
+        let mut source = FailingRngSeedSource;
+
+        let err = build_arm64_fdt_with_rng_seed_source(&config, &mut source)
+            .expect_err("rng-seed failure should fail FDT generation");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::RngSeed {
+                source: Arm64FdtRngSeedError::new(),
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "failed to create arm64 FDT rng-seed: failed to generate arm64 FDT rng-seed"
+        );
+        assert_eq!(
+            std::error::Error::source(&err)
+                .expect("rng-seed error should expose its source")
+                .to_string(),
+            "failed to generate arm64 FDT rng-seed"
+        );
     }
 
     #[test]
@@ -1791,7 +1934,7 @@ mod tests {
             },
         );
 
-        let bytes = build_arm64_fdt(&config).expect("max-sized command line should fit");
+        let bytes = build_test_arm64_fdt(&config).expect("max-sized command line should fit");
         let tree = DeviceTree::load(&bytes).expect("FDT should parse");
         let chosen = required_node(&tree, "/chosen");
 
@@ -1810,7 +1953,7 @@ mod tests {
             },
         );
 
-        let err = build_arm64_fdt(&config).expect_err("oversized command line should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("oversized command line should fail");
 
         assert_eq!(
             err,
@@ -1834,7 +1977,7 @@ mod tests {
             },
         );
 
-        let err = build_arm64_fdt(&config).expect_err("NUL command line should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("NUL command line should fail");
 
         assert_eq!(
             err,
@@ -1856,7 +1999,7 @@ mod tests {
             },
         );
 
-        let err = build_arm64_fdt(&config).expect_err("empty initrd range should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("empty initrd range should fail");
 
         assert_eq!(
             err,
@@ -1882,8 +2025,8 @@ mod tests {
             },
         );
 
-        let err =
-            build_arm64_fdt(&config).expect_err("initrd outside advertised memory should fail");
+        let err = build_test_arm64_fdt(&config)
+            .expect_err("initrd outside advertised memory should fail");
 
         assert_eq!(err, Arm64FdtError::InitrdNotInGuestMemory { range });
     }
@@ -1903,7 +2046,7 @@ mod tests {
             },
         );
 
-        let err = build_arm64_fdt(&config).expect_err("initrd overlapping FDT should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("initrd overlapping FDT should fail");
 
         assert_eq!(
             err,
@@ -1943,7 +2086,8 @@ mod tests {
             },
         );
 
-        let bytes = build_arm64_fdt(&config).expect("later-range initrd should not overlap FDT");
+        let bytes =
+            build_test_arm64_fdt(&config).expect("later-range initrd should not overlap FDT");
         let tree = DeviceTree::load(&bytes).expect("FDT should parse");
         let chosen = required_node(&tree, "/chosen");
 
@@ -1968,7 +2112,7 @@ mod tests {
             },
         );
 
-        let bytes = build_arm64_fdt(&config).expect("FDT should be built");
+        let bytes = build_test_arm64_fdt(&config).expect("FDT should be built");
         let tree = DeviceTree::load(&bytes).expect("FDT should parse");
         let memory = required_node(&tree, "/memory@ram");
         let reg = prop_u64_cells(memory, "reg");
@@ -2004,7 +2148,7 @@ mod tests {
             },
         );
 
-        let err = build_arm64_fdt(&config).expect_err("MMIO64 gap RAM should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("MMIO64 gap RAM should fail");
 
         assert_eq!(
             err,
@@ -2036,7 +2180,7 @@ mod tests {
             },
         );
 
-        let err = build_arm64_fdt(&config).expect_err("oversized guest memory should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("oversized guest memory should fail");
 
         assert_eq!(
             err,
@@ -2073,7 +2217,7 @@ mod tests {
             },
         );
 
-        let err = build_arm64_fdt(&config).expect_err("sparse memory layout should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("sparse memory layout should fail");
 
         assert_eq!(
             err,
@@ -2097,7 +2241,7 @@ mod tests {
             },
         );
 
-        let bytes = build_arm64_fdt(&config).expect("FDT should be built");
+        let bytes = build_test_arm64_fdt(&config).expect("FDT should be built");
         let tree = DeviceTree::load(&bytes).expect("FDT should parse");
         let memory = required_node(&tree, "/memory@ram");
 
@@ -2123,7 +2267,7 @@ mod tests {
             },
         );
 
-        let bytes = build_arm64_fdt(&config).expect("FDT should be built");
+        let bytes = build_test_arm64_fdt(&config).expect("FDT should be built");
         let tree = DeviceTree::load(&bytes).expect("FDT should parse");
         let intc = required_node(&tree, "/intc");
 
@@ -2160,7 +2304,7 @@ mod tests {
             )
         };
 
-        let err = build_arm64_fdt(&config).expect_err("overlapping GIC regions should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("overlapping GIC regions should fail");
 
         assert_eq!(
             err,
@@ -2192,7 +2336,8 @@ mod tests {
             )
         };
 
-        let err = build_arm64_fdt(&config).expect_err("GIC region overlapping memory should fail");
+        let err =
+            build_test_arm64_fdt(&config).expect_err("GIC region overlapping memory should fail");
 
         assert_eq!(
             err,
@@ -2221,7 +2366,7 @@ mod tests {
             )
         };
 
-        let err = build_arm64_fdt(&config).expect_err("unexpected GIC compatible should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("unexpected GIC compatible should fail");
 
         assert_eq!(
             err,
@@ -2249,7 +2394,7 @@ mod tests {
             )
         };
 
-        let err = build_arm64_fdt(&config).expect_err("reused maintenance PPI should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("reused maintenance PPI should fail");
 
         assert_eq!(
             err,
@@ -2272,7 +2417,7 @@ mod tests {
             },
         );
 
-        let bytes = build_arm64_fdt(&config).expect("FDT should be built");
+        let bytes = build_test_arm64_fdt(&config).expect("FDT should be built");
         let tree = DeviceTree::load(&bytes).expect("FDT should parse");
         let timer = required_node(&tree, "/timer");
 
@@ -2297,7 +2442,7 @@ mod tests {
             serial,
         );
 
-        let bytes = build_arm64_fdt(&config).expect("FDT should be built");
+        let bytes = build_test_arm64_fdt(&config).expect("FDT should be built");
         let tree = DeviceTree::load(&bytes).expect("FDT should parse");
         let clock = required_node(&tree, "/apb-pclk");
         let serial_node = required_node(&tree, "/uart@40002000");
@@ -2347,7 +2492,7 @@ mod tests {
             &devices,
         );
 
-        let bytes = build_arm64_fdt(&config).expect("FDT should be built");
+        let bytes = build_test_arm64_fdt(&config).expect("FDT should be built");
         let tree = DeviceTree::load(&bytes).expect("FDT should parse");
         let root_children: Vec<&str> = tree
             .root
@@ -2392,7 +2537,7 @@ mod tests {
             &devices,
         );
 
-        let bytes = build_arm64_fdt(&config).expect("FDT should be built");
+        let bytes = build_test_arm64_fdt(&config).expect("FDT should be built");
         let tree = DeviceTree::load(&bytes).expect("FDT should parse");
         let virtio = required_node(&tree, "/virtio_mmio@40001000");
 
@@ -2419,7 +2564,7 @@ mod tests {
             &devices,
         );
 
-        let bytes = build_arm64_fdt(&config).expect("FDT should be built");
+        let bytes = build_test_arm64_fdt(&config).expect("FDT should be built");
         let tree = DeviceTree::load(&bytes).expect("FDT should parse");
         let root_children: Vec<&str> = tree
             .root
@@ -2460,7 +2605,7 @@ mod tests {
             &devices,
         );
 
-        let err = build_arm64_fdt(&config).expect_err("empty device region should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("empty device region should fail");
 
         assert_eq!(
             err,
@@ -2487,7 +2632,7 @@ mod tests {
             &devices,
         );
 
-        let err = build_arm64_fdt(&config).expect_err("overflowing device region should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("overflowing device region should fail");
 
         assert_eq!(
             err,
@@ -2515,7 +2660,7 @@ mod tests {
             &devices,
         );
 
-        let err = build_arm64_fdt(&config).expect_err("RAM-overlapping device should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("RAM-overlapping device should fail");
 
         assert_eq!(
             err,
@@ -2540,7 +2685,7 @@ mod tests {
             &devices,
         );
 
-        let err = build_arm64_fdt(&config).expect_err("GIC-overlapping device should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("GIC-overlapping device should fail");
 
         assert_eq!(
             err,
@@ -2568,7 +2713,7 @@ mod tests {
             &devices,
         );
 
-        let err = build_arm64_fdt(&config).expect_err("overlapping devices should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("overlapping devices should fail");
 
         assert_eq!(
             err,
@@ -2599,7 +2744,8 @@ mod tests {
             &devices,
         );
 
-        let bytes = build_arm64_fdt(&config).expect("adjacent device regions should be accepted");
+        let bytes =
+            build_test_arm64_fdt(&config).expect("adjacent device regions should be accepted");
         let tree = DeviceTree::load(&bytes).expect("FDT should parse");
         let gic_adjacent = required_node(&tree, "/virtio_mmio@40000000");
         let device_adjacent = required_node(&tree, "/virtio_mmio@40001000");
@@ -2636,7 +2782,7 @@ mod tests {
             &devices,
         );
 
-        let err = build_arm64_fdt(&config).expect_err("duplicate devices should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("duplicate devices should fail");
 
         assert_eq!(
             err,
@@ -2662,7 +2808,7 @@ mod tests {
             &devices,
         );
 
-        let err = build_arm64_fdt(&config).expect_err("non-SPI interrupt should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("non-SPI interrupt should fail");
 
         assert_eq!(
             err,
@@ -2686,7 +2832,7 @@ mod tests {
             serial,
         );
 
-        let err = build_arm64_fdt(&config).expect_err("empty serial region should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("empty serial region should fail");
 
         assert_eq!(
             err,
@@ -2712,7 +2858,7 @@ mod tests {
             serial,
         );
 
-        let err = build_arm64_fdt(&config).expect_err("overflowing serial region should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("overflowing serial region should fail");
 
         assert_eq!(
             err,
@@ -2739,7 +2885,7 @@ mod tests {
             serial,
         );
 
-        let err = build_arm64_fdt(&config).expect_err("RAM-overlapping serial should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("RAM-overlapping serial should fail");
 
         assert_eq!(
             err,
@@ -2763,7 +2909,7 @@ mod tests {
             serial,
         );
 
-        let err = build_arm64_fdt(&config).expect_err("GIC-overlapping serial should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("GIC-overlapping serial should fail");
 
         assert_eq!(
             err,
@@ -2789,7 +2935,7 @@ mod tests {
             &devices,
         );
 
-        let err = build_arm64_fdt(&config).expect_err("virtio-overlapping serial should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("virtio-overlapping serial should fail");
 
         assert_eq!(
             err,
@@ -2816,7 +2962,8 @@ mod tests {
             &devices,
         );
 
-        let bytes = build_arm64_fdt(&config).expect("adjacent serial region should be accepted");
+        let bytes =
+            build_test_arm64_fdt(&config).expect("adjacent serial region should be accepted");
         let tree = DeviceTree::load(&bytes).expect("FDT should parse");
         let serial_node = required_node(&tree, "/uart@40000000");
         let virtio_node = required_node(&tree, "/virtio_mmio@40001000");
@@ -2845,7 +2992,8 @@ mod tests {
             serial,
         );
 
-        let bytes = build_arm64_fdt(&config).expect("memory-adjacent serial should be accepted");
+        let bytes =
+            build_test_arm64_fdt(&config).expect("memory-adjacent serial should be accepted");
         let tree = DeviceTree::load(&bytes).expect("FDT should parse");
         let serial_node = required_node(&tree, &format!("/uart@{memory_adjacent_base:x}"));
 
@@ -2868,7 +3016,7 @@ mod tests {
             rtc,
         );
 
-        let err = build_arm64_fdt(&config).expect_err("empty RTC region should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("empty RTC region should fail");
 
         assert_eq!(
             err,
@@ -2894,7 +3042,7 @@ mod tests {
             rtc,
         );
 
-        let err = build_arm64_fdt(&config).expect_err("overflowing RTC region should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("overflowing RTC region should fail");
 
         assert_eq!(
             err,
@@ -2921,7 +3069,7 @@ mod tests {
             rtc,
         );
 
-        let err = build_arm64_fdt(&config).expect_err("RAM-overlapping RTC should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("RAM-overlapping RTC should fail");
 
         assert_eq!(
             err,
@@ -2945,7 +3093,7 @@ mod tests {
             rtc,
         );
 
-        let err = build_arm64_fdt(&config).expect_err("GIC-overlapping RTC should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("GIC-overlapping RTC should fail");
 
         assert_eq!(
             err,
@@ -2972,7 +3120,7 @@ mod tests {
             &devices,
         );
 
-        let err = build_arm64_fdt(&config).expect_err("virtio-overlapping RTC should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("virtio-overlapping RTC should fail");
 
         assert_eq!(
             err,
@@ -3000,7 +3148,7 @@ mod tests {
             &[],
         );
 
-        let err = build_arm64_fdt(&config).expect_err("RTC-overlapping serial should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("RTC-overlapping serial should fail");
 
         assert_eq!(
             err,
@@ -3028,7 +3176,7 @@ mod tests {
             &devices,
         );
 
-        let bytes = build_arm64_fdt(&config).expect("adjacent RTC region should be accepted");
+        let bytes = build_test_arm64_fdt(&config).expect("adjacent RTC region should be accepted");
         let tree = DeviceTree::load(&bytes).expect("FDT should parse");
         let rtc_node = required_node(&tree, "/rtc@40001000");
         let serial_node = required_node(&tree, "/uart@40002000");
@@ -3058,7 +3206,7 @@ mod tests {
             serial,
         );
 
-        let err = build_arm64_fdt(&config).expect_err("non-SPI serial interrupt should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("non-SPI serial interrupt should fail");
 
         assert_eq!(
             err,
@@ -3080,7 +3228,7 @@ mod tests {
             },
         );
 
-        let write = write_arm64_fdt(&config, &mut memory).expect("FDT should write");
+        let write = write_test_arm64_fdt(&config, &mut memory).expect("FDT should write");
 
         assert_eq!(
             write.address,
@@ -3124,6 +3272,40 @@ mod tests {
     }
 
     #[test]
+    fn rejects_rng_seed_failure_before_guest_memory_write() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let mut memory = GuestMemory::allocate(&layout).expect("guest memory should allocate");
+        let address = aarch64::fdt_address(&layout).expect("FDT address should resolve");
+        let before = [0x5a; 16];
+        memory
+            .write_slice(&before, address)
+            .expect("initial sentinel should write");
+        let config = test_config(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+        );
+        let mut source = FailingRngSeedSource;
+
+        let err = write_arm64_fdt_with_rng_seed_source(&config, &mut memory, &mut source)
+            .expect_err("rng-seed failure should fail before writing FDT bytes");
+
+        assert_eq!(
+            err,
+            Arm64FdtError::RngSeed {
+                source: Arm64FdtRngSeedError::new(),
+            }
+        );
+        let mut after = [0; 16];
+        memory
+            .read_slice(&mut after, address)
+            .expect("FDT bytes should remain readable");
+        assert_eq!(after, before);
+    }
+
+    #[test]
     fn rejects_oversized_generated_fdt() {
         let layout = oversized_fdt_layout();
         let config = test_config(
@@ -3134,7 +3316,7 @@ mod tests {
             },
         );
 
-        let err = build_arm64_fdt(&config).expect_err("oversized generated FDT should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("oversized generated FDT should fail");
 
         assert_eq!(
             err,
@@ -3171,7 +3353,8 @@ mod tests {
             )
         };
 
-        let err = build_arm64_fdt(&config).expect_err("MSI should be explicit unsupported work");
+        let err =
+            build_test_arm64_fdt(&config).expect_err("MSI should be explicit unsupported work");
 
         assert_eq!(err, Arm64FdtError::UnsupportedMsi);
     }
@@ -3200,7 +3383,7 @@ mod tests {
             },
         );
 
-        let err = write_arm64_fdt(&config, &mut memory)
+        let err = write_test_arm64_fdt(&config, &mut memory)
             .expect_err("mismatched guest memory layout should fail before write");
 
         assert_eq!(
@@ -3269,7 +3452,7 @@ mod tests {
             },
         );
 
-        let err = build_arm64_fdt(&config).expect_err("tiny memory should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("tiny memory should fail");
 
         assert_eq!(
             err,
@@ -3295,7 +3478,7 @@ mod tests {
             },
         );
 
-        let err = build_arm64_fdt(&config).expect_err("unexpected DRAM start should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("unexpected DRAM start should fail");
 
         assert_eq!(
             err,
@@ -3320,7 +3503,7 @@ mod tests {
             )
         };
 
-        let err = build_arm64_fdt(&config).expect_err("missing CPU should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("missing CPU should fail");
 
         assert_eq!(err, Arm64FdtError::MissingCpu);
     }
@@ -3340,7 +3523,7 @@ mod tests {
             )
         };
 
-        let err = build_arm64_fdt(&config).expect_err("too many CPUs should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("too many CPUs should fail");
 
         assert_eq!(
             err,
@@ -3366,7 +3549,7 @@ mod tests {
             )
         };
 
-        let err = build_arm64_fdt(&config).expect_err("duplicate CPU reg should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("duplicate CPU reg should fail");
 
         assert_eq!(
             err,
@@ -3393,7 +3576,7 @@ mod tests {
             )
         };
 
-        let bytes = build_arm64_fdt(&config).expect("FDT should be built");
+        let bytes = build_test_arm64_fdt(&config).expect("FDT should be built");
         let tree = DeviceTree::load(&bytes).expect("FDT should parse");
 
         assert_eq!(
@@ -3426,7 +3609,7 @@ mod tests {
             )
         };
 
-        let err = build_arm64_fdt(&config).expect_err("duplicate timer PPI should fail");
+        let err = build_test_arm64_fdt(&config).expect_err("duplicate timer PPI should fail");
 
         assert_eq!(
             err,
@@ -3480,7 +3663,7 @@ mod tests {
             rtc,
         );
 
-        let bytes = build_arm64_fdt(&config).expect("FDT should be built");
+        let bytes = build_test_arm64_fdt(&config).expect("FDT should be built");
         let tree = DeviceTree::load(&bytes).expect("FDT should parse");
         let clock = required_node(&tree, "/apb-pclk");
         let rtc_node = required_node(&tree, "/rtc@40001000");
@@ -3528,7 +3711,7 @@ mod tests {
             &devices,
         );
 
-        let bytes = build_arm64_fdt(&config).expect("FDT should be built");
+        let bytes = build_test_arm64_fdt(&config).expect("FDT should be built");
         let tree = DeviceTree::load(&bytes).expect("FDT should parse");
         let root_children: Vec<&str> = tree
             .root
@@ -3553,6 +3736,52 @@ mod tests {
                 "virtio_mmio@40005000",
             ]
         );
+    }
+
+    fn build_test_arm64_fdt(config: &Arm64FdtConfig<'_>) -> Result<Vec<u8>, Arm64FdtError> {
+        let mut source = FixedRngSeedSource::new(TEST_RNG_SEED);
+        build_arm64_fdt_with_rng_seed_source(config, &mut source)
+    }
+
+    fn write_test_arm64_fdt(
+        config: &Arm64FdtConfig<'_>,
+        memory: &mut GuestMemory,
+    ) -> Result<Arm64FdtGuestMemoryWrite, Arm64FdtError> {
+        let mut source = FixedRngSeedSource::new(TEST_RNG_SEED);
+        write_arm64_fdt_with_rng_seed_source(config, memory, &mut source)
+    }
+
+    #[derive(Debug)]
+    struct FixedRngSeedSource {
+        seed: [u8; ARM64_FDT_RNG_SEED_SIZE],
+    }
+
+    impl FixedRngSeedSource {
+        const fn new(seed: [u8; ARM64_FDT_RNG_SEED_SIZE]) -> Self {
+            Self { seed }
+        }
+    }
+
+    impl Arm64FdtRngSeedSource for FixedRngSeedSource {
+        fn fill_rng_seed(
+            &mut self,
+            destination: &mut [u8; ARM64_FDT_RNG_SEED_SIZE],
+        ) -> Result<(), Arm64FdtRngSeedError> {
+            *destination = self.seed;
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingRngSeedSource;
+
+    impl Arm64FdtRngSeedSource for FailingRngSeedSource {
+        fn fill_rng_seed(
+            &mut self,
+            _destination: &mut [u8; ARM64_FDT_RNG_SEED_SIZE],
+        ) -> Result<(), Arm64FdtRngSeedError> {
+            Err(Arm64FdtRngSeedError::new())
+        }
     }
 
     fn test_layout(size: u64) -> GuestMemoryLayout {
