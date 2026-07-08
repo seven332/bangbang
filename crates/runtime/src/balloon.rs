@@ -5217,6 +5217,47 @@ mod tests {
     }
 
     #[test]
+    fn statistics_descriptor_accepts_exact_maximum_payload() {
+        let mut memory = pfn_descriptor_memory();
+        let stats =
+            vec![(VIRTIO_BALLOON_S_MEMFREE, 0x5678); VIRTIO_BALLOON_MAX_STATS_PER_DESCRIPTOR];
+        let bytes = stat_payload_bytes(&stats);
+        assert_eq!(bytes.len(), VIRTIO_BALLOON_MAX_STATS_PAYLOAD_SIZE);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
+        write_statistics_descriptor(
+            &mut memory,
+            VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&bytes), None),
+        );
+        let chain = read_descriptor_chain(
+            &memory,
+            descriptor_table_for_queue(VIRTIO_BALLOON_STATS_QUEUE_INDEX),
+            TEST_QUEUE_SIZE,
+            0,
+        )
+        .expect("statistics descriptor chain should read");
+
+        let payload = VirtioBalloonStatisticsDescriptor::read(&memory, &chain)
+            .expect("maximum statistics descriptor should read")
+            .payload();
+        let parsed_stats = payload
+            .report_stats()
+            .expect("maximum statistics descriptor should produce a report");
+
+        assert!(!payload.is_oversized());
+        assert_eq!(
+            payload.stat_count(),
+            VIRTIO_BALLOON_MAX_STATS_PER_DESCRIPTOR
+        );
+        assert_eq!(
+            payload.recognized_stat_count(),
+            VIRTIO_BALLOON_MAX_STATS_PER_DESCRIPTOR
+        );
+        assert_eq!(parsed_stats.free_memory(), Some(0x5678));
+    }
+
+    #[test]
     fn default_prepared_device_has_version_feature_and_base_queues() {
         let device = prepared(balloon_config(64, false, 0, false, false));
 
