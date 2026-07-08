@@ -1176,9 +1176,8 @@ optional RTC, serial, and sorted virtio-mmio device nodes from caller-supplied
 descriptors. The optional RTC node uses Firecracker's aarch64 PL031 shape with
 `compatible = "arm,pl031", "arm,primecell"`, `reg`, `clocks`, and
 `clock-names = "apb_pclk"`, and intentionally omits `interrupts` because the
-minimal RTC device does not implement alarm interrupts. PCI, vmgenid, vmclock,
-pvtime, and other device nodes remain deferred until the corresponding
-emulation paths exist.
+minimal RTC device does not implement alarm interrupts. PCI and other device
+nodes remain deferred until the corresponding emulation paths exist.
 Because the FDT advertises PSCI with `method = "hvc"`, the HVF backend decodes
 arm64 HVC exception exits and handles `HVC #0` as a minimal PSCI 0.2 responder
 for early single-vCPU boot probing. The responder returns `PSCI_VERSION`,
@@ -1237,6 +1236,29 @@ or any virtio-mmio range, and that the serial interrupt line is an SPI INTID
 before encoding it. The internal boot-resource assembly path can register one
 optional serial MMIO handler and pass matching serial FDT metadata from the
 same placement and interrupt line.
+
+## RTC-Adjacent Time And Identity Devices
+
+bangbang currently implements only the guest-visible PL031 RTC subset described
+above. RTC alarm interrupts are intentionally unsupported in that subset because
+Firecracker's aarch64 PL031 node is exposed without an interrupt line; guest
+flows that depend on RTC alarm interrupts should not be treated as supported by
+the current compatibility surface.
+
+PVTime/steal-time is a separate platform capability rather than an RTC feature.
+Firecracker implements ARM steal-time by allocating per-vCPU memory and
+registering it through KVM ARM vCPU device attributes. bangbang should not claim
+PVTime until an HVF-specific capability and guest ABI design exists; for now it
+is platform-limited and deferred.
+
+VMGenID/SysGenID and VMClock are supported-target device families, but they are
+not part of the minimal RTC device. Firecracker exposes them as guest memory
+regions with interrupt notification and updates them around snapshot restore.
+bangbang should implement them only after guest-memory placement, FDT metadata,
+interrupt signaling, persistence, and snapshot/restore semantics are designed.
+Until snapshot support is implemented, VMGenID/VMClock restore notifications and
+generation-counter updates remain deferred to the snapshot work tracked by
+#543.
 
 FDT writes first reject mismatches between the layout used to describe guest RAM
 and the allocated guest memory object. FDT bytes are then built before guest
