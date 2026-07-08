@@ -321,9 +321,10 @@ output. Current explicit and periodic metrics lines can expose selected API
 request counters, startup timing fields, logger and serial counters, a terse
 boot run-loop status summary, and minimal device counters such as block
 queue/update activity, virtio-net packet counters, and virtio-vsock queue,
-packet, byte, and connection cleanup counters. Vsock metrics are counters only
-and must not expose Unix socket paths, guest payload bytes, host stream data,
-worker error strings, host paths, guest serial bytes, or unexpected guest data.
+packet, byte, and connection cleanup counters. Serial and vsock metrics are
+counters only and must not expose Unix socket paths, guest payload bytes, host
+stream data, worker error strings, host paths, guest serial bytes, or
+unexpected guest data.
 Future full logging and metrics support must preserve those redaction
 boundaries.
 

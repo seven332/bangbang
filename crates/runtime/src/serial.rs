@@ -41,22 +41,110 @@ const NANOS_PER_MILLISECOND: u64 = 1_000_000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SerialOutputMetrics {
+    error_count: u64,
+    flush_count: u64,
+    missed_read_count: u64,
+    missed_write_count: u64,
+    read_count: u64,
+    write_count: u64,
     rate_limiter_dropped_bytes: u64,
 }
 
 impl SerialOutputMetrics {
-    pub const fn new(rate_limiter_dropped_bytes: u64) -> Self {
+    const fn from_fields(
+        error_count: u64,
+        flush_count: u64,
+        missed_read_count: u64,
+        missed_write_count: u64,
+        read_count: u64,
+        write_count: u64,
+        rate_limiter_dropped_bytes: u64,
+    ) -> Self {
         Self {
+            error_count,
+            flush_count,
+            missed_read_count,
+            missed_write_count,
+            read_count,
+            write_count,
             rate_limiter_dropped_bytes,
         }
+    }
+
+    pub const fn error_count(self) -> u64 {
+        self.error_count
+    }
+
+    pub const fn flush_count(self) -> u64 {
+        self.flush_count
+    }
+
+    pub const fn missed_read_count(self) -> u64 {
+        self.missed_read_count
+    }
+
+    pub const fn missed_write_count(self) -> u64 {
+        self.missed_write_count
+    }
+
+    pub const fn read_count(self) -> u64 {
+        self.read_count
+    }
+
+    pub const fn write_count(self) -> u64 {
+        self.write_count
     }
 
     pub const fn rate_limiter_dropped_bytes(self) -> u64 {
         self.rate_limiter_dropped_bytes
     }
 
+    pub const fn with_error_count(mut self, error_count: u64) -> Self {
+        self.error_count = error_count;
+        self
+    }
+
+    pub const fn with_flush_count(mut self, flush_count: u64) -> Self {
+        self.flush_count = flush_count;
+        self
+    }
+
+    pub const fn with_missed_read_count(mut self, missed_read_count: u64) -> Self {
+        self.missed_read_count = missed_read_count;
+        self
+    }
+
+    pub const fn with_missed_write_count(mut self, missed_write_count: u64) -> Self {
+        self.missed_write_count = missed_write_count;
+        self
+    }
+
+    pub const fn with_read_count(mut self, read_count: u64) -> Self {
+        self.read_count = read_count;
+        self
+    }
+
+    pub const fn with_write_count(mut self, write_count: u64) -> Self {
+        self.write_count = write_count;
+        self
+    }
+
+    pub const fn with_rate_limiter_dropped_bytes(
+        mut self,
+        rate_limiter_dropped_bytes: u64,
+    ) -> Self {
+        self.rate_limiter_dropped_bytes = rate_limiter_dropped_bytes;
+        self
+    }
+
     pub const fn is_empty(self) -> bool {
-        self.rate_limiter_dropped_bytes == 0
+        self.error_count == 0
+            && self.flush_count == 0
+            && self.missed_read_count == 0
+            && self.missed_write_count == 0
+            && self.read_count == 0
+            && self.write_count == 0
+            && self.rate_limiter_dropped_bytes == 0
     }
 }
 
@@ -66,31 +154,30 @@ struct SharedSerialOutputMetrics {
 }
 
 impl SharedSerialOutputMetrics {
-    fn record_rate_limiter_dropped_bytes(&self, bytes: u64) {
-        if bytes == 0 {
-            return;
-        }
+    fn record_error(&self) {
+        record_serial_metric(&self.inner.error_count, 1);
+    }
 
-        let mut current = self
-            .inner
-            .rate_limiter_dropped_bytes
-            .load(Ordering::Relaxed);
-        loop {
-            let next = current.saturating_add(bytes);
-            match self.inner.rate_limiter_dropped_bytes.compare_exchange_weak(
-                current,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(observed) => current = observed,
-            }
-        }
+    fn record_missed_write(&self) {
+        record_serial_metric(&self.inner.missed_write_count, 1);
+    }
+
+    fn record_write(&self) {
+        record_serial_metric(&self.inner.write_count, 1);
+    }
+
+    fn record_rate_limiter_dropped_bytes(&self, bytes: u64) {
+        record_serial_metric(&self.inner.rate_limiter_dropped_bytes, bytes);
     }
 
     fn snapshot(&self) -> SerialOutputMetrics {
-        SerialOutputMetrics::new(
+        SerialOutputMetrics::from_fields(
+            self.inner.error_count.load(Ordering::Relaxed),
+            self.inner.flush_count.load(Ordering::Relaxed),
+            self.inner.missed_read_count.load(Ordering::Relaxed),
+            self.inner.missed_write_count.load(Ordering::Relaxed),
+            self.inner.read_count.load(Ordering::Relaxed),
+            self.inner.write_count.load(Ordering::Relaxed),
             self.inner
                 .rate_limiter_dropped_bytes
                 .load(Ordering::Relaxed),
@@ -100,7 +187,28 @@ impl SharedSerialOutputMetrics {
 
 #[derive(Debug, Default)]
 struct SharedSerialOutputMetricsInner {
+    error_count: AtomicU64,
+    flush_count: AtomicU64,
+    missed_read_count: AtomicU64,
+    missed_write_count: AtomicU64,
+    read_count: AtomicU64,
+    write_count: AtomicU64,
     rate_limiter_dropped_bytes: AtomicU64,
+}
+
+fn record_serial_metric(counter: &AtomicU64, value: u64) {
+    if value == 0 {
+        return;
+    }
+
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(value);
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,6 +436,34 @@ impl SerialOutput for SharedSerialOutputBuffer {
     }
 }
 
+#[derive(Debug)]
+struct MeteredSerialOutput<O> {
+    output: O,
+    metrics: SharedSerialOutputMetrics,
+}
+
+impl<O> MeteredSerialOutput<O> {
+    fn new(output: O, metrics: SharedSerialOutputMetrics) -> Self {
+        Self { output, metrics }
+    }
+}
+
+impl<O: SerialOutput> SerialOutput for MeteredSerialOutput<O> {
+    fn write_byte(&mut self, byte: u8) -> Result<(), SerialOutputError> {
+        match self.output.write_byte(byte) {
+            Ok(()) => {
+                self.metrics.record_write();
+                Ok(())
+            }
+            Err(err) => {
+                self.metrics.record_missed_write();
+                self.metrics.record_error();
+                Err(err)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SharedSerialOutput {
     output: Arc<Mutex<Box<dyn SerialOutput>>>,
@@ -336,9 +472,13 @@ pub struct SharedSerialOutput {
 
 impl SharedSerialOutput {
     pub fn new(output: impl SerialOutput + 'static) -> Self {
+        let metrics = SharedSerialOutputMetrics::default();
         Self {
-            output: Arc::new(Mutex::new(Box::new(output))),
-            metrics: SharedSerialOutputMetrics::default(),
+            output: Arc::new(Mutex::new(Box::new(MeteredSerialOutput::new(
+                output,
+                metrics.clone(),
+            )))),
+            metrics,
         }
     }
 
@@ -347,13 +487,14 @@ impl SharedSerialOutput {
         rate_limiter: Option<SerialRateLimiterConfig>,
     ) -> Self {
         let metrics = SharedSerialOutputMetrics::default();
+        let metered_output = MeteredSerialOutput::new(output, metrics.clone());
         let output: Box<dyn SerialOutput> = match rate_limiter.and_then(SerialTokenBucket::new) {
             Some(bucket) => Box::new(RateLimitedSerialOutput::from_bucket(
-                output,
+                metered_output,
                 bucket,
                 metrics.clone(),
             )),
-            None => Box::new(output),
+            None => Box::new(metered_output),
         };
 
         Self {
@@ -375,10 +516,11 @@ impl From<SharedSerialOutputBuffer> for SharedSerialOutput {
 
 impl SerialOutput for SharedSerialOutput {
     fn write_byte(&mut self, byte: u8) -> Result<(), SerialOutputError> {
-        let mut output = self
-            .output
-            .lock()
-            .map_err(|_| SerialOutputError::lock_poisoned())?;
+        let mut output = self.output.lock().map_err(|_| {
+            self.metrics.record_missed_write();
+            self.metrics.record_error();
+            SerialOutputError::lock_poisoned()
+        })?;
 
         output.write_byte(byte)
     }
@@ -1239,6 +1381,21 @@ mod tests {
     }
 
     #[test]
+    fn shared_serial_output_counts_successful_writes() {
+        let buffer = SharedSerialOutputBuffer::default();
+        let mut output = SharedSerialOutput::from(buffer.clone());
+
+        output.write_byte(b'a').expect("first byte should write");
+        output.write_byte(b'b').expect("second byte should write");
+
+        assert_eq!(buffer.bytes().expect("shared bytes should read"), b"ab");
+        assert_eq!(
+            output.metrics(),
+            SerialOutputMetrics::default().with_write_count(2)
+        );
+    }
+
+    #[test]
     fn token_bucket_consumes_burst_budget_and_refills_by_time() {
         let now = Instant::now();
         let mut bucket =
@@ -1302,17 +1459,29 @@ mod tests {
             .expect("second exhausted byte should be dropped");
 
         assert_eq!(buffer.bytes().expect("shared bytes should read"), b"a");
-        assert_eq!(output.metrics().rate_limiter_dropped_bytes(), 2);
+        assert_eq!(
+            output.metrics(),
+            SerialOutputMetrics::default()
+                .with_write_count(1)
+                .with_rate_limiter_dropped_bytes(2)
+        );
     }
 
     #[test]
-    fn shared_serial_output_metrics_saturates_dropped_bytes() {
+    fn shared_serial_output_metrics_saturates_counters() {
         let metrics = SharedSerialOutputMetrics::default();
 
         metrics.record_rate_limiter_dropped_bytes(u64::MAX - 1);
         metrics.record_rate_limiter_dropped_bytes(2);
+        metrics.record_write();
+        metrics.record_write();
 
-        assert_eq!(metrics.snapshot().rate_limiter_dropped_bytes(), u64::MAX);
+        assert_eq!(
+            metrics.snapshot(),
+            SerialOutputMetrics::default()
+                .with_write_count(2)
+                .with_rate_limiter_dropped_bytes(u64::MAX)
+        );
     }
 
     #[test]
@@ -1333,7 +1502,13 @@ mod tests {
             "serial output buffer reached its 1-byte limit"
         );
         assert_eq!(buffer.bytes().expect("shared bytes should read"), b"a");
-        assert_eq!(output.metrics(), SerialOutputMetrics::default());
+        assert_eq!(
+            output.metrics(),
+            SerialOutputMetrics::default()
+                .with_error_count(1)
+                .with_missed_write_count(1)
+                .with_write_count(1)
+        );
     }
 
     #[test]
