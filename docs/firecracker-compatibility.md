@@ -59,7 +59,7 @@ interrupt signaling,
 virtual timer PPI assertion, per-controller metrics and logger output state, and an initial process startup argument model.
 There is no broader API request body model beyond the initial boot-source,
 drive configuration, drive update, network-interface configuration, vsock configuration, machine-configuration, metrics, logger, serial, and actions bodies, public guest
-execution beyond internal startup execution across bounded step windows, public run-loop control, complete interrupt
+execution beyond internal startup execution across bounded step windows, full public run-loop control beyond the current pause/resume subset, complete interrupt
 delivery, including timer EOI/deactivation-driven unmasking,
 general HVF runner-loop notification scheduling, public serial output streaming,
 serial/backend interrupt wiring beyond the internal boot block and network notification
@@ -103,12 +103,12 @@ socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
 `PUT /boot-source`, pre-boot `PUT /drives/{drive_id}`, pre-boot
 `PUT /network-interfaces/{iface_id}`, pre-boot `PUT /pmem/{id}`, pre-boot `PUT /vsock`, pre-boot
 `PUT /metrics`, pre-boot `PUT /logger`, pre-boot `PUT /serial`, parsed `PUT /actions`,
-pre-boot `PATCH /machine-config`, parsed `PATCH /mmds`, parsed `PATCH /vm`, and
+pre-boot `PATCH /machine-config`, parsed `PATCH /mmds`, runtime `PATCH /vm`, and
 runtime `PATCH /drives/{drive_id}` requests already map through a minimal internal VMM
 action/data boundary. Validation rejects malformed boot-source, drive update,
 VM state update, and actions requests before VMM state mutation.
-Successful `InstanceStart` startup, the `Running` transition, and an internal boot run-loop worker across bounded step windows are implemented with configured or default internal serial MMIO
-output and retained internal active, terminal-outcome, or error worker status. Process-owned API-enabled and no-api runs can exit successfully after guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET` terminal outcomes, and fail the process on non-success terminal worker states. Startup CLI and config-file metrics paths write one initial minimal metrics line when the metrics sink is configured. `FlushMetrics` is implemented as a runtime-only minimal JSON-line flush through per-process metrics state, and includes a terse `boot_run_loop_status` summary when a process-owned boot worker exists plus initial Firecracker-shaped GET, core configuration PUT, MMDS PUT, selected PATCH, observability PUT, `/actions` API request counters, selected deprecated HTTP API usage, `logger.missed_metrics_count` after a previous metrics write failure, `logger.missed_log_count` after a previous logger action write failure, and `uart.rate_limiter_dropped_bytes` when an active serial output limiter has dropped guest TX bytes. API-enabled and no-api runtime loops also flush the same minimal metrics output every 60 seconds while the VM is running. `PUT /logger` is implemented as pre-boot per-process observability configuration with minimal successful `InstanceStart` and `FlushMetrics` action-event output; public run-loop control, public serial
+Successful `InstanceStart` startup, the `Running` transition, runtime `Paused`/`Running` transitions through `PATCH /vm`, and an internal boot run-loop worker across bounded step windows are implemented with configured or default internal serial MMIO
+output and retained internal active, paused, terminal-outcome, or error worker status. Process-owned API-enabled and no-api runs can exit successfully after guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET` terminal outcomes, and fail the process on non-success terminal worker states. Startup CLI and config-file metrics paths write one initial minimal metrics line when the metrics sink is configured. `FlushMetrics` is implemented as a runtime-only minimal JSON-line flush through per-process metrics state, and includes a terse `boot_run_loop_status` summary when a process-owned boot worker exists plus initial Firecracker-shaped GET, core configuration PUT, MMDS PUT, selected PATCH, observability PUT, `/actions` API request counters, selected deprecated HTTP API usage, `logger.missed_metrics_count` after a previous metrics write failure, `logger.missed_log_count` after a previous logger action write failure, and `uart.rate_limiter_dropped_bytes` when an active serial output limiter has dropped guest TX bytes. API-enabled and no-api runtime loops also flush the same minimal metrics output every 60 seconds while the VM is running. `PUT /logger` is implemented as pre-boot per-process observability configuration with minimal successful `InstanceStart` and `FlushMetrics` action-event output; full Firecracker run-loop control beyond the current single-worker pause/resume subset, public serial
 streaming, full Firecracker serial counters beyond limiter drops, broader Firecracker metrics counters, and full logger integration remain deferred.
 
 ## Process Startup CLI
@@ -129,7 +129,7 @@ supported startup subset, start the VM before serving the API socket, and then
 keep the API socket available for runtime requests. With `--no-api`, the same
 supported config-file startup path runs without publishing an API socket and
 exits on handled `SIGINT`, handled `SIGTERM`, or guest PSCI `SYSTEM_OFF` or
-`SYSTEM_RESET`. It does not provide public run-loop control yet.
+`SYSTEM_RESET`. It does not provide reboot-in-place or external run-loop management yet.
 
 | Argument | Current behavior | Compatibility notes |
 | --- | --- | --- |
@@ -377,7 +377,7 @@ compatibility targets.
 | `PUT`, `PATCH` | `/pmem/{id}` | partial; pre-boot config storage, startup backing mapping, guest-visible MMIO/FDT attachment, HVF guest-memory registration, shadow writeback, guest-range config-space, flush queue dispatch, and runtime no-op rate-limiter PATCH implemented | `PUT /pmem/{id}` stores Firecracker-shaped pmem configuration before boot, replaces prior config for the same ID, and appears in `GET /vm/config` under `pmem`. It rejects empty backing paths without opening host files during the request. `InstanceStart` opens each configured backing, validates it as a non-zero regular file, mmaps it to a 2 MiB-aligned host range, assigns a deterministic non-overlapping 2 MiB-aligned guest physical range after the aarch64 MMIO64 gap while skipping current guest RAM, creates the HVF VM with the framework-reported maximum IPA size, copies the prepared mapping into an HVF-compatible anonymous shadow, registers that shadow with HVF after DRAM using read-only or read/write non-executable permissions, copies writable shadows back to the backing file for guest queue-driven flush requests and after clean unmap, skips writeback after failed unmap cleanup, and attaches one virtio-mmio/FDT node per prepared pmem device. Runtime defines the backend-neutral virtio-pmem identity, one 256-entry queue, modern virtio feature bit, 2 MiB alignment constant, 16-byte config-space layout, and flush request completion/status handling; the attached MMIO config-space exposes the prepared `start`/`size` values. Empty or all-null rate limiter objects are treated as unconfigured, and configured rate limiters are rejected without mutating stored pmem configuration. `PATCH /pmem/{id}` remains post-boot-only, accepts unconfigured/no-op limiter updates for existing runtime pmem devices, rejects missing devices or configured limiters without mutating stored configuration, and leaves real rate limiting, root-device semantics, dirty-range tracking, direct file-backed HVF mapping, and hot-unplug to dedicated device designs. |
 | `PUT` | `/entropy` | supported target; configuration storage, startup attachment, and signed executable guest read validation implemented | Stores one Firecracker-shaped virtio-rng entropy configuration before boot when `rate_limiter` is omitted, `null`, an empty object, or an all-null `bandwidth`/`ops` object. `GET /vm/config` includes `"entropy": {}` after API or config-file configuration, and `InstanceStart` attaches the existing HVF virtio-rng MMIO/FDT device backed by the session-owned host OS randomness source. The signed executable HVF e2e target boots a direct-rootfs guest, checks that Linux selected `virtio_rng` as the current hardware RNG, reads non-empty data from `/dev/hwrng`, and writes a host-observable success marker. Configured rate limiters are validated and then rejected with the entropy rate-limiter unsupported fault without mutating stored entropy configuration. Post-start requests follow the pre-boot-only unsupported-state policy. Real rate limiting and entropy metrics remain deferred. |
 | `GET`, `PUT`, `PATCH` | `/hotplug/memory` | recognized; VMM-routed unsupported | Parses Firecracker-shaped `PUT` and `PATCH` memory hotplug request bodies, rejects malformed or schema-invalid bodies first, and then routes valid requests through the VMM state/action policy. `PUT` is treated as pre-boot-only, applies Firecracker-shaped block/slot/total size semantic validation, and then reaches the memory-hotplug-specific unsupported fault before startup for valid configs. `GET` and `PATCH` are treated as post-boot-only and reach the memory-hotplug-specific unsupported fault after startup. Requests made in the wrong lifecycle state return the normal unsupported-state fault. This is a control-plane compatibility baseline only: it preserves request-shape validation, PUT config semantic validation, lifecycle classification, memory-hotplug-specific unsupported faults, metrics accounting, and non-echoing unsupported/lifecycle API faults for size fields. Real virtio-mem device support, hotplug configuration storage, hotpluggable guest memory accounting, runtime resize, and memory hot-unplug need a dedicated design. |
-| `PATCH` | `/vm` | recognized; rejected | Parses the Firecracker-shaped VM state request with required `state` values `Paused` and `Resumed`, then routes valid requests through `Pause` or `Resume` VMM actions. Requests before startup fail as unsupported in `Not started` state, and runtime requests fail as unsupported actions without mutating VM state. Real pause/resume state transitions and public run-loop control remain deferred. |
+| `PATCH` | `/vm` | partial; runtime pause/resume implemented | Parses the Firecracker-shaped VM state request with required `state` values `Paused` and `Resumed`, then routes valid requests through `Pause` or `Resume` VMM actions. Requests before startup fail as unsupported in `Not started` state. After startup, `Paused` transitions a `Running` instance to `Paused` only after the process-owned boot worker stops entering new bounded run-loop windows, and `Resumed` transitions it back to `Running` only after the worker accepts resume. Repeated pause/resume requests fail as unsupported-state errors without mutating VM state. Full multi-vCPU pause coordination, HVF vCPU state capture, snapshot-ready paused ownership, and reboot-in-place remain deferred. |
 | `PATCH` | `/drives/{drive_id}` | supported target; runtime backing refresh implemented | Parses the Firecracker-shaped block-device update request with required `drive_id`, optional `path_on_host`, and optional `rate_limiter`, then routes valid updates through `UpdateBlockDevice`. Empty or all-null rate limiter objects are treated as unconfigured. Pre-boot requests fail as post-boot-only operations. Runtime requests for an existing active drive open the replacement backing before mutating stored configuration, refresh the matching virtio-block MMIO handler, update the guest-visible block capacity/config generation, and leave the old backing and stored config intact on failure. Configured rate limiters remain unsupported. |
 | `PATCH` | `/network-interfaces/{iface_id}` | no-op subset implemented | Returns unsupported-state before startup, validates the target interface after startup, and accepts omitted, `null`, empty, or all-null `rx_rate_limiter` and `tx_rate_limiter` objects as runtime no-ops. Configured rate limiters are rejected, and real network-interface mutation and hotplug behavior need dedicated device designs. |
 | `DELETE` | `/drives/{drive_id}`, `/pmem/{id}`, `/network-interfaces/{iface_id}` | recognized; VMM-routed unsupported | Firecracker routes bodyless hot-unplug requests in `parsed_request.rs`, but they are not in the `v1.16.0` swagger surface. bangbang parses bodyless hot-unplug requests into one VMM action, returns the normal post-boot-only unsupported-state fault before startup, and returns the matching device-specific unsupported fault after startup. Body-bearing `DELETE` requests fail first as malformed request shape before hot-unplug routing. Real hot-unplug behavior remains deferred. |
@@ -500,7 +500,7 @@ fields and duplicate token bucket fields before VMM dispatch.
 | `PUT /hotplug/memory` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PATCH /hotplug/memory` | `requested_size_mib` | required; unsupported after VMM routing | Required Firecracker-shaped target hotpluggable-memory size. The parser accepts syntactically valid unsigned integer values, then the API server routes the request through the post-boot-only memory-hotplug action before returning the unsupported fault. Real resize behavior remains deferred. |
 | `PATCH /hotplug/memory` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
-| `PUT /actions` | `action_type=InstanceStart` | process-routed; internal startup execution across bounded step windows implemented | Validates stored boot-source and state preflight first, then attempts owned HVF boot-session preparation with configured serial output or the default internal serial MMIO console and starts the process-owned internal boot run-loop worker across bounded step windows. Success returns `204 No Content`, writes one minimal logger action line when configured and allowed by level/module filters, and commits `Running`; preparation, worker-start, or logger-output failures return a fault without mutating state. Public run-loop control and public serial streaming remain deferred. |
+| `PUT /actions` | `action_type=InstanceStart` | process-routed; internal startup execution across bounded step windows implemented | Validates stored boot-source and state preflight first, then attempts owned HVF boot-session preparation with configured serial output or the default internal serial MMIO console and starts the process-owned internal boot run-loop worker across bounded step windows. Success returns `204 No Content`, writes one minimal logger action line when configured and allowed by level/module filters, and commits `Running`; preparation, worker-start, or logger-output failures return a fault without mutating state. Full public run-loop control beyond the current pause/resume subset and public serial streaming remain deferred. |
 | `PUT /actions` | `action_type=FlushMetrics` | runtime-only; minimal execution implemented | Rejected before startup. After startup, returns `204 No Content`; if metrics output was configured, appends one minimal JSON line with `metrics_flush_count`, the current selected API request counters, `logger.missed_metrics_count` after a previous metrics write failure, and `logger.missed_log_count` after a previous logger action write failure; if logger output was configured and allowed by level/module filters, appends one minimal action line. Periodic metrics flushes reuse the same metrics payload every 60 seconds while running, but are not `/actions` requests and do not write logger action lines. Full Firecracker counters and full logger integration remain deferred. |
 | `PUT /actions` | `action_type=SendCtrlAltDel` | intentionally unsupported; parser rejected | Firecracker gates this on x86 keyboard behavior; the first target is Apple Silicon. The request is still counted in `put_api_requests.actions_count` without an `actions_fails` increment. |
 | `PUT /actions` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
@@ -622,9 +622,9 @@ Parsed deprecated HTTP API usage is counted under
 above; malformed parser failures remain outside the deprecated counter.
 Device runtime counters, remaining API request counters, and parser-level
 malformed-request counters for endpoints without Firecracker-shaped request
-metric fields remain deferred. Public run-loop control, guest boot
-output, public runner loop scheduling, full Firecracker metrics counters, and
-full logger integration remain deferred. Metrics write failures increment
+metric fields remain deferred. Full public run-loop control beyond pause/resume,
+guest boot output, public runner loop scheduling, full Firecracker metrics
+counters, and full logger integration remain deferred. Metrics write failures increment
 `logger.missed_metrics_count`; logger action write failures increment
 `logger.missed_log_count`; broader logger metrics remain deferred.
 The process startup path and API/VMM state path implement the logger field
@@ -1304,8 +1304,8 @@ The assembled bundle is used by owned HVF startup preparation. HVF owns the
 mapped guest memory while runtime metadata, the MMIO dispatcher, optional RTC
 metadata, optional serial metadata, and block/network metadata stay available to
 the retained session. bangbang
-now starts an internal boot run-loop worker across bounded step windows after successful startup and retains internal active, terminal-outcome, or error worker status, but
-does not yet provide public run-loop control, signal backend
+now starts an internal boot run-loop worker across bounded step windows after successful startup and retains internal active, paused, terminal-outcome, or error worker status, but
+does not yet provide full Firecracker run-loop control beyond the current pause/resume subset, signal backend
 interrupts outside the internal boot block and network notification paths,
 or prove guest boot with an integration test.
 
@@ -1512,7 +1512,7 @@ runtime notifications and releases it before HVF GIC signaling.
 bangbang now wires `mem_size_mib` into startup preparation, and process-level
 tests cover the current HVF startup rejection for stored `vcpu_count` values
 above one. It still does not wire device interrupts into public guest execution,
-emulate devices, provide public run-loop control, power on secondary vCPUs,
+emulate devices, provide full public run-loop control beyond pause/resume, power on secondary vCPUs,
 implement reboot-in-place after `SYSTEM_RESET`, or implement full PSCI CPU
 control and process exit-code parity for error power actions. Public
 machine configuration rejects `mem_size_mib` above the current 1022 GiB Apple
@@ -1578,8 +1578,9 @@ The first API implementation should model the same broad stages as Firecracker:
   state on success
 - runtime: the microVM is running; pre-boot-only configuration requests should
   fail with a Firecracker-shaped unsupported-state error
-- paused/resumed: `PATCH /vm` parses `Paused` and `Resumed` requests, but real
-  pause and resume behavior remains deferred
+- paused/resumed: `PATCH /vm` supports `Paused` and `Resumed` for the current
+  process-owned single boot-worker run-loop by pausing scheduling between
+  bounded run-loop windows
 
 ### Initial Operation State Matrix
 
@@ -1611,8 +1612,8 @@ The first API implementation should model the same broad stages as Firecracker:
 | `PUT /balloon` | partial; `204` empty response on successful pre-boot configuration | unsupported after start; `400` `fault_message` | Stores Firecracker-shaped balloon configuration before startup, rejects targets larger than configured guest memory without mutating previous balloon config, exposes it through `GET /balloon` and `GET /vm/config`, and can attach the current virtio-mmio/FDT shell during `InstanceStart`. Runtime `PATCH /balloon` can update the target size after startup when a balloon was configured, runtime `PATCH /balloon/statistics` can update nonzero statistics polling intervals without toggling statistics enabled state, `GET /balloon/statistics` can return required target and actual fields from stored target state plus internal inflated-page accounting and optional guest-reported fields from statistics queue reports, and hinting start/stop/status can update and report host-owned command state plus 4-byte guest command acknowledgements when `free_page_hinting` is enabled. Runtime-handler and HVF boot-loop inflate/deflate/statistics descriptor dispatch is implemented with queue interrupt signaling and internal inflated-page accounting for mapped guest PFNs; active-run hinting range descriptors are validated and recorded, while periodic statistics polling, timer-driven statistics descriptor completion, reporting, and host reclaim remain deferred. |
 | `GET /balloon/hinting/status` | post-boot-only unsupported-state fault; `400` `fault_message` | partial; `200` JSON with `free_page_hinting: true`, otherwise `400` `fault_message` | Requires a configured balloon with free-page hinting enabled and returns the active host command and guest command state. Start/stop commands update `host_cmd`; a 4-byte hinting queue descriptor updates `guest_cmd`, which remains `null` until the guest sends one. Guest `STOP(0)` and unexpected guest `DONE(1)` descriptors complete the current hinting run and, when the active run was started with `acknowledge_on_stop=true`, update `host_cmd` to `DONE(1)` through the same config-space/config-interrupt path as explicit stop. Active-run range descriptors are validated and recorded internally; host reclaim remains deferred. |
 | `PATCH /balloon/hinting/start`, `PATCH /balloon/hinting/stop` | post-boot-only unsupported-state fault; `400` `fault_message` | partial; `204` with `free_page_hinting: true`, otherwise `400` `fault_message` | Start advances the host command id, skips Firecracker reserved command values, updates active config space, raises a config interrupt, and preserves `acknowledge_on_stop` in host-owned state. Stop writes Firecracker's done command, updates active config space, and raises a config interrupt. Hinting queue command acknowledgements can update `guest_cmd`, completed guest `STOP(0)`/`DONE(1)` commands automatically write host `DONE(1)` when `acknowledge_on_stop` is enabled, and active-run range descriptors are validated and recorded internally. Host reclaim remains deferred. |
-| `PUT /actions` with `InstanceStart` | process-routed; `204` after successful owned HVF startup with internal boot run-loop worker across bounded step windows or `400` preflight/preparation/logger-output fault | unsupported after start; `400` `fault_message` | Commits `Running` only after the owned HVF boot-session worker with configured serial output or default internal serial capture is retained and any emitted action logging succeeds. The worker keeps internal active, terminal-outcome, or error status; guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET` can terminate the owning process successfully. Public run-loop control, reboot-in-place, error exit-code parity, and public serial streaming remain deferred. |
-| `PUT /actions` with `FlushMetrics` | VMM-routed; `400` unsupported-state `fault_message` | implemented; `204` empty response or `400` logger/metrics output fault | Firecracker treats this as runtime-only. bangbang writes one minimal JSON line when metrics output was configured, including selected API request counters, `logger.missed_metrics_count` after a previous metrics write failure, `logger.missed_log_count` after a previous logger action write failure, and `boot_run_loop_status` as `running`, `exited`, or `failed` when a process-owned boot worker exists, writes one minimal action line when logger output is configured and allowed by level/module filters, and otherwise succeeds without writing. Periodic metrics flushes reuse the same metrics payload every 60 seconds while running, but are not `/actions` requests and do not write logger action lines. |
+| `PUT /actions` with `InstanceStart` | process-routed; `204` after successful owned HVF startup with internal boot run-loop worker across bounded step windows or `400` preflight/preparation/logger-output fault | unsupported after start; `400` `fault_message` | Commits `Running` only after the owned HVF boot-session worker with configured serial output or default internal serial capture is retained and any emitted action logging succeeds. The worker keeps internal active, paused, terminal-outcome, or error status; guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET` can terminate the owning process successfully. Full Firecracker run-loop control beyond the current pause/resume subset, reboot-in-place, error exit-code parity, and public serial streaming remain deferred. |
+| `PUT /actions` with `FlushMetrics` | VMM-routed; `400` unsupported-state `fault_message` | implemented; `204` empty response or `400` logger/metrics output fault | Firecracker treats this as runtime-only. bangbang writes one minimal JSON line when metrics output was configured, including selected API request counters, `logger.missed_metrics_count` after a previous metrics write failure, `logger.missed_log_count` after a previous logger action write failure, and `boot_run_loop_status` as `running`, `paused`, `exited`, or `failed` when a process-owned boot worker exists, writes one minimal action line when logger output is configured and allowed by level/module filters, and otherwise succeeds without writing. Periodic metrics flushes reuse the same metrics payload every 60 seconds while running, but are not `/actions` requests and do not write logger action lines. |
 | `PUT /actions` with `SendCtrlAltDel` | intentionally unsupported; parser returns `400` `fault_message` | intentionally unsupported; `400` `fault_message` | Firecracker rejects this on aarch64; bangbang's first target is Apple Silicon. The request contributes to `put_api_requests.actions_count` but not `actions_fails`. |
 | Non-initial endpoints from the endpoint matrix | `400` `fault_message` until their capability exists | `400` `fault_message` until their capability exists | Covers planned later and deferred endpoints; a later capability PR may define more specific state behavior. |
 | Unknown endpoint or invalid method/path | `400` `fault_message` | `400` `fault_message` | Matches Firecracker's parser-level invalid path or method handling. |
@@ -1766,7 +1767,8 @@ Their eventual support level should follow the endpoint matrix:
 - full logger integration, and full Firecracker metrics counters beyond the
   currently implemented minimal metrics subset
 - memory hotplug
-- real pause and resume VM state transitions
+- full multi-vCPU pause coordination, HVF vCPU state capture, and
+  snapshot-ready paused ownership
 - PATCH and DELETE hotplug/update behavior
 
 Non-initial features should be introduced through narrower capability work that
@@ -1782,7 +1784,8 @@ macOS design work instead of direct implementation:
   KVM ioctl usage.
 - HVF guest RAM is mapped with a backend-owned owner that holds the anonymous
   host allocation until unmap or VM destruction. Startup can load payloads into
-  that memory and run the internal boot worker across bounded step windows; public run-loop control remains deferred.
+  that memory and run the internal boot worker across bounded step windows; full
+  run-loop control beyond pause/resume remains deferred.
 - HVF vCPU handles are thread-affine: creation, register access, run, and
   destroy operations must happen on the owning thread. The current vCPU wrapper
   covers current-thread lifecycle, typed exit surface, narrow register access,
@@ -1808,12 +1811,13 @@ macOS design work instead of direct implementation:
   an explicit runner-thread command, and completed back into guest GPRs for
   successful reads. The runner and boot session can perform that path for one
   run step, and the boot session can repeat it through a bounded internal loop
-  that terminates on explicit outcomes, but they do not yet provide an
-  public run-loop control or translate exits into interrupt or runtime events.
-- Firecracker's full paused/resumed microVM loop is not implemented yet.
-  bangbang's runner is only the HVF ownership and cancellation primitive set
-  needed before guest memory, interrupt, timer, and device work can build the
-  real run loop.
+  that terminates on explicit outcomes, but they do not yet provide full
+  Firecracker run-loop control beyond pause/resume or translate exits into
+  interrupt or runtime events.
+- Firecracker's full paused/resumed microVM loop is not implemented yet. The
+  current `PATCH /vm` support pauses the process-owned single boot-worker
+  scheduler between bounded run-loop windows, while multi-vCPU coordination,
+  HVF state capture, and snapshot-ready paused ownership remain deferred.
 - Device-facing interrupt triggers are backend-neutral runtime state today, and
   HVF interrupt-line support can allocate deterministic SPI lines from GIC
   metadata and set validated SPI levels through `hv_gic_set_spi`. Internal boot
