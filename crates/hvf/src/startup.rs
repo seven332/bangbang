@@ -20,7 +20,10 @@ use bangbang_runtime::interrupt::{
     DeviceInterruptKind, DeviceInterruptTriggerError, GuestInterruptLine, InterruptSink,
 };
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
-use bangbang_runtime::metrics::{SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry};
+use bangbang_runtime::metrics::{
+    SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry,
+    SharedNetworkInterfaceMetricsRegistry,
+};
 use bangbang_runtime::mmio::{MmioDispatcher, MmioRegionId};
 use bangbang_runtime::network::NetworkMmioLayout;
 use bangbang_runtime::pmem::{PmemMmioLayout, VirtioPmemFlushStatus};
@@ -185,6 +188,7 @@ pub struct HvfArm64BootSession<'vm> {
     entropy_source: VirtioRngOsEntropySource,
     block_device_metrics: SharedBlockDeviceMetricsRegistry,
     balloon_device_metrics: SharedBalloonDeviceMetrics,
+    network_interface_metrics: SharedNetworkInterfaceMetricsRegistry,
     gic: HvfGicMetadata,
     primary_mpidr: u64,
     block_interrupt_lines: Vec<GuestInterruptLine>,
@@ -208,6 +212,7 @@ pub struct OwnedHvfArm64BootSession {
     entropy_source: VirtioRngOsEntropySource,
     block_device_metrics: SharedBlockDeviceMetricsRegistry,
     balloon_device_metrics: SharedBalloonDeviceMetrics,
+    network_interface_metrics: SharedNetworkInterfaceMetricsRegistry,
     gic: HvfGicMetadata,
     primary_mpidr: u64,
     block_interrupt_lines: Vec<GuestInterruptLine>,
@@ -573,6 +578,10 @@ impl HvfArm64BootSession<'_> {
         self.block_device_metrics.clone()
     }
 
+    pub fn shared_network_interface_metrics(&self) -> SharedNetworkInterfaceMetricsRegistry {
+        self.network_interface_metrics.clone()
+    }
+
     /// Return a cloned handle to the runner-compatible MMIO dispatcher.
     ///
     /// The dispatcher is local to this boot session. It is shared only so
@@ -755,7 +764,18 @@ impl HvfArm64BootSession<'_> {
             )?
         };
 
-        collect_or_signal_network_queue_interrupts(dispatches, &self.gic)
+        record_network_runtime_dispatch_metrics(
+            &self.network_interface_metrics,
+            dispatches.as_slice(),
+        );
+        let result = collect_or_signal_network_queue_interrupts(dispatches, &self.gic);
+        match &result {
+            Ok(dispatches) => {
+                record_network_signal_metrics(&self.network_interface_metrics, dispatches);
+            }
+            Err(_) => self.network_interface_metrics.record_event_failure(),
+        }
+        result
     }
 
     pub fn dispatch_network_queue_notifications_with_packet_io_and_signal_interrupts(
@@ -782,7 +802,18 @@ impl HvfArm64BootSession<'_> {
             )?
         };
 
-        collect_or_signal_network_queue_interrupts(dispatches, &self.gic)
+        record_network_runtime_dispatch_metrics(
+            &self.network_interface_metrics,
+            dispatches.as_slice(),
+        );
+        let result = collect_or_signal_network_queue_interrupts(dispatches, &self.gic);
+        match &result {
+            Ok(dispatches) => {
+                record_network_signal_metrics(&self.network_interface_metrics, dispatches);
+            }
+            Err(_) => self.network_interface_metrics.record_event_failure(),
+        }
+        result
     }
 
     pub fn dispatch_vsock_queue_notifications_and_signal_interrupts(
@@ -929,6 +960,7 @@ impl OwnedHvfArm64BootSession {
             entropy_source: VirtioRngOsEntropySource::new(),
             block_device_metrics: prepared.block_device_metrics,
             balloon_device_metrics: prepared.balloon_device_metrics,
+            network_interface_metrics: prepared.network_interface_metrics,
             gic: prepared.gic,
             primary_mpidr: prepared.primary_mpidr,
             block_interrupt_lines: prepared.block_interrupt_lines,
@@ -971,6 +1003,10 @@ impl OwnedHvfArm64BootSession {
 
     pub fn shared_block_device_metrics(&self) -> SharedBlockDeviceMetricsRegistry {
         self.block_device_metrics.clone()
+    }
+
+    pub fn shared_network_interface_metrics(&self) -> SharedNetworkInterfaceMetricsRegistry {
+        self.network_interface_metrics.clone()
     }
 
     /// Return a cloned handle to the runner-compatible MMIO dispatcher.
@@ -1142,7 +1178,18 @@ impl OwnedHvfArm64BootSession {
             )?
         };
 
-        collect_or_signal_network_queue_interrupts(dispatches, &self.gic)
+        record_network_runtime_dispatch_metrics(
+            &self.network_interface_metrics,
+            dispatches.as_slice(),
+        );
+        let result = collect_or_signal_network_queue_interrupts(dispatches, &self.gic);
+        match &result {
+            Ok(dispatches) => {
+                record_network_signal_metrics(&self.network_interface_metrics, dispatches);
+            }
+            Err(_) => self.network_interface_metrics.record_event_failure(),
+        }
+        result
     }
 
     pub fn dispatch_network_queue_notifications_with_packet_io_and_signal_interrupts(
@@ -1169,7 +1216,18 @@ impl OwnedHvfArm64BootSession {
             )?
         };
 
-        collect_or_signal_network_queue_interrupts(dispatches, &self.gic)
+        record_network_runtime_dispatch_metrics(
+            &self.network_interface_metrics,
+            dispatches.as_slice(),
+        );
+        let result = collect_or_signal_network_queue_interrupts(dispatches, &self.gic);
+        match &result {
+            Ok(dispatches) => {
+                record_network_signal_metrics(&self.network_interface_metrics, dispatches);
+            }
+            Err(_) => self.network_interface_metrics.record_event_failure(),
+        }
+        result
     }
 
     pub fn dispatch_vsock_queue_notifications_and_signal_interrupts(
@@ -3147,6 +3205,51 @@ fn record_block_signal_metrics(
 }
 
 #[cfg(test)]
+fn record_network_dispatch_metrics(
+    metrics: &SharedNetworkInterfaceMetricsRegistry,
+    dispatches: &HvfArm64BootNetworkNotificationDispatches,
+) {
+    let runtime_dispatches = dispatches
+        .as_slice()
+        .iter()
+        .map(HvfArm64BootNetworkNotificationDispatch::dispatch);
+    record_network_runtime_dispatch_metrics(metrics, runtime_dispatches);
+    record_network_signal_metrics(metrics, dispatches);
+}
+
+fn record_network_runtime_dispatch_metrics<'a>(
+    metrics: &SharedNetworkInterfaceMetricsRegistry,
+    dispatches: impl IntoIterator<Item = &'a Arm64BootNetworkNotificationDispatch>,
+) {
+    for dispatch in dispatches {
+        let iface_id = dispatch.device().registration.iface_id();
+        if let Some(dispatched) = dispatch.outcome().dispatched() {
+            metrics.record_notification_dispatch_for_interface(iface_id, dispatched);
+        }
+        if let Some(source) = dispatch.outcome().dispatch_error() {
+            metrics.record_notification_error_for_interface(iface_id, source);
+        }
+        if dispatch.outcome().handler_lookup_error().is_some()
+            || dispatch.outcome().packet_io_error().is_some()
+        {
+            metrics.record_event_failure_for_interface(iface_id);
+        }
+    }
+}
+
+fn record_network_signal_metrics(
+    metrics: &SharedNetworkInterfaceMetricsRegistry,
+    dispatches: &HvfArm64BootNetworkNotificationDispatches,
+) {
+    for dispatch in dispatches.as_slice() {
+        if dispatch.signal_error().is_some() {
+            let iface_id = dispatch.dispatch().device().registration.iface_id();
+            metrics.record_event_failure_for_interface(iface_id);
+        }
+    }
+}
+
+#[cfg(test)]
 fn record_balloon_dispatch_metrics(
     metrics: &SharedBalloonDeviceMetrics,
     dispatches: &HvfArm64BootBalloonNotificationDispatches,
@@ -3638,6 +3741,7 @@ struct PreparedHvfArm64BootSession<'vm> {
     run_loop_wakeup: HvfArm64BootRunLoopWakeupToken,
     block_device_metrics: SharedBlockDeviceMetricsRegistry,
     balloon_device_metrics: SharedBalloonDeviceMetrics,
+    network_interface_metrics: SharedNetworkInterfaceMetricsRegistry,
     gic: HvfGicMetadata,
     primary_mpidr: u64,
     block_interrupt_lines: Vec<GuestInterruptLine>,
@@ -3700,6 +3804,7 @@ impl HvfBackend {
             entropy_source: VirtioRngOsEntropySource::new(),
             block_device_metrics: prepared.block_device_metrics,
             balloon_device_metrics: prepared.balloon_device_metrics,
+            network_interface_metrics: prepared.network_interface_metrics,
             gic: prepared.gic,
             primary_mpidr: prepared.primary_mpidr,
             block_interrupt_lines: prepared.block_interrupt_lines,
@@ -3810,6 +3915,12 @@ fn prepare_arm64_boot_session_parts<'vm>(
             .iter()
             .map(|device| device.registration.drive_id()),
     );
+    let network_interface_metrics = SharedNetworkInterfaceMetricsRegistry::from_interface_ids(
+        runtime
+            .network_devices
+            .iter()
+            .map(|device| device.registration.iface_id()),
+    );
 
     Ok(PreparedHvfArm64BootSession {
         runner,
@@ -3819,6 +3930,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
         run_loop_wakeup: HvfArm64BootRunLoopWakeupToken::default(),
         block_device_metrics,
         balloon_device_metrics: SharedBalloonDeviceMetrics::default(),
+        network_interface_metrics,
         gic,
         primary_mpidr,
         block_interrupt_lines: interrupt_lines.block,
@@ -3981,7 +4093,8 @@ mod tests {
     use bangbang_runtime::memory::{GuestAddress, GuestMemory};
     use bangbang_runtime::metrics::{
         BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive,
-        SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry,
+        NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface, SharedBalloonDeviceMetrics,
+        SharedBlockDeviceMetricsRegistry, SharedNetworkInterfaceMetricsRegistry,
     };
     use bangbang_runtime::mmio::{
         MmioAccess, MmioAccessBytes, MmioDispatchOutcome, MmioDispatcher, MmioHandler,
@@ -7370,6 +7483,18 @@ mod tests {
             .expect("TX queue dispatch should be present");
         assert_eq!(tx.processed_frames(), 1);
         assert_eq!(tx.sink_successful_frames(), 1);
+        let metrics = SharedNetworkInterfaceMetricsRegistry::from_interface_ids(["eth0"]);
+        super::record_network_dispatch_metrics(&metrics, &result);
+        let expected = NetworkInterfaceMetrics::default()
+            .with_tx_queue_event_count(1)
+            .with_tx_bytes_count(16)
+            .with_tx_packets_count(1)
+            .with_tx_count(1);
+        assert_eq!(metrics.aggregate_snapshot(), expected);
+        assert_eq!(
+            metrics.per_interface_snapshot(),
+            NetworkInterfaceMetricsByInterface::new().with_interface_metrics("eth0", expected)
+        );
         assert_eq!(read_network_tx_used_index(&memory), 1);
         assert_eq!(read_network_tx_used_element(&memory, 0), (0, 0));
     }
@@ -7420,6 +7545,19 @@ mod tests {
             .expect("failed network packet I/O dispatch should collect");
         assert!(!result.has_signal_failure());
         assert!(recorded_lines(&lines).is_empty());
+        let metrics = SharedNetworkInterfaceMetricsRegistry::from_interface_ids(["eth0"]);
+        super::record_network_dispatch_metrics(&metrics, &result);
+        assert_eq!(
+            metrics.aggregate_snapshot(),
+            NetworkInterfaceMetrics::default().with_event_fails(1)
+        );
+        assert_eq!(
+            metrics.per_interface_snapshot(),
+            NetworkInterfaceMetricsByInterface::new().with_interface_metrics(
+                "eth0",
+                NetworkInterfaceMetrics::default().with_event_fails(1),
+            )
+        );
 
         let retried =
             dispatch_boot_network_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
@@ -7478,6 +7616,17 @@ mod tests {
         assert_eq!(completed.processed_frames(), 1);
         assert!(completed.needs_queue_interrupt());
         assert_eq!(recorded_lines(&lines), vec![32]);
+        let metrics = SharedNetworkInterfaceMetricsRegistry::from_interface_ids(["eth0"]);
+        super::record_network_dispatch_metrics(&metrics, &result);
+        assert_eq!(
+            metrics.aggregate_snapshot(),
+            NetworkInterfaceMetrics::default()
+                .with_event_fails(1)
+                .with_tx_queue_event_count(1)
+                .with_tx_bytes_count(16)
+                .with_tx_packets_count(1)
+                .with_tx_count(1)
+        );
         assert_eq!(read_network_tx_used_index(&memory), 1);
         assert_eq!(read_network_tx_used_element(&memory, 0), (0, 0));
     }
@@ -7516,6 +7665,17 @@ mod tests {
             "failed to signal guest interrupt line 32 for queue interrupt: injected network signal failure"
         );
         assert_eq!(recorded_lines(&lines), vec![32]);
+        let metrics = SharedNetworkInterfaceMetricsRegistry::from_interface_ids(["eth0"]);
+        super::record_network_dispatch_metrics(&metrics, &result);
+        assert_eq!(
+            metrics.aggregate_snapshot(),
+            NetworkInterfaceMetrics::default()
+                .with_event_fails(1)
+                .with_tx_queue_event_count(1)
+                .with_tx_bytes_count(16)
+                .with_tx_packets_count(1)
+                .with_tx_count(1)
+        );
         assert_eq!(
             read_boot_network_mmio_u32(
                 &mut runtime,
@@ -7543,6 +7703,12 @@ mod tests {
         assert!(!device.queue_interrupt_signaled());
         assert!(device.signal_error().is_none());
         assert!(recorded_lines(&lines).is_empty());
+        let metrics = SharedNetworkInterfaceMetricsRegistry::from_interface_ids(["eth0"]);
+        super::record_network_dispatch_metrics(&metrics, &result);
+        assert_eq!(
+            metrics.aggregate_snapshot(),
+            NetworkInterfaceMetrics::default().with_event_fails(1)
+        );
     }
 
     #[test]

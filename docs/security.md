@@ -320,9 +320,10 @@ logger action events are host VMM events only and do not expose guest serial
 output. Current explicit and periodic metrics lines can expose selected API
 request counters, startup timing fields, logger and serial counters, a terse
 boot run-loop status summary, and minimal device counters such as block
-queue/update activity. They must not expose worker error strings, host paths,
-guest serial bytes, or unexpected guest data. Future full logging and metrics
-support must preserve those redaction boundaries.
+queue/update activity and virtio-net packet counters. They must not expose
+worker error strings, host paths, guest serial bytes, or unexpected guest data.
+Future full logging and metrics support must preserve those redaction
+boundaries.
 
 MMDS control-plane contents are process-local in-memory JSON state configured
 through the unauthenticated local API socket. Treat metadata as sensitive host

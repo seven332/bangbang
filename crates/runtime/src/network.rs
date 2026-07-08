@@ -2266,6 +2266,7 @@ pub struct VirtioNetworkTxQueueDispatch {
     parse_failures: usize,
     sink_successful_frames: usize,
     sink_failures: usize,
+    sink_successful_bytes: u64,
     frames: Vec<VirtioNetworkTxFrame>,
     first_parse_failure: Option<VirtioNetworkTxFrameParseError>,
     first_sink_failure: Option<VirtioNetworkTxPacketSinkError>,
@@ -2287,6 +2288,7 @@ impl VirtioNetworkTxQueueDispatch {
             parse_failures: 0,
             sink_successful_frames: 0,
             sink_failures: 0,
+            sink_successful_bytes: 0,
             frames,
             first_parse_failure: None,
             first_sink_failure: None,
@@ -2312,6 +2314,10 @@ impl VirtioNetworkTxQueueDispatch {
 
     pub const fn sink_failures(&self) -> usize {
         self.sink_failures
+    }
+
+    pub const fn sink_successful_bytes(&self) -> u64 {
+        self.sink_successful_bytes
     }
 
     pub const fn first_parse_failure(&self) -> Option<&VirtioNetworkTxFrameParseError> {
@@ -2349,6 +2355,8 @@ impl VirtioNetworkTxQueueDispatch {
                     }
                     None => {
                         self.sink_successful_frames += 1;
+                        self.sink_successful_bytes =
+                            self.sink_successful_bytes.saturating_add(frame.frame_len());
                     }
                 }
                 self.frames.push(frame);
@@ -3963,6 +3971,7 @@ mod tests {
 
     use crate::interrupt::DeviceInterruptKind;
     use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
+    use crate::metrics::{NetworkInterfaceMetrics, SharedNetworkInterfaceMetrics};
     use crate::mmio::{
         MmioAccess, MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioDispatcher, MmioOperation,
         MmioRegionId,
@@ -6994,6 +7003,16 @@ mod tests {
         assert_eq!(delivery.descriptor_head(), 0);
         assert_eq!(delivery.packet_len(), 4);
         assert_eq!(delivery.bytes_written_to_guest(), rx_used_len(4));
+        let metrics = SharedNetworkInterfaceMetrics::default();
+        metrics.record_notification_dispatch(&notification);
+        assert_eq!(
+            metrics.snapshot(),
+            NetworkInterfaceMetrics::default()
+                .with_rx_queue_event_count(1)
+                .with_rx_bytes_count(u64::from(rx_used_len(4)))
+                .with_rx_packets_count(1)
+                .with_rx_count(1)
+        );
         assert_eq!(source.consume_calls, 1);
         assert_eq!(source.remaining_packets(), 0);
         assert_eq!(read_rx_used_index(&memory), 1);
@@ -7371,6 +7390,14 @@ mod tests {
             dispatch.first_buffer_parse_failure(),
             Some(VirtioNetworkRxBufferParseError::BufferDescriptorReadOnly { index: 0 })
         ));
+        let metrics = SharedNetworkInterfaceMetrics::default();
+        metrics.record_notification_dispatch(&notification);
+        assert_eq!(
+            metrics.snapshot(),
+            NetworkInterfaceMetrics::default()
+                .with_rx_queue_event_count(1)
+                .with_rx_fails(1)
+        );
         assert_eq!(source.consume_calls, 0);
         assert_eq!(source.remaining_packets(), 1);
         assert_eq!(read_rx_used_index(&memory), 1);
@@ -7430,6 +7457,14 @@ mod tests {
         assert_eq!(failure.descriptor_head(), 0);
         assert_eq!(failure.len(), VIRTIO_NET_RX_MIN_BUFFER_SIZE);
         assert_eq!(failure.required_len(), u64::from(rx_used_len(2_000)));
+        let metrics = SharedNetworkInterfaceMetrics::default();
+        metrics.record_notification_dispatch(&notification);
+        assert_eq!(
+            metrics.snapshot(),
+            NetworkInterfaceMetrics::default()
+                .with_rx_queue_event_count(1)
+                .with_rx_fails(1)
+        );
         assert_eq!(source.consume_calls, 0);
         assert_eq!(source.remaining_packets(), 1);
         assert_eq!(read_rx_used_index(&memory), 1);
@@ -7607,6 +7642,12 @@ mod tests {
                 .expect("source failure should be recorded")
                 .message(),
             "test source failure on peek 1"
+        );
+        let metrics = SharedNetworkInterfaceMetrics::default();
+        metrics.record_rx_queue_dispatch(completed);
+        assert_eq!(
+            metrics.snapshot(),
+            NetworkInterfaceMetrics::default().with_rx_fails(1)
         );
         assert_eq!(source.consume_calls, 0);
         assert_eq!(read_interrupt_status(&handler), 0);
@@ -7801,7 +7842,18 @@ mod tests {
         assert_eq!(dispatch.processed_frames(), 1);
         assert_eq!(dispatch.successful_frames(), 1);
         assert_eq!(dispatch.sink_successful_frames(), 1);
+        assert_eq!(dispatch.sink_successful_bytes(), 16);
         assert_eq!(dispatch.sink_failures(), 0);
+        let metrics = SharedNetworkInterfaceMetrics::default();
+        metrics.record_notification_dispatch(&notification);
+        assert_eq!(
+            metrics.snapshot(),
+            NetworkInterfaceMetrics::default()
+                .with_tx_queue_event_count(1)
+                .with_tx_bytes_count(16)
+                .with_tx_packets_count(1)
+                .with_tx_count(1)
+        );
         assert_eq!(sink.calls, 1);
         assert_eq!(sink.frame_heads, [0]);
         assert_eq!(sink.packets, [vec![0xde, 0xad, 0xbe, 0xef]]);
@@ -8417,6 +8469,7 @@ mod tests {
         assert_eq!(dispatch.parse_failures(), 1);
         assert_eq!(dispatch.sink_successful_frames(), 0);
         assert_eq!(dispatch.sink_failures(), 0);
+        assert_eq!(dispatch.sink_successful_bytes(), 0);
         assert!(matches!(
             dispatch.first_parse_failure(),
             Some(VirtioNetworkTxFrameParseError::HeaderDescriptorTooSmall {
@@ -8425,6 +8478,14 @@ mod tests {
                 min: 12,
             })
         ));
+        let metrics = SharedNetworkInterfaceMetrics::default();
+        metrics.record_notification_dispatch(&notification);
+        assert_eq!(
+            metrics.snapshot(),
+            NetworkInterfaceMetrics::default()
+                .with_tx_queue_event_count(1)
+                .with_tx_malformed_frames(1)
+        );
         assert!(dispatch.first_sink_failure().is_none());
         assert!(dispatch.frames().is_empty());
         assert_eq!(sink.calls, 0);
@@ -8491,6 +8552,7 @@ mod tests {
         assert_eq!(dispatch.parse_failures(), 0);
         assert_eq!(dispatch.sink_successful_frames(), 2);
         assert_eq!(dispatch.sink_failures(), 1);
+        assert_eq!(dispatch.sink_successful_bytes(), 30);
         assert_eq!(
             dispatch
                 .first_sink_failure()
@@ -8503,6 +8565,17 @@ mod tests {
         assert_eq!(
             sink.packets,
             [vec![0x10, 0x11], vec![0x30, 0x31, 0x32, 0x33]]
+        );
+        let metrics = SharedNetworkInterfaceMetrics::default();
+        metrics.record_notification_dispatch(&notification);
+        assert_eq!(
+            metrics.snapshot(),
+            NetworkInterfaceMetrics::default()
+                .with_tx_queue_event_count(1)
+                .with_tx_bytes_count(30)
+                .with_tx_fails(1)
+                .with_tx_packets_count(2)
+                .with_tx_count(2)
         );
         assert!(notification.needs_queue_interrupt());
         assert_eq!(
