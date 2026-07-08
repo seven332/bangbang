@@ -987,6 +987,7 @@ impl MetricsDiagnostics {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootRunLoopMetricStatus {
     Running,
+    Paused,
     Exited,
     Failed,
 }
@@ -995,6 +996,7 @@ impl BootRunLoopMetricStatus {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Running => "running",
+            Self::Paused => "paused",
             Self::Exited => "exited",
             Self::Failed => "failed",
         }
@@ -1559,6 +1561,27 @@ mod tests {
         assert_eq!(
             output,
             "{\"vmm\":{\"boot_run_loop_status\":\"failed\",\"metrics_flush_count\":1}}\n"
+        );
+
+        fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn writes_paused_boot_run_loop_diagnostics_when_provided() {
+        let path = unique_metrics_path("paused-diagnostics");
+        let mut state = MetricsState::default();
+        let diagnostics =
+            MetricsDiagnostics::new().with_boot_run_loop_status(BootRunLoopMetricStatus::Paused);
+
+        state
+            .configure(MetricsConfigInput::new(&path))
+            .expect("metrics should configure");
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        let output = fs::read_to_string(&path).expect("metrics output should be readable");
+        assert_eq!(
+            output,
+            "{\"vmm\":{\"boot_run_loop_status\":\"paused\",\"metrics_flush_count\":1}}\n"
         );
 
         fs::remove_file(path).expect("fixture should clean up");

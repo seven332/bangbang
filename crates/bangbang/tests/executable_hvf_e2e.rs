@@ -226,27 +226,25 @@ mod macos_arm64 {
             "GET / after InstanceStart",
         );
 
-        for (requested_state, action_name) in [("Paused", "Pause"), ("Resumed", "Resume")] {
-            let context = format!("PATCH /vm {requested_state} after InstanceStart");
-            let body = format!(r#"{{"state":"{requested_state}"}}"#);
-            let response = http_json(&socket_path, "PATCH", "/vm", &body);
-            assert_bad_request_response(&response, &context);
-            assert_response_contains(
-                &response,
-                &format!(
-                    r#"{{"fault_message":"The requested operation is not supported: {action_name}"}}"#
-                ),
-                &context,
-            );
+        let pause_response = http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Paused"}"#);
+        assert_no_content_response(&pause_response, "PATCH /vm Paused after InstanceStart");
+        let paused_instance_info = http_get(&socket_path, "/");
+        assert_ok_response(&paused_instance_info, "GET / after PATCH /vm Paused");
+        assert_response_contains(
+            &paused_instance_info,
+            r#""state":"Paused""#,
+            "GET / after PATCH /vm Paused",
+        );
 
-            let instance_info_after_patch = http_get(&socket_path, "/");
-            assert_ok_response(&instance_info_after_patch, "GET / after rejected PATCH /vm");
-            assert_response_contains(
-                &instance_info_after_patch,
-                r#""state":"Running""#,
-                "GET / after rejected PATCH /vm",
-            );
-        }
+        let resume_response = http_json(&socket_path, "PATCH", "/vm", r#"{"state":"Resumed"}"#);
+        assert_no_content_response(&resume_response, "PATCH /vm Resumed after pause");
+        let resumed_instance_info = http_get(&socket_path, "/");
+        assert_ok_response(&resumed_instance_info, "GET / after PATCH /vm Resumed");
+        assert_response_contains(
+            &resumed_instance_info,
+            r#""state":"Running""#,
+            "GET / after PATCH /vm Resumed",
+        );
 
         let replacement_kernel_path = test_dir.path().join("replacement-vmlinux");
         let replacement_kernel_path_json = json_string(path_text(&replacement_kernel_path));

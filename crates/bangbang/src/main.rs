@@ -1433,12 +1433,12 @@ fn help_text() -> String {
             "minimal action logs; --config-file can apply the same supported ",
             "pre-boot configuration and start the VM before API serving, ",
             "or with --no-api can start without publishing an API socket; ",
-            "PATCH /vm parses Paused and Resumed state requests ",
-            "as unsupported lifecycle actions; PUT /cpu-config accepts empty ",
+            "PATCH /vm supports Paused and Resumed for the current ",
+            "process-owned boot worker; PUT /cpu-config accepts empty ",
             "CPU config as no-op and rejects custom CPU templates; ",
             "PUT /actions starts a process-owned ",
-            "HVF boot run-loop worker across bounded step windows for InstanceStart, ",
-            "but public run-loop control is not implemented yet."
+            "HVF boot run-loop worker across bounded step windows for InstanceStart; ",
+            "full Firecracker run-loop control remains deferred."
         ),
         env!("CARGO_PKG_VERSION"),
         DEFAULT_API_SOCK_PATH,
@@ -2003,7 +2003,7 @@ mod tests {
         assert!(help.contains("pre-boot PUT /logger and startup logger configuration"));
         assert!(help.contains("minimal action logs"));
         assert!(help.contains("--config-file can apply the same supported pre-boot configuration"));
-        assert!(help.contains("PATCH /vm parses Paused and Resumed state requests"));
+        assert!(help.contains("PATCH /vm supports Paused and Resumed"));
         assert!(help.contains("PUT /cpu-config accepts empty CPU config as no-op"));
         assert!(help.contains("--log-path <PATH>"));
         assert!(help.contains("--metrics-path <PATH>"));
@@ -2018,7 +2018,8 @@ mod tests {
         assert!(help.contains("--parent-cpu-time-us <MICROS>"));
         assert!(help.contains("PUT /actions starts a process-owned HVF boot run-loop worker"));
         assert!(help.contains("across bounded step windows for InstanceStart"));
-        assert!(help.contains("public run-loop control is not implemented yet"));
+        assert!(help.contains("PATCH /vm supports Paused and Resumed"));
+        assert!(help.contains("full Firecracker run-loop control remains deferred"));
     }
 
     #[test]

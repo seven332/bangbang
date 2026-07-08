@@ -1755,6 +1755,14 @@ mod tests {
                 .unwrap_or_default()
         }
 
+        fn pause(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn resume(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+
         fn update_block_device(&mut self, _config: &DriveConfig) -> Result<(), DriveUpdateError> {
             match self.drive_update_result.clone() {
                 Some(err) => Err(err),
@@ -6507,9 +6515,43 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
         assert!(
             response.contains(
-                r#"{"fault_message":"The requested operation is not supported: Resume"}"#
+                r#"{"fault_message":"The requested operation is not supported in Running state: Resume"}"#
             )
         );
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::Running
+        );
+    }
+
+    #[test]
+    fn vm_state_update_pauses_and_resumes_running_instance() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let boot_body = r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#;
+        let boot_request = format!(
+            "PUT /boot-source HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{boot_body}",
+            boot_body.len()
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "vm-p-start", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let pause_request = "PATCH /vm HTTP/1.1\r\nHost: localhost\r\nContent-Length: 18\r\n\r\n{\"state\":\"Paused\"}";
+        let pause_response = request_over_socket(&mut vmm, "vm-pause", pause_request);
+
+        assert!(pause_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert_eq!(
+            vmm.instance_info().state,
+            bangbang_runtime::InstanceState::Paused
+        );
+
+        let resume_request = "PATCH /vm HTTP/1.1\r\nHost: localhost\r\nContent-Length: 19\r\n\r\n{\"state\":\"Resumed\"}";
+        let resume_response = request_over_socket(&mut vmm, "vm-resume", resume_request);
+
+        assert!(resume_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::Running

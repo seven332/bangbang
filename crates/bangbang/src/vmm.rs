@@ -5,9 +5,7 @@ use std::net::Ipv4Addr;
 use std::num::NonZeroUsize;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-#[cfg(test)]
-use std::sync::Condvar;
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
 
 use bangbang_hvf::{
@@ -115,6 +113,14 @@ pub(crate) trait InstanceStartExecutor {
 pub(crate) trait ProcessSessionDiagnostics {
     fn metrics_diagnostics(&self) -> MetricsDiagnostics {
         MetricsDiagnostics::default()
+    }
+
+    fn pause(&mut self) -> Result<(), BackendError> {
+        Err(BackendError::InvalidState("active session unavailable"))
+    }
+
+    fn resume(&mut self) -> Result<(), BackendError> {
+        Err(BackendError::InvalidState("active session unavailable"))
     }
 
     fn update_block_device(&mut self, _config: &DriveConfig) -> Result<(), DriveUpdateError> {
@@ -897,6 +903,8 @@ where
     pub(crate) fn handle_action(&mut self, action: VmmAction) -> Result<VmmData, VmmActionError> {
         match action {
             VmmAction::InstanceStart => self.start_instance(),
+            VmmAction::Pause => self.pause_instance(),
+            VmmAction::Resume => self.resume_instance(),
             VmmAction::UpdateBlockDevice(input) => self.update_block_device(input),
             VmmAction::PatchBalloon(input) => self.update_balloon(input),
             VmmAction::PatchBalloonStats(input) => self.update_balloon_statistics(input),
@@ -988,6 +996,30 @@ where
         let diagnostics = self.metrics_diagnostics();
 
         self.controller.flush_metrics_with_diagnostics(&diagnostics)
+    }
+
+    fn pause_instance(&mut self) -> Result<VmmData, VmmActionError> {
+        self.controller.preflight_pause_instance()?;
+        let Some(session) = self.started_session.as_mut() else {
+            return Err(VmmActionError::Lifecycle(BackendError::InvalidState(
+                "active session unavailable",
+            )));
+        };
+
+        session.pause().map_err(VmmActionError::Lifecycle)?;
+        self.controller.pause_instance()
+    }
+
+    fn resume_instance(&mut self) -> Result<VmmData, VmmActionError> {
+        self.controller.preflight_resume_instance()?;
+        let Some(session) = self.started_session.as_mut() else {
+            return Err(VmmActionError::Lifecycle(BackendError::InvalidState(
+                "active session unavailable",
+            )));
+        };
+
+        session.resume().map_err(VmmActionError::Lifecycle)?;
+        self.controller.resume_instance()
     }
 
     fn update_block_device(&mut self, input: DriveUpdateInput) -> Result<VmmData, VmmActionError> {
@@ -1972,6 +2004,7 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BootRunLoopWorkerStatus<O> {
     Running,
+    Paused,
     Exited(O),
     Failed(String),
 }
@@ -2032,7 +2065,10 @@ impl<O> BootRunLoopWorkerStatusCell<O> {
         O: Clone,
     {
         let mut current = self.lock_status();
-        while matches!(&*current, BootRunLoopWorkerStatus::Running) {
+        while matches!(
+            &*current,
+            BootRunLoopWorkerStatus::Running | BootRunLoopWorkerStatus::Paused
+        ) {
             current = match self.changed.wait(current) {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
@@ -2052,6 +2088,95 @@ impl<O> BootRunLoopWorkerStatusCell<O> {
 impl<O> Default for BootRunLoopWorkerStatusCell<O> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[derive(Debug, Default)]
+struct BootRunLoopPauseGate {
+    state: Mutex<BootRunLoopPauseState>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct BootRunLoopPauseState {
+    paused: bool,
+    shutdown: bool,
+    command_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootRunLoopPauseWait {
+    Running,
+    Paused,
+    Shutdown,
+}
+
+impl BootRunLoopPauseGate {
+    fn pause(&self) {
+        {
+            let mut state = self.lock_state();
+            if !state.shutdown {
+                state.paused = true;
+            }
+        }
+        self.changed.notify_all();
+    }
+
+    fn resume(&self) {
+        {
+            let mut state = self.lock_state();
+            state.paused = false;
+        }
+        self.changed.notify_all();
+    }
+
+    fn shutdown(&self) {
+        {
+            let mut state = self.lock_state();
+            state.shutdown = true;
+            state.paused = false;
+        }
+        self.changed.notify_all();
+    }
+
+    fn notify_command_available(&self) {
+        {
+            let mut state = self.lock_state();
+            state.command_generation = state.command_generation.wrapping_add(1);
+        }
+        self.changed.notify_all();
+    }
+
+    fn command_generation(&self) -> u64 {
+        self.lock_state().command_generation
+    }
+
+    fn wait_once_if_paused(&self, observed_command_generation: &mut u64) -> BootRunLoopPauseWait {
+        let mut state = self.lock_state();
+        loop {
+            if state.shutdown {
+                return BootRunLoopPauseWait::Shutdown;
+            }
+            if !state.paused {
+                return BootRunLoopPauseWait::Running;
+            }
+            if state.command_generation != *observed_command_generation {
+                *observed_command_generation = state.command_generation;
+                return BootRunLoopPauseWait::Paused;
+            }
+
+            state = match self.changed.wait(state) {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, BootRunLoopPauseState> {
+        match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 }
 
@@ -2156,6 +2281,28 @@ where
     }
 }
 
+fn lifecycle_error_from_boot_run_loop_command<C>(
+    err: BootRunLoopCommandError<C, BackendError>,
+) -> BackendError
+where
+    C: fmt::Display,
+{
+    match err {
+        BootRunLoopCommandError::Command { source } => source,
+        BootRunLoopCommandError::WorkerNotRunning
+        | BootRunLoopCommandError::QueueClosed
+        | BootRunLoopCommandError::ResponseClosed => {
+            BackendError::InvalidState("boot run loop worker is not running")
+        }
+        BootRunLoopCommandError::QueueFull => {
+            BackendError::Hypervisor("boot run loop command queue is full".to_string())
+        }
+        BootRunLoopCommandError::Wakeup { source } => BackendError::Hypervisor(format!(
+            "failed to wake boot run loop for lifecycle command: {source}"
+        )),
+    }
+}
+
 pub(crate) struct BootRunLoopCommandHandle<S>
 where
     S: BootRunLoopSession,
@@ -2163,6 +2310,7 @@ where
     sender: mpsc::SyncSender<BootRunLoopCommand<S>>,
     control: S::Control,
     status: Arc<BootRunLoopWorkerStatusCell<S::Outcome>>,
+    pause_gate: Arc<BootRunLoopPauseGate>,
 }
 
 impl<S> Clone for BootRunLoopCommandHandle<S>
@@ -2174,6 +2322,7 @@ where
             sender: self.sender.clone(),
             control: self.control.clone(),
             status: Arc::clone(&self.status),
+            pause_gate: Arc::clone(&self.pause_gate),
         }
     }
 }
@@ -2198,11 +2347,13 @@ where
         sender: mpsc::SyncSender<BootRunLoopCommand<S>>,
         control: S::Control,
         status: Arc<BootRunLoopWorkerStatusCell<S::Outcome>>,
+        pause_gate: Arc<BootRunLoopPauseGate>,
     ) -> Self {
         Self {
             sender,
             control,
             status,
+            pause_gate,
         }
     }
 
@@ -2214,7 +2365,10 @@ where
         R: Send + 'static,
         E: Send + 'static,
     {
-        if !matches!(self.status.snapshot(), BootRunLoopWorkerStatus::Running) {
+        if !matches!(
+            self.status.snapshot(),
+            BootRunLoopWorkerStatus::Running | BootRunLoopWorkerStatus::Paused
+        ) {
             return Err(BootRunLoopCommandError::WorkerNotRunning);
         }
 
@@ -2230,6 +2384,7 @@ where
                 return Err(BootRunLoopCommandError::QueueClosed);
             }
         }
+        self.pause_gate.notify_command_available();
 
         match response_receiver.try_recv() {
             Ok(Ok(result)) => return Ok(result),
@@ -2276,9 +2431,10 @@ where
     balloon_device_updater: Option<BootRunLoopBalloonDeviceUpdater>,
     command_handle: BootRunLoopCommandHandle<S>,
     status: Arc<BootRunLoopWorkerStatusCell<S::Outcome>>,
+    pause_gate: Arc<BootRunLoopPauseGate>,
     terminal_wakeup_reader: UnixStream,
     session_release_sender: Option<mpsc::Sender<()>>,
-    worker: Option<JoinHandle<Result<S::Outcome, S::Error>>>,
+    worker: Option<JoinHandle<()>>,
 }
 
 impl<S> BootRunLoopSupervisor<S>
@@ -2304,9 +2460,15 @@ where
         let stop_token = control.stop_token();
         let status = Arc::new(BootRunLoopWorkerStatusCell::new());
         let worker_status = Arc::clone(&status);
+        let pause_gate = Arc::new(BootRunLoopPauseGate::default());
+        let worker_pause_gate = Arc::clone(&pause_gate);
         let (command_sender, command_receiver) = mpsc::sync_channel(command_queue_capacity);
-        let command_handle =
-            BootRunLoopCommandHandle::new(command_sender, control.clone(), Arc::clone(&status));
+        let command_handle = BootRunLoopCommandHandle::new(
+            command_sender,
+            control.clone(),
+            Arc::clone(&status),
+            Arc::clone(&pause_gate),
+        );
         let (terminal_wakeup_reader, mut terminal_wakeup_writer) =
             UnixStream::pair().map_err(|err| {
                 BackendError::Hypervisor(format!(
@@ -2324,29 +2486,48 @@ where
         let worker = thread::Builder::new()
             .name(HVF_BOOT_RUN_LOOP_THREAD_NAME.to_owned())
             .spawn(move || {
-                let result = loop {
+                let mut observed_command_generation = worker_pause_gate.command_generation();
+                loop {
                     drain_boot_run_loop_commands(
                         &mut session,
                         &command_receiver,
                         command_queue_capacity,
                     );
+                    loop {
+                        match worker_pause_gate
+                            .wait_once_if_paused(&mut observed_command_generation)
+                        {
+                            BootRunLoopPauseWait::Running => break,
+                            BootRunLoopPauseWait::Paused => {
+                                drain_boot_run_loop_commands(
+                                    &mut session,
+                                    &command_receiver,
+                                    command_queue_capacity,
+                                );
+                            }
+                            BootRunLoopPauseWait::Shutdown => {
+                                drop(command_receiver);
+                                let _ = session_release_receiver.recv();
+                                return;
+                            }
+                        }
+                    }
                     match session.run_loop(&stop_token, max_steps) {
                         Ok(outcome) if S::should_continue_after_outcome(&outcome) => continue,
                         Ok(outcome) => {
                             worker_status.record(BootRunLoopWorkerStatus::Exited(outcome.clone()));
                             let _ = terminal_wakeup_writer.write_all(&[1]);
-                            break Ok(outcome);
+                            break;
                         }
                         Err(err) => {
                             worker_status.record(BootRunLoopWorkerStatus::Failed(err.to_string()));
                             let _ = terminal_wakeup_writer.write_all(&[1]);
-                            break Err(err);
+                            break;
                         }
                     }
-                };
+                }
                 drop(command_receiver);
                 let _ = session_release_receiver.recv();
-                result
             })
             .map_err(|err| {
                 BackendError::Hypervisor(format!("failed to spawn HVF boot run loop: {err}"))
@@ -2358,6 +2539,7 @@ where
             balloon_device_updater,
             command_handle,
             status,
+            pause_gate,
             terminal_wakeup_reader,
             session_release_sender: Some(session_release_sender),
             worker: Some(worker),
@@ -2393,9 +2575,44 @@ where
         let current = self.status.lock_status();
         match &*current {
             BootRunLoopWorkerStatus::Running => BootRunLoopMetricStatus::Running,
+            BootRunLoopWorkerStatus::Paused => BootRunLoopMetricStatus::Paused,
             BootRunLoopWorkerStatus::Exited(_) => BootRunLoopMetricStatus::Exited,
             BootRunLoopWorkerStatus::Failed(_) => BootRunLoopMetricStatus::Failed,
         }
+    }
+
+    fn pause(&self) -> Result<(), BackendError> {
+        if !matches!(self.status(), BootRunLoopWorkerStatus::Running) {
+            return Err(BackendError::InvalidState(
+                "boot run loop worker is not running",
+            ));
+        }
+
+        let status = Arc::clone(&self.status);
+        let pause_gate = Arc::clone(&self.pause_gate);
+        self.run_command(move |_| {
+            status.record(BootRunLoopWorkerStatus::Paused);
+            pause_gate.pause();
+            Ok(())
+        })
+        .map_err(lifecycle_error_from_boot_run_loop_command)
+    }
+
+    fn resume(&self) -> Result<(), BackendError> {
+        if !matches!(self.status(), BootRunLoopWorkerStatus::Paused) {
+            return Err(BackendError::InvalidState(
+                "boot run loop worker is not paused",
+            ));
+        }
+
+        let status = Arc::clone(&self.status);
+        let pause_gate = Arc::clone(&self.pause_gate);
+        self.run_command(move |_| {
+            status.record(BootRunLoopWorkerStatus::Running);
+            pause_gate.resume();
+            Ok(())
+        })
+        .map_err(lifecycle_error_from_boot_run_loop_command)
     }
 
     fn stop_and_join(&mut self) {
@@ -2403,12 +2620,14 @@ where
             return;
         };
 
+        let was_paused = matches!(self.status(), BootRunLoopWorkerStatus::Paused);
         let stop_requested = self.control.request_stop().is_ok();
+        self.pause_gate.shutdown();
         drop(self.session_release_sender.take());
 
         // A stop error can mean an in-flight vCPU run was not canceled; avoid
         // turning cleanup into an unbounded join in that error path.
-        if stop_requested || worker.is_finished() {
+        if stop_requested || was_paused || worker.is_finished() {
             let _ = worker.join();
         }
     }
@@ -2421,6 +2640,14 @@ where
 {
     fn metrics_diagnostics(&self) -> MetricsDiagnostics {
         MetricsDiagnostics::new().with_boot_run_loop_status(self.metric_status())
+    }
+
+    fn pause(&mut self) -> Result<(), BackendError> {
+        BootRunLoopSupervisor::pause(self)
+    }
+
+    fn resume(&mut self) -> Result<(), BackendError> {
+        BootRunLoopSupervisor::resume(self)
     }
 
     fn update_block_device(&mut self, config: &DriveConfig) -> Result<(), DriveUpdateError> {
@@ -2562,6 +2789,7 @@ where
         let current = self.status.lock_status();
         match &*current {
             BootRunLoopWorkerStatus::Running => ProcessSessionExitStatus::Running,
+            BootRunLoopWorkerStatus::Paused => ProcessSessionExitStatus::Running,
             BootRunLoopWorkerStatus::Exited(outcome) => outcome.process_exit_status(),
             BootRunLoopWorkerStatus::Failed(_) => ProcessSessionExitStatus::Terminal,
         }
@@ -2788,6 +3016,10 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct FakeSession {
         id: u64,
+        pause_count: usize,
+        pause_result: Option<BackendError>,
+        resume_count: usize,
+        resume_result: Option<BackendError>,
         block_update_count: usize,
         last_block_update: Option<String>,
         block_update_result: Option<DriveUpdateError>,
@@ -2814,6 +3046,10 @@ mod tests {
         const fn new(id: u64) -> Self {
             Self {
                 id,
+                pause_count: 0,
+                pause_result: None,
+                resume_count: 0,
+                resume_result: None,
                 block_update_count: 0,
                 last_block_update: None,
                 block_update_result: None,
@@ -2839,6 +3075,18 @@ mod tests {
         fn with_block_update_result(id: u64, result: DriveUpdateError) -> Self {
             let mut session = Self::new(id);
             session.block_update_result = Some(result);
+            session
+        }
+
+        fn with_pause_result(id: u64, result: BackendError) -> Self {
+            let mut session = Self::new(id);
+            session.pause_result = Some(result);
+            session
+        }
+
+        fn with_resume_result(id: u64, result: BackendError) -> Self {
+            let mut session = Self::new(id);
+            session.resume_result = Some(result);
             session
         }
 
@@ -2892,6 +3140,22 @@ mod tests {
     }
 
     impl ProcessSessionDiagnostics for FakeSession {
+        fn pause(&mut self) -> Result<(), BackendError> {
+            self.pause_count += 1;
+            match self.pause_result.clone() {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        }
+
+        fn resume(&mut self) -> Result<(), BackendError> {
+            self.resume_count += 1;
+            match self.resume_result.clone() {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        }
+
         fn update_block_device(&mut self, config: &DriveConfig) -> Result<(), DriveUpdateError> {
             self.block_update_count += 1;
             self.last_block_update = Some(config.drive_id().to_string());
@@ -4342,6 +4606,7 @@ mod tests {
             | VmmActionError::BalloonUpdate(_)
             | VmmActionError::EntropyConfig(_)
             | VmmActionError::EntropyUnsupported
+            | VmmActionError::Lifecycle(_)
             | VmmActionError::MissingBootSource
             | VmmActionError::BootSourceConfig(_)
             | VmmActionError::DriveConfig(_)
@@ -4442,6 +4707,142 @@ mod tests {
 
         drop(supervisor);
 
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_pauses_without_entering_next_run_loop() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_outcomes([
+                    Ok(FakeRunLoopOutcome::Wakeup),
+                    Ok(FakeRunLoopOutcome::Wakeup),
+                ])
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true);
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(17).expect("non-zero limit"))
+                .expect("supervisor should start");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter first run loop"),
+            17
+        );
+
+        supervisor.pause().expect("supervisor should pause");
+
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+        assert_eq!(
+            supervisor.metrics_diagnostics().boot_run_loop_status(),
+            Some(BootRunLoopMetricStatus::Paused)
+        );
+        assert_eq!(
+            supervisor.process_exit_status(),
+            super::ProcessSessionExitStatus::Running
+        );
+        assert_eq!(
+            max_steps_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+
+        supervisor.resume().expect("supervisor should resume");
+
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("run loop should restart after resume"),
+            17
+        );
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Running);
+        drop(supervisor);
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_runs_command_while_paused() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true);
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(19).expect("non-zero limit"))
+                .expect("supervisor should start");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter first run loop"),
+            19
+        );
+        supervisor.pause().expect("supervisor should pause");
+
+        let run_count = supervisor
+            .run_command(|session| {
+                Ok::<u64, FakeRunLoopCommandError>(session.run_count.load(Ordering::SeqCst))
+            })
+            .expect("paused worker should still execute queued commands");
+
+        assert_eq!(run_count, 1);
+        assert_eq!(
+            max_steps_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+        drop(supervisor);
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_rejects_pause_and_resume_after_terminal_outcome() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_outcomes([Ok(FakeRunLoopOutcome::Terminal)])
+                .with_wait_for_stop(false);
+        let mut supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(23).expect("non-zero limit"))
+                .expect("supervisor should start");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            23
+        );
+        assert_eq!(
+            supervisor.wait_for_terminal_status(),
+            BootRunLoopWorkerStatus::Exited(FakeRunLoopOutcome::Terminal)
+        );
+
+        let pause_err = supervisor
+            .pause()
+            .expect_err("terminal worker should reject pause");
+        let resume_err = supervisor
+            .resume()
+            .expect_err("terminal worker should reject resume");
+
+        assert_eq!(
+            pause_err,
+            BackendError::InvalidState("boot run loop worker is not running")
+        );
+        assert_eq!(
+            resume_err,
+            BackendError::InvalidState("boot run loop worker is not paused")
+        );
+        supervisor
+            .drain_process_exit_wakeup()
+            .expect("terminal wakeup should drain");
+        drop(supervisor);
         assert_eq!(control.request_stop_count(), 1);
         assert_eq!(drop_count.load(Ordering::SeqCst), 1);
     }
@@ -5267,6 +5668,143 @@ mod tests {
         assert_eq!(vmm.instance_info().state, InstanceState::Running);
         assert_eq!(vmm.starter.calls, 1);
         assert_eq!(vmm.started_session, Some(FakeSession::new(7)));
+    }
+
+    #[test]
+    fn runtime_pause_updates_session_before_state_commit() {
+        let mut vmm = configured_vmm(FakeStarter::success(8));
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        let data = vmm
+            .handle_action(VmmAction::Pause)
+            .expect("running instance should pause");
+
+        assert_eq!(data, bangbang_runtime::VmmData::Empty);
+        assert_eq!(vmm.instance_info().state, InstanceState::Paused);
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.pause_count, 1);
+        assert_eq!(session.resume_count, 0);
+    }
+
+    #[test]
+    fn runtime_resume_updates_session_before_state_commit() {
+        let mut vmm = configured_vmm(FakeStarter::success(9));
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+        vmm.handle_action(VmmAction::Pause)
+            .expect("running instance should pause");
+
+        let data = vmm
+            .handle_action(VmmAction::Resume)
+            .expect("paused instance should resume");
+
+        assert_eq!(data, bangbang_runtime::VmmData::Empty);
+        assert_eq!(vmm.instance_info().state, InstanceState::Running);
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.pause_count, 1);
+        assert_eq!(session.resume_count, 1);
+    }
+
+    #[test]
+    fn runtime_pause_failure_does_not_commit_state() {
+        let source = BackendError::Hypervisor("pause failed".to_string());
+        let mut vmm = configured_vmm(FakeStarter::success_with_session(
+            FakeSession::with_pause_result(10, source.clone()),
+        ));
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        let err = vmm
+            .handle_action(VmmAction::Pause)
+            .expect_err("pause should fail before state commit");
+
+        assert_eq!(err, VmmActionError::Lifecycle(source));
+        assert_eq!(vmm.instance_info().state, InstanceState::Running);
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.pause_count, 1);
+        assert_eq!(session.resume_count, 0);
+    }
+
+    #[test]
+    fn runtime_resume_failure_does_not_commit_state() {
+        let source = BackendError::Hypervisor("resume failed".to_string());
+        let mut vmm = configured_vmm(FakeStarter::success_with_session(
+            FakeSession::with_resume_result(11, source.clone()),
+        ));
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+        vmm.handle_action(VmmAction::Pause)
+            .expect("running instance should pause");
+
+        let err = vmm
+            .handle_action(VmmAction::Resume)
+            .expect_err("resume should fail before state commit");
+
+        assert_eq!(err, VmmActionError::Lifecycle(source));
+        assert_eq!(vmm.instance_info().state, InstanceState::Paused);
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.pause_count, 1);
+        assert_eq!(session.resume_count, 1);
+    }
+
+    #[test]
+    fn runtime_pause_and_resume_reject_invalid_transitions_without_session_call() {
+        let mut vmm = configured_vmm(FakeStarter::success(12));
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        let err = vmm
+            .handle_action(VmmAction::Resume)
+            .expect_err("running instance should not resume again");
+
+        assert_eq!(
+            err,
+            VmmActionError::UnsupportedState {
+                action: VmmAction::Resume.name(),
+                state: InstanceState::Running,
+            }
+        );
+        assert_eq!(vmm.instance_info().state, InstanceState::Running);
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.pause_count, 0);
+        assert_eq!(session.resume_count, 0);
+
+        vmm.handle_action(VmmAction::Pause)
+            .expect("running instance should pause");
+        let err = vmm
+            .handle_action(VmmAction::Pause)
+            .expect_err("paused instance should not pause again");
+
+        assert_eq!(
+            err,
+            VmmActionError::UnsupportedState {
+                action: VmmAction::Pause.name(),
+                state: InstanceState::Paused,
+            }
+        );
+        assert_eq!(vmm.instance_info().state, InstanceState::Paused);
+        let session = vmm
+            .started_session
+            .as_ref()
+            .expect("started session should remain available");
+        assert_eq!(session.pause_count, 1);
+        assert_eq!(session.resume_count, 0);
     }
 
     #[test]

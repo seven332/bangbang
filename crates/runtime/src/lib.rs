@@ -305,6 +305,7 @@ pub enum VmmActionError {
     EntropyUnsupported,
     MissingBootSource,
     InstanceStart(BackendError),
+    Lifecycle(BackendError),
     BootSourceConfig(boot::BootSourceConfigError),
     DriveConfig(block::DriveConfigError),
     DriveUpdate(block::DriveUpdateError),
@@ -354,6 +355,7 @@ impl fmt::Display for VmmActionError {
                 f.write_str("boot source must be configured before InstanceStart")
             }
             Self::InstanceStart(err) => write!(f, "failed to start microVM: {err}"),
+            Self::Lifecycle(err) => write!(f, "failed to update microVM lifecycle: {err}"),
             Self::BootSourceConfig(err) => write!(f, "{err}"),
             Self::DriveConfig(err) => write!(f, "{err}"),
             Self::DriveUpdate(err) => write!(f, "{err}"),
@@ -388,6 +390,7 @@ impl std::error::Error for VmmActionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InstanceStart(err) => Some(err),
+            Self::Lifecycle(err) => Some(err),
             Self::BootSourceConfig(err) => Some(err),
             Self::BalloonConfig(err) => Some(err),
             Self::BalloonStats(err) => Some(err),
@@ -702,6 +705,40 @@ impl VmmController {
         Ok(VmmData::Empty)
     }
 
+    pub fn preflight_pause_instance(&self) -> Result<(), VmmActionError> {
+        if self.instance_info.state != InstanceState::Running {
+            return Err(VmmActionError::UnsupportedState {
+                action: VmmAction::Pause.name(),
+                state: self.instance_info.state,
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn pause_instance(&mut self) -> Result<VmmData, VmmActionError> {
+        self.preflight_pause_instance()?;
+        self.instance_info.state = InstanceState::Paused;
+        Ok(VmmData::Empty)
+    }
+
+    pub fn preflight_resume_instance(&self) -> Result<(), VmmActionError> {
+        if self.instance_info.state != InstanceState::Paused {
+            return Err(VmmActionError::UnsupportedState {
+                action: VmmAction::Resume.name(),
+                state: self.instance_info.state,
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn resume_instance(&mut self) -> Result<VmmData, VmmActionError> {
+        self.preflight_resume_instance()?;
+        self.instance_info.state = InstanceState::Running;
+        Ok(VmmData::Empty)
+    }
+
     #[track_caller]
     fn log_action(&mut self, action: &str) -> Result<(), VmmActionError> {
         if let Err(err) = self.logger_state.log_action(action) {
@@ -931,16 +968,8 @@ impl VmmController {
                 self.preflight_instance_start()?;
                 Err(VmmActionError::UnsupportedAction(action_name))
             }
-            VmmAction::Pause | VmmAction::Resume => {
-                if self.instance_info.state == InstanceState::NotStarted {
-                    return Err(VmmActionError::UnsupportedState {
-                        action: action_name,
-                        state: self.instance_info.state,
-                    });
-                }
-
-                Err(VmmActionError::UnsupportedAction(action_name))
-            }
+            VmmAction::Pause => self.pause_instance(),
+            VmmAction::Resume => self.resume_instance(),
             VmmAction::CreateSnapshot => {
                 if self.instance_info.state == InstanceState::NotStarted {
                     return Err(VmmActionError::UnsupportedState {
@@ -1287,7 +1316,7 @@ impl VmmController {
         &mut self,
         diagnostics: &metrics::MetricsDiagnostics,
     ) -> Result<VmmData, VmmActionError> {
-        if self.instance_info.state != InstanceState::Running {
+        if self.instance_info.state == InstanceState::NotStarted {
             return Err(VmmActionError::UnsupportedState {
                 action: VmmAction::FlushMetrics.name(),
                 state: self.instance_info.state,
@@ -1945,23 +1974,64 @@ mod tests {
     }
 
     #[test]
-    fn pause_and_resume_reject_running_or_paused_without_mutating() {
-        for state in [InstanceState::Running, InstanceState::Paused] {
-            for action in [VmmAction::Pause, VmmAction::Resume] {
-                let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
-                controller
-                    .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
-                    .expect("boot source config should be stored");
-                controller.instance_info.state = state;
+    fn pause_running_instance_transitions_to_paused() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller.instance_info.state = InstanceState::Running;
 
-                let err = controller
-                    .handle_action(action.clone())
-                    .expect_err("VM state update should remain unsupported");
+        let data = controller
+            .handle_action(VmmAction::Pause)
+            .expect("running instance should pause");
 
-                assert_eq!(err, VmmActionError::UnsupportedAction(action.name()));
-                assert_eq!(controller.instance_info().state, state);
-                assert!(controller.boot_source_config().is_some());
-            }
+        assert_eq!(data, VmmData::Empty);
+        assert_eq!(controller.instance_info().state, InstanceState::Paused);
+        assert!(controller.boot_source_config().is_some());
+    }
+
+    #[test]
+    fn resume_paused_instance_transitions_to_running() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller.instance_info.state = InstanceState::Paused;
+
+        let data = controller
+            .handle_action(VmmAction::Resume)
+            .expect("paused instance should resume");
+
+        assert_eq!(data, VmmData::Empty);
+        assert_eq!(controller.instance_info().state, InstanceState::Running);
+        assert!(controller.boot_source_config().is_some());
+    }
+
+    #[test]
+    fn pause_and_resume_reject_invalid_runtime_state_without_mutating() {
+        for (state, action) in [
+            (InstanceState::Paused, VmmAction::Pause),
+            (InstanceState::Running, VmmAction::Resume),
+        ] {
+            let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+            controller
+                .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+                .expect("boot source config should be stored");
+            controller.instance_info.state = state;
+
+            let err = controller
+                .handle_action(action.clone())
+                .expect_err("invalid VM state update should fail");
+
+            assert_eq!(
+                err,
+                VmmActionError::UnsupportedState {
+                    action: action.name(),
+                    state,
+                }
+            );
+            assert_eq!(controller.instance_info().state, state);
+            assert!(controller.boot_source_config().is_some());
         }
     }
 
@@ -3862,6 +3932,21 @@ mod tests {
     }
 
     #[test]
+    fn flush_metrics_while_paused_without_configuration_is_noop() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+            .expect("boot source config should be stored");
+        controller.instance_info.state = InstanceState::Paused;
+
+        assert_eq!(
+            controller.handle_action(VmmAction::FlushMetrics),
+            Ok(VmmData::Empty)
+        );
+        assert_eq!(controller.instance_info().state, InstanceState::Paused);
+    }
+
+    #[test]
     fn flush_metrics_after_start_writes_configured_logger_action() {
         let path = unique_logger_path("flush-action");
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
@@ -5443,6 +5528,17 @@ mod tests {
             err.to_string(),
             "The requested operation is not supported in Running state: GetVmmVersion"
         );
+    }
+
+    #[test]
+    fn displays_lifecycle_error() {
+        let err = VmmActionError::Lifecycle(BackendError::InvalidState("worker unavailable"));
+
+        assert_eq!(
+            err.to_string(),
+            "failed to update microVM lifecycle: invalid backend state: worker unavailable"
+        );
+        assert!(err.source().is_some());
     }
 
     #[test]
