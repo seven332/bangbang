@@ -75,7 +75,7 @@ pub struct DriveUpdateInput {
     path_drive_id: String,
     body_drive_id: String,
     path_on_host: Option<PathBuf>,
-    rate_limiter_configured: bool,
+    rate_limiter: Option<DriveRateLimiterConfig>,
 }
 
 impl DriveUpdateInput {
@@ -88,7 +88,7 @@ impl DriveUpdateInput {
             path_drive_id: path_drive_id.into(),
             body_drive_id: body_drive_id.into(),
             path_on_host,
-            rate_limiter_configured: false,
+            rate_limiter: None,
         }
     }
 
@@ -104,13 +104,24 @@ impl DriveUpdateInput {
         self.path_on_host.as_deref()
     }
 
-    pub const fn rate_limiter_configured(&self) -> bool {
-        self.rate_limiter_configured
+    pub const fn rate_limiter(&self) -> Option<DriveRateLimiterConfig> {
+        self.rate_limiter
     }
 
-    pub const fn with_rate_limiter_configured(mut self) -> Self {
-        self.rate_limiter_configured = true;
+    pub const fn rate_limiter_configured(&self) -> bool {
+        matches!(self.rate_limiter, Some(rate_limiter) if rate_limiter.is_configured())
+    }
+
+    pub const fn with_rate_limiter(mut self, rate_limiter: DriveRateLimiterConfig) -> Self {
+        self.rate_limiter = Some(rate_limiter);
         self
+    }
+
+    pub const fn with_rate_limiter_configured(self) -> Self {
+        self.with_rate_limiter(DriveRateLimiterConfig::new(
+            None,
+            Some(DriveTokenBucketConfig::new(1, None, 1)),
+        ))
     }
 
     pub fn validate(self) -> Result<DriveUpdate, DriveUpdateError> {
@@ -122,6 +133,7 @@ impl DriveUpdateInput {
 pub struct DriveUpdate {
     drive_id: String,
     path_on_host: Option<PathBuf>,
+    rate_limiter: Option<DriveRateLimiterConfig>,
 }
 
 impl DriveUpdate {
@@ -131,6 +143,14 @@ impl DriveUpdate {
 
     pub fn path_on_host(&self) -> Option<&Path> {
         self.path_on_host.as_deref()
+    }
+
+    pub const fn rate_limiter(&self) -> Option<DriveRateLimiterConfig> {
+        self.rate_limiter
+    }
+
+    pub const fn rate_limiter_configured(&self) -> bool {
+        matches!(self.rate_limiter, Some(rate_limiter) if rate_limiter.is_configured())
     }
 }
 
@@ -266,6 +286,14 @@ impl DriveRateLimiterConfig {
     pub const fn is_configured(self) -> bool {
         self.bandwidth.is_some() || self.ops.is_some()
     }
+
+    fn applied_to(self, existing: Option<Self>) -> Option<Self> {
+        let updated = Self {
+            bandwidth: updated_token_bucket(existing.and_then(Self::bandwidth), self.bandwidth),
+            ops: updated_token_bucket(existing.and_then(Self::ops), self.ops),
+        };
+        updated.is_configured().then_some(updated)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,6 +326,21 @@ impl DriveTokenBucketConfig {
 
     const fn token_bucket_config(self) -> TokenBucketConfig {
         TokenBucketConfig::new(self.size, self.one_time_burst, self.refill_time)
+    }
+
+    const fn is_enabled(self) -> bool {
+        self.token_bucket_config().is_enabled()
+    }
+}
+
+const fn updated_token_bucket(
+    existing: Option<DriveTokenBucketConfig>,
+    update: Option<DriveTokenBucketConfig>,
+) -> Option<DriveTokenBucketConfig> {
+    match update {
+        Some(bucket) if bucket.is_enabled() => Some(bucket),
+        Some(_) => None,
+        None => existing,
     }
 }
 
@@ -364,7 +407,10 @@ impl DriveConfig {
             partuuid: self.partuuid.clone(),
             cache_type: self.cache_type,
             io_engine: self.io_engine,
-            rate_limiter: self.rate_limiter,
+            rate_limiter: match update.rate_limiter() {
+                Some(rate_limiter) => rate_limiter.applied_to(self.rate_limiter),
+                None => self.rate_limiter,
+            },
         })
     }
 }
@@ -504,13 +550,10 @@ impl TryFrom<DriveUpdateInput> for DriveUpdate {
             return Err(DriveUpdateError::EmptyPathOnHost);
         }
 
-        if input.rate_limiter_configured {
-            return Err(DriveUpdateError::UnsupportedRateLimiter);
-        }
-
         Ok(Self {
             drive_id: input.path_drive_id,
             path_on_host: input.path_on_host,
+            rate_limiter: input.rate_limiter,
         })
     }
 }
@@ -597,7 +640,6 @@ pub enum DriveUpdateError {
         body_drive_id: String,
     },
     EmptyPathOnHost,
-    UnsupportedRateLimiter,
     UnknownDrive {
         drive_id: String,
     },
@@ -652,7 +694,6 @@ impl fmt::Display for DriveUpdateError {
             }
             Self::MismatchedDriveId { .. } => f.write_str("path drive_id must match body drive_id"),
             Self::EmptyPathOnHost => f.write_str("drive path_on_host must not be empty"),
-            Self::UnsupportedRateLimiter => f.write_str("drive rate_limiter is not supported"),
             Self::UnknownDrive { drive_id } => {
                 write!(f, "drive {drive_id} is not configured")
             }
@@ -2781,6 +2822,10 @@ impl VirtioBlockDevice {
         self.backing = backing;
     }
 
+    pub fn update_rate_limiter(&mut self, rate_limiter: Option<DriveRateLimiterConfig>) {
+        self.rate_limiter = rate_limiter.and_then(VirtioBlockRateLimiter::new);
+    }
+
     pub fn device_id(&self) -> VirtioBlockDeviceId {
         self.device_id
     }
@@ -3495,6 +3540,11 @@ impl VirtioMmioRegisterHandler<VirtioBlockConfigSpace, VirtioBlockDevice> {
         *self.device_config_handler_mut() = config_space;
         self.increment_config_generation();
         self.mark_interrupt_pending(DeviceInterruptKind::Config);
+    }
+
+    pub fn update_block_rate_limiter(&mut self, config: &DriveConfig) {
+        self.activation_handler_mut()
+            .update_rate_limiter(config.rate_limiter());
     }
 }
 
@@ -4907,13 +4957,15 @@ mod tests {
             Err(DriveUpdateError::EmptyPathOnHost)
         );
 
+        let rate_limiter =
+            DriveRateLimiterConfig::new(None, Some(DriveTokenBucketConfig::new(1, None, 1)));
         let rate_limited_update =
-            DriveUpdateInput::new("rootfs", "rootfs", None).with_rate_limiter_configured();
+            DriveUpdateInput::new("rootfs", "rootfs", None).with_rate_limiter(rate_limiter);
         assert!(rate_limited_update.rate_limiter_configured());
-        assert_eq!(
-            rate_limited_update.validate(),
-            Err(DriveUpdateError::UnsupportedRateLimiter)
-        );
+        let update = rate_limited_update
+            .validate()
+            .expect("rate-limited drive update should validate");
+        assert_eq!(update.rate_limiter(), Some(rate_limiter));
     }
 
     #[test]
@@ -4989,6 +5041,60 @@ mod tests {
             .expect("pathless runtime drive update should build");
 
         assert_eq!(updated.path_on_host(), Path::new("/tmp/rootfs.ext4"));
+    }
+
+    #[test]
+    fn drive_configs_runtime_rate_limiter_update_preserves_missing_bucket() {
+        let mut configs = DriveConfigs::new();
+        let bandwidth = DriveTokenBucketConfig::new(1024, Some(2048), 100);
+        configs
+            .insert(
+                DriveConfigInput::new("rootfs", "rootfs", "/tmp/rootfs.ext4", true)
+                    .with_rate_limiter(DriveRateLimiterConfig::new(Some(bandwidth), None)),
+            )
+            .expect("root drive config should insert");
+
+        let ops = DriveTokenBucketConfig::new(10, None, 1000);
+        let updated = configs
+            .updated_config(
+                DriveUpdateInput::new("rootfs", "rootfs", None)
+                    .with_rate_limiter(DriveRateLimiterConfig::new(None, Some(ops))),
+            )
+            .expect("runtime drive limiter update should build");
+
+        assert_eq!(
+            updated.rate_limiter(),
+            Some(DriveRateLimiterConfig::new(Some(bandwidth), Some(ops)))
+        );
+    }
+
+    #[test]
+    fn drive_configs_runtime_rate_limiter_update_clears_disabled_bucket() {
+        let mut configs = DriveConfigs::new();
+        let bandwidth = DriveTokenBucketConfig::new(1024, Some(2048), 100);
+        let ops = DriveTokenBucketConfig::new(10, None, 1000);
+        configs
+            .insert(
+                DriveConfigInput::new("rootfs", "rootfs", "/tmp/rootfs.ext4", true)
+                    .with_rate_limiter(DriveRateLimiterConfig::new(Some(bandwidth), Some(ops))),
+            )
+            .expect("root drive config should insert");
+
+        let updated = configs
+            .updated_config(
+                DriveUpdateInput::new("rootfs", "rootfs", None).with_rate_limiter(
+                    DriveRateLimiterConfig::new(
+                        Some(DriveTokenBucketConfig::new(0, None, 100)),
+                        None,
+                    ),
+                ),
+            )
+            .expect("runtime drive limiter update should build");
+
+        assert_eq!(
+            updated.rate_limiter(),
+            Some(DriveRateLimiterConfig::new(None, Some(ops)))
+        );
     }
 
     #[test]

@@ -1557,8 +1557,8 @@ fn drive_update_input_from_request(config: &DrivePatchRequest) -> DriveUpdateInp
         config.path_on_host().map(std::path::PathBuf::from),
     );
 
-    if config.rate_limiter_configured() {
-        input = input.with_rate_limiter_configured();
+    if let Some(rate_limiter) = config.rate_limiter() {
+        input = input.with_rate_limiter(drive_rate_limiter_config_from_request(rate_limiter));
     }
 
     input
@@ -1891,7 +1891,12 @@ mod tests {
             Ok(())
         }
 
-        fn update_block_device(&mut self, _config: &DriveConfig) -> Result<(), DriveUpdateError> {
+        fn update_block_device(
+            &mut self,
+            _config: &DriveConfig,
+            _refresh_backing: bool,
+            _update_rate_limiter: bool,
+        ) -> Result<(), DriveUpdateError> {
             match self.drive_update_result.clone() {
                 Some(err) => Err(err),
                 None => Ok(()),
@@ -7566,7 +7571,7 @@ mod tests {
     }
 
     #[test]
-    fn running_state_rejects_drive_patch_rate_limiter_without_mutating() {
+    fn running_state_accepts_drive_patch_rate_limiter_and_updates_stored_config() {
         let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
         vmm.handle_action(VmmAction::PutDrive(
             DriveConfigInput::new("rootfs", "rootfs", "/tmp/rootfs.ext4", true)
@@ -7602,9 +7607,8 @@ mod tests {
 
         let response = request_over_socket(&mut vmm, "dprl", &request);
 
-        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        assert!(response.contains(r#"{"fault_message":"drive rate_limiter is not supported"}"#));
-        assert!(!response.contains("/tmp/rejected.ext4"));
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(response.contains("Content-Length: 0\r\n"));
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::Running
@@ -7613,9 +7617,19 @@ mod tests {
         let config = &vmm.drive_configs()[0];
         assert_eq!(
             config.path_on_host(),
-            std::path::Path::new("/tmp/rootfs.ext4")
+            std::path::Path::new("/tmp/rejected.ext4")
         );
         assert!(config.is_read_only());
+        let rate_limiter = config
+            .rate_limiter()
+            .expect("rate limiter should be stored");
+        let bandwidth = rate_limiter
+            .bandwidth()
+            .expect("bandwidth limiter should be stored");
+        assert_eq!(bandwidth.size(), 1000);
+        assert_eq!(bandwidth.one_time_burst(), Some(1000));
+        assert_eq!(bandwidth.refill_time(), 100);
+        assert_eq!(rate_limiter.ops(), None);
     }
 
     #[test]

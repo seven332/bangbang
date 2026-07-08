@@ -1489,9 +1489,31 @@ pub fn update_block_device_backing_for_devices_with_opened(
     config: &DriveConfig,
     backing: BlockFileBacking,
 ) -> Result<(), DriveUpdateError> {
+    update_block_device_for_devices_with_opened(
+        block_devices,
+        mmio_dispatcher,
+        config,
+        Some(backing),
+        false,
+    )
+}
+
+pub fn update_block_device_for_devices_with_opened(
+    block_devices: &[Arm64BootBlockDevice],
+    mmio_dispatcher: &mut MmioDispatcher,
+    config: &DriveConfig,
+    backing: Option<BlockFileBacking>,
+    update_rate_limiter: bool,
+) -> Result<(), DriveUpdateError> {
     let region_id = block_device_region_id(block_devices, config)?;
 
-    update_block_device_backing_for_region_with_opened(mmio_dispatcher, region_id, config, backing)
+    update_block_device_for_region_with_opened(
+        mmio_dispatcher,
+        region_id,
+        config,
+        backing,
+        update_rate_limiter,
+    )
 }
 
 fn block_device_region_id(
@@ -1516,6 +1538,22 @@ fn update_block_device_backing_for_region_with_opened(
     config: &DriveConfig,
     backing: BlockFileBacking,
 ) -> Result<(), DriveUpdateError> {
+    update_block_device_for_region_with_opened(
+        mmio_dispatcher,
+        region_id,
+        config,
+        Some(backing),
+        false,
+    )
+}
+
+fn update_block_device_for_region_with_opened(
+    mmio_dispatcher: &mut MmioDispatcher,
+    region_id: MmioRegionId,
+    config: &DriveConfig,
+    backing: Option<BlockFileBacking>,
+    update_rate_limiter: bool,
+) -> Result<(), DriveUpdateError> {
     let handler = mmio_dispatcher
         .handler_mut::<VirtioBlockMmioHandler>(region_id)
         .map_err(|source| DriveUpdateError::HandlerLookup {
@@ -1524,7 +1562,12 @@ fn update_block_device_backing_for_region_with_opened(
             message: source.to_string(),
         })?;
 
-    handler.refresh_block_backing_with_opened(config, backing);
+    if let Some(backing) = backing {
+        handler.refresh_block_backing_with_opened(config, backing);
+    }
+    if update_rate_limiter {
+        handler.update_block_rate_limiter(config);
+    }
 
     Ok(())
 }
@@ -2570,6 +2613,7 @@ mod tests {
         balloon_hinting_status_for_device, balloon_stats_for_device, block_device_metadata,
         start_balloon_hinting_for_device, stop_balloon_hinting_for_device,
         update_balloon_config_for_device, update_balloon_statistics_for_device,
+        update_block_device_for_devices_with_opened,
     };
     use crate::VmmAction;
     use crate::balloon::{
@@ -2582,9 +2626,10 @@ mod tests {
         VIRTIO_BALLOON_STATS_QUEUE_INDEX, VirtioBalloonMmioHandler,
     };
     use crate::block::{
-        DriveConfigInput, DriveUpdateError, VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
-        VIRTIO_BLOCK_REQUEST_TYPE_FLUSH, VIRTIO_BLOCK_REQUEST_TYPE_IN, VIRTIO_BLOCK_SECTOR_SIZE,
-        VIRTIO_BLOCK_STATUS_OK, VIRTIO_BLOCK_STATUS_SIZE, VirtioBlockMmioHandler,
+        DriveConfigInput, DriveRateLimiterConfig, DriveTokenBucketConfig, DriveUpdateError,
+        VIRTIO_BLOCK_REQUEST_HEADER_SIZE, VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
+        VIRTIO_BLOCK_REQUEST_TYPE_IN, VIRTIO_BLOCK_SECTOR_SIZE, VIRTIO_BLOCK_STATUS_OK,
+        VIRTIO_BLOCK_STATUS_SIZE, VirtioBlockMmioHandler,
     };
     use crate::boot::{
         BootCommandLineError, BootPayloadKind, BootSourceConfigInput, BootSourceLoadError,
@@ -8139,6 +8184,72 @@ mod tests {
         assert_eq!(
             second.read_register(VirtioMmioRegister::InterruptStatus),
             Ok(DeviceInterruptKind::Config.status().bits())
+        );
+    }
+
+    #[test]
+    fn boot_runtime_update_block_device_rate_limiter_updates_matching_device_only() {
+        let kernel = temp_file("kernel-block-rate-limiter", &arm64_image());
+        let first_block = temp_file("block-rate-limiter-first", &[0x11; 512]);
+        let second_block = temp_file("block-rate-limiter-second", &[0x22; 512]);
+        let mut controller = controller_with_kernel(kernel.path());
+        add_drive(&mut controller, "rootfs", first_block.path());
+        add_drive_with_root(&mut controller, "data", second_block.path(), false);
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            valid_config(&[line(32), line(33)]),
+        )
+        .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
+        let runtime = parts.runtime;
+        let updated = DriveConfigInput::new("data", "data", second_block.path(), false)
+            .with_rate_limiter(DriveRateLimiterConfig::new(
+                Some(DriveTokenBucketConfig::new(1024, Some(2048), 100)),
+                None,
+            ))
+            .validate()
+            .expect("updated drive config should validate");
+
+        update_block_device_for_devices_with_opened(
+            &runtime.block_devices,
+            &mut mmio_dispatcher,
+            &updated,
+            None,
+            true,
+        )
+        .expect("matching block device rate limiter should refresh");
+
+        let first_region = runtime.block_devices[0].registration.region_id();
+        let first = mmio_dispatcher
+            .handler_mut::<VirtioBlockMmioHandler>(first_region)
+            .expect("first block handler should exist");
+        assert_eq!(first.device_config_handler().capacity_sectors(), 1);
+        assert_eq!(first.activation_handler().backing().len(), 512);
+        assert!(first.activation_handler().rate_limiter().is_none());
+        assert_eq!(
+            first.read_register(VirtioMmioRegister::ConfigGeneration),
+            Ok(0)
+        );
+        assert_eq!(
+            first.read_register(VirtioMmioRegister::InterruptStatus),
+            Ok(0)
+        );
+
+        let second_region = runtime.block_devices[1].registration.region_id();
+        let second = mmio_dispatcher
+            .handler_mut::<VirtioBlockMmioHandler>(second_region)
+            .expect("second block handler should exist");
+        assert_eq!(second.device_config_handler().capacity_sectors(), 1);
+        assert_eq!(second.activation_handler().backing().len(), 512);
+        assert!(second.activation_handler().rate_limiter().is_some());
+        assert_eq!(
+            second.read_register(VirtioMmioRegister::ConfigGeneration),
+            Ok(0)
+        );
+        assert_eq!(
+            second.read_register(VirtioMmioRegister::InterruptStatus),
+            Ok(0)
         );
     }
 

@@ -1716,7 +1716,7 @@ pub struct DrivePatchRequest {
     path_drive_id: String,
     body_drive_id: String,
     path_on_host: Option<String>,
-    rate_limiter_configured: bool,
+    rate_limiter: Option<DriveRateLimiterRequest>,
 }
 
 impl DrivePatchRequest {
@@ -1732,8 +1732,12 @@ impl DrivePatchRequest {
         self.path_on_host.as_deref()
     }
 
+    pub const fn rate_limiter(&self) -> Option<DriveRateLimiterRequest> {
+        self.rate_limiter
+    }
+
     pub const fn rate_limiter_configured(&self) -> bool {
-        self.rate_limiter_configured
+        self.rate_limiter.is_some()
     }
 }
 
@@ -3037,19 +3041,13 @@ fn parse_drive_patch_request(path_drive_id: &str, body: &[u8]) -> Result<ApiRequ
     if path_drive_id != body.drive_id {
         return Err(RequestError::MismatchedDriveId);
     }
-    let rate_limiter_configured = match &body.rate_limiter {
-        Some(rate_limiter) => {
-            validate_rate_limiter_config(rate_limiter.as_value())?;
-            rate_limiter_configured(rate_limiter.as_value())?
-        }
-        None => false,
-    };
+    let rate_limiter = parse_drive_rate_limiter(body.rate_limiter.as_ref())?;
 
     Ok(ApiRequest::PatchDrive(Box::new(DrivePatchRequest {
         path_drive_id: path_drive_id.to_string(),
         body_drive_id: body.drive_id,
         path_on_host: body.path_on_host,
-        rate_limiter_configured,
+        rate_limiter,
     })))
 }
 
@@ -5558,7 +5556,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_patch_drive_configured_rate_limiter_marker() {
+    fn parses_patch_drive_rate_limiter_config() {
         let request = request_with_body(
             "PATCH",
             "/drives/rootfs",
@@ -5574,6 +5572,13 @@ mod tests {
         assert_eq!(config.body_drive_id(), "rootfs");
         assert_eq!(config.path_on_host(), None);
         assert!(config.rate_limiter_configured());
+        assert_eq!(
+            config.rate_limiter(),
+            Some(DriveRateLimiterRequest::new(
+                None,
+                Some(TokenBucketRequest::new(100, None, 1000)),
+            ))
+        );
     }
 
     #[test]
