@@ -106,6 +106,10 @@ pub(crate) trait InstanceStartExecutor {
     type Session: ProcessSessionDiagnostics;
 
     fn start(&mut self, controller: &VmmController) -> Result<Self::Session, BackendError>;
+
+    fn metrics_diagnostics(&self) -> MetricsDiagnostics {
+        MetricsDiagnostics::default()
+    }
 }
 
 pub(crate) trait ProcessSessionDiagnostics {
@@ -1172,6 +1176,7 @@ where
             .map(ProcessSessionDiagnostics::metrics_diagnostics)
             .unwrap_or_default();
         self.process_metrics_diagnostics
+            .merged_with(self.starter.metrics_diagnostics())
             .merged_with(session_diagnostics)
     }
 
@@ -1256,6 +1261,7 @@ where
 #[derive(Debug, Clone, Default)]
 pub(crate) struct HvfInstanceStartExecutor {
     serial_output: SharedSerialOutputBuffer,
+    active_serial_output: Option<SharedSerialOutput>,
 }
 
 impl HvfInstanceStartExecutor {
@@ -1264,21 +1270,36 @@ impl HvfInstanceStartExecutor {
         default_hvf_boot_session_config(SharedSerialOutput::from(self.serial_output.clone()))
     }
 
+    fn serial_output_for_controller(
+        &self,
+        controller: &VmmController,
+    ) -> Result<SharedSerialOutput, SerialConfigError> {
+        match controller.serial_config().serial_out_path() {
+            Some(path) => Ok(SharedSerialOutput::with_rate_limiter(
+                SerialOutputFile::open(path)?,
+                controller.serial_config().rate_limiter(),
+            )),
+            None => Ok(SharedSerialOutput::with_rate_limiter(
+                self.serial_output.clone(),
+                controller.serial_config().rate_limiter(),
+            )),
+        }
+    }
+
+    #[cfg(test)]
     fn boot_session_config_for_controller(
         &self,
         controller: &VmmController,
     ) -> Result<HvfArm64BootSessionConfig, SerialConfigError> {
-        let serial_output = match controller.serial_config().serial_out_path() {
-            Some(path) => SharedSerialOutput::with_rate_limiter(
-                SerialOutputFile::open(path)?,
-                controller.serial_config().rate_limiter(),
-            ),
-            None => SharedSerialOutput::with_rate_limiter(
-                self.serial_output.clone(),
-                controller.serial_config().rate_limiter(),
-            ),
-        };
+        let serial_output = self.serial_output_for_controller(controller)?;
+        Ok(self.boot_session_config_for_controller_with_serial_output(controller, serial_output))
+    }
 
+    fn boot_session_config_for_controller_with_serial_output(
+        &self,
+        controller: &VmmController,
+        serial_output: SharedSerialOutput,
+    ) -> HvfArm64BootSessionConfig {
         let mut config = default_hvf_boot_session_config(serial_output);
         if controller.entropy_config().is_some() {
             config = config.with_entropy_device(HvfArm64BootEntropyDeviceConfig::new(
@@ -1291,7 +1312,7 @@ impl HvfInstanceStartExecutor {
             ));
         }
 
-        Ok(config)
+        config
     }
 }
 
@@ -1299,11 +1320,15 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
     type Session = HvfBootRunLoopSupervisor;
 
     fn start(&mut self, controller: &VmmController) -> Result<Self::Session, BackendError> {
-        let boot_session_config = self
-            .boot_session_config_for_controller(controller)
+        let serial_output = self
+            .serial_output_for_controller(controller)
             .map_err(|err| {
                 BackendError::Hypervisor(format!("failed to initialize serial output: {err}"))
             })?;
+        let boot_session_config = self.boot_session_config_for_controller_with_serial_output(
+            controller,
+            serial_output.clone(),
+        );
         let packet_io =
             ProcessNetworkPacketIoProvider::from_controller(controller).map_err(|err| {
                 BackendError::Hypervisor(format!(
@@ -1313,7 +1338,18 @@ impl InstanceStartExecutor for HvfInstanceStartExecutor {
         let session = OwnedHvfArm64BootSession::new(controller, boot_session_config)
             .map_err(|err| BackendError::Hypervisor(err.to_string()))?;
         let session = ProcessHvfBootSession::new(session, packet_io);
-        HvfBootRunLoopSupervisor::start(session, default_hvf_boot_run_loop_step_limit())
+        let supervisor =
+            HvfBootRunLoopSupervisor::start(session, default_hvf_boot_run_loop_step_limit())?;
+        self.active_serial_output = Some(serial_output);
+
+        Ok(supervisor)
+    }
+
+    fn metrics_diagnostics(&self) -> MetricsDiagnostics {
+        self.active_serial_output
+            .as_ref()
+            .map(|output| MetricsDiagnostics::new().with_serial_output_metrics(output.metrics()))
+            .unwrap_or_default()
     }
 }
 
@@ -2615,8 +2651,8 @@ mod tests {
         PreparedNetworkDevices,
     };
     use bangbang_runtime::serial::{
-        SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialConfigInput, SerialOutput, SerialRateLimiterConfig,
-        SharedSerialOutput, SharedSerialOutputBuffer,
+        SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialConfigInput, SerialOutput, SerialOutputMetrics,
+        SerialRateLimiterConfig, SharedSerialOutput, SharedSerialOutputBuffer,
     };
     use bangbang_runtime::startup::{
         Arm64BootBlockDevice, Arm64BootNetworkDevice, Arm64BootNetworkPacketIo,
@@ -2947,12 +2983,22 @@ mod tests {
     #[derive(Debug, Clone)]
     struct DiagnosticStarter {
         status: BootRunLoopMetricStatus,
+        diagnostics: MetricsDiagnostics,
         calls: usize,
     }
 
     impl DiagnosticStarter {
         const fn new(status: BootRunLoopMetricStatus) -> Self {
-            Self { status, calls: 0 }
+            Self {
+                status,
+                diagnostics: MetricsDiagnostics::new(),
+                calls: 0,
+            }
+        }
+
+        const fn with_metrics_diagnostics(mut self, diagnostics: MetricsDiagnostics) -> Self {
+            self.diagnostics = diagnostics;
+            self
         }
     }
 
@@ -2967,6 +3013,10 @@ mod tests {
             Ok(DiagnosticSession {
                 status: self.status,
             })
+        }
+
+        fn metrics_diagnostics(&self) -> MetricsDiagnostics {
+            self.diagnostics
         }
     }
 
@@ -3641,6 +3691,7 @@ mod tests {
             retained_output.bytes().expect("serial output should read"),
             b"A"
         );
+        assert_eq!(output.metrics().rate_limiter_dropped_bytes(), 1);
     }
 
     #[test]
@@ -3749,6 +3800,7 @@ mod tests {
             fs::read(serial_file.path()).expect("serial output should read"),
             b"F"
         );
+        assert_eq!(output.metrics().rate_limiter_dropped_bytes(), 1);
     }
 
     #[test]
@@ -5799,6 +5851,38 @@ mod tests {
         assert_eq!(
             fs::read_to_string(metrics.path()).expect("metrics output should read"),
             "{\"api_server\":{\"process_startup_time_us\":1000},\"vmm\":{\"boot_run_loop_status\":\"failed\",\"metrics_flush_count\":1}}\n"
+        );
+    }
+
+    #[test]
+    fn flush_metrics_includes_starter_serial_output_diagnostics() {
+        let metrics = TempFilePath::create("metrics");
+        let starter_diagnostics =
+            MetricsDiagnostics::new().with_serial_output_metrics(SerialOutputMetrics::new(2));
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            "0.1.0",
+            "bangbang",
+            DiagnosticStarter::new(BootRunLoopMetricStatus::Running)
+                .with_metrics_diagnostics(starter_diagnostics),
+        );
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            metrics.path(),
+        )))
+        .expect("metrics should configure");
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        vmm.handle_action(VmmAction::FlushMetrics)
+            .expect("metrics should flush");
+
+        assert_eq!(
+            fs::read_to_string(metrics.path()).expect("metrics output should read"),
+            "{\"uart\":{\"rate_limiter_dropped_bytes\":2},\"vmm\":{\"boot_run_loop_status\":\"running\",\"metrics_flush_count\":1}}\n"
         );
     }
 

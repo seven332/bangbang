@@ -296,11 +296,12 @@ serial bytes go to a bounded internal capture buffer; when `/serial` configures
 `serial_out_path`, startup opens that host path with nonblocking output
 semantics and routes guest TX bytes there. A configured serial `rate_limiter`
 must remain nonblocking: exhausted guest TX bytes are dropped instead of
-sleeping the VM thread or propagating a host-output backpressure error. Treat
-serial output as untrusted guest data. Reviews for serial-output changes must
-preserve explicit host-observation behavior, bounded internal buffering where
-used, path redaction, limiter state scoped to one process output, and
-per-process ownership.
+sleeping the VM thread or propagating a host-output backpressure error. Metrics
+may report the number of rate-limited dropped bytes, but must not include the
+dropped guest byte values. Treat serial output as untrusted guest data. Reviews
+for serial-output changes must preserve explicit host-observation behavior,
+bounded internal buffering where used, path redaction, limiter state scoped to
+one process output, and per-process ownership.
 
 Block devices can expose host file contents to the guest and can write to the
 backing file when configured read-write. Operators should use dedicated disk

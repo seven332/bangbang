@@ -6,6 +6,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -37,6 +38,70 @@ pub trait SerialOutput: fmt::Debug + Send {
 }
 
 const NANOS_PER_MILLISECOND: u64 = 1_000_000;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SerialOutputMetrics {
+    rate_limiter_dropped_bytes: u64,
+}
+
+impl SerialOutputMetrics {
+    pub const fn new(rate_limiter_dropped_bytes: u64) -> Self {
+        Self {
+            rate_limiter_dropped_bytes,
+        }
+    }
+
+    pub const fn rate_limiter_dropped_bytes(self) -> u64 {
+        self.rate_limiter_dropped_bytes
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.rate_limiter_dropped_bytes == 0
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct SharedSerialOutputMetrics {
+    inner: Arc<SharedSerialOutputMetricsInner>,
+}
+
+impl SharedSerialOutputMetrics {
+    fn record_rate_limiter_dropped_bytes(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+
+        let mut current = self
+            .inner
+            .rate_limiter_dropped_bytes
+            .load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_add(bytes);
+            match self.inner.rate_limiter_dropped_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn snapshot(&self) -> SerialOutputMetrics {
+        SerialOutputMetrics::new(
+            self.inner
+                .rate_limiter_dropped_bytes
+                .load(Ordering::Relaxed),
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct SharedSerialOutputMetricsInner {
+    rate_limiter_dropped_bytes: AtomicU64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SerialRateLimiterConfig {
@@ -266,12 +331,14 @@ impl SerialOutput for SharedSerialOutputBuffer {
 #[derive(Debug, Clone)]
 pub struct SharedSerialOutput {
     output: Arc<Mutex<Box<dyn SerialOutput>>>,
+    metrics: SharedSerialOutputMetrics,
 }
 
 impl SharedSerialOutput {
     pub fn new(output: impl SerialOutput + 'static) -> Self {
         Self {
             output: Arc::new(Mutex::new(Box::new(output))),
+            metrics: SharedSerialOutputMetrics::default(),
         }
     }
 
@@ -279,10 +346,24 @@ impl SharedSerialOutput {
         output: impl SerialOutput + 'static,
         rate_limiter: Option<SerialRateLimiterConfig>,
     ) -> Self {
-        match rate_limiter.and_then(SerialTokenBucket::new) {
-            Some(bucket) => Self::new(RateLimitedSerialOutput::from_bucket(output, bucket)),
-            None => Self::new(output),
+        let metrics = SharedSerialOutputMetrics::default();
+        let output: Box<dyn SerialOutput> = match rate_limiter.and_then(SerialTokenBucket::new) {
+            Some(bucket) => Box::new(RateLimitedSerialOutput::from_bucket(
+                output,
+                bucket,
+                metrics.clone(),
+            )),
+            None => Box::new(output),
+        };
+
+        Self {
+            output: Arc::new(Mutex::new(output)),
+            metrics,
         }
+    }
+
+    pub fn metrics(&self) -> SerialOutputMetrics {
+        self.metrics.snapshot()
     }
 }
 
@@ -307,16 +388,35 @@ impl SerialOutput for SharedSerialOutput {
 struct RateLimitedSerialOutput<O> {
     output: O,
     bucket: SerialTokenBucket,
+    metrics: SharedSerialOutputMetrics,
 }
 
 impl<O> RateLimitedSerialOutput<O> {
     #[cfg(test)]
     fn new(output: O, config: SerialRateLimiterConfig) -> Option<Self> {
-        SerialTokenBucket::new(config).map(|bucket| Self { output, bucket })
+        let metrics = SharedSerialOutputMetrics::default();
+        SerialTokenBucket::new(config).map(|bucket| Self {
+            output,
+            bucket,
+            metrics,
+        })
     }
 
-    fn from_bucket(output: O, bucket: SerialTokenBucket) -> Self {
-        Self { output, bucket }
+    fn from_bucket(
+        output: O,
+        bucket: SerialTokenBucket,
+        metrics: SharedSerialOutputMetrics,
+    ) -> Self {
+        Self {
+            output,
+            bucket,
+            metrics,
+        }
+    }
+
+    #[cfg(test)]
+    fn metrics(&self) -> SerialOutputMetrics {
+        self.metrics.snapshot()
     }
 }
 
@@ -325,6 +425,7 @@ impl<O: SerialOutput> SerialOutput for RateLimitedSerialOutput<O> {
         if self.bucket.reduce_at(1, Instant::now()) {
             self.output.write_byte(byte)
         } else {
+            self.metrics.record_rate_limiter_dropped_bytes(1);
             Ok(())
         }
     }
@@ -825,7 +926,8 @@ mod tests {
         SERIAL_OUTPUT_BUFFER_DEFAULT_LIMIT, SERIAL_SCRATCH_REGISTER_OFFSET,
         SERIAL_TRANSMIT_REGISTER_OFFSET, SerialConfigError, SerialConfigInput, SerialMmioDevice,
         SerialMmioError, SerialOutput, SerialOutputBuffer, SerialOutputError, SerialOutputFile,
-        SerialRateLimiterConfig, SerialTokenBucket, SharedSerialOutput, SharedSerialOutputBuffer,
+        SerialOutputMetrics, SerialRateLimiterConfig, SerialTokenBucket, SharedSerialOutput,
+        SharedSerialOutputBuffer, SharedSerialOutputMetrics,
     };
     use crate::memory::GuestAddress;
     use crate::mmio::{
@@ -1180,6 +1282,37 @@ mod tests {
             .expect("exhausted byte should be dropped");
 
         assert_eq!(buffer.bytes().expect("shared bytes should read"), b"a");
+        assert_eq!(output.metrics().rate_limiter_dropped_bytes(), 1);
+    }
+
+    #[test]
+    fn shared_serial_output_counts_rate_limited_dropped_bytes() {
+        let buffer = SharedSerialOutputBuffer::new(1);
+        let mut output = SharedSerialOutput::with_rate_limiter(
+            buffer.clone(),
+            Some(SerialRateLimiterConfig::new(1, None, 100)),
+        );
+
+        output.write_byte(b'a').expect("first byte should write");
+        output
+            .write_byte(b'b')
+            .expect("first exhausted byte should be dropped");
+        output
+            .write_byte(b'c')
+            .expect("second exhausted byte should be dropped");
+
+        assert_eq!(buffer.bytes().expect("shared bytes should read"), b"a");
+        assert_eq!(output.metrics().rate_limiter_dropped_bytes(), 2);
+    }
+
+    #[test]
+    fn shared_serial_output_metrics_saturates_dropped_bytes() {
+        let metrics = SharedSerialOutputMetrics::default();
+
+        metrics.record_rate_limiter_dropped_bytes(u64::MAX - 1);
+        metrics.record_rate_limiter_dropped_bytes(2);
+
+        assert_eq!(metrics.snapshot().rate_limiter_dropped_bytes(), u64::MAX);
     }
 
     #[test]
@@ -1200,6 +1333,7 @@ mod tests {
             "serial output buffer reached its 1-byte limit"
         );
         assert_eq!(buffer.bytes().expect("shared bytes should read"), b"a");
+        assert_eq!(output.metrics(), SerialOutputMetrics::default());
     }
 
     #[test]

@@ -4,6 +4,8 @@ use std::io::{LineWriter, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+use crate::serial::SerialOutputMetrics;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetricsConfigInput {
     metrics_path: PathBuf,
@@ -899,6 +901,7 @@ pub struct MetricsDiagnostics {
     start_time_us: Option<u64>,
     start_time_cpu_us: Option<u64>,
     parent_cpu_time_us: Option<u64>,
+    serial_output_metrics: Option<SerialOutputMetrics>,
 }
 
 impl MetricsDiagnostics {
@@ -908,6 +911,7 @@ impl MetricsDiagnostics {
             start_time_us: None,
             start_time_cpu_us: None,
             parent_cpu_time_us: None,
+            serial_output_metrics: None,
         }
     }
 
@@ -931,6 +935,14 @@ impl MetricsDiagnostics {
         self
     }
 
+    pub const fn with_serial_output_metrics(
+        mut self,
+        serial_output_metrics: SerialOutputMetrics,
+    ) -> Self {
+        self.serial_output_metrics = Some(serial_output_metrics);
+        self
+    }
+
     pub const fn merged_with(mut self, other: Self) -> Self {
         if other.boot_run_loop_status.is_some() {
             self.boot_run_loop_status = other.boot_run_loop_status;
@@ -943,6 +955,9 @@ impl MetricsDiagnostics {
         }
         if other.parent_cpu_time_us.is_some() {
             self.parent_cpu_time_us = other.parent_cpu_time_us;
+        }
+        if other.serial_output_metrics.is_some() {
+            self.serial_output_metrics = other.serial_output_metrics;
         }
 
         self
@@ -962,6 +977,10 @@ impl MetricsDiagnostics {
 
     pub const fn parent_cpu_time_us(&self) -> Option<u64> {
         self.parent_cpu_time_us
+    }
+
+    pub const fn serial_output_metrics(&self) -> Option<SerialOutputMetrics> {
+        self.serial_output_metrics
     }
 }
 
@@ -1139,6 +1158,20 @@ impl MetricsSink {
                 );
             }
             root.insert("logger".to_string(), serde_json::Value::Object(logger));
+        }
+        if let Some(serial_output_metrics) = diagnostics.serial_output_metrics()
+            && !serial_output_metrics.is_empty()
+        {
+            let mut uart = serde_json::Map::new();
+            if serial_output_metrics.rate_limiter_dropped_bytes() != 0 {
+                uart.insert(
+                    "rate_limiter_dropped_bytes".to_string(),
+                    serde_json::Value::Number(
+                        serial_output_metrics.rate_limiter_dropped_bytes().into(),
+                    ),
+                );
+            }
+            root.insert("uart".to_string(), serde_json::Value::Object(uart));
         }
         if !patch_api_requests.is_empty() {
             let mut patch_requests = serde_json::Map::new();
@@ -1342,6 +1375,7 @@ mod tests {
         BootRunLoopMetricStatus, MetricsConfigError, MetricsConfigInput, MetricsDiagnostics,
         MetricsFlushError, MetricsOutput, MetricsState,
     };
+    use crate::serial::SerialOutputMetrics;
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -1528,6 +1562,33 @@ mod tests {
         );
 
         fs::remove_file(path).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn writes_serial_output_diagnostics_when_dropped_bytes_are_nonzero() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let diagnostics =
+            MetricsDiagnostics::new().with_serial_output_metrics(SerialOutputMetrics::new(3));
+
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        assert_eq!(
+            output.lines(),
+            [r#"{"uart":{"rate_limiter_dropped_bytes":3},"vmm":{"metrics_flush_count":1}}"#]
+        );
+    }
+
+    #[test]
+    fn omits_serial_output_diagnostics_when_dropped_bytes_are_zero() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let diagnostics =
+            MetricsDiagnostics::new().with_serial_output_metrics(SerialOutputMetrics::default());
+
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        assert_eq!(output.lines(), [r#"{"vmm":{"metrics_flush_count":1}}"#]);
     }
 
     #[test]
