@@ -1777,6 +1777,39 @@ mod macos_arm64 {
             "GET / after pmem direct rootfs InstanceStart",
         );
 
+        let pmem_patch_response = http_json(
+            &socket_path,
+            "PATCH",
+            "/pmem/pmem0",
+            r#"{"id":"pmem0","rate_limiter":{"bandwidth":null,"ops":null}}"#,
+        );
+        assert_no_content_response(
+            &pmem_patch_response,
+            "PATCH /pmem/pmem0 no-op rate limiter after InstanceStart",
+        );
+
+        let pmem_rate_limiter_patch_response = http_json(
+            &socket_path,
+            "PATCH",
+            "/pmem/pmem0",
+            r#"{"id":"pmem0","rate_limiter":{"ops":{"size":123456,"one_time_burst":234567,"refill_time":345678}}}"#,
+        );
+        assert_bad_request_response(
+            &pmem_rate_limiter_patch_response,
+            "PATCH /pmem/pmem0 configured rate limiter after InstanceStart",
+        );
+        assert_response_contains(
+            &pmem_rate_limiter_patch_response,
+            r#"{"fault_message":"pmem rate_limiter is not supported"}"#,
+            "PATCH /pmem/pmem0 configured rate limiter after InstanceStart",
+        );
+        for private_value in ["123456", "234567", "345678"] {
+            assert!(
+                !pmem_rate_limiter_patch_response.contains(private_value),
+                "PATCH /pmem/pmem0 configured rate limiter must not echo {private_value}: {pmem_rate_limiter_patch_response}"
+            );
+        }
+
         if let Err(err) = wait_for_file_prefix_marker(
             &data_backing_path,
             DIRECT_ROOTFS_PMEM_READ_FLUSH_MARKER,

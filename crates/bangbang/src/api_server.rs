@@ -24,9 +24,9 @@ use bangbang_api::http::{
     MemoryHotplugSizeUpdateRequest, MetricsConfigRequest, MmdsConfigRequest, MmdsConfigResponse,
     MmdsContentRequest, MmdsVersion as ApiMmdsVersion, NetworkInterfaceConfigRequest,
     NetworkInterfaceConfigResponse, NetworkInterfacePatchRequest, PmemConfigRequest,
-    PmemConfigResponse, RequestError, SerialConfigRequest, VmConfigResponse, VmStateUpdate,
-    VmStateUpdateRequest, VsockConfigRequest, VsockConfigResponse, api_request_metric_endpoint,
-    parse_request_with_limit, request_total_len_with_limit,
+    PmemConfigResponse, PmemPatchRequest, RequestError, SerialConfigRequest, VmConfigResponse,
+    VmStateUpdate, VmStateUpdateRequest, VsockConfigRequest, VsockConfigResponse,
+    api_request_metric_endpoint, parse_request_with_limit, request_total_len_with_limit,
 };
 use bangbang_runtime::balloon::{
     BalloonConfig, BalloonConfigInput, BalloonHintingStartInput, BalloonHintingStatus,
@@ -54,7 +54,7 @@ use bangbang_runtime::network::MAX_NETWORK_INTERFACE_COUNT;
 use bangbang_runtime::network::{
     NetworkInterfaceConfig, NetworkInterfaceConfigInput, NetworkInterfaceUpdateInput,
 };
-use bangbang_runtime::pmem::{PmemConfig, PmemConfigInput};
+use bangbang_runtime::pmem::{PmemConfig, PmemConfigInput, PmemUpdateInput};
 use bangbang_runtime::serial::{SerialConfigInput, SerialRateLimiterConfig};
 use bangbang_runtime::vsock::{VsockConfig, VsockConfigInput};
 use bangbang_runtime::{
@@ -754,7 +754,9 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PutPmem(config) => handle_empty(vmm.handle_put_request(PutApiRequest::pmem(
             pmem_config_input_from_request(config.as_ref()),
         ))),
-        ApiRequest::PatchPmem => handle_empty(vmm.handle_patch_request(PatchApiRequest::pmem())),
+        ApiRequest::PatchPmem(config) => handle_empty(vmm.handle_patch_request(
+            PatchApiRequest::pmem(pmem_update_input_from_request(config.as_ref())),
+        )),
         ApiRequest::PutSnapshotCreate => handle_empty(vmm.handle_action(VmmAction::CreateSnapshot)),
         ApiRequest::PutSnapshotLoad(_) => handle_empty(vmm.handle_action(VmmAction::LoadSnapshot)),
         ApiRequest::PutVsock(config) => handle_empty(vmm.handle_put_request(PutApiRequest::vsock(
@@ -794,7 +796,7 @@ fn request_uses_deprecated_api(request: &ApiRequest) -> bool {
         | ApiRequest::PatchMemoryHotplug(_)
         | ApiRequest::PatchMmds(_)
         | ApiRequest::PatchNetworkInterface(_)
-        | ApiRequest::PatchPmem
+        | ApiRequest::PatchPmem(_)
         | ApiRequest::PatchVmState(_)
         | ApiRequest::PutAction(_)
         | ApiRequest::PutBalloon(_)
@@ -902,7 +904,7 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         | ApiRequest::PatchMmds(_)
         | ApiRequest::PatchMemoryHotplug(_)
         | ApiRequest::PatchNetworkInterface(_)
-        | ApiRequest::PatchPmem
+        | ApiRequest::PatchPmem(_)
         | ApiRequest::PatchVmState(_)
         | ApiRequest::PutAction(_)
         | ApiRequest::PutMemoryHotplug(_)
@@ -1535,6 +1537,16 @@ fn pmem_config_input_from_request(config: &PmemConfigRequest) -> PmemConfigInput
     let mut input = PmemConfigInput::new(config.body_pmem_id(), config.path_on_host())
         .with_root_device(config.root_device())
         .with_read_only(config.read_only());
+
+    if config.rate_limiter_configured() {
+        input = input.with_rate_limiter_configured();
+    }
+
+    input
+}
+
+fn pmem_update_input_from_request(config: &PmemPatchRequest) -> PmemUpdateInput {
+    let mut input = PmemUpdateInput::new(config.path_pmem_id(), config.body_pmem_id());
 
     if config.rate_limiter_configured() {
         input = input.with_rate_limiter_configured();
@@ -4562,13 +4574,24 @@ mod tests {
         let start_response = put_action_over_socket(&mut vmm, "pm-a1", "InstanceStart");
         assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
 
+        let runtime_patch_response = request_over_socket(
+            &mut vmm,
+            "pm-pat-runtime",
+            &request_with_body(
+                "PATCH",
+                "/pmem/pmem0",
+                r#"{"id":"pmem0","rate_limiter":{"bandwidth":null,"ops":null}}"#,
+            ),
+        );
+        assert!(runtime_patch_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
         let flush_response = put_action_over_socket(&mut vmm, "pm-a2", "FlushMetrics");
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
         let metrics_output =
             fs::read_to_string(&metrics_path).expect("metrics output should be readable");
         assert_eq!(
             metrics_output,
-            "{\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":2,\"pmem_fails\":2},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":2,\"pmem_fails\":1,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":3,\"pmem_fails\":2},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":0,\"hotplug_memory_fails\":0,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":2,\"pmem_fails\":1,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
         assert!(!metrics_output.contains("pmem0"));
         assert!(!metrics_output.contains("/private/tmp/pmem.img"));
@@ -6710,13 +6733,18 @@ mod tests {
                 "The requested operation is not supported in Running state: PutPmem",
             ),
             (
-                "pmem-patch-running",
+                "pm-prl-run",
                 request_with_body(
                     "PATCH",
                     "/pmem/pmem0",
                     r#"{"id":"pmem0","rate_limiter":{"ops":{"size":123456,"one_time_burst":234567,"refill_time":345678}}}"#,
                 ),
-                "Pmem device is not supported.",
+                "pmem rate_limiter is not supported",
+            ),
+            (
+                "pm-pmiss-run",
+                request_with_body("PATCH", "/pmem/pmem0", r#"{"id":"pmem0"}"#),
+                "pmem device is not configured",
             ),
         ] {
             let response = request_over_socket(&mut vmm, socket_name, &request);

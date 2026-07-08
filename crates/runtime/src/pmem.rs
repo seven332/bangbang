@@ -1052,6 +1052,13 @@ pub struct PmemConfigInput {
     rate_limiter_configured: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PmemUpdateInput {
+    path_pmem_id: String,
+    body_pmem_id: String,
+    rate_limiter_configured: bool,
+}
+
 impl PmemConfigInput {
     pub fn new(id: impl Into<String>, path_on_host: impl Into<String>) -> Self {
         Self {
@@ -1099,12 +1106,48 @@ impl PmemConfigInput {
     }
 }
 
+impl PmemUpdateInput {
+    pub fn new(path_pmem_id: impl Into<String>, body_pmem_id: impl Into<String>) -> Self {
+        Self {
+            path_pmem_id: path_pmem_id.into(),
+            body_pmem_id: body_pmem_id.into(),
+            rate_limiter_configured: false,
+        }
+    }
+
+    pub fn path_pmem_id(&self) -> &str {
+        &self.path_pmem_id
+    }
+
+    pub fn body_pmem_id(&self) -> &str {
+        &self.body_pmem_id
+    }
+
+    pub const fn rate_limiter_configured(&self) -> bool {
+        self.rate_limiter_configured
+    }
+
+    pub const fn with_rate_limiter_configured(mut self) -> Self {
+        self.rate_limiter_configured = true;
+        self
+    }
+
+    pub fn validate(self) -> Result<PmemUpdate, PmemUpdateError> {
+        PmemUpdate::try_from(self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PmemConfig {
     id: String,
     path_on_host: String,
     root_device: bool,
     read_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PmemUpdate {
+    id: String,
 }
 
 impl PmemConfig {
@@ -1122,6 +1165,12 @@ impl PmemConfig {
 
     pub const fn read_only(&self) -> bool {
         self.read_only
+    }
+}
+
+impl PmemUpdate {
+    pub fn id(&self) -> &str {
+        &self.id
     }
 }
 
@@ -1144,6 +1193,26 @@ impl TryFrom<PmemConfigInput> for PmemConfig {
             path_on_host: input.path_on_host,
             root_device: input.root_device,
             read_only: input.read_only,
+        })
+    }
+}
+
+impl TryFrom<PmemUpdateInput> for PmemUpdate {
+    type Error = PmemUpdateError;
+
+    fn try_from(input: PmemUpdateInput) -> Result<Self, Self::Error> {
+        validate_pmem_update_id(PmemIdSource::Path, &input.path_pmem_id)?;
+        validate_pmem_update_id(PmemIdSource::Body, &input.body_pmem_id)?;
+        if input.path_pmem_id != input.body_pmem_id {
+            return Err(PmemUpdateError::MismatchedPmemId);
+        }
+
+        if input.rate_limiter_configured {
+            return Err(PmemUpdateError::UnsupportedRateLimiter);
+        }
+
+        Ok(Self {
+            id: input.path_pmem_id,
         })
     }
 }
@@ -1175,6 +1244,15 @@ impl PmemConfigs {
         }
 
         self.configs.push(config);
+    }
+
+    pub fn validate_update(&self, input: PmemUpdateInput) -> Result<PmemUpdate, PmemUpdateError> {
+        let update = input.validate()?;
+        if !self.configs.iter().any(|config| config.id() == update.id()) {
+            return Err(PmemUpdateError::UnknownPmem);
+        }
+
+        Ok(update)
     }
 }
 
@@ -2526,6 +2604,30 @@ pub enum PmemConfigError {
     UnsupportedRateLimiter,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmemIdSource {
+    Path,
+    Body,
+}
+
+impl fmt::Display for PmemIdSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Path => f.write_str("path pmem id"),
+            Self::Body => f.write_str("body id"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PmemUpdateError {
+    EmptyPmemId { source: PmemIdSource },
+    InvalidPmemId { source: PmemIdSource },
+    MismatchedPmemId,
+    UnknownPmem,
+    UnsupportedRateLimiter,
+}
+
 impl fmt::Display for PmemConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -2541,6 +2643,25 @@ impl fmt::Display for PmemConfigError {
 
 impl std::error::Error for PmemConfigError {}
 
+impl fmt::Display for PmemUpdateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyPmemId { source } => write!(f, "{source} must not be empty"),
+            Self::InvalidPmemId { source, .. } => {
+                write!(
+                    f,
+                    "{source} must contain only alphanumeric characters or '_'"
+                )
+            }
+            Self::MismatchedPmemId => f.write_str("path pmem id must match body id"),
+            Self::UnknownPmem => f.write_str("pmem device is not configured"),
+            Self::UnsupportedRateLimiter => f.write_str("pmem rate_limiter is not supported"),
+        }
+    }
+}
+
+impl std::error::Error for PmemUpdateError {}
+
 fn validate_pmem_id(id: &str) -> Result<(), PmemConfigError> {
     if id.is_empty() {
         return Err(PmemConfigError::EmptyPmemId);
@@ -2551,6 +2672,21 @@ fn validate_pmem_id(id: &str) -> Result<(), PmemConfigError> {
         .all(|character| character == '_' || character.is_alphanumeric())
     {
         return Err(PmemConfigError::InvalidPmemId);
+    }
+
+    Ok(())
+}
+
+fn validate_pmem_update_id(source: PmemIdSource, id: &str) -> Result<(), PmemUpdateError> {
+    if id.is_empty() {
+        return Err(PmemUpdateError::EmptyPmemId { source });
+    }
+
+    if !id
+        .chars()
+        .all(|character| character == '_' || character.is_alphanumeric())
+    {
+        return Err(PmemUpdateError::InvalidPmemId { source });
     }
 
     Ok(())
@@ -3550,6 +3686,120 @@ mod tests {
 
         assert_eq!(err, PmemConfigError::EmptyPathOnHost);
         assert_eq!(err.to_string(), "pmem path_on_host must not be empty");
+    }
+
+    #[test]
+    fn update_input_defaults_to_noop_update() {
+        let input = PmemUpdateInput::new("pmem0", "pmem0");
+
+        assert_eq!(input.path_pmem_id(), "pmem0");
+        assert_eq!(input.body_pmem_id(), "pmem0");
+        assert!(!input.rate_limiter_configured());
+    }
+
+    #[test]
+    fn update_accepts_existing_noop_pmem_update() {
+        let mut configs = PmemConfigs::new();
+        configs.upsert(pmem_config(PmemConfigInput::new("pmem0", "/tmp/pmem.img")));
+
+        let update = configs
+            .validate_update(PmemUpdateInput::new("pmem0", "pmem0"))
+            .expect("existing no-op pmem update should validate");
+
+        assert_eq!(update.id(), "pmem0");
+        assert_eq!(configs.as_slice().len(), 1);
+        assert_eq!(configs.as_slice()[0].path_on_host(), "/tmp/pmem.img");
+    }
+
+    #[test]
+    fn update_rejects_unknown_pmem() {
+        let mut configs = PmemConfigs::new();
+        configs.upsert(pmem_config(PmemConfigInput::new("pmem0", "/tmp/pmem.img")));
+
+        let err = configs
+            .validate_update(PmemUpdateInput::new("pmem1", "pmem1"))
+            .expect_err("unknown pmem update should fail");
+
+        assert_eq!(err, PmemUpdateError::UnknownPmem);
+        assert_eq!(err.to_string(), "pmem device is not configured");
+        assert_eq!(configs.as_slice().len(), 1);
+        assert_eq!(configs.as_slice()[0].id(), "pmem0");
+        assert_eq!(configs.as_slice()[0].path_on_host(), "/tmp/pmem.img");
+    }
+
+    #[test]
+    fn update_rejects_configured_rate_limiter() {
+        let mut configs = PmemConfigs::new();
+        configs.upsert(pmem_config(PmemConfigInput::new("pmem0", "/tmp/pmem.img")));
+
+        let err = configs
+            .validate_update(PmemUpdateInput::new("pmem0", "pmem0").with_rate_limiter_configured())
+            .expect_err("configured pmem rate limiter should fail");
+
+        assert_eq!(err, PmemUpdateError::UnsupportedRateLimiter);
+        assert_eq!(err.to_string(), "pmem rate_limiter is not supported");
+        assert_eq!(configs.as_slice().len(), 1);
+        assert_eq!(configs.as_slice()[0].id(), "pmem0");
+        assert_eq!(configs.as_slice()[0].path_on_host(), "/tmp/pmem.img");
+    }
+
+    #[test]
+    fn update_rejects_empty_path_pmem_id() {
+        let err = PmemUpdate::try_from(PmemUpdateInput::new("", "pmem0"))
+            .expect_err("empty path pmem id should fail");
+
+        assert_eq!(
+            err,
+            PmemUpdateError::EmptyPmemId {
+                source: PmemIdSource::Path
+            }
+        );
+        assert_eq!(err.to_string(), "path pmem id must not be empty");
+    }
+
+    #[test]
+    fn update_rejects_empty_body_pmem_id() {
+        let err = PmemUpdate::try_from(PmemUpdateInput::new("pmem0", ""))
+            .expect_err("empty body pmem id should fail");
+
+        assert_eq!(
+            err,
+            PmemUpdateError::EmptyPmemId {
+                source: PmemIdSource::Body
+            }
+        );
+        assert_eq!(err.to_string(), "body id must not be empty");
+    }
+
+    #[test]
+    fn update_rejects_invalid_pmem_id_without_echoing_it() {
+        let invalid = "bad/id\nsecret";
+        let err = PmemUpdate::try_from(PmemUpdateInput::new(invalid, invalid))
+            .expect_err("invalid pmem update id should fail");
+
+        assert_eq!(
+            err,
+            PmemUpdateError::InvalidPmemId {
+                source: PmemIdSource::Path
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "path pmem id must contain only alphanumeric characters or '_'"
+        );
+        assert!(!err.to_string().contains(invalid));
+        assert!(!format!("{err:?}").contains(invalid));
+    }
+
+    #[test]
+    fn update_rejects_mismatched_pmem_id_without_echoing_values() {
+        let err = PmemUpdate::try_from(PmemUpdateInput::new("pmem0", "pmem1"))
+            .expect_err("mismatched pmem update id should fail");
+
+        assert_eq!(err, PmemUpdateError::MismatchedPmemId);
+        assert_eq!(err.to_string(), "path pmem id must match body id");
+        assert!(!format!("{err:?}").contains("pmem0"));
+        assert!(!format!("{err:?}").contains("pmem1"));
     }
 
     #[test]
