@@ -4,8 +4,7 @@ pub(crate) const FIRECRACKER_PERIODIC_METRICS_FLUSH_INTERVAL: Duration = Duratio
 
 #[derive(Debug, Clone)]
 pub(crate) struct PeriodicMetricsScheduler {
-    period: Duration,
-    next_deadline: Instant,
+    deadline: PeriodicDeadline,
 }
 
 impl PeriodicMetricsScheduler {
@@ -16,12 +15,95 @@ impl PeriodicMetricsScheduler {
     #[cfg(test)]
     pub(crate) fn due_now(now: Instant) -> Self {
         Self {
-            period: FIRECRACKER_PERIODIC_METRICS_FLUSH_INTERVAL,
-            next_deadline: now,
+            deadline: PeriodicDeadline::due_now(now, FIRECRACKER_PERIODIC_METRICS_FLUSH_INTERVAL),
         }
     }
 
     fn with_period(now: Instant, period: Duration) -> Self {
+        Self {
+            deadline: PeriodicDeadline::new(now, period),
+        }
+    }
+
+    pub(crate) fn poll_timeout_ms(&self, now: Instant) -> i32 {
+        self.deadline.poll_timeout_ms(now)
+    }
+
+    pub(crate) fn is_due(&self, now: Instant) -> bool {
+        self.deadline.is_due(now)
+    }
+
+    pub(crate) fn schedule_next(&mut self, now: Instant) {
+        self.deadline.schedule_next(now);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PeriodicBalloonStatisticsScheduler {
+    deadline: Option<PeriodicDeadline>,
+}
+
+impl PeriodicBalloonStatisticsScheduler {
+    pub(crate) fn new(now: Instant, interval: Option<Duration>) -> Self {
+        let mut scheduler = Self { deadline: None };
+        scheduler.sync_interval(now, interval);
+        scheduler
+    }
+
+    #[cfg(test)]
+    pub(crate) fn due_now(now: Instant, interval: Duration) -> Self {
+        Self {
+            deadline: Some(PeriodicDeadline::due_now(now, interval)),
+        }
+    }
+
+    pub(crate) fn poll_timeout_ms(
+        &mut self,
+        now: Instant,
+        interval: Option<Duration>,
+    ) -> Option<i32> {
+        self.sync_interval(now, interval);
+        self.deadline
+            .as_ref()
+            .map(|deadline| deadline.poll_timeout_ms(now))
+    }
+
+    pub(crate) fn is_due(&mut self, now: Instant, interval: Option<Duration>) -> bool {
+        self.sync_interval(now, interval);
+        self.deadline
+            .as_ref()
+            .is_some_and(|deadline| deadline.is_due(now))
+    }
+
+    pub(crate) fn schedule_next(&mut self, now: Instant, interval: Option<Duration>) {
+        self.sync_interval(now, interval);
+        if let Some(deadline) = self.deadline.as_mut() {
+            deadline.schedule_next(now);
+        }
+    }
+
+    fn sync_interval(&mut self, now: Instant, interval: Option<Duration>) {
+        let Some(interval) = interval.filter(|interval| !interval.is_zero()) else {
+            self.deadline = None;
+            return;
+        };
+
+        match self.deadline.as_mut() {
+            Some(deadline) if deadline.period() == interval => {}
+            Some(deadline) => *deadline = PeriodicDeadline::new(now, interval),
+            None => self.deadline = Some(PeriodicDeadline::new(now, interval)),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PeriodicDeadline {
+    period: Duration,
+    next_deadline: Instant,
+}
+
+impl PeriodicDeadline {
+    fn new(now: Instant, period: Duration) -> Self {
         let period = if period.is_zero() {
             Duration::from_millis(1)
         } else {
@@ -35,7 +117,18 @@ impl PeriodicMetricsScheduler {
         }
     }
 
-    pub(crate) fn poll_timeout_ms(&self, now: Instant) -> i32 {
+    #[cfg(test)]
+    fn due_now(now: Instant, period: Duration) -> Self {
+        let mut deadline = Self::new(now, period);
+        deadline.next_deadline = now;
+        deadline
+    }
+
+    const fn period(&self) -> Duration {
+        self.period
+    }
+
+    fn poll_timeout_ms(&self, now: Instant) -> i32 {
         if now >= self.next_deadline {
             return 0;
         }
@@ -52,8 +145,21 @@ impl PeriodicMetricsScheduler {
         }
     }
 
-    pub(crate) fn schedule_next(&mut self, now: Instant) {
+    fn is_due(&self, now: Instant) -> bool {
+        now >= self.next_deadline
+    }
+
+    fn schedule_next(&mut self, now: Instant) {
         self.next_deadline = now.checked_add(self.period).unwrap_or(now);
+    }
+}
+
+pub(crate) fn min_poll_timeout_ms(first: Option<i32>, second: Option<i32>) -> Option<i32> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(first.min(second)),
+        (Some(first), None) => Some(first),
+        (None, Some(second)) => Some(second),
+        (None, None) => None,
     }
 }
 
@@ -78,6 +184,7 @@ mod tests {
         let scheduler = PeriodicMetricsScheduler::due_now(now);
 
         assert_eq!(scheduler.poll_timeout_ms(now), 0);
+        assert!(scheduler.is_due(now));
     }
 
     #[test]
@@ -109,5 +216,68 @@ mod tests {
             scheduler.poll_timeout_ms(now),
             FIRECRACKER_PERIODIC_METRICS_FLUSH_INTERVAL.as_millis() as i32
         );
+    }
+
+    #[test]
+    fn balloon_scheduler_is_disabled_without_interval() {
+        let now = Instant::now();
+        let mut scheduler = PeriodicBalloonStatisticsScheduler::new(now, None);
+
+        assert_eq!(scheduler.poll_timeout_ms(now, None), None);
+        assert!(!scheduler.is_due(now, None));
+    }
+
+    #[test]
+    fn balloon_scheduler_uses_configured_interval() {
+        let now = Instant::now();
+        let mut scheduler =
+            PeriodicBalloonStatisticsScheduler::new(now, Some(Duration::from_secs(3)));
+
+        assert_eq!(
+            scheduler.poll_timeout_ms(now, Some(Duration::from_secs(3))),
+            Some(3000)
+        );
+        assert!(!scheduler.is_due(now, Some(Duration::from_secs(3))));
+        assert_eq!(
+            scheduler.poll_timeout_ms(
+                now.checked_add(Duration::from_secs(3))
+                    .expect("deadline should advance"),
+                Some(Duration::from_secs(3))
+            ),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn balloon_scheduler_resets_when_interval_changes() {
+        let now = Instant::now();
+        let mut scheduler =
+            PeriodicBalloonStatisticsScheduler::new(now, Some(Duration::from_secs(60)));
+        let later = now
+            .checked_add(Duration::from_secs(10))
+            .expect("later instant should build");
+
+        assert_eq!(
+            scheduler.poll_timeout_ms(later, Some(Duration::from_secs(30))),
+            Some(30_000)
+        );
+    }
+
+    #[test]
+    fn balloon_scheduler_disables_after_interval_is_removed() {
+        let now = Instant::now();
+        let mut scheduler =
+            PeriodicBalloonStatisticsScheduler::new(now, Some(Duration::from_secs(1)));
+
+        assert_eq!(scheduler.poll_timeout_ms(now, None), None);
+        assert!(!scheduler.is_due(now, None));
+    }
+
+    #[test]
+    fn min_poll_timeout_prefers_shorter_enabled_timeout() {
+        assert_eq!(min_poll_timeout_ms(Some(60_000), Some(1_000)), Some(1_000));
+        assert_eq!(min_poll_timeout_ms(Some(60_000), None), Some(60_000));
+        assert_eq!(min_poll_timeout_ms(None, Some(1_000)), Some(1_000));
+        assert_eq!(min_poll_timeout_ms(None, None), None);
     }
 }

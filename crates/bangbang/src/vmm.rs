@@ -7,6 +7,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use bangbang_hvf::{
     HvfArm64BootBalloonDeviceConfig, HvfArm64BootEntropyDeviceConfig, HvfArm64BootRunLoopControl,
@@ -135,6 +136,10 @@ pub(crate) trait ProcessSessionDiagnostics {
         &mut self,
         _input: BalloonStatsUpdateInput,
     ) -> Result<(), BalloonUpdateError> {
+        Err(BalloonUpdateError::ActiveSessionUnavailable)
+    }
+
+    fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
         Err(BalloonUpdateError::ActiveSessionUnavailable)
     }
 
@@ -776,6 +781,14 @@ pub(crate) trait VmmRequestHandler {
         Ok(false)
     }
 
+    fn balloon_statistics_update_interval(&self) -> Option<Duration> {
+        None
+    }
+
+    fn handle_periodic_balloon_statistics_update(&mut self) -> Result<bool, VmmActionError> {
+        Ok(false)
+    }
+
     fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
         None
     }
@@ -1201,6 +1214,37 @@ where
             .flush_periodic_metrics_with_diagnostics(&diagnostics)
     }
 
+    fn balloon_statistics_update_interval(&self) -> Option<Duration> {
+        if self.controller.instance_info().state != bangbang_runtime::InstanceState::Running {
+            return None;
+        }
+
+        let interval_s = self.controller.balloon_config()?.stats_polling_interval_s();
+        if interval_s == 0 {
+            return None;
+        }
+
+        Some(Duration::from_secs(u64::from(interval_s)))
+    }
+
+    fn trigger_periodic_balloon_statistics_update(&mut self) -> Result<bool, VmmActionError> {
+        if self.balloon_statistics_update_interval().is_none() {
+            return Ok(false);
+        }
+
+        let Some(session) = self.started_session.as_mut() else {
+            return Err(VmmActionError::BalloonUpdate(
+                BalloonUpdateError::ActiveSessionUnavailable,
+            ));
+        };
+
+        session
+            .trigger_balloon_statistics_update()
+            .map_err(VmmActionError::BalloonUpdate)?;
+
+        Ok(true)
+    }
+
     fn metrics_diagnostics(&self) -> MetricsDiagnostics {
         let session_diagnostics = self
             .started_session
@@ -1248,6 +1292,14 @@ where
 
     fn handle_periodic_metrics_flush(&mut self) -> Result<bool, VmmActionError> {
         ProcessVmm::flush_periodic_metrics(self)
+    }
+
+    fn balloon_statistics_update_interval(&self) -> Option<Duration> {
+        ProcessVmm::balloon_statistics_update_interval(self)
+    }
+
+    fn handle_periodic_balloon_statistics_update(&mut self) -> Result<bool, VmmActionError> {
+        ProcessVmm::trigger_periodic_balloon_statistics_update(self)
     }
 
     fn handle_get_request(&mut self, request: GetApiRequest) -> Result<VmmData, VmmActionError> {
@@ -1816,6 +1868,10 @@ pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
         None
     }
 
+    fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
+        Err(BalloonUpdateError::ActiveSessionUnavailable)
+    }
+
     fn run_loop_with_network_packet_io<P>(
         &mut self,
         stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
@@ -1849,6 +1905,10 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
             .balloon_device
             .clone()
             .map(|device| BootRunLoopBalloonDeviceUpdater::new(device, self.mmio_dispatcher()))
+    }
+
+    fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
+        OwnedHvfArm64BootSession::trigger_balloon_statistics_update_and_signal_interrupts(self)
     }
 
     fn run_loop_with_network_packet_io<P>(
@@ -1917,6 +1977,10 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
         None
     }
 
+    fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
+        Err(BalloonUpdateError::ActiveSessionUnavailable)
+    }
+
     fn run_loop(
         &mut self,
         stop_token: &<Self::Control as BootRunLoopControl>::StopToken,
@@ -1947,6 +2011,10 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
             .balloon_device
             .clone()
             .map(|device| BootRunLoopBalloonDeviceUpdater::new(device, self.mmio_dispatcher()))
+    }
+
+    fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
+        OwnedHvfArm64BootSession::trigger_balloon_statistics_update_and_signal_interrupts(self)
     }
 
     fn run_loop(
@@ -1985,6 +2053,10 @@ where
 
     fn balloon_device_updater(&self) -> Option<BootRunLoopBalloonDeviceUpdater> {
         self.session.balloon_device_updater()
+    }
+
+    fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
+        self.session.trigger_balloon_statistics_update()
     }
 
     fn run_loop(
@@ -2702,6 +2774,19 @@ where
             .map_err(balloon_update_error_from_boot_run_loop_command)
     }
 
+    fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
+        if self.balloon_device_updater.is_none() {
+            return Err(BalloonUpdateError::ActiveSessionUnavailable);
+        }
+
+        if !matches!(self.status(), BootRunLoopWorkerStatus::Running) {
+            return Err(BalloonUpdateError::ActiveSessionUnavailable);
+        }
+
+        self.run_command(BootRunLoopSession::trigger_balloon_statistics_update)
+            .map_err(balloon_update_error_from_boot_run_loop_command)
+    }
+
     fn balloon_stats(&mut self, config: BalloonConfig) -> Result<BalloonStats, BalloonStatsError> {
         let Some(updater) = self.balloon_device_updater.as_ref() else {
             return Err(BalloonStatsError::ActiveSessionUnavailable);
@@ -2851,6 +2936,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
+    use std::time::Duration;
 
     use bangbang_runtime::balloon::{
         BalloonConfig, BalloonConfigInput, BalloonHintingCommandError, BalloonHintingStartInput,
@@ -3029,6 +3115,8 @@ mod tests {
         balloon_stats_update_count: usize,
         last_balloon_stats_update_interval_s: Option<u16>,
         balloon_stats_update_result: Option<BalloonUpdateError>,
+        balloon_stats_trigger_count: usize,
+        balloon_stats_trigger_result: Option<BalloonUpdateError>,
         balloon_stats_count: usize,
         last_balloon_stats_mib: Option<u32>,
         balloon_stats_result: Option<Result<BalloonStats, BalloonStatsError>>,
@@ -3059,6 +3147,8 @@ mod tests {
                 balloon_stats_update_count: 0,
                 last_balloon_stats_update_interval_s: None,
                 balloon_stats_update_result: None,
+                balloon_stats_trigger_count: 0,
+                balloon_stats_trigger_result: None,
                 balloon_stats_count: 0,
                 last_balloon_stats_mib: None,
                 balloon_stats_result: None,
@@ -3099,6 +3189,12 @@ mod tests {
         fn with_balloon_stats_update_result(id: u64, result: BalloonUpdateError) -> Self {
             let mut session = Self::new(id);
             session.balloon_stats_update_result = Some(result);
+            session
+        }
+
+        fn with_balloon_stats_trigger_result(id: u64, result: BalloonUpdateError) -> Self {
+            let mut session = Self::new(id);
+            session.balloon_stats_trigger_result = Some(result);
             session
         }
 
@@ -3184,6 +3280,14 @@ mod tests {
             self.balloon_stats_update_count += 1;
             self.last_balloon_stats_update_interval_s = Some(input.stats_polling_interval_s());
             match self.balloon_stats_update_result.clone() {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        }
+
+        fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
+            self.balloon_stats_trigger_count += 1;
+            match self.balloon_stats_trigger_result.clone() {
                 Some(err) => Err(err),
                 None => Ok(()),
             }
@@ -5936,6 +6040,120 @@ mod tests {
             bangbang_runtime::VmmData::BalloonConfiguration(BalloonConfig::from(
                 BalloonConfigInput::new(64, false).with_stats_polling_interval_s(60)
             ))
+        );
+    }
+
+    #[test]
+    fn periodic_balloon_statistics_interval_requires_running_enabled_balloon() {
+        let mut vmm = configured_vmm(FakeStarter::success(20));
+
+        assert_eq!(vmm.balloon_statistics_update_interval(), None);
+        vmm.handle_action(VmmAction::PutBalloon(BalloonConfigInput::new(64, false)))
+            .expect("disabled statistics balloon should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+        assert_eq!(vmm.balloon_statistics_update_interval(), None);
+
+        vmm.handle_action(VmmAction::PatchBalloonStats(balloon_stats_update_input(1)))
+            .expect_err("statistics cannot be enabled after activation");
+
+        let mut enabled = configured_vmm(FakeStarter::success(21));
+        enabled
+            .handle_action(VmmAction::PutBalloon(
+                BalloonConfigInput::new(64, false).with_stats_polling_interval_s(60),
+            ))
+            .expect("enabled statistics balloon should configure");
+        assert_eq!(enabled.balloon_statistics_update_interval(), None);
+        enabled
+            .handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+        assert_eq!(
+            enabled.balloon_statistics_update_interval(),
+            Some(Duration::from_secs(60))
+        );
+        enabled
+            .handle_action(VmmAction::PatchBalloonStats(balloon_stats_update_input(30)))
+            .expect("runtime statistics interval update should succeed");
+        assert_eq!(
+            enabled.balloon_statistics_update_interval(),
+            Some(Duration::from_secs(30))
+        );
+        enabled
+            .handle_action(VmmAction::Pause)
+            .expect("pause should succeed");
+        assert_eq!(enabled.balloon_statistics_update_interval(), None);
+        enabled
+            .handle_action(VmmAction::Resume)
+            .expect("resume should succeed");
+        assert_eq!(
+            enabled.balloon_statistics_update_interval(),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn periodic_balloon_statistics_update_triggers_active_session() {
+        let mut vmm = configured_vmm(FakeStarter::success(22));
+        vmm.handle_action(VmmAction::PutBalloon(
+            BalloonConfigInput::new(64, false).with_stats_polling_interval_s(60),
+        ))
+        .expect("enabled statistics balloon should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        assert_eq!(vmm.trigger_periodic_balloon_statistics_update(), Ok(true));
+        assert_eq!(
+            vmm.started_session
+                .as_ref()
+                .expect("started session should remain available")
+                .balloon_stats_trigger_count,
+            1
+        );
+    }
+
+    #[test]
+    fn periodic_balloon_statistics_update_is_noop_when_disabled() {
+        let mut vmm = configured_vmm(FakeStarter::success(23));
+        vmm.handle_action(VmmAction::PutBalloon(BalloonConfigInput::new(64, false)))
+            .expect("disabled statistics balloon should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        assert_eq!(vmm.trigger_periodic_balloon_statistics_update(), Ok(false));
+        assert_eq!(
+            vmm.started_session
+                .as_ref()
+                .expect("started session should remain available")
+                .balloon_stats_trigger_count,
+            0
+        );
+    }
+
+    #[test]
+    fn periodic_balloon_statistics_update_propagates_session_failure() {
+        let expected_error = BalloonUpdateError::ActiveSessionCommand {
+            message: "stats trigger failed".to_string(),
+        };
+        let mut vmm = configured_vmm(FakeStarter::success_with_session(
+            FakeSession::with_balloon_stats_trigger_result(24, expected_error.clone()),
+        ));
+        vmm.handle_action(VmmAction::PutBalloon(
+            BalloonConfigInput::new(64, false).with_stats_polling_interval_s(60),
+        ))
+        .expect("enabled statistics balloon should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        assert_eq!(
+            vmm.trigger_periodic_balloon_statistics_update(),
+            Err(VmmActionError::BalloonUpdate(expected_error))
+        );
+        assert_eq!(
+            vmm.started_session
+                .as_ref()
+                .expect("started session should remain available")
+                .balloon_stats_trigger_count,
+            1
         );
     }
 
