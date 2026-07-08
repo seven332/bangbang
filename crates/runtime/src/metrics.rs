@@ -11,6 +11,11 @@ use crate::balloon::VirtioBalloonDeviceNotificationDispatch;
 use crate::block::{
     VirtioBlockDeviceNotificationDispatch, VirtioBlockLatencyAggregate, VirtioBlockQueueDispatch,
 };
+use crate::network::{
+    VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_QUEUE_INDEX, VirtioNetworkDeviceNotificationDispatch,
+    VirtioNetworkDeviceNotificationError, VirtioNetworkRxQueueDispatch,
+    VirtioNetworkTxQueueDispatch,
+};
 use crate::serial::SerialOutputMetrics;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1431,6 +1436,497 @@ impl SharedBlockDeviceMetricsRegistry {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NetworkInterfaceMetrics {
+    event_fails: u64,
+    rx_queue_event_count: u64,
+    rx_bytes_count: u64,
+    rx_packets_count: u64,
+    rx_fails: u64,
+    rx_count: u64,
+    tx_bytes_count: u64,
+    tx_malformed_frames: u64,
+    tx_fails: u64,
+    tx_count: u64,
+    tx_packets_count: u64,
+    tx_queue_event_count: u64,
+}
+
+impl NetworkInterfaceMetrics {
+    pub const fn is_empty(self) -> bool {
+        self.event_fails == 0
+            && self.rx_queue_event_count == 0
+            && self.rx_bytes_count == 0
+            && self.rx_packets_count == 0
+            && self.rx_fails == 0
+            && self.rx_count == 0
+            && self.tx_bytes_count == 0
+            && self.tx_malformed_frames == 0
+            && self.tx_fails == 0
+            && self.tx_count == 0
+            && self.tx_packets_count == 0
+            && self.tx_queue_event_count == 0
+    }
+
+    pub const fn event_fails(self) -> u64 {
+        self.event_fails
+    }
+
+    pub const fn rx_queue_event_count(self) -> u64 {
+        self.rx_queue_event_count
+    }
+
+    pub const fn rx_bytes_count(self) -> u64 {
+        self.rx_bytes_count
+    }
+
+    pub const fn rx_packets_count(self) -> u64 {
+        self.rx_packets_count
+    }
+
+    pub const fn rx_fails(self) -> u64 {
+        self.rx_fails
+    }
+
+    pub const fn rx_count(self) -> u64 {
+        self.rx_count
+    }
+
+    pub const fn tx_bytes_count(self) -> u64 {
+        self.tx_bytes_count
+    }
+
+    pub const fn tx_malformed_frames(self) -> u64 {
+        self.tx_malformed_frames
+    }
+
+    pub const fn tx_fails(self) -> u64 {
+        self.tx_fails
+    }
+
+    pub const fn tx_count(self) -> u64 {
+        self.tx_count
+    }
+
+    pub const fn tx_packets_count(self) -> u64 {
+        self.tx_packets_count
+    }
+
+    pub const fn tx_queue_event_count(self) -> u64 {
+        self.tx_queue_event_count
+    }
+
+    pub const fn with_event_fails(mut self, event_fails: u64) -> Self {
+        self.event_fails = event_fails;
+        self
+    }
+
+    pub const fn with_rx_queue_event_count(mut self, rx_queue_event_count: u64) -> Self {
+        self.rx_queue_event_count = rx_queue_event_count;
+        self
+    }
+
+    pub const fn with_rx_bytes_count(mut self, rx_bytes_count: u64) -> Self {
+        self.rx_bytes_count = rx_bytes_count;
+        self
+    }
+
+    pub const fn with_rx_packets_count(mut self, rx_packets_count: u64) -> Self {
+        self.rx_packets_count = rx_packets_count;
+        self
+    }
+
+    pub const fn with_rx_fails(mut self, rx_fails: u64) -> Self {
+        self.rx_fails = rx_fails;
+        self
+    }
+
+    pub const fn with_rx_count(mut self, rx_count: u64) -> Self {
+        self.rx_count = rx_count;
+        self
+    }
+
+    pub const fn with_tx_bytes_count(mut self, tx_bytes_count: u64) -> Self {
+        self.tx_bytes_count = tx_bytes_count;
+        self
+    }
+
+    pub const fn with_tx_malformed_frames(mut self, tx_malformed_frames: u64) -> Self {
+        self.tx_malformed_frames = tx_malformed_frames;
+        self
+    }
+
+    pub const fn with_tx_fails(mut self, tx_fails: u64) -> Self {
+        self.tx_fails = tx_fails;
+        self
+    }
+
+    pub const fn with_tx_count(mut self, tx_count: u64) -> Self {
+        self.tx_count = tx_count;
+        self
+    }
+
+    pub const fn with_tx_packets_count(mut self, tx_packets_count: u64) -> Self {
+        self.tx_packets_count = tx_packets_count;
+        self
+    }
+
+    pub const fn with_tx_queue_event_count(mut self, tx_queue_event_count: u64) -> Self {
+        self.tx_queue_event_count = tx_queue_event_count;
+        self
+    }
+
+    const fn merged_with(self, other: Self) -> Self {
+        Self {
+            event_fails: self.event_fails.saturating_add(other.event_fails),
+            rx_queue_event_count: self
+                .rx_queue_event_count
+                .saturating_add(other.rx_queue_event_count),
+            rx_bytes_count: self.rx_bytes_count.saturating_add(other.rx_bytes_count),
+            rx_packets_count: self.rx_packets_count.saturating_add(other.rx_packets_count),
+            rx_fails: self.rx_fails.saturating_add(other.rx_fails),
+            rx_count: self.rx_count.saturating_add(other.rx_count),
+            tx_bytes_count: self.tx_bytes_count.saturating_add(other.tx_bytes_count),
+            tx_malformed_frames: self
+                .tx_malformed_frames
+                .saturating_add(other.tx_malformed_frames),
+            tx_fails: self.tx_fails.saturating_add(other.tx_fails),
+            tx_count: self.tx_count.saturating_add(other.tx_count),
+            tx_packets_count: self.tx_packets_count.saturating_add(other.tx_packets_count),
+            tx_queue_event_count: self
+                .tx_queue_event_count
+                .saturating_add(other.tx_queue_event_count),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkInterfaceMetricsByInterface {
+    metrics: BTreeMap<String, NetworkInterfaceMetrics>,
+}
+
+impl NetworkInterfaceMetricsByInterface {
+    pub fn new() -> Self {
+        Self {
+            metrics: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_interface_metrics(
+        mut self,
+        iface_id: impl Into<String>,
+        metrics: NetworkInterfaceMetrics,
+    ) -> Self {
+        self.insert_interface_metrics(iface_id, metrics);
+        self
+    }
+
+    pub fn insert_interface_metrics(
+        &mut self,
+        iface_id: impl Into<String>,
+        metrics: NetworkInterfaceMetrics,
+    ) {
+        self.metrics
+            .entry(iface_id.into())
+            .and_modify(|existing| *existing = existing.merged_with(metrics))
+            .or_insert(metrics);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.metrics
+            .values()
+            .all(|metrics| NetworkInterfaceMetrics::is_empty(*metrics))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, NetworkInterfaceMetrics)> {
+        self.metrics
+            .iter()
+            .map(|(iface_id, metrics)| (iface_id.as_str(), *metrics))
+    }
+
+    fn merged_with(mut self, other: Self) -> Self {
+        for (iface_id, metrics) in other.metrics {
+            self.insert_interface_metrics(iface_id, metrics);
+        }
+        self
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SharedNetworkInterfaceMetrics {
+    inner: Arc<SharedNetworkInterfaceMetricsInner>,
+}
+
+impl SharedNetworkInterfaceMetrics {
+    pub fn record_notification_dispatch(&self, dispatch: &VirtioNetworkDeviceNotificationDispatch) {
+        let rx_queue_events = dispatch
+            .drained_notifications()
+            .iter()
+            .copied()
+            .filter(|queue_index| *queue_index == VIRTIO_NET_RX_QUEUE_INDEX)
+            .count();
+        let tx_queue_events = dispatch
+            .drained_notifications()
+            .iter()
+            .copied()
+            .filter(|queue_index| *queue_index == VIRTIO_NET_TX_QUEUE_INDEX)
+            .count();
+        self.record_rx_queue_events(usize_to_u64_saturating(rx_queue_events));
+        self.record_tx_queue_events(usize_to_u64_saturating(tx_queue_events));
+        if let Some(dispatch) = dispatch.rx_queue_dispatch() {
+            self.record_rx_queue_dispatch(dispatch);
+        }
+        if let Some(dispatch) = dispatch.tx_queue_dispatch() {
+            self.record_tx_queue_dispatch(dispatch);
+        }
+        if let Some(dispatch) = dispatch.post_tx_rx_queue_dispatch() {
+            self.record_rx_queue_dispatch(dispatch);
+        }
+    }
+
+    pub fn record_rx_queue_dispatch(&self, dispatch: &VirtioNetworkRxQueueDispatch) {
+        let delivered_packets = usize_to_u64_saturating(dispatch.delivered_packets());
+        self.record_rx_packets(
+            delivered_packets,
+            dispatch.deliveries().iter().fold(0, |sum, delivery| {
+                sum.saturating_add(u64::from(delivery.bytes_written_to_guest()))
+            }),
+        );
+        self.record_rx_failures(usize_to_u64_saturating(
+            dispatch
+                .buffer_parse_failures()
+                .saturating_add(dispatch.buffer_too_small_failures())
+                .saturating_add(dispatch.source_failures()),
+        ));
+    }
+
+    pub fn record_tx_queue_dispatch(&self, dispatch: &VirtioNetworkTxQueueDispatch) {
+        let successful_frames = usize_to_u64_saturating(dispatch.sink_successful_frames());
+        self.record_tx_packets(successful_frames, dispatch.sink_successful_bytes());
+        self.record_tx_malformed_frames(usize_to_u64_saturating(dispatch.parse_failures()));
+        self.record_tx_failures(usize_to_u64_saturating(dispatch.sink_failures()));
+    }
+
+    pub fn record_event_failure(&self) {
+        record_atomic_metric(&self.inner.event_fails, 1);
+    }
+
+    pub fn record_rx_queue_events(&self, count: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.rx_queue_event_count, count);
+        }
+    }
+
+    pub fn record_tx_queue_events(&self, count: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.tx_queue_event_count, count);
+        }
+    }
+
+    pub fn snapshot(&self) -> NetworkInterfaceMetrics {
+        NetworkInterfaceMetrics {
+            event_fails: self.inner.event_fails.load(Ordering::Relaxed),
+            rx_queue_event_count: self.inner.rx_queue_event_count.load(Ordering::Relaxed),
+            rx_bytes_count: self.inner.rx_bytes_count.load(Ordering::Relaxed),
+            rx_packets_count: self.inner.rx_packets_count.load(Ordering::Relaxed),
+            rx_fails: self.inner.rx_fails.load(Ordering::Relaxed),
+            rx_count: self.inner.rx_count.load(Ordering::Relaxed),
+            tx_bytes_count: self.inner.tx_bytes_count.load(Ordering::Relaxed),
+            tx_malformed_frames: self.inner.tx_malformed_frames.load(Ordering::Relaxed),
+            tx_fails: self.inner.tx_fails.load(Ordering::Relaxed),
+            tx_count: self.inner.tx_count.load(Ordering::Relaxed),
+            tx_packets_count: self.inner.tx_packets_count.load(Ordering::Relaxed),
+            tx_queue_event_count: self.inner.tx_queue_event_count.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_rx_packets(&self, count: u64, bytes: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.rx_count, count);
+            record_atomic_metric(&self.inner.rx_packets_count, count);
+        }
+        if bytes != 0 {
+            record_atomic_metric(&self.inner.rx_bytes_count, bytes);
+        }
+    }
+
+    fn record_rx_failures(&self, count: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.rx_fails, count);
+        }
+    }
+
+    fn record_tx_packets(&self, count: u64, bytes: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.tx_count, count);
+            record_atomic_metric(&self.inner.tx_packets_count, count);
+        }
+        if bytes != 0 {
+            record_atomic_metric(&self.inner.tx_bytes_count, bytes);
+        }
+    }
+
+    fn record_tx_malformed_frames(&self, count: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.tx_malformed_frames, count);
+        }
+    }
+
+    fn record_tx_failures(&self, count: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.tx_fails, count);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SharedNetworkInterfaceMetricsInner {
+    event_fails: AtomicU64,
+    rx_queue_event_count: AtomicU64,
+    rx_bytes_count: AtomicU64,
+    rx_packets_count: AtomicU64,
+    rx_fails: AtomicU64,
+    rx_count: AtomicU64,
+    tx_bytes_count: AtomicU64,
+    tx_malformed_frames: AtomicU64,
+    tx_fails: AtomicU64,
+    tx_count: AtomicU64,
+    tx_packets_count: AtomicU64,
+    tx_queue_event_count: AtomicU64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SharedNetworkInterfaceMetricsRegistry {
+    aggregate: SharedNetworkInterfaceMetrics,
+    per_interface: Arc<BTreeMap<String, SharedNetworkInterfaceMetrics>>,
+}
+
+impl SharedNetworkInterfaceMetricsRegistry {
+    pub fn from_interface_ids<'a>(iface_ids: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut per_interface = BTreeMap::new();
+        for iface_id in iface_ids {
+            per_interface
+                .entry(iface_id.to_string())
+                .or_insert_with(SharedNetworkInterfaceMetrics::default);
+        }
+
+        Self {
+            aggregate: SharedNetworkInterfaceMetrics::default(),
+            per_interface: Arc::new(per_interface),
+        }
+    }
+
+    pub fn aggregate(&self) -> SharedNetworkInterfaceMetrics {
+        self.aggregate.clone()
+    }
+
+    pub fn per_interface(&self, iface_id: &str) -> Option<SharedNetworkInterfaceMetrics> {
+        self.per_interface.get(iface_id).cloned()
+    }
+
+    pub fn record_notification_dispatch_for_interface(
+        &self,
+        iface_id: &str,
+        dispatch: &VirtioNetworkDeviceNotificationDispatch,
+    ) {
+        self.aggregate.record_notification_dispatch(dispatch);
+        if let Some(metrics) = self.per_interface(iface_id) {
+            metrics.record_notification_dispatch(dispatch);
+        }
+    }
+
+    pub fn record_notification_error_for_interface(
+        &self,
+        iface_id: &str,
+        source: &VirtioNetworkDeviceNotificationError,
+    ) {
+        let rx_queue_events = source
+            .drained_notifications()
+            .iter()
+            .copied()
+            .filter(|queue_index| *queue_index == VIRTIO_NET_RX_QUEUE_INDEX)
+            .count();
+        let tx_queue_events = source
+            .drained_notifications()
+            .iter()
+            .copied()
+            .filter(|queue_index| *queue_index == VIRTIO_NET_TX_QUEUE_INDEX)
+            .count();
+        self.record_queue_events_for_interface(
+            iface_id,
+            usize_to_u64_saturating(rx_queue_events),
+            usize_to_u64_saturating(tx_queue_events),
+        );
+        self.record_event_failure_for_interface(iface_id);
+        if let Some(dispatch) = source.completed_initial_rx_dispatch() {
+            self.record_rx_queue_dispatch_for_interface(iface_id, dispatch);
+        }
+        if let Some(dispatch) = source.completed_tx_dispatch() {
+            self.record_tx_queue_dispatch_for_interface(iface_id, dispatch);
+        }
+        if let Some(dispatch) = source.completed_rx_dispatch() {
+            self.record_rx_queue_dispatch_for_interface(iface_id, dispatch);
+        }
+    }
+
+    pub fn record_event_failure(&self) {
+        self.aggregate.record_event_failure();
+    }
+
+    pub fn record_event_failure_for_interface(&self, iface_id: &str) {
+        self.aggregate.record_event_failure();
+        if let Some(metrics) = self.per_interface(iface_id) {
+            metrics.record_event_failure();
+        }
+    }
+
+    pub fn record_rx_queue_dispatch_for_interface(
+        &self,
+        iface_id: &str,
+        dispatch: &VirtioNetworkRxQueueDispatch,
+    ) {
+        self.aggregate.record_rx_queue_dispatch(dispatch);
+        if let Some(metrics) = self.per_interface(iface_id) {
+            metrics.record_rx_queue_dispatch(dispatch);
+        }
+    }
+
+    pub fn record_tx_queue_dispatch_for_interface(
+        &self,
+        iface_id: &str,
+        dispatch: &VirtioNetworkTxQueueDispatch,
+    ) {
+        self.aggregate.record_tx_queue_dispatch(dispatch);
+        if let Some(metrics) = self.per_interface(iface_id) {
+            metrics.record_tx_queue_dispatch(dispatch);
+        }
+    }
+
+    pub fn record_queue_events_for_interface(&self, iface_id: &str, rx_count: u64, tx_count: u64) {
+        self.aggregate.record_rx_queue_events(rx_count);
+        self.aggregate.record_tx_queue_events(tx_count);
+        if let Some(metrics) = self.per_interface(iface_id) {
+            metrics.record_rx_queue_events(rx_count);
+            metrics.record_tx_queue_events(tx_count);
+        }
+    }
+
+    pub fn aggregate_snapshot(&self) -> NetworkInterfaceMetrics {
+        self.aggregate.snapshot()
+    }
+
+    pub fn per_interface_snapshot(&self) -> NetworkInterfaceMetricsByInterface {
+        let mut snapshot = NetworkInterfaceMetricsByInterface::new();
+        for (iface_id, metrics) in self.per_interface.iter() {
+            let metrics = metrics.snapshot();
+            if !metrics.is_empty() {
+                snapshot.insert_interface_metrics(iface_id.clone(), metrics);
+            }
+        }
+        snapshot
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BalloonDeviceMetrics {
     activate_fails: u64,
     inflate_count: u64,
@@ -1664,6 +2160,8 @@ fn latency_aggregate_snapshot(
 pub struct MetricsDiagnostics {
     block_device_metrics: Option<BlockDeviceMetrics>,
     block_device_metrics_by_drive: Option<BlockDeviceMetricsByDrive>,
+    network_interface_metrics: Option<NetworkInterfaceMetrics>,
+    network_interface_metrics_by_interface: Option<NetworkInterfaceMetricsByInterface>,
     balloon_device_metrics: Option<BalloonDeviceMetrics>,
     boot_run_loop_status: Option<BootRunLoopMetricStatus>,
     start_time_us: Option<u64>,
@@ -1677,6 +2175,8 @@ impl MetricsDiagnostics {
         Self {
             block_device_metrics: None,
             block_device_metrics_by_drive: None,
+            network_interface_metrics: None,
+            network_interface_metrics_by_interface: None,
             balloon_device_metrics: None,
             boot_run_loop_status: None,
             start_time_us: None,
@@ -1696,6 +2196,22 @@ impl MetricsDiagnostics {
         block_device_metrics_by_drive: BlockDeviceMetricsByDrive,
     ) -> Self {
         self.block_device_metrics_by_drive = Some(block_device_metrics_by_drive);
+        self
+    }
+
+    pub fn with_network_interface_metrics(
+        mut self,
+        network_interface_metrics: NetworkInterfaceMetrics,
+    ) -> Self {
+        self.network_interface_metrics = Some(network_interface_metrics);
+        self
+    }
+
+    pub fn with_network_interface_metrics_by_interface(
+        mut self,
+        network_interface_metrics_by_interface: NetworkInterfaceMetricsByInterface,
+    ) -> Self {
+        self.network_interface_metrics_by_interface = Some(network_interface_metrics_by_interface);
         self
     }
 
@@ -1748,6 +2264,19 @@ impl MetricsDiagnostics {
                 None => metrics,
             });
         }
+        if let Some(metrics) = other.network_interface_metrics {
+            self.network_interface_metrics = Some(match self.network_interface_metrics {
+                Some(existing) => existing.merged_with(metrics),
+                None => metrics,
+            });
+        }
+        if let Some(metrics) = other.network_interface_metrics_by_interface {
+            self.network_interface_metrics_by_interface =
+                Some(match self.network_interface_metrics_by_interface {
+                    Some(existing) => existing.merged_with(metrics),
+                    None => metrics,
+                });
+        }
         if let Some(metrics) = other.balloon_device_metrics {
             self.balloon_device_metrics = Some(match self.balloon_device_metrics {
                 Some(existing) => existing.merged_with(metrics),
@@ -1779,6 +2308,16 @@ impl MetricsDiagnostics {
 
     pub fn block_device_metrics_by_drive(&self) -> Option<&BlockDeviceMetricsByDrive> {
         self.block_device_metrics_by_drive.as_ref()
+    }
+
+    pub fn network_interface_metrics(&self) -> Option<NetworkInterfaceMetrics> {
+        self.network_interface_metrics
+    }
+
+    pub fn network_interface_metrics_by_interface(
+        &self,
+    ) -> Option<&NetworkInterfaceMetricsByInterface> {
+        self.network_interface_metrics_by_interface.as_ref()
     }
 
     pub fn balloon_device_metrics(&self) -> Option<BalloonDeviceMetrics> {
@@ -1918,6 +2457,61 @@ fn block_device_metrics_json_object(
     block
 }
 
+fn network_interface_metrics_json_object(
+    metrics: NetworkInterfaceMetrics,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut net = serde_json::Map::new();
+    net.insert(
+        "event_fails".to_string(),
+        serde_json::Value::Number(metrics.event_fails().into()),
+    );
+    net.insert(
+        "rx_bytes_count".to_string(),
+        serde_json::Value::Number(metrics.rx_bytes_count().into()),
+    );
+    net.insert(
+        "rx_count".to_string(),
+        serde_json::Value::Number(metrics.rx_count().into()),
+    );
+    net.insert(
+        "rx_fails".to_string(),
+        serde_json::Value::Number(metrics.rx_fails().into()),
+    );
+    net.insert(
+        "rx_packets_count".to_string(),
+        serde_json::Value::Number(metrics.rx_packets_count().into()),
+    );
+    net.insert(
+        "rx_queue_event_count".to_string(),
+        serde_json::Value::Number(metrics.rx_queue_event_count().into()),
+    );
+    net.insert(
+        "tx_bytes_count".to_string(),
+        serde_json::Value::Number(metrics.tx_bytes_count().into()),
+    );
+    net.insert(
+        "tx_count".to_string(),
+        serde_json::Value::Number(metrics.tx_count().into()),
+    );
+    net.insert(
+        "tx_fails".to_string(),
+        serde_json::Value::Number(metrics.tx_fails().into()),
+    );
+    net.insert(
+        "tx_malformed_frames".to_string(),
+        serde_json::Value::Number(metrics.tx_malformed_frames().into()),
+    );
+    net.insert(
+        "tx_packets_count".to_string(),
+        serde_json::Value::Number(metrics.tx_packets_count().into()),
+    );
+    net.insert(
+        "tx_queue_event_count".to_string(),
+        serde_json::Value::Number(metrics.tx_queue_event_count().into()),
+    );
+    net
+}
+
 fn latency_aggregate_metrics_json_object(
     metrics: VirtioBlockLatencyAggregate,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -2030,6 +2624,28 @@ impl MetricsSink {
             root.insert(
                 "block".to_string(),
                 serde_json::Value::Object(block_device_metrics_json_object(block_device_metrics)),
+            );
+        }
+        if let Some(network_interface_metrics_by_interface) =
+            diagnostics.network_interface_metrics_by_interface()
+        {
+            for (iface_id, metrics) in network_interface_metrics_by_interface.iter() {
+                if !metrics.is_empty() {
+                    root.insert(
+                        format!("net_{iface_id}"),
+                        serde_json::Value::Object(network_interface_metrics_json_object(metrics)),
+                    );
+                }
+            }
+        }
+        if let Some(network_interface_metrics) = diagnostics.network_interface_metrics()
+            && !network_interface_metrics.is_empty()
+        {
+            root.insert(
+                "net".to_string(),
+                serde_json::Value::Object(network_interface_metrics_json_object(
+                    network_interface_metrics,
+                )),
             );
         }
         if let Some(balloon_device_metrics) = diagnostics.balloon_device_metrics()
@@ -2324,8 +2940,10 @@ mod tests {
     use super::{
         BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive,
         BootRunLoopMetricStatus, MetricsConfigError, MetricsConfigInput, MetricsDiagnostics,
-        MetricsFlushError, MetricsOutput, MetricsState, SharedBalloonDeviceMetrics,
-        SharedBlockDeviceMetrics, SharedBlockDeviceMetricsRegistry,
+        MetricsFlushError, MetricsOutput, MetricsState, NetworkInterfaceMetrics,
+        NetworkInterfaceMetricsByInterface, SharedBalloonDeviceMetrics, SharedBlockDeviceMetrics,
+        SharedBlockDeviceMetricsRegistry, SharedNetworkInterfaceMetrics,
+        SharedNetworkInterfaceMetricsRegistry,
     };
     use crate::block::VirtioBlockLatencyAggregate;
     use crate::serial::SerialOutputMetrics;
@@ -2403,6 +3021,22 @@ mod tests {
             .with_write_count(9)
             .with_read_agg(VirtioBlockLatencyAggregate::new(12, 30, 42, 2))
             .with_write_agg(VirtioBlockLatencyAggregate::new(13, 31, 44, 3))
+    }
+
+    fn network_metrics_with_all_fields() -> NetworkInterfaceMetrics {
+        NetworkInterfaceMetrics::default()
+            .with_event_fails(1)
+            .with_rx_queue_event_count(2)
+            .with_rx_bytes_count(3)
+            .with_rx_packets_count(4)
+            .with_rx_fails(5)
+            .with_rx_count(6)
+            .with_tx_bytes_count(7)
+            .with_tx_malformed_frames(8)
+            .with_tx_fails(9)
+            .with_tx_count(10)
+            .with_tx_packets_count(11)
+            .with_tx_queue_event_count(12)
     }
 
     #[test]
@@ -2822,6 +3456,222 @@ mod tests {
         let merged = base.merged_with(additional);
 
         assert_eq!(merged.block_device_metrics_by_drive(), Some(&expected));
+    }
+
+    #[test]
+    fn writes_network_interface_metrics_when_provided() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let diagnostics = MetricsDiagnostics::new()
+            .with_network_interface_metrics(network_metrics_with_all_fields());
+
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        assert_eq!(
+            output.lines(),
+            [
+                r#"{"net":{"event_fails":1,"rx_bytes_count":3,"rx_count":6,"rx_fails":5,"rx_packets_count":4,"rx_queue_event_count":2,"tx_bytes_count":7,"tx_count":10,"tx_fails":9,"tx_malformed_frames":8,"tx_packets_count":11,"tx_queue_event_count":12},"vmm":{"metrics_flush_count":1}}"#
+            ]
+        );
+    }
+
+    #[test]
+    fn omits_empty_network_interface_metrics() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let diagnostics = MetricsDiagnostics::new()
+            .with_network_interface_metrics(NetworkInterfaceMetrics::default());
+
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        assert_eq!(output.lines(), [r#"{"vmm":{"metrics_flush_count":1}}"#]);
+    }
+
+    #[test]
+    fn writes_network_interface_metrics_by_interface_when_provided() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let eth0_metrics = NetworkInterfaceMetrics::default()
+            .with_rx_queue_event_count(1)
+            .with_rx_bytes_count(128)
+            .with_rx_packets_count(1)
+            .with_rx_count(1);
+        let eth1_metrics = NetworkInterfaceMetrics::default()
+            .with_tx_queue_event_count(1)
+            .with_tx_bytes_count(64)
+            .with_tx_packets_count(1)
+            .with_tx_count(1);
+        let diagnostics = MetricsDiagnostics::new()
+            .with_network_interface_metrics(eth0_metrics.merged_with(eth1_metrics))
+            .with_network_interface_metrics_by_interface(
+                NetworkInterfaceMetricsByInterface::new()
+                    .with_interface_metrics("eth0", eth0_metrics)
+                    .with_interface_metrics("noop", NetworkInterfaceMetrics::default())
+                    .with_interface_metrics("eth1", eth1_metrics),
+            );
+
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        assert_eq!(
+            output.lines(),
+            [
+                r#"{"net":{"event_fails":0,"rx_bytes_count":128,"rx_count":1,"rx_fails":0,"rx_packets_count":1,"rx_queue_event_count":1,"tx_bytes_count":64,"tx_count":1,"tx_fails":0,"tx_malformed_frames":0,"tx_packets_count":1,"tx_queue_event_count":1},"net_eth0":{"event_fails":0,"rx_bytes_count":128,"rx_count":1,"rx_fails":0,"rx_packets_count":1,"rx_queue_event_count":1,"tx_bytes_count":0,"tx_count":0,"tx_fails":0,"tx_malformed_frames":0,"tx_packets_count":0,"tx_queue_event_count":0},"net_eth1":{"event_fails":0,"rx_bytes_count":0,"rx_count":0,"rx_fails":0,"rx_packets_count":0,"rx_queue_event_count":0,"tx_bytes_count":64,"tx_count":1,"tx_fails":0,"tx_malformed_frames":0,"tx_packets_count":1,"tx_queue_event_count":1},"vmm":{"metrics_flush_count":1}}"#
+            ]
+        );
+    }
+
+    #[test]
+    fn shared_network_interface_metrics_snapshot_is_per_instance() {
+        let first = SharedNetworkInterfaceMetrics::default();
+        let second = SharedNetworkInterfaceMetrics::default();
+
+        first.record_rx_queue_events(2);
+        first.record_tx_queue_events(3);
+        first.record_event_failure();
+
+        assert_eq!(
+            first.snapshot(),
+            NetworkInterfaceMetrics::default()
+                .with_event_fails(1)
+                .with_rx_queue_event_count(2)
+                .with_tx_queue_event_count(3)
+        );
+        assert_eq!(second.snapshot(), NetworkInterfaceMetrics::default());
+    }
+
+    #[test]
+    fn shared_network_interface_metrics_registry_snapshot_is_per_instance() {
+        let first = SharedNetworkInterfaceMetricsRegistry::from_interface_ids(["eth0", "eth1"]);
+        let second = SharedNetworkInterfaceMetricsRegistry::from_interface_ids(["eth0"]);
+
+        first.record_queue_events_for_interface("eth0", 2, 3);
+        first.record_event_failure_for_interface("eth0");
+        first.record_event_failure_for_interface("eth1");
+
+        assert_eq!(
+            first.aggregate_snapshot(),
+            NetworkInterfaceMetrics::default()
+                .with_event_fails(2)
+                .with_rx_queue_event_count(2)
+                .with_tx_queue_event_count(3)
+        );
+        assert_eq!(
+            first.per_interface_snapshot(),
+            NetworkInterfaceMetricsByInterface::new()
+                .with_interface_metrics(
+                    "eth0",
+                    NetworkInterfaceMetrics::default()
+                        .with_event_fails(1)
+                        .with_rx_queue_event_count(2)
+                        .with_tx_queue_event_count(3),
+                )
+                .with_interface_metrics(
+                    "eth1",
+                    NetworkInterfaceMetrics::default().with_event_fails(1),
+                )
+        );
+        assert_eq!(
+            second.aggregate_snapshot(),
+            NetworkInterfaceMetrics::default()
+        );
+        assert!(second.per_interface_snapshot().is_empty());
+    }
+
+    #[test]
+    fn network_metric_increment_saturates() {
+        let metrics = SharedNetworkInterfaceMetrics::default();
+        metrics
+            .inner
+            .rx_queue_event_count
+            .store(u64::MAX - 1, Ordering::Relaxed);
+
+        metrics.record_rx_queue_events(3);
+
+        assert_eq!(metrics.snapshot().rx_queue_event_count(), u64::MAX);
+    }
+
+    #[test]
+    fn network_diagnostics_merge_saturates() {
+        let base = MetricsDiagnostics::new().with_network_interface_metrics(
+            NetworkInterfaceMetrics::default()
+                .with_event_fails(u64::MAX - 1)
+                .with_rx_queue_event_count(u64::MAX - 2)
+                .with_rx_bytes_count(u64::MAX - 3)
+                .with_rx_packets_count(u64::MAX - 4)
+                .with_rx_fails(u64::MAX - 5)
+                .with_rx_count(u64::MAX - 6)
+                .with_tx_bytes_count(u64::MAX - 7)
+                .with_tx_malformed_frames(u64::MAX - 8)
+                .with_tx_fails(u64::MAX - 9)
+                .with_tx_count(u64::MAX - 10)
+                .with_tx_packets_count(u64::MAX - 11)
+                .with_tx_queue_event_count(u64::MAX - 12),
+        );
+        let additional = MetricsDiagnostics::new()
+            .with_network_interface_metrics(network_metrics_with_all_fields());
+
+        assert_eq!(
+            base.merged_with(additional).network_interface_metrics(),
+            Some(
+                NetworkInterfaceMetrics::default()
+                    .with_event_fails(u64::MAX)
+                    .with_rx_queue_event_count(u64::MAX)
+                    .with_rx_bytes_count(u64::MAX)
+                    .with_rx_packets_count(u64::MAX)
+                    .with_rx_fails(u64::MAX)
+                    .with_rx_count(u64::MAX)
+                    .with_tx_bytes_count(u64::MAX)
+                    .with_tx_malformed_frames(u64::MAX)
+                    .with_tx_fails(u64::MAX)
+                    .with_tx_count(u64::MAX)
+                    .with_tx_packets_count(u64::MAX)
+                    .with_tx_queue_event_count(u64::MAX)
+            )
+        );
+    }
+
+    #[test]
+    fn network_diagnostics_merge_per_interface_metrics_saturates() {
+        let base = MetricsDiagnostics::new().with_network_interface_metrics_by_interface(
+            NetworkInterfaceMetricsByInterface::new().with_interface_metrics(
+                "eth0",
+                NetworkInterfaceMetrics::default()
+                    .with_event_fails(u64::MAX - 1)
+                    .with_rx_count(u64::MAX - 2),
+            ),
+        );
+        let additional = MetricsDiagnostics::new().with_network_interface_metrics_by_interface(
+            NetworkInterfaceMetricsByInterface::new()
+                .with_interface_metrics("eth0", network_metrics_with_all_fields())
+                .with_interface_metrics(
+                    "eth1",
+                    NetworkInterfaceMetrics::default().with_tx_count(3),
+                ),
+        );
+        let expected = NetworkInterfaceMetricsByInterface::new()
+            .with_interface_metrics(
+                "eth0",
+                NetworkInterfaceMetrics::default()
+                    .with_event_fails(u64::MAX)
+                    .with_rx_queue_event_count(2)
+                    .with_rx_bytes_count(3)
+                    .with_rx_packets_count(4)
+                    .with_rx_fails(5)
+                    .with_rx_count(u64::MAX)
+                    .with_tx_bytes_count(7)
+                    .with_tx_malformed_frames(8)
+                    .with_tx_fails(9)
+                    .with_tx_count(10)
+                    .with_tx_packets_count(11)
+                    .with_tx_queue_event_count(12),
+            )
+            .with_interface_metrics("eth1", NetworkInterfaceMetrics::default().with_tx_count(3));
+        let merged = base.merged_with(additional);
+
+        assert_eq!(
+            merged.network_interface_metrics_by_interface(),
+            Some(&expected)
+        );
     }
 
     #[test]

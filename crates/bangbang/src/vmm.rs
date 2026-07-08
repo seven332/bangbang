@@ -34,7 +34,7 @@ use bangbang_runtime::memory::{GuestAddress, GuestMemory};
 use bangbang_runtime::memory_hotplug::{MemoryHotplugConfigInput, MemoryHotplugSizeUpdateInput};
 use bangbang_runtime::metrics::{
     BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics, SharedBalloonDeviceMetrics,
-    SharedBlockDeviceMetricsRegistry,
+    SharedBlockDeviceMetricsRegistry, SharedNetworkInterfaceMetricsRegistry,
 };
 use bangbang_runtime::mmds::{
     MmdsConfig, MmdsConfigInput, MmdsContentInput, MmdsStateHandle, MmdsStateLockError,
@@ -1880,6 +1880,10 @@ pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
         None
     }
 
+    fn shared_network_interface_metrics(&self) -> Option<SharedNetworkInterfaceMetricsRegistry> {
+        None
+    }
+
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
         Err(BalloonUpdateError::ActiveSessionUnavailable)
     }
@@ -1927,6 +1931,12 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
 
     fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetricsRegistry> {
         Some(OwnedHvfArm64BootSession::shared_block_device_metrics(self))
+    }
+
+    fn shared_network_interface_metrics(&self) -> Option<SharedNetworkInterfaceMetricsRegistry> {
+        Some(OwnedHvfArm64BootSession::shared_network_interface_metrics(
+            self,
+        ))
     }
 
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
@@ -2007,6 +2017,10 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
         None
     }
 
+    fn shared_network_interface_metrics(&self) -> Option<SharedNetworkInterfaceMetricsRegistry> {
+        None
+    }
+
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
         Err(BalloonUpdateError::ActiveSessionUnavailable)
     }
@@ -2051,6 +2065,12 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
 
     fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetricsRegistry> {
         Some(OwnedHvfArm64BootSession::shared_block_device_metrics(self))
+    }
+
+    fn shared_network_interface_metrics(&self) -> Option<SharedNetworkInterfaceMetricsRegistry> {
+        Some(OwnedHvfArm64BootSession::shared_network_interface_metrics(
+            self,
+        ))
     }
 
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
@@ -2101,6 +2121,10 @@ where
 
     fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetricsRegistry> {
         self.session.shared_block_device_metrics()
+    }
+
+    fn shared_network_interface_metrics(&self) -> Option<SharedNetworkInterfaceMetricsRegistry> {
+        self.session.shared_network_interface_metrics()
     }
 
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
@@ -2551,6 +2575,7 @@ where
     balloon_device_updater: Option<BootRunLoopBalloonDeviceUpdater>,
     block_device_metrics: Option<SharedBlockDeviceMetricsRegistry>,
     balloon_device_metrics: Option<SharedBalloonDeviceMetrics>,
+    network_interface_metrics: Option<SharedNetworkInterfaceMetricsRegistry>,
     command_handle: BootRunLoopCommandHandle<S>,
     status: Arc<BootRunLoopWorkerStatusCell<S::Outcome>>,
     pause_gate: Arc<BootRunLoopPauseGate>,
@@ -2581,6 +2606,7 @@ where
         let balloon_device_updater = session.balloon_device_updater();
         let block_device_metrics = session.shared_block_device_metrics();
         let balloon_device_metrics = session.shared_balloon_device_metrics();
+        let network_interface_metrics = session.shared_network_interface_metrics();
         let stop_token = control.stop_token();
         let status = Arc::new(BootRunLoopWorkerStatusCell::new());
         let worker_status = Arc::clone(&status);
@@ -2663,6 +2689,7 @@ where
             balloon_device_updater,
             block_device_metrics,
             balloon_device_metrics,
+            network_interface_metrics,
             command_handle,
             status,
             pause_gate,
@@ -2783,6 +2810,11 @@ where
             diagnostics = diagnostics
                 .with_block_device_metrics(metrics.aggregate_snapshot())
                 .with_block_device_metrics_by_drive(metrics.per_drive_snapshot());
+        }
+        if let Some(metrics) = &self.network_interface_metrics {
+            diagnostics = diagnostics
+                .with_network_interface_metrics(metrics.aggregate_snapshot())
+                .with_network_interface_metrics_by_interface(metrics.per_interface_snapshot());
         }
         if let Some(metrics) = &self.balloon_device_metrics {
             diagnostics = diagnostics.with_balloon_device_metrics(metrics.snapshot());
@@ -3048,8 +3080,9 @@ mod tests {
     use bangbang_runtime::machine::{MachineConfigInput, MachineConfigPatchInput};
     use bangbang_runtime::metrics::{
         BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive,
-        BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics,
-        SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry,
+        BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics, NetworkInterfaceMetrics,
+        NetworkInterfaceMetricsByInterface, SharedBalloonDeviceMetrics,
+        SharedBlockDeviceMetricsRegistry, SharedNetworkInterfaceMetricsRegistry,
     };
     use bangbang_runtime::mmds::{MmdsConfigInput, MmdsContentInput, MmdsStateHandle};
     use bangbang_runtime::mmio::MmioRegion;
@@ -3729,6 +3762,7 @@ mod tests {
         block_device_updater: Option<BootRunLoopBlockDeviceUpdater>,
         block_device_metrics: Option<SharedBlockDeviceMetricsRegistry>,
         balloon_device_metrics: Option<SharedBalloonDeviceMetrics>,
+        network_interface_metrics: Option<SharedNetworkInterfaceMetricsRegistry>,
         wait_for_stop: bool,
         wait_for_wakeup: bool,
         wait_for_stop_sequence: Arc<Mutex<VecDeque<bool>>>,
@@ -3751,6 +3785,7 @@ mod tests {
                 block_device_updater: None,
                 block_device_metrics: None,
                 balloon_device_metrics: None,
+                network_interface_metrics: None,
                 wait_for_stop: true,
                 wait_for_wakeup: false,
                 wait_for_stop_sequence: Arc::default(),
@@ -3781,6 +3816,14 @@ mod tests {
 
         fn with_balloon_device_metrics(mut self, metrics: SharedBalloonDeviceMetrics) -> Self {
             self.balloon_device_metrics = Some(metrics);
+            self
+        }
+
+        fn with_network_interface_metrics(
+            mut self,
+            metrics: SharedNetworkInterfaceMetricsRegistry,
+        ) -> Self {
+            self.network_interface_metrics = Some(metrics);
             self
         }
 
@@ -3828,6 +3871,12 @@ mod tests {
 
         fn shared_balloon_device_metrics(&self) -> Option<SharedBalloonDeviceMetrics> {
             self.balloon_device_metrics.clone()
+        }
+
+        fn shared_network_interface_metrics(
+            &self,
+        ) -> Option<SharedNetworkInterfaceMetricsRegistry> {
+            self.network_interface_metrics.clone()
         }
 
         fn run_loop(
@@ -4971,6 +5020,58 @@ mod tests {
                     BlockDeviceMetrics::default()
                         .with_event_fails(1)
                         .with_queue_event_count(1),
+                )
+            )
+        );
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_reports_network_interface_metrics() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let metrics = SharedNetworkInterfaceMetricsRegistry::from_interface_ids(["eth0", "eth1"]);
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_network_interface_metrics(metrics.clone());
+
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(5).expect("non-zero limit"))
+                .expect("supervisor should start");
+
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            5
+        );
+        metrics.record_queue_events_for_interface("eth0", 1, 2);
+        metrics.record_event_failure_for_interface("eth0");
+        let diagnostics = supervisor.metrics_diagnostics();
+
+        assert_eq!(
+            diagnostics.network_interface_metrics(),
+            Some(
+                NetworkInterfaceMetrics::default()
+                    .with_event_fails(1)
+                    .with_rx_queue_event_count(1)
+                    .with_tx_queue_event_count(2)
+            )
+        );
+        assert_eq!(
+            diagnostics.network_interface_metrics_by_interface(),
+            Some(
+                &NetworkInterfaceMetricsByInterface::new().with_interface_metrics(
+                    "eth0",
+                    NetworkInterfaceMetrics::default()
+                        .with_event_fails(1)
+                        .with_rx_queue_event_count(1)
+                        .with_tx_queue_event_count(2),
                 )
             )
         );
