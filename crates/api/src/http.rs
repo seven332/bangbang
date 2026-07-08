@@ -34,12 +34,12 @@ pub enum ApiRequest {
     PutCpuConfig(Box<CpuConfigRequest>),
     PutDrive(Box<DriveConfigRequest>),
     PutEntropy(Box<EntropyConfigRequest>),
-    PutMemoryHotplug,
+    PutMemoryHotplug(MemoryHotplugConfigRequest),
     PatchBalloon(Box<BalloonUpdateRequest>),
     PatchBalloonStats(Box<BalloonStatsUpdateRequest>),
     PatchBalloonHintingStart(BalloonHintingStartRequest),
     PatchBalloonHintingStop,
-    PatchMemoryHotplug,
+    PatchMemoryHotplug(MemoryHotplugSizeUpdateRequest),
     PatchDrive(Box<DrivePatchRequest>),
     PatchVmState(Box<VmStateUpdateRequest>),
     PutLogger(Box<LoggerConfigRequest>),
@@ -713,6 +713,50 @@ struct MemoryHotplugConfigRequestBody {
 #[serde(deny_unknown_fields)]
 struct MemoryHotplugSizeUpdateRequestBody {
     requested_size_mib: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryHotplugConfigRequest {
+    total_size_mib: u64,
+    block_size_mib: u64,
+    slot_size_mib: u64,
+}
+
+impl MemoryHotplugConfigRequest {
+    pub const fn new(total_size_mib: u64, block_size_mib: u64, slot_size_mib: u64) -> Self {
+        Self {
+            total_size_mib,
+            block_size_mib,
+            slot_size_mib,
+        }
+    }
+
+    pub const fn total_size_mib(self) -> u64 {
+        self.total_size_mib
+    }
+
+    pub const fn block_size_mib(self) -> u64 {
+        self.block_size_mib
+    }
+
+    pub const fn slot_size_mib(self) -> u64 {
+        self.slot_size_mib
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryHotplugSizeUpdateRequest {
+    requested_size_mib: u64,
+}
+
+impl MemoryHotplugSizeUpdateRequest {
+    pub const fn new(requested_size_mib: u64) -> Self {
+        Self { requested_size_mib }
+    }
+
+    pub const fn requested_size_mib(self) -> u64 {
+        self.requested_size_mib
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2766,18 +2810,18 @@ fn parse_memory_hotplug_config_request(body: &[u8]) -> Result<ApiRequest, Reques
         slot_size_mib,
     } = serde_json::from_slice::<MemoryHotplugConfigRequestBody>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
-    let _ = (total_size_mib, block_size_mib, slot_size_mib);
-
-    Ok(ApiRequest::PutMemoryHotplug)
+    Ok(ApiRequest::PutMemoryHotplug(
+        MemoryHotplugConfigRequest::new(total_size_mib, block_size_mib, slot_size_mib),
+    ))
 }
 
 fn parse_memory_hotplug_size_update_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
     let MemoryHotplugSizeUpdateRequestBody { requested_size_mib } =
         serde_json::from_slice::<MemoryHotplugSizeUpdateRequestBody>(body)
             .map_err(|_| RequestError::MalformedRequest)?;
-    let _ = requested_size_mib;
-
-    Ok(ApiRequest::PatchMemoryHotplug)
+    Ok(ApiRequest::PatchMemoryHotplug(
+        MemoryHotplugSizeUpdateRequest::new(requested_size_mib),
+    ))
 }
 
 fn parse_drive_config_request(
@@ -3312,8 +3356,8 @@ impl From<ApiRequest> for Endpoint {
             ApiRequest::GetVmConfig => Self::VmConfig,
             ApiRequest::GetVersion => Self::Version,
             ApiRequest::GetMemoryHotplug
-            | ApiRequest::PutMemoryHotplug
-            | ApiRequest::PatchMemoryHotplug => Self::MemoryHotplug,
+            | ApiRequest::PutMemoryHotplug(_)
+            | ApiRequest::PatchMemoryHotplug(_) => Self::MemoryHotplug,
             ApiRequest::GetBalloon
             | ApiRequest::GetBalloonStats
             | ApiRequest::GetBalloonHintingStatus
@@ -6248,17 +6292,17 @@ mod tests {
             (
                 "PUT",
                 r#"{"total_size_mib":2048}"#,
-                ApiRequest::PutMemoryHotplug,
+                ApiRequest::PutMemoryHotplug(MemoryHotplugConfigRequest::new(2048, 2, 128)),
             ),
             (
                 "PUT",
-                r#"{"total_size_mib":2048,"block_size_mib":2,"slot_size_mib":128}"#,
-                ApiRequest::PutMemoryHotplug,
+                r#"{"total_size_mib":2048,"block_size_mib":4,"slot_size_mib":256}"#,
+                ApiRequest::PutMemoryHotplug(MemoryHotplugConfigRequest::new(2048, 4, 256)),
             ),
             (
                 "PATCH",
                 r#"{"requested_size_mib":256}"#,
-                ApiRequest::PatchMemoryHotplug,
+                ApiRequest::PatchMemoryHotplug(MemoryHotplugSizeUpdateRequest::new(256)),
             ),
         ] {
             let request = request_with_body(method, "/hotplug/memory", body);
