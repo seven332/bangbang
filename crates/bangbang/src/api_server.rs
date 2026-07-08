@@ -1895,7 +1895,7 @@ mod tests {
             &mut self,
             _config: &DriveConfig,
             _refresh_backing: bool,
-            _update_rate_limiter: bool,
+            _rate_limiter_update: Option<DriveRateLimiterConfig>,
         ) -> Result<(), DriveUpdateError> {
             match self.drive_update_result.clone() {
                 Some(err) => Err(err),

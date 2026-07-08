@@ -15,9 +15,9 @@ use crate::balloon::{
 };
 use crate::block::{
     BlockFileBacking, BlockMmioDeviceRegistration, BlockMmioLayout, BlockMmioRegistrationError,
-    DriveConfig, DriveUpdateError, PreparedBlockDeviceError, PreparedBlockDevices,
-    VirtioBlockDeviceNotificationDispatch, VirtioBlockDeviceNotificationError,
-    VirtioBlockMmioHandler,
+    DriveConfig, DriveRateLimiterConfig, DriveUpdateError, PreparedBlockDeviceError,
+    PreparedBlockDevices, VirtioBlockDeviceNotificationDispatch,
+    VirtioBlockDeviceNotificationError, VirtioBlockMmioHandler,
 };
 use crate::boot::{
     BootCommandLineError, BootSource, BootSourceConfig, BootSourceLoadError, LoadedBootSource,
@@ -1494,7 +1494,7 @@ pub fn update_block_device_backing_for_devices_with_opened(
         mmio_dispatcher,
         config,
         Some(backing),
-        false,
+        None,
     )
 }
 
@@ -1503,7 +1503,7 @@ pub fn update_block_device_for_devices_with_opened(
     mmio_dispatcher: &mut MmioDispatcher,
     config: &DriveConfig,
     backing: Option<BlockFileBacking>,
-    update_rate_limiter: bool,
+    rate_limiter_update: Option<DriveRateLimiterConfig>,
 ) -> Result<(), DriveUpdateError> {
     let region_id = block_device_region_id(block_devices, config)?;
 
@@ -1512,7 +1512,7 @@ pub fn update_block_device_for_devices_with_opened(
         region_id,
         config,
         backing,
-        update_rate_limiter,
+        rate_limiter_update,
     )
 }
 
@@ -1543,7 +1543,7 @@ fn update_block_device_backing_for_region_with_opened(
         region_id,
         config,
         Some(backing),
-        false,
+        None,
     )
 }
 
@@ -1552,7 +1552,7 @@ fn update_block_device_for_region_with_opened(
     region_id: MmioRegionId,
     config: &DriveConfig,
     backing: Option<BlockFileBacking>,
-    update_rate_limiter: bool,
+    rate_limiter_update: Option<DriveRateLimiterConfig>,
 ) -> Result<(), DriveUpdateError> {
     let handler = mmio_dispatcher
         .handler_mut::<VirtioBlockMmioHandler>(region_id)
@@ -1565,8 +1565,8 @@ fn update_block_device_for_region_with_opened(
     if let Some(backing) = backing {
         handler.refresh_block_backing_with_opened(config, backing);
     }
-    if update_rate_limiter {
-        handler.update_block_rate_limiter(config);
+    if let Some(rate_limiter) = rate_limiter_update {
+        handler.update_block_rate_limiter(rate_limiter);
     }
 
     Ok(())
@@ -8216,7 +8216,7 @@ mod tests {
             &mut mmio_dispatcher,
             &updated,
             None,
-            true,
+            updated.rate_limiter(),
         )
         .expect("matching block device rate limiter should refresh");
 

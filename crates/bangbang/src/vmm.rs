@@ -22,8 +22,8 @@ use bangbang_runtime::balloon::{
     BalloonStatsUpdateInput, BalloonUpdateError, BalloonUpdateInput,
 };
 use bangbang_runtime::block::{
-    BlockFileBacking, BlockMmioLayout, DriveConfig, DriveConfigInput, DriveUpdateError,
-    DriveUpdateInput,
+    BlockFileBacking, BlockMmioLayout, DriveConfig, DriveConfigInput, DriveRateLimiterConfig,
+    DriveUpdateError, DriveUpdateInput,
 };
 use bangbang_runtime::boot::BootSourceConfigInput;
 use bangbang_runtime::cpu::CpuConfigInput;
@@ -132,7 +132,7 @@ pub(crate) trait ProcessSessionDiagnostics {
         &mut self,
         _config: &DriveConfig,
         _refresh_backing: bool,
-        _update_rate_limiter: bool,
+        _rate_limiter_update: Option<DriveRateLimiterConfig>,
     ) -> Result<(), DriveUpdateError> {
         Err(DriveUpdateError::ActiveSessionUnavailable)
     }
@@ -296,7 +296,7 @@ impl BootRunLoopBlockDeviceUpdater {
         &self,
         config: &DriveConfig,
         backing: Option<BlockFileBacking>,
-        update_rate_limiter: bool,
+        rate_limiter_update: Option<DriveRateLimiterConfig>,
     ) -> Result<(), DriveUpdateError> {
         let mut dispatcher = self
             .mmio_dispatcher
@@ -308,7 +308,7 @@ impl BootRunLoopBlockDeviceUpdater {
             &mut dispatcher,
             config,
             backing,
-            update_rate_limiter,
+            rate_limiter_update,
         )
     }
 }
@@ -1055,9 +1055,9 @@ where
         }
 
         let refresh_backing = input.path_on_host().is_some();
-        let update_rate_limiter = input.rate_limiter().is_some();
+        let rate_limiter_update = input.rate_limiter();
         let updated_config = self.controller.updated_drive_config(input)?;
-        if refresh_backing || update_rate_limiter {
+        if refresh_backing || rate_limiter_update.is_some() {
             let Some(session) = self.started_session.as_mut() else {
                 return Err(VmmActionError::DriveUpdate(
                     DriveUpdateError::ActiveSessionUnavailable,
@@ -1065,7 +1065,7 @@ where
             };
 
             session
-                .update_block_device(&updated_config, refresh_backing, update_rate_limiter)
+                .update_block_device(&updated_config, refresh_backing, rate_limiter_update)
                 .map_err(VmmActionError::DriveUpdate)?;
         }
         self.controller.commit_drive_update(updated_config)?;
@@ -2899,7 +2899,7 @@ where
         &mut self,
         config: &DriveConfig,
         refresh_backing: bool,
-        update_rate_limiter: bool,
+        rate_limiter_update: Option<DriveRateLimiterConfig>,
     ) -> Result<(), DriveUpdateError> {
         let drive_id = config.drive_id();
         let Some(updater) = self.block_device_updater.as_ref() else {
@@ -2930,7 +2930,7 @@ where
 
         let result = self
             .run_command(move |_| {
-                updater.update_block_device_with_opened(&config, backing, update_rate_limiter)
+                updater.update_block_device_with_opened(&config, backing, rate_limiter_update)
             })
             .map_err(drive_update_error_from_boot_run_loop_command);
         if result.is_ok() {
@@ -3313,7 +3313,7 @@ mod tests {
         block_update_count: usize,
         last_block_update: Option<String>,
         last_block_update_refresh_backing: Option<bool>,
-        last_block_update_rate_limiter: Option<bool>,
+        last_block_update_rate_limiter: Option<Option<DriveRateLimiterConfig>>,
         block_update_result: Option<DriveUpdateError>,
         balloon_update_count: usize,
         last_balloon_update_mib: Option<u32>,
@@ -3464,12 +3464,12 @@ mod tests {
             &mut self,
             config: &DriveConfig,
             refresh_backing: bool,
-            update_rate_limiter: bool,
+            rate_limiter_update: Option<DriveRateLimiterConfig>,
         ) -> Result<(), DriveUpdateError> {
             self.block_update_count += 1;
             self.last_block_update = Some(config.drive_id().to_string());
             self.last_block_update_refresh_backing = Some(refresh_backing);
-            self.last_block_update_rate_limiter = Some(update_rate_limiter);
+            self.last_block_update_rate_limiter = Some(rate_limiter_update);
             match self.block_update_result.clone() {
                 Some(err) => Err(err),
                 None => Ok(()),
@@ -5896,7 +5896,7 @@ mod tests {
             43
         );
         supervisor
-            .update_block_device(&replacement_config, true, false)
+            .update_block_device(&replacement_config, true, None)
             .expect("drive update should run on worker");
         let diagnostics = supervisor.metrics_diagnostics();
 
@@ -5972,7 +5972,7 @@ mod tests {
                 .expect("blocking command should start on worker");
 
             let drive_update =
-                scope.spawn(|| supervisor.update_block_device(&replacement_config, true, false));
+                scope.spawn(|| supervisor.update_block_device(&replacement_config, true, None));
             control.wait_for_request_wakeup_count(2);
             release_command_sender
                 .send(())
@@ -6029,7 +6029,7 @@ mod tests {
         );
 
         let error = supervisor
-            .update_block_device(&replacement_config, true, false)
+            .update_block_device(&replacement_config, true, None)
             .expect_err("unknown active drive should fail");
 
         assert_eq!(
@@ -6078,7 +6078,7 @@ mod tests {
         );
 
         let error = supervisor
-            .update_block_device(&replacement_config, true, false)
+            .update_block_device(&replacement_config, true, None)
             .expect_err("full queue should fail");
 
         assert_eq!(
@@ -6137,7 +6137,7 @@ mod tests {
         );
 
         let error = supervisor
-            .update_block_device(&missing_config, true, false)
+            .update_block_device(&missing_config, true, None)
             .expect_err("missing backing should fail before queueing command");
 
         assert!(matches!(
@@ -7011,7 +7011,7 @@ mod tests {
         assert_eq!(session.block_update_count, 1);
         assert_eq!(session.last_block_update.as_deref(), Some("data"));
         assert_eq!(session.last_block_update_refresh_backing, Some(true));
-        assert_eq!(session.last_block_update_rate_limiter, Some(false));
+        assert_eq!(session.last_block_update_rate_limiter, Some(None));
     }
 
     #[test]
@@ -7083,7 +7083,10 @@ mod tests {
         assert_eq!(session.block_update_count, 1);
         assert_eq!(session.last_block_update.as_deref(), Some("data"));
         assert_eq!(session.last_block_update_refresh_backing, Some(false));
-        assert_eq!(session.last_block_update_rate_limiter, Some(true));
+        assert_eq!(
+            session.last_block_update_rate_limiter,
+            Some(Some(DriveRateLimiterConfig::new(Some(bandwidth), None)))
+        );
     }
 
     #[test]
@@ -7124,7 +7127,7 @@ mod tests {
         assert_eq!(session.block_update_count, 1);
         assert_eq!(session.last_block_update.as_deref(), Some("data"));
         assert_eq!(session.last_block_update_refresh_backing, Some(true));
-        assert_eq!(session.last_block_update_rate_limiter, Some(false));
+        assert_eq!(session.last_block_update_rate_limiter, Some(None));
     }
 
     #[test]

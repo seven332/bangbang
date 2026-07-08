@@ -2789,6 +2789,24 @@ impl VirtioBlockRateLimiter {
 
         true
     }
+
+    fn apply_update(&mut self, update: DriveRateLimiterConfig) {
+        update_runtime_token_bucket(&mut self.bandwidth, update.bandwidth());
+        update_runtime_token_bucket(&mut self.ops, update.ops());
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bandwidth.is_none() && self.ops.is_none()
+    }
+}
+
+fn update_runtime_token_bucket(
+    bucket: &mut Option<TokenBucket>,
+    update: Option<DriveTokenBucketConfig>,
+) {
+    if let Some(config) = update {
+        *bucket = TokenBucket::new(config.token_bucket_config());
+    }
 }
 
 #[derive(Debug)]
@@ -2822,8 +2840,15 @@ impl VirtioBlockDevice {
         self.backing = backing;
     }
 
-    pub fn update_rate_limiter(&mut self, rate_limiter: Option<DriveRateLimiterConfig>) {
-        self.rate_limiter = rate_limiter.and_then(VirtioBlockRateLimiter::new);
+    pub fn update_rate_limiter(&mut self, update: DriveRateLimiterConfig) {
+        if let Some(rate_limiter) = self.rate_limiter.as_mut() {
+            rate_limiter.apply_update(update);
+            if rate_limiter.is_empty() {
+                self.rate_limiter = None;
+            }
+        } else {
+            self.rate_limiter = VirtioBlockRateLimiter::new(update);
+        }
     }
 
     pub fn device_id(&self) -> VirtioBlockDeviceId {
@@ -3542,9 +3567,9 @@ impl VirtioMmioRegisterHandler<VirtioBlockConfigSpace, VirtioBlockDevice> {
         self.mark_interrupt_pending(DeviceInterruptKind::Config);
     }
 
-    pub fn update_block_rate_limiter(&mut self, config: &DriveConfig) {
+    pub fn update_block_rate_limiter(&mut self, rate_limiter: DriveRateLimiterConfig) {
         self.activation_handler_mut()
-            .update_rate_limiter(config.rate_limiter());
+            .update_rate_limiter(rate_limiter);
     }
 }
 
@@ -5479,6 +5504,86 @@ mod tests {
 
         assert_eq!(prepared.as_slice().len(), 1);
         assert!(prepared.as_slice()[0].device().rate_limiter().is_some());
+    }
+
+    #[test]
+    fn block_device_rate_limiter_update_preserves_missing_bucket_runtime_state() {
+        let now = Instant::now();
+        let file = temp_file("runtime-rate-limiter-preserve.img", &[0; 1024]);
+        let backing = open_backing(file.as_path(), true).expect("backing should open");
+        let mut device = VirtioBlockDevice::new(backing, TEST_DEVICE_ID).with_rate_limiter(
+            VirtioBlockRateLimiter::new_at(
+                DriveRateLimiterConfig::new(
+                    Some(DriveTokenBucketConfig::new(4, Some(2), 1000)),
+                    Some(DriveTokenBucketConfig::new(1, None, 1000)),
+                ),
+                now,
+            )
+            .expect("rate limiter should be enabled"),
+        );
+        let rate_limiter = device
+            .rate_limiter
+            .as_mut()
+            .expect("rate limiter should exist");
+        let bandwidth = rate_limiter
+            .bandwidth
+            .as_mut()
+            .expect("bandwidth bucket should exist");
+        assert!(bandwidth.reduce_at(3, now));
+        let bandwidth_snapshot = bandwidth.snapshot();
+
+        device.update_rate_limiter(DriveRateLimiterConfig::new(
+            None,
+            Some(DriveTokenBucketConfig::new(2, None, 1000)),
+        ));
+
+        let rate_limiter = device
+            .rate_limiter()
+            .expect("rate limiter should remain configured");
+        assert_eq!(
+            rate_limiter
+                .bandwidth
+                .as_ref()
+                .expect("missing bandwidth update should preserve bucket")
+                .snapshot(),
+            bandwidth_snapshot
+        );
+        assert!(rate_limiter.ops.is_some());
+    }
+
+    #[test]
+    fn block_device_rate_limiter_update_clears_disabled_buckets() {
+        let now = Instant::now();
+        let file = temp_file("runtime-rate-limiter-clear.img", &[0; 1024]);
+        let backing = open_backing(file.as_path(), true).expect("backing should open");
+        let mut device = VirtioBlockDevice::new(backing, TEST_DEVICE_ID).with_rate_limiter(
+            VirtioBlockRateLimiter::new_at(
+                DriveRateLimiterConfig::new(
+                    Some(DriveTokenBucketConfig::new(4, None, 1000)),
+                    Some(DriveTokenBucketConfig::new(1, None, 1000)),
+                ),
+                now,
+            )
+            .expect("rate limiter should be enabled"),
+        );
+
+        device.update_rate_limiter(DriveRateLimiterConfig::new(
+            Some(DriveTokenBucketConfig::new(0, None, 1000)),
+            None,
+        ));
+
+        let rate_limiter = device
+            .rate_limiter()
+            .expect("ops bucket should keep limiter configured");
+        assert!(rate_limiter.bandwidth.is_none());
+        assert!(rate_limiter.ops.is_some());
+
+        device.update_rate_limiter(DriveRateLimiterConfig::new(
+            None,
+            Some(DriveTokenBucketConfig::new(1, None, 0)),
+        ));
+
+        assert!(device.rate_limiter().is_none());
     }
 
     #[test]
