@@ -18,14 +18,15 @@ use bangbang_api::http::{
     BalloonStatsUpdateRequest, BalloonUpdateRequest, BootSourceRequest, BootSourceResponse,
     CpuConfigRequest, DriveCacheType as ApiDriveCacheType, DriveConfigRequest, DriveConfigResponse,
     DriveIoEngine as ApiDriveIoEngine, DrivePatchRequest, EntropyConfigRequest,
-    EntropyConfigResponse, HotUnplugDeviceKind as ApiHotUnplugDeviceKind, HotUnplugDeviceRequest,
-    HttpResponse, LoggerConfigRequest, LoggerLevel as ApiLoggerLevel, MachineConfigPatchRequest,
+    EntropyConfigResponse, EntropyRateLimiterRequest,
+    HotUnplugDeviceKind as ApiHotUnplugDeviceKind, HotUnplugDeviceRequest, HttpResponse,
+    LoggerConfigRequest, LoggerLevel as ApiLoggerLevel, MachineConfigPatchRequest,
     MachineConfigRequest, MachineConfigResponse, MemoryHotplugConfigRequest,
     MemoryHotplugSizeUpdateRequest, MetricsConfigRequest, MmdsConfigRequest, MmdsConfigResponse,
     MmdsContentRequest, MmdsVersion as ApiMmdsVersion, NetworkInterfaceConfigRequest,
     NetworkInterfaceConfigResponse, NetworkInterfacePatchRequest, PmemConfigRequest,
-    PmemConfigResponse, PmemPatchRequest, RequestError, SerialConfigRequest, VmConfigResponse,
-    VmStateUpdate, VmStateUpdateRequest, VsockConfigRequest, VsockConfigResponse,
+    PmemConfigResponse, PmemPatchRequest, RequestError, SerialConfigRequest, TokenBucketRequest,
+    VmConfigResponse, VmStateUpdate, VmStateUpdateRequest, VsockConfigRequest, VsockConfigResponse,
     api_request_metric_endpoint, parse_request_with_limit, request_total_len_with_limit,
 };
 use bangbang_runtime::balloon::{
@@ -37,7 +38,9 @@ use bangbang_runtime::block::{
 };
 use bangbang_runtime::boot::{BootSourceConfig, BootSourceConfigInput};
 use bangbang_runtime::cpu::CpuConfigInput;
-use bangbang_runtime::entropy::EntropyConfigInput;
+use bangbang_runtime::entropy::{
+    EntropyConfigInput, EntropyRateLimiterConfig, EntropyTokenBucketConfig,
+};
 use bangbang_runtime::logger::{LoggerConfigInput, LoggerLevel};
 use bangbang_runtime::machine::{
     MachineConfig, MachineConfigCpuTemplate as RuntimeMachineConfigCpuTemplate,
@@ -1243,9 +1246,30 @@ fn balloon_hinting_status_response_from_runtime(
 }
 
 fn entropy_config_response_from_runtime(
-    _config: bangbang_runtime::entropy::EntropyConfig,
+    config: bangbang_runtime::entropy::EntropyConfig,
 ) -> EntropyConfigResponse {
-    EntropyConfigResponse::new()
+    match config.rate_limiter() {
+        Some(rate_limiter) => EntropyConfigResponse::new()
+            .with_rate_limiter(entropy_rate_limiter_response_from_runtime(rate_limiter)),
+        None => EntropyConfigResponse::new(),
+    }
+}
+
+fn entropy_rate_limiter_response_from_runtime(
+    config: EntropyRateLimiterConfig,
+) -> EntropyRateLimiterRequest {
+    EntropyRateLimiterRequest::new(
+        config
+            .bandwidth()
+            .map(entropy_token_bucket_response_from_runtime),
+        config.ops().map(entropy_token_bucket_response_from_runtime),
+    )
+}
+
+fn entropy_token_bucket_response_from_runtime(
+    config: EntropyTokenBucketConfig,
+) -> TokenBucketRequest {
+    TokenBucketRequest::new(config.size(), config.one_time_burst(), config.refill_time())
 }
 
 fn pmem_config_response_from_runtime(config: &PmemConfig) -> PmemConfigResponse {
@@ -1567,11 +1591,24 @@ fn serial_config_input_from_request(config: &SerialConfigRequest) -> SerialConfi
 fn entropy_config_input_from_request(config: &EntropyConfigRequest) -> EntropyConfigInput {
     let mut input = EntropyConfigInput::new();
 
-    if config.rate_limiter_configured() {
-        input = input.with_rate_limiter_configured();
+    if let Some(rate_limiter) = config.rate_limiter() {
+        input = input.with_rate_limiter(entropy_rate_limiter_config_from_request(rate_limiter));
     }
 
     input
+}
+
+fn entropy_rate_limiter_config_from_request(
+    config: EntropyRateLimiterRequest,
+) -> EntropyRateLimiterConfig {
+    EntropyRateLimiterConfig::new(
+        config.bandwidth().map(entropy_token_bucket_from_request),
+        config.ops().map(entropy_token_bucket_from_request),
+    )
+}
+
+fn entropy_token_bucket_from_request(config: TokenBucketRequest) -> EntropyTokenBucketConfig {
+    EntropyTokenBucketConfig::new(config.size(), config.one_time_burst(), config.refill_time())
 }
 
 fn memory_hotplug_config_input_from_request(
@@ -5911,23 +5948,68 @@ mod tests {
     }
 
     #[test]
+    fn stores_entropy_endpoint_with_configured_rate_limiter() {
+        let mut vmm = test_controller();
+        let body = r#"{"rate_limiter":{"bandwidth":{"size":123456789,"one_time_burst":987654321,"refill_time":777},"ops":{"size":3,"one_time_burst":null,"refill_time":4}}}"#;
+        let request = format!(
+            "PUT /entropy HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        let response = request_over_socket(&mut vmm, "ent-rate-limiter", &request);
+
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        let data = vmm
+            .handle_action(VmmAction::GetVmConfig)
+            .expect("VM config should be returned");
+        let VmmData::VmConfiguration(config) = data else {
+            panic!("expected VM config");
+        };
+        assert!(config.entropy_config().is_some());
+        let vm_config_response = handle_request_bytes(
+            b"GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            &mut vmm,
+        );
+
+        assert_eq!(
+            vm_config_response.status(),
+            bangbang_api::http::StatusCode::Ok
+        );
+        assert!(vm_config_response.body().contains(r#""entropy":{"#));
+        assert!(vm_config_response.body().contains(r#""rate_limiter":{"#));
+        assert!(
+            vm_config_response.body().contains(
+                r#""bandwidth":{"one_time_burst":987654321,"refill_time":777,"size":123456789}"#
+            ),
+            "{}",
+            vm_config_response.body()
+        );
+        assert!(
+            vm_config_response
+                .body()
+                .contains(r#""ops":{"one_time_burst":null,"refill_time":4,"size":3}"#),
+            "{}",
+            vm_config_response.body()
+        );
+    }
+
+    #[test]
     fn returns_fault_for_invalid_entropy_endpoint_without_mutating() {
         let mut vmm = test_controller();
         vmm.handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
             .expect("initial entropy config should store");
         for (socket_name, body, fault_message, private_values) in [
             (
-                "ent-rl",
-                r#"{"rate_limiter":{"bandwidth":{"size":123456789,"one_time_burst":987654321,"refill_time":777}}}"#,
-                "entropy rate_limiter is not supported",
-                &["123456789", "987654321", "777"][..],
+                "ent-bad",
+                "not-json",
+                "Malformed HTTP request.",
+                &[] as &[&str],
             ),
-            ("ent-bad", "not-json", "Malformed HTTP request.", &[][..]),
             (
                 "ent-bad-rl",
                 r#"{"rate_limiter":{"bandwidth":{"size":1}}}"#,
                 "Malformed HTTP request.",
-                &[][..],
+                &[] as &[&str],
             ),
         ] {
             let request = format!(

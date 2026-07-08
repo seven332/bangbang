@@ -530,27 +530,16 @@ fn executable_handles_remaining_device_requests_and_pmem_config() {
         "/entropy",
         r#"{"rate_limiter":{"bandwidth":{"size":123456789,"one_time_burst":987654321,"refill_time":777}}}"#,
     );
-    assert_bad_request_response(&entropy_rate_limiter_response, "PUT /entropy rate_limiter");
-    assert_response_contains(
-        &entropy_rate_limiter_response,
-        r#"{"fault_message":"entropy rate_limiter is not supported"}"#,
-        "PUT /entropy rate_limiter",
-    );
-    for private_value in ["123456789", "987654321", "777"] {
-        assert!(
-            !entropy_rate_limiter_response.contains(private_value),
-            "PUT /entropy rate_limiter must not echo private config value {private_value:?}; response:\n{entropy_rate_limiter_response}"
-        );
-    }
-    let entropy_vm_config_after_fault = http_get(&socket_path, "/vm/config");
+    assert_no_content_response(&entropy_rate_limiter_response, "PUT /entropy rate_limiter");
+    let entropy_vm_config_after_limiter = http_get(&socket_path, "/vm/config");
     assert_ok_response(
-        &entropy_vm_config_after_fault,
-        "GET /vm/config after rejected PUT /entropy rate_limiter",
+        &entropy_vm_config_after_limiter,
+        "GET /vm/config after PUT /entropy rate_limiter",
     );
     assert_response_contains(
-        &entropy_vm_config_after_fault,
-        r#""entropy":{}"#,
-        "GET /vm/config after rejected PUT /entropy rate_limiter",
+        &entropy_vm_config_after_limiter,
+        r#""bandwidth":{"one_time_burst":987654321,"refill_time":777,"size":123456789}"#,
+        "GET /vm/config after PUT /entropy rate_limiter",
     );
 
     let memory_hotplug_get_response = http_get(&socket_path, "/hotplug/memory");
@@ -817,10 +806,10 @@ fn executable_config_file_malformed_entropy_section_does_not_publish_socket() {
 }
 
 #[test]
-fn executable_config_file_rejected_entropy_rate_limiter_does_not_publish_socket() {
+fn executable_config_file_entropy_rate_limiter_reaches_startup_failure_without_publishing_socket() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
-    let config_path = write_rejected_entropy_rate_limiter_config(&test_dir);
+    let config_path = write_entropy_rate_limiter_startup_config(&test_dir);
     let instance_id = test_dir.instance_id();
 
     let output = BangbangProcess::start_with_extra_args_expect_failure(
@@ -829,18 +818,19 @@ fn executable_config_file_rejected_entropy_rate_limiter_does_not_publish_socket(
         &["--config-file", path_text(&config_path)],
     );
 
-    assert_rejected_entropy_config_failure(
+    assert_entropy_rate_limiter_startup_failure(
         &output,
         &socket_path,
-        "config-file rejected entropy rate limiter",
+        "config-file entropy rate limiter startup",
     );
 }
 
 #[test]
-fn executable_no_api_config_file_rejected_entropy_rate_limiter_does_not_publish_socket() {
+fn executable_no_api_config_file_entropy_rate_limiter_reaches_startup_failure_without_publishing_socket()
+ {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
-    let config_path = write_rejected_entropy_rate_limiter_config(&test_dir);
+    let config_path = write_entropy_rate_limiter_startup_config(&test_dir);
     let instance_id = test_dir.instance_id();
 
     let output = BangbangProcess::start_with_extra_args_expect_failure(
@@ -849,10 +839,10 @@ fn executable_no_api_config_file_rejected_entropy_rate_limiter_does_not_publish_
         &["--config-file", path_text(&config_path), "--no-api"],
     );
 
-    assert_rejected_entropy_config_failure(
+    assert_entropy_rate_limiter_startup_failure(
         &output,
         &socket_path,
-        "no-api config-file rejected entropy rate limiter",
+        "no-api config-file entropy rate limiter startup",
     );
 }
 
@@ -2740,7 +2730,7 @@ fn write_malformed_serial_rate_limiter_config(
     (config_path, serial_output_path)
 }
 
-fn write_rejected_entropy_rate_limiter_config(test_dir: &TestDir) -> std::path::PathBuf {
+fn write_entropy_rate_limiter_startup_config(test_dir: &TestDir) -> std::path::PathBuf {
     let config_path = test_dir.path().join("vm-config.json");
     fs::write(
         &config_path,
@@ -2980,7 +2970,7 @@ fn assert_rejected_serial_config_failure(
     );
 }
 
-fn assert_rejected_entropy_config_failure(
+fn assert_entropy_rate_limiter_startup_failure(
     output: &support::CompletedProcess,
     socket_path: &std::path::Path,
     case_name: &str,
@@ -3008,9 +2998,9 @@ fn assert_rejected_entropy_config_failure(
     );
     assert!(
         output.stderr.contains(
-            "bangbang: config-file error: failed to apply config-file action: entropy rate_limiter is not supported"
+            "bangbang: config-file error: failed to apply config-file action: failed to start microVM"
         ),
-        "{case_name} stderr should describe config-file entropy rejection; stderr:\n{}",
+        "{case_name} stderr should describe config-file startup failure; stderr:\n{}",
         output.stderr
     );
     for private_value in ["123456789", "987654321", "777"] {

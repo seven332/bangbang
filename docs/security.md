@@ -145,6 +145,14 @@ is resource-specific:
   configuration. Root-device boot semantics, runtime updates, direct
   file-backed HVF mapping, dirty-range tracking, and hot-unplug remain
   deferred.
+- `/entropy` accepts Firecracker-shaped bandwidth and ops rate-limiter buckets.
+  The limiter is process-local runtime state, is applied before host entropy is
+  read or guest memory is written, and must not sleep or busy-wait while budget
+  is exhausted. Throttled descriptors remain pending for a later dispatch
+  opportunity instead of completing with zero bytes or exposing host entropy
+  source details. Metrics may count throttling and limiter retry events, but
+  must not include random bytes, descriptor contents, host RNG errors, or host
+  paths.
 - `/snapshot/create` and `/snapshot/load` currently parse Firecracker-shaped
   snapshot paths before returning unsupported faults, and they do not open or
   create snapshot state or memory files. Future snapshot support must treat

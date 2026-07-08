@@ -8,11 +8,11 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use crate::mmio::{
     MmioAccess, MmioAccessBytes, MmioAccessBytesError, MmioHandler, MmioHandlerError,
 };
+use crate::token_bucket::{TokenBucket, TokenBucketConfig};
 
 pub const SERIAL_MMIO_DEVICE_WINDOW_SIZE: u64 = 0x1000;
 pub const SERIAL_REGISTER_SPACE_SIZE: u64 = 8;
@@ -36,8 +36,6 @@ pub const SERIAL_OUTPUT_BUFFER_DEFAULT_LIMIT: usize = 64 * 1024;
 pub trait SerialOutput: fmt::Debug + Send {
     fn write_byte(&mut self, byte: u8) -> Result<(), SerialOutputError>;
 }
-
-const NANOS_PER_MILLISECOND: u64 = 1_000_000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SerialOutputMetrics {
@@ -488,7 +486,7 @@ impl SharedSerialOutput {
     ) -> Self {
         let metrics = SharedSerialOutputMetrics::default();
         let metered_output = MeteredSerialOutput::new(output, metrics.clone());
-        let output: Box<dyn SerialOutput> = match rate_limiter.and_then(SerialTokenBucket::new) {
+        let output: Box<dyn SerialOutput> = match rate_limiter.and_then(serial_token_bucket) {
             Some(bucket) => Box::new(RateLimitedSerialOutput::from_bucket(
                 metered_output,
                 bucket,
@@ -529,7 +527,7 @@ impl SerialOutput for SharedSerialOutput {
 #[derive(Debug)]
 struct RateLimitedSerialOutput<O> {
     output: O,
-    bucket: SerialTokenBucket,
+    bucket: TokenBucket,
     metrics: SharedSerialOutputMetrics,
 }
 
@@ -537,18 +535,14 @@ impl<O> RateLimitedSerialOutput<O> {
     #[cfg(test)]
     fn new(output: O, config: SerialRateLimiterConfig) -> Option<Self> {
         let metrics = SharedSerialOutputMetrics::default();
-        SerialTokenBucket::new(config).map(|bucket| Self {
+        serial_token_bucket(config).map(|bucket| Self {
             output,
             bucket,
             metrics,
         })
     }
 
-    fn from_bucket(
-        output: O,
-        bucket: SerialTokenBucket,
-        metrics: SharedSerialOutputMetrics,
-    ) -> Self {
+    fn from_bucket(output: O, bucket: TokenBucket, metrics: SharedSerialOutputMetrics) -> Self {
         Self {
             output,
             bucket,
@@ -564,7 +558,7 @@ impl<O> RateLimitedSerialOutput<O> {
 
 impl<O: SerialOutput> SerialOutput for RateLimitedSerialOutput<O> {
     fn write_byte(&mut self, byte: u8) -> Result<(), SerialOutputError> {
-        if self.bucket.reduce_at(1, Instant::now()) {
+        if self.bucket.reduce(1) {
             self.output.write_byte(byte)
         } else {
             self.metrics.record_rate_limiter_dropped_bytes(1);
@@ -573,97 +567,12 @@ impl<O: SerialOutput> SerialOutput for RateLimitedSerialOutput<O> {
     }
 }
 
-#[derive(Debug, Clone)]
-struct SerialTokenBucket {
-    size: u64,
-    refill_time_nanos: u64,
-    budget: u64,
-    one_time_burst: u64,
-    last_update: Instant,
-}
-
-impl SerialTokenBucket {
-    fn new(config: SerialRateLimiterConfig) -> Option<Self> {
-        Self::new_at(config, Instant::now())
-    }
-
-    fn new_at(config: SerialRateLimiterConfig, now: Instant) -> Option<Self> {
-        let refill_time_nanos = config.refill_time().checked_mul(NANOS_PER_MILLISECOND)?;
-        if config.size() == 0 || refill_time_nanos == 0 {
-            return None;
-        }
-
-        Some(Self {
-            size: config.size(),
-            refill_time_nanos,
-            budget: config.size(),
-            one_time_burst: config.one_time_burst().unwrap_or(0),
-            last_update: now,
-        })
-    }
-
-    fn reduce_at(&mut self, tokens: u64, now: Instant) -> bool {
-        if tokens == 0 {
-            return true;
-        }
-        if self.one_time_burst >= tokens {
-            self.one_time_burst -= tokens;
-            self.last_update = now;
-            return true;
-        }
-
-        let tokens = tokens.saturating_sub(self.one_time_burst);
-        self.one_time_burst = 0;
-        self.replenish_at(now);
-
-        if tokens > self.size {
-            self.budget = 0;
-            return false;
-        }
-        if tokens > self.budget {
-            return false;
-        }
-
-        self.budget -= tokens;
-        true
-    }
-
-    fn replenish_at(&mut self, now: Instant) {
-        if now <= self.last_update {
-            return;
-        }
-
-        let elapsed = now.duration_since(self.last_update);
-        let elapsed_nanos = elapsed.as_nanos();
-        let refill_time_nanos = u128::from(self.refill_time_nanos);
-        if elapsed_nanos >= refill_time_nanos {
-            self.budget = self.size;
-            self.last_update = now;
-            return;
-        }
-
-        let tokens = elapsed_nanos * u128::from(self.size) / refill_time_nanos;
-        if tokens == 0 {
-            return;
-        }
-
-        let budget = u128::from(self.budget)
-            .saturating_add(tokens)
-            .min(u128::from(self.size));
-        self.budget = match u64::try_from(budget) {
-            Ok(value) => value,
-            Err(_) => self.size,
-        };
-
-        let adjusted_nanos = tokens
-            .saturating_mul(refill_time_nanos)
-            .div_ceil(u128::from(self.size));
-        let adjusted_nanos = match u64::try_from(adjusted_nanos) {
-            Ok(value) => value,
-            Err(_) => self.refill_time_nanos,
-        };
-        self.last_update += Duration::from_nanos(adjusted_nanos);
-    }
+fn serial_token_bucket(config: SerialRateLimiterConfig) -> Option<TokenBucket> {
+    TokenBucket::new(TokenBucketConfig::new(
+        config.size(),
+        config.one_time_burst(),
+        config.refill_time(),
+    ))
 }
 
 #[derive(Debug)]
@@ -1068,14 +977,15 @@ mod tests {
         SERIAL_OUTPUT_BUFFER_DEFAULT_LIMIT, SERIAL_SCRATCH_REGISTER_OFFSET,
         SERIAL_TRANSMIT_REGISTER_OFFSET, SerialConfigError, SerialConfigInput, SerialMmioDevice,
         SerialMmioError, SerialOutput, SerialOutputBuffer, SerialOutputError, SerialOutputFile,
-        SerialOutputMetrics, SerialRateLimiterConfig, SerialTokenBucket, SharedSerialOutput,
-        SharedSerialOutputBuffer, SharedSerialOutputMetrics,
+        SerialOutputMetrics, SerialRateLimiterConfig, SharedSerialOutput, SharedSerialOutputBuffer,
+        SharedSerialOutputMetrics,
     };
     use crate::memory::GuestAddress;
     use crate::mmio::{
         MmioAccess, MmioAccessBytes, MmioDispatchError, MmioDispatchOutcome, MmioDispatcher,
         MmioHandler, MmioOperation, MmioRegionId,
     };
+    use crate::token_bucket::{TokenBucket, TokenBucketConfig};
 
     fn access(offset: u64, size: u64) -> MmioAccess {
         let mut dispatcher = MmioDispatcher::new();
@@ -1398,9 +1308,8 @@ mod tests {
     #[test]
     fn token_bucket_consumes_burst_budget_and_refills_by_time() {
         let now = Instant::now();
-        let mut bucket =
-            SerialTokenBucket::new_at(SerialRateLimiterConfig::new(2, Some(1), 100), now)
-                .expect("bucket should be enabled");
+        let mut bucket = TokenBucket::new_at(TokenBucketConfig::new(2, Some(1), 100), now)
+            .expect("bucket should be enabled");
 
         assert!(bucket.reduce_at(1, now));
         assert!(bucket.reduce_at(1, now));
@@ -1420,7 +1329,17 @@ mod tests {
             SerialRateLimiterConfig::new(1, None, 0),
             SerialRateLimiterConfig::new(1, None, u64::MAX),
         ] {
-            assert!(SerialTokenBucket::new_at(config, now).is_none());
+            assert!(
+                TokenBucket::new_at(
+                    TokenBucketConfig::new(
+                        config.size(),
+                        config.one_time_burst(),
+                        config.refill_time(),
+                    ),
+                    now,
+                )
+                .is_none()
+            );
         }
     }
 

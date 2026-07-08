@@ -1,11 +1,13 @@
 use std::collections::TryReserveError;
 use std::fmt;
+use std::time::Instant;
 
 use crate::interrupt::DeviceInterruptKind;
 use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError};
 use crate::mmio::{
     MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandlerError, MmioRegion, MmioRegionId,
 };
+use crate::token_bucket::{TokenBucket, TokenBucketConfig, TokenBucketSnapshot};
 use crate::virtio_mmio::{
     UnsupportedVirtioMmioDeviceConfig, VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation,
     VirtioMmioDeviceActivationError, VirtioMmioDeviceActivationHandler,
@@ -34,23 +36,34 @@ const VIRTIO_RNG_QUEUE_INDEX_USIZE: usize = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntropyConfigInput {
-    rate_limiter_configured: bool,
+    rate_limiter: Option<EntropyRateLimiterConfig>,
 }
 
 impl EntropyConfigInput {
     pub const fn new() -> Self {
-        Self {
-            rate_limiter_configured: false,
-        }
+        Self { rate_limiter: None }
     }
 
-    pub const fn with_rate_limiter_configured(mut self) -> Self {
-        self.rate_limiter_configured = true;
+    pub const fn with_rate_limiter(mut self, rate_limiter: EntropyRateLimiterConfig) -> Self {
+        self.rate_limiter = Some(rate_limiter);
         self
     }
 
+    pub const fn rate_limiter(&self) -> Option<EntropyRateLimiterConfig> {
+        self.rate_limiter
+    }
+
     pub const fn rate_limiter_configured(&self) -> bool {
-        self.rate_limiter_configured
+        self.rate_limiter.is_some()
+    }
+
+    pub const fn validate(self) -> Result<EntropyConfig, EntropyConfigError> {
+        Ok(EntropyConfig {
+            rate_limiter: match self.rate_limiter {
+                Some(rate_limiter) if rate_limiter.is_configured() => Some(rate_limiter),
+                _ => None,
+            },
+        })
     }
 }
 
@@ -61,24 +74,91 @@ impl Default for EntropyConfigInput {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct EntropyConfig;
+pub struct EntropyConfig {
+    rate_limiter: Option<EntropyRateLimiterConfig>,
+}
 
 impl EntropyConfig {
     pub const fn new() -> Self {
-        Self
+        Self { rate_limiter: None }
+    }
+
+    pub const fn with_rate_limiter(mut self, rate_limiter: EntropyRateLimiterConfig) -> Self {
+        self.rate_limiter = Some(rate_limiter);
+        self
+    }
+
+    pub const fn rate_limiter(self) -> Option<EntropyRateLimiterConfig> {
+        self.rate_limiter
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EntropyConfigError {
-    UnsupportedRateLimiter,
+pub struct EntropyRateLimiterConfig {
+    bandwidth: Option<EntropyTokenBucketConfig>,
+    ops: Option<EntropyTokenBucketConfig>,
 }
 
-impl fmt::Display for EntropyConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnsupportedRateLimiter => f.write_str("entropy rate_limiter is not supported"),
+impl EntropyRateLimiterConfig {
+    pub const fn new(
+        bandwidth: Option<EntropyTokenBucketConfig>,
+        ops: Option<EntropyTokenBucketConfig>,
+    ) -> Self {
+        Self { bandwidth, ops }
+    }
+
+    pub const fn bandwidth(self) -> Option<EntropyTokenBucketConfig> {
+        self.bandwidth
+    }
+
+    pub const fn ops(self) -> Option<EntropyTokenBucketConfig> {
+        self.ops
+    }
+
+    pub const fn is_configured(self) -> bool {
+        self.bandwidth.is_some() || self.ops.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntropyTokenBucketConfig {
+    size: u64,
+    one_time_burst: Option<u64>,
+    refill_time: u64,
+}
+
+impl EntropyTokenBucketConfig {
+    pub const fn new(size: u64, one_time_burst: Option<u64>, refill_time: u64) -> Self {
+        Self {
+            size,
+            one_time_burst,
+            refill_time,
         }
+    }
+
+    pub const fn size(self) -> u64 {
+        self.size
+    }
+
+    pub const fn one_time_burst(self) -> Option<u64> {
+        self.one_time_burst
+    }
+
+    pub const fn refill_time(self) -> u64 {
+        self.refill_time
+    }
+
+    const fn token_bucket_config(self) -> TokenBucketConfig {
+        TokenBucketConfig::new(self.size, self.one_time_burst, self.refill_time)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntropyConfigError {}
+
+impl fmt::Display for EntropyConfigError {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {}
     }
 }
 
@@ -93,6 +173,12 @@ impl PreparedEntropyDevice {
     pub const fn new() -> Self {
         Self {
             device: VirtioRngDevice::new(),
+        }
+    }
+
+    pub fn from_config(config: EntropyConfig) -> Self {
+        Self {
+            device: VirtioRngDevice::from_config(config),
         }
     }
 
@@ -387,6 +473,61 @@ impl std::error::Error for VirtioRngQueueBuildError {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct VirtioRngRateLimiter {
+    bandwidth: Option<TokenBucket>,
+    ops: Option<TokenBucket>,
+}
+
+impl VirtioRngRateLimiter {
+    fn new_at(config: EntropyRateLimiterConfig, now: Instant) -> Option<Self> {
+        let bandwidth = config
+            .bandwidth()
+            .and_then(|bucket| TokenBucket::new_at(bucket.token_bucket_config(), now));
+        let ops = config
+            .ops()
+            .and_then(|bucket| TokenBucket::new_at(bucket.token_bucket_config(), now));
+
+        if bandwidth.is_none() && ops.is_none() {
+            None
+        } else {
+            Some(Self { bandwidth, ops })
+        }
+    }
+
+    fn reduce_at(&mut self, bytes: u64, now: Instant) -> bool {
+        let bandwidth_snapshot = self.bandwidth.as_ref().map(TokenBucket::snapshot);
+        let ops_snapshot = self.ops.as_ref().map(TokenBucket::snapshot);
+
+        if let Some(ops) = self.ops.as_mut()
+            && !ops.reduce_at(1, now)
+        {
+            return false;
+        }
+        if let Some(bandwidth) = self.bandwidth.as_mut()
+            && !bandwidth.reduce_allow_overconsumption_at(bytes, now)
+        {
+            self.restore(bandwidth_snapshot, ops_snapshot);
+            return false;
+        }
+
+        true
+    }
+
+    fn restore(
+        &mut self,
+        bandwidth_snapshot: Option<TokenBucketSnapshot>,
+        ops_snapshot: Option<TokenBucketSnapshot>,
+    ) {
+        if let (Some(bandwidth), Some(snapshot)) = (self.bandwidth.as_mut(), bandwidth_snapshot) {
+            bandwidth.restore(snapshot);
+        }
+        if let (Some(ops), Some(snapshot)) = (self.ops.as_mut(), ops_snapshot) {
+            ops.restore(snapshot);
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtioRngQueue {
     available: VirtqueueAvailableRing,
@@ -429,9 +570,21 @@ impl VirtioRngQueue {
         &mut self,
         memory: &mut GuestMemory,
         entropy_source: &mut (impl VirtioRngEntropySource + ?Sized),
+        rate_limiter: Option<&mut VirtioRngRateLimiter>,
+    ) -> Result<VirtioRngQueueDispatch, VirtioRngQueueDispatchError> {
+        self.dispatch_with_source_at(memory, entropy_source, rate_limiter, Instant::now())
+    }
+
+    fn dispatch_with_source_at(
+        &mut self,
+        memory: &mut GuestMemory,
+        entropy_source: &mut (impl VirtioRngEntropySource + ?Sized),
+        rate_limiter: Option<&mut VirtioRngRateLimiter>,
+        now: Instant,
     ) -> Result<VirtioRngQueueDispatch, VirtioRngQueueDispatchError> {
         let mut dispatch = VirtioRngQueueDispatch::default();
         let mut entropy_buffer = Vec::new();
+        let mut rate_limiter = rate_limiter;
 
         while let Some(chain) = match self.available.pop_descriptor_chain(memory) {
             Ok(chain) => chain,
@@ -453,6 +606,27 @@ impl VirtioRngQueue {
 
             let (bytes_written_to_guest, outcome) = match VirtioRngBuffer::parse(memory, &chain) {
                 Ok(buffer) => {
+                    let requested_len = match entropy_request_len_from_buffer_len(buffer.len()) {
+                        Ok(requested_len) => requested_len,
+                        Err(len) => {
+                            return Err(VirtioRngQueueDispatchError::CompletedLengthTooLarge {
+                                completed_dispatch: Box::new(dispatch),
+                                len,
+                            });
+                        }
+                    };
+                    if let Some(limiter) = rate_limiter.as_deref_mut()
+                        && !limiter.reduce_at(requested_len as u64, now)
+                    {
+                        if let Err(source) = self.available.undo_pop_descriptor_chain() {
+                            return Err(VirtioRngQueueDispatchError::AvailableRing {
+                                completed_dispatch: Box::new(dispatch),
+                                source,
+                            });
+                        }
+                        dispatch.record_rate_limited_request();
+                        break;
+                    }
                     match fill_entropy_buffer(memory, &buffer, entropy_source, &mut entropy_buffer)
                     {
                         Ok(bytes_written_to_guest) => (
@@ -519,11 +693,31 @@ impl VirtioRngQueue {
 #[derive(Debug, Default)]
 pub struct VirtioRngDevice {
     active_queue: Option<VirtioRngQueue>,
+    rate_limiter: Option<VirtioRngRateLimiter>,
+    pending_rate_limited_queue: bool,
 }
 
 impl VirtioRngDevice {
     pub const fn new() -> Self {
-        Self { active_queue: None }
+        Self {
+            active_queue: None,
+            rate_limiter: None,
+            pending_rate_limited_queue: false,
+        }
+    }
+
+    pub fn from_config(config: EntropyConfig) -> Self {
+        Self::from_config_at(config, Instant::now())
+    }
+
+    fn from_config_at(config: EntropyConfig, now: Instant) -> Self {
+        Self {
+            active_queue: None,
+            rate_limiter: config
+                .rate_limiter()
+                .and_then(|rate_limiter| VirtioRngRateLimiter::new_at(rate_limiter, now)),
+            pending_rate_limited_queue: false,
+        }
     }
 
     pub fn is_activated(&self) -> bool {
@@ -536,6 +730,10 @@ impl VirtioRngDevice {
 
     pub fn active_queue_mut(&mut self) -> Option<&mut VirtioRngQueue> {
         self.active_queue.as_mut()
+    }
+
+    pub const fn has_pending_rate_limited_queue(&self) -> bool {
+        self.pending_rate_limited_queue
     }
 
     pub fn activate_rng(
@@ -573,11 +771,27 @@ impl VirtioRngDevice {
         Ok(())
     }
 
+    #[cfg(test)]
     fn dispatch_drained_queue_notifications(
         &mut self,
         memory: &mut GuestMemory,
         drained_notifications: Vec<usize>,
         entropy_source: &mut (impl VirtioRngEntropySource + ?Sized),
+    ) -> Result<VirtioRngDeviceNotificationDispatch, VirtioRngDeviceNotificationError> {
+        self.dispatch_drained_queue_notifications_at(
+            memory,
+            drained_notifications,
+            entropy_source,
+            Instant::now(),
+        )
+    }
+
+    fn dispatch_drained_queue_notifications_at(
+        &mut self,
+        memory: &mut GuestMemory,
+        drained_notifications: Vec<usize>,
+        entropy_source: &mut (impl VirtioRngEntropySource + ?Sized),
+        now: Instant,
     ) -> Result<VirtioRngDeviceNotificationDispatch, VirtioRngDeviceNotificationError> {
         if drained_notifications.is_empty() {
             return Ok(VirtioRngDeviceNotificationDispatch::new(
@@ -603,11 +817,19 @@ impl VirtioRngDevice {
             });
         };
 
-        match queue.dispatch_with_source(memory, entropy_source) {
-            Ok(dispatch) => Ok(VirtioRngDeviceNotificationDispatch::new(
-                drained_notifications,
-                Some(dispatch),
-            )),
+        let had_pending_rate_limited_queue = self.pending_rate_limited_queue;
+        match queue.dispatch_with_source_at(memory, entropy_source, self.rate_limiter.as_mut(), now)
+        {
+            Ok(mut dispatch) => {
+                if had_pending_rate_limited_queue {
+                    dispatch.record_rate_limiter_event();
+                }
+                self.pending_rate_limited_queue = dispatch.rate_limiter_throttled_requests() != 0;
+                Ok(VirtioRngDeviceNotificationDispatch::new(
+                    drained_notifications,
+                    Some(dispatch),
+                ))
+            }
             Err(source) => Err(VirtioRngDeviceNotificationError::QueueDispatch {
                 drained_notifications,
                 source,
@@ -617,19 +839,44 @@ impl VirtioRngDevice {
 
     pub fn reset(&mut self) {
         self.active_queue = None;
+        self.pending_rate_limited_queue = false;
     }
 }
 
 impl VirtioMmioRegisterHandler<UnsupportedVirtioMmioDeviceConfig, VirtioRngDevice> {
+    pub fn has_pending_rng_queue_work(&self) -> bool {
+        self.has_pending_queue_notifications()
+            || self.activation_handler().has_pending_rate_limited_queue()
+    }
+
     pub fn dispatch_rng_queue_notifications(
         &mut self,
         memory: &mut GuestMemory,
         entropy_source: &mut (impl VirtioRngEntropySource + ?Sized),
     ) -> Result<VirtioRngDeviceNotificationDispatch, VirtioRngDeviceNotificationError> {
-        let drained_notifications = self.take_pending_queue_notifications();
+        self.dispatch_rng_queue_notifications_at(memory, entropy_source, Instant::now())
+    }
+
+    fn dispatch_rng_queue_notifications_at(
+        &mut self,
+        memory: &mut GuestMemory,
+        entropy_source: &mut (impl VirtioRngEntropySource + ?Sized),
+        now: Instant,
+    ) -> Result<VirtioRngDeviceNotificationDispatch, VirtioRngDeviceNotificationError> {
+        let mut drained_notifications = self.take_pending_queue_notifications();
+        if drained_notifications.is_empty()
+            && self.activation_handler().has_pending_rate_limited_queue()
+        {
+            drained_notifications.push(VIRTIO_RNG_QUEUE_INDEX_USIZE);
+        }
         let dispatch = self
             .activation_handler_mut()
-            .dispatch_drained_queue_notifications(memory, drained_notifications, entropy_source);
+            .dispatch_drained_queue_notifications_at(
+                memory,
+                drained_notifications,
+                entropy_source,
+                now,
+            );
         let needs_queue_interrupt = match &dispatch {
             Ok(dispatch) => dispatch.needs_queue_interrupt(),
             Err(error) => error
@@ -831,6 +1078,8 @@ pub struct VirtioRngQueueDispatch {
     successful_requests: usize,
     buffer_parse_failures: usize,
     source_failures: usize,
+    rate_limiter_throttled_requests: usize,
+    rate_limiter_events: usize,
     bytes_written_to_guest: u64,
     first_buffer_parse_failure: Option<VirtioRngBufferParseError>,
     first_source_failure: Option<VirtioRngEntropySourceError>,
@@ -852,6 +1101,14 @@ impl VirtioRngQueueDispatch {
 
     pub const fn source_failures(&self) -> usize {
         self.source_failures
+    }
+
+    pub const fn rate_limiter_throttled_requests(&self) -> usize {
+        self.rate_limiter_throttled_requests
+    }
+
+    pub const fn rate_limiter_events(&self) -> usize {
+        self.rate_limiter_events
     }
 
     pub const fn bytes_written_to_guest(&self) -> u64 {
@@ -897,6 +1154,14 @@ impl VirtioRngQueueDispatch {
                 }
             }
         }
+    }
+
+    fn record_rate_limited_request(&mut self) {
+        self.rate_limiter_throttled_requests += 1;
+    }
+
+    fn record_rate_limiter_event(&mut self) {
+        self.rate_limiter_events += 1;
     }
 }
 
@@ -1300,12 +1565,16 @@ fn fill_entropy_buffer(
 }
 
 fn entropy_request_len(buffer_len: u64) -> Result<usize, VirtioRngFillError> {
+    entropy_request_len_from_buffer_len(buffer_len)
+        .map_err(|len| VirtioRngFillError::CompletedLengthTooLarge { len })
+}
+
+fn entropy_request_len_from_buffer_len(buffer_len: u64) -> Result<usize, usize> {
     if buffer_len > VIRTIO_RNG_MAX_REQUEST_BYTES_U64 {
         return Ok(VIRTIO_RNG_MAX_REQUEST_BYTES);
     }
 
-    usize::try_from(buffer_len)
-        .map_err(|_| VirtioRngFillError::CompletedLengthTooLarge { len: usize::MAX })
+    usize::try_from(buffer_len).map_err(|_| usize::MAX)
 }
 
 fn write_entropy_to_buffer(
@@ -1355,6 +1624,7 @@ fn descriptor_chain_head(chain: &VirtqueueDescriptorChain) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
+    use std::time::{Duration, Instant};
 
     use crate::interrupt::DeviceInterruptKind;
     use crate::memory::{GuestMemoryError, GuestMemoryLayout, GuestMemoryRange};
@@ -1375,6 +1645,7 @@ mod tests {
         VirtqueueAvailableRing, VirtqueueUsedRing,
     };
 
+    use super::{EntropyConfig, EntropyRateLimiterConfig, EntropyTokenBucketConfig};
     use super::{
         EntropyMmioLayout, EntropyMmioRegistrationError, GuestAddress, GuestMemory,
         PreparedEntropyDevice, VIRTIO_RNG_DEVICE_ID, VIRTIO_RNG_MAX_REQUEST_BYTES,
@@ -1382,6 +1653,7 @@ mod tests {
         VirtioRngDeviceActivationError, VirtioRngDeviceNotificationError, VirtioRngEntropySource,
         VirtioRngEntropySourceError, VirtioRngMmioHandler, VirtioRngOsEntropySource,
         VirtioRngQueue, VirtioRngQueueBuildError, VirtioRngQueueDispatchError,
+        VirtioRngRateLimiter,
     };
 
     const TEST_DESCRIPTOR_TABLE: GuestAddress = GuestAddress::new(0x1000);
@@ -1505,6 +1777,17 @@ mod tests {
         VirtioRngQueue::new(available, used)
     }
 
+    fn bandwidth_limiter(size: u64, refill_time: u64, now: Instant) -> VirtioRngRateLimiter {
+        VirtioRngRateLimiter::new_at(
+            EntropyRateLimiterConfig::new(
+                Some(EntropyTokenBucketConfig::new(size, None, refill_time)),
+                None,
+            ),
+            now,
+        )
+        .expect("bandwidth limiter should be enabled")
+    }
+
     fn guest_address_low(address: GuestAddress) -> u32 {
         u32::try_from(address.raw_value()).expect("test address should fit in queue low register")
     }
@@ -1530,6 +1813,19 @@ mod tests {
             0,
             &VIRTIO_RNG_QUEUE_SIZES,
             VirtioRngDevice::new(),
+        )
+        .expect("virtio-rng MMIO handler should build")
+    }
+
+    fn rng_mmio_handler_with_entropy_config(
+        config: EntropyConfig,
+        now: Instant,
+    ) -> VirtioRngMmioHandler {
+        VirtioRngMmioHandler::with_activation(
+            VIRTIO_RNG_DEVICE_ID,
+            0,
+            &VIRTIO_RNG_QUEUE_SIZES,
+            VirtioRngDevice::from_config_at(config, now),
         )
         .expect("virtio-rng MMIO handler should build")
     }
@@ -2470,6 +2766,75 @@ mod tests {
     }
 
     #[test]
+    fn rng_mmio_handler_retries_rate_limited_queue_without_second_notification() {
+        let now = Instant::now();
+        let mut memory = memory();
+        write_descriptor(&mut memory, 0, TEST_DATA, 4, VIRTQUEUE_DESC_F_WRITE, 0);
+        write_descriptor(
+            &mut memory,
+            1,
+            TEST_SECOND_DATA,
+            4,
+            VIRTQUEUE_DESC_F_WRITE,
+            0,
+        );
+        queue_head(&mut memory, 0, 0);
+        queue_head(&mut memory, 1, 1);
+        set_available_index(&mut memory, 2);
+        let entropy_config = EntropyConfig::new().with_rate_limiter(EntropyRateLimiterConfig::new(
+            Some(EntropyTokenBucketConfig::new(4, None, 100)),
+            None,
+        ));
+
+        let mut handler = rng_mmio_handler_with_entropy_config(entropy_config, now);
+        configure_rng_mmio_handler_queue(&mut handler, TEST_USED_RING);
+        activate_rng_mmio_handler(&mut handler);
+        notify_rng_queue(&mut handler, 0);
+
+        let mut source = TestEntropySource::default();
+        let first = handler
+            .dispatch_rng_queue_notifications_at(&mut memory, &mut source, now)
+            .expect("first notification should dispatch and throttle second request");
+        let second = handler
+            .dispatch_rng_queue_notifications_at(
+                &mut memory,
+                &mut source,
+                now + Duration::from_millis(100),
+            )
+            .expect("pending rate-limited queue should retry without a new notification");
+
+        assert!(!handler.has_pending_queue_notifications());
+        assert_eq!(first.drained_notifications(), &[0]);
+        assert_eq!(second.drained_notifications(), &[0]);
+        assert_eq!(
+            first
+                .queue_dispatch()
+                .expect("first queue dispatch should be present")
+                .rate_limiter_throttled_requests(),
+            1
+        );
+        let retry_dispatch = second
+            .queue_dispatch()
+            .expect("retry queue dispatch should be present");
+        assert_eq!(retry_dispatch.processed_requests(), 1);
+        assert_eq!(retry_dispatch.rate_limiter_events(), 1);
+        assert_eq!(retry_dispatch.rate_limiter_throttled_requests(), 0);
+        let metrics = SharedEntropyDeviceMetrics::default();
+        metrics.record_notification_dispatch(&first);
+        metrics.record_notification_dispatch(&second);
+        assert_eq!(
+            metrics.snapshot(),
+            EntropyDeviceMetrics::default()
+                .with_entropy_event_count(2)
+                .with_entropy_bytes(8)
+                .with_entropy_rate_limiter_throttled(1)
+                .with_rate_limiter_event_count(1)
+        );
+        assert_eq!(source.calls(), &[4, 4]);
+        assert_eq!(read_used_index(&memory), 2);
+    }
+
+    #[test]
     fn rng_queue_dispatch_fills_single_writable_descriptor() {
         let mut memory = memory();
         write_descriptor(&mut memory, 0, TEST_DATA, 8, VIRTQUEUE_DESC_F_WRITE, 0);
@@ -2479,7 +2844,7 @@ mod tests {
         let mut source = TestEntropySource::default();
         let mut queue = rng_queue();
         let dispatch = queue
-            .dispatch_with_source(&mut memory, &mut source)
+            .dispatch_with_source(&mut memory, &mut source, None)
             .expect("rng queue dispatch should succeed");
 
         assert_eq!(dispatch.processed_requests(), 1);
@@ -2505,7 +2870,7 @@ mod tests {
         let mut queue = rng_queue();
 
         let dispatch = queue
-            .dispatch_with_source(&mut memory, &mut source)
+            .dispatch_with_source(&mut memory, &mut source, None)
             .expect("empty rng queue dispatch should succeed");
 
         assert_eq!(dispatch.processed_requests(), 0);
@@ -2514,6 +2879,99 @@ mod tests {
         assert!(!dispatch.needs_queue_interrupt());
         assert!(source.calls().is_empty());
         assert_eq!(read_used_index(&memory), 0);
+    }
+
+    #[test]
+    fn rng_queue_dispatch_throttles_without_completing_descriptor_or_reading_source() {
+        let now = Instant::now();
+        let mut memory = memory();
+        write_descriptor(&mut memory, 0, TEST_DATA, 4, VIRTQUEUE_DESC_F_WRITE, 0);
+        write_descriptor(
+            &mut memory,
+            1,
+            TEST_SECOND_DATA,
+            4,
+            VIRTQUEUE_DESC_F_WRITE,
+            0,
+        );
+        queue_head(&mut memory, 0, 0);
+        queue_head(&mut memory, 1, 1);
+        set_available_index(&mut memory, 2);
+
+        let mut source = TestEntropySource::default();
+        let mut limiter = bandwidth_limiter(4, 100, now);
+        let mut queue = rng_queue();
+        let dispatch = queue
+            .dispatch_with_source_at(&mut memory, &mut source, Some(&mut limiter), now)
+            .expect("throttled rng queue dispatch should succeed");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_requests(), 1);
+        assert_eq!(dispatch.rate_limiter_throttled_requests(), 1);
+        assert_eq!(source.calls(), &[4]);
+        assert_eq!(read_used_index(&memory), 1);
+        assert_eq!(queue.available_ring().next_avail(), 1);
+        assert_eq!(read_guest_bytes(&memory, TEST_DATA, 4), vec![0, 1, 2, 3]);
+        assert_eq!(read_guest_bytes(&memory, TEST_SECOND_DATA, 4), vec![0; 4]);
+    }
+
+    #[test]
+    fn rng_queue_dispatch_retries_throttled_descriptor_after_budget_replenishes() {
+        let now = Instant::now();
+        let mut memory = memory();
+        write_descriptor(&mut memory, 0, TEST_DATA, 4, VIRTQUEUE_DESC_F_WRITE, 0);
+        write_descriptor(
+            &mut memory,
+            1,
+            TEST_SECOND_DATA,
+            4,
+            VIRTQUEUE_DESC_F_WRITE,
+            0,
+        );
+        queue_head(&mut memory, 0, 0);
+        queue_head(&mut memory, 1, 1);
+        set_available_index(&mut memory, 2);
+
+        let mut source = TestEntropySource::default();
+        let mut limiter = bandwidth_limiter(4, 100, now);
+        let mut queue = rng_queue();
+        let first = queue
+            .dispatch_with_source_at(&mut memory, &mut source, Some(&mut limiter), now)
+            .expect("first dispatch should throttle");
+        let second = queue
+            .dispatch_with_source_at(
+                &mut memory,
+                &mut source,
+                Some(&mut limiter),
+                now + Duration::from_millis(100),
+            )
+            .expect("second dispatch should complete after replenishment");
+
+        assert_eq!(first.rate_limiter_throttled_requests(), 1);
+        assert_eq!(second.rate_limiter_throttled_requests(), 0);
+        assert_eq!(second.processed_requests(), 1);
+        assert_eq!(second.successful_requests(), 1);
+        assert_eq!(source.calls(), &[4, 4]);
+        assert_eq!(read_used_index(&memory), 2);
+        assert_eq!(read_used_id(&memory, 0), 0);
+        assert_eq!(read_used_len(&memory, 0), 4);
+        assert_eq!(read_used_id(&memory, 1), 1);
+        assert_eq!(read_used_len(&memory, 1), 4);
+    }
+
+    #[test]
+    fn rng_rate_limiter_rolls_back_ops_budget_when_bandwidth_throttles() {
+        let now = Instant::now();
+        let config = EntropyRateLimiterConfig::new(
+            Some(EntropyTokenBucketConfig::new(1, None, 100)),
+            Some(EntropyTokenBucketConfig::new(2, None, 1_000)),
+        );
+        let mut limiter =
+            VirtioRngRateLimiter::new_at(config, now).expect("limiter should be enabled");
+
+        assert!(limiter.reduce_at(1, now));
+        assert!(!limiter.reduce_at(1, now));
+        assert!(limiter.reduce_at(1, now + Duration::from_millis(100)));
     }
 
     #[test]
@@ -2541,7 +2999,7 @@ mod tests {
         let mut source = TestEntropySource::default();
         let mut queue = rng_queue();
         let dispatch = queue
-            .dispatch_with_source(&mut memory, &mut source)
+            .dispatch_with_source(&mut memory, &mut source, None)
             .expect("rng queue dispatch should succeed");
 
         assert_eq!(dispatch.processed_requests(), 1);
@@ -2583,7 +3041,7 @@ mod tests {
         let mut source = TestEntropySource::default();
         let mut queue = rng_queue();
         let dispatch = queue
-            .dispatch_with_source(&mut memory, &mut source)
+            .dispatch_with_source(&mut memory, &mut source, None)
             .expect("rng queue dispatch should succeed");
 
         assert_eq!(dispatch.processed_requests(), 1);
@@ -2616,7 +3074,7 @@ mod tests {
         let mut source = TestEntropySource::default();
         let mut queue = rng_queue();
         let dispatch = queue
-            .dispatch_with_source(&mut memory, &mut source)
+            .dispatch_with_source(&mut memory, &mut source, None)
             .expect("rng queue dispatch should succeed");
 
         assert_eq!(dispatch.processed_requests(), 2);
@@ -2645,7 +3103,7 @@ mod tests {
         let mut source = TestEntropySource::default();
         let mut queue = rng_queue();
         let first = queue
-            .dispatch_with_source(&mut memory, &mut source)
+            .dispatch_with_source(&mut memory, &mut source, None)
             .expect("first rng queue dispatch should succeed");
 
         write_descriptor(
@@ -2659,7 +3117,7 @@ mod tests {
         queue_head(&mut memory, 1, 1);
         set_available_index(&mut memory, 2);
         let second = queue
-            .dispatch_with_source(&mut memory, &mut source)
+            .dispatch_with_source(&mut memory, &mut source, None)
             .expect("second rng queue dispatch should succeed");
 
         assert_eq!(first.processed_requests(), 1);
@@ -2694,7 +3152,7 @@ mod tests {
         let mut source = TestEntropySource::default();
         let mut queue = rng_queue();
         let dispatch = queue
-            .dispatch_with_source(&mut memory, &mut source)
+            .dispatch_with_source(&mut memory, &mut source, None)
             .expect("rng queue dispatch should succeed");
 
         assert_eq!(dispatch.processed_requests(), 1);
@@ -2734,7 +3192,7 @@ mod tests {
         let mut source = TestEntropySource::default();
         let mut queue = rng_queue();
         let dispatch = queue
-            .dispatch_with_source(&mut memory, &mut source)
+            .dispatch_with_source(&mut memory, &mut source, None)
             .expect("rng queue dispatch should complete invalid descriptor");
 
         assert_eq!(dispatch.processed_requests(), 1);
@@ -2761,7 +3219,7 @@ mod tests {
         let mut source = TestEntropySource::default();
         let mut queue = rng_queue();
         let dispatch = queue
-            .dispatch_with_source(&mut memory, &mut source)
+            .dispatch_with_source(&mut memory, &mut source, None)
             .expect("rng queue dispatch should complete invalid descriptor");
 
         assert_eq!(dispatch.processed_requests(), 1);
@@ -2793,7 +3251,7 @@ mod tests {
         let mut source = TestEntropySource::default();
         let mut queue = rng_queue();
         let dispatch = queue
-            .dispatch_with_source(&mut memory, &mut source)
+            .dispatch_with_source(&mut memory, &mut source, None)
             .expect("rng queue dispatch should complete invalid descriptor");
 
         assert_eq!(dispatch.processed_requests(), 1);
@@ -2824,7 +3282,7 @@ mod tests {
         let mut source = TestEntropySource::default();
         let mut queue = rng_queue();
         let dispatch = queue
-            .dispatch_with_source(&mut memory, &mut source)
+            .dispatch_with_source(&mut memory, &mut source, None)
             .expect("rng queue dispatch should complete invalid descriptor");
 
         assert_eq!(dispatch.processed_requests(), 1);
@@ -2848,7 +3306,7 @@ mod tests {
         let mut source = TestEntropySource::failing();
         let mut queue = rng_queue();
         let dispatch = queue
-            .dispatch_with_source(&mut memory, &mut source)
+            .dispatch_with_source(&mut memory, &mut source, None)
             .expect("rng queue dispatch should complete source failure");
 
         assert_eq!(dispatch.processed_requests(), 1);
@@ -2874,7 +3332,7 @@ mod tests {
         let mut source = TestEntropySource::failing();
         let mut queue = rng_queue();
         let dispatch = queue
-            .dispatch_with_source(&mut memory, &mut source)
+            .dispatch_with_source(&mut memory, &mut source, None)
             .expect("rng queue dispatch should complete source failure");
         let metrics = SharedEntropyDeviceMetrics::default();
         metrics.record_queue_dispatch(&dispatch);
@@ -2907,7 +3365,7 @@ mod tests {
         let mut source = TestEntropySource::default();
 
         let error = queue
-            .dispatch_with_source(&mut memory, &mut source)
+            .dispatch_with_source(&mut memory, &mut source, None)
             .expect_err("unmapped used ring should fail");
 
         match &error {

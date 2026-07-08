@@ -3743,7 +3743,7 @@ mod tests {
     }
 
     #[test]
-    fn config_file_entropy_rate_limiter_fails_before_starting() {
+    fn config_file_entropy_rate_limiter_stores_config_before_starting() {
         let config_path = unique_config_path("entropy-rate-limiter");
         let config = r#"{
             "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
@@ -3757,29 +3757,32 @@ mod tests {
             TestInstanceStarter,
         );
 
-        let err = super::apply_startup_config_file(
-            &mut vmm,
-            Some(config_path.to_str().expect("UTF-8 path")),
-        )
-        .expect_err("configured entropy rate limiter should fail");
+        super::apply_startup_config_file(&mut vmm, Some(config_path.to_str().expect("UTF-8 path")))
+            .expect("configured entropy rate limiter should apply");
 
-        assert_eq!(
-            err,
-            ProcessError::ConfigFile(super::ConfigFileError::Apply(
-                bangbang_runtime::VmmActionError::EntropyConfig(
-                    bangbang_runtime::entropy::EntropyConfigError::UnsupportedRateLimiter
-                )
-            ))
-        );
-        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
-        assert!(!vmm.has_started_session());
+        assert_eq!(vmm.instance_info().state, InstanceState::Running);
+        assert!(vmm.has_started_session());
         let data = vmm
             .handle_action(VmmAction::GetVmConfig)
             .expect("VM config should be returned");
         let VmmData::VmConfiguration(config) = data else {
             panic!("expected VM config");
         };
-        assert_eq!(config.entropy_config(), None);
+        assert_eq!(
+            config.entropy_config(),
+            Some(
+                bangbang_runtime::entropy::EntropyConfig::new().with_rate_limiter(
+                    bangbang_runtime::entropy::EntropyRateLimiterConfig::new(
+                        Some(bangbang_runtime::entropy::EntropyTokenBucketConfig::new(
+                            123456789,
+                            Some(987654321),
+                            777
+                        )),
+                        None,
+                    )
+                )
+            )
+        );
 
         fs::remove_file(config_path).expect("fixture config should clean up");
     }

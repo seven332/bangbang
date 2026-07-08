@@ -2635,6 +2635,10 @@ impl SharedEntropyDeviceMetrics {
                 .saturating_add(dispatch.source_failures()),
         ));
         self.record_host_rng_failures(usize_to_u64_saturating(dispatch.source_failures()));
+        self.record_rate_limiter_throttled(usize_to_u64_saturating(
+            dispatch.rate_limiter_throttled_requests(),
+        ));
+        self.record_rate_limiter_events(usize_to_u64_saturating(dispatch.rate_limiter_events()));
     }
 
     fn record_entropy_events(&self, count: u64) {
@@ -2658,6 +2662,18 @@ impl SharedEntropyDeviceMetrics {
     fn record_host_rng_failures(&self, count: u64) {
         if count != 0 {
             record_atomic_metric(&self.inner.host_rng_fails, count);
+        }
+    }
+
+    fn record_rate_limiter_throttled(&self, count: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.entropy_rate_limiter_throttled, count);
+        }
+    }
+
+    fn record_rate_limiter_events(&self, count: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.rate_limiter_event_count, count);
         }
     }
 }
