@@ -21,7 +21,9 @@ use api_server::{ApiServer, ApiServerError, config_vmm_action_from_api_request};
 use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_api::http::{RequestError, parse_request_with_limit};
 use bangbang_hvf::HvfBackend;
-use periodic_metrics::PeriodicMetricsScheduler;
+use periodic_metrics::{
+    PeriodicBalloonStatisticsScheduler, PeriodicMetricsScheduler, min_poll_timeout_ms,
+};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::{SigId, low_level};
@@ -142,22 +144,53 @@ fn wait_for_no_api_shutdown(
 fn wait_for_no_api_shutdown_with_periodic_metrics_scheduler(
     shutdown_signal: &mut ShutdownSignal,
     vmm: &mut impl VmmRequestHandler,
+    metrics_scheduler: PeriodicMetricsScheduler,
+) -> Result<(), ProcessError> {
+    wait_for_no_api_shutdown_with_periodic_schedulers(
+        shutdown_signal,
+        vmm,
+        metrics_scheduler,
+        PeriodicBalloonStatisticsScheduler::new(
+            Instant::now(),
+            vmm.balloon_statistics_update_interval(),
+        ),
+    )
+}
+
+fn wait_for_no_api_shutdown_with_periodic_schedulers(
+    shutdown_signal: &mut ShutdownSignal,
+    vmm: &mut impl VmmRequestHandler,
     mut metrics_scheduler: PeriodicMetricsScheduler,
+    mut balloon_scheduler: PeriodicBalloonStatisticsScheduler,
 ) -> Result<(), ProcessError> {
     shutdown_signal.set_nonblocking()?;
 
     loop {
         let now = Instant::now();
+        let metrics_timeout = Some(metrics_scheduler.poll_timeout_ms(now));
+        let balloon_timeout =
+            balloon_scheduler.poll_timeout_ms(now, vmm.balloon_statistics_update_interval());
         match wait_for_shutdown_or_process_exit(
             shutdown_signal.wakeup_fd(),
             vmm.process_exit_wakeup_fd(),
-            Some(metrics_scheduler.poll_timeout_ms(now)),
+            min_poll_timeout_ms(metrics_timeout, balloon_timeout),
         )? {
             ProcessWaitResult::Ready => {}
             ProcessWaitResult::TimedOut => {
-                vmm.handle_periodic_metrics_flush()
-                    .map_err(ProcessError::PeriodicMetricsFlush)?;
-                metrics_scheduler.schedule_next(Instant::now());
+                let now = Instant::now();
+                let balloon_interval = vmm.balloon_statistics_update_interval();
+                if balloon_scheduler.is_due(now, balloon_interval) {
+                    vmm.handle_periodic_balloon_statistics_update()
+                        .map_err(ProcessError::PeriodicBalloonStatisticsUpdate)?;
+                    balloon_scheduler
+                        .schedule_next(Instant::now(), vmm.balloon_statistics_update_interval());
+                }
+                let now = Instant::now();
+                if metrics_scheduler.is_due(now) {
+                    vmm.handle_periodic_metrics_flush()
+                        .map_err(ProcessError::PeriodicMetricsFlush)?;
+                    metrics_scheduler.schedule_next(Instant::now());
+                }
                 continue;
             }
         }
@@ -667,6 +700,7 @@ enum ProcessError {
     ArgumentParsing(String),
     ConfigFile(ConfigFileError),
     Metadata(MetadataFileError),
+    PeriodicBalloonStatisticsUpdate(VmmActionError),
     PeriodicMetricsFlush(VmmActionError),
     ProcessExitNotification(std::io::ErrorKind),
     ProcessSessionTerminal,
@@ -682,6 +716,7 @@ impl ProcessError {
             Self::ArgumentParsing(_) => ProcessExitCode::ArgumentParsing,
             Self::ConfigFile(_) => ProcessExitCode::ProcessFailure,
             Self::Metadata(_) => ProcessExitCode::ProcessFailure,
+            Self::PeriodicBalloonStatisticsUpdate(_) => ProcessExitCode::ProcessFailure,
             Self::PeriodicMetricsFlush(_) => ProcessExitCode::ProcessFailure,
             Self::ProcessExitNotification(_) => ProcessExitCode::ProcessFailure,
             Self::ProcessSessionTerminal => ProcessExitCode::ProcessFailure,
@@ -699,6 +734,12 @@ impl fmt::Display for ProcessError {
             Self::ArgumentParsing(message) => f.write_str(message),
             Self::ConfigFile(err) => write!(f, "config-file error: {err}"),
             Self::Metadata(err) => write!(f, "metadata error: {err}"),
+            Self::PeriodicBalloonStatisticsUpdate(err) => {
+                write!(
+                    f,
+                    "failed to trigger periodic balloon statistics update: {err}"
+                )
+            }
             Self::PeriodicMetricsFlush(err) => {
                 write!(f, "failed to flush periodic metrics: {err}")
             }
@@ -1591,8 +1632,9 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use bangbang_runtime::balloon::BalloonConfigInput;
     use bangbang_runtime::block::{DriveConfigError, DriveConfigInput};
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel};
@@ -1654,6 +1696,12 @@ mod tests {
     }
 
     impl ProcessSessionDiagnostics for TestProcessExitSession {
+        fn trigger_balloon_statistics_update(
+            &mut self,
+        ) -> Result<(), bangbang_runtime::balloon::BalloonUpdateError> {
+            Ok(())
+        }
+
         fn process_exit_wakeup_fd(&self) -> Option<RawFd> {
             Some(self.signal.wakeup_fd())
         }
@@ -1804,6 +1852,17 @@ mod tests {
 
         fn handle_periodic_metrics_flush(&mut self) -> Result<bool, VmmActionError> {
             let result = self.inner.handle_periodic_metrics_flush();
+            self.process_exit_trigger
+                .trigger(ProcessSessionExitStatus::GuestRequestedStop);
+            result
+        }
+
+        fn balloon_statistics_update_interval(&self) -> Option<Duration> {
+            self.inner.balloon_statistics_update_interval()
+        }
+
+        fn handle_periodic_balloon_statistics_update(&mut self) -> Result<bool, VmmActionError> {
+            let result = self.inner.handle_periodic_balloon_statistics_update();
             self.process_exit_trigger
                 .trigger(ProcessSessionExitStatus::GuestRequestedStop);
             result
@@ -3116,6 +3175,53 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
             "{\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+        fs::remove_file(metrics_path).expect("fixture metrics should clean up");
+    }
+
+    #[test]
+    fn no_api_wait_periodic_balloon_statistics_timeout_triggers_without_early_metrics_flush() {
+        let metrics_path = unique_metrics_path("no-api-balloon-periodic");
+        let process_exit_signal = TestProcessExitSignal::new();
+        let process_exit_trigger = process_exit_signal.clone();
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            ProcessExitTestStarter {
+                signal: process_exit_signal,
+            },
+        );
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            &metrics_path,
+        )))
+        .expect("metrics should configure");
+        vmm.handle_action(VmmAction::PutBalloon(
+            BalloonConfigInput::new(64, false).with_stats_polling_interval_s(1),
+        ))
+        .expect("balloon should configure");
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("instance should start");
+        let mut vmm = ProcessExitAfterPeriodicFlush::new(vmm, process_exit_trigger);
+        let mut shutdown_signal = test_shutdown_signal();
+        let now = Instant::now();
+
+        assert_eq!(
+            super::wait_for_no_api_shutdown_with_periodic_schedulers(
+                &mut shutdown_signal,
+                &mut vmm,
+                super::PeriodicMetricsScheduler::new(now),
+                super::PeriodicBalloonStatisticsScheduler::due_now(now, Duration::from_secs(1)),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
+            ""
         );
         fs::remove_file(metrics_path).expect("fixture metrics should clean up");
     }

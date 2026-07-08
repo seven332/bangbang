@@ -1383,6 +1383,35 @@ impl Arm64BootRuntimeResources {
         Ok(Arm64BootBalloonNotificationDispatches::new(devices))
     }
 
+    pub fn trigger_balloon_statistics_update(
+        &mut self,
+        memory: &mut GuestMemory,
+        mmio_dispatcher: &mut MmioDispatcher,
+    ) -> Result<Arm64BootBalloonNotificationDispatches, Arm64BootBalloonNotificationDispatchError>
+    {
+        let mut devices = Vec::new();
+        let device_count = if self.balloon_device.is_some() { 1 } else { 0 };
+        devices.try_reserve_exact(device_count).map_err(|source| {
+            Arm64BootBalloonNotificationDispatchError::ResultAllocation { source }
+        })?;
+
+        if let Some(device) = self.balloon_device.clone() {
+            let region_id = device.registration.region_id();
+            let outcome = match mmio_dispatcher.handler_mut::<VirtioBalloonMmioHandler>(region_id) {
+                Ok(handler) => match handler.trigger_balloon_statistics_update(memory) {
+                    Ok(dispatch) => {
+                        Arm64BootBalloonNotificationOutcome::Dispatched(Box::new(dispatch))
+                    }
+                    Err(source) => Arm64BootBalloonNotificationOutcome::DispatchFailed(source),
+                },
+                Err(source) => Arm64BootBalloonNotificationOutcome::HandlerLookupFailed(source),
+            };
+            devices.push(Arm64BootBalloonNotificationDispatch::new(device, outcome));
+        }
+
+        Ok(Arm64BootBalloonNotificationDispatches::new(devices))
+    }
+
     pub fn dispatch_entropy_queue_notifications_with_source(
         &mut self,
         memory: &mut GuestMemory,

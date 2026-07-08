@@ -62,7 +62,9 @@ use bangbang_runtime::{
     VmmAction, VmmActionError, VmmData,
 };
 
-use crate::periodic_metrics::PeriodicMetricsScheduler;
+use crate::periodic_metrics::{
+    PeriodicBalloonStatisticsScheduler, PeriodicMetricsScheduler, min_poll_timeout_ms,
+};
 use crate::vmm::{
     ApiRequestMetricParseFailure, ApiRequestMetricPatchParseFailure,
     ApiRequestMetricPutParseFailure, GetApiRequest, PatchApiRequest, ProcessSessionExitDecision,
@@ -79,6 +81,7 @@ pub(crate) enum ApiServerError {
     Accept(std::io::ErrorKind),
     Bind(std::io::ErrorKind),
     Connection(std::io::ErrorKind),
+    PeriodicBalloonStatisticsUpdate(VmmActionError),
     PeriodicMetricsFlush(VmmActionError),
     ProcessSessionTerminal,
     SocketMetadata(std::io::ErrorKind),
@@ -95,6 +98,12 @@ impl std::fmt::Display for ApiServerError {
             Self::Accept(kind) => write!(f, "failed to accept API connection: {kind:?}"),
             Self::Bind(kind) => write!(f, "failed to bind API socket: {kind:?}"),
             Self::Connection(kind) => write!(f, "API connection I/O failed: {kind:?}"),
+            Self::PeriodicBalloonStatisticsUpdate(err) => {
+                write!(
+                    f,
+                    "failed to trigger periodic balloon statistics update: {err}"
+                )
+            }
             Self::PeriodicMetricsFlush(err) => {
                 write!(f, "failed to flush periodic metrics: {err}")
             }
@@ -170,7 +179,25 @@ impl ApiServer {
         &self,
         vmm: &mut impl VmmRequestHandler,
         shutdown_wakeup: &mut UnixStream,
+        metrics_scheduler: PeriodicMetricsScheduler,
+    ) -> Result<(), ApiServerError> {
+        self.run_until_with_periodic_schedulers(
+            vmm,
+            shutdown_wakeup,
+            metrics_scheduler,
+            PeriodicBalloonStatisticsScheduler::new(
+                Instant::now(),
+                vmm.balloon_statistics_update_interval(),
+            ),
+        )
+    }
+
+    fn run_until_with_periodic_schedulers(
+        &self,
+        vmm: &mut impl VmmRequestHandler,
+        shutdown_wakeup: &mut UnixStream,
         mut metrics_scheduler: PeriodicMetricsScheduler,
+        mut balloon_scheduler: PeriodicBalloonStatisticsScheduler,
     ) -> Result<(), ApiServerError> {
         self.listener
             .set_nonblocking(true)
@@ -181,17 +208,33 @@ impl ApiServer {
 
         loop {
             let now = Instant::now();
+            let metrics_timeout = Some(metrics_scheduler.poll_timeout_ms(now));
+            let balloon_timeout =
+                balloon_scheduler.poll_timeout_ms(now, vmm.balloon_statistics_update_interval());
             match wait_for_listener_or_shutdown(
                 &self.listener,
                 shutdown_wakeup,
                 vmm.process_exit_wakeup_fd(),
-                Some(metrics_scheduler.poll_timeout_ms(now)),
+                min_poll_timeout_ms(metrics_timeout, balloon_timeout),
             )? {
                 ApiServerWaitResult::Ready => {}
                 ApiServerWaitResult::TimedOut => {
-                    vmm.handle_periodic_metrics_flush()
-                        .map_err(ApiServerError::PeriodicMetricsFlush)?;
-                    metrics_scheduler.schedule_next(Instant::now());
+                    let now = Instant::now();
+                    let balloon_interval = vmm.balloon_statistics_update_interval();
+                    if balloon_scheduler.is_due(now, balloon_interval) {
+                        vmm.handle_periodic_balloon_statistics_update()
+                            .map_err(ApiServerError::PeriodicBalloonStatisticsUpdate)?;
+                        balloon_scheduler.schedule_next(
+                            Instant::now(),
+                            vmm.balloon_statistics_update_interval(),
+                        );
+                    }
+                    let now = Instant::now();
+                    if metrics_scheduler.is_due(now) {
+                        vmm.handle_periodic_metrics_flush()
+                            .map_err(ApiServerError::PeriodicMetricsFlush)?;
+                        metrics_scheduler.schedule_next(Instant::now());
+                    }
                     continue;
                 }
             }
@@ -1681,10 +1724,11 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use bangbang_runtime::balloon::{
-        BalloonConfig, BalloonHintingCommandError, BalloonHintingStartInput, BalloonHintingStatus,
-        BalloonHintingStatusError, BalloonOptionalStats, BalloonStats, BalloonStatsError,
-        BalloonUpdateError, VIRTIO_BALLOON_FREE_PAGE_HINT_DONE, VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
-        VIRTIO_BALLOON_S_MEMFREE, VIRTIO_BALLOON_S_SWAP_OUT, VirtioBalloonStat,
+        BalloonConfig, BalloonConfigInput, BalloonHintingCommandError, BalloonHintingStartInput,
+        BalloonHintingStatus, BalloonHintingStatusError, BalloonOptionalStats, BalloonStats,
+        BalloonStatsError, BalloonUpdateError, VIRTIO_BALLOON_FREE_PAGE_HINT_DONE,
+        VIRTIO_BALLOON_FREE_PAGE_HINT_STOP, VIRTIO_BALLOON_S_MEMFREE, VIRTIO_BALLOON_S_SWAP_OUT,
+        VirtioBalloonStat,
     };
     use bangbang_runtime::block::DriveUpdateError;
     use bangbang_runtime::logger::{LoggerConfigInput, LoggerWriteError};
@@ -1778,6 +1822,10 @@ mod tests {
             &mut self,
             _input: BalloonStatsUpdateInput,
         ) -> Result<(), BalloonUpdateError> {
+            Ok(())
+        }
+
+        fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
             Ok(())
         }
 
@@ -2155,6 +2203,18 @@ mod tests {
             self.shutdown_writer
                 .write_all(b"x")
                 .expect("periodic flush test should signal shutdown");
+            result
+        }
+
+        fn balloon_statistics_update_interval(&self) -> Option<Duration> {
+            self.inner.balloon_statistics_update_interval()
+        }
+
+        fn handle_periodic_balloon_statistics_update(&mut self) -> Result<bool, VmmActionError> {
+            let result = self.inner.handle_periodic_balloon_statistics_update();
+            self.shutdown_writer
+                .write_all(b"x")
+                .expect("periodic balloon test should signal shutdown");
             result
         }
 
@@ -7918,6 +7978,51 @@ mod tests {
             ),
             Ok(())
         );
+        drop(server);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn run_until_periodic_balloon_statistics_timeout_triggers_without_early_metrics_flush() {
+        let path = unique_socket_path("periodic-balloon");
+        let metrics_path =
+            unique_socket_path("periodic-balloon-metrics-output").with_extension("metrics");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let (mut shutdown_reader, shutdown_writer) =
+            UnixStream::pair().expect("shutdown stream pair should be created");
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            &metrics_path,
+        )))
+        .expect("metrics should configure");
+        vmm.handle_action(VmmAction::PutBalloon(
+            BalloonConfigInput::new(64, false).with_stats_polling_interval_s(1),
+        ))
+        .expect("balloon should configure");
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("instance should start");
+        let mut vmm = ShutdownAfterPeriodicFlush::new(vmm, &shutdown_writer);
+        let now = Instant::now();
+
+        assert_eq!(
+            server.run_until_with_periodic_schedulers(
+                &mut vmm,
+                &mut shutdown_reader,
+                PeriodicMetricsScheduler::new(now),
+                PeriodicBalloonStatisticsScheduler::due_now(now, Duration::from_secs(1)),
+            ),
+            Ok(())
+        );
+
+        assert_eq!(
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
+            ""
+        );
+        fs::remove_file(metrics_path).expect("fixture should clean up");
         drop(server);
         assert!(!path.exists());
     }
