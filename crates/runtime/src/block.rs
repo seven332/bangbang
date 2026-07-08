@@ -7,7 +7,7 @@ use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::interrupt::DeviceInterruptKind;
 use crate::memory::{
@@ -1769,17 +1769,21 @@ impl VirtioBlockQueue {
             let (completion, outcome) =
                 match VirtioBlockRequest::parse(memory, &chain, capacity_sectors) {
                     Ok(request) => {
-                        if let Some(limiter) = rate_limiter.as_deref_mut()
-                            && !limiter.reduce_request_at(&request, now)
-                        {
-                            if let Err(source) = self.available.undo_pop_descriptor_chain() {
-                                return Err(VirtioBlockQueueDispatchError::AvailableRing {
-                                    completed_dispatch: Box::new(dispatch.clone()),
-                                    source,
-                                });
+                        if let Some(limiter) = rate_limiter.as_deref_mut() {
+                            match limiter.reduce_request_at(&request, now) {
+                                VirtioBlockRateLimiterReduction::Allowed => {}
+                                VirtioBlockRateLimiterReduction::Throttled { retry_after } => {
+                                    if let Err(source) = self.available.undo_pop_descriptor_chain()
+                                    {
+                                        return Err(VirtioBlockQueueDispatchError::AvailableRing {
+                                            completed_dispatch: Box::new(dispatch.clone()),
+                                            source,
+                                        });
+                                    }
+                                    dispatch.record_rate_limited_request(retry_after);
+                                    break;
+                                }
                             }
-                            dispatch.record_rate_limited_request();
-                            break;
                         }
                         let execution = request.execute(memory, backing, device_id);
                         (
@@ -1853,6 +1857,7 @@ pub struct VirtioBlockQueueDispatch {
     unsupported_requests: usize,
     status_write_failures: usize,
     rate_limiter_throttled_requests: usize,
+    rate_limiter_retry_after: Option<Duration>,
     first_parse_failure: Option<VirtioBlockRequestError>,
     needs_queue_interrupt: bool,
 }
@@ -1918,6 +1923,10 @@ impl VirtioBlockQueueDispatch {
         self.rate_limiter_throttled_requests
     }
 
+    pub const fn rate_limiter_retry_after(&self) -> Option<Duration> {
+        self.rate_limiter_retry_after
+    }
+
     pub const fn needs_queue_interrupt(&self) -> bool {
         self.needs_queue_interrupt
     }
@@ -1973,8 +1982,12 @@ impl VirtioBlockQueueDispatch {
         }
     }
 
-    fn record_rate_limited_request(&mut self) {
+    fn record_rate_limited_request(&mut self, retry_after: Duration) {
         self.rate_limiter_throttled_requests += 1;
+        self.rate_limiter_retry_after = Some(match self.rate_limiter_retry_after {
+            Some(existing) => existing.min(retry_after),
+            None => retry_after,
+        });
     }
 
     fn record_latency_sample(&mut self, sample: VirtioBlockRequestLatencySample) {
@@ -2749,6 +2762,12 @@ pub struct VirtioBlockRateLimiter {
     ops: Option<TokenBucket>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VirtioBlockRateLimiterReduction {
+    Allowed,
+    Throttled { retry_after: Duration },
+}
+
 impl VirtioBlockRateLimiter {
     pub(crate) fn new(config: DriveRateLimiterConfig) -> Option<Self> {
         Self::new_at(config, Instant::now())
@@ -2769,25 +2788,31 @@ impl VirtioBlockRateLimiter {
         }
     }
 
-    fn reduce_request_at(&mut self, request: &VirtioBlockRequest, now: Instant) -> bool {
+    fn reduce_request_at(
+        &mut self,
+        request: &VirtioBlockRequest,
+        now: Instant,
+    ) -> VirtioBlockRateLimiterReduction {
         let ops_snapshot = self.ops.as_ref().map(TokenBucket::snapshot);
         if let Some(ops) = self.ops.as_mut()
-            && !ops.reduce_at(1, now)
+            && let Some(retry_after) = ops.reduce_with_retry_at(1, now).retry_after()
         {
-            return false;
+            return VirtioBlockRateLimiterReduction::Throttled { retry_after };
         }
 
         let bandwidth_bytes = request.rate_limiter_bandwidth_bytes();
         if let Some(bandwidth) = self.bandwidth.as_mut()
-            && !bandwidth.reduce_allow_overconsumption_at(bandwidth_bytes, now)
+            && let Some(retry_after) = bandwidth
+                .reduce_allow_overconsumption_with_retry_at(bandwidth_bytes, now)
+                .retry_after()
         {
             if let (Some(ops), Some(snapshot)) = (self.ops.as_mut(), ops_snapshot) {
                 ops.restore(snapshot);
             }
-            return false;
+            return VirtioBlockRateLimiterReduction::Throttled { retry_after };
         }
 
-        true
+        VirtioBlockRateLimiterReduction::Allowed
     }
 
     fn apply_update(&mut self, update: DriveRateLimiterConfig) {
@@ -7920,6 +7945,7 @@ mod tests {
         assert_eq!(dispatch.write_bytes(), 0);
         assert_eq!(dispatch.parse_failures(), 0);
         assert_eq!(dispatch.io_errors(), 0);
+        assert_eq!(dispatch.rate_limiter_retry_after(), None);
         assert!(!dispatch.needs_queue_interrupt());
         assert_eq!(queue.available_ring().next_avail(), 0);
         assert_eq!(queue.used_ring().next_used(), 0);
@@ -7961,6 +7987,7 @@ mod tests {
         assert_eq!(dispatch.io_errors(), 0);
         assert_eq!(dispatch.unsupported_requests(), 0);
         assert_eq!(dispatch.status_write_failures(), 0);
+        assert_eq!(dispatch.rate_limiter_retry_after(), None);
         assert!(dispatch.needs_queue_interrupt());
         assert_eq!(
             read_guest_bytes(&memory, DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as usize),
@@ -8204,6 +8231,10 @@ mod tests {
         assert_eq!(dispatch.processed_requests(), 1);
         assert_eq!(dispatch.successful_requests(), 1);
         assert_eq!(dispatch.rate_limiter_throttled_requests(), 1);
+        assert_eq!(
+            dispatch.rate_limiter_retry_after(),
+            Some(Duration::from_millis(1000))
+        );
         assert!(dispatch.needs_queue_interrupt());
         assert_eq!(queue.available_ring().next_avail(), 1);
         assert_eq!(queue.used_ring().next_used(), 1);
@@ -8296,6 +8327,7 @@ mod tests {
         assert_eq!(dispatch.processed_requests(), 1);
         assert_eq!(dispatch.successful_requests(), 1);
         assert_eq!(dispatch.rate_limiter_throttled_requests(), 0);
+        assert_eq!(dispatch.rate_limiter_retry_after(), None);
         assert_eq!(queue.available_ring().next_avail(), 2);
         assert_eq!(queue.used_ring().next_used(), 2);
         assert_eq!(read_used_index(&memory), 2);
@@ -8373,7 +8405,7 @@ mod tests {
             now,
         )
         .expect("rate limiter should be enabled");
-        queue
+        let first = queue
             .dispatch_with_rate_limiter_at(
                 &mut memory,
                 &backing,
@@ -8382,6 +8414,11 @@ mod tests {
                 now,
             )
             .expect("first dispatch should leave second request bandwidth-throttled");
+        assert_eq!(first.rate_limiter_throttled_requests(), 1);
+        assert_eq!(
+            first.rate_limiter_retry_after(),
+            Some(Duration::from_millis(1000))
+        );
 
         let dispatch = queue
             .dispatch_with_rate_limiter_at(
@@ -8396,6 +8433,7 @@ mod tests {
         assert_eq!(dispatch.processed_requests(), 1);
         assert_eq!(dispatch.successful_requests(), 1);
         assert_eq!(dispatch.rate_limiter_throttled_requests(), 0);
+        assert_eq!(dispatch.rate_limiter_retry_after(), None);
         assert_eq!(queue.available_ring().next_avail(), 2);
         assert_eq!(queue.used_ring().next_used(), 2);
         assert_eq!(

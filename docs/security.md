@@ -329,7 +329,9 @@ advertises guest flush support and handles flush requests through the backing
 file `sync_all()` path. Configured block rate limiters must not create shared
 global state between processes; each active device owns its limiter budget, and
 throttled descriptors remain pending without writing request status, publishing
-used-ring entries, or mutating the backing file.
+used-ring entries, or mutating the backing file. Runtime block dispatch may
+report a process-local retry delay for the pending descriptor, but that signal
+does not by itself sleep, poll, or schedule an HVF wakeup.
 
 Metrics and logger outputs are host observability state, not guest
 configuration, and are intentionally omitted from `GET /vm/config`. Current
