@@ -1599,7 +1599,7 @@ mod tests {
     use bangbang_runtime::metrics::{MetricsConfigError, MetricsConfigInput, MetricsDiagnostics};
     use bangbang_runtime::mmds::MmdsDataStoreError;
     use bangbang_runtime::pmem::{PmemConfigError, PmemConfigInput};
-    use bangbang_runtime::serial::SerialConfigError;
+    use bangbang_runtime::serial::SerialRateLimiterConfig;
     use bangbang_runtime::{BackendError, InstanceState, VmmAction, VmmActionError, VmmData};
 
     use crate::vmm::{
@@ -3703,7 +3703,7 @@ mod tests {
     }
 
     #[test]
-    fn config_file_serial_errors_do_not_start_instance() {
+    fn config_file_serial_rate_limiter_starts_instance() {
         let config_path = unique_config_path("serial-rate-limiter");
         fs::write(
             &config_path,
@@ -3723,23 +3723,19 @@ mod tests {
             TestInstanceStarter,
         );
 
-        let err = super::apply_startup_config_file(
-            &mut vmm,
-            Some(config_path.to_str().expect("UTF-8 path")),
-        )
-        .expect_err("unsupported serial rate limiter should fail");
+        super::apply_startup_config_file(&mut vmm, Some(config_path.to_str().expect("UTF-8 path")))
+            .expect("serial rate limiter should not block config-file startup");
 
-        assert!(matches!(
-            err,
-            ProcessError::ConfigFile(super::ConfigFileError::Apply(
-                bangbang_runtime::VmmActionError::SerialConfig(
-                    SerialConfigError::RateLimiterUnsupported
-                )
-            ))
-        ));
-        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
-        assert!(!vmm.has_started_session());
-        assert_eq!(vmm.serial_config().serial_out_path(), None);
+        assert_eq!(vmm.instance_info().state, InstanceState::Running);
+        assert!(vmm.has_started_session());
+        assert_eq!(
+            vmm.serial_config().serial_out_path(),
+            Some(std::path::Path::new("/tmp/private-serial.out"))
+        );
+        assert_eq!(
+            vmm.serial_config().rate_limiter(),
+            Some(SerialRateLimiterConfig::new(1, None, 1))
+        );
 
         fs::remove_file(config_path).expect("fixture config should clean up");
     }

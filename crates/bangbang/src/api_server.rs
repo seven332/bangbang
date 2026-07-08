@@ -55,7 +55,7 @@ use bangbang_runtime::network::{
     NetworkInterfaceConfig, NetworkInterfaceConfigInput, NetworkInterfaceUpdateInput,
 };
 use bangbang_runtime::pmem::{PmemConfig, PmemConfigInput};
-use bangbang_runtime::serial::SerialConfigInput;
+use bangbang_runtime::serial::{SerialConfigInput, SerialRateLimiterConfig};
 use bangbang_runtime::vsock::{VsockConfig, VsockConfigInput};
 use bangbang_runtime::{
     HotUnplugDeviceInput, HotUnplugDeviceKind as RuntimeHotUnplugDeviceKind, VmConfiguration,
@@ -1494,8 +1494,12 @@ fn serial_config_input_from_request(config: &SerialConfigRequest) -> SerialConfi
     if let Some(serial_out_path) = config.serial_out_path() {
         input = input.with_serial_out_path(serial_out_path);
     }
-    if config.rate_limiter_configured() {
-        input = input.with_rate_limiter_configured();
+    if let Some(rate_limiter) = config.rate_limiter() {
+        input = input.with_rate_limiter(SerialRateLimiterConfig::new(
+            rate_limiter.size(),
+            rate_limiter.one_time_burst(),
+            rate_limiter.refill_time(),
+        ));
     }
 
     input
@@ -6288,7 +6292,7 @@ mod tests {
         let path = unique_socket_path("serial-config");
         let serial_path = unique_socket_path("serial-output").with_extension("out");
         let body = format!(
-            r#"{{"serial_out_path":"{}"}}"#,
+            r#"{{"serial_out_path":"{}","rate_limiter":{{"size":2,"one_time_burst":1,"refill_time":3}}}}"#,
             serial_path.to_string_lossy()
         );
         let request = format!(
@@ -6316,6 +6320,10 @@ mod tests {
         assert_eq!(
             vmm.serial_config().serial_out_path(),
             Some(serial_path.as_path())
+        );
+        assert_eq!(
+            vmm.serial_config().rate_limiter(),
+            Some(SerialRateLimiterConfig::new(2, Some(1), 3))
         );
         assert_eq!(
             vmm.instance_info().state,
@@ -6350,11 +6358,6 @@ mod tests {
                 "serial-control-path",
                 "{\"serial_out_path\":\"/tmp/bad\\npath\"}",
                 "serial output path must not contain control characters",
-            ),
-            (
-                "serial-rate-limiter",
-                r#"{"rate_limiter":{"size":1,"refill_time":1}}"#,
-                "serial output rate limiting is not supported",
             ),
         ] {
             let request = format!(

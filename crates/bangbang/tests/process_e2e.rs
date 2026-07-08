@@ -1057,10 +1057,10 @@ fn executable_no_api_config_file_rejected_drive_socket_does_not_publish_socket()
 }
 
 #[test]
-fn executable_config_file_rejected_serial_rate_limiter_does_not_publish_socket() {
+fn executable_config_file_malformed_serial_rate_limiter_does_not_publish_socket() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
-    let (config_path, serial_output_path) = write_rejected_serial_rate_limiter_config(&test_dir);
+    let (config_path, serial_output_path) = write_malformed_serial_rate_limiter_config(&test_dir);
     let instance_id = test_dir.instance_id();
 
     let output = BangbangProcess::start_with_extra_args_expect_failure(
@@ -1073,15 +1073,15 @@ fn executable_config_file_rejected_serial_rate_limiter_does_not_publish_socket()
         &output,
         &socket_path,
         &serial_output_path,
-        "config-file rejected serial rate limiter",
+        "config-file malformed serial rate limiter",
     );
 }
 
 #[test]
-fn executable_no_api_config_file_rejected_serial_rate_limiter_does_not_publish_socket() {
+fn executable_no_api_config_file_malformed_serial_rate_limiter_does_not_publish_socket() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");
-    let (config_path, serial_output_path) = write_rejected_serial_rate_limiter_config(&test_dir);
+    let (config_path, serial_output_path) = write_malformed_serial_rate_limiter_config(&test_dir);
     let instance_id = test_dir.instance_id();
 
     let output = BangbangProcess::start_with_extra_args_expect_failure(
@@ -1094,7 +1094,7 @@ fn executable_no_api_config_file_rejected_serial_rate_limiter_does_not_publish_s
         &output,
         &socket_path,
         &serial_output_path,
-        "no-api config-file rejected serial rate limiter",
+        "no-api config-file malformed serial rate limiter",
     );
 }
 
@@ -2685,7 +2685,7 @@ fn write_rejected_drive_socket_config(
     (config_path, private_socket_path)
 }
 
-fn write_rejected_serial_rate_limiter_config(
+fn write_malformed_serial_rate_limiter_config(
     test_dir: &TestDir,
 ) -> (std::path::PathBuf, std::path::PathBuf) {
     let config_path = test_dir.path().join("vm-config.json");
@@ -2696,7 +2696,7 @@ fn write_rejected_serial_rate_limiter_config(
             "boot-source": {{"kernel_image_path": "/tmp/vmlinux"}},
             "serial": {{
                 "serial_out_path": {serial_output_path_json},
-                "rate_limiter": {{"size": 1, "refill_time": 1}}
+                "rate_limiter": {{"size": 1}}
             }}
         }}"#
     );
@@ -2923,9 +2923,9 @@ fn assert_rejected_serial_config_failure(
     );
     assert!(
         output.stderr.contains(
-            "bangbang: config-file error: failed to apply config-file action: serial output rate limiting is not supported"
+            "bangbang: config-file error: invalid config-file section serial: Malformed HTTP request."
         ),
-        "{case_name} stderr should describe config-file serial rejection; stderr:\n{}",
+        "{case_name} stderr should describe malformed serial config; stderr:\n{}",
         output.stderr
     );
     let serial_output_path_text = path_text(serial_output_path);

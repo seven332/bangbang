@@ -1382,7 +1382,7 @@ mod tests {
             NetworkInterfaceConfigInput, NetworkInterfaceUpdateError, NetworkInterfaceUpdateInput,
         },
         pmem::{PmemConfigError, PmemConfigInput},
-        serial::{SerialConfigError, SerialConfigInput},
+        serial::{SerialConfigError, SerialConfigInput, SerialRateLimiterConfig},
         vsock::{MIN_GUEST_CID, VsockConfigError, VsockConfigInput},
     };
 
@@ -5141,13 +5141,23 @@ mod tests {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
 
         assert_eq!(
-            controller.handle_action(VmmAction::PutSerial(serial_input("/tmp/serial.out"))),
+            controller.handle_action(VmmAction::PutSerial(
+                serial_input("/tmp/serial.out").with_rate_limiter(SerialRateLimiterConfig::new(
+                    2,
+                    Some(1),
+                    3
+                ))
+            )),
             Ok(VmmData::Empty)
         );
 
         assert_eq!(
             controller.serial_config().serial_out_path(),
             Some(Path::new("/tmp/serial.out"))
+        );
+        assert_eq!(
+            controller.serial_config().rate_limiter(),
+            Some(SerialRateLimiterConfig::new(2, Some(1), 3))
         );
     }
 
@@ -5163,6 +5173,7 @@ mod tests {
             .expect("serial clear request should be stored");
 
         assert_eq!(controller.serial_config().serial_out_path(), None);
+        assert_eq!(controller.serial_config().rate_limiter(), None);
     }
 
     #[test]
@@ -5213,29 +5224,20 @@ mod tests {
     }
 
     #[test]
-    fn put_serial_config_rejects_rate_limiter_without_mutating() {
+    fn put_serial_config_accepts_rate_limiter() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
         controller
-            .handle_action(VmmAction::PutSerial(serial_input("/tmp/original.out")))
-            .expect("initial serial config should be stored");
-
-        let err = controller
             .handle_action(VmmAction::PutSerial(
-                SerialConfigInput::new().with_rate_limiter_configured(),
+                SerialConfigInput::new()
+                    .with_rate_limiter(SerialRateLimiterConfig::new(4, None, 5)),
             ))
-            .expect_err("serial rate limiter should fail");
+            .expect("serial rate limiter should be stored");
 
+        assert_eq!(controller.serial_config().serial_out_path(), None);
         assert_eq!(
-            err,
-            VmmActionError::SerialConfig(SerialConfigError::RateLimiterUnsupported)
-        );
-        assert_eq!(
-            err.to_string(),
-            "serial output rate limiting is not supported"
-        );
-        assert_eq!(
-            controller.serial_config().serial_out_path(),
-            Some(Path::new("/tmp/original.out"))
+            controller.serial_config().rate_limiter(),
+            Some(SerialRateLimiterConfig::new(4, None, 5))
         );
     }
 

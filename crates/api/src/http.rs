@@ -488,7 +488,7 @@ struct LoggerConfigRequestBody {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SerialConfigRequest {
     serial_out_path: Option<String>,
-    rate_limiter_configured: bool,
+    rate_limiter: Option<SerialRateLimiterRequest>,
 }
 
 impl SerialConfigRequest {
@@ -496,8 +496,37 @@ impl SerialConfigRequest {
         self.serial_out_path.as_deref()
     }
 
-    pub const fn rate_limiter_configured(&self) -> bool {
-        self.rate_limiter_configured
+    pub const fn rate_limiter(&self) -> Option<SerialRateLimiterRequest> {
+        self.rate_limiter
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SerialRateLimiterRequest {
+    size: u64,
+    one_time_burst: Option<u64>,
+    refill_time: u64,
+}
+
+impl SerialRateLimiterRequest {
+    pub const fn new(size: u64, one_time_burst: Option<u64>, refill_time: u64) -> Self {
+        Self {
+            size,
+            one_time_burst,
+            refill_time,
+        }
+    }
+
+    pub const fn size(self) -> u64 {
+        self.size
+    }
+
+    pub const fn one_time_burst(self) -> Option<u64> {
+        self.one_time_burst
+    }
+
+    pub const fn refill_time(self) -> u64 {
+        self.refill_time
     }
 }
 
@@ -2649,17 +2678,11 @@ fn parse_logger_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> 
 fn parse_serial_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
     let body = serde_json::from_slice::<SerialConfigRequestBody>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
-    let rate_limiter_configured = match &body.rate_limiter {
-        Some(rate_limiter) => {
-            validate_token_bucket(rate_limiter.as_value())?;
-            true
-        }
-        None => false,
-    };
+    let rate_limiter = parse_serial_token_bucket(body.rate_limiter.as_ref())?;
 
     Ok(ApiRequest::PutSerial(Box::new(SerialConfigRequest {
         serial_out_path: body.serial_out_path,
-        rate_limiter_configured,
+        rate_limiter,
     })))
 }
 
@@ -3153,12 +3176,37 @@ fn rate_limiter_configured(value: &serde_json::Value) -> Result<bool, RequestErr
         .ok_or(RequestError::MalformedRequest)
 }
 
+fn parse_serial_token_bucket(
+    value: Option<&JsonValueWithoutDuplicateObjectKeys>,
+) -> Result<Option<SerialRateLimiterRequest>, RequestError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let bucket = value
+        .as_value()
+        .as_object()
+        .ok_or(RequestError::MalformedRequest)?;
+    validate_token_bucket_object(bucket)?;
+
+    Ok(Some(SerialRateLimiterRequest::new(
+        require_u64_field(bucket, TOKEN_BUCKET_SIZE_FIELD)?,
+        optional_u64_field(bucket, TOKEN_BUCKET_ONE_TIME_BURST_FIELD)?,
+        require_u64_field(bucket, TOKEN_BUCKET_REFILL_TIME_FIELD)?,
+    )))
+}
+
 fn validate_token_bucket(value: &serde_json::Value) -> Result<(), RequestError> {
     if value.is_null() {
         return Ok(());
     }
 
     let bucket = value.as_object().ok_or(RequestError::MalformedRequest)?;
+    validate_token_bucket_object(bucket)
+}
+
+fn validate_token_bucket_object(
+    bucket: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), RequestError> {
     for key in bucket.keys() {
         if key != TOKEN_BUCKET_SIZE_FIELD
             && key != TOKEN_BUCKET_ONE_TIME_BURST_FIELD
@@ -3170,12 +3218,7 @@ fn validate_token_bucket(value: &serde_json::Value) -> Result<(), RequestError> 
 
     require_u64_field(bucket, TOKEN_BUCKET_SIZE_FIELD)?;
     require_u64_field(bucket, TOKEN_BUCKET_REFILL_TIME_FIELD)?;
-    if let Some(value) = bucket.get(TOKEN_BUCKET_ONE_TIME_BURST_FIELD)
-        && !value.is_null()
-        && value.as_u64().is_none()
-    {
-        return Err(RequestError::MalformedRequest);
-    }
+    optional_u64_field(bucket, TOKEN_BUCKET_ONE_TIME_BURST_FIELD)?;
 
     Ok(())
 }
@@ -3183,11 +3226,27 @@ fn validate_token_bucket(value: &serde_json::Value) -> Result<(), RequestError> 
 fn require_u64_field(
     object: &serde_json::Map<String, serde_json::Value>,
     field: &str,
-) -> Result<(), RequestError> {
+) -> Result<u64, RequestError> {
     object
         .get(field)
         .and_then(serde_json::Value::as_u64)
-        .map(|_| ())
+        .ok_or(RequestError::MalformedRequest)
+}
+
+fn optional_u64_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Option<u64>, RequestError> {
+    let Some(value) = object.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+
+    value
+        .as_u64()
+        .map(Some)
         .ok_or(RequestError::MalformedRequest)
 }
 
@@ -6613,7 +6672,7 @@ mod tests {
             panic!("expected serial config request");
         };
         assert_eq!(config.serial_out_path(), Some("/tmp/serial.out"));
-        assert!(!config.rate_limiter_configured());
+        assert_eq!(config.rate_limiter(), None);
     }
 
     #[test]
@@ -6626,7 +6685,7 @@ mod tests {
                 panic!("expected serial config request");
             };
             assert_eq!(config.serial_out_path(), None);
-            assert!(!config.rate_limiter_configured());
+            assert_eq!(config.rate_limiter(), None);
         }
     }
 
@@ -6644,15 +6703,15 @@ mod tests {
             panic!("expected serial config request");
         };
         assert_eq!(config.serial_out_path(), Some("/tmp/serial.out"));
-        assert!(!config.rate_limiter_configured());
+        assert_eq!(config.rate_limiter(), None);
     }
 
     #[test]
-    fn marks_serial_rate_limiter_as_configured() {
+    fn parses_serial_rate_limiter_config() {
         let request = request_with_body(
             "PUT",
             "/serial",
-            r#"{"rate_limiter":{"size":1,"one_time_burst":null,"refill_time":1}}"#,
+            r#"{"rate_limiter":{"size":2,"one_time_burst":3,"refill_time":4}}"#,
         );
 
         let parsed = parse_request(&request).expect("serial config should parse");
@@ -6661,7 +6720,29 @@ mod tests {
             panic!("expected serial config request");
         };
         assert_eq!(config.serial_out_path(), None);
-        assert!(config.rate_limiter_configured());
+        assert_eq!(
+            config.rate_limiter(),
+            Some(SerialRateLimiterRequest::new(2, Some(3), 4))
+        );
+    }
+
+    #[test]
+    fn parses_serial_rate_limiter_null_burst_as_none() {
+        let request = request_with_body(
+            "PUT",
+            "/serial",
+            r#"{"rate_limiter":{"size":1,"one_time_burst":null,"refill_time":2}}"#,
+        );
+
+        let parsed = parse_request(&request).expect("serial config should parse");
+
+        let ApiRequest::PutSerial(config) = parsed else {
+            panic!("expected serial config request");
+        };
+        assert_eq!(
+            config.rate_limiter(),
+            Some(SerialRateLimiterRequest::new(1, None, 2))
+        );
     }
 
     #[test]

@@ -1269,8 +1269,14 @@ impl HvfInstanceStartExecutor {
         controller: &VmmController,
     ) -> Result<HvfArm64BootSessionConfig, SerialConfigError> {
         let serial_output = match controller.serial_config().serial_out_path() {
-            Some(path) => SharedSerialOutput::new(SerialOutputFile::open(path)?),
-            None => SharedSerialOutput::from(self.serial_output.clone()),
+            Some(path) => SharedSerialOutput::with_rate_limiter(
+                SerialOutputFile::open(path)?,
+                controller.serial_config().rate_limiter(),
+            ),
+            None => SharedSerialOutput::with_rate_limiter(
+                self.serial_output.clone(),
+                controller.serial_config().rate_limiter(),
+            ),
         };
 
         let mut config = default_hvf_boot_session_config(serial_output);
@@ -2609,8 +2615,8 @@ mod tests {
         PreparedNetworkDevices,
     };
     use bangbang_runtime::serial::{
-        SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialConfigInput, SerialOutput, SharedSerialOutput,
-        SharedSerialOutputBuffer,
+        SERIAL_MMIO_DEVICE_WINDOW_SIZE, SerialConfigInput, SerialOutput, SerialRateLimiterConfig,
+        SharedSerialOutput, SharedSerialOutputBuffer,
     };
     use bangbang_runtime::startup::{
         Arm64BootBlockDevice, Arm64BootNetworkDevice, Arm64BootNetworkPacketIo,
@@ -3605,6 +3611,39 @@ mod tests {
     }
 
     #[test]
+    fn configured_hvf_boot_session_config_rate_limits_default_serial_output() {
+        let executor = HvfInstanceStartExecutor::default();
+        let retained_output = executor.serial_output.clone();
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutSerial(
+                SerialConfigInput::new()
+                    .with_rate_limiter(SerialRateLimiterConfig::new(1, None, 60_000)),
+            ))
+            .expect("serial config should store");
+
+        let config = executor
+            .boot_session_config_for_controller(&controller)
+            .expect("configured serial output should build");
+
+        let mut output = config
+            .serial_device
+            .expect("default HVF boot config should include serial MMIO")
+            .output
+            .clone();
+        output
+            .write_byte(b'A')
+            .expect("first serial byte should write");
+        output
+            .write_byte(b'B')
+            .expect("exhausted serial byte should be dropped");
+        assert_eq!(
+            retained_output.bytes().expect("serial output should read"),
+            b"A"
+        );
+    }
+
+    #[test]
     fn configured_hvf_boot_session_config_includes_balloon_device() {
         let executor = HvfInstanceStartExecutor::default();
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
@@ -3675,6 +3714,40 @@ mod tests {
         assert_eq!(
             fs::read(serial_file.path()).expect("serial output should read"),
             b"S"
+        );
+    }
+
+    #[test]
+    fn configured_hvf_boot_session_config_rate_limits_serial_output_file() {
+        let executor = HvfInstanceStartExecutor::default();
+        let serial_file = TempFilePath::create("serial-output-rate-limited");
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutSerial(
+                SerialConfigInput::new()
+                    .with_serial_out_path(serial_file.path().to_string_lossy().into_owned())
+                    .with_rate_limiter(SerialRateLimiterConfig::new(1, None, 60_000)),
+            ))
+            .expect("serial config should store");
+
+        let config = executor
+            .boot_session_config_for_controller(&controller)
+            .expect("configured serial output should open");
+
+        let mut output = config
+            .serial_device
+            .expect("default HVF boot config should include serial MMIO")
+            .output
+            .clone();
+        output
+            .write_byte(b'F')
+            .expect("first serial file byte should write");
+        output
+            .write_byte(b'G')
+            .expect("exhausted serial file byte should be dropped");
+        assert_eq!(
+            fs::read(serial_file.path()).expect("serial output should read"),
+            b"F"
         );
     }
 
