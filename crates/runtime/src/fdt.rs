@@ -1890,6 +1890,30 @@ mod tests {
     }
 
     #[test]
+    fn default_build_emits_os_rng_seed() {
+        let layout = test_layout(TEST_MEMORY_SIZE);
+        let config = test_config(
+            &layout,
+            Arm64FdtBootInfo {
+                command_line: "panic=1",
+                initrd: None,
+            },
+        );
+
+        let bytes = build_arm64_fdt(&config).expect("FDT should be built");
+        let tree = DeviceTree::load(&bytes).expect("FDT should parse");
+        let chosen = required_node(&tree, "/chosen");
+
+        assert_eq!(
+            chosen
+                .prop_raw("rng-seed")
+                .expect("rng-seed should exist")
+                .len(),
+            ARM64_FDT_RNG_SEED_SIZE
+        );
+    }
+
+    #[test]
     fn reports_rng_seed_source_errors() {
         let layout = test_layout(TEST_MEMORY_SIZE);
         let config = test_config(
