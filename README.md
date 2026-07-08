@@ -196,8 +196,9 @@ connection cleanup counters, and classifiable queue/event failures; a
 top-level `entropy` object with Firecracker-shaped counters for implemented
 virtio-rng request, byte, host-randomness failure, and event-failure activity; a
 top-level `uart` object with Firecracker-shaped serial counters for implemented
-TX writes, missed writes, output errors, and rate-limiter drops; plus a
-top-level `balloon` object for implemented virtio-balloon activity and
+TX writes, missed writes, output errors, and rate-limiter drops; a top-level
+`signals` object with `sigpipe` counts for handled non-terminating `SIGPIPE`;
+plus a top-level `balloon` object for implemented virtio-balloon activity and
 failures.
 Parsed deprecated HTTP API
 usage is counted under `deprecated_api.deprecated_http_api_calls` for supported

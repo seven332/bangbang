@@ -345,15 +345,19 @@ impl BangbangProcess {
         self.stop_with_signal(libc::SIGINT, "SIGINT")
     }
 
+    pub(crate) fn send_signal(&self, signal: i32, signal_name: &str) {
+        let child = self.child.as_ref().expect("child should still be running");
+        if let Err(err) = send_signal(child.id(), signal) {
+            panic!("{signal_name} should be delivered: {err}");
+        }
+    }
+
     #[allow(
         dead_code,
         reason = "shared integration-test support is compiled once per test target"
     )]
     pub(crate) fn stop_with_signal(mut self, signal: i32, signal_name: &str) -> CompletedProcess {
-        let child = self.child.as_ref().expect("child should still be running");
-        if let Err(err) = send_signal(child.id(), signal) {
-            panic!("{signal_name} should be delivered: {err}");
-        }
+        self.send_signal(signal, signal_name);
         let child = self.child.take().expect("child should still be owned");
         let status = wait_for_child_exit(child, SHUTDOWN_TIMEOUT);
 

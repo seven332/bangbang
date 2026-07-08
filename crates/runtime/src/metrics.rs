@@ -418,6 +418,51 @@ impl LoggerMetrics {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SignalMetrics {
+    sigpipe: u64,
+}
+
+impl SignalMetrics {
+    pub const fn new(sigpipe: u64) -> Self {
+        Self { sigpipe }
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.sigpipe == 0
+    }
+
+    pub const fn sigpipe(self) -> u64 {
+        self.sigpipe
+    }
+
+    const fn merged_with(self, other: Self) -> Self {
+        Self {
+            sigpipe: self.sigpipe.saturating_add(other.sigpipe),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SharedSignalMetrics {
+    inner: Arc<SharedSignalMetricsInner>,
+}
+
+impl SharedSignalMetrics {
+    pub fn record_sigpipe(&self) {
+        record_atomic_metric(&self.inner.sigpipe, 1);
+    }
+
+    pub fn snapshot(&self) -> SignalMetrics {
+        SignalMetrics::new(self.inner.sigpipe.load(Ordering::Relaxed))
+    }
+}
+
+#[derive(Debug, Default)]
+struct SharedSignalMetricsInner {
+    sigpipe: AtomicU64,
+}
+
 impl GetApiRequestMetrics {
     const fn is_empty(self) -> bool {
         self.balloon_count == 0
@@ -2982,6 +3027,7 @@ pub struct MetricsDiagnostics {
     start_time_cpu_us: Option<u64>,
     parent_cpu_time_us: Option<u64>,
     serial_output_metrics: Option<SerialOutputMetrics>,
+    signal_metrics: Option<SignalMetrics>,
 }
 
 impl MetricsDiagnostics {
@@ -2999,6 +3045,7 @@ impl MetricsDiagnostics {
             start_time_cpu_us: None,
             parent_cpu_time_us: None,
             serial_output_metrics: None,
+            signal_metrics: None,
         }
     }
 
@@ -3080,6 +3127,11 @@ impl MetricsDiagnostics {
         self
     }
 
+    pub fn with_signal_metrics(mut self, signal_metrics: SignalMetrics) -> Self {
+        self.signal_metrics = Some(signal_metrics);
+        self
+    }
+
     pub fn merged_with(mut self, other: Self) -> Self {
         if let Some(metrics) = other.block_device_metrics {
             self.block_device_metrics = Some(match self.block_device_metrics {
@@ -3139,6 +3191,12 @@ impl MetricsDiagnostics {
         if other.serial_output_metrics.is_some() {
             self.serial_output_metrics = other.serial_output_metrics;
         }
+        if let Some(metrics) = other.signal_metrics {
+            self.signal_metrics = Some(match self.signal_metrics {
+                Some(existing) => existing.merged_with(metrics),
+                None => metrics,
+            });
+        }
 
         self
     }
@@ -3191,6 +3249,10 @@ impl MetricsDiagnostics {
 
     pub fn serial_output_metrics(&self) -> Option<SerialOutputMetrics> {
         self.serial_output_metrics
+    }
+
+    pub fn signal_metrics(&self) -> Option<SignalMetrics> {
+        self.signal_metrics
     }
 }
 
@@ -3526,6 +3588,20 @@ fn serial_output_metrics_json_object(
     uart
 }
 
+fn signal_metrics_json_object(
+    metrics: SignalMetrics,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut signals = serde_json::Map::new();
+    if metrics.sigpipe() != 0 {
+        signals.insert(
+            "sigpipe".to_string(),
+            serde_json::Value::Number(metrics.sigpipe().into()),
+        );
+    }
+
+    signals
+}
+
 fn latency_aggregate_metrics_json_object(
     metrics: VirtioBlockLatencyAggregate,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -3765,6 +3841,14 @@ impl MetricsSink {
                 serde_json::Value::Object(serial_output_metrics_json_object(serial_output_metrics)),
             );
         }
+        if let Some(signal_metrics) = diagnostics.signal_metrics()
+            && !signal_metrics.is_empty()
+        {
+            root.insert(
+                "signals".to_string(),
+                serde_json::Value::Object(signal_metrics_json_object(signal_metrics)),
+            );
+        }
         if !patch_api_requests.is_empty() {
             let mut patch_requests = serde_json::Map::new();
             patch_requests.insert(
@@ -3969,8 +4053,8 @@ mod tests {
         MetricsDiagnostics, MetricsFlushError, MetricsOutput, MetricsState,
         NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface, SharedBalloonDeviceMetrics,
         SharedBlockDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
-        SharedNetworkInterfaceMetrics, SharedNetworkInterfaceMetricsRegistry,
-        SharedVsockDeviceMetrics, VsockDeviceMetrics,
+        SharedNetworkInterfaceMetrics, SharedNetworkInterfaceMetricsRegistry, SharedSignalMetrics,
+        SharedVsockDeviceMetrics, SignalMetrics, VsockDeviceMetrics,
     };
     use crate::block::VirtioBlockLatencyAggregate;
     use crate::serial::SerialOutputMetrics;
@@ -4209,6 +4293,41 @@ mod tests {
                 r#"{"logger":{"missed_log_count":1,"missed_metrics_count":1},"vmm":{"metrics_flush_count":1}}"#
             ]
         );
+    }
+
+    #[test]
+    fn writes_signal_metrics_when_recorded() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let diagnostics = MetricsDiagnostics::new().with_signal_metrics(SignalMetrics::new(2));
+
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        assert_eq!(
+            output.lines(),
+            [r#"{"signals":{"sigpipe":2},"vmm":{"metrics_flush_count":1}}"#]
+        );
+    }
+
+    #[test]
+    fn omits_signal_metrics_when_empty() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let diagnostics = MetricsDiagnostics::new().with_signal_metrics(SignalMetrics::default());
+
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        assert_eq!(output.lines(), [r#"{"vmm":{"metrics_flush_count":1}}"#]);
+    }
+
+    #[test]
+    fn shared_signal_metrics_snapshots_sigpipe_count() {
+        let metrics = SharedSignalMetrics::default();
+
+        metrics.record_sigpipe();
+        metrics.record_sigpipe();
+
+        assert_eq!(metrics.snapshot(), SignalMetrics::new(2));
     }
 
     #[test]
@@ -5421,6 +5540,17 @@ mod tests {
         assert_eq!(diagnostics.start_time_us(), Some(1000));
         assert_eq!(diagnostics.start_time_cpu_us(), Some(2000));
         assert_eq!(diagnostics.parent_cpu_time_us(), Some(3000));
+    }
+
+    #[test]
+    fn signal_diagnostics_merge_saturates() {
+        let base = MetricsDiagnostics::new().with_signal_metrics(SignalMetrics::new(u64::MAX - 1));
+        let additional = MetricsDiagnostics::new().with_signal_metrics(SignalMetrics::new(2));
+
+        assert_eq!(
+            base.merged_with(additional).signal_metrics(),
+            Some(SignalMetrics::new(u64::MAX))
+        );
     }
 
     #[test]

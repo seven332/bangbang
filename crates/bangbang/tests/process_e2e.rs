@@ -273,6 +273,26 @@ fn executable_handles_sigint_shutdown_cleanly() {
 }
 
 #[test]
+fn executable_handles_sigpipe_without_shutdown() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let instance_id = test_dir.instance_id();
+    let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+    bangbang.send_signal(libc::SIGPIPE, "SIGPIPE");
+
+    let instance_info = http_get(&socket_path, "/");
+    assert_ok_response(&instance_info, "GET / after SIGPIPE");
+    assert_response_contains(
+        &instance_info,
+        r#""state":"Not started""#,
+        "GET / after SIGPIPE",
+    );
+
+    assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang SIGPIPE");
+}
+
+#[test]
 fn executable_maps_firecracker_fatal_signals_to_exit_codes() {
     for (signal_name, signal, expected_exit_code) in [
         ("SIGSYS", libc::SIGSYS, BAD_SYSCALL_EXIT_CODE),

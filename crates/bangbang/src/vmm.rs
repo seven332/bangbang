@@ -35,7 +35,7 @@ use bangbang_runtime::memory_hotplug::{MemoryHotplugConfigInput, MemoryHotplugSi
 use bangbang_runtime::metrics::{
     BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics, SharedBalloonDeviceMetrics,
     SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
-    SharedNetworkInterfaceMetricsRegistry, SharedVsockDeviceMetrics,
+    SharedNetworkInterfaceMetricsRegistry, SharedSignalMetrics, SharedVsockDeviceMetrics,
 };
 use bangbang_runtime::mmds::{
     MmdsConfig, MmdsConfigInput, MmdsContentInput, MmdsStateHandle, MmdsStateLockError,
@@ -822,6 +822,7 @@ where
     starter: S,
     started_session: Option<S::Session>,
     process_metrics_diagnostics: MetricsDiagnostics,
+    process_signal_metrics: Option<SharedSignalMetrics>,
 }
 
 impl ProcessVmm<HvfInstanceStartExecutor> {
@@ -878,6 +879,7 @@ where
             starter,
             started_session: None,
             process_metrics_diagnostics: MetricsDiagnostics::default(),
+            process_signal_metrics: None,
         }
     }
 
@@ -886,6 +888,11 @@ where
         diagnostics: MetricsDiagnostics,
     ) -> Self {
         self.process_metrics_diagnostics = diagnostics;
+        self
+    }
+
+    pub(crate) fn with_process_signal_metrics(mut self, metrics: SharedSignalMetrics) -> Self {
+        self.process_signal_metrics = Some(metrics);
         self
     }
 
@@ -1263,8 +1270,14 @@ where
             .as_ref()
             .map(ProcessSessionDiagnostics::metrics_diagnostics)
             .unwrap_or_default();
+        let signal_diagnostics = self
+            .process_signal_metrics
+            .as_ref()
+            .map(|metrics| MetricsDiagnostics::new().with_signal_metrics(metrics.snapshot()))
+            .unwrap_or_default();
         self.process_metrics_diagnostics
             .clone()
+            .merged_with(signal_diagnostics)
             .merged_with(self.starter.metrics_diagnostics())
             .merged_with(session_diagnostics)
     }
@@ -3159,7 +3172,8 @@ mod tests {
         BootRunLoopMetricStatus, EntropyDeviceMetrics, MetricsConfigInput, MetricsDiagnostics,
         NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface, SharedBalloonDeviceMetrics,
         SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
-        SharedNetworkInterfaceMetricsRegistry, SharedVsockDeviceMetrics, VsockDeviceMetrics,
+        SharedNetworkInterfaceMetricsRegistry, SharedSignalMetrics, SharedVsockDeviceMetrics,
+        VsockDeviceMetrics,
     };
     use bangbang_runtime::mmds::{MmdsConfigInput, MmdsContentInput, MmdsStateHandle};
     use bangbang_runtime::mmio::MmioRegion;
@@ -7192,6 +7206,38 @@ mod tests {
         assert_eq!(
             fs::read_to_string(metrics.path()).expect("metrics output should read"),
             "{\"api_server\":{\"process_startup_time_us\":1000},\"vmm\":{\"boot_run_loop_status\":\"failed\",\"metrics_flush_count\":1}}\n"
+        );
+    }
+
+    #[test]
+    fn flush_metrics_includes_process_signal_metrics() {
+        let metrics = TempFilePath::create("metrics");
+        let signal_metrics = SharedSignalMetrics::default();
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            "0.1.0",
+            "bangbang",
+            DiagnosticStarter::new(BootRunLoopMetricStatus::Running),
+        )
+        .with_process_signal_metrics(signal_metrics.clone());
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            metrics.path(),
+        )))
+        .expect("metrics should configure");
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("startup should succeed");
+
+        signal_metrics.record_sigpipe();
+        vmm.handle_action(VmmAction::FlushMetrics)
+            .expect("metrics should flush");
+
+        assert_eq!(
+            fs::read_to_string(metrics.path()).expect("metrics output should read"),
+            "{\"signals\":{\"sigpipe\":1},\"vmm\":{\"boot_run_loop_status\":\"running\",\"metrics_flush_count\":1}}\n"
         );
     }
 
