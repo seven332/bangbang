@@ -7554,6 +7554,7 @@ mod tests {
 
     use crate::interrupt::DeviceInterruptKind;
     use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
+    use crate::metrics::{SharedVsockDeviceMetrics, VsockDeviceMetrics};
     use crate::mmio::{
         MmioAccess, MmioAccessBytes, MmioBus, MmioDispatchOutcome, MmioDispatcher, MmioOperation,
         MmioRegionId,
@@ -7683,6 +7684,20 @@ mod tests {
 
     fn validate(input: VsockConfigInput) -> Result<super::VsockConfig, VsockConfigError> {
         input.validate()
+    }
+
+    fn assert_vsock_metrics_for_notification(
+        notification: &super::VirtioVsockDeviceNotificationDispatch,
+        expected: VsockDeviceMetrics,
+    ) {
+        let metrics = SharedVsockDeviceMetrics::default();
+        metrics.record_notification_dispatch(notification);
+
+        assert_eq!(metrics.snapshot(), expected);
+    }
+
+    fn test_len_as_u64(value: usize) -> u64 {
+        u64::try_from(value).expect("test length should fit in u64")
     }
 
     fn valid_vsock_config(guest_cid: u32, uds_path: impl Into<String>) -> super::VsockConfig {
@@ -13256,6 +13271,12 @@ mod tests {
             read_vsock_rx_used_element(&memory, 0),
             (0, VIRTIO_VSOCK_PACKET_HEADER_SIZE as u32)
         );
+        assert_vsock_metrics_for_notification(
+            &second,
+            VsockDeviceMetrics::default()
+                .with_rx_packets_count(1)
+                .with_conns_added(1),
+        );
         assert_host_connection_request_header(
             read_vsock_packet_header(&memory, TEST_VSOCK_RX_BUFFER),
             42,
@@ -13830,6 +13851,14 @@ mod tests {
         assert_eq!(tx.successful_packets(), 1);
         assert_eq!(read_vsock_tx_used_index(&memory), 1);
         assert_eq!(read_vsock_tx_used_element(&memory, 0), (0, 0));
+        assert_vsock_metrics_for_notification(
+            &notification,
+            VsockDeviceMetrics::default()
+                .with_tx_queue_event_count(1)
+                .with_rx_packets_count(1)
+                .with_tx_packets_count(1)
+                .with_conns_added(1),
+        );
         assert_eq!(
             handler
                 .activation_handler()
@@ -14418,6 +14447,13 @@ mod tests {
         assert_eq!(read_vsock_tx_used_index(&memory), 2);
         assert_eq!(read_vsock_tx_used_element(&memory, 1), (1, 0));
         assert_host_payload(&mut accepted, payload);
+        assert_vsock_metrics_for_notification(
+            &notification,
+            VsockDeviceMetrics::default()
+                .with_tx_queue_event_count(1)
+                .with_tx_bytes_count(test_len_as_u64(payload.len()))
+                .with_tx_packets_count(1),
+        );
         assert!(
             handler
                 .activation_handler()
@@ -14934,6 +14970,13 @@ mod tests {
         assert_eq!(
             read_vsock_rx_used_element(&memory, 1),
             (1, vsock_packet_len_with_payload(payload))
+        );
+        assert_vsock_metrics_for_notification(
+            &notification,
+            VsockDeviceMetrics::default()
+                .with_rx_queue_event_count(1)
+                .with_rx_bytes_count(test_len_as_u64(payload.len()))
+                .with_rx_packets_count(1),
         );
         assert!(
             handler

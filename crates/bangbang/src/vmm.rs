@@ -35,6 +35,7 @@ use bangbang_runtime::memory_hotplug::{MemoryHotplugConfigInput, MemoryHotplugSi
 use bangbang_runtime::metrics::{
     BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics, SharedBalloonDeviceMetrics,
     SharedBlockDeviceMetricsRegistry, SharedNetworkInterfaceMetricsRegistry,
+    SharedVsockDeviceMetrics,
 };
 use bangbang_runtime::mmds::{
     MmdsConfig, MmdsConfigInput, MmdsContentInput, MmdsStateHandle, MmdsStateLockError,
@@ -1884,6 +1885,10 @@ pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
         None
     }
 
+    fn shared_vsock_device_metrics(&self) -> Option<SharedVsockDeviceMetrics> {
+        None
+    }
+
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
         Err(BalloonUpdateError::ActiveSessionUnavailable)
     }
@@ -1937,6 +1942,10 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
         Some(OwnedHvfArm64BootSession::shared_network_interface_metrics(
             self,
         ))
+    }
+
+    fn shared_vsock_device_metrics(&self) -> Option<SharedVsockDeviceMetrics> {
+        Some(OwnedHvfArm64BootSession::shared_vsock_device_metrics(self))
     }
 
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
@@ -2021,6 +2030,10 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
         None
     }
 
+    fn shared_vsock_device_metrics(&self) -> Option<SharedVsockDeviceMetrics> {
+        None
+    }
+
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
         Err(BalloonUpdateError::ActiveSessionUnavailable)
     }
@@ -2071,6 +2084,10 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
         Some(OwnedHvfArm64BootSession::shared_network_interface_metrics(
             self,
         ))
+    }
+
+    fn shared_vsock_device_metrics(&self) -> Option<SharedVsockDeviceMetrics> {
+        Some(OwnedHvfArm64BootSession::shared_vsock_device_metrics(self))
     }
 
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
@@ -2125,6 +2142,10 @@ where
 
     fn shared_network_interface_metrics(&self) -> Option<SharedNetworkInterfaceMetricsRegistry> {
         self.session.shared_network_interface_metrics()
+    }
+
+    fn shared_vsock_device_metrics(&self) -> Option<SharedVsockDeviceMetrics> {
+        self.session.shared_vsock_device_metrics()
     }
 
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
@@ -2576,6 +2597,7 @@ where
     block_device_metrics: Option<SharedBlockDeviceMetricsRegistry>,
     balloon_device_metrics: Option<SharedBalloonDeviceMetrics>,
     network_interface_metrics: Option<SharedNetworkInterfaceMetricsRegistry>,
+    vsock_device_metrics: Option<SharedVsockDeviceMetrics>,
     command_handle: BootRunLoopCommandHandle<S>,
     status: Arc<BootRunLoopWorkerStatusCell<S::Outcome>>,
     pause_gate: Arc<BootRunLoopPauseGate>,
@@ -2607,6 +2629,7 @@ where
         let block_device_metrics = session.shared_block_device_metrics();
         let balloon_device_metrics = session.shared_balloon_device_metrics();
         let network_interface_metrics = session.shared_network_interface_metrics();
+        let vsock_device_metrics = session.shared_vsock_device_metrics();
         let stop_token = control.stop_token();
         let status = Arc::new(BootRunLoopWorkerStatusCell::new());
         let worker_status = Arc::clone(&status);
@@ -2690,6 +2713,7 @@ where
             block_device_metrics,
             balloon_device_metrics,
             network_interface_metrics,
+            vsock_device_metrics,
             command_handle,
             status,
             pause_gate,
@@ -2815,6 +2839,9 @@ where
             diagnostics = diagnostics
                 .with_network_interface_metrics(metrics.aggregate_snapshot())
                 .with_network_interface_metrics_by_interface(metrics.per_interface_snapshot());
+        }
+        if let Some(metrics) = &self.vsock_device_metrics {
+            diagnostics = diagnostics.with_vsock_device_metrics(metrics.snapshot());
         }
         if let Some(metrics) = &self.balloon_device_metrics {
             diagnostics = diagnostics.with_balloon_device_metrics(metrics.snapshot());
@@ -3083,6 +3110,7 @@ mod tests {
         BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics, NetworkInterfaceMetrics,
         NetworkInterfaceMetricsByInterface, SharedBalloonDeviceMetrics,
         SharedBlockDeviceMetricsRegistry, SharedNetworkInterfaceMetricsRegistry,
+        SharedVsockDeviceMetrics, VsockDeviceMetrics,
     };
     use bangbang_runtime::mmds::{MmdsConfigInput, MmdsContentInput, MmdsStateHandle};
     use bangbang_runtime::mmio::MmioRegion;
@@ -3763,6 +3791,7 @@ mod tests {
         block_device_metrics: Option<SharedBlockDeviceMetricsRegistry>,
         balloon_device_metrics: Option<SharedBalloonDeviceMetrics>,
         network_interface_metrics: Option<SharedNetworkInterfaceMetricsRegistry>,
+        vsock_device_metrics: Option<SharedVsockDeviceMetrics>,
         wait_for_stop: bool,
         wait_for_wakeup: bool,
         wait_for_stop_sequence: Arc<Mutex<VecDeque<bool>>>,
@@ -3786,6 +3815,7 @@ mod tests {
                 block_device_metrics: None,
                 balloon_device_metrics: None,
                 network_interface_metrics: None,
+                vsock_device_metrics: None,
                 wait_for_stop: true,
                 wait_for_wakeup: false,
                 wait_for_stop_sequence: Arc::default(),
@@ -3824,6 +3854,11 @@ mod tests {
             metrics: SharedNetworkInterfaceMetricsRegistry,
         ) -> Self {
             self.network_interface_metrics = Some(metrics);
+            self
+        }
+
+        fn with_vsock_device_metrics(mut self, metrics: SharedVsockDeviceMetrics) -> Self {
+            self.vsock_device_metrics = Some(metrics);
             self
         }
 
@@ -3877,6 +3912,10 @@ mod tests {
             &self,
         ) -> Option<SharedNetworkInterfaceMetricsRegistry> {
             self.network_interface_metrics.clone()
+        }
+
+        fn shared_vsock_device_metrics(&self) -> Option<SharedVsockDeviceMetrics> {
+            self.vsock_device_metrics.clone()
         }
 
         fn run_loop(
@@ -5073,6 +5112,44 @@ mod tests {
                         .with_rx_queue_event_count(1)
                         .with_tx_queue_event_count(2),
                 )
+            )
+        );
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_reports_vsock_device_metrics() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let metrics = SharedVsockDeviceMetrics::default();
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_vsock_device_metrics(metrics.clone());
+
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(5).expect("non-zero limit"))
+                .expect("supervisor should start");
+
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            5
+        );
+        metrics.record_activation_failure();
+        metrics.record_muxer_event_failure();
+
+        assert_eq!(
+            supervisor.metrics_diagnostics().vsock_device_metrics(),
+            Some(
+                VsockDeviceMetrics::default()
+                    .with_activate_fails(1)
+                    .with_muxer_event_fails(1)
             )
         );
 
