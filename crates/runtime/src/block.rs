@@ -908,8 +908,8 @@ impl VirtioBlockRequest {
                 Err(error) => (
                     VIRTIO_BLOCK_STATUS_IOERR,
                     0,
-                    VirtioBlockRequestExecutionOutcome::IoError { error },
-                    None,
+                    VirtioBlockRequestExecutionOutcome::IoError { error: error.error },
+                    error.latency_sample,
                 ),
             };
 
@@ -929,11 +929,19 @@ impl VirtioBlockRequest {
         memory: &mut GuestMemory,
         backing: &BlockFileBacking,
         device_id: VirtioBlockDeviceId,
-    ) -> Result<VirtioBlockRequestSideEffect, VirtioBlockRequestExecutionError> {
+    ) -> Result<VirtioBlockRequestSideEffect, VirtioBlockRequestSideEffectError> {
         match self.request_type {
             VirtioBlockRequestType::In => {
                 let started_at = Instant::now();
-                let bytes_written_to_guest = self.execute_in(memory, backing)?;
+                let bytes_written_to_guest = self.execute_in(memory, backing).map_err(|error| {
+                    VirtioBlockRequestSideEffectError::new(
+                        error,
+                        Some(VirtioBlockRequestLatencySample::new(
+                            VirtioBlockRequestType::In,
+                            elapsed_microseconds_since(started_at),
+                        )),
+                    )
+                })?;
                 Ok(VirtioBlockRequestSideEffect::Completed {
                     bytes_written_to_guest,
                     latency_sample: Some(VirtioBlockRequestLatencySample::new(
@@ -944,7 +952,16 @@ impl VirtioBlockRequest {
             }
             VirtioBlockRequestType::Out => {
                 let started_at = Instant::now();
-                let bytes_written_to_guest = self.execute_out(memory, backing)?;
+                let bytes_written_to_guest =
+                    self.execute_out(memory, backing).map_err(|error| {
+                        VirtioBlockRequestSideEffectError::new(
+                            error,
+                            Some(VirtioBlockRequestLatencySample::new(
+                                VirtioBlockRequestType::Out,
+                                elapsed_microseconds_since(started_at),
+                            )),
+                        )
+                    })?;
                 Ok(VirtioBlockRequestSideEffect::Completed {
                     bytes_written_to_guest,
                     latency_sample: Some(VirtioBlockRequestLatencySample::new(
@@ -954,11 +971,15 @@ impl VirtioBlockRequest {
                 })
             }
             VirtioBlockRequestType::Flush => Ok(VirtioBlockRequestSideEffect::Completed {
-                bytes_written_to_guest: self.execute_flush(backing)?,
+                bytes_written_to_guest: self
+                    .execute_flush(backing)
+                    .map_err(VirtioBlockRequestSideEffectError::without_latency)?,
                 latency_sample: None,
             }),
             VirtioBlockRequestType::GetDeviceId => Ok(VirtioBlockRequestSideEffect::Completed {
-                bytes_written_to_guest: self.execute_get_device_id(memory, device_id)?,
+                bytes_written_to_guest: self
+                    .execute_get_device_id(memory, device_id)
+                    .map_err(VirtioBlockRequestSideEffectError::without_latency)?,
                 latency_sample: None,
             }),
             VirtioBlockRequestType::Unsupported(request_type) => {
@@ -1113,6 +1134,28 @@ enum VirtioBlockRequestSideEffect {
     Unsupported {
         request_type: u32,
     },
+}
+
+#[derive(Debug)]
+struct VirtioBlockRequestSideEffectError {
+    error: VirtioBlockRequestExecutionError,
+    latency_sample: Option<VirtioBlockRequestLatencySample>,
+}
+
+impl VirtioBlockRequestSideEffectError {
+    const fn new(
+        error: VirtioBlockRequestExecutionError,
+        latency_sample: Option<VirtioBlockRequestLatencySample>,
+    ) -> Self {
+        Self {
+            error,
+            latency_sample,
+        }
+    }
+
+    const fn without_latency(error: VirtioBlockRequestExecutionError) -> Self {
+        Self::new(error, None)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7728,12 +7771,18 @@ mod tests {
         assert_eq!(dispatch.write_count(), 0);
         assert_eq!(dispatch.flush_count(), 0);
         assert_eq!(dispatch.io_errors(), 1);
+        assert!(dispatch.read_latency_aggregate().is_none());
+        let write_agg = dispatch
+            .write_latency_aggregate()
+            .expect("attempted write side effect should record latency");
         assert_eq!(dispatch.parse_failures(), 0);
         let metrics = SharedBlockDeviceMetrics::default();
         metrics.record_queue_dispatch(&dispatch);
         assert_eq!(
             metrics.snapshot(),
-            BlockDeviceMetrics::default().with_invalid_reqs_count(1)
+            BlockDeviceMetrics::default()
+                .with_invalid_reqs_count(1)
+                .with_write_agg(write_agg)
         );
         assert_eq!(read_used_element(&memory, 0), (0, VIRTIO_BLOCK_STATUS_SIZE));
         assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_IOERR);
