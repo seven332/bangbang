@@ -3691,6 +3691,7 @@ mod tests {
             retained_output.bytes().expect("serial output should read"),
             b"A"
         );
+        assert_eq!(output.metrics().rate_limiter_dropped_bytes(), 1);
     }
 
     #[test]
@@ -3799,6 +3800,7 @@ mod tests {
             fs::read(serial_file.path()).expect("serial output should read"),
             b"F"
         );
+        assert_eq!(output.metrics().rate_limiter_dropped_bytes(), 1);
     }
 
     #[test]
