@@ -17,6 +17,7 @@ use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
     MmioHandlerError, MmioRegion, MmioRegionId,
 };
+use crate::token_bucket::{TokenBucket, TokenBucketConfig};
 use crate::virtio_mmio::{
     VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
     VirtioMmioDeviceActivationHandler, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
@@ -65,7 +66,7 @@ pub struct DriveConfigInput {
     partuuid: Option<String>,
     cache_type: Option<DriveCacheType>,
     io_engine: Option<DriveIoEngine>,
-    rate_limiter_configured: bool,
+    rate_limiter: Option<DriveRateLimiterConfig>,
     socket: Option<PathBuf>,
 }
 
@@ -149,7 +150,7 @@ impl DriveConfigInput {
             partuuid: None,
             cache_type: None,
             io_engine: None,
-            rate_limiter_configured: false,
+            rate_limiter: None,
             socket: None,
         }
     }
@@ -186,8 +187,12 @@ impl DriveConfigInput {
         self.io_engine
     }
 
+    pub const fn rate_limiter(&self) -> Option<DriveRateLimiterConfig> {
+        self.rate_limiter
+    }
+
     pub const fn rate_limiter_configured(&self) -> bool {
-        self.rate_limiter_configured
+        matches!(self.rate_limiter, Some(rate_limiter) if rate_limiter.is_configured())
     }
 
     pub fn socket(&self) -> Option<&Path> {
@@ -214,9 +219,16 @@ impl DriveConfigInput {
         self
     }
 
-    pub const fn with_rate_limiter_configured(mut self) -> Self {
-        self.rate_limiter_configured = true;
+    pub const fn with_rate_limiter(mut self, rate_limiter: DriveRateLimiterConfig) -> Self {
+        self.rate_limiter = Some(rate_limiter);
         self
+    }
+
+    pub const fn with_rate_limiter_configured(self) -> Self {
+        self.with_rate_limiter(DriveRateLimiterConfig::new(
+            None,
+            Some(DriveTokenBucketConfig::new(1, None, 1)),
+        ))
     }
 
     pub fn with_socket(mut self, socket: impl Into<PathBuf>) -> Self {
@@ -229,6 +241,66 @@ impl DriveConfigInput {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriveRateLimiterConfig {
+    bandwidth: Option<DriveTokenBucketConfig>,
+    ops: Option<DriveTokenBucketConfig>,
+}
+
+impl DriveRateLimiterConfig {
+    pub const fn new(
+        bandwidth: Option<DriveTokenBucketConfig>,
+        ops: Option<DriveTokenBucketConfig>,
+    ) -> Self {
+        Self { bandwidth, ops }
+    }
+
+    pub const fn bandwidth(self) -> Option<DriveTokenBucketConfig> {
+        self.bandwidth
+    }
+
+    pub const fn ops(self) -> Option<DriveTokenBucketConfig> {
+        self.ops
+    }
+
+    pub const fn is_configured(self) -> bool {
+        self.bandwidth.is_some() || self.ops.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriveTokenBucketConfig {
+    size: u64,
+    one_time_burst: Option<u64>,
+    refill_time: u64,
+}
+
+impl DriveTokenBucketConfig {
+    pub const fn new(size: u64, one_time_burst: Option<u64>, refill_time: u64) -> Self {
+        Self {
+            size,
+            one_time_burst,
+            refill_time,
+        }
+    }
+
+    pub const fn size(self) -> u64 {
+        self.size
+    }
+
+    pub const fn one_time_burst(self) -> Option<u64> {
+        self.one_time_burst
+    }
+
+    pub const fn refill_time(self) -> u64 {
+        self.refill_time
+    }
+
+    const fn token_bucket_config(self) -> TokenBucketConfig {
+        TokenBucketConfig::new(self.size, self.one_time_burst, self.refill_time)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriveConfig {
     drive_id: String,
@@ -238,6 +310,7 @@ pub struct DriveConfig {
     partuuid: Option<String>,
     cache_type: DriveCacheType,
     io_engine: DriveIoEngine,
+    rate_limiter: Option<DriveRateLimiterConfig>,
 }
 
 impl DriveConfig {
@@ -269,6 +342,10 @@ impl DriveConfig {
         self.io_engine
     }
 
+    pub const fn rate_limiter(&self) -> Option<DriveRateLimiterConfig> {
+        self.rate_limiter
+    }
+
     fn updated(&self, update: &DriveUpdate) -> Result<Self, DriveUpdateError> {
         if self.drive_id() != update.drive_id() {
             return Err(DriveUpdateError::UnknownDrive {
@@ -287,6 +364,7 @@ impl DriveConfig {
             partuuid: self.partuuid.clone(),
             cache_type: self.cache_type,
             io_engine: self.io_engine,
+            rate_limiter: self.rate_limiter,
         })
     }
 }
@@ -385,10 +463,6 @@ impl TryFrom<DriveConfigInput> for DriveConfig {
             return Err(DriveConfigError::UnsupportedIoEngine { io_engine });
         }
 
-        if input.rate_limiter_configured {
-            return Err(DriveConfigError::UnsupportedRateLimiter);
-        }
-
         if input.socket.is_some() {
             return Err(DriveConfigError::UnsupportedSocket);
         }
@@ -401,6 +475,10 @@ impl TryFrom<DriveConfigInput> for DriveConfig {
             partuuid: input.partuuid,
             cache_type,
             io_engine,
+            rate_limiter: match input.rate_limiter {
+                Some(rate_limiter) if rate_limiter.is_configured() => Some(rate_limiter),
+                _ => None,
+            },
         })
     }
 }
@@ -501,7 +579,6 @@ pub enum DriveConfigError {
     UnsupportedIoEngine {
         io_engine: DriveIoEngine,
     },
-    UnsupportedRateLimiter,
     UnsupportedSocket,
     RootDeviceAlreadyConfigured,
 }
@@ -555,7 +632,6 @@ impl fmt::Display for DriveConfigError {
             Self::UnsupportedIoEngine { io_engine } => {
                 write!(f, "drive io_engine {io_engine} is not supported")
             }
-            Self::UnsupportedRateLimiter => f.write_str("drive rate_limiter is not supported"),
             Self::UnsupportedSocket => f.write_str("drive socket is not supported"),
             Self::RootDeviceAlreadyConfigured => f.write_str("a root drive is already configured"),
         }
@@ -880,6 +956,18 @@ impl VirtioBlockRequest {
 
     pub const fn status(&self) -> VirtioBlockStatusDescriptor {
         self.status
+    }
+
+    const fn rate_limiter_bandwidth_bytes(&self) -> u64 {
+        match self.request_type {
+            VirtioBlockRequestType::In | VirtioBlockRequestType::Out => match self.data {
+                Some(data) => data.len() as u64,
+                None => 0,
+            },
+            VirtioBlockRequestType::Flush
+            | VirtioBlockRequestType::GetDeviceId
+            | VirtioBlockRequestType::Unsupported(_) => 0,
+        }
     }
 
     pub fn execute(
@@ -1600,8 +1688,30 @@ impl VirtioBlockQueue {
         backing: &BlockFileBacking,
         device_id: VirtioBlockDeviceId,
     ) -> Result<VirtioBlockQueueDispatch, VirtioBlockQueueDispatchError> {
+        self.dispatch_with_rate_limiter(memory, backing, device_id, None)
+    }
+
+    fn dispatch_with_rate_limiter(
+        &mut self,
+        memory: &mut GuestMemory,
+        backing: &BlockFileBacking,
+        device_id: VirtioBlockDeviceId,
+        rate_limiter: Option<&mut VirtioBlockRateLimiter>,
+    ) -> Result<VirtioBlockQueueDispatch, VirtioBlockQueueDispatchError> {
+        self.dispatch_with_rate_limiter_at(memory, backing, device_id, rate_limiter, Instant::now())
+    }
+
+    fn dispatch_with_rate_limiter_at(
+        &mut self,
+        memory: &mut GuestMemory,
+        backing: &BlockFileBacking,
+        device_id: VirtioBlockDeviceId,
+        rate_limiter: Option<&mut VirtioBlockRateLimiter>,
+        now: Instant,
+    ) -> Result<VirtioBlockQueueDispatch, VirtioBlockQueueDispatchError> {
         let mut dispatch = VirtioBlockQueueDispatch::default();
         let capacity_sectors = backing.len() >> VIRTIO_BLOCK_SECTOR_SHIFT;
+        let mut rate_limiter = rate_limiter;
         while let Some(chain) = self
             .available
             .pop_descriptor_chain(memory)
@@ -1618,6 +1728,18 @@ impl VirtioBlockQueue {
             let (completion, outcome) =
                 match VirtioBlockRequest::parse(memory, &chain, capacity_sectors) {
                     Ok(request) => {
+                        if let Some(limiter) = rate_limiter.as_deref_mut()
+                            && !limiter.reduce_request_at(&request, now)
+                        {
+                            if let Err(source) = self.available.undo_pop_descriptor_chain() {
+                                return Err(VirtioBlockQueueDispatchError::AvailableRing {
+                                    completed_dispatch: Box::new(dispatch.clone()),
+                                    source,
+                                });
+                            }
+                            dispatch.record_rate_limited_request();
+                            break;
+                        }
                         let execution = request.execute(memory, backing, device_id);
                         (
                             execution.completion(),
@@ -1689,6 +1811,7 @@ pub struct VirtioBlockQueueDispatch {
     io_errors: usize,
     unsupported_requests: usize,
     status_write_failures: usize,
+    rate_limiter_throttled_requests: usize,
     first_parse_failure: Option<VirtioBlockRequestError>,
     needs_queue_interrupt: bool,
 }
@@ -1750,6 +1873,10 @@ impl VirtioBlockQueueDispatch {
         self.status_write_failures
     }
 
+    pub const fn rate_limiter_throttled_requests(&self) -> usize {
+        self.rate_limiter_throttled_requests
+    }
+
     pub const fn needs_queue_interrupt(&self) -> bool {
         self.needs_queue_interrupt
     }
@@ -1803,6 +1930,10 @@ impl VirtioBlockQueueDispatch {
                 self.status_write_failures += 1;
             }
         }
+    }
+
+    fn record_rate_limited_request(&mut self) {
+        self.rate_limiter_throttled_requests += 1;
     }
 
     fn record_latency_sample(&mut self, sample: VirtioBlockRequestLatencySample) {
@@ -2571,11 +2702,60 @@ impl std::error::Error for BlockFileBackingError {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct VirtioBlockRateLimiter {
+    bandwidth: Option<TokenBucket>,
+    ops: Option<TokenBucket>,
+}
+
+impl VirtioBlockRateLimiter {
+    pub(crate) fn new(config: DriveRateLimiterConfig) -> Option<Self> {
+        Self::new_at(config, Instant::now())
+    }
+
+    pub(crate) fn new_at(config: DriveRateLimiterConfig, now: Instant) -> Option<Self> {
+        let bandwidth = config
+            .bandwidth()
+            .and_then(|bucket| TokenBucket::new_at(bucket.token_bucket_config(), now));
+        let ops = config
+            .ops()
+            .and_then(|bucket| TokenBucket::new_at(bucket.token_bucket_config(), now));
+
+        if bandwidth.is_none() && ops.is_none() {
+            None
+        } else {
+            Some(Self { bandwidth, ops })
+        }
+    }
+
+    fn reduce_request_at(&mut self, request: &VirtioBlockRequest, now: Instant) -> bool {
+        let ops_snapshot = self.ops.as_ref().map(TokenBucket::snapshot);
+        if let Some(ops) = self.ops.as_mut()
+            && !ops.reduce_at(1, now)
+        {
+            return false;
+        }
+
+        let bandwidth_bytes = request.rate_limiter_bandwidth_bytes();
+        if let Some(bandwidth) = self.bandwidth.as_mut()
+            && !bandwidth.reduce_allow_overconsumption_at(bandwidth_bytes, now)
+        {
+            if let (Some(ops), Some(snapshot)) = (self.ops.as_mut(), ops_snapshot) {
+                ops.restore(snapshot);
+            }
+            return false;
+        }
+
+        true
+    }
+}
+
 #[derive(Debug)]
 pub struct VirtioBlockDevice {
     backing: BlockFileBacking,
     device_id: VirtioBlockDeviceId,
     active_queue: Option<VirtioBlockQueue>,
+    rate_limiter: Option<VirtioBlockRateLimiter>,
 }
 
 impl VirtioBlockDevice {
@@ -2584,7 +2764,13 @@ impl VirtioBlockDevice {
             backing,
             device_id,
             active_queue: None,
+            rate_limiter: None,
         }
+    }
+
+    pub fn with_rate_limiter(mut self, rate_limiter: VirtioBlockRateLimiter) -> Self {
+        self.rate_limiter = Some(rate_limiter);
+        self
     }
 
     pub fn backing(&self) -> &BlockFileBacking {
@@ -2597,6 +2783,10 @@ impl VirtioBlockDevice {
 
     pub fn device_id(&self) -> VirtioBlockDeviceId {
         self.device_id
+    }
+
+    pub fn rate_limiter(&self) -> Option<&VirtioBlockRateLimiter> {
+        self.rate_limiter.as_ref()
     }
 
     pub fn is_activated(&self) -> bool {
@@ -2642,7 +2832,8 @@ impl VirtioBlockDevice {
 
         let backing = &self.backing;
         let device_id = self.device_id;
-        match queue.dispatch(memory, backing, device_id) {
+        let rate_limiter = self.rate_limiter.as_mut();
+        match queue.dispatch_with_rate_limiter(memory, backing, device_id, rate_limiter) {
             Ok(dispatch) => Ok(VirtioBlockDeviceNotificationDispatch::new(
                 drained_notifications,
                 Some(dispatch),
@@ -2713,7 +2904,10 @@ impl PreparedBlockDevice {
         })?;
         let config_space = VirtioBlockConfigSpace::from_backing(&backing, config.cache_type());
         let device_id = VirtioBlockDeviceId::from_bytes(config.drive_id().as_bytes());
-        let device = VirtioBlockDevice::new(backing, device_id);
+        let mut device = VirtioBlockDevice::new(backing, device_id);
+        if let Some(rate_limiter) = config.rate_limiter().and_then(VirtioBlockRateLimiter::new) {
+            device = device.with_rate_limiter(rate_limiter);
+        }
 
         Ok(Self {
             drive_id: config.drive_id().to_string(),
@@ -3521,7 +3715,7 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use crate::interrupt::DeviceInterruptKind;
     use crate::memory::{GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange};
@@ -3548,19 +3742,20 @@ mod tests {
     use super::{
         BlockFileBacking, BlockFileBackingError, BlockMmioDevices, BlockMmioLayout,
         BlockMmioRegistrationError, DriveCacheType, DriveConfig, DriveConfigError,
-        DriveConfigInput, DriveConfigs, DriveIdSource, DriveIoEngine, DriveUpdateError,
-        DriveUpdateInput, PreparedBlockDeviceError, PreparedBlockDevices,
-        VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE, VIRTIO_BLOCK_DEVICE_ID, VIRTIO_BLOCK_FEATURE_FLUSH,
-        VIRTIO_BLOCK_FEATURE_READ_ONLY, VIRTIO_BLOCK_ID_BYTES, VIRTIO_BLOCK_QUEUE_COUNT,
-        VIRTIO_BLOCK_QUEUE_SIZE, VIRTIO_BLOCK_QUEUE_SIZES, VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
-        VIRTIO_BLOCK_REQUEST_TYPE_FLUSH, VIRTIO_BLOCK_REQUEST_TYPE_GET_ID,
-        VIRTIO_BLOCK_REQUEST_TYPE_IN, VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT,
-        VIRTIO_BLOCK_SECTOR_SIZE, VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK,
-        VIRTIO_BLOCK_STATUS_SIZE, VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1,
-        VIRTIO_RING_FEATURE_EVENT_IDX, VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioBlockConfigSpace,
-        VirtioBlockDevice, VirtioBlockDeviceActivationError, VirtioBlockDeviceId,
-        VirtioBlockDeviceNotificationError, VirtioBlockQueue, VirtioBlockQueueBuildError,
-        VirtioBlockQueueDispatchError, VirtioBlockRequest, VirtioBlockRequestCompletion,
+        DriveConfigInput, DriveConfigs, DriveIdSource, DriveIoEngine, DriveRateLimiterConfig,
+        DriveTokenBucketConfig, DriveUpdateError, DriveUpdateInput, PreparedBlockDeviceError,
+        PreparedBlockDevices, VIRTIO_BLOCK_CONFIG_CAPACITY_SIZE, VIRTIO_BLOCK_DEVICE_ID,
+        VIRTIO_BLOCK_FEATURE_FLUSH, VIRTIO_BLOCK_FEATURE_READ_ONLY, VIRTIO_BLOCK_ID_BYTES,
+        VIRTIO_BLOCK_QUEUE_COUNT, VIRTIO_BLOCK_QUEUE_SIZE, VIRTIO_BLOCK_QUEUE_SIZES,
+        VIRTIO_BLOCK_REQUEST_HEADER_SIZE, VIRTIO_BLOCK_REQUEST_TYPE_FLUSH,
+        VIRTIO_BLOCK_REQUEST_TYPE_GET_ID, VIRTIO_BLOCK_REQUEST_TYPE_IN,
+        VIRTIO_BLOCK_REQUEST_TYPE_OUT, VIRTIO_BLOCK_SECTOR_SHIFT, VIRTIO_BLOCK_SECTOR_SIZE,
+        VIRTIO_BLOCK_STATUS_IOERR, VIRTIO_BLOCK_STATUS_OK, VIRTIO_BLOCK_STATUS_SIZE,
+        VIRTIO_BLOCK_STATUS_UNSUPPORTED, VIRTIO_FEATURE_VERSION_1, VIRTIO_RING_FEATURE_EVENT_IDX,
+        VIRTIO_RING_FEATURE_INDIRECT_DESC, VirtioBlockConfigSpace, VirtioBlockDevice,
+        VirtioBlockDeviceActivationError, VirtioBlockDeviceId, VirtioBlockDeviceNotificationError,
+        VirtioBlockQueue, VirtioBlockQueueBuildError, VirtioBlockQueueDispatchError,
+        VirtioBlockRateLimiter, VirtioBlockRequest, VirtioBlockRequestCompletion,
         VirtioBlockRequestError, VirtioBlockRequestExecutionError,
         VirtioBlockRequestExecutionOutcome, VirtioBlockRequestType, normalize_completion_status,
     };
@@ -4357,6 +4552,7 @@ mod tests {
         assert_eq!(config.partuuid(), None);
         assert_eq!(config.cache_type(), DriveCacheType::Unsafe);
         assert_eq!(config.io_engine(), DriveIoEngine::Sync);
+        assert_eq!(config.rate_limiter(), None);
     }
 
     #[test]
@@ -4511,11 +4707,30 @@ mod tests {
     }
 
     #[test]
-    fn rejects_rate_limiter_and_socket_fields() {
-        assert_eq!(
-            validate(input().with_rate_limiter_configured()),
-            Err(DriveConfigError::UnsupportedRateLimiter)
+    fn accepts_configured_rate_limiter() {
+        let rate_limiter = DriveRateLimiterConfig::new(
+            Some(DriveTokenBucketConfig::new(1024, Some(2048), 100)),
+            Some(DriveTokenBucketConfig::new(10, None, 1000)),
         );
+        let config = validate(input().with_rate_limiter(rate_limiter))
+            .expect("configured drive rate limiter should be stored");
+
+        assert_eq!(config.rate_limiter(), Some(rate_limiter));
+    }
+
+    #[test]
+    fn drops_unconfigured_rate_limiter() {
+        let input = input().with_rate_limiter(DriveRateLimiterConfig::new(None, None));
+        assert!(!input.rate_limiter_configured());
+
+        let config =
+            validate(input).expect("empty rate limiter should be accepted as unconfigured");
+
+        assert_eq!(config.rate_limiter(), None);
+    }
+
+    #[test]
+    fn rejects_socket_field() {
         assert_eq!(
             validate(input().with_socket("/tmp/vhost-user-block.sock")),
             Err(DriveConfigError::UnsupportedSocket)
@@ -4538,15 +4753,16 @@ mod tests {
         assert_eq!(input.partuuid(), Some("part"));
         assert_eq!(input.cache_type(), Some(DriveCacheType::Unsafe));
         assert_eq!(input.io_engine(), Some(DriveIoEngine::Sync));
+        assert_eq!(input.rate_limiter(), None);
         assert!(!input.rate_limiter_configured());
         assert_eq!(input.socket(), None);
     }
 
     #[test]
     fn drive_config_errors_display_and_preserve_sources() {
-        let err = DriveConfigError::UnsupportedRateLimiter;
+        let err = DriveConfigError::UnsupportedSocket;
 
-        assert_eq!(err.to_string(), "drive rate_limiter is not supported");
+        assert_eq!(err.to_string(), "drive socket is not supported");
         assert!(err.source().is_none());
     }
 
@@ -5135,6 +5351,28 @@ mod tests {
             dispatch_block_mmio_read_u32(&mut devices, 0, VirtioMmioRegister::DeviceId.offset()),
             VIRTIO_BLOCK_DEVICE_ID,
         );
+    }
+
+    #[test]
+    fn prepared_block_device_attaches_configured_rate_limiter() {
+        let file = temp_file("prepared-rate-limiter.img", &[0; 1024]);
+        let mut configs = DriveConfigs::new();
+        configs
+            .insert(
+                DriveConfigInput::new("rootfs", "rootfs", file.as_path(), true).with_rate_limiter(
+                    DriveRateLimiterConfig::new(
+                        Some(DriveTokenBucketConfig::new(512, None, 100)),
+                        Some(DriveTokenBucketConfig::new(1, None, 1000)),
+                    ),
+                ),
+            )
+            .expect("root drive config should insert");
+
+        let prepared =
+            PreparedBlockDevices::from_configs(&configs).expect("block device should prepare");
+
+        assert_eq!(prepared.as_slice().len(), 1);
+        assert!(prepared.as_slice()[0].device().rate_limiter().is_some());
     }
 
     #[test]
@@ -7684,6 +7922,279 @@ mod tests {
         assert_eq!(
             read_guest_bytes(&memory, second_status, 1),
             [VIRTIO_BLOCK_STATUS_OK]
+        );
+    }
+
+    #[test]
+    fn block_queue_dispatch_keeps_rate_limited_request_pending() {
+        let now = Instant::now();
+        let mut memory = request_memory();
+        let first_payload = sector_payload(0x41);
+        let second_payload = sector_payload(0x42);
+        memory
+            .write_slice(&first_payload, DATA_ADDR)
+            .expect("first guest data should write");
+        let second_data = DATA_ADDR
+            .checked_add(VIRTIO_BLOCK_SECTOR_SIZE)
+            .expect("second data address should not overflow");
+        let second_header = HEADER_ADDR
+            .checked_add(0x100)
+            .expect("second header address should not overflow");
+        let second_status = STATUS_ADDR
+            .checked_add(0x100)
+            .expect("second status address should not overflow");
+        memory
+            .write_slice(&second_payload, second_data)
+            .expect("second guest data should write");
+        memory
+            .write_slice(&[0xaa], second_status)
+            .expect("second status sentinel should write");
+        let file = temp_file(
+            "queue-rate-limited-pending.img",
+            &vec![0; (VIRTIO_BLOCK_SECTOR_SIZE * 2) as usize],
+        );
+        let backing = open_backing(file.as_path(), false).expect("backing should open");
+        write_queued_request(
+            &mut memory,
+            0,
+            VIRTIO_BLOCK_REQUEST_TYPE_OUT,
+            0,
+            HEADER_ADDR,
+            Some((DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as u32, false)),
+            STATUS_ADDR,
+        );
+        write_queued_request(
+            &mut memory,
+            3,
+            VIRTIO_BLOCK_REQUEST_TYPE_OUT,
+            1,
+            second_header,
+            Some((second_data, VIRTIO_BLOCK_SECTOR_SIZE as u32, false)),
+            second_status,
+        );
+        write_available_heads(&mut memory, &[0, 3]);
+        let mut queue = block_queue();
+        let mut rate_limiter = VirtioBlockRateLimiter::new_at(
+            DriveRateLimiterConfig::new(None, Some(DriveTokenBucketConfig::new(1, None, 1000))),
+            now,
+        )
+        .expect("rate limiter should be enabled");
+
+        let dispatch = queue
+            .dispatch_with_rate_limiter_at(
+                &mut memory,
+                &backing,
+                TEST_DEVICE_ID,
+                Some(&mut rate_limiter),
+                now,
+            )
+            .expect("rate-limited queue dispatch should succeed");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_requests(), 1);
+        assert_eq!(dispatch.rate_limiter_throttled_requests(), 1);
+        assert!(dispatch.needs_queue_interrupt());
+        assert_eq!(queue.available_ring().next_avail(), 1);
+        assert_eq!(queue.used_ring().next_used(), 1);
+        assert_eq!(read_used_index(&memory), 1);
+        assert_eq!(read_used_element(&memory, 0), (0, VIRTIO_BLOCK_STATUS_SIZE));
+        assert_eq!(read_status(&memory), VIRTIO_BLOCK_STATUS_OK);
+        assert_eq!(read_guest_bytes(&memory, second_status, 1), [0xaa]);
+        let written_file = fs::read(file.as_path()).expect("file should read");
+        assert_eq!(
+            &written_file[..VIRTIO_BLOCK_SECTOR_SIZE as usize],
+            first_payload.as_slice()
+        );
+        assert_eq!(
+            &written_file[VIRTIO_BLOCK_SECTOR_SIZE as usize..],
+            vec![0; VIRTIO_BLOCK_SECTOR_SIZE as usize].as_slice()
+        );
+    }
+
+    #[test]
+    fn block_queue_dispatch_retries_rate_limited_request_after_replenish() {
+        let now = Instant::now();
+        let mut memory = request_memory();
+        let first_payload = sector_payload(0x51);
+        let second_payload = sector_payload(0x52);
+        memory
+            .write_slice(&first_payload, DATA_ADDR)
+            .expect("first guest data should write");
+        let second_data = DATA_ADDR
+            .checked_add(VIRTIO_BLOCK_SECTOR_SIZE)
+            .expect("second data address should not overflow");
+        let second_header = HEADER_ADDR
+            .checked_add(0x100)
+            .expect("second header address should not overflow");
+        let second_status = STATUS_ADDR
+            .checked_add(0x100)
+            .expect("second status address should not overflow");
+        memory
+            .write_slice(&second_payload, second_data)
+            .expect("second guest data should write");
+        let file = temp_file(
+            "queue-rate-limited-retry.img",
+            &vec![0; (VIRTIO_BLOCK_SECTOR_SIZE * 2) as usize],
+        );
+        let backing = open_backing(file.as_path(), false).expect("backing should open");
+        write_queued_request(
+            &mut memory,
+            0,
+            VIRTIO_BLOCK_REQUEST_TYPE_OUT,
+            0,
+            HEADER_ADDR,
+            Some((DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as u32, false)),
+            STATUS_ADDR,
+        );
+        write_queued_request(
+            &mut memory,
+            3,
+            VIRTIO_BLOCK_REQUEST_TYPE_OUT,
+            1,
+            second_header,
+            Some((second_data, VIRTIO_BLOCK_SECTOR_SIZE as u32, false)),
+            second_status,
+        );
+        write_available_heads(&mut memory, &[0, 3]);
+        let mut queue = block_queue();
+        let mut rate_limiter = VirtioBlockRateLimiter::new_at(
+            DriveRateLimiterConfig::new(None, Some(DriveTokenBucketConfig::new(1, None, 1000))),
+            now,
+        )
+        .expect("rate limiter should be enabled");
+        queue
+            .dispatch_with_rate_limiter_at(
+                &mut memory,
+                &backing,
+                TEST_DEVICE_ID,
+                Some(&mut rate_limiter),
+                now,
+            )
+            .expect("first dispatch should leave one request pending");
+
+        let dispatch = queue
+            .dispatch_with_rate_limiter_at(
+                &mut memory,
+                &backing,
+                TEST_DEVICE_ID,
+                Some(&mut rate_limiter),
+                now + Duration::from_millis(1000),
+            )
+            .expect("replenished queue dispatch should succeed");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_requests(), 1);
+        assert_eq!(dispatch.rate_limiter_throttled_requests(), 0);
+        assert_eq!(queue.available_ring().next_avail(), 2);
+        assert_eq!(queue.used_ring().next_used(), 2);
+        assert_eq!(read_used_index(&memory), 2);
+        assert_eq!(read_used_element(&memory, 1), (3, VIRTIO_BLOCK_STATUS_SIZE));
+        assert_eq!(
+            read_guest_bytes(&memory, second_status, 1),
+            [VIRTIO_BLOCK_STATUS_OK]
+        );
+        let written_file = fs::read(file.as_path()).expect("file should read");
+        assert_eq!(
+            &written_file[..VIRTIO_BLOCK_SECTOR_SIZE as usize],
+            first_payload.as_slice()
+        );
+        assert_eq!(
+            &written_file[VIRTIO_BLOCK_SECTOR_SIZE as usize..],
+            second_payload.as_slice()
+        );
+    }
+
+    #[test]
+    fn block_rate_limiter_rolls_back_ops_when_bandwidth_throttles() {
+        let now = Instant::now();
+        let mut memory = request_memory();
+        let first_payload = sector_payload(0x61);
+        let second_payload = sector_payload(0x62);
+        memory
+            .write_slice(&first_payload, DATA_ADDR)
+            .expect("first guest data should write");
+        let second_data = DATA_ADDR
+            .checked_add(VIRTIO_BLOCK_SECTOR_SIZE)
+            .expect("second data address should not overflow");
+        let second_header = HEADER_ADDR
+            .checked_add(0x100)
+            .expect("second header address should not overflow");
+        let second_status = STATUS_ADDR
+            .checked_add(0x100)
+            .expect("second status address should not overflow");
+        memory
+            .write_slice(&second_payload, second_data)
+            .expect("second guest data should write");
+        let file = temp_file(
+            "queue-rate-limited-rollback.img",
+            &vec![0; (VIRTIO_BLOCK_SECTOR_SIZE * 2) as usize],
+        );
+        let backing = open_backing(file.as_path(), false).expect("backing should open");
+        write_queued_request(
+            &mut memory,
+            0,
+            VIRTIO_BLOCK_REQUEST_TYPE_OUT,
+            0,
+            HEADER_ADDR,
+            Some((DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as u32, false)),
+            STATUS_ADDR,
+        );
+        write_queued_request(
+            &mut memory,
+            3,
+            VIRTIO_BLOCK_REQUEST_TYPE_OUT,
+            1,
+            second_header,
+            Some((second_data, VIRTIO_BLOCK_SECTOR_SIZE as u32, false)),
+            second_status,
+        );
+        write_available_heads(&mut memory, &[0, 3]);
+        let mut queue = block_queue();
+        let mut rate_limiter = VirtioBlockRateLimiter::new_at(
+            DriveRateLimiterConfig::new(
+                Some(DriveTokenBucketConfig::new(
+                    VIRTIO_BLOCK_SECTOR_SIZE,
+                    None,
+                    1000,
+                )),
+                Some(DriveTokenBucketConfig::new(2, None, 60_000)),
+            ),
+            now,
+        )
+        .expect("rate limiter should be enabled");
+        queue
+            .dispatch_with_rate_limiter_at(
+                &mut memory,
+                &backing,
+                TEST_DEVICE_ID,
+                Some(&mut rate_limiter),
+                now,
+            )
+            .expect("first dispatch should leave second request bandwidth-throttled");
+
+        let dispatch = queue
+            .dispatch_with_rate_limiter_at(
+                &mut memory,
+                &backing,
+                TEST_DEVICE_ID,
+                Some(&mut rate_limiter),
+                now + Duration::from_millis(1000),
+            )
+            .expect("bandwidth replenish should allow retry with restored op budget");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.successful_requests(), 1);
+        assert_eq!(dispatch.rate_limiter_throttled_requests(), 0);
+        assert_eq!(queue.available_ring().next_avail(), 2);
+        assert_eq!(queue.used_ring().next_used(), 2);
+        assert_eq!(
+            read_guest_bytes(&memory, second_status, 1),
+            [VIRTIO_BLOCK_STATUS_OK]
+        );
+        let written_file = fs::read(file.as_path()).expect("file should read");
+        assert_eq!(
+            &written_file[VIRTIO_BLOCK_SECTOR_SIZE as usize..],
+            second_payload.as_slice()
         );
     }
 

@@ -118,7 +118,11 @@ is resource-specific:
   drive before mutating stored configuration, refreshes only the matching
   virtio-block MMIO handler, and leaves the old backing and stored
   configuration in place if opening or handler lookup fails. It does not
-  implement block-device hotplug or removal.
+  implement block-device hotplug or removal. Initial block rate limiters are
+  process-local runtime state created during startup preparation after backing
+  validation. Exhausted limiters leave the descriptor pending for a later
+  dispatch opportunity instead of sleeping, busy-waiting, writing request
+  status, publishing a used-ring entry, or mutating the backing file.
 - `/pmem/{id}` stores Firecracker-shaped pmem backing paths during pre-boot
   configuration after rejecting empty paths, and reports them through
   `GET /vm/config`. Startup opens each configured path with nonblocking
@@ -320,7 +324,10 @@ images per microVM and avoid sharing writable backing files between multiple
 bangbang processes. The default `cache_type=Unsafe` mode does not advertise
 guest flush support. When `cache_type=Writeback` is configured, the block device
 advertises guest flush support and handles flush requests through the backing
-file `sync_all()` path.
+file `sync_all()` path. Configured block rate limiters must not create shared
+global state between processes; each active device owns its limiter budget, and
+throttled descriptors remain pending without writing request status, publishing
+used-ring entries, or mutating the backing file.
 
 Metrics and logger outputs are host observability state, not guest
 configuration, and are intentionally omitted from `GET /vm/config`. Current
@@ -328,13 +335,13 @@ logger action events are host VMM events only and do not expose guest serial
 output. Current explicit and periodic metrics lines can expose selected API
 request counters, startup timing fields, logger and serial counters, a terse
 boot run-loop status summary, and minimal device counters such as block
-queue/update activity, virtio-net packet counters, and virtio-vsock queue,
-packet, byte, and connection cleanup counters, plus virtio-rng request, byte,
-host-randomness failure, and event-failure counters. Serial, vsock, and entropy
-metrics are counters only and must not expose Unix socket paths, guest payload
-bytes, host stream data, worker error strings, host paths, guest serial bytes,
-randomness bytes, host entropy-source details, guest descriptors, guest memory
-addresses, or unexpected guest data.
+queue/update/throttling activity, virtio-net packet counters, and virtio-vsock
+queue, packet, byte, and connection cleanup counters, plus virtio-rng request,
+byte, host-randomness failure, and event-failure counters. Serial, vsock, block,
+and entropy metrics are counters only and must not expose Unix socket paths,
+guest payload bytes, host stream data, worker error strings, host paths, guest
+serial bytes, randomness bytes, host entropy-source details, guest descriptors,
+guest memory addresses, or unexpected guest data.
 Future full logging and metrics support must preserve those redaction
 boundaries.
 

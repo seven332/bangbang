@@ -1653,7 +1653,7 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use bangbang_runtime::balloon::BalloonConfigInput;
-    use bangbang_runtime::block::{DriveConfigError, DriveConfigInput};
+    use bangbang_runtime::block::DriveConfigInput;
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel};
     use bangbang_runtime::machine::{MAX_MEM_SIZE_MIB, MachineConfigError};
@@ -3603,7 +3603,7 @@ mod tests {
     }
 
     #[test]
-    fn config_file_drive_rate_limiter_fails_before_starting() {
+    fn config_file_drive_rate_limiter_replaces_stored_drive() {
         let config_path = unique_config_path("drive-rate-limiter");
         let config = r#"{
             "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
@@ -3620,20 +3620,11 @@ mod tests {
             TestInstanceStarter,
         );
 
-        let err = super::apply_startup_config_file(
-            &mut vmm,
-            Some(config_path.to_str().expect("UTF-8 path")),
-        )
-        .expect_err("configured drive rate limiter should fail");
+        super::apply_startup_config_file(&mut vmm, Some(config_path.to_str().expect("UTF-8 path")))
+            .expect("configured drive rate limiter should apply");
 
-        assert_eq!(
-            err,
-            ProcessError::ConfigFile(super::ConfigFileError::Apply(VmmActionError::DriveConfig(
-                DriveConfigError::UnsupportedRateLimiter
-            )))
-        );
-        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
-        assert!(!vmm.has_started_session());
+        assert_eq!(vmm.instance_info().state, InstanceState::Running);
+        assert!(vmm.has_started_session());
         let data = vmm
             .handle_action(VmmAction::GetVmConfig)
             .expect("VM config should be returned");
@@ -3643,8 +3634,14 @@ mod tests {
         assert_eq!(config.drive_configs().len(), 1);
         assert_eq!(
             config.drive_configs()[0].path_on_host(),
-            "/tmp/rootfs-old.ext4"
+            "/tmp/rootfs-new.ext4"
         );
+        let rate_limiter = config.drive_configs()[0]
+            .rate_limiter()
+            .expect("configured drive rate limiter should be stored");
+        let ops = rate_limiter.ops().expect("ops bucket should be stored");
+        assert_eq!(ops.size(), 1);
+        assert_eq!(ops.refill_time(), 1);
 
         fs::remove_file(config_path).expect("fixture config should clean up");
     }

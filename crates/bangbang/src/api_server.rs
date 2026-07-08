@@ -17,8 +17,8 @@ use bangbang_api::http::{
     BalloonHintingStartRequest, BalloonHintingStatusResponse, BalloonStatsResponse,
     BalloonStatsUpdateRequest, BalloonUpdateRequest, BootSourceRequest, BootSourceResponse,
     CpuConfigRequest, DriveCacheType as ApiDriveCacheType, DriveConfigRequest, DriveConfigResponse,
-    DriveIoEngine as ApiDriveIoEngine, DrivePatchRequest, EntropyConfigRequest,
-    EntropyConfigResponse, EntropyRateLimiterRequest,
+    DriveIoEngine as ApiDriveIoEngine, DrivePatchRequest, DriveRateLimiterRequest,
+    EntropyConfigRequest, EntropyConfigResponse, EntropyRateLimiterRequest,
     HotUnplugDeviceKind as ApiHotUnplugDeviceKind, HotUnplugDeviceRequest, HttpResponse,
     LoggerConfigRequest, LoggerLevel as ApiLoggerLevel, MachineConfigPatchRequest,
     MachineConfigRequest, MachineConfigResponse, MemoryHotplugConfigRequest,
@@ -34,7 +34,8 @@ use bangbang_runtime::balloon::{
     BalloonStats, BalloonStatsUpdateInput, BalloonUpdateInput,
 };
 use bangbang_runtime::block::{
-    DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine, DriveUpdateInput,
+    DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine, DriveRateLimiterConfig,
+    DriveTokenBucketConfig, DriveUpdateInput,
 };
 use bangbang_runtime::boot::{BootSourceConfig, BootSourceConfigInput};
 use bangbang_runtime::cpu::CpuConfigInput;
@@ -1315,8 +1316,27 @@ fn drive_config_response_from_runtime(config: &DriveConfig) -> DriveConfigRespon
     if let Some(partuuid) = config.partuuid() {
         response = response.with_partuuid(partuuid);
     }
+    if let Some(rate_limiter) = config.rate_limiter() {
+        response =
+            response.with_rate_limiter(drive_rate_limiter_response_from_runtime(rate_limiter));
+    }
 
     response
+}
+
+fn drive_rate_limiter_response_from_runtime(
+    config: DriveRateLimiterConfig,
+) -> DriveRateLimiterRequest {
+    DriveRateLimiterRequest::new(
+        config
+            .bandwidth()
+            .map(drive_token_bucket_response_from_runtime),
+        config.ops().map(drive_token_bucket_response_from_runtime),
+    )
+}
+
+fn drive_token_bucket_response_from_runtime(config: DriveTokenBucketConfig) -> TokenBucketRequest {
+    TokenBucketRequest::new(config.size(), config.one_time_burst(), config.refill_time())
 }
 
 fn network_interface_config_response_from_runtime(
@@ -1507,14 +1527,27 @@ fn drive_config_input_from_request(config: &DriveConfigRequest) -> DriveConfigIn
             ApiDriveIoEngine::Async => DriveIoEngine::Async,
         });
     }
-    if config.rate_limiter_configured() {
-        input = input.with_rate_limiter_configured();
+    if let Some(rate_limiter) = config.rate_limiter() {
+        input = input.with_rate_limiter(drive_rate_limiter_config_from_request(rate_limiter));
     }
     if let Some(socket) = config.socket() {
         input = input.with_socket(socket);
     }
 
     input
+}
+
+fn drive_rate_limiter_config_from_request(
+    config: DriveRateLimiterRequest,
+) -> DriveRateLimiterConfig {
+    DriveRateLimiterConfig::new(
+        config.bandwidth().map(drive_token_bucket_from_request),
+        config.ops().map(drive_token_bucket_from_request),
+    )
+}
+
+fn drive_token_bucket_from_request(config: TokenBucketRequest) -> DriveTokenBucketConfig {
+    DriveTokenBucketConfig::new(config.size(), config.one_time_burst(), config.refill_time())
 }
 
 fn drive_update_input_from_request(config: &DrivePatchRequest) -> DriveUpdateInput {
@@ -7387,7 +7420,7 @@ mod tests {
     }
 
     #[test]
-    fn returns_fault_for_configured_drive_rate_limiter_without_storing() {
+    fn stores_drive_with_configured_rate_limiter() {
         let body = r#"{
             "drive_id": "rootfs",
             "path_on_host": "/tmp/rootfs.ext4",
@@ -7408,9 +7441,18 @@ mod tests {
 
         let response = request_over_socket(&mut vmm, "drive-rate-limiter", &request);
 
-        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        assert!(response.contains(r#"{"fault_message":"drive rate_limiter is not supported"}"#));
-        assert!(vmm.drive_configs().is_empty());
+        assert!(response.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert_eq!(vmm.drive_configs().len(), 1);
+        let rate_limiter = vmm.drive_configs()[0]
+            .rate_limiter()
+            .expect("configured drive rate limiter should be stored");
+        let bandwidth = rate_limiter
+            .bandwidth()
+            .expect("bandwidth bucket should be stored");
+        assert_eq!(bandwidth.size(), 1000);
+        assert_eq!(bandwidth.one_time_burst(), Some(1000));
+        assert_eq!(bandwidth.refill_time(), 100);
+        assert_eq!(rate_limiter.ops(), None);
     }
 
     #[test]
