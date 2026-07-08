@@ -218,25 +218,7 @@ impl ApiServer {
                 min_poll_timeout_ms(metrics_timeout, balloon_timeout),
             )? {
                 ApiServerWaitResult::Ready => {}
-                ApiServerWaitResult::TimedOut => {
-                    let now = Instant::now();
-                    let balloon_interval = vmm.balloon_statistics_update_interval();
-                    if balloon_scheduler.is_due(now, balloon_interval) {
-                        vmm.handle_periodic_balloon_statistics_update()
-                            .map_err(ApiServerError::PeriodicBalloonStatisticsUpdate)?;
-                        balloon_scheduler.schedule_next(
-                            Instant::now(),
-                            vmm.balloon_statistics_update_interval(),
-                        );
-                    }
-                    let now = Instant::now();
-                    if metrics_scheduler.is_due(now) {
-                        vmm.handle_periodic_metrics_flush()
-                            .map_err(ApiServerError::PeriodicMetricsFlush)?;
-                        metrics_scheduler.schedule_next(Instant::now());
-                    }
-                    continue;
-                }
+                ApiServerWaitResult::TimedOut => {}
             }
             if drain_shutdown_wakeup(shutdown_wakeup)? {
                 return Ok(());
@@ -249,6 +231,11 @@ impl ApiServer {
                 ProcessSessionExitDecision::ExitWithFailure => {
                     return Err(ApiServerError::ProcessSessionTerminal);
                 }
+            }
+
+            if handle_due_periodic_schedulers(vmm, &mut metrics_scheduler, &mut balloon_scheduler)?
+            {
+                continue;
             }
 
             match self.serve_next(vmm) {
@@ -272,6 +259,33 @@ impl ApiServer {
 
         Ok(())
     }
+}
+
+fn handle_due_periodic_schedulers(
+    vmm: &mut impl VmmRequestHandler,
+    metrics_scheduler: &mut PeriodicMetricsScheduler,
+    balloon_scheduler: &mut PeriodicBalloonStatisticsScheduler,
+) -> Result<bool, ApiServerError> {
+    let mut handled = false;
+
+    let now = Instant::now();
+    let balloon_interval = vmm.balloon_statistics_update_interval();
+    if balloon_scheduler.is_due(now, balloon_interval) {
+        vmm.handle_periodic_balloon_statistics_update()
+            .map_err(ApiServerError::PeriodicBalloonStatisticsUpdate)?;
+        balloon_scheduler.schedule_next(Instant::now(), vmm.balloon_statistics_update_interval());
+        handled = true;
+    }
+
+    let now = Instant::now();
+    if metrics_scheduler.is_due(now) {
+        vmm.handle_periodic_metrics_flush()
+            .map_err(ApiServerError::PeriodicMetricsFlush)?;
+        metrics_scheduler.schedule_next(Instant::now());
+        handled = true;
+    }
+
+    Ok(handled)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7978,6 +7992,49 @@ mod tests {
             ),
             Ok(())
         );
+        drop(server);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn run_until_due_periodic_metrics_is_not_starved_by_ready_client_request() {
+        let path = unique_socket_path("prc");
+        let metrics_path = unique_socket_path("prco").with_extension("metrics");
+        let server = ApiServer::bind(&path).expect("server should bind");
+        let mut client = UnixStream::connect(&path).expect("client should connect");
+        client
+            .write_all(b"GET /version HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("client should write ready request");
+        let (mut shutdown_reader, shutdown_writer) =
+            UnixStream::pair().expect("shutdown stream pair should be created");
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        vmm.handle_action(VmmAction::PutMetrics(MetricsConfigInput::new(
+            &metrics_path,
+        )))
+        .expect("metrics should configure");
+        vmm.handle_action(VmmAction::PutBootSource(BootSourceConfigInput::new(
+            "/tmp/vmlinux",
+        )))
+        .expect("boot source should configure");
+        vmm.handle_action(VmmAction::InstanceStart)
+            .expect("instance should start");
+        let mut vmm = ShutdownAfterPeriodicFlush::new(vmm, &shutdown_writer);
+
+        assert_eq!(
+            server.run_until_with_periodic_metrics_scheduler(
+                &mut vmm,
+                &mut shutdown_reader,
+                PeriodicMetricsScheduler::due_now(Instant::now()),
+            ),
+            Ok(())
+        );
+
+        assert_eq!(
+            fs::read_to_string(&metrics_path).expect("metrics output should be readable"),
+            "{\"vmm\":{\"metrics_flush_count\":1}}\n"
+        );
+        fs::remove_file(metrics_path).expect("fixture should clean up");
+        drop(client);
         drop(server);
         assert!(!path.exists());
     }

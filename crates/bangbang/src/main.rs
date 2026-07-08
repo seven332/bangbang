@@ -176,23 +176,7 @@ fn wait_for_no_api_shutdown_with_periodic_schedulers(
             min_poll_timeout_ms(metrics_timeout, balloon_timeout),
         )? {
             ProcessWaitResult::Ready => {}
-            ProcessWaitResult::TimedOut => {
-                let now = Instant::now();
-                let balloon_interval = vmm.balloon_statistics_update_interval();
-                if balloon_scheduler.is_due(now, balloon_interval) {
-                    vmm.handle_periodic_balloon_statistics_update()
-                        .map_err(ProcessError::PeriodicBalloonStatisticsUpdate)?;
-                    balloon_scheduler
-                        .schedule_next(Instant::now(), vmm.balloon_statistics_update_interval());
-                }
-                let now = Instant::now();
-                if metrics_scheduler.is_due(now) {
-                    vmm.handle_periodic_metrics_flush()
-                        .map_err(ProcessError::PeriodicMetricsFlush)?;
-                    metrics_scheduler.schedule_next(Instant::now());
-                }
-                continue;
-            }
+            ProcessWaitResult::TimedOut => {}
         }
         if shutdown_signal.drain_wakeup()? {
             return Ok(());
@@ -206,7 +190,41 @@ fn wait_for_no_api_shutdown_with_periodic_schedulers(
                 return Err(ProcessError::ProcessSessionTerminal);
             }
         }
+        if handle_due_no_api_periodic_schedulers(
+            vmm,
+            &mut metrics_scheduler,
+            &mut balloon_scheduler,
+        )? {
+            continue;
+        }
     }
+}
+
+fn handle_due_no_api_periodic_schedulers(
+    vmm: &mut impl VmmRequestHandler,
+    metrics_scheduler: &mut PeriodicMetricsScheduler,
+    balloon_scheduler: &mut PeriodicBalloonStatisticsScheduler,
+) -> Result<bool, ProcessError> {
+    let mut handled = false;
+
+    let now = Instant::now();
+    let balloon_interval = vmm.balloon_statistics_update_interval();
+    if balloon_scheduler.is_due(now, balloon_interval) {
+        vmm.handle_periodic_balloon_statistics_update()
+            .map_err(ProcessError::PeriodicBalloonStatisticsUpdate)?;
+        balloon_scheduler.schedule_next(Instant::now(), vmm.balloon_statistics_update_interval());
+        handled = true;
+    }
+
+    let now = Instant::now();
+    if metrics_scheduler.is_due(now) {
+        vmm.handle_periodic_metrics_flush()
+            .map_err(ProcessError::PeriodicMetricsFlush)?;
+        metrics_scheduler.schedule_next(Instant::now());
+        handled = true;
+    }
+
+    Ok(handled)
 }
 
 fn apply_startup_config_file<S>(
