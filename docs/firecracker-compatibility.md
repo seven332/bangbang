@@ -500,7 +500,7 @@ fields and duplicate token bucket fields before VMM dispatch.
 | `PUT /hotplug/memory` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PATCH /hotplug/memory` | `requested_size_mib` | required; unsupported after VMM routing | Required Firecracker-shaped target hotpluggable-memory size. The parser accepts syntactically valid unsigned integer values, then the API server routes the request through the post-boot-only memory-hotplug action before returning the unsupported fault. Real resize behavior remains deferred. |
 | `PATCH /hotplug/memory` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
-| `PUT /actions` | `action_type=InstanceStart` | process-routed; internal startup execution across bounded step windows implemented | Validates stored boot-source and state preflight first, then attempts owned HVF boot-session preparation with configured serial output or the default internal serial MMIO console and starts the process-owned internal boot run-loop worker across bounded step windows. Success returns `204 No Content`, writes one minimal logger action line when configured and allowed by level/module filters, and commits `Running`; preparation, worker-start, or logger-output failures return a fault without mutating state. Public run-loop control and public serial streaming remain deferred. |
+| `PUT /actions` | `action_type=InstanceStart` | process-routed; internal startup execution across bounded step windows implemented | Validates stored boot-source and state preflight first, then attempts owned HVF boot-session preparation with configured serial output or the default internal serial MMIO console and starts the process-owned internal boot run-loop worker across bounded step windows. Success returns `204 No Content`, writes one minimal logger action line when configured and allowed by level/module filters, and commits `Running`; preparation, worker-start, or logger-output failures return a fault without mutating state. Full public run-loop control beyond the current pause/resume subset and public serial streaming remain deferred. |
 | `PUT /actions` | `action_type=FlushMetrics` | runtime-only; minimal execution implemented | Rejected before startup. After startup, returns `204 No Content`; if metrics output was configured, appends one minimal JSON line with `metrics_flush_count`, the current selected API request counters, `logger.missed_metrics_count` after a previous metrics write failure, and `logger.missed_log_count` after a previous logger action write failure; if logger output was configured and allowed by level/module filters, appends one minimal action line. Periodic metrics flushes reuse the same metrics payload every 60 seconds while running, but are not `/actions` requests and do not write logger action lines. Full Firecracker counters and full logger integration remain deferred. |
 | `PUT /actions` | `action_type=SendCtrlAltDel` | intentionally unsupported; parser rejected | Firecracker gates this on x86 keyboard behavior; the first target is Apple Silicon. The request is still counted in `put_api_requests.actions_count` without an `actions_fails` increment. |
 | `PUT /actions` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
@@ -622,9 +622,9 @@ Parsed deprecated HTTP API usage is counted under
 above; malformed parser failures remain outside the deprecated counter.
 Device runtime counters, remaining API request counters, and parser-level
 malformed-request counters for endpoints without Firecracker-shaped request
-metric fields remain deferred. Public run-loop control, guest boot
-output, public runner loop scheduling, full Firecracker metrics counters, and
-full logger integration remain deferred. Metrics write failures increment
+metric fields remain deferred. Full public run-loop control beyond pause/resume,
+guest boot output, public runner loop scheduling, full Firecracker metrics
+counters, and full logger integration remain deferred. Metrics write failures increment
 `logger.missed_metrics_count`; logger action write failures increment
 `logger.missed_log_count`; broader logger metrics remain deferred.
 The process startup path and API/VMM state path implement the logger field
