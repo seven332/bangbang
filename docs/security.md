@@ -274,11 +274,14 @@ memory validation path before acknowledging descriptor heads. Completed
 descriptors update only internal inflated-page accounting on the owning balloon
 device; they do not release, remap, or otherwise alter host memory. The HVF boot
 loop can drain these balloon notifications and signal the allocated balloon
-interrupt line, but parsed PFNs, statistics descriptors, free-page hinting
-range descriptors, and reporting queue data remain untrusted guest input and
-must not change host memory accounting or reclaim behavior until those host-side
-paths are implemented and reviewed. Free-page hinting command descriptors are
-limited to 4-byte command identifiers stored in active device state.
+interrupt line. Bounded statistics queue reports can update only optional
+statistics fields, and a runtime policy trigger can complete the pending
+statistics descriptor with a zero-length used-ring entry plus queue-interrupt
+intent. Parsed PFNs, statistics descriptors, free-page hinting range
+descriptors, and reporting queue data remain untrusted guest input and must not
+change host memory accounting or reclaim behavior until those host-side paths
+are implemented and reviewed. Free-page hinting command descriptors are limited
+to 4-byte command identifiers stored in active device state.
 Runtime balloon target-size updates change only the stored target and active
 virtio-balloon `num_pages` config-space value, then signal a config interrupt;
 they do not map, unmap, reclaim, or release host memory. Balloon statistics
