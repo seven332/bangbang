@@ -32,7 +32,9 @@ use bangbang_runtime::logger::LoggerConfigInput;
 use bangbang_runtime::machine::{MachineConfigInput, MachineConfigPatchInput};
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
 use bangbang_runtime::memory_hotplug::{MemoryHotplugConfigInput, MemoryHotplugSizeUpdateInput};
-use bangbang_runtime::metrics::{BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics};
+use bangbang_runtime::metrics::{
+    BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics, SharedBalloonDeviceMetrics,
+};
 use bangbang_runtime::mmds::{
     MmdsConfig, MmdsConfigInput, MmdsContentInput, MmdsStateHandle, MmdsStateLockError,
 };
@@ -1868,6 +1870,10 @@ pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
         None
     }
 
+    fn shared_balloon_device_metrics(&self) -> Option<SharedBalloonDeviceMetrics> {
+        None
+    }
+
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
         Err(BalloonUpdateError::ActiveSessionUnavailable)
     }
@@ -1905,6 +1911,12 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
             .balloon_device
             .clone()
             .map(|device| BootRunLoopBalloonDeviceUpdater::new(device, self.mmio_dispatcher()))
+    }
+
+    fn shared_balloon_device_metrics(&self) -> Option<SharedBalloonDeviceMetrics> {
+        Some(OwnedHvfArm64BootSession::shared_balloon_device_metrics(
+            self,
+        ))
     }
 
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
@@ -1977,6 +1989,10 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
         None
     }
 
+    fn shared_balloon_device_metrics(&self) -> Option<SharedBalloonDeviceMetrics> {
+        None
+    }
+
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
         Err(BalloonUpdateError::ActiveSessionUnavailable)
     }
@@ -2011,6 +2027,12 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
             .balloon_device
             .clone()
             .map(|device| BootRunLoopBalloonDeviceUpdater::new(device, self.mmio_dispatcher()))
+    }
+
+    fn shared_balloon_device_metrics(&self) -> Option<SharedBalloonDeviceMetrics> {
+        Some(OwnedHvfArm64BootSession::shared_balloon_device_metrics(
+            self,
+        ))
     }
 
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
@@ -2053,6 +2075,10 @@ where
 
     fn balloon_device_updater(&self) -> Option<BootRunLoopBalloonDeviceUpdater> {
         self.session.balloon_device_updater()
+    }
+
+    fn shared_balloon_device_metrics(&self) -> Option<SharedBalloonDeviceMetrics> {
+        self.session.shared_balloon_device_metrics()
     }
 
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
@@ -2501,6 +2527,7 @@ where
     control: S::Control,
     block_device_updater: Option<BootRunLoopBlockDeviceUpdater>,
     balloon_device_updater: Option<BootRunLoopBalloonDeviceUpdater>,
+    balloon_device_metrics: Option<SharedBalloonDeviceMetrics>,
     command_handle: BootRunLoopCommandHandle<S>,
     status: Arc<BootRunLoopWorkerStatusCell<S::Outcome>>,
     pause_gate: Arc<BootRunLoopPauseGate>,
@@ -2529,6 +2556,7 @@ where
         let control = session.run_loop_control();
         let block_device_updater = session.block_device_updater();
         let balloon_device_updater = session.balloon_device_updater();
+        let balloon_device_metrics = session.shared_balloon_device_metrics();
         let stop_token = control.stop_token();
         let status = Arc::new(BootRunLoopWorkerStatusCell::new());
         let worker_status = Arc::clone(&status);
@@ -2609,6 +2637,7 @@ where
             control,
             block_device_updater,
             balloon_device_updater,
+            balloon_device_metrics,
             command_handle,
             status,
             pause_gate,
@@ -2711,7 +2740,11 @@ where
     S::Outcome: BootRunLoopProcessExit,
 {
     fn metrics_diagnostics(&self) -> MetricsDiagnostics {
-        MetricsDiagnostics::new().with_boot_run_loop_status(self.metric_status())
+        let diagnostics = MetricsDiagnostics::new().with_boot_run_loop_status(self.metric_status());
+        match &self.balloon_device_metrics {
+            Some(metrics) => diagnostics.with_balloon_device_metrics(metrics.snapshot()),
+            None => diagnostics,
+        }
     }
 
     fn pause(&mut self) -> Result<(), BackendError> {
@@ -2955,7 +2988,8 @@ mod tests {
     use bangbang_runtime::logger::LoggerConfigInput;
     use bangbang_runtime::machine::{MachineConfigInput, MachineConfigPatchInput};
     use bangbang_runtime::metrics::{
-        BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics,
+        BalloonDeviceMetrics, BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics,
+        SharedBalloonDeviceMetrics,
     };
     use bangbang_runtime::mmds::{MmdsConfigInput, MmdsContentInput, MmdsStateHandle};
     use bangbang_runtime::mmio::MmioRegion;
@@ -3633,6 +3667,7 @@ mod tests {
         max_steps_sender: mpsc::Sender<usize>,
         outcomes: Arc<Mutex<VecDeque<Result<FakeRunLoopOutcome, FakeRunLoopError>>>>,
         block_device_updater: Option<BootRunLoopBlockDeviceUpdater>,
+        balloon_device_metrics: Option<SharedBalloonDeviceMetrics>,
         wait_for_stop: bool,
         wait_for_wakeup: bool,
         wait_for_stop_sequence: Arc<Mutex<VecDeque<bool>>>,
@@ -3653,6 +3688,7 @@ mod tests {
                     FakeRunLoopOutcome::Terminal,
                 )]))),
                 block_device_updater: None,
+                balloon_device_metrics: None,
                 wait_for_stop: true,
                 wait_for_wakeup: false,
                 wait_for_stop_sequence: Arc::default(),
@@ -3673,6 +3709,11 @@ mod tests {
 
         fn with_block_device_updater(mut self, updater: BootRunLoopBlockDeviceUpdater) -> Self {
             self.block_device_updater = Some(updater);
+            self
+        }
+
+        fn with_balloon_device_metrics(mut self, metrics: SharedBalloonDeviceMetrics) -> Self {
+            self.balloon_device_metrics = Some(metrics);
             self
         }
 
@@ -3712,6 +3753,10 @@ mod tests {
 
         fn block_device_updater(&self) -> Option<BootRunLoopBlockDeviceUpdater> {
             self.block_device_updater.clone()
+        }
+
+        fn shared_balloon_device_metrics(&self) -> Option<SharedBalloonDeviceMetrics> {
+            self.balloon_device_metrics.clone()
         }
 
         fn run_loop(
@@ -4808,6 +4853,40 @@ mod tests {
             Some(BootRunLoopMetricStatus::Running)
         );
         assert_eq!(drop_count.load(Ordering::SeqCst), 0);
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_reports_balloon_device_metrics() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let metrics = SharedBalloonDeviceMetrics::default();
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_balloon_device_metrics(metrics.clone());
+
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(5).expect("non-zero limit"))
+                .expect("supervisor should start");
+
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            5
+        );
+        metrics.record_event_failure();
+        metrics.record_statistics_update_failure();
+
+        assert_eq!(
+            supervisor.metrics_diagnostics().balloon_device_metrics(),
+            Some(BalloonDeviceMetrics::new(0, 0, 0, 1, 0, 1))
+        );
 
         drop(supervisor);
 

@@ -4671,6 +4671,7 @@ mod tests {
         GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryLayout,
         GuestMemoryRange,
     };
+    use crate::metrics::{BalloonDeviceMetrics, SharedBalloonDeviceMetrics};
     use crate::mmio::{MmioAccessBytes, MmioDispatchOutcome, MmioOperation, MmioRegionId};
     use crate::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
@@ -8697,6 +8698,12 @@ mod tests {
                 page_count: 1,
             }]
         );
+        let metrics = SharedBalloonDeviceMetrics::default();
+        metrics.record_notification_dispatch(&dispatch);
+        assert_eq!(
+            metrics.snapshot(),
+            BalloonDeviceMetrics::new(0, 0, 0, 0, 2, 0)
+        );
         assert_eq!(read_used_idx(&memory, deflate_used_ring()), 1);
         assert_eq!(read_used_element(&memory, deflate_used_ring(), 0), (0, 0));
     }
@@ -9432,6 +9439,12 @@ mod tests {
         );
         assert_eq!(statistics_dispatch.statistics().swap_out(), Some(9));
         assert_eq!(statistics_dispatch.statistics().free_memory(), Some(0x5678));
+        let metrics = SharedBalloonDeviceMetrics::default();
+        metrics.record_notification_dispatch(&dispatch);
+        assert_eq!(
+            metrics.snapshot(),
+            BalloonDeviceMetrics::new(0, 0, 1, 0, 0, 0)
+        );
         assert_eq!(
             read_used_idx(&memory, queue_used_ring(VIRTIO_BALLOON_STATS_QUEUE_INDEX)),
             1
