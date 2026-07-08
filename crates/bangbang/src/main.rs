@@ -699,6 +699,7 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessExitCode {
     ProcessFailure = 1,
+    BadConfiguration = 152,
     ArgumentParsing = 153,
 }
 
@@ -732,14 +733,14 @@ impl ProcessError {
         match self {
             Self::ApiServer(_) => ProcessExitCode::ProcessFailure,
             Self::ArgumentParsing(_) => ProcessExitCode::ArgumentParsing,
-            Self::ConfigFile(_) => ProcessExitCode::ProcessFailure,
-            Self::Metadata(_) => ProcessExitCode::ProcessFailure,
+            Self::ConfigFile(_) => ProcessExitCode::BadConfiguration,
+            Self::Metadata(_) => ProcessExitCode::BadConfiguration,
             Self::PeriodicBalloonStatisticsUpdate(_) => ProcessExitCode::ProcessFailure,
             Self::PeriodicMetricsFlush(_) => ProcessExitCode::ProcessFailure,
             Self::ProcessExitNotification(_) => ProcessExitCode::ProcessFailure,
             Self::ProcessSessionTerminal => ProcessExitCode::ProcessFailure,
             Self::SignalHandler(_) => ProcessExitCode::ProcessFailure,
-            Self::StartupConfiguration(_) => ProcessExitCode::ProcessFailure,
+            Self::StartupConfiguration(_) => ProcessExitCode::BadConfiguration,
             Self::StartupTime(_) => ProcessExitCode::ProcessFailure,
         }
     }
@@ -1959,8 +1960,9 @@ mod tests {
     }
 
     #[test]
-    fn process_exit_code_value_matches_argument_parsing_contract() {
+    fn process_exit_code_values_match_firecracker_contract() {
         assert_eq!(ProcessExitCode::ProcessFailure.value(), 1);
+        assert_eq!(ProcessExitCode::BadConfiguration.value(), 152);
         assert_eq!(ProcessExitCode::ArgumentParsing.value(), 153);
     }
 
@@ -1972,12 +1974,28 @@ mod tests {
     }
 
     #[test]
-    fn startup_configuration_error_maps_to_process_failure_exit_code() {
+    fn runtime_process_errors_stay_on_process_failure_exit_code() {
+        for err in [
+            ProcessError::PeriodicBalloonStatisticsUpdate(VmmActionError::BalloonUnsupported),
+            ProcessError::PeriodicMetricsFlush(VmmActionError::EntropyUnsupported),
+            ProcessError::ProcessExitNotification(std::io::ErrorKind::BrokenPipe),
+            ProcessError::ProcessSessionTerminal,
+            ProcessError::SignalHandler(std::io::ErrorKind::Interrupted),
+            ProcessError::StartupTime(super::StartupTimeClockError::Monotonic(
+                std::io::ErrorKind::Other,
+            )),
+        ] {
+            assert_eq!(err.exit_code(), ProcessExitCode::ProcessFailure, "{err}");
+        }
+    }
+
+    #[test]
+    fn startup_configuration_error_maps_to_bad_configuration_exit_code() {
         let err = ProcessError::StartupConfiguration(
             bangbang_runtime::VmmActionError::LoggerConfig(LoggerConfigError::EmptyPath),
         );
 
-        assert_eq!(err.exit_code(), ProcessExitCode::ProcessFailure);
+        assert_eq!(err.exit_code(), ProcessExitCode::BadConfiguration);
         assert_eq!(
             err.to_string(),
             "startup configuration error: logger path must not be empty"
@@ -1987,11 +2005,25 @@ mod tests {
             bangbang_runtime::VmmActionError::MetricsConfig(MetricsConfigError::EmptyPath),
         );
 
-        assert_eq!(err.exit_code(), ProcessExitCode::ProcessFailure);
+        assert_eq!(err.exit_code(), ProcessExitCode::BadConfiguration);
         assert_eq!(
             err.to_string(),
             "startup configuration error: metrics path must not be empty"
         );
+    }
+
+    #[test]
+    fn config_file_error_maps_to_bad_configuration_exit_code() {
+        let err = ProcessError::ConfigFile(super::ConfigFileError::Malformed);
+
+        assert_eq!(err.exit_code(), ProcessExitCode::BadConfiguration);
+    }
+
+    #[test]
+    fn metadata_error_maps_to_bad_configuration_exit_code() {
+        let err = ProcessError::Metadata(super::MetadataFileError::Malformed);
+
+        assert_eq!(err.exit_code(), ProcessExitCode::BadConfiguration);
     }
 
     #[test]

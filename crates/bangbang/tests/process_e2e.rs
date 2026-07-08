@@ -22,6 +22,7 @@ use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_runtime::machine::MAX_MEM_SIZE_MIB;
 
 const BANGBANG_VERSION: &str = env!("CARGO_PKG_VERSION");
+const BAD_CONFIGURATION_EXIT_CODE: i32 = 152;
 const ARGUMENT_PARSING_EXIT_CODE: i32 = 153;
 const MULTI_VCPU_STARTUP_ERROR: &str = "HVF arm64 boot session supports exactly 1 vCPU, got 2";
 
@@ -702,6 +703,7 @@ fn executable_config_file_failure_does_not_publish_socket() {
         output.stdout,
         output.stderr
     );
+    assert_bad_configuration_exit_code(&output, "malformed config file");
     assert!(
         !socket_path.exists(),
         "malformed config file should fail before API socket publication"
@@ -736,6 +738,7 @@ fn executable_no_api_config_file_failure_does_not_publish_socket() {
         output.stdout,
         output.stderr
     );
+    assert_bad_configuration_exit_code(&output, "malformed no-api config file");
     assert!(
         !socket_path.exists(),
         "malformed no-api config file should not publish an API socket"
@@ -2777,6 +2780,7 @@ fn assert_metadata_failure(
         output.stdout,
         output.stderr
     );
+    assert_bad_configuration_exit_code(output, case_name);
     assert!(
         !socket_path.exists(),
         "{case_name} should fail before API socket publication"
@@ -2823,6 +2827,7 @@ fn assert_multi_vcpu_startup_failure(
         output.stdout,
         output.stderr
     );
+    assert_bad_configuration_exit_code(output, case_name);
     assert!(
         !socket_path.exists(),
         "{case_name} should fail before API socket publication"
@@ -2879,6 +2884,7 @@ fn assert_rejected_drive_socket_config_failure(
         output.stdout,
         output.stderr
     );
+    assert_bad_configuration_exit_code(output, case_name);
     assert!(
         !socket_path.exists(),
         "{case_name} should fail before API socket publication"
@@ -2930,6 +2936,7 @@ fn assert_rejected_serial_config_failure(
         output.stdout,
         output.stderr
     );
+    assert_bad_configuration_exit_code(output, case_name);
     assert!(
         !socket_path.exists(),
         "{case_name} should fail before API socket publication"
@@ -2980,6 +2987,7 @@ fn assert_entropy_rate_limiter_startup_failure(
         output.stdout,
         output.stderr
     );
+    assert_bad_configuration_exit_code(output, case_name);
     assert!(
         !socket_path.exists(),
         "{case_name} should fail before API socket publication"
@@ -3009,6 +3017,17 @@ fn assert_entropy_rate_limiter_startup_failure(
             output.stderr
         );
     }
+}
+
+fn assert_bad_configuration_exit_code(output: &support::CompletedProcess, case_name: &str) {
+    assert_eq!(
+        output.status.code(),
+        Some(BAD_CONFIGURATION_EXIT_CODE),
+        "{case_name} should fail with the bad-configuration exit code; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        output.stdout,
+        output.stderr
+    );
 }
 
 fn assert_instance_info_matches(

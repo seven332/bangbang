@@ -282,8 +282,11 @@ rules, guest boot artifact caching, and local verification expectations.
 
 - `0`: help or version completed successfully, the API server exited without
   error, or no-api mode handled `SIGINT`/`SIGTERM`.
+- `152`: startup configuration failed before the process entered runtime,
+  including config-file, metadata, startup logger, and startup metrics
+  configuration failures. This matches Firecracker's bad-configuration exit
+  code.
 - `153`: startup argument parsing failed before process configuration began.
   This matches Firecracker's argument-parsing exit code.
-- `1`: process failure, including config-file startup, startup metrics/logger
-  configuration, API socket bind, shutdown signal handling, or API accept
-  failures.
+- `1`: process failure, including API socket bind, shutdown signal handling, API
+  accept failures, or process-owned runtime failures.

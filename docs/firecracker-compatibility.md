@@ -150,7 +150,7 @@ exits on handled `SIGINT`, handled `SIGTERM`, or guest PSCI `SYSTEM_OFF` or
 | `--config-file <PATH>` | startup implemented for supported subset | Reads a Firecracker-shaped JSON configuration from a readable regular file up to 1 MiB, applies supported sections through the same validation path as matching API requests, and starts the VM with `InstanceStart`. In API-enabled mode, the API socket is published only after successful startup. Malformed files, oversized files, duplicate object keys, unknown sections, unsupported sections, or invalid sections fail before socket publication or no-api readiness. |
 | `--help`, `-h` | prints help | Help describes the current API socket scope. |
 | `--version`, `-V` | prints version | `-V` is retained from the existing bangbang scaffold. |
-| `--no-api` | config-file startup without API socket | Requires `--config-file`. Starts the supported config-file subset without binding or publishing the configured API socket, then waits for handled `SIGINT`, handled `SIGTERM`, or guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET`. Runtime control, reboot-in-place, and error exit-code parity remain deferred. |
+| `--no-api` | config-file startup without API socket | Requires `--config-file`. Starts the supported config-file subset without binding or publishing the configured API socket, then waits for handled `SIGINT`, handled `SIGTERM`, or guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET`. Runtime control, reboot-in-place, and remaining runtime error exit-code parity remain deferred. |
 | seccomp, snapshot, boot timer, and PCI process flags | rejected | These Firecracker options are Linux-specific or tied to later capability work. |
 
 Startup timing arguments are intentionally not exposed in `GET /vm/config` or
@@ -297,12 +297,13 @@ The current executable uses a small process exit status contract:
 | Exit status | Current meaning | Compatibility notes |
 | --- | --- | --- |
 | `0` | Help or version completed successfully, the API server exited without error, no-api mode handled `SIGINT`/`SIGTERM` shutdown, or a process-owned VM exited after guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET`. | Matches Firecracker's success status. |
+| `152` | Startup configuration failed before the process entered runtime, including config-file, metadata, startup logger, and startup metrics configuration failures. | Matches Firecracker's `BadConfiguration` exit code for clearly startup configuration failures. |
 | `153` | Startup argument parsing failed before process configuration began. | Matches Firecracker's `ArgParsing` exit code. |
-| `1` | Process failure, including config-file startup, startup metrics/logger configuration, API socket bind, signal handler registration, no-api signal wait failure, API accept failure, or a process-owned boot worker non-success terminal state. | Used for non-argument process failures before more specific Firecracker-compatible process errors exist. Per-connection read/write errors do not terminate the API server. |
+| `1` | Process failure, including API socket bind, signal handler registration, no-api signal wait failure, API accept failure, startup time accounting failure, periodic runtime work failure, or a process-owned boot worker non-success terminal state. | Used for non-configuration process failures before more specific Firecracker-compatible process errors exist. Per-connection read/write errors do not terminate the API server. |
 
-Firecracker also defines bad-configuration and signal-specific exit codes.
-bangbang does not expose those until the corresponding configuration loading,
-signal handling, API server, or VM runtime behavior exists.
+Firecracker also defines signal-specific exit codes. bangbang does not expose
+those until the corresponding signal handling, API server, or VM runtime
+behavior exists.
 
 ## Compatibility Baseline
 
