@@ -2859,7 +2859,7 @@ fn parse_drive_config_request(
     let rate_limiter_configured = match &body.rate_limiter {
         Some(rate_limiter) => {
             validate_rate_limiter_config(rate_limiter.as_value())?;
-            true
+            rate_limiter_configured(rate_limiter.as_value())?
         }
         None => false,
     };
@@ -2887,7 +2887,7 @@ fn parse_drive_patch_request(path_drive_id: &str, body: &[u8]) -> Result<ApiRequ
     let rate_limiter_configured = match &body.rate_limiter {
         Some(rate_limiter) => {
             validate_rate_limiter_config(rate_limiter.as_value())?;
-            true
+            rate_limiter_configured(rate_limiter.as_value())?
         }
         None => false,
     };
@@ -2951,14 +2951,14 @@ fn parse_network_interface_config_request(
     let rx_rate_limiter_configured = match &body.rx_rate_limiter {
         Some(rate_limiter) => {
             validate_rate_limiter_config(rate_limiter.as_value())?;
-            true
+            rate_limiter_configured(rate_limiter.as_value())?
         }
         None => false,
     };
     let tx_rate_limiter_configured = match &body.tx_rate_limiter {
         Some(rate_limiter) => {
             validate_rate_limiter_config(rate_limiter.as_value())?;
-            true
+            rate_limiter_configured(rate_limiter.as_value())?
         }
         None => false,
     };
@@ -2988,14 +2988,14 @@ fn parse_network_interface_patch_request(
     let rx_rate_limiter_configured = match &body.rx_rate_limiter {
         Some(rate_limiter) => {
             validate_rate_limiter_config(rate_limiter.as_value())?;
-            true
+            rate_limiter_configured(rate_limiter.as_value())?
         }
         None => false,
     };
     let tx_rate_limiter_configured = match &body.tx_rate_limiter {
         Some(rate_limiter) => {
             validate_rate_limiter_config(rate_limiter.as_value())?;
-            true
+            rate_limiter_configured(rate_limiter.as_value())?
         }
         None => false,
     };
@@ -3170,10 +3170,14 @@ fn validate_rate_limiter_config(value: &serde_json::Value) -> Result<(), Request
 }
 
 fn rate_limiter_configured(value: &serde_json::Value) -> Result<bool, RequestError> {
-    value
-        .as_object()
-        .map(|rate_limiter| !rate_limiter.is_empty())
-        .ok_or(RequestError::MalformedRequest)
+    let rate_limiter = value.as_object().ok_or(RequestError::MalformedRequest)?;
+
+    Ok(rate_limiter
+        .get(RATE_LIMITER_BANDWIDTH_FIELD)
+        .is_some_and(|bucket| !bucket.is_null())
+        || rate_limiter
+            .get(RATE_LIMITER_OPS_FIELD)
+            .is_some_and(|bucket| !bucket.is_null()))
 }
 
 fn parse_serial_token_bucket(
@@ -4920,6 +4924,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_put_drive_with_noop_rate_limiter_objects() {
+        for body in [
+            r#"{"drive_id":"rootfs","path_on_host":"/tmp/rootfs.ext4","is_root_device":true,"rate_limiter":{}}"#,
+            r#"{"drive_id":"rootfs","path_on_host":"/tmp/rootfs.ext4","is_root_device":true,"rate_limiter":{"bandwidth":null}}"#,
+            r#"{"drive_id":"rootfs","path_on_host":"/tmp/rootfs.ext4","is_root_device":true,"rate_limiter":{"ops":null}}"#,
+            r#"{"drive_id":"rootfs","path_on_host":"/tmp/rootfs.ext4","is_root_device":true,"rate_limiter":{"bandwidth":null,"ops":null}}"#,
+        ] {
+            let request = request_with_body("PUT", "/drives/rootfs", body);
+
+            let parsed = parse_request(&request).expect("drive request should parse");
+
+            let ApiRequest::PutDrive(config) = parsed else {
+                panic!("expected drive request");
+            };
+            assert!(!config.rate_limiter_configured(), "{body}");
+        }
+    }
+
+    #[test]
     fn parses_put_drive_with_deferred_cache_and_io_values() {
         let body = r#"{
             "drive_id": "data",
@@ -5236,6 +5259,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_patch_drive_with_noop_rate_limiter_objects() {
+        for body in [
+            r#"{"drive_id":"rootfs","rate_limiter":{}}"#,
+            r#"{"drive_id":"rootfs","rate_limiter":{"bandwidth":null}}"#,
+            r#"{"drive_id":"rootfs","rate_limiter":{"ops":null}}"#,
+            r#"{"drive_id":"rootfs","rate_limiter":{"bandwidth":null,"ops":null}}"#,
+        ] {
+            let request = request_with_body("PATCH", "/drives/rootfs", body);
+
+            let parsed = parse_request(&request).expect("drive patch should parse");
+
+            let ApiRequest::PatchDrive(config) = parsed else {
+                panic!("expected drive patch request");
+            };
+            assert_eq!(config.path_drive_id(), "rootfs", "{body}");
+            assert_eq!(config.body_drive_id(), "rootfs", "{body}");
+            assert_eq!(config.path_on_host(), None, "{body}");
+            assert!(!config.rate_limiter_configured(), "{body}");
+        }
+    }
+
+    #[test]
     fn rejects_patch_drive_malformed_body() {
         let request = request_with_body("PATCH", "/drives/rootfs", "not-json");
 
@@ -5503,6 +5548,37 @@ mod tests {
     }
 
     #[test]
+    fn parses_put_network_interface_with_noop_rate_limiter_objects() {
+        for (body, expected_rx, expected_tx) in [
+            (
+                r#"{"iface_id":"eth0","host_dev_name":"tap0","rx_rate_limiter":{},"tx_rate_limiter":{}}"#,
+                false,
+                false,
+            ),
+            (
+                r#"{"iface_id":"eth0","host_dev_name":"tap0","rx_rate_limiter":{"bandwidth":null},"tx_rate_limiter":{"ops":null}}"#,
+                false,
+                false,
+            ),
+            (
+                r#"{"iface_id":"eth0","host_dev_name":"tap0","rx_rate_limiter":{"bandwidth":null,"ops":{"size":100,"one_time_burst":null,"refill_time":1000}},"tx_rate_limiter":{"bandwidth":null,"ops":null}}"#,
+                true,
+                false,
+            ),
+        ] {
+            let request = request_with_body("PUT", "/network-interfaces/eth0", body);
+
+            let parsed = parse_request(&request).expect("network request should parse");
+
+            let ApiRequest::PutNetworkInterface(config) = parsed else {
+                panic!("expected network interface request");
+            };
+            assert_eq!(config.rx_rate_limiter_configured(), expected_rx, "{body}");
+            assert_eq!(config.tx_rate_limiter_configured(), expected_tx, "{body}");
+        }
+    }
+
+    #[test]
     fn parses_put_network_interface_with_firecracker_id_character_set() {
         let body = r#"{
             "iface_id": "net_é1",
@@ -5650,6 +5726,11 @@ mod tests {
                 false,
             ),
             (
+                r#"{"iface_id":"eth0","rx_rate_limiter":{},"tx_rate_limiter":{"bandwidth":null,"ops":null}}"#,
+                false,
+                false,
+            ),
+            (
                 r#"{"iface_id":"eth0","rx_rate_limiter":{"bandwidth":{"size":100,"one_time_burst":null,"refill_time":1000}}}"#,
                 true,
                 false,
@@ -5658,6 +5739,11 @@ mod tests {
                 r#"{"iface_id":"eth0","tx_rate_limiter":{"ops":{"size":100,"one_time_burst":200,"refill_time":1000}}}"#,
                 false,
                 true,
+            ),
+            (
+                r#"{"iface_id":"eth0","rx_rate_limiter":{"bandwidth":null,"ops":{"size":100,"one_time_burst":null,"refill_time":1000}},"tx_rate_limiter":{"bandwidth":null}}"#,
+                true,
+                false,
             ),
         ] {
             let request = request_with_body("PATCH", "/network-interfaces/eth0", body);
@@ -5926,7 +6012,12 @@ mod tests {
 
     #[test]
     fn parses_entropy_config_without_configured_rate_limiter() {
-        for body in ["{}", r#"{"rate_limiter":null}"#, r#"{"rate_limiter":{}}"#] {
+        for body in [
+            "{}",
+            r#"{"rate_limiter":null}"#,
+            r#"{"rate_limiter":{}}"#,
+            r#"{"rate_limiter":{"bandwidth":null,"ops":null}}"#,
+        ] {
             let request = request_with_body("PUT", "/entropy", body);
 
             let parsed = parse_request(&request).expect("entropy config should parse");
@@ -6477,6 +6568,17 @@ mod tests {
                 false,
                 false,
             ),
+            (
+                "PUT /pmem/pmem3 all-null rate limiter buckets",
+                request_with_body(
+                    "PUT",
+                    "/pmem/pmem3",
+                    r#"{"id":"pmem3","path_on_host":"/tmp/pmem.img","rate_limiter":{"bandwidth":null,"ops":null}}"#,
+                ),
+                false,
+                false,
+                false,
+            ),
         ] {
             let parsed = parse_request(&request).expect("pmem request should parse");
             let ApiRequest::PutPmem(config) = parsed else {
@@ -6512,6 +6614,14 @@ mod tests {
                     "PATCH",
                     "/pmem/pmem0",
                     r#"{"id":"pmem0","rate_limiter":null}"#,
+                ),
+            ),
+            (
+                "PATCH /pmem/pmem0 all-null rate limiter buckets",
+                request_with_body(
+                    "PATCH",
+                    "/pmem/pmem0",
+                    r#"{"id":"pmem0","rate_limiter":{"bandwidth":null,"ops":null}}"#,
                 ),
             ),
             (

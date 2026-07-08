@@ -1593,11 +1593,13 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+    use bangbang_runtime::block::{DriveConfigError, DriveConfigInput};
     use bangbang_runtime::boot::BootSourceConfigInput;
     use bangbang_runtime::logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel};
     use bangbang_runtime::machine::{MAX_MEM_SIZE_MIB, MachineConfigError};
     use bangbang_runtime::metrics::{MetricsConfigError, MetricsConfigInput, MetricsDiagnostics};
     use bangbang_runtime::mmds::MmdsDataStoreError;
+    use bangbang_runtime::network::{NetworkInterfaceConfigError, NetworkInterfaceConfigInput};
     use bangbang_runtime::pmem::{PmemConfigError, PmemConfigInput};
     use bangbang_runtime::serial::SerialRateLimiterConfig;
     use bangbang_runtime::{BackendError, InstanceState, VmmAction, VmmActionError, VmmData};
@@ -3259,6 +3261,7 @@ mod tests {
         for config in [
             r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"entropy":{"rate_limiter":null}}"#,
             r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"entropy":{"rate_limiter":{}}}"#,
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"entropy":{"rate_limiter":{"bandwidth":null,"ops":null}}}"#,
         ] {
             let actions = super::config_file_actions_from_str(config)
                 .expect("entropy config section should accept no-op rate limiter");
@@ -3271,6 +3274,54 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn config_file_accepts_shared_noop_rate_limiter_objects() {
+        let actions = super::config_file_actions_from_str(
+            r#"{
+                "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
+                "drives":[{
+                    "drive_id":"rootfs",
+                    "path_on_host":"/tmp/rootfs.ext4",
+                    "is_root_device":true,
+                    "rate_limiter":{"bandwidth":null,"ops":null}
+                }],
+                "pmem":[{
+                    "id":"pmem0",
+                    "path_on_host":"/tmp/pmem.img",
+                    "rate_limiter":{"bandwidth":null}
+                }],
+                "network-interfaces":[{
+                    "iface_id":"eth0",
+                    "host_dev_name":"vmnet:shared",
+                    "rx_rate_limiter":{},
+                    "tx_rate_limiter":{"ops":null}
+                }],
+                "entropy":{"rate_limiter":{"bandwidth":null,"ops":null}}
+            }"#,
+        )
+        .expect("shared no-op rate limiters should parse");
+
+        assert_eq!(
+            actions,
+            [
+                VmmAction::PutBootSource(BootSourceConfigInput::new("/tmp/vmlinux")),
+                VmmAction::PutDrive(DriveConfigInput::new(
+                    "rootfs",
+                    "rootfs",
+                    "/tmp/rootfs.ext4",
+                    true
+                )),
+                VmmAction::PutPmem(PmemConfigInput::new("pmem0", "/tmp/pmem.img")),
+                VmmAction::PutNetworkInterface(NetworkInterfaceConfigInput::new(
+                    "eth0",
+                    "eth0",
+                    "vmnet:shared"
+                )),
+                VmmAction::PutEntropy(bangbang_runtime::entropy::EntropyConfigInput::new()),
+            ]
+        );
     }
 
     #[test]
@@ -3422,6 +3473,102 @@ mod tests {
         };
         assert_eq!(config.pmem_configs().len(), 1);
         assert_eq!(config.pmem_configs()[0].path_on_host(), "/tmp/pmem-old.img");
+
+        fs::remove_file(config_path).expect("fixture config should clean up");
+    }
+
+    #[test]
+    fn config_file_drive_rate_limiter_fails_before_starting() {
+        let config_path = unique_config_path("drive-rate-limiter");
+        let config = r#"{
+            "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
+            "drives":[
+                {"drive_id":"rootfs","path_on_host":"/tmp/rootfs-old.ext4","is_root_device":true},
+                {"drive_id":"rootfs","path_on_host":"/tmp/rootfs-new.ext4","is_root_device":true,"rate_limiter":{"ops":{"size":1,"refill_time":1}}}
+            ]
+        }"#;
+        fs::write(&config_path, config).expect("config file should be written");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        let err = super::apply_startup_config_file(
+            &mut vmm,
+            Some(config_path.to_str().expect("UTF-8 path")),
+        )
+        .expect_err("configured drive rate limiter should fail");
+
+        assert_eq!(
+            err,
+            ProcessError::ConfigFile(super::ConfigFileError::Apply(VmmActionError::DriveConfig(
+                DriveConfigError::UnsupportedRateLimiter
+            )))
+        );
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+        let data = vmm
+            .handle_action(VmmAction::GetVmConfig)
+            .expect("VM config should be returned");
+        let VmmData::VmConfiguration(config) = data else {
+            panic!("expected VM config");
+        };
+        assert_eq!(config.drive_configs().len(), 1);
+        assert_eq!(
+            config.drive_configs()[0].path_on_host(),
+            "/tmp/rootfs-old.ext4"
+        );
+
+        fs::remove_file(config_path).expect("fixture config should clean up");
+    }
+
+    #[test]
+    fn config_file_network_rate_limiter_fails_before_starting() {
+        let config_path = unique_config_path("network-rate-limiter");
+        let config = r#"{
+            "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
+            "network-interfaces":[
+                {"iface_id":"eth0","host_dev_name":"vmnet:shared"},
+                {"iface_id":"eth0","host_dev_name":"vmnet:host","rx_rate_limiter":{"bandwidth":{"size":1,"refill_time":1}}}
+            ]
+        }"#;
+        fs::write(&config_path, config).expect("config file should be written");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        let err = super::apply_startup_config_file(
+            &mut vmm,
+            Some(config_path.to_str().expect("UTF-8 path")),
+        )
+        .expect_err("configured network rate limiter should fail");
+
+        assert_eq!(
+            err,
+            ProcessError::ConfigFile(super::ConfigFileError::Apply(
+                VmmActionError::NetworkInterfaceConfig(
+                    NetworkInterfaceConfigError::UnsupportedRxRateLimiter
+                )
+            ))
+        );
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+        let data = vmm
+            .handle_action(VmmAction::GetVmConfig)
+            .expect("VM config should be returned");
+        let VmmData::VmConfiguration(config) = data else {
+            panic!("expected VM config");
+        };
+        assert_eq!(config.network_interface_configs().len(), 1);
+        assert_eq!(
+            config.network_interface_configs()[0].host_dev_name(),
+            "vmnet:shared"
+        );
 
         fs::remove_file(config_path).expect("fixture config should clean up");
     }
