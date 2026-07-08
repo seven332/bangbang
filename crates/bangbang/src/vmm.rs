@@ -2741,6 +2741,18 @@ where
         .map_err(lifecycle_error_from_boot_run_loop_command)
     }
 
+    fn record_block_device_update(&self, drive_id: &str) {
+        if let Some(metrics) = &self.block_device_metrics {
+            metrics.record_update_for_drive(drive_id);
+        }
+    }
+
+    fn record_block_device_update_failure(&self, drive_id: &str) {
+        if let Some(metrics) = &self.block_device_metrics {
+            metrics.record_update_failure_for_drive(drive_id);
+        }
+    }
+
     fn stop_and_join(&mut self) {
         let Some(worker) = self.worker.take() else {
             return;
@@ -2787,22 +2799,38 @@ where
     }
 
     fn update_block_device(&mut self, config: &DriveConfig) -> Result<(), DriveUpdateError> {
+        let drive_id = config.drive_id();
         let Some(updater) = self.block_device_updater.as_ref() else {
+            self.record_block_device_update_failure(drive_id);
             return Err(DriveUpdateError::ActiveSessionUnavailable);
         };
 
         if !matches!(self.status(), BootRunLoopWorkerStatus::Running) {
+            self.record_block_device_update_failure(drive_id);
             return Err(DriveUpdateError::ActiveSessionUnavailable);
         }
 
         // Keep host file open/stat work on the caller side; only the active
         // handler mutation runs on the boot run-loop worker.
-        let backing = BootRunLoopBlockDeviceUpdater::open_block_device_backing(config)?;
+        let backing = match BootRunLoopBlockDeviceUpdater::open_block_device_backing(config) {
+            Ok(backing) => backing,
+            Err(err) => {
+                self.record_block_device_update_failure(drive_id);
+                return Err(err);
+            }
+        };
         let updater = updater.clone();
         let config = config.clone();
 
-        self.run_command(move |_| updater.update_block_device_with_opened(&config, backing))
-            .map_err(drive_update_error_from_boot_run_loop_command)
+        let result = self
+            .run_command(move |_| updater.update_block_device_with_opened(&config, backing))
+            .map_err(drive_update_error_from_boot_run_loop_command);
+        if result.is_ok() {
+            self.record_block_device_update(drive_id);
+        } else {
+            self.record_block_device_update_failure(drive_id);
+        }
+        result
     }
 
     fn update_balloon(&mut self, config: BalloonConfig) -> Result<(), BalloonUpdateError> {
@@ -5557,10 +5585,12 @@ mod tests {
         let replacement_config = drive_config("data", replacement.path());
         let control = FakeRunLoopControl::default();
         let drop_count = Arc::new(AtomicU64::new(0));
+        let metrics = SharedBlockDeviceMetricsRegistry::from_drive_ids(["data"]);
         let (max_steps_sender, max_steps_receiver) = mpsc::channel();
         let session =
             FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
                 .with_block_device_updater(updater)
+                .with_block_device_metrics(metrics)
                 .with_wait_for_stop(false)
                 .with_wait_for_wakeup(true)
                 .with_outcomes([
@@ -5581,8 +5611,20 @@ mod tests {
         supervisor
             .update_block_device(&replacement_config)
             .expect("drive update should run on worker");
+        let diagnostics = supervisor.metrics_diagnostics();
 
         assert_eq!(control.request_wakeup_count(), 1);
+        assert_eq!(
+            diagnostics.block_device_metrics(),
+            Some(BlockDeviceMetrics::default().with_update_count(1))
+        );
+        assert_eq!(
+            diagnostics.block_device_metrics_by_drive(),
+            Some(
+                &BlockDeviceMetricsByDrive::new()
+                    .with_drive_metrics("data", BlockDeviceMetrics::default().with_update_count(1))
+            )
+        );
 
         drop(supervisor);
 
@@ -5726,10 +5768,12 @@ mod tests {
         let replacement_config = drive_config("data", replacement.path());
         let control = FakeRunLoopControl::default();
         let drop_count = Arc::new(AtomicU64::new(0));
+        let metrics = SharedBlockDeviceMetricsRegistry::from_drive_ids(["data"]);
         let (max_steps_sender, max_steps_receiver) = mpsc::channel();
         let session =
             FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
-                .with_block_device_updater(updater);
+                .with_block_device_updater(updater)
+                .with_block_device_metrics(metrics);
 
         let mut supervisor = BootRunLoopSupervisor::start_with_command_queue_capacity(
             session,
@@ -5755,7 +5799,21 @@ mod tests {
                 message: "boot run loop command queue is full".to_string()
             }
         );
+        let diagnostics = supervisor.metrics_diagnostics();
         assert_eq!(control.request_wakeup_count(), 0);
+        assert_eq!(
+            diagnostics.block_device_metrics(),
+            Some(BlockDeviceMetrics::default().with_update_fails(1))
+        );
+        assert_eq!(
+            diagnostics.block_device_metrics_by_drive(),
+            Some(
+                &BlockDeviceMetricsByDrive::new().with_drive_metrics(
+                    "data",
+                    BlockDeviceMetrics::default().with_update_fails(1),
+                )
+            )
+        );
 
         drop(supervisor);
 
@@ -5772,10 +5830,12 @@ mod tests {
         let missing_config = drive_config("data", &missing);
         let control = FakeRunLoopControl::default();
         let drop_count = Arc::new(AtomicU64::new(0));
+        let metrics = SharedBlockDeviceMetricsRegistry::from_drive_ids(["data"]);
         let (max_steps_sender, max_steps_receiver) = mpsc::channel();
         let session =
             FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
-                .with_block_device_updater(updater);
+                .with_block_device_updater(updater)
+                .with_block_device_metrics(metrics);
 
         let mut supervisor =
             BootRunLoopSupervisor::start(session, NonZeroUsize::new(59).expect("non-zero limit"))
@@ -5796,7 +5856,21 @@ mod tests {
             error,
             DriveUpdateError::OpenBacking { drive_id, .. } if drive_id == "data"
         ));
+        let diagnostics = supervisor.metrics_diagnostics();
         assert_eq!(control.request_wakeup_count(), 0);
+        assert_eq!(
+            diagnostics.block_device_metrics(),
+            Some(BlockDeviceMetrics::default().with_update_fails(1))
+        );
+        assert_eq!(
+            diagnostics.block_device_metrics_by_drive(),
+            Some(
+                &BlockDeviceMetricsByDrive::new().with_drive_metrics(
+                    "data",
+                    BlockDeviceMetrics::default().with_update_fails(1),
+                )
+            )
+        );
 
         drop(supervisor);
 

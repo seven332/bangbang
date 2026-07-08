@@ -122,6 +122,8 @@ mod macos_arm64 {
         let test_dir = TestDir::new();
         let socket_path = test_dir.path().join("api.socket");
         let backing_path = test_dir.path().join("data.img");
+        let scratch_backing_path = test_dir.path().join("scratch.img");
+        let replacement_scratch_backing_path = test_dir.path().join("scratch-replacement.img");
         let serial_output_path = test_dir.path().join("serial.out");
         let metrics_path = test_dir.path().join("metrics.out");
         let logger_path = test_dir.path().join("logger.out");
@@ -132,6 +134,8 @@ mod macos_arm64 {
         let future_start_time = u64::MAX.to_string();
 
         create_zeroed_block_backing(&backing_path);
+        create_zeroed_block_backing(&scratch_backing_path);
+        create_zeroed_block_backing(&replacement_scratch_backing_path);
         create_empty_file(&serial_output_path);
 
         let mut bangbang = BangbangProcess::start_with_extra_args(
@@ -181,6 +185,19 @@ mod macos_arm64 {
         );
         let drive_response = http_put_json(&socket_path, "/drives/data", &drive_body);
         assert_no_content_response(&drive_response, "PUT /drives/data");
+
+        let scratch_backing_path_json = json_string(path_text(&scratch_backing_path));
+        let scratch_drive_body = format!(
+            r#"{{
+                "drive_id":"scratch",
+                "path_on_host":{scratch_backing_path_json},
+                "is_root_device":false,
+                "is_read_only":false
+            }}"#
+        );
+        let scratch_drive_response =
+            http_put_json(&socket_path, "/drives/scratch", &scratch_drive_body);
+        assert_no_content_response(&scratch_drive_response, "PUT /drives/scratch");
 
         let serial_output_path_json = json_string(path_text(&serial_output_path));
         let serial_body = format!(r#"{{"serial_out_path":{serial_output_path_json}}}"#);
@@ -311,15 +328,19 @@ mod macos_arm64 {
             replacement_put_backing_path.display()
         );
 
-        let drive_update_response = http_json(
-            &socket_path,
-            "PATCH",
-            "/drives/data",
-            r#"{"drive_id":"data"}"#,
+        let replacement_scratch_backing_path_json =
+            json_string(path_text(&replacement_scratch_backing_path));
+        let drive_update_body = format!(
+            r#"{{
+                "drive_id":"scratch",
+                "path_on_host":{replacement_scratch_backing_path_json}
+            }}"#
         );
+        let drive_update_response =
+            http_json(&socket_path, "PATCH", "/drives/scratch", &drive_update_body);
         assert_no_content_response(
             &drive_update_response,
-            "PATCH /drives/data no-op after InstanceStart",
+            "PATCH /drives/scratch backing after InstanceStart",
         );
 
         let drive_rate_limiter_update_response = http_json(
@@ -586,10 +607,20 @@ mod macos_arm64 {
             &format!(r#""path_on_host":{backing_path_json}"#),
             "GET /vm/config after InstanceStart",
         );
+        assert_response_contains(
+            &vm_config,
+            r#""drive_id":"scratch""#,
+            "GET /vm/config after InstanceStart",
+        );
+        assert_response_contains(
+            &vm_config,
+            &format!(r#""path_on_host":{replacement_scratch_backing_path_json}"#),
+            "GET /vm/config after InstanceStart",
+        );
         assert_eq!(
             vm_config.matches(r#""drive_id":"#).count(),
-            1,
-            "drive no-op update must not add another drive; response:\n{vm_config}"
+            2,
+            "drive update must keep only the configured data and scratch drives; response:\n{vm_config}"
         );
         assert!(
             !vm_config.contains(r#""drive_id":"replacement""#),
@@ -650,11 +681,12 @@ mod macos_arm64 {
             Some(
                 r#"{"balloon_count":3,"hotplug_memory_count":0,"instance_info_count":5,"machine_cfg_count":0,"mmds_count":1,"vmm_version_count":0}"#,
             ),
-            r#"{"actions_count":2,"actions_fails":0,"balloon_count":1,"balloon_fails":1,"boot_source_count":2,"boot_source_fails":1,"cpu_cfg_count":1,"cpu_cfg_fails":1,"drive_count":2,"drive_fails":1,"hotplug_memory_count":0,"hotplug_memory_fails":0,"logger_count":2,"logger_fails":1,"machine_cfg_count":1,"machine_cfg_fails":0,"metrics_count":2,"metrics_fails":1,"mmds_count":2,"mmds_fails":1,"network_count":1,"network_fails":1,"pmem_count":0,"pmem_fails":0,"serial_count":2,"serial_fails":1,"vsock_count":2,"vsock_fails":1}"#,
+            r#"{"actions_count":2,"actions_fails":0,"balloon_count":1,"balloon_fails":1,"boot_source_count":2,"boot_source_fails":1,"cpu_cfg_count":1,"cpu_cfg_fails":1,"drive_count":3,"drive_fails":1,"hotplug_memory_count":0,"hotplug_memory_fails":0,"logger_count":2,"logger_fails":1,"machine_cfg_count":1,"machine_cfg_fails":0,"metrics_count":2,"metrics_fails":1,"mmds_count":2,"mmds_fails":1,"network_count":1,"network_fails":1,"pmem_count":0,"pmem_fails":0,"serial_count":2,"serial_fails":1,"vsock_count":2,"vsock_fails":1}"#,
             Some(
                 r#"{"balloon_count":4,"balloon_fails":4,"drive_count":2,"drive_fails":1,"hotplug_memory_count":0,"hotplug_memory_fails":0,"machine_cfg_count":0,"machine_cfg_fails":0,"mmds_count":1,"mmds_fails":0,"network_count":0,"network_fails":0,"pmem_count":0,"pmem_fails":0}"#,
             ),
         );
+        assert_block_update_metrics_output(&metrics_path);
         assert_startup_time_metrics_output(&metrics_path);
         assert!(
             !replacement_metrics_path.exists(),
@@ -3313,6 +3345,52 @@ mod macos_arm64 {
         assert!(
             !output.contains(r#""boot_run_loop_status":"failed""#),
             "metrics output should not report failed boot run-loop status; output:\n{output}"
+        );
+    }
+
+    fn assert_block_update_metrics_output(path: &Path) {
+        let output = fs::read_to_string(path).unwrap_or_else(|err| {
+            panic!(
+                "metrics output {} should be readable for block update metrics: {err}",
+                path.display()
+            )
+        });
+
+        let mut found_block_update_metrics = false;
+        for line in output.lines() {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|err| {
+                panic!("metrics output line should be valid JSON: {err}; line:\n{line}")
+            });
+            let Some(block) = value.get("block") else {
+                continue;
+            };
+            let Some(scratch) = value.get("block_scratch") else {
+                continue;
+            };
+            if block
+                .get("update_count")
+                .and_then(serde_json::Value::as_u64)
+                == Some(1)
+                && block
+                    .get("update_fails")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(0)
+                && scratch
+                    .get("update_count")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(1)
+                && scratch
+                    .get("update_fails")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(0)
+            {
+                found_block_update_metrics = true;
+            }
+        }
+
+        assert!(
+            found_block_update_metrics,
+            "metrics output should include block metrics after drive update; output:\n{output}"
         );
     }
 
