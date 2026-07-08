@@ -52,7 +52,7 @@ pub enum ApiRequest {
     PatchNetworkInterface(Box<NetworkInterfacePatchRequest>),
     HotUnplugDevice(Box<HotUnplugDeviceRequest>),
     PutPmem(Box<PmemConfigRequest>),
-    PatchPmem,
+    PatchPmem(Box<PmemPatchRequest>),
     PutSerial(Box<SerialConfigRequest>),
     PutSnapshotCreate,
     PutSnapshotLoad(SnapshotLoadRequest),
@@ -1147,6 +1147,27 @@ impl PmemConfigRequest {
 
     pub const fn read_only(&self) -> bool {
         self.read_only
+    }
+
+    pub const fn rate_limiter_configured(&self) -> bool {
+        self.rate_limiter_configured
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PmemPatchRequest {
+    path_pmem_id: String,
+    body_pmem_id: String,
+    rate_limiter_configured: bool,
+}
+
+impl PmemPatchRequest {
+    pub fn path_pmem_id(&self) -> &str {
+        &self.path_pmem_id
+    }
+
+    pub fn body_pmem_id(&self) -> &str {
+        &self.body_pmem_id
     }
 
     pub const fn rate_limiter_configured(&self) -> bool {
@@ -2927,16 +2948,22 @@ fn parse_pmem_config_request(path_pmem_id: &str, body: &[u8]) -> Result<ApiReque
 fn parse_pmem_patch_request(path_pmem_id: &str, body: &[u8]) -> Result<ApiRequest, RequestError> {
     let body = serde_json::from_slice::<PmemPatchRequestBody>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
-    if let Some(rate_limiter) = &body.rate_limiter {
-        validate_rate_limiter_config(rate_limiter.as_value())?;
-    }
+    let rate_limiter_configured = match &body.rate_limiter {
+        Some(rate_limiter) => {
+            validate_rate_limiter_config(rate_limiter.as_value())?;
+            rate_limiter_configured(rate_limiter.as_value())?
+        }
+        None => false,
+    };
     if path_pmem_id != body.id {
         return Err(RequestError::MismatchedPmemId);
     }
-    let PmemPatchRequestBody { id, rate_limiter } = body;
-    let _ = (id, rate_limiter);
 
-    Ok(ApiRequest::PatchPmem)
+    Ok(ApiRequest::PatchPmem(Box::new(PmemPatchRequest {
+        path_pmem_id: path_pmem_id.to_string(),
+        body_pmem_id: body.id,
+        rate_limiter_configured,
+    })))
 }
 
 fn parse_network_interface_config_request(
@@ -3450,7 +3477,7 @@ impl From<ApiRequest> for Endpoint {
             ApiRequest::PutNetworkInterface(_) | ApiRequest::PatchNetworkInterface(_) => {
                 Self::NetworkInterface
             }
-            ApiRequest::PutPmem(_) | ApiRequest::PatchPmem => Self::Pmem,
+            ApiRequest::PutPmem(_) | ApiRequest::PatchPmem(_) => Self::Pmem,
             ApiRequest::PutSerial(_) => Self::Serial,
             ApiRequest::PutSnapshotCreate | ApiRequest::PutSnapshotLoad(_) => Self::Snapshot,
             ApiRequest::PutVsock(_) => Self::Vsock,
@@ -6595,10 +6622,11 @@ mod tests {
             );
         }
 
-        for (route, request) in [
+        for (route, request, expected_rate_limiter) in [
             (
                 "PATCH /pmem/pmem0",
                 request_with_body("PATCH", "/pmem/pmem0", r#"{"id":"pmem0"}"#),
+                false,
             ),
             (
                 "PATCH /pmem/pmem0 empty rate limiter",
@@ -6607,6 +6635,7 @@ mod tests {
                     "/pmem/pmem0",
                     r#"{"id":"pmem0","rate_limiter":{}}"#,
                 ),
+                false,
             ),
             (
                 "PATCH /pmem/pmem0 null rate limiter",
@@ -6615,6 +6644,7 @@ mod tests {
                     "/pmem/pmem0",
                     r#"{"id":"pmem0","rate_limiter":null}"#,
                 ),
+                false,
             ),
             (
                 "PATCH /pmem/pmem0 all-null rate limiter buckets",
@@ -6623,6 +6653,7 @@ mod tests {
                     "/pmem/pmem0",
                     r#"{"id":"pmem0","rate_limiter":{"bandwidth":null,"ops":null}}"#,
                 ),
+                false,
             ),
             (
                 "PATCH /pmem/pmem0 rate limiter",
@@ -6631,11 +6662,20 @@ mod tests {
                     "/pmem/pmem0",
                     r#"{"id":"pmem0","rate_limiter":{"ops":{"size":100,"one_time_burst":200,"refill_time":1000}}}"#,
                 ),
+                true,
             ),
         ] {
             let parsed = parse_request(&request).expect("pmem request should parse");
             match parsed {
-                ApiRequest::PatchPmem => {}
+                ApiRequest::PatchPmem(config) => {
+                    assert_eq!(config.path_pmem_id(), "pmem0", "{route}");
+                    assert_eq!(config.body_pmem_id(), "pmem0", "{route}");
+                    assert_eq!(
+                        config.rate_limiter_configured(),
+                        expected_rate_limiter,
+                        "{route}"
+                    );
+                }
                 other => panic!("unexpected pmem request for {route}: {other:?}"),
             }
         }

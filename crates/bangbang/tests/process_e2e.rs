@@ -404,6 +404,41 @@ fn executable_handles_remaining_device_requests_and_pmem_config() {
         "GET /vm/config after PUT /pmem/pmem0",
     );
 
+    let pmem_patch_response = http_json(
+        &socket_path,
+        "PATCH",
+        "/pmem/pmem0",
+        r#"{"id":"pmem0","rate_limiter":{"bandwidth":null,"ops":null}}"#,
+    );
+    assert_bad_request_response(&pmem_patch_response, "PATCH /pmem/pmem0");
+    assert_response_contains(
+        &pmem_patch_response,
+        r#"{"fault_message":"The requested operation is not supported in Not started state: PatchPmem"}"#,
+        "PATCH /pmem/pmem0",
+    );
+
+    let pmem_patch_rate_limiter_response = http_json(
+        &socket_path,
+        "PATCH",
+        "/pmem/pmem0",
+        r#"{"id":"pmem0","rate_limiter":{"ops":{"size":123456789,"one_time_burst":987654321,"refill_time":777}}}"#,
+    );
+    assert_bad_request_response(
+        &pmem_patch_rate_limiter_response,
+        "PATCH /pmem/pmem0 rate_limiter",
+    );
+    assert_response_contains(
+        &pmem_patch_rate_limiter_response,
+        r#"{"fault_message":"The requested operation is not supported in Not started state: PatchPmem"}"#,
+        "PATCH /pmem/pmem0 rate_limiter",
+    );
+    for private_value in ["123456789", "987654321", "777"] {
+        assert!(
+            !pmem_patch_rate_limiter_response.contains(private_value),
+            "PATCH /pmem/pmem0 rate_limiter must not echo private config value {private_value:?}; response:\n{pmem_patch_rate_limiter_response}"
+        );
+    }
+
     let pmem_rate_limiter_response = http_put_json(
         &socket_path,
         "/pmem/pmem0",

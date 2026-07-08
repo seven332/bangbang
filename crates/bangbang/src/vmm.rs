@@ -44,7 +44,7 @@ use bangbang_runtime::network::{
     VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame,
     VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError, validate_network_interface_count,
 };
-use bangbang_runtime::pmem::PmemMmioLayout;
+use bangbang_runtime::pmem::{PmemMmioLayout, PmemUpdateInput};
 use bangbang_runtime::rtc::RtcMmioLayout;
 use bangbang_runtime::serial::{
     SerialConfigError, SerialConfigInput, SerialOutputFile, SharedSerialOutput,
@@ -600,10 +600,10 @@ impl PatchApiRequest {
         }
     }
 
-    pub(crate) const fn pmem() -> Self {
+    pub(crate) const fn pmem(input: PmemUpdateInput) -> Self {
         Self {
             kind: PatchApiRequestKind::Pmem,
-            action: VmmAction::PatchPmem,
+            action: VmmAction::PatchPmem(input),
         }
     }
 
@@ -4361,6 +4361,7 @@ mod tests {
             | VmmActionError::MemoryHotplugConfig(_)
             | VmmActionError::MemoryHotplugUnsupported
             | VmmActionError::PmemConfig(_)
+            | VmmActionError::PmemUpdate(_)
             | VmmActionError::PmemUnsupported
             | VmmActionError::SerialConfig(_)
             | VmmActionError::SnapshotUnsupported
