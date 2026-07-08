@@ -1756,9 +1756,8 @@ Their eventual support level should follow the endpoint matrix:
 - entropy rate limiting, runtime metrics, and security docs
 - serial input, public serial streaming, and full Firecracker serial counters
   beyond limiter drops
-- full logger integration, full Firecracker metrics counters beyond the minimal
-  `logger.missed_metrics_count`, `logger.missed_log_count`, and
-  `uart.rate_limiter_dropped_bytes`
+- full logger integration, and full Firecracker metrics counters beyond the
+  currently implemented minimal metrics subset
 - memory hotplug
 - real pause and resume VM state transitions
 - PATCH and DELETE hotplug/update behavior
