@@ -3,7 +3,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{LineWriter, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::balloon::VirtioBalloonDeviceNotificationDispatch;
 use crate::serial::SerialOutputMetrics;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -896,7 +899,174 @@ impl PutApiRequestMetrics {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BalloonDeviceMetrics {
+    activate_fails: u64,
+    inflate_count: u64,
+    stats_updates_count: u64,
+    stats_update_fails: u64,
+    deflate_count: u64,
+    event_fails: u64,
+}
+
+impl BalloonDeviceMetrics {
+    pub const fn new(
+        activate_fails: u64,
+        inflate_count: u64,
+        stats_updates_count: u64,
+        stats_update_fails: u64,
+        deflate_count: u64,
+        event_fails: u64,
+    ) -> Self {
+        Self {
+            activate_fails,
+            inflate_count,
+            stats_updates_count,
+            stats_update_fails,
+            deflate_count,
+            event_fails,
+        }
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.activate_fails == 0
+            && self.inflate_count == 0
+            && self.stats_updates_count == 0
+            && self.stats_update_fails == 0
+            && self.deflate_count == 0
+            && self.event_fails == 0
+    }
+
+    pub const fn activate_fails(self) -> u64 {
+        self.activate_fails
+    }
+
+    pub const fn inflate_count(self) -> u64 {
+        self.inflate_count
+    }
+
+    pub const fn stats_updates_count(self) -> u64 {
+        self.stats_updates_count
+    }
+
+    pub const fn stats_update_fails(self) -> u64 {
+        self.stats_update_fails
+    }
+
+    pub const fn deflate_count(self) -> u64 {
+        self.deflate_count
+    }
+
+    pub const fn event_fails(self) -> u64 {
+        self.event_fails
+    }
+
+    const fn merged_with(self, other: Self) -> Self {
+        Self {
+            activate_fails: self.activate_fails.saturating_add(other.activate_fails),
+            inflate_count: self.inflate_count.saturating_add(other.inflate_count),
+            stats_updates_count: self
+                .stats_updates_count
+                .saturating_add(other.stats_updates_count),
+            stats_update_fails: self
+                .stats_update_fails
+                .saturating_add(other.stats_update_fails),
+            deflate_count: self.deflate_count.saturating_add(other.deflate_count),
+            event_fails: self.event_fails.saturating_add(other.event_fails),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SharedBalloonDeviceMetrics {
+    inner: Arc<SharedBalloonDeviceMetricsInner>,
+}
+
+impl SharedBalloonDeviceMetrics {
+    pub fn record_activation_failure(&self) {
+        record_atomic_metric(&self.inner.activate_fails, 1);
+    }
+
+    pub fn record_notification_dispatch(&self, dispatch: &VirtioBalloonDeviceNotificationDispatch) {
+        self.record_inflations(usize_to_u64_saturating(dispatch.inflate_notifications()));
+        self.record_deflations(usize_to_u64_saturating(dispatch.deflate_notifications()));
+
+        let stats_updates = if dispatch.statistics_notifications() != 0 {
+            dispatch.statistics_notifications()
+        } else {
+            dispatch
+                .statistics_queue_dispatch()
+                .map(|queue| queue.completed_descriptors())
+                .unwrap_or_default()
+        };
+        self.record_statistics_updates(usize_to_u64_saturating(stats_updates));
+    }
+
+    pub fn record_statistics_update_failure(&self) {
+        record_atomic_metric(&self.inner.stats_update_fails, 1);
+    }
+
+    pub fn record_event_failure(&self) {
+        record_atomic_metric(&self.inner.event_fails, 1);
+    }
+
+    pub fn snapshot(&self) -> BalloonDeviceMetrics {
+        BalloonDeviceMetrics::new(
+            self.inner.activate_fails.load(Ordering::Relaxed),
+            self.inner.inflate_count.load(Ordering::Relaxed),
+            self.inner.stats_updates_count.load(Ordering::Relaxed),
+            self.inner.stats_update_fails.load(Ordering::Relaxed),
+            self.inner.deflate_count.load(Ordering::Relaxed),
+            self.inner.event_fails.load(Ordering::Relaxed),
+        )
+    }
+
+    fn record_inflations(&self, count: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.inflate_count, count);
+        }
+    }
+
+    fn record_deflations(&self, count: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.deflate_count, count);
+        }
+    }
+
+    fn record_statistics_updates(&self, count: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.stats_updates_count, count);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SharedBalloonDeviceMetricsInner {
+    activate_fails: AtomicU64,
+    inflate_count: AtomicU64,
+    stats_updates_count: AtomicU64,
+    stats_update_fails: AtomicU64,
+    deflate_count: AtomicU64,
+    event_fails: AtomicU64,
+}
+
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn record_atomic_metric(metric: &AtomicU64, increment: u64) {
+    let mut current = metric.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(increment);
+        match metric.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MetricsDiagnostics {
+    balloon_device_metrics: Option<BalloonDeviceMetrics>,
     boot_run_loop_status: Option<BootRunLoopMetricStatus>,
     start_time_us: Option<u64>,
     start_time_cpu_us: Option<u64>,
@@ -907,12 +1077,21 @@ pub struct MetricsDiagnostics {
 impl MetricsDiagnostics {
     pub const fn new() -> Self {
         Self {
+            balloon_device_metrics: None,
             boot_run_loop_status: None,
             start_time_us: None,
             start_time_cpu_us: None,
             parent_cpu_time_us: None,
             serial_output_metrics: None,
         }
+    }
+
+    pub const fn with_balloon_device_metrics(
+        mut self,
+        balloon_device_metrics: BalloonDeviceMetrics,
+    ) -> Self {
+        self.balloon_device_metrics = Some(balloon_device_metrics);
+        self
     }
 
     pub const fn with_boot_run_loop_status(mut self, status: BootRunLoopMetricStatus) -> Self {
@@ -944,6 +1123,12 @@ impl MetricsDiagnostics {
     }
 
     pub const fn merged_with(mut self, other: Self) -> Self {
+        if let Some(metrics) = other.balloon_device_metrics {
+            self.balloon_device_metrics = Some(match self.balloon_device_metrics {
+                Some(existing) => existing.merged_with(metrics),
+                None => metrics,
+            });
+        }
         if other.boot_run_loop_status.is_some() {
             self.boot_run_loop_status = other.boot_run_loop_status;
         }
@@ -961,6 +1146,10 @@ impl MetricsDiagnostics {
         }
 
         self
+    }
+
+    pub const fn balloon_device_metrics(&self) -> Option<BalloonDeviceMetrics> {
+        self.balloon_device_metrics
     }
 
     pub const fn boot_run_loop_status(&self) -> Option<BootRunLoopMetricStatus> {
@@ -1113,6 +1302,36 @@ impl MetricsSink {
                 "deprecated_api".to_string(),
                 serde_json::Value::Object(deprecated),
             );
+        }
+        if let Some(balloon_device_metrics) = diagnostics.balloon_device_metrics()
+            && !balloon_device_metrics.is_empty()
+        {
+            let mut balloon = serde_json::Map::new();
+            balloon.insert(
+                "activate_fails".to_string(),
+                serde_json::Value::Number(balloon_device_metrics.activate_fails().into()),
+            );
+            balloon.insert(
+                "deflate_count".to_string(),
+                serde_json::Value::Number(balloon_device_metrics.deflate_count().into()),
+            );
+            balloon.insert(
+                "event_fails".to_string(),
+                serde_json::Value::Number(balloon_device_metrics.event_fails().into()),
+            );
+            balloon.insert(
+                "inflate_count".to_string(),
+                serde_json::Value::Number(balloon_device_metrics.inflate_count().into()),
+            );
+            balloon.insert(
+                "stats_update_fails".to_string(),
+                serde_json::Value::Number(balloon_device_metrics.stats_update_fails().into()),
+            );
+            balloon.insert(
+                "stats_updates_count".to_string(),
+                serde_json::Value::Number(balloon_device_metrics.stats_updates_count().into()),
+            );
+            root.insert("balloon".to_string(), serde_json::Value::Object(balloon));
         }
         if !get_api_requests.is_empty() {
             let mut get_requests = serde_json::Map::new();
@@ -1374,8 +1593,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        BootRunLoopMetricStatus, MetricsConfigError, MetricsConfigInput, MetricsDiagnostics,
-        MetricsFlushError, MetricsOutput, MetricsState,
+        BalloonDeviceMetrics, BootRunLoopMetricStatus, MetricsConfigError, MetricsConfigInput,
+        MetricsDiagnostics, MetricsFlushError, MetricsOutput, MetricsState,
+        SharedBalloonDeviceMetrics,
     };
     use crate::serial::SerialOutputMetrics;
 
@@ -1612,6 +1832,87 @@ mod tests {
         assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
 
         assert_eq!(output.lines(), [r#"{"vmm":{"metrics_flush_count":1}}"#]);
+    }
+
+    #[test]
+    fn writes_balloon_device_metrics_when_provided() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let diagnostics = MetricsDiagnostics::new()
+            .with_balloon_device_metrics(BalloonDeviceMetrics::new(1, 2, 3, 4, 5, 6));
+
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        assert_eq!(
+            output.lines(),
+            [
+                r#"{"balloon":{"activate_fails":1,"deflate_count":5,"event_fails":6,"inflate_count":2,"stats_update_fails":4,"stats_updates_count":3},"vmm":{"metrics_flush_count":1}}"#
+            ]
+        );
+    }
+
+    #[test]
+    fn omits_empty_balloon_device_metrics() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let diagnostics =
+            MetricsDiagnostics::new().with_balloon_device_metrics(BalloonDeviceMetrics::default());
+
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        assert_eq!(output.lines(), [r#"{"vmm":{"metrics_flush_count":1}}"#]);
+    }
+
+    #[test]
+    fn shared_balloon_device_metrics_snapshot_is_per_instance() {
+        let first = SharedBalloonDeviceMetrics::default();
+        let second = SharedBalloonDeviceMetrics::default();
+
+        first.record_activation_failure();
+        first.record_statistics_update_failure();
+        first.record_event_failure();
+
+        assert_eq!(
+            first.snapshot(),
+            BalloonDeviceMetrics::new(1, 0, 0, 1, 0, 1)
+        );
+        assert_eq!(second.snapshot(), BalloonDeviceMetrics::default());
+    }
+
+    #[test]
+    fn balloon_metric_increment_saturates() {
+        let metric = AtomicU64::new(u64::MAX - 1);
+
+        super::record_atomic_metric(&metric, 5);
+
+        assert_eq!(metric.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn balloon_diagnostics_merge_saturates() {
+        let base =
+            MetricsDiagnostics::new().with_balloon_device_metrics(BalloonDeviceMetrics::new(
+                u64::MAX,
+                u64::MAX - 1,
+                u64::MAX - 2,
+                u64::MAX - 3,
+                u64::MAX - 4,
+                u64::MAX - 5,
+            ));
+        let additional = MetricsDiagnostics::new()
+            .with_balloon_device_metrics(BalloonDeviceMetrics::new(1, 2, 3, 4, 5, 6));
+
+        assert_eq!(
+            base.merged_with(additional).balloon_device_metrics(),
+            Some(BalloonDeviceMetrics::new(
+                u64::MAX,
+                u64::MAX,
+                u64::MAX,
+                u64::MAX,
+                u64::MAX,
+                u64::MAX,
+            ))
+        );
     }
 
     #[test]
@@ -1974,14 +2275,20 @@ mod tests {
     #[test]
     fn merges_independent_diagnostics() {
         let base = MetricsDiagnostics::new()
+            .with_balloon_device_metrics(BalloonDeviceMetrics::new(1, 2, 3, 4, 5, 6))
             .with_start_time_us(1000)
             .with_start_time_cpu_us(2000);
         let session = MetricsDiagnostics::new()
+            .with_balloon_device_metrics(BalloonDeviceMetrics::new(10, 20, 30, 40, 50, 60))
             .with_boot_run_loop_status(BootRunLoopMetricStatus::Running)
             .with_parent_cpu_time_us(3000);
 
         let diagnostics = base.merged_with(session);
 
+        assert_eq!(
+            diagnostics.balloon_device_metrics(),
+            Some(BalloonDeviceMetrics::new(11, 22, 33, 44, 55, 66))
+        );
         assert_eq!(
             diagnostics.boot_run_loop_status(),
             Some(BootRunLoopMetricStatus::Running)

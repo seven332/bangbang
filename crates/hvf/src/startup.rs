@@ -20,6 +20,7 @@ use bangbang_runtime::interrupt::{
     DeviceInterruptKind, DeviceInterruptTriggerError, GuestInterruptLine, InterruptSink,
 };
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
+use bangbang_runtime::metrics::SharedBalloonDeviceMetrics;
 use bangbang_runtime::mmio::{MmioDispatcher, MmioRegionId};
 use bangbang_runtime::network::NetworkMmioLayout;
 use bangbang_runtime::pmem::{PmemMmioLayout, VirtioPmemFlushStatus};
@@ -182,6 +183,7 @@ pub struct HvfArm64BootSession<'vm> {
     control_wakeup: HvfArm64BootRunLoopControlWakeupToken,
     run_loop_wakeup: HvfArm64BootRunLoopWakeupToken,
     entropy_source: VirtioRngOsEntropySource,
+    balloon_device_metrics: SharedBalloonDeviceMetrics,
     gic: HvfGicMetadata,
     primary_mpidr: u64,
     block_interrupt_lines: Vec<GuestInterruptLine>,
@@ -203,6 +205,7 @@ pub struct OwnedHvfArm64BootSession {
     control_wakeup: HvfArm64BootRunLoopControlWakeupToken,
     run_loop_wakeup: HvfArm64BootRunLoopWakeupToken,
     entropy_source: VirtioRngOsEntropySource,
+    balloon_device_metrics: SharedBalloonDeviceMetrics,
     gic: HvfGicMetadata,
     primary_mpidr: u64,
     block_interrupt_lines: Vec<GuestInterruptLine>,
@@ -560,6 +563,10 @@ impl HvfArm64BootSession<'_> {
         &self.runtime_resources
     }
 
+    pub fn shared_balloon_device_metrics(&self) -> SharedBalloonDeviceMetrics {
+        self.balloon_device_metrics.clone()
+    }
+
     /// Return a cloned handle to the runner-compatible MMIO dispatcher.
     ///
     /// The dispatcher is local to this boot session. It is shared only so
@@ -810,29 +817,55 @@ impl HvfArm64BootSession<'_> {
             )?
         };
 
-        collect_or_signal_balloon_queue_interrupts(dispatches, &self.gic)
+        record_balloon_runtime_dispatch_metrics(
+            &self.balloon_device_metrics,
+            dispatches.as_slice(),
+            true,
+        );
+        let result = collect_or_signal_balloon_queue_interrupts(dispatches, &self.gic);
+        match &result {
+            Ok(dispatches) => {
+                record_balloon_signal_metrics(&self.balloon_device_metrics, dispatches)
+            }
+            Err(_) => self.balloon_device_metrics.record_event_failure(),
+        }
+        result
     }
 
     pub fn trigger_balloon_statistics_update_and_signal_interrupts(
         &mut self,
     ) -> Result<(), BalloonUpdateError> {
-        let dispatches = {
-            let memory = self
-                .backend
-                .mapped_guest_memory_mut()
+        let result = (|| {
+            let dispatches = {
+                let memory = self
+                    .backend
+                    .mapped_guest_memory_mut()
+                    .map_err(balloon_update_error_from_display)?;
+                let mut mmio_dispatcher = lock_boot_mmio_dispatcher(&self.mmio_dispatcher)
+                    .map_err(balloon_update_error_from_display)?;
+
+                self.runtime_resources
+                    .trigger_balloon_statistics_update(memory, &mut mmio_dispatcher)
+                    .map_err(balloon_update_error_from_display)?
+            };
+
+            record_balloon_runtime_dispatch_metrics(
+                &self.balloon_device_metrics,
+                dispatches.as_slice(),
+                false,
+            );
+            let dispatches = collect_or_signal_balloon_queue_interrupts(dispatches, &self.gic)
                 .map_err(balloon_update_error_from_display)?;
-            let mut mmio_dispatcher = lock_boot_mmio_dispatcher(&self.mmio_dispatcher)
-                .map_err(balloon_update_error_from_display)?;
+            record_balloon_signal_metrics(&self.balloon_device_metrics, &dispatches);
 
-            self.runtime_resources
-                .trigger_balloon_statistics_update(memory, &mut mmio_dispatcher)
-                .map_err(balloon_update_error_from_display)?
-        };
+            balloon_update_result_from_hvf_dispatches(&dispatches)
+        })();
+        if result.is_err() {
+            self.balloon_device_metrics
+                .record_statistics_update_failure();
+        }
 
-        let dispatches = collect_or_signal_balloon_queue_interrupts(dispatches, &self.gic)
-            .map_err(balloon_update_error_from_display)?;
-
-        balloon_update_result_from_hvf_dispatches(&dispatches)
+        result
     }
 
     pub fn dispatch_entropy_queue_notifications_and_signal_interrupts(
@@ -881,6 +914,7 @@ impl OwnedHvfArm64BootSession {
             control_wakeup: prepared.control_wakeup,
             run_loop_wakeup: prepared.run_loop_wakeup,
             entropy_source: VirtioRngOsEntropySource::new(),
+            balloon_device_metrics: prepared.balloon_device_metrics,
             gic: prepared.gic,
             primary_mpidr: prepared.primary_mpidr,
             block_interrupt_lines: prepared.block_interrupt_lines,
@@ -915,6 +949,10 @@ impl OwnedHvfArm64BootSession {
 
     pub fn runtime_resources(&self) -> &Arm64BootRuntimeResources {
         &self.runtime_resources
+    }
+
+    pub fn shared_balloon_device_metrics(&self) -> SharedBalloonDeviceMetrics {
+        self.balloon_device_metrics.clone()
     }
 
     /// Return a cloned handle to the runner-compatible MMIO dispatcher.
@@ -1154,29 +1192,55 @@ impl OwnedHvfArm64BootSession {
             )?
         };
 
-        collect_or_signal_balloon_queue_interrupts(dispatches, &self.gic)
+        record_balloon_runtime_dispatch_metrics(
+            &self.balloon_device_metrics,
+            dispatches.as_slice(),
+            true,
+        );
+        let result = collect_or_signal_balloon_queue_interrupts(dispatches, &self.gic);
+        match &result {
+            Ok(dispatches) => {
+                record_balloon_signal_metrics(&self.balloon_device_metrics, dispatches)
+            }
+            Err(_) => self.balloon_device_metrics.record_event_failure(),
+        }
+        result
     }
 
     pub fn trigger_balloon_statistics_update_and_signal_interrupts(
         &mut self,
     ) -> Result<(), BalloonUpdateError> {
-        let dispatches = {
-            let memory = self
-                .backend
-                .mapped_guest_memory_mut()
+        let result = (|| {
+            let dispatches = {
+                let memory = self
+                    .backend
+                    .mapped_guest_memory_mut()
+                    .map_err(balloon_update_error_from_display)?;
+                let mut mmio_dispatcher = lock_boot_mmio_dispatcher(&self.mmio_dispatcher)
+                    .map_err(balloon_update_error_from_display)?;
+
+                self.runtime_resources
+                    .trigger_balloon_statistics_update(memory, &mut mmio_dispatcher)
+                    .map_err(balloon_update_error_from_display)?
+            };
+
+            record_balloon_runtime_dispatch_metrics(
+                &self.balloon_device_metrics,
+                dispatches.as_slice(),
+                false,
+            );
+            let dispatches = collect_or_signal_balloon_queue_interrupts(dispatches, &self.gic)
                 .map_err(balloon_update_error_from_display)?;
-            let mut mmio_dispatcher = lock_boot_mmio_dispatcher(&self.mmio_dispatcher)
-                .map_err(balloon_update_error_from_display)?;
+            record_balloon_signal_metrics(&self.balloon_device_metrics, &dispatches);
 
-            self.runtime_resources
-                .trigger_balloon_statistics_update(memory, &mut mmio_dispatcher)
-                .map_err(balloon_update_error_from_display)?
-        };
+            balloon_update_result_from_hvf_dispatches(&dispatches)
+        })();
+        if result.is_err() {
+            self.balloon_device_metrics
+                .record_statistics_update_failure();
+        }
 
-        let dispatches = collect_or_signal_balloon_queue_interrupts(dispatches, &self.gic)
-            .map_err(balloon_update_error_from_display)?;
-
-        balloon_update_result_from_hvf_dispatches(&dispatches)
+        result
     }
 
     pub fn dispatch_entropy_queue_notifications_and_signal_interrupts(
@@ -3003,6 +3067,59 @@ fn balloon_update_error_from_display(source: impl fmt::Display) -> BalloonUpdate
     }
 }
 
+#[cfg(test)]
+fn record_balloon_dispatch_metrics(
+    metrics: &SharedBalloonDeviceMetrics,
+    dispatches: &HvfArm64BootBalloonNotificationDispatches,
+    inactive_is_failure: bool,
+) {
+    let runtime_dispatches = dispatches
+        .as_slice()
+        .iter()
+        .map(HvfArm64BootBalloonNotificationDispatch::dispatch);
+    record_balloon_runtime_dispatch_metrics(metrics, runtime_dispatches, inactive_is_failure);
+    record_balloon_signal_metrics(metrics, dispatches);
+}
+
+fn record_balloon_runtime_dispatch_metrics<'a>(
+    metrics: &SharedBalloonDeviceMetrics,
+    dispatches: impl IntoIterator<Item = &'a Arm64BootBalloonNotificationDispatch>,
+    inactive_is_failure: bool,
+) {
+    for dispatch in dispatches {
+        if let Some(dispatched) = dispatch.outcome().dispatched() {
+            metrics.record_notification_dispatch(dispatched);
+        }
+        if let Some(source) = dispatch.outcome().dispatch_error() {
+            if inactive_is_failure
+                || !matches!(
+                    source,
+                    &VirtioBalloonDeviceNotificationError::Inactive { .. }
+                )
+            {
+                metrics.record_event_failure();
+            }
+            if let Some(completed) = source.completed_notification_dispatch() {
+                metrics.record_notification_dispatch(completed);
+            }
+        }
+        if dispatch.outcome().handler_lookup_error().is_some() {
+            metrics.record_event_failure();
+        }
+    }
+}
+
+fn record_balloon_signal_metrics(
+    metrics: &SharedBalloonDeviceMetrics,
+    dispatches: &HvfArm64BootBalloonNotificationDispatches,
+) {
+    for dispatch in dispatches.as_slice() {
+        if dispatch.signal_error().is_some() {
+            metrics.record_event_failure();
+        }
+    }
+}
+
 fn balloon_update_result_from_hvf_dispatches(
     dispatches: &HvfArm64BootBalloonNotificationDispatches,
 ) -> Result<(), BalloonUpdateError> {
@@ -3440,6 +3557,7 @@ struct PreparedHvfArm64BootSession<'vm> {
     runtime_resources: Arm64BootRuntimeResources,
     control_wakeup: HvfArm64BootRunLoopControlWakeupToken,
     run_loop_wakeup: HvfArm64BootRunLoopWakeupToken,
+    balloon_device_metrics: SharedBalloonDeviceMetrics,
     gic: HvfGicMetadata,
     primary_mpidr: u64,
     block_interrupt_lines: Vec<GuestInterruptLine>,
@@ -3500,6 +3618,7 @@ impl HvfBackend {
             control_wakeup: prepared.control_wakeup,
             run_loop_wakeup: prepared.run_loop_wakeup,
             entropy_source: VirtioRngOsEntropySource::new(),
+            balloon_device_metrics: prepared.balloon_device_metrics,
             gic: prepared.gic,
             primary_mpidr: prepared.primary_mpidr,
             block_interrupt_lines: prepared.block_interrupt_lines,
@@ -3611,6 +3730,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
         runtime_resources: runtime,
         control_wakeup: HvfArm64BootRunLoopControlWakeupToken::default(),
         run_loop_wakeup: HvfArm64BootRunLoopWakeupToken::default(),
+        balloon_device_metrics: SharedBalloonDeviceMetrics::default(),
         gic,
         primary_mpidr,
         block_interrupt_lines: interrupt_lines.block,
@@ -3771,6 +3891,7 @@ mod tests {
     };
     use bangbang_runtime::machine::MachineConfigInput;
     use bangbang_runtime::memory::{GuestAddress, GuestMemory};
+    use bangbang_runtime::metrics::{BalloonDeviceMetrics, SharedBalloonDeviceMetrics};
     use bangbang_runtime::mmio::{
         MmioAccess, MmioAccessBytes, MmioDispatchOutcome, MmioDispatcher, MmioHandler,
         MmioHandlerError, MmioOperation, MmioRegionId,
@@ -7592,6 +7713,9 @@ mod tests {
             super::balloon_update_result_from_hvf_dispatches(&result),
             Ok(())
         );
+        let metrics = SharedBalloonDeviceMetrics::default();
+        super::record_balloon_dispatch_metrics(&metrics, &result, false);
+        assert_eq!(metrics.snapshot(), BalloonDeviceMetrics::default());
     }
 
     #[test]
@@ -7721,6 +7845,16 @@ mod tests {
         );
         let dispatches =
             dispatch_boot_balloon_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let runtime_metrics = SharedBalloonDeviceMetrics::default();
+        super::record_balloon_runtime_dispatch_metrics(
+            &runtime_metrics,
+            dispatches.as_slice(),
+            true,
+        );
+        assert_eq!(
+            runtime_metrics.snapshot(),
+            BalloonDeviceMetrics::new(0, 1, 0, 0, 0, 0)
+        );
         let (lines, sink) = RecordingSink::failing("injected balloon signal failure");
 
         let result = signal_balloon_queue_interrupts(dispatches, sink.as_ref())
@@ -7744,6 +7878,12 @@ mod tests {
                 VirtioMmioRegister::InterruptStatus
             ),
             DeviceInterruptKind::Queue.status().bits()
+        );
+        let metrics = SharedBalloonDeviceMetrics::default();
+        super::record_balloon_dispatch_metrics(&metrics, &result, true);
+        assert_eq!(
+            metrics.snapshot(),
+            BalloonDeviceMetrics::new(0, 1, 0, 0, 0, 1)
         );
     }
 
