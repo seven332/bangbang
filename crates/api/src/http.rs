@@ -6617,6 +6617,14 @@ mod tests {
                 ),
             ),
             (
+                "PATCH /pmem/pmem0 all-null rate limiter buckets",
+                request_with_body(
+                    "PATCH",
+                    "/pmem/pmem0",
+                    r#"{"id":"pmem0","rate_limiter":{"bandwidth":null,"ops":null}}"#,
+                ),
+            ),
+            (
                 "PATCH /pmem/pmem0 rate limiter",
                 request_with_body(
                     "PATCH",
