@@ -927,7 +927,7 @@ mod tests {
         SERIAL_TRANSMIT_REGISTER_OFFSET, SerialConfigError, SerialConfigInput, SerialMmioDevice,
         SerialMmioError, SerialOutput, SerialOutputBuffer, SerialOutputError, SerialOutputFile,
         SerialOutputMetrics, SerialRateLimiterConfig, SerialTokenBucket, SharedSerialOutput,
-        SharedSerialOutputBuffer,
+        SharedSerialOutputBuffer, SharedSerialOutputMetrics,
     };
     use crate::memory::GuestAddress;
     use crate::mmio::{
@@ -1303,6 +1303,16 @@ mod tests {
 
         assert_eq!(buffer.bytes().expect("shared bytes should read"), b"a");
         assert_eq!(output.metrics().rate_limiter_dropped_bytes(), 2);
+    }
+
+    #[test]
+    fn shared_serial_output_metrics_saturates_dropped_bytes() {
+        let metrics = SharedSerialOutputMetrics::default();
+
+        metrics.record_rate_limiter_dropped_bytes(u64::MAX - 1);
+        metrics.record_rate_limiter_dropped_bytes(2);
+
+        assert_eq!(metrics.snapshot().rate_limiter_dropped_bytes(), u64::MAX);
     }
 
     #[test]
