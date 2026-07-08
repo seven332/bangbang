@@ -33,6 +33,10 @@ pub const VIRTIO_BALLOON_STATS_QUEUE_INDEX: usize = 2;
 pub const VIRTIO_BALLOON_PFN_SIZE: usize = 4;
 pub const VIRTIO_BALLOON_HINTING_COMMAND_SIZE: usize = 4;
 const VIRTIO_BALLOON_HINTING_COMMAND_SIZE_U32: u32 = 4;
+pub const VIRTIO_BALLOON_STAT_SIZE: usize = 10;
+pub const VIRTIO_BALLOON_MAX_STATS_PER_DESCRIPTOR: usize = 256;
+pub const VIRTIO_BALLOON_MAX_STATS_PAYLOAD_SIZE: usize =
+    VIRTIO_BALLOON_MAX_STATS_PER_DESCRIPTOR * VIRTIO_BALLOON_STAT_SIZE;
 pub const VIRTIO_BALLOON_MAX_PFNS_PER_DESCRIPTOR: usize = 256;
 pub const VIRTIO_BALLOON_MAX_PFN_PAYLOAD_SIZE: usize =
     VIRTIO_BALLOON_MAX_PFNS_PER_DESCRIPTOR * VIRTIO_BALLOON_PFN_SIZE;
@@ -47,6 +51,22 @@ pub const VIRTIO_BALLOON_F_DEFLATE_ON_OOM: u32 = 2;
 pub const VIRTIO_BALLOON_F_FREE_PAGE_HINTING: u32 = 3;
 pub const VIRTIO_BALLOON_F_FREE_PAGE_REPORTING: u32 = 5;
 pub const VIRTIO_FEATURE_VERSION_1: u32 = 32;
+pub const VIRTIO_BALLOON_S_SWAP_IN: u16 = 0;
+pub const VIRTIO_BALLOON_S_SWAP_OUT: u16 = 1;
+pub const VIRTIO_BALLOON_S_MAJFLT: u16 = 2;
+pub const VIRTIO_BALLOON_S_MINFLT: u16 = 3;
+pub const VIRTIO_BALLOON_S_MEMFREE: u16 = 4;
+pub const VIRTIO_BALLOON_S_MEMTOT: u16 = 5;
+pub const VIRTIO_BALLOON_S_AVAIL: u16 = 6;
+pub const VIRTIO_BALLOON_S_CACHES: u16 = 7;
+pub const VIRTIO_BALLOON_S_HTLB_PGALLOC: u16 = 8;
+pub const VIRTIO_BALLOON_S_HTLB_PGFAIL: u16 = 9;
+pub const VIRTIO_BALLOON_S_OOM_KILL: u16 = 10;
+pub const VIRTIO_BALLOON_S_ALLOC_STALL: u16 = 11;
+pub const VIRTIO_BALLOON_S_ASYNC_SCAN: u16 = 12;
+pub const VIRTIO_BALLOON_S_DIRECT_SCAN: u16 = 13;
+pub const VIRTIO_BALLOON_S_ASYNC_RECLAIM: u16 = 14;
+pub const VIRTIO_BALLOON_S_DIRECT_RECLAIM: u16 = 15;
 
 pub type VirtioBalloonMmioHandler =
     VirtioMmioRegisterHandler<VirtioBalloonConfigSpace, VirtioBalloonDevice>;
@@ -407,18 +427,233 @@ impl From<BalloonConfigInput> for BalloonConfig {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BalloonOptionalStats {
+    swap_in: Option<u64>,
+    swap_out: Option<u64>,
+    major_faults: Option<u64>,
+    minor_faults: Option<u64>,
+    free_memory: Option<u64>,
+    total_memory: Option<u64>,
+    available_memory: Option<u64>,
+    disk_caches: Option<u64>,
+    hugetlb_allocations: Option<u64>,
+    hugetlb_failures: Option<u64>,
+    oom_kill: Option<u64>,
+    alloc_stall: Option<u64>,
+    async_scan: Option<u64>,
+    direct_scan: Option<u64>,
+    async_reclaim: Option<u64>,
+    direct_reclaim: Option<u64>,
+}
+
+impl BalloonOptionalStats {
+    pub const fn new() -> Self {
+        Self {
+            swap_in: None,
+            swap_out: None,
+            major_faults: None,
+            minor_faults: None,
+            free_memory: None,
+            total_memory: None,
+            available_memory: None,
+            disk_caches: None,
+            hugetlb_allocations: None,
+            hugetlb_failures: None,
+            oom_kill: None,
+            alloc_stall: None,
+            async_scan: None,
+            direct_scan: None,
+            async_reclaim: None,
+            direct_reclaim: None,
+        }
+    }
+
+    pub const fn swap_in(self) -> Option<u64> {
+        self.swap_in
+    }
+
+    pub const fn swap_out(self) -> Option<u64> {
+        self.swap_out
+    }
+
+    pub const fn major_faults(self) -> Option<u64> {
+        self.major_faults
+    }
+
+    pub const fn minor_faults(self) -> Option<u64> {
+        self.minor_faults
+    }
+
+    pub const fn free_memory(self) -> Option<u64> {
+        self.free_memory
+    }
+
+    pub const fn total_memory(self) -> Option<u64> {
+        self.total_memory
+    }
+
+    pub const fn available_memory(self) -> Option<u64> {
+        self.available_memory
+    }
+
+    pub const fn disk_caches(self) -> Option<u64> {
+        self.disk_caches
+    }
+
+    pub const fn hugetlb_allocations(self) -> Option<u64> {
+        self.hugetlb_allocations
+    }
+
+    pub const fn hugetlb_failures(self) -> Option<u64> {
+        self.hugetlb_failures
+    }
+
+    pub const fn oom_kill(self) -> Option<u64> {
+        self.oom_kill
+    }
+
+    pub const fn alloc_stall(self) -> Option<u64> {
+        self.alloc_stall
+    }
+
+    pub const fn async_scan(self) -> Option<u64> {
+        self.async_scan
+    }
+
+    pub const fn direct_scan(self) -> Option<u64> {
+        self.direct_scan
+    }
+
+    pub const fn async_reclaim(self) -> Option<u64> {
+        self.async_reclaim
+    }
+
+    pub const fn direct_reclaim(self) -> Option<u64> {
+        self.direct_reclaim
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.swap_in.is_none()
+            && self.swap_out.is_none()
+            && self.major_faults.is_none()
+            && self.minor_faults.is_none()
+            && self.free_memory.is_none()
+            && self.total_memory.is_none()
+            && self.available_memory.is_none()
+            && self.disk_caches.is_none()
+            && self.hugetlb_allocations.is_none()
+            && self.hugetlb_failures.is_none()
+            && self.oom_kill.is_none()
+            && self.alloc_stall.is_none()
+            && self.async_scan.is_none()
+            && self.direct_scan.is_none()
+            && self.async_reclaim.is_none()
+            && self.direct_reclaim.is_none()
+    }
+
+    pub fn record_stat(&mut self, stat: VirtioBalloonStat) -> bool {
+        let value = Some(stat.value());
+        match stat.tag() {
+            VIRTIO_BALLOON_S_SWAP_IN => self.swap_in = value,
+            VIRTIO_BALLOON_S_SWAP_OUT => self.swap_out = value,
+            VIRTIO_BALLOON_S_MAJFLT => self.major_faults = value,
+            VIRTIO_BALLOON_S_MINFLT => self.minor_faults = value,
+            VIRTIO_BALLOON_S_MEMFREE => self.free_memory = value,
+            VIRTIO_BALLOON_S_MEMTOT => self.total_memory = value,
+            VIRTIO_BALLOON_S_AVAIL => self.available_memory = value,
+            VIRTIO_BALLOON_S_CACHES => self.disk_caches = value,
+            VIRTIO_BALLOON_S_HTLB_PGALLOC => self.hugetlb_allocations = value,
+            VIRTIO_BALLOON_S_HTLB_PGFAIL => self.hugetlb_failures = value,
+            VIRTIO_BALLOON_S_OOM_KILL => self.oom_kill = value,
+            VIRTIO_BALLOON_S_ALLOC_STALL => self.alloc_stall = value,
+            VIRTIO_BALLOON_S_ASYNC_SCAN => self.async_scan = value,
+            VIRTIO_BALLOON_S_DIRECT_SCAN => self.direct_scan = value,
+            VIRTIO_BALLOON_S_ASYNC_RECLAIM => self.async_reclaim = value,
+            VIRTIO_BALLOON_S_DIRECT_RECLAIM => self.direct_reclaim = value,
+            _ => return false,
+        }
+
+        true
+    }
+
+    fn merge_from(&mut self, other: Self) {
+        if other.swap_in.is_some() {
+            self.swap_in = other.swap_in;
+        }
+        if other.swap_out.is_some() {
+            self.swap_out = other.swap_out;
+        }
+        if other.major_faults.is_some() {
+            self.major_faults = other.major_faults;
+        }
+        if other.minor_faults.is_some() {
+            self.minor_faults = other.minor_faults;
+        }
+        if other.free_memory.is_some() {
+            self.free_memory = other.free_memory;
+        }
+        if other.total_memory.is_some() {
+            self.total_memory = other.total_memory;
+        }
+        if other.available_memory.is_some() {
+            self.available_memory = other.available_memory;
+        }
+        if other.disk_caches.is_some() {
+            self.disk_caches = other.disk_caches;
+        }
+        if other.hugetlb_allocations.is_some() {
+            self.hugetlb_allocations = other.hugetlb_allocations;
+        }
+        if other.hugetlb_failures.is_some() {
+            self.hugetlb_failures = other.hugetlb_failures;
+        }
+        if other.oom_kill.is_some() {
+            self.oom_kill = other.oom_kill;
+        }
+        if other.alloc_stall.is_some() {
+            self.alloc_stall = other.alloc_stall;
+        }
+        if other.async_scan.is_some() {
+            self.async_scan = other.async_scan;
+        }
+        if other.direct_scan.is_some() {
+            self.direct_scan = other.direct_scan;
+        }
+        if other.async_reclaim.is_some() {
+            self.async_reclaim = other.async_reclaim;
+        }
+        if other.direct_reclaim.is_some() {
+            self.direct_reclaim = other.direct_reclaim;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BalloonStats {
     target_pages: u32,
     actual_pages: u32,
     target_mib: u32,
     actual_mib: u32,
+    optional: BalloonOptionalStats,
 }
 
 impl BalloonStats {
     pub fn from_config_and_actual_pages(
         config: BalloonConfig,
         actual_pages: u64,
+    ) -> Result<Self, BalloonStatsError> {
+        Self::from_config_actual_pages_and_optional_stats(
+            config,
+            actual_pages,
+            BalloonOptionalStats::default(),
+        )
+    }
+
+    pub fn from_config_actual_pages_and_optional_stats(
+        config: BalloonConfig,
+        actual_pages: u64,
+        optional: BalloonOptionalStats,
     ) -> Result<Self, BalloonStatsError> {
         let target_pages =
             mib_to_4k_pages(config.amount_mib()).map_err(BalloonStatsError::PageCountOverflow)?;
@@ -430,6 +665,7 @@ impl BalloonStats {
             actual_pages,
             target_mib: config.amount_mib(),
             actual_mib: actual_pages / VIRTIO_BALLOON_MIB_TO_4K_PAGES,
+            optional,
         })
     }
 
@@ -447,6 +683,10 @@ impl BalloonStats {
 
     pub const fn actual_mib(self) -> u32 {
         self.actual_mib
+    }
+
+    pub const fn optional(self) -> BalloonOptionalStats {
+        self.optional
     }
 }
 
@@ -1411,6 +1651,427 @@ fn validate_pfn_range_mapped(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioBalloonStat {
+    tag: u16,
+    value: u64,
+}
+
+impl VirtioBalloonStat {
+    pub const fn new(tag: u16, value: u64) -> Self {
+        Self { tag, value }
+    }
+
+    pub const fn tag(self) -> u16 {
+        self.tag
+    }
+
+    pub const fn value(self) -> u64 {
+        self.value
+    }
+
+    pub const fn from_le_bytes(bytes: [u8; VIRTIO_BALLOON_STAT_SIZE]) -> Self {
+        let [
+            tag0,
+            tag1,
+            value0,
+            value1,
+            value2,
+            value3,
+            value4,
+            value5,
+            value6,
+            value7,
+        ] = bytes;
+        Self {
+            tag: u16::from_le_bytes([tag0, tag1]),
+            value: u64::from_le_bytes([
+                value0, value1, value2, value3, value4, value5, value6, value7,
+            ]),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioBalloonStatisticsDescriptorPayload {
+    stats: Option<BalloonOptionalStats>,
+    stat_count: usize,
+    recognized_stat_count: usize,
+    oversized_len: Option<usize>,
+    max_len: usize,
+}
+
+impl VirtioBalloonStatisticsDescriptorPayload {
+    const fn report(
+        stats: BalloonOptionalStats,
+        stat_count: usize,
+        recognized_stat_count: usize,
+    ) -> Self {
+        Self {
+            stats: Some(stats),
+            stat_count,
+            recognized_stat_count,
+            oversized_len: None,
+            max_len: VIRTIO_BALLOON_MAX_STATS_PAYLOAD_SIZE,
+        }
+    }
+
+    const fn oversized(len: usize, max: usize) -> Self {
+        Self {
+            stats: None,
+            stat_count: 0,
+            recognized_stat_count: 0,
+            oversized_len: Some(len),
+            max_len: max,
+        }
+    }
+
+    pub const fn report_stats(self) -> Option<BalloonOptionalStats> {
+        self.stats
+    }
+
+    pub const fn stat_count(self) -> usize {
+        self.stat_count
+    }
+
+    pub const fn recognized_stat_count(self) -> usize {
+        self.recognized_stat_count
+    }
+
+    pub const fn is_oversized(self) -> bool {
+        self.oversized_len.is_some()
+    }
+
+    pub const fn oversized_len(self) -> Option<usize> {
+        self.oversized_len
+    }
+
+    pub const fn max_len(self) -> usize {
+        self.max_len
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioBalloonStatisticsDescriptor {
+    payload: VirtioBalloonStatisticsDescriptorPayload,
+}
+
+impl VirtioBalloonStatisticsDescriptor {
+    pub fn read(
+        memory: &GuestMemory,
+        chain: &VirtqueueDescriptorChain,
+    ) -> Result<Self, VirtioBalloonStatisticsDescriptorReadError> {
+        let payload_len = validate_balloon_statistics_descriptor_chain(memory, chain)?;
+        if payload_len > VIRTIO_BALLOON_MAX_STATS_PAYLOAD_SIZE {
+            return Ok(Self {
+                payload: VirtioBalloonStatisticsDescriptorPayload::oversized(
+                    payload_len,
+                    VIRTIO_BALLOON_MAX_STATS_PAYLOAD_SIZE,
+                ),
+            });
+        }
+
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(payload_len).map_err(|source| {
+            VirtioBalloonStatisticsDescriptorReadError::PayloadAllocation {
+                len: payload_len,
+                source,
+            }
+        })?;
+        bytes.resize(payload_len, 0);
+
+        let mut offset = 0;
+        for descriptor in chain.descriptors().iter().copied() {
+            offset =
+                read_balloon_statistics_descriptor_segment(memory, descriptor, &mut bytes, offset)?;
+        }
+
+        let mut stats = BalloonOptionalStats::default();
+        let mut stat_count = 0;
+        let mut recognized_stat_count = 0;
+        for chunk in bytes.chunks_exact(VIRTIO_BALLOON_STAT_SIZE) {
+            let mut stat_bytes = [0; VIRTIO_BALLOON_STAT_SIZE];
+            stat_bytes.copy_from_slice(chunk);
+            stat_count += 1;
+            if stats.record_stat(VirtioBalloonStat::from_le_bytes(stat_bytes)) {
+                recognized_stat_count += 1;
+            }
+        }
+
+        Ok(Self {
+            payload: VirtioBalloonStatisticsDescriptorPayload::report(
+                stats,
+                stat_count,
+                recognized_stat_count,
+            ),
+        })
+    }
+
+    pub const fn payload(&self) -> VirtioBalloonStatisticsDescriptorPayload {
+        self.payload
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioBalloonStatisticsDescriptorReadError {
+    EmptyDescriptorChain,
+    DescriptorWriteOnly {
+        index: u16,
+    },
+    DescriptorEmpty {
+        index: u16,
+    },
+    DescriptorLengthTooLarge {
+        index: u16,
+        len: u32,
+    },
+    PayloadLengthOverflow {
+        current: usize,
+        len: u32,
+    },
+    PayloadLengthUnaligned {
+        len: usize,
+    },
+    DescriptorRange {
+        index: u16,
+        address: GuestAddress,
+        len: u32,
+        source: GuestMemoryError,
+    },
+    DescriptorAccess {
+        index: u16,
+        address: GuestAddress,
+        len: u32,
+        source: GuestMemoryAccessError,
+    },
+    PayloadAllocation {
+        len: usize,
+        source: TryReserveError,
+    },
+    PayloadBufferRange {
+        offset: usize,
+        len: usize,
+        buffer_len: usize,
+    },
+    DescriptorRead {
+        index: u16,
+        address: GuestAddress,
+        len: u32,
+        source: GuestMemoryAccessError,
+    },
+}
+
+impl fmt::Display for VirtioBalloonStatisticsDescriptorReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyDescriptorChain => {
+                f.write_str("virtio-balloon statistics descriptor chain cannot be empty")
+            }
+            Self::DescriptorWriteOnly { index } => {
+                write!(
+                    f,
+                    "virtio-balloon statistics descriptor {index} is write-only"
+                )
+            }
+            Self::DescriptorEmpty { index } => {
+                write!(f, "virtio-balloon statistics descriptor {index} is empty")
+            }
+            Self::DescriptorLengthTooLarge { index, len } => write!(
+                f,
+                "virtio-balloon statistics descriptor {index} length {len} is too large to represent"
+            ),
+            Self::PayloadLengthOverflow { current, len } => write!(
+                f,
+                "virtio-balloon statistics descriptor payload length overflows: current={current}, len={len}"
+            ),
+            Self::PayloadLengthUnaligned { len } => write!(
+                f,
+                "virtio-balloon statistics descriptor payload length {len} is not a multiple of {VIRTIO_BALLOON_STAT_SIZE}"
+            ),
+            Self::DescriptorRange {
+                index,
+                address,
+                len,
+                source,
+            } => write!(
+                f,
+                "virtio-balloon statistics descriptor {index} range address={address}, len={len} is invalid: {source}"
+            ),
+            Self::DescriptorAccess {
+                index,
+                address,
+                len,
+                source,
+            } => write!(
+                f,
+                "virtio-balloon statistics descriptor {index} range address={address}, len={len} is not readable: {source}"
+            ),
+            Self::PayloadAllocation { len, source } => write!(
+                f,
+                "failed to allocate virtio-balloon statistics payload with {len} bytes: {source}"
+            ),
+            Self::PayloadBufferRange {
+                offset,
+                len,
+                buffer_len,
+            } => write!(
+                f,
+                "internal virtio-balloon statistics payload buffer range offset={offset}, len={len}, buffer_len={buffer_len} is invalid"
+            ),
+            Self::DescriptorRead {
+                index,
+                address,
+                len,
+                source,
+            } => write!(
+                f,
+                "failed to read virtio-balloon statistics descriptor {index} at address={address}, len={len}: {source}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VirtioBalloonStatisticsDescriptorReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DescriptorRange { source, .. } => Some(source),
+            Self::DescriptorAccess { source, .. } => Some(source),
+            Self::PayloadAllocation { source, .. } => Some(source),
+            Self::DescriptorRead { source, .. } => Some(source),
+            Self::EmptyDescriptorChain
+            | Self::DescriptorWriteOnly { .. }
+            | Self::DescriptorEmpty { .. }
+            | Self::DescriptorLengthTooLarge { .. }
+            | Self::PayloadLengthOverflow { .. }
+            | Self::PayloadLengthUnaligned { .. }
+            | Self::PayloadBufferRange { .. } => None,
+        }
+    }
+}
+
+fn validate_balloon_statistics_descriptor_chain(
+    memory: &GuestMemory,
+    chain: &VirtqueueDescriptorChain,
+) -> Result<usize, VirtioBalloonStatisticsDescriptorReadError> {
+    if chain.is_empty() {
+        return Err(VirtioBalloonStatisticsDescriptorReadError::EmptyDescriptorChain);
+    }
+
+    let mut payload_len: usize = 0;
+    for descriptor in chain.descriptors().iter().copied() {
+        validate_balloon_statistics_descriptor_header(descriptor)?;
+        let segment_len = balloon_statistics_descriptor_len(descriptor)?;
+        payload_len = payload_len.checked_add(segment_len).ok_or(
+            VirtioBalloonStatisticsDescriptorReadError::PayloadLengthOverflow {
+                current: payload_len,
+                len: descriptor.len(),
+            },
+        )?;
+        if payload_len > VIRTIO_BALLOON_MAX_STATS_PAYLOAD_SIZE {
+            return Ok(payload_len);
+        }
+        validate_balloon_statistics_descriptor_range(memory, descriptor)?;
+    }
+
+    if !payload_len.is_multiple_of(VIRTIO_BALLOON_STAT_SIZE) {
+        return Err(
+            VirtioBalloonStatisticsDescriptorReadError::PayloadLengthUnaligned { len: payload_len },
+        );
+    }
+
+    Ok(payload_len)
+}
+
+fn validate_balloon_statistics_descriptor_header(
+    descriptor: VirtqueueDescriptor,
+) -> Result<(), VirtioBalloonStatisticsDescriptorReadError> {
+    if descriptor.is_write_only() {
+        return Err(
+            VirtioBalloonStatisticsDescriptorReadError::DescriptorWriteOnly {
+                index: descriptor.index(),
+            },
+        );
+    }
+    if descriptor.is_empty() {
+        return Err(
+            VirtioBalloonStatisticsDescriptorReadError::DescriptorEmpty {
+                index: descriptor.index(),
+            },
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_balloon_statistics_descriptor_range(
+    memory: &GuestMemory,
+    descriptor: VirtqueueDescriptor,
+) -> Result<(), VirtioBalloonStatisticsDescriptorReadError> {
+    let range = GuestMemoryRange::new(descriptor.address(), u64::from(descriptor.len())).map_err(
+        |source| VirtioBalloonStatisticsDescriptorReadError::DescriptorRange {
+            index: descriptor.index(),
+            address: descriptor.address(),
+            len: descriptor.len(),
+            source,
+        },
+    )?;
+    memory.validate_mapped_range(range).map_err(|source| {
+        VirtioBalloonStatisticsDescriptorReadError::DescriptorAccess {
+            index: descriptor.index(),
+            address: descriptor.address(),
+            len: descriptor.len(),
+            source,
+        }
+    })
+}
+
+fn balloon_statistics_descriptor_len(
+    descriptor: VirtqueueDescriptor,
+) -> Result<usize, VirtioBalloonStatisticsDescriptorReadError> {
+    usize::try_from(descriptor.len()).map_err(|_| {
+        VirtioBalloonStatisticsDescriptorReadError::DescriptorLengthTooLarge {
+            index: descriptor.index(),
+            len: descriptor.len(),
+        }
+    })
+}
+
+fn read_balloon_statistics_descriptor_segment(
+    memory: &GuestMemory,
+    descriptor: VirtqueueDescriptor,
+    bytes: &mut [u8],
+    offset: usize,
+) -> Result<usize, VirtioBalloonStatisticsDescriptorReadError> {
+    let segment_len = balloon_statistics_descriptor_len(descriptor)?;
+    let end = offset.checked_add(segment_len).ok_or(
+        VirtioBalloonStatisticsDescriptorReadError::PayloadLengthOverflow {
+            current: offset,
+            len: descriptor.len(),
+        },
+    )?;
+    let buffer_len = bytes.len();
+    let destination = bytes.get_mut(offset..end).ok_or(
+        VirtioBalloonStatisticsDescriptorReadError::PayloadBufferRange {
+            offset,
+            len: segment_len,
+            buffer_len,
+        },
+    )?;
+
+    memory
+        .read_slice(destination, descriptor.address())
+        .map_err(
+            |source| VirtioBalloonStatisticsDescriptorReadError::DescriptorRead {
+                index: descriptor.index(),
+                address: descriptor.address(),
+                len: descriptor.len(),
+                source,
+            },
+        )?;
+
+    Ok(end)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VirtioBalloonQueueKind {
     Inflate,
     Deflate,
@@ -1790,6 +2451,66 @@ impl VirtioBalloonQueue {
         Ok(dispatch)
     }
 
+    pub fn dispatch_statistics(
+        &mut self,
+        memory: &mut GuestMemory,
+        context: VirtioBalloonStatisticsDispatchContext,
+    ) -> Result<VirtioBalloonQueueDispatch, VirtioBalloonQueueDispatchError> {
+        let mut dispatch = VirtioBalloonQueueDispatch {
+            statistics_pending_descriptor_head: context.pending_descriptor_head(),
+            statistics: context.statistics(),
+            ..Default::default()
+        };
+
+        while let Some(chain) = self
+            .available
+            .pop_descriptor_chain(memory)
+            .map_err(|source| VirtioBalloonQueueDispatchError::AvailableRing {
+                queue: VirtioBalloonQueueKind::Statistics,
+                completed_dispatch: Box::new(dispatch.clone()),
+                source,
+            })?
+        {
+            let descriptor_head = descriptor_chain_head(&chain).ok_or_else(|| {
+                VirtioBalloonQueueDispatchError::EmptyDescriptorChain {
+                    queue: VirtioBalloonQueueKind::Statistics,
+                    completed_dispatch: Box::new(dispatch.clone()),
+                }
+            })?;
+
+            if let Some(pending_descriptor_head) = dispatch.statistics_pending_descriptor_head {
+                let publication = self
+                    .used
+                    .publish_used_element_with_notification(
+                        memory,
+                        pending_descriptor_head,
+                        0,
+                        VirtqueueNotificationSuppression::Disabled,
+                    )
+                    .map_err(|source| VirtioBalloonQueueDispatchError::UsedRing {
+                        queue: VirtioBalloonQueueKind::Statistics,
+                        completed_dispatch: Box::new(dispatch.clone()),
+                        descriptor_head: pending_descriptor_head,
+                        source,
+                    })?;
+                dispatch.statistics_pending_descriptor_head = None;
+                dispatch.record_statistics_completed_descriptor(publication);
+            }
+
+            let descriptor =
+                VirtioBalloonStatisticsDescriptor::read(memory, &chain).map_err(|source| {
+                    VirtioBalloonQueueDispatchError::StatisticsDescriptorRead {
+                        completed_dispatch: Box::new(dispatch.clone()),
+                        descriptor_head,
+                        source,
+                    }
+                })?;
+            dispatch.record_statistics_descriptor(descriptor_head, descriptor.payload());
+        }
+
+        Ok(dispatch)
+    }
+
     pub fn dispatch_hinting_commands(
         &mut self,
         memory: &mut GuestMemory,
@@ -1856,6 +2577,32 @@ impl VirtioBalloonQueue {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioBalloonStatisticsDispatchContext {
+    pending_descriptor_head: Option<u16>,
+    statistics: BalloonOptionalStats,
+}
+
+impl VirtioBalloonStatisticsDispatchContext {
+    pub const fn new(
+        pending_descriptor_head: Option<u16>,
+        statistics: BalloonOptionalStats,
+    ) -> Self {
+        Self {
+            pending_descriptor_head,
+            statistics,
+        }
+    }
+
+    pub const fn pending_descriptor_head(self) -> Option<u16> {
+        self.pending_descriptor_head
+    }
+
+    pub const fn statistics(self) -> BalloonOptionalStats {
+        self.statistics
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtioBalloonHintingDispatchContext {
     host_cmd: u32,
     guest_cmd: Option<u32>,
@@ -1884,6 +2631,10 @@ pub struct VirtioBalloonQueueDispatch {
     needs_queue_interrupt: bool,
     inflated_page_ranges: Vec<VirtioBalloonPfnRange>,
     deflated_page_ranges: Vec<VirtioBalloonPfnRange>,
+    statistics: BalloonOptionalStats,
+    statistics_reports: usize,
+    statistics_oversized_reports: usize,
+    statistics_pending_descriptor_head: Option<u16>,
     hinting_page_ranges: Vec<GuestMemoryRange>,
     hinting_guest_cmd: Option<u32>,
     hinting_completed_run: bool,
@@ -1904,6 +2655,22 @@ impl VirtioBalloonQueueDispatch {
 
     pub fn deflated_page_ranges(&self) -> &[VirtioBalloonPfnRange] {
         &self.deflated_page_ranges
+    }
+
+    pub const fn statistics(&self) -> BalloonOptionalStats {
+        self.statistics
+    }
+
+    pub const fn statistics_reports(&self) -> usize {
+        self.statistics_reports
+    }
+
+    pub const fn statistics_oversized_reports(&self) -> usize {
+        self.statistics_oversized_reports
+    }
+
+    pub const fn statistics_pending_descriptor_head(&self) -> Option<u16> {
+        self.statistics_pending_descriptor_head
     }
 
     pub fn hinting_page_ranges(&self) -> &[GuestMemoryRange] {
@@ -1948,6 +2715,29 @@ impl VirtioBalloonQueueDispatch {
         self.completed_descriptors += 1;
         self.needs_queue_interrupt |= publication.needs_queue_interrupt();
         self.deflated_page_ranges.extend_from_slice(ranges);
+    }
+
+    fn record_statistics_completed_descriptor(
+        &mut self,
+        publication: VirtqueueUsedRingPublication,
+    ) {
+        self.completed_descriptors += 1;
+        self.needs_queue_interrupt |= publication.needs_queue_interrupt();
+    }
+
+    fn record_statistics_descriptor(
+        &mut self,
+        descriptor_head: u16,
+        payload: VirtioBalloonStatisticsDescriptorPayload,
+    ) {
+        self.statistics_pending_descriptor_head = Some(descriptor_head);
+        if let Some(stats) = payload.report_stats() {
+            self.statistics_reports += 1;
+            self.statistics.merge_from(stats);
+        }
+        if payload.is_oversized() {
+            self.statistics_oversized_reports += 1;
+        }
     }
 
     fn record_hinting_descriptor(
@@ -2186,6 +2976,11 @@ pub enum VirtioBalloonQueueDispatchError {
         descriptor_head: u16,
         source: VirtioBalloonPfnRangeAccessError,
     },
+    StatisticsDescriptorRead {
+        completed_dispatch: Box<VirtioBalloonQueueDispatch>,
+        descriptor_head: u16,
+        source: VirtioBalloonStatisticsDescriptorReadError,
+    },
     InflatedRangeAllocation {
         completed_dispatch: Box<VirtioBalloonQueueDispatch>,
         descriptor_head: u16,
@@ -2243,6 +3038,9 @@ impl VirtioBalloonQueueDispatchError {
                 completed_dispatch, ..
             }
             | Self::PfnRangeAccess {
+                completed_dispatch, ..
+            }
+            | Self::StatisticsDescriptorRead {
                 completed_dispatch, ..
             }
             | Self::InflatedRangeAllocation {
@@ -2331,6 +3129,16 @@ impl fmt::Display for VirtioBalloonQueueDispatchError {
                     "failed to validate virtio-balloon {queue} descriptor {descriptor_head} PFN ranges: {source}"
                 )
             }
+            Self::StatisticsDescriptorRead {
+                descriptor_head,
+                source,
+                ..
+            } => {
+                write!(
+                    f,
+                    "failed to read virtio-balloon statistics descriptor {descriptor_head}: {source}"
+                )
+            }
             Self::InflatedRangeAllocation {
                 descriptor_head,
                 range_count,
@@ -2402,6 +3210,7 @@ impl std::error::Error for VirtioBalloonQueueDispatchError {
             Self::PfnPayloadParse { source, .. } => Some(source),
             Self::PfnRangeCompact { source, .. } => Some(source),
             Self::PfnRangeAccess { source, .. } => Some(source),
+            Self::StatisticsDescriptorRead { source, .. } => Some(source),
             Self::InflatedRangeAllocation { source, .. } => Some(source),
             Self::DeflatedRangeAllocation { source, .. } => Some(source),
             Self::HintingRange { source, .. } => Some(source),
@@ -2461,6 +3270,10 @@ impl VirtioBalloonActiveQueues {
         self.statistics.as_ref()
     }
 
+    pub fn statistics_mut(&mut self) -> Option<&mut VirtioBalloonQueue> {
+        self.statistics.as_mut()
+    }
+
     pub const fn free_page_hinting(&self) -> Option<&VirtioBalloonQueue> {
         self.free_page_hinting.as_ref()
     }
@@ -2492,6 +3305,8 @@ pub struct VirtioBalloonDevice {
     queue_layout: VirtioBalloonQueueLayout,
     active_queues: Option<VirtioBalloonActiveQueues>,
     memory_accounting: VirtioBalloonMemoryAccounting,
+    statistics: BalloonOptionalStats,
+    statistics_pending_descriptor_head: Option<u16>,
     hinting_host_cmd: u32,
     hinting_guest_cmd: Option<u32>,
     hinting_last_cmd: u32,
@@ -2504,6 +3319,8 @@ impl VirtioBalloonDevice {
             queue_layout,
             active_queues: None,
             memory_accounting: VirtioBalloonMemoryAccounting::new(),
+            statistics: BalloonOptionalStats::new(),
+            statistics_pending_descriptor_head: None,
             hinting_host_cmd: VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
             hinting_guest_cmd: None,
             hinting_last_cmd: VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
@@ -2529,6 +3346,10 @@ impl VirtioBalloonDevice {
 
     pub const fn memory_accounting(&self) -> &VirtioBalloonMemoryAccounting {
         &self.memory_accounting
+    }
+
+    pub const fn statistics(&self) -> BalloonOptionalStats {
+        self.statistics
     }
 
     pub fn hinting_status(&self) -> Result<BalloonHintingStatus, BalloonHintingStatusError> {
@@ -2620,33 +3441,45 @@ impl VirtioBalloonDevice {
         drained_notifications: Vec<usize>,
     ) -> Result<VirtioBalloonDeviceNotificationDispatch, VirtioBalloonDeviceNotificationError> {
         if drained_notifications.is_empty() {
-            return Ok(VirtioBalloonDeviceNotificationDispatch::new(
+            return Ok(VirtioBalloonDeviceNotificationDispatch {
                 drained_notifications,
-                0,
-                0,
-                0,
-                None,
-                None,
-                None,
-            ));
+                inflate_notifications: 0,
+                deflate_notifications: 0,
+                statistics_notifications: 0,
+                hinting_notifications: 0,
+                inflate_queue_dispatch: None,
+                deflate_queue_dispatch: None,
+                statistics_queue_dispatch: None,
+                hinting_queue_dispatch: None,
+            });
         }
 
+        let statistics_queue_index = self
+            .queue_layout
+            .statistics()
+            .map(VirtioBalloonQueueConfig::index);
         let hinting_queue_index = self
             .queue_layout
             .free_page_hinting()
             .map(VirtioBalloonQueueConfig::index);
 
-        if let Some(queue_index) = drained_notifications
-            .iter()
-            .copied()
-            .find(|queue_index| !is_supported_notification_queue(*queue_index, hinting_queue_index))
-        {
+        if let Some(queue_index) = drained_notifications.iter().copied().find(|queue_index| {
+            !is_supported_notification_queue(
+                *queue_index,
+                statistics_queue_index,
+                hinting_queue_index,
+            )
+        }) {
             return Err(VirtioBalloonDeviceNotificationError::UnsupportedQueue {
                 drained_notifications,
                 queue_index,
             });
         }
 
+        let statistics_context = VirtioBalloonStatisticsDispatchContext::new(
+            self.statistics_pending_descriptor_head,
+            self.statistics,
+        );
         let hinting_context =
             VirtioBalloonHintingDispatchContext::new(self.hinting_host_cmd, self.hinting_guest_cmd);
         let Some(active_queues) = self.active_queues.as_mut() else {
@@ -2657,26 +3490,32 @@ impl VirtioBalloonDevice {
 
         let mut inflate_notifications = 0;
         let mut deflate_notifications = 0;
+        let mut statistics_notifications = 0;
         let mut hinting_notifications = 0;
         for queue_index in &drained_notifications {
             match *queue_index {
                 VIRTIO_BALLOON_INFLATE_QUEUE_INDEX => inflate_notifications += 1,
                 VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX => deflate_notifications += 1,
+                queue_index if Some(queue_index) == statistics_queue_index => {
+                    statistics_notifications += 1;
+                }
                 queue_index if Some(queue_index) == hinting_queue_index => {
                     hinting_notifications += 1;
                 }
                 _ => {}
             }
         }
-        let mut dispatch = VirtioBalloonDeviceNotificationDispatch::new(
+        let mut dispatch = VirtioBalloonDeviceNotificationDispatch {
             drained_notifications,
             inflate_notifications,
             deflate_notifications,
+            statistics_notifications,
             hinting_notifications,
-            None,
-            None,
-            None,
-        );
+            inflate_queue_dispatch: None,
+            deflate_queue_dispatch: None,
+            statistics_queue_dispatch: None,
+            hinting_queue_dispatch: None,
+        };
 
         if inflate_notifications > 0 {
             match active_queues.inflate_mut().dispatch_inflate(memory) {
@@ -2748,6 +3587,34 @@ impl VirtioBalloonDevice {
             }
         }
 
+        if statistics_notifications > 0 {
+            let Some(statistics_queue) = active_queues.statistics_mut() else {
+                return Err(VirtioBalloonDeviceNotificationError::UnsupportedQueue {
+                    drained_notifications: dispatch.drained_notifications().to_vec(),
+                    queue_index: statistics_queue_index.unwrap_or(VIRTIO_BALLOON_STATS_QUEUE_INDEX),
+                });
+            };
+            match statistics_queue.dispatch_statistics(memory, statistics_context) {
+                Ok(statistics_dispatch) => {
+                    self.statistics = statistics_dispatch.statistics();
+                    self.statistics_pending_descriptor_head =
+                        statistics_dispatch.statistics_pending_descriptor_head();
+                    dispatch.statistics_queue_dispatch = Some(statistics_dispatch);
+                }
+                Err(source) => {
+                    let completed = source.completed_dispatch().clone();
+                    self.statistics = completed.statistics();
+                    self.statistics_pending_descriptor_head =
+                        completed.statistics_pending_descriptor_head();
+                    dispatch.statistics_queue_dispatch = Some(completed);
+                    return Err(VirtioBalloonDeviceNotificationError::QueueDispatch {
+                        completed_dispatch: Box::new(dispatch),
+                        source,
+                    });
+                }
+            }
+        }
+
         if hinting_notifications > 0 {
             let Some(hinting_queue) = active_queues.free_page_hinting_mut() else {
                 return Err(VirtioBalloonDeviceNotificationError::UnsupportedQueue {
@@ -2783,6 +3650,8 @@ impl VirtioBalloonDevice {
     pub fn reset(&mut self) {
         self.active_queues = None;
         self.memory_accounting = VirtioBalloonMemoryAccounting::new();
+        self.statistics = BalloonOptionalStats::default();
+        self.statistics_pending_descriptor_head = None;
         self.hinting_host_cmd = VIRTIO_BALLOON_FREE_PAGE_HINT_STOP;
         self.hinting_guest_cmd = None;
         self.hinting_last_cmd = VIRTIO_BALLOON_FREE_PAGE_HINT_STOP;
@@ -2969,33 +3838,15 @@ pub struct VirtioBalloonDeviceNotificationDispatch {
     drained_notifications: Vec<usize>,
     inflate_notifications: usize,
     deflate_notifications: usize,
+    statistics_notifications: usize,
     hinting_notifications: usize,
     inflate_queue_dispatch: Option<VirtioBalloonQueueDispatch>,
     deflate_queue_dispatch: Option<VirtioBalloonQueueDispatch>,
+    statistics_queue_dispatch: Option<VirtioBalloonQueueDispatch>,
     hinting_queue_dispatch: Option<VirtioBalloonQueueDispatch>,
 }
 
 impl VirtioBalloonDeviceNotificationDispatch {
-    const fn new(
-        drained_notifications: Vec<usize>,
-        inflate_notifications: usize,
-        deflate_notifications: usize,
-        hinting_notifications: usize,
-        inflate_queue_dispatch: Option<VirtioBalloonQueueDispatch>,
-        deflate_queue_dispatch: Option<VirtioBalloonQueueDispatch>,
-        hinting_queue_dispatch: Option<VirtioBalloonQueueDispatch>,
-    ) -> Self {
-        Self {
-            drained_notifications,
-            inflate_notifications,
-            deflate_notifications,
-            hinting_notifications,
-            inflate_queue_dispatch,
-            deflate_queue_dispatch,
-            hinting_queue_dispatch,
-        }
-    }
-
     pub fn drained_notifications(&self) -> &[usize] {
         &self.drained_notifications
     }
@@ -3008,6 +3859,10 @@ impl VirtioBalloonDeviceNotificationDispatch {
         self.deflate_notifications
     }
 
+    pub const fn statistics_notifications(&self) -> usize {
+        self.statistics_notifications
+    }
+
     pub const fn hinting_notifications(&self) -> usize {
         self.hinting_notifications
     }
@@ -3018,6 +3873,10 @@ impl VirtioBalloonDeviceNotificationDispatch {
 
     pub const fn deflate_queue_dispatch(&self) -> Option<&VirtioBalloonQueueDispatch> {
         self.deflate_queue_dispatch.as_ref()
+    }
+
+    pub const fn statistics_queue_dispatch(&self) -> Option<&VirtioBalloonQueueDispatch> {
+        self.statistics_queue_dispatch.as_ref()
     }
 
     pub const fn hinting_queue_dispatch(&self) -> Option<&VirtioBalloonQueueDispatch> {
@@ -3036,6 +3895,10 @@ impl VirtioBalloonDeviceNotificationDispatch {
             .is_some_and(VirtioBalloonQueueDispatch::needs_queue_interrupt)
             || self
                 .deflate_queue_dispatch
+                .as_ref()
+                .is_some_and(VirtioBalloonQueueDispatch::needs_queue_interrupt)
+            || self
+                .statistics_queue_dispatch
                 .as_ref()
                 .is_some_and(VirtioBalloonQueueDispatch::needs_queue_interrupt)
             || self
@@ -3266,8 +4129,14 @@ const fn is_inflate_or_deflate_queue(queue_index: usize) -> bool {
         || queue_index == VIRTIO_BALLOON_DEFLATE_QUEUE_INDEX
 }
 
-fn is_supported_notification_queue(queue_index: usize, hinting_queue_index: Option<usize>) -> bool {
-    is_inflate_or_deflate_queue(queue_index) || Some(queue_index) == hinting_queue_index
+fn is_supported_notification_queue(
+    queue_index: usize,
+    statistics_queue_index: Option<usize>,
+    hinting_queue_index: Option<usize>,
+) -> bool {
+    is_inflate_or_deflate_queue(queue_index)
+        || Some(queue_index) == statistics_queue_index
+        || Some(queue_index) == hinting_queue_index
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3661,6 +4530,15 @@ mod tests {
         bytes
     }
 
+    fn stat_payload_bytes(stats: &[(u16, u64)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for (tag, value) in stats {
+            bytes.extend_from_slice(&tag.to_le_bytes());
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+
     #[derive(Debug, Clone, Copy)]
     struct TestDescriptor {
         address: GuestAddress,
@@ -3755,7 +4633,7 @@ mod tests {
         );
     }
 
-    fn write_hinting_descriptor(
+    fn write_queue_descriptor(
         memory: &mut GuestMemory,
         queue_index: usize,
         index: u16,
@@ -3767,6 +4645,24 @@ mod tests {
             index,
             descriptor,
         );
+    }
+
+    fn write_statistics_descriptor(
+        memory: &mut GuestMemory,
+        queue_index: usize,
+        index: u16,
+        descriptor: TestDescriptor,
+    ) {
+        write_queue_descriptor(memory, queue_index, index, descriptor);
+    }
+
+    fn write_hinting_descriptor(
+        memory: &mut GuestMemory,
+        queue_index: usize,
+        index: u16,
+        descriptor: TestDescriptor,
+    ) {
+        write_queue_descriptor(memory, queue_index, index, descriptor);
     }
 
     fn descriptor_chain(memory: &GuestMemory, head_index: u16) -> VirtqueueDescriptorChain {
@@ -3888,6 +4784,26 @@ mod tests {
         hinting_queue_with_used_ring(queue_index, queue_used_ring(queue_index))
     }
 
+    fn statistics_queue(queue_index: usize) -> VirtioBalloonQueue {
+        statistics_queue_with_used_ring(queue_index, queue_used_ring(queue_index))
+    }
+
+    fn statistics_queue_with_used_ring(
+        queue_index: usize,
+        used_ring: GuestAddress,
+    ) -> VirtioBalloonQueue {
+        VirtioBalloonQueue::new(
+            VirtqueueAvailableRing::new(
+                descriptor_table_for_queue(queue_index),
+                queue_available_ring(queue_index),
+                TEST_QUEUE_SIZE,
+            )
+            .expect("statistics available ring should build"),
+            VirtqueueUsedRing::new(used_ring, TEST_QUEUE_SIZE)
+                .expect("statistics used ring should build"),
+        )
+    }
+
     fn hinting_queue_with_used_ring(
         queue_index: usize,
         used_ring: GuestAddress,
@@ -3912,6 +4828,13 @@ mod tests {
 
     const fn default_hinting_context() -> VirtioBalloonHintingDispatchContext {
         hinting_context(VIRTIO_BALLOON_FREE_PAGE_HINT_STOP, None)
+    }
+
+    const fn statistics_context(
+        pending_descriptor_head: Option<u16>,
+        statistics: BalloonOptionalStats,
+    ) -> VirtioBalloonStatisticsDispatchContext {
+        VirtioBalloonStatisticsDispatchContext::new(pending_descriptor_head, statistics)
     }
 
     fn queue_available_ring(queue_index: usize) -> GuestAddress {
@@ -4233,6 +5156,105 @@ mod tests {
                 actual_pages: u64::from(u32::MAX) + 1,
             }
         );
+    }
+
+    #[test]
+    fn balloon_stats_include_optional_guest_reported_fields() {
+        let mut optional = BalloonOptionalStats::default();
+        assert!(optional.is_empty());
+        assert!(optional.record_stat(VirtioBalloonStat::new(VIRTIO_BALLOON_S_SWAP_OUT, 9)));
+        assert!(optional.record_stat(VirtioBalloonStat::new(VIRTIO_BALLOON_S_MEMFREE, 0x5678)));
+        assert!(!optional.record_stat(VirtioBalloonStat::new(0xffff, 1)));
+
+        let stats = BalloonStats::from_config_actual_pages_and_optional_stats(
+            balloon_config(64, false, 0, false, false),
+            513,
+            optional,
+        )
+        .expect("balloon stats should convert with optional stats");
+
+        assert_eq!(stats.optional().swap_out(), Some(9));
+        assert_eq!(stats.optional().free_memory(), Some(0x5678));
+        assert_eq!(stats.optional().swap_in(), None);
+    }
+
+    #[test]
+    fn statistics_descriptor_reads_recognized_and_unknown_tags() {
+        let mut memory = pfn_descriptor_memory();
+        let bytes = stat_payload_bytes(&[
+            (VIRTIO_BALLOON_S_SWAP_OUT, 9),
+            (0xffff, 10),
+            (VIRTIO_BALLOON_S_MEMFREE, 0x5678),
+        ]);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
+        write_statistics_descriptor(
+            &mut memory,
+            VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&bytes), None),
+        );
+        let chain = read_descriptor_chain(
+            &memory,
+            descriptor_table_for_queue(VIRTIO_BALLOON_STATS_QUEUE_INDEX),
+            TEST_QUEUE_SIZE,
+            0,
+        )
+        .expect("statistics descriptor chain should read");
+
+        let descriptor = VirtioBalloonStatisticsDescriptor::read(&memory, &chain)
+            .expect("statistics descriptor should read");
+        let payload = descriptor.payload();
+        let stats = payload
+            .report_stats()
+            .expect("valid statistics descriptor should produce a report");
+
+        assert!(!payload.is_oversized());
+        assert_eq!(payload.stat_count(), 3);
+        assert_eq!(payload.recognized_stat_count(), 2);
+        assert_eq!(stats.swap_out(), Some(9));
+        assert_eq!(stats.free_memory(), Some(0x5678));
+        assert_eq!(stats.swap_in(), None);
+    }
+
+    #[test]
+    fn statistics_descriptor_accepts_exact_maximum_payload() {
+        let mut memory = pfn_descriptor_memory();
+        let stats =
+            vec![(VIRTIO_BALLOON_S_MEMFREE, 0x5678); VIRTIO_BALLOON_MAX_STATS_PER_DESCRIPTOR];
+        let bytes = stat_payload_bytes(&stats);
+        assert_eq!(bytes.len(), VIRTIO_BALLOON_MAX_STATS_PAYLOAD_SIZE);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
+        write_statistics_descriptor(
+            &mut memory,
+            VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&bytes), None),
+        );
+        let chain = read_descriptor_chain(
+            &memory,
+            descriptor_table_for_queue(VIRTIO_BALLOON_STATS_QUEUE_INDEX),
+            TEST_QUEUE_SIZE,
+            0,
+        )
+        .expect("statistics descriptor chain should read");
+
+        let payload = VirtioBalloonStatisticsDescriptor::read(&memory, &chain)
+            .expect("maximum statistics descriptor should read")
+            .payload();
+        let parsed_stats = payload
+            .report_stats()
+            .expect("maximum statistics descriptor should produce a report");
+
+        assert!(!payload.is_oversized());
+        assert_eq!(
+            payload.stat_count(),
+            VIRTIO_BALLOON_MAX_STATS_PER_DESCRIPTOR
+        );
+        assert_eq!(
+            payload.recognized_stat_count(),
+            VIRTIO_BALLOON_MAX_STATS_PER_DESCRIPTOR
+        );
+        assert_eq!(parsed_stats.free_memory(), Some(0x5678));
     }
 
     #[test]
@@ -5624,6 +6646,244 @@ mod tests {
     }
 
     #[test]
+    fn statistics_queue_dispatch_records_stats_and_holds_current_descriptor() {
+        let mut memory = pfn_descriptor_memory();
+        let bytes = stat_payload_bytes(&[
+            (VIRTIO_BALLOON_S_SWAP_OUT, 9),
+            (VIRTIO_BALLOON_S_MEMFREE, 0x5678),
+        ]);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
+        write_statistics_descriptor(
+            &mut memory,
+            VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&bytes), None),
+        );
+        write_available_heads(
+            &mut memory,
+            queue_available_ring(VIRTIO_BALLOON_STATS_QUEUE_INDEX),
+            &[0],
+        );
+        let mut queue = statistics_queue(VIRTIO_BALLOON_STATS_QUEUE_INDEX);
+
+        let dispatch = queue
+            .dispatch_statistics(
+                &mut memory,
+                statistics_context(None, BalloonOptionalStats::default()),
+            )
+            .expect("statistics descriptor should dispatch");
+
+        assert_eq!(dispatch.completed_descriptors(), 0);
+        assert!(!dispatch.needs_queue_interrupt());
+        assert_eq!(dispatch.statistics_reports(), 1);
+        assert_eq!(dispatch.statistics_oversized_reports(), 0);
+        assert_eq!(dispatch.statistics_pending_descriptor_head(), Some(0));
+        assert_eq!(dispatch.statistics().swap_out(), Some(9));
+        assert_eq!(dispatch.statistics().free_memory(), Some(0x5678));
+        assert_eq!(
+            read_used_idx(&memory, queue_used_ring(VIRTIO_BALLOON_STATS_QUEUE_INDEX)),
+            0
+        );
+    }
+
+    #[test]
+    fn statistics_queue_dispatch_merges_with_existing_stats() {
+        let mut memory = pfn_descriptor_memory();
+        let mut existing = BalloonOptionalStats::default();
+        assert!(existing.record_stat(VirtioBalloonStat::new(VIRTIO_BALLOON_S_SWAP_OUT, 9,)));
+        let bytes = stat_payload_bytes(&[(VIRTIO_BALLOON_S_MEMFREE, 0x5678)]);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
+        write_statistics_descriptor(
+            &mut memory,
+            VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&bytes), None),
+        );
+        write_available_heads(
+            &mut memory,
+            queue_available_ring(VIRTIO_BALLOON_STATS_QUEUE_INDEX),
+            &[0],
+        );
+        let mut queue = statistics_queue(VIRTIO_BALLOON_STATS_QUEUE_INDEX);
+
+        let dispatch = queue
+            .dispatch_statistics(&mut memory, statistics_context(None, existing))
+            .expect("statistics descriptor should dispatch");
+
+        assert_eq!(dispatch.statistics().swap_out(), Some(9));
+        assert_eq!(dispatch.statistics().free_memory(), Some(0x5678));
+    }
+
+    #[test]
+    fn statistics_queue_dispatch_completes_previous_pending_descriptor() {
+        let mut memory = pfn_descriptor_memory();
+        let bytes = stat_payload_bytes(&[(VIRTIO_BALLOON_S_MEMFREE, 0x5678)]);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
+        write_statistics_descriptor(
+            &mut memory,
+            VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&bytes), None),
+        );
+        write_available_heads(
+            &mut memory,
+            queue_available_ring(VIRTIO_BALLOON_STATS_QUEUE_INDEX),
+            &[0],
+        );
+        let mut queue = statistics_queue(VIRTIO_BALLOON_STATS_QUEUE_INDEX);
+
+        let dispatch = queue
+            .dispatch_statistics(
+                &mut memory,
+                statistics_context(Some(5), BalloonOptionalStats::default()),
+            )
+            .expect("statistics descriptor should dispatch");
+
+        assert_eq!(dispatch.completed_descriptors(), 1);
+        assert!(dispatch.needs_queue_interrupt());
+        assert_eq!(dispatch.statistics_pending_descriptor_head(), Some(0));
+        assert_eq!(
+            read_used_idx(&memory, queue_used_ring(VIRTIO_BALLOON_STATS_QUEUE_INDEX)),
+            1
+        );
+        assert_eq!(
+            read_used_element(
+                &memory,
+                queue_used_ring(VIRTIO_BALLOON_STATS_QUEUE_INDEX),
+                0
+            ),
+            (5, 0)
+        );
+    }
+
+    #[test]
+    fn statistics_queue_dispatch_preserves_previous_pending_descriptor_on_used_ring_error() {
+        let mut memory = pfn_descriptor_memory();
+        let bytes = stat_payload_bytes(&[(VIRTIO_BALLOON_S_MEMFREE, 0x5678)]);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
+        write_statistics_descriptor(
+            &mut memory,
+            VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&bytes), None),
+        );
+        write_available_heads(
+            &mut memory,
+            queue_available_ring(VIRTIO_BALLOON_STATS_QUEUE_INDEX),
+            &[0],
+        );
+        let mut existing = BalloonOptionalStats::default();
+        assert!(existing.record_stat(VirtioBalloonStat::new(VIRTIO_BALLOON_S_SWAP_OUT, 9)));
+        let mut queue = statistics_queue_with_used_ring(
+            VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+            GuestAddress::new(TEST_MEMORY_SIZE),
+        );
+
+        let error = queue
+            .dispatch_statistics(&mut memory, statistics_context(Some(5), existing))
+            .expect_err("unmapped statistics used ring should fail publication");
+
+        assert!(matches!(
+            error,
+            VirtioBalloonQueueDispatchError::UsedRing {
+                queue: VirtioBalloonQueueKind::Statistics,
+                descriptor_head: 5,
+                ..
+            }
+        ));
+        let completed = error.completed_dispatch();
+        assert_eq!(completed.completed_descriptors(), 0);
+        assert!(!completed.needs_queue_interrupt());
+        assert_eq!(completed.statistics_pending_descriptor_head(), Some(5));
+        assert_eq!(completed.statistics().swap_out(), Some(9));
+        assert_eq!(completed.statistics().free_memory(), None);
+    }
+
+    #[test]
+    fn statistics_queue_dispatch_holds_oversized_descriptor_without_reading_payload() {
+        let mut memory = pfn_descriptor_memory();
+        write_statistics_descriptor(
+            &mut memory,
+            VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+            0,
+            TestDescriptor::readable(
+                GuestAddress::new(TEST_MEMORY_SIZE),
+                u32::try_from(VIRTIO_BALLOON_MAX_STATS_PAYLOAD_SIZE + 1)
+                    .expect("oversized stat payload length should fit u32"),
+                None,
+            ),
+        );
+        write_available_heads(
+            &mut memory,
+            queue_available_ring(VIRTIO_BALLOON_STATS_QUEUE_INDEX),
+            &[0],
+        );
+        let mut queue = statistics_queue(VIRTIO_BALLOON_STATS_QUEUE_INDEX);
+
+        let dispatch = queue
+            .dispatch_statistics(
+                &mut memory,
+                statistics_context(None, BalloonOptionalStats::default()),
+            )
+            .expect("oversized statistics descriptor should be held without guest memory access");
+
+        assert_eq!(dispatch.completed_descriptors(), 0);
+        assert_eq!(dispatch.statistics_reports(), 0);
+        assert_eq!(dispatch.statistics_oversized_reports(), 1);
+        assert_eq!(dispatch.statistics_pending_descriptor_head(), Some(0));
+        assert!(dispatch.statistics().is_empty());
+        assert_eq!(
+            read_used_idx(&memory, queue_used_ring(VIRTIO_BALLOON_STATS_QUEUE_INDEX)),
+            0
+        );
+    }
+
+    #[test]
+    fn statistics_queue_dispatch_rejects_unaligned_descriptor_without_publication() {
+        let mut memory = pfn_descriptor_memory();
+        let bytes = [1, 2, 3];
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
+        write_statistics_descriptor(
+            &mut memory,
+            VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&bytes), None),
+        );
+        write_available_heads(
+            &mut memory,
+            queue_available_ring(VIRTIO_BALLOON_STATS_QUEUE_INDEX),
+            &[0],
+        );
+        let mut queue = statistics_queue(VIRTIO_BALLOON_STATS_QUEUE_INDEX);
+
+        let error = queue
+            .dispatch_statistics(
+                &mut memory,
+                statistics_context(None, BalloonOptionalStats::default()),
+            )
+            .expect_err("unaligned statistics descriptor should fail");
+
+        assert!(matches!(
+            error,
+            VirtioBalloonQueueDispatchError::StatisticsDescriptorRead {
+                descriptor_head: 0,
+                ..
+            }
+        ));
+        assert_eq!(error.completed_dispatch().completed_descriptors(), 0);
+        assert_eq!(
+            error
+                .completed_dispatch()
+                .statistics_pending_descriptor_head(),
+            None
+        );
+        assert_eq!(
+            read_used_idx(&memory, queue_used_ring(VIRTIO_BALLOON_STATS_QUEUE_INDEX)),
+            0
+        );
+    }
+
+    #[test]
     fn hinting_queue_dispatch_records_guest_command_and_completes_descriptor() {
         let mut memory = pfn_descriptor_memory();
         let queue_index = VIRTIO_BALLOON_STATS_QUEUE_INDEX;
@@ -6621,44 +7881,35 @@ mod tests {
     }
 
     #[test]
-    fn balloon_notification_dispatch_keeps_other_optional_queues_unsupported_with_hinting() {
+    fn balloon_notification_dispatch_keeps_reporting_queue_unsupported_with_hinting() {
         let mut memory = pfn_descriptor_memory();
         let layout = prepared(balloon_config(64, false, 1, true, true)).queue_layout();
-        let unsupported_queue_indexes = [
-            layout
-                .statistics()
-                .expect("statistics queue should be configured")
-                .index(),
-            layout
-                .free_page_reporting()
-                .expect("reporting queue should be configured")
-                .index(),
-        ];
+        let queue_index = layout
+            .free_page_reporting()
+            .expect("reporting queue should be configured")
+            .index();
+        let device_registers = VirtioMmioDeviceRegisters::new(
+            VIRTIO_BALLOON_DEVICE_ID,
+            virtio_feature_bit(VIRTIO_FEATURE_VERSION_1),
+        );
+        let queues = configured_queue_registers(layout.queue_count());
+        let mut device = VirtioBalloonDevice::new(layout);
+        device
+            .activate_balloon(activation_for_queues(&device_registers, &queues))
+            .expect("activation should succeed");
 
-        for queue_index in unsupported_queue_indexes {
-            let device_registers = VirtioMmioDeviceRegisters::new(
-                VIRTIO_BALLOON_DEVICE_ID,
-                virtio_feature_bit(VIRTIO_FEATURE_VERSION_1),
-            );
-            let queues = configured_queue_registers(layout.queue_count());
-            let mut device = VirtioBalloonDevice::new(layout);
-            device
-                .activate_balloon(activation_for_queues(&device_registers, &queues))
-                .expect("activation should succeed");
+        let error = device
+            .dispatch_drained_queue_notifications(&mut memory, vec![queue_index])
+            .expect_err("reporting queue should remain unsupported");
 
-            let error = device
-                .dispatch_drained_queue_notifications(&mut memory, vec![queue_index])
-                .expect_err("non-hinting optional queue should remain unsupported");
-
-            assert!(matches!(
-                error,
-                VirtioBalloonDeviceNotificationError::UnsupportedQueue {
-                    queue_index: unsupported_queue_index,
-                    ..
-                } if unsupported_queue_index == queue_index
-            ));
-            assert_eq!(error.drained_notifications(), &[queue_index]);
-        }
+        assert!(matches!(
+            error,
+            VirtioBalloonDeviceNotificationError::UnsupportedQueue {
+                queue_index: unsupported_queue_index,
+                ..
+            } if unsupported_queue_index == queue_index
+        ));
+        assert_eq!(error.drained_notifications(), &[queue_index]);
     }
 
     #[test]
@@ -7747,8 +8998,24 @@ mod tests {
     }
 
     #[test]
-    fn balloon_mmio_handler_rejects_unsupported_optional_queue_notification() {
+    fn balloon_mmio_handler_dispatches_statistics_notification() {
         let mut memory = pfn_descriptor_memory();
+        let bytes = stat_payload_bytes(&[
+            (VIRTIO_BALLOON_S_SWAP_OUT, 9),
+            (VIRTIO_BALLOON_S_MEMFREE, 0x5678),
+        ]);
+        write_guest_bytes(&mut memory, TEST_PFN_DATA, &bytes);
+        write_statistics_descriptor(
+            &mut memory,
+            VIRTIO_BALLOON_STATS_QUEUE_INDEX,
+            0,
+            TestDescriptor::readable(TEST_PFN_DATA, descriptor_len(&bytes), None),
+        );
+        write_available_heads(
+            &mut memory,
+            queue_available_ring(VIRTIO_BALLOON_STATS_QUEUE_INDEX),
+            &[0],
+        );
         let mut device = balloon_mmio_device(balloon_config(64, false, 1, false, false));
         let handler = device
             .dispatcher_mut()
@@ -7763,9 +9030,52 @@ mod tests {
             )
             .expect("statistics queue notification should write");
 
+        let dispatch = handler
+            .dispatch_balloon_queue_notifications(&mut memory)
+            .expect("statistics queue notification should dispatch");
+
+        assert_eq!(dispatch.statistics_notifications(), 1);
+        let statistics_dispatch = dispatch
+            .statistics_queue_dispatch()
+            .expect("statistics queue dispatch should be recorded");
+        assert_eq!(statistics_dispatch.statistics_reports(), 1);
+        assert_eq!(
+            statistics_dispatch.statistics_pending_descriptor_head(),
+            Some(0)
+        );
+        assert_eq!(statistics_dispatch.statistics().swap_out(), Some(9));
+        assert_eq!(statistics_dispatch.statistics().free_memory(), Some(0x5678));
+        assert_eq!(
+            handler.activation_handler().statistics().swap_out(),
+            Some(9)
+        );
+        assert_eq!(
+            read_used_idx(&memory, queue_used_ring(VIRTIO_BALLOON_STATS_QUEUE_INDEX)),
+            0
+        );
+        assert!(handler.pending_queue_notifications().is_empty());
+    }
+
+    #[test]
+    fn balloon_mmio_handler_rejects_unsupported_reporting_queue_notification() {
+        let mut memory = pfn_descriptor_memory();
+        let mut device = balloon_mmio_device(balloon_config(64, false, 0, false, true));
+        let handler = device
+            .dispatcher_mut()
+            .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+            .expect("balloon handler should be registered");
+        activate_handler(handler);
+
+        handler
+            .write_register(
+                VirtioMmioRegister::QueueNotify,
+                queue_index_u32(VIRTIO_BALLOON_STATS_QUEUE_INDEX),
+            )
+            .expect("reporting queue notification should write");
+
         let error = handler
             .dispatch_balloon_queue_notifications(&mut memory)
-            .expect_err("statistics queue notification should fail closed");
+            .expect_err("reporting queue notification should fail closed");
 
         assert!(matches!(
             error,

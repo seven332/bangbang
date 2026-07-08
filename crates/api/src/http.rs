@@ -1327,6 +1327,22 @@ pub struct BalloonStatsResponse {
     actual_pages: u32,
     target_mib: u32,
     actual_mib: u32,
+    swap_in: Option<u64>,
+    swap_out: Option<u64>,
+    major_faults: Option<u64>,
+    minor_faults: Option<u64>,
+    free_memory: Option<u64>,
+    total_memory: Option<u64>,
+    available_memory: Option<u64>,
+    disk_caches: Option<u64>,
+    hugetlb_allocations: Option<u64>,
+    hugetlb_failures: Option<u64>,
+    oom_kill: Option<u64>,
+    alloc_stall: Option<u64>,
+    async_scan: Option<u64>,
+    direct_scan: Option<u64>,
+    async_reclaim: Option<u64>,
+    direct_reclaim: Option<u64>,
 }
 
 impl BalloonStatsResponse {
@@ -1341,7 +1357,103 @@ impl BalloonStatsResponse {
             actual_pages,
             target_mib,
             actual_mib,
+            swap_in: None,
+            swap_out: None,
+            major_faults: None,
+            minor_faults: None,
+            free_memory: None,
+            total_memory: None,
+            available_memory: None,
+            disk_caches: None,
+            hugetlb_allocations: None,
+            hugetlb_failures: None,
+            oom_kill: None,
+            alloc_stall: None,
+            async_scan: None,
+            direct_scan: None,
+            async_reclaim: None,
+            direct_reclaim: None,
         }
+    }
+
+    pub const fn with_swap_in(mut self, value: Option<u64>) -> Self {
+        self.swap_in = value;
+        self
+    }
+
+    pub const fn with_swap_out(mut self, value: Option<u64>) -> Self {
+        self.swap_out = value;
+        self
+    }
+
+    pub const fn with_major_faults(mut self, value: Option<u64>) -> Self {
+        self.major_faults = value;
+        self
+    }
+
+    pub const fn with_minor_faults(mut self, value: Option<u64>) -> Self {
+        self.minor_faults = value;
+        self
+    }
+
+    pub const fn with_free_memory(mut self, value: Option<u64>) -> Self {
+        self.free_memory = value;
+        self
+    }
+
+    pub const fn with_total_memory(mut self, value: Option<u64>) -> Self {
+        self.total_memory = value;
+        self
+    }
+
+    pub const fn with_available_memory(mut self, value: Option<u64>) -> Self {
+        self.available_memory = value;
+        self
+    }
+
+    pub const fn with_disk_caches(mut self, value: Option<u64>) -> Self {
+        self.disk_caches = value;
+        self
+    }
+
+    pub const fn with_hugetlb_allocations(mut self, value: Option<u64>) -> Self {
+        self.hugetlb_allocations = value;
+        self
+    }
+
+    pub const fn with_hugetlb_failures(mut self, value: Option<u64>) -> Self {
+        self.hugetlb_failures = value;
+        self
+    }
+
+    pub const fn with_oom_kill(mut self, value: Option<u64>) -> Self {
+        self.oom_kill = value;
+        self
+    }
+
+    pub const fn with_alloc_stall(mut self, value: Option<u64>) -> Self {
+        self.alloc_stall = value;
+        self
+    }
+
+    pub const fn with_async_scan(mut self, value: Option<u64>) -> Self {
+        self.async_scan = value;
+        self
+    }
+
+    pub const fn with_direct_scan(mut self, value: Option<u64>) -> Self {
+        self.direct_scan = value;
+        self
+    }
+
+    pub const fn with_async_reclaim(mut self, value: Option<u64>) -> Self {
+        self.async_reclaim = value;
+        self
+    }
+
+    pub const fn with_direct_reclaim(mut self, value: Option<u64>) -> Self {
+        self.direct_reclaim = value;
+        self
     }
 }
 
@@ -1990,12 +2102,39 @@ fn balloon_config_response_value(balloon: &BalloonConfigResponse) -> serde_json:
 }
 
 fn balloon_stats_response_value(stats: &BalloonStatsResponse) -> serde_json::Value {
-    serde_json::json!({
-        "actual_mib": stats.actual_mib,
-        "actual_pages": stats.actual_pages,
-        "target_mib": stats.target_mib,
-        "target_pages": stats.target_pages,
-    })
+    let mut body = serde_json::Map::new();
+    body.insert("actual_mib".to_string(), stats.actual_mib.into());
+    body.insert("actual_pages".to_string(), stats.actual_pages.into());
+    body.insert("target_mib".to_string(), stats.target_mib.into());
+    body.insert("target_pages".to_string(), stats.target_pages.into());
+    insert_optional_u64(&mut body, "swap_in", stats.swap_in);
+    insert_optional_u64(&mut body, "swap_out", stats.swap_out);
+    insert_optional_u64(&mut body, "major_faults", stats.major_faults);
+    insert_optional_u64(&mut body, "minor_faults", stats.minor_faults);
+    insert_optional_u64(&mut body, "free_memory", stats.free_memory);
+    insert_optional_u64(&mut body, "total_memory", stats.total_memory);
+    insert_optional_u64(&mut body, "available_memory", stats.available_memory);
+    insert_optional_u64(&mut body, "disk_caches", stats.disk_caches);
+    insert_optional_u64(&mut body, "hugetlb_allocations", stats.hugetlb_allocations);
+    insert_optional_u64(&mut body, "hugetlb_failures", stats.hugetlb_failures);
+    insert_optional_u64(&mut body, "oom_kill", stats.oom_kill);
+    insert_optional_u64(&mut body, "alloc_stall", stats.alloc_stall);
+    insert_optional_u64(&mut body, "async_scan", stats.async_scan);
+    insert_optional_u64(&mut body, "direct_scan", stats.direct_scan);
+    insert_optional_u64(&mut body, "async_reclaim", stats.async_reclaim);
+    insert_optional_u64(&mut body, "direct_reclaim", stats.direct_reclaim);
+
+    serde_json::Value::Object(body)
+}
+
+fn insert_optional_u64(
+    body: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: Option<u64>,
+) {
+    if let Some(value) = value {
+        body.insert(key.to_string(), value.into());
+    }
 }
 
 fn balloon_hinting_status_response_value(
@@ -7074,6 +7213,33 @@ mod tests {
                 "target_pages": 1024,
             })
         );
+    }
+
+    #[test]
+    fn response_body_contains_recorded_balloon_optional_stats() {
+        let response = HttpResponse::balloon_stats(
+            BalloonStatsResponse::new(1024, 513, 4, 2)
+                .with_swap_out(Some(9))
+                .with_free_memory(Some(0x5678))
+                .with_direct_reclaim(Some(42)),
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(response.body()).expect("body should be JSON");
+
+        assert_eq!(response.status(), StatusCode::Ok);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "actual_mib": 2,
+                "actual_pages": 513,
+                "direct_reclaim": 42,
+                "free_memory": 0x5678,
+                "swap_out": 9,
+                "target_mib": 4,
+                "target_pages": 1024,
+            })
+        );
+        assert_eq!(body.get("swap_in"), None);
     }
 
     #[test]

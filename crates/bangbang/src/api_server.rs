@@ -1150,12 +1150,29 @@ fn balloon_config_response_from_runtime(config: BalloonConfig) -> BalloonConfigR
 }
 
 fn balloon_stats_response_from_runtime(stats: BalloonStats) -> BalloonStatsResponse {
+    let optional = stats.optional();
     BalloonStatsResponse::new(
         stats.target_pages(),
         stats.actual_pages(),
         stats.target_mib(),
         stats.actual_mib(),
     )
+    .with_swap_in(optional.swap_in())
+    .with_swap_out(optional.swap_out())
+    .with_major_faults(optional.major_faults())
+    .with_minor_faults(optional.minor_faults())
+    .with_free_memory(optional.free_memory())
+    .with_total_memory(optional.total_memory())
+    .with_available_memory(optional.available_memory())
+    .with_disk_caches(optional.disk_caches())
+    .with_hugetlb_allocations(optional.hugetlb_allocations())
+    .with_hugetlb_failures(optional.hugetlb_failures())
+    .with_oom_kill(optional.oom_kill())
+    .with_alloc_stall(optional.alloc_stall())
+    .with_async_scan(optional.async_scan())
+    .with_direct_scan(optional.direct_scan())
+    .with_async_reclaim(optional.async_reclaim())
+    .with_direct_reclaim(optional.direct_reclaim())
 }
 
 fn balloon_hinting_status_response_from_runtime(
@@ -1625,8 +1642,9 @@ mod tests {
 
     use bangbang_runtime::balloon::{
         BalloonConfig, BalloonHintingCommandError, BalloonHintingStartInput, BalloonHintingStatus,
-        BalloonHintingStatusError, BalloonStats, BalloonStatsError, BalloonUpdateError,
-        VIRTIO_BALLOON_FREE_PAGE_HINT_DONE, VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
+        BalloonHintingStatusError, BalloonOptionalStats, BalloonStats, BalloonStatsError,
+        BalloonUpdateError, VIRTIO_BALLOON_FREE_PAGE_HINT_DONE, VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
+        VIRTIO_BALLOON_S_MEMFREE, VIRTIO_BALLOON_S_SWAP_OUT, VirtioBalloonStat,
     };
     use bangbang_runtime::block::DriveUpdateError;
     use bangbang_runtime::logger::{LoggerConfigInput, LoggerWriteError};
@@ -1904,6 +1922,29 @@ mod tests {
             starter,
             mmds_data_store_limit_bytes,
         )
+    }
+
+    #[test]
+    fn balloon_stats_response_from_runtime_preserves_optional_stats() {
+        let mut optional = BalloonOptionalStats::default();
+        assert!(optional.record_stat(VirtioBalloonStat::new(VIRTIO_BALLOON_S_SWAP_OUT, 9,)));
+        assert!(optional.record_stat(VirtioBalloonStat::new(VIRTIO_BALLOON_S_MEMFREE, 0x5678,)));
+        let stats = BalloonStats::from_config_actual_pages_and_optional_stats(
+            BalloonConfigInput::new(4, false).into(),
+            513,
+            optional,
+        )
+        .expect("balloon stats should build");
+
+        let response = bangbang_api::http::HttpResponse::balloon_stats(
+            balloon_stats_response_from_runtime(stats),
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(response.body()).expect("balloon stats response should be JSON");
+
+        assert_eq!(body.get("swap_out"), Some(&serde_json::json!(9)));
+        assert_eq!(body.get("free_memory"), Some(&serde_json::json!(0x5678)));
+        assert_eq!(body.get("swap_in"), None);
     }
 
     #[test]
