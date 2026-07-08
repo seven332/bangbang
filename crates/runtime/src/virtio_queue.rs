@@ -376,6 +376,7 @@ pub struct VirtqueueAvailableRing {
     available_ring: GuestAddress,
     queue_size: u16,
     next_avail: u16,
+    can_undo_pop: bool,
     descriptor_chain_options: VirtqueueDescriptorChainOptions,
 }
 
@@ -404,6 +405,7 @@ impl VirtqueueAvailableRing {
             available_ring,
             queue_size,
             next_avail,
+            can_undo_pop: false,
             descriptor_chain_options: VirtqueueDescriptorChainOptions::new(),
         })
     }
@@ -500,8 +502,19 @@ impl VirtqueueAvailableRing {
         .map_err(|source| VirtqueueAvailableRingError::DescriptorChain { head_index, source })?;
 
         self.next_avail = self.next_avail.wrapping_add(1);
+        self.can_undo_pop = true;
 
         Ok(Some(chain))
+    }
+
+    pub(crate) fn undo_pop_descriptor_chain(&mut self) -> Result<(), VirtqueueAvailableRingError> {
+        if !self.can_undo_pop {
+            return Err(VirtqueueAvailableRingError::NoDescriptorChainToUndo);
+        }
+
+        self.next_avail = self.next_avail.wrapping_sub(1);
+        self.can_undo_pop = false;
+        Ok(())
     }
 }
 
@@ -772,6 +785,7 @@ pub enum VirtqueueAvailableRingError {
         head_index: u16,
         source: VirtqueueDescriptorChainError,
     },
+    NoDescriptorChainToUndo,
 }
 
 impl fmt::Display for VirtqueueAvailableRingError {
@@ -841,6 +855,9 @@ impl fmt::Display for VirtqueueAvailableRingError {
                     "failed to read virtqueue descriptor chain from available head {head_index}: {source}"
                 )
             }
+            Self::NoDescriptorChainToUndo => {
+                f.write_str("virtqueue available ring has no popped descriptor chain to undo")
+            }
         }
     }
 }
@@ -854,7 +871,8 @@ impl std::error::Error for VirtqueueAvailableRingError {
             | Self::UnalignedDescriptorTable { .. }
             | Self::UnalignedAvailableRing { .. }
             | Self::AvailableRingRangeOverflow { .. }
-            | Self::AvailableRingLengthTooLarge { .. } => None,
+            | Self::AvailableRingLengthTooLarge { .. }
+            | Self::NoDescriptorChainToUndo => None,
         }
     }
 }
@@ -2002,6 +2020,69 @@ mod tests {
         assert_eq!(chain.descriptors()[0].index(), 2);
         assert_eq!(chain.descriptors()[0].address(), GuestAddress::new(0x3000));
         assert_eq!(queue.next_avail(), 1);
+    }
+
+    #[test]
+    fn undo_pop_descriptor_chain_rewinds_next_avail() {
+        let mut memory = guest_memory(0x4000);
+        write_descriptor(&mut memory, TABLE, 2, 0x3000, 0x40, 0, 0);
+        write_available_index(&mut memory, AVAIL, 1);
+        write_available_head(&mut memory, AVAIL, 0, 2);
+        let mut queue =
+            VirtqueueAvailableRing::new(TABLE, AVAIL, 8).expect("available ring should be valid");
+
+        queue
+            .pop_descriptor_chain(&memory)
+            .expect("available descriptor chain should pop")
+            .expect("available ring should contain one head");
+        queue
+            .undo_pop_descriptor_chain()
+            .expect("popped descriptor chain should undo");
+        let chain = queue
+            .pop_descriptor_chain(&memory)
+            .expect("rewound descriptor chain should pop")
+            .expect("available ring should contain the rewound head");
+
+        assert_eq!(queue.next_avail(), 1);
+        assert_eq!(chain.descriptors()[0].index(), 2);
+    }
+
+    #[test]
+    fn undo_pop_descriptor_chain_rejects_empty_history() {
+        let mut queue =
+            VirtqueueAvailableRing::new(TABLE, AVAIL, 8).expect("available ring should be valid");
+
+        let err = queue
+            .undo_pop_descriptor_chain()
+            .expect_err("empty available ring history should not undo");
+
+        assert!(matches!(
+            err,
+            VirtqueueAvailableRingError::NoDescriptorChainToUndo
+        ));
+        assert_eq!(queue.next_avail(), 0);
+    }
+
+    #[test]
+    fn undo_pop_descriptor_chain_handles_next_avail_wraparound() {
+        let mut memory = guest_memory(0x4000);
+        write_descriptor(&mut memory, TABLE, 2, 0x3000, 0x40, 0, 0);
+        write_available_index(&mut memory, AVAIL, 0);
+        write_available_head(&mut memory, AVAIL, 7, 2);
+        let mut queue = VirtqueueAvailableRing::with_next_avail(TABLE, AVAIL, 8, u16::MAX)
+            .expect("available ring should be valid");
+
+        queue
+            .pop_descriptor_chain(&memory)
+            .expect("wrapped descriptor chain should pop")
+            .expect("available ring should contain one wrapped head");
+        assert_eq!(queue.next_avail(), 0);
+
+        queue
+            .undo_pop_descriptor_chain()
+            .expect("wrapped pop should undo");
+
+        assert_eq!(queue.next_avail(), u16::MAX);
     }
 
     #[test]

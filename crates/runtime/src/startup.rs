@@ -1429,7 +1429,7 @@ impl Arm64BootRuntimeResources {
             let region_id = device.registration.region_id();
             let outcome = match mmio_dispatcher.handler_mut::<VirtioRngMmioHandler>(region_id) {
                 Ok(handler) => {
-                    if handler.has_pending_queue_notifications() {
+                    if handler.has_pending_rng_queue_work() {
                         match entropy_source.entropy_source(&device) {
                             Ok(source) => match handler
                                 .dispatch_rng_queue_notifications(memory, source.into_inner())
@@ -2091,11 +2091,13 @@ impl Arm64BootResources {
         };
         let entropy_device = match entropy_device {
             Some(config) => {
-                let entropy_mmio = PreparedEntropyDevice::new()
-                    .register_mmio_with_dispatcher(config.mmio_layout, mmio_dispatcher)
-                    .map_err(|source| Arm64BootResourceError::RegisterEntropyMmio {
-                        source: Box::new(source),
-                    })?;
+                let entropy_mmio = PreparedEntropyDevice::from_config(
+                    controller.entropy_config().unwrap_or_default(),
+                )
+                .register_mmio_with_dispatcher(config.mmio_layout, mmio_dispatcher)
+                .map_err(|source| Arm64BootResourceError::RegisterEntropyMmio {
+                    source: Box::new(source),
+                })?;
                 let (dispatcher, registration) = entropy_mmio.into_parts();
                 mmio_dispatcher = dispatcher;
                 let (device, fdt_device) =

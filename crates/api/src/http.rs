@@ -488,7 +488,7 @@ struct LoggerConfigRequestBody {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SerialConfigRequest {
     serial_out_path: Option<String>,
-    rate_limiter: Option<SerialRateLimiterRequest>,
+    rate_limiter: Option<TokenBucketRequest>,
 }
 
 impl SerialConfigRequest {
@@ -496,19 +496,21 @@ impl SerialConfigRequest {
         self.serial_out_path.as_deref()
     }
 
-    pub const fn rate_limiter(&self) -> Option<SerialRateLimiterRequest> {
+    pub const fn rate_limiter(&self) -> Option<TokenBucketRequest> {
         self.rate_limiter
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SerialRateLimiterRequest {
+pub struct TokenBucketRequest {
     size: u64,
     one_time_burst: Option<u64>,
     refill_time: u64,
 }
 
-impl SerialRateLimiterRequest {
+pub type SerialRateLimiterRequest = TokenBucketRequest;
+
+impl TokenBucketRequest {
     pub const fn new(size: u64, one_time_burst: Option<u64>, refill_time: u64) -> Self {
         Self {
             size,
@@ -532,12 +534,39 @@ impl SerialRateLimiterRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntropyConfigRequest {
-    rate_limiter_configured: bool,
+    rate_limiter: Option<EntropyRateLimiterRequest>,
 }
 
 impl EntropyConfigRequest {
+    pub const fn rate_limiter(&self) -> Option<EntropyRateLimiterRequest> {
+        self.rate_limiter
+    }
+
     pub const fn rate_limiter_configured(&self) -> bool {
-        self.rate_limiter_configured
+        self.rate_limiter.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntropyRateLimiterRequest {
+    bandwidth: Option<TokenBucketRequest>,
+    ops: Option<TokenBucketRequest>,
+}
+
+impl EntropyRateLimiterRequest {
+    pub const fn new(
+        bandwidth: Option<TokenBucketRequest>,
+        ops: Option<TokenBucketRequest>,
+    ) -> Self {
+        Self { bandwidth, ops }
+    }
+
+    pub const fn bandwidth(self) -> Option<TokenBucketRequest> {
+        self.bandwidth
+    }
+
+    pub const fn ops(self) -> Option<TokenBucketRequest> {
+        self.ops
     }
 }
 
@@ -1595,11 +1624,22 @@ impl BalloonHintingStartRequest {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct EntropyConfigResponse;
+pub struct EntropyConfigResponse {
+    rate_limiter: Option<EntropyRateLimiterRequest>,
+}
 
 impl EntropyConfigResponse {
     pub const fn new() -> Self {
-        Self
+        Self { rate_limiter: None }
+    }
+
+    pub const fn with_rate_limiter(mut self, rate_limiter: EntropyRateLimiterRequest) -> Self {
+        self.rate_limiter = Some(rate_limiter);
+        self
+    }
+
+    pub const fn rate_limiter(self) -> Option<EntropyRateLimiterRequest> {
+        self.rate_limiter
     }
 }
 
@@ -2192,8 +2232,55 @@ fn pmem_config_response_value(pmem: &PmemConfigResponse) -> serde_json::Value {
     })
 }
 
-fn entropy_config_response_value(_entropy: &EntropyConfigResponse) -> serde_json::Value {
-    serde_json::Value::Object(serde_json::Map::new())
+fn entropy_config_response_value(entropy: &EntropyConfigResponse) -> serde_json::Value {
+    let mut value = serde_json::Map::new();
+    if let Some(rate_limiter) = entropy.rate_limiter() {
+        value.insert(
+            "rate_limiter".to_string(),
+            entropy_rate_limiter_response_value(rate_limiter),
+        );
+    }
+    serde_json::Value::Object(value)
+}
+
+fn entropy_rate_limiter_response_value(
+    rate_limiter: EntropyRateLimiterRequest,
+) -> serde_json::Value {
+    let mut value = serde_json::Map::new();
+    if let Some(bandwidth) = rate_limiter.bandwidth() {
+        value.insert(
+            RATE_LIMITER_BANDWIDTH_FIELD.to_string(),
+            token_bucket_response_value(bandwidth),
+        );
+    }
+    if let Some(ops) = rate_limiter.ops() {
+        value.insert(
+            RATE_LIMITER_OPS_FIELD.to_string(),
+            token_bucket_response_value(ops),
+        );
+    }
+    serde_json::Value::Object(value)
+}
+
+fn token_bucket_response_value(bucket: TokenBucketRequest) -> serde_json::Value {
+    let mut value = serde_json::Map::new();
+    value.insert(
+        TOKEN_BUCKET_SIZE_FIELD.to_string(),
+        serde_json::Value::Number(bucket.size().into()),
+    );
+    value.insert(
+        TOKEN_BUCKET_ONE_TIME_BURST_FIELD.to_string(),
+        bucket
+            .one_time_burst()
+            .map_or(serde_json::Value::Null, |burst| {
+                serde_json::Value::Number(burst.into())
+            }),
+    );
+    value.insert(
+        TOKEN_BUCKET_REFILL_TIME_FIELD.to_string(),
+        serde_json::Value::Number(bucket.refill_time().into()),
+    );
+    serde_json::Value::Object(value)
 }
 
 fn balloon_config_response_value(balloon: &BalloonConfigResponse) -> serde_json::Value {
@@ -2710,16 +2797,10 @@ fn parse_serial_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> 
 fn parse_entropy_config_request(body: &[u8]) -> Result<ApiRequest, RequestError> {
     let body = serde_json::from_slice::<EntropyDeviceConfigRequestBody>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
-    let rate_limiter_configured = match &body.rate_limiter {
-        Some(rate_limiter) => {
-            validate_rate_limiter_config(rate_limiter.as_value())?;
-            rate_limiter_configured(rate_limiter.as_value())?
-        }
-        None => false,
-    };
+    let rate_limiter = parse_entropy_rate_limiter(body.rate_limiter.as_ref())?;
 
     Ok(ApiRequest::PutEntropy(Box::new(EntropyConfigRequest {
-        rate_limiter_configured,
+        rate_limiter,
     })))
 }
 
@@ -3209,7 +3290,7 @@ fn rate_limiter_configured(value: &serde_json::Value) -> Result<bool, RequestErr
 
 fn parse_serial_token_bucket(
     value: Option<&JsonValueWithoutDuplicateObjectKeys>,
-) -> Result<Option<SerialRateLimiterRequest>, RequestError> {
+) -> Result<Option<TokenBucketRequest>, RequestError> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -3219,7 +3300,50 @@ fn parse_serial_token_bucket(
         .ok_or(RequestError::MalformedRequest)?;
     validate_token_bucket_object(bucket)?;
 
-    Ok(Some(SerialRateLimiterRequest::new(
+    Ok(Some(TokenBucketRequest::new(
+        require_u64_field(bucket, TOKEN_BUCKET_SIZE_FIELD)?,
+        optional_u64_field(bucket, TOKEN_BUCKET_ONE_TIME_BURST_FIELD)?,
+        require_u64_field(bucket, TOKEN_BUCKET_REFILL_TIME_FIELD)?,
+    )))
+}
+
+fn parse_entropy_rate_limiter(
+    value: Option<&JsonValueWithoutDuplicateObjectKeys>,
+) -> Result<Option<EntropyRateLimiterRequest>, RequestError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let rate_limiter = value
+        .as_value()
+        .as_object()
+        .ok_or(RequestError::MalformedRequest)?;
+    validate_rate_limiter_config(value.as_value())?;
+
+    let bandwidth =
+        parse_optional_rate_limiter_bucket(rate_limiter.get(RATE_LIMITER_BANDWIDTH_FIELD))?;
+    let ops = parse_optional_rate_limiter_bucket(rate_limiter.get(RATE_LIMITER_OPS_FIELD))?;
+
+    if bandwidth.is_none() && ops.is_none() {
+        Ok(None)
+    } else {
+        Ok(Some(EntropyRateLimiterRequest::new(bandwidth, ops)))
+    }
+}
+
+fn parse_optional_rate_limiter_bucket(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<TokenBucketRequest>, RequestError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+
+    let bucket = value.as_object().ok_or(RequestError::MalformedRequest)?;
+    validate_token_bucket_object(bucket)?;
+
+    Ok(Some(TokenBucketRequest::new(
         require_u64_field(bucket, TOKEN_BUCKET_SIZE_FIELD)?,
         optional_u64_field(bucket, TOKEN_BUCKET_ONE_TIME_BURST_FIELD)?,
         require_u64_field(bucket, TOKEN_BUCKET_REFILL_TIME_FIELD)?,
@@ -6052,15 +6176,34 @@ mod tests {
             let ApiRequest::PutEntropy(config) = parsed else {
                 panic!("expected entropy config request");
             };
-            assert!(!config.rate_limiter_configured(), "{body}");
+            assert_eq!(config.rate_limiter(), None, "{body}");
         }
     }
 
     #[test]
-    fn parses_entropy_config_with_configured_rate_limiter_marker() {
-        for body in [
-            r#"{"rate_limiter":{"bandwidth":{"size":100,"one_time_burst":null,"refill_time":1000}}}"#,
-            r#"{"rate_limiter":{"ops":{"size":100,"one_time_burst":200,"refill_time":1000}}}"#,
+    fn parses_entropy_config_with_configured_rate_limiter_buckets() {
+        for (body, expected) in [
+            (
+                r#"{"rate_limiter":{"bandwidth":{"size":100,"one_time_burst":null,"refill_time":1000}}}"#,
+                EntropyRateLimiterRequest::new(
+                    Some(TokenBucketRequest::new(100, None, 1000)),
+                    None,
+                ),
+            ),
+            (
+                r#"{"rate_limiter":{"ops":{"size":100,"one_time_burst":200,"refill_time":1000}}}"#,
+                EntropyRateLimiterRequest::new(
+                    None,
+                    Some(TokenBucketRequest::new(100, Some(200), 1000)),
+                ),
+            ),
+            (
+                r#"{"rate_limiter":{"bandwidth":{"size":1,"one_time_burst":2,"refill_time":3},"ops":{"size":4,"one_time_burst":null,"refill_time":5}}}"#,
+                EntropyRateLimiterRequest::new(
+                    Some(TokenBucketRequest::new(1, Some(2), 3)),
+                    Some(TokenBucketRequest::new(4, None, 5)),
+                ),
+            ),
         ] {
             let request = request_with_body("PUT", "/entropy", body);
 
@@ -6069,7 +6212,7 @@ mod tests {
             let ApiRequest::PutEntropy(config) = parsed else {
                 panic!("expected entropy config request");
             };
-            assert!(config.rate_limiter_configured(), "{body}");
+            assert_eq!(config.rate_limiter(), Some(expected), "{body}");
         }
     }
 

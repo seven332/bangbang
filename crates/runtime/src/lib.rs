@@ -19,6 +19,7 @@ pub mod pmem;
 pub mod rtc;
 pub mod serial;
 pub mod startup;
+pub(crate) mod token_bucket;
 pub mod virtio_mmio;
 pub mod virtio_queue;
 pub mod vsock;
@@ -1038,13 +1039,9 @@ impl VmmController {
                         state: self.instance_info.state,
                     });
                 }
-                if config.rate_limiter_configured() {
-                    return Err(VmmActionError::EntropyConfig(
-                        entropy::EntropyConfigError::UnsupportedRateLimiter,
-                    ));
-                }
+                let config = config.validate().map_err(VmmActionError::EntropyConfig)?;
 
-                self.entropy_config = Some(entropy::EntropyConfig::new());
+                self.entropy_config = Some(config);
                 Ok(VmmData::Empty)
             }
             VmmAction::PutMemoryHotplug(config) => {
@@ -1399,7 +1396,9 @@ mod tests {
             BootCommandLineError, BootPayloadKind, BootSourceConfigError, BootSourceConfigInput,
         },
         cpu::CpuConfigInput,
-        entropy::{EntropyConfig, EntropyConfigError, EntropyConfigInput},
+        entropy::{
+            EntropyConfig, EntropyConfigInput, EntropyRateLimiterConfig, EntropyTokenBucketConfig,
+        },
         logger::{LoggerConfigError, LoggerConfigInput, LoggerLevel, LoggerWriteError},
         machine::{
             DEFAULT_MEM_SIZE_MIB, DEFAULT_VCPU_COUNT, MAX_MEM_SIZE_MIB, MachineConfigError,
@@ -1444,6 +1443,13 @@ mod tests {
 
     fn serial_input(serial_out_path: &str) -> SerialConfigInput {
         SerialConfigInput::new().with_serial_out_path(serial_out_path)
+    }
+
+    const fn entropy_rate_limiter_input() -> EntropyConfigInput {
+        EntropyConfigInput::new().with_rate_limiter(EntropyRateLimiterConfig::new(
+            Some(EntropyTokenBucketConfig::new(1, None, 100)),
+            None,
+        ))
     }
 
     fn balloon_input(amount_mib: u32, deflate_on_oom: bool) -> BalloonConfigInput {
@@ -2556,7 +2562,7 @@ mod tests {
     }
 
     #[test]
-    fn put_entropy_rejects_rate_limiter_before_start_without_mutating() {
+    fn put_entropy_stores_rate_limiter_before_start() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         controller
             .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
@@ -2565,19 +2571,19 @@ mod tests {
             .handle_action(VmmAction::PutEntropy(EntropyConfigInput::new()))
             .expect("initial entropy config should be stored");
 
-        let err = controller
-            .handle_action(VmmAction::PutEntropy(
-                EntropyConfigInput::new().with_rate_limiter_configured(),
-            ))
-            .expect_err("entropy rate limiter should remain unsupported");
+        let data = controller
+            .handle_action(VmmAction::PutEntropy(entropy_rate_limiter_input()))
+            .expect("entropy rate limiter should be stored");
 
-        assert_eq!(
-            err,
-            VmmActionError::EntropyConfig(EntropyConfigError::UnsupportedRateLimiter)
-        );
+        let expected_limiter =
+            EntropyRateLimiterConfig::new(Some(EntropyTokenBucketConfig::new(1, None, 100)), None);
+        assert_eq!(data, VmmData::Empty);
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
         assert!(controller.boot_source_config().is_some());
-        assert_eq!(controller.entropy_config(), Some(EntropyConfig::new()));
+        assert_eq!(
+            controller.entropy_config(),
+            Some(EntropyConfig::new().with_rate_limiter(expected_limiter))
+        );
         assert!(controller.drive_configs().is_empty());
         assert!(controller.network_interface_configs().is_empty());
     }
@@ -2595,9 +2601,7 @@ mod tests {
             controller.instance_info.state = state;
 
             let err = controller
-                .handle_action(VmmAction::PutEntropy(
-                    EntropyConfigInput::new().with_rate_limiter_configured(),
-                ))
+                .handle_action(VmmAction::PutEntropy(entropy_rate_limiter_input()))
                 .expect_err("entropy should be pre-boot-only");
 
             assert_eq!(
@@ -5633,14 +5637,6 @@ mod tests {
 
         assert_eq!(err.to_string(), "Entropy device is not supported.");
         assert!(err.source().is_none());
-    }
-
-    #[test]
-    fn displays_entropy_config_error() {
-        let err = VmmActionError::EntropyConfig(EntropyConfigError::UnsupportedRateLimiter);
-
-        assert_eq!(err.to_string(), "entropy rate_limiter is not supported");
-        assert!(err.source().is_some());
     }
 
     #[test]
