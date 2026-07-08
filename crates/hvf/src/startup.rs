@@ -6845,12 +6845,16 @@ mod tests {
 
         super::record_block_dispatch_metrics(&metrics, &result);
 
+        let aggregate = metrics.aggregate_snapshot();
+        let read_agg = aggregate.read_agg();
+        assert!(!read_agg.is_empty());
         assert_eq!(
-            metrics.aggregate_snapshot(),
+            aggregate,
             BlockDeviceMetrics::default()
                 .with_queue_event_count(1)
                 .with_read_bytes(VIRTIO_BLOCK_SECTOR_SIZE)
                 .with_read_count(1)
+                .with_read_agg(read_agg)
         );
         assert_eq!(
             metrics.per_drive_snapshot(),
@@ -6859,7 +6863,8 @@ mod tests {
                 BlockDeviceMetrics::default()
                     .with_queue_event_count(1)
                     .with_read_bytes(VIRTIO_BLOCK_SECTOR_SIZE)
-                    .with_read_count(1),
+                    .with_read_count(1)
+                    .with_read_agg(read_agg),
             )
         );
     }
@@ -6916,13 +6921,17 @@ mod tests {
 
         super::record_block_dispatch_metrics(&metrics, &result);
 
+        let aggregate = metrics.aggregate_snapshot();
+        let read_agg = aggregate.read_agg();
+        assert!(!read_agg.is_empty());
         assert_eq!(
-            metrics.aggregate_snapshot(),
+            aggregate,
             BlockDeviceMetrics::default()
                 .with_event_fails(1)
                 .with_queue_event_count(1)
                 .with_read_bytes(VIRTIO_BLOCK_SECTOR_SIZE)
                 .with_read_count(1)
+                .with_read_agg(read_agg)
         );
         assert_eq!(
             metrics.per_drive_snapshot(),
@@ -6932,7 +6941,8 @@ mod tests {
                     .with_event_fails(1)
                     .with_queue_event_count(1)
                     .with_read_bytes(VIRTIO_BLOCK_SECTOR_SIZE)
-                    .with_read_count(1),
+                    .with_read_count(1)
+                    .with_read_agg(read_agg),
             )
         );
     }
