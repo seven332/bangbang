@@ -193,6 +193,8 @@ failures; top-level aggregate `net` and non-empty per-interface
 packet counts, byte counts, and failures; a top-level `vsock` object for
 implemented virtio-vsock RX/TX queue activity, packet counts, byte counts,
 connection cleanup counters, and classifiable queue/event failures; a
+top-level `entropy` object with Firecracker-shaped counters for implemented
+virtio-rng request, byte, host-randomness failure, and event-failure activity; a
 top-level `uart` object with Firecracker-shaped serial counters for implemented
 TX writes, missed writes, output errors, and rate-limiter drops; plus a
 top-level `balloon` object for implemented virtio-balloon activity and

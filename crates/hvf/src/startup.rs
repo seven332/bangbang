@@ -21,7 +21,7 @@ use bangbang_runtime::interrupt::{
 };
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
 use bangbang_runtime::metrics::{
-    SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry,
+    SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
     SharedNetworkInterfaceMetricsRegistry, SharedVsockDeviceMetrics,
 };
 use bangbang_runtime::mmio::{MmioDispatcher, MmioRegionId};
@@ -190,6 +190,7 @@ pub struct HvfArm64BootSession<'vm> {
     balloon_device_metrics: SharedBalloonDeviceMetrics,
     network_interface_metrics: SharedNetworkInterfaceMetricsRegistry,
     vsock_device_metrics: SharedVsockDeviceMetrics,
+    entropy_device_metrics: SharedEntropyDeviceMetrics,
     gic: HvfGicMetadata,
     primary_mpidr: u64,
     block_interrupt_lines: Vec<GuestInterruptLine>,
@@ -215,6 +216,7 @@ pub struct OwnedHvfArm64BootSession {
     balloon_device_metrics: SharedBalloonDeviceMetrics,
     network_interface_metrics: SharedNetworkInterfaceMetricsRegistry,
     vsock_device_metrics: SharedVsockDeviceMetrics,
+    entropy_device_metrics: SharedEntropyDeviceMetrics,
     gic: HvfGicMetadata,
     primary_mpidr: u64,
     block_interrupt_lines: Vec<GuestInterruptLine>,
@@ -588,6 +590,10 @@ impl HvfArm64BootSession<'_> {
         self.vsock_device_metrics.clone()
     }
 
+    pub fn shared_entropy_device_metrics(&self) -> SharedEntropyDeviceMetrics {
+        self.entropy_device_metrics.clone()
+    }
+
     /// Return a cloned handle to the runner-compatible MMIO dispatcher.
     ///
     /// The dispatcher is local to this boot session. It is shared only so
@@ -936,6 +942,7 @@ impl HvfArm64BootSession<'_> {
             &self.mmio_dispatcher,
             &mut self.runtime_resources,
             &self.gic,
+            &self.entropy_device_metrics,
             entropy_source,
         )
     }
@@ -974,6 +981,7 @@ impl OwnedHvfArm64BootSession {
             balloon_device_metrics: prepared.balloon_device_metrics,
             network_interface_metrics: prepared.network_interface_metrics,
             vsock_device_metrics: prepared.vsock_device_metrics,
+            entropy_device_metrics: prepared.entropy_device_metrics,
             gic: prepared.gic,
             primary_mpidr: prepared.primary_mpidr,
             block_interrupt_lines: prepared.block_interrupt_lines,
@@ -1024,6 +1032,10 @@ impl OwnedHvfArm64BootSession {
 
     pub fn shared_vsock_device_metrics(&self) -> SharedVsockDeviceMetrics {
         self.vsock_device_metrics.clone()
+    }
+
+    pub fn shared_entropy_device_metrics(&self) -> SharedEntropyDeviceMetrics {
+        self.entropy_device_metrics.clone()
     }
 
     /// Return a cloned handle to the runner-compatible MMIO dispatcher.
@@ -1361,6 +1373,7 @@ impl OwnedHvfArm64BootSession {
             &self.mmio_dispatcher,
             &mut self.runtime_resources,
             &self.gic,
+            &self.entropy_device_metrics,
             entropy_source,
         )
     }
@@ -1445,6 +1458,7 @@ impl BootSessionRunLoopSession for OwnedHvfArm64BootSession {
             &self.mmio_dispatcher,
             &mut self.runtime_resources,
             &self.gic,
+            &self.entropy_device_metrics,
             &mut self.entropy_source,
         )
     }
@@ -1554,6 +1568,7 @@ where
             &self.session.mmio_dispatcher,
             &mut self.session.runtime_resources,
             &self.session.gic,
+            &self.session.entropy_device_metrics,
             &mut self.session.entropy_source,
         )
     }
@@ -2522,6 +2537,7 @@ impl BootSessionRunLoopSession for HvfArm64BootSession<'_> {
             &self.mmio_dispatcher,
             &mut self.runtime_resources,
             &self.gic,
+            &self.entropy_device_metrics,
             &mut self.entropy_source,
         )
     }
@@ -3390,11 +3406,56 @@ fn balloon_update_result_from_hvf_dispatches(
     Ok(())
 }
 
+#[cfg(test)]
+fn record_entropy_dispatch_metrics(
+    metrics: &SharedEntropyDeviceMetrics,
+    dispatches: &HvfArm64BootEntropyNotificationDispatches,
+) {
+    let runtime_dispatches = dispatches
+        .as_slice()
+        .iter()
+        .map(HvfArm64BootEntropyNotificationDispatch::dispatch);
+    record_entropy_runtime_dispatch_metrics(metrics, runtime_dispatches);
+    record_entropy_signal_metrics(metrics, dispatches);
+}
+
+fn record_entropy_runtime_dispatch_metrics<'a>(
+    metrics: &SharedEntropyDeviceMetrics,
+    dispatches: impl IntoIterator<Item = &'a Arm64BootEntropyNotificationDispatch>,
+) {
+    for dispatch in dispatches {
+        if let Some(dispatched) = dispatch.outcome().dispatched() {
+            metrics.record_notification_dispatch(dispatched);
+        }
+        if let Some(source) = dispatch.outcome().dispatch_error() {
+            metrics.record_notification_error(source);
+        }
+        if dispatch.outcome().handler_lookup_error().is_some() {
+            metrics.record_event_failure();
+        }
+        if dispatch.outcome().entropy_source_error().is_some() {
+            metrics.record_entropy_source_provider_failure();
+        }
+    }
+}
+
+fn record_entropy_signal_metrics(
+    metrics: &SharedEntropyDeviceMetrics,
+    dispatches: &HvfArm64BootEntropyNotificationDispatches,
+) {
+    for dispatch in dispatches.as_slice() {
+        if dispatch.signal_error().is_some() {
+            metrics.record_event_failure();
+        }
+    }
+}
+
 fn dispatch_entropy_queue_notifications_and_signal_interrupts_with_source(
     backend: &mut HvfBackend,
     dispatcher: &Arc<Mutex<MmioDispatcher>>,
     runtime_resources: &mut Arm64BootRuntimeResources,
     gic: &HvfGicMetadata,
+    metrics: &SharedEntropyDeviceMetrics,
     entropy_source: &mut impl Arm64BootEntropySourceProvider,
 ) -> Result<HvfArm64BootEntropyNotificationDispatches, HvfArm64BootEntropyNotificationDispatchError>
 {
@@ -3414,7 +3475,13 @@ fn dispatch_entropy_queue_notifications_and_signal_interrupts_with_source(
         )?
     };
 
-    collect_or_signal_entropy_queue_interrupts(dispatches, gic)
+    record_entropy_runtime_dispatch_metrics(metrics, dispatches.as_slice());
+    let result = collect_or_signal_entropy_queue_interrupts(dispatches, gic);
+    match &result {
+        Ok(dispatches) => record_entropy_signal_metrics(metrics, dispatches),
+        Err(_) => metrics.record_event_failure(),
+    }
+    result
 }
 
 fn dispatch_entropy_runtime_notifications_with_source(
@@ -3807,6 +3874,7 @@ struct PreparedHvfArm64BootSession<'vm> {
     balloon_device_metrics: SharedBalloonDeviceMetrics,
     network_interface_metrics: SharedNetworkInterfaceMetricsRegistry,
     vsock_device_metrics: SharedVsockDeviceMetrics,
+    entropy_device_metrics: SharedEntropyDeviceMetrics,
     gic: HvfGicMetadata,
     primary_mpidr: u64,
     block_interrupt_lines: Vec<GuestInterruptLine>,
@@ -3871,6 +3939,7 @@ impl HvfBackend {
             balloon_device_metrics: prepared.balloon_device_metrics,
             network_interface_metrics: prepared.network_interface_metrics,
             vsock_device_metrics: prepared.vsock_device_metrics,
+            entropy_device_metrics: prepared.entropy_device_metrics,
             gic: prepared.gic,
             primary_mpidr: prepared.primary_mpidr,
             block_interrupt_lines: prepared.block_interrupt_lines,
@@ -3998,6 +4067,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
         balloon_device_metrics: SharedBalloonDeviceMetrics::default(),
         network_interface_metrics,
         vsock_device_metrics: SharedVsockDeviceMetrics::default(),
+        entropy_device_metrics: SharedEntropyDeviceMetrics::default(),
         gic,
         primary_mpidr,
         block_interrupt_lines: interrupt_lines.block,
@@ -4159,10 +4229,10 @@ mod tests {
     use bangbang_runtime::machine::MachineConfigInput;
     use bangbang_runtime::memory::{GuestAddress, GuestMemory};
     use bangbang_runtime::metrics::{
-        BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive,
+        BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive, EntropyDeviceMetrics,
         NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface, SharedBalloonDeviceMetrics,
-        SharedBlockDeviceMetricsRegistry, SharedNetworkInterfaceMetricsRegistry,
-        SharedVsockDeviceMetrics, VsockDeviceMetrics,
+        SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
+        SharedNetworkInterfaceMetricsRegistry, SharedVsockDeviceMetrics, VsockDeviceMetrics,
     };
     use bangbang_runtime::mmio::{
         MmioAccess, MmioAccessBytes, MmioDispatchOutcome, MmioDispatcher, MmioHandler,
@@ -4212,9 +4282,10 @@ mod tests {
         collect_entropy_notification_dispatches, collect_network_notification_dispatches,
         collect_vsock_notification_dispatches,
         dispatch_network_runtime_notifications_with_packet_io, lock_boot_mmio_dispatcher,
-        run_boot_session_loop, run_boot_session_vcpu_step, signal_balloon_queue_interrupts,
-        signal_block_queue_interrupts, signal_entropy_queue_interrupts,
-        signal_network_queue_interrupts, signal_vsock_queue_interrupts, validate_single_vcpu,
+        record_entropy_dispatch_metrics, run_boot_session_loop, run_boot_session_vcpu_step,
+        signal_balloon_queue_interrupts, signal_block_queue_interrupts,
+        signal_entropy_queue_interrupts, signal_network_queue_interrupts,
+        signal_vsock_queue_interrupts, validate_single_vcpu,
     };
     use crate::exit::{
         HvfExceptionExit, HvfHvcExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
@@ -7347,6 +7418,36 @@ mod tests {
                 VirtioMmioRegister::InterruptStatus,
             ),
             DeviceInterruptKind::Queue.status().bits()
+        );
+    }
+
+    #[test]
+    fn entropy_metrics_record_signal_failure() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_with_entropy();
+        configure_boot_entropy_queue(&mut runtime, &mut mmio_dispatcher, TEST_USED_RING);
+        write_entropy_request(&mut memory, 16);
+        notify_boot_entropy_queue(&mut runtime, &mut mmio_dispatcher);
+        let mut provider = RecordingEntropySourceProvider::default();
+        let dispatches = dispatch_boot_entropy_notifications(
+            &mut memory,
+            &mut runtime,
+            &mut mmio_dispatcher,
+            &mut provider,
+        );
+        let (lines, sink) = RecordingSink::failing("injected entropy signal failure");
+        let result = signal_entropy_queue_interrupts(dispatches, sink.as_ref())
+            .expect("entropy signal failure should stay per-device");
+        let metrics = SharedEntropyDeviceMetrics::default();
+
+        record_entropy_dispatch_metrics(&metrics, &result);
+
+        assert_eq!(recorded_lines(&lines), vec![32]);
+        assert_eq!(
+            metrics.snapshot(),
+            EntropyDeviceMetrics::default()
+                .with_entropy_event_fails(1)
+                .with_entropy_event_count(1)
+                .with_entropy_bytes(16)
         );
     }
 

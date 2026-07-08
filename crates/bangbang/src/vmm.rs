@@ -34,8 +34,8 @@ use bangbang_runtime::memory::{GuestAddress, GuestMemory};
 use bangbang_runtime::memory_hotplug::{MemoryHotplugConfigInput, MemoryHotplugSizeUpdateInput};
 use bangbang_runtime::metrics::{
     BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics, SharedBalloonDeviceMetrics,
-    SharedBlockDeviceMetricsRegistry, SharedNetworkInterfaceMetricsRegistry,
-    SharedVsockDeviceMetrics,
+    SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
+    SharedNetworkInterfaceMetricsRegistry, SharedVsockDeviceMetrics,
 };
 use bangbang_runtime::mmds::{
     MmdsConfig, MmdsConfigInput, MmdsContentInput, MmdsStateHandle, MmdsStateLockError,
@@ -1889,6 +1889,10 @@ pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
         None
     }
 
+    fn shared_entropy_device_metrics(&self) -> Option<SharedEntropyDeviceMetrics> {
+        None
+    }
+
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
         Err(BalloonUpdateError::ActiveSessionUnavailable)
     }
@@ -1946,6 +1950,12 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
 
     fn shared_vsock_device_metrics(&self) -> Option<SharedVsockDeviceMetrics> {
         Some(OwnedHvfArm64BootSession::shared_vsock_device_metrics(self))
+    }
+
+    fn shared_entropy_device_metrics(&self) -> Option<SharedEntropyDeviceMetrics> {
+        Some(OwnedHvfArm64BootSession::shared_entropy_device_metrics(
+            self,
+        ))
     }
 
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
@@ -2034,6 +2044,10 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
         None
     }
 
+    fn shared_entropy_device_metrics(&self) -> Option<SharedEntropyDeviceMetrics> {
+        None
+    }
+
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
         Err(BalloonUpdateError::ActiveSessionUnavailable)
     }
@@ -2088,6 +2102,12 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
 
     fn shared_vsock_device_metrics(&self) -> Option<SharedVsockDeviceMetrics> {
         Some(OwnedHvfArm64BootSession::shared_vsock_device_metrics(self))
+    }
+
+    fn shared_entropy_device_metrics(&self) -> Option<SharedEntropyDeviceMetrics> {
+        Some(OwnedHvfArm64BootSession::shared_entropy_device_metrics(
+            self,
+        ))
     }
 
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
@@ -2146,6 +2166,10 @@ where
 
     fn shared_vsock_device_metrics(&self) -> Option<SharedVsockDeviceMetrics> {
         self.session.shared_vsock_device_metrics()
+    }
+
+    fn shared_entropy_device_metrics(&self) -> Option<SharedEntropyDeviceMetrics> {
+        self.session.shared_entropy_device_metrics()
     }
 
     fn trigger_balloon_statistics_update(&mut self) -> Result<(), BalloonUpdateError> {
@@ -2598,6 +2622,7 @@ where
     balloon_device_metrics: Option<SharedBalloonDeviceMetrics>,
     network_interface_metrics: Option<SharedNetworkInterfaceMetricsRegistry>,
     vsock_device_metrics: Option<SharedVsockDeviceMetrics>,
+    entropy_device_metrics: Option<SharedEntropyDeviceMetrics>,
     command_handle: BootRunLoopCommandHandle<S>,
     status: Arc<BootRunLoopWorkerStatusCell<S::Outcome>>,
     pause_gate: Arc<BootRunLoopPauseGate>,
@@ -2630,6 +2655,7 @@ where
         let balloon_device_metrics = session.shared_balloon_device_metrics();
         let network_interface_metrics = session.shared_network_interface_metrics();
         let vsock_device_metrics = session.shared_vsock_device_metrics();
+        let entropy_device_metrics = session.shared_entropy_device_metrics();
         let stop_token = control.stop_token();
         let status = Arc::new(BootRunLoopWorkerStatusCell::new());
         let worker_status = Arc::clone(&status);
@@ -2714,6 +2740,7 @@ where
             balloon_device_metrics,
             network_interface_metrics,
             vsock_device_metrics,
+            entropy_device_metrics,
             command_handle,
             status,
             pause_gate,
@@ -2842,6 +2869,9 @@ where
         }
         if let Some(metrics) = &self.vsock_device_metrics {
             diagnostics = diagnostics.with_vsock_device_metrics(metrics.snapshot());
+        }
+        if let Some(metrics) = &self.entropy_device_metrics {
+            diagnostics = diagnostics.with_entropy_device_metrics(metrics.snapshot());
         }
         if let Some(metrics) = &self.balloon_device_metrics {
             diagnostics = diagnostics.with_balloon_device_metrics(metrics.snapshot());
@@ -3107,10 +3137,10 @@ mod tests {
     use bangbang_runtime::machine::{MachineConfigInput, MachineConfigPatchInput};
     use bangbang_runtime::metrics::{
         BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive,
-        BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics, NetworkInterfaceMetrics,
-        NetworkInterfaceMetricsByInterface, SharedBalloonDeviceMetrics,
-        SharedBlockDeviceMetricsRegistry, SharedNetworkInterfaceMetricsRegistry,
-        SharedVsockDeviceMetrics, VsockDeviceMetrics,
+        BootRunLoopMetricStatus, EntropyDeviceMetrics, MetricsConfigInput, MetricsDiagnostics,
+        NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface, SharedBalloonDeviceMetrics,
+        SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
+        SharedNetworkInterfaceMetricsRegistry, SharedVsockDeviceMetrics, VsockDeviceMetrics,
     };
     use bangbang_runtime::mmds::{MmdsConfigInput, MmdsContentInput, MmdsStateHandle};
     use bangbang_runtime::mmio::MmioRegion;
@@ -3792,6 +3822,7 @@ mod tests {
         balloon_device_metrics: Option<SharedBalloonDeviceMetrics>,
         network_interface_metrics: Option<SharedNetworkInterfaceMetricsRegistry>,
         vsock_device_metrics: Option<SharedVsockDeviceMetrics>,
+        entropy_device_metrics: Option<SharedEntropyDeviceMetrics>,
         wait_for_stop: bool,
         wait_for_wakeup: bool,
         wait_for_stop_sequence: Arc<Mutex<VecDeque<bool>>>,
@@ -3816,6 +3847,7 @@ mod tests {
                 balloon_device_metrics: None,
                 network_interface_metrics: None,
                 vsock_device_metrics: None,
+                entropy_device_metrics: None,
                 wait_for_stop: true,
                 wait_for_wakeup: false,
                 wait_for_stop_sequence: Arc::default(),
@@ -3859,6 +3891,11 @@ mod tests {
 
         fn with_vsock_device_metrics(mut self, metrics: SharedVsockDeviceMetrics) -> Self {
             self.vsock_device_metrics = Some(metrics);
+            self
+        }
+
+        fn with_entropy_device_metrics(mut self, metrics: SharedEntropyDeviceMetrics) -> Self {
+            self.entropy_device_metrics = Some(metrics);
             self
         }
 
@@ -3916,6 +3953,10 @@ mod tests {
 
         fn shared_vsock_device_metrics(&self) -> Option<SharedVsockDeviceMetrics> {
             self.vsock_device_metrics.clone()
+        }
+
+        fn shared_entropy_device_metrics(&self) -> Option<SharedEntropyDeviceMetrics> {
+            self.entropy_device_metrics.clone()
         }
 
         fn run_loop(
@@ -5150,6 +5191,44 @@ mod tests {
                 VsockDeviceMetrics::default()
                     .with_activate_fails(1)
                     .with_muxer_event_fails(1)
+            )
+        );
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_reports_entropy_device_metrics() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let metrics = SharedEntropyDeviceMetrics::default();
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_entropy_device_metrics(metrics.clone());
+
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(5).expect("non-zero limit"))
+                .expect("supervisor should start");
+
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            5
+        );
+        metrics.record_event_failure();
+        metrics.record_entropy_source_provider_failure();
+
+        assert_eq!(
+            supervisor.metrics_diagnostics().entropy_device_metrics(),
+            Some(
+                EntropyDeviceMetrics::default()
+                    .with_entropy_event_fails(2)
+                    .with_host_rng_fails(1)
             )
         );
 
