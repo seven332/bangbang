@@ -1358,6 +1358,7 @@ mod tests {
 
     use crate::interrupt::DeviceInterruptKind;
     use crate::memory::{GuestMemoryError, GuestMemoryLayout, GuestMemoryRange};
+    use crate::metrics::{EntropyDeviceMetrics, SharedEntropyDeviceMetrics};
     use crate::mmio::{
         MmioAccess, MmioAccessBytes, MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandler,
         MmioHandlerError, MmioHandlerLookupError, MmioRegionId,
@@ -2311,6 +2312,33 @@ mod tests {
     }
 
     #[test]
+    fn entropy_metrics_record_notification_dispatch() {
+        let mut memory = memory();
+        write_descriptor(&mut memory, 0, TEST_DATA, 8, VIRTQUEUE_DESC_F_WRITE, 0);
+        queue_head(&mut memory, 0, 0);
+        set_available_index(&mut memory, 1);
+
+        let mut handler = rng_mmio_handler();
+        configure_rng_mmio_handler_queue(&mut handler, TEST_USED_RING);
+        activate_rng_mmio_handler(&mut handler);
+        notify_rng_queue(&mut handler, 0);
+
+        let mut source = TestEntropySource::default();
+        let dispatch = handler
+            .dispatch_rng_queue_notifications(&mut memory, &mut source)
+            .expect("virtio-rng notification should dispatch");
+        let metrics = SharedEntropyDeviceMetrics::default();
+        metrics.record_notification_dispatch(&dispatch);
+
+        assert_eq!(
+            metrics.snapshot(),
+            EntropyDeviceMetrics::default()
+                .with_entropy_event_count(1)
+                .with_entropy_bytes(8)
+        );
+    }
+
+    #[test]
     fn rng_mmio_handler_preserves_partial_queue_error_and_marks_interrupt() {
         let mut memory = memory();
         write_descriptor(&mut memory, 0, TEST_DATA, 4, VIRTQUEUE_DESC_F_WRITE, 0);
@@ -2353,6 +2381,35 @@ mod tests {
                 .interrupt_registers()
                 .pending_status()
                 .contains(DeviceInterruptKind::Queue)
+        );
+    }
+
+    #[test]
+    fn entropy_metrics_record_partial_notification_error() {
+        let mut memory = memory();
+        write_descriptor(&mut memory, 0, TEST_DATA, 4, VIRTQUEUE_DESC_F_WRITE, 0);
+        queue_head(&mut memory, 0, 0);
+        queue_head(&mut memory, 1, TEST_QUEUE_SIZE);
+        set_available_index(&mut memory, 2);
+
+        let mut handler = rng_mmio_handler();
+        configure_rng_mmio_handler_queue(&mut handler, TEST_USED_RING);
+        activate_rng_mmio_handler(&mut handler);
+        notify_rng_queue(&mut handler, 0);
+
+        let mut source = TestEntropySource::default();
+        let error = handler
+            .dispatch_rng_queue_notifications(&mut memory, &mut source)
+            .expect_err("second available head should fail");
+        let metrics = SharedEntropyDeviceMetrics::default();
+        metrics.record_notification_error(&error);
+
+        assert_eq!(
+            metrics.snapshot(),
+            EntropyDeviceMetrics::default()
+                .with_entropy_event_fails(1)
+                .with_entropy_event_count(1)
+                .with_entropy_bytes(4)
         );
     }
 
@@ -2805,6 +2862,30 @@ mod tests {
         assert_eq!(read_guest_bytes(&memory, TEST_DATA, 8), vec![0; 8]);
         assert_eq!(read_used_index(&memory), 1);
         assert_eq!(read_used_len(&memory, 0), 0);
+    }
+
+    #[test]
+    fn entropy_metrics_record_source_failure() {
+        let mut memory = memory();
+        write_descriptor(&mut memory, 0, TEST_DATA, 8, VIRTQUEUE_DESC_F_WRITE, 0);
+        queue_head(&mut memory, 0, 0);
+        set_available_index(&mut memory, 1);
+
+        let mut source = TestEntropySource::failing();
+        let mut queue = rng_queue();
+        let dispatch = queue
+            .dispatch_with_source(&mut memory, &mut source)
+            .expect("rng queue dispatch should complete source failure");
+        let metrics = SharedEntropyDeviceMetrics::default();
+        metrics.record_queue_dispatch(&dispatch);
+
+        assert_eq!(
+            metrics.snapshot(),
+            EntropyDeviceMetrics::default()
+                .with_entropy_event_fails(1)
+                .with_entropy_event_count(1)
+                .with_host_rng_fails(1)
+        );
     }
 
     #[test]

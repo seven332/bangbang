@@ -11,6 +11,9 @@ use crate::balloon::VirtioBalloonDeviceNotificationDispatch;
 use crate::block::{
     VirtioBlockDeviceNotificationDispatch, VirtioBlockLatencyAggregate, VirtioBlockQueueDispatch,
 };
+use crate::entropy::{
+    VirtioRngDeviceNotificationDispatch, VirtioRngDeviceNotificationError, VirtioRngQueueDispatch,
+};
 use crate::network::{
     VIRTIO_NET_RX_QUEUE_INDEX, VIRTIO_NET_TX_QUEUE_INDEX, VirtioNetworkDeviceNotificationDispatch,
     VirtioNetworkDeviceNotificationError, VirtioNetworkRxQueueDispatch,
@@ -2464,6 +2467,213 @@ fn vsock_queue_event_count(drained_notifications: &[usize], queue_index: usize) 
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EntropyDeviceMetrics {
+    activate_fails: u64,
+    entropy_event_fails: u64,
+    entropy_event_count: u64,
+    entropy_bytes: u64,
+    host_rng_fails: u64,
+    entropy_rate_limiter_throttled: u64,
+    rate_limiter_event_count: u64,
+}
+
+impl EntropyDeviceMetrics {
+    pub const fn is_empty(self) -> bool {
+        self.activate_fails == 0
+            && self.entropy_event_fails == 0
+            && self.entropy_event_count == 0
+            && self.entropy_bytes == 0
+            && self.host_rng_fails == 0
+            && self.entropy_rate_limiter_throttled == 0
+            && self.rate_limiter_event_count == 0
+    }
+
+    pub const fn activate_fails(self) -> u64 {
+        self.activate_fails
+    }
+
+    pub const fn entropy_event_fails(self) -> u64 {
+        self.entropy_event_fails
+    }
+
+    pub const fn entropy_event_count(self) -> u64 {
+        self.entropy_event_count
+    }
+
+    pub const fn entropy_bytes(self) -> u64 {
+        self.entropy_bytes
+    }
+
+    pub const fn host_rng_fails(self) -> u64 {
+        self.host_rng_fails
+    }
+
+    pub const fn entropy_rate_limiter_throttled(self) -> u64 {
+        self.entropy_rate_limiter_throttled
+    }
+
+    pub const fn rate_limiter_event_count(self) -> u64 {
+        self.rate_limiter_event_count
+    }
+
+    pub const fn with_activate_fails(mut self, activate_fails: u64) -> Self {
+        self.activate_fails = activate_fails;
+        self
+    }
+
+    pub const fn with_entropy_event_fails(mut self, entropy_event_fails: u64) -> Self {
+        self.entropy_event_fails = entropy_event_fails;
+        self
+    }
+
+    pub const fn with_entropy_event_count(mut self, entropy_event_count: u64) -> Self {
+        self.entropy_event_count = entropy_event_count;
+        self
+    }
+
+    pub const fn with_entropy_bytes(mut self, entropy_bytes: u64) -> Self {
+        self.entropy_bytes = entropy_bytes;
+        self
+    }
+
+    pub const fn with_host_rng_fails(mut self, host_rng_fails: u64) -> Self {
+        self.host_rng_fails = host_rng_fails;
+        self
+    }
+
+    pub const fn with_entropy_rate_limiter_throttled(
+        mut self,
+        entropy_rate_limiter_throttled: u64,
+    ) -> Self {
+        self.entropy_rate_limiter_throttled = entropy_rate_limiter_throttled;
+        self
+    }
+
+    pub const fn with_rate_limiter_event_count(mut self, rate_limiter_event_count: u64) -> Self {
+        self.rate_limiter_event_count = rate_limiter_event_count;
+        self
+    }
+
+    const fn merged_with(self, other: Self) -> Self {
+        Self {
+            activate_fails: self.activate_fails.saturating_add(other.activate_fails),
+            entropy_event_fails: self
+                .entropy_event_fails
+                .saturating_add(other.entropy_event_fails),
+            entropy_event_count: self
+                .entropy_event_count
+                .saturating_add(other.entropy_event_count),
+            entropy_bytes: self.entropy_bytes.saturating_add(other.entropy_bytes),
+            host_rng_fails: self.host_rng_fails.saturating_add(other.host_rng_fails),
+            entropy_rate_limiter_throttled: self
+                .entropy_rate_limiter_throttled
+                .saturating_add(other.entropy_rate_limiter_throttled),
+            rate_limiter_event_count: self
+                .rate_limiter_event_count
+                .saturating_add(other.rate_limiter_event_count),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SharedEntropyDeviceMetrics {
+    inner: Arc<SharedEntropyDeviceMetricsInner>,
+}
+
+impl SharedEntropyDeviceMetrics {
+    pub fn record_activation_failure(&self) {
+        record_atomic_metric(&self.inner.activate_fails, 1);
+    }
+
+    pub fn record_notification_dispatch(&self, dispatch: &VirtioRngDeviceNotificationDispatch) {
+        if let Some(queue_dispatch) = dispatch.queue_dispatch() {
+            self.record_queue_dispatch(queue_dispatch);
+        }
+    }
+
+    pub fn record_notification_error(&self, source: &VirtioRngDeviceNotificationError) {
+        if let Some(completed) = source.completed_dispatch() {
+            self.record_queue_dispatch(completed);
+        }
+        self.record_event_failure();
+    }
+
+    pub fn record_entropy_source_provider_failure(&self) {
+        self.record_host_rng_failure();
+        self.record_event_failure();
+    }
+
+    pub fn record_event_failure(&self) {
+        record_atomic_metric(&self.inner.entropy_event_fails, 1);
+    }
+
+    pub fn record_host_rng_failure(&self) {
+        record_atomic_metric(&self.inner.host_rng_fails, 1);
+    }
+
+    pub fn snapshot(&self) -> EntropyDeviceMetrics {
+        EntropyDeviceMetrics {
+            activate_fails: self.inner.activate_fails.load(Ordering::Relaxed),
+            entropy_event_fails: self.inner.entropy_event_fails.load(Ordering::Relaxed),
+            entropy_event_count: self.inner.entropy_event_count.load(Ordering::Relaxed),
+            entropy_bytes: self.inner.entropy_bytes.load(Ordering::Relaxed),
+            host_rng_fails: self.inner.host_rng_fails.load(Ordering::Relaxed),
+            entropy_rate_limiter_throttled: self
+                .inner
+                .entropy_rate_limiter_throttled
+                .load(Ordering::Relaxed),
+            rate_limiter_event_count: self.inner.rate_limiter_event_count.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn record_queue_dispatch(&self, dispatch: &VirtioRngQueueDispatch) {
+        self.record_entropy_events(usize_to_u64_saturating(dispatch.processed_requests()));
+        self.record_entropy_bytes(dispatch.bytes_written_to_guest());
+        self.record_event_failures(usize_to_u64_saturating(
+            dispatch
+                .buffer_parse_failures()
+                .saturating_add(dispatch.source_failures()),
+        ));
+        self.record_host_rng_failures(usize_to_u64_saturating(dispatch.source_failures()));
+    }
+
+    fn record_entropy_events(&self, count: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.entropy_event_count, count);
+        }
+    }
+
+    fn record_entropy_bytes(&self, count: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.entropy_bytes, count);
+        }
+    }
+
+    fn record_event_failures(&self, count: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.entropy_event_fails, count);
+        }
+    }
+
+    fn record_host_rng_failures(&self, count: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.host_rng_fails, count);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SharedEntropyDeviceMetricsInner {
+    activate_fails: AtomicU64,
+    entropy_event_fails: AtomicU64,
+    entropy_event_count: AtomicU64,
+    entropy_bytes: AtomicU64,
+    host_rng_fails: AtomicU64,
+    entropy_rate_limiter_throttled: AtomicU64,
+    rate_limiter_event_count: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BalloonDeviceMetrics {
     activate_fails: u64,
     inflate_count: u64,
@@ -2700,6 +2910,7 @@ pub struct MetricsDiagnostics {
     network_interface_metrics: Option<NetworkInterfaceMetrics>,
     network_interface_metrics_by_interface: Option<NetworkInterfaceMetricsByInterface>,
     vsock_device_metrics: Option<VsockDeviceMetrics>,
+    entropy_device_metrics: Option<EntropyDeviceMetrics>,
     balloon_device_metrics: Option<BalloonDeviceMetrics>,
     boot_run_loop_status: Option<BootRunLoopMetricStatus>,
     start_time_us: Option<u64>,
@@ -2716,6 +2927,7 @@ impl MetricsDiagnostics {
             network_interface_metrics: None,
             network_interface_metrics_by_interface: None,
             vsock_device_metrics: None,
+            entropy_device_metrics: None,
             balloon_device_metrics: None,
             boot_run_loop_status: None,
             start_time_us: None,
@@ -2756,6 +2968,14 @@ impl MetricsDiagnostics {
 
     pub fn with_vsock_device_metrics(mut self, vsock_device_metrics: VsockDeviceMetrics) -> Self {
         self.vsock_device_metrics = Some(vsock_device_metrics);
+        self
+    }
+
+    pub fn with_entropy_device_metrics(
+        mut self,
+        entropy_device_metrics: EntropyDeviceMetrics,
+    ) -> Self {
+        self.entropy_device_metrics = Some(entropy_device_metrics);
         self
     }
 
@@ -2827,6 +3047,12 @@ impl MetricsDiagnostics {
                 None => metrics,
             });
         }
+        if let Some(metrics) = other.entropy_device_metrics {
+            self.entropy_device_metrics = Some(match self.entropy_device_metrics {
+                Some(existing) => existing.merged_with(metrics),
+                None => metrics,
+            });
+        }
         if let Some(metrics) = other.balloon_device_metrics {
             self.balloon_device_metrics = Some(match self.balloon_device_metrics {
                 Some(existing) => existing.merged_with(metrics),
@@ -2872,6 +3098,10 @@ impl MetricsDiagnostics {
 
     pub fn vsock_device_metrics(&self) -> Option<VsockDeviceMetrics> {
         self.vsock_device_metrics
+    }
+
+    pub fn entropy_device_metrics(&self) -> Option<EntropyDeviceMetrics> {
+        self.entropy_device_metrics
     }
 
     pub fn balloon_device_metrics(&self) -> Option<BalloonDeviceMetrics> {
@@ -3153,6 +3383,41 @@ fn vsock_device_metrics_json_object(
     vsock
 }
 
+fn entropy_device_metrics_json_object(
+    metrics: EntropyDeviceMetrics,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut entropy = serde_json::Map::new();
+    entropy.insert(
+        "activate_fails".to_string(),
+        serde_json::Value::Number(metrics.activate_fails().into()),
+    );
+    entropy.insert(
+        "entropy_bytes".to_string(),
+        serde_json::Value::Number(metrics.entropy_bytes().into()),
+    );
+    entropy.insert(
+        "entropy_event_count".to_string(),
+        serde_json::Value::Number(metrics.entropy_event_count().into()),
+    );
+    entropy.insert(
+        "entropy_event_fails".to_string(),
+        serde_json::Value::Number(metrics.entropy_event_fails().into()),
+    );
+    entropy.insert(
+        "entropy_rate_limiter_throttled".to_string(),
+        serde_json::Value::Number(metrics.entropy_rate_limiter_throttled().into()),
+    );
+    entropy.insert(
+        "host_rng_fails".to_string(),
+        serde_json::Value::Number(metrics.host_rng_fails().into()),
+    );
+    entropy.insert(
+        "rate_limiter_event_count".to_string(),
+        serde_json::Value::Number(metrics.rate_limiter_event_count().into()),
+    );
+    entropy
+}
+
 fn serial_output_metrics_json_object(
     metrics: SerialOutputMetrics,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -3330,6 +3595,16 @@ impl MetricsSink {
             root.insert(
                 "vsock".to_string(),
                 serde_json::Value::Object(vsock_device_metrics_json_object(vsock_device_metrics)),
+            );
+        }
+        if let Some(entropy_device_metrics) = diagnostics.entropy_device_metrics()
+            && !entropy_device_metrics.is_empty()
+        {
+            root.insert(
+                "entropy".to_string(),
+                serde_json::Value::Object(entropy_device_metrics_json_object(
+                    entropy_device_metrics,
+                )),
             );
         }
         if let Some(balloon_device_metrics) = diagnostics.balloon_device_metrics()
@@ -3617,11 +3892,12 @@ mod tests {
 
     use super::{
         BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive,
-        BootRunLoopMetricStatus, MetricsConfigError, MetricsConfigInput, MetricsDiagnostics,
-        MetricsFlushError, MetricsOutput, MetricsState, NetworkInterfaceMetrics,
-        NetworkInterfaceMetricsByInterface, SharedBalloonDeviceMetrics, SharedBlockDeviceMetrics,
-        SharedBlockDeviceMetricsRegistry, SharedNetworkInterfaceMetrics,
-        SharedNetworkInterfaceMetricsRegistry, SharedVsockDeviceMetrics, VsockDeviceMetrics,
+        BootRunLoopMetricStatus, EntropyDeviceMetrics, MetricsConfigError, MetricsConfigInput,
+        MetricsDiagnostics, MetricsFlushError, MetricsOutput, MetricsState,
+        NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface, SharedBalloonDeviceMetrics,
+        SharedBlockDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
+        SharedNetworkInterfaceMetrics, SharedNetworkInterfaceMetricsRegistry,
+        SharedVsockDeviceMetrics, VsockDeviceMetrics,
     };
     use crate::block::VirtioBlockLatencyAggregate;
     use crate::serial::SerialOutputMetrics;
@@ -3739,6 +4015,17 @@ mod tests {
             .with_tx_flush_fails(18)
             .with_tx_write_fails(19)
             .with_rx_read_fails(20)
+    }
+
+    fn entropy_metrics_with_all_fields() -> EntropyDeviceMetrics {
+        EntropyDeviceMetrics::default()
+            .with_activate_fails(1)
+            .with_entropy_event_fails(2)
+            .with_entropy_event_count(3)
+            .with_entropy_bytes(4)
+            .with_host_rng_fails(5)
+            .with_entropy_rate_limiter_throttled(6)
+            .with_rate_limiter_event_count(7)
     }
 
     #[test]
@@ -4496,6 +4783,97 @@ mod tests {
                     .with_tx_flush_fails(u64::MAX)
                     .with_tx_write_fails(u64::MAX)
                     .with_rx_read_fails(u64::MAX)
+            )
+        );
+    }
+
+    #[test]
+    fn writes_entropy_device_metrics_when_provided() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let diagnostics = MetricsDiagnostics::new()
+            .with_entropy_device_metrics(entropy_metrics_with_all_fields());
+
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        assert_eq!(
+            output.lines(),
+            [
+                r#"{"entropy":{"activate_fails":1,"entropy_bytes":4,"entropy_event_count":3,"entropy_event_fails":2,"entropy_rate_limiter_throttled":6,"host_rng_fails":5,"rate_limiter_event_count":7},"vmm":{"metrics_flush_count":1}}"#
+            ]
+        );
+    }
+
+    #[test]
+    fn omits_empty_entropy_device_metrics() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let diagnostics =
+            MetricsDiagnostics::new().with_entropy_device_metrics(EntropyDeviceMetrics::default());
+
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        assert_eq!(output.lines(), [r#"{"vmm":{"metrics_flush_count":1}}"#]);
+    }
+
+    #[test]
+    fn shared_entropy_device_metrics_snapshot_is_per_instance() {
+        let first = SharedEntropyDeviceMetrics::default();
+        let second = SharedEntropyDeviceMetrics::default();
+
+        first.record_activation_failure();
+        first.record_event_failure();
+        first.record_entropy_source_provider_failure();
+
+        assert_eq!(
+            first.snapshot(),
+            EntropyDeviceMetrics::default()
+                .with_activate_fails(1)
+                .with_entropy_event_fails(2)
+                .with_host_rng_fails(1)
+        );
+        assert_eq!(second.snapshot(), EntropyDeviceMetrics::default());
+    }
+
+    #[test]
+    fn entropy_metric_increment_saturates() {
+        let metrics = SharedEntropyDeviceMetrics::default();
+        metrics
+            .inner
+            .entropy_event_count
+            .store(u64::MAX - 1, Ordering::Relaxed);
+
+        metrics.record_entropy_events(3);
+
+        assert_eq!(metrics.snapshot().entropy_event_count(), u64::MAX);
+    }
+
+    #[test]
+    fn entropy_diagnostics_merge_saturates() {
+        let base = MetricsDiagnostics::new().with_entropy_device_metrics(
+            EntropyDeviceMetrics::default()
+                .with_activate_fails(u64::MAX - 1)
+                .with_entropy_event_fails(u64::MAX - 2)
+                .with_entropy_event_count(u64::MAX - 3)
+                .with_entropy_bytes(u64::MAX - 4)
+                .with_host_rng_fails(u64::MAX - 5)
+                .with_entropy_rate_limiter_throttled(u64::MAX - 6)
+                .with_rate_limiter_event_count(u64::MAX - 7),
+        );
+        let additional = MetricsDiagnostics::new()
+            .with_entropy_device_metrics(entropy_metrics_with_all_fields());
+
+        assert_eq!(
+            base.merged_with(additional).entropy_device_metrics(),
+            Some(
+                EntropyDeviceMetrics::default()
+                    .with_activate_fails(u64::MAX)
+                    .with_entropy_event_fails(u64::MAX)
+                    .with_entropy_event_count(u64::MAX)
+                    .with_entropy_bytes(u64::MAX)
+                    .with_host_rng_fails(u64::MAX)
+                    .with_entropy_rate_limiter_throttled(u64::MAX)
+                    .with_rate_limiter_event_count(u64::MAX)
             )
         );
     }
