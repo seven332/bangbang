@@ -6296,8 +6296,8 @@ mod tests {
             ),
             (
                 "PUT",
-                r#"{"total_size_mib":2048,"block_size_mib":2,"slot_size_mib":128}"#,
-                ApiRequest::PutMemoryHotplug(MemoryHotplugConfigRequest::new(2048, 2, 128)),
+                r#"{"total_size_mib":2048,"block_size_mib":4,"slot_size_mib":256}"#,
+                ApiRequest::PutMemoryHotplug(MemoryHotplugConfigRequest::new(2048, 4, 256)),
             ),
             (
                 "PATCH",
