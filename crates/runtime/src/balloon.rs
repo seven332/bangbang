@@ -134,6 +134,7 @@ impl std::error::Error for BalloonConfigError {}
 pub enum BalloonUpdateError {
     PageCountOverflow(BalloonPageCountOverflow),
     TargetExceedsGuestMemory { amount_mib: u32, mem_size_mib: u64 },
+    StatisticsStateChange,
     ActiveSessionUnavailable,
     ActiveSessionCommand { message: String },
     MmioDispatcherUnavailable,
@@ -150,6 +151,9 @@ impl fmt::Display for BalloonUpdateError {
             } => write!(
                 f,
                 "balloon amount_mib {amount_mib} exceeds configured guest memory {mem_size_mib} MiB"
+            ),
+            Self::StatisticsStateChange => f.write_str(
+                "balloon statistics cannot be enabled or disabled after device activation",
             ),
             Self::ActiveSessionUnavailable => {
                 f.write_str("active balloon device session is unavailable")
@@ -169,6 +173,7 @@ impl std::error::Error for BalloonUpdateError {
             Self::PageCountOverflow(err) => Some(err),
             Self::HandlerLookup(err) => Some(err),
             Self::TargetExceedsGuestMemory { .. }
+            | Self::StatisticsStateChange
             | Self::ActiveSessionUnavailable
             | Self::ActiveSessionCommand { .. }
             | Self::MmioDispatcherUnavailable => None,
@@ -372,6 +377,23 @@ impl BalloonUpdateInput {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BalloonStatsUpdateInput {
+    stats_polling_interval_s: u16,
+}
+
+impl BalloonStatsUpdateInput {
+    pub const fn new(stats_polling_interval_s: u16) -> Self {
+        Self {
+            stats_polling_interval_s,
+        }
+    }
+
+    pub const fn stats_polling_interval_s(self) -> u16 {
+        self.stats_polling_interval_s
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BalloonConfig {
     amount_mib: u32,
     deflate_on_oom: bool,
@@ -409,6 +431,24 @@ impl BalloonConfig {
             amount_mib,
             deflate_on_oom: self.deflate_on_oom,
             stats_polling_interval_s: self.stats_polling_interval_s,
+            free_page_hinting: self.free_page_hinting,
+            free_page_reporting: self.free_page_reporting,
+        })
+    }
+
+    pub fn updated_stats(self, input: BalloonStatsUpdateInput) -> Result<Self, BalloonUpdateError> {
+        let stats_polling_interval_s = input.stats_polling_interval_s();
+        if self.stats_polling_interval_s == stats_polling_interval_s {
+            return Ok(self);
+        }
+        if self.stats_polling_interval_s == 0 || stats_polling_interval_s == 0 {
+            return Err(BalloonUpdateError::StatisticsStateChange);
+        }
+
+        Ok(Self {
+            amount_mib: self.amount_mib,
+            deflate_on_oom: self.deflate_on_oom,
+            stats_polling_interval_s,
             free_page_hinting: self.free_page_hinting,
             free_page_reporting: self.free_page_reporting,
         })
@@ -3305,6 +3345,7 @@ pub struct VirtioBalloonDevice {
     queue_layout: VirtioBalloonQueueLayout,
     active_queues: Option<VirtioBalloonActiveQueues>,
     memory_accounting: VirtioBalloonMemoryAccounting,
+    stats_polling_interval_s: u16,
     statistics: BalloonOptionalStats,
     statistics_pending_descriptor_head: Option<u16>,
     hinting_host_cmd: u32,
@@ -3315,10 +3356,23 @@ pub struct VirtioBalloonDevice {
 
 impl VirtioBalloonDevice {
     pub const fn new(queue_layout: VirtioBalloonQueueLayout) -> Self {
+        let stats_polling_interval_s = if queue_layout.statistics().is_some() {
+            1
+        } else {
+            0
+        };
+        Self::with_stats_polling_interval_s(queue_layout, stats_polling_interval_s)
+    }
+
+    pub const fn with_stats_polling_interval_s(
+        queue_layout: VirtioBalloonQueueLayout,
+        stats_polling_interval_s: u16,
+    ) -> Self {
         Self {
             queue_layout,
             active_queues: None,
             memory_accounting: VirtioBalloonMemoryAccounting::new(),
+            stats_polling_interval_s,
             statistics: BalloonOptionalStats::new(),
             statistics_pending_descriptor_head: None,
             hinting_host_cmd: VIRTIO_BALLOON_FREE_PAGE_HINT_STOP,
@@ -3350,6 +3404,26 @@ impl VirtioBalloonDevice {
 
     pub const fn statistics(&self) -> BalloonOptionalStats {
         self.statistics
+    }
+
+    pub const fn stats_polling_interval_s(&self) -> u16 {
+        self.stats_polling_interval_s
+    }
+
+    pub fn update_stats_polling_interval_s(
+        &mut self,
+        input: BalloonStatsUpdateInput,
+    ) -> Result<(), BalloonUpdateError> {
+        let stats_polling_interval_s = input.stats_polling_interval_s();
+        if self.stats_polling_interval_s == stats_polling_interval_s {
+            return Ok(());
+        }
+        if self.stats_polling_interval_s == 0 || stats_polling_interval_s == 0 {
+            return Err(BalloonUpdateError::StatisticsStateChange);
+        }
+
+        self.stats_polling_interval_s = stats_polling_interval_s;
+        Ok(())
     }
 
     pub fn hinting_status(&self) -> Result<BalloonHintingStatus, BalloonHintingStatusError> {
@@ -3730,6 +3804,14 @@ impl VirtioMmioRegisterHandler<VirtioBalloonConfigSpace, VirtioBalloonDevice> {
         self.mark_interrupt_pending(DeviceInterruptKind::Config);
 
         Ok(())
+    }
+
+    pub fn update_balloon_statistics(
+        &mut self,
+        input: BalloonStatsUpdateInput,
+    ) -> Result<(), BalloonUpdateError> {
+        self.activation_handler_mut()
+            .update_stats_polling_interval_s(input)
     }
 
     fn update_balloon_hinting_host_cmd(&mut self, cmd_id: u32) {
@@ -4144,6 +4226,7 @@ pub struct PreparedBalloonDevice {
     config_space: VirtioBalloonConfigSpace,
     available_features: u64,
     queue_layout: VirtioBalloonQueueLayout,
+    stats_polling_interval_s: u16,
 }
 
 impl PreparedBalloonDevice {
@@ -4152,6 +4235,7 @@ impl PreparedBalloonDevice {
             config_space: VirtioBalloonConfigSpace::from_config(config)?,
             available_features: available_features(config),
             queue_layout: VirtioBalloonQueueLayout::from_config(config),
+            stats_polling_interval_s: config.stats_polling_interval_s(),
         })
     }
 
@@ -4165,6 +4249,10 @@ impl PreparedBalloonDevice {
 
     pub const fn queue_layout(self) -> VirtioBalloonQueueLayout {
         self.queue_layout
+    }
+
+    pub const fn stats_polling_interval_s(self) -> u16 {
+        self.stats_polling_interval_s
     }
 
     pub fn queue_sizes(self) -> VirtioBalloonQueueSizes {
@@ -4288,7 +4376,10 @@ impl BalloonMmioDevice {
             prepared.available_features(),
             queue_sizes.as_slice(),
             prepared.config_space(),
-            VirtioBalloonDevice::new(prepared.queue_layout()),
+            VirtioBalloonDevice::with_stats_polling_interval_s(
+                prepared.queue_layout(),
+                prepared.stats_polling_interval_s(),
+            ),
         )
         .map_err(|source| BalloonMmioRegistrationError::BuildHandler {
             region_id: layout.region_id(),
@@ -5126,6 +5217,45 @@ mod tests {
             .expect_err("oversized target should fail");
 
         assert!(matches!(err, BalloonUpdateError::PageCountOverflow(_)));
+    }
+
+    #[test]
+    fn balloon_config_stats_update_changes_only_nonzero_interval() {
+        let config = balloon_config(64, true, 60, true, false);
+
+        let updated = config
+            .updated_stats(BalloonStatsUpdateInput::new(30))
+            .expect("balloon stats interval update should validate");
+
+        assert_eq!(updated.amount_mib(), config.amount_mib());
+        assert_eq!(updated.deflate_on_oom(), config.deflate_on_oom());
+        assert_eq!(updated.stats_polling_interval_s(), 30);
+        assert_eq!(updated.free_page_hinting(), config.free_page_hinting());
+        assert_eq!(updated.free_page_reporting(), config.free_page_reporting());
+    }
+
+    #[test]
+    fn balloon_config_stats_update_accepts_same_interval() {
+        let config = balloon_config(64, true, 0, true, false);
+
+        let updated = config
+            .updated_stats(BalloonStatsUpdateInput::new(0))
+            .expect("same stats interval should be a no-op");
+
+        assert_eq!(updated, config);
+    }
+
+    #[test]
+    fn balloon_config_stats_update_rejects_enabled_state_change() {
+        for (current, updated) in [(0, 1), (1, 0)] {
+            let config = balloon_config(64, false, current, false, false);
+
+            let err = config
+                .updated_stats(BalloonStatsUpdateInput::new(updated))
+                .expect_err("stats enabled-state change should fail");
+
+            assert_eq!(err, BalloonUpdateError::StatisticsStateChange);
+        }
     }
 
     #[test]
@@ -9117,6 +9247,43 @@ mod tests {
         assert!(!handler.is_device_activated());
         assert!(!handler.activation_handler().is_activated());
         assert!(handler.pending_queue_notifications().is_empty());
+    }
+
+    #[test]
+    fn balloon_mmio_handler_updates_statistics_interval_without_resetting_on_status_reset() {
+        let mut device = balloon_mmio_device(balloon_config(64, false, 60, false, false));
+        let handler = device
+            .dispatcher_mut()
+            .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+            .expect("balloon handler should be registered");
+
+        assert_eq!(handler.activation_handler().stats_polling_interval_s(), 60);
+        handler
+            .update_balloon_statistics(BalloonStatsUpdateInput::new(30))
+            .expect("statistics interval should update");
+        assert_eq!(handler.activation_handler().stats_polling_interval_s(), 30);
+
+        handler
+            .write_register(VirtioMmioRegister::Status, 0)
+            .expect("status reset should write");
+
+        assert_eq!(handler.activation_handler().stats_polling_interval_s(), 30);
+    }
+
+    #[test]
+    fn balloon_mmio_handler_rejects_statistics_interval_enabled_state_change() {
+        let mut device = balloon_mmio_device(balloon_config(64, false, 0, false, false));
+        let handler = device
+            .dispatcher_mut()
+            .handler_mut::<VirtioBalloonMmioHandler>(TEST_BALLOON_MMIO_REGION_ID)
+            .expect("balloon handler should be registered");
+
+        let err = handler
+            .update_balloon_statistics(BalloonStatsUpdateInput::new(1))
+            .expect_err("statistics enabled-state change should fail");
+
+        assert_eq!(err, BalloonUpdateError::StatisticsStateChange);
+        assert_eq!(handler.activation_handler().stats_polling_interval_s(), 0);
     }
 
     #[test]

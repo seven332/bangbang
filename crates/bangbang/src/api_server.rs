@@ -15,8 +15,8 @@ use bangbang_api::http::{
     ActionRequest, ActionType, ApiRequest, ApiRequestMetricEndpoint, ApiRequestMetricPatchEndpoint,
     ApiRequestMetricPutEndpoint, BalloonConfigRequest, BalloonConfigResponse,
     BalloonHintingStartRequest, BalloonHintingStatusResponse, BalloonStatsResponse,
-    BalloonUpdateRequest, BootSourceRequest, BootSourceResponse, CpuConfigRequest,
-    DriveCacheType as ApiDriveCacheType, DriveConfigRequest, DriveConfigResponse,
+    BalloonStatsUpdateRequest, BalloonUpdateRequest, BootSourceRequest, BootSourceResponse,
+    CpuConfigRequest, DriveCacheType as ApiDriveCacheType, DriveConfigRequest, DriveConfigResponse,
     DriveIoEngine as ApiDriveIoEngine, DrivePatchRequest, EntropyConfigRequest,
     EntropyConfigResponse, HotUnplugDeviceKind as ApiHotUnplugDeviceKind, HotUnplugDeviceRequest,
     HttpResponse, LoggerConfigRequest, LoggerLevel as ApiLoggerLevel, MachineConfigPatchRequest,
@@ -29,7 +29,7 @@ use bangbang_api::http::{
 };
 use bangbang_runtime::balloon::{
     BalloonConfig, BalloonConfigInput, BalloonHintingStartInput, BalloonHintingStatus,
-    BalloonStats, BalloonUpdateInput,
+    BalloonStats, BalloonStatsUpdateInput, BalloonUpdateInput,
 };
 use bangbang_runtime::block::{
     DriveCacheType, DriveConfig, DriveConfigInput, DriveIoEngine, DriveUpdateInput,
@@ -726,9 +726,9 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::PatchBalloon(update) => handle_empty(vmm.handle_patch_request(
             PatchApiRequest::balloon(balloon_update_input_from_request(*update)),
         )),
-        ApiRequest::PatchBalloonStats => {
-            handle_empty(vmm.handle_patch_request(PatchApiRequest::balloon_stats()))
-        }
+        ApiRequest::PatchBalloonStats(update) => handle_empty(vmm.handle_patch_request(
+            PatchApiRequest::balloon_stats(balloon_stats_update_input_from_request(*update)),
+        )),
         ApiRequest::PatchBalloonHintingStart(request) => handle_empty(vmm.handle_patch_request(
             PatchApiRequest::balloon_hinting_start(balloon_hinting_start_input_from_request(
                 request,
@@ -785,7 +785,7 @@ fn request_uses_deprecated_api(request: &ApiRequest) -> bool {
         | ApiRequest::GetVersion
         | ApiRequest::HotUnplugDevice(_)
         | ApiRequest::PatchBalloon(_)
-        | ApiRequest::PatchBalloonStats
+        | ApiRequest::PatchBalloonStats(_)
         | ApiRequest::PatchBalloonHintingStart(_)
         | ApiRequest::PatchBalloonHintingStop
         | ApiRequest::PatchDrive(_)
@@ -892,7 +892,7 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         | ApiRequest::GetVersion
         | ApiRequest::HotUnplugDevice(_)
         | ApiRequest::PatchBalloon(_)
-        | ApiRequest::PatchBalloonStats
+        | ApiRequest::PatchBalloonStats(_)
         | ApiRequest::PatchBalloonHintingStart(_)
         | ApiRequest::PatchBalloonHintingStop
         | ApiRequest::PatchDrive(_)
@@ -1532,6 +1532,12 @@ fn balloon_update_input_from_request(update: BalloonUpdateRequest) -> BalloonUpd
     BalloonUpdateInput::new(update.amount_mib())
 }
 
+fn balloon_stats_update_input_from_request(
+    update: BalloonStatsUpdateRequest,
+) -> BalloonStatsUpdateInput {
+    BalloonStatsUpdateInput::new(update.stats_polling_interval_s())
+}
+
 fn balloon_hinting_start_input_from_request(
     request: BalloonHintingStartRequest,
 ) -> BalloonHintingStartInput {
@@ -1723,6 +1729,13 @@ mod tests {
         }
 
         fn update_balloon(&mut self, _config: BalloonConfig) -> Result<(), BalloonUpdateError> {
+            Ok(())
+        }
+
+        fn update_balloon_statistics(
+            &mut self,
+            _input: BalloonStatsUpdateInput,
+        ) -> Result<(), BalloonUpdateError> {
             Ok(())
         }
 
@@ -6014,6 +6027,56 @@ mod tests {
         assert!(get_updated_response.contains(r#""stats_polling_interval_s":60"#));
         assert!(get_updated_response.contains(r#""free_page_hinting":true"#));
         assert!(get_updated_response.contains(r#""free_page_reporting":false"#));
+
+        let stats_patch_response = request_over_socket(
+            &mut vmm,
+            "b-sp",
+            &request_with_body(
+                "PATCH",
+                "/balloon/statistics",
+                r#"{"stats_polling_interval_s":30}"#,
+            ),
+        );
+        assert!(stats_patch_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let get_after_stats_patch_response = request_over_socket(
+            &mut vmm,
+            "b-gsp",
+            "GET /balloon HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(get_after_stats_patch_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(get_after_stats_patch_response.contains(r#""amount_mib":128"#));
+        assert!(get_after_stats_patch_response.contains(r#""stats_polling_interval_s":30"#));
+
+        let vm_config_after_stats_patch_response = request_over_socket(
+            &mut vmm,
+            "b-vsp",
+            "GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(vm_config_after_stats_patch_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(vm_config_after_stats_patch_response.contains(r#""stats_polling_interval_s":30"#));
+
+        let stats_disable_response = request_over_socket(
+            &mut vmm,
+            "b-sd",
+            &request_with_body(
+                "PATCH",
+                "/balloon/statistics",
+                r#"{"stats_polling_interval_s":0}"#,
+            ),
+        );
+        assert!(stats_disable_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(stats_disable_response.contains(
+            r#""fault_message":"balloon statistics cannot be enabled or disabled after device activation""#
+        ));
+
+        let get_after_stats_disable_response = request_over_socket(
+            &mut vmm,
+            "b-gsd",
+            "GET /balloon HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(get_after_stats_disable_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(get_after_stats_disable_response.contains(r#""stats_polling_interval_s":30"#));
 
         let stats_response = request_over_socket(
             &mut vmm,

@@ -83,7 +83,7 @@ pub enum VmmAction {
     GetBalloonHintingStatus,
     PutBalloon(balloon::BalloonConfigInput),
     PatchBalloon(balloon::BalloonUpdateInput),
-    PatchBalloonStats,
+    PatchBalloonStats(balloon::BalloonStatsUpdateInput),
     PatchBalloonHintingStart(balloon::BalloonHintingStartInput),
     PatchBalloonHintingStop,
     GetMemoryHotplug,
@@ -159,7 +159,7 @@ impl VmmAction {
             Self::GetBalloonHintingStatus => "GetBalloonHintingStatus",
             Self::PutBalloon(_) => "PutBalloon",
             Self::PatchBalloon(_) => "PatchBalloon",
-            Self::PatchBalloonStats => "PatchBalloonStats",
+            Self::PatchBalloonStats(_) => "PatchBalloonStats",
             Self::PatchBalloonHintingStart(_) => "PatchBalloonHintingStart",
             Self::PatchBalloonHintingStop => "PatchBalloonHintingStop",
             Self::GetMemoryHotplug => "GetMemoryHotplug",
@@ -643,6 +643,23 @@ impl VmmController {
             .map_err(VmmActionError::BalloonUpdate)
     }
 
+    pub fn updated_balloon_stats_config(
+        &self,
+        input: balloon::BalloonStatsUpdateInput,
+    ) -> Result<balloon::BalloonConfig, VmmActionError> {
+        if self.instance_info.state == InstanceState::NotStarted {
+            return Err(VmmActionError::UnsupportedState {
+                action: VmmAction::PatchBalloonStats(input).name(),
+                state: self.instance_info.state,
+            });
+        }
+
+        self.balloon_config
+            .ok_or(VmmActionError::BalloonUnsupported)?
+            .updated_stats(input)
+            .map_err(VmmActionError::BalloonUpdate)
+    }
+
     pub fn commit_balloon_update(&mut self, config: balloon::BalloonConfig) {
         self.balloon_config = Some(config);
     }
@@ -959,9 +976,13 @@ impl VmmController {
                 self.commit_balloon_update(config);
                 Ok(VmmData::Empty)
             }
+            VmmAction::PatchBalloonStats(input) => {
+                let config = self.updated_balloon_stats_config(input)?;
+                self.commit_balloon_update(config);
+                Ok(VmmData::Empty)
+            }
             VmmAction::GetBalloonStats
             | VmmAction::GetBalloonHintingStatus
-            | VmmAction::PatchBalloonStats
             | VmmAction::PatchBalloonHintingStart(_)
             | VmmAction::PatchBalloonHintingStop => {
                 if self.instance_info.state == InstanceState::NotStarted {
@@ -1327,7 +1348,7 @@ mod tests {
         balloon::{
             BalloonConfig, BalloonConfigError, BalloonConfigInput, BalloonHintingCommandError,
             BalloonHintingStartInput, BalloonHintingStatusError, BalloonStatsError,
-            BalloonUpdateError, BalloonUpdateInput,
+            BalloonStatsUpdateInput, BalloonUpdateError, BalloonUpdateInput,
         },
         block::{DriveConfigError, DriveConfigInput, DriveUpdateInput},
         boot::{
@@ -1383,6 +1404,10 @@ mod tests {
 
     const fn balloon_update_input(amount_mib: u32) -> BalloonUpdateInput {
         BalloonUpdateInput::new(amount_mib)
+    }
+
+    const fn balloon_stats_update_input(stats_polling_interval_s: u16) -> BalloonStatsUpdateInput {
+        BalloonStatsUpdateInput::new(stats_polling_interval_s)
     }
 
     fn boot_source_input(kernel_image_path: &str) -> BootSourceConfigInput {
@@ -1754,7 +1779,10 @@ mod tests {
             VmmAction::PatchBalloon(balloon_update_input(32)).name(),
             "PatchBalloon"
         );
-        assert_eq!(VmmAction::PatchBalloonStats.name(), "PatchBalloonStats");
+        assert_eq!(
+            VmmAction::PatchBalloonStats(balloon_stats_update_input(1)).name(),
+            "PatchBalloonStats"
+        );
         assert_eq!(
             VmmAction::PatchBalloonHintingStart(BalloonHintingStartInput::new(true)).name(),
             "PatchBalloonHintingStart"
@@ -2244,12 +2272,89 @@ mod tests {
     }
 
     #[test]
+    fn patch_balloon_stats_updates_interval_after_start_without_changing_other_fields() {
+        for state in [InstanceState::Running, InstanceState::Paused] {
+            let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+            controller
+                .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
+                .expect("boot source config should be stored");
+            controller
+                .handle_action(VmmAction::PutBalloon(balloon_input(64, true)))
+                .expect("initial balloon config should be stored");
+            controller.instance_info.state = state;
+
+            let data = controller
+                .handle_action(VmmAction::PatchBalloonStats(balloon_stats_update_input(30)))
+                .expect("balloon stats interval should update after start");
+
+            let updated = controller
+                .balloon_config()
+                .expect("balloon config should remain configured");
+            assert_eq!(data, VmmData::Empty);
+            assert_eq!(controller.instance_info().state, state);
+            assert_eq!(updated.amount_mib(), 64);
+            assert!(updated.deflate_on_oom());
+            assert_eq!(updated.stats_polling_interval_s(), 30);
+            assert!(updated.free_page_hinting());
+            assert!(!updated.free_page_reporting());
+        }
+    }
+
+    #[test]
+    fn patch_balloon_stats_accepts_same_interval_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBalloon(balloon_input(64, true)))
+            .expect("initial balloon config should be stored");
+        controller.instance_info.state = InstanceState::Running;
+
+        let data = controller
+            .handle_action(VmmAction::PatchBalloonStats(balloon_stats_update_input(60)))
+            .expect("same stats interval should be accepted");
+
+        assert_eq!(data, VmmData::Empty);
+        assert_eq!(
+            controller.balloon_config(),
+            Some(BalloonConfig::from(balloon_input(64, true)))
+        );
+    }
+
+    #[test]
+    fn patch_balloon_stats_rejects_enabled_state_change_without_mutating() {
+        for (initial, requested) in [(0, 1), (60, 0)] {
+            let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+            let input = BalloonConfigInput::new(64, true)
+                .with_stats_polling_interval_s(initial)
+                .with_free_page_hinting(true);
+            controller
+                .handle_action(VmmAction::PutBalloon(input))
+                .expect("initial balloon config should be stored");
+            controller.instance_info.state = InstanceState::Running;
+
+            let err = controller
+                .handle_action(VmmAction::PatchBalloonStats(balloon_stats_update_input(
+                    requested,
+                )))
+                .expect_err("stats enabled-state change should fail");
+
+            assert_eq!(
+                err,
+                VmmActionError::BalloonUpdate(BalloonUpdateError::StatisticsStateChange)
+            );
+            assert_eq!(
+                controller.balloon_config(),
+                Some(BalloonConfig::from(input))
+            );
+        }
+    }
+
+    #[test]
     fn postboot_balloon_actions_reject_not_started_without_mutating() {
         for action in [
             VmmAction::GetBalloonStats,
             VmmAction::GetBalloonHintingStatus,
             VmmAction::PatchBalloon(balloon_update_input(32)),
-            VmmAction::PatchBalloonStats,
+            VmmAction::PatchBalloonStats(balloon_stats_update_input(1)),
             VmmAction::PatchBalloonHintingStart(BalloonHintingStartInput::new(true)),
             VmmAction::PatchBalloonHintingStop,
         ] {
@@ -2282,7 +2387,7 @@ mod tests {
             for action in [
                 VmmAction::GetBalloonStats,
                 VmmAction::GetBalloonHintingStatus,
-                VmmAction::PatchBalloonStats,
+                VmmAction::PatchBalloonStats(balloon_stats_update_input(1)),
                 VmmAction::PatchBalloonHintingStart(BalloonHintingStartInput::new(true)),
                 VmmAction::PatchBalloonHintingStop,
             ] {
