@@ -124,7 +124,9 @@ is resource-specific:
   process-local runtime state created during startup preparation or runtime
   drive update. Exhausted limiters leave the descriptor pending for a later
   dispatch opportunity instead of sleeping, busy-waiting, writing request
-  status, publishing a used-ring entry, or mutating the backing file.
+  status, publishing a used-ring entry, or mutating the backing file. Active
+  HVF boot sessions schedule block retry wakeups with per-session state so one
+  VM cannot wake or share limiter state with another VM.
 - `/pmem/{id}` stores Firecracker-shaped pmem backing paths during pre-boot
   configuration after rejecting empty paths, and reports them through
   `GET /vm/config`. Startup opens each configured path with nonblocking
@@ -330,8 +332,10 @@ file `sync_all()` path. Configured block rate limiters must not create shared
 global state between processes; each active device owns its limiter budget, and
 throttled descriptors remain pending without writing request status, publishing
 used-ring entries, or mutating the backing file. Runtime block dispatch may
-report a process-local retry delay for the pending descriptor, but that signal
-does not by itself sleep, poll, or schedule an HVF wakeup.
+report a process-local retry delay for the pending descriptor. The HVF boot run
+loop uses that delay to schedule a per-session retry wakeup through the vCPU
+cancel path; the backend-neutral dispatch path itself still does not sleep or
+busy-wait.
 
 Metrics and logger outputs are host observability state, not guest
 configuration, and are intentionally omitted from `GET /vm/config`. Current

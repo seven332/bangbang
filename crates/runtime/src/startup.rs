@@ -3,6 +3,7 @@
 use std::collections::TryReserveError;
 use std::fmt;
 use std::os::fd::RawFd;
+use std::time::Duration;
 
 use crate::VmmController;
 use crate::balloon::{
@@ -235,6 +236,13 @@ impl Arm64BootBlockNotificationDispatches {
             .iter()
             .any(Arm64BootBlockNotificationDispatch::needs_queue_interrupt)
     }
+
+    pub fn rate_limiter_retry_after(&self) -> Option<Duration> {
+        self.devices
+            .iter()
+            .filter_map(Arm64BootBlockNotificationDispatch::rate_limiter_retry_after)
+            .min()
+    }
 }
 
 #[derive(Debug)]
@@ -259,6 +267,10 @@ impl Arm64BootBlockNotificationDispatch {
     pub fn needs_queue_interrupt(&self) -> bool {
         self.outcome.needs_queue_interrupt()
     }
+
+    pub fn rate_limiter_retry_after(&self) -> Option<Duration> {
+        self.outcome.rate_limiter_retry_after()
+    }
 }
 
 #[derive(Debug)]
@@ -276,6 +288,18 @@ impl Arm64BootBlockNotificationOutcome {
                 .completed_dispatch()
                 .is_some_and(crate::block::VirtioBlockQueueDispatch::needs_queue_interrupt),
             Self::HandlerLookupFailed(_) => false,
+        }
+    }
+
+    pub fn rate_limiter_retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Dispatched(dispatch) => dispatch
+                .queue_dispatch()
+                .and_then(|dispatch| dispatch.rate_limiter_retry_after()),
+            Self::DispatchFailed(source) => source
+                .completed_dispatch()
+                .and_then(|dispatch| dispatch.rate_limiter_retry_after()),
+            Self::HandlerLookupFailed(_) => None,
         }
     }
 
@@ -2600,6 +2624,7 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     use device_tree::DeviceTree;
 
@@ -2727,7 +2752,7 @@ mod tests {
     const TEST_BALLOON_STATS_USED_RING: GuestAddress = GuestAddress::new(0x8069_0000);
     const TEST_BALLOON_STATS_PAYLOAD: GuestAddress = GuestAddress::new(0x806a_0000);
     const TEST_BALLOON_MAPPED_PFN: u32 = 0x80000;
-    const TEST_NETWORK_QUEUE_DEVICE_STRIDE: u64 = 0x0010_0000;
+    const TEST_QUEUE_DEVICE_STRIDE: u64 = 0x0010_0000;
     const TEST_AVAILABLE_RING_IDX_OFFSET: u64 = 2;
     const TEST_AVAILABLE_RING_RING_OFFSET: u64 = 4;
     const TEST_AVAILABLE_RING_ENTRY_SIZE: u64 = 2;
@@ -2846,6 +2871,21 @@ mod tests {
 
     fn add_drive(controller: &mut crate::VmmController, id: &str, path: &Path) {
         add_drive_with_root(controller, id, path, true);
+    }
+
+    fn add_drive_with_rate_limiter(
+        controller: &mut crate::VmmController,
+        id: &str,
+        path: &Path,
+        is_root_device: bool,
+        rate_limiter: DriveRateLimiterConfig,
+    ) {
+        controller
+            .handle_action(VmmAction::PutDrive(
+                DriveConfigInput::new(id, id, path.to_path_buf(), is_root_device)
+                    .with_rate_limiter(rate_limiter),
+            ))
+            .expect("drive config with rate limiter should be stored");
     }
 
     fn add_drive_with_root(
@@ -3342,6 +3382,26 @@ mod tests {
         device_index: usize,
         device_ring: GuestAddress,
     ) {
+        configure_boot_block_queue_at(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            TEST_DESCRIPTOR_TABLE,
+            TEST_AVAILABLE_RING,
+            device_ring,
+            TEST_QUEUE_SIZE,
+        );
+    }
+
+    fn configure_boot_block_queue_at(
+        runtime: &mut super::Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        device_index: usize,
+        descriptor_table: GuestAddress,
+        available_ring: GuestAddress,
+        used_ring: GuestAddress,
+        queue_size: u16,
+    ) {
         write_boot_block_mmio_u32(
             runtime,
             mmio_dispatcher,
@@ -3368,28 +3428,28 @@ mod tests {
             mmio_dispatcher,
             device_index,
             VirtioMmioRegister::QueueNum,
-            u32::from(TEST_QUEUE_SIZE),
+            u32::from(queue_size),
         );
         write_boot_block_mmio_u32(
             runtime,
             mmio_dispatcher,
             device_index,
             VirtioMmioRegister::QueueDescLow,
-            guest_address_low(TEST_DESCRIPTOR_TABLE),
+            guest_address_low(descriptor_table),
         );
         write_boot_block_mmio_u32(
             runtime,
             mmio_dispatcher,
             device_index,
             VirtioMmioRegister::QueueDriverLow,
-            guest_address_low(TEST_AVAILABLE_RING),
+            guest_address_low(available_ring),
         );
         write_boot_block_mmio_u32(
             runtime,
             mmio_dispatcher,
             device_index,
             VirtioMmioRegister::QueueDeviceLow,
-            guest_address_low(device_ring),
+            guest_address_low(used_ring),
         );
         write_boot_block_mmio_u32(
             runtime,
@@ -4436,19 +4496,60 @@ mod tests {
     }
 
     fn write_queued_read_request(memory: &mut crate::memory::GuestMemory) {
-        write_request_header(memory, HEADER_ADDR, VIRTIO_BLOCK_REQUEST_TYPE_IN, 0);
-        write_descriptor(
+        write_read_request_at(
             memory,
             0,
-            TestDescriptor::readable(HEADER_ADDR, VIRTIO_BLOCK_REQUEST_HEADER_SIZE, Some(1)),
+            TEST_DESCRIPTOR_TABLE,
+            HEADER_ADDR,
+            DATA_ADDR,
+            STATUS_ADDR,
+            0,
         );
-        write_descriptor(
-            memory,
-            1,
-            TestDescriptor::writable(DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as u32, Some(2)),
-        );
-        write_descriptor(memory, 2, TestDescriptor::writable(STATUS_ADDR, 1, None));
         write_available_heads(memory, &[0]);
+    }
+
+    fn write_read_request_at(
+        memory: &mut crate::memory::GuestMemory,
+        head: u16,
+        descriptor_table: GuestAddress,
+        header: GuestAddress,
+        data: GuestAddress,
+        status: GuestAddress,
+        sector: u64,
+    ) {
+        write_request_header(memory, header, VIRTIO_BLOCK_REQUEST_TYPE_IN, sector);
+        let data_descriptor = head
+            .checked_add(1)
+            .expect("test data descriptor index should not overflow");
+        let status_descriptor = head
+            .checked_add(2)
+            .expect("test status descriptor index should not overflow");
+        write_descriptor_at(
+            memory,
+            descriptor_table,
+            head,
+            TestDescriptor::readable(
+                header,
+                VIRTIO_BLOCK_REQUEST_HEADER_SIZE,
+                Some(data_descriptor),
+            ),
+        );
+        write_descriptor_at(
+            memory,
+            descriptor_table,
+            data_descriptor,
+            TestDescriptor::writable(
+                data,
+                VIRTIO_BLOCK_SECTOR_SIZE as u32,
+                Some(status_descriptor),
+            ),
+        );
+        write_descriptor_at(
+            memory,
+            descriptor_table,
+            status_descriptor,
+            TestDescriptor::writable(status, 1, None),
+        );
     }
 
     fn write_partially_invalid_queued_flush_request(memory: &mut crate::memory::GuestMemory) {
@@ -4651,10 +4752,86 @@ mod tests {
         );
     }
 
+    fn block_queue_layout(device_index: usize) -> TestBlockQueueLayout {
+        let offset = u64::try_from(device_index)
+            .expect("test device index should fit in u64")
+            .checked_mul(TEST_QUEUE_DEVICE_STRIDE)
+            .expect("test queue offset should not overflow");
+        let second_request_offset = 0x1000;
+
+        TestBlockQueueLayout {
+            descriptor_table: TEST_DESCRIPTOR_TABLE
+                .checked_add(offset)
+                .expect("test block descriptor table should not overflow"),
+            available_ring: TEST_AVAILABLE_RING
+                .checked_add(offset)
+                .expect("test block available ring should not overflow"),
+            used_ring: TEST_USED_RING
+                .checked_add(offset)
+                .expect("test block used ring should not overflow"),
+            first_header: HEADER_ADDR
+                .checked_add(offset)
+                .expect("test first header should not overflow"),
+            first_data: DATA_ADDR
+                .checked_add(offset)
+                .expect("test first data should not overflow"),
+            first_status: STATUS_ADDR
+                .checked_add(offset)
+                .expect("test first status should not overflow"),
+            second_header: HEADER_ADDR
+                .checked_add(offset + second_request_offset)
+                .expect("test second header should not overflow"),
+            second_data: DATA_ADDR
+                .checked_add(offset + second_request_offset)
+                .expect("test second data should not overflow"),
+            second_status: STATUS_ADDR
+                .checked_add(offset + second_request_offset)
+                .expect("test second status should not overflow"),
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct TestBlockQueueLayout {
+        descriptor_table: GuestAddress,
+        available_ring: GuestAddress,
+        used_ring: GuestAddress,
+        first_header: GuestAddress,
+        first_data: GuestAddress,
+        first_status: GuestAddress,
+        second_header: GuestAddress,
+        second_data: GuestAddress,
+        second_status: GuestAddress,
+    }
+
+    fn write_two_queued_block_read_requests(
+        memory: &mut crate::memory::GuestMemory,
+        layout: TestBlockQueueLayout,
+    ) {
+        write_read_request_at(
+            memory,
+            0,
+            layout.descriptor_table,
+            layout.first_header,
+            layout.first_data,
+            layout.first_status,
+            0,
+        );
+        write_read_request_at(
+            memory,
+            3,
+            layout.descriptor_table,
+            layout.second_header,
+            layout.second_data,
+            layout.second_status,
+            1,
+        );
+        write_available_heads_at(memory, layout.available_ring, &[0, 3]);
+    }
+
     fn network_queue_layout(device_index: usize) -> TestNetworkQueueLayout {
         let offset = u64::try_from(device_index)
             .expect("test device index should fit in u64")
-            .checked_mul(TEST_NETWORK_QUEUE_DEVICE_STRIDE)
+            .checked_mul(TEST_QUEUE_DEVICE_STRIDE)
             .expect("test queue offset should not overflow");
 
         TestNetworkQueueLayout {
@@ -7791,6 +7968,8 @@ mod tests {
         assert!(dispatch.drained_notifications().is_empty());
         assert!(dispatch.queue_dispatch().is_none());
         assert!(!device_dispatch.needs_queue_interrupt());
+        assert_eq!(device_dispatch.rate_limiter_retry_after(), None);
+        assert_eq!(dispatches.rate_limiter_retry_after(), None);
         assert_eq!(
             read_boot_block_mmio_u32(
                 &mut runtime,
@@ -8128,6 +8307,114 @@ mod tests {
         assert_eq!(
             read_guest_bytes(&memory, DATA_ADDR, VIRTIO_BLOCK_SECTOR_SIZE as usize),
             second_payload
+        );
+    }
+
+    #[test]
+    fn boot_runtime_block_notification_dispatch_reports_earliest_rate_limiter_retry() {
+        let kernel = temp_file("kernel-block-rate-limit-retry", &arm64_image());
+        let first_block = temp_file(
+            "block-rate-limit-retry-first",
+            &vec![0x11; (VIRTIO_BLOCK_SECTOR_SIZE * 2) as usize],
+        );
+        let second_block = temp_file(
+            "block-rate-limit-retry-second",
+            &vec![0x22; (VIRTIO_BLOCK_SECTOR_SIZE * 2) as usize],
+        );
+        let mut controller = controller_with_kernel(kernel.path());
+        add_drive_with_rate_limiter(
+            &mut controller,
+            "rootfs",
+            first_block.path(),
+            true,
+            DriveRateLimiterConfig::new(None, Some(DriveTokenBucketConfig::new(1, None, 60_000))),
+        );
+        add_drive_with_rate_limiter(
+            &mut controller,
+            "data",
+            second_block.path(),
+            false,
+            DriveRateLimiterConfig::new(None, Some(DriveTokenBucketConfig::new(1, None, 30_000))),
+        );
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            valid_config(&[line(32), line(33)]),
+        )
+        .expect("boot resources should assemble");
+        let parts = resources.into_parts();
+        let mut memory = parts.memory;
+        let mut mmio_dispatcher = parts.mmio_dispatcher;
+        let mut runtime = parts.runtime;
+        let first_layout = block_queue_layout(0);
+        let second_layout = block_queue_layout(1);
+        configure_boot_block_queue_at(
+            &mut runtime,
+            &mut mmio_dispatcher,
+            0,
+            first_layout.descriptor_table,
+            first_layout.available_ring,
+            first_layout.used_ring,
+            8,
+        );
+        configure_boot_block_queue_at(
+            &mut runtime,
+            &mut mmio_dispatcher,
+            1,
+            second_layout.descriptor_table,
+            second_layout.available_ring,
+            second_layout.used_ring,
+            8,
+        );
+        write_two_queued_block_read_requests(&mut memory, first_layout);
+        write_two_queued_block_read_requests(&mut memory, second_layout);
+        notify_boot_block_queue(&mut runtime, &mut mmio_dispatcher, 0);
+        notify_boot_block_queue(&mut runtime, &mut mmio_dispatcher, 1);
+
+        let dispatches = runtime
+            .dispatch_block_queue_notifications(&mut memory, &mut mmio_dispatcher)
+            .expect("block dispatch result should allocate");
+
+        assert_eq!(dispatches.len(), 2);
+        assert!(dispatches.needs_queue_interrupt());
+        let first = &dispatches.as_slice()[0];
+        let second = &dispatches.as_slice()[1];
+        let first_retry = first
+            .rate_limiter_retry_after()
+            .expect("first dispatch should report retry delay");
+        let second_retry = second
+            .rate_limiter_retry_after()
+            .expect("second dispatch should report retry delay");
+        assert!(first_retry > second_retry);
+        assert_eq!(dispatches.rate_limiter_retry_after(), Some(second_retry));
+        assert!(first_retry <= Duration::from_secs(60));
+        assert!(second_retry <= Duration::from_secs(30));
+        assert_eq!(
+            first
+                .outcome()
+                .dispatched()
+                .expect("first block queue should dispatch")
+                .queue_dispatch()
+                .expect("first queue dispatch should be present")
+                .rate_limiter_throttled_requests(),
+            1
+        );
+        assert_eq!(
+            second
+                .outcome()
+                .dispatched()
+                .expect("second block queue should dispatch")
+                .queue_dispatch()
+                .expect("second queue dispatch should be present")
+                .rate_limiter_throttled_requests(),
+            1
+        );
+        assert_eq!(
+            read_guest_bytes(&memory, first_layout.second_status, 1),
+            [0]
+        );
+        assert_eq!(
+            read_guest_bytes(&memory, second_layout.second_status, 1),
+            [0]
         );
     }
 
