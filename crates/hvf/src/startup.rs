@@ -21,6 +21,7 @@ use bangbang_runtime::memory::{GuestAddress, GuestMemory};
 use bangbang_runtime::mmio::{MmioDispatcher, MmioRegionId};
 use bangbang_runtime::network::NetworkMmioLayout;
 use bangbang_runtime::pmem::{PmemMmioLayout, VirtioPmemFlushStatus};
+use bangbang_runtime::rtc::RtcMmioLayout;
 use bangbang_runtime::serial::SharedSerialOutput;
 use bangbang_runtime::startup::{
     Arm64BootBalloonNotificationDispatch, Arm64BootBalloonNotificationDispatchError,
@@ -33,7 +34,8 @@ use bangbang_runtime::startup::{
     Arm64BootNetworkNotificationDispatches, Arm64BootNetworkPacketIoProvider,
     Arm64BootPmemNotificationDispatch, Arm64BootPmemNotificationDispatchError,
     Arm64BootPmemNotificationDispatches, Arm64BootResourceConfig, Arm64BootResourceError,
-    Arm64BootResourceParts, Arm64BootResources, Arm64BootRuntimeResources,
+    Arm64BootResourceParts, Arm64BootResources,
+    Arm64BootRtcDeviceConfig as RuntimeArm64BootRtcDeviceConfig, Arm64BootRuntimeResources,
     Arm64BootSerialDeviceConfig as RuntimeArm64BootSerialDeviceConfig,
     Arm64BootVsockNotificationDispatch, Arm64BootVsockNotificationDispatchError,
     Arm64BootVsockNotificationDispatches, Arm64BootVsockWakeupFdsError,
@@ -63,6 +65,7 @@ pub struct HvfArm64BootSessionConfig {
     pub pmem_mmio_layout: PmemMmioLayout,
     pub network_mmio_layout: NetworkMmioLayout,
     pub vsock_mmio_layout: VsockMmioLayout,
+    pub rtc_mmio_layout: RtcMmioLayout,
     pub balloon_device: Option<HvfArm64BootBalloonDeviceConfig>,
     pub entropy_device: Option<HvfArm64BootEntropyDeviceConfig>,
     pub serial_device: Option<HvfArm64BootSerialDeviceConfig>,
@@ -74,12 +77,14 @@ impl HvfArm64BootSessionConfig {
         pmem_mmio_layout: PmemMmioLayout,
         network_mmio_layout: NetworkMmioLayout,
         vsock_mmio_layout: VsockMmioLayout,
+        rtc_mmio_layout: RtcMmioLayout,
     ) -> Self {
         Self {
             block_mmio_layout,
             pmem_mmio_layout,
             network_mmio_layout,
             vsock_mmio_layout,
+            rtc_mmio_layout,
             balloon_device: None,
             entropy_device: None,
             serial_device: None,
@@ -3482,6 +3487,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
             vcpu_mpidrs: &[primary_mpidr],
             gic: gic.arm64_fdt_gic(),
             timer,
+            rtc_device: Some(RuntimeArm64BootRtcDeviceConfig::new(config.rtc_mmio_layout)),
             serial_device: runtime_serial,
             block_mmio_layout: config.block_mmio_layout,
             block_interrupt_lines: &interrupt_lines.block,
@@ -3700,6 +3706,7 @@ mod tests {
         VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
     };
     use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::rtc::RtcMmioLayout;
     use bangbang_runtime::serial::{SharedSerialOutput, SharedSerialOutputBuffer};
     use bangbang_runtime::startup::{
         Arm64BootBalloonNotificationDispatches, Arm64BootBlockNotificationDispatches,
@@ -3813,6 +3820,7 @@ mod tests {
     const PSCI_VERSION_0_2: u64 = 0x0000_0002;
     const PSCI_RET_SUCCESS: u64 = 0;
     const TEST_NETWORK_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_4000);
+    const TEST_RTC_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_1000);
     const TEST_ENTROPY_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_7000);
     const TEST_BALLOON_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_8000);
 
@@ -4753,6 +4761,7 @@ mod tests {
             vcpu_mpidrs: &[0],
             gic: valid_fdt_gic(),
             timer: Arm64FdtTimerInterrupts::firecracker_default(),
+            rtc_device: None,
             serial_device: None,
             block_mmio_layout: BlockMmioLayout::new(TEST_BLOCK_MMIO_BASE, MmioRegionId::new(1)),
             block_interrupt_lines: block_lines,
@@ -8638,11 +8647,13 @@ mod tests {
             PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
             network_layout,
             VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+            RtcMmioLayout::new(TEST_RTC_MMIO_BASE, MmioRegionId::new(3000)),
         )
         .with_serial_device(serial);
 
         assert!(config.serial_device.is_some());
         assert_eq!(config.network_mmio_layout, network_layout);
+        assert_eq!(config.rtc_mmio_layout.base(), TEST_RTC_MMIO_BASE);
     }
 
     #[test]
@@ -8656,6 +8667,7 @@ mod tests {
             PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
             NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
             VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+            RtcMmioLayout::new(TEST_RTC_MMIO_BASE, MmioRegionId::new(3000)),
         )
         .with_entropy_device(entropy);
 
@@ -8674,6 +8686,7 @@ mod tests {
             PmemMmioLayout::new(GuestAddress::new(0x5800_0000), MmioRegionId::new(500)),
             NetworkMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(1000)),
             VsockMmioLayout::new(GuestAddress::new(0x7000_0000), MmioRegionId::new(2000)),
+            RtcMmioLayout::new(TEST_RTC_MMIO_BASE, MmioRegionId::new(3000)),
         )
         .with_balloon_device(balloon);
 

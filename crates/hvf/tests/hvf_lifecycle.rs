@@ -4,6 +4,14 @@ static HVF_LIFECYCLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(())
 static NEXT_HVF_TEST_FILE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn test_rtc_mmio_layout() -> bangbang_runtime::rtc::RtcMmioLayout {
+    bangbang_runtime::rtc::RtcMmioLayout::new(
+        bangbang_runtime::memory::GuestAddress::new(0x4000_1000),
+        bangbang_runtime::mmio::MmioRegionId::new(3000),
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn creates_and_destroys_hvf_vcpu() {
     use bangbang_hvf::{HvfBackend, HvfRegister};
@@ -300,11 +308,13 @@ fn prepares_internal_hvf_arm64_boot_session() {
     let mut backend = HvfBackend::new();
     let pmem_mmio_layout =
         PmemMmioLayout::new(GuestAddress::new(0x4800_0000), MmioRegionId::new(500));
+    let rtc_mmio_layout = test_rtc_mmio_layout();
     let config = HvfArm64BootSessionConfig::new(
         BlockMmioLayout::new(GuestAddress::new(0x4000_0000), MmioRegionId::new(1)),
         pmem_mmio_layout,
         NetworkMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1000)),
         VsockMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(2000)),
+        rtc_mmio_layout,
     );
 
     let mut session = backend
@@ -317,30 +327,45 @@ fn prepares_internal_hvf_arm64_boot_session() {
         .expect("session MMIO dispatcher should lock")
         .regions()
         .to_vec();
-    assert_eq!(mmio_regions.len(), 2);
-    assert_eq!(mmio_regions[0].id(), pmem_mmio_layout.base_region_id());
+    assert_eq!(mmio_regions.len(), 3);
+    let first_pmem_region = mmio_regions
+        .iter()
+        .find(|region| region.id() == pmem_mmio_layout.base_region_id())
+        .expect("first pmem MMIO region should be registered");
     assert_eq!(
-        mmio_regions[0].range().start(),
+        first_pmem_region.range().start(),
         pmem_mmio_layout.base_address()
     );
     assert_eq!(
-        mmio_regions[0].range().size(),
+        first_pmem_region.range().size(),
         bangbang_runtime::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE
     );
+    let second_pmem_region_id =
+        MmioRegionId::new(pmem_mmio_layout.base_region_id().raw_value() + 1);
+    let second_pmem_region = mmio_regions
+        .iter()
+        .find(|region| region.id() == second_pmem_region_id)
+        .expect("second pmem MMIO region should be registered");
+    assert_eq!(second_pmem_region.id(), second_pmem_region_id);
     assert_eq!(
-        mmio_regions[1].id(),
-        MmioRegionId::new(pmem_mmio_layout.base_region_id().raw_value() + 1)
-    );
-    assert_eq!(
-        mmio_regions[1].range().start(),
+        second_pmem_region.range().start(),
         pmem_mmio_layout
             .base_address()
             .checked_add(pmem_mmio_layout.address_stride())
             .expect("second pmem MMIO address should fit")
     );
     assert_eq!(
-        mmio_regions[1].range().size(),
+        second_pmem_region.range().size(),
         bangbang_runtime::virtio_mmio::VIRTIO_MMIO_DEVICE_WINDOW_SIZE
+    );
+    let rtc_region = mmio_regions
+        .iter()
+        .find(|region| region.id() == rtc_mmio_layout.region_id())
+        .expect("RTC MMIO region should be registered");
+    assert_eq!(rtc_region.range().start(), rtc_mmio_layout.base());
+    assert_eq!(
+        rtc_region.range().size(),
+        bangbang_runtime::rtc::RTC_MMIO_DEVICE_WINDOW_SIZE
     );
     assert!(session.block_interrupt_lines().is_empty());
     assert_eq!(session.pmem_interrupt_lines().len(), 2);
@@ -444,23 +469,30 @@ fn prepares_owned_hvf_arm64_boot_session() {
             kernel.path(),
         )))
         .expect("boot source config should be stored");
+    let rtc_mmio_layout = test_rtc_mmio_layout();
     let config = HvfArm64BootSessionConfig::new(
         BlockMmioLayout::new(GuestAddress::new(0x4000_0000), MmioRegionId::new(1)),
         PmemMmioLayout::new(GuestAddress::new(0x4800_0000), MmioRegionId::new(500)),
         NetworkMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1000)),
         VsockMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(2000)),
+        rtc_mmio_layout,
     );
 
     let mut session = OwnedHvfArm64BootSession::new(&controller, config.clone())
         .expect("owned HVF arm64 boot session should prepare");
 
     let mmio_dispatcher = session.mmio_dispatcher();
-    assert!(
-        mmio_dispatcher
-            .try_lock()
-            .expect("owned session MMIO dispatcher should lock")
-            .regions()
-            .is_empty()
+    let mmio_regions = mmio_dispatcher
+        .try_lock()
+        .expect("owned session MMIO dispatcher should lock")
+        .regions()
+        .to_vec();
+    assert_eq!(mmio_regions.len(), 1);
+    assert_eq!(mmio_regions[0].id(), rtc_mmio_layout.region_id());
+    assert_eq!(mmio_regions[0].range().start(), rtc_mmio_layout.base());
+    assert_eq!(
+        mmio_regions[0].range().size(),
+        bangbang_runtime::rtc::RTC_MMIO_DEVICE_WINDOW_SIZE
     );
     assert!(session.block_interrupt_lines().is_empty());
     assert_eq!(
@@ -543,6 +575,7 @@ fn owned_hvf_arm64_boot_session_cleans_up_after_prepare_error() {
         PmemMmioLayout::new(GuestAddress::new(0x4800_0000), MmioRegionId::new(500)),
         NetworkMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1000)),
         VsockMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(2000)),
+        test_rtc_mmio_layout(),
     );
     let empty_controller = bangbang_runtime::VmmController::new("test", "0.1.0", "bangbang");
 
@@ -599,6 +632,7 @@ fn rejects_boot_session_on_existing_hvf_vm_without_destroying_it() {
                 PmemMmioLayout::new(GuestAddress::new(0x4800_0000), MmioRegionId::new(500)),
                 NetworkMmioLayout::new(GuestAddress::new(0x5000_0000), MmioRegionId::new(1000)),
                 VsockMmioLayout::new(GuestAddress::new(0x6000_0000), MmioRegionId::new(2000)),
+                test_rtc_mmio_layout(),
             ),
         )
         .expect_err("existing VM should be rejected");
