@@ -15,6 +15,7 @@ dependencies = [
  "serde",
  "serde_json",
  "signal-hook",
+ "signal-hook-registry",
 ]
 
 [[package]]

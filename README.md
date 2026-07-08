@@ -288,5 +288,8 @@ rules, guest boot artifact caching, and local verification expectations.
   code.
 - `153`: startup argument parsing failed before process configuration began.
   This matches Firecracker's argument-parsing exit code.
+- `148`, `149`, `150`, `151`, `154`, `156`, `157`: Firecracker-compatible
+  fatal or restricted host signal exits for `SIGSYS`, `SIGBUS`, `SIGSEGV`,
+  `SIGXFSZ`, `SIGXCPU`, `SIGHUP`, and `SIGILL`.
 - `1`: process failure, including API socket bind, shutdown signal handling, API
   accept failures, or process-owned runtime failures.

@@ -322,7 +322,7 @@ impl BangbangProcess {
         }
     }
 
-    pub(crate) fn terminate(mut self) -> CompletedProcess {
+    pub(crate) fn terminate(self) -> CompletedProcess {
         self.stop_with_signal(libc::SIGTERM, "SIGTERM")
     }
 
@@ -341,11 +341,15 @@ impl BangbangProcess {
         dead_code,
         reason = "shared integration-test support is compiled once per test target"
     )]
-    pub(crate) fn interrupt(mut self) -> CompletedProcess {
+    pub(crate) fn interrupt(self) -> CompletedProcess {
         self.stop_with_signal(libc::SIGINT, "SIGINT")
     }
 
-    fn stop_with_signal(&mut self, signal: i32, signal_name: &str) -> CompletedProcess {
+    #[allow(
+        dead_code,
+        reason = "shared integration-test support is compiled once per test target"
+    )]
+    pub(crate) fn stop_with_signal(mut self, signal: i32, signal_name: &str) -> CompletedProcess {
         let child = self.child.as_ref().expect("child should still be running");
         if let Err(err) = send_signal(child.id(), signal) {
             panic!("{signal_name} should be delivered: {err}");

@@ -282,8 +282,9 @@ CLI values are untrusted input. Current validation rejects invalid IDs, empty
 socket paths, and socket paths containing control characters. API startup also
 fails if the configured socket path already exists. Socket cleanup removes the
 socket inode created by the current process during normal shutdown and handled
-`SIGINT`/`SIGTERM` shutdown; uncatchable forced termination such as `SIGKILL`
-can still leave a stale socket path behind. The API socket is unauthenticated;
+`SIGINT`/`SIGTERM` shutdown; fatal signal exits use `_exit`, and uncatchable
+forced termination such as `SIGKILL` can still leave a stale socket path behind.
+The API socket is unauthenticated;
 bangbang restricts the published socket inode to owner-only permissions, and
 the parent directory remains part of the access-control boundary. Operators
 should use a private socket directory on multi-user hosts. Process CLI parsing
@@ -297,13 +298,21 @@ The current executable uses a small process exit status contract:
 | Exit status | Current meaning | Compatibility notes |
 | --- | --- | --- |
 | `0` | Help or version completed successfully, the API server exited without error, no-api mode handled `SIGINT`/`SIGTERM` shutdown, or a process-owned VM exited after guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET`. | Matches Firecracker's success status. |
+| `148` | The process intercepted `SIGSYS`. | Matches Firecracker's `BadSyscall` exit code for an explicitly delivered signal. Linux seccomp bad-syscall enforcement remains platform-limited on macOS. |
+| `149` | The process intercepted `SIGBUS`. | Matches Firecracker's fatal signal exit code. |
+| `150` | The process intercepted `SIGSEGV`. | Matches Firecracker's fatal signal exit code. |
+| `151` | The process intercepted `SIGXFSZ`. | Matches Firecracker's fatal signal exit code. |
 | `152` | Startup configuration failed before the process entered runtime, including config-file, metadata, startup logger, and startup metrics configuration failures. | Matches Firecracker's `BadConfiguration` exit code for clearly startup configuration failures. |
 | `153` | Startup argument parsing failed before process configuration began. | Matches Firecracker's `ArgParsing` exit code. |
+| `154` | The process intercepted `SIGXCPU`. | Matches Firecracker's fatal signal exit code. |
+| `156` | The process intercepted `SIGHUP`. | Matches Firecracker's fatal signal exit code. |
+| `157` | The process intercepted `SIGILL`. | Matches Firecracker's fatal signal exit code. |
 | `1` | Process failure, including API socket bind, signal handler registration, no-api signal wait failure, API accept failure, startup time accounting failure, periodic runtime work failure, or a process-owned boot worker non-success terminal state. | Used for non-configuration process failures before more specific Firecracker-compatible process errors exist. Per-connection read/write errors do not terminate the API server. |
 
-Firecracker also defines signal-specific exit codes. bangbang does not expose
-those until the corresponding signal handling, API server, or VM runtime
-behavior exists.
+Fatal signal exits call `_exit`, so normal Rust destructors and API socket
+cleanup do not run on those paths. `SIGPIPE` remains non-terminating in
+Firecracker and is not exposed as a process-exit status by bangbang. `SIGINT`
+and `SIGTERM` remain graceful successful shutdown signals.
 
 ## Compatibility Baseline
 
