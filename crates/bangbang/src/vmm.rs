@@ -34,7 +34,7 @@ use bangbang_runtime::memory::{GuestAddress, GuestMemory};
 use bangbang_runtime::memory_hotplug::{MemoryHotplugConfigInput, MemoryHotplugSizeUpdateInput};
 use bangbang_runtime::metrics::{
     BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics, SharedBalloonDeviceMetrics,
-    SharedBlockDeviceMetrics,
+    SharedBlockDeviceMetricsRegistry,
 };
 use bangbang_runtime::mmds::{
     MmdsConfig, MmdsConfigInput, MmdsContentInput, MmdsStateHandle, MmdsStateLockError,
@@ -1255,6 +1255,7 @@ where
             .map(ProcessSessionDiagnostics::metrics_diagnostics)
             .unwrap_or_default();
         self.process_metrics_diagnostics
+            .clone()
             .merged_with(self.starter.metrics_diagnostics())
             .merged_with(session_diagnostics)
     }
@@ -1875,7 +1876,7 @@ pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
         None
     }
 
-    fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetrics> {
+    fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetricsRegistry> {
         None
     }
 
@@ -1924,7 +1925,7 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
         ))
     }
 
-    fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetrics> {
+    fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetricsRegistry> {
         Some(OwnedHvfArm64BootSession::shared_block_device_metrics(self))
     }
 
@@ -2002,7 +2003,7 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
         None
     }
 
-    fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetrics> {
+    fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetricsRegistry> {
         None
     }
 
@@ -2048,7 +2049,7 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
         ))
     }
 
-    fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetrics> {
+    fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetricsRegistry> {
         Some(OwnedHvfArm64BootSession::shared_block_device_metrics(self))
     }
 
@@ -2098,7 +2099,7 @@ where
         self.session.shared_balloon_device_metrics()
     }
 
-    fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetrics> {
+    fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetricsRegistry> {
         self.session.shared_block_device_metrics()
     }
 
@@ -2548,7 +2549,7 @@ where
     control: S::Control,
     block_device_updater: Option<BootRunLoopBlockDeviceUpdater>,
     balloon_device_updater: Option<BootRunLoopBalloonDeviceUpdater>,
-    block_device_metrics: Option<SharedBlockDeviceMetrics>,
+    block_device_metrics: Option<SharedBlockDeviceMetricsRegistry>,
     balloon_device_metrics: Option<SharedBalloonDeviceMetrics>,
     command_handle: BootRunLoopCommandHandle<S>,
     status: Arc<BootRunLoopWorkerStatusCell<S::Outcome>>,
@@ -2767,7 +2768,9 @@ where
         let mut diagnostics =
             MetricsDiagnostics::new().with_boot_run_loop_status(self.metric_status());
         if let Some(metrics) = &self.block_device_metrics {
-            diagnostics = diagnostics.with_block_device_metrics(metrics.snapshot());
+            diagnostics = diagnostics
+                .with_block_device_metrics(metrics.aggregate_snapshot())
+                .with_block_device_metrics_by_drive(metrics.per_drive_snapshot());
         }
         if let Some(metrics) = &self.balloon_device_metrics {
             diagnostics = diagnostics.with_balloon_device_metrics(metrics.snapshot());
@@ -3016,8 +3019,9 @@ mod tests {
     use bangbang_runtime::logger::LoggerConfigInput;
     use bangbang_runtime::machine::{MachineConfigInput, MachineConfigPatchInput};
     use bangbang_runtime::metrics::{
-        BalloonDeviceMetrics, BlockDeviceMetrics, BootRunLoopMetricStatus, MetricsConfigInput,
-        MetricsDiagnostics, SharedBalloonDeviceMetrics, SharedBlockDeviceMetrics,
+        BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive,
+        BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics,
+        SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry,
     };
     use bangbang_runtime::mmds::{MmdsConfigInput, MmdsContentInput, MmdsStateHandle};
     use bangbang_runtime::mmio::MmioRegion;
@@ -3418,7 +3422,7 @@ mod tests {
     }
 
     impl DiagnosticStarter {
-        const fn new(status: BootRunLoopMetricStatus) -> Self {
+        fn new(status: BootRunLoopMetricStatus) -> Self {
             Self {
                 status,
                 diagnostics: MetricsDiagnostics::new(),
@@ -3426,7 +3430,7 @@ mod tests {
             }
         }
 
-        const fn with_metrics_diagnostics(mut self, diagnostics: MetricsDiagnostics) -> Self {
+        fn with_metrics_diagnostics(mut self, diagnostics: MetricsDiagnostics) -> Self {
             self.diagnostics = diagnostics;
             self
         }
@@ -3446,7 +3450,7 @@ mod tests {
         }
 
         fn metrics_diagnostics(&self) -> MetricsDiagnostics {
-            self.diagnostics
+            self.diagnostics.clone()
         }
     }
 
@@ -3695,7 +3699,7 @@ mod tests {
         max_steps_sender: mpsc::Sender<usize>,
         outcomes: Arc<Mutex<VecDeque<Result<FakeRunLoopOutcome, FakeRunLoopError>>>>,
         block_device_updater: Option<BootRunLoopBlockDeviceUpdater>,
-        block_device_metrics: Option<SharedBlockDeviceMetrics>,
+        block_device_metrics: Option<SharedBlockDeviceMetricsRegistry>,
         balloon_device_metrics: Option<SharedBalloonDeviceMetrics>,
         wait_for_stop: bool,
         wait_for_wakeup: bool,
@@ -3742,7 +3746,7 @@ mod tests {
             self
         }
 
-        fn with_block_device_metrics(mut self, metrics: SharedBlockDeviceMetrics) -> Self {
+        fn with_block_device_metrics(mut self, metrics: SharedBlockDeviceMetricsRegistry) -> Self {
             self.block_device_metrics = Some(metrics);
             self
         }
@@ -3790,7 +3794,7 @@ mod tests {
             self.block_device_updater.clone()
         }
 
-        fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetrics> {
+        fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetricsRegistry> {
             self.block_device_metrics.clone()
         }
 
@@ -4903,7 +4907,7 @@ mod tests {
     fn boot_run_loop_supervisor_reports_block_device_metrics() {
         let control = FakeRunLoopControl::default();
         let drop_count = Arc::new(AtomicU64::new(0));
-        let metrics = SharedBlockDeviceMetrics::default();
+        let metrics = SharedBlockDeviceMetricsRegistry::from_drive_ids(["rootfs", "data"]);
         let (max_steps_sender, max_steps_receiver) = mpsc::channel();
         let session =
             FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
@@ -4919,15 +4923,27 @@ mod tests {
                 .expect("worker should enter run loop"),
             5
         );
-        metrics.record_queue_events(1);
-        metrics.record_event_failure();
+        metrics.record_queue_events_for_drive("rootfs", 1);
+        metrics.record_event_failure_for_drive("rootfs");
+        let diagnostics = supervisor.metrics_diagnostics();
 
         assert_eq!(
-            supervisor.metrics_diagnostics().block_device_metrics(),
+            diagnostics.block_device_metrics(),
             Some(
                 BlockDeviceMetrics::default()
                     .with_event_fails(1)
                     .with_queue_event_count(1)
+            )
+        );
+        assert_eq!(
+            diagnostics.block_device_metrics_by_drive(),
+            Some(
+                &BlockDeviceMetricsByDrive::new().with_drive_metrics(
+                    "rootfs",
+                    BlockDeviceMetrics::default()
+                        .with_event_fails(1)
+                        .with_queue_event_count(1),
+                )
             )
         );
 
