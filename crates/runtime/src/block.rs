@@ -1221,7 +1221,7 @@ pub struct VirtioBlockLatencyAggregate {
 }
 
 impl VirtioBlockLatencyAggregate {
-    pub const fn new(min_us: u64, max_us: u64, sum_us: u64, sample_count: u64) -> Self {
+    pub(crate) const fn new(min_us: u64, max_us: u64, sum_us: u64, sample_count: u64) -> Self {
         if sample_count == 0 {
             return Self {
                 min_us: 0,
@@ -1251,7 +1251,7 @@ impl VirtioBlockLatencyAggregate {
         self.sum_us
     }
 
-    pub const fn sample_count(self) -> u64 {
+    pub(crate) const fn sample_count(self) -> u64 {
         self.sample_count
     }
 
@@ -1259,7 +1259,7 @@ impl VirtioBlockLatencyAggregate {
         self.sample_count == 0
     }
 
-    pub const fn from_sample(latency_us: u64) -> Self {
+    const fn from_sample(latency_us: u64) -> Self {
         Self {
             min_us: latency_us,
             max_us: latency_us,
@@ -1268,7 +1268,7 @@ impl VirtioBlockLatencyAggregate {
         }
     }
 
-    pub const fn merged_with(mut self, other: Self) -> Self {
+    pub(crate) const fn merged_with(mut self, other: Self) -> Self {
         if other.is_empty() {
             return self;
         }
