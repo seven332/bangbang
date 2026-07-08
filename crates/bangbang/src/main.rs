@@ -25,7 +25,8 @@ use periodic_metrics::{
     PeriodicBalloonStatisticsScheduler, PeriodicMetricsScheduler, min_poll_timeout_ms,
 };
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
-use signal_hook::consts::signal::{SIGINT, SIGTERM};
+use signal_hook::consts::signal::{SIGBUS, SIGHUP, SIGILL, SIGINT, SIGSEGV, SIGSYS, SIGTERM};
+use signal_hook::consts::signal::{SIGXCPU, SIGXFSZ};
 use signal_hook::{SigId, low_level};
 use vmm::{ProcessSessionExitDecision, ProcessVmm, VmmRequestHandler};
 
@@ -108,6 +109,7 @@ fn run() -> Result<(), ProcessError> {
             apply_startup_metrics_config(&mut vmm, metrics_config)?;
             apply_startup_logger_config(&mut vmm, logger_config)?;
             apply_startup_metadata(&mut vmm, metadata.as_deref())?;
+            let _fatal_signal_handlers = FatalSignalHandlers::install()?;
             apply_startup_config_file(&mut vmm, config_file.as_deref())?;
             let mut shutdown_signal = ShutdownSignal::install()?;
             if no_api {
@@ -699,8 +701,15 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProcessExitCode {
     ProcessFailure = 1,
+    BadSyscall = 148,
+    SigBus = 149,
+    SigSegv = 150,
+    SigXfsz = 151,
     BadConfiguration = 152,
     ArgumentParsing = 153,
+    SigXcpu = 154,
+    SigHup = 156,
+    SigIll = 157,
 }
 
 impl ProcessExitCode {
@@ -887,6 +896,65 @@ impl std::error::Error for MetadataFileError {}
 struct ShutdownSignal {
     wakeup_reader: UnixStream,
     signal_ids: [SigId; 2],
+}
+
+const FATAL_SIGNAL_EXITS: &[(i32, ProcessExitCode)] = &[
+    (SIGSYS, ProcessExitCode::BadSyscall),
+    (SIGBUS, ProcessExitCode::SigBus),
+    (SIGSEGV, ProcessExitCode::SigSegv),
+    (SIGXFSZ, ProcessExitCode::SigXfsz),
+    (SIGXCPU, ProcessExitCode::SigXcpu),
+    (SIGHUP, ProcessExitCode::SigHup),
+    (SIGILL, ProcessExitCode::SigIll),
+];
+
+#[derive(Debug)]
+struct FatalSignalHandlers {
+    signal_ids: Vec<SigId>,
+}
+
+impl FatalSignalHandlers {
+    fn install() -> Result<Self, ProcessError> {
+        let mut signal_ids = Vec::with_capacity(FATAL_SIGNAL_EXITS.len());
+
+        for &(signal, exit_code) in FATAL_SIGNAL_EXITS {
+            match register_fatal_signal_exit(signal, exit_code) {
+                Ok(signal_id) => signal_ids.push(signal_id),
+                Err(err) => {
+                    for signal_id in signal_ids {
+                        low_level::unregister(signal_id);
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        Ok(Self { signal_ids })
+    }
+}
+
+impl Drop for FatalSignalHandlers {
+    fn drop(&mut self) {
+        for signal_id in self.signal_ids.drain(..) {
+            low_level::unregister(signal_id);
+        }
+    }
+}
+
+fn register_fatal_signal_exit(
+    signal: i32,
+    exit_code: ProcessExitCode,
+) -> Result<SigId, ProcessError> {
+    // SAFETY: Registering these normally forbidden fatal signals is intentional
+    // Firecracker exit-code compatibility. The registered handler only invokes
+    // `signal_hook::low_level::exit`, which wraps async-signal-safe `_exit` and
+    // does not allocate, lock, or run Rust destructors from the signal context.
+    unsafe {
+        signal_hook_registry::register_signal_unchecked(signal, move || {
+            low_level::exit(i32::from(exit_code.value()));
+        })
+    }
+    .map_err(|err| ProcessError::SignalHandler(err.kind()))
 }
 
 impl ShutdownSignal {
@@ -2039,8 +2107,15 @@ mod tests {
     #[test]
     fn process_exit_code_values_match_firecracker_contract() {
         assert_eq!(ProcessExitCode::ProcessFailure.value(), 1);
+        assert_eq!(ProcessExitCode::BadSyscall.value(), 148);
+        assert_eq!(ProcessExitCode::SigBus.value(), 149);
+        assert_eq!(ProcessExitCode::SigSegv.value(), 150);
+        assert_eq!(ProcessExitCode::SigXfsz.value(), 151);
         assert_eq!(ProcessExitCode::BadConfiguration.value(), 152);
         assert_eq!(ProcessExitCode::ArgumentParsing.value(), 153);
+        assert_eq!(ProcessExitCode::SigXcpu.value(), 154);
+        assert_eq!(ProcessExitCode::SigHup.value(), 156);
+        assert_eq!(ProcessExitCode::SigIll.value(), 157);
     }
 
     #[test]

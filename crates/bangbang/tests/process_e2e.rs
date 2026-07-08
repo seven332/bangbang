@@ -22,8 +22,15 @@ use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_runtime::machine::MAX_MEM_SIZE_MIB;
 
 const BANGBANG_VERSION: &str = env!("CARGO_PKG_VERSION");
+const BAD_SYSCALL_EXIT_CODE: i32 = 148;
+const SIGBUS_EXIT_CODE: i32 = 149;
+const SIGSEGV_EXIT_CODE: i32 = 150;
+const SIGXFSZ_EXIT_CODE: i32 = 151;
 const BAD_CONFIGURATION_EXIT_CODE: i32 = 152;
 const ARGUMENT_PARSING_EXIT_CODE: i32 = 153;
+const SIGXCPU_EXIT_CODE: i32 = 154;
+const SIGHUP_EXIT_CODE: i32 = 156;
+const SIGILL_EXIT_CODE: i32 = 157;
 const MULTI_VCPU_STARTUP_ERROR: &str = "HVF arm64 boot session supports exactly 1 vCPU, got 2";
 
 #[test]
@@ -263,6 +270,39 @@ fn executable_handles_sigint_shutdown_cleanly() {
     );
 
     assert_clean_shutdown(bangbang.interrupt(), &socket_path, "bangbang SIGINT");
+}
+
+#[test]
+fn executable_maps_firecracker_fatal_signals_to_exit_codes() {
+    for (signal_name, signal, expected_exit_code) in [
+        ("SIGSYS", libc::SIGSYS, BAD_SYSCALL_EXIT_CODE),
+        ("SIGBUS", libc::SIGBUS, SIGBUS_EXIT_CODE),
+        ("SIGSEGV", libc::SIGSEGV, SIGSEGV_EXIT_CODE),
+        ("SIGXFSZ", libc::SIGXFSZ, SIGXFSZ_EXIT_CODE),
+        ("SIGXCPU", libc::SIGXCPU, SIGXCPU_EXIT_CODE),
+        ("SIGHUP", libc::SIGHUP, SIGHUP_EXIT_CODE),
+        ("SIGILL", libc::SIGILL, SIGILL_EXIT_CODE),
+    ] {
+        let test_dir = TestDir::new();
+        let socket_path = test_dir.path().join(format!("{signal_name}.socket"));
+        let instance_id = test_dir.instance_id();
+        let bangbang = BangbangProcess::start(&socket_path, &instance_id);
+
+        assert!(
+            socket_path.exists(),
+            "bangbang should publish the configured API socket before {signal_name}"
+        );
+
+        let output = bangbang.stop_with_signal(signal, signal_name);
+        assert_eq!(
+            output.status.code(),
+            Some(expected_exit_code),
+            "{signal_name} should make bangbang exit with the Firecracker-compatible exit code; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            output.stdout,
+            output.stderr
+        );
+    }
 }
 
 #[test]
