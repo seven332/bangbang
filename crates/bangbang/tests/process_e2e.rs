@@ -326,6 +326,37 @@ fn executable_rejects_unsupported_firecracker_process_flags_before_socket_public
 }
 
 #[test]
+fn executable_rejects_invalid_logger_level_as_bad_configuration() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let instance_id = test_dir.instance_id();
+
+    let output = BangbangProcess::start_with_extra_args_expect_failure(
+        &socket_path,
+        &instance_id,
+        &["--level", "verbose"],
+    );
+
+    assert_bad_configuration_exit_code(&output, "invalid logger level");
+    assert!(
+        output
+            .stderr
+            .contains("bangbang: invalid --level: logger level is invalid"),
+        "stderr should describe invalid logger level; stderr:\n{}",
+        output.stderr
+    );
+    assert!(
+        !output.stdout.contains("status: API server listening"),
+        "invalid logger level must not report API readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !socket_path.exists(),
+        "invalid logger level must fail before publishing the API socket"
+    );
+}
+
+#[test]
 fn executable_rejects_snapshot_requests_without_mutating() {
     let test_dir = TestDir::new();
     let socket_path = test_dir.path().join("api.socket");

@@ -693,7 +693,7 @@ fn parse_process_args<I>(args: I) -> Result<Args, ProcessError>
 where
     I: IntoIterator<Item = OsString>,
 {
-    Args::parse_os(args).map_err(ProcessError::ArgumentParsing)
+    Args::parse_os(args).map_err(ProcessError::from)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -717,6 +717,7 @@ impl ProcessExitCode {
 enum ProcessError {
     ApiServer(ApiServerError),
     ArgumentParsing(String),
+    BadConfiguration(String),
     ConfigFile(ConfigFileError),
     Metadata(MetadataFileError),
     PeriodicBalloonStatisticsUpdate(VmmActionError),
@@ -733,6 +734,7 @@ impl ProcessError {
         match self {
             Self::ApiServer(_) => ProcessExitCode::ProcessFailure,
             Self::ArgumentParsing(_) => ProcessExitCode::ArgumentParsing,
+            Self::BadConfiguration(_) => ProcessExitCode::BadConfiguration,
             Self::ConfigFile(_) => ProcessExitCode::BadConfiguration,
             Self::Metadata(_) => ProcessExitCode::BadConfiguration,
             Self::PeriodicBalloonStatisticsUpdate(_) => ProcessExitCode::ProcessFailure,
@@ -751,6 +753,7 @@ impl fmt::Display for ProcessError {
         match self {
             Self::ApiServer(err) => write!(f, "API server error: {err}"),
             Self::ArgumentParsing(message) => f.write_str(message),
+            Self::BadConfiguration(message) => f.write_str(message),
             Self::ConfigFile(err) => write!(f, "config-file error: {err}"),
             Self::Metadata(err) => write!(f, "metadata error: {err}"),
             Self::PeriodicBalloonStatisticsUpdate(err) => {
@@ -780,6 +783,15 @@ impl fmt::Display for ProcessError {
 }
 
 impl std::error::Error for ProcessError {}
+
+impl From<ArgsError> for ProcessError {
+    fn from(err: ArgsError) -> Self {
+        match err {
+            ArgsError::ArgumentParsing(message) => Self::ArgumentParsing(message),
+            ArgsError::BadConfiguration(message) => Self::BadConfiguration(message),
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum StartupFileReadError {
@@ -1182,7 +1194,7 @@ impl StartupConfig {
 }
 
 impl Args {
-    fn parse_os<I>(args: I) -> Result<Self, String>
+    fn parse_os<I>(args: I) -> Result<Self, ArgsError>
     where
         I: IntoIterator<Item = OsString>,
     {
@@ -1208,7 +1220,7 @@ impl Args {
         Self::parse(args)
     }
 
-    fn parse<I>(args: I) -> Result<Self, String>
+    fn parse<I>(args: I) -> Result<Self, ArgsError>
     where
         I: IntoIterator<Item = String>,
     {
@@ -1251,7 +1263,9 @@ impl Args {
             match arg.as_str() {
                 value_arg if is_value_arg(value_arg, "--api-sock") => {
                     if api_sock_seen {
-                        return Err("duplicate argument: --api-sock".to_string());
+                        return Err(ArgsError::argument_parsing(
+                            "duplicate argument: --api-sock",
+                        ));
                     }
                     let (value, consumed) = take_value_arg(&args, index, "--api-sock")?;
                     validate_api_sock(&value)?;
@@ -1261,7 +1275,9 @@ impl Args {
                 }
                 value_arg if is_value_arg(value_arg, "--config-file") => {
                     if config_file_seen {
-                        return Err("duplicate argument: --config-file".to_string());
+                        return Err(ArgsError::argument_parsing(
+                            "duplicate argument: --config-file",
+                        ));
                     }
                     let (value, consumed) = take_value_arg(&args, index, "--config-file")?;
                     validate_config_file_path(&value)?;
@@ -1271,7 +1287,9 @@ impl Args {
                 }
                 value_arg if is_value_arg(value_arg, "--http-api-max-payload-size") => {
                     if http_api_max_payload_size_seen {
-                        return Err("duplicate argument: --http-api-max-payload-size".to_string());
+                        return Err(ArgsError::argument_parsing(
+                            "duplicate argument: --http-api-max-payload-size",
+                        ));
                     }
                     let (value, consumed) =
                         take_value_arg(&args, index, "--http-api-max-payload-size")?;
@@ -1281,7 +1299,7 @@ impl Args {
                 }
                 value_arg if is_value_arg(value_arg, "--id") => {
                     if id_seen {
-                        return Err("duplicate argument: --id".to_string());
+                        return Err(ArgsError::argument_parsing("duplicate argument: --id"));
                     }
                     let (value, consumed) = take_value_arg(&args, index, "--id")?;
                     validate_instance_id(&value)?;
@@ -1291,7 +1309,9 @@ impl Args {
                 }
                 value_arg if is_value_arg(value_arg, "--log-path") => {
                     if log_path_seen {
-                        return Err("duplicate argument: --log-path".to_string());
+                        return Err(ArgsError::argument_parsing(
+                            "duplicate argument: --log-path",
+                        ));
                     }
                     let (value, consumed) = take_value_arg(&args, index, "--log-path")?;
                     logger_config = logger_config.with_log_path(value);
@@ -1301,12 +1321,12 @@ impl Args {
                 }
                 value_arg if is_value_arg(value_arg, "--level") => {
                     if level_seen {
-                        return Err("duplicate argument: --level".to_string());
+                        return Err(ArgsError::argument_parsing("duplicate argument: --level"));
                     }
                     let (value, consumed) = take_value_arg(&args, index, "--level")?;
-                    let level = value
-                        .parse::<LoggerLevel>()
-                        .map_err(|err| format!("invalid --level: {err}"))?;
+                    let level = value.parse::<LoggerLevel>().map_err(|err| {
+                        ArgsError::bad_configuration(format!("invalid --level: {err}"))
+                    })?;
                     logger_config = logger_config.with_level(level);
                     logger_config_seen = true;
                     level_seen = true;
@@ -1314,7 +1334,9 @@ impl Args {
                 }
                 value_arg if is_value_arg(value_arg, "--mmds-size-limit") => {
                     if mmds_size_limit_seen {
-                        return Err("duplicate argument: --mmds-size-limit".to_string());
+                        return Err(ArgsError::argument_parsing(
+                            "duplicate argument: --mmds-size-limit",
+                        ));
                     }
                     let (value, consumed) = take_value_arg(&args, index, "--mmds-size-limit")?;
                     config.mmds_size_limit = Some(parse_mmds_size_limit(&value)?);
@@ -1323,7 +1345,9 @@ impl Args {
                 }
                 value_arg if is_value_arg(value_arg, "--metadata") => {
                     if metadata_seen {
-                        return Err("duplicate argument: --metadata".to_string());
+                        return Err(ArgsError::argument_parsing(
+                            "duplicate argument: --metadata",
+                        ));
                     }
                     let (value, consumed) = take_value_arg(&args, index, "--metadata")?;
                     validate_metadata_path(&value)?;
@@ -1333,7 +1357,7 @@ impl Args {
                 }
                 "--no-api" => {
                     if no_api_seen {
-                        return Err("duplicate argument: --no-api".to_string());
+                        return Err(ArgsError::argument_parsing("duplicate argument: --no-api"));
                     }
                     config.no_api = true;
                     no_api_seen = true;
@@ -1341,7 +1365,9 @@ impl Args {
                 }
                 value_arg if is_value_arg(value_arg, "--parent-cpu-time-us") => {
                     if parent_cpu_time_us_seen {
-                        return Err("duplicate argument: --parent-cpu-time-us".to_string());
+                        return Err(ArgsError::argument_parsing(
+                            "duplicate argument: --parent-cpu-time-us",
+                        ));
                     }
                     let (value, consumed) = take_value_arg(&args, index, "--parent-cpu-time-us")?;
                     config.startup_time.parent_cpu_time_us =
@@ -1351,7 +1377,9 @@ impl Args {
                 }
                 value_arg if is_value_arg(value_arg, "--metrics-path") => {
                     if metrics_path_seen {
-                        return Err("duplicate argument: --metrics-path".to_string());
+                        return Err(ArgsError::argument_parsing(
+                            "duplicate argument: --metrics-path",
+                        ));
                     }
                     let (value, consumed) = take_value_arg(&args, index, "--metrics-path")?;
                     config.metrics_config = Some(MetricsConfigInput::new(value));
@@ -1360,7 +1388,7 @@ impl Args {
                 }
                 value_arg if is_value_arg(value_arg, "--module") => {
                     if module_seen {
-                        return Err("duplicate argument: --module".to_string());
+                        return Err(ArgsError::argument_parsing("duplicate argument: --module"));
                     }
                     let (value, consumed) = take_value_arg(&args, index, "--module")?;
                     logger_config = logger_config.with_module(value);
@@ -1370,7 +1398,9 @@ impl Args {
                 }
                 "--show-level" => {
                     if show_level_seen {
-                        return Err("duplicate argument: --show-level".to_string());
+                        return Err(ArgsError::argument_parsing(
+                            "duplicate argument: --show-level",
+                        ));
                     }
                     logger_config = logger_config.with_show_level(true);
                     logger_config_seen = true;
@@ -1379,7 +1409,9 @@ impl Args {
                 }
                 "--show-log-origin" => {
                     if show_log_origin_seen {
-                        return Err("duplicate argument: --show-log-origin".to_string());
+                        return Err(ArgsError::argument_parsing(
+                            "duplicate argument: --show-log-origin",
+                        ));
                     }
                     logger_config = logger_config.with_show_log_origin(true);
                     logger_config_seen = true;
@@ -1388,7 +1420,9 @@ impl Args {
                 }
                 value_arg if is_value_arg(value_arg, "--start-time-cpu-us") => {
                     if start_time_cpu_us_seen {
-                        return Err("duplicate argument: --start-time-cpu-us".to_string());
+                        return Err(ArgsError::argument_parsing(
+                            "duplicate argument: --start-time-cpu-us",
+                        ));
                     }
                     let (value, consumed) = take_value_arg(&args, index, "--start-time-cpu-us")?;
                     config.startup_time.start_time_cpu_us =
@@ -1398,7 +1432,9 @@ impl Args {
                 }
                 value_arg if is_value_arg(value_arg, "--start-time-us") => {
                     if start_time_us_seen {
-                        return Err("duplicate argument: --start-time-us".to_string());
+                        return Err(ArgsError::argument_parsing(
+                            "duplicate argument: --start-time-us",
+                        ));
                     }
                     let (value, consumed) = take_value_arg(&args, index, "--start-time-us")?;
                     config.startup_time.start_time_us =
@@ -1408,20 +1444,27 @@ impl Args {
                 }
                 other => {
                     if let Some(name) = unsupported_flag_equals_syntax(other) {
-                        return Err(format!(
+                        return Err(ArgsError::argument_parsing(format!(
                             "unsupported argument syntax for --{name}; use --{name}"
-                        ));
+                        )));
                     }
 
                     if let Some(name) = unsupported_firecracker_arg(other) {
-                        return Err(format!("unsupported Firecracker argument: --{name}"));
+                        return Err(ArgsError::argument_parsing(format!(
+                            "unsupported Firecracker argument: --{name}"
+                        )));
                     }
 
                     if other.starts_with('-') {
-                        return Err(format!("unknown argument: {}", display_arg_name(other)));
+                        return Err(ArgsError::argument_parsing(format!(
+                            "unknown argument: {}",
+                            display_arg_name(other)
+                        )));
                     }
 
-                    return Err("unexpected positional argument".to_string());
+                    return Err(ArgsError::argument_parsing(
+                        "unexpected positional argument",
+                    ));
                 }
             }
         }
@@ -1431,12 +1474,46 @@ impl Args {
         }
 
         if config.no_api && config.config_file.is_none() {
-            return Err("--no-api requires --config-file".to_string());
+            return Err(ArgsError::argument_parsing(
+                "--no-api requires --config-file",
+            ));
         }
 
         Ok(Self {
             command: Command::Run(Box::new(config)),
         })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ArgsError {
+    ArgumentParsing(String),
+    BadConfiguration(String),
+}
+
+impl ArgsError {
+    fn argument_parsing(message: impl Into<String>) -> Self {
+        Self::ArgumentParsing(message.into())
+    }
+
+    fn bad_configuration(message: impl Into<String>) -> Self {
+        Self::BadConfiguration(message.into())
+    }
+}
+
+impl From<String> for ArgsError {
+    fn from(message: String) -> Self {
+        Self::argument_parsing(message)
+    }
+}
+
+impl fmt::Display for ArgsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ArgumentParsing(message) | Self::BadConfiguration(message) => {
+                f.write_str(message)
+            }
+        }
     }
 }
 
@@ -1901,7 +1978,7 @@ mod tests {
     }
 
     fn parse(args: &[&str]) -> Result<Args, String> {
-        Args::parse(args.iter().map(|arg| arg.to_string()))
+        Args::parse(args.iter().map(|arg| arg.to_string())).map_err(|err| err.to_string())
     }
 
     fn parse_run(args: &[&str]) -> Result<StartupConfig, String> {
@@ -2053,6 +2130,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_process_args_maps_invalid_logger_level_to_bad_configuration() {
+        let err = parse_process_args([OsString::from("--level"), OsString::from("verbose")])
+            .expect_err("invalid logger level should fail");
+
+        assert_eq!(
+            err,
+            ProcessError::BadConfiguration("invalid --level: logger level is invalid".to_string())
+        );
+        assert_eq!(err.exit_code(), ProcessExitCode::BadConfiguration);
+    }
+
+    #[test]
     fn parse_os_help_arg_ignores_non_utf8_args() {
         let args = Args::parse_os([OsString::from("--help"), OsString::from_vec(vec![0xff])])
             .expect("help should bypass parsing");
@@ -2065,7 +2154,10 @@ mod tests {
         let err =
             Args::parse_os([OsString::from_vec(vec![0xff])]).expect_err("non-utf8 arg should fail");
 
-        assert_eq!(err, "invalid argument: arguments must be valid UTF-8");
+        assert_eq!(
+            err.to_string(),
+            "invalid argument: arguments must be valid UTF-8"
+        );
     }
 
     #[test]
@@ -2937,7 +3029,7 @@ mod tests {
         let err = Args::parse(["--id".to_string(), id]).expect_err("non-ascii id should fail");
 
         assert_eq!(
-            err,
+            err.to_string(),
             format!("invalid --id: invalid character {NON_ASCII_ALPHANUMERIC:?} at position 2")
         );
     }
@@ -2948,7 +3040,7 @@ mod tests {
         let err = Args::parse(["--id".to_string(), id]).expect_err("long id should fail");
 
         assert_eq!(
-            err,
+            err.to_string(),
             "invalid --id: invalid length 65; length must be between 1 and 64"
         );
     }
@@ -2959,7 +3051,7 @@ mod tests {
         let err = Args::parse(["--id".to_string(), id]).expect_err("long id should fail");
 
         assert_eq!(
-            err,
+            err.to_string(),
             "invalid --id: invalid length 66; length must be between 1 and 64"
         );
     }
