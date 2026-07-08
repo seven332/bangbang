@@ -922,6 +922,8 @@ pub struct BlockDeviceMetrics {
     invalid_reqs_count: u64,
     flush_count: u64,
     queue_event_count: u64,
+    rate_limiter_event_count: u64,
+    rate_limiter_throttled_events: u64,
     update_count: u64,
     update_fails: u64,
     read_bytes: u64,
@@ -939,6 +941,8 @@ impl BlockDeviceMetrics {
             && self.invalid_reqs_count == 0
             && self.flush_count == 0
             && self.queue_event_count == 0
+            && self.rate_limiter_event_count == 0
+            && self.rate_limiter_throttled_events == 0
             && self.update_count == 0
             && self.update_fails == 0
             && self.read_bytes == 0
@@ -967,6 +971,14 @@ impl BlockDeviceMetrics {
 
     pub const fn queue_event_count(self) -> u64 {
         self.queue_event_count
+    }
+
+    pub const fn rate_limiter_event_count(self) -> u64 {
+        self.rate_limiter_event_count
+    }
+
+    pub const fn rate_limiter_throttled_events(self) -> u64 {
+        self.rate_limiter_throttled_events
     }
 
     pub const fn update_count(self) -> u64 {
@@ -1026,6 +1038,19 @@ impl BlockDeviceMetrics {
         self
     }
 
+    pub const fn with_rate_limiter_event_count(mut self, rate_limiter_event_count: u64) -> Self {
+        self.rate_limiter_event_count = rate_limiter_event_count;
+        self
+    }
+
+    pub const fn with_rate_limiter_throttled_events(
+        mut self,
+        rate_limiter_throttled_events: u64,
+    ) -> Self {
+        self.rate_limiter_throttled_events = rate_limiter_throttled_events;
+        self
+    }
+
     pub const fn with_update_count(mut self, update_count: u64) -> Self {
         self.update_count = update_count;
         self
@@ -1077,6 +1102,12 @@ impl BlockDeviceMetrics {
             queue_event_count: self
                 .queue_event_count
                 .saturating_add(other.queue_event_count),
+            rate_limiter_event_count: self
+                .rate_limiter_event_count
+                .saturating_add(other.rate_limiter_event_count),
+            rate_limiter_throttled_events: self
+                .rate_limiter_throttled_events
+                .saturating_add(other.rate_limiter_throttled_events),
             update_count: self.update_count.saturating_add(other.update_count),
             update_fails: self.update_fails.saturating_add(other.update_fails),
             read_bytes: self.read_bytes.saturating_add(other.read_bytes),
@@ -1172,6 +1203,9 @@ impl SharedBlockDeviceMetrics {
             self.record_write_latency_aggregate(write_agg);
         }
         self.record_flushes(usize_to_u64_saturating(dispatch.flush_count()));
+        self.record_rate_limiter_throttled_events(usize_to_u64_saturating(
+            dispatch.rate_limiter_throttled_requests(),
+        ));
         self.record_execute_failures(usize_to_u64_saturating(
             dispatch
                 .parse_failures()
@@ -1209,6 +1243,11 @@ impl SharedBlockDeviceMetrics {
             invalid_reqs_count: self.inner.invalid_reqs_count.load(Ordering::Relaxed),
             flush_count: self.inner.flush_count.load(Ordering::Relaxed),
             queue_event_count: self.inner.queue_event_count.load(Ordering::Relaxed),
+            rate_limiter_event_count: self.inner.rate_limiter_event_count.load(Ordering::Relaxed),
+            rate_limiter_throttled_events: self
+                .inner
+                .rate_limiter_throttled_events
+                .load(Ordering::Relaxed),
             update_count: self.inner.update_count.load(Ordering::Relaxed),
             update_fails: self.inner.update_fails.load(Ordering::Relaxed),
             read_bytes: self.inner.read_bytes.load(Ordering::Relaxed),
@@ -1282,6 +1321,12 @@ impl SharedBlockDeviceMetrics {
         }
     }
 
+    fn record_rate_limiter_throttled_events(&self, count: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.rate_limiter_throttled_events, count);
+        }
+    }
+
     fn record_execute_failures(&self, count: u64) {
         if count != 0 {
             record_atomic_metric(&self.inner.execute_fails, count);
@@ -1302,6 +1347,8 @@ struct SharedBlockDeviceMetricsInner {
     invalid_reqs_count: AtomicU64,
     flush_count: AtomicU64,
     queue_event_count: AtomicU64,
+    rate_limiter_event_count: AtomicU64,
+    rate_limiter_throttled_events: AtomicU64,
     update_count: AtomicU64,
     update_fails: AtomicU64,
     read_bytes: AtomicU64,
@@ -1326,6 +1373,8 @@ impl Default for SharedBlockDeviceMetricsInner {
             invalid_reqs_count: AtomicU64::new(0),
             flush_count: AtomicU64::new(0),
             queue_event_count: AtomicU64::new(0),
+            rate_limiter_event_count: AtomicU64::new(0),
+            rate_limiter_throttled_events: AtomicU64::new(0),
             update_count: AtomicU64::new(0),
             update_fails: AtomicU64::new(0),
             read_bytes: AtomicU64::new(0),
@@ -3223,6 +3272,14 @@ fn block_device_metrics_json_object(
         serde_json::Value::Number(metrics.queue_event_count().into()),
     );
     block.insert(
+        "rate_limiter_event_count".to_string(),
+        serde_json::Value::Number(metrics.rate_limiter_event_count().into()),
+    );
+    block.insert(
+        "rate_limiter_throttled_events".to_string(),
+        serde_json::Value::Number(metrics.rate_limiter_throttled_events().into()),
+    );
+    block.insert(
         "update_count".to_string(),
         serde_json::Value::Number(metrics.update_count().into()),
     );
@@ -3983,6 +4040,8 @@ mod tests {
             .with_invalid_reqs_count(3)
             .with_flush_count(4)
             .with_queue_event_count(5)
+            .with_rate_limiter_event_count(12)
+            .with_rate_limiter_throttled_events(13)
             .with_update_count(10)
             .with_update_fails(11)
             .with_read_bytes(6)
@@ -4240,7 +4299,7 @@ mod tests {
         assert_eq!(
             output.lines(),
             [
-                r#"{"block":{"event_fails":1,"execute_fails":2,"flush_count":4,"invalid_reqs_count":3,"queue_event_count":5,"read_agg":{"max_us":30,"min_us":12,"sum_us":42},"read_bytes":6,"read_count":8,"update_count":10,"update_fails":11,"write_agg":{"max_us":31,"min_us":13,"sum_us":44},"write_bytes":7,"write_count":9},"vmm":{"metrics_flush_count":1}}"#
+                r#"{"block":{"event_fails":1,"execute_fails":2,"flush_count":4,"invalid_reqs_count":3,"queue_event_count":5,"rate_limiter_event_count":12,"rate_limiter_throttled_events":13,"read_agg":{"max_us":30,"min_us":12,"sum_us":42},"read_bytes":6,"read_count":8,"update_count":10,"update_fails":11,"write_agg":{"max_us":31,"min_us":13,"sum_us":44},"write_bytes":7,"write_count":9},"vmm":{"metrics_flush_count":1}}"#
             ]
         );
     }
@@ -4285,7 +4344,7 @@ mod tests {
         assert_eq!(
             output.lines(),
             [
-                r#"{"block":{"event_fails":0,"execute_fails":0,"flush_count":0,"invalid_reqs_count":0,"queue_event_count":2,"read_agg":{"max_us":4,"min_us":2,"sum_us":6},"read_bytes":512,"read_count":1,"update_count":0,"update_fails":0,"write_agg":{"max_us":5,"min_us":3,"sum_us":8},"write_bytes":256,"write_count":1},"block_data":{"event_fails":0,"execute_fails":0,"flush_count":0,"invalid_reqs_count":0,"queue_event_count":1,"read_agg":{"max_us":0,"min_us":0,"sum_us":0},"read_bytes":0,"read_count":0,"update_count":0,"update_fails":0,"write_agg":{"max_us":5,"min_us":3,"sum_us":8},"write_bytes":256,"write_count":1},"block_rootfs":{"event_fails":0,"execute_fails":0,"flush_count":0,"invalid_reqs_count":0,"queue_event_count":1,"read_agg":{"max_us":4,"min_us":2,"sum_us":6},"read_bytes":512,"read_count":1,"update_count":0,"update_fails":0,"write_agg":{"max_us":0,"min_us":0,"sum_us":0},"write_bytes":0,"write_count":0},"vmm":{"metrics_flush_count":1}}"#
+                r#"{"block":{"event_fails":0,"execute_fails":0,"flush_count":0,"invalid_reqs_count":0,"queue_event_count":2,"rate_limiter_event_count":0,"rate_limiter_throttled_events":0,"read_agg":{"max_us":4,"min_us":2,"sum_us":6},"read_bytes":512,"read_count":1,"update_count":0,"update_fails":0,"write_agg":{"max_us":5,"min_us":3,"sum_us":8},"write_bytes":256,"write_count":1},"block_data":{"event_fails":0,"execute_fails":0,"flush_count":0,"invalid_reqs_count":0,"queue_event_count":1,"rate_limiter_event_count":0,"rate_limiter_throttled_events":0,"read_agg":{"max_us":0,"min_us":0,"sum_us":0},"read_bytes":0,"read_count":0,"update_count":0,"update_fails":0,"write_agg":{"max_us":5,"min_us":3,"sum_us":8},"write_bytes":256,"write_count":1},"block_rootfs":{"event_fails":0,"execute_fails":0,"flush_count":0,"invalid_reqs_count":0,"queue_event_count":1,"rate_limiter_event_count":0,"rate_limiter_throttled_events":0,"read_agg":{"max_us":4,"min_us":2,"sum_us":6},"read_bytes":512,"read_count":1,"update_count":0,"update_fails":0,"write_agg":{"max_us":0,"min_us":0,"sum_us":0},"write_bytes":0,"write_count":0},"vmm":{"metrics_flush_count":1}}"#
             ]
         );
     }
@@ -4397,6 +4456,8 @@ mod tests {
                 .with_invalid_reqs_count(u64::MAX - 3)
                 .with_flush_count(u64::MAX - 4)
                 .with_queue_event_count(u64::MAX - 5)
+                .with_rate_limiter_event_count(u64::MAX - 12)
+                .with_rate_limiter_throttled_events(u64::MAX - 13)
                 .with_update_count(u64::MAX - 10)
                 .with_update_fails(u64::MAX - 11)
                 .with_read_bytes(u64::MAX - 6)
@@ -4418,6 +4479,8 @@ mod tests {
                     .with_invalid_reqs_count(u64::MAX)
                     .with_flush_count(u64::MAX)
                     .with_queue_event_count(u64::MAX)
+                    .with_rate_limiter_event_count(u64::MAX)
+                    .with_rate_limiter_throttled_events(u64::MAX)
                     .with_update_count(u64::MAX)
                     .with_update_fails(u64::MAX)
                     .with_read_bytes(u64::MAX)
@@ -4455,6 +4518,8 @@ mod tests {
                     .with_invalid_reqs_count(3)
                     .with_flush_count(4)
                     .with_queue_event_count(5)
+                    .with_rate_limiter_event_count(12)
+                    .with_rate_limiter_throttled_events(13)
                     .with_update_count(10)
                     .with_update_fails(11)
                     .with_read_bytes(6)

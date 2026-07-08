@@ -553,6 +553,31 @@ pub struct EntropyRateLimiterRequest {
     ops: Option<TokenBucketRequest>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriveRateLimiterRequest {
+    bandwidth: Option<TokenBucketRequest>,
+    ops: Option<TokenBucketRequest>,
+}
+
+type RateLimiterBuckets = (Option<TokenBucketRequest>, Option<TokenBucketRequest>);
+
+impl DriveRateLimiterRequest {
+    pub const fn new(
+        bandwidth: Option<TokenBucketRequest>,
+        ops: Option<TokenBucketRequest>,
+    ) -> Self {
+        Self { bandwidth, ops }
+    }
+
+    pub const fn bandwidth(self) -> Option<TokenBucketRequest> {
+        self.bandwidth
+    }
+
+    pub const fn ops(self) -> Option<TokenBucketRequest> {
+        self.ops
+    }
+}
+
 impl EntropyRateLimiterRequest {
     pub const fn new(
         bandwidth: Option<TokenBucketRequest>,
@@ -1034,7 +1059,7 @@ pub struct DriveConfigRequest {
     partuuid: Option<String>,
     cache_type: Option<DriveCacheType>,
     io_engine: Option<DriveIoEngine>,
-    rate_limiter_configured: bool,
+    rate_limiter: Option<DriveRateLimiterRequest>,
     socket: Option<String>,
 }
 
@@ -1071,8 +1096,12 @@ impl DriveConfigRequest {
         self.io_engine
     }
 
+    pub const fn rate_limiter(&self) -> Option<DriveRateLimiterRequest> {
+        self.rate_limiter
+    }
+
     pub const fn rate_limiter_configured(&self) -> bool {
-        self.rate_limiter_configured
+        self.rate_limiter.is_some()
     }
 
     pub fn socket(&self) -> Option<&str> {
@@ -1300,6 +1329,7 @@ pub struct DriveConfigResponse {
     partuuid: Option<String>,
     cache_type: String,
     io_engine: String,
+    rate_limiter: Option<DriveRateLimiterRequest>,
 }
 
 impl DriveConfigResponse {
@@ -1319,12 +1349,22 @@ impl DriveConfigResponse {
             partuuid: None,
             cache_type: cache_type.into(),
             io_engine: io_engine.into(),
+            rate_limiter: None,
         }
     }
 
     pub fn with_partuuid(mut self, partuuid: impl Into<String>) -> Self {
         self.partuuid = Some(partuuid.into());
         self
+    }
+
+    pub const fn with_rate_limiter(mut self, rate_limiter: DriveRateLimiterRequest) -> Self {
+        self.rate_limiter = Some(rate_limiter);
+        self
+    }
+
+    pub const fn rate_limiter(&self) -> Option<DriveRateLimiterRequest> {
+        self.rate_limiter
     }
 }
 
@@ -2191,6 +2231,12 @@ fn drive_config_response_value(drive: &DriveConfigResponse) -> serde_json::Value
         "path_on_host".to_string(),
         serde_json::Value::String(drive.path_on_host.clone()),
     );
+    if let Some(rate_limiter) = drive.rate_limiter() {
+        body.insert(
+            "rate_limiter".to_string(),
+            drive_rate_limiter_response_value(rate_limiter),
+        );
+    }
 
     serde_json::Value::Object(body)
 }
@@ -2246,14 +2292,25 @@ fn entropy_config_response_value(entropy: &EntropyConfigResponse) -> serde_json:
 fn entropy_rate_limiter_response_value(
     rate_limiter: EntropyRateLimiterRequest,
 ) -> serde_json::Value {
+    rate_limiter_response_value(rate_limiter.bandwidth(), rate_limiter.ops())
+}
+
+fn drive_rate_limiter_response_value(rate_limiter: DriveRateLimiterRequest) -> serde_json::Value {
+    rate_limiter_response_value(rate_limiter.bandwidth(), rate_limiter.ops())
+}
+
+fn rate_limiter_response_value(
+    bandwidth: Option<TokenBucketRequest>,
+    ops: Option<TokenBucketRequest>,
+) -> serde_json::Value {
     let mut value = serde_json::Map::new();
-    if let Some(bandwidth) = rate_limiter.bandwidth() {
+    if let Some(bandwidth) = bandwidth {
         value.insert(
             RATE_LIMITER_BANDWIDTH_FIELD.to_string(),
             token_bucket_response_value(bandwidth),
         );
     }
-    if let Some(ops) = rate_limiter.ops() {
+    if let Some(ops) = ops {
         value.insert(
             RATE_LIMITER_OPS_FIELD.to_string(),
             token_bucket_response_value(ops),
@@ -2958,13 +3015,7 @@ fn parse_drive_config_request(
     if path_drive_id != body.drive_id {
         return Err(RequestError::MismatchedDriveId);
     }
-    let rate_limiter_configured = match &body.rate_limiter {
-        Some(rate_limiter) => {
-            validate_rate_limiter_config(rate_limiter.as_value())?;
-            rate_limiter_configured(rate_limiter.as_value())?
-        }
-        None => false,
-    };
+    let rate_limiter = parse_drive_rate_limiter(body.rate_limiter.as_ref())?;
 
     Ok(ApiRequest::PutDrive(Box::new(DriveConfigRequest {
         path_drive_id: path_drive_id.to_string(),
@@ -2975,7 +3026,7 @@ fn parse_drive_config_request(
         partuuid: body.partuuid,
         cache_type: body.cache_type,
         io_engine: body.io_engine,
-        rate_limiter_configured,
+        rate_limiter,
         socket: body.socket,
     })))
 }
@@ -3310,6 +3361,21 @@ fn parse_serial_token_bucket(
 fn parse_entropy_rate_limiter(
     value: Option<&JsonValueWithoutDuplicateObjectKeys>,
 ) -> Result<Option<EntropyRateLimiterRequest>, RequestError> {
+    parse_rate_limiter_buckets(value).map(|buckets| {
+        buckets.map(|(bandwidth, ops)| EntropyRateLimiterRequest::new(bandwidth, ops))
+    })
+}
+
+fn parse_drive_rate_limiter(
+    value: Option<&JsonValueWithoutDuplicateObjectKeys>,
+) -> Result<Option<DriveRateLimiterRequest>, RequestError> {
+    parse_rate_limiter_buckets(value)
+        .map(|buckets| buckets.map(|(bandwidth, ops)| DriveRateLimiterRequest::new(bandwidth, ops)))
+}
+
+fn parse_rate_limiter_buckets(
+    value: Option<&JsonValueWithoutDuplicateObjectKeys>,
+) -> Result<Option<RateLimiterBuckets>, RequestError> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -3326,7 +3392,7 @@ fn parse_entropy_rate_limiter(
     if bandwidth.is_none() && ops.is_none() {
         Ok(None)
     } else {
-        Ok(Some(EntropyRateLimiterRequest::new(bandwidth, ops)))
+        Ok(Some((bandwidth, ops)))
     }
 }
 
@@ -5051,6 +5117,13 @@ mod tests {
         assert_eq!(config.cache_type(), Some(DriveCacheType::Unsafe));
         assert_eq!(config.io_engine(), Some(DriveIoEngine::Sync));
         assert!(config.rate_limiter_configured());
+        assert_eq!(
+            config.rate_limiter(),
+            Some(DriveRateLimiterRequest::new(
+                Some(TokenBucketRequest::new(0, Some(0), 0)),
+                None,
+            ))
+        );
         assert_eq!(config.socket(), Some("/tmp/vhost.sock"));
     }
 
@@ -5330,6 +5403,13 @@ mod tests {
             panic!("expected drive request");
         };
         assert!(config.rate_limiter_configured());
+        assert_eq!(
+            config.rate_limiter(),
+            Some(DriveRateLimiterRequest::new(
+                None,
+                Some(TokenBucketRequest::new(100, None, 1000)),
+            ))
+        );
     }
 
     #[test]
@@ -7485,7 +7565,11 @@ mod tests {
             .with_boot_args("console=hvc0 reboot=k panic=1");
         let drive =
             DriveConfigResponse::new("rootfs", "/tmp/rootfs.ext4", true, true, "Unsafe", "Sync")
-                .with_partuuid("0eaa91a0-01");
+                .with_partuuid("0eaa91a0-01")
+                .with_rate_limiter(DriveRateLimiterRequest::new(
+                    Some(TokenBucketRequest::new(1024, Some(2048), 100)),
+                    Some(TokenBucketRequest::new(10, None, 1000)),
+                ));
         let network_interface = NetworkInterfaceConfigResponse::new("eth0", "tap0")
             .with_guest_mac("12:34:56:78:9a:bc")
             .with_mtu(1500);
@@ -7535,6 +7619,18 @@ mod tests {
                         "is_root_device": true,
                         "partuuid": "0eaa91a0-01",
                         "path_on_host": "/tmp/rootfs.ext4",
+                        "rate_limiter": {
+                            "bandwidth": {
+                                "one_time_burst": 2048,
+                                "refill_time": 100,
+                                "size": 1024,
+                            },
+                            "ops": {
+                                "one_time_burst": null,
+                                "refill_time": 1000,
+                                "size": 10,
+                            },
+                        },
                     },
                 ],
                 "entropy": {},

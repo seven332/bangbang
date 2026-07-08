@@ -1646,31 +1646,6 @@ fn executable_rejects_unsupported_drive_options_without_mutating() {
     let accepted_response = http_put_json(&socket_path, "/drives/accepted", &accepted_drive_body);
     assert_no_content_response(&accepted_response, "PUT /drives/accepted");
 
-    let assert_only_accepted_drive =
-        |request_name: &str, rejected_drive_id: &str, rejected_path_json: &str| {
-            let vm_config = http_get(&socket_path, "/vm/config");
-            assert_ok_response(&vm_config, request_name);
-            assert_response_contains(&vm_config, r#""drive_id":"accepted""#, request_name);
-            assert_response_contains(
-                &vm_config,
-                &format!(r#""path_on_host":{accepted_drive_path_json}"#),
-                request_name,
-            );
-            assert_eq!(
-                vm_config.matches(r#""drive_id":"#).count(),
-                1,
-                "{request_name} must keep only the accepted drive; response:\n{vm_config}"
-            );
-            assert!(
-                !vm_config.contains(&format!(r#""drive_id":"{rejected_drive_id}""#)),
-                "{request_name} must not store rejected drive {rejected_drive_id}; response:\n{vm_config}"
-            );
-            assert!(
-                !vm_config.contains(&format!(r#""path_on_host":{rejected_path_json}"#)),
-                "{request_name} must not store rejected drive path; response:\n{vm_config}"
-            );
-        };
-
     let rate_limited_drive_path_json = json_string(path_text(&rate_limited_drive_path));
     let rate_limiter_body = format!(
         r#"{{
@@ -1688,17 +1663,40 @@ fn executable_rejects_unsupported_drive_options_without_mutating() {
     );
     let rate_limiter_response =
         http_put_json(&socket_path, "/drives/rate_limited", &rate_limiter_body);
-    assert_bad_request_response(&rate_limiter_response, "PUT /drives/rate_limited");
-    assert_response_contains(
-        &rate_limiter_response,
-        r#"{"fault_message":"drive rate_limiter is not supported"}"#,
-        "PUT /drives/rate_limited",
-    );
-    assert_only_accepted_drive(
-        "GET /vm/config after rejected drive rate_limiter",
-        "rate_limited",
-        &rate_limited_drive_path_json,
-    );
+    assert_no_content_response(&rate_limiter_response, "PUT /drives/rate_limited");
+
+    let assert_only_accepted_and_rate_limited_drives =
+        |request_name: &str, rejected_drive_id: &str, rejected_path_json: &str| {
+            let vm_config = http_get(&socket_path, "/vm/config");
+            assert_ok_response(&vm_config, request_name);
+            assert_response_contains(&vm_config, r#""drive_id":"accepted""#, request_name);
+            assert_response_contains(
+                &vm_config,
+                &format!(r#""path_on_host":{accepted_drive_path_json}"#),
+                request_name,
+            );
+            assert_response_contains(&vm_config, r#""drive_id":"rate_limited""#, request_name);
+            assert_response_contains(
+                &vm_config,
+                &format!(r#""path_on_host":{rate_limited_drive_path_json}"#),
+                request_name,
+            );
+            assert_response_contains(&vm_config, r#""rate_limiter":{"bandwidth":"#, request_name);
+            assert_response_contains(&vm_config, r#""size":1000"#, request_name);
+            assert_eq!(
+                vm_config.matches(r#""drive_id":"#).count(),
+                2,
+                "{request_name} must keep only accepted drives; response:\n{vm_config}"
+            );
+            assert!(
+                !vm_config.contains(&format!(r#""drive_id":"{rejected_drive_id}""#)),
+                "{request_name} must not store rejected drive {rejected_drive_id}; response:\n{vm_config}"
+            );
+            assert!(
+                !vm_config.contains(&format!(r#""path_on_host":{rejected_path_json}"#)),
+                "{request_name} must not store rejected drive path; response:\n{vm_config}"
+            );
+        };
 
     let async_drive_path_json = json_string(path_text(&async_drive_path));
     let async_body = format!(
@@ -1716,7 +1714,7 @@ fn executable_rejects_unsupported_drive_options_without_mutating() {
         r#"{"fault_message":"drive io_engine Async is not supported"}"#,
         "PUT /drives/async",
     );
-    assert_only_accepted_drive(
+    assert_only_accepted_and_rate_limited_drives(
         "GET /vm/config after rejected drive io_engine",
         "async",
         &async_drive_path_json,
@@ -1748,7 +1746,7 @@ fn executable_rejects_unsupported_drive_options_without_mutating() {
         !private_socket_path.exists(),
         "rejected drive socket request must not create the private socket path"
     );
-    assert_only_accepted_drive(
+    assert_only_accepted_and_rate_limited_drives(
         "GET /vm/config after rejected drive socket",
         "socket",
         &socket_drive_path_json,
