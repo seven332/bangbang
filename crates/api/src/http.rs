@@ -2692,7 +2692,7 @@ fn parse_entropy_config_request(body: &[u8]) -> Result<ApiRequest, RequestError>
     let rate_limiter_configured = match &body.rate_limiter {
         Some(rate_limiter) => {
             validate_rate_limiter_config(rate_limiter.as_value())?;
-            true
+            rate_limiter_configured(rate_limiter.as_value())?
         }
         None => false,
     };
@@ -5925,8 +5925,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_entropy_config_without_rate_limiter() {
-        for body in ["{}", r#"{"rate_limiter":null}"#] {
+    fn parses_entropy_config_without_configured_rate_limiter() {
+        for body in ["{}", r#"{"rate_limiter":null}"#, r#"{"rate_limiter":{}}"#] {
             let request = request_with_body("PUT", "/entropy", body);
 
             let parsed = parse_request(&request).expect("entropy config should parse");
@@ -5939,9 +5939,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_entropy_config_with_rate_limiter_marker() {
+    fn parses_entropy_config_with_configured_rate_limiter_marker() {
         for body in [
-            r#"{"rate_limiter":{}}"#,
             r#"{"rate_limiter":{"bandwidth":{"size":100,"one_time_burst":null,"refill_time":1000}}}"#,
             r#"{"rate_limiter":{"ops":{"size":100,"one_time_burst":200,"refill_time":1000}}}"#,
         ] {

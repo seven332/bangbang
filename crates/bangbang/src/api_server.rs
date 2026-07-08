@@ -5752,11 +5752,12 @@ mod tests {
     }
 
     #[test]
-    fn stores_entropy_endpoint_without_rate_limiter() {
+    fn stores_entropy_endpoint_without_configured_rate_limiter() {
         let mut vmm = test_controller();
         for (socket_name, body) in [
             ("ent-empty", "{}"),
             ("ent-null-rl", r#"{"rate_limiter":null}"#),
+            ("ent-empty-rl", r#"{"rate_limiter":{}}"#),
         ] {
             let request = format!(
                 "PUT /entropy HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
