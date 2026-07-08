@@ -3255,19 +3255,22 @@ mod tests {
     }
 
     #[test]
-    fn config_file_accepts_entropy_null_rate_limiter() {
-        let actions = super::config_file_actions_from_str(
+    fn config_file_accepts_entropy_noop_rate_limiter() {
+        for config in [
             r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"entropy":{"rate_limiter":null}}"#,
-        )
-        .expect("entropy config section should accept null rate limiter");
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"entropy":{"rate_limiter":{}}}"#,
+        ] {
+            let actions = super::config_file_actions_from_str(config)
+                .expect("entropy config section should accept no-op rate limiter");
 
-        assert_eq!(
-            actions,
-            [
-                VmmAction::PutBootSource(BootSourceConfigInput::new("/tmp/vmlinux")),
-                VmmAction::PutEntropy(bangbang_runtime::entropy::EntropyConfigInput::new()),
-            ]
-        );
+            assert_eq!(
+                actions,
+                [
+                    VmmAction::PutBootSource(BootSourceConfigInput::new("/tmp/vmlinux")),
+                    VmmAction::PutEntropy(bangbang_runtime::entropy::EntropyConfigInput::new()),
+                ]
+            );
+        }
     }
 
     #[test]
