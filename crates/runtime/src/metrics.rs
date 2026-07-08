@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::balloon::VirtioBalloonDeviceNotificationDispatch;
-use crate::block::{VirtioBlockDeviceNotificationDispatch, VirtioBlockQueueDispatch};
+use crate::block::{
+    VirtioBlockDeviceNotificationDispatch, VirtioBlockLatencyAggregate, VirtioBlockQueueDispatch,
+};
 use crate::serial::SerialOutputMetrics;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -913,6 +915,8 @@ pub struct BlockDeviceMetrics {
     write_bytes: u64,
     read_count: u64,
     write_count: u64,
+    read_agg: VirtioBlockLatencyAggregate,
+    write_agg: VirtioBlockLatencyAggregate,
 }
 
 impl BlockDeviceMetrics {
@@ -928,6 +932,8 @@ impl BlockDeviceMetrics {
             && self.write_bytes == 0
             && self.read_count == 0
             && self.write_count == 0
+            && self.read_agg.is_empty()
+            && self.write_agg.is_empty()
     }
 
     pub const fn event_fails(self) -> u64 {
@@ -972,6 +978,14 @@ impl BlockDeviceMetrics {
 
     pub const fn write_count(self) -> u64 {
         self.write_count
+    }
+
+    pub const fn read_agg(self) -> VirtioBlockLatencyAggregate {
+        self.read_agg
+    }
+
+    pub const fn write_agg(self) -> VirtioBlockLatencyAggregate {
+        self.write_agg
     }
 
     pub const fn with_event_fails(mut self, event_fails: u64) -> Self {
@@ -1029,6 +1043,16 @@ impl BlockDeviceMetrics {
         self
     }
 
+    pub const fn with_read_agg(mut self, read_agg: VirtioBlockLatencyAggregate) -> Self {
+        self.read_agg = read_agg;
+        self
+    }
+
+    pub const fn with_write_agg(mut self, write_agg: VirtioBlockLatencyAggregate) -> Self {
+        self.write_agg = write_agg;
+        self
+    }
+
     const fn merged_with(self, other: Self) -> Self {
         Self {
             event_fails: self.event_fails.saturating_add(other.event_fails),
@@ -1046,6 +1070,8 @@ impl BlockDeviceMetrics {
             write_bytes: self.write_bytes.saturating_add(other.write_bytes),
             read_count: self.read_count.saturating_add(other.read_count),
             write_count: self.write_count.saturating_add(other.write_count),
+            read_agg: self.read_agg.merged_with(other.read_agg),
+            write_agg: self.write_agg.merged_with(other.write_agg),
         }
     }
 }
@@ -1126,6 +1152,12 @@ impl SharedBlockDeviceMetrics {
             usize_to_u64_saturating(dispatch.write_count()),
             dispatch.write_bytes(),
         );
+        if let Some(read_agg) = dispatch.read_latency_aggregate() {
+            self.record_read_latency_aggregate(read_agg);
+        }
+        if let Some(write_agg) = dispatch.write_latency_aggregate() {
+            self.record_write_latency_aggregate(write_agg);
+        }
         self.record_flushes(usize_to_u64_saturating(dispatch.flush_count()));
         self.record_execute_failures(usize_to_u64_saturating(
             dispatch
@@ -1170,6 +1202,8 @@ impl SharedBlockDeviceMetrics {
             write_bytes: self.inner.write_bytes.load(Ordering::Relaxed),
             read_count: self.inner.read_count.load(Ordering::Relaxed),
             write_count: self.inner.write_count.load(Ordering::Relaxed),
+            read_agg: self.read_latency_aggregate_snapshot(),
+            write_agg: self.write_latency_aggregate_snapshot(),
         }
     }
 
@@ -1191,6 +1225,44 @@ impl SharedBlockDeviceMetrics {
         }
     }
 
+    fn record_read_latency_aggregate(&self, latency_aggregate: VirtioBlockLatencyAggregate) {
+        record_latency_aggregate(
+            latency_aggregate,
+            &self.inner.read_agg_min_us,
+            &self.inner.read_agg_max_us,
+            &self.inner.read_agg_sum_us,
+            &self.inner.read_agg_sample_count,
+        );
+    }
+
+    fn record_write_latency_aggregate(&self, latency_aggregate: VirtioBlockLatencyAggregate) {
+        record_latency_aggregate(
+            latency_aggregate,
+            &self.inner.write_agg_min_us,
+            &self.inner.write_agg_max_us,
+            &self.inner.write_agg_sum_us,
+            &self.inner.write_agg_sample_count,
+        );
+    }
+
+    fn read_latency_aggregate_snapshot(&self) -> VirtioBlockLatencyAggregate {
+        latency_aggregate_snapshot(
+            &self.inner.read_agg_min_us,
+            &self.inner.read_agg_max_us,
+            &self.inner.read_agg_sum_us,
+            &self.inner.read_agg_sample_count,
+        )
+    }
+
+    fn write_latency_aggregate_snapshot(&self) -> VirtioBlockLatencyAggregate {
+        latency_aggregate_snapshot(
+            &self.inner.write_agg_min_us,
+            &self.inner.write_agg_max_us,
+            &self.inner.write_agg_sum_us,
+            &self.inner.write_agg_sample_count,
+        )
+    }
+
     fn record_flushes(&self, count: u64) {
         if count != 0 {
             record_atomic_metric(&self.inner.flush_count, count);
@@ -1210,7 +1282,7 @@ impl SharedBlockDeviceMetrics {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct SharedBlockDeviceMetricsInner {
     event_fails: AtomicU64,
     execute_fails: AtomicU64,
@@ -1223,6 +1295,40 @@ struct SharedBlockDeviceMetricsInner {
     write_bytes: AtomicU64,
     read_count: AtomicU64,
     write_count: AtomicU64,
+    read_agg_min_us: AtomicU64,
+    read_agg_max_us: AtomicU64,
+    read_agg_sum_us: AtomicU64,
+    read_agg_sample_count: AtomicU64,
+    write_agg_min_us: AtomicU64,
+    write_agg_max_us: AtomicU64,
+    write_agg_sum_us: AtomicU64,
+    write_agg_sample_count: AtomicU64,
+}
+
+impl Default for SharedBlockDeviceMetricsInner {
+    fn default() -> Self {
+        Self {
+            event_fails: AtomicU64::new(0),
+            execute_fails: AtomicU64::new(0),
+            invalid_reqs_count: AtomicU64::new(0),
+            flush_count: AtomicU64::new(0),
+            queue_event_count: AtomicU64::new(0),
+            update_count: AtomicU64::new(0),
+            update_fails: AtomicU64::new(0),
+            read_bytes: AtomicU64::new(0),
+            write_bytes: AtomicU64::new(0),
+            read_count: AtomicU64::new(0),
+            write_count: AtomicU64::new(0),
+            read_agg_min_us: AtomicU64::new(u64::MAX),
+            read_agg_max_us: AtomicU64::new(0),
+            read_agg_sum_us: AtomicU64::new(0),
+            read_agg_sample_count: AtomicU64::new(0),
+            write_agg_min_us: AtomicU64::new(u64::MAX),
+            write_agg_max_us: AtomicU64::new(0),
+            write_agg_sum_us: AtomicU64::new(0),
+            write_agg_sample_count: AtomicU64::new(0),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1480,14 +1586,78 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
 }
 
 fn record_atomic_metric(metric: &AtomicU64, increment: u64) {
+    record_atomic_metric_with_ordering(metric, increment, Ordering::Relaxed);
+}
+
+fn record_atomic_metric_release(metric: &AtomicU64, increment: u64) {
+    record_atomic_metric_with_ordering(metric, increment, Ordering::Release);
+}
+
+fn record_atomic_metric_with_ordering(metric: &AtomicU64, increment: u64, success: Ordering) {
     let mut current = metric.load(Ordering::Relaxed);
     loop {
         let next = current.saturating_add(increment);
-        match metric.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+        match metric.compare_exchange_weak(current, next, success, Ordering::Relaxed) {
             Ok(_) => return,
             Err(observed) => current = observed,
         }
     }
+}
+
+fn record_atomic_min_metric(metric: &AtomicU64, value: u64) {
+    let mut current = metric.load(Ordering::Relaxed);
+    while value < current {
+        match metric.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn record_atomic_max_metric(metric: &AtomicU64, value: u64) {
+    let mut current = metric.load(Ordering::Relaxed);
+    while value > current {
+        match metric.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn record_latency_aggregate(
+    latency_aggregate: VirtioBlockLatencyAggregate,
+    min_us: &AtomicU64,
+    max_us: &AtomicU64,
+    sum_us: &AtomicU64,
+    sample_count: &AtomicU64,
+) {
+    if latency_aggregate.is_empty() {
+        return;
+    }
+
+    record_atomic_min_metric(min_us, latency_aggregate.min_us());
+    record_atomic_max_metric(max_us, latency_aggregate.max_us());
+    record_atomic_metric(sum_us, latency_aggregate.sum_us());
+    record_atomic_metric_release(sample_count, latency_aggregate.sample_count());
+}
+
+fn latency_aggregate_snapshot(
+    min_us: &AtomicU64,
+    max_us: &AtomicU64,
+    sum_us: &AtomicU64,
+    sample_count: &AtomicU64,
+) -> VirtioBlockLatencyAggregate {
+    let sample_count = sample_count.load(Ordering::Acquire);
+    if sample_count == 0 {
+        return VirtioBlockLatencyAggregate::default();
+    }
+
+    VirtioBlockLatencyAggregate::new(
+        min_us.load(Ordering::Relaxed),
+        max_us.load(Ordering::Relaxed),
+        sum_us.load(Ordering::Relaxed),
+        sample_count,
+    )
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1737,7 +1907,34 @@ fn block_device_metrics_json_object(
         "write_count".to_string(),
         serde_json::Value::Number(metrics.write_count().into()),
     );
+    block.insert(
+        "read_agg".to_string(),
+        serde_json::Value::Object(latency_aggregate_metrics_json_object(metrics.read_agg())),
+    );
+    block.insert(
+        "write_agg".to_string(),
+        serde_json::Value::Object(latency_aggregate_metrics_json_object(metrics.write_agg())),
+    );
     block
+}
+
+fn latency_aggregate_metrics_json_object(
+    metrics: VirtioBlockLatencyAggregate,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut aggregate = serde_json::Map::new();
+    aggregate.insert(
+        "min_us".to_string(),
+        serde_json::Value::Number(metrics.min_us().into()),
+    );
+    aggregate.insert(
+        "max_us".to_string(),
+        serde_json::Value::Number(metrics.max_us().into()),
+    );
+    aggregate.insert(
+        "sum_us".to_string(),
+        serde_json::Value::Number(metrics.sum_us().into()),
+    );
+    aggregate
 }
 
 impl MetricsSink {
@@ -2130,6 +2327,7 @@ mod tests {
         MetricsFlushError, MetricsOutput, MetricsState, SharedBalloonDeviceMetrics,
         SharedBlockDeviceMetrics, SharedBlockDeviceMetricsRegistry,
     };
+    use crate::block::VirtioBlockLatencyAggregate;
     use crate::serial::SerialOutputMetrics;
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -2203,6 +2401,8 @@ mod tests {
             .with_write_bytes(7)
             .with_read_count(8)
             .with_write_count(9)
+            .with_read_agg(VirtioBlockLatencyAggregate::new(12, 30, 42, 2))
+            .with_write_agg(VirtioBlockLatencyAggregate::new(13, 31, 44, 3))
     }
 
     #[test]
@@ -2394,7 +2594,7 @@ mod tests {
         assert_eq!(
             output.lines(),
             [
-                r#"{"block":{"event_fails":1,"execute_fails":2,"flush_count":4,"invalid_reqs_count":3,"queue_event_count":5,"read_bytes":6,"read_count":8,"update_count":10,"update_fails":11,"write_bytes":7,"write_count":9},"vmm":{"metrics_flush_count":1}}"#
+                r#"{"block":{"event_fails":1,"execute_fails":2,"flush_count":4,"invalid_reqs_count":3,"queue_event_count":5,"read_agg":{"max_us":30,"min_us":12,"sum_us":42},"read_bytes":6,"read_count":8,"update_count":10,"update_fails":11,"write_agg":{"max_us":31,"min_us":13,"sum_us":44},"write_bytes":7,"write_count":9},"vmm":{"metrics_flush_count":1}}"#
             ]
         );
     }
@@ -2418,11 +2618,13 @@ mod tests {
         let rootfs_metrics = BlockDeviceMetrics::default()
             .with_queue_event_count(1)
             .with_read_bytes(512)
-            .with_read_count(1);
+            .with_read_count(1)
+            .with_read_agg(VirtioBlockLatencyAggregate::new(2, 4, 6, 2));
         let data_metrics = BlockDeviceMetrics::default()
             .with_queue_event_count(1)
             .with_write_bytes(256)
-            .with_write_count(1);
+            .with_write_count(1)
+            .with_write_agg(VirtioBlockLatencyAggregate::new(3, 5, 8, 2));
         let diagnostics = MetricsDiagnostics::new()
             .with_block_device_metrics(rootfs_metrics.merged_with(data_metrics))
             .with_block_device_metrics_by_drive(
@@ -2437,7 +2639,7 @@ mod tests {
         assert_eq!(
             output.lines(),
             [
-                r#"{"block":{"event_fails":0,"execute_fails":0,"flush_count":0,"invalid_reqs_count":0,"queue_event_count":2,"read_bytes":512,"read_count":1,"update_count":0,"update_fails":0,"write_bytes":256,"write_count":1},"block_data":{"event_fails":0,"execute_fails":0,"flush_count":0,"invalid_reqs_count":0,"queue_event_count":1,"read_bytes":0,"read_count":0,"update_count":0,"update_fails":0,"write_bytes":256,"write_count":1},"block_rootfs":{"event_fails":0,"execute_fails":0,"flush_count":0,"invalid_reqs_count":0,"queue_event_count":1,"read_bytes":512,"read_count":1,"update_count":0,"update_fails":0,"write_bytes":0,"write_count":0},"vmm":{"metrics_flush_count":1}}"#
+                r#"{"block":{"event_fails":0,"execute_fails":0,"flush_count":0,"invalid_reqs_count":0,"queue_event_count":2,"read_agg":{"max_us":4,"min_us":2,"sum_us":6},"read_bytes":512,"read_count":1,"update_count":0,"update_fails":0,"write_agg":{"max_us":5,"min_us":3,"sum_us":8},"write_bytes":256,"write_count":1},"block_data":{"event_fails":0,"execute_fails":0,"flush_count":0,"invalid_reqs_count":0,"queue_event_count":1,"read_agg":{"max_us":0,"min_us":0,"sum_us":0},"read_bytes":0,"read_count":0,"update_count":0,"update_fails":0,"write_agg":{"max_us":5,"min_us":3,"sum_us":8},"write_bytes":256,"write_count":1},"block_rootfs":{"event_fails":0,"execute_fails":0,"flush_count":0,"invalid_reqs_count":0,"queue_event_count":1,"read_agg":{"max_us":4,"min_us":2,"sum_us":6},"read_bytes":512,"read_count":1,"update_count":0,"update_fails":0,"write_agg":{"max_us":0,"min_us":0,"sum_us":0},"write_bytes":0,"write_count":0},"vmm":{"metrics_flush_count":1}}"#
             ]
         );
     }
@@ -2468,6 +2670,13 @@ mod tests {
         first.record_event_failure_for_drive("rootfs");
         first.record_update_for_drive("rootfs");
         first.record_update_failure_for_drive("data");
+        first
+            .aggregate()
+            .record_read_latency_aggregate(VirtioBlockLatencyAggregate::new(0, 10, 10, 2));
+        first
+            .per_drive("rootfs")
+            .expect("rootfs metrics should exist")
+            .record_read_latency_aggregate(VirtioBlockLatencyAggregate::new(0, 10, 10, 2));
 
         assert_eq!(
             first.aggregate_snapshot(),
@@ -2476,6 +2685,7 @@ mod tests {
                 .with_queue_event_count(2)
                 .with_update_count(1)
                 .with_update_fails(1)
+                .with_read_agg(VirtioBlockLatencyAggregate::new(0, 10, 10, 2))
         );
         assert_eq!(
             first.per_drive_snapshot(),
@@ -2485,7 +2695,8 @@ mod tests {
                     BlockDeviceMetrics::default()
                         .with_event_fails(1)
                         .with_queue_event_count(2)
-                        .with_update_count(1),
+                        .with_update_count(1)
+                        .with_read_agg(VirtioBlockLatencyAggregate::new(0, 10, 10, 2)),
                 )
                 .with_drive_metrics("data", BlockDeviceMetrics::default().with_update_fails(1),)
         );
@@ -2507,6 +2718,31 @@ mod tests {
     }
 
     #[test]
+    fn block_latency_metric_preserves_saturated_minimum() {
+        let metrics = SharedBlockDeviceMetrics::default();
+
+        metrics.record_read_latency_aggregate(VirtioBlockLatencyAggregate::new(
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            1,
+        ));
+
+        assert_eq!(
+            metrics.snapshot().read_agg(),
+            VirtioBlockLatencyAggregate::new(u64::MAX, u64::MAX, u64::MAX, 1)
+        );
+    }
+
+    #[test]
+    fn empty_block_latency_aggregate_normalizes_metric_values() {
+        assert_eq!(
+            VirtioBlockLatencyAggregate::new(7, 9, 11, 0),
+            VirtioBlockLatencyAggregate::default()
+        );
+    }
+
+    #[test]
     fn block_diagnostics_merge_saturates() {
         let base = MetricsDiagnostics::new().with_block_device_metrics(
             BlockDeviceMetrics::default()
@@ -2520,7 +2756,9 @@ mod tests {
                 .with_read_bytes(u64::MAX - 6)
                 .with_write_bytes(u64::MAX - 7)
                 .with_read_count(u64::MAX - 8)
-                .with_write_count(u64::MAX - 9),
+                .with_write_count(u64::MAX - 9)
+                .with_read_agg(VirtioBlockLatencyAggregate::new(20, 24, u64::MAX - 1, 2))
+                .with_write_agg(VirtioBlockLatencyAggregate::new(14, 20, u64::MAX - 2, 1)),
         );
         let additional =
             MetricsDiagnostics::new().with_block_device_metrics(block_metrics_with_all_fields());
@@ -2540,6 +2778,8 @@ mod tests {
                     .with_write_bytes(u64::MAX)
                     .with_read_count(u64::MAX)
                     .with_write_count(u64::MAX)
+                    .with_read_agg(VirtioBlockLatencyAggregate::new(12, 30, u64::MAX, 4))
+                    .with_write_agg(VirtioBlockLatencyAggregate::new(13, 31, u64::MAX, 4))
             )
         );
     }
@@ -2551,7 +2791,8 @@ mod tests {
                 "rootfs",
                 BlockDeviceMetrics::default()
                     .with_event_fails(u64::MAX - 1)
-                    .with_read_count(u64::MAX - 2),
+                    .with_read_count(u64::MAX - 2)
+                    .with_read_agg(VirtioBlockLatencyAggregate::new(20, 20, u64::MAX - 1, 1)),
             ),
         );
         let additional = MetricsDiagnostics::new().with_block_device_metrics_by_drive(
@@ -2573,7 +2814,9 @@ mod tests {
                     .with_read_bytes(6)
                     .with_write_bytes(7)
                     .with_read_count(u64::MAX)
-                    .with_write_count(9),
+                    .with_write_count(9)
+                    .with_read_agg(VirtioBlockLatencyAggregate::new(12, 30, u64::MAX, 3))
+                    .with_write_agg(VirtioBlockLatencyAggregate::new(13, 31, 44, 3)),
             )
             .with_drive_metrics("data", BlockDeviceMetrics::default().with_write_count(3));
         let merged = base.merged_with(additional);
