@@ -32,6 +32,7 @@ use bangbang_runtime::entropy::EntropyMmioLayout;
 use bangbang_runtime::logger::LoggerConfigInput;
 use bangbang_runtime::machine::{MachineConfigInput, MachineConfigPatchInput};
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
+use bangbang_runtime::memory_hotplug::{MemoryHotplugConfigInput, MemoryHotplugSizeUpdateInput};
 use bangbang_runtime::metrics::{BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics};
 use bangbang_runtime::mmds::{
     MmdsConfig, MmdsConfigInput, MmdsContentInput, MmdsStateHandle, MmdsStateLockError,
@@ -393,10 +394,10 @@ impl PutApiRequest {
         }
     }
 
-    pub(crate) const fn memory_hotplug() -> Self {
+    pub(crate) const fn memory_hotplug(input: MemoryHotplugConfigInput) -> Self {
         Self {
             kind: PutApiRequestKind::HotplugMemory,
-            action: VmmAction::PutMemoryHotplug,
+            action: VmmAction::PutMemoryHotplug(input),
         }
     }
 
@@ -581,10 +582,10 @@ impl PatchApiRequest {
         }
     }
 
-    pub(crate) const fn memory_hotplug() -> Self {
+    pub(crate) const fn memory_hotplug(input: MemoryHotplugSizeUpdateInput) -> Self {
         Self {
             kind: PatchApiRequestKind::HotplugMemory,
-            action: VmmAction::PatchMemoryHotplug,
+            action: VmmAction::PatchMemoryHotplug(input),
         }
     }
 
@@ -4232,6 +4233,7 @@ mod tests {
             | VmmActionError::NetworkInterfaceConfig(_)
             | VmmActionError::NetworkInterfaceUpdate(_)
             | VmmActionError::NetworkInterfaceUpdateUnsupported
+            | VmmActionError::MemoryHotplugConfig(_)
             | VmmActionError::MemoryHotplugUnsupported
             | VmmActionError::PmemConfig(_)
             | VmmActionError::PmemUnsupported

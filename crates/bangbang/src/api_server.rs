@@ -20,12 +20,13 @@ use bangbang_api::http::{
     DriveIoEngine as ApiDriveIoEngine, DrivePatchRequest, EntropyConfigRequest,
     EntropyConfigResponse, HotUnplugDeviceKind as ApiHotUnplugDeviceKind, HotUnplugDeviceRequest,
     HttpResponse, LoggerConfigRequest, LoggerLevel as ApiLoggerLevel, MachineConfigPatchRequest,
-    MachineConfigRequest, MachineConfigResponse, MetricsConfigRequest, MmdsConfigRequest,
-    MmdsConfigResponse, MmdsContentRequest, MmdsVersion as ApiMmdsVersion,
-    NetworkInterfaceConfigRequest, NetworkInterfaceConfigResponse, NetworkInterfacePatchRequest,
-    PmemConfigRequest, PmemConfigResponse, RequestError, SerialConfigRequest, VmConfigResponse,
-    VmStateUpdate, VmStateUpdateRequest, VsockConfigRequest, VsockConfigResponse,
-    api_request_metric_endpoint, parse_request_with_limit, request_total_len_with_limit,
+    MachineConfigRequest, MachineConfigResponse, MemoryHotplugConfigRequest,
+    MemoryHotplugSizeUpdateRequest, MetricsConfigRequest, MmdsConfigRequest, MmdsConfigResponse,
+    MmdsContentRequest, MmdsVersion as ApiMmdsVersion, NetworkInterfaceConfigRequest,
+    NetworkInterfaceConfigResponse, NetworkInterfacePatchRequest, PmemConfigRequest,
+    PmemConfigResponse, RequestError, SerialConfigRequest, VmConfigResponse, VmStateUpdate,
+    VmStateUpdateRequest, VsockConfigRequest, VsockConfigResponse, api_request_metric_endpoint,
+    parse_request_with_limit, request_total_len_with_limit,
 };
 use bangbang_runtime::balloon::{
     BalloonConfig, BalloonConfigInput, BalloonHintingStartInput, BalloonHintingStatus,
@@ -43,6 +44,7 @@ use bangbang_runtime::machine::{
     MachineConfigHugePages as RuntimeMachineConfigHugePages, MachineConfigInput,
     MachineConfigPatchInput,
 };
+use bangbang_runtime::memory_hotplug::{MemoryHotplugConfigInput, MemoryHotplugSizeUpdateInput};
 use bangbang_runtime::metrics::MetricsConfigInput;
 use bangbang_runtime::mmds::{
     MmdsConfig, MmdsConfigInput, MmdsContentInput, MmdsVersion as RuntimeMmdsVersion,
@@ -740,12 +742,12 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
         ApiRequest::GetMemoryHotplug => {
             handle_empty(vmm.handle_get_request(GetApiRequest::HotplugMemory))
         }
-        ApiRequest::PutMemoryHotplug => {
-            handle_empty(vmm.handle_put_request(PutApiRequest::memory_hotplug()))
-        }
-        ApiRequest::PatchMemoryHotplug => {
-            handle_empty(vmm.handle_patch_request(PatchApiRequest::memory_hotplug()))
-        }
+        ApiRequest::PutMemoryHotplug(config) => handle_empty(vmm.handle_put_request(
+            PutApiRequest::memory_hotplug(memory_hotplug_config_input_from_request(config)),
+        )),
+        ApiRequest::PatchMemoryHotplug(update) => handle_empty(vmm.handle_patch_request(
+            PatchApiRequest::memory_hotplug(memory_hotplug_size_update_input_from_request(update)),
+        )),
         ApiRequest::PutEntropy(config) => handle_empty(vmm.handle_action(VmmAction::PutEntropy(
             entropy_config_input_from_request(config.as_ref()),
         ))),
@@ -789,7 +791,7 @@ fn request_uses_deprecated_api(request: &ApiRequest) -> bool {
         | ApiRequest::PatchBalloonHintingStart(_)
         | ApiRequest::PatchBalloonHintingStop
         | ApiRequest::PatchDrive(_)
-        | ApiRequest::PatchMemoryHotplug
+        | ApiRequest::PatchMemoryHotplug(_)
         | ApiRequest::PatchMmds(_)
         | ApiRequest::PatchNetworkInterface(_)
         | ApiRequest::PatchPmem
@@ -801,7 +803,7 @@ fn request_uses_deprecated_api(request: &ApiRequest) -> bool {
         | ApiRequest::PutDrive(_)
         | ApiRequest::PutEntropy(_)
         | ApiRequest::PutLogger(_)
-        | ApiRequest::PutMemoryHotplug
+        | ApiRequest::PutMemoryHotplug(_)
         | ApiRequest::PutMetrics(_)
         | ApiRequest::PutMmds(_)
         | ApiRequest::PutNetworkInterface(_)
@@ -898,12 +900,12 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         | ApiRequest::PatchDrive(_)
         | ApiRequest::PatchMachineConfig(_)
         | ApiRequest::PatchMmds(_)
-        | ApiRequest::PatchMemoryHotplug
+        | ApiRequest::PatchMemoryHotplug(_)
         | ApiRequest::PatchNetworkInterface(_)
         | ApiRequest::PatchPmem
         | ApiRequest::PatchVmState(_)
         | ApiRequest::PutAction(_)
-        | ApiRequest::PutMemoryHotplug
+        | ApiRequest::PutMemoryHotplug(_)
         | ApiRequest::PutMmds(_)
         | ApiRequest::PutSnapshotCreate
         | ApiRequest::PutSnapshotLoad(_) => None,
@@ -1507,6 +1509,22 @@ fn entropy_config_input_from_request(config: &EntropyConfigRequest) -> EntropyCo
     }
 
     input
+}
+
+fn memory_hotplug_config_input_from_request(
+    config: MemoryHotplugConfigRequest,
+) -> MemoryHotplugConfigInput {
+    MemoryHotplugConfigInput::new(
+        config.total_size_mib(),
+        config.block_size_mib(),
+        config.slot_size_mib(),
+    )
+}
+
+fn memory_hotplug_size_update_input_from_request(
+    update: MemoryHotplugSizeUpdateRequest,
+) -> MemoryHotplugSizeUpdateInput {
+    MemoryHotplugSizeUpdateInput::new(update.requested_size_mib())
 }
 
 fn pmem_config_input_from_request(config: &PmemConfigRequest) -> PmemConfigInput {
@@ -4587,8 +4605,7 @@ mod tests {
                 .contains(r#"{"fault_message":"GET request cannot have a body."}"#)
         );
 
-        let valid_put_body =
-            r#"{"total_size_mib":222222222,"block_size_mib":2,"slot_size_mib":128}"#;
+        let valid_put_body = r#"{"total_size_mib":2048,"block_size_mib":2,"slot_size_mib":128}"#;
         let valid_put_response = request_over_socket(
             &mut vmm,
             "mh-m-put",
@@ -4598,6 +4615,20 @@ mod tests {
         assert!(
             valid_put_response.contains(r#"{"fault_message":"Memory hotplug is not supported."}"#)
         );
+
+        let semantic_put_response = request_over_socket(
+            &mut vmm,
+            "mh-m-put-invalid",
+            &request_with_body(
+                "PUT",
+                "/hotplug/memory",
+                r#"{"total_size_mib":222222222,"block_size_mib":2,"slot_size_mib":128}"#,
+            ),
+        );
+        assert!(semantic_put_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(semantic_put_response.contains(
+            r#"{"fault_message":"Total size must be a multiple of slot size (128 MiB)"}"#
+        ));
 
         let malformed_put_response = request_over_socket(
             &mut vmm,
@@ -4646,7 +4677,7 @@ mod tests {
             fs::read_to_string(&metrics_path).expect("metrics output should be readable");
         assert_eq!(
             metrics_output,
-            "{\"get_api_requests\":{\"balloon_count\":0,\"hotplug_memory_count\":1,\"instance_info_count\":0,\"machine_cfg_count\":0,\"mmds_count\":0,\"vmm_version_count\":0},\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":2,\"hotplug_memory_fails\":2,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":2,\"hotplug_memory_fails\":2,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
+            "{\"get_api_requests\":{\"balloon_count\":0,\"hotplug_memory_count\":1,\"instance_info_count\":0,\"machine_cfg_count\":0,\"mmds_count\":0,\"vmm_version_count\":0},\"patch_api_requests\":{\"balloon_count\":0,\"balloon_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":2,\"hotplug_memory_fails\":2,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0},\"put_api_requests\":{\"actions_count\":2,\"actions_fails\":0,\"balloon_count\":0,\"balloon_fails\":0,\"boot_source_count\":1,\"boot_source_fails\":0,\"cpu_cfg_count\":0,\"cpu_cfg_fails\":0,\"drive_count\":0,\"drive_fails\":0,\"hotplug_memory_count\":3,\"hotplug_memory_fails\":3,\"logger_count\":0,\"logger_fails\":0,\"machine_cfg_count\":0,\"machine_cfg_fails\":0,\"metrics_count\":1,\"metrics_fails\":0,\"mmds_count\":0,\"mmds_fails\":0,\"network_count\":0,\"network_fails\":0,\"pmem_count\":0,\"pmem_fails\":0,\"serial_count\":0,\"serial_fails\":0,\"vsock_count\":0,\"vsock_fails\":0},\"vmm\":{\"metrics_flush_count\":1}}\n"
         );
         assert!(!metrics_output.contains("222222222"));
         assert!(!metrics_output.contains("333333333"));
@@ -6463,6 +6494,15 @@ mod tests {
                 "mh-put",
                 request_with_body("PUT", "/hotplug/memory", r#"{"total_size_mib":2048}"#),
                 "Memory hotplug is not supported.",
+            ),
+            (
+                "mh-pic",
+                request_with_body(
+                    "PUT",
+                    "/hotplug/memory",
+                    r#"{"total_size_mib":2048,"block_size_mib":3,"slot_size_mib":128}"#,
+                ),
+                "Block size must be a power of 2",
             ),
             (
                 "mh-put-bad",
