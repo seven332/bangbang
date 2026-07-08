@@ -141,7 +141,7 @@ exits on handled `SIGINT`, handled `SIGTERM`, or guest PSCI `SYSTEM_OFF` or
 | `--parent-cpu-time-us <MICROS>` | parsed and reported in minimal metrics | Accepts non-negative `u64` microsecond values passed by Firecracker-style launchers. When `--start-time-cpu-us` is also provided, startup, explicit runtime `FlushMetrics`, and periodic runtime metrics output add this value into `api_server.process_startup_time_cpu_us`; it is not serialized separately. |
 | `--metrics-path <PATH>` | configures metrics output before API serving | Uses the same per-process metrics sink and redacted host-path error policy as `PUT /metrics`. A later duplicate `PUT /metrics` request fails without replacing this sink. |
 | `--log-path <PATH>` | configures logger output before API serving | Uses the same per-process logger sink and redacted host-path error policy as `PUT /logger`. |
-| `--level <LEVEL>` | configures logger level before API serving | Accepts the existing logger levels `Off`, `Trace`, `Debug`, `Info`, `Warn`, `Warning`, and `Error`; minimal action logs are emitted only when the configured level allows `Info`. |
+| `--level <LEVEL>` | configures logger level before API serving | Accepts the existing logger levels `Off`, `Trace`, `Debug`, `Info`, `Warn`, `Warning`, and `Error`; invalid levels fail before readiness with the bad-configuration exit status. Minimal action logs are emitted only when the configured level allows `Info`. |
 | `--module <MODULE>` | filters minimal action logs | Matches the stored `PUT /logger` field and filters the current minimal action logs with Firecracker-style module-path prefix matching. Minimal action logs use module path `bangbang_runtime::vmm_action`; full internal log routing remains deferred. |
 | `--show-level` | enables level prefix for minimal action logs | Writes `level=Info` before minimal `InstanceStart` and `FlushMetrics` action lines. |
 | `--show-log-origin` | enables origin field for minimal action logs | Writes `origin=<file>:<line>` before minimal `InstanceStart` and `FlushMetrics` action names. Full Firecracker logger integration remains deferred. |
@@ -150,7 +150,7 @@ exits on handled `SIGINT`, handled `SIGTERM`, or guest PSCI `SYSTEM_OFF` or
 | `--config-file <PATH>` | startup implemented for supported subset | Reads a Firecracker-shaped JSON configuration from a readable regular file up to 1 MiB, applies supported sections through the same validation path as matching API requests, and starts the VM with `InstanceStart`. In API-enabled mode, the API socket is published only after successful startup. Malformed files, oversized files, duplicate object keys, unknown sections, unsupported sections, or invalid sections fail before socket publication or no-api readiness. |
 | `--help`, `-h` | prints help | Help describes the current API socket scope. |
 | `--version`, `-V` | prints version | `-V` is retained from the existing bangbang scaffold. |
-| `--no-api` | config-file startup without API socket | Requires `--config-file`. Starts the supported config-file subset without binding or publishing the configured API socket, then waits for handled `SIGINT`, handled `SIGTERM`, or guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET`. Runtime control, reboot-in-place, and error exit-code parity remain deferred. |
+| `--no-api` | config-file startup without API socket | Requires `--config-file`. Starts the supported config-file subset without binding or publishing the configured API socket, then waits for handled `SIGINT`, handled `SIGTERM`, or guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET`. Runtime control, reboot-in-place, and remaining runtime error exit-code parity remain deferred. |
 | seccomp, snapshot, boot timer, and PCI process flags | rejected | These Firecracker options are Linux-specific or tied to later capability work. |
 
 Startup timing arguments are intentionally not exposed in `GET /vm/config` or
@@ -297,12 +297,13 @@ The current executable uses a small process exit status contract:
 | Exit status | Current meaning | Compatibility notes |
 | --- | --- | --- |
 | `0` | Help or version completed successfully, the API server exited without error, no-api mode handled `SIGINT`/`SIGTERM` shutdown, or a process-owned VM exited after guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET`. | Matches Firecracker's success status. |
+| `152` | Startup configuration failed before the process entered runtime, including config-file, metadata, startup logger, and startup metrics configuration failures. | Matches Firecracker's `BadConfiguration` exit code for clearly startup configuration failures. |
 | `153` | Startup argument parsing failed before process configuration began. | Matches Firecracker's `ArgParsing` exit code. |
-| `1` | Process failure, including config-file startup, startup metrics/logger configuration, API socket bind, signal handler registration, no-api signal wait failure, API accept failure, or a process-owned boot worker non-success terminal state. | Used for non-argument process failures before more specific Firecracker-compatible process errors exist. Per-connection read/write errors do not terminate the API server. |
+| `1` | Process failure, including API socket bind, signal handler registration, no-api signal wait failure, API accept failure, startup time accounting failure, periodic runtime work failure, or a process-owned boot worker non-success terminal state. | Used for non-configuration process failures before more specific Firecracker-compatible process errors exist. Per-connection read/write errors do not terminate the API server. |
 
-Firecracker also defines bad-configuration and signal-specific exit codes.
-bangbang does not expose those until the corresponding configuration loading,
-signal handling, API server, or VM runtime behavior exists.
+Firecracker also defines signal-specific exit codes. bangbang does not expose
+those until the corresponding signal handling, API server, or VM runtime
+behavior exists.
 
 ## Compatibility Baseline
 

@@ -22,6 +22,7 @@ use bangbang_api::HTTP_MAX_PAYLOAD_SIZE;
 use bangbang_runtime::machine::MAX_MEM_SIZE_MIB;
 
 const BANGBANG_VERSION: &str = env!("CARGO_PKG_VERSION");
+const BAD_CONFIGURATION_EXIT_CODE: i32 = 152;
 const ARGUMENT_PARSING_EXIT_CODE: i32 = 153;
 const MULTI_VCPU_STARTUP_ERROR: &str = "HVF arm64 boot session supports exactly 1 vCPU, got 2";
 
@@ -322,6 +323,37 @@ fn executable_rejects_unsupported_firecracker_process_flags_before_socket_public
             "unsupported --{name} must fail before publishing the API socket"
         );
     }
+}
+
+#[test]
+fn executable_rejects_invalid_logger_level_as_bad_configuration() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let instance_id = test_dir.instance_id();
+
+    let output = BangbangProcess::start_with_extra_args_expect_failure(
+        &socket_path,
+        &instance_id,
+        &["--level", "verbose"],
+    );
+
+    assert_bad_configuration_exit_code(&output, "invalid logger level");
+    assert!(
+        output
+            .stderr
+            .contains("bangbang: invalid --level: logger level is invalid"),
+        "stderr should describe invalid logger level; stderr:\n{}",
+        output.stderr
+    );
+    assert!(
+        !output.stdout.contains("status: API server listening"),
+        "invalid logger level must not report API readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !socket_path.exists(),
+        "invalid logger level must fail before publishing the API socket"
+    );
 }
 
 #[test]
@@ -702,6 +734,7 @@ fn executable_config_file_failure_does_not_publish_socket() {
         output.stdout,
         output.stderr
     );
+    assert_bad_configuration_exit_code(&output, "malformed config file");
     assert!(
         !socket_path.exists(),
         "malformed config file should fail before API socket publication"
@@ -736,6 +769,7 @@ fn executable_no_api_config_file_failure_does_not_publish_socket() {
         output.stdout,
         output.stderr
     );
+    assert_bad_configuration_exit_code(&output, "malformed no-api config file");
     assert!(
         !socket_path.exists(),
         "malformed no-api config file should not publish an API socket"
@@ -2777,6 +2811,7 @@ fn assert_metadata_failure(
         output.stdout,
         output.stderr
     );
+    assert_bad_configuration_exit_code(output, case_name);
     assert!(
         !socket_path.exists(),
         "{case_name} should fail before API socket publication"
@@ -2823,6 +2858,7 @@ fn assert_multi_vcpu_startup_failure(
         output.stdout,
         output.stderr
     );
+    assert_bad_configuration_exit_code(output, case_name);
     assert!(
         !socket_path.exists(),
         "{case_name} should fail before API socket publication"
@@ -2879,6 +2915,7 @@ fn assert_rejected_drive_socket_config_failure(
         output.stdout,
         output.stderr
     );
+    assert_bad_configuration_exit_code(output, case_name);
     assert!(
         !socket_path.exists(),
         "{case_name} should fail before API socket publication"
@@ -2930,6 +2967,7 @@ fn assert_rejected_serial_config_failure(
         output.stdout,
         output.stderr
     );
+    assert_bad_configuration_exit_code(output, case_name);
     assert!(
         !socket_path.exists(),
         "{case_name} should fail before API socket publication"
@@ -2980,6 +3018,7 @@ fn assert_entropy_rate_limiter_startup_failure(
         output.stdout,
         output.stderr
     );
+    assert_bad_configuration_exit_code(output, case_name);
     assert!(
         !socket_path.exists(),
         "{case_name} should fail before API socket publication"
@@ -3009,6 +3048,17 @@ fn assert_entropy_rate_limiter_startup_failure(
             output.stderr
         );
     }
+}
+
+fn assert_bad_configuration_exit_code(output: &support::CompletedProcess, case_name: &str) {
+    assert_eq!(
+        output.status.code(),
+        Some(BAD_CONFIGURATION_EXIT_CODE),
+        "{case_name} should fail with the bad-configuration exit code; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        output.stdout,
+        output.stderr
+    );
 }
 
 fn assert_instance_info_matches(
