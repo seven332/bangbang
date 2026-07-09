@@ -1070,6 +1070,25 @@ mod tests {
     }
 
     #[test]
+    fn prepared_virtio_mem_device_rejects_block_size_overflow() {
+        let block_size_mib = 1_u64 << 63;
+        let config = MemoryHotplugConfig::try_from(MemoryHotplugConfigInput::new(
+            block_size_mib,
+            block_size_mib,
+            block_size_mib,
+        ))
+        .expect("large but shape-valid memory hotplug config should convert");
+
+        assert_eq!(
+            PreparedVirtioMemDevice::from_config(config),
+            Err(VirtioMemPrepareError::SizeOverflow {
+                field: "block_size_mib",
+                mib: block_size_mib,
+            })
+        );
+    }
+
+    #[test]
     fn prepared_virtio_mem_device_rejects_region_address_overflow() {
         let config = MemoryHotplugConfig::try_from(MemoryHotplugConfigInput::new(1024, 2, 128))
             .expect("valid memory hotplug config should convert");
