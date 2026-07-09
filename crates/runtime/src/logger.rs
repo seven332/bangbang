@@ -557,6 +557,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn missed_log_counter_saturates_at_u64_max() {
+        let counter = MissedLogCounter::default();
+        counter.count.store(u64::MAX - 1, Ordering::Relaxed);
+
+        counter.record();
+        assert_eq!(counter.count(), u64::MAX);
+        counter.record();
+        assert_eq!(counter.count(), u64::MAX);
+    }
+
     fn assert_action_output_with_origin(output: &str, level: Option<LoggerLevel>, action: &str) {
         let mut lines = output.lines();
         let line = lines
