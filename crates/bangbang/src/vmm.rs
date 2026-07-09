@@ -3428,6 +3428,11 @@ mod tests {
         MemoryHotplugConfigInput::new(1024, 2, 128)
     }
 
+    fn memory_hotplug_config() -> MemoryHotplugConfig {
+        MemoryHotplugConfig::try_from(memory_hotplug_config_input())
+            .expect("test memory hotplug config should validate")
+    }
+
     const fn memory_hotplug_size_update_input(
         requested_size_mib: u64,
     ) -> MemoryHotplugSizeUpdateInput {
@@ -3435,12 +3440,7 @@ mod tests {
     }
 
     fn memory_hotplug_status(requested_size_mib: u64) -> MemoryHotplugStatus {
-        MemoryHotplugStatus::new(
-            MemoryHotplugConfig::try_from(memory_hotplug_config_input())
-                .expect("test memory hotplug config should validate"),
-            0,
-            requested_size_mib,
-        )
+        MemoryHotplugStatus::new(memory_hotplug_config(), 0, requested_size_mib)
     }
 
     fn block_device_updater_fixture(
@@ -4073,6 +4073,7 @@ mod tests {
         network_interface_metrics: Option<SharedNetworkInterfaceMetricsRegistry>,
         vsock_device_metrics: Option<SharedVsockDeviceMetrics>,
         entropy_device_metrics: Option<SharedEntropyDeviceMetrics>,
+        memory_hotplug_updates: Arc<Mutex<Vec<u64>>>,
         wait_for_stop: bool,
         wait_for_wakeup: bool,
         wait_for_stop_sequence: Arc<Mutex<VecDeque<bool>>>,
@@ -4099,6 +4100,7 @@ mod tests {
                 network_interface_metrics: None,
                 vsock_device_metrics: None,
                 entropy_device_metrics: None,
+                memory_hotplug_updates: Arc::default(),
                 wait_for_stop: true,
                 wait_for_wakeup: false,
                 wait_for_stop_sequence: Arc::default(),
@@ -4107,6 +4109,10 @@ mod tests {
 
         fn run_count(&self) -> Arc<AtomicU64> {
             Arc::clone(&self.run_count)
+        }
+
+        fn memory_hotplug_updates(&self) -> Arc<Mutex<Vec<u64>>> {
+            Arc::clone(&self.memory_hotplug_updates)
         }
 
         fn with_outcomes(
@@ -4217,6 +4223,17 @@ mod tests {
 
         fn shared_entropy_device_metrics(&self) -> Option<SharedEntropyDeviceMetrics> {
             self.entropy_device_metrics.clone()
+        }
+
+        fn update_memory_hotplug(
+            &mut self,
+            update: MemoryHotplugSizeUpdate,
+        ) -> Result<(), MemoryHotplugUpdateError> {
+            self.memory_hotplug_updates
+                .lock()
+                .expect("fake memory hotplug updates should lock")
+                .push(update.requested_size_mib());
+            Ok(())
         }
 
         fn run_loop(
@@ -5766,6 +5783,98 @@ mod tests {
             Err(mpsc::TryRecvError::Empty)
         );
         drop(supervisor);
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_updates_memory_hotplug_on_worker_after_wakeup() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let update = memory_hotplug_config()
+            .validate_size_update(memory_hotplug_size_update_input(256))
+            .expect("memory hotplug update should validate");
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true)
+                .with_outcomes([
+                    Ok(FakeRunLoopOutcome::Wakeup),
+                    Ok(FakeRunLoopOutcome::Terminal),
+                ]);
+        let updates = session.memory_hotplug_updates();
+        let mut supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(21).expect("non-zero limit"))
+                .expect("supervisor should start");
+
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            21
+        );
+        supervisor
+            .update_memory_hotplug(update)
+            .expect("memory hotplug update should run on worker");
+
+        assert_eq!(control.request_wakeup_count(), 1);
+        assert_eq!(
+            *updates
+                .lock()
+                .expect("fake memory hotplug updates should lock"),
+            [256]
+        );
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_updates_memory_hotplug_while_paused() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let update = memory_hotplug_config()
+            .validate_size_update(memory_hotplug_size_update_input(128))
+            .expect("memory hotplug update should validate");
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_outcomes([Ok(FakeRunLoopOutcome::Wakeup)])
+                .with_wait_for_stop(false)
+                .with_wait_for_wakeup(true);
+        let updates = session.memory_hotplug_updates();
+        let mut supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(22).expect("non-zero limit"))
+                .expect("supervisor should start");
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter first run loop"),
+            22
+        );
+        supervisor.pause().expect("supervisor should pause");
+
+        supervisor
+            .update_memory_hotplug(update)
+            .expect("paused worker should still update memory hotplug");
+
+        assert_eq!(supervisor.status(), BootRunLoopWorkerStatus::Paused);
+        assert_eq!(
+            max_steps_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+        assert_eq!(
+            *updates
+                .lock()
+                .expect("fake memory hotplug updates should lock"),
+            [128]
+        );
+
+        drop(supervisor);
+
         assert_eq!(control.request_stop_count(), 1);
         assert_eq!(drop_count.load(Ordering::SeqCst), 1);
     }
