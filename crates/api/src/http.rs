@@ -1421,6 +1421,50 @@ impl PmemConfigResponse {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryHotplugConfigResponse {
+    total_size_mib: u64,
+    block_size_mib: u64,
+    slot_size_mib: u64,
+}
+
+impl MemoryHotplugConfigResponse {
+    pub const fn new(total_size_mib: u64, block_size_mib: u64, slot_size_mib: u64) -> Self {
+        Self {
+            total_size_mib,
+            block_size_mib,
+            slot_size_mib,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryHotplugStatusResponse {
+    total_size_mib: u64,
+    block_size_mib: u64,
+    slot_size_mib: u64,
+    plugged_size_mib: u64,
+    requested_size_mib: u64,
+}
+
+impl MemoryHotplugStatusResponse {
+    pub const fn new(
+        total_size_mib: u64,
+        block_size_mib: u64,
+        slot_size_mib: u64,
+        plugged_size_mib: u64,
+        requested_size_mib: u64,
+    ) -> Self {
+        Self {
+            total_size_mib,
+            block_size_mib,
+            slot_size_mib,
+            plugged_size_mib,
+            requested_size_mib,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmConfigResponse {
     machine_config: MachineConfigResponse,
@@ -1430,6 +1474,7 @@ pub struct VmConfigResponse {
     mmds_config: Option<MmdsConfigResponse>,
     vsock: Option<VsockConfigResponse>,
     entropy: Option<EntropyConfigResponse>,
+    memory_hotplug: Option<MemoryHotplugConfigResponse>,
     balloon: Option<BalloonConfigResponse>,
     pmem: Vec<PmemConfigResponse>,
 }
@@ -1452,9 +1497,18 @@ impl VmConfigResponse {
             mmds_config,
             vsock,
             entropy,
+            memory_hotplug: None,
             balloon: None,
             pmem: Vec::new(),
         }
+    }
+
+    pub const fn with_memory_hotplug(
+        mut self,
+        memory_hotplug: Option<MemoryHotplugConfigResponse>,
+    ) -> Self {
+        self.memory_hotplug = memory_hotplug;
+        self
     }
 
     pub const fn with_balloon(mut self, balloon: Option<BalloonConfigResponse>) -> Self {
@@ -2070,6 +2124,12 @@ impl HttpResponse {
                 entropy_config_response_value(entropy),
             );
         }
+        if let Some(memory_hotplug) = &config.memory_hotplug {
+            body.insert(
+                "memory-hotplug".to_string(),
+                memory_hotplug_config_response_value(memory_hotplug),
+            );
+        }
         body.insert(
             "machine-config".to_string(),
             machine_config_response_value(&config.machine_config),
@@ -2129,6 +2189,13 @@ impl HttpResponse {
         Self {
             status: StatusCode::Ok,
             body: balloon_hinting_status_response_value(&status).to_string(),
+        }
+    }
+
+    pub fn memory_hotplug_status(status: MemoryHotplugStatusResponse) -> Self {
+        Self {
+            status: StatusCode::Ok,
+            body: memory_hotplug_status_response_value(&status).to_string(),
         }
     }
 
@@ -2298,6 +2365,14 @@ fn pmem_config_response_value(pmem: &PmemConfigResponse) -> serde_json::Value {
     })
 }
 
+fn memory_hotplug_config_response_value(config: &MemoryHotplugConfigResponse) -> serde_json::Value {
+    serde_json::json!({
+        "block_size_mib": config.block_size_mib,
+        "slot_size_mib": config.slot_size_mib,
+        "total_size_mib": config.total_size_mib,
+    })
+}
+
 fn entropy_config_response_value(entropy: &EntropyConfigResponse) -> serde_json::Value {
     let mut value = serde_json::Map::new();
     if let Some(rate_limiter) = entropy.rate_limiter() {
@@ -2394,6 +2469,16 @@ fn balloon_stats_response_value(stats: &BalloonStatsResponse) -> serde_json::Val
     insert_optional_u64(&mut body, "direct_reclaim", stats.direct_reclaim);
 
     serde_json::Value::Object(body)
+}
+
+fn memory_hotplug_status_response_value(status: &MemoryHotplugStatusResponse) -> serde_json::Value {
+    serde_json::json!({
+        "block_size_mib": status.block_size_mib,
+        "plugged_size_mib": status.plugged_size_mib,
+        "requested_size_mib": status.requested_size_mib,
+        "slot_size_mib": status.slot_size_mib,
+        "total_size_mib": status.total_size_mib,
+    })
 }
 
 fn insert_optional_u64(
@@ -7625,6 +7710,7 @@ mod tests {
         assert_eq!(body.get("logger"), None);
         assert_eq!(body.get("mmds-config"), None);
         assert_eq!(body.get("entropy"), None);
+        assert_eq!(body.get("memory-hotplug"), None);
         assert_eq!(body.get("pmem"), Some(&serde_json::json!([])));
         assert_eq!(body.get("vsock"), None);
     }
@@ -7647,6 +7733,7 @@ mod tests {
         let mmds_config = MmdsConfigResponse::new(vec!["eth0".to_string()], "V2", true)
             .with_ipv4_address("169.254.169.254");
         let vsock = VsockConfigResponse::new(3, "./v.sock");
+        let memory_hotplug = MemoryHotplugConfigResponse::new(1024, 2, 128);
         let balloon = BalloonConfigResponse::new(128, true, 60, true, false);
         let pmem = PmemConfigResponse::new("pmem0", "/tmp/pmem.img", true, false);
         let response = HttpResponse::vm_config(
@@ -7659,6 +7746,7 @@ mod tests {
                 Some(vsock),
                 Some(EntropyConfigResponse::new()),
             )
+            .with_memory_hotplug(Some(memory_hotplug))
             .with_balloon(Some(balloon))
             .with_pmem(vec![pmem]),
         );
@@ -7711,6 +7799,11 @@ mod tests {
                     "smt": false,
                     "track_dirty_pages": false,
                     "vcpu_count": 2,
+                },
+                "memory-hotplug": {
+                    "block_size_mib": 2,
+                    "slot_size_mib": 128,
+                    "total_size_mib": 1024,
                 },
                 "network-interfaces": [
                     {
@@ -7857,6 +7950,27 @@ mod tests {
             serde_json::json!({
                 "guest_cmd": null,
                 "host_cmd": 7,
+            })
+        );
+    }
+
+    #[test]
+    fn response_body_contains_memory_hotplug_status() {
+        let response = HttpResponse::memory_hotplug_status(MemoryHotplugStatusResponse::new(
+            1024, 2, 128, 0, 0,
+        ));
+        let body: serde_json::Value =
+            serde_json::from_str(response.body()).expect("body should be JSON");
+
+        assert_eq!(response.status(), StatusCode::Ok);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "block_size_mib": 2,
+                "plugged_size_mib": 0,
+                "requested_size_mib": 0,
+                "slot_size_mib": 128,
+                "total_size_mib": 1024,
             })
         );
     }

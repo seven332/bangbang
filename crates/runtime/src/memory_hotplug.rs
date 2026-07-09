@@ -70,6 +70,93 @@ impl MemoryHotplugConfigInput {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryHotplugConfig {
+    total_size_mib: u64,
+    block_size_mib: u64,
+    slot_size_mib: u64,
+}
+
+impl MemoryHotplugConfig {
+    const fn new(total_size_mib: u64, block_size_mib: u64, slot_size_mib: u64) -> Self {
+        Self {
+            total_size_mib,
+            block_size_mib,
+            slot_size_mib,
+        }
+    }
+
+    pub const fn total_size_mib(self) -> u64 {
+        self.total_size_mib
+    }
+
+    pub const fn block_size_mib(self) -> u64 {
+        self.block_size_mib
+    }
+
+    pub const fn slot_size_mib(self) -> u64 {
+        self.slot_size_mib
+    }
+
+    pub const fn initial_status(self) -> MemoryHotplugStatus {
+        MemoryHotplugStatus::new(self, 0, 0)
+    }
+}
+
+impl TryFrom<MemoryHotplugConfigInput> for MemoryHotplugConfig {
+    type Error = MemoryHotplugConfigError;
+
+    fn try_from(input: MemoryHotplugConfigInput) -> Result<Self, Self::Error> {
+        input.validate()?;
+        Ok(Self::new(
+            input.total_size_mib(),
+            input.block_size_mib(),
+            input.slot_size_mib(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryHotplugStatus {
+    config: MemoryHotplugConfig,
+    plugged_size_mib: u64,
+    requested_size_mib: u64,
+}
+
+impl MemoryHotplugStatus {
+    pub const fn new(
+        config: MemoryHotplugConfig,
+        plugged_size_mib: u64,
+        requested_size_mib: u64,
+    ) -> Self {
+        Self {
+            config,
+            plugged_size_mib,
+            requested_size_mib,
+        }
+    }
+
+    pub const fn total_size_mib(self) -> u64 {
+        self.config.total_size_mib()
+    }
+
+    pub const fn block_size_mib(self) -> u64 {
+        self.config.block_size_mib()
+    }
+
+    pub const fn slot_size_mib(self) -> u64 {
+        self.config.slot_size_mib()
+    }
+
+    pub const fn plugged_size_mib(self) -> u64 {
+        self.plugged_size_mib
+    }
+
+    pub const fn requested_size_mib(self) -> u64 {
+        self.requested_size_mib
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryHotplugSizeUpdateInput {
     requested_size_mib: u64,
 }
@@ -131,6 +218,29 @@ mod tests {
         let input = MemoryHotplugConfigInput::new(1024, 2, 128);
 
         assert_eq!(input.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validates_config_input_into_config() {
+        let config = MemoryHotplugConfig::try_from(MemoryHotplugConfigInput::new(1024, 2, 128))
+            .expect("valid memory hotplug config should convert");
+
+        assert_eq!(config.total_size_mib(), 1024);
+        assert_eq!(config.block_size_mib(), 2);
+        assert_eq!(config.slot_size_mib(), 128);
+    }
+
+    #[test]
+    fn exposes_initial_status() {
+        let config = MemoryHotplugConfig::try_from(MemoryHotplugConfigInput::new(1024, 2, 128))
+            .expect("valid memory hotplug config should convert");
+        let status = config.initial_status();
+
+        assert_eq!(status.total_size_mib(), 1024);
+        assert_eq!(status.block_size_mib(), 2);
+        assert_eq!(status.slot_size_mib(), 128);
+        assert_eq!(status.plugged_size_mib(), 0);
+        assert_eq!(status.requested_size_mib(), 0);
     }
 
     #[test]

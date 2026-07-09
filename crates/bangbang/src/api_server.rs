@@ -22,12 +22,13 @@ use bangbang_api::http::{
     HotUnplugDeviceKind as ApiHotUnplugDeviceKind, HotUnplugDeviceRequest, HttpResponse,
     LoggerConfigRequest, LoggerLevel as ApiLoggerLevel, MachineConfigPatchRequest,
     MachineConfigRequest, MachineConfigResponse, MemoryHotplugConfigRequest,
-    MemoryHotplugSizeUpdateRequest, MetricsConfigRequest, MmdsConfigRequest, MmdsConfigResponse,
-    MmdsContentRequest, MmdsVersion as ApiMmdsVersion, NetworkInterfaceConfigRequest,
-    NetworkInterfaceConfigResponse, NetworkInterfacePatchRequest, PmemConfigRequest,
-    PmemConfigResponse, PmemPatchRequest, RequestError, SerialConfigRequest, TokenBucketRequest,
-    VmConfigResponse, VmStateUpdate, VmStateUpdateRequest, VsockConfigRequest, VsockConfigResponse,
-    api_request_metric_endpoint, parse_request_with_limit, request_total_len_with_limit,
+    MemoryHotplugConfigResponse, MemoryHotplugSizeUpdateRequest, MemoryHotplugStatusResponse,
+    MetricsConfigRequest, MmdsConfigRequest, MmdsConfigResponse, MmdsContentRequest,
+    MmdsVersion as ApiMmdsVersion, NetworkInterfaceConfigRequest, NetworkInterfaceConfigResponse,
+    NetworkInterfacePatchRequest, PmemConfigRequest, PmemConfigResponse, PmemPatchRequest,
+    RequestError, SerialConfigRequest, TokenBucketRequest, VmConfigResponse, VmStateUpdate,
+    VmStateUpdateRequest, VsockConfigRequest, VsockConfigResponse, api_request_metric_endpoint,
+    parse_request_with_limit, request_total_len_with_limit,
 };
 use bangbang_runtime::balloon::{
     BalloonConfig, BalloonConfigInput, BalloonHintingStartInput, BalloonHintingStatus,
@@ -48,7 +49,10 @@ use bangbang_runtime::machine::{
     MachineConfigHugePages as RuntimeMachineConfigHugePages, MachineConfigInput,
     MachineConfigPatchInput,
 };
-use bangbang_runtime::memory_hotplug::{MemoryHotplugConfigInput, MemoryHotplugSizeUpdateInput};
+use bangbang_runtime::memory_hotplug::{
+    MemoryHotplugConfig, MemoryHotplugConfigInput, MemoryHotplugSizeUpdateInput,
+    MemoryHotplugStatus,
+};
 use bangbang_runtime::metrics::MetricsConfigInput;
 use bangbang_runtime::mmds::{
     MmdsConfig, MmdsConfigInput, MmdsContentInput, MmdsVersion as RuntimeMmdsVersion,
@@ -803,7 +807,7 @@ fn handle_api_request(request: ApiRequest, vmm: &mut impl VmmRequestHandler) -> 
             handle_empty(vmm.handle_patch_request(PatchApiRequest::balloon_hinting_stop()))
         }
         ApiRequest::GetMemoryHotplug => {
-            handle_empty(vmm.handle_get_request(GetApiRequest::HotplugMemory))
+            handle_memory_hotplug_status(vmm.handle_get_request(GetApiRequest::HotplugMemory))
         }
         ApiRequest::PutMemoryHotplug(config) => handle_empty(vmm.handle_put_request(
             PutApiRequest::memory_hotplug(memory_hotplug_config_input_from_request(config)),
@@ -936,6 +940,9 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         ApiRequest::PutMmdsConfig(config) => Some(VmmAction::PutMmdsConfig(
             mmds_config_input_from_request(config.as_ref()),
         )),
+        ApiRequest::PutMemoryHotplug(config) => Some(VmmAction::PutMemoryHotplug(
+            memory_hotplug_config_input_from_request(config),
+        )),
         ApiRequest::PutNetworkInterface(config) => Some(VmmAction::PutNetworkInterface(
             network_interface_config_input_from_request(config.as_ref()),
         )),
@@ -970,7 +977,6 @@ pub(crate) fn config_vmm_action_from_api_request(request: ApiRequest) -> Option<
         | ApiRequest::PatchPmem(_)
         | ApiRequest::PatchVmState(_)
         | ApiRequest::PutAction(_)
-        | ApiRequest::PutMemoryHotplug(_)
         | ApiRequest::PutMmds(_)
         | ApiRequest::PutSnapshotCreate
         | ApiRequest::PutSnapshotLoad(_) => None,
@@ -1003,6 +1009,7 @@ fn handle_vmm_version(result: Result<VmmData, bangbang_runtime::VmmActionError>)
             | VmmData::BalloonConfiguration(_)
             | VmmData::BalloonStatistics(_)
             | VmmData::BalloonHintingStatus(_)
+            | VmmData::MemoryHotplugStatus(_)
             | VmmData::MachineConfiguration(_)
             | VmmData::MmdsValue(_)
             | VmmData::VmConfiguration(_),
@@ -1023,6 +1030,7 @@ fn handle_instance_info(result: Result<VmmData, bangbang_runtime::VmmActionError
             | VmmData::BalloonConfiguration(_)
             | VmmData::BalloonStatistics(_)
             | VmmData::BalloonHintingStatus(_)
+            | VmmData::MemoryHotplugStatus(_)
             | VmmData::MachineConfiguration(_)
             | VmmData::MmdsValue(_)
             | VmmData::VmConfiguration(_),
@@ -1049,6 +1057,7 @@ fn handle_machine_config(
             | VmmData::BalloonConfiguration(_)
             | VmmData::BalloonStatistics(_)
             | VmmData::BalloonHintingStatus(_)
+            | VmmData::MemoryHotplugStatus(_)
             | VmmData::MmdsValue(_)
             | VmmData::VmConfiguration(_),
         ) => HttpResponse::fault("machine config request returned unexpected VMM data."),
@@ -1067,6 +1076,7 @@ fn handle_balloon(result: Result<VmmData, bangbang_runtime::VmmActionError>) -> 
             | VmmData::InstanceInformation(_)
             | VmmData::BalloonStatistics(_)
             | VmmData::BalloonHintingStatus(_)
+            | VmmData::MemoryHotplugStatus(_)
             | VmmData::MachineConfiguration(_)
             | VmmData::MmdsValue(_)
             | VmmData::VmConfiguration(_),
@@ -1086,6 +1096,7 @@ fn handle_balloon_stats(result: Result<VmmData, bangbang_runtime::VmmActionError
             | VmmData::InstanceInformation(_)
             | VmmData::BalloonConfiguration(_)
             | VmmData::BalloonHintingStatus(_)
+            | VmmData::MemoryHotplugStatus(_)
             | VmmData::MachineConfiguration(_)
             | VmmData::MmdsValue(_)
             | VmmData::VmConfiguration(_),
@@ -1107,10 +1118,33 @@ fn handle_balloon_hinting_status(
             | VmmData::InstanceInformation(_)
             | VmmData::BalloonConfiguration(_)
             | VmmData::BalloonStatistics(_)
+            | VmmData::MemoryHotplugStatus(_)
             | VmmData::MachineConfiguration(_)
             | VmmData::MmdsValue(_)
             | VmmData::VmConfiguration(_),
         ) => HttpResponse::fault("balloon hinting status request returned unexpected VMM data."),
+        Err(err) => HttpResponse::fault(&err.to_string()),
+    }
+}
+
+fn handle_memory_hotplug_status(
+    result: Result<VmmData, bangbang_runtime::VmmActionError>,
+) -> HttpResponse {
+    match result {
+        Ok(VmmData::MemoryHotplugStatus(status)) => {
+            HttpResponse::memory_hotplug_status(memory_hotplug_status_response_from_runtime(status))
+        }
+        Ok(
+            VmmData::Empty
+            | VmmData::VmmVersion(_)
+            | VmmData::InstanceInformation(_)
+            | VmmData::BalloonConfiguration(_)
+            | VmmData::BalloonStatistics(_)
+            | VmmData::BalloonHintingStatus(_)
+            | VmmData::MachineConfiguration(_)
+            | VmmData::MmdsValue(_)
+            | VmmData::VmConfiguration(_),
+        ) => HttpResponse::fault("memory hotplug status request returned unexpected VMM data."),
         Err(err) => HttpResponse::fault(&err.to_string()),
     }
 }
@@ -1127,6 +1161,7 @@ fn handle_vm_config(result: Result<VmmData, bangbang_runtime::VmmActionError>) -
             | VmmData::BalloonConfiguration(_)
             | VmmData::BalloonStatistics(_)
             | VmmData::BalloonHintingStatus(_)
+            | VmmData::MemoryHotplugStatus(_)
             | VmmData::MachineConfiguration(_)
             | VmmData::MmdsValue(_),
         ) => HttpResponse::fault("VM config request returned unexpected VMM data."),
@@ -1144,6 +1179,7 @@ fn handle_mmds(result: Result<VmmData, bangbang_runtime::VmmActionError>) -> Htt
             | VmmData::BalloonConfiguration(_)
             | VmmData::BalloonStatistics(_)
             | VmmData::BalloonHintingStatus(_)
+            | VmmData::MemoryHotplugStatus(_)
             | VmmData::MachineConfiguration(_)
             | VmmData::VmConfiguration(_),
         ) => HttpResponse::fault("MMDS request returned unexpected VMM data."),
@@ -1160,6 +1196,7 @@ fn handle_empty(result: Result<VmmData, bangbang_runtime::VmmActionError>) -> Ht
             | VmmData::BalloonConfiguration(_)
             | VmmData::BalloonStatistics(_)
             | VmmData::BalloonHintingStatus(_)
+            | VmmData::MemoryHotplugStatus(_)
             | VmmData::MachineConfiguration(_)
             | VmmData::MmdsValue(_)
             | VmmData::VmConfiguration(_),
@@ -1192,6 +1229,11 @@ fn vm_config_response_from_runtime(config: &VmConfiguration) -> VmConfigResponse
             .entropy_config()
             .map(entropy_config_response_from_runtime),
     )
+    .with_memory_hotplug(
+        config
+            .memory_hotplug_config()
+            .map(memory_hotplug_config_response_from_runtime),
+    )
     .with_balloon(
         config
             .balloon_config()
@@ -1203,6 +1245,28 @@ fn vm_config_response_from_runtime(config: &VmConfiguration) -> VmConfigResponse
             .iter()
             .map(pmem_config_response_from_runtime)
             .collect(),
+    )
+}
+
+fn memory_hotplug_config_response_from_runtime(
+    config: MemoryHotplugConfig,
+) -> MemoryHotplugConfigResponse {
+    MemoryHotplugConfigResponse::new(
+        config.total_size_mib(),
+        config.block_size_mib(),
+        config.slot_size_mib(),
+    )
+}
+
+fn memory_hotplug_status_response_from_runtime(
+    status: MemoryHotplugStatus,
+) -> MemoryHotplugStatusResponse {
+    MemoryHotplugStatusResponse::new(
+        status.total_size_mib(),
+        status.block_size_mib(),
+        status.slot_size_mib(),
+        status.plugged_size_mib(),
+        status.requested_size_mib(),
     )
 }
 
@@ -4784,9 +4848,9 @@ mod tests {
             "GET /hotplug/memory HTTP/1.1\r\nHost: localhost\r\n\r\n",
         );
         assert!(valid_get_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        assert!(valid_get_response.contains(
-            r#"{"fault_message":"The requested operation is not supported in Not started state: GetMemoryHotplug"}"#
-        ));
+        assert!(
+            valid_get_response.contains(r#"{"fault_message":"Memory hotplug is not supported."}"#)
+        );
 
         let malformed_get_response = request_over_socket(
             &mut vmm,
@@ -4797,17 +4861,6 @@ mod tests {
         assert!(
             malformed_get_response
                 .contains(r#"{"fault_message":"GET request cannot have a body."}"#)
-        );
-
-        let valid_put_body = r#"{"total_size_mib":2048,"block_size_mib":2,"slot_size_mib":128}"#;
-        let valid_put_response = request_over_socket(
-            &mut vmm,
-            "mh-m-put",
-            &request_with_body("PUT", "/hotplug/memory", valid_put_body),
-        );
-        assert!(valid_put_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
-        assert!(
-            valid_put_response.contains(r#"{"fault_message":"Memory hotplug is not supported."}"#)
         );
 
         let semantic_put_response = request_over_socket(
@@ -4864,6 +4917,17 @@ mod tests {
         );
         let start_response = put_action_over_socket(&mut vmm, "mh-m-a1", "InstanceStart");
         assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let valid_put_body = r#"{"total_size_mib":2048,"block_size_mib":2,"slot_size_mib":128}"#;
+        let valid_put_response = request_over_socket(
+            &mut vmm,
+            "mh-m-put",
+            &request_with_body("PUT", "/hotplug/memory", valid_put_body),
+        );
+        assert!(valid_put_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(valid_put_response.contains(
+            r#"{"fault_message":"The requested operation is not supported in Running state: PutMemoryHotplug"}"#
+        ));
 
         let flush_response = put_action_over_socket(&mut vmm, "mh-m-a2", "FlushMetrics");
         assert!(flush_response.starts_with("HTTP/1.1 204 No Content\r\n"));
@@ -6788,19 +6852,63 @@ mod tests {
     }
 
     #[test]
-    fn returns_fault_for_memory_hotplug_endpoints() {
+    fn handles_memory_hotplug_endpoints_without_mutating_unrelated_state() {
         let mut vmm = test_controller();
+
+        let missing_get_response = request_over_socket(
+            &mut vmm,
+            "mh-get-missing",
+            "GET /hotplug/memory HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(missing_get_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(
+            missing_get_response
+                .contains(r#"{"fault_message":"Memory hotplug is not supported."}"#)
+        );
+
+        let put_response = request_over_socket(
+            &mut vmm,
+            "mh-put",
+            &request_with_body(
+                "PUT",
+                "/hotplug/memory",
+                r#"{"total_size_mib":2048,"block_size_mib":2,"slot_size_mib":128}"#,
+            ),
+        );
+        assert!(put_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let get_response = request_over_socket(
+            &mut vmm,
+            "mh-get",
+            "GET /hotplug/memory HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(
+            get_response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "{get_response}"
+        );
+        assert!(
+            get_response.contains(
+                r#"{"block_size_mib":2,"plugged_size_mib":0,"requested_size_mib":0,"slot_size_mib":128,"total_size_mib":2048}"#
+            ),
+            "{get_response}"
+        );
+        let vm_config_response = request_over_socket(
+            &mut vmm,
+            "mh-vm-config",
+            "GET /vm/config HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(
+            vm_config_response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "{vm_config_response}"
+        );
+        assert!(
+            vm_config_response.contains(
+                r#""memory-hotplug":{"block_size_mib":2,"slot_size_mib":128,"total_size_mib":2048}"#
+            ),
+            "{vm_config_response}"
+        );
+
         for (socket_name, request, fault_message) in [
-            (
-                "mh-get",
-                "GET /hotplug/memory HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
-                "The requested operation is not supported in Not started state: GetMemoryHotplug",
-            ),
-            (
-                "mh-put",
-                request_with_body("PUT", "/hotplug/memory", r#"{"total_size_mib":2048}"#),
-                "Memory hotplug is not supported.",
-            ),
             (
                 "mh-pic",
                 request_with_body(
