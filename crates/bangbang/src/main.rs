@@ -3761,7 +3761,7 @@ mod tests {
     #[test]
     fn config_file_accepts_pmem_section() {
         let actions = super::config_file_actions_from_str(
-            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"pmem":[{"id":"pmem0","path_on_host":"/tmp/pmem.img","root_device":true,"read_only":false},{"id":"pmem1","path_on_host":"/tmp/pmem-other.img","rate_limiter":{}}]}"#,
+            r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"pmem":[{"id":"pmem0","path_on_host":"/tmp/pmem.img","root_device":false,"read_only":false},{"id":"pmem1","path_on_host":"/tmp/pmem-other.img","rate_limiter":{}}]}"#,
         )
         .expect("pmem config section should parse");
 
@@ -3769,9 +3769,7 @@ mod tests {
             actions,
             [
                 VmmAction::PutBootSource(BootSourceConfigInput::new("/tmp/vmlinux")),
-                VmmAction::PutPmem(
-                    PmemConfigInput::new("pmem0", "/tmp/pmem.img").with_root_device(true)
-                ),
+                VmmAction::PutPmem(PmemConfigInput::new("pmem0", "/tmp/pmem.img")),
                 VmmAction::PutPmem(PmemConfigInput::new("pmem1", "/tmp/pmem-other.img")),
             ]
         );
@@ -3886,6 +3884,51 @@ mod tests {
         };
         assert_eq!(config.pmem_configs().len(), 1);
         assert_eq!(config.pmem_configs()[0].path_on_host(), "/tmp/pmem-old.img");
+
+        fs::remove_file(config_path).expect("fixture config should clean up");
+    }
+
+    #[test]
+    fn config_file_pmem_root_device_fails_before_starting() {
+        let config_path = unique_config_path("pmem-root-device");
+        let config = r#"{
+            "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
+            "pmem":[
+                {"id":"pmem0","path_on_host":"/tmp/pmem-old.img"},
+                {"id":"pmem0","path_on_host":"/tmp/pmem-new.img","root_device":true}
+            ]
+        }"#;
+        fs::write(&config_path, config).expect("config file should be written");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        let err = super::apply_startup_config_file(
+            &mut vmm,
+            Some(config_path.to_str().expect("UTF-8 path")),
+        )
+        .expect_err("pmem root device should fail");
+
+        assert_eq!(
+            err,
+            ProcessError::ConfigFile(super::ConfigFileError::Apply(VmmActionError::PmemConfig(
+                PmemConfigError::UnsupportedRootDevice
+            )))
+        );
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+        let data = vmm
+            .handle_action(VmmAction::GetVmConfig)
+            .expect("VM config should be returned");
+        let VmmData::VmConfiguration(config) = data else {
+            panic!("expected VM config");
+        };
+        assert_eq!(config.pmem_configs().len(), 1);
+        assert_eq!(config.pmem_configs()[0].path_on_host(), "/tmp/pmem-old.img");
+        assert!(!config.pmem_configs()[0].root_device());
 
         fs::remove_file(config_path).expect("fixture config should clean up");
     }

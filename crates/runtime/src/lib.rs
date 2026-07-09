@@ -1727,9 +1727,7 @@ mod tests {
             .expect("balloon config should be stored");
         controller
             .handle_action(VmmAction::PutPmem(
-                pmem_input("pmem0", "/tmp/pmem.img")
-                    .with_root_device(true)
-                    .with_read_only(true),
+                pmem_input("pmem0", "/tmp/pmem.img").with_read_only(true),
             ))
             .expect("pmem config should be stored");
 
@@ -1794,7 +1792,7 @@ mod tests {
         assert_eq!(config.pmem_configs().len(), 1);
         assert_eq!(config.pmem_configs()[0].id(), "pmem0");
         assert_eq!(config.pmem_configs()[0].path_on_host(), "/tmp/pmem.img");
-        assert!(config.pmem_configs()[0].root_device());
+        assert!(!config.pmem_configs()[0].root_device());
         assert!(config.pmem_configs()[0].read_only());
         assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
     }
@@ -2826,7 +2824,7 @@ mod tests {
         );
         assert_eq!(
             controller.handle_action(VmmAction::PutPmem(
-                pmem_input("pmem0", "/tmp/pmem-new.img").with_root_device(true)
+                pmem_input("pmem0", "/tmp/pmem-new.img").with_read_only(true)
             )),
             Ok(VmmData::Empty)
         );
@@ -2841,8 +2839,8 @@ mod tests {
             controller.pmem_configs()[0].path_on_host(),
             "/tmp/pmem-new.img"
         );
-        assert!(controller.pmem_configs()[0].root_device());
-        assert!(!controller.pmem_configs()[0].read_only());
+        assert!(!controller.pmem_configs()[0].root_device());
+        assert!(controller.pmem_configs()[0].read_only());
         assert_eq!(controller.pmem_configs()[1].id(), "pmem1");
         assert_eq!(
             controller.pmem_configs()[1].path_on_host(),
@@ -2874,6 +2872,32 @@ mod tests {
             controller.pmem_configs()[0].path_on_host(),
             "/tmp/pmem-old.img"
         );
+    }
+
+    #[test]
+    fn put_pmem_rejects_root_device_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutPmem(pmem_input("pmem0", "/tmp/pmem-old.img")))
+            .expect("pmem config should be stored");
+
+        let err = controller
+            .handle_action(VmmAction::PutPmem(
+                pmem_input("pmem0", "/tmp/pmem-new.img").with_root_device(true),
+            ))
+            .expect_err("pmem root device should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::PmemConfig(PmemConfigError::UnsupportedRootDevice)
+        );
+        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert_eq!(controller.pmem_configs().len(), 1);
+        assert_eq!(
+            controller.pmem_configs()[0].path_on_host(),
+            "/tmp/pmem-old.img"
+        );
+        assert!(!controller.pmem_configs()[0].root_device());
     }
 
     #[test]

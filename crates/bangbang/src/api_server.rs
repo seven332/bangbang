@@ -6871,7 +6871,7 @@ mod tests {
             &request_with_body(
                 "PUT",
                 "/pmem/pmem0",
-                r#"{"id":"pmem0","path_on_host":"/tmp/pmem.img","root_device":true,"read_only":false,"rate_limiter":{"bandwidth":null,"ops":null}}"#,
+                r#"{"id":"pmem0","path_on_host":"/tmp/pmem.img","root_device":false,"read_only":false,"rate_limiter":{"bandwidth":null,"ops":null}}"#,
             ),
         );
         assert!(put_response.starts_with("HTTP/1.1 204 No Content\r\n"));
@@ -6884,7 +6884,7 @@ mod tests {
         assert!(vm_config_response.contains(r#""pmem":[{"#));
         assert!(vm_config_response.contains(r#""id":"pmem0""#));
         assert!(vm_config_response.contains(r#""path_on_host":"/tmp/pmem.img""#));
-        assert!(vm_config_response.contains(r#""root_device":true"#));
+        assert!(vm_config_response.contains(r#""root_device":false"#));
         assert!(vm_config_response.contains(r#""read_only":false"#));
 
         for (socket_name, request, fault_message) in [
@@ -6901,6 +6901,15 @@ mod tests {
                     r#"{"id":"pmem0","path_on_host":"/tmp/pmem-new.img","rate_limiter":{"ops":{"size":1,"refill_time":1}}}"#,
                 ),
                 "pmem rate_limiter is not supported",
+            ),
+            (
+                "p-put-root-device",
+                request_with_body(
+                    "PUT",
+                    "/pmem/pmem0",
+                    r#"{"id":"pmem0","path_on_host":"/tmp/pmem-new.img","root_device":true}"#,
+                ),
+                "pmem root_device is not supported",
             ),
             (
                 "p-put-empty-path",
@@ -6946,6 +6955,7 @@ mod tests {
         };
         assert_eq!(config.pmem_configs().len(), 1);
         assert_eq!(config.pmem_configs()[0].path_on_host(), "/tmp/pmem.img");
+        assert!(!config.pmem_configs()[0].root_device());
     }
 
     #[test]
