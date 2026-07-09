@@ -26,7 +26,8 @@ use bangbang_runtime::interrupt::{
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
 use bangbang_runtime::metrics::{
     SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
-    SharedNetworkInterfaceMetricsRegistry, SharedVsockDeviceMetrics,
+    SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry,
+    SharedVsockDeviceMetrics,
 };
 use bangbang_runtime::mmio::{MmioDispatcher, MmioRegionId};
 use bangbang_runtime::network::NetworkMmioLayout;
@@ -218,6 +219,7 @@ pub struct HvfArm64BootSession<'vm> {
     entropy_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler,
     entropy_source: VirtioRngOsEntropySource,
     block_device_metrics: SharedBlockDeviceMetricsRegistry,
+    pmem_device_metrics: SharedPmemDeviceMetricsRegistry,
     balloon_device_metrics: SharedBalloonDeviceMetrics,
     network_interface_metrics: SharedNetworkInterfaceMetricsRegistry,
     vsock_device_metrics: SharedVsockDeviceMetrics,
@@ -248,6 +250,7 @@ pub struct OwnedHvfArm64BootSession {
     entropy_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler,
     entropy_source: VirtioRngOsEntropySource,
     block_device_metrics: SharedBlockDeviceMetricsRegistry,
+    pmem_device_metrics: SharedPmemDeviceMetricsRegistry,
     balloon_device_metrics: SharedBalloonDeviceMetrics,
     network_interface_metrics: SharedNetworkInterfaceMetricsRegistry,
     vsock_device_metrics: SharedVsockDeviceMetrics,
@@ -786,6 +789,10 @@ impl HvfArm64BootSession<'_> {
         self.block_device_metrics.clone()
     }
 
+    pub fn shared_pmem_device_metrics(&self) -> SharedPmemDeviceMetricsRegistry {
+        self.pmem_device_metrics.clone()
+    }
+
     pub fn shared_network_interface_metrics(&self) -> SharedNetworkInterfaceMetricsRegistry {
         self.network_interface_metrics.clone()
     }
@@ -955,6 +962,7 @@ impl HvfArm64BootSession<'_> {
             &self.mmio_dispatcher,
             &mut self.runtime_resources,
             &self.gic,
+            &self.pmem_device_metrics,
         )
     }
 
@@ -1186,6 +1194,7 @@ impl OwnedHvfArm64BootSession {
             entropy_retry_wakeup_scheduler: prepared.entropy_retry_wakeup_scheduler,
             entropy_source: VirtioRngOsEntropySource::new(),
             block_device_metrics: prepared.block_device_metrics,
+            pmem_device_metrics: prepared.pmem_device_metrics,
             balloon_device_metrics: prepared.balloon_device_metrics,
             network_interface_metrics: prepared.network_interface_metrics,
             vsock_device_metrics: prepared.vsock_device_metrics,
@@ -1234,6 +1243,10 @@ impl OwnedHvfArm64BootSession {
 
     pub fn shared_block_device_metrics(&self) -> SharedBlockDeviceMetricsRegistry {
         self.block_device_metrics.clone()
+    }
+
+    pub fn shared_pmem_device_metrics(&self) -> SharedPmemDeviceMetricsRegistry {
+        self.pmem_device_metrics.clone()
     }
 
     pub fn shared_network_interface_metrics(&self) -> SharedNetworkInterfaceMetricsRegistry {
@@ -1392,6 +1405,7 @@ impl OwnedHvfArm64BootSession {
             &self.mmio_dispatcher,
             &mut self.runtime_resources,
             &self.gic,
+            &self.pmem_device_metrics,
         )
     }
 
@@ -3500,6 +3514,7 @@ fn dispatch_pmem_queue_notifications_and_signal_interrupts(
     dispatcher: &Arc<Mutex<MmioDispatcher>>,
     runtime_resources: &mut Arm64BootRuntimeResources,
     gic: &HvfGicMetadata,
+    metrics: &SharedPmemDeviceMetricsRegistry,
 ) -> Result<HvfArm64BootPmemNotificationDispatches, HvfArm64BootPmemNotificationDispatchError> {
     let flush_status = {
         let mut mmio_dispatcher = lock_boot_mmio_dispatcher(dispatcher).map_err(|source| {
@@ -3529,7 +3544,13 @@ fn dispatch_pmem_queue_notifications_and_signal_interrupts(
         )?
     };
 
-    collect_or_signal_pmem_queue_interrupts(dispatches, gic)
+    record_pmem_runtime_dispatch_metrics(metrics, dispatches.as_slice());
+    let result = collect_or_signal_pmem_queue_interrupts(dispatches, gic);
+    match &result {
+        Ok(dispatches) => record_pmem_signal_metrics(metrics, dispatches),
+        Err(_) => metrics.record_event_failure(),
+    }
+    result
 }
 
 fn dispatch_pmem_runtime_notifications(
@@ -3650,6 +3671,49 @@ fn record_block_signal_metrics(
         if dispatch.signal_error().is_some() {
             let drive_id = dispatch.dispatch().device().registration.drive_id();
             metrics.record_event_failure_for_drive(drive_id);
+        }
+    }
+}
+
+#[cfg(test)]
+fn record_pmem_dispatch_metrics(
+    metrics: &SharedPmemDeviceMetricsRegistry,
+    dispatches: &HvfArm64BootPmemNotificationDispatches,
+) {
+    let runtime_dispatches = dispatches
+        .as_slice()
+        .iter()
+        .map(HvfArm64BootPmemNotificationDispatch::dispatch);
+    record_pmem_runtime_dispatch_metrics(metrics, runtime_dispatches);
+    record_pmem_signal_metrics(metrics, dispatches);
+}
+
+fn record_pmem_runtime_dispatch_metrics<'a>(
+    metrics: &SharedPmemDeviceMetricsRegistry,
+    dispatches: impl IntoIterator<Item = &'a Arm64BootPmemNotificationDispatch>,
+) {
+    for dispatch in dispatches {
+        let device_id = dispatch.device().registration.pmem_id();
+        if let Some(dispatched) = dispatch.outcome().dispatched() {
+            metrics.record_notification_dispatch_for_device(device_id, dispatched);
+        }
+        if let Some(source) = dispatch.outcome().dispatch_error() {
+            metrics.record_notification_error_for_device(device_id, source);
+        }
+        if dispatch.outcome().handler_lookup_error().is_some() {
+            metrics.record_event_failure_for_device(device_id);
+        }
+    }
+}
+
+fn record_pmem_signal_metrics(
+    metrics: &SharedPmemDeviceMetricsRegistry,
+    dispatches: &HvfArm64BootPmemNotificationDispatches,
+) {
+    for dispatch in dispatches.as_slice() {
+        if dispatch.signal_error().is_some() {
+            let device_id = dispatch.dispatch().device().registration.pmem_id();
+            metrics.record_event_failure_for_device(device_id);
         }
     }
 }
@@ -4313,6 +4377,7 @@ struct PreparedHvfArm64BootSession<'vm> {
     entropy_retry_wakeup: HvfArm64BootLimiterRetryWakeupToken,
     entropy_retry_wakeup_scheduler: HvfArm64BootLimiterRetryWakeupScheduler,
     block_device_metrics: SharedBlockDeviceMetricsRegistry,
+    pmem_device_metrics: SharedPmemDeviceMetricsRegistry,
     balloon_device_metrics: SharedBalloonDeviceMetrics,
     network_interface_metrics: SharedNetworkInterfaceMetricsRegistry,
     vsock_device_metrics: SharedVsockDeviceMetrics,
@@ -4382,6 +4447,7 @@ impl HvfBackend {
             entropy_retry_wakeup_scheduler: prepared.entropy_retry_wakeup_scheduler,
             entropy_source: VirtioRngOsEntropySource::new(),
             block_device_metrics: prepared.block_device_metrics,
+            pmem_device_metrics: prepared.pmem_device_metrics,
             balloon_device_metrics: prepared.balloon_device_metrics,
             network_interface_metrics: prepared.network_interface_metrics,
             vsock_device_metrics: prepared.vsock_device_metrics,
@@ -4504,6 +4570,9 @@ fn prepare_arm64_boot_session_parts<'vm>(
             .iter()
             .map(|device| device.registration.drive_id()),
     );
+    let pmem_device_metrics = SharedPmemDeviceMetricsRegistry::from_device_ids(
+        runtime.pmem_devices.iter().map(|device| device.id()),
+    );
     let network_interface_metrics = SharedNetworkInterfaceMetricsRegistry::from_interface_ids(
         runtime
             .network_devices
@@ -4544,6 +4613,7 @@ fn prepare_arm64_boot_session_parts<'vm>(
         entropy_retry_wakeup,
         entropy_retry_wakeup_scheduler,
         block_device_metrics,
+        pmem_device_metrics,
         balloon_device_metrics: SharedBalloonDeviceMetrics::default(),
         network_interface_metrics,
         vsock_device_metrics: SharedVsockDeviceMetrics::default(),
@@ -4712,9 +4782,10 @@ mod tests {
     use bangbang_runtime::memory::{GuestAddress, GuestMemory};
     use bangbang_runtime::metrics::{
         BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive, EntropyDeviceMetrics,
-        NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface, SharedBalloonDeviceMetrics,
-        SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
-        SharedNetworkInterfaceMetricsRegistry, SharedVsockDeviceMetrics, VsockDeviceMetrics,
+        NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface, PmemDeviceMetrics,
+        PmemDeviceMetricsByDevice, SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry,
+        SharedEntropyDeviceMetrics, SharedNetworkInterfaceMetricsRegistry,
+        SharedPmemDeviceMetricsRegistry, SharedVsockDeviceMetrics, VsockDeviceMetrics,
     };
     use bangbang_runtime::mmio::{
         MmioAccess, MmioAccessBytes, MmioDispatchOutcome, MmioDispatcher, MmioHandler,
@@ -4726,7 +4797,10 @@ mod tests {
         VirtioNetworkRxPacketSource, VirtioNetworkRxPacketSourceError, VirtioNetworkTxFrame,
         VirtioNetworkTxPacketSink, VirtioNetworkTxPacketSinkError,
     };
-    use bangbang_runtime::pmem::PmemMmioLayout;
+    use bangbang_runtime::pmem::{
+        PmemConfigInput, PmemMmioLayout, VIRTIO_PMEM_ALIGNMENT, VIRTIO_PMEM_REQUEST_SIZE,
+        VIRTIO_PMEM_REQUEST_TYPE_FLUSH, VIRTIO_PMEM_STATUS_SIZE, VirtioPmemFlushStatus,
+    };
     use bangbang_runtime::rtc::RtcMmioLayout;
     use bangbang_runtime::serial::{SharedSerialOutput, SharedSerialOutputBuffer};
     use bangbang_runtime::startup::{
@@ -4735,8 +4809,8 @@ mod tests {
         Arm64BootEntropySource, Arm64BootEntropySourceError, Arm64BootEntropySourceProvider,
         Arm64BootNetworkNotificationDispatches, Arm64BootNetworkNotificationOutcome,
         Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
-        Arm64BootResourceConfig, Arm64BootResources, Arm64BootRuntimeResources,
-        Arm64BootVsockNotificationDispatches,
+        Arm64BootPmemNotificationDispatches, Arm64BootResourceConfig, Arm64BootResources,
+        Arm64BootRuntimeResources, Arm64BootVsockNotificationDispatches,
     };
     use bangbang_runtime::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
@@ -4764,10 +4838,10 @@ mod tests {
         collect_entropy_notification_dispatches, collect_network_notification_dispatches,
         collect_vsock_notification_dispatches,
         dispatch_network_runtime_notifications_with_packet_io, lock_boot_mmio_dispatcher,
-        record_entropy_dispatch_metrics, run_boot_session_loop, run_boot_session_vcpu_step,
-        signal_balloon_queue_interrupts, signal_block_queue_interrupts,
+        record_entropy_dispatch_metrics, record_pmem_dispatch_metrics, run_boot_session_loop,
+        run_boot_session_vcpu_step, signal_balloon_queue_interrupts, signal_block_queue_interrupts,
         signal_entropy_queue_interrupts, signal_network_queue_interrupts,
-        signal_vsock_queue_interrupts, validate_single_vcpu,
+        signal_pmem_queue_interrupts, signal_vsock_queue_interrupts, validate_single_vcpu,
     };
     use crate::exit::{
         HvfExceptionExit, HvfHvcExit, HvfMmioAccessSize, HvfMmioDirection, HvfMmioRegister,
@@ -5732,6 +5806,17 @@ mod tests {
         TempFile { path }
     }
 
+    fn temp_sized_file(name: &str, len: u64) -> TempFile {
+        let path = temp_path(name);
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("test file should be created");
+        file.set_len(len).expect("test file length should be set");
+        TempFile { path }
+    }
+
     fn arm64_image() -> Vec<u8> {
         let mut bytes = vec![0xaa; ARM64_IMAGE_HEADER_SIZE];
         write_u64_le(&mut bytes, ARM64_IMAGE_TEXT_OFFSET_OFFSET, 0);
@@ -5817,6 +5902,15 @@ mod tests {
                 amount_mib, false,
             )))
             .expect("balloon config should be stored");
+    }
+
+    fn add_pmem(controller: &mut bangbang_runtime::VmmController, id: &str, path: &Path) {
+        controller
+            .handle_action(VmmAction::PutPmem(PmemConfigInput::new(
+                id,
+                path.to_string_lossy().into_owned(),
+            )))
+            .expect("pmem config should be stored");
     }
 
     fn valid_boot_resource_config(lines: &[GuestInterruptLine]) -> Arm64BootResourceConfig<'_> {
@@ -5921,6 +6015,41 @@ mod tests {
         )
         .expect("boot resources should assemble");
         drop(blocks);
+        let parts = resources.into_parts();
+
+        (parts.memory, parts.runtime, parts.mmio_dispatcher)
+    }
+
+    fn boot_runtime_with_pmem(
+        devices: &[&str],
+    ) -> (GuestMemory, Arm64BootRuntimeResources, MmioDispatcher) {
+        let kernel = temp_file("kernel-with-pmem", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        let mut pmem_files = Vec::new();
+        pmem_files
+            .try_reserve_exact(devices.len())
+            .expect("test pmem files should reserve");
+
+        for id in devices {
+            let pmem = temp_sized_file(id, VIRTIO_PMEM_ALIGNMENT);
+            add_pmem(&mut controller, id, pmem.path());
+            pmem_files.push(pmem);
+        }
+
+        let interrupt_lines: Vec<_> = (0..devices.len())
+            .map(|index| {
+                line(32 + u32::try_from(index).expect("test pmem device index should fit in u32"))
+            })
+            .collect();
+        let resources = Arm64BootResources::assemble_from_controller(
+            &controller,
+            Arm64BootResourceConfig {
+                pmem_interrupt_lines: &interrupt_lines,
+                ..valid_boot_resource_config(&[])
+            },
+        )
+        .expect("boot resources should assemble");
+        drop(pmem_files);
         let parts = resources.into_parts();
 
         (parts.memory, parts.runtime, parts.mmio_dispatcher)
@@ -6037,6 +6166,20 @@ mod tests {
             .expect("block notification dispatch result should allocate")
     }
 
+    fn dispatch_boot_pmem_notifications(
+        memory: &mut GuestMemory,
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+    ) -> Arm64BootPmemNotificationDispatches {
+        runtime
+            .dispatch_pmem_queue_notifications(
+                memory,
+                mmio_dispatcher,
+                VirtioPmemFlushStatus::Success,
+            )
+            .expect("pmem notification dispatch result should allocate")
+    }
+
     fn dispatch_boot_network_notifications(
         memory: &mut GuestMemory,
         runtime: &mut Arm64BootRuntimeResources,
@@ -6133,6 +6276,57 @@ mod tests {
         let outcome = mmio_dispatcher
             .dispatch(MmioOperation::read(access).expect("u32 read should be valid"))
             .expect("block MMIO read should dispatch");
+
+        match outcome {
+            MmioDispatchOutcome::Read { data } => u32::from_le_bytes(
+                data.as_slice()
+                    .try_into()
+                    .expect("u32 read should return four bytes"),
+            ),
+            MmioDispatchOutcome::Write => panic!("read operation should not return write outcome"),
+        }
+    }
+
+    fn write_boot_pmem_mmio_u32(
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        device_index: usize,
+        register: VirtioMmioRegister,
+        value: u32,
+    ) {
+        let address = runtime.pmem_mmio_devices[device_index]
+            .registration
+            .address()
+            .checked_add(register.offset())
+            .expect("test MMIO address should not overflow");
+        let access = mmio_dispatcher
+            .lookup(address, 4)
+            .expect("pmem MMIO access should resolve");
+        let data = MmioAccessBytes::new(&value.to_le_bytes()).expect("u32 bytes should be valid");
+        let outcome = mmio_dispatcher
+            .dispatch(MmioOperation::write(access, data).expect("u32 write should be valid"))
+            .expect("pmem MMIO write should dispatch");
+
+        assert_eq!(outcome, MmioDispatchOutcome::Write);
+    }
+
+    fn read_boot_pmem_mmio_u32(
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        device_index: usize,
+        register: VirtioMmioRegister,
+    ) -> u32 {
+        let address = runtime.pmem_mmio_devices[device_index]
+            .registration
+            .address()
+            .checked_add(register.offset())
+            .expect("test MMIO address should not overflow");
+        let access = mmio_dispatcher
+            .lookup(address, 4)
+            .expect("pmem MMIO access should resolve");
+        let outcome = mmio_dispatcher
+            .dispatch(MmioOperation::read(access).expect("u32 read should be valid"))
+            .expect("pmem MMIO read should dispatch");
 
         match outcome {
             MmioDispatchOutcome::Read { data } => u32::from_le_bytes(
@@ -6437,6 +6631,91 @@ mod tests {
         device_index: usize,
     ) {
         write_boot_block_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::QueueNotify,
+            0,
+        );
+    }
+
+    fn configure_boot_pmem_queue(
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        device_index: usize,
+        device_ring: GuestAddress,
+    ) {
+        write_boot_pmem_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
+        );
+        write_boot_pmem_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::Status,
+            VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+        );
+        write_boot_pmem_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::Status,
+            QUEUE_CONFIG_STATUS,
+        );
+        write_boot_pmem_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::QueueNum,
+            u32::from(TEST_QUEUE_SIZE),
+        );
+        write_boot_pmem_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::QueueDescLow,
+            guest_address_low(TEST_DESCRIPTOR_TABLE),
+        );
+        write_boot_pmem_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::QueueDriverLow,
+            guest_address_low(TEST_AVAILABLE_RING),
+        );
+        write_boot_pmem_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::QueueDeviceLow,
+            guest_address_low(device_ring),
+        );
+        write_boot_pmem_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::QueueReady,
+            1,
+        );
+        write_boot_pmem_mmio_u32(
+            runtime,
+            mmio_dispatcher,
+            device_index,
+            VirtioMmioRegister::Status,
+            DRIVER_OK_STATUS,
+        );
+    }
+
+    fn notify_boot_pmem_queue(
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        device_index: usize,
+    ) {
+        write_boot_pmem_mmio_u32(
             runtime,
             mmio_dispatcher,
             device_index,
@@ -6903,6 +7182,40 @@ mod tests {
         write_available_heads(memory, &[0]);
     }
 
+    fn write_queued_pmem_flush_request(memory: &mut GuestMemory) {
+        memory
+            .write_slice(&VIRTIO_PMEM_REQUEST_TYPE_FLUSH.to_le_bytes(), HEADER_ADDR)
+            .expect("pmem request type should write");
+        write_descriptor(
+            memory,
+            0,
+            TestDescriptor::readable(HEADER_ADDR, VIRTIO_PMEM_REQUEST_SIZE, Some(1)),
+        );
+        write_descriptor(
+            memory,
+            1,
+            TestDescriptor::writable(STATUS_ADDR, VIRTIO_PMEM_STATUS_SIZE, None),
+        );
+        write_available_heads(memory, &[0]);
+    }
+
+    fn write_partially_invalid_queued_pmem_flush_request(memory: &mut GuestMemory) {
+        memory
+            .write_slice(&VIRTIO_PMEM_REQUEST_TYPE_FLUSH.to_le_bytes(), HEADER_ADDR)
+            .expect("pmem request type should write");
+        write_descriptor(
+            memory,
+            0,
+            TestDescriptor::writable(HEADER_ADDR, VIRTIO_PMEM_REQUEST_SIZE, Some(1)),
+        );
+        write_descriptor(
+            memory,
+            1,
+            TestDescriptor::writable(STATUS_ADDR, VIRTIO_PMEM_STATUS_SIZE, None),
+        );
+        write_available_heads(memory, &[0]);
+    }
+
     fn write_partially_invalid_queued_flush_request(memory: &mut GuestMemory) {
         write_request_header(memory, HEADER_ADDR, VIRTIO_BLOCK_REQUEST_TYPE_FLUSH, 0);
         write_descriptor(
@@ -7195,6 +7508,30 @@ mod tests {
             TEST_USED_RING
                 .checked_add(2)
                 .expect("entropy used idx address should not overflow"),
+        )
+    }
+
+    fn read_pmem_used_index(memory: &GuestMemory) -> u16 {
+        read_guest_u16(
+            memory,
+            TEST_USED_RING
+                .checked_add(2)
+                .expect("pmem used idx address should not overflow"),
+        )
+    }
+
+    fn read_pmem_used_element(memory: &GuestMemory, ring_index: u16) -> (u32, u32) {
+        let element = TEST_USED_RING
+            .checked_add(4 + u64::from(ring_index) * 8)
+            .expect("pmem used element address should not overflow");
+        (
+            read_guest_u32(memory, element),
+            read_guest_u32(
+                memory,
+                element
+                    .checked_add(4)
+                    .expect("pmem used element len address should not overflow"),
+            ),
         )
     }
 
@@ -7805,6 +8142,143 @@ mod tests {
         assert!(!device.queue_interrupt_signaled());
         assert!(device.signal_error().is_none());
         assert!(recorded_lines(&lines).is_empty());
+    }
+
+    #[test]
+    fn pmem_metrics_record_successful_signal_dispatch() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) =
+            boot_runtime_with_pmem(&["pmem0", "pmem1"]);
+        configure_boot_pmem_queue(&mut runtime, &mut mmio_dispatcher, 1, TEST_USED_RING);
+        write_queued_pmem_flush_request(&mut memory);
+        notify_boot_pmem_queue(&mut runtime, &mut mmio_dispatcher, 1);
+        let dispatches =
+            dispatch_boot_pmem_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let (lines, sink) = RecordingSink::successful();
+        let result = signal_pmem_queue_interrupts(dispatches, sink.as_ref())
+            .expect("queued pmem dispatch should collect");
+        let metrics = SharedPmemDeviceMetricsRegistry::from_device_ids(["pmem0", "pmem1"]);
+
+        record_pmem_dispatch_metrics(&metrics, &result);
+
+        assert_eq!(recorded_lines(&lines), vec![33]);
+        assert_eq!(
+            read_boot_pmem_mmio_u32(
+                &mut runtime,
+                &mut mmio_dispatcher,
+                1,
+                VirtioMmioRegister::InterruptStatus,
+            ),
+            DeviceInterruptKind::Queue.status().bits()
+        );
+        assert_eq!(read_pmem_used_index(&memory), 1);
+        assert_eq!(
+            read_pmem_used_element(&memory, 0),
+            (0, VIRTIO_PMEM_STATUS_SIZE)
+        );
+        assert_eq!(
+            metrics.aggregate_snapshot(),
+            PmemDeviceMetrics::default().with_queue_event_count(1)
+        );
+        assert_eq!(
+            metrics.per_device_snapshot(),
+            PmemDeviceMetricsByDevice::new().with_device_metrics(
+                "pmem1",
+                PmemDeviceMetrics::default().with_queue_event_count(1),
+            )
+        );
+    }
+
+    #[test]
+    fn pmem_metrics_record_parse_failure_before_signal() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_with_pmem(&["pmem0"]);
+        configure_boot_pmem_queue(&mut runtime, &mut mmio_dispatcher, 0, TEST_USED_RING);
+        write_partially_invalid_queued_pmem_flush_request(&mut memory);
+        notify_boot_pmem_queue(&mut runtime, &mut mmio_dispatcher, 0);
+        let dispatches =
+            dispatch_boot_pmem_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let (lines, sink) = RecordingSink::successful();
+        let result = signal_pmem_queue_interrupts(dispatches, sink.as_ref())
+            .expect("partial pmem dispatch result should collect");
+        let metrics = SharedPmemDeviceMetricsRegistry::from_device_ids(["pmem0"]);
+
+        record_pmem_dispatch_metrics(&metrics, &result);
+
+        assert_eq!(recorded_lines(&lines), vec![32]);
+        assert_eq!(read_pmem_used_index(&memory), 1);
+        assert_eq!(read_pmem_used_element(&memory, 0), (0, 0));
+        assert_eq!(
+            metrics.aggregate_snapshot(),
+            PmemDeviceMetrics::default()
+                .with_event_fails(1)
+                .with_queue_event_count(1)
+        );
+        assert_eq!(
+            metrics.per_device_snapshot(),
+            PmemDeviceMetricsByDevice::new().with_device_metrics(
+                "pmem0",
+                PmemDeviceMetrics::default()
+                    .with_event_fails(1)
+                    .with_queue_event_count(1),
+            )
+        );
+    }
+
+    #[test]
+    fn pmem_metrics_record_signal_failure() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_with_pmem(&["pmem0"]);
+        configure_boot_pmem_queue(&mut runtime, &mut mmio_dispatcher, 0, TEST_USED_RING);
+        write_queued_pmem_flush_request(&mut memory);
+        notify_boot_pmem_queue(&mut runtime, &mut mmio_dispatcher, 0);
+        let dispatches =
+            dispatch_boot_pmem_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let (lines, sink) = RecordingSink::failing("injected pmem signal failure");
+        let result = signal_pmem_queue_interrupts(dispatches, sink.as_ref())
+            .expect("pmem signal failure should stay per-device");
+        let metrics = SharedPmemDeviceMetricsRegistry::from_device_ids(["pmem0"]);
+
+        record_pmem_dispatch_metrics(&metrics, &result);
+
+        assert_eq!(recorded_lines(&lines), vec![32]);
+        assert!(result.has_signal_failure());
+        assert_eq!(
+            metrics.aggregate_snapshot(),
+            PmemDeviceMetrics::default()
+                .with_event_fails(1)
+                .with_queue_event_count(1)
+        );
+        assert_eq!(
+            metrics.per_device_snapshot(),
+            PmemDeviceMetricsByDevice::new().with_device_metrics(
+                "pmem0",
+                PmemDeviceMetrics::default()
+                    .with_event_fails(1)
+                    .with_queue_event_count(1),
+            )
+        );
+    }
+
+    #[test]
+    fn pmem_metrics_record_handler_lookup_failure() {
+        let (mut memory, mut runtime, _) = boot_runtime_with_pmem(&["pmem0"]);
+        let mut mmio_dispatcher = MmioDispatcher::new();
+        let dispatches =
+            dispatch_boot_pmem_notifications(&mut memory, &mut runtime, &mut mmio_dispatcher);
+        let result =
+            signal_pmem_queue_interrupts(dispatches, RecordingSink::successful().1.as_ref())
+                .expect("missing pmem handler dispatch should collect");
+        let metrics = SharedPmemDeviceMetricsRegistry::from_device_ids(["pmem0"]);
+
+        record_pmem_dispatch_metrics(&metrics, &result);
+
+        assert_eq!(
+            metrics.aggregate_snapshot(),
+            PmemDeviceMetrics::default().with_event_fails(1)
+        );
+        assert_eq!(
+            metrics.per_device_snapshot(),
+            PmemDeviceMetricsByDevice::new()
+                .with_device_metrics("pmem0", PmemDeviceMetrics::default().with_event_fails(1),)
+        );
     }
 
     #[test]
