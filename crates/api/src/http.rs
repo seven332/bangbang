@@ -1963,6 +1963,7 @@ pub enum StatusCode {
     Ok,
     NoContent,
     BadRequest,
+    PayloadTooLarge,
 }
 
 impl StatusCode {
@@ -1971,6 +1972,7 @@ impl StatusCode {
             Self::Ok => 200,
             Self::NoContent => 204,
             Self::BadRequest => 400,
+            Self::PayloadTooLarge => 413,
         }
     }
 
@@ -1979,6 +1981,7 @@ impl StatusCode {
             Self::Ok => "OK",
             Self::NoContent => "No Content",
             Self::BadRequest => "Bad Request",
+            Self::PayloadTooLarge => "Payload Too Large",
         }
     }
 }
@@ -2133,6 +2136,18 @@ impl HttpResponse {
 
         Self {
             status: StatusCode::BadRequest,
+            body,
+        }
+    }
+
+    pub fn payload_too_large_fault() -> Self {
+        let body = serde_json::json!({
+            "fault_message": RequestError::PayloadTooLarge.fault_message()
+        })
+        .to_string();
+
+        Self {
+            status: StatusCode::PayloadTooLarge,
             body,
         }
     }
@@ -7818,6 +7833,20 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BadRequest);
         assert_eq!(response.body(), r#"{"fault_message":"message"}"#);
+    }
+
+    #[test]
+    fn payload_too_large_fault_uses_413_with_fault_message() {
+        let response = HttpResponse::payload_too_large_fault();
+        let bytes = response.to_http_bytes();
+        let text = std::str::from_utf8(&bytes).expect("response should be utf-8");
+
+        assert_eq!(response.status(), StatusCode::PayloadTooLarge);
+        assert_eq!(
+            response.body(),
+            r#"{"fault_message":"HTTP request payload exceeds the configured limit."}"#
+        );
+        assert!(text.starts_with("HTTP/1.1 413 Payload Too Large\r\n"));
     }
 
     #[test]

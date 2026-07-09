@@ -590,9 +590,7 @@ fn handle_connection(
             RequestRead::Complete(request) => {
                 handle_request_bytes_with_limit(&request, vmm, http_api_max_payload_size)
             }
-            RequestRead::TooLarge => {
-                HttpResponse::fault(RequestError::PayloadTooLarge.fault_message())
-            }
+            RequestRead::TooLarge => HttpResponse::payload_too_large_fault(),
         };
 
     stream
@@ -618,7 +616,11 @@ fn handle_request_bytes_with_limit(
             } else if should_record_api_request_parse_failure(&err) {
                 record_api_request_parse_failure(bytes, vmm);
             }
-            HttpResponse::fault(err.fault_message())
+            if err == RequestError::PayloadTooLarge {
+                HttpResponse::payload_too_large_fault()
+            } else {
+                HttpResponse::fault(err.fault_message())
+            }
         }
     }
 }
@@ -4336,7 +4338,7 @@ mod tests {
                 oversized_boot_request.len() - 1,
             )
             .status(),
-            bangbang_api::http::StatusCode::BadRequest
+            bangbang_api::http::StatusCode::PayloadTooLarge
         );
 
         let boot_response = handle_request_bytes(
@@ -7881,7 +7883,7 @@ mod tests {
             .read_to_string(&mut response)
             .expect("client should read response");
 
-        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.starts_with("HTTP/1.1 413 Payload Too Large\r\n"));
         assert!(
             response.contains(
                 r#"{"fault_message":"HTTP request payload exceeds the configured limit."}"#
@@ -7918,13 +7920,32 @@ mod tests {
             .read_to_string(&mut response)
             .expect("client should read response");
 
-        assert!(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(response.starts_with("HTTP/1.1 413 Payload Too Large\r\n"));
         assert!(
             response.contains(
                 r#"{"fault_message":"HTTP request payload exceeds the configured limit."}"#
             )
         );
         assert!(!logger_path.exists());
+    }
+
+    #[test]
+    fn parse_time_payload_limit_failure_returns_413() {
+        let request = format!(
+            "GET /version HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            HTTP_MAX_PAYLOAD_SIZE + 1
+        );
+        let mut vmm = test_controller();
+        let response = handle_request_bytes_with_limit(request.as_bytes(), &mut vmm, request.len());
+
+        assert_eq!(
+            response.status(),
+            bangbang_api::http::StatusCode::PayloadTooLarge
+        );
+        assert_eq!(
+            response.body(),
+            r#"{"fault_message":"HTTP request payload exceeds the configured limit."}"#
+        );
     }
 
     #[test]

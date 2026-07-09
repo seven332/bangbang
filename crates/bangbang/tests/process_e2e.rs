@@ -203,7 +203,10 @@ fn executable_rejects_api_payload_over_limit_without_stopping() {
     );
 
     let oversized_response = http_raw(&socket_path, request.as_bytes());
-    assert_bad_request_response(&oversized_response, "oversized PUT /mmds");
+    assert!(
+        oversized_response.starts_with("HTTP/1.1 413 Payload Too Large\r\n"),
+        "oversized PUT /mmds should return 413 Payload Too Large; response:\n{oversized_response}"
+    );
     assert_response_contains(
         &oversized_response,
         r#"{"fault_message":"HTTP request payload exceeds the configured limit."}"#,
