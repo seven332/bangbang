@@ -486,13 +486,13 @@ fields and duplicate token bucket fields before VMM dispatch.
 | `PUT /drives/{drive_id}` | path `drive_id` | required | The API parser captures this value, and the internal model validates it as nonempty alphanumeric or `_`, matching Firecracker's `checked_id` rule. |
 | `PUT /drives/{drive_id}` | body `drive_id` | required | The API parser rejects requests where this does not match the path `drive_id`. |
 | `PUT /drives/{drive_id}` | `is_root_device` | required | Identifies whether this drive is the boot device. |
-| `PUT /drives/{drive_id}` | `path_on_host` | required | The API/VMM path records this value only after rejecting empty paths; it does not open or stat the path yet. Future validation must cover access, file type, and path redaction in errors. |
+| `PUT /drives/{drive_id}` | `path_on_host` | required for virtio-block; omitted for recognized unsupported vhost-user-block | The API/VMM path records this value only after rejecting empty paths; it does not open or stat the path yet. Socket-backed vhost-user-block requests may omit it and are rejected through the `socket` unsupported path instead of being treated as malformed. Future validation must cover access, file type, and path redaction in errors. |
 | `PUT /drives/{drive_id}` | `is_read_only` | optional | The internal model defaults omitted virtio-block drives to read-write. |
 | `PUT /drives/{drive_id}` | `partuuid` | optional | Only meaningful for root-device boot selection. |
 | `PUT /drives/{drive_id}` | `cache_type` | optional when `Unsafe`; supported when `Writeback` | The internal model accepts omitted/default `Unsafe` and explicit `Writeback`. `Unsafe` does not advertise `VIRTIO_BLK_F_FLUSH`; `Writeback` advertises it and routes guest flush requests through the backing flush path. |
 | `PUT /drives/{drive_id}` | `rate_limiter` | optional bandwidth/ops token buckets | Missing, `null`, empty-object, or all-null `bandwidth`/`ops` values are accepted as unconfigured. Configured Firecracker-shaped buckets are stored before startup, echoed through `GET /vm/config`, and applied to virtio-block queue dispatch without sleeping. |
 | `PUT /drives/{drive_id}` | `io_engine` | optional when `Sync`; rejected when `Async` | The internal model accepts omitted/default `Sync` and rejects `Async`; `Async` is tied to Linux io_uring and does not directly map to the first macOS target. |
-| `PUT /drives/{drive_id}` | `socket` | optional when absent or `null`; rejected when configured | The internal model rejects configured sockets with `drive socket is not supported`; vhost-user-block is outside the first tier. |
+| `PUT /drives/{drive_id}` | `socket` | optional when absent or `null`; rejected when configured | The parser accepts Firecracker-shaped socket-backed drive requests, including requests that omit `path_on_host`, then the internal model rejects configured sockets with `drive socket is not supported` without opening host paths, creating sockets, mutating drive state, or echoing the socket path. Real vhost-user-block device support is outside the first tier. |
 | `PUT /drives/{drive_id}` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PATCH /drives/{drive_id}` | path `drive_id` | required | The API parser captures this value before building the runtime update action. |
 | `PATCH /drives/{drive_id}` | body `drive_id` | required | The API parser rejects requests where this does not match the path `drive_id`. |
@@ -949,7 +949,10 @@ The API crate has strict Firecracker-shaped `PUT /drives/{drive_id}` and
 `PATCH /drives/{drive_id}` request parser and body models. Initial drive
 configuration accepts the documented drive fields, rejects unknown fields,
 rejects malformed or incomplete JSON bodies, rejects extra path segments, and
-rejects path/body `drive_id` mismatches without echoing host paths. Drive update
+rejects path/body `drive_id` mismatches without echoing host paths. The initial
+parser treats a body with neither `path_on_host` nor `socket` as incomplete, but
+accepts Firecracker-shaped socket-backed vhost-user-block bodies far enough to
+route them to the unsupported socket fault. Drive update
 requests parse the Firecracker-shaped `drive_id`, `path_on_host`, and
 `rate_limiter` fields, reject invalid or mismatched bodies, and route valid
 runtime updates to the process-owned block-device refresh path. The running API server
@@ -960,13 +963,16 @@ The runtime crate has an internal, Firecracker-shaped drive configuration model
 for the initial virtio-block subset. It validates path and body `drive_id`
 values as nonempty alphanumeric strings with `_`, requires the two IDs to
 match, rejects an empty `path_on_host` without opening or statting host files,
-and normalizes omitted `is_read_only` to read-write.
+and normalizes omitted `is_read_only` to read-write. A missing `path_on_host`
+without a configured `socket` is rejected; a configured `socket` is rejected as
+unsupported before path validation so socket-only vhost-user-block configs
+produce the stable socket fault.
 
 The internal model accepts omitted/default `cache_type=Unsafe`, explicit
 `cache_type=Writeback`, omitted/default `io_engine=Sync`, and configured
 bandwidth/ops rate limiters. It rejects `Async` and configured sockets as
-unsupported. Displayed errors avoid echoing `path_on_host` so future API code
-can preserve host path redaction.
+unsupported. Displayed errors avoid echoing `path_on_host` or socket paths so
+future API code can preserve host path redaction.
 
 The runtime crate can also open the normalized `path_on_host` as a regular
 host file, preserve the configured read-only mode, report byte length, and
@@ -1659,7 +1665,7 @@ The first API implementation should model the same broad stages as Firecracker:
 | `PUT /machine-config` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Pre-boot-only configuration. Stored values are applied during startup preparation. |
 | `PATCH /machine-config` | implemented; `204` empty response on successful partial config update | unsupported after start; `400` `fault_message` | Pre-boot-only partial configuration. Omitted fields preserve current stored values; invalid updates leave stored values unchanged. |
 | `PUT /boot-source` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config; host paths are opened during startup preparation. Host path errors must avoid leaking sensitive path details. |
-| `PUT /drives/{drive_id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records validated pre-boot config, including optional bandwidth/ops rate limiters. Startup preparation opens backing files, registers initial block MMIO devices, applies configured limiters in queue dispatch without sleeping, and wires HVF block retry wakeups when a throttled descriptor remains pending. Runtime hotplug and full Firecracker timerfd/eventfd parity remain deferred. |
+| `PUT /drives/{drive_id}` | implemented; `204` empty response on successful config storage; recognized unsupported for vhost-user-block `socket` configs | unsupported after start; `400` `fault_message` | Records validated pre-boot virtio-block config, including optional bandwidth/ops rate limiters. Startup preparation opens backing files, registers initial block MMIO devices, applies configured limiters in queue dispatch without sleeping, and wires HVF block retry wakeups when a throttled descriptor remains pending. Firecracker-shaped socket-backed vhost-user-block configs are parsed and rejected with `drive socket is not supported` without mutating stored config. Runtime hotplug, vhost-user-block device support, and full Firecracker timerfd/eventfd parity remain deferred. |
 | `PUT /pmem/{id}` | implemented; `204` empty response on successful config storage | unsupported after start; `400` `fault_message` | Records Firecracker-shaped pre-boot config and replaces prior config for the same ID without opening the host backing file during the request; empty or all-null limiter objects are treated as unconfigured, and `root_device: true` is rejected without mutating stored config. Stored configs appear in `GET /vm/config`; startup opens and validates each backing as a non-zero regular file, mmaps it to a 2 MiB-aligned host range, assigns non-overlapping guest physical range/config-space metadata, attaches one virtio-mmio/FDT node per prepared pmem device, copies the prepared mapping into an HVF-compatible anonymous shadow, registers that shadow with HVF after DRAM, writes writable shadows back for guest queue-driven flush requests and after clean unmap, skips writeback after failed unmap cleanup, and retains the handles, mappings, and range metadata. Root-device semantics, real rate limiting, dirty-range tracking, direct file-backed HVF mapping, and hot-unplug remain deferred. |
 | `PATCH /pmem/{id}` | recognized post-boot-only operation; `400` `fault_message` | no-op subset supported; `204` empty response when the target exists and the limiter is omitted, `null`, empty, or all-null | Parses Firecracker-shaped pmem rate-limiter update requests, rejects malformed or mismatched bodies first, returns unsupported-state before startup, validates that the target pmem device already exists after startup, and accepts omitted, `null`, empty, or all-null rate limiters as a no-op without mutating stored configuration. Configured rate limiters and real runtime pmem limiter mutation remain deferred. |
 | `PATCH /drives/{drive_id}` | recognized post-boot-only operation; `400` `fault_message` | supported target; `204` empty response on successful backing or rate-limiter update | Parses Firecracker-shaped update requests and routes valid bodies through `UpdateBlockDevice`. Empty or all-null limiter objects are treated as unconfigured/no-op updates. Runtime updates for existing active drives open replacement backing files only when `path_on_host` is present, update active per-device limiter buckets when configured limiter buckets are present, update stored drive configuration after handler success, and preserve previous state on failure. Active backing or limiter update attempts report aggregate plus per-drive block `update_count` or `update_fails` metrics; parser-level rejections, unsupported-state faults, unknown-drive validation failures, and pathless no-op updates are not reported as block update attempts. Throttled block dispatches expose a backend-neutral retry delay and active HVF block queues schedule a per-session retry wakeup. Runtime hotplug and full Firecracker timerfd/eventfd parity remain deferred. |
