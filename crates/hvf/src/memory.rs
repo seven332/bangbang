@@ -12,6 +12,10 @@ use bangbang_runtime::memory::{
     GuestMemory, GuestMemoryAllocationError, GuestMemoryRange, GuestMemoryRegion,
     GuestMemoryRegionRemovalError,
 };
+use bangbang_runtime::memory_hotplug::{
+    VirtioMemAppliedMutation, VirtioMemMutation, VirtioMemMutationError, VirtioMemMutationExecutor,
+    VirtioMemMutationKind, VirtioMemMutationRollbackError,
+};
 
 const HOST_MEMORY_WRITEBACK_BUFFER_SIZE: usize = 64 * 1024;
 
@@ -390,6 +394,11 @@ impl HvfGuestMemoryFlushFailure {
 #[derive(Debug)]
 pub(crate) struct HvfGuestMemoryMapping {
     memory: Option<GuestMemory>,
+    state: HvfGuestMemoryMappingState,
+}
+
+#[derive(Debug)]
+struct HvfGuestMemoryMappingState {
     host_memory: Vec<HvfHostMemoryMapping>,
     host_memory_should_flush: bool,
     host_memory_flushed: bool,
@@ -416,12 +425,14 @@ impl HvfGuestMemoryMapping {
     ) -> Result<Self, Box<FailedGuestMemoryMapping>> {
         let mut mapping = Self {
             memory: Some(memory),
-            host_memory,
-            host_memory_should_flush: false,
-            host_memory_flushed: false,
-            mapped_regions: Vec::new(),
-            dynamic_regions: Vec::new(),
-            mapper,
+            state: HvfGuestMemoryMappingState {
+                host_memory,
+                host_memory_should_flush: false,
+                host_memory_flushed: false,
+                mapped_regions: Vec::new(),
+                dynamic_regions: Vec::new(),
+                mapper,
+            },
         };
 
         match mapping.map_all(permissions) {
@@ -441,21 +452,21 @@ impl HvfGuestMemoryMapping {
     }
 
     pub(crate) fn unmap_all(&mut self) -> Result<(), HvfGuestMemoryMappingError> {
-        let failures = self.unmap_mapped_regions();
+        let failures = self.state.unmap_mapped_regions();
         if !failures.is_empty() {
             return Err(HvfGuestMemoryMappingError::UnmapFailed { failures });
         }
 
-        self.flush_host_memory()
+        self.state.flush_host_memory()
     }
 
     pub(crate) fn has_mapped_regions(&self) -> bool {
-        !self.mapped_regions.is_empty()
+        self.state.has_mapped_regions()
     }
 
     #[cfg(test)]
     fn has_dynamic_regions(&self) -> bool {
-        !self.dynamic_regions.is_empty()
+        self.state.has_dynamic_regions()
     }
 
     pub(crate) fn memory(&self) -> Result<&GuestMemory, HvfGuestMemoryMappingError> {
@@ -475,6 +486,82 @@ impl HvfGuestMemoryMapping {
     }
 
     pub(crate) fn flush_host_memory_now(&self) -> Result<(), HvfGuestMemoryMappingError> {
+        self.state.flush_host_memory_now()
+    }
+
+    // HVF destroys guest mappings with the VM. Use this only after `hv_vm_destroy`
+    // succeeds following an earlier unmap failure.
+    pub(crate) fn release_after_vm_destroy(mut self) {
+        self.state.release_after_vm_destroy();
+    }
+
+    pub(crate) fn map_dynamic_region(
+        &mut self,
+        range: GuestMemoryRange,
+        permissions: HvfMemoryPermissions,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        let (memory, state) = self.memory_and_state_mut()?;
+        state.map_dynamic_region(memory, range, permissions)
+    }
+
+    pub(crate) fn unmap_dynamic_region(
+        &mut self,
+        range: GuestMemoryRange,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        let (memory, state) = self.memory_and_state_mut()?;
+        state.unmap_dynamic_region(memory, range)
+    }
+
+    pub(crate) fn memory_and_virtio_mem_executor_mut(
+        &mut self,
+        permissions: HvfMemoryPermissions,
+    ) -> Result<(&mut GuestMemory, HvfVirtioMemMutationExecutor<'_>), HvfGuestMemoryMappingError>
+    {
+        let (memory, state) = self.memory_and_state_mut()?;
+        Ok((
+            memory,
+            HvfVirtioMemMutationExecutor::new(state, permissions),
+        ))
+    }
+
+    fn memory_and_state_mut(
+        &mut self,
+    ) -> Result<(&mut GuestMemory, &mut HvfGuestMemoryMappingState), HvfGuestMemoryMappingError>
+    {
+        let memory = self
+            .memory
+            .as_mut()
+            .ok_or(HvfGuestMemoryMappingError::InvalidState(
+                "guest memory owner is missing",
+            ))?;
+        Ok((memory, &mut self.state))
+    }
+
+    fn map_all(
+        &mut self,
+        permissions: HvfMemoryPermissions,
+    ) -> Result<(), HvfGuestMemoryMappingError> {
+        let memory = self
+            .memory
+            .as_ref()
+            .ok_or(HvfGuestMemoryMappingError::InvalidState(
+                "guest memory owner is missing",
+            ))?;
+        self.state.map_all(memory, permissions)
+    }
+}
+
+impl HvfGuestMemoryMappingState {
+    fn has_mapped_regions(&self) -> bool {
+        !self.mapped_regions.is_empty()
+    }
+
+    #[cfg(test)]
+    fn has_dynamic_regions(&self) -> bool {
+        !self.dynamic_regions.is_empty()
+    }
+
+    fn flush_host_memory_now(&self) -> Result<(), HvfGuestMemoryMappingError> {
         let mut failures = Vec::new();
         for mapping in &self.host_memory {
             if let Err(source) = mapping.flush() {
@@ -489,16 +576,15 @@ impl HvfGuestMemoryMapping {
         }
     }
 
-    // HVF destroys guest mappings with the VM. Use this only after `hv_vm_destroy`
-    // succeeds following an earlier unmap failure.
-    pub(crate) fn release_after_vm_destroy(mut self) {
+    fn release_after_vm_destroy(&mut self) {
         self.mapped_regions.clear();
         self.dynamic_regions.clear();
         self.host_memory_should_flush = false;
     }
 
-    pub(crate) fn map_dynamic_region(
+    fn map_dynamic_region(
         &mut self,
+        memory: &mut GuestMemory,
         range: GuestMemoryRange,
         permissions: HvfMemoryPermissions,
     ) -> Result<(), HvfGuestMemoryMappingError> {
@@ -517,12 +603,6 @@ impl HvfGuestMemoryMapping {
                 |source| HvfGuestMemoryMappingError::MappingMetadataAllocationFailed { source },
             )?;
 
-        let memory = self
-            .memory
-            .as_mut()
-            .ok_or(HvfGuestMemoryMappingError::InvalidState(
-                "guest memory owner is missing",
-            ))?;
         memory.insert_region(range).map_err(|source| {
             HvfGuestMemoryMappingError::DynamicRegionAllocationFailed { range, source }
         })?;
@@ -550,8 +630,9 @@ impl HvfGuestMemoryMapping {
         Ok(())
     }
 
-    pub(crate) fn unmap_dynamic_region(
+    fn unmap_dynamic_region(
         &mut self,
+        memory: &mut GuestMemory,
         range: GuestMemoryRange,
     ) -> Result<(), HvfGuestMemoryMappingError> {
         let dynamic_index = self
@@ -564,12 +645,6 @@ impl HvfGuestMemoryMapping {
             .iter()
             .position(|mapped_region| mapped_region.range == range)
             .ok_or(HvfGuestMemoryMappingError::DynamicRegionMissing { range })?;
-        let memory = self
-            .memory
-            .as_mut()
-            .ok_or(HvfGuestMemoryMappingError::InvalidState(
-                "guest memory owner is missing",
-            ))?;
         if !guest_memory_contains_region(memory, range) {
             return Err(HvfGuestMemoryMappingError::DynamicRegionOwnerMissing { range });
         }
@@ -624,14 +699,9 @@ impl HvfGuestMemoryMapping {
 
     fn map_all(
         &mut self,
+        memory: &GuestMemory,
         permissions: HvfMemoryPermissions,
     ) -> Result<(), HvfGuestMemoryMappingError> {
-        let memory = self
-            .memory
-            .as_ref()
-            .ok_or(HvfGuestMemoryMappingError::InvalidState(
-                "guest memory owner is missing",
-            ))?;
         let page_size = host_page_size()?;
         let requests = validated_map_requests(memory, permissions, page_size)?;
         let host_requests = validated_host_map_requests(&self.host_memory, page_size)?;
@@ -712,6 +782,143 @@ impl HvfGuestMemoryMapping {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct HvfVirtioMemMutationExecutor<'a> {
+    state: &'a mut HvfGuestMemoryMappingState,
+    permissions: HvfMemoryPermissions,
+}
+
+impl<'a> HvfVirtioMemMutationExecutor<'a> {
+    fn new(state: &'a mut HvfGuestMemoryMappingState, permissions: HvfMemoryPermissions) -> Self {
+        Self { state, permissions }
+    }
+
+    fn map_dynamic_region(
+        &mut self,
+        memory: &mut GuestMemory,
+        range: GuestMemoryRange,
+    ) -> Result<(), VirtioMemMutationError> {
+        self.state
+            .map_dynamic_region(memory, range, self.permissions)
+            .map_err(hvf_mutation_error)
+    }
+
+    fn unmap_dynamic_region(
+        &mut self,
+        memory: &mut GuestMemory,
+        range: GuestMemoryRange,
+    ) -> Result<(), VirtioMemMutationError> {
+        self.state
+            .unmap_dynamic_region(memory, range)
+            .map_err(hvf_mutation_error)
+    }
+
+    fn rollback_mapped_region(
+        &mut self,
+        memory: &mut GuestMemory,
+        range: GuestMemoryRange,
+    ) -> Result<(), VirtioMemMutationRollbackError> {
+        self.state
+            .unmap_dynamic_region(memory, range)
+            .map_err(hvf_mutation_rollback_error)
+    }
+
+    fn rollback_unmapped_region(
+        &mut self,
+        memory: &mut GuestMemory,
+        range: GuestMemoryRange,
+    ) -> Result<(), VirtioMemMutationRollbackError> {
+        self.state
+            .map_dynamic_region(memory, range, self.permissions)
+            .map_err(hvf_mutation_rollback_error)
+    }
+
+    fn apply_unplug_all(
+        &mut self,
+        memory: &mut GuestMemory,
+        ranges: &[GuestMemoryRange],
+    ) -> Result<(), VirtioMemMutationError> {
+        let mut applied = Vec::new();
+        applied
+            .try_reserve_exact(ranges.len())
+            .map_err(|source| VirtioMemMutationError::new(source.to_string()))?;
+
+        for range in ranges {
+            if let Err(source) = self.unmap_dynamic_region(memory, *range) {
+                if let Err(rollback_source) = self.rollback_unplug_all(memory, &applied) {
+                    return Err(VirtioMemMutationError::new(format!(
+                        "{source}; also failed to roll back partially applied unplug-all: {rollback_source}"
+                    )));
+                }
+
+                return Err(source);
+            }
+
+            applied.push(*range);
+        }
+
+        Ok(())
+    }
+
+    fn rollback_unplug_all(
+        &mut self,
+        memory: &mut GuestMemory,
+        ranges: &[GuestMemoryRange],
+    ) -> Result<(), VirtioMemMutationRollbackError> {
+        let mut first_error = None;
+        for range in ranges.iter().rev().copied() {
+            if let Err(source) = self.rollback_unmapped_region(memory, range)
+                && first_error.is_none()
+            {
+                first_error = Some(source);
+            }
+        }
+
+        match first_error {
+            Some(source) => Err(source),
+            None => Ok(()),
+        }
+    }
+}
+
+impl VirtioMemMutationExecutor for HvfVirtioMemMutationExecutor<'_> {
+    fn apply(
+        &mut self,
+        memory: &mut GuestMemory,
+        mutation: VirtioMemMutation,
+    ) -> Result<VirtioMemAppliedMutation, VirtioMemMutationError> {
+        match mutation.kind() {
+            VirtioMemMutationKind::Plug(range) => self.map_dynamic_region(memory, *range)?,
+            VirtioMemMutationKind::Unplug(range) => self.unmap_dynamic_region(memory, *range)?,
+            VirtioMemMutationKind::UnplugAll(ranges) => self.apply_unplug_all(memory, ranges)?,
+        }
+
+        Ok(VirtioMemAppliedMutation::new(mutation))
+    }
+
+    fn rollback(
+        &mut self,
+        memory: &mut GuestMemory,
+        applied: VirtioMemAppliedMutation,
+    ) -> Result<(), VirtioMemMutationRollbackError> {
+        match applied.mutation().kind() {
+            VirtioMemMutationKind::Plug(range) => self.rollback_mapped_region(memory, *range),
+            VirtioMemMutationKind::Unplug(range) => self.rollback_unmapped_region(memory, *range),
+            VirtioMemMutationKind::UnplugAll(ranges) => self.rollback_unplug_all(memory, ranges),
+        }
+    }
+}
+
+fn hvf_mutation_error(source: HvfGuestMemoryMappingError) -> VirtioMemMutationError {
+    VirtioMemMutationError::new(source.to_string())
+}
+
+fn hvf_mutation_rollback_error(
+    source: HvfGuestMemoryMappingError,
+) -> VirtioMemMutationRollbackError {
+    VirtioMemMutationRollbackError::new(source.to_string())
+}
+
 impl Drop for HvfGuestMemoryMapping {
     fn drop(&mut self) {
         if self.unmap_all().is_err() && self.has_mapped_regions() {
@@ -719,7 +926,7 @@ impl Drop for HvfGuestMemoryMapping {
                 std::mem::forget(memory);
             }
 
-            let host_memory = std::mem::take(&mut self.host_memory);
+            let host_memory = std::mem::take(&mut self.state.host_memory);
             std::mem::forget(host_memory);
         }
     }
@@ -1234,6 +1441,9 @@ mod tests {
     use bangbang_runtime::memory::{
         GuestAddress, GuestMemory, GuestMemoryLayout, GuestMemoryRange,
     };
+    use bangbang_runtime::memory_hotplug::{
+        VirtioMemMutation, VirtioMemMutationExecutor, VirtioMemMutationKind,
+    };
 
     use super::{
         HvfGuestMemoryMapping, HvfGuestMemoryMappingError, HvfHostMemoryMapping,
@@ -1463,7 +1673,7 @@ mod tests {
         )
         .expect("guest memory mapping should succeed");
 
-        assert_eq!(mapping.mapped_regions.len(), 2);
+        assert_eq!(mapping.state.mapped_regions.len(), 2);
         let maps = mapper.maps();
         let mut mapped_ranges = maps.iter().map(|(request, _)| request.range);
         assert_eq!(mapped_ranges.next(), Some(range(0, page_size)));
@@ -1510,7 +1720,7 @@ mod tests {
         )
         .expect("guest and host-backed memory mapping should succeed");
 
-        assert_eq!(mapping.mapped_regions.len(), 3);
+        assert_eq!(mapping.state.mapped_regions.len(), 3);
         let maps = mapper.maps();
         let mut mapped = maps
             .iter()
@@ -1801,8 +2011,8 @@ mod tests {
             memory_ranges(mapping.memory().expect("guest memory owner should exist")),
             vec![base_range, dynamic_range]
         );
-        assert_eq!(mapping.mapped_regions.len(), 2);
-        assert_eq!(mapping.dynamic_regions, vec![dynamic_range]);
+        assert_eq!(mapping.state.mapped_regions.len(), 2);
+        assert_eq!(mapping.state.dynamic_regions, vec![dynamic_range]);
         let maps = mapper.maps();
         let mut mapped = maps.iter().map(|(request, _)| request.range);
         assert_eq!(mapped.next(), Some(base_range));
@@ -1831,6 +2041,7 @@ mod tests {
         );
         assert_eq!(
             mapping
+                .state
                 .mapped_regions
                 .iter()
                 .map(|mapped_region| mapped_region.range)
@@ -1955,7 +2166,7 @@ mod tests {
             memory_ranges(mapping.memory().expect("guest memory owner should exist")),
             vec![base_range]
         );
-        assert_eq!(mapping.mapped_regions.len(), 1);
+        assert_eq!(mapping.state.mapped_regions.len(), 1);
         assert!(!mapping.has_dynamic_regions());
         assert_eq!(mapper.map_count(), 2);
         assert_eq!(mapper.unmap_count(), 0);
@@ -1986,7 +2197,7 @@ mod tests {
             memory_ranges(mapping.memory().expect("guest memory owner should exist")),
             vec![base_range]
         );
-        assert_eq!(mapping.mapped_regions.len(), 1);
+        assert_eq!(mapping.state.mapped_regions.len(), 1);
         assert!(!mapping.has_dynamic_regions());
         let unmaps = mapper.unmaps();
         assert_eq!(
@@ -2057,7 +2268,7 @@ mod tests {
             memory_ranges(mapping.memory().expect("guest memory owner should exist")),
             vec![base_range, dynamic_range]
         );
-        assert_eq!(mapping.dynamic_regions, vec![dynamic_range]);
+        assert_eq!(mapping.state.dynamic_regions, vec![dynamic_range]);
 
         mapper.set_fail_unmap(false);
         mapping
@@ -2070,6 +2281,258 @@ mod tests {
         );
         assert!(!mapping.has_dynamic_regions());
         assert_eq!(mapper.unmap_count(), 2);
+    }
+
+    #[test]
+    fn virtio_mem_executor_plug_maps_dynamic_range_and_rollback_unmaps() {
+        let page_size = page_size();
+        let base_range = range(0, page_size);
+        let dynamic_range = range(page_size, page_size);
+        let memory = memory_for_ranges(vec![base_range]);
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper(
+            memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            mapper.clone(),
+        )
+        .expect("initial guest memory should map");
+
+        let applied = {
+            let (memory, mut executor) = mapping
+                .memory_and_virtio_mem_executor_mut(HvfMemoryPermissions::GUEST_RAM)
+                .expect("virtio-mem executor should borrow mapped memory");
+            executor
+                .apply(
+                    memory,
+                    VirtioMemMutation::new(VirtioMemMutationKind::Plug(dynamic_range)),
+                )
+                .expect("plug mutation should map dynamic memory")
+        };
+
+        assert_eq!(
+            memory_ranges(mapping.memory().expect("guest memory owner should exist")),
+            vec![base_range, dynamic_range]
+        );
+        assert_eq!(mapper.map_count(), 2);
+
+        {
+            let (memory, mut executor) = mapping
+                .memory_and_virtio_mem_executor_mut(HvfMemoryPermissions::GUEST_RAM)
+                .expect("virtio-mem executor should borrow mapped memory");
+            executor
+                .rollback(memory, applied)
+                .expect("plug rollback should unmap dynamic memory");
+        }
+
+        assert_eq!(
+            memory_ranges(mapping.memory().expect("guest memory owner should exist")),
+            vec![base_range]
+        );
+        assert!(!mapping.has_dynamic_regions());
+        assert_eq!(mapper.unmap_count(), 1);
+    }
+
+    #[test]
+    fn virtio_mem_executor_unplug_removes_dynamic_range_and_rollback_remaps() {
+        let page_size = page_size();
+        let base_range = range(0, page_size);
+        let dynamic_range = range(page_size, page_size);
+        let memory = memory_for_ranges(vec![base_range]);
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper(
+            memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            mapper.clone(),
+        )
+        .expect("initial guest memory should map");
+        mapping
+            .map_dynamic_region(dynamic_range, HvfMemoryPermissions::GUEST_RAM)
+            .expect("dynamic range should map");
+
+        let applied = {
+            let (memory, mut executor) = mapping
+                .memory_and_virtio_mem_executor_mut(HvfMemoryPermissions::GUEST_RAM)
+                .expect("virtio-mem executor should borrow mapped memory");
+            executor
+                .apply(
+                    memory,
+                    VirtioMemMutation::new(VirtioMemMutationKind::Unplug(dynamic_range)),
+                )
+                .expect("unplug mutation should remove dynamic memory")
+        };
+
+        assert_eq!(
+            memory_ranges(mapping.memory().expect("guest memory owner should exist")),
+            vec![base_range]
+        );
+        assert!(!mapping.has_dynamic_regions());
+
+        {
+            let (memory, mut executor) = mapping
+                .memory_and_virtio_mem_executor_mut(HvfMemoryPermissions::GUEST_RAM)
+                .expect("virtio-mem executor should borrow mapped memory");
+            executor
+                .rollback(memory, applied)
+                .expect("unplug rollback should remap dynamic memory");
+        }
+
+        assert_eq!(
+            memory_ranges(mapping.memory().expect("guest memory owner should exist")),
+            vec![base_range, dynamic_range]
+        );
+        assert_eq!(mapper.map_count(), 3);
+        assert_eq!(mapper.unmap_count(), 1);
+    }
+
+    #[test]
+    fn virtio_mem_executor_unplug_all_removes_snapshot_and_rollback_remaps() {
+        let page_size = page_size();
+        let base_range = range(0, page_size);
+        let first_dynamic = range(page_size, page_size);
+        let second_dynamic = range(page_size * 2, page_size);
+        let memory = memory_for_ranges(vec![base_range]);
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper(
+            memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            mapper.clone(),
+        )
+        .expect("initial guest memory should map");
+        mapping
+            .map_dynamic_region(first_dynamic, HvfMemoryPermissions::GUEST_RAM)
+            .expect("first dynamic range should map");
+        mapping
+            .map_dynamic_region(second_dynamic, HvfMemoryPermissions::GUEST_RAM)
+            .expect("second dynamic range should map");
+
+        let applied = {
+            let (memory, mut executor) = mapping
+                .memory_and_virtio_mem_executor_mut(HvfMemoryPermissions::GUEST_RAM)
+                .expect("virtio-mem executor should borrow mapped memory");
+            executor
+                .apply(
+                    memory,
+                    VirtioMemMutation::new(VirtioMemMutationKind::UnplugAll(vec![
+                        first_dynamic,
+                        second_dynamic,
+                    ])),
+                )
+                .expect("unplug-all should remove dynamic memory")
+        };
+
+        assert_eq!(
+            memory_ranges(mapping.memory().expect("guest memory owner should exist")),
+            vec![base_range]
+        );
+        assert!(!mapping.has_dynamic_regions());
+
+        {
+            let (memory, mut executor) = mapping
+                .memory_and_virtio_mem_executor_mut(HvfMemoryPermissions::GUEST_RAM)
+                .expect("virtio-mem executor should borrow mapped memory");
+            executor
+                .rollback(memory, applied)
+                .expect("unplug-all rollback should remap dynamic memory");
+        }
+
+        assert_eq!(
+            memory_ranges(mapping.memory().expect("guest memory owner should exist")),
+            vec![base_range, first_dynamic, second_dynamic]
+        );
+        assert_eq!(mapper.map_count(), 5);
+        assert_eq!(mapper.unmap_count(), 2);
+    }
+
+    #[test]
+    fn virtio_mem_executor_unplug_all_rolls_back_partial_apply_failure() {
+        let page_size = page_size();
+        let base_range = range(0, page_size);
+        let dynamic_range = range(page_size, page_size);
+        let missing_range = range(page_size * 2, page_size);
+        let memory = memory_for_ranges(vec![base_range]);
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper(
+            memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            mapper.clone(),
+        )
+        .expect("initial guest memory should map");
+        mapping
+            .map_dynamic_region(dynamic_range, HvfMemoryPermissions::GUEST_RAM)
+            .expect("dynamic range should map");
+
+        {
+            let (memory, mut executor) = mapping
+                .memory_and_virtio_mem_executor_mut(HvfMemoryPermissions::GUEST_RAM)
+                .expect("virtio-mem executor should borrow mapped memory");
+            let err = executor
+                .apply(
+                    memory,
+                    VirtioMemMutation::new(VirtioMemMutationKind::UnplugAll(vec![
+                        dynamic_range,
+                        missing_range,
+                    ])),
+                )
+                .expect_err("missing range should fail unplug-all");
+            assert!(
+                err.to_string().contains("not mapped"),
+                "unexpected error: {err}"
+            );
+        }
+
+        assert_eq!(
+            memory_ranges(mapping.memory().expect("guest memory owner should exist")),
+            vec![base_range, dynamic_range]
+        );
+        assert_eq!(mapping.state.dynamic_regions, vec![dynamic_range]);
+        assert_eq!(mapper.map_count(), 3);
+        assert_eq!(mapper.unmap_count(), 1);
+    }
+
+    #[test]
+    fn virtio_mem_executor_reports_rollback_failure() {
+        let page_size = page_size();
+        let base_range = range(0, page_size);
+        let dynamic_range = range(page_size, page_size);
+        let memory = memory_for_ranges(vec![base_range]);
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut mapping = HvfGuestMemoryMapping::map_with_mapper(
+            memory,
+            HvfMemoryPermissions::GUEST_RAM,
+            mapper.clone(),
+        )
+        .expect("initial guest memory should map");
+        let applied = {
+            let (memory, mut executor) = mapping
+                .memory_and_virtio_mem_executor_mut(HvfMemoryPermissions::GUEST_RAM)
+                .expect("virtio-mem executor should borrow mapped memory");
+            executor
+                .apply(
+                    memory,
+                    VirtioMemMutation::new(VirtioMemMutationKind::Plug(dynamic_range)),
+                )
+                .expect("plug mutation should map dynamic memory")
+        };
+
+        mapper.set_fail_unmap(true);
+        {
+            let (memory, mut executor) = mapping
+                .memory_and_virtio_mem_executor_mut(HvfMemoryPermissions::GUEST_RAM)
+                .expect("virtio-mem executor should borrow mapped memory");
+            let err = executor
+                .rollback(memory, applied)
+                .expect_err("injected rollback unmap failure should surface");
+            assert!(
+                err.to_string().contains("failed to unmap"),
+                "unexpected error: {err}"
+            );
+        }
+
+        assert_eq!(
+            memory_ranges(mapping.memory().expect("guest memory owner should exist")),
+            vec![base_range, dynamic_range]
+        );
+        assert_eq!(mapping.state.dynamic_regions, vec![dynamic_range]);
     }
 
     #[test]

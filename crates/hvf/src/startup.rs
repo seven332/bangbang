@@ -26,7 +26,7 @@ use bangbang_runtime::interrupt::{
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
 use bangbang_runtime::memory_hotplug::{
     MemoryHotplugConfig, MemoryHotplugSizeUpdate, MemoryHotplugStatus, MemoryHotplugStatusError,
-    MemoryHotplugUpdateError, VirtioMemMmioLayout,
+    MemoryHotplugUpdateError, VirtioMemMmioLayout, VirtioMemMutationExecutor,
 };
 use bangbang_runtime::metrics::{
     SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
@@ -1166,18 +1166,22 @@ impl HvfArm64BootSession<'_> {
         HvfArm64BootMemoryHotplugNotificationDispatchError,
     > {
         let dispatches = {
-            let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
-                HvfArm64BootMemoryHotplugNotificationDispatchError::MapGuestMemory { source }
-            })?;
+            let (memory, mut mutation_executor) = self
+                .backend
+                .mapped_guest_memory_and_virtio_mem_executor_mut(HvfMemoryPermissions::GUEST_RAM)
+                .map_err(|source| {
+                    HvfArm64BootMemoryHotplugNotificationDispatchError::MapGuestMemory { source }
+                })?;
             let mut mmio_dispatcher =
                 lock_boot_mmio_dispatcher(&self.mmio_dispatcher).map_err(|source| {
                     HvfArm64BootMemoryHotplugNotificationDispatchError::MmioDispatcher { source }
                 })?;
 
-            dispatch_memory_hotplug_runtime_notifications(
+            dispatch_memory_hotplug_runtime_notifications_with_executor(
                 memory,
                 &mut self.runtime_resources,
                 &mut mmio_dispatcher,
+                &mut mutation_executor,
             )?
         };
 
@@ -1664,18 +1668,22 @@ impl OwnedHvfArm64BootSession {
         HvfArm64BootMemoryHotplugNotificationDispatchError,
     > {
         let dispatches = {
-            let memory = self.backend.mapped_guest_memory_mut().map_err(|source| {
-                HvfArm64BootMemoryHotplugNotificationDispatchError::MapGuestMemory { source }
-            })?;
+            let (memory, mut mutation_executor) = self
+                .backend
+                .mapped_guest_memory_and_virtio_mem_executor_mut(HvfMemoryPermissions::GUEST_RAM)
+                .map_err(|source| {
+                    HvfArm64BootMemoryHotplugNotificationDispatchError::MapGuestMemory { source }
+                })?;
             let mut mmio_dispatcher =
                 lock_boot_mmio_dispatcher(&self.mmio_dispatcher).map_err(|source| {
                     HvfArm64BootMemoryHotplugNotificationDispatchError::MmioDispatcher { source }
                 })?;
 
-            dispatch_memory_hotplug_runtime_notifications(
+            dispatch_memory_hotplug_runtime_notifications_with_executor(
                 memory,
                 &mut self.runtime_resources,
                 &mut mmio_dispatcher,
+                &mut mutation_executor,
             )?
         };
 
@@ -3973,16 +3981,21 @@ fn dispatch_balloon_runtime_notifications(
         )
 }
 
-fn dispatch_memory_hotplug_runtime_notifications(
+fn dispatch_memory_hotplug_runtime_notifications_with_executor(
     memory: &mut GuestMemory,
     runtime_resources: &mut Arm64BootRuntimeResources,
     mmio_dispatcher: &mut MmioDispatcher,
+    mutation_executor: &mut impl VirtioMemMutationExecutor,
 ) -> Result<
     Arm64BootMemoryHotplugNotificationDispatches,
     HvfArm64BootMemoryHotplugNotificationDispatchError,
 > {
     runtime_resources
-        .dispatch_memory_hotplug_queue_notifications(memory, mmio_dispatcher)
+        .dispatch_memory_hotplug_queue_notifications_with_executor(
+            memory,
+            mmio_dispatcher,
+            mutation_executor,
+        )
         .map_err(|source| {
             HvfArm64BootMemoryHotplugNotificationDispatchError::DispatchNotifications { source }
         })
@@ -5283,10 +5296,12 @@ mod tests {
         DeviceInterruptKind, GuestInterruptLine, InterruptSignalError, InterruptSink,
     };
     use bangbang_runtime::machine::MachineConfigInput;
-    use bangbang_runtime::memory::{GuestAddress, GuestMemory};
+    use bangbang_runtime::memory::{GuestAddress, GuestMemory, GuestMemoryRange};
     use bangbang_runtime::memory_hotplug::{
-        MemoryHotplugConfigInput, VIRTIO_MEM_DEFAULT_REGION_ADDRESS, VIRTIO_MEM_REQUEST_SIZE,
-        VIRTIO_MEM_RESPONSE_SIZE, VirtioMemMmioLayout,
+        MemoryHotplugConfig, MemoryHotplugConfigInput, MemoryHotplugSizeUpdateInput,
+        VIRTIO_MEM_DEFAULT_REGION_ADDRESS, VIRTIO_MEM_REQUEST_SIZE, VIRTIO_MEM_RESPONSE_SIZE,
+        VirtioMemAppliedMutation, VirtioMemMmioLayout, VirtioMemMutation, VirtioMemMutationError,
+        VirtioMemMutationExecutor, VirtioMemMutationKind, VirtioMemMutationRollbackError,
     };
     use bangbang_runtime::metrics::{
         BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive, EntropyDeviceMetrics,
@@ -5320,6 +5335,7 @@ mod tests {
         Arm64BootNetworkPacketIo, Arm64BootNetworkPacketIoError, Arm64BootNetworkPacketIoProvider,
         Arm64BootPmemNotificationDispatches, Arm64BootResourceConfig, Arm64BootResources,
         Arm64BootRuntimeResources, Arm64BootVsockNotificationDispatches,
+        update_memory_hotplug_config_for_device,
     };
     use bangbang_runtime::virtio_mmio::{
         VIRTIO_DEVICE_STATUS_ACKNOWLEDGE, VIRTIO_DEVICE_STATUS_DRIVER,
@@ -5347,6 +5363,7 @@ mod tests {
         collect_balloon_notification_dispatches, collect_block_notification_dispatches,
         collect_entropy_notification_dispatches, collect_memory_hotplug_notification_dispatches,
         collect_network_notification_dispatches, collect_vsock_notification_dispatches,
+        dispatch_memory_hotplug_runtime_notifications_with_executor,
         dispatch_network_runtime_notifications_with_packet_io, lock_boot_mmio_dispatcher,
         record_entropy_dispatch_metrics, record_pmem_dispatch_metrics, run_boot_session_loop,
         run_boot_session_vcpu_step, signal_balloon_queue_interrupts, signal_block_queue_interrupts,
@@ -5414,6 +5431,8 @@ mod tests {
     const TEST_BALLOON_DEFLATE_USED_RING: GuestAddress = GuestAddress::new(0x807a_5000);
     const TEST_BALLOON_PFN_PAYLOAD: GuestAddress = GuestAddress::new(0x807a_6000);
     const TEST_BALLOON_MAPPED_PFN: u32 = 0x80000;
+    const TEST_VIRTIO_MEM_REQ_PLUG: u16 = 0;
+    const TEST_VIRTIO_MEM_REQ_STATE: u16 = 3;
     const TEST_AVAILABLE_RING_IDX_OFFSET: u64 = 2;
     const TEST_AVAILABLE_RING_RING_OFFSET: u64 = 4;
     const TEST_AVAILABLE_RING_ENTRY_SIZE: u64 = 2;
@@ -5623,6 +5642,32 @@ mod tests {
         ) -> Result<Arm64BootEntropySource<'_>, Arm64BootEntropySourceError> {
             self.requested_regions.push(device.registration.region_id());
             Ok(Arm64BootEntropySource::new(&mut self.source))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingVirtioMemMutationExecutor {
+        applied: Vec<VirtioMemMutation>,
+        rolled_back: Vec<VirtioMemMutation>,
+    }
+
+    impl VirtioMemMutationExecutor for RecordingVirtioMemMutationExecutor {
+        fn apply(
+            &mut self,
+            _memory: &mut GuestMemory,
+            mutation: VirtioMemMutation,
+        ) -> Result<VirtioMemAppliedMutation, VirtioMemMutationError> {
+            self.applied.push(mutation.clone());
+            Ok(VirtioMemAppliedMutation::new(mutation))
+        }
+
+        fn rollback(
+            &mut self,
+            _memory: &mut GuestMemory,
+            applied: VirtioMemAppliedMutation,
+        ) -> Result<(), VirtioMemMutationRollbackError> {
+            self.rolled_back.push(applied.mutation().clone());
+            Ok(())
         }
     }
 
@@ -6822,6 +6867,21 @@ mod tests {
             .expect("memory-hotplug notification dispatch result should allocate")
     }
 
+    fn dispatch_boot_memory_hotplug_notifications_with_executor(
+        memory: &mut GuestMemory,
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        mutation_executor: &mut impl VirtioMemMutationExecutor,
+    ) -> Arm64BootMemoryHotplugNotificationDispatches {
+        dispatch_memory_hotplug_runtime_notifications_with_executor(
+            memory,
+            runtime,
+            mmio_dispatcher,
+            mutation_executor,
+        )
+        .expect("memory-hotplug notification dispatch result should allocate")
+    }
+
     fn dispatch_boot_entropy_notifications(
         memory: &mut GuestMemory,
         runtime: &mut Arm64BootRuntimeResources,
@@ -7797,6 +7857,24 @@ mod tests {
         );
     }
 
+    fn update_boot_memory_hotplug_requested_size(
+        runtime: &mut Arm64BootRuntimeResources,
+        mmio_dispatcher: &mut MmioDispatcher,
+        requested_size_mib: u64,
+    ) {
+        let config = MemoryHotplugConfig::try_from(MemoryHotplugConfigInput::new(1024, 2, 128))
+            .expect("test memory-hotplug config should be valid");
+        let update = config
+            .validate_size_update(MemoryHotplugSizeUpdateInput::new(requested_size_mib))
+            .expect("test memory-hotplug requested size should be valid");
+        let device = runtime
+            .memory_hotplug_device
+            .as_ref()
+            .expect("test memory-hotplug device should exist");
+        update_memory_hotplug_config_for_device(device, mmio_dispatcher, update)
+            .expect("test memory-hotplug requested size update should succeed");
+    }
+
     fn network_queue_addresses(queue_index: u32) -> (GuestAddress, GuestAddress, GuestAddress) {
         match queue_index {
             0 => (
@@ -8010,12 +8088,17 @@ mod tests {
         write_balloon_deflate_available_heads(memory, &[0]);
     }
 
-    fn write_queued_memory_hotplug_state_request(memory: &mut GuestMemory) {
+    fn write_queued_memory_hotplug_request(
+        memory: &mut GuestMemory,
+        request_type: u16,
+        address: GuestAddress,
+        block_count: u16,
+    ) {
         let mut request = Vec::new();
-        request.extend_from_slice(&3u16.to_le_bytes());
+        request.extend_from_slice(&request_type.to_le_bytes());
         request.extend_from_slice(&[0; 6]);
-        request.extend_from_slice(&VIRTIO_MEM_DEFAULT_REGION_ADDRESS.raw_value().to_le_bytes());
-        request.extend_from_slice(&1u16.to_le_bytes());
+        request.extend_from_slice(&address.raw_value().to_le_bytes());
+        request.extend_from_slice(&block_count.to_le_bytes());
         request.extend_from_slice(&[0; 6]);
         assert_eq!(request.len(), VIRTIO_MEM_REQUEST_SIZE);
         memory
@@ -8040,6 +8123,24 @@ mod tests {
             ),
         );
         write_available_heads(memory, &[0]);
+    }
+
+    fn write_queued_memory_hotplug_state_request(memory: &mut GuestMemory) {
+        write_queued_memory_hotplug_request(
+            memory,
+            TEST_VIRTIO_MEM_REQ_STATE,
+            VIRTIO_MEM_DEFAULT_REGION_ADDRESS,
+            1,
+        );
+    }
+
+    fn write_queued_memory_hotplug_plug_request(memory: &mut GuestMemory) {
+        write_queued_memory_hotplug_request(
+            memory,
+            TEST_VIRTIO_MEM_REQ_PLUG,
+            VIRTIO_MEM_DEFAULT_REGION_ADDRESS,
+            1,
+        );
     }
 
     fn write_request_header(
@@ -10209,6 +10310,57 @@ mod tests {
             ),
             DeviceInterruptKind::Queue.status().bits()
         );
+        assert_eq!(read_memory_hotplug_used_index(&memory), 1);
+    }
+
+    #[test]
+    fn memory_hotplug_runtime_dispatch_uses_injected_mutation_executor() {
+        let (mut memory, mut runtime, mut mmio_dispatcher) = boot_runtime_with_memory_hotplug();
+        configure_boot_memory_hotplug_queue(&mut runtime, &mut mmio_dispatcher);
+        update_boot_memory_hotplug_requested_size(&mut runtime, &mut mmio_dispatcher, 2);
+        write_queued_memory_hotplug_plug_request(&mut memory);
+        notify_boot_memory_hotplug_queue(&mut runtime, &mut mmio_dispatcher);
+        let mut mutation_executor = RecordingVirtioMemMutationExecutor::default();
+
+        let dispatches = dispatch_boot_memory_hotplug_notifications_with_executor(
+            &mut memory,
+            &mut runtime,
+            &mut mmio_dispatcher,
+            &mut mutation_executor,
+        );
+        let (lines, sink) = RecordingSink::successful();
+
+        let result = signal_memory_hotplug_queue_interrupts(dispatches, sink.as_ref())
+            .expect("queued memory-hotplug dispatch should collect");
+
+        let expected_range =
+            GuestMemoryRange::new(VIRTIO_MEM_DEFAULT_REGION_ADDRESS, 2 * 1024 * 1024)
+                .expect("expected virtio-mem range should be valid");
+        assert_eq!(
+            mutation_executor.applied,
+            vec![VirtioMemMutation::new(VirtioMemMutationKind::Plug(
+                expected_range
+            ))]
+        );
+        assert!(mutation_executor.rolled_back.is_empty());
+        assert_eq!(result.len(), 1);
+        let device = &result.as_slice()[0];
+        assert!(device.dispatch().needs_queue_interrupt());
+        assert!(device.queue_interrupt_signaled());
+        assert!(device.signal_error().is_none());
+        assert_eq!(recorded_lines(&lines), vec![32]);
+        let dispatch = device
+            .dispatch()
+            .outcome()
+            .dispatched()
+            .expect("memory-hotplug notification should dispatch");
+        let queue = dispatch
+            .queue_dispatch()
+            .expect("memory-hotplug queue dispatch should be present");
+        assert_eq!(queue.processed_requests(), 1);
+        assert_eq!(queue.policy_errors(), 0);
+        assert_eq!(queue.mutation_failures(), 0);
+        assert!(queue.needs_queue_interrupt());
         assert_eq!(read_memory_hotplug_used_index(&memory), 1);
     }
 
