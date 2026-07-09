@@ -6,7 +6,7 @@ use crate::interrupt::DeviceInterruptKind;
 use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError};
 use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
-    MmioHandlerError, MmioRegion, MmioRegionId,
+    MmioHandlerError, MmioHandlerLookupError, MmioRegion, MmioRegionId,
 };
 use crate::virtio_mmio::{
     VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
@@ -143,6 +143,39 @@ impl MemoryHotplugConfig {
     pub const fn initial_status(self) -> MemoryHotplugStatus {
         MemoryHotplugStatus::new(self, 0, 0)
     }
+
+    pub fn validate_size_update(
+        self,
+        input: MemoryHotplugSizeUpdateInput,
+    ) -> Result<MemoryHotplugSizeUpdate, MemoryHotplugUpdateError> {
+        let requested_size =
+            memory_hotplug_mib_to_bytes(input.requested_size_mib(), "requested_size_mib")?;
+        let block_size = memory_hotplug_mib_to_bytes(self.block_size_mib, "block_size_mib")?;
+        let slot_size = memory_hotplug_mib_to_bytes(self.slot_size_mib, "slot_size_mib")?;
+        let total_size = memory_hotplug_mib_to_bytes(self.total_size_mib, "total_size_mib")?;
+
+        if !requested_size.is_multiple_of(block_size) {
+            return Err(
+                MemoryHotplugUpdateError::RequestedSizeNotMultipleOfBlockSize {
+                    requested_size_mib: input.requested_size_mib(),
+                    block_size_mib: self.block_size_mib,
+                },
+            );
+        }
+
+        if requested_size > total_size {
+            return Err(MemoryHotplugUpdateError::RequestedSizeTooLarge {
+                requested_size_mib: input.requested_size_mib(),
+                total_size_mib: self.total_size_mib,
+            });
+        }
+
+        Ok(MemoryHotplugSizeUpdate::new(
+            input.requested_size_mib(),
+            requested_size,
+            slot_size,
+        ))
+    }
 }
 
 impl TryFrom<MemoryHotplugConfigInput> for MemoryHotplugConfig {
@@ -215,6 +248,35 @@ impl MemoryHotplugSizeUpdateInput {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryHotplugSizeUpdate {
+    requested_size_mib: u64,
+    requested_size: u64,
+    slot_size: u64,
+}
+
+impl MemoryHotplugSizeUpdate {
+    const fn new(requested_size_mib: u64, requested_size: u64, slot_size: u64) -> Self {
+        Self {
+            requested_size_mib,
+            requested_size,
+            slot_size,
+        }
+    }
+
+    pub const fn requested_size_mib(self) -> u64 {
+        self.requested_size_mib
+    }
+
+    pub const fn requested_size(self) -> u64 {
+        self.requested_size
+    }
+
+    pub const fn slot_size(self) -> u64 {
+        self.slot_size
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryHotplugConfigError {
     BlockSizeTooSmall { min_mib: u64 },
     BlockSizeNotPowerOfTwo,
@@ -251,6 +313,83 @@ impl fmt::Display for MemoryHotplugConfigError {
 }
 
 impl std::error::Error for MemoryHotplugConfigError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryHotplugUpdateError {
+    SizeOverflow {
+        field: &'static str,
+        mib: u64,
+    },
+    RequestedSizeNotMultipleOfBlockSize {
+        requested_size_mib: u64,
+        block_size_mib: u64,
+    },
+    RequestedSizeTooLarge {
+        requested_size_mib: u64,
+        total_size_mib: u64,
+    },
+    UsableRegionSizeOverflow {
+        requested_size: u64,
+        slot_size: u64,
+    },
+    ActiveSessionUnavailable,
+    ActiveSessionCommand {
+        message: String,
+    },
+    HandlerLookup(MmioHandlerLookupError),
+}
+
+impl fmt::Display for MemoryHotplugUpdateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SizeOverflow { field, mib } => {
+                write!(f, "memory hotplug {field} value {mib} MiB overflows bytes")
+            }
+            Self::RequestedSizeNotMultipleOfBlockSize {
+                requested_size_mib,
+                block_size_mib,
+            } => write!(
+                f,
+                "Requested size ({requested_size_mib} MiB) must be a multiple of block size ({block_size_mib} MiB)"
+            ),
+            Self::RequestedSizeTooLarge {
+                requested_size_mib,
+                total_size_mib,
+            } => write!(
+                f,
+                "Requested size ({requested_size_mib} MiB) must not exceed total memory hotplug size ({total_size_mib} MiB)"
+            ),
+            Self::UsableRegionSizeOverflow {
+                requested_size,
+                slot_size,
+            } => write!(
+                f,
+                "memory hotplug requested size {requested_size} bytes cannot be rounded to slot size {slot_size} bytes"
+            ),
+            Self::ActiveSessionUnavailable => {
+                f.write_str("active memory hotplug device session is unavailable")
+            }
+            Self::ActiveSessionCommand { message } => {
+                write!(f, "active memory hotplug device update failed: {message}")
+            }
+            Self::HandlerLookup(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for MemoryHotplugUpdateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::HandlerLookup(err) => Some(err),
+            Self::SizeOverflow { .. }
+            | Self::RequestedSizeNotMultipleOfBlockSize { .. }
+            | Self::RequestedSizeTooLarge { .. }
+            | Self::UsableRegionSizeOverflow { .. }
+            | Self::ActiveSessionUnavailable
+            | Self::ActiveSessionCommand { .. } => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PreparedVirtioMemDevice {
@@ -597,6 +736,20 @@ impl VirtioMemConfigSpace {
     pub const fn with_requested_size(mut self, requested_size: u64) -> Self {
         self.requested_size = requested_size;
         self
+    }
+
+    pub fn updated_requested_size(
+        mut self,
+        update: MemoryHotplugSizeUpdate,
+    ) -> Result<Self, MemoryHotplugUpdateError> {
+        if self.usable_region_size < update.requested_size() {
+            self.usable_region_size =
+                next_slot_multiple(update.requested_size(), update.slot_size())?
+                    .min(self.region_size);
+        }
+        self.requested_size = update.requested_size();
+
+        Ok(self)
     }
 
     pub const fn available_features(self) -> u64 {
@@ -1600,6 +1753,20 @@ impl VirtioMmioRegisterHandler<VirtioMemConfigSpace, VirtioMemDevice> {
 
         dispatch
     }
+
+    pub fn update_mem_requested_size(
+        &mut self,
+        update: MemoryHotplugSizeUpdate,
+    ) -> Result<(), MemoryHotplugUpdateError> {
+        let config_space = self
+            .device_config_handler()
+            .updated_requested_size(update)?;
+        *self.device_config_handler_mut() = config_space;
+        self.increment_config_generation();
+        self.mark_interrupt_pending(DeviceInterruptKind::Config);
+
+        Ok(())
+    }
 }
 
 impl VirtioMmioDeviceActivationHandler for VirtioMemDevice {
@@ -1993,6 +2160,28 @@ fn mib_to_bytes(mib: u64, field: VirtioMemSizeField) -> Result<u64, VirtioMemPre
         })
 }
 
+fn memory_hotplug_mib_to_bytes(
+    mib: u64,
+    field: &'static str,
+) -> Result<u64, MemoryHotplugUpdateError> {
+    mib.checked_mul(MIB)
+        .ok_or(MemoryHotplugUpdateError::SizeOverflow { field, mib })
+}
+
+fn next_slot_multiple(value: u64, slot_size: u64) -> Result<u64, MemoryHotplugUpdateError> {
+    let remainder = value % slot_size;
+    if remainder == 0 {
+        return Ok(value);
+    }
+
+    value.checked_add(slot_size - remainder).ok_or(
+        MemoryHotplugUpdateError::UsableRegionSizeOverflow {
+            requested_size: value,
+            slot_size,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2052,6 +2241,54 @@ mod tests {
         assert_eq!(status.slot_size_mib(), 128);
         assert_eq!(status.plugged_size_mib(), 0);
         assert_eq!(status.requested_size_mib(), 0);
+    }
+
+    #[test]
+    fn validates_memory_hotplug_requested_size_updates() {
+        let config = MemoryHotplugConfig::try_from(MemoryHotplugConfigInput::new(1024, 2, 128))
+            .expect("valid memory hotplug config should convert");
+
+        let zero = config
+            .validate_size_update(MemoryHotplugSizeUpdateInput::new(0))
+            .expect("zero requested size should be valid");
+        assert_eq!(zero.requested_size_mib(), 0);
+        assert_eq!(zero.requested_size(), 0);
+        assert_eq!(zero.slot_size(), 128 * MIB);
+
+        let exact = config
+            .validate_size_update(MemoryHotplugSizeUpdateInput::new(1024))
+            .expect("total requested size should be valid");
+        assert_eq!(exact.requested_size(), 1024 * MIB);
+    }
+
+    #[test]
+    fn rejects_invalid_memory_hotplug_requested_size_updates() {
+        let config = MemoryHotplugConfig::try_from(MemoryHotplugConfigInput::new(1024, 2, 128))
+            .expect("valid memory hotplug config should convert");
+
+        assert_eq!(
+            config.validate_size_update(MemoryHotplugSizeUpdateInput::new(3)),
+            Err(
+                MemoryHotplugUpdateError::RequestedSizeNotMultipleOfBlockSize {
+                    requested_size_mib: 3,
+                    block_size_mib: 2,
+                }
+            )
+        );
+        assert_eq!(
+            config.validate_size_update(MemoryHotplugSizeUpdateInput::new(1026)),
+            Err(MemoryHotplugUpdateError::RequestedSizeTooLarge {
+                requested_size_mib: 1026,
+                total_size_mib: 1024,
+            })
+        );
+        assert_eq!(
+            config.validate_size_update(MemoryHotplugSizeUpdateInput::new(u64::MAX)),
+            Err(MemoryHotplugUpdateError::SizeOverflow {
+                field: "requested_size_mib",
+                mib: u64::MAX,
+            })
+        );
     }
 
     #[test]
@@ -2157,6 +2394,65 @@ mod tests {
                 .read_register(VirtioMmioRegister::DeviceId)
                 .expect("device ID should read"),
             VIRTIO_MEM_DEVICE_ID
+        );
+    }
+
+    #[test]
+    fn virtio_mem_mmio_handler_updates_requested_size_and_interrupt_state() {
+        let config = memory_hotplug_config();
+        let update = config
+            .validate_size_update(MemoryHotplugSizeUpdateInput::new(256))
+            .expect("requested size update should validate");
+        let mut handler = mem_mmio_handler(zero_usable_virtio_mem_config_space());
+
+        handler
+            .update_mem_requested_size(update)
+            .expect("requested size should update active handler");
+
+        let config_space = handler.device_config_handler();
+        assert_eq!(config_space.requested_size(), 256 * MIB);
+        assert_eq!(config_space.usable_region_size(), 256 * MIB);
+        assert_eq!(
+            handler
+                .read_register(VirtioMmioRegister::ConfigGeneration)
+                .expect("config generation should read"),
+            1
+        );
+        assert_eq!(
+            handler
+                .read_register(VirtioMmioRegister::InterruptStatus)
+                .expect("interrupt status should read"),
+            DeviceInterruptKind::Config.status().bits()
+        );
+    }
+
+    #[test]
+    fn virtio_mem_mmio_handler_grows_but_does_not_shrink_usable_region() {
+        let config = memory_hotplug_config();
+        let mut handler = mem_mmio_handler(zero_usable_virtio_mem_config_space());
+        let grow = config
+            .validate_size_update(MemoryHotplugSizeUpdateInput::new(130))
+            .expect("requested size update should validate");
+        let shrink = config
+            .validate_size_update(MemoryHotplugSizeUpdateInput::new(64))
+            .expect("smaller requested size update should validate");
+
+        handler
+            .update_mem_requested_size(grow)
+            .expect("requested size should grow usable region");
+        assert_eq!(handler.device_config_handler().requested_size(), 130 * MIB);
+        assert_eq!(
+            handler.device_config_handler().usable_region_size(),
+            256 * MIB
+        );
+
+        handler
+            .update_mem_requested_size(shrink)
+            .expect("requested size should shrink without shrinking usable region");
+        assert_eq!(handler.device_config_handler().requested_size(), 64 * MIB);
+        assert_eq!(
+            handler.device_config_handler().usable_region_size(),
+            256 * MIB
         );
     }
 

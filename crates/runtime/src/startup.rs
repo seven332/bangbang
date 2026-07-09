@@ -40,7 +40,8 @@ use crate::memory::{
     GuestMemory, GuestMemoryAllocationError, GuestMemoryError, GuestMemoryLayout, aarch64,
 };
 use crate::memory_hotplug::{
-    PreparedVirtioMemDevice, VirtioMemDeviceNotificationDispatch, VirtioMemDeviceNotificationError,
+    MemoryHotplugSizeUpdate, MemoryHotplugUpdateError, PreparedVirtioMemDevice,
+    VirtioMemDeviceNotificationDispatch, VirtioMemDeviceNotificationError,
     VirtioMemMmioDeviceRegistration, VirtioMemMmioHandler, VirtioMemMmioLayout,
     VirtioMemMmioRegistrationError, VirtioMemPrepareError,
 };
@@ -1818,6 +1819,17 @@ pub fn update_balloon_config_for_device(
         .handler_mut::<VirtioBalloonMmioHandler>(device.registration.region_id())
         .map_err(BalloonUpdateError::HandlerLookup)?
         .update_balloon_config(config)
+}
+
+pub fn update_memory_hotplug_config_for_device(
+    device: &Arm64BootMemoryHotplugDevice,
+    mmio_dispatcher: &mut MmioDispatcher,
+    update: MemoryHotplugSizeUpdate,
+) -> Result<(), MemoryHotplugUpdateError> {
+    mmio_dispatcher
+        .handler_mut::<VirtioMemMmioHandler>(device.registration.region_id())
+        .map_err(MemoryHotplugUpdateError::HandlerLookup)?
+        .update_mem_requested_size(update)
 }
 
 pub fn update_balloon_statistics_for_device(

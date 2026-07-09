@@ -1891,6 +1891,7 @@ mod tests {
     use bangbang_runtime::block::DriveUpdateError;
     use bangbang_runtime::logger::{LoggerConfigInput, LoggerWriteError};
     use bangbang_runtime::machine::MAX_MEM_SIZE_MIB;
+    use bangbang_runtime::memory_hotplug::{MemoryHotplugSizeUpdate, MemoryHotplugUpdateError};
     use bangbang_runtime::metrics::{
         BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics,
     };
@@ -2022,6 +2023,13 @@ mod tests {
         fn stop_balloon_hinting(&mut self) -> Result<(), BalloonHintingCommandError> {
             self.hinting_host_cmd = VIRTIO_BALLOON_FREE_PAGE_HINT_DONE;
 
+            Ok(())
+        }
+
+        fn update_memory_hotplug(
+            &mut self,
+            _update: MemoryHotplugSizeUpdate,
+        ) -> Result<(), MemoryHotplugUpdateError> {
             Ok(())
         }
 
@@ -7000,6 +7008,81 @@ mod tests {
         assert_eq!(
             vmm.instance_info().state,
             bangbang_runtime::InstanceState::Running
+        );
+    }
+
+    #[test]
+    fn running_state_accepts_memory_hotplug_patch_and_updates_status() {
+        let mut vmm = test_controller_with_starter(TestInstanceStarter::success());
+        let memory_hotplug_request = request_with_body(
+            "PUT",
+            "/hotplug/memory",
+            r#"{"total_size_mib":1024,"block_size_mib":2,"slot_size_mib":128}"#,
+        );
+        assert_eq!(
+            handle_request_bytes(memory_hotplug_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let boot_request = request_with_body(
+            "PUT",
+            "/boot-source",
+            r#"{"kernel_image_path":"/tmp/original-vmlinux"}"#,
+        );
+        assert_eq!(
+            handle_request_bytes(boot_request.as_bytes(), &mut vmm).status(),
+            bangbang_api::http::StatusCode::NoContent
+        );
+        let start_response = put_action_over_socket(&mut vmm, "mhpst", "InstanceStart");
+        assert!(start_response.starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        let patch_response = request_over_socket(
+            &mut vmm,
+            "mhprt",
+            &request_with_body("PATCH", "/hotplug/memory", r#"{"requested_size_mib":256}"#),
+        );
+        assert!(
+            patch_response.starts_with("HTTP/1.1 204 No Content\r\n"),
+            "{patch_response}"
+        );
+
+        let get_response = request_over_socket(
+            &mut vmm,
+            "mhgrt",
+            "GET /hotplug/memory HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(
+            get_response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "{get_response}"
+        );
+        assert!(
+            get_response.contains(
+                r#"{"block_size_mib":2,"plugged_size_mib":0,"requested_size_mib":256,"slot_size_mib":128,"total_size_mib":1024}"#
+            ),
+            "{get_response}"
+        );
+
+        let invalid_patch_response = request_over_socket(
+            &mut vmm,
+            "mhpri",
+            &request_with_body("PATCH", "/hotplug/memory", r#"{"requested_size_mib":3}"#),
+        );
+        assert!(
+            invalid_patch_response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "{invalid_patch_response}"
+        );
+        assert!(
+            invalid_patch_response
+                .contains("Requested size (3 MiB) must be a multiple of block size (2 MiB)"),
+            "{invalid_patch_response}"
+        );
+        let get_after_invalid_response = request_over_socket(
+            &mut vmm,
+            "mhgai",
+            "GET /hotplug/memory HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(
+            get_after_invalid_response.contains(r#""requested_size_mib":256"#),
+            "{get_after_invalid_response}"
         );
     }
 
