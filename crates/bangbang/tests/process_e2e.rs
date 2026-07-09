@@ -756,6 +756,11 @@ fn executable_handles_remaining_device_requests_and_pmem_config() {
         r#""amount_mib":64"#,
         "GET /vm/config after PUT /balloon",
     );
+    assert_response_contains(
+        &balloon_vm_config,
+        r#""free_page_reporting":false"#,
+        "GET /vm/config after PUT /balloon",
+    );
 
     let balloon_reporting_response = http_put_json(
         &socket_path,

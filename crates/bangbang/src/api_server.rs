@@ -6285,6 +6285,7 @@ mod tests {
         assert!(vm_config_response.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(vm_config_response.contains(r#""balloon":"#));
         assert!(vm_config_response.contains(r#""amount_mib":64"#));
+        assert!(vm_config_response.contains(r#""free_page_reporting":false"#));
 
         let boot_response = request_over_socket(
             &mut vmm,
