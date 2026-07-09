@@ -12,6 +12,7 @@ use crate::mmio::{
 
 pub const BOOT_TIMER_MMIO_DEVICE_WINDOW_SIZE: u64 = 0x1000;
 pub const BOOT_TIMER_MAGIC_VALUE: u8 = 123;
+const BOOT_TIMER_REGISTER_SPACE_SIZE: u64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BootTimerMmioLayout {
@@ -331,7 +332,7 @@ fn validate_register_offset(offset: u64) -> Result<(), BootTimerMmioError> {
     } else {
         Err(BootTimerMmioError::InvalidRegisterOffset {
             offset,
-            register_space_size: BOOT_TIMER_MMIO_DEVICE_WINDOW_SIZE,
+            register_space_size: BOOT_TIMER_REGISTER_SPACE_SIZE,
         })
     }
 }
@@ -395,9 +396,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        BOOT_TIMER_MAGIC_VALUE, BOOT_TIMER_MMIO_DEVICE_WINDOW_SIZE, BootTimerClock,
-        BootTimerClockError, BootTimerMmioDevice, BootTimerMmioError, BootTimerMmioLayout,
-        BootTimerTimestamp, register_boot_timer_mmio,
+        BOOT_TIMER_MAGIC_VALUE, BOOT_TIMER_MMIO_DEVICE_WINDOW_SIZE, BOOT_TIMER_REGISTER_SPACE_SIZE,
+        BootTimerClock, BootTimerClockError, BootTimerMmioDevice, BootTimerMmioError,
+        BootTimerMmioLayout, BootTimerTimestamp, register_boot_timer_mmio,
     };
     use crate::logger::{LoggerConfigInput, LoggerState};
     use crate::memory::GuestAddress;
@@ -647,6 +648,16 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "boot timer MMIO offset 0x0 only supports 1-byte accesses, got 4 bytes"
+        );
+
+        let err = BootTimerMmioError::InvalidRegisterOffset {
+            offset: 1,
+            register_space_size: BOOT_TIMER_REGISTER_SPACE_SIZE,
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "boot timer MMIO offset 0x1 is outside the 1-byte register space"
         );
     }
 }
