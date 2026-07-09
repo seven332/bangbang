@@ -638,11 +638,11 @@ fn validate_virtio_mem_queue(
             actual: queue.max_size(),
         });
     }
-    if queue.size() == 0 {
-        return Err(VirtioMemDeviceActivationError::QueueSizeZero { queue_index });
-    }
     if !queue.ready() {
         return Err(VirtioMemDeviceActivationError::QueueNotReady { queue_index });
+    }
+    if queue.size() == 0 {
+        return Err(VirtioMemDeviceActivationError::QueueSizeZero { queue_index });
     }
 
     Ok(())
@@ -1063,6 +1063,23 @@ mod tests {
     }
 
     #[test]
+    fn virtio_mem_mmio_handler_rejects_driver_ok_before_queue_ready() {
+        let mut handler = mem_mmio_handler(virtio_mem_config_space());
+
+        advance_mem_mmio_handler_to_features_ok(&mut handler);
+        let error = handler
+            .write_register(VirtioMmioRegister::Status, TEST_DRIVER_OK_STATUS)
+            .expect_err("DRIVER_OK before queue ready should fail activation");
+
+        assert_eq!(
+            error.to_string(),
+            "virtio-mmio device activation failed while status is 0x4f: virtio-mmio device activation handler failed: virtio-mem queue 0 is not ready"
+        );
+        assert!(!handler.is_device_activated());
+        assert!(!handler.activation_handler().is_activated());
+    }
+
+    #[test]
     fn virtio_mem_device_activation_rejects_duplicate_activation() {
         let queues = configured_mem_queue(&[VIRTIO_MEM_QUEUE_SIZE], VIRTIO_MEM_QUEUE_SIZE, true);
         let device_registers = mem_device_registers();
@@ -1239,18 +1256,7 @@ mod tests {
     }
 
     fn configure_mem_mmio_handler_queue(handler: &mut VirtioMemMmioHandler) {
-        handler
-            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
-            .expect("ACKNOWLEDGE status should write");
-        handler
-            .write_register(
-                VirtioMmioRegister::Status,
-                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
-            )
-            .expect("DRIVER status should write");
-        handler
-            .write_register(VirtioMmioRegister::Status, TEST_QUEUE_CONFIG_STATUS)
-            .expect("FEATURES_OK status should write");
+        advance_mem_mmio_handler_to_features_ok(handler);
         handler
             .write_register(
                 VirtioMmioRegister::QueueNum,
@@ -1278,6 +1284,21 @@ mod tests {
         handler
             .write_register(VirtioMmioRegister::QueueReady, 1)
             .expect("queue ready should write");
+    }
+
+    fn advance_mem_mmio_handler_to_features_ok(handler: &mut VirtioMemMmioHandler) {
+        handler
+            .write_register(VirtioMmioRegister::Status, VIRTIO_DEVICE_STATUS_ACKNOWLEDGE)
+            .expect("ACKNOWLEDGE status should write");
+        handler
+            .write_register(
+                VirtioMmioRegister::Status,
+                VIRTIO_DEVICE_STATUS_ACKNOWLEDGE | VIRTIO_DEVICE_STATUS_DRIVER,
+            )
+            .expect("DRIVER status should write");
+        handler
+            .write_register(VirtioMmioRegister::Status, TEST_QUEUE_CONFIG_STATUS)
+            .expect("FEATURES_OK status should write");
     }
 
     fn configured_mem_queue(
