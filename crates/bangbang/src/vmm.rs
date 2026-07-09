@@ -12,8 +12,8 @@ use std::time::Duration;
 use bangbang_hvf::{
     HvfArm64BootBalloonDeviceConfig, HvfArm64BootEntropyDeviceConfig, HvfArm64BootRunLoopControl,
     HvfArm64BootRunLoopError, HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopStopToken,
-    HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig, HvfVcpuRunnerError,
-    OwnedHvfArm64BootSession,
+    HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig, HvfArm64BootTimerDeviceConfig,
+    HvfVcpuRunnerError, OwnedHvfArm64BootSession,
 };
 use bangbang_runtime::balloon::BalloonMmioLayout;
 use bangbang_runtime::balloon::{
@@ -26,6 +26,7 @@ use bangbang_runtime::block::{
     DriveUpdateError, DriveUpdateInput,
 };
 use bangbang_runtime::boot::BootSourceConfigInput;
+use bangbang_runtime::boot_timer::BootTimerMmioLayout;
 use bangbang_runtime::cpu::CpuConfigInput;
 use bangbang_runtime::entropy::EntropyMmioLayout;
 use bangbang_runtime::logger::LoggerConfigInput;
@@ -93,8 +94,10 @@ const DEFAULT_NETWORK_MMIO_BASE: GuestAddress = GuestAddress::new(0x6000_0000);
 const DEFAULT_NETWORK_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(1000);
 const DEFAULT_VSOCK_MMIO_BASE: GuestAddress = GuestAddress::new(0x7000_0000);
 const DEFAULT_VSOCK_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(2000);
-const DEFAULT_SERIAL_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_0000);
-const DEFAULT_SERIAL_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(0);
+const DEFAULT_BOOT_TIMER_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_0000);
+const DEFAULT_BOOT_TIMER_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(0);
+const DEFAULT_SERIAL_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_2000);
+const DEFAULT_SERIAL_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(20);
 const DEFAULT_RTC_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_1000);
 const DEFAULT_RTC_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(10);
 const DEFAULT_ENTROPY_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_7000);
@@ -840,6 +843,11 @@ impl ProcessVmm<HvfInstanceStartExecutor> {
             mmds_data_store_limit_bytes,
         )
     }
+
+    pub(crate) fn with_boot_timer_enabled(mut self, enabled: bool) -> Self {
+        self.starter.boot_timer_enabled = enabled;
+        self
+    }
 }
 
 impl<S> ProcessVmm<S>
@@ -1370,6 +1378,7 @@ where
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct HvfInstanceStartExecutor {
+    boot_timer_enabled: bool,
     serial_output: SharedSerialOutputBuffer,
     active_serial_output: Option<SharedSerialOutput>,
 }
@@ -1419,6 +1428,14 @@ impl HvfInstanceStartExecutor {
         if controller.balloon_config().is_some() {
             config = config.with_balloon_device(HvfArm64BootBalloonDeviceConfig::new(
                 BalloonMmioLayout::new(DEFAULT_BALLOON_MMIO_BASE, DEFAULT_BALLOON_MMIO_REGION_ID),
+            ));
+        }
+        if self.boot_timer_enabled {
+            config = config.with_boot_timer_device(HvfArm64BootTimerDeviceConfig::new(
+                BootTimerMmioLayout::new(
+                    DEFAULT_BOOT_TIMER_MMIO_BASE,
+                    DEFAULT_BOOT_TIMER_MMIO_REGION_ID,
+                ),
             ));
         }
 
@@ -3204,16 +3221,17 @@ mod tests {
         BootRunLoopBlockDeviceUpdater, BootRunLoopControl, BootRunLoopSession,
         BootRunLoopSupervisor, BootRunLoopWorkerStatus, DEFAULT_BALLOON_MMIO_BASE,
         DEFAULT_BALLOON_MMIO_REGION_ID, DEFAULT_BLOCK_MMIO_BASE, DEFAULT_BLOCK_MMIO_REGION_ID,
-        DEFAULT_ENTROPY_MMIO_BASE, DEFAULT_ENTROPY_MMIO_REGION_ID,
-        DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT, DEFAULT_NETWORK_MMIO_BASE,
-        DEFAULT_NETWORK_MMIO_REGION_ID, DEFAULT_PMEM_MMIO_BASE, DEFAULT_PMEM_MMIO_REGION_ID,
-        DEFAULT_SERIAL_MMIO_BASE, DEFAULT_SERIAL_MMIO_REGION_ID, DEFAULT_VSOCK_MMIO_BASE,
-        DEFAULT_VSOCK_MMIO_REGION_ID, EmptyProcessNetworkRxPacketSource, HvfInstanceStartExecutor,
-        InstanceStartExecutor, NetworkPacketIoRunLoopSession, NoopProcessNetworkTxPacketSink,
-        ProcessHvfBootSession, ProcessMmdsPacketDetourConfig, ProcessNetworkPacketIoProvider,
-        ProcessNetworkPacketIoProviderBuildError, ProcessSessionDiagnostics, ProcessVmm,
-        ProcessVmnetPacketIoBackendFactory, default_hvf_boot_run_loop_step_limit,
-        default_hvf_boot_session_config, process_vmnet_packet_io_provider_from_configs,
+        DEFAULT_BOOT_TIMER_MMIO_BASE, DEFAULT_BOOT_TIMER_MMIO_REGION_ID, DEFAULT_ENTROPY_MMIO_BASE,
+        DEFAULT_ENTROPY_MMIO_REGION_ID, DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT,
+        DEFAULT_NETWORK_MMIO_BASE, DEFAULT_NETWORK_MMIO_REGION_ID, DEFAULT_PMEM_MMIO_BASE,
+        DEFAULT_PMEM_MMIO_REGION_ID, DEFAULT_SERIAL_MMIO_BASE, DEFAULT_SERIAL_MMIO_REGION_ID,
+        DEFAULT_VSOCK_MMIO_BASE, DEFAULT_VSOCK_MMIO_REGION_ID, EmptyProcessNetworkRxPacketSource,
+        HvfInstanceStartExecutor, InstanceStartExecutor, NetworkPacketIoRunLoopSession,
+        NoopProcessNetworkTxPacketSink, ProcessHvfBootSession, ProcessMmdsPacketDetourConfig,
+        ProcessNetworkPacketIoProvider, ProcessNetworkPacketIoProviderBuildError,
+        ProcessSessionDiagnostics, ProcessVmm, ProcessVmnetPacketIoBackendFactory,
+        default_hvf_boot_run_loop_step_limit, default_hvf_boot_session_config,
+        process_vmnet_packet_io_provider_from_configs,
     };
 
     static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -4300,12 +4318,15 @@ mod tests {
         let config = executor.boot_session_config();
 
         assert_eq!(config.balloon_device, None);
+        assert_eq!(config.boot_timer_device, None);
         assert_eq!(config.entropy_device, None);
         let serial = config
             .serial_device
             .expect("default HVF boot config should include serial MMIO");
         assert_eq!(serial.region_id, DEFAULT_SERIAL_MMIO_REGION_ID);
         assert_eq!(serial.address, DEFAULT_SERIAL_MMIO_BASE);
+        assert_ne!(serial.region_id, DEFAULT_BOOT_TIMER_MMIO_REGION_ID);
+        assert_ne!(serial.address, DEFAULT_BOOT_TIMER_MMIO_BASE);
 
         let mut configured_output = serial.output.clone();
         configured_output
@@ -4392,6 +4413,31 @@ mod tests {
         assert_eq!(
             entropy.mmio_layout.region_id(),
             DEFAULT_ENTROPY_MMIO_REGION_ID
+        );
+    }
+
+    #[test]
+    fn configured_hvf_boot_session_config_includes_boot_timer_device() {
+        let executor = HvfInstanceStartExecutor {
+            boot_timer_enabled: true,
+            ..Default::default()
+        };
+        let controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+
+        let config = executor
+            .boot_session_config_for_controller(&controller)
+            .expect("configured boot timer should build boot config");
+
+        let boot_timer = config
+            .boot_timer_device
+            .expect("configured boot timer should add HVF boot timer device");
+        assert_eq!(
+            boot_timer.mmio_layout.address(),
+            DEFAULT_BOOT_TIMER_MMIO_BASE
+        );
+        assert_eq!(
+            boot_timer.mmio_layout.region_id(),
+            DEFAULT_BOOT_TIMER_MMIO_REGION_ID
         );
     }
 

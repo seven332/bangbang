@@ -199,10 +199,13 @@ direct-rootfs scenarios boot the generated ext4 rootfs without an initrd. They
 include a public `/serial` scenario that waits for
 `BANGBANG_DIRECT_ROOTFS_BOOT_OK` in the configured serial output file, plus
 scratch-drive scenarios that write `BANGBANG_DIRECT_ROOTFS_BLOCK_OK` through a
-second writable drive. This verifies the public process/API/config-file/HVF
-path, including public serial output redirection and minimal observability
-output. The executable HVF e2e target also includes direct-rootfs MMDS v1 and
-v2 token-flow scenarios that
+second writable drive. A boot-timer scenario starts the signed executable with
+`--boot-timer`, boots the Firecracker rootfs-provided `/usr/local/bin/init`
+wrapper, and waits for `Guest-boot-time` in the configured logger output after
+that wrapper writes the Firecracker magic byte to the boot-timer MMIO address.
+This verifies the public process/API/config-file/HVF path, including public
+serial output redirection and minimal observability output. The executable HVF
+e2e target also includes direct-rootfs MMDS v1 and v2 token-flow scenarios that
 configure a `vmnet:shared` network interface, configure MMDS for that
 interface, fetch a deterministic MMDS value from the guest through
 `169.254.169.254`, and write host-observable markers to unique scratch drives.

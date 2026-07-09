@@ -36,6 +36,10 @@ Value-less flags, such as `--no-api`, do not accept an attached value.
 
 - `--api-sock <PATH>` sets the Unix socket path. The default is
   `/tmp/bangbang.socket`.
+- `--boot-timer` enables Firecracker-compatible guest boot-time logging. During
+  startup, bangbang registers a pseudo-MMIO boot timer at Firecracker's aarch64
+  boot timer address; a guest write of byte value `123` at offset `0` logs the
+  elapsed wall and process CPU time when logger output is configured.
 - `--config-file <PATH>` reads a Firecracker-shaped JSON configuration for the
   supported startup subset from a readable regular file up to 1 MiB, starts the
   VM, then serves the API socket unless `--no-api` is set.
@@ -221,7 +225,8 @@ Configured logger output records minimal successful `InstanceStart` and
 `FlushMetrics` action events. `show_level` adds `level=Info`, and
 `show_log_origin` adds the runtime action callsite as `origin=<file>:<line>`.
 `module` filters these minimal action logs by prefix against
-`bangbang_runtime::vmm_action`.
+`bangbang_runtime::vmm_action`. When `--boot-timer` is enabled, boot-time log
+events use module path `bangbang_runtime::boot_timer`.
 Full internal log routing remains deferred.
 
 Submit an `InstanceStart` action:

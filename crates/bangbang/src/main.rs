@@ -44,7 +44,6 @@ const METADATA_FILE_MAX_BYTES: usize = CONFIG_FILE_MAX_BYTES;
 const MIN_INSTANCE_ID_LEN: usize = 1;
 const MAX_INSTANCE_ID_LEN: usize = 64;
 const UNSUPPORTED_FIRECRACKER_ARGS: &[&str] = &[
-    "boot-timer",
     "describe-snapshot",
     "enable-pci",
     "no-seccomp",
@@ -80,6 +79,7 @@ fn run() -> Result<(), ProcessError> {
             let effective_mmds_size_limit = config.effective_mmds_size_limit();
             let StartupConfig {
                 api_sock,
+                boot_timer,
                 config_file,
                 http_api_max_payload_size,
                 id,
@@ -107,6 +107,7 @@ fn run() -> Result<(), ProcessError> {
                 APP_NAME,
                 effective_mmds_size_limit,
             )
+            .with_boot_timer_enabled(boot_timer)
             .with_process_metrics_diagnostics(process_metrics_diagnostics)
             .with_process_signal_metrics(signal_metrics.clone());
             apply_startup_metrics_config(&mut vmm, metrics_config)?;
@@ -1147,6 +1148,7 @@ enum Command {
 #[derive(Debug, PartialEq, Eq)]
 struct StartupConfig {
     api_sock: String,
+    boot_timer: bool,
     config_file: Option<String>,
     http_api_max_payload_size: usize,
     id: String,
@@ -1276,6 +1278,7 @@ impl Default for StartupConfig {
     fn default() -> Self {
         Self {
             api_sock: DEFAULT_API_SOCK_PATH.to_string(),
+            boot_timer: false,
             config_file: None,
             http_api_max_payload_size: HTTP_MAX_PAYLOAD_SIZE,
             id: DEFAULT_INSTANCE_ID.to_string(),
@@ -1343,6 +1346,7 @@ impl Args {
 
         let mut config = StartupConfig::default();
         let mut api_sock_seen = false;
+        let mut boot_timer_seen = false;
         let mut config_file_seen = false;
         let mut http_api_max_payload_size_seen = false;
         let mut id_seen = false;
@@ -1375,6 +1379,16 @@ impl Args {
                     config.api_sock = value;
                     api_sock_seen = true;
                     index += consumed;
+                }
+                "--boot-timer" => {
+                    if boot_timer_seen {
+                        return Err(ArgsError::argument_parsing(
+                            "duplicate argument: --boot-timer",
+                        ));
+                    }
+                    config.boot_timer = true;
+                    boot_timer_seen = true;
+                    index += 1;
                 }
                 value_arg if is_value_arg(value_arg, "--config-file") => {
                     if config_file_seen {
@@ -1639,6 +1653,7 @@ fn help_text() -> String {
             "Value-less flags reject attached values.\n\n",
             "Options:\n",
             "      --api-sock <PATH>  Unix domain socket path for the API server [default: {}]\n",
+            "      --boot-timer      Enable Firecracker-compatible guest boot-time logging\n",
             "      --config-file <PATH>\n",
             "                         Firecracker-shaped config file for API-enabled startup\n",
             "      --http-api-max-payload-size <BYTES>\n",
@@ -1812,6 +1827,7 @@ fn display_arg_name(arg: &str) -> &str {
 fn unsupported_flag_equals_syntax(arg: &str) -> Option<&'static str> {
     [
         ("--help=", "help"),
+        ("--boot-timer=", "boot-timer"),
         ("--no-api=", "no-api"),
         ("--show-level=", "show-level"),
         ("--show-log-origin=", "show-log-origin"),
@@ -2287,6 +2303,7 @@ mod tests {
         let config = parse_run(&[]).expect("empty args should parse");
 
         assert_eq!(config.api_sock, DEFAULT_API_SOCK_PATH);
+        assert!(!config.boot_timer);
         assert_eq!(config.config_file, None);
         assert_eq!(config.http_api_max_payload_size, HTTP_MAX_PAYLOAD_SIZE);
         assert_eq!(config.mmds_size_limit, None);
@@ -2316,6 +2333,7 @@ mod tests {
         );
         assert!(help.contains("Value-less flags reject attached values"));
         assert!(help.contains("GET /vm/config"));
+        assert!(help.contains("--boot-timer"));
         assert!(help.contains("--config-file <PATH>"));
         assert!(help.contains("GET /machine-config"));
         assert!(help.contains("pre-boot PUT /machine-config"));
@@ -2415,6 +2433,13 @@ mod tests {
             Some("/tmp/bangbang-config.json".to_string())
         );
         assert!(config.no_api);
+    }
+
+    #[test]
+    fn parse_boot_timer_arg() {
+        let config = parse_run(&["--boot-timer"]).expect("boot timer arg should parse");
+
+        assert!(config.boot_timer);
     }
 
     #[test]
@@ -2641,6 +2666,7 @@ mod tests {
         let config = parse_run(&[
             "--api-sock",
             "/tmp/custom.socket",
+            "--boot-timer",
             "--config-file",
             "/tmp/bangbang-config.json",
             "--id",
@@ -2663,6 +2689,7 @@ mod tests {
         .expect("startup args should parse");
 
         assert_eq!(config.api_sock, "/tmp/custom.socket");
+        assert!(config.boot_timer);
         assert_eq!(
             config.config_file,
             Some("/tmp/bangbang-config.json".to_string())
@@ -2873,6 +2900,14 @@ mod tests {
         .expect_err("duplicate no-api should fail");
 
         assert_eq!(err, "duplicate argument: --no-api");
+    }
+
+    #[test]
+    fn rejects_duplicate_boot_timer() {
+        let err =
+            parse(&["--boot-timer", "--boot-timer"]).expect_err("duplicate boot timer should fail");
+
+        assert_eq!(err, "duplicate argument: --boot-timer");
     }
 
     #[test]
@@ -3214,6 +3249,13 @@ mod tests {
         assert_eq!(
             err,
             "unsupported argument syntax for --no-api; use --no-api"
+        );
+
+        let err = parse(&["--boot-timer=true"]).expect_err("flag with value should fail");
+
+        assert_eq!(
+            err,
+            "unsupported argument syntax for --boot-timer; use --boot-timer"
         );
 
         let err = parse(&["--show-level=true"]).expect_err("flag with value should fail");
