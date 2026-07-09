@@ -673,7 +673,7 @@ metric fields remain deferred. Full public run-loop control beyond pause/resume,
 guest boot output, public runner loop scheduling, full Firecracker metrics
 counters, and full logger integration beyond action and boot-timer events remain
 deferred. Metrics write failures increment `logger.missed_metrics_count`;
-logger action and boot-timer logger write failures increment `logger.missed_log_count`; broader logger
+logger action write failures and boot-timer logger write failures increment `logger.missed_log_count`; broader logger
 metrics remain deferred.
 The process startup path and API/VMM state path implement the logger field
 policy above as pre-boot-only per-process observability configuration. Startup
