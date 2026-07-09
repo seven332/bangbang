@@ -114,7 +114,7 @@ rootfs_arch="aarch64"
 rootfs_name="ubuntu-24.04"
 rootfs_sha256="0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608"
 rootfs_url="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${firecracker_minor}/${rootfs_arch}/${rootfs_name}.squashfs"
-direct_boot_variant="direct-boot-v21"
+direct_boot_variant="direct-boot-v24"
 
 cache_root="${BANGBANG_GUEST_ARTIFACTS_DIR:-$repo_root/.tmp/guest-artifacts}"
 upstream_dir="${cache_root}/firecracker-ci/${firecracker_minor}/${rootfs_arch}"
@@ -506,6 +506,165 @@ check_balloon_marker() {
 
   emit_line BANGBANG_BALLOON_GUEST_CHECK_OK
   write_vdb_marker BANGBANG_BALLOON_GUEST_CHECK_OK
+}
+
+check_memory_hotplug_marker() {
+  if [ ! -d /sys/bus/virtio/devices ]; then
+    emit_line BANGBANG_MEMORY_HOTPLUG_GUEST_CHECK_FAIL_NO_VIRTIO_BUS
+    write_vdb_marker BANGBANG_MEMORY_HOTPLUG_GUEST_CHECK_FAIL
+    return
+  fi
+
+  memory_device=
+  for driver_link in /sys/bus/virtio/devices/*/driver; do
+    if [ ! -L "$driver_link" ]; then
+      continue
+    fi
+
+    driver_target=$(readlink "$driver_link" 2>/dev/null || true)
+    if [ "${driver_target##*/}" = virtio_mem ]; then
+      memory_device=${driver_link%/driver}
+      break
+    fi
+  done
+
+  if [ -z "$memory_device" ]; then
+    emit_line BANGBANG_MEMORY_HOTPLUG_GUEST_CHECK_FAIL_NO_DEVICE
+    write_vdb_marker BANGBANG_MEMORY_HOTPLUG_GUEST_CHECK_FAIL
+    return
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    emit_line BANGBANG_MEMORY_HOTPLUG_GUEST_CHECK_FAIL_NO_PYTHON
+    write_vdb_marker BANGBANG_MEMORY_HOTPLUG_GUEST_CHECK_FAIL
+    return
+  fi
+
+  memory_hotplug_result=$(
+    python3 - <<'PY' 2>/dev/null || true
+import select
+import subprocess
+import sys
+import time
+
+DEVICE = "/dev/vdb"
+EXPECTED_REQUESTED_SIZE = 128 * 1024 * 1024
+READY_MARKER = b"BANGBANG_MEMORY_HOTPLUG_GUEST_READY"
+SUCCESS_MARKER = b"BANGBANG_MEMORY_HOTPLUG_GUEST_CHECK_OK"
+FAIL_MARKER = b"BANGBANG_MEMORY_HOTPLUG_GUEST_CHECK_FAIL"
+TIMEOUT_SECONDS = 20.0
+
+
+def marker_text(marker):
+    return marker.decode("ascii")
+
+
+def write_marker(marker):
+    try:
+        with open(DEVICE, "wb", buffering=0) as drive:
+            drive.write(marker.ljust(512, b" "))
+    except OSError:
+        pass
+
+
+def fail(reason):
+    marker = FAIL_MARKER + b"_" + reason.encode("ascii")
+    write_marker(marker)
+    print(marker_text(marker))
+    sys.exit(1)
+
+
+def requested_size_from_line(line):
+    if "virtio_mem" not in line or "requested size" not in line:
+        return None
+
+    value = line.rsplit(":", 1)[-1].strip().split()
+    if value:
+        try:
+            return int(value[0], 0)
+        except ValueError:
+            pass
+
+    normalized = line.lower()
+    if "0x8000000" in normalized or "134217728" in normalized:
+        return EXPECTED_REQUESTED_SIZE
+
+    return None
+
+
+try:
+    dmesg = subprocess.Popen(
+        ["dmesg", "--follow"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+except OSError:
+    fail("DMESG_START")
+
+try:
+    if dmesg.stdout is None:
+        fail("DMESG_STDOUT")
+
+    deadline = time.monotonic() + TIMEOUT_SECONDS
+    ready = False
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if ready:
+                fail("TIMEOUT")
+            fail("INIT_TIMEOUT")
+
+        readable, _, _ = select.select([dmesg.stdout], [], [], remaining)
+        if not readable:
+            if ready:
+                fail("TIMEOUT")
+            fail("INIT_TIMEOUT")
+
+        line = dmesg.stdout.readline()
+        if not line:
+            if dmesg.poll() is not None:
+                fail("DMESG_EXIT")
+            continue
+
+        text = line.decode("utf-8", "replace").strip()
+        requested_size = requested_size_from_line(text)
+        if requested_size is None:
+            continue
+
+        if not ready and requested_size == 0:
+            ready = True
+            deadline = time.monotonic() + TIMEOUT_SECONDS
+            write_marker(READY_MARKER)
+            print(marker_text(READY_MARKER), flush=True)
+            continue
+
+        if ready and requested_size == EXPECTED_REQUESTED_SIZE:
+            write_marker(SUCCESS_MARKER)
+            print(marker_text(SUCCESS_MARKER))
+            sys.exit(0)
+finally:
+    dmesg.terminate()
+    try:
+        dmesg.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        dmesg.kill()
+        dmesg.wait()
+PY
+  )
+
+  case "$memory_hotplug_result" in
+    *BANGBANG_MEMORY_HOTPLUG_GUEST_CHECK_OK*)
+      emit_line BANGBANG_MEMORY_HOTPLUG_GUEST_CHECK_OK
+      ;;
+    *BANGBANG_MEMORY_HOTPLUG_GUEST_CHECK_FAIL_*)
+      emit_line BANGBANG_MEMORY_HOTPLUG_GUEST_CHECK_FAIL
+      ;;
+    *)
+      emit_line BANGBANG_MEMORY_HOTPLUG_GUEST_CHECK_FAIL_RESULT
+      write_vdb_marker BANGBANG_MEMORY_HOTPLUG_GUEST_CHECK_FAIL
+      ;;
+  esac
 }
 
 flush_writeback_block_marker() {
@@ -1113,6 +1272,8 @@ if cmdline_has bangbang.entropy-read=1; then
   read_entropy_marker
 elif cmdline_has bangbang.balloon-check=1; then
   check_balloon_marker
+elif cmdline_has bangbang.memory-hotplug-check=1; then
+  check_memory_hotplug_marker
 elif cmdline_has bangbang.block-writeback-flush=1; then
   flush_writeback_block_marker
 elif cmdline_has bangbang.pmem-read-flush=1; then
