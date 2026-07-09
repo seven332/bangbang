@@ -1898,7 +1898,6 @@ fn executable_rejects_unsupported_drive_options_without_mutating() {
     let accepted_drive_path = test_dir.path().join("accepted.img");
     let rate_limited_drive_path = test_dir.path().join("rate-limited.img");
     let async_drive_path = test_dir.path().join("async.img");
-    let socket_drive_path = test_dir.path().join("socket.img");
     let private_socket_path = test_dir.path().join("private-vhost.sock");
     let instance_id = test_dir.instance_id();
     let bangbang = BangbangProcess::start(&socket_path, &instance_id);
@@ -1935,7 +1934,7 @@ fn executable_rejects_unsupported_drive_options_without_mutating() {
     assert_no_content_response(&rate_limiter_response, "PUT /drives/rate_limited");
 
     let assert_only_accepted_and_rate_limited_drives =
-        |request_name: &str, rejected_drive_id: &str, rejected_path_json: &str| {
+        |request_name: &str, rejected_drive_id: &str, rejected_path_json: Option<&str>| {
             let vm_config = http_get(&socket_path, "/vm/config");
             assert_ok_response(&vm_config, request_name);
             assert_response_contains(&vm_config, r#""drive_id":"accepted""#, request_name);
@@ -1961,10 +1960,12 @@ fn executable_rejects_unsupported_drive_options_without_mutating() {
                 !vm_config.contains(&format!(r#""drive_id":"{rejected_drive_id}""#)),
                 "{request_name} must not store rejected drive {rejected_drive_id}; response:\n{vm_config}"
             );
-            assert!(
-                !vm_config.contains(&format!(r#""path_on_host":{rejected_path_json}"#)),
-                "{request_name} must not store rejected drive path; response:\n{vm_config}"
-            );
+            if let Some(rejected_path_json) = rejected_path_json {
+                assert!(
+                    !vm_config.contains(&format!(r#""path_on_host":{rejected_path_json}"#)),
+                    "{request_name} must not store rejected drive path; response:\n{vm_config}"
+                );
+            }
         };
 
     let async_drive_path_json = json_string(path_text(&async_drive_path));
@@ -1986,16 +1987,14 @@ fn executable_rejects_unsupported_drive_options_without_mutating() {
     assert_only_accepted_and_rate_limited_drives(
         "GET /vm/config after rejected drive io_engine",
         "async",
-        &async_drive_path_json,
+        Some(&async_drive_path_json),
     );
 
-    let socket_drive_path_json = json_string(path_text(&socket_drive_path));
     let private_socket_path_text = path_text(&private_socket_path);
     let private_socket_path_json = json_string(private_socket_path_text);
     let socket_body = format!(
         r#"{{
             "drive_id":"socket",
-            "path_on_host":{socket_drive_path_json},
             "is_root_device":false,
             "socket":{private_socket_path_json}
         }}"#
@@ -2018,7 +2017,7 @@ fn executable_rejects_unsupported_drive_options_without_mutating() {
     assert_only_accepted_and_rate_limited_drives(
         "GET /vm/config after rejected drive socket",
         "socket",
-        &socket_drive_path_json,
+        None,
     );
 
     assert_clean_shutdown(bangbang.terminate(), &socket_path, "bangbang");
@@ -2957,16 +2956,13 @@ fn write_rejected_drive_socket_config(
     test_dir: &TestDir,
 ) -> (std::path::PathBuf, std::path::PathBuf) {
     let config_path = test_dir.path().join("vm-config.json");
-    let drive_path = test_dir.path().join("drive.img");
     let private_socket_path = test_dir.path().join("private-vhost.sock");
-    let drive_path_json = json_string(path_text(&drive_path));
     let private_socket_path_json = json_string(path_text(&private_socket_path));
     let config = format!(
         r#"{{
             "boot-source": {{"kernel_image_path": "/tmp/vmlinux"}},
             "drives": [{{
                 "drive_id": "rootfs",
-                "path_on_host": {drive_path_json},
                 "is_root_device": true,
                 "socket": {private_socket_path_json}
             }}]

@@ -1053,7 +1053,7 @@ struct MmdsConfigRequestBody {
 pub struct DriveConfigRequest {
     path_drive_id: String,
     body_drive_id: String,
-    path_on_host: String,
+    path_on_host: Option<String>,
     is_root_device: bool,
     is_read_only: Option<bool>,
     partuuid: Option<String>,
@@ -1072,8 +1072,8 @@ impl DriveConfigRequest {
         &self.body_drive_id
     }
 
-    pub fn path_on_host(&self) -> &str {
-        &self.path_on_host
+    pub fn path_on_host(&self) -> Option<&str> {
+        self.path_on_host.as_deref()
     }
 
     pub const fn is_root_device(&self) -> bool {
@@ -1760,7 +1760,8 @@ impl VsockConfigResponse {
 #[serde(deny_unknown_fields)]
 struct DriveConfigRequestBody {
     drive_id: String,
-    path_on_host: String,
+    #[serde(default)]
+    path_on_host: Option<String>,
     is_root_device: bool,
     #[serde(default)]
     is_read_only: Option<bool>,
@@ -3031,6 +3032,9 @@ fn parse_drive_config_request(
 ) -> Result<ApiRequest, RequestError> {
     let body = serde_json::from_slice::<DriveConfigRequestBody>(body)
         .map_err(|_| RequestError::MalformedRequest)?;
+    if body.path_on_host.is_none() && body.socket.is_none() {
+        return Err(RequestError::MalformedRequest);
+    }
     if path_drive_id != body.drive_id {
         return Err(RequestError::MismatchedDriveId);
     }
@@ -5084,7 +5088,7 @@ mod tests {
         };
         assert_eq!(config.path_drive_id(), "rootfs");
         assert_eq!(config.body_drive_id(), "rootfs");
-        assert_eq!(config.path_on_host(), "/tmp/rootfs.ext4");
+        assert_eq!(config.path_on_host(), Some("/tmp/rootfs.ext4"));
         assert!(config.is_root_device());
         assert_eq!(config.is_read_only(), None);
         assert_eq!(config.partuuid(), None);
@@ -5123,7 +5127,7 @@ mod tests {
         };
         assert_eq!(config.path_drive_id(), "rootfs");
         assert_eq!(config.body_drive_id(), "rootfs");
-        assert_eq!(config.path_on_host(), "/tmp/rootfs.ext4");
+        assert_eq!(config.path_on_host(), Some("/tmp/rootfs.ext4"));
         assert!(config.is_root_device());
         assert_eq!(config.is_read_only(), Some(true));
         assert_eq!(config.partuuid(), Some("0eaa91a0-01"));
@@ -5158,6 +5162,27 @@ mod tests {
         };
         assert!(!config.rate_limiter_configured());
         assert_eq!(config.socket(), None);
+    }
+
+    #[test]
+    fn parses_put_drive_with_socket_without_path_on_host() {
+        let body = r#"{
+            "drive_id": "vhost",
+            "is_root_device": false,
+            "socket": "/tmp/vhost.sock"
+        }"#;
+        let request = request_with_body("PUT", "/drives/vhost", body);
+
+        let parsed = parse_request(&request).expect("socket-backed drive request should parse");
+
+        let ApiRequest::PutDrive(config) = parsed else {
+            panic!("expected drive request");
+        };
+        assert_eq!(config.path_drive_id(), "vhost");
+        assert_eq!(config.body_drive_id(), "vhost");
+        assert_eq!(config.path_on_host(), None);
+        assert!(!config.is_root_device());
+        assert_eq!(config.socket(), Some("/tmp/vhost.sock"));
     }
 
     #[test]
@@ -5305,6 +5330,32 @@ mod tests {
         let request = request_with_body("PUT", "/drives/rootfs", body);
 
         assert_eq!(parse_request(&request), Err(RequestError::MalformedRequest));
+    }
+
+    #[test]
+    fn rejects_put_drive_without_path_on_host_or_socket() {
+        for (path, body) in [
+            (
+                "/drives/rootfs",
+                r#"{"drive_id":"rootfs","is_root_device":true}"#,
+            ),
+            (
+                "/drives/rootfs",
+                r#"{"drive_id":"rootfs","is_root_device":true,"path_on_host":null,"socket":null}"#,
+            ),
+            (
+                "/drives/other",
+                r#"{"drive_id":"rootfs","is_root_device":true}"#,
+            ),
+        ] {
+            let request = request_with_body("PUT", path, body);
+
+            assert_eq!(
+                parse_request(&request),
+                Err(RequestError::MalformedRequest),
+                "{body}"
+            );
+        }
     }
 
     #[test]

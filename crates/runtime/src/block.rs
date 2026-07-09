@@ -60,7 +60,7 @@ pub type VirtioBlockMmioHandler =
 pub struct DriveConfigInput {
     path_drive_id: String,
     body_drive_id: String,
-    path_on_host: PathBuf,
+    path_on_host: Option<PathBuf>,
     is_root_device: bool,
     is_read_only: Option<bool>,
     partuuid: Option<String>,
@@ -164,7 +164,26 @@ impl DriveConfigInput {
         Self {
             path_drive_id: path_drive_id.into(),
             body_drive_id: body_drive_id.into(),
-            path_on_host: path_on_host.into(),
+            path_on_host: Some(path_on_host.into()),
+            is_root_device,
+            is_read_only: None,
+            partuuid: None,
+            cache_type: None,
+            io_engine: None,
+            rate_limiter: None,
+            socket: None,
+        }
+    }
+
+    pub fn new_without_path_on_host(
+        path_drive_id: impl Into<String>,
+        body_drive_id: impl Into<String>,
+        is_root_device: bool,
+    ) -> Self {
+        Self {
+            path_drive_id: path_drive_id.into(),
+            body_drive_id: body_drive_id.into(),
+            path_on_host: None,
             is_root_device,
             is_read_only: None,
             partuuid: None,
@@ -183,8 +202,8 @@ impl DriveConfigInput {
         &self.body_drive_id
     }
 
-    pub fn path_on_host(&self) -> &Path {
-        &self.path_on_host
+    pub fn path_on_host(&self) -> Option<&Path> {
+        self.path_on_host.as_deref()
     }
 
     pub const fn is_root_device(&self) -> bool {
@@ -499,10 +518,6 @@ impl TryFrom<DriveConfigInput> for DriveConfig {
             });
         }
 
-        if input.path_on_host.as_os_str().is_empty() {
-            return Err(DriveConfigError::EmptyPathOnHost);
-        }
-
         let cache_type = input.cache_type.unwrap_or_default();
         let io_engine = input.io_engine.unwrap_or_default();
         if io_engine != DriveIoEngine::Sync {
@@ -513,9 +528,16 @@ impl TryFrom<DriveConfigInput> for DriveConfig {
             return Err(DriveConfigError::UnsupportedSocket);
         }
 
+        let Some(path_on_host) = input.path_on_host else {
+            return Err(DriveConfigError::EmptyPathOnHost);
+        };
+        if path_on_host.as_os_str().is_empty() {
+            return Err(DriveConfigError::EmptyPathOnHost);
+        }
+
         Ok(Self {
             drive_id: input.path_drive_id,
-            path_on_host: input.path_on_host,
+            path_on_host,
             is_root_device: input.is_root_device,
             is_read_only: input.is_read_only.unwrap_or(false),
             partuuid: input.partuuid,
@@ -4785,6 +4807,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_missing_path_on_host_without_socket() {
+        let err = validate(DriveConfigInput::new_without_path_on_host(
+            "rootfs", "rootfs", false,
+        ))
+        .expect_err("missing host path should fail");
+
+        assert_eq!(err, DriveConfigError::EmptyPathOnHost);
+        assert_eq!(err.to_string(), "drive path_on_host must not be empty");
+    }
+
+    #[test]
     fn accepts_writeback_cache_type() {
         let config = validate(input().with_cache_type(DriveCacheType::Writeback))
             .expect("Writeback cache should be supported");
@@ -4838,6 +4871,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_socket_field_without_path_on_host() {
+        let err = validate(
+            DriveConfigInput::new_without_path_on_host("vhost", "vhost", false)
+                .with_socket("/tmp/private-vhost.sock"),
+        )
+        .expect_err("socket-backed drive should be unsupported");
+
+        assert_eq!(err, DriveConfigError::UnsupportedSocket);
+        assert_eq!(err.to_string(), "drive socket is not supported");
+        assert!(!err.to_string().contains("private-vhost"));
+    }
+
+    #[test]
     fn drive_config_input_exposes_firecracker_shape() {
         let input = input()
             .with_is_read_only(false)
@@ -4847,7 +4893,7 @@ mod tests {
 
         assert_eq!(input.path_drive_id(), "rootfs");
         assert_eq!(input.body_drive_id(), "rootfs");
-        assert_eq!(input.path_on_host(), PathBuf::from("/tmp/rootfs.ext4"));
+        assert_eq!(input.path_on_host(), Some(Path::new("/tmp/rootfs.ext4")));
         assert!(!input.is_root_device());
         assert_eq!(input.is_read_only(), Some(false));
         assert_eq!(input.partuuid(), Some("part"));

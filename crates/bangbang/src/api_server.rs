@@ -1504,12 +1504,20 @@ fn mmds_version_name(version: RuntimeMmdsVersion) -> &'static str {
 }
 
 fn drive_config_input_from_request(config: &DriveConfigRequest) -> DriveConfigInput {
-    let mut input = DriveConfigInput::new(
-        config.path_drive_id(),
-        config.body_drive_id(),
-        config.path_on_host(),
-        config.is_root_device(),
-    );
+    let mut input = if let Some(path_on_host) = config.path_on_host() {
+        DriveConfigInput::new(
+            config.path_drive_id(),
+            config.body_drive_id(),
+            path_on_host,
+            config.is_root_device(),
+        )
+    } else {
+        DriveConfigInput::new_without_path_on_host(
+            config.path_drive_id(),
+            config.body_drive_id(),
+            config.is_root_device(),
+        )
+    };
 
     if let Some(is_read_only) = config.is_read_only() {
         input = input.with_is_read_only(is_read_only);
@@ -7793,7 +7801,6 @@ mod tests {
         let mut client = UnixStream::connect(&path).expect("client should connect");
         let body = r#"{
             "drive_id": "rootfs",
-            "path_on_host": "/tmp/rootfs.ext4",
             "is_root_device": true,
             "socket": "/tmp/private-vhost.sock"
         }"#;
