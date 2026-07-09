@@ -100,14 +100,17 @@ rationale, and platform limits.
 
 The intended public control plane is Firecracker-style HTTP over a Unix domain
 socket. The implemented `GET /`, `GET /version`, `GET /vm/config`,
-`GET /machine-config`, pre-boot `PUT /machine-config`, pre-boot
-`PUT /boot-source`, pre-boot `PUT /drives/{drive_id}`, pre-boot
-`PUT /network-interfaces/{iface_id}`, pre-boot `PUT /pmem/{id}`, pre-boot `PUT /vsock`, pre-boot
-`PUT /metrics`, pre-boot `PUT /logger`, pre-boot `PUT /serial`, parsed `PUT /actions`,
-pre-boot `PATCH /machine-config`, parsed `PATCH /mmds`, runtime `PATCH /vm`, and
-runtime `PATCH /drives/{drive_id}` requests already map through a minimal internal VMM
-action/data boundary. Validation rejects malformed boot-source, drive update,
-VM state update, and actions requests before VMM state mutation.
+`GET /machine-config`, `GET /hotplug/memory`, pre-boot
+`PUT /machine-config`, pre-boot `PUT /boot-source`, pre-boot
+`PUT /drives/{drive_id}`, pre-boot `PUT /network-interfaces/{iface_id}`,
+pre-boot `PUT /pmem/{id}`, pre-boot `PUT /vsock`, pre-boot
+`PUT /hotplug/memory`, pre-boot `PUT /metrics`, pre-boot `PUT /logger`,
+pre-boot `PUT /serial`, parsed `PUT /actions`, pre-boot
+`PATCH /machine-config`, parsed `PATCH /mmds`, parsed
+`PATCH /hotplug/memory`, runtime `PATCH /vm`, and runtime
+`PATCH /drives/{drive_id}` requests already map through a minimal internal VMM
+action/data boundary. Validation rejects malformed boot-source, memory-hotplug,
+drive update, VM state update, and actions requests before VMM state mutation.
 Successful `InstanceStart` startup, the `Running` transition, runtime `Paused`/`Running` transitions through `PATCH /vm`, and an internal boot run-loop worker across bounded step windows are implemented with configured or default internal serial MMIO
 output and retained internal active, paused, terminal-outcome, or error worker status. Process-owned API-enabled and no-api runs can exit successfully after guest PSCI `SYSTEM_OFF` or `SYSTEM_RESET` terminal outcomes, and fail the process on non-success terminal worker states. Startup CLI and config-file metrics paths write one initial minimal metrics line when the metrics sink is configured. `FlushMetrics` is implemented as a runtime-only minimal JSON-line flush through per-process metrics state, and includes a terse `boot_run_loop_status` summary when a process-owned boot worker exists plus initial Firecracker-shaped GET, core configuration PUT, MMDS PUT, selected PATCH, observability PUT, `/actions` API request counters, selected deprecated HTTP API usage, `logger.missed_metrics_count` after a previous metrics write failure, `logger.missed_log_count` after a previous logger action write failure or boot-timer logger write failure, Firecracker-shaped `signals.sigpipe` counts for handled non-terminating `SIGPIPE`, Firecracker-shaped `uart` metrics for implemented serial TX writes, output errors, missed writes, and rate-limiter drops, a minimal aggregate `block` object and non-empty per-drive `block_{drive_id}` objects for implemented virtio-block queue activity, read/write latency aggregates, backing update counters, and failures, a minimal aggregate `net` and non-empty per-interface `net_{iface_id}` objects for implemented virtio-net RX/TX queue activity, packet counts, byte counts, and failures, a minimal aggregate `vsock` object for implemented virtio-vsock RX/TX queue activity, packet counts, payload byte counts, connection add/remove cleanup counters, and classifiable queue/event failures, a minimal aggregate `entropy` object for implemented virtio-rng request, byte, host-randomness failure, and event-failure activity, and a minimal `balloon` object when the active balloon device reports implemented queue activity or failures. API-enabled and no-api runtime loops also flush the same minimal metrics output every 60 seconds while the VM is running. `PUT /logger` is implemented as pre-boot per-process observability configuration with minimal successful `InstanceStart` and `FlushMetrics` action-event output; full Firecracker run-loop control beyond the current single-worker pause/resume subset, public serial
 streaming, serial input and flush counter producers, broader Firecracker metrics
@@ -119,14 +122,17 @@ deferred.
 The current `bangbang` executable parses only the first process-lifecycle
 arguments and starts the first API socket surface. It binds a Unix socket and
 serves `GET /`, `GET /version`, `GET /vm/config`, `GET /machine-config`,
-pre-boot `PUT /machine-config`, pre-boot `PUT /boot-source` configuration storage, and
-pre-boot `PUT /drives/{drive_id}` configuration storage, pre-boot
-`PUT /pmem/{id}` configuration storage, runtime
-`PATCH /drives/{drive_id}` backing refresh, pre-boot
-`PUT /network-interfaces/{iface_id}` configuration storage, pre-boot `PUT /vsock` configuration storage, pre-boot `PUT /metrics`
-output configuration, pre-boot `PUT /logger` output configuration, pre-boot
-`PUT /serial` output configuration, metrics and logger startup CLI configuration, plus process-routed `PUT /actions` startup and metrics
-flush with an internal boot run-loop worker across bounded step windows or
+`GET /hotplug/memory`, pre-boot `PUT /machine-config`, pre-boot
+`PUT /boot-source` configuration storage, and pre-boot
+`PUT /drives/{drive_id}` configuration storage, pre-boot `PUT /pmem/{id}`
+configuration storage, runtime `PATCH /drives/{drive_id}` backing refresh,
+pre-boot `PUT /network-interfaces/{iface_id}` configuration storage, pre-boot
+`PUT /vsock` configuration storage, pre-boot `PUT /hotplug/memory`
+configuration storage, pre-boot `PUT /metrics` output configuration, pre-boot
+`PUT /logger` output configuration, pre-boot `PUT /serial` output
+configuration, parsed `PATCH /hotplug/memory`, metrics and logger startup CLI
+configuration, plus process-routed `PUT /actions` startup and metrics flush
+with an internal boot run-loop worker across bounded step windows or
 state/configuration faults. The process can also read `--config-file` for the
 supported startup subset, start the VM before serving the API socket, and then
 keep the API socket available for runtime requests. With `--no-api`, the same
