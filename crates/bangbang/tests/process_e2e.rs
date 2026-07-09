@@ -756,6 +756,41 @@ fn executable_handles_remaining_device_requests_and_pmem_config() {
         r#""amount_mib":64"#,
         "GET /vm/config after PUT /balloon",
     );
+    assert_response_contains(
+        &balloon_vm_config,
+        r#""free_page_reporting":false"#,
+        "GET /vm/config after PUT /balloon",
+    );
+
+    let balloon_reporting_response = http_put_json(
+        &socket_path,
+        "/balloon",
+        r#"{"amount_mib":32,"deflate_on_oom":false,"free_page_reporting":true}"#,
+    );
+    assert_bad_request_response(
+        &balloon_reporting_response,
+        "PUT /balloon free_page_reporting",
+    );
+    assert_response_contains(
+        &balloon_reporting_response,
+        r#"{"fault_message":"balloon free_page_reporting is not supported"}"#,
+        "PUT /balloon free_page_reporting",
+    );
+    let balloon_after_reporting = http_get(&socket_path, "/balloon");
+    assert_ok_response(
+        &balloon_after_reporting,
+        "GET /balloon after rejected free_page_reporting",
+    );
+    assert_response_contains(
+        &balloon_after_reporting,
+        r#""amount_mib":64"#,
+        "GET /balloon after rejected free_page_reporting",
+    );
+    assert_response_contains(
+        &balloon_after_reporting,
+        r#""free_page_reporting":false"#,
+        "GET /balloon after rejected free_page_reporting",
+    );
 
     for (path, action) in [
         ("/balloon/statistics", "GetBalloonStats"),
@@ -1037,6 +1072,46 @@ fn executable_no_api_config_file_pmem_root_device_fails_before_socket() {
         &socket_path,
         &pmem_path,
         "no-api config-file pmem root-device startup",
+    );
+}
+
+#[test]
+fn executable_config_file_balloon_free_page_reporting_fails_before_socket() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let config_path = write_balloon_free_page_reporting_startup_config(&test_dir);
+    let instance_id = test_dir.instance_id();
+
+    let output = BangbangProcess::start_with_extra_args_expect_failure(
+        &socket_path,
+        &instance_id,
+        &["--config-file", path_text(&config_path)],
+    );
+
+    assert_balloon_free_page_reporting_startup_failure(
+        &output,
+        &socket_path,
+        "config-file balloon free-page reporting startup",
+    );
+}
+
+#[test]
+fn executable_no_api_config_file_balloon_free_page_reporting_fails_before_socket() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let config_path = write_balloon_free_page_reporting_startup_config(&test_dir);
+    let instance_id = test_dir.instance_id();
+
+    let output = BangbangProcess::start_with_extra_args_expect_failure(
+        &socket_path,
+        &instance_id,
+        &["--config-file", path_text(&config_path), "--no-api"],
+    );
+
+    assert_balloon_free_page_reporting_startup_failure(
+        &output,
+        &socket_path,
+        "no-api config-file balloon free-page reporting startup",
     );
 }
 
@@ -2956,6 +3031,20 @@ fn write_pmem_root_device_startup_config(
     (config_path, pmem_path)
 }
 
+fn write_balloon_free_page_reporting_startup_config(test_dir: &TestDir) -> std::path::PathBuf {
+    let config_path = test_dir.path().join("vm-config.json");
+    fs::write(
+        &config_path,
+        r#"{
+            "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
+            "balloon":{"amount_mib":64,"deflate_on_oom":true,"free_page_reporting":true}
+        }"#,
+    )
+    .expect("config file should be written");
+
+    config_path
+}
+
 fn write_multi_vcpu_startup_config(test_dir: &TestDir) -> (std::path::PathBuf, std::path::PathBuf) {
     let config_path = test_dir.path().join("vm-config.json");
     let kernel_path = test_dir.path().join("private-vmlinux");
@@ -3279,6 +3368,42 @@ fn assert_pmem_root_device_startup_failure(
     assert!(
         !pmem_path.exists(),
         "{case_name} must not create rejected pmem backing path"
+    );
+}
+
+fn assert_balloon_free_page_reporting_startup_failure(
+    output: &support::CompletedProcess,
+    socket_path: &std::path::Path,
+    case_name: &str,
+) {
+    assert!(
+        !output.status.success(),
+        "{case_name} should fail startup; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        output.stdout,
+        output.stderr
+    );
+    assert_bad_configuration_exit_code(output, case_name);
+    assert!(
+        !socket_path.exists(),
+        "{case_name} should fail before API socket publication"
+    );
+    assert!(
+        !output.stdout.contains("status: API server listening"),
+        "{case_name} must not report API readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !output.stdout.contains("status: VM running without API"),
+        "{case_name} must not report no-api readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        output.stderr.contains(
+            "bangbang: config-file error: failed to apply config-file action: balloon free_page_reporting is not supported"
+        ),
+        "{case_name} stderr should describe balloon free-page reporting rejection; stderr:\n{}",
+        output.stderr
     );
 }
 

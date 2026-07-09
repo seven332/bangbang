@@ -4193,6 +4193,45 @@ mod tests {
     }
 
     #[test]
+    fn config_file_rejects_balloon_free_page_reporting_before_starting() {
+        let config_path = unique_config_path("balloon-free-page-reporting");
+        let config = r#"{
+            "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
+            "balloon":{"amount_mib":64,"deflate_on_oom":true,"free_page_reporting":true}
+        }"#;
+        fs::write(&config_path, config).expect("config file should be written");
+        let mut vmm = ProcessVmm::with_starter(
+            "demo-1",
+            env!("CARGO_PKG_VERSION"),
+            "bangbang",
+            TestInstanceStarter,
+        );
+
+        let err = super::apply_startup_config_file(
+            &mut vmm,
+            Some(config_path.to_str().expect("UTF-8 path")),
+        )
+        .expect_err("free-page reporting should fail before start");
+
+        assert_eq!(
+            err,
+            ProcessError::ConfigFile(super::ConfigFileError::Apply(
+                VmmActionError::BalloonConfig(
+                    bangbang_runtime::balloon::BalloonConfigError::UnsupportedFreePageReporting,
+                ),
+            ))
+        );
+        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
+        assert!(!vmm.has_started_session());
+        assert_eq!(
+            vmm.handle_action(VmmAction::GetBalloon),
+            Err(VmmActionError::BalloonUnsupported)
+        );
+
+        fs::remove_file(config_path).expect("fixture config should clean up");
+    }
+
+    #[test]
     fn config_file_rejects_malformed_drive_array() {
         let err = super::config_file_actions_from_str(
             r#"{"boot-source":{"kernel_image_path":"/tmp/vmlinux"},"drives":{}}"#,

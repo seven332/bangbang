@@ -112,6 +112,7 @@ impl std::error::Error for BalloonPageCountOverflow {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BalloonConfigError {
     TargetExceedsGuestMemory { amount_mib: u32, mem_size_mib: u64 },
+    UnsupportedFreePageReporting,
 }
 
 impl fmt::Display for BalloonConfigError {
@@ -124,6 +125,9 @@ impl fmt::Display for BalloonConfigError {
                 f,
                 "balloon amount_mib {amount_mib} exceeds configured guest memory {mem_size_mib} MiB"
             ),
+            Self::UnsupportedFreePageReporting => {
+                f.write_str("balloon free_page_reporting is not supported")
+            }
         }
     }
 }
@@ -358,6 +362,14 @@ impl BalloonConfigInput {
 
     pub const fn free_page_reporting(self) -> bool {
         self.free_page_reporting
+    }
+
+    pub fn validate(self) -> Result<BalloonConfig, BalloonConfigError> {
+        if self.free_page_reporting {
+            return Err(BalloonConfigError::UnsupportedFreePageReporting);
+        }
+
+        Ok(self.into())
     }
 }
 
@@ -4716,6 +4728,37 @@ mod tests {
 
     fn prepared(config: BalloonConfig) -> PreparedBalloonDevice {
         PreparedBalloonDevice::from_config(config).expect("balloon config should prepare")
+    }
+
+    #[test]
+    fn config_input_rejects_free_page_reporting() {
+        let err = BalloonConfigInput::new(64, true)
+            .with_free_page_reporting(true)
+            .validate()
+            .expect_err("free-page reporting should be rejected");
+
+        assert_eq!(err, BalloonConfigError::UnsupportedFreePageReporting);
+        assert_eq!(
+            err.to_string(),
+            "balloon free_page_reporting is not supported"
+        );
+    }
+
+    #[test]
+    fn config_input_accepts_missing_or_false_free_page_reporting() {
+        assert_eq!(
+            BalloonConfigInput::new(64, true)
+                .validate()
+                .expect("omitted free-page reporting should be accepted"),
+            balloon_config(64, true, 0, false, false)
+        );
+        assert_eq!(
+            BalloonConfigInput::new(64, true)
+                .with_free_page_reporting(false)
+                .validate()
+                .expect("false free-page reporting should be accepted"),
+            balloon_config(64, true, 0, false, false)
+        );
     }
 
     fn pfn_payload_bytes(pfns: &[u32]) -> Vec<u8> {

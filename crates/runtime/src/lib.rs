@@ -614,7 +614,7 @@ impl VmmController {
         &self,
         input: balloon::BalloonConfigInput,
     ) -> Result<balloon::BalloonConfig, VmmActionError> {
-        let config = balloon::BalloonConfig::from(input);
+        let config = input.validate().map_err(VmmActionError::BalloonConfig)?;
         Self::validate_balloon_config_target_against_memory(
             config.amount_mib(),
             self.machine_config.mem_size_mib(),
@@ -2226,6 +2226,29 @@ mod tests {
                 amount_mib: (DEFAULT_MEM_SIZE_MIB + 1) as u32,
                 mem_size_mib: DEFAULT_MEM_SIZE_MIB,
             })
+        );
+        assert_eq!(
+            controller.balloon_config(),
+            Some(BalloonConfig::from(balloon_input(64, true)))
+        );
+    }
+
+    #[test]
+    fn put_balloon_rejects_free_page_reporting_without_mutating() {
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutBalloon(balloon_input(64, true)))
+            .expect("initial balloon should store");
+
+        let err = controller
+            .handle_action(VmmAction::PutBalloon(
+                balloon_input(32, false).with_free_page_reporting(true),
+            ))
+            .expect_err("free-page reporting should fail");
+
+        assert_eq!(
+            err,
+            VmmActionError::BalloonConfig(BalloonConfigError::UnsupportedFreePageReporting)
         );
         assert_eq!(
             controller.balloon_config(),
