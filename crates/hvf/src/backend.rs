@@ -9,7 +9,7 @@ use bangbang_runtime::{BackendError, VmBackend};
 use crate::gic::{HvfGicCreator, HvfGicError, HvfGicMetadata, RealHvfGicCreator};
 use crate::memory::{
     HvfGuestMemoryMapping, HvfGuestMemoryMappingError, HvfHostMemoryMapping, HvfMemoryMapper,
-    HvfMemoryPermissions, RealHvfMemoryMapper,
+    HvfMemoryPermissions, HvfVirtioMemMutationExecutor, RealHvfMemoryMapper,
 };
 use crate::runner::{HvfVcpuRunner, HvfVcpuRunnerError};
 use crate::vcpu::HvfVcpu;
@@ -110,6 +110,19 @@ impl HvfBackend {
                 GUEST_MEMORY_NOT_MAPPED_MESSAGE,
             ))?
             .memory_mut()
+    }
+
+    pub(crate) fn mapped_guest_memory_and_virtio_mem_executor_mut(
+        &mut self,
+        permissions: HvfMemoryPermissions,
+    ) -> Result<(&mut GuestMemory, HvfVirtioMemMutationExecutor<'_>), HvfGuestMemoryMappingError>
+    {
+        self.guest_memory
+            .as_mut()
+            .ok_or(HvfGuestMemoryMappingError::InvalidState(
+                GUEST_MEMORY_NOT_MAPPED_MESSAGE,
+            ))?
+            .memory_and_virtio_mem_executor_mut(permissions)
     }
 
     /// Insert one owned guest memory region and map it into the active HVF VM.

@@ -43,7 +43,8 @@ use crate::memory_hotplug::{
     MemoryHotplugConfig, MemoryHotplugSizeUpdate, MemoryHotplugStatus, MemoryHotplugStatusError,
     MemoryHotplugUpdateError, PreparedVirtioMemDevice, VirtioMemDeviceNotificationDispatch,
     VirtioMemDeviceNotificationError, VirtioMemMmioDeviceRegistration, VirtioMemMmioHandler,
-    VirtioMemMmioLayout, VirtioMemMmioRegistrationError, VirtioMemPrepareError,
+    VirtioMemMmioLayout, VirtioMemMmioRegistrationError, VirtioMemMutationExecutor,
+    VirtioMemPrepareError,
 };
 use crate::mmio::{
     MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandlerLookupError, MmioRegion,
@@ -1590,6 +1591,23 @@ impl Arm64BootRuntimeResources {
         Arm64BootMemoryHotplugNotificationDispatches,
         Arm64BootMemoryHotplugNotificationDispatchError,
     > {
+        let mut mutation_executor = crate::memory_hotplug::NoopVirtioMemMutationExecutor;
+        self.dispatch_memory_hotplug_queue_notifications_with_executor(
+            memory,
+            mmio_dispatcher,
+            &mut mutation_executor,
+        )
+    }
+
+    pub fn dispatch_memory_hotplug_queue_notifications_with_executor(
+        &mut self,
+        memory: &mut GuestMemory,
+        mmio_dispatcher: &mut MmioDispatcher,
+        mutation_executor: &mut impl VirtioMemMutationExecutor,
+    ) -> Result<
+        Arm64BootMemoryHotplugNotificationDispatches,
+        Arm64BootMemoryHotplugNotificationDispatchError,
+    > {
         let mut devices = Vec::new();
         let device_count = if self.memory_hotplug_device.is_some() {
             1
@@ -1603,12 +1621,18 @@ impl Arm64BootRuntimeResources {
         if let Some(device) = self.memory_hotplug_device.clone() {
             let region_id = device.registration.region_id();
             let outcome = match mmio_dispatcher.handler_mut::<VirtioMemMmioHandler>(region_id) {
-                Ok(handler) => match handler.dispatch_mem_queue_notifications(memory) {
-                    Ok(dispatch) => Arm64BootMemoryHotplugNotificationOutcome::Dispatched(dispatch),
-                    Err(source) => {
-                        Arm64BootMemoryHotplugNotificationOutcome::DispatchFailed(source)
+                Ok(handler) => {
+                    match handler
+                        .dispatch_mem_queue_notifications_with_executor(memory, mutation_executor)
+                    {
+                        Ok(dispatch) => {
+                            Arm64BootMemoryHotplugNotificationOutcome::Dispatched(dispatch)
+                        }
+                        Err(source) => {
+                            Arm64BootMemoryHotplugNotificationOutcome::DispatchFailed(source)
+                        }
                     }
-                },
+                }
                 Err(source) => {
                     Arm64BootMemoryHotplugNotificationOutcome::HandlerLookupFailed(source)
                 }

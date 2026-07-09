@@ -1324,7 +1324,7 @@ impl VirtioMemRequest {
         if let Some(mutation) = prepared.mutation {
             match mutation
                 .to_executable_mutation(config_space, plugged_blocks)
-                .and_then(|mutation| mutation_executor.apply(mutation))
+                .and_then(|mutation| mutation_executor.apply(memory, mutation))
             {
                 Ok(applied) => {
                     applied_mutation = Some(applied);
@@ -1348,7 +1348,7 @@ impl VirtioMemRequest {
             Err(source) => {
                 if let Some(applied) = applied_mutation {
                     mutation_executor
-                        .rollback(applied)
+                        .rollback(memory, applied)
                         .map_err(|rollback_source| {
                             VirtioMemRequestExecutionError::ResponseWriteRollback {
                                 descriptor_head: self.descriptor_head,
@@ -1560,11 +1560,13 @@ impl VirtioMemAppliedMutation {
 pub trait VirtioMemMutationExecutor {
     fn apply(
         &mut self,
+        memory: &mut GuestMemory,
         mutation: VirtioMemMutation,
     ) -> Result<VirtioMemAppliedMutation, VirtioMemMutationError>;
 
     fn rollback(
         &mut self,
+        memory: &mut GuestMemory,
         applied: VirtioMemAppliedMutation,
     ) -> Result<(), VirtioMemMutationRollbackError>;
 }
@@ -1575,6 +1577,7 @@ pub struct NoopVirtioMemMutationExecutor;
 impl VirtioMemMutationExecutor for NoopVirtioMemMutationExecutor {
     fn apply(
         &mut self,
+        _memory: &mut GuestMemory,
         mutation: VirtioMemMutation,
     ) -> Result<VirtioMemAppliedMutation, VirtioMemMutationError> {
         Ok(VirtioMemAppliedMutation::new(mutation))
@@ -1582,6 +1585,7 @@ impl VirtioMemMutationExecutor for NoopVirtioMemMutationExecutor {
 
     fn rollback(
         &mut self,
+        _memory: &mut GuestMemory,
         _applied: VirtioMemAppliedMutation,
     ) -> Result<(), VirtioMemMutationRollbackError> {
         Ok(())
@@ -1840,6 +1844,7 @@ impl VirtioMemQueue {
         &self.used
     }
 
+    #[cfg(test)]
     fn dispatch(
         &mut self,
         memory: &mut GuestMemory,
@@ -1904,7 +1909,7 @@ impl VirtioMemQueue {
                     descriptor_head: completion.descriptor_head(),
                     bytes_written_to_guest: completion.bytes_written_to_guest(),
                     rollback_error: applied_mutation
-                        .map(|applied| mutation_executor.rollback(applied).err())
+                        .map(|applied| mutation_executor.rollback(memory, applied).err())
                         .unwrap_or(None),
                     source,
                 })?;
@@ -2274,11 +2279,28 @@ impl VirtioMemDevice {
         self.active_queue.as_mut()
     }
 
+    #[cfg(test)]
     fn dispatch_drained_queue_notifications(
         &mut self,
         memory: &mut GuestMemory,
         config_space: &mut VirtioMemConfigSpace,
         drained_notifications: Vec<usize>,
+    ) -> Result<VirtioMemDeviceNotificationDispatch, VirtioMemDeviceNotificationError> {
+        let mut mutation_executor = NoopVirtioMemMutationExecutor;
+        self.dispatch_drained_queue_notifications_with_executor(
+            memory,
+            config_space,
+            drained_notifications,
+            &mut mutation_executor,
+        )
+    }
+
+    fn dispatch_drained_queue_notifications_with_executor(
+        &mut self,
+        memory: &mut GuestMemory,
+        config_space: &mut VirtioMemConfigSpace,
+        drained_notifications: Vec<usize>,
+        mutation_executor: &mut impl VirtioMemMutationExecutor,
     ) -> Result<VirtioMemDeviceNotificationDispatch, VirtioMemDeviceNotificationError> {
         if drained_notifications.is_empty() {
             return Ok(VirtioMemDeviceNotificationDispatch::new(
@@ -2304,7 +2326,12 @@ impl VirtioMemDevice {
             });
         };
 
-        match queue.dispatch(memory, config_space, &mut self.plugged_blocks) {
+        match queue.dispatch_with_executor(
+            memory,
+            config_space,
+            &mut self.plugged_blocks,
+            mutation_executor,
+        ) {
             Ok(dispatch) => Ok(VirtioMemDeviceNotificationDispatch::new(
                 drained_notifications,
                 Some(dispatch),
@@ -2360,12 +2387,26 @@ impl VirtioMmioRegisterHandler<VirtioMemConfigSpace, VirtioMemDevice> {
         &mut self,
         memory: &mut GuestMemory,
     ) -> Result<VirtioMemDeviceNotificationDispatch, VirtioMemDeviceNotificationError> {
+        let mut mutation_executor = NoopVirtioMemMutationExecutor;
+        self.dispatch_mem_queue_notifications_with_executor(memory, &mut mutation_executor)
+    }
+
+    pub fn dispatch_mem_queue_notifications_with_executor(
+        &mut self,
+        memory: &mut GuestMemory,
+        mutation_executor: &mut impl VirtioMemMutationExecutor,
+    ) -> Result<VirtioMemDeviceNotificationDispatch, VirtioMemDeviceNotificationError> {
         let drained_notifications = self.take_pending_queue_notifications();
         let previous_config_space = *self.device_config_handler();
         let mut config_space = previous_config_space;
         let dispatch = self
             .activation_handler_mut()
-            .dispatch_drained_queue_notifications(memory, &mut config_space, drained_notifications);
+            .dispatch_drained_queue_notifications_with_executor(
+                memory,
+                &mut config_space,
+                drained_notifications,
+                mutation_executor,
+            );
         if config_space != previous_config_space {
             *self.device_config_handler_mut() = config_space;
             self.increment_config_generation();
@@ -5023,6 +5064,7 @@ mod tests {
     impl VirtioMemMutationExecutor for RecordingMutationExecutor {
         fn apply(
             &mut self,
+            _memory: &mut GuestMemory,
             mutation: VirtioMemMutation,
         ) -> Result<VirtioMemAppliedMutation, VirtioMemMutationError> {
             self.apply_calls.push(mutation.clone());
@@ -5034,6 +5076,7 @@ mod tests {
 
         fn rollback(
             &mut self,
+            _memory: &mut GuestMemory,
             applied: VirtioMemAppliedMutation,
         ) -> Result<(), VirtioMemMutationRollbackError> {
             self.rolled_back.push(applied);
