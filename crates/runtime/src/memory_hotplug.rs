@@ -288,15 +288,6 @@ enum VirtioMemSizeField {
     TotalSize,
 }
 
-impl fmt::Display for VirtioMemSizeField {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::BlockSize => f.write_str("block_size_mib"),
-            Self::TotalSize => f.write_str("total_size_mib"),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VirtioMemPrepareError {
     SizeOverflow {
