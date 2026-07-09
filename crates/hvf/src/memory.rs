@@ -1811,6 +1811,35 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_map_before_existing_range_preserves_owner_and_mapping_order() {
+        let page_size = page_size();
+        let dynamic_range = range(0, page_size);
+        let base_range = range(page_size * 2, page_size);
+        let memory = memory_for_ranges(vec![base_range]);
+        let mapper = Arc::new(RecordingMapper::default());
+        let mut mapping =
+            HvfGuestMemoryMapping::map_with_mapper(memory, HvfMemoryPermissions::GUEST_RAM, mapper)
+                .expect("initial guest memory should map");
+
+        mapping
+            .map_dynamic_region(dynamic_range, HvfMemoryPermissions::GUEST_RAM)
+            .expect("dynamic range before existing range should map");
+
+        assert_eq!(
+            memory_ranges(mapping.memory().expect("guest memory owner should exist")),
+            vec![dynamic_range, base_range]
+        );
+        assert_eq!(
+            mapping
+                .mapped_regions
+                .iter()
+                .map(|mapped_region| mapped_region.range)
+                .collect::<Vec<_>>(),
+            vec![dynamic_range, base_range]
+        );
+    }
+
+    #[test]
     fn dynamic_map_rejects_overlap_without_owner_mutation() {
         let page_size = page_size();
         let base_range = range(0, page_size);
