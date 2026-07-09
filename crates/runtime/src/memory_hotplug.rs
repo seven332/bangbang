@@ -336,7 +336,6 @@ pub enum MemoryHotplugUpdateError {
     ActiveSessionCommand {
         message: String,
     },
-    MmioDispatcherUnavailable,
     HandlerLookup(MmioHandlerLookupError),
 }
 
@@ -373,7 +372,6 @@ impl fmt::Display for MemoryHotplugUpdateError {
             Self::ActiveSessionCommand { message } => {
                 write!(f, "active memory hotplug device update failed: {message}")
             }
-            Self::MmioDispatcherUnavailable => f.write_str("active MMIO dispatcher is unavailable"),
             Self::HandlerLookup(err) => write!(f, "{err}"),
         }
     }
@@ -388,8 +386,7 @@ impl std::error::Error for MemoryHotplugUpdateError {
             | Self::RequestedSizeTooLarge { .. }
             | Self::UsableRegionSizeOverflow { .. }
             | Self::ActiveSessionUnavailable
-            | Self::ActiveSessionCommand { .. }
-            | Self::MmioDispatcherUnavailable => None,
+            | Self::ActiveSessionCommand { .. } => None,
         }
     }
 }
