@@ -192,7 +192,9 @@ because Firecracker does not expose matching balloon API request metric fields.
 Runtime metrics flushes can also include a top-level aggregate `block` object
 and non-empty per-drive `block_{drive_id}` objects for implemented virtio-block
 queue activity, read/write latency aggregates, backing update counters, and
-failures; top-level aggregate `net` and non-empty per-interface
+failures; a top-level aggregate `pmem` object and non-empty per-device
+`pmem_{id}` objects for implemented virtio-pmem queue activity and failures;
+top-level aggregate `net` and non-empty per-interface
 `net_{iface_id}` objects for implemented virtio-net RX/TX queue activity,
 packet counts, byte counts, and failures; a top-level `vsock` object for
 implemented virtio-vsock RX/TX queue activity, packet counts, byte counts,

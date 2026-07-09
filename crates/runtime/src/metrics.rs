@@ -20,6 +20,10 @@ use crate::network::{
     VirtioNetworkDeviceNotificationError, VirtioNetworkRxQueueDispatch,
     VirtioNetworkTxQueueDispatch,
 };
+use crate::pmem::{
+    VirtioPmemDeviceNotificationDispatch, VirtioPmemDeviceNotificationError,
+    VirtioPmemQueueDispatch,
+};
 use crate::serial::SerialOutputMetrics;
 use crate::vsock::{
     VIRTIO_VSOCK_EVENT_QUEUE_INDEX, VIRTIO_VSOCK_RX_QUEUE_INDEX, VIRTIO_VSOCK_TX_QUEUE_INDEX,
@@ -1547,6 +1551,320 @@ impl SharedBlockDeviceMetricsRegistry {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PmemDeviceMetrics {
+    activate_fails: u64,
+    cfg_fails: u64,
+    event_fails: u64,
+    queue_event_count: u64,
+    rate_limiter_throttled_events: u64,
+    rate_limiter_event_count: u64,
+}
+
+impl PmemDeviceMetrics {
+    pub const fn is_empty(self) -> bool {
+        self.activate_fails == 0
+            && self.cfg_fails == 0
+            && self.event_fails == 0
+            && self.queue_event_count == 0
+            && self.rate_limiter_throttled_events == 0
+            && self.rate_limiter_event_count == 0
+    }
+
+    pub const fn activate_fails(self) -> u64 {
+        self.activate_fails
+    }
+
+    pub const fn cfg_fails(self) -> u64 {
+        self.cfg_fails
+    }
+
+    pub const fn event_fails(self) -> u64 {
+        self.event_fails
+    }
+
+    pub const fn queue_event_count(self) -> u64 {
+        self.queue_event_count
+    }
+
+    pub const fn rate_limiter_throttled_events(self) -> u64 {
+        self.rate_limiter_throttled_events
+    }
+
+    pub const fn rate_limiter_event_count(self) -> u64 {
+        self.rate_limiter_event_count
+    }
+
+    pub const fn with_activate_fails(mut self, activate_fails: u64) -> Self {
+        self.activate_fails = activate_fails;
+        self
+    }
+
+    pub const fn with_cfg_fails(mut self, cfg_fails: u64) -> Self {
+        self.cfg_fails = cfg_fails;
+        self
+    }
+
+    pub const fn with_event_fails(mut self, event_fails: u64) -> Self {
+        self.event_fails = event_fails;
+        self
+    }
+
+    pub const fn with_queue_event_count(mut self, queue_event_count: u64) -> Self {
+        self.queue_event_count = queue_event_count;
+        self
+    }
+
+    pub const fn with_rate_limiter_throttled_events(
+        mut self,
+        rate_limiter_throttled_events: u64,
+    ) -> Self {
+        self.rate_limiter_throttled_events = rate_limiter_throttled_events;
+        self
+    }
+
+    pub const fn with_rate_limiter_event_count(mut self, rate_limiter_event_count: u64) -> Self {
+        self.rate_limiter_event_count = rate_limiter_event_count;
+        self
+    }
+
+    const fn merged_with(self, other: Self) -> Self {
+        Self {
+            activate_fails: self.activate_fails.saturating_add(other.activate_fails),
+            cfg_fails: self.cfg_fails.saturating_add(other.cfg_fails),
+            event_fails: self.event_fails.saturating_add(other.event_fails),
+            queue_event_count: self
+                .queue_event_count
+                .saturating_add(other.queue_event_count),
+            rate_limiter_throttled_events: self
+                .rate_limiter_throttled_events
+                .saturating_add(other.rate_limiter_throttled_events),
+            rate_limiter_event_count: self
+                .rate_limiter_event_count
+                .saturating_add(other.rate_limiter_event_count),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PmemDeviceMetricsByDevice {
+    metrics: BTreeMap<String, PmemDeviceMetrics>,
+}
+
+impl PmemDeviceMetricsByDevice {
+    pub fn new() -> Self {
+        Self {
+            metrics: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_device_metrics(
+        mut self,
+        device_id: impl Into<String>,
+        metrics: PmemDeviceMetrics,
+    ) -> Self {
+        self.insert_device_metrics(device_id, metrics);
+        self
+    }
+
+    pub fn insert_device_metrics(
+        &mut self,
+        device_id: impl Into<String>,
+        metrics: PmemDeviceMetrics,
+    ) {
+        self.metrics
+            .entry(device_id.into())
+            .and_modify(|existing| *existing = existing.merged_with(metrics))
+            .or_insert(metrics);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.metrics
+            .values()
+            .all(|metrics| PmemDeviceMetrics::is_empty(*metrics))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, PmemDeviceMetrics)> {
+        self.metrics
+            .iter()
+            .map(|(device_id, metrics)| (device_id.as_str(), *metrics))
+    }
+
+    fn merged_with(mut self, other: Self) -> Self {
+        for (device_id, metrics) in other.metrics {
+            self.insert_device_metrics(device_id, metrics);
+        }
+        self
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SharedPmemDeviceMetrics {
+    inner: Arc<SharedPmemDeviceMetricsInner>,
+}
+
+impl SharedPmemDeviceMetrics {
+    pub fn record_activation_failure(&self) {
+        record_atomic_metric(&self.inner.activate_fails, 1);
+    }
+
+    pub fn record_config_failure(&self) {
+        record_atomic_metric(&self.inner.cfg_fails, 1);
+    }
+
+    pub fn record_notification_dispatch(&self, dispatch: &VirtioPmemDeviceNotificationDispatch) {
+        self.record_queue_events(usize_to_u64_saturating(
+            dispatch.drained_notifications().len(),
+        ));
+        if let Some(queue_dispatch) = dispatch.queue_dispatch() {
+            self.record_queue_dispatch(queue_dispatch);
+        }
+    }
+
+    pub fn record_notification_error(&self, source: &VirtioPmemDeviceNotificationError) {
+        self.record_queue_events(usize_to_u64_saturating(
+            source.drained_notifications().len(),
+        ));
+        self.record_event_failure();
+        if let Some(completed) = source.completed_dispatch() {
+            self.record_queue_dispatch(completed);
+        }
+    }
+
+    pub fn record_queue_dispatch(&self, dispatch: &VirtioPmemQueueDispatch) {
+        self.record_event_failures(usize_to_u64_saturating(
+            dispatch
+                .parse_failures()
+                .saturating_add(dispatch.status_write_failures()),
+        ));
+    }
+
+    pub fn record_queue_events(&self, count: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.queue_event_count, count);
+        }
+    }
+
+    pub fn record_event_failure(&self) {
+        record_atomic_metric(&self.inner.event_fails, 1);
+    }
+
+    pub fn snapshot(&self) -> PmemDeviceMetrics {
+        PmemDeviceMetrics {
+            activate_fails: self.inner.activate_fails.load(Ordering::Relaxed),
+            cfg_fails: self.inner.cfg_fails.load(Ordering::Relaxed),
+            event_fails: self.inner.event_fails.load(Ordering::Relaxed),
+            queue_event_count: self.inner.queue_event_count.load(Ordering::Relaxed),
+            rate_limiter_throttled_events: self
+                .inner
+                .rate_limiter_throttled_events
+                .load(Ordering::Relaxed),
+            rate_limiter_event_count: self.inner.rate_limiter_event_count.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_event_failures(&self, count: u64) {
+        if count != 0 {
+            record_atomic_metric(&self.inner.event_fails, count);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SharedPmemDeviceMetricsInner {
+    activate_fails: AtomicU64,
+    cfg_fails: AtomicU64,
+    event_fails: AtomicU64,
+    queue_event_count: AtomicU64,
+    rate_limiter_throttled_events: AtomicU64,
+    rate_limiter_event_count: AtomicU64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SharedPmemDeviceMetricsRegistry {
+    aggregate: SharedPmemDeviceMetrics,
+    per_device: Arc<BTreeMap<String, SharedPmemDeviceMetrics>>,
+}
+
+impl SharedPmemDeviceMetricsRegistry {
+    pub fn from_device_ids<'a>(device_ids: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut per_device = BTreeMap::new();
+        for device_id in device_ids {
+            per_device
+                .entry(device_id.to_string())
+                .or_insert_with(SharedPmemDeviceMetrics::default);
+        }
+
+        Self {
+            aggregate: SharedPmemDeviceMetrics::default(),
+            per_device: Arc::new(per_device),
+        }
+    }
+
+    pub fn aggregate(&self) -> SharedPmemDeviceMetrics {
+        self.aggregate.clone()
+    }
+
+    pub fn per_device(&self, device_id: &str) -> Option<SharedPmemDeviceMetrics> {
+        self.per_device.get(device_id).cloned()
+    }
+
+    pub fn record_notification_dispatch_for_device(
+        &self,
+        device_id: &str,
+        dispatch: &VirtioPmemDeviceNotificationDispatch,
+    ) {
+        self.aggregate.record_notification_dispatch(dispatch);
+        if let Some(metrics) = self.per_device(device_id) {
+            metrics.record_notification_dispatch(dispatch);
+        }
+    }
+
+    pub fn record_notification_error_for_device(
+        &self,
+        device_id: &str,
+        source: &VirtioPmemDeviceNotificationError,
+    ) {
+        self.aggregate.record_notification_error(source);
+        if let Some(metrics) = self.per_device(device_id) {
+            metrics.record_notification_error(source);
+        }
+    }
+
+    pub fn record_event_failure(&self) {
+        self.aggregate.record_event_failure();
+    }
+
+    pub fn record_event_failure_for_device(&self, device_id: &str) {
+        self.aggregate.record_event_failure();
+        if let Some(metrics) = self.per_device(device_id) {
+            metrics.record_event_failure();
+        }
+    }
+
+    pub fn record_queue_events_for_device(&self, device_id: &str, count: u64) {
+        self.aggregate.record_queue_events(count);
+        if let Some(metrics) = self.per_device(device_id) {
+            metrics.record_queue_events(count);
+        }
+    }
+
+    pub fn aggregate_snapshot(&self) -> PmemDeviceMetrics {
+        self.aggregate.snapshot()
+    }
+
+    pub fn per_device_snapshot(&self) -> PmemDeviceMetricsByDevice {
+        let mut snapshot = PmemDeviceMetricsByDevice::new();
+        for (device_id, metrics) in self.per_device.iter() {
+            let metrics = metrics.snapshot();
+            if !metrics.is_empty() {
+                snapshot.insert_device_metrics(device_id.clone(), metrics);
+            }
+        }
+        snapshot
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NetworkInterfaceMetrics {
     event_fails: u64,
     rx_queue_event_count: u64,
@@ -3026,6 +3344,8 @@ fn latency_aggregate_snapshot(
 pub struct MetricsDiagnostics {
     block_device_metrics: Option<BlockDeviceMetrics>,
     block_device_metrics_by_drive: Option<BlockDeviceMetricsByDrive>,
+    pmem_device_metrics: Option<PmemDeviceMetrics>,
+    pmem_device_metrics_by_device: Option<PmemDeviceMetricsByDevice>,
     network_interface_metrics: Option<NetworkInterfaceMetrics>,
     network_interface_metrics_by_interface: Option<NetworkInterfaceMetricsByInterface>,
     vsock_device_metrics: Option<VsockDeviceMetrics>,
@@ -3044,6 +3364,8 @@ impl MetricsDiagnostics {
         Self {
             block_device_metrics: None,
             block_device_metrics_by_drive: None,
+            pmem_device_metrics: None,
+            pmem_device_metrics_by_device: None,
             network_interface_metrics: None,
             network_interface_metrics_by_interface: None,
             vsock_device_metrics: None,
@@ -3068,6 +3390,19 @@ impl MetricsDiagnostics {
         block_device_metrics_by_drive: BlockDeviceMetricsByDrive,
     ) -> Self {
         self.block_device_metrics_by_drive = Some(block_device_metrics_by_drive);
+        self
+    }
+
+    pub fn with_pmem_device_metrics(mut self, pmem_device_metrics: PmemDeviceMetrics) -> Self {
+        self.pmem_device_metrics = Some(pmem_device_metrics);
+        self
+    }
+
+    pub fn with_pmem_device_metrics_by_device(
+        mut self,
+        pmem_device_metrics_by_device: PmemDeviceMetricsByDevice,
+    ) -> Self {
+        self.pmem_device_metrics_by_device = Some(pmem_device_metrics_by_device);
         self
     }
 
@@ -3154,6 +3489,18 @@ impl MetricsDiagnostics {
                 None => metrics,
             });
         }
+        if let Some(metrics) = other.pmem_device_metrics {
+            self.pmem_device_metrics = Some(match self.pmem_device_metrics {
+                Some(existing) => existing.merged_with(metrics),
+                None => metrics,
+            });
+        }
+        if let Some(metrics) = other.pmem_device_metrics_by_device {
+            self.pmem_device_metrics_by_device = Some(match self.pmem_device_metrics_by_device {
+                Some(existing) => existing.merged_with(metrics),
+                None => metrics,
+            });
+        }
         if let Some(metrics) = other.network_interface_metrics {
             self.network_interface_metrics = Some(match self.network_interface_metrics {
                 Some(existing) => existing.merged_with(metrics),
@@ -3216,6 +3563,14 @@ impl MetricsDiagnostics {
 
     pub fn block_device_metrics_by_drive(&self) -> Option<&BlockDeviceMetricsByDrive> {
         self.block_device_metrics_by_drive.as_ref()
+    }
+
+    pub fn pmem_device_metrics(&self) -> Option<PmemDeviceMetrics> {
+        self.pmem_device_metrics
+    }
+
+    pub fn pmem_device_metrics_by_device(&self) -> Option<&PmemDeviceMetricsByDevice> {
+        self.pmem_device_metrics_by_device.as_ref()
     }
 
     pub fn network_interface_metrics(&self) -> Option<NetworkInterfaceMetrics> {
@@ -3383,6 +3738,37 @@ fn block_device_metrics_json_object(
         serde_json::Value::Object(latency_aggregate_metrics_json_object(metrics.write_agg())),
     );
     block
+}
+
+fn pmem_device_metrics_json_object(
+    metrics: PmemDeviceMetrics,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut pmem = serde_json::Map::new();
+    pmem.insert(
+        "activate_fails".to_string(),
+        serde_json::Value::Number(metrics.activate_fails().into()),
+    );
+    pmem.insert(
+        "cfg_fails".to_string(),
+        serde_json::Value::Number(metrics.cfg_fails().into()),
+    );
+    pmem.insert(
+        "event_fails".to_string(),
+        serde_json::Value::Number(metrics.event_fails().into()),
+    );
+    pmem.insert(
+        "queue_event_count".to_string(),
+        serde_json::Value::Number(metrics.queue_event_count().into()),
+    );
+    pmem.insert(
+        "rate_limiter_event_count".to_string(),
+        serde_json::Value::Number(metrics.rate_limiter_event_count().into()),
+    );
+    pmem.insert(
+        "rate_limiter_throttled_events".to_string(),
+        serde_json::Value::Number(metrics.rate_limiter_throttled_events().into()),
+    );
+    pmem
 }
 
 fn network_interface_metrics_json_object(
@@ -3725,6 +4111,24 @@ impl MetricsSink {
                 serde_json::Value::Object(block_device_metrics_json_object(block_device_metrics)),
             );
         }
+        if let Some(pmem_device_metrics_by_device) = diagnostics.pmem_device_metrics_by_device() {
+            for (device_id, metrics) in pmem_device_metrics_by_device.iter() {
+                if !metrics.is_empty() {
+                    root.insert(
+                        format!("pmem_{device_id}"),
+                        serde_json::Value::Object(pmem_device_metrics_json_object(metrics)),
+                    );
+                }
+            }
+        }
+        if let Some(pmem_device_metrics) = diagnostics.pmem_device_metrics()
+            && !pmem_device_metrics.is_empty()
+        {
+            root.insert(
+                "pmem".to_string(),
+                serde_json::Value::Object(pmem_device_metrics_json_object(pmem_device_metrics)),
+            );
+        }
         if let Some(network_interface_metrics_by_interface) =
             diagnostics.network_interface_metrics_by_interface()
         {
@@ -4060,9 +4464,11 @@ mod tests {
         BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive,
         BootRunLoopMetricStatus, EntropyDeviceMetrics, MetricsConfigError, MetricsConfigInput,
         MetricsDiagnostics, MetricsFlushError, MetricsOutput, MetricsState,
-        NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface, SharedBalloonDeviceMetrics,
-        SharedBlockDeviceMetrics, SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
-        SharedNetworkInterfaceMetrics, SharedNetworkInterfaceMetricsRegistry, SharedSignalMetrics,
+        NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface, PmemDeviceMetrics,
+        PmemDeviceMetricsByDevice, SharedBalloonDeviceMetrics, SharedBlockDeviceMetrics,
+        SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
+        SharedNetworkInterfaceMetrics, SharedNetworkInterfaceMetricsRegistry,
+        SharedPmemDeviceMetrics, SharedPmemDeviceMetricsRegistry, SharedSignalMetrics,
         SharedVsockDeviceMetrics, SignalMetrics, VsockDeviceMetrics,
     };
     use crate::block::VirtioBlockLatencyAggregate;
@@ -4143,6 +4549,16 @@ mod tests {
             .with_write_count(9)
             .with_read_agg(VirtioBlockLatencyAggregate::new(12, 30, 42, 2))
             .with_write_agg(VirtioBlockLatencyAggregate::new(13, 31, 44, 3))
+    }
+
+    fn pmem_metrics_with_all_fields() -> PmemDeviceMetrics {
+        PmemDeviceMetrics::default()
+            .with_activate_fails(1)
+            .with_cfg_fails(2)
+            .with_event_fails(3)
+            .with_queue_event_count(4)
+            .with_rate_limiter_event_count(5)
+            .with_rate_limiter_throttled_events(6)
     }
 
     fn network_metrics_with_all_fields() -> NetworkInterfaceMetrics {
@@ -4661,6 +5077,170 @@ mod tests {
         let merged = base.merged_with(additional);
 
         assert_eq!(merged.block_device_metrics_by_drive(), Some(&expected));
+    }
+
+    #[test]
+    fn writes_pmem_device_metrics_when_provided() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let diagnostics =
+            MetricsDiagnostics::new().with_pmem_device_metrics(pmem_metrics_with_all_fields());
+
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        assert_eq!(
+            output.lines(),
+            [
+                r#"{"pmem":{"activate_fails":1,"cfg_fails":2,"event_fails":3,"queue_event_count":4,"rate_limiter_event_count":5,"rate_limiter_throttled_events":6},"vmm":{"metrics_flush_count":1}}"#
+            ]
+        );
+    }
+
+    #[test]
+    fn omits_empty_pmem_device_metrics() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let diagnostics =
+            MetricsDiagnostics::new().with_pmem_device_metrics(PmemDeviceMetrics::default());
+
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        assert_eq!(output.lines(), [r#"{"vmm":{"metrics_flush_count":1}}"#]);
+    }
+
+    #[test]
+    fn writes_pmem_device_metrics_by_device_when_provided() {
+        let output = TestMetricsOutput::default();
+        let mut state = MetricsState::with_test_output(output.clone());
+        let first_metrics = PmemDeviceMetrics::default()
+            .with_queue_event_count(1)
+            .with_event_fails(1);
+        let second_metrics = PmemDeviceMetrics::default().with_queue_event_count(2);
+        let diagnostics = MetricsDiagnostics::new()
+            .with_pmem_device_metrics(first_metrics.merged_with(second_metrics))
+            .with_pmem_device_metrics_by_device(
+                PmemDeviceMetricsByDevice::new()
+                    .with_device_metrics("pmem0", first_metrics)
+                    .with_device_metrics("empty", PmemDeviceMetrics::default())
+                    .with_device_metrics("pmem1", second_metrics),
+            );
+
+        assert_eq!(state.flush_with_diagnostics(&diagnostics), Ok(true));
+
+        assert_eq!(
+            output.lines(),
+            [
+                r#"{"pmem":{"activate_fails":0,"cfg_fails":0,"event_fails":1,"queue_event_count":3,"rate_limiter_event_count":0,"rate_limiter_throttled_events":0},"pmem_pmem0":{"activate_fails":0,"cfg_fails":0,"event_fails":1,"queue_event_count":1,"rate_limiter_event_count":0,"rate_limiter_throttled_events":0},"pmem_pmem1":{"activate_fails":0,"cfg_fails":0,"event_fails":0,"queue_event_count":2,"rate_limiter_event_count":0,"rate_limiter_throttled_events":0},"vmm":{"metrics_flush_count":1}}"#
+            ]
+        );
+    }
+
+    #[test]
+    fn shared_pmem_device_metrics_registry_snapshot_is_per_instance() {
+        let first = SharedPmemDeviceMetricsRegistry::from_device_ids(["pmem0", "pmem1"]);
+        let second = SharedPmemDeviceMetricsRegistry::from_device_ids(["pmem0"]);
+
+        first.record_queue_events_for_device("pmem0", 2);
+        first.record_event_failure_for_device("pmem0");
+        first.aggregate().record_config_failure();
+        first
+            .per_device("pmem1")
+            .expect("pmem1 metrics should exist")
+            .record_activation_failure();
+
+        assert_eq!(
+            first.aggregate_snapshot(),
+            PmemDeviceMetrics::default()
+                .with_cfg_fails(1)
+                .with_event_fails(1)
+                .with_queue_event_count(2)
+        );
+        assert_eq!(
+            first.per_device_snapshot(),
+            PmemDeviceMetricsByDevice::new()
+                .with_device_metrics(
+                    "pmem0",
+                    PmemDeviceMetrics::default()
+                        .with_event_fails(1)
+                        .with_queue_event_count(2),
+                )
+                .with_device_metrics("pmem1", PmemDeviceMetrics::default().with_activate_fails(1),)
+        );
+        assert_eq!(second.aggregate_snapshot(), PmemDeviceMetrics::default());
+        assert!(second.per_device_snapshot().is_empty());
+    }
+
+    #[test]
+    fn shared_pmem_metric_increment_saturates() {
+        let metrics = SharedPmemDeviceMetrics::default();
+        metrics
+            .inner
+            .queue_event_count
+            .store(u64::MAX - 1, Ordering::Relaxed);
+
+        metrics.record_queue_events(3);
+
+        assert_eq!(metrics.snapshot().queue_event_count(), u64::MAX);
+    }
+
+    #[test]
+    fn pmem_diagnostics_merge_saturates() {
+        let base = MetricsDiagnostics::new().with_pmem_device_metrics(
+            PmemDeviceMetrics::default()
+                .with_activate_fails(u64::MAX - 1)
+                .with_cfg_fails(u64::MAX - 2)
+                .with_event_fails(u64::MAX - 3)
+                .with_queue_event_count(u64::MAX - 4)
+                .with_rate_limiter_event_count(u64::MAX - 5)
+                .with_rate_limiter_throttled_events(u64::MAX - 6),
+        );
+        let additional =
+            MetricsDiagnostics::new().with_pmem_device_metrics(pmem_metrics_with_all_fields());
+
+        assert_eq!(
+            base.merged_with(additional).pmem_device_metrics(),
+            Some(
+                PmemDeviceMetrics::default()
+                    .with_activate_fails(u64::MAX)
+                    .with_cfg_fails(u64::MAX)
+                    .with_event_fails(u64::MAX)
+                    .with_queue_event_count(u64::MAX)
+                    .with_rate_limiter_event_count(u64::MAX)
+                    .with_rate_limiter_throttled_events(u64::MAX)
+            )
+        );
+    }
+
+    #[test]
+    fn pmem_diagnostics_merge_per_device_metrics_saturates() {
+        let base = MetricsDiagnostics::new().with_pmem_device_metrics_by_device(
+            PmemDeviceMetricsByDevice::new().with_device_metrics(
+                "pmem0",
+                PmemDeviceMetrics::default()
+                    .with_event_fails(u64::MAX - 1)
+                    .with_queue_event_count(u64::MAX - 2),
+            ),
+        );
+        let additional = MetricsDiagnostics::new().with_pmem_device_metrics_by_device(
+            PmemDeviceMetricsByDevice::new()
+                .with_device_metrics("pmem0", pmem_metrics_with_all_fields())
+                .with_device_metrics("pmem1", PmemDeviceMetrics::default().with_event_fails(3)),
+        );
+        let expected = PmemDeviceMetricsByDevice::new()
+            .with_device_metrics(
+                "pmem0",
+                PmemDeviceMetrics::default()
+                    .with_activate_fails(1)
+                    .with_cfg_fails(2)
+                    .with_event_fails(u64::MAX)
+                    .with_queue_event_count(u64::MAX)
+                    .with_rate_limiter_event_count(5)
+                    .with_rate_limiter_throttled_events(6),
+            )
+            .with_device_metrics("pmem1", PmemDeviceMetrics::default().with_event_fails(3));
+        let merged = base.merged_with(additional);
+
+        assert_eq!(merged.pmem_device_metrics_by_device(), Some(&expected));
     }
 
     #[test]

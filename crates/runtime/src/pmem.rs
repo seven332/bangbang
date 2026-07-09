@@ -2748,6 +2748,7 @@ mod tests {
     use super::*;
 
     use crate::memory::{GuestAddress, GuestMemoryLayout, GuestMemoryRange, aarch64};
+    use crate::metrics::{PmemDeviceMetrics, SharedPmemDeviceMetrics};
     use crate::mmio::{MmioAccess, MmioAccessBytes, MmioBus, MmioOperation, MmioRegionId};
     use crate::virtio_mmio::{
         VIRTIO_MMIO_DEVICE_CONFIG_OFFSET, VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VIRTIO_MMIO_MAGIC_VALUE,
@@ -3350,6 +3351,9 @@ mod tests {
         assert_eq!(dispatch.parse_failures(), 0);
         assert_eq!(dispatch.status_write_failures(), 0);
         assert!(dispatch.needs_queue_interrupt());
+        let metrics = SharedPmemDeviceMetrics::default();
+        metrics.record_queue_dispatch(&dispatch);
+        assert_eq!(metrics.snapshot(), PmemDeviceMetrics::default());
         assert_eq!(
             read_guest_i32(&memory, TEST_PMEM_STATUS_ADDR),
             VIRTIO_PMEM_STATUS_SUCCESS
@@ -3416,6 +3420,12 @@ mod tests {
             Some(VirtioPmemRequestError::RequestDescriptorWriteOnly { index: 0 })
         ));
         assert!(dispatch.needs_queue_interrupt());
+        let metrics = SharedPmemDeviceMetrics::default();
+        metrics.record_queue_dispatch(&dispatch);
+        assert_eq!(
+            metrics.snapshot(),
+            PmemDeviceMetrics::default().with_event_fails(1)
+        );
         assert_eq!(read_guest_i32(&memory, TEST_PMEM_STATUS_ADDR), 99);
         assert_eq!(read_used_index(&memory), 1);
         assert_eq!(read_used_element(&memory, 0), (0, 0));
@@ -3452,6 +3462,12 @@ mod tests {
         assert_eq!(dispatch.parse_failures(), 0);
         assert_eq!(dispatch.status_write_failures(), 1);
         assert!(dispatch.needs_queue_interrupt());
+        let metrics = SharedPmemDeviceMetrics::default();
+        metrics.record_queue_dispatch(&dispatch);
+        assert_eq!(
+            metrics.snapshot(),
+            PmemDeviceMetrics::default().with_event_fails(1)
+        );
         assert_eq!(read_used_index(&memory), 1);
         assert_eq!(read_used_element(&memory, 0), (0, 0));
     }

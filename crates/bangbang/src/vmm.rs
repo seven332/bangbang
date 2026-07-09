@@ -36,7 +36,8 @@ use bangbang_runtime::memory_hotplug::{MemoryHotplugConfigInput, MemoryHotplugSi
 use bangbang_runtime::metrics::{
     BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics, SharedBalloonDeviceMetrics,
     SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
-    SharedNetworkInterfaceMetricsRegistry, SharedSignalMetrics, SharedVsockDeviceMetrics,
+    SharedNetworkInterfaceMetricsRegistry, SharedPmemDeviceMetricsRegistry, SharedSignalMetrics,
+    SharedVsockDeviceMetrics,
 };
 use bangbang_runtime::mmds::{
     MmdsConfig, MmdsConfigInput, MmdsContentInput, MmdsStateHandle, MmdsStateLockError,
@@ -1919,6 +1920,10 @@ pub(crate) trait NetworkPacketIoRunLoopSession: Send + 'static {
         None
     }
 
+    fn shared_pmem_device_metrics(&self) -> Option<SharedPmemDeviceMetricsRegistry> {
+        None
+    }
+
     fn shared_network_interface_metrics(&self) -> Option<SharedNetworkInterfaceMetricsRegistry> {
         None
     }
@@ -1978,6 +1983,10 @@ impl NetworkPacketIoRunLoopSession for OwnedHvfArm64BootSession {
 
     fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetricsRegistry> {
         Some(OwnedHvfArm64BootSession::shared_block_device_metrics(self))
+    }
+
+    fn shared_pmem_device_metrics(&self) -> Option<SharedPmemDeviceMetricsRegistry> {
+        Some(OwnedHvfArm64BootSession::shared_pmem_device_metrics(self))
     }
 
     fn shared_network_interface_metrics(&self) -> Option<SharedNetworkInterfaceMetricsRegistry> {
@@ -2074,6 +2083,10 @@ pub(crate) trait BootRunLoopSession: Send + 'static {
         None
     }
 
+    fn shared_pmem_device_metrics(&self) -> Option<SharedPmemDeviceMetricsRegistry> {
+        None
+    }
+
     fn shared_network_interface_metrics(&self) -> Option<SharedNetworkInterfaceMetricsRegistry> {
         None
     }
@@ -2130,6 +2143,10 @@ impl BootRunLoopSession for OwnedHvfArm64BootSession {
 
     fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetricsRegistry> {
         Some(OwnedHvfArm64BootSession::shared_block_device_metrics(self))
+    }
+
+    fn shared_pmem_device_metrics(&self) -> Option<SharedPmemDeviceMetricsRegistry> {
+        Some(OwnedHvfArm64BootSession::shared_pmem_device_metrics(self))
     }
 
     fn shared_network_interface_metrics(&self) -> Option<SharedNetworkInterfaceMetricsRegistry> {
@@ -2196,6 +2213,10 @@ where
 
     fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetricsRegistry> {
         self.session.shared_block_device_metrics()
+    }
+
+    fn shared_pmem_device_metrics(&self) -> Option<SharedPmemDeviceMetricsRegistry> {
+        self.session.shared_pmem_device_metrics()
     }
 
     fn shared_network_interface_metrics(&self) -> Option<SharedNetworkInterfaceMetricsRegistry> {
@@ -2657,6 +2678,7 @@ where
     block_device_updater: Option<BootRunLoopBlockDeviceUpdater>,
     balloon_device_updater: Option<BootRunLoopBalloonDeviceUpdater>,
     block_device_metrics: Option<SharedBlockDeviceMetricsRegistry>,
+    pmem_device_metrics: Option<SharedPmemDeviceMetricsRegistry>,
     balloon_device_metrics: Option<SharedBalloonDeviceMetrics>,
     network_interface_metrics: Option<SharedNetworkInterfaceMetricsRegistry>,
     vsock_device_metrics: Option<SharedVsockDeviceMetrics>,
@@ -2690,6 +2712,7 @@ where
         let block_device_updater = session.block_device_updater();
         let balloon_device_updater = session.balloon_device_updater();
         let block_device_metrics = session.shared_block_device_metrics();
+        let pmem_device_metrics = session.shared_pmem_device_metrics();
         let balloon_device_metrics = session.shared_balloon_device_metrics();
         let network_interface_metrics = session.shared_network_interface_metrics();
         let vsock_device_metrics = session.shared_vsock_device_metrics();
@@ -2775,6 +2798,7 @@ where
             block_device_updater,
             balloon_device_updater,
             block_device_metrics,
+            pmem_device_metrics,
             balloon_device_metrics,
             network_interface_metrics,
             vsock_device_metrics,
@@ -2899,6 +2923,11 @@ where
             diagnostics = diagnostics
                 .with_block_device_metrics(metrics.aggregate_snapshot())
                 .with_block_device_metrics_by_drive(metrics.per_drive_snapshot());
+        }
+        if let Some(metrics) = &self.pmem_device_metrics {
+            diagnostics = diagnostics
+                .with_pmem_device_metrics(metrics.aggregate_snapshot())
+                .with_pmem_device_metrics_by_device(metrics.per_device_snapshot());
         }
         if let Some(metrics) = &self.network_interface_metrics {
             diagnostics = diagnostics
@@ -3187,9 +3216,10 @@ mod tests {
     use bangbang_runtime::metrics::{
         BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive,
         BootRunLoopMetricStatus, EntropyDeviceMetrics, MetricsConfigInput, MetricsDiagnostics,
-        NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface, SharedBalloonDeviceMetrics,
-        SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
-        SharedNetworkInterfaceMetricsRegistry, SharedSignalMetrics, SharedVsockDeviceMetrics,
+        NetworkInterfaceMetrics, NetworkInterfaceMetricsByInterface, PmemDeviceMetrics,
+        PmemDeviceMetricsByDevice, SharedBalloonDeviceMetrics, SharedBlockDeviceMetricsRegistry,
+        SharedEntropyDeviceMetrics, SharedNetworkInterfaceMetricsRegistry,
+        SharedPmemDeviceMetricsRegistry, SharedSignalMetrics, SharedVsockDeviceMetrics,
         VsockDeviceMetrics,
     };
     use bangbang_runtime::mmds::{MmdsConfigInput, MmdsContentInput, MmdsStateHandle};
@@ -3881,6 +3911,7 @@ mod tests {
         outcomes: Arc<Mutex<VecDeque<Result<FakeRunLoopOutcome, FakeRunLoopError>>>>,
         block_device_updater: Option<BootRunLoopBlockDeviceUpdater>,
         block_device_metrics: Option<SharedBlockDeviceMetricsRegistry>,
+        pmem_device_metrics: Option<SharedPmemDeviceMetricsRegistry>,
         balloon_device_metrics: Option<SharedBalloonDeviceMetrics>,
         network_interface_metrics: Option<SharedNetworkInterfaceMetricsRegistry>,
         vsock_device_metrics: Option<SharedVsockDeviceMetrics>,
@@ -3906,6 +3937,7 @@ mod tests {
                 )]))),
                 block_device_updater: None,
                 block_device_metrics: None,
+                pmem_device_metrics: None,
                 balloon_device_metrics: None,
                 network_interface_metrics: None,
                 vsock_device_metrics: None,
@@ -3935,6 +3967,11 @@ mod tests {
 
         fn with_block_device_metrics(mut self, metrics: SharedBlockDeviceMetricsRegistry) -> Self {
             self.block_device_metrics = Some(metrics);
+            self
+        }
+
+        fn with_pmem_device_metrics(mut self, metrics: SharedPmemDeviceMetricsRegistry) -> Self {
+            self.pmem_device_metrics = Some(metrics);
             self
         }
 
@@ -4001,6 +4038,10 @@ mod tests {
 
         fn shared_block_device_metrics(&self) -> Option<SharedBlockDeviceMetricsRegistry> {
             self.block_device_metrics.clone()
+        }
+
+        fn shared_pmem_device_metrics(&self) -> Option<SharedPmemDeviceMetricsRegistry> {
+            self.pmem_device_metrics.clone()
         }
 
         fn shared_balloon_device_metrics(&self) -> Option<SharedBalloonDeviceMetrics> {
@@ -5188,6 +5229,56 @@ mod tests {
                 &BlockDeviceMetricsByDrive::new().with_drive_metrics(
                     "rootfs",
                     BlockDeviceMetrics::default()
+                        .with_event_fails(1)
+                        .with_queue_event_count(1),
+                )
+            )
+        );
+
+        drop(supervisor);
+
+        assert_eq!(control.request_stop_count(), 1);
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn boot_run_loop_supervisor_reports_pmem_device_metrics() {
+        let control = FakeRunLoopControl::default();
+        let drop_count = Arc::new(AtomicU64::new(0));
+        let metrics = SharedPmemDeviceMetricsRegistry::from_device_ids(["pmem0", "pmem1"]);
+        let (max_steps_sender, max_steps_receiver) = mpsc::channel();
+        let session =
+            FakeRunLoopSession::new(control.clone(), Arc::clone(&drop_count), max_steps_sender)
+                .with_pmem_device_metrics(metrics.clone());
+
+        let supervisor =
+            BootRunLoopSupervisor::start(session, NonZeroUsize::new(5).expect("non-zero limit"))
+                .expect("supervisor should start");
+
+        assert_eq!(
+            max_steps_receiver
+                .recv()
+                .expect("worker should enter run loop"),
+            5
+        );
+        metrics.record_queue_events_for_device("pmem0", 1);
+        metrics.record_event_failure_for_device("pmem0");
+        let diagnostics = supervisor.metrics_diagnostics();
+
+        assert_eq!(
+            diagnostics.pmem_device_metrics(),
+            Some(
+                PmemDeviceMetrics::default()
+                    .with_event_fails(1)
+                    .with_queue_event_count(1)
+            )
+        );
+        assert_eq!(
+            diagnostics.pmem_device_metrics_by_device(),
+            Some(
+                &PmemDeviceMetricsByDevice::new().with_device_metrics(
+                    "pmem0",
+                    PmemDeviceMetrics::default()
                         .with_event_fails(1)
                         .with_queue_event_count(1),
                 )
