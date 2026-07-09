@@ -4222,6 +4222,55 @@ mod tests {
     }
 
     #[test]
+    fn virtio_mem_queue_dispatch_reports_mutation_range_failure_without_executor_apply() {
+        let mut memory = request_memory();
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 1, 1);
+        write_available_heads(&mut memory, &[0]);
+        let mut queue = virtio_mem_queue();
+        let mut config_space = VirtioMemConfigSpace::new(u64::MAX, 1, u64::MAX)
+            .with_usable_region_size(u64::MAX)
+            .with_requested_size(u64::MAX);
+        let mut plugged_blocks = VirtioMemPluggedBlocks::default();
+        let mut executor = RecordingMutationExecutor::default();
+
+        let dispatch = queue
+            .dispatch_with_executor(
+                &mut memory,
+                &mut config_space,
+                &mut plugged_blocks,
+                &mut executor,
+            )
+            .expect("range conversion failure should still publish error response");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.mutation_failures(), 1);
+        let mutation_failure = dispatch
+            .first_mutation_failure()
+            .expect("mutation failure should be recorded")
+            .to_string();
+        assert!(mutation_failure.contains("invalid virtio-mem mutation range"));
+        assert!(mutation_failure.contains("start=0x1"));
+        assert!(mutation_failure.contains("size=18446744073709551615"));
+        assert_eq!(
+            read_response(&memory),
+            VirtioMemResponse::Error.to_le_bytes()
+        );
+        assert!(executor.apply_calls.is_empty());
+        assert!(executor.rolled_back.is_empty());
+        assert_eq!(config_space.plugged_size(), 0);
+        assert_eq!(
+            plugged_blocks.range_state(
+                requested_block_range(
+                    VirtioMemRequestedRange::new(GuestAddress::new(1), 1),
+                    config_space,
+                )
+                .expect("test range should validate before executable conversion"),
+            ),
+            VirtioMemBlockState::Unplugged,
+        );
+    }
+
+    #[test]
     fn virtio_mem_queue_dispatch_rolls_back_applied_mutation_after_response_write_failure() {
         let mut memory = request_memory();
         write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4000_0000, 1);
