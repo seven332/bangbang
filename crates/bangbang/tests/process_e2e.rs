@@ -591,6 +591,36 @@ fn executable_handles_remaining_device_requests_and_pmem_config() {
         "rejected pmem update must not replace stored path: {pmem_vm_config_after_fault}"
     );
 
+    let pmem_root_device_response = http_put_json(
+        &socket_path,
+        "/pmem/pmem0",
+        r#"{"id":"pmem0","path_on_host":"secret-root-pmem.img","root_device":true}"#,
+    );
+    assert_bad_request_response(&pmem_root_device_response, "PUT /pmem/pmem0 root_device");
+    assert_response_contains(
+        &pmem_root_device_response,
+        r#"{"fault_message":"pmem root_device is not supported"}"#,
+        "PUT /pmem/pmem0 root_device",
+    );
+    assert!(
+        !pmem_root_device_response.contains("secret-root-pmem.img"),
+        "PUT /pmem/pmem0 root_device must not echo rejected path; response:\n{pmem_root_device_response}"
+    );
+    let pmem_vm_config_after_root_device = http_get(&socket_path, "/vm/config");
+    assert_ok_response(
+        &pmem_vm_config_after_root_device,
+        "GET /vm/config after rejected PUT /pmem/pmem0 root_device",
+    );
+    assert_response_contains(
+        &pmem_vm_config_after_root_device,
+        r#""path_on_host":"secret-pmem.img""#,
+        "GET /vm/config after rejected PUT /pmem/pmem0 root_device",
+    );
+    assert!(
+        !pmem_vm_config_after_root_device.contains("secret-root-pmem.img"),
+        "rejected root-device pmem update must not replace stored path: {pmem_vm_config_after_root_device}"
+    );
+
     let pmem_empty_path_response = http_put_json(
         &socket_path,
         "/pmem/pmem0",
@@ -965,6 +995,48 @@ fn executable_no_api_config_file_entropy_rate_limiter_reaches_startup_failure_wi
         &output,
         &socket_path,
         "no-api config-file entropy rate limiter startup",
+    );
+}
+
+#[test]
+fn executable_config_file_pmem_root_device_fails_before_socket() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let (config_path, pmem_path) = write_pmem_root_device_startup_config(&test_dir);
+    let instance_id = test_dir.instance_id();
+
+    let output = BangbangProcess::start_with_extra_args_expect_failure(
+        &socket_path,
+        &instance_id,
+        &["--config-file", path_text(&config_path)],
+    );
+
+    assert_pmem_root_device_startup_failure(
+        &output,
+        &socket_path,
+        &pmem_path,
+        "config-file pmem root-device startup",
+    );
+}
+
+#[test]
+fn executable_no_api_config_file_pmem_root_device_fails_before_socket() {
+    let test_dir = TestDir::new();
+    let socket_path = test_dir.path().join("api.socket");
+    let (config_path, pmem_path) = write_pmem_root_device_startup_config(&test_dir);
+    let instance_id = test_dir.instance_id();
+
+    let output = BangbangProcess::start_with_extra_args_expect_failure(
+        &socket_path,
+        &instance_id,
+        &["--config-file", path_text(&config_path), "--no-api"],
+    );
+
+    assert_pmem_root_device_startup_failure(
+        &output,
+        &socket_path,
+        &pmem_path,
+        "no-api config-file pmem root-device startup",
     );
 }
 
@@ -2864,6 +2936,26 @@ fn write_entropy_rate_limiter_startup_config(test_dir: &TestDir) -> std::path::P
     config_path
 }
 
+fn write_pmem_root_device_startup_config(
+    test_dir: &TestDir,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let config_path = test_dir.path().join("vm-config.json");
+    let pmem_path = test_dir.path().join("private-root-pmem.img");
+    let pmem_path_json = json_string(path_text(&pmem_path));
+    let config = format!(
+        r#"{{
+            "boot-source": {{"kernel_image_path": "/tmp/vmlinux"}},
+            "pmem": [
+                {{"id": "pmem0", "path_on_host": "/tmp/pmem-old.img"}},
+                {{"id": "pmem0", "path_on_host": {pmem_path_json}, "root_device": true}}
+            ]
+        }}"#
+    );
+    fs::write(&config_path, config).expect("config file should be written");
+
+    (config_path, pmem_path)
+}
+
 fn write_multi_vcpu_startup_config(test_dir: &TestDir) -> (std::path::PathBuf, std::path::PathBuf) {
     let config_path = test_dir.path().join("vm-config.json");
     let kernel_path = test_dir.path().join("private-vmlinux");
@@ -3136,6 +3228,58 @@ fn assert_entropy_rate_limiter_startup_failure(
             output.stderr
         );
     }
+}
+
+fn assert_pmem_root_device_startup_failure(
+    output: &support::CompletedProcess,
+    socket_path: &std::path::Path,
+    pmem_path: &std::path::Path,
+    case_name: &str,
+) {
+    assert!(
+        !output.status.success(),
+        "{case_name} should fail startup; status: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        output.stdout,
+        output.stderr
+    );
+    assert_bad_configuration_exit_code(output, case_name);
+    assert!(
+        !socket_path.exists(),
+        "{case_name} should fail before API socket publication"
+    );
+    assert!(
+        !output.stdout.contains("status: API server listening"),
+        "{case_name} must not report API readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !output.stdout.contains("status: VM running without API"),
+        "{case_name} must not report no-api readiness; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        output.stderr.contains(
+            "bangbang: config-file error: failed to apply config-file action: pmem root_device is not supported"
+        ),
+        "{case_name} stderr should describe pmem root-device rejection; stderr:\n{}",
+        output.stderr
+    );
+    let pmem_path_text = path_text(pmem_path);
+    assert!(
+        !output.stdout.contains(pmem_path_text),
+        "{case_name} stdout must not echo private pmem path; stdout:\n{}",
+        output.stdout
+    );
+    assert!(
+        !output.stderr.contains(pmem_path_text),
+        "{case_name} stderr must not echo private pmem path; stderr:\n{}",
+        output.stderr
+    );
+    assert!(
+        !pmem_path.exists(),
+        "{case_name} must not create rejected pmem backing path"
+    );
 }
 
 fn assert_bad_configuration_exit_code(output: &support::CompletedProcess, case_name: &str) {

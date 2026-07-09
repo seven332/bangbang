@@ -1188,6 +1188,10 @@ impl TryFrom<PmemConfigInput> for PmemConfig {
             return Err(PmemConfigError::UnsupportedRateLimiter);
         }
 
+        if input.root_device {
+            return Err(PmemConfigError::UnsupportedRootDevice);
+        }
+
         Ok(Self {
             id: input.id,
             path_on_host: input.path_on_host,
@@ -2602,6 +2606,7 @@ pub enum PmemConfigError {
     InvalidPmemId,
     EmptyPathOnHost,
     UnsupportedRateLimiter,
+    UnsupportedRootDevice,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2637,6 +2642,7 @@ impl fmt::Display for PmemConfigError {
             }
             Self::EmptyPathOnHost => f.write_str("pmem path_on_host must not be empty"),
             Self::UnsupportedRateLimiter => f.write_str("pmem rate_limiter is not supported"),
+            Self::UnsupportedRootDevice => f.write_str("pmem root_device is not supported"),
         }
     }
 }
@@ -3689,6 +3695,17 @@ mod tests {
     }
 
     #[test]
+    fn config_rejects_root_device() {
+        let err = PmemConfig::try_from(
+            PmemConfigInput::new("pmem0", "/tmp/pmem.img").with_root_device(true),
+        )
+        .expect_err("pmem root device should fail");
+
+        assert_eq!(err, PmemConfigError::UnsupportedRootDevice);
+        assert_eq!(err.to_string(), "pmem root_device is not supported");
+    }
+
+    #[test]
     fn update_input_defaults_to_noop_update() {
         let input = PmemUpdateInput::new("pmem0", "pmem0");
 
@@ -3808,15 +3825,13 @@ mod tests {
         configs.upsert(pmem_config(PmemConfigInput::new("pmem0", "/tmp/old.img")));
         configs.upsert(pmem_config(PmemConfigInput::new("pmem1", "/tmp/other.img")));
         configs.upsert(pmem_config(
-            PmemConfigInput::new("pmem0", "/tmp/new.img")
-                .with_root_device(true)
-                .with_read_only(true),
+            PmemConfigInput::new("pmem0", "/tmp/new.img").with_read_only(true),
         ));
 
         assert_eq!(configs.as_slice().len(), 2);
         assert_eq!(configs.as_slice()[0].id(), "pmem0");
         assert_eq!(configs.as_slice()[0].path_on_host(), "/tmp/new.img");
-        assert!(configs.as_slice()[0].root_device());
+        assert!(!configs.as_slice()[0].root_device());
         assert!(configs.as_slice()[0].read_only());
         assert_eq!(configs.as_slice()[1].id(), "pmem1");
         assert_eq!(configs.as_slice()[1].path_on_host(), "/tmp/other.img");
