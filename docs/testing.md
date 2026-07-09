@@ -324,7 +324,7 @@ artifacts and is not a substitute for a production rootfs build process.
 The signed `guest_boot` and executable HVF e2e targets also validate a
 deterministic direct-rootfs boot. For those scenarios,
 `scripts/run-integration-tests.sh` prepares
-`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v25.ext4`
+`.tmp/guest-artifacts/bangbang/rootfs/ubuntu-24.04-512M-direct-boot-v26.ext4`
 after confirming the host can execute HVF. The generated image is an ext4 copy
 of the pinned Firecracker rootfs with a test-specific
 `/bangbang-direct-rootfs-init` script added before image creation. The test
@@ -361,6 +361,10 @@ requested-size update, and writes `BANGBANG_MEMORY_HOTPLUG_GUEST_CHECK_OK`
 only after the guest observes that update. The host-side e2e waits for the
 ready marker, sends `PATCH /hotplug/memory`, verifies the public API requested
 size, and then waits for the guest success marker.
+When the boot args include `bangbang.rtc-check=1`, the same init script checks
+that Linux exposes `/dev/rtc0` as a character device and finds PL031 RTC
+evidence in sysfs, procfs, or dmesg before writing
+`BANGBANG_RTC_GUEST_CHECK_OK`.
 When the boot args include `bangbang.block-writeback-flush=1`, the same init
 script opens `/dev/vdb`, writes a deterministic pre-flush marker, calls `fsync`
 on that block-device file descriptor, and writes
@@ -399,14 +403,16 @@ checks prove the kernel mounted the virtio-block root drive as `/`, give
 executable-boundary MMDS fetch coverage through the process-local MMDS-only
 packet path, prove guest-visible virtio-rng reads through `/dev/hwrng`, prove
 guest virtio-balloon driver binding, prove guest-visible virtio-mem driver
-binding plus the runtime requested-size signal, prove the current writeback
-virtio-block flush path, prove the current virtio-pmem read/flush path, and cover
-guest-initiated plus host-initiated virtio-vsock connection exchange through the
-signed executable, including narrow multi-payload stream cases and multi-stream
-retention in both directions. They do not claim that bangbang can boot an
-arbitrary distro image through its default init, that full networking
-compatibility is complete, or that full block, balloon, memory-hotplug, pmem,
-and vsock runtime behavior is complete.
+binding plus the runtime requested-size signal, prove guest-visible PL031 RTC
+device discovery, prove the current writeback virtio-block flush path, prove
+the current virtio-pmem read/flush path, and cover guest-initiated plus
+host-initiated virtio-vsock connection exchange through the signed executable,
+including narrow multi-payload stream cases and multi-stream retention in both
+directions. They do not claim that bangbang can boot an arbitrary distro image
+through its default init, that full networking compatibility is complete, that
+RTC alarm interrupts or RTC-adjacent time/identity devices are supported, or
+that full block, balloon, memory-hotplug, pmem, and vsock runtime behavior is
+complete.
 
 bangbang appends Firecracker-style root-drive command-line arguments during
 startup resource assembly when a configured drive has `is_root_device=true`.

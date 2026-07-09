@@ -1339,10 +1339,12 @@ same placement and interrupt line.
 ## RTC-Adjacent Time And Identity Devices
 
 bangbang currently implements only the guest-visible PL031 RTC subset described
-above. RTC alarm interrupts are intentionally unsupported in that subset because
-Firecracker's aarch64 PL031 node is exposed without an interrupt line; guest
-flows that depend on RTC alarm interrupts should not be treated as supported by
-the current compatibility surface.
+above. Signed executable direct-rootfs coverage checks that Linux exposes
+`/dev/rtc0` as a character device and reports PL031 RTC evidence through sysfs,
+procfs, or dmesg. RTC alarm interrupts are intentionally unsupported in that
+subset because Firecracker's aarch64 PL031 node is exposed without an interrupt
+line; guest flows that depend on RTC alarm interrupts should not be treated as
+supported by the current compatibility surface.
 
 PVTime/steal-time is a separate platform capability rather than an RTC feature.
 Firecracker implements ARM steal-time by allocating per-vCPU memory and
