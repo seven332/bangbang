@@ -6253,6 +6253,30 @@ mod tests {
         assert!(get_after_oversized_put_response.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(get_after_oversized_put_response.contains(r#""amount_mib":64"#));
 
+        let reporting_put_response = request_over_socket(
+            &mut vmm,
+            "b-put-r",
+            &request_with_body(
+                "PUT",
+                "/balloon",
+                r#"{"amount_mib":32,"deflate_on_oom":false,"free_page_reporting":true}"#,
+            ),
+        );
+        assert!(reporting_put_response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        assert!(
+            reporting_put_response
+                .contains(r#""fault_message":"balloon free_page_reporting is not supported""#)
+        );
+
+        let get_after_reporting_put_response = request_over_socket(
+            &mut vmm,
+            "b-get-pr",
+            "GET /balloon HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(get_after_reporting_put_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(get_after_reporting_put_response.contains(r#""amount_mib":64"#));
+        assert!(get_after_reporting_put_response.contains(r#""free_page_reporting":false"#));
+
         let vm_config_response = request_over_socket(
             &mut vmm,
             "b-vm-config",
