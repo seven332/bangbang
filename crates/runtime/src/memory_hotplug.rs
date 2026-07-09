@@ -1,9 +1,12 @@
 //! Backend-neutral memory hotplug configuration model.
 
+use std::collections::TryReserveError;
 use std::fmt;
 
 use crate::interrupt::DeviceInterruptKind;
-use crate::memory::{GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError};
+use crate::memory::{
+    GuestAddress, GuestMemory, GuestMemoryAccessError, GuestMemoryError, GuestMemoryRange,
+};
 use crate::mmio::{
     MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
     MmioHandlerError, MmioHandlerLookupError, MmioRegion, MmioRegionId,
@@ -1310,24 +1313,63 @@ impl VirtioMemRequest {
         memory: &mut GuestMemory,
         config_space: VirtioMemConfigSpace,
         plugged_blocks: &VirtioMemPluggedBlocks,
-    ) -> VirtioMemRequestExecution {
+        mutation_executor: &mut impl VirtioMemMutationExecutor,
+    ) -> Result<VirtioMemRequestExecution, VirtioMemRequestExecutionError> {
         let prepared = response_for_request(self.kind, config_space, plugged_blocks);
-        match memory.write_slice(&prepared.response.to_le_bytes(), self.response.address()) {
-            Ok(()) => VirtioMemRequestExecution::new(
+        let mut response = prepared.response;
+        let mut outcome = prepared.outcome;
+        let mut commit_mutation = prepared.mutation;
+        let mut applied_mutation = None;
+
+        if let Some(mutation) = prepared.mutation {
+            match mutation
+                .to_executable_mutation(config_space, plugged_blocks)
+                .and_then(|mutation| mutation_executor.apply(mutation))
+            {
+                Ok(applied) => {
+                    applied_mutation = Some(applied);
+                }
+                Err(source) => {
+                    response = VirtioMemResponse::Error;
+                    outcome = VirtioMemRequestExecutionOutcome::MutationFailed { source };
+                    commit_mutation = None;
+                }
+            }
+        }
+
+        match memory.write_slice(&response.to_le_bytes(), self.response.address()) {
+            Ok(()) => Ok(VirtioMemRequestExecution::new(
                 VirtioMemRequestCompletion::new(self.descriptor_head, VIRTIO_MEM_RESPONSE_SIZE_U32),
-                prepared.response,
-                prepared.outcome,
-                prepared.mutation,
-            ),
-            Err(source) => VirtioMemRequestExecution::new(
-                VirtioMemRequestCompletion::new(self.descriptor_head, 0),
-                prepared.response,
-                VirtioMemRequestExecutionOutcome::ResponseWriteFailed {
-                    address: self.response.address(),
-                    source,
-                },
-                None,
-            ),
+                response,
+                outcome,
+                commit_mutation,
+                applied_mutation,
+            )),
+            Err(source) => {
+                if let Some(applied) = applied_mutation {
+                    mutation_executor
+                        .rollback(applied)
+                        .map_err(|rollback_source| {
+                            VirtioMemRequestExecutionError::ResponseWriteRollback {
+                                descriptor_head: self.descriptor_head,
+                                address: self.response.address(),
+                                response_source: source,
+                                rollback_source,
+                            }
+                        })?;
+                }
+
+                Ok(VirtioMemRequestExecution::new(
+                    VirtioMemRequestCompletion::new(self.descriptor_head, 0),
+                    response,
+                    VirtioMemRequestExecutionOutcome::ResponseWriteFailed {
+                        address: self.response.address(),
+                        source,
+                    },
+                    None,
+                    None,
+                ))
+            }
         }
     }
 }
@@ -1382,6 +1424,7 @@ pub struct VirtioMemRequestExecution {
     response: VirtioMemResponse,
     outcome: VirtioMemRequestExecutionOutcome,
     mutation: Option<VirtioMemPendingMutation>,
+    applied_mutation: Option<VirtioMemAppliedMutation>,
 }
 
 impl VirtioMemRequestExecution {
@@ -1390,12 +1433,14 @@ impl VirtioMemRequestExecution {
         response: VirtioMemResponse,
         outcome: VirtioMemRequestExecutionOutcome,
         mutation: Option<VirtioMemPendingMutation>,
+        applied_mutation: Option<VirtioMemAppliedMutation>,
     ) -> Self {
         Self {
             completion,
             response,
             outcome,
             mutation,
+            applied_mutation,
         }
     }
 
@@ -1414,6 +1459,10 @@ impl VirtioMemRequestExecution {
     const fn mutation(&self) -> Option<VirtioMemPendingMutation> {
         self.mutation
     }
+
+    fn into_applied_mutation(self) -> Option<VirtioMemAppliedMutation> {
+        self.applied_mutation
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1426,11 +1475,160 @@ pub enum VirtioMemRequestExecutionOutcome {
     UnsupportedRequest {
         request_type: u16,
     },
+    MutationFailed {
+        source: VirtioMemMutationError,
+    },
     ResponseWriteFailed {
         address: GuestAddress,
         source: GuestMemoryAccessError,
     },
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VirtioMemRequestExecutionError {
+    ResponseWriteRollback {
+        descriptor_head: u16,
+        address: GuestAddress,
+        response_source: GuestMemoryAccessError,
+        rollback_source: VirtioMemMutationRollbackError,
+    },
+}
+
+impl fmt::Display for VirtioMemRequestExecutionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ResponseWriteRollback {
+                descriptor_head,
+                address,
+                response_source,
+                rollback_source,
+            } => write!(
+                f,
+                "failed to write virtio-mem response for descriptor head {descriptor_head} at {address}: {response_source}; also failed to roll back applied mutation: {rollback_source}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VirtioMemRequestExecutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ResponseWriteRollback {
+                rollback_source, ..
+            } => Some(rollback_source),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioMemMutation {
+    kind: VirtioMemMutationKind,
+}
+
+impl VirtioMemMutation {
+    pub const fn new(kind: VirtioMemMutationKind) -> Self {
+        Self { kind }
+    }
+
+    pub const fn kind(&self) -> &VirtioMemMutationKind {
+        &self.kind
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VirtioMemMutationKind {
+    Plug(GuestMemoryRange),
+    Unplug(GuestMemoryRange),
+    UnplugAll(Vec<GuestMemoryRange>),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct VirtioMemAppliedMutation {
+    mutation: VirtioMemMutation,
+}
+
+impl VirtioMemAppliedMutation {
+    pub const fn new(mutation: VirtioMemMutation) -> Self {
+        Self { mutation }
+    }
+
+    pub const fn mutation(&self) -> &VirtioMemMutation {
+        &self.mutation
+    }
+}
+
+pub trait VirtioMemMutationExecutor {
+    fn apply(
+        &mut self,
+        mutation: VirtioMemMutation,
+    ) -> Result<VirtioMemAppliedMutation, VirtioMemMutationError>;
+
+    fn rollback(
+        &mut self,
+        applied: VirtioMemAppliedMutation,
+    ) -> Result<(), VirtioMemMutationRollbackError>;
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NoopVirtioMemMutationExecutor;
+
+impl VirtioMemMutationExecutor for NoopVirtioMemMutationExecutor {
+    fn apply(
+        &mut self,
+        mutation: VirtioMemMutation,
+    ) -> Result<VirtioMemAppliedMutation, VirtioMemMutationError> {
+        Ok(VirtioMemAppliedMutation::new(mutation))
+    }
+
+    fn rollback(
+        &mut self,
+        _applied: VirtioMemAppliedMutation,
+    ) -> Result<(), VirtioMemMutationRollbackError> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioMemMutationError {
+    message: String,
+}
+
+impl VirtioMemMutationError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for VirtioMemMutationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "virtio-mem mutation failed: {}", self.message)
+    }
+}
+
+impl std::error::Error for VirtioMemMutationError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioMemMutationRollbackError {
+    message: String,
+}
+
+impl VirtioMemMutationRollbackError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for VirtioMemMutationRollbackError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "virtio-mem mutation rollback failed: {}", self.message)
+    }
+}
+
+impl std::error::Error for VirtioMemMutationRollbackError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VirtioMemPendingMutation {
@@ -1440,6 +1638,36 @@ enum VirtioMemPendingMutation {
 }
 
 impl VirtioMemPendingMutation {
+    fn to_executable_mutation(
+        self,
+        config_space: VirtioMemConfigSpace,
+        plugged_blocks: &VirtioMemPluggedBlocks,
+    ) -> Result<VirtioMemMutation, VirtioMemMutationError> {
+        match self {
+            Self::Plug(range) => Ok(VirtioMemMutation::new(VirtioMemMutationKind::Plug(
+                block_range_to_guest_range(range, config_space)?,
+            ))),
+            Self::Unplug(range) => Ok(VirtioMemMutation::new(VirtioMemMutationKind::Unplug(
+                block_range_to_guest_range(range, config_space)?,
+            ))),
+            Self::UnplugAll => {
+                let mut ranges = Vec::new();
+                ranges
+                    .try_reserve_exact(plugged_blocks.ranges.len())
+                    .map_err(|source| {
+                        VirtioMemMutationError::from_try_reserve_error("unplug-all", source)
+                    })?;
+                for range in plugged_blocks.ranges.iter().copied() {
+                    ranges.push(block_range_to_guest_range(range, config_space)?);
+                }
+
+                Ok(VirtioMemMutation::new(VirtioMemMutationKind::UnplugAll(
+                    ranges,
+                )))
+            }
+        }
+    }
+
     fn commit(
         self,
         config_space: &mut VirtioMemConfigSpace,
@@ -1455,6 +1683,43 @@ impl VirtioMemPendingMutation {
         }
         config_space.plugged_size = plugged_blocks.plugged_size(config_space.block_size());
     }
+}
+
+impl VirtioMemMutationError {
+    fn from_try_reserve_error(context: &str, source: TryReserveError) -> Self {
+        Self::new(format!(
+            "failed to allocate {context} mutation metadata: {source}"
+        ))
+    }
+}
+
+fn block_range_to_guest_range(
+    range: VirtioMemBlockRange,
+    config_space: VirtioMemConfigSpace,
+) -> Result<GuestMemoryRange, VirtioMemMutationError> {
+    let block_size = config_space.block_size();
+    let Some(offset) = range.start().checked_mul(block_size) else {
+        return Err(VirtioMemMutationError::new(format!(
+            "virtio-mem block range start {} overflows block size {block_size}",
+            range.start()
+        )));
+    };
+    let Some(start) = config_space.addr().checked_add(offset) else {
+        return Err(VirtioMemMutationError::new(format!(
+            "virtio-mem block range start offset {offset} overflows base address {}",
+            config_space.addr()
+        )));
+    };
+    let Some(size) = range.len_bytes(block_size) else {
+        return Err(VirtioMemMutationError::new(format!(
+            "virtio-mem block range length {} overflows block size {block_size}",
+            range.block_count()
+        )));
+    };
+
+    GuestMemoryRange::new(GuestAddress::new(start), size).map_err(|source| {
+        VirtioMemMutationError::new(format!("invalid virtio-mem mutation range: {source}"))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1581,6 +1846,17 @@ impl VirtioMemQueue {
         config_space: &mut VirtioMemConfigSpace,
         plugged_blocks: &mut VirtioMemPluggedBlocks,
     ) -> Result<VirtioMemQueueDispatch, VirtioMemQueueDispatchError> {
+        let mut mutation_executor = NoopVirtioMemMutationExecutor;
+        self.dispatch_with_executor(memory, config_space, plugged_blocks, &mut mutation_executor)
+    }
+
+    fn dispatch_with_executor(
+        &mut self,
+        memory: &mut GuestMemory,
+        config_space: &mut VirtioMemConfigSpace,
+        plugged_blocks: &mut VirtioMemPluggedBlocks,
+        mutation_executor: &mut impl VirtioMemMutationExecutor,
+    ) -> Result<VirtioMemQueueDispatch, VirtioMemQueueDispatchError> {
         let mut dispatch = VirtioMemQueueDispatch::default();
         while let Some(chain) = self
             .available
@@ -1591,21 +1867,29 @@ impl VirtioMemQueue {
             })?
         {
             let descriptor_head = chain.head_index();
-            let (completion, outcome, mutation) = match VirtioMemRequest::parse(memory, &chain) {
-                Ok(request) => {
-                    let execution = request.execute(memory, *config_space, plugged_blocks);
-                    (
-                        execution.completion(),
-                        VirtioMemQueueDispatchOutcome::from_execution(&execution),
-                        execution.mutation(),
-                    )
-                }
-                Err(source) => (
-                    VirtioMemRequestCompletion::new(descriptor_head, 0),
-                    VirtioMemQueueDispatchOutcome::ParseError(source),
-                    None,
-                ),
-            };
+            let (completion, outcome, mutation, applied_mutation) =
+                match VirtioMemRequest::parse(memory, &chain) {
+                    Ok(request) => {
+                        let execution = request
+                            .execute(memory, *config_space, plugged_blocks, mutation_executor)
+                            .map_err(|source| VirtioMemQueueDispatchError::MutationRollback {
+                                completed_dispatch: Box::new(dispatch.clone()),
+                                source,
+                            })?;
+                        (
+                            execution.completion(),
+                            VirtioMemQueueDispatchOutcome::from_execution(&execution),
+                            execution.mutation(),
+                            execution.into_applied_mutation(),
+                        )
+                    }
+                    Err(source) => (
+                        VirtioMemRequestCompletion::new(descriptor_head, 0),
+                        VirtioMemQueueDispatchOutcome::ParseError(source),
+                        None,
+                        None,
+                    ),
+                };
 
             let publication = self
                 .used
@@ -1619,6 +1903,9 @@ impl VirtioMemQueue {
                     completed_dispatch: Box::new(dispatch.clone()),
                     descriptor_head: completion.descriptor_head(),
                     bytes_written_to_guest: completion.bytes_written_to_guest(),
+                    rollback_error: applied_mutation
+                        .map(|applied| mutation_executor.rollback(applied).err())
+                        .unwrap_or(None),
                     source,
                 })?;
             if let Some(mutation) = mutation {
@@ -1668,8 +1955,10 @@ pub struct VirtioMemQueueDispatch {
     state_requests: usize,
     policy_errors: usize,
     unsupported_requests: usize,
+    mutation_failures: usize,
     parse_failures: usize,
     response_write_failures: usize,
+    first_mutation_failure: Option<VirtioMemMutationError>,
     first_parse_failure: Option<VirtioMemRequestError>,
     needs_queue_interrupt: bool,
 }
@@ -1689,6 +1978,14 @@ impl VirtioMemQueueDispatch {
 
     pub const fn unsupported_requests(&self) -> usize {
         self.unsupported_requests
+    }
+
+    pub const fn mutation_failures(&self) -> usize {
+        self.mutation_failures
+    }
+
+    pub const fn first_mutation_failure(&self) -> Option<&VirtioMemMutationError> {
+        self.first_mutation_failure.as_ref()
     }
 
     pub const fn parse_failures(&self) -> usize {
@@ -1725,6 +2022,12 @@ impl VirtioMemQueueDispatch {
             VirtioMemQueueDispatchOutcome::UnsupportedRequest { .. } => {
                 self.unsupported_requests += 1;
             }
+            VirtioMemQueueDispatchOutcome::MutationFailed { source } => {
+                self.mutation_failures += 1;
+                if self.first_mutation_failure.is_none() {
+                    self.first_mutation_failure = Some(source);
+                }
+            }
             VirtioMemQueueDispatchOutcome::ParseError(source) => {
                 self.parse_failures += 1;
                 if self.first_parse_failure.is_none() {
@@ -1744,12 +2047,13 @@ enum VirtioMemQueueDispatchOutcome {
     MutationAccepted,
     PolicyError,
     UnsupportedRequest { request_type: u16 },
+    MutationFailed { source: VirtioMemMutationError },
     ParseError(VirtioMemRequestError),
     ResponseWriteFailed,
 }
 
 impl VirtioMemQueueDispatchOutcome {
-    const fn from_execution(execution: &VirtioMemRequestExecution) -> Self {
+    fn from_execution(execution: &VirtioMemRequestExecution) -> Self {
         match execution.outcome() {
             VirtioMemRequestExecutionOutcome::State { state } => Self::State { state: *state },
             VirtioMemRequestExecutionOutcome::MutationAccepted => Self::MutationAccepted,
@@ -1759,6 +2063,9 @@ impl VirtioMemQueueDispatchOutcome {
                     request_type: *request_type,
                 }
             }
+            VirtioMemRequestExecutionOutcome::MutationFailed { source } => Self::MutationFailed {
+                source: source.clone(),
+            },
             VirtioMemRequestExecutionOutcome::ResponseWriteFailed { .. } => {
                 Self::ResponseWriteFailed
             }
@@ -1776,7 +2083,12 @@ pub enum VirtioMemQueueDispatchError {
         completed_dispatch: Box<VirtioMemQueueDispatch>,
         descriptor_head: u16,
         bytes_written_to_guest: u32,
+        rollback_error: Option<VirtioMemMutationRollbackError>,
         source: VirtqueueUsedRingError,
+    },
+    MutationRollback {
+        completed_dispatch: Box<VirtioMemQueueDispatch>,
+        source: VirtioMemRequestExecutionError,
     },
 }
 
@@ -1793,13 +2105,19 @@ impl fmt::Display for VirtioMemQueueDispatchError {
                 descriptor_head,
                 bytes_written_to_guest,
                 source,
+                rollback_error,
                 ..
-            } => {
-                write!(
+            } => match rollback_error {
+                Some(rollback_error) => write!(
+                    f,
+                    "failed to publish virtio-mem used descriptor head {descriptor_head} with length {bytes_written_to_guest}: {source}; also failed to roll back applied mutation: {rollback_error}"
+                ),
+                None => write!(
                     f,
                     "failed to publish virtio-mem used descriptor head {descriptor_head} with length {bytes_written_to_guest}: {source}"
-                )
-            }
+                ),
+            },
+            Self::MutationRollback { source, .. } => write!(f, "{source}"),
         }
     }
 }
@@ -1809,6 +2127,7 @@ impl std::error::Error for VirtioMemQueueDispatchError {
         match self {
             Self::AvailableRing { source, .. } => Some(source),
             Self::UsedRing { source, .. } => Some(source),
+            Self::MutationRollback { source, .. } => Some(source),
         }
     }
 }
@@ -1820,6 +2139,9 @@ impl VirtioMemQueueDispatchError {
                 completed_dispatch, ..
             }
             | Self::UsedRing {
+                completed_dispatch, ..
+            }
+            | Self::MutationRollback {
                 completed_dispatch, ..
             } => completed_dispatch,
         }
@@ -2554,6 +2876,8 @@ fn next_slot_multiple(value: u64, slot_size: u64) -> Result<u64, MemoryHotplugUp
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
     use crate::memory::{GuestAddress, GuestMemoryLayout, GuestMemoryRange};
     use crate::mmio::{MmioAccess, MmioBus, MmioOperation, MmioRegionId};
@@ -3766,6 +4090,374 @@ mod tests {
     }
 
     #[test]
+    fn virtio_mem_queue_dispatch_calls_mutation_executor_for_plug() {
+        let mut memory = request_memory();
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4000_0000, 1);
+        write_available_heads(&mut memory, &[0]);
+        let mut queue = virtio_mem_queue();
+        let mut config_space = virtio_mem_config_space()
+            .with_usable_region_size(0x20_0000)
+            .with_requested_size(0x20_0000);
+        let mut plugged_blocks = VirtioMemPluggedBlocks::default();
+        let mut executor = RecordingMutationExecutor::default();
+
+        let dispatch = queue
+            .dispatch_with_executor(
+                &mut memory,
+                &mut config_space,
+                &mut plugged_blocks,
+                &mut executor,
+            )
+            .expect("plug should dispatch through executor");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.mutation_failures(), 0);
+        assert_eq!(
+            executor.apply_calls,
+            [plug_mutation(0x4000_0000, 0x20_0000)]
+        );
+        assert!(executor.rolled_back.is_empty());
+        assert_eq!(config_space.plugged_size(), 0x20_0000);
+        assert_eq!(read_response(&memory), VirtioMemResponse::Ack.to_le_bytes());
+    }
+
+    #[test]
+    fn virtio_mem_queue_dispatch_unplug_all_executor_uses_plugged_range_snapshot() {
+        let mut memory = request_memory();
+        let mut queue = virtio_mem_queue();
+        let mut config_space = virtio_mem_config_space()
+            .with_usable_region_size(0x80_0000)
+            .with_requested_size(0x80_0000);
+        let mut plugged_blocks = VirtioMemPluggedBlocks::default();
+
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4000_0000, 1);
+        write_available_heads(&mut memory, &[0]);
+        queue
+            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
+            .expect("first plug should dispatch");
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4040_0000, 1);
+        write_available_heads(&mut memory, &[0, 0]);
+        queue
+            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
+            .expect("second plug should dispatch");
+        let mut executor = RecordingMutationExecutor::default();
+
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_UNPLUG_ALL, 0, 0);
+        write_available_heads(&mut memory, &[0, 0, 0]);
+        let dispatch = queue
+            .dispatch_with_executor(
+                &mut memory,
+                &mut config_space,
+                &mut plugged_blocks,
+                &mut executor,
+            )
+            .expect("unplug-all should dispatch through executor");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(
+            executor.apply_calls,
+            [VirtioMemMutation::new(VirtioMemMutationKind::UnplugAll(
+                vec![
+                    guest_range(0x4000_0000, 0x20_0000),
+                    guest_range(0x4040_0000, 0x20_0000),
+                ]
+            ))]
+        );
+        assert_eq!(config_space.plugged_size(), 0);
+        assert_eq!(config_space.usable_region_size(), 0);
+    }
+
+    #[test]
+    fn virtio_mem_queue_dispatch_reports_mutation_executor_failure_without_commit() {
+        let mut memory = request_memory();
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4000_0000, 1);
+        write_available_heads(&mut memory, &[0]);
+        let mut queue = virtio_mem_queue();
+        let mut config_space = virtio_mem_config_space()
+            .with_usable_region_size(0x20_0000)
+            .with_requested_size(0x20_0000);
+        let mut plugged_blocks = VirtioMemPluggedBlocks::default();
+        let mut executor = RecordingMutationExecutor::default()
+            .with_apply_error(VirtioMemMutationError::new("map failed"));
+
+        let dispatch = queue
+            .dispatch_with_executor(
+                &mut memory,
+                &mut config_space,
+                &mut plugged_blocks,
+                &mut executor,
+            )
+            .expect("executor failure should still publish error response");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.mutation_failures(), 1);
+        assert_eq!(
+            dispatch.first_mutation_failure().map(ToString::to_string),
+            Some("virtio-mem mutation failed: map failed".to_string())
+        );
+        assert_eq!(
+            read_response(&memory),
+            VirtioMemResponse::Error.to_le_bytes()
+        );
+        assert_eq!(
+            read_used_element(&memory, 0),
+            (0, VIRTIO_MEM_RESPONSE_SIZE_U32)
+        );
+        assert_eq!(config_space.plugged_size(), 0);
+        assert_eq!(
+            plugged_blocks.range_state(
+                requested_block_range(
+                    VirtioMemRequestedRange::new(GuestAddress::new(0x4000_0000), 1),
+                    config_space,
+                )
+                .expect("test range should validate"),
+            ),
+            VirtioMemBlockState::Unplugged,
+        );
+        assert_eq!(
+            executor.apply_calls,
+            [plug_mutation(0x4000_0000, 0x20_0000)]
+        );
+        assert!(executor.rolled_back.is_empty());
+    }
+
+    #[test]
+    fn virtio_mem_queue_dispatch_reports_mutation_range_failure_without_executor_apply() {
+        let mut memory = request_memory();
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 1, 1);
+        write_available_heads(&mut memory, &[0]);
+        let mut queue = virtio_mem_queue();
+        let mut config_space = VirtioMemConfigSpace::new(u64::MAX, 1, u64::MAX)
+            .with_usable_region_size(u64::MAX)
+            .with_requested_size(u64::MAX);
+        let mut plugged_blocks = VirtioMemPluggedBlocks::default();
+        let mut executor = RecordingMutationExecutor::default();
+
+        let dispatch = queue
+            .dispatch_with_executor(
+                &mut memory,
+                &mut config_space,
+                &mut plugged_blocks,
+                &mut executor,
+            )
+            .expect("range conversion failure should still publish error response");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.mutation_failures(), 1);
+        let mutation_failure = dispatch
+            .first_mutation_failure()
+            .expect("mutation failure should be recorded")
+            .to_string();
+        assert!(mutation_failure.contains("invalid virtio-mem mutation range"));
+        assert!(mutation_failure.contains("start=0x1"));
+        assert!(mutation_failure.contains("size=18446744073709551615"));
+        assert_eq!(
+            read_response(&memory),
+            VirtioMemResponse::Error.to_le_bytes()
+        );
+        assert!(executor.apply_calls.is_empty());
+        assert!(executor.rolled_back.is_empty());
+        assert_eq!(config_space.plugged_size(), 0);
+        assert_eq!(
+            plugged_blocks.range_state(
+                requested_block_range(
+                    VirtioMemRequestedRange::new(GuestAddress::new(1), 1),
+                    config_space,
+                )
+                .expect("test range should validate before executable conversion"),
+            ),
+            VirtioMemBlockState::Unplugged,
+        );
+    }
+
+    #[test]
+    fn virtio_mem_queue_dispatch_rolls_back_applied_mutation_after_response_write_failure() {
+        let mut memory = request_memory();
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4000_0000, 1);
+        write_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::writable(
+                GuestAddress::new(TEST_MEMORY_SIZE),
+                VIRTIO_MEM_RESPONSE_SIZE_U32,
+                None,
+            ),
+        );
+        write_available_heads(&mut memory, &[0]);
+        let mut queue = virtio_mem_queue();
+        let mut config_space = virtio_mem_config_space()
+            .with_usable_region_size(0x20_0000)
+            .with_requested_size(0x20_0000);
+        let mut plugged_blocks = VirtioMemPluggedBlocks::default();
+        let mut executor = RecordingMutationExecutor::default();
+
+        let dispatch = queue
+            .dispatch_with_executor(
+                &mut memory,
+                &mut config_space,
+                &mut plugged_blocks,
+                &mut executor,
+            )
+            .expect("response write failure should roll back and publish zero-length used entry");
+
+        assert_eq!(dispatch.response_write_failures(), 1);
+        assert_eq!(read_used_element(&memory, 0), (0, 0));
+        assert_eq!(config_space.plugged_size(), 0);
+        assert_eq!(
+            executor.apply_calls,
+            [plug_mutation(0x4000_0000, 0x20_0000)]
+        );
+        assert_eq!(
+            executor.rolled_back_mutations(),
+            [plug_mutation(0x4000_0000, 0x20_0000)]
+        );
+    }
+
+    #[test]
+    fn virtio_mem_queue_dispatch_rolls_back_applied_mutation_after_used_ring_failure() {
+        let mut memory = request_memory();
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4000_0000, 1);
+        write_available_heads(&mut memory, &[0]);
+        let available = VirtqueueAvailableRing::new(
+            TEST_QUEUE_DESCRIPTOR_TABLE,
+            TEST_QUEUE_DRIVER_RING,
+            TEST_QUEUE_SIZE,
+        )
+        .expect("available ring should build");
+        let used = VirtqueueUsedRing::new(GuestAddress::new(TEST_MEMORY_SIZE), TEST_QUEUE_SIZE)
+            .expect("used ring should build");
+        let mut queue = VirtioMemQueue::new(available, used);
+        let mut config_space = virtio_mem_config_space()
+            .with_usable_region_size(0x20_0000)
+            .with_requested_size(0x20_0000);
+        let mut plugged_blocks = VirtioMemPluggedBlocks::default();
+        let mut executor = RecordingMutationExecutor::default();
+
+        let error = queue
+            .dispatch_with_executor(
+                &mut memory,
+                &mut config_space,
+                &mut plugged_blocks,
+                &mut executor,
+            )
+            .expect_err("used ring publication should fail after rollback");
+
+        match error {
+            VirtioMemQueueDispatchError::UsedRing { rollback_error, .. } => {
+                assert_eq!(rollback_error, None);
+            }
+            other => panic!("expected used-ring error, got {other:?}"),
+        }
+        assert_eq!(config_space.plugged_size(), 0);
+        assert_eq!(
+            executor.apply_calls,
+            [plug_mutation(0x4000_0000, 0x20_0000)]
+        );
+        assert_eq!(
+            executor.rolled_back_mutations(),
+            [plug_mutation(0x4000_0000, 0x20_0000)]
+        );
+    }
+
+    #[test]
+    fn virtio_mem_queue_dispatch_surfaces_rollback_failure_after_response_write_failure() {
+        let mut memory = request_memory();
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4000_0000, 1);
+        write_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::writable(
+                GuestAddress::new(TEST_MEMORY_SIZE),
+                VIRTIO_MEM_RESPONSE_SIZE_U32,
+                None,
+            ),
+        );
+        write_available_heads(&mut memory, &[0]);
+        let mut queue = virtio_mem_queue();
+        let mut config_space = virtio_mem_config_space()
+            .with_usable_region_size(0x20_0000)
+            .with_requested_size(0x20_0000);
+        let mut plugged_blocks = VirtioMemPluggedBlocks::default();
+        let mut executor = RecordingMutationExecutor::default()
+            .with_rollback_error(VirtioMemMutationRollbackError::new("rollback failed"));
+
+        let error = queue
+            .dispatch_with_executor(
+                &mut memory,
+                &mut config_space,
+                &mut plugged_blocks,
+                &mut executor,
+            )
+            .expect_err("rollback failure should surface as dispatch error");
+
+        assert!(matches!(
+            error,
+            VirtioMemQueueDispatchError::MutationRollback { .. }
+        ));
+        assert_eq!(error.completed_dispatch().processed_requests(), 0);
+        assert!(error.to_string().contains("rollback failed"));
+        assert_eq!(config_space.plugged_size(), 0);
+        assert_eq!(
+            executor.apply_calls,
+            [plug_mutation(0x4000_0000, 0x20_0000)]
+        );
+        assert_eq!(
+            executor.rolled_back_mutations(),
+            [plug_mutation(0x4000_0000, 0x20_0000)]
+        );
+    }
+
+    #[test]
+    fn virtio_mem_queue_dispatch_surfaces_rollback_failure_after_used_ring_failure() {
+        let mut memory = request_memory();
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4000_0000, 1);
+        write_available_heads(&mut memory, &[0]);
+        let available = VirtqueueAvailableRing::new(
+            TEST_QUEUE_DESCRIPTOR_TABLE,
+            TEST_QUEUE_DRIVER_RING,
+            TEST_QUEUE_SIZE,
+        )
+        .expect("available ring should build");
+        let used = VirtqueueUsedRing::new(GuestAddress::new(TEST_MEMORY_SIZE), TEST_QUEUE_SIZE)
+            .expect("used ring should build");
+        let mut queue = VirtioMemQueue::new(available, used);
+        let mut config_space = virtio_mem_config_space()
+            .with_usable_region_size(0x20_0000)
+            .with_requested_size(0x20_0000);
+        let mut plugged_blocks = VirtioMemPluggedBlocks::default();
+        let mut executor = RecordingMutationExecutor::default()
+            .with_rollback_error(VirtioMemMutationRollbackError::new("rollback failed"));
+
+        let error = queue
+            .dispatch_with_executor(
+                &mut memory,
+                &mut config_space,
+                &mut plugged_blocks,
+                &mut executor,
+            )
+            .expect_err("used-ring rollback failure should surface in used-ring error");
+
+        match error {
+            VirtioMemQueueDispatchError::UsedRing { rollback_error, .. } => {
+                assert_eq!(
+                    rollback_error.map(|source| source.to_string()),
+                    Some("virtio-mem mutation rollback failed: rollback failed".to_string())
+                );
+            }
+            other => panic!("expected used-ring error, got {other:?}"),
+        }
+        assert_eq!(config_space.plugged_size(), 0);
+        assert_eq!(
+            executor.apply_calls,
+            [plug_mutation(0x4000_0000, 0x20_0000)]
+        );
+        assert_eq!(
+            executor.rolled_back_mutations(),
+            [plug_mutation(0x4000_0000, 0x20_0000)]
+        );
+    }
+
+    #[test]
     fn virtio_mem_queue_dispatch_preserves_completed_dispatch_on_available_ring_error() {
         let mut memory = request_memory();
         write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_STATE, 0x4000_0000, 1);
@@ -4299,6 +4991,65 @@ mod tests {
         queues: &'a VirtioMmioQueueRegisters,
     ) -> VirtioMmioDeviceActivation<'a> {
         VirtioMmioDeviceActivation::new(device, queues)
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingMutationExecutor {
+        apply_results: VecDeque<Result<(), VirtioMemMutationError>>,
+        rollback_results: VecDeque<Result<(), VirtioMemMutationRollbackError>>,
+        apply_calls: Vec<VirtioMemMutation>,
+        rolled_back: Vec<VirtioMemAppliedMutation>,
+    }
+
+    impl RecordingMutationExecutor {
+        fn with_apply_error(mut self, source: VirtioMemMutationError) -> Self {
+            self.apply_results.push_back(Err(source));
+            self
+        }
+
+        fn with_rollback_error(mut self, source: VirtioMemMutationRollbackError) -> Self {
+            self.rollback_results.push_back(Err(source));
+            self
+        }
+
+        fn rolled_back_mutations(&self) -> Vec<VirtioMemMutation> {
+            self.rolled_back
+                .iter()
+                .map(|applied| applied.mutation().clone())
+                .collect()
+        }
+    }
+
+    impl VirtioMemMutationExecutor for RecordingMutationExecutor {
+        fn apply(
+            &mut self,
+            mutation: VirtioMemMutation,
+        ) -> Result<VirtioMemAppliedMutation, VirtioMemMutationError> {
+            self.apply_calls.push(mutation.clone());
+            match self.apply_results.pop_front() {
+                Some(Err(source)) => Err(source),
+                Some(Ok(())) | None => Ok(VirtioMemAppliedMutation::new(mutation)),
+            }
+        }
+
+        fn rollback(
+            &mut self,
+            applied: VirtioMemAppliedMutation,
+        ) -> Result<(), VirtioMemMutationRollbackError> {
+            self.rolled_back.push(applied);
+            match self.rollback_results.pop_front() {
+                Some(result) => result,
+                None => Ok(()),
+            }
+        }
+    }
+
+    fn guest_range(start: u64, size: u64) -> GuestMemoryRange {
+        GuestMemoryRange::new(GuestAddress::new(start), size).expect("test range should be valid")
+    }
+
+    fn plug_mutation(start: u64, size: u64) -> VirtioMemMutation {
+        VirtioMemMutation::new(VirtioMemMutationKind::Plug(guest_range(start, size)))
     }
 
     #[derive(Clone, Copy)]
