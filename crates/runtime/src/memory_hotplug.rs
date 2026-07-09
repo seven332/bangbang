@@ -42,7 +42,9 @@ const VIRTIO_MEM_REQ_UNPLUG_ALL: u16 = 2;
 const VIRTIO_MEM_REQ_STATE: u16 = 3;
 const VIRTIO_MEM_RESP_ACK: u16 = 0;
 const VIRTIO_MEM_RESP_ERROR: u16 = 3;
+const VIRTIO_MEM_STATE_PLUGGED: u16 = 0;
 const VIRTIO_MEM_STATE_UNPLUGGED: u16 = 1;
+const VIRTIO_MEM_STATE_MIXED: u16 = 2;
 const VIRTIO_MEM_REQUEST_SIZE_U32: u32 = VIRTIO_MEM_REQUEST_SIZE as u32;
 const VIRTIO_MEM_RESPONSE_SIZE_U32: u32 = VIRTIO_MEM_RESPONSE_SIZE as u32;
 
@@ -1006,20 +1008,194 @@ impl VirtioMemRequestKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VirtioMemResponse {
+    Ack,
+    AckPlugged,
     AckUnplugged,
+    AckMixed,
     Error,
 }
 
 impl VirtioMemResponse {
     pub const fn to_le_bytes(self) -> [u8; VIRTIO_MEM_RESPONSE_SIZE] {
         let (response_type, state) = match self {
+            Self::Ack => (VIRTIO_MEM_RESP_ACK, 0),
+            Self::AckPlugged => (VIRTIO_MEM_RESP_ACK, VIRTIO_MEM_STATE_PLUGGED),
             Self::AckUnplugged => (VIRTIO_MEM_RESP_ACK, VIRTIO_MEM_STATE_UNPLUGGED),
+            Self::AckMixed => (VIRTIO_MEM_RESP_ACK, VIRTIO_MEM_STATE_MIXED),
             Self::Error => (VIRTIO_MEM_RESP_ERROR, 0),
         };
         let [type0, type1] = response_type.to_le_bytes();
         let [state0, state1] = state.to_le_bytes();
 
         [type0, type1, 0, 0, 0, 0, 0, 0, state0, state1]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtioMemBlockState {
+    Plugged,
+    Unplugged,
+    Mixed,
+}
+
+impl VirtioMemBlockState {
+    const fn response(self) -> VirtioMemResponse {
+        match self {
+            Self::Plugged => VirtioMemResponse::AckPlugged,
+            Self::Unplugged => VirtioMemResponse::AckUnplugged,
+            Self::Mixed => VirtioMemResponse::AckMixed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VirtioMemBlockRange {
+    start: u64,
+    end: u64,
+}
+
+impl VirtioMemBlockRange {
+    fn new(start: u64, block_count: u64) -> Option<Self> {
+        if block_count == 0 {
+            return None;
+        }
+        let end = start.checked_add(block_count)?;
+        Some(Self { start, end })
+    }
+
+    const fn start(self) -> u64 {
+        self.start
+    }
+
+    const fn end(self) -> u64 {
+        self.end
+    }
+
+    const fn block_count(self) -> u64 {
+        self.end - self.start
+    }
+
+    fn len_bytes(self, block_size: u64) -> Option<u64> {
+        self.block_count().checked_mul(block_size)
+    }
+
+    const fn overlaps(self, other: Self) -> bool {
+        self.start < other.end && other.start < self.end
+    }
+
+    const fn merge(self, other: Self) -> Self {
+        Self {
+            start: if self.start < other.start {
+                self.start
+            } else {
+                other.start
+            },
+            end: if self.end > other.end {
+                self.end
+            } else {
+                other.end
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct VirtioMemPluggedBlocks {
+    ranges: Vec<VirtioMemBlockRange>,
+}
+
+impl VirtioMemPluggedBlocks {
+    fn range_state(&self, range: VirtioMemBlockRange) -> VirtioMemBlockState {
+        let mut cursor = range.start();
+        let mut saw_overlap = false;
+
+        for plugged in &self.ranges {
+            if plugged.end() <= range.start() {
+                continue;
+            }
+            if plugged.start() >= range.end() {
+                break;
+            }
+            if plugged.start() > cursor {
+                return VirtioMemBlockState::Mixed;
+            }
+
+            saw_overlap = true;
+            if plugged.end() > cursor {
+                cursor = plugged.end().min(range.end());
+            }
+            if cursor == range.end() {
+                return VirtioMemBlockState::Plugged;
+            }
+        }
+
+        if saw_overlap {
+            VirtioMemBlockState::Mixed
+        } else {
+            VirtioMemBlockState::Unplugged
+        }
+    }
+
+    fn plugged_size(&self, block_size: u64) -> u64 {
+        self.ranges
+            .iter()
+            .map(|range| range.block_count())
+            .sum::<u64>()
+            * block_size
+    }
+
+    fn plug(&mut self, range: VirtioMemBlockRange) {
+        let mut pending = range;
+        let mut inserted = false;
+        let mut merged = Vec::with_capacity(self.ranges.len() + 1);
+
+        for current in self.ranges.drain(..) {
+            if current.end() < pending.start() {
+                merged.push(current);
+            } else if pending.end() < current.start() {
+                if !inserted {
+                    merged.push(pending);
+                    inserted = true;
+                }
+                merged.push(current);
+            } else {
+                pending = pending.merge(current);
+            }
+        }
+
+        if !inserted {
+            merged.push(pending);
+        }
+        self.ranges = merged;
+    }
+
+    fn unplug(&mut self, range: VirtioMemBlockRange) {
+        let mut remaining = Vec::with_capacity(self.ranges.len());
+
+        for current in self.ranges.drain(..) {
+            if !current.overlaps(range) {
+                remaining.push(current);
+                continue;
+            }
+            if current.start() < range.start() {
+                remaining.push(VirtioMemBlockRange {
+                    start: current.start(),
+                    end: range.start(),
+                });
+            }
+            if range.end() < current.end() {
+                remaining.push(VirtioMemBlockRange {
+                    start: range.end(),
+                    end: current.end(),
+                });
+            }
+        }
+
+        self.ranges = remaining;
+    }
+
+    fn clear(&mut self) {
+        self.ranges.clear();
     }
 }
 
@@ -1075,26 +1251,50 @@ impl VirtioMemRequest {
         self.response
     }
 
-    pub fn execute(
+    fn execute(
         &self,
         memory: &mut GuestMemory,
         config_space: VirtioMemConfigSpace,
+        plugged_blocks: &VirtioMemPluggedBlocks,
     ) -> VirtioMemRequestExecution {
-        let (response, outcome) = response_for_request(self.kind, config_space);
-        match memory.write_slice(&response.to_le_bytes(), self.response.address()) {
+        let prepared = response_for_request(self.kind, config_space, plugged_blocks);
+        match memory.write_slice(&prepared.response.to_le_bytes(), self.response.address()) {
             Ok(()) => VirtioMemRequestExecution::new(
                 VirtioMemRequestCompletion::new(self.descriptor_head, VIRTIO_MEM_RESPONSE_SIZE_U32),
-                response,
-                outcome,
+                prepared.response,
+                prepared.outcome,
+                prepared.mutation,
             ),
             Err(source) => VirtioMemRequestExecution::new(
                 VirtioMemRequestCompletion::new(self.descriptor_head, 0),
-                response,
+                prepared.response,
                 VirtioMemRequestExecutionOutcome::ResponseWriteFailed {
                     address: self.response.address(),
                     source,
                 },
+                None,
             ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VirtioMemPreparedRequestExecution {
+    response: VirtioMemResponse,
+    outcome: VirtioMemRequestExecutionOutcome,
+    mutation: Option<VirtioMemPendingMutation>,
+}
+
+impl VirtioMemPreparedRequestExecution {
+    const fn new(
+        response: VirtioMemResponse,
+        outcome: VirtioMemRequestExecutionOutcome,
+        mutation: Option<VirtioMemPendingMutation>,
+    ) -> Self {
+        Self {
+            response,
+            outcome,
+            mutation,
         }
     }
 }
@@ -1127,18 +1327,21 @@ pub struct VirtioMemRequestExecution {
     completion: VirtioMemRequestCompletion,
     response: VirtioMemResponse,
     outcome: VirtioMemRequestExecutionOutcome,
+    mutation: Option<VirtioMemPendingMutation>,
 }
 
 impl VirtioMemRequestExecution {
-    pub const fn new(
+    const fn new(
         completion: VirtioMemRequestCompletion,
         response: VirtioMemResponse,
         outcome: VirtioMemRequestExecutionOutcome,
+        mutation: Option<VirtioMemPendingMutation>,
     ) -> Self {
         Self {
             completion,
             response,
             outcome,
+            mutation,
         }
     }
 
@@ -1153,11 +1356,18 @@ impl VirtioMemRequestExecution {
     pub const fn outcome(&self) -> &VirtioMemRequestExecutionOutcome {
         &self.outcome
     }
+
+    const fn mutation(&self) -> Option<VirtioMemPendingMutation> {
+        self.mutation
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VirtioMemRequestExecutionOutcome {
-    StateUnplugged,
+    State {
+        state: VirtioMemBlockState,
+    },
+    MutationAccepted,
     PolicyError,
     UnsupportedRequest {
         request_type: u16,
@@ -1166,6 +1376,31 @@ pub enum VirtioMemRequestExecutionOutcome {
         address: GuestAddress,
         source: GuestMemoryAccessError,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VirtioMemPendingMutation {
+    Plug(VirtioMemBlockRange),
+    Unplug(VirtioMemBlockRange),
+    UnplugAll,
+}
+
+impl VirtioMemPendingMutation {
+    fn commit(
+        self,
+        config_space: &mut VirtioMemConfigSpace,
+        plugged_blocks: &mut VirtioMemPluggedBlocks,
+    ) {
+        match self {
+            Self::Plug(range) => plugged_blocks.plug(range),
+            Self::Unplug(range) => plugged_blocks.unplug(range),
+            Self::UnplugAll => {
+                plugged_blocks.clear();
+                config_space.usable_region_size = 0;
+            }
+        }
+        config_space.plugged_size = plugged_blocks.plugged_size(config_space.block_size());
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1286,10 +1521,11 @@ impl VirtioMemQueue {
         &self.used
     }
 
-    pub fn dispatch(
+    fn dispatch(
         &mut self,
         memory: &mut GuestMemory,
-        config_space: VirtioMemConfigSpace,
+        config_space: &mut VirtioMemConfigSpace,
+        plugged_blocks: &mut VirtioMemPluggedBlocks,
     ) -> Result<VirtioMemQueueDispatch, VirtioMemQueueDispatchError> {
         let mut dispatch = VirtioMemQueueDispatch::default();
         while let Some(chain) = self
@@ -1301,17 +1537,19 @@ impl VirtioMemQueue {
             })?
         {
             let descriptor_head = chain.head_index();
-            let (completion, outcome) = match VirtioMemRequest::parse(memory, &chain) {
+            let (completion, outcome, mutation) = match VirtioMemRequest::parse(memory, &chain) {
                 Ok(request) => {
-                    let execution = request.execute(memory, config_space);
+                    let execution = request.execute(memory, *config_space, plugged_blocks);
                     (
                         execution.completion(),
                         VirtioMemQueueDispatchOutcome::from_execution(&execution),
+                        execution.mutation(),
                     )
                 }
                 Err(source) => (
                     VirtioMemRequestCompletion::new(descriptor_head, 0),
                     VirtioMemQueueDispatchOutcome::ParseError(source),
+                    None,
                 ),
             };
 
@@ -1329,6 +1567,9 @@ impl VirtioMemQueue {
                     bytes_written_to_guest: completion.bytes_written_to_guest(),
                     source,
                 })?;
+            if let Some(mutation) = mutation {
+                mutation.commit(config_space, plugged_blocks);
+            }
             dispatch.record(outcome, publication);
         }
 
@@ -1420,9 +1661,10 @@ impl VirtioMemQueueDispatch {
         self.processed_requests += 1;
         self.needs_queue_interrupt |= publication.needs_queue_interrupt();
         match outcome {
-            VirtioMemQueueDispatchOutcome::StateUnplugged => {
+            VirtioMemQueueDispatchOutcome::State { .. } => {
                 self.state_requests += 1;
             }
+            VirtioMemQueueDispatchOutcome::MutationAccepted => {}
             VirtioMemQueueDispatchOutcome::PolicyError => {
                 self.policy_errors += 1;
             }
@@ -1444,7 +1686,8 @@ impl VirtioMemQueueDispatch {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum VirtioMemQueueDispatchOutcome {
-    StateUnplugged,
+    State { state: VirtioMemBlockState },
+    MutationAccepted,
     PolicyError,
     UnsupportedRequest { request_type: u16 },
     ParseError(VirtioMemRequestError),
@@ -1454,7 +1697,8 @@ enum VirtioMemQueueDispatchOutcome {
 impl VirtioMemQueueDispatchOutcome {
     const fn from_execution(execution: &VirtioMemRequestExecution) -> Self {
         match execution.outcome() {
-            VirtioMemRequestExecutionOutcome::StateUnplugged => Self::StateUnplugged,
+            VirtioMemRequestExecutionOutcome::State { state } => Self::State { state: *state },
+            VirtioMemRequestExecutionOutcome::MutationAccepted => Self::MutationAccepted,
             VirtioMemRequestExecutionOutcome::PolicyError => Self::PolicyError,
             VirtioMemRequestExecutionOutcome::UnsupportedRequest { request_type } => {
                 Self::UnsupportedRequest {
@@ -1631,11 +1875,15 @@ impl std::error::Error for VirtioMemDeviceNotificationError {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct VirtioMemDevice {
     active_queue: Option<VirtioMemQueue>,
+    plugged_blocks: VirtioMemPluggedBlocks,
 }
 
 impl VirtioMemDevice {
     pub const fn new() -> Self {
-        Self { active_queue: None }
+        Self {
+            active_queue: None,
+            plugged_blocks: VirtioMemPluggedBlocks { ranges: Vec::new() },
+        }
     }
 
     pub fn is_activated(&self) -> bool {
@@ -1653,7 +1901,7 @@ impl VirtioMemDevice {
     fn dispatch_drained_queue_notifications(
         &mut self,
         memory: &mut GuestMemory,
-        config_space: VirtioMemConfigSpace,
+        config_space: &mut VirtioMemConfigSpace,
         drained_notifications: Vec<usize>,
     ) -> Result<VirtioMemDeviceNotificationDispatch, VirtioMemDeviceNotificationError> {
         if drained_notifications.is_empty() {
@@ -1680,7 +1928,7 @@ impl VirtioMemDevice {
             });
         };
 
-        match queue.dispatch(memory, config_space) {
+        match queue.dispatch(memory, config_space, &mut self.plugged_blocks) {
             Ok(dispatch) => Ok(VirtioMemDeviceNotificationDispatch::new(
                 drained_notifications,
                 Some(dispatch),
@@ -1737,10 +1985,15 @@ impl VirtioMmioRegisterHandler<VirtioMemConfigSpace, VirtioMemDevice> {
         memory: &mut GuestMemory,
     ) -> Result<VirtioMemDeviceNotificationDispatch, VirtioMemDeviceNotificationError> {
         let drained_notifications = self.take_pending_queue_notifications();
-        let config_space = *self.device_config_handler();
+        let previous_config_space = *self.device_config_handler();
+        let mut config_space = previous_config_space;
         let dispatch = self
             .activation_handler_mut()
-            .dispatch_drained_queue_notifications(memory, config_space, drained_notifications);
+            .dispatch_drained_queue_notifications(memory, &mut config_space, drained_notifications);
+        if config_space != previous_config_space {
+            *self.device_config_handler_mut() = config_space;
+            self.increment_config_generation();
+        }
         let needs_queue_interrupt = match &dispatch {
             Ok(dispatch) => dispatch.needs_queue_interrupt(),
             Err(error) => error
@@ -1960,67 +2213,130 @@ pub fn virtio_mem_mmio_handler_from_config_space(
 fn response_for_request(
     request: VirtioMemRequestKind,
     config_space: VirtioMemConfigSpace,
-) -> (VirtioMemResponse, VirtioMemRequestExecutionOutcome) {
+    plugged_blocks: &VirtioMemPluggedBlocks,
+) -> VirtioMemPreparedRequestExecution {
     match request {
-        VirtioMemRequestKind::State(range) => {
-            if validate_requested_range(range, config_space).is_ok() {
-                (
-                    VirtioMemResponse::AckUnplugged,
-                    VirtioMemRequestExecutionOutcome::StateUnplugged,
-                )
-            } else {
-                (
-                    VirtioMemResponse::Error,
-                    VirtioMemRequestExecutionOutcome::PolicyError,
+        VirtioMemRequestKind::State(range) => match requested_block_range(range, config_space) {
+            Some(range) => {
+                let state = plugged_blocks.range_state(range);
+                VirtioMemPreparedRequestExecution::new(
+                    state.response(),
+                    VirtioMemRequestExecutionOutcome::State { state },
+                    None,
                 )
             }
+            None => policy_error_response(),
+        },
+        VirtioMemRequestKind::Plug(range) => {
+            prepare_plug_request(range, config_space, plugged_blocks)
         }
-        VirtioMemRequestKind::Plug(_)
-        | VirtioMemRequestKind::Unplug(_)
-        | VirtioMemRequestKind::UnplugAll => (
-            VirtioMemResponse::Error,
-            VirtioMemRequestExecutionOutcome::PolicyError,
+        VirtioMemRequestKind::Unplug(range) => {
+            prepare_unplug_request(range, config_space, plugged_blocks)
+        }
+        VirtioMemRequestKind::UnplugAll => VirtioMemPreparedRequestExecution::new(
+            VirtioMemResponse::Ack,
+            VirtioMemRequestExecutionOutcome::MutationAccepted,
+            Some(VirtioMemPendingMutation::UnplugAll),
         ),
-        VirtioMemRequestKind::Unsupported { request_type } => (
-            VirtioMemResponse::Error,
-            VirtioMemRequestExecutionOutcome::UnsupportedRequest { request_type },
-        ),
+        VirtioMemRequestKind::Unsupported { request_type } => {
+            VirtioMemPreparedRequestExecution::new(
+                VirtioMemResponse::Error,
+                VirtioMemRequestExecutionOutcome::UnsupportedRequest { request_type },
+                None,
+            )
+        }
     }
 }
 
-fn validate_requested_range(
+fn requested_block_range(
     range: VirtioMemRequestedRange,
     config_space: VirtioMemConfigSpace,
-) -> Result<(), ()> {
+) -> Option<VirtioMemBlockRange> {
     let block_size = config_space.block_size();
     if block_size == 0 {
-        return Err(());
+        return None;
     }
     if range.block_count() == 0 {
-        return Err(());
+        return None;
     }
-    let Some(start_offset) = range
+    let start_offset = range
         .address()
         .raw_value()
         .checked_sub(config_space.addr())
         .filter(|start_offset| *start_offset < config_space.usable_region_size())
-    else {
-        return Err(());
-    };
+        .filter(|start_offset| *start_offset < config_space.region_size())?;
     if !start_offset.is_multiple_of(block_size) {
-        return Err(());
+        return None;
     }
-    let Some(range_len) = u64::from(range.block_count()).checked_mul(block_size) else {
-        return Err(());
-    };
-    let Some(end_offset) = start_offset.checked_add(range_len) else {
-        return Err(());
-    };
+    let range_len = u64::from(range.block_count()).checked_mul(block_size)?;
+    let end_offset = start_offset.checked_add(range_len)?;
     if end_offset > config_space.usable_region_size() {
-        return Err(());
+        return None;
+    }
+    if end_offset > config_space.region_size() {
+        return None;
+    }
+    let start_block = start_offset / block_size;
+
+    VirtioMemBlockRange::new(start_block, u64::from(range.block_count()))
+}
+
+fn prepare_plug_request(
+    range: VirtioMemRequestedRange,
+    config_space: VirtioMemConfigSpace,
+    plugged_blocks: &VirtioMemPluggedBlocks,
+) -> VirtioMemPreparedRequestExecution {
+    let Some(range) = requested_block_range(range, config_space) else {
+        return policy_error_response();
+    };
+    let VirtioMemBlockState::Unplugged = plugged_blocks.range_state(range) else {
+        return policy_error_response();
+    };
+    let Some(range_len) = range.len_bytes(config_space.block_size()) else {
+        return policy_error_response();
+    };
+    let Some(plugged_size) = plugged_blocks
+        .plugged_size(config_space.block_size())
+        .checked_add(range_len)
+    else {
+        return policy_error_response();
+    };
+    if plugged_size > config_space.requested_size() {
+        return policy_error_response();
     }
 
-    Ok(())
+    VirtioMemPreparedRequestExecution::new(
+        VirtioMemResponse::Ack,
+        VirtioMemRequestExecutionOutcome::MutationAccepted,
+        Some(VirtioMemPendingMutation::Plug(range)),
+    )
+}
+
+fn prepare_unplug_request(
+    range: VirtioMemRequestedRange,
+    config_space: VirtioMemConfigSpace,
+    plugged_blocks: &VirtioMemPluggedBlocks,
+) -> VirtioMemPreparedRequestExecution {
+    let Some(range) = requested_block_range(range, config_space) else {
+        return policy_error_response();
+    };
+    let VirtioMemBlockState::Plugged = plugged_blocks.range_state(range) else {
+        return policy_error_response();
+    };
+
+    VirtioMemPreparedRequestExecution::new(
+        VirtioMemResponse::Ack,
+        VirtioMemRequestExecutionOutcome::MutationAccepted,
+        Some(VirtioMemPendingMutation::Unplug(range)),
+    )
+}
+
+const fn policy_error_response() -> VirtioMemPreparedRequestExecution {
+    VirtioMemPreparedRequestExecution::new(
+        VirtioMemResponse::Error,
+        VirtioMemRequestExecutionOutcome::PolicyError,
+        None,
+    )
 }
 
 fn descriptor_at(
@@ -2809,6 +3125,18 @@ mod tests {
             [0, 0, 0, 0, 0, 0, 0, 0, 1, 0]
         );
         assert_eq!(
+            VirtioMemResponse::AckPlugged.to_le_bytes(),
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            VirtioMemResponse::AckMixed.to_le_bytes(),
+            [0, 0, 0, 0, 0, 0, 0, 0, 2, 0]
+        );
+        assert_eq!(
+            VirtioMemResponse::Ack.to_le_bytes(),
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
             VirtioMemResponse::Error.to_le_bytes(),
             [3, 0, 0, 0, 0, 0, 0, 0, 0, 0]
         );
@@ -2961,12 +3289,11 @@ mod tests {
         write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_STATE, 0x4000_0000, 1);
         write_available_heads(&mut memory, &[0]);
         let mut queue = virtio_mem_queue();
+        let mut config_space = virtio_mem_config_space().with_usable_region_size(0x20_0000);
+        let mut plugged_blocks = VirtioMemPluggedBlocks::default();
 
         let dispatch = queue
-            .dispatch(
-                &mut memory,
-                virtio_mem_config_space().with_usable_region_size(0x20_0000),
-            )
+            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
             .expect("state request should dispatch");
 
         assert_eq!(dispatch.processed_requests(), 1);
@@ -2990,13 +3317,12 @@ mod tests {
         write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_STATE, 0x4000_0001, 1);
         write_available_heads(&mut memory, &[0]);
         let mut queue = virtio_mem_queue();
+        let mut config_space = VirtioMemConfigSpace::new(0x20_0000, 0x4000_0001, 0x8000_0000)
+            .with_usable_region_size(0x20_0000);
+        let mut plugged_blocks = VirtioMemPluggedBlocks::default();
 
         let dispatch = queue
-            .dispatch(
-                &mut memory,
-                VirtioMemConfigSpace::new(0x20_0000, 0x4000_0001, 0x8000_0000)
-                    .with_usable_region_size(0x20_0000),
-            )
+            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
             .expect("state request should validate against the hotplug aperture offset");
 
         assert_eq!(dispatch.processed_requests(), 1);
@@ -3013,9 +3339,11 @@ mod tests {
         write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_STATE, 0x4000_0000, 1);
         write_available_heads(&mut memory, &[0]);
         let mut queue = virtio_mem_queue();
+        let mut config_space = zero_usable_virtio_mem_config_space();
+        let mut plugged_blocks = VirtioMemPluggedBlocks::default();
 
         let dispatch = queue
-            .dispatch(&mut memory, zero_usable_virtio_mem_config_space())
+            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
             .expect("state request should dispatch with error response");
 
         assert_eq!(dispatch.processed_requests(), 1);
@@ -3032,33 +3360,116 @@ mod tests {
     }
 
     #[test]
-    fn virtio_mem_queue_dispatch_completes_mutation_requests_with_error() {
-        for request_type in [
-            VIRTIO_MEM_REQ_PLUG,
-            VIRTIO_MEM_REQ_UNPLUG,
-            VIRTIO_MEM_REQ_UNPLUG_ALL,
-        ] {
-            let mut memory = request_memory();
-            write_virtio_mem_chain(&mut memory, request_type, 0x4000_0000, 1);
-            write_available_heads(&mut memory, &[0]);
-            let mut queue = virtio_mem_queue();
+    fn virtio_mem_queue_dispatch_accepts_plug_unplug_and_unplug_all() {
+        let mut memory = request_memory();
+        let mut queue = virtio_mem_queue();
+        let mut config_space = virtio_mem_config_space()
+            .with_usable_region_size(0x80_0000)
+            .with_requested_size(0x80_0000);
+        let mut plugged_blocks = VirtioMemPluggedBlocks::default();
 
-            let dispatch = queue
-                .dispatch(&mut memory, virtio_mem_config_space())
-                .expect("mutation request should dispatch with error response");
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4000_0000, 2);
+        write_available_heads(&mut memory, &[0]);
+        let dispatch = queue
+            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
+            .expect("plug request should dispatch");
 
-            assert_eq!(dispatch.processed_requests(), 1);
-            assert_eq!(dispatch.policy_errors(), 1);
-            assert_eq!(dispatch.unsupported_requests(), 0);
-            assert_eq!(
-                read_response(&memory),
-                VirtioMemResponse::Error.to_le_bytes()
-            );
-            assert_eq!(
-                read_used_element(&memory, 0),
-                (0, VIRTIO_MEM_RESPONSE_SIZE_U32)
-            );
-        }
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.policy_errors(), 0);
+        assert_eq!(read_response(&memory), VirtioMemResponse::Ack.to_le_bytes());
+        assert_eq!(config_space.plugged_size(), 0x40_0000);
+
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_STATE, 0x4000_0000, 1);
+        write_available_heads(&mut memory, &[0, 0]);
+        let dispatch = queue
+            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
+            .expect("plugged state request should dispatch");
+
+        assert_eq!(dispatch.state_requests(), 1);
+        assert_eq!(
+            read_response(&memory),
+            VirtioMemResponse::AckPlugged.to_le_bytes()
+        );
+
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_STATE, 0x4000_0000, 3);
+        write_available_heads(&mut memory, &[0, 0, 0]);
+        queue
+            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
+            .expect("mixed state request should dispatch");
+
+        assert_eq!(
+            read_response(&memory),
+            VirtioMemResponse::AckMixed.to_le_bytes()
+        );
+
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_UNPLUG, 0x4000_0000, 2);
+        write_available_heads(&mut memory, &[0, 0, 0, 0]);
+        queue
+            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
+            .expect("unplug request should dispatch");
+
+        assert_eq!(read_response(&memory), VirtioMemResponse::Ack.to_le_bytes());
+        assert_eq!(config_space.plugged_size(), 0);
+
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4040_0000, 1);
+        write_available_heads(&mut memory, &[0, 0, 0, 0, 0]);
+        queue
+            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
+            .expect("second plug request should dispatch");
+        assert_eq!(config_space.plugged_size(), 0x20_0000);
+
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_UNPLUG_ALL, 0, 0);
+        write_available_heads(&mut memory, &[0, 0, 0, 0, 0, 0]);
+        queue
+            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
+            .expect("unplug all request should dispatch");
+
+        assert_eq!(read_response(&memory), VirtioMemResponse::Ack.to_le_bytes());
+        assert_eq!(config_space.plugged_size(), 0);
+        assert_eq!(config_space.usable_region_size(), 0);
+    }
+
+    #[test]
+    fn virtio_mem_queue_dispatch_rejects_duplicate_plug_and_unplug() {
+        let mut memory = request_memory();
+        let mut queue = virtio_mem_queue();
+        let mut config_space = virtio_mem_config_space()
+            .with_usable_region_size(0x40_0000)
+            .with_requested_size(0x40_0000);
+        let mut plugged_blocks = VirtioMemPluggedBlocks::default();
+
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4000_0000, 1);
+        write_available_heads(&mut memory, &[0]);
+        queue
+            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
+            .expect("initial plug should dispatch");
+        assert_eq!(config_space.plugged_size(), 0x20_0000);
+
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4000_0000, 1);
+        write_available_heads(&mut memory, &[0, 0]);
+        let dispatch = queue
+            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
+            .expect("duplicate plug should dispatch with error response");
+
+        assert_eq!(dispatch.policy_errors(), 1);
+        assert_eq!(
+            read_response(&memory),
+            VirtioMemResponse::Error.to_le_bytes()
+        );
+        assert_eq!(config_space.plugged_size(), 0x20_0000);
+
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_UNPLUG, 0x4020_0000, 1);
+        write_available_heads(&mut memory, &[0, 0, 0]);
+        let dispatch = queue
+            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
+            .expect("duplicate unplug should dispatch with error response");
+
+        assert_eq!(dispatch.policy_errors(), 1);
+        assert_eq!(
+            read_response(&memory),
+            VirtioMemResponse::Error.to_le_bytes()
+        );
+        assert_eq!(config_space.plugged_size(), 0x20_0000);
     }
 
     #[test]
@@ -3067,9 +3478,11 @@ mod tests {
         write_virtio_mem_chain(&mut memory, 99, 0, 0);
         write_available_heads(&mut memory, &[0]);
         let mut queue = virtio_mem_queue();
+        let mut config_space = virtio_mem_config_space();
+        let mut plugged_blocks = VirtioMemPluggedBlocks::default();
 
         let dispatch = queue
-            .dispatch(&mut memory, virtio_mem_config_space())
+            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
             .expect("unsupported request should dispatch with error response");
 
         assert_eq!(dispatch.processed_requests(), 1);
@@ -3096,9 +3509,11 @@ mod tests {
         );
         write_available_heads(&mut memory, &[0]);
         let mut queue = virtio_mem_queue();
+        let mut config_space = virtio_mem_config_space();
+        let mut plugged_blocks = VirtioMemPluggedBlocks::default();
 
         let dispatch = queue
-            .dispatch(&mut memory, virtio_mem_config_space())
+            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
             .expect("parse failure should still publish used element");
 
         assert_eq!(dispatch.processed_requests(), 1);
@@ -3126,12 +3541,11 @@ mod tests {
         );
         write_available_heads(&mut memory, &[0]);
         let mut queue = virtio_mem_queue();
+        let mut config_space = virtio_mem_config_space().with_usable_region_size(0x20_0000);
+        let mut plugged_blocks = VirtioMemPluggedBlocks::default();
 
         let dispatch = queue
-            .dispatch(
-                &mut memory,
-                virtio_mem_config_space().with_usable_region_size(0x20_0000),
-            )
+            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
             .expect("response write failure should still publish used element");
 
         assert_eq!(dispatch.processed_requests(), 1);
@@ -3140,17 +3554,95 @@ mod tests {
     }
 
     #[test]
+    fn virtio_mem_queue_dispatch_does_not_plug_after_response_write_failure() {
+        let mut memory = request_memory();
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4000_0000, 1);
+        write_descriptor(
+            &mut memory,
+            1,
+            TestDescriptor::writable(
+                GuestAddress::new(TEST_MEMORY_SIZE),
+                VIRTIO_MEM_RESPONSE_SIZE_U32,
+                None,
+            ),
+        );
+        write_available_heads(&mut memory, &[0]);
+        let mut queue = virtio_mem_queue();
+        let mut config_space = virtio_mem_config_space()
+            .with_usable_region_size(0x20_0000)
+            .with_requested_size(0x20_0000);
+        let mut plugged_blocks = VirtioMemPluggedBlocks::default();
+
+        let dispatch = queue
+            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
+            .expect("response write failure should still publish used element");
+
+        assert_eq!(dispatch.response_write_failures(), 1);
+        assert_eq!(config_space.plugged_size(), 0);
+        assert_eq!(
+            plugged_blocks.range_state(
+                requested_block_range(
+                    VirtioMemRequestedRange::new(GuestAddress::new(0x4000_0000), 1),
+                    config_space,
+                )
+                .expect("test range should validate"),
+            ),
+            VirtioMemBlockState::Unplugged,
+        );
+    }
+
+    #[test]
+    fn virtio_mem_queue_dispatch_does_not_plug_after_used_ring_failure() {
+        let mut memory = request_memory();
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4000_0000, 1);
+        write_available_heads(&mut memory, &[0]);
+        let available = VirtqueueAvailableRing::new(
+            TEST_QUEUE_DESCRIPTOR_TABLE,
+            TEST_QUEUE_DRIVER_RING,
+            TEST_QUEUE_SIZE,
+        )
+        .expect("available ring should build");
+        let used = VirtqueueUsedRing::new(GuestAddress::new(TEST_MEMORY_SIZE), TEST_QUEUE_SIZE)
+            .expect("used ring should build");
+        let mut queue = VirtioMemQueue::new(available, used);
+        let mut config_space = virtio_mem_config_space()
+            .with_usable_region_size(0x20_0000)
+            .with_requested_size(0x20_0000);
+        let mut plugged_blocks = VirtioMemPluggedBlocks::default();
+
+        let error = queue
+            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
+            .expect_err("used ring publication should fail");
+
+        assert!(matches!(
+            error,
+            VirtioMemQueueDispatchError::UsedRing { .. }
+        ));
+        assert_eq!(error.completed_dispatch().processed_requests(), 0);
+        assert_eq!(config_space.plugged_size(), 0);
+        assert_eq!(
+            plugged_blocks.range_state(
+                requested_block_range(
+                    VirtioMemRequestedRange::new(GuestAddress::new(0x4000_0000), 1),
+                    config_space,
+                )
+                .expect("test range should validate"),
+            ),
+            VirtioMemBlockState::Unplugged,
+        );
+    }
+
+    #[test]
     fn virtio_mem_queue_dispatch_preserves_completed_dispatch_on_available_ring_error() {
         let mut memory = request_memory();
         write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_STATE, 0x4000_0000, 1);
         write_available_heads(&mut memory, &[0, TEST_QUEUE_SIZE]);
         let mut queue = virtio_mem_queue();
+        let mut config_space = virtio_mem_config_space().with_usable_region_size(0x20_0000);
+        let mut plugged_blocks = VirtioMemPluggedBlocks::default();
 
         let error = queue
-            .dispatch(
-                &mut memory,
-                virtio_mem_config_space().with_usable_region_size(0x20_0000),
-            )
+            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
             .expect_err("invalid second available head should fail after first completion");
 
         assert!(matches!(
@@ -3201,6 +3693,49 @@ mod tests {
     }
 
     #[test]
+    fn virtio_mem_handler_dispatch_updates_plugged_size_config() {
+        let mut memory = request_memory();
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4000_0000, 1);
+        write_available_heads(&mut memory, &[0]);
+        let mut handler = mem_mmio_handler(
+            virtio_mem_config_space()
+                .with_usable_region_size(0x20_0000)
+                .with_requested_size(0x20_0000),
+        );
+
+        configure_mem_mmio_handler_queue(&mut handler);
+        handler
+            .write_register(VirtioMmioRegister::Status, TEST_DRIVER_OK_STATUS)
+            .expect("DRIVER_OK status should activate virtio-mem");
+        let initial_generation = handler
+            .read_register(VirtioMmioRegister::ConfigGeneration)
+            .expect("config generation should read");
+        handler
+            .write_register(VirtioMmioRegister::QueueNotify, 0)
+            .expect("queue notification should write");
+
+        let dispatch = handler
+            .dispatch_mem_queue_notifications(&mut memory)
+            .expect("pending queue notification should dispatch");
+
+        assert_eq!(
+            dispatch
+                .queue_dispatch()
+                .expect("queue dispatch should be present")
+                .policy_errors(),
+            0
+        );
+        assert_eq!(handler.device_config_handler().plugged_size(), 0x20_0000);
+        assert_eq!(
+            handler
+                .read_register(VirtioMmioRegister::ConfigGeneration)
+                .expect("config generation should read"),
+            initial_generation.wrapping_add(1)
+        );
+        assert_eq!(read_response(&memory), VirtioMemResponse::Ack.to_le_bytes());
+    }
+
+    #[test]
     fn virtio_mem_handler_rejects_inactive_queue_notifications() {
         let mut memory = request_memory();
         let mut handler = mem_mmio_handler(virtio_mem_config_space());
@@ -3237,13 +3772,10 @@ mod tests {
     fn virtio_mem_device_notification_dispatch_rejects_unsupported_queue_without_dispatch() {
         let mut memory = request_memory();
         let mut device = VirtioMemDevice::new();
+        let mut config_space = virtio_mem_config_space();
 
         let error = device
-            .dispatch_drained_queue_notifications(
-                &mut memory,
-                virtio_mem_config_space(),
-                vec![0, 1],
-            )
+            .dispatch_drained_queue_notifications(&mut memory, &mut config_space, vec![0, 1])
             .expect_err("unsupported queue should prevent notification dispatch");
 
         match error {
