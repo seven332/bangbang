@@ -455,8 +455,8 @@ fields and duplicate token bucket fields before VMM dispatch.
 
 | Endpoint | Field | Handling | Notes |
 | --- | --- | --- | --- |
-| `PUT /boot-source` | `kernel_image_path` | required | Host path to the kernel image. The API/VMM storage path rejects empty paths without file IO; future startup validation must check access without leaking sensitive path details. |
-| `PUT /boot-source` | `initrd_path` | optional | Host path to an initrd. The API/VMM storage path rejects explicitly empty initrd paths without file IO; future startup validation follows the kernel path policy. |
+| `PUT /boot-source` | `kernel_image_path` | required | Host path to the kernel image. The API/VMM storage path rejects empty paths without file IO; startup opens the payload read-only/nonblocking, rejects inaccessible, non-regular, or empty files, and redacts path details from API-facing load errors. |
+| `PUT /boot-source` | `initrd_path` | optional | Host path to an initrd. The API/VMM storage path rejects explicitly empty initrd paths without file IO; startup applies the same read-only/nonblocking payload loading and redacted error policy as the kernel path. |
 | `PUT /boot-source` | `boot_args` | optional | Firecracker uses its default kernel command line when omitted. The API/VMM storage path validates the 2048-byte aarch64 limit including the trailing NUL byte and rejects embedded NUL bytes. |
 | `PUT /boot-source` | unknown fields | rejected | Matches Firecracker's strict request model behavior. |
 | `PUT /machine-config` | `vcpu_count` | required | Firecracker bounds this to `1..=32`, and bangbang stores that range for API compatibility. Current HVF startup supports exactly one vCPU and rejects larger stored values during `InstanceStart` before creating an HVF VM. |
@@ -639,9 +639,11 @@ The API and VMM state path implement the `PUT /boot-source` field policy above.
 Valid pre-boot requests replace the stored boot-source configuration and return
 `204 No Content`; invalid requests fail without mutating existing state or
 echoing host path and boot-argument values. The public API path stores path
-values at configuration time; `InstanceStart` opens kernel and initrd host paths,
-loads payloads, builds an FDT, configures vCPU registers, and retains the owned
-HVF boot run-loop worker only after preparation succeeds.
+values at configuration time; `InstanceStart` opens kernel and initrd host paths
+read-only/nonblocking, rejects inaccessible, non-regular, or empty payloads
+without echoing the private path in API-facing load errors, loads accepted
+payloads, builds an FDT, configures vCPU registers, and retains the owned HVF
+boot run-loop worker only after preparation succeeds.
 
 The API and VMM state path implement the `PUT /actions` field policy above for
 `InstanceStart` and `FlushMetrics` and rejects malformed bodies before VMM state

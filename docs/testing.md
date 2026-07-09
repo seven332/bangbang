@@ -75,6 +75,10 @@ memory, or host resources.
 For deferred-open paths such as serial output, also cover that parsing stores
 configuration without opening the path, and that startup wiring opens or writes
 through the selected sink with redacted errors.
+For boot-source payload failures, cover both request/API fault formatting and
+config-file startup failure paths. Use a test starter that invokes runtime boot
+resource assembly when the behavior does not need real HVF execution; keep real
+signed executable/HVF coverage in dedicated integration targets.
 
 For guest memory, address, and range logic, cover exact-fit success, one-past
 failure, overflow failure, overlapping ranges, and no-partial-mutation behavior.
