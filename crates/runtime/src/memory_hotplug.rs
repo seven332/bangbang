@@ -3360,6 +3360,75 @@ mod tests {
     }
 
     #[test]
+    fn virtio_mem_queue_dispatch_accepts_request_ending_at_usable_limit() {
+        let mut memory = request_memory();
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4020_0000, 1);
+        write_available_heads(&mut memory, &[0]);
+        let mut queue = virtio_mem_queue();
+        let mut config_space = virtio_mem_config_space()
+            .with_usable_region_size(0x40_0000)
+            .with_requested_size(0x40_0000);
+        let mut plugged_blocks = VirtioMemPluggedBlocks::default();
+
+        let dispatch = queue
+            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
+            .expect("exact end-exclusive usable bound should dispatch");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.policy_errors(), 0);
+        assert_eq!(read_response(&memory), VirtioMemResponse::Ack.to_le_bytes());
+        assert_eq!(config_space.plugged_size(), 0x20_0000);
+    }
+
+    #[test]
+    fn virtio_mem_queue_dispatch_rejects_request_past_usable_limit() {
+        let mut memory = request_memory();
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4000_0000, 2);
+        write_available_heads(&mut memory, &[0]);
+        let mut queue = virtio_mem_queue();
+        let mut config_space = virtio_mem_config_space()
+            .with_usable_region_size(0x20_0000)
+            .with_requested_size(0x40_0000);
+        let mut plugged_blocks = VirtioMemPluggedBlocks::default();
+
+        let dispatch = queue
+            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
+            .expect("out-of-usable request should dispatch with error response");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.policy_errors(), 1);
+        assert_eq!(
+            read_response(&memory),
+            VirtioMemResponse::Error.to_le_bytes()
+        );
+        assert_eq!(config_space.plugged_size(), 0);
+    }
+
+    #[test]
+    fn virtio_mem_queue_dispatch_rejects_request_past_region_limit() {
+        let mut memory = request_memory();
+        write_virtio_mem_chain(&mut memory, VIRTIO_MEM_REQ_PLUG, 0x4000_0000, 2);
+        write_available_heads(&mut memory, &[0]);
+        let mut queue = virtio_mem_queue();
+        let mut config_space = VirtioMemConfigSpace::new(0x20_0000, 0x4000_0000, 0x20_0000)
+            .with_usable_region_size(0x40_0000)
+            .with_requested_size(0x40_0000);
+        let mut plugged_blocks = VirtioMemPluggedBlocks::default();
+
+        let dispatch = queue
+            .dispatch(&mut memory, &mut config_space, &mut plugged_blocks)
+            .expect("out-of-region request should dispatch with error response");
+
+        assert_eq!(dispatch.processed_requests(), 1);
+        assert_eq!(dispatch.policy_errors(), 1);
+        assert_eq!(
+            read_response(&memory),
+            VirtioMemResponse::Error.to_le_bytes()
+        );
+        assert_eq!(config_space.plugged_size(), 0);
+    }
+
+    #[test]
     fn virtio_mem_queue_dispatch_accepts_plug_unplug_and_unplug_all() {
         let mut memory = request_memory();
         let mut queue = virtio_mem_queue();
