@@ -717,10 +717,6 @@ impl VmmController {
             return Err(VmmActionError::MissingBootSource);
         }
 
-        if self.memory_hotplug_config.is_some() {
-            return Err(VmmActionError::MemoryHotplugUnsupported);
-        }
-
         Ok(())
     }
 
@@ -2901,7 +2897,7 @@ mod tests {
     }
 
     #[test]
-    fn instance_start_rejects_configured_memory_hotplug_without_mutating() {
+    fn instance_start_with_memory_hotplug_invokes_executor_and_commits() {
         let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
         controller
             .handle_action(VmmAction::PutBootSource(boot_source_input("/tmp/vmlinux")))
@@ -2909,13 +2905,22 @@ mod tests {
         controller
             .handle_action(VmmAction::PutMemoryHotplug(memory_hotplug_config_input()))
             .expect("memory hotplug config should be stored");
+        let mut executor_called = false;
 
-        let err = controller
-            .commit_instance_start()
-            .expect_err("memory hotplug should require later virtio-mem startup work");
+        let data = controller
+            .start_instance_with(|startup_controller| {
+                executor_called = true;
+                assert_eq!(
+                    startup_controller.memory_hotplug_config(),
+                    Some(memory_hotplug_config())
+                );
+                Ok(())
+            })
+            .expect("memory hotplug config should not block startup preflight");
 
-        assert_eq!(err, VmmActionError::MemoryHotplugUnsupported);
-        assert_eq!(controller.instance_info().state, InstanceState::NotStarted);
+        assert!(executor_called);
+        assert_eq!(data, VmmData::Empty);
+        assert_eq!(controller.instance_info().state, InstanceState::Running);
         assert_eq!(
             controller.memory_hotplug_config(),
             Some(memory_hotplug_config())

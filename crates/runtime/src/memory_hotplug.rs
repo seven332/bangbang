@@ -2,16 +2,24 @@
 
 use std::fmt;
 
-use crate::mmio::{MmioAccessBytes, MmioAccessBytesError, MmioHandlerError};
-use crate::virtio_mmio::{
-    VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError, VirtioMmioDeviceActivationHandler,
-    VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError, VirtioMmioDeviceConfigHandler,
-    VirtioMmioQueueRegisterError, VirtioMmioQueueState, VirtioMmioRegisterHandler,
-    VirtioMmioRegisterHandlerError,
+use crate::memory::{GuestAddress, GuestMemoryError};
+use crate::mmio::{
+    MmioAccessBytes, MmioAccessBytesError, MmioBusError, MmioDispatchError, MmioDispatcher,
+    MmioHandlerError, MmioRegion, MmioRegionId,
 };
+use crate::virtio_mmio::{
+    VIRTIO_MMIO_DEVICE_WINDOW_SIZE, VirtioMmioDeviceActivation, VirtioMmioDeviceActivationError,
+    VirtioMmioDeviceActivationHandler, VirtioMmioDeviceConfigAccess, VirtioMmioDeviceConfigError,
+    VirtioMmioDeviceConfigHandler, VirtioMmioQueueRegisterError, VirtioMmioQueueState,
+    VirtioMmioRegisterHandler, VirtioMmioRegisterHandlerError,
+};
+
+const MIB: u64 = 1024 * 1024;
 
 pub const MEMORY_HOTPLUG_DEFAULT_BLOCK_SIZE_MIB: u64 = 2;
 pub const MEMORY_HOTPLUG_DEFAULT_SLOT_SIZE_MIB: u64 = 128;
+// Current aarch64 DRAM layout tops out immediately below this address.
+pub const VIRTIO_MEM_DEFAULT_REGION_ADDRESS: GuestAddress = GuestAddress::new(0x0140_0000_0000);
 pub const VIRTIO_MEM_DEVICE_ID: u32 = 24;
 pub const VIRTIO_MEM_QUEUE_COUNT: usize = 1;
 pub const VIRTIO_MEM_QUEUE_SIZE: u16 = 256;
@@ -225,6 +233,281 @@ impl fmt::Display for MemoryHotplugConfigError {
 }
 
 impl std::error::Error for MemoryHotplugConfigError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedVirtioMemDevice {
+    config_space: VirtioMemConfigSpace,
+}
+
+impl PreparedVirtioMemDevice {
+    pub fn from_config(config: MemoryHotplugConfig) -> Result<Self, VirtioMemPrepareError> {
+        Self::from_config_at(config, VIRTIO_MEM_DEFAULT_REGION_ADDRESS)
+    }
+
+    pub fn from_config_at(
+        config: MemoryHotplugConfig,
+        address: GuestAddress,
+    ) -> Result<Self, VirtioMemPrepareError> {
+        let block_size = mib_to_bytes(config.block_size_mib(), VirtioMemSizeField::BlockSize)?;
+        let region_size = mib_to_bytes(config.total_size_mib(), VirtioMemSizeField::TotalSize)?;
+        if address.checked_add(region_size).is_none() {
+            return Err(VirtioMemPrepareError::RegionAddressOverflow {
+                address,
+                region_size,
+            });
+        }
+
+        Ok(Self {
+            config_space: VirtioMemConfigSpace::new(block_size, address.raw_value(), region_size),
+        })
+    }
+
+    pub const fn config_space(self) -> VirtioMemConfigSpace {
+        self.config_space
+    }
+
+    pub fn register_mmio(
+        self,
+        layout: VirtioMemMmioLayout,
+    ) -> Result<VirtioMemMmioDevice, VirtioMemMmioRegistrationError> {
+        VirtioMemMmioDevice::from_prepared(self, layout)
+    }
+
+    pub fn register_mmio_with_dispatcher(
+        self,
+        layout: VirtioMemMmioLayout,
+        dispatcher: MmioDispatcher,
+    ) -> Result<VirtioMemMmioDevice, VirtioMemMmioRegistrationError> {
+        VirtioMemMmioDevice::from_prepared_with_dispatcher(self, layout, dispatcher)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VirtioMemSizeField {
+    BlockSize,
+    TotalSize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VirtioMemPrepareError {
+    SizeOverflow {
+        field: &'static str,
+        mib: u64,
+    },
+    RegionAddressOverflow {
+        address: GuestAddress,
+        region_size: u64,
+    },
+}
+
+impl fmt::Display for VirtioMemPrepareError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SizeOverflow { field, mib } => {
+                write!(f, "virtio-mem {field} value {mib} MiB overflows bytes")
+            }
+            Self::RegionAddressOverflow {
+                address,
+                region_size,
+            } => write!(
+                f,
+                "virtio-mem region at {address} with size {region_size} bytes overflows guest address space"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VirtioMemPrepareError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioMemMmioLayout {
+    address: GuestAddress,
+    region_id: MmioRegionId,
+}
+
+impl VirtioMemMmioLayout {
+    pub const fn new(address: GuestAddress, region_id: MmioRegionId) -> Self {
+        Self { address, region_id }
+    }
+
+    pub const fn address(self) -> GuestAddress {
+        self.address
+    }
+
+    pub const fn region_id(self) -> MmioRegionId {
+        self.region_id
+    }
+
+    fn region(self) -> Result<MmioRegion, VirtioMemMmioRegistrationError> {
+        MmioRegion::new(self.region_id, self.address, VIRTIO_MMIO_DEVICE_WINDOW_SIZE).map_err(
+            |source| VirtioMemMmioRegistrationError::InvalidRegion {
+                region_id: self.region_id,
+                address: self.address,
+                source,
+            },
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioMemMmioDeviceRegistration {
+    region: MmioRegion,
+}
+
+impl VirtioMemMmioDeviceRegistration {
+    pub const fn region(self) -> MmioRegion {
+        self.region
+    }
+
+    pub const fn region_id(self) -> MmioRegionId {
+        self.region.id()
+    }
+
+    pub const fn address(self) -> GuestAddress {
+        self.region.range().start()
+    }
+}
+
+#[derive(Debug)]
+pub struct VirtioMemMmioDevice {
+    dispatcher: MmioDispatcher,
+    registration: VirtioMemMmioDeviceRegistration,
+}
+
+impl VirtioMemMmioDevice {
+    pub fn from_prepared(
+        prepared: PreparedVirtioMemDevice,
+        layout: VirtioMemMmioLayout,
+    ) -> Result<Self, VirtioMemMmioRegistrationError> {
+        Self::from_prepared_with_dispatcher(prepared, layout, MmioDispatcher::new())
+    }
+
+    pub fn from_prepared_with_dispatcher(
+        prepared: PreparedVirtioMemDevice,
+        layout: VirtioMemMmioLayout,
+        dispatcher: MmioDispatcher,
+    ) -> Result<Self, VirtioMemMmioRegistrationError> {
+        let region = layout.region()?;
+        let handler = virtio_mem_mmio_handler_from_config_space(prepared.config_space()).map_err(
+            |source| VirtioMemMmioRegistrationError::BuildHandler {
+                region_id: layout.region_id(),
+                source,
+            },
+        )?;
+        let mut dispatcher = dispatcher;
+        let inserted_region = dispatcher
+            .insert_region(
+                layout.region_id(),
+                layout.address(),
+                VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+            )
+            .map_err(|source| VirtioMemMmioRegistrationError::InsertRegion {
+                region_id: layout.region_id(),
+                address: layout.address(),
+                source,
+            })?;
+        dispatcher
+            .register_handler(layout.region_id(), handler)
+            .map_err(|source| VirtioMemMmioRegistrationError::RegisterHandler {
+                region_id: layout.region_id(),
+                source,
+            })?;
+        debug_assert_eq!(inserted_region, region);
+
+        Ok(Self {
+            dispatcher,
+            registration: VirtioMemMmioDeviceRegistration { region },
+        })
+    }
+
+    pub fn dispatcher(&self) -> &MmioDispatcher {
+        &self.dispatcher
+    }
+
+    pub fn dispatcher_mut(&mut self) -> &mut MmioDispatcher {
+        &mut self.dispatcher
+    }
+
+    pub const fn registration(&self) -> VirtioMemMmioDeviceRegistration {
+        self.registration
+    }
+
+    pub fn into_parts(self) -> (MmioDispatcher, VirtioMemMmioDeviceRegistration) {
+        (self.dispatcher, self.registration)
+    }
+}
+
+#[derive(Debug)]
+pub enum VirtioMemMmioRegistrationError {
+    InvalidRegion {
+        region_id: MmioRegionId,
+        address: GuestAddress,
+        source: GuestMemoryError,
+    },
+    BuildHandler {
+        region_id: MmioRegionId,
+        source: VirtioMmioRegisterHandlerError,
+    },
+    InsertRegion {
+        region_id: MmioRegionId,
+        address: GuestAddress,
+        source: MmioBusError,
+    },
+    RegisterHandler {
+        region_id: MmioRegionId,
+        source: MmioDispatchError,
+    },
+}
+
+impl fmt::Display for VirtioMemMmioRegistrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRegion {
+                region_id,
+                address,
+                source,
+            } => {
+                write!(
+                    f,
+                    "invalid virtio-mem MMIO region id={region_id} at {address}: {source}"
+                )
+            }
+            Self::BuildHandler { region_id, source } => {
+                write!(
+                    f,
+                    "failed to build virtio-mem MMIO handler for region id={region_id}: {source}"
+                )
+            }
+            Self::InsertRegion {
+                region_id,
+                address,
+                source,
+            } => {
+                write!(
+                    f,
+                    "failed to insert virtio-mem MMIO region id={region_id} at {address}: {source}"
+                )
+            }
+            Self::RegisterHandler { region_id, source } => {
+                write!(
+                    f,
+                    "failed to register virtio-mem MMIO handler for region id={region_id}: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VirtioMemMmioRegistrationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidRegion { source, .. } => Some(source),
+            Self::BuildHandler { source, .. } => Some(source),
+            Self::InsertRegion { source, .. } => Some(source),
+            Self::RegisterHandler { source, .. } => Some(source),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtioMemConfigSpace {
@@ -683,6 +966,17 @@ fn config_bytes_error(source: MmioAccessBytesError) -> VirtioMmioDeviceConfigErr
     }
 }
 
+fn mib_to_bytes(mib: u64, field: VirtioMemSizeField) -> Result<u64, VirtioMemPrepareError> {
+    mib.checked_mul(MIB)
+        .ok_or(VirtioMemPrepareError::SizeOverflow {
+            field: match field {
+                VirtioMemSizeField::BlockSize => "block_size_mib",
+                VirtioMemSizeField::TotalSize => "total_size_mib",
+            },
+            mib,
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -735,6 +1029,178 @@ mod tests {
         assert_eq!(status.slot_size_mib(), 128);
         assert_eq!(status.plugged_size_mib(), 0);
         assert_eq!(status.requested_size_mib(), 0);
+    }
+
+    #[test]
+    fn prepared_virtio_mem_device_derives_config_space_from_config() {
+        let config = MemoryHotplugConfig::try_from(MemoryHotplugConfigInput::new(1024, 2, 128))
+            .expect("valid memory hotplug config should convert");
+        let prepared =
+            PreparedVirtioMemDevice::from_config(config).expect("virtio-mem device should prepare");
+        let config_space = prepared.config_space();
+
+        assert_eq!(config_space.block_size(), 2 * MIB);
+        assert_eq!(
+            config_space.addr(),
+            VIRTIO_MEM_DEFAULT_REGION_ADDRESS.raw_value()
+        );
+        assert_eq!(config_space.region_size(), 1024 * MIB);
+        assert_eq!(config_space.usable_region_size(), 0);
+        assert_eq!(config_space.plugged_size(), 0);
+        assert_eq!(config_space.requested_size(), 0);
+    }
+
+    #[test]
+    fn prepared_virtio_mem_device_rejects_size_overflow() {
+        let total_size_mib = u64::MAX - (u64::MAX % MEMORY_HOTPLUG_DEFAULT_SLOT_SIZE_MIB);
+        let config = MemoryHotplugConfig::try_from(MemoryHotplugConfigInput::new(
+            total_size_mib,
+            MEMORY_HOTPLUG_DEFAULT_BLOCK_SIZE_MIB,
+            MEMORY_HOTPLUG_DEFAULT_SLOT_SIZE_MIB,
+        ))
+        .expect("large but shape-valid memory hotplug config should convert");
+
+        assert_eq!(
+            PreparedVirtioMemDevice::from_config(config),
+            Err(VirtioMemPrepareError::SizeOverflow {
+                field: "total_size_mib",
+                mib: total_size_mib,
+            })
+        );
+    }
+
+    #[test]
+    fn prepared_virtio_mem_device_rejects_block_size_overflow() {
+        let block_size_mib = 1_u64 << 63;
+        let config = MemoryHotplugConfig::try_from(MemoryHotplugConfigInput::new(
+            block_size_mib,
+            block_size_mib,
+            block_size_mib,
+        ))
+        .expect("large but shape-valid memory hotplug config should convert");
+
+        assert_eq!(
+            PreparedVirtioMemDevice::from_config(config),
+            Err(VirtioMemPrepareError::SizeOverflow {
+                field: "block_size_mib",
+                mib: block_size_mib,
+            })
+        );
+    }
+
+    #[test]
+    fn prepared_virtio_mem_device_rejects_region_address_overflow() {
+        let config = MemoryHotplugConfig::try_from(MemoryHotplugConfigInput::new(1024, 2, 128))
+            .expect("valid memory hotplug config should convert");
+
+        assert_eq!(
+            PreparedVirtioMemDevice::from_config_at(config, GuestAddress::new(u64::MAX)),
+            Err(VirtioMemPrepareError::RegionAddressOverflow {
+                address: GuestAddress::new(u64::MAX),
+                region_size: 1024 * MIB,
+            })
+        );
+    }
+
+    #[test]
+    fn virtio_mem_mmio_device_registers_handler() {
+        let prepared = PreparedVirtioMemDevice::from_config(memory_hotplug_config())
+            .expect("virtio-mem device should prepare");
+        let mut device = prepared
+            .register_mmio(VirtioMemMmioLayout::new(
+                GuestAddress::new(TEST_VIRTIO_MEM_MMIO_BASE),
+                TEST_VIRTIO_MEM_MMIO_REGION_ID,
+            ))
+            .expect("virtio-mem MMIO device should register");
+        let registration = device.registration();
+
+        assert_eq!(registration.region_id(), TEST_VIRTIO_MEM_MMIO_REGION_ID);
+        assert_eq!(
+            registration.address(),
+            GuestAddress::new(TEST_VIRTIO_MEM_MMIO_BASE)
+        );
+        assert_eq!(
+            registration.region().range().size(),
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE
+        );
+        assert_eq!(device.dispatcher().regions(), &[registration.region()]);
+
+        let handler = device
+            .dispatcher_mut()
+            .handler_mut::<VirtioMemMmioHandler>(registration.region_id())
+            .expect("virtio-mem handler should be registered");
+        assert_eq!(
+            handler
+                .read_register(VirtioMmioRegister::DeviceId)
+                .expect("device ID should read"),
+            VIRTIO_MEM_DEVICE_ID
+        );
+    }
+
+    #[test]
+    fn virtio_mem_mmio_device_rejects_overlapping_region() {
+        let prepared = PreparedVirtioMemDevice::from_config(memory_hotplug_config())
+            .expect("virtio-mem device should prepare");
+        let mut dispatcher = MmioDispatcher::new();
+        dispatcher
+            .insert_region(
+                MmioRegionId::new(1),
+                GuestAddress::new(TEST_VIRTIO_MEM_MMIO_BASE),
+                VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+            )
+            .expect("existing MMIO region should insert");
+
+        let error = prepared
+            .register_mmio_with_dispatcher(
+                VirtioMemMmioLayout::new(
+                    GuestAddress::new(TEST_VIRTIO_MEM_MMIO_BASE),
+                    TEST_VIRTIO_MEM_MMIO_REGION_ID,
+                ),
+                dispatcher,
+            )
+            .expect_err("overlapping virtio-mem MMIO region should fail");
+
+        assert!(matches!(
+            error,
+            VirtioMemMmioRegistrationError::InsertRegion {
+                source: MmioBusError::OverlappingRegion { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn virtio_mem_mmio_device_rejects_duplicate_handler() {
+        let prepared = PreparedVirtioMemDevice::from_config(memory_hotplug_config())
+            .expect("virtio-mem device should prepare");
+        let mut dispatcher = MmioDispatcher::new();
+        dispatcher
+            .register_handler(
+                TEST_VIRTIO_MEM_MMIO_REGION_ID,
+                virtio_mem_mmio_handler_from_config_space(virtio_mem_config_space())
+                    .expect("existing handler should build"),
+            )
+            .expect("existing handler should register");
+
+        let error = prepared
+            .register_mmio_with_dispatcher(
+                VirtioMemMmioLayout::new(
+                    GuestAddress::new(TEST_VIRTIO_MEM_MMIO_BASE),
+                    TEST_VIRTIO_MEM_MMIO_REGION_ID,
+                ),
+                dispatcher,
+            )
+            .expect_err("duplicate virtio-mem MMIO handler should fail");
+
+        assert!(matches!(
+            error,
+            VirtioMemMmioRegistrationError::RegisterHandler {
+                source: MmioDispatchError::DuplicateHandler {
+                    region_id: TEST_VIRTIO_MEM_MMIO_REGION_ID,
+                },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1225,6 +1691,11 @@ mod tests {
     ) -> Result<(), VirtioMmioDeviceConfigError> {
         let data = MmioAccessBytes::new(data).expect("write bytes should be valid");
         config.write_device_config(device_config_write_access(offset, data), data)
+    }
+
+    fn memory_hotplug_config() -> MemoryHotplugConfig {
+        MemoryHotplugConfig::try_from(MemoryHotplugConfigInput::new(1024, 2, 128))
+            .expect("valid memory hotplug config should convert")
     }
 
     fn virtio_mem_config_space() -> VirtioMemConfigSpace {

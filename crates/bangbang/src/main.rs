@@ -3885,7 +3885,7 @@ mod tests {
     }
 
     #[test]
-    fn config_file_memory_hotplug_fails_before_starting() {
+    fn config_file_memory_hotplug_starts_with_configured_device() {
         let config_path = unique_config_path("memory-hotplug");
         let config = r#"{
             "boot-source":{"kernel_image_path":"/tmp/vmlinux"},
@@ -3899,20 +3899,11 @@ mod tests {
             TestInstanceStarter,
         );
 
-        let err = super::apply_startup_config_file(
-            &mut vmm,
-            Some(config_path.to_str().expect("UTF-8 path")),
-        )
-        .expect_err("memory-hotplug should block startup until virtio-mem exists");
+        super::apply_startup_config_file(&mut vmm, Some(config_path.to_str().expect("UTF-8 path")))
+            .expect("memory-hotplug config should apply before startup");
 
-        assert!(matches!(
-            err,
-            ProcessError::ConfigFile(super::ConfigFileError::Apply(
-                bangbang_runtime::VmmActionError::MemoryHotplugUnsupported
-            ))
-        ));
-        assert_eq!(vmm.instance_info().state, InstanceState::NotStarted);
-        assert!(!vmm.has_started_session());
+        assert_eq!(vmm.instance_info().state, InstanceState::Running);
+        assert!(vmm.has_started_session());
         let data = vmm
             .handle_action(VmmAction::GetVmConfig)
             .expect("VM config should be returned");

@@ -39,6 +39,10 @@ use crate::machine::MachineConfig;
 use crate::memory::{
     GuestMemory, GuestMemoryAllocationError, GuestMemoryError, GuestMemoryLayout, aarch64,
 };
+use crate::memory_hotplug::{
+    PreparedVirtioMemDevice, VirtioMemMmioDeviceRegistration, VirtioMemMmioLayout,
+    VirtioMemMmioRegistrationError, VirtioMemPrepareError,
+};
 use crate::mmio::{
     MmioBusError, MmioDispatchError, MmioDispatcher, MmioHandlerLookupError, MmioRegion,
     MmioRegionId,
@@ -81,6 +85,7 @@ pub struct Arm64BootResourceConfig<'a> {
     pub vsock_interrupt_line: Option<GuestInterruptLine>,
     pub balloon_mmio_layout: BalloonMmioLayout,
     pub balloon_interrupt_line: Option<GuestInterruptLine>,
+    pub memory_hotplug_device: Option<Arm64BootMemoryHotplugDeviceConfig>,
     pub entropy_device: Option<Arm64BootEntropyDeviceConfig>,
 }
 
@@ -134,6 +139,21 @@ impl Arm64BootEntropyDeviceConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Arm64BootMemoryHotplugDeviceConfig {
+    pub mmio_layout: VirtioMemMmioLayout,
+    pub interrupt_line: GuestInterruptLine,
+}
+
+impl Arm64BootMemoryHotplugDeviceConfig {
+    pub const fn new(mmio_layout: VirtioMemMmioLayout, interrupt_line: GuestInterruptLine) -> Self {
+        Self {
+            mmio_layout,
+            interrupt_line,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Arm64BootResources {
     pub machine_config: MachineConfig,
@@ -150,6 +170,7 @@ pub struct Arm64BootResources {
     pub network_devices: Vec<Arm64BootNetworkDevice>,
     pub vsock_device: Option<Arm64BootVsockDevice>,
     pub balloon_device: Option<Arm64BootBalloonDevice>,
+    pub memory_hotplug_device: Option<Arm64BootMemoryHotplugDevice>,
     pub entropy_device: Option<Arm64BootEntropyDevice>,
 }
 
@@ -174,6 +195,7 @@ pub struct Arm64BootRuntimeResources {
     pub network_devices: Vec<Arm64BootNetworkDevice>,
     pub vsock_device: Option<Arm64BootVsockDevice>,
     pub balloon_device: Option<Arm64BootBalloonDevice>,
+    pub memory_hotplug_device: Option<Arm64BootMemoryHotplugDevice>,
     pub entropy_device: Option<Arm64BootEntropyDevice>,
 }
 
@@ -1166,6 +1188,12 @@ pub struct Arm64BootBalloonDevice {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Arm64BootMemoryHotplugDevice {
+    pub registration: VirtioMemMmioDeviceRegistration,
+    pub fdt_device: Arm64FdtVirtioMmioDevice,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arm64BootEntropyDevice {
     pub registration: EntropyMmioDeviceRegistration,
     pub fdt_device: Arm64FdtVirtioMmioDevice,
@@ -1722,6 +1750,9 @@ pub enum Arm64BootResourceError {
     PrepareBalloonDevice {
         source: BalloonPageCountOverflow,
     },
+    PrepareMemoryHotplugDevice {
+        source: VirtioMemPrepareError,
+    },
     RegisterBlockMmio {
         source: Box<BlockMmioRegistrationError>,
     },
@@ -1736,6 +1767,9 @@ pub enum Arm64BootResourceError {
     },
     RegisterBalloonMmio {
         source: Box<BalloonMmioRegistrationError>,
+    },
+    RegisterMemoryHotplugMmio {
+        source: Box<VirtioMemMmioRegistrationError>,
     },
     RegisterEntropyMmio {
         source: Box<EntropyMmioRegistrationError>,
@@ -1766,6 +1800,10 @@ pub enum Arm64BootResourceError {
         devices: usize,
         lines: usize,
     },
+    MemoryHotplugInterruptLineCount {
+        devices: usize,
+        lines: usize,
+    },
     BlockDeviceMetadataAllocation {
         source: TryReserveError,
     },
@@ -1779,6 +1817,9 @@ pub enum Arm64BootResourceError {
         source: TryReserveError,
     },
     BalloonDeviceMetadataAllocation {
+        source: TryReserveError,
+    },
+    MemoryHotplugDeviceMetadataAllocation {
         source: TryReserveError,
     },
     EntropyDeviceMetadataAllocation {
@@ -1833,6 +1874,9 @@ impl fmt::Display for Arm64BootResourceError {
             Self::PrepareBalloonDevice { source } => {
                 write!(f, "failed to prepare balloon device: {source}")
             }
+            Self::PrepareMemoryHotplugDevice { source } => {
+                write!(f, "failed to prepare memory hotplug device: {source}")
+            }
             Self::RegisterBlockMmio { source } => {
                 write!(f, "failed to register block MMIO devices: {source}")
             }
@@ -1847,6 +1891,9 @@ impl fmt::Display for Arm64BootResourceError {
             }
             Self::RegisterBalloonMmio { source } => {
                 write!(f, "failed to register balloon MMIO device: {source}")
+            }
+            Self::RegisterMemoryHotplugMmio { source } => {
+                write!(f, "failed to register memory hotplug MMIO device: {source}")
             }
             Self::RegisterEntropyMmio { source } => {
                 write!(f, "failed to register entropy MMIO device: {source}")
@@ -1877,6 +1924,10 @@ impl fmt::Display for Arm64BootResourceError {
                 f,
                 "balloon MMIO device count {devices} does not match interrupt line count {lines}"
             ),
+            Self::MemoryHotplugInterruptLineCount { devices, lines } => write!(
+                f,
+                "memory hotplug MMIO device count {devices} does not match interrupt line count {lines}"
+            ),
             Self::BlockDeviceMetadataAllocation { source } => {
                 write!(f, "failed to allocate block device metadata: {source}")
             }
@@ -1891,6 +1942,12 @@ impl fmt::Display for Arm64BootResourceError {
             }
             Self::BalloonDeviceMetadataAllocation { source } => {
                 write!(f, "failed to allocate balloon device metadata: {source}")
+            }
+            Self::MemoryHotplugDeviceMetadataAllocation { source } => {
+                write!(
+                    f,
+                    "failed to allocate memory hotplug device metadata: {source}"
+                )
             }
             Self::EntropyDeviceMetadataAllocation { source } => {
                 write!(f, "failed to allocate entropy device metadata: {source}")
@@ -1912,11 +1969,13 @@ impl std::error::Error for Arm64BootResourceError {
             Self::PrepareNetworkDevices { source } => Some(source),
             Self::PrepareVsockDevice { source } => Some(source),
             Self::PrepareBalloonDevice { source } => Some(source),
+            Self::PrepareMemoryHotplugDevice { source } => Some(source),
             Self::RegisterBlockMmio { source } => Some(source.as_ref()),
             Self::RegisterPmemMmio { source } => Some(source.as_ref()),
             Self::RegisterNetworkMmio { source } => Some(source.as_ref()),
             Self::RegisterVsockMmio { source } => Some(source.as_ref()),
             Self::RegisterBalloonMmio { source } => Some(source.as_ref()),
+            Self::RegisterMemoryHotplugMmio { source } => Some(source.as_ref()),
             Self::RegisterEntropyMmio { source } => Some(source.as_ref()),
             Self::RegisterRtcMmio { source } => Some(source.as_ref()),
             Self::RegisterSerialMmio { source } => Some(source.as_ref()),
@@ -1925,6 +1984,7 @@ impl std::error::Error for Arm64BootResourceError {
             Self::NetworkDeviceMetadataAllocation { source } => Some(source),
             Self::VsockDeviceMetadataAllocation { source } => Some(source),
             Self::BalloonDeviceMetadataAllocation { source } => Some(source),
+            Self::MemoryHotplugDeviceMetadataAllocation { source } => Some(source),
             Self::EntropyDeviceMetadataAllocation { source } => Some(source),
             Self::Fdt { source } => Some(source),
             Self::MissingBootSource
@@ -1934,7 +1994,8 @@ impl std::error::Error for Arm64BootResourceError {
             | Self::PmemInterruptLineCount { .. }
             | Self::NetworkInterruptLineCount { .. }
             | Self::VsockInterruptLineCount { .. }
-            | Self::BalloonInterruptLineCount { .. } => None,
+            | Self::BalloonInterruptLineCount { .. }
+            | Self::MemoryHotplugInterruptLineCount { .. } => None,
         }
     }
 }
@@ -2042,6 +2103,7 @@ impl Arm64BootResources {
             vsock_interrupt_line,
             balloon_mmio_layout,
             balloon_interrupt_line,
+            memory_hotplug_device,
             entropy_device,
         } = config;
         let boot_source_config = controller
@@ -2066,6 +2128,10 @@ impl Arm64BootResources {
         validate_balloon_interrupt_line_count(
             controller.balloon_config().is_some(),
             balloon_interrupt_line.is_some(),
+        )?;
+        validate_memory_hotplug_interrupt_line_count(
+            controller.memory_hotplug_config().is_some(),
+            memory_hotplug_device.is_some(),
         )?;
 
         let machine_config = controller.machine_config();
@@ -2175,6 +2241,38 @@ impl Arm64BootResources {
                 ));
             }
         };
+        let memory_hotplug_device =
+            match (controller.memory_hotplug_config(), memory_hotplug_device) {
+                (Some(config), Some(device_config)) => {
+                    let prepared_mem =
+                        PreparedVirtioMemDevice::from_config(config).map_err(|source| {
+                            Arm64BootResourceError::PrepareMemoryHotplugDevice { source }
+                        })?;
+                    let mem_mmio = prepared_mem
+                        .register_mmio_with_dispatcher(device_config.mmio_layout, mmio_dispatcher)
+                        .map_err(|source| Arm64BootResourceError::RegisterMemoryHotplugMmio {
+                            source: Box::new(source),
+                        })?;
+                    let (dispatcher, registration) = mem_mmio.into_parts();
+                    mmio_dispatcher = dispatcher;
+                    let (device, fdt_device) = arm64_boot_memory_hotplug_device_metadata(
+                        registration,
+                        device_config.interrupt_line,
+                    );
+                    fdt_devices.try_reserve_exact(1).map_err(|source| {
+                        Arm64BootResourceError::MemoryHotplugDeviceMetadataAllocation { source }
+                    })?;
+                    fdt_devices.push(fdt_device);
+                    Some(device)
+                }
+                (None, None) => None,
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err(memory_hotplug_interrupt_line_count_error(
+                        controller.memory_hotplug_config().is_some(),
+                        memory_hotplug_device.is_some(),
+                    ));
+                }
+            };
         let entropy_device = match entropy_device {
             Some(config) => {
                 let entropy_mmio = PreparedEntropyDevice::from_config(
@@ -2234,6 +2332,7 @@ impl Arm64BootResources {
             network_devices,
             vsock_device,
             balloon_device,
+            memory_hotplug_device,
             entropy_device,
         })
     }
@@ -2255,6 +2354,7 @@ impl Arm64BootResources {
                 network_devices: self.network_devices,
                 vsock_device: self.vsock_device,
                 balloon_device: self.balloon_device,
+                memory_hotplug_device: self.memory_hotplug_device,
                 entropy_device: self.entropy_device,
             },
         }
@@ -2367,6 +2467,20 @@ fn validate_balloon_interrupt_line_count(
     }
 }
 
+fn validate_memory_hotplug_interrupt_line_count(
+    configured: bool,
+    line_present: bool,
+) -> Result<(), Arm64BootResourceError> {
+    if configured == line_present {
+        Ok(())
+    } else {
+        Err(memory_hotplug_interrupt_line_count_error(
+            configured,
+            line_present,
+        ))
+    }
+}
+
 fn vsock_interrupt_line_count_error(
     configured: bool,
     line_present: bool,
@@ -2382,6 +2496,16 @@ fn balloon_interrupt_line_count_error(
     line_present: bool,
 ) -> Arm64BootResourceError {
     Arm64BootResourceError::BalloonInterruptLineCount {
+        devices: usize::from(configured),
+        lines: usize::from(line_present),
+    }
+}
+
+fn memory_hotplug_interrupt_line_count_error(
+    configured: bool,
+    line_present: bool,
+) -> Arm64BootResourceError {
+    Arm64BootResourceError::MemoryHotplugInterruptLineCount {
         devices: usize::from(configured),
         lines: usize::from(line_present),
     }
@@ -2555,6 +2679,28 @@ fn arm64_boot_balloon_device_metadata(
     )
 }
 
+fn arm64_boot_memory_hotplug_device_metadata(
+    registration: VirtioMemMmioDeviceRegistration,
+    interrupt_line: GuestInterruptLine,
+) -> (Arm64BootMemoryHotplugDevice, Arm64FdtVirtioMmioDevice) {
+    let range = registration.region().range();
+    let fdt_device = Arm64FdtVirtioMmioDevice {
+        region: Arm64FdtRegion {
+            base: range.start().raw_value(),
+            size: range.size(),
+        },
+        interrupt_line,
+    };
+
+    (
+        Arm64BootMemoryHotplugDevice {
+            registration,
+            fdt_device,
+        },
+        fdt_device,
+    )
+}
+
 fn register_rtc_mmio(
     dispatcher: &mut MmioDispatcher,
     config: Arm64BootRtcDeviceConfig,
@@ -2688,6 +2834,10 @@ mod tests {
     use crate::interrupt::{DeviceInterruptKind, GuestInterruptLine};
     use crate::machine::{MachineConfig, MachineConfigInput};
     use crate::memory::{GuestAddress, aarch64};
+    use crate::memory_hotplug::{
+        MemoryHotplugConfigInput, VIRTIO_MEM_DEFAULT_REGION_ADDRESS, VirtioMemMmioHandler,
+        VirtioMemMmioLayout,
+    };
     use crate::mmio::{
         MmioAccess, MmioAccessBytes, MmioBusError, MmioDispatchOutcome, MmioDispatcher,
         MmioHandler, MmioHandlerError, MmioOperation, MmioRegionId,
@@ -2737,6 +2887,7 @@ mod tests {
     const TEST_VSOCK_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_6000);
     const TEST_ENTROPY_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_7000);
     const TEST_BALLOON_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_8000);
+    const TEST_MEMORY_HOTPLUG_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_a000);
     const TEST_RTC_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_1000);
     const TEST_SERIAL_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_2000);
     const TEST_QUEUE_SIZE: u16 = 4;
@@ -2974,6 +3125,14 @@ mod tests {
             .expect("balloon config should be stored");
     }
 
+    fn add_memory_hotplug(controller: &mut crate::VmmController) {
+        controller
+            .handle_action(VmmAction::PutMemoryHotplug(MemoryHotplugConfigInput::new(
+                1024, 2, 128,
+            )))
+            .expect("memory hotplug config should be stored");
+    }
+
     fn network_registrations(
         interfaces: &[(&str, &str)],
         layout: NetworkMmioLayout,
@@ -3030,6 +3189,7 @@ mod tests {
                 MmioRegionId::new(110),
             ),
             balloon_interrupt_line: None,
+            memory_hotplug_device: None,
             entropy_device: None,
         }
     }
@@ -6003,6 +6163,107 @@ mod tests {
         assert!(tree.find("/virtio_mmio@40004000").is_some());
         assert!(tree.find("/virtio_mmio@40006000").is_some());
         assert!(tree.find("/virtio_mmio@40007000").is_some());
+    }
+
+    #[test]
+    fn assembles_boot_resources_with_memory_hotplug_device() {
+        let kernel = temp_file("kernel-memory-hotplug", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        add_memory_hotplug(&mut controller);
+        let config = Arm64BootResourceConfig {
+            memory_hotplug_device: Some(super::Arm64BootMemoryHotplugDeviceConfig::new(
+                VirtioMemMmioLayout::new(TEST_MEMORY_HOTPLUG_MMIO_BASE, MmioRegionId::new(120)),
+                line(32),
+            )),
+            ..valid_config(&[])
+        };
+
+        let mut resources = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect("boot resources should assemble with memory hotplug device");
+
+        let device = resources
+            .memory_hotplug_device
+            .as_ref()
+            .expect("memory hotplug metadata should be returned");
+        assert_eq!(device.registration.region_id(), MmioRegionId::new(120));
+        assert_eq!(device.registration.address(), TEST_MEMORY_HOTPLUG_MMIO_BASE);
+        assert_eq!(device.fdt_device.interrupt_line, line(32));
+        assert_eq!(device.fdt_device.region.base, 0x4000_a000);
+        assert_eq!(
+            device.fdt_device.region.size,
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE
+        );
+        assert_eq!(resources.mmio_dispatcher.regions().len(), 1);
+        let handler = resources
+            .mmio_dispatcher
+            .handler_mut::<VirtioMemMmioHandler>(device.registration.region_id())
+            .expect("virtio-mem handler should be registered");
+        let config_space = *handler.device_config_handler();
+        assert_eq!(config_space.block_size(), 2 * MIB);
+        assert_eq!(
+            config_space.addr(),
+            VIRTIO_MEM_DEFAULT_REGION_ADDRESS.raw_value()
+        );
+        assert_eq!(config_space.region_size(), 1024 * MIB);
+        assert_eq!(config_space.usable_region_size(), 0);
+        assert_eq!(config_space.plugged_size(), 0);
+        assert_eq!(config_space.requested_size(), 0);
+
+        let tree = read_fdt(&resources);
+        assert!(tree.find("/virtio_mmio@4000a000").is_some());
+    }
+
+    #[test]
+    fn memory_hotplug_config_without_startup_device_fails() {
+        let kernel = temp_file("kernel-memory-hotplug-missing-device", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        add_memory_hotplug(&mut controller);
+
+        let err = Arm64BootResources::assemble_from_controller(&controller, valid_config(&[]))
+            .expect_err("memory hotplug config without device config should fail");
+
+        assert_eq!(
+            err.to_string(),
+            "memory hotplug MMIO device count 1 does not match interrupt line count 0"
+        );
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::MemoryHotplugInterruptLineCount {
+                devices: 1,
+                lines: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn memory_hotplug_region_overlapping_balloon_mmio_fails_during_registration() {
+        let kernel = temp_file("kernel-memory-hotplug-overlap-balloon", &arm64_image());
+        let mut controller = controller_with_kernel(kernel.path());
+        add_memory_hotplug(&mut controller);
+        add_balloon(&mut controller, 4);
+        let config = Arm64BootResourceConfig {
+            balloon_interrupt_line: Some(line(32)),
+            memory_hotplug_device: Some(super::Arm64BootMemoryHotplugDeviceConfig::new(
+                VirtioMemMmioLayout::new(TEST_BALLOON_MMIO_BASE, MmioRegionId::new(120)),
+                line(33),
+            )),
+            ..valid_config(&[])
+        };
+
+        let err = Arm64BootResources::assemble_from_controller(&controller, config)
+            .expect_err("overlapping memory hotplug and balloon MMIO should fail");
+
+        assert!(matches!(
+            err,
+            Arm64BootResourceError::RegisterMemoryHotplugMmio { source }
+                if matches!(
+                    source.as_ref(),
+                    crate::memory_hotplug::VirtioMemMmioRegistrationError::InsertRegion {
+                        source: MmioBusError::OverlappingRegion { .. },
+                        ..
+                    }
+                )
+        ));
     }
 
     #[test]

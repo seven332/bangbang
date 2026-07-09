@@ -10,10 +10,11 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use bangbang_hvf::{
-    HvfArm64BootBalloonDeviceConfig, HvfArm64BootEntropyDeviceConfig, HvfArm64BootRunLoopControl,
-    HvfArm64BootRunLoopError, HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopStopToken,
-    HvfArm64BootSerialDeviceConfig, HvfArm64BootSessionConfig, HvfArm64BootTimerDeviceConfig,
-    HvfVcpuRunnerError, OwnedHvfArm64BootSession,
+    HvfArm64BootBalloonDeviceConfig, HvfArm64BootEntropyDeviceConfig,
+    HvfArm64BootMemoryHotplugDeviceConfig, HvfArm64BootRunLoopControl, HvfArm64BootRunLoopError,
+    HvfArm64BootRunLoopOutcome, HvfArm64BootRunLoopStopToken, HvfArm64BootSerialDeviceConfig,
+    HvfArm64BootSessionConfig, HvfArm64BootTimerDeviceConfig, HvfVcpuRunnerError,
+    OwnedHvfArm64BootSession,
 };
 use bangbang_runtime::balloon::BalloonMmioLayout;
 use bangbang_runtime::balloon::{
@@ -32,7 +33,9 @@ use bangbang_runtime::entropy::EntropyMmioLayout;
 use bangbang_runtime::logger::LoggerConfigInput;
 use bangbang_runtime::machine::{MachineConfigInput, MachineConfigPatchInput};
 use bangbang_runtime::memory::{GuestAddress, GuestMemory};
-use bangbang_runtime::memory_hotplug::{MemoryHotplugConfigInput, MemoryHotplugSizeUpdateInput};
+use bangbang_runtime::memory_hotplug::{
+    MemoryHotplugConfigInput, MemoryHotplugSizeUpdateInput, VirtioMemMmioLayout,
+};
 use bangbang_runtime::metrics::{
     BootRunLoopMetricStatus, MetricsConfigInput, MetricsDiagnostics, SharedBalloonDeviceMetrics,
     SharedBlockDeviceMetricsRegistry, SharedEntropyDeviceMetrics,
@@ -105,6 +108,8 @@ const DEFAULT_ENTROPY_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_7000);
 const DEFAULT_ENTROPY_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(3000);
 const DEFAULT_BALLOON_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_8000);
 const DEFAULT_BALLOON_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(4000);
+const DEFAULT_MEMORY_HOTPLUG_MMIO_BASE: GuestAddress = GuestAddress::new(0x4000_9000);
+const DEFAULT_MEMORY_HOTPLUG_MMIO_REGION_ID: MmioRegionId = MmioRegionId::new(5000);
 const DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT: usize = 1024;
 const BOOT_RUN_LOOP_COMMAND_QUEUE_CAPACITY: usize = 32;
 const HVF_BOOT_RUN_LOOP_THREAD_NAME: &str = "bangbang-hvf-boot-loop";
@@ -1429,6 +1434,14 @@ impl HvfInstanceStartExecutor {
         if controller.balloon_config().is_some() {
             config = config.with_balloon_device(HvfArm64BootBalloonDeviceConfig::new(
                 BalloonMmioLayout::new(DEFAULT_BALLOON_MMIO_BASE, DEFAULT_BALLOON_MMIO_REGION_ID),
+            ));
+        }
+        if controller.memory_hotplug_config().is_some() {
+            config = config.with_memory_hotplug_device(HvfArm64BootMemoryHotplugDeviceConfig::new(
+                VirtioMemMmioLayout::new(
+                    DEFAULT_MEMORY_HOTPLUG_MMIO_BASE,
+                    DEFAULT_MEMORY_HOTPLUG_MMIO_REGION_ID,
+                ),
             ));
         }
         if self.boot_timer_enabled {
@@ -3213,6 +3226,7 @@ mod tests {
     use bangbang_runtime::interrupt::GuestInterruptLine;
     use bangbang_runtime::logger::LoggerConfigInput;
     use bangbang_runtime::machine::{MachineConfigInput, MachineConfigPatchInput};
+    use bangbang_runtime::memory_hotplug::MemoryHotplugConfigInput;
     use bangbang_runtime::metrics::{
         BalloonDeviceMetrics, BlockDeviceMetrics, BlockDeviceMetricsByDrive,
         BootRunLoopMetricStatus, EntropyDeviceMetrics, MetricsConfigInput, MetricsDiagnostics,
@@ -3253,6 +3267,7 @@ mod tests {
         DEFAULT_BALLOON_MMIO_REGION_ID, DEFAULT_BLOCK_MMIO_BASE, DEFAULT_BLOCK_MMIO_REGION_ID,
         DEFAULT_BOOT_TIMER_MMIO_BASE, DEFAULT_BOOT_TIMER_MMIO_REGION_ID, DEFAULT_ENTROPY_MMIO_BASE,
         DEFAULT_ENTROPY_MMIO_REGION_ID, DEFAULT_HVF_BOOT_RUN_LOOP_STEP_LIMIT,
+        DEFAULT_MEMORY_HOTPLUG_MMIO_BASE, DEFAULT_MEMORY_HOTPLUG_MMIO_REGION_ID,
         DEFAULT_NETWORK_MMIO_BASE, DEFAULT_NETWORK_MMIO_REGION_ID, DEFAULT_PMEM_MMIO_BASE,
         DEFAULT_PMEM_MMIO_REGION_ID, DEFAULT_SERIAL_MMIO_BASE, DEFAULT_SERIAL_MMIO_REGION_ID,
         DEFAULT_VSOCK_MMIO_BASE, DEFAULT_VSOCK_MMIO_REGION_ID, EmptyProcessNetworkRxPacketSource,
@@ -4458,6 +4473,33 @@ mod tests {
     }
 
     #[test]
+    fn configured_hvf_boot_session_config_includes_memory_hotplug_device() {
+        let executor = HvfInstanceStartExecutor::default();
+        let mut controller = VmmController::new("demo-1", "0.1.0", "bangbang");
+        controller
+            .handle_action(VmmAction::PutMemoryHotplug(MemoryHotplugConfigInput::new(
+                1024, 2, 128,
+            )))
+            .expect("memory hotplug config should store");
+
+        let config = executor
+            .boot_session_config_for_controller(&controller)
+            .expect("configured memory hotplug should build boot config");
+
+        let memory_hotplug = config
+            .memory_hotplug_device
+            .expect("configured memory hotplug should add HVF boot device");
+        assert_eq!(
+            memory_hotplug.mmio_layout.address(),
+            DEFAULT_MEMORY_HOTPLUG_MMIO_BASE
+        );
+        assert_eq!(
+            memory_hotplug.mmio_layout.region_id(),
+            DEFAULT_MEMORY_HOTPLUG_MMIO_REGION_ID
+        );
+    }
+
+    #[test]
     fn configured_hvf_boot_session_config_includes_boot_timer_device() {
         let executor = HvfInstanceStartExecutor {
             boot_timer_enabled: true,
@@ -4687,6 +4729,12 @@ mod tests {
             VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
         )
         .expect("balloon MMIO region should be valid");
+        let memory_hotplug_region = MmioRegion::new(
+            DEFAULT_MEMORY_HOTPLUG_MMIO_REGION_ID,
+            DEFAULT_MEMORY_HOTPLUG_MMIO_BASE,
+            VIRTIO_MMIO_DEVICE_WINDOW_SIZE,
+        )
+        .expect("memory hotplug MMIO region should be valid");
         let serial_region = MmioRegion::new(
             serial_region_id,
             DEFAULT_SERIAL_MMIO_BASE,
@@ -4702,7 +4750,8 @@ mod tests {
                     && registration.region_id() != pmem_first_region.id()
                     && registration.region_id() != vsock_region.id()
                     && registration.region_id() != entropy_region.id()
-                    && registration.region_id() != balloon_region.id())
+                    && registration.region_id() != balloon_region.id()
+                    && registration.region_id() != memory_hotplug_region.id())
         );
         assert!(network_devices.registrations().iter().all(
             |registration| registration.region_id() != serial_region_id
@@ -4710,6 +4759,7 @@ mod tests {
                 && registration.region_id() != vsock_region.id()
                 && registration.region_id() != entropy_region.id()
                 && registration.region_id() != balloon_region.id()
+                && registration.region_id() != memory_hotplug_region.id()
         ));
         assert_ne!(pmem_first_region.id(), serial_region_id);
         assert_ne!(vsock_region.id(), serial_region_id);
@@ -4721,6 +4771,11 @@ mod tests {
         assert_ne!(balloon_region.id(), pmem_first_region.id());
         assert_ne!(balloon_region.id(), vsock_region.id());
         assert_ne!(balloon_region.id(), entropy_region.id());
+        assert_ne!(memory_hotplug_region.id(), serial_region_id);
+        assert_ne!(memory_hotplug_region.id(), pmem_first_region.id());
+        assert_ne!(memory_hotplug_region.id(), vsock_region.id());
+        assert_ne!(memory_hotplug_region.id(), entropy_region.id());
+        assert_ne!(memory_hotplug_region.id(), balloon_region.id());
         assert!(block_devices.registrations().iter().all(|block| {
             network_devices
                 .registrations()
@@ -4731,6 +4786,10 @@ mod tests {
                 && !block.region().range().overlaps(vsock_region.range())
                 && !block.region().range().overlaps(entropy_region.range())
                 && !block.region().range().overlaps(balloon_region.range())
+                && !block
+                    .region()
+                    .range()
+                    .overlaps(memory_hotplug_region.range())
         }));
         assert!(network_devices.registrations().iter().all(|network| {
             !network.region().range().overlaps(serial_region.range())
@@ -4738,6 +4797,10 @@ mod tests {
                 && !network.region().range().overlaps(vsock_region.range())
                 && !network.region().range().overlaps(entropy_region.range())
                 && !network.region().range().overlaps(balloon_region.range())
+                && !network
+                    .region()
+                    .range()
+                    .overlaps(memory_hotplug_region.range())
         }));
         assert!(!pmem_first_region.range().overlaps(serial_region.range()));
         assert!(!vsock_region.range().overlaps(serial_region.range()));
@@ -4749,6 +4812,27 @@ mod tests {
         assert!(!balloon_region.range().overlaps(pmem_first_region.range()));
         assert!(!balloon_region.range().overlaps(vsock_region.range()));
         assert!(!balloon_region.range().overlaps(entropy_region.range()));
+        assert!(
+            !memory_hotplug_region
+                .range()
+                .overlaps(serial_region.range())
+        );
+        assert!(
+            !memory_hotplug_region
+                .range()
+                .overlaps(pmem_first_region.range())
+        );
+        assert!(!memory_hotplug_region.range().overlaps(vsock_region.range()));
+        assert!(
+            !memory_hotplug_region
+                .range()
+                .overlaps(entropy_region.range())
+        );
+        assert!(
+            !memory_hotplug_region
+                .range()
+                .overlaps(balloon_region.range())
+        );
     }
 
     #[test]
