@@ -1667,8 +1667,9 @@ mod tests {
     #[test]
     fn guest_memory_insert_region_rejects_overlap_without_mutation() {
         let page_size = host_page_size().expect("host page size should be available for tests");
-        let original_range = range(page_size, page_size);
-        let overlapping_range = range(0, page_size * 2);
+        let original_range = range(page_size, page_size * 2);
+        let overlapping_before = range(0, page_size * 2);
+        let overlapping_after = range(page_size * 2, page_size);
         let drop_count = Arc::new(AtomicUsize::new(0));
         let mut mapper = CountingMapper {
             maps: 0,
@@ -1682,15 +1683,27 @@ mod tests {
         .expect("guest memory should allocate");
 
         let err = memory
-            .insert_region_with_mapper(overlapping_range, page_size, &mut mapper)
-            .expect_err("overlapping insert should fail");
+            .insert_region_with_mapper(overlapping_before, page_size, &mut mapper)
+            .expect_err("overlapping insert before existing range should fail");
 
         assert!(matches!(
             err,
             GuestMemoryAllocationError::InvalidLayout(GuestMemoryError::OverlappingRange {
                 previous,
                 next,
-            }) if previous == overlapping_range && next == original_range
+            }) if previous == overlapping_before && next == original_range
+        ));
+
+        let err = memory
+            .insert_region_with_mapper(overlapping_after, page_size, &mut mapper)
+            .expect_err("overlapping insert after existing range should fail");
+
+        assert!(matches!(
+            err,
+            GuestMemoryAllocationError::InvalidLayout(GuestMemoryError::OverlappingRange {
+                previous,
+                next,
+            }) if previous == original_range && next == overlapping_after
         ));
         assert_eq!(memory_ranges(&memory), vec![original_range]);
         assert_eq!(mapper.maps, 1);
